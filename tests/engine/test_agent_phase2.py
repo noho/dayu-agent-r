@@ -814,6 +814,62 @@ def test_exception_diagnostic_message_marks_truncation() -> None:
     )
 
 
+def test_exception_diagnostic_message_redacts_api_key_with_space() -> None:
+    """异常诊断消息必须识别 ``api key`` 空格写法。"""
+
+    message = agent_module._exception_diagnostic_message(
+        RuntimeError("provider rejected api key sk-secret-value")
+    )
+
+    assert message == "RuntimeError: exception message redacted"
+    assert "sk-secret-value" not in message
+
+
+@pytest.mark.parametrize(
+    "raw_message",
+    (
+        "JWT token has expired",
+        "Content-Type header is invalid",
+    ),
+)
+def test_exception_diagnostic_message_preserves_normal_token_and_header_words(
+    raw_message: str,
+) -> None:
+    """异常诊断保留不含 secret 值的 token/header 普通诊断词。"""
+
+    message = agent_module._exception_diagnostic_message(
+        RuntimeError(raw_message)
+    )
+
+    assert message == f"RuntimeError: {raw_message}"
+
+
+@pytest.mark.parametrize(
+    "raw_message",
+    (
+        "provider rejected Bearer sk-secret-value",
+        "provider rejected API key sk-secret-value",
+        "provider rejected api_key=sk-secret-value",
+        "provider rejected apikey=sk-secret-value",
+        "provider rejected authorization=sk-secret-value",
+        "provider rejected password=sk-secret-value",
+        "provider rejected secret=sk-secret-value",
+        "provider rejected token=sk-secret-value",
+    ),
+)
+def test_exception_diagnostic_message_redacts_sensitive_value_patterns(
+    raw_message: str,
+) -> None:
+    """异常诊断只要包含疑似 secret 明文值就整条脱敏。"""
+
+    message = agent_module._exception_diagnostic_message(
+        RuntimeError(raw_message)
+    )
+
+    assert message == "RuntimeError: exception message redacted"
+    assert "sk-secret-value" not in message
+
+
 @pytest.mark.asyncio
 async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
     """入口已取消时不调用 Runner，但先 close 再产出 run_cancelled。"""

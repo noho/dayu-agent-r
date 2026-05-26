@@ -45,10 +45,9 @@ from dayu.host import (
     OperationContext,
     OrdinaryRunExecutionBaseline,
     SubmitFollowupRequest,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     open_host,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.memory import default_memory_projection_policy
 
 
@@ -101,7 +100,7 @@ class _FinalHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消。
 
         :param reason: 取消原因。

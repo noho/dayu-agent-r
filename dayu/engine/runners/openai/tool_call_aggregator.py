@@ -69,6 +69,22 @@ def _bounded_name_fragment(name: str) -> str | None:
     return name[:PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS]
 
 
+def _sorted_partial_indices(
+    partials_by_index: Mapping[int, "_PartialToolCall"],
+) -> list[int]:
+    """按 provider 原生 index 与合成 index 分区排序 partial key。
+
+    :param partials_by_index: 当前累积的 partial 映射。
+    :returns: 原生非负 index 升序在前，合成负数 index 按分配顺序在后。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return sorted(
+        partials_by_index.keys(),
+        key=lambda index: (index < 0, -index if index < 0 else index),
+    )
+
+
 @dataclass(slots=True)
 class _PartialToolCall:
     """累积中的 tool call 状态。"""
@@ -128,26 +144,24 @@ class ToolCallAggregator:
         self._provider_request_id: str | None = provider_request_id
         self._partials_by_index: dict[int, _PartialToolCall] = {}
         self._index_by_id: dict[str, int] = {}
-        # 合成 index 与真实 index 共用一个稠密命名空间，从 0 开始。
-        # 既能避免与 provider 提供的真实 ``index`` 冲突，也使 finalize
-        # 阶段按 sorted-key 顺序生成的 ``index_in_iteration`` 与本 index
-        # 在「单一来源」场景下保持一致，让 SSE delta 与 completed 事件
-        # 中的 tool_call_index 可稳定对照。
-        self._next_synthetic_index: int = 0
+        # 合成 index 使用负数 keyspace，避免先收到缺 index delta 后又
+        # 收到 provider 原生 index=0 时把两条 tool call 错误合并。
+        self._next_synthetic_index: int = -1
+        self._index_by_position: dict[int, int] = {}
         self._fatal_errors: list[RunnerProtocolErrorData] = []
         self._warnings: list[RunnerProtocolErrorData] = []
 
     def _allocate_synthetic_index(self) -> int:
         """缺失 ``index`` 但有 ``id`` 时分配的合成顺序键。
 
-        从下一个未被占用（既不在 ``_partials_by_index`` 也未被合成过）
-        的整数开始，保证不会与 provider 真实 ``index`` 冲突。
+        从 ``-1`` 开始向负方向分配，保证不会与 provider 合法原生
+        ``index`` 冲突。
         """
 
         while self._next_synthetic_index in self._partials_by_index:
-            self._next_synthetic_index += 1
+            self._next_synthetic_index -= 1
         index = self._next_synthetic_index
-        self._next_synthetic_index += 1
+        self._next_synthetic_index -= 1
         return index
 
     def _resolve_index(
@@ -180,6 +194,11 @@ class ToolCallAggregator:
         # 无 ``id`` 也无 ``index``：若调用方提供了 ``pos``，且该位置已
         # 有 partial，则归到该 partial（OLD ``sse_parser.py`` 的 pos
         # fallback 行为）。
+        if (
+            position is not None
+            and position in self._index_by_position
+        ):
+            return self._index_by_position[position]
         if (
             position is not None
             and position in self._partials_by_index
@@ -223,6 +242,8 @@ class ToolCallAggregator:
         partial = self._partials_by_index.setdefault(
             index, _PartialToolCall()
         )
+        if position is not None:
+            self._index_by_position[position] = index
         delta_id = delta.get("id")
         if isinstance(delta_id, str) and delta_id:
             partial.tool_call_id = delta_id
@@ -304,7 +325,7 @@ class ToolCallAggregator:
         """
 
         tool_calls: list[ToolCallRequest] = []
-        sorted_indices = sorted(self._partials_by_index.keys())
+        sorted_indices = _sorted_partial_indices(self._partials_by_index)
         result_index = 0
         for index in sorted_indices:
             partial = self._partials_by_index[index]
@@ -362,7 +383,7 @@ class ToolCallAggregator:
         """
 
         summaries: list[PartialToolCallSummary] = []
-        for index in sorted(self._partials_by_index.keys())[
+        for index in _sorted_partial_indices(self._partials_by_index)[
             :PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS
         ]:
             partial = self._partials_by_index[index]

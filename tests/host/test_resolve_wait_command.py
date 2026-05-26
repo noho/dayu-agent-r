@@ -188,14 +188,14 @@ def test_resolve_wait_survives_projection_catchup_failure(
         host.close()
 
 
-def test_resolve_wait_committed_tool_fact_catches_up_memory(
+def test_resolve_wait_committed_tool_result_catches_up_memory_without_fact(
     tmp_path: Path,
 ) -> None:
-    """显式 concrete catch-up port 会投影 resolve_wait 工具事实。
+    """显式 concrete catch-up port 会追平 accepted tool result cursor。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
-    :raises AssertionError: resolve_wait committed 工具事实未进入 memory 时抛出。
+    :raises AssertionError: resolve_wait committed 工具结果未被 memory 覆盖时抛出。
     """
 
     policy = default_memory_projection_policy()
@@ -225,13 +225,15 @@ def test_resolve_wait_committed_tool_fact_catches_up_memory(
 
         assert snapshot.status is RunStatus.RUNNING
         assert memory_snapshot is not None
-        assert len(memory_snapshot.snapshot.verified_facts) == 1
-        assert memory_snapshot.snapshot.verified_facts[0].provenance.event_id in {
-            row.event_id
-            for row in _events_by_type(
-                _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
-            )
-        }
+        tool_events = _events_by_type(
+            _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
+        )
+        assert memory_snapshot.snapshot.evidence_backed_facts == ()
+        assert len(tool_events) > 0
+        assert (
+            memory_snapshot.snapshot.cursor.checkpoint_event_sequence
+            >= tool_events[-1].event_sequence
+        )
     finally:
         host.close()
 
@@ -437,7 +439,7 @@ class _SeededWaitingRun:
         self.wait_id = wait_id
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -985,7 +987,7 @@ def _token() -> CancellationToken:
     :returns: 未取消 token。
     """
 
-    return _NeverCancelledToken()
+    return _OpenCancellationToken()
 
 
 def _policy_snapshot() -> PolicySnapshot:

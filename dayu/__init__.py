@@ -3,6 +3,7 @@
 本包提供 `dayu` 命名空间。具体能力按子包提供：
 
 - ``dayu.engine``：Engine 公共契约。
-
-Phase 0 仅落地 Engine 公共契约；Host / Service / UI 等其它子包尚未引入。
+- ``dayu.host``：Host 生命周期、持久化状态机与本地 dispatch。
+- ``dayu.runtime``：跨层复用的运行时基础设施。
+- ``dayu.service``：面向应用入口的装配层。
 """

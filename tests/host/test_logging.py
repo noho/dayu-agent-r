@@ -45,7 +45,7 @@ _SECRET_PROMPT = "SECRET_FULL_PROMPT_DO_NOT_LOG"
 _SECRET_AUTH = "SECRET_AUTH_CLAIM_DO_NOT_LOG"
 
 
-class _NeverCancelledToken(CancellationToken):
+class _OpenCancellationToken(CancellationToken):
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -267,7 +267,7 @@ def _attempt_snapshot() -> AttemptDispatchSnapshot:
         dispatch_record_id="dispatch-log",
         execution_target="target-log",
         policy_snapshot_ref="policy-log",
-        cancellation_token=_NeverCancelledToken(),
+        cancellation_token=_OpenCancellationToken(),
     )
 
 

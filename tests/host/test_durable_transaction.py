@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime, timezone, timedelta
 from pathlib import Path
@@ -233,8 +234,9 @@ def test_after_commit_failure_preserves_durable_commit(tmp_path: Path) -> None:
 
 def test_after_commit_failure_still_attempts_later_callbacks(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """首个 after-commit 失败时仍必须尝试后续 callback。"""
+    """首个 after-commit 失败时仍尝试后续 callback 并记录次生失败。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -268,21 +270,28 @@ def test_after_commit_failure_still_attempts_later_callbacks(
             raise RuntimeError("first callback failed")
 
         def second_callback() -> None:
-            """记录第二个 callback 已执行。
+            """记录第二个 callback 并模拟次生失败。
 
-            :returns: ``None``。
+            :returns: 永不返回。
+            :raises RuntimeError: 始终抛出。
             """
 
             callback_events.append("second")
+            raise RuntimeError("second callback failed")
 
-        with pytest.raises(HostAfterCommitError) as error_info:
-            store.transaction_runner.run_write(
-                operation,
-                after_commit=(first_callback, second_callback),
-            )
+        with caplog.at_level(
+            logging.ERROR, logger="dayu.host.durable.transaction"
+        ):
+            with pytest.raises(HostAfterCommitError) as error_info:
+                store.transaction_runner.run_write(
+                    operation,
+                    after_commit=(first_callback, second_callback),
+                )
 
         assert error_info.value.callback_index == 0
         assert callback_events == ["first", "second"]
+        assert "after-commit callback secondary failure" in caplog.text
+        assert "callback_index=1" in caplog.text
         check_connection = store.connect()
         try:
             assert _count_rows(check_connection, "notes") == 1

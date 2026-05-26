@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -177,15 +178,12 @@ _CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE: str = (
 _EXCEPTION_MESSAGE_REDACTED: str = "exception message redacted"
 _EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
 _EXCEPTION_MESSAGE_TRUNCATED_SUFFIX: str = "... [truncated]"
-_SENSITIVE_EXCEPTION_MARKERS: tuple[str, ...] = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "bearer ",
-    "header",
-    "password",
-    "secret",
-    "token",
+_BEARER_SECRET_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_API_KEY_VALUE_PATTERN = re.compile(
+    r"(?i)\b(?:api[ _-]?key|apikey)\b\s*(?::|=|\s+)\s*[^,\s}\]]+"
+)
+_ASSIGNED_SECRET_VALUE_PATTERN = re.compile(
+    r"(?i)\b(?:authorization|password|secret|token)\b\s*[:=]\s*[^,\s}\]]+"
 )
 
 _PlainJsonValue: TypeAlias = (
@@ -214,8 +212,7 @@ def _exception_diagnostic_message(exc: Exception) -> str:
     raw_message = str(exc)
     if not raw_message:
         return exc_type
-    lowered_message = raw_message.lower()
-    if any(marker in lowered_message for marker in _SENSITIVE_EXCEPTION_MARKERS):
+    if _contains_sensitive_exception_value(raw_message):
         return f"{exc_type}: {_EXCEPTION_MESSAGE_REDACTED}"
     if len(raw_message) > _EXCEPTION_MESSAGE_MAX_LENGTH:
         max_body_length = (
@@ -229,6 +226,21 @@ def _exception_diagnostic_message(exc: Exception) -> str:
     return f"{exc_type}: {raw_message}"
 
 
+def _contains_sensitive_exception_value(message: str) -> bool:
+    """判断异常消息是否包含疑似 secret 明文值。
+
+    :param message: provider / runner 原始异常消息。
+    :returns: 命中 Bearer token、API key 或显式 secret 赋值时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        _BEARER_SECRET_PATTERN.search(message) is not None
+        or _API_KEY_VALUE_PATTERN.search(message) is not None
+        or _ASSIGNED_SECRET_VALUE_PATTERN.search(message) is not None
+    )
+
+
 def _safe_log_message(message: str) -> str:
     """构造可进入日志的一行脱敏短消息。
 
@@ -239,8 +251,7 @@ def _safe_log_message(message: str) -> str:
 
     if message.strip() == "":
         return _EXCEPTION_MESSAGE_REDACTED
-    lowered_message = message.lower()
-    if any(marker in lowered_message for marker in _SENSITIVE_EXCEPTION_MARKERS):
+    if _contains_sensitive_exception_value(message):
         return _EXCEPTION_MESSAGE_REDACTED
     if len(message) <= _EXCEPTION_MESSAGE_MAX_LENGTH:
         return message

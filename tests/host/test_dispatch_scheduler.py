@@ -9,10 +9,11 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
@@ -23,7 +24,7 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.messages import AgentMessage
+from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -68,16 +69,29 @@ from dayu.host.context_policy import (
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.dispatch import (
     ActiveCancelMessage,
     ActiveWorkerRegistry,
     DispatchDrainResult,
     HostDispatchScheduler,
+    _DurableRunCancellationToken,
     _safe_close_worker_handle,
     _safe_release_lane_token,
+)
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    MemoryRepairReason,
+    MemoryRepairRequest,
+    MemorySnapshotCursor,
+    default_memory_projection_policy,
+    digest_memory_projection_policy,
+)
+from dayu.host.run_input import (
+    MemoryProjectionRepairRequired,
+    NoToolExecutor,
+    PolicySnapshot,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
@@ -103,6 +117,7 @@ from dayu.host.durable.run_transition import (
     FailUnstartedRunInput,
     fail_unstarted_run_in_transaction,
 )
+from dayu.host.durable.liveness import HostInstanceIdentity, register_current_instance
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     AttemptRow,
@@ -117,7 +132,11 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
 )
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import (
+    HostReadTransactionOperation,
+    HostTransaction,
+    HostTransactionRunner,
+)
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.runtime.lane import (
@@ -137,6 +156,31 @@ _SOFT_CONTEXT_WINDOW_SIZE = 110
 _SOFT_RESERVED_OUTPUT_TOKENS = 10
 _SOFT_HARD_THRESHOLD_TOKENS = 80
 _SOFT_SAFETY_MARGIN_RATIO = 0.5
+_T = TypeVar("_T")
+
+
+class _RetryExhaustedReadRunner(HostTransactionRunner):
+    """测试用 read transaction runner，始终模拟 durable 不可读。"""
+
+    def __init__(self) -> None:
+        """跳过真实 SQLite runner 初始化。
+
+        :returns: ``None``。
+        """
+
+    def run_read(self, operation: HostReadTransactionOperation[_T]) -> _T:
+        """模拟 read transaction busy 重试耗尽。
+
+        :param operation: Host read transaction operation。
+        :returns: 不会返回。
+        :raises HostTransactionRetryExhaustedError: 始终抛出。
+        """
+
+        del operation
+        raise HostTransactionRetryExhaustedError(
+            "Host durable read transaction busy retry exhausted",
+            attempts=3,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +250,7 @@ class _FakeHandle:
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -253,10 +297,13 @@ class _TransactionReadableCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """执行 compact 并验证当前不在外层 write transaction 内。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: fake compaction candidate。
         """
 
@@ -265,7 +312,7 @@ class _TransactionReadableCompactor(ContextCompactor):
             lambda transaction: read_run_by_id(transaction, request.run_id)
         )
         assert row is not None
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _StaleMutatingCompactor(ContextCompactor):
@@ -281,10 +328,13 @@ class _StaleMutatingCompactor(ContextCompactor):
         self._transaction_runner = transaction_runner
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """先把源 Run 失败收口，再返回 candidate。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: fake compaction candidate。
         """
 
@@ -308,21 +358,25 @@ class _StaleMutatingCompactor(ContextCompactor):
             )
 
         self._transaction_runner.run_write(_operation)
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _RaisingCompactor(ContextCompactor):
     """测试用始终失败 compactor。"""
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """模拟 proposal failure。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: 不会返回。
         :raises RuntimeError: 始终抛出测试错误。
         """
 
         del request
+        del cancellation_token
         raise RuntimeError("proposal failed")
 
 
@@ -338,18 +392,47 @@ class _QualityRejectOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """构造一次可修复 quality rejection。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: compaction candidate。
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request)
+        candidate = await self._fake.compact(request, cancellation_token)
         if self.calls == 1:
             return replace(candidate, retained_current_user_input_ref="wrong-input")
         return candidate
+
+
+class _RequestCapturingCompactor(ContextCompactor):
+    """记录 proactive compaction request 的测试 compactor。"""
+
+    def __init__(self) -> None:
+        """初始化 request recorder。
+
+        :returns: ``None``。
+        """
+
+        self.requests: list[CompactionRequest] = []
+        self._fake = FakeContextCompactor()
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """记录 request 并返回 fake candidate。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: fake compaction candidate。
+        """
+
+        self.requests.append(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _CloseFailingHandle(_FakeHandle):
@@ -365,7 +448,7 @@ class _CloseFailingHandle(_FakeHandle):
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """模拟 handle cancel 异常。
 
         :param reason: 取消原因。
@@ -409,7 +492,7 @@ class _CloseCountingHandle(_FakeHandle):
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -459,7 +542,7 @@ class _ControlledBlockingHandle(_FakeHandle):
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -656,6 +739,100 @@ class _FakeWorkerFactory:
         if self._slow:
             return _SlowWorker()
         return _AcceptingWorker(self)
+
+
+class _LagRepairRunInputBuilder:
+    """首次 build 抛出大滞后 repair，第二次返回最小 Engine request。"""
+
+    def __init__(self) -> None:
+        """初始化调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+
+    def build(self, snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
+        """构造测试 Engine request，首次模拟 snapshot 大滞后。
+
+        :param snapshot: dispatch snapshot。
+        :returns: 最小 no-tool Engine request。
+        :raises MemoryProjectionRepairRequired: 首次调用时抛出 lag repair。
+        """
+
+        self.calls += 1
+        if self.calls == 1:
+            policy = default_memory_projection_policy()
+            raise MemoryProjectionRepairRequired(
+                MemoryRepairRequest(
+                    session_id=snapshot.session_id,
+                    reason=MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD,
+                    required_event_sequence=20,
+                    observed_cursor=MemorySnapshotCursor(
+                        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                        checkpoint_event_sequence=0,
+                        checkpoint_event_id=None,
+                        session_id=snapshot.session_id,
+                    ),
+                    policy_digest=digest_memory_projection_policy(policy),
+                )
+            )
+        return AgentRunRequest(
+            run_id=snapshot.run_id,
+            session_id=snapshot.session_id,
+            messages=(
+                UserMessage(role=AgentMessageRole.USER, content="dispatch after lag"),
+            ),
+            disable_tools=True,
+            runner_spec=_runner_spec(),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=False,
+            ),
+            agent_policy=_agent_policy(False),
+            tool_schemas=(),
+            tool_executor=NoToolExecutor(),
+            cancellation_token=snapshot.cancellation_token,
+        )
+
+
+class _PersistentLagRepairRunInputBuilder:
+    """每次 build 都抛出大滞后 repair。"""
+
+    def __init__(self) -> None:
+        """初始化调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+
+    def build(self, snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
+        """构造测试 Engine request，始终模拟 snapshot 大滞后。
+
+        :param snapshot: dispatch snapshot。
+        :returns: 不会返回。
+        :raises MemoryProjectionRepairRequired: 始终抛出 lag repair。
+        """
+
+        self.calls += 1
+        policy = default_memory_projection_policy()
+        raise MemoryProjectionRepairRequired(
+            MemoryRepairRequest(
+                session_id=snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD,
+                required_event_sequence=20,
+                observed_cursor=MemorySnapshotCursor(
+                    consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                    checkpoint_event_sequence=0,
+                    checkpoint_event_id=None,
+                    session_id=snapshot.session_id,
+                ),
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
 
 
 class _SnapshotEventHandle(_FakeHandle):
@@ -993,7 +1170,7 @@ class _FailingCloseWorkerHandle:
 
         raise RuntimeError("worker close failed")
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消请求。
 
         :param reason: 取消原因。
@@ -1065,6 +1242,195 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
                 == seeded.dispatch_record_id
             )
             assert factory.accepted_requests[0].disable_tools is True
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_lag_repair_rebuild_retry_does_not_fail_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SNAPSHOT_LAG_OVER_THRESHOLD 触发 rebuild retry，不关闭 Run。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
+    builder = _LagRepairRunInputBuilder()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def _noop_catch_up(record: PendingDispatchRecord) -> None:
+            """跳过 dispatch 预构建 catch-up，让 builder 暴露 lag repair。
+
+            :param record: pending dispatch 摘要。
+            :returns: ``None``。
+            """
+
+            del record
+
+        def _fake_builder_for_dispatch(
+            *,
+            snapshot: AttemptDispatchSnapshot,
+            policy_snapshot: PolicySnapshot,
+            selected_business_tool_names: frozenset[str] | None,
+        ) -> _LagRepairRunInputBuilder:
+            """返回会先抛 lag repair 的测试 builder。
+
+            :param snapshot: dispatch snapshot。
+            :param policy_snapshot: 冻结 policy snapshot。
+            :param selected_business_tool_names: 冻结业务工具名。
+            :returns: 测试 builder。
+            """
+
+            del snapshot, policy_snapshot, selected_business_tool_names
+            return builder
+
+        monkeypatch.setattr(
+            scheduler,
+            "_catch_up_memory_projection_before_worker",
+            _noop_catch_up,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_input_builder_for_dispatch",
+            _fake_builder_for_dispatch,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            assert result.dispatched == 1
+            assert builder.calls == 2
+            assert factory.created == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+            assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pre-dispatch memory lag repair 不得把 Run 推入 RECOVERING。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
+    builder = _LagRepairRunInputBuilder()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def _noop_catch_up(record: PendingDispatchRecord) -> None:
+            """跳过 catch-up 以触发 builder lag repair 分支。
+
+            :param record: pending dispatch 摘要。
+            :returns: ``None``。
+            """
+
+            del record
+
+        def _fake_builder_for_dispatch(
+            *,
+            snapshot: AttemptDispatchSnapshot,
+            policy_snapshot: PolicySnapshot,
+            selected_business_tool_names: frozenset[str] | None,
+        ) -> _LagRepairRunInputBuilder:
+            """返回测试 builder。
+
+            :param snapshot: dispatch snapshot。
+            :param policy_snapshot: policy snapshot。
+            :param selected_business_tool_names: 业务工具名集合。
+            :returns: 测试 builder。
+            """
+
+            del snapshot, policy_snapshot, selected_business_tool_names
+            return builder
+
+        monkeypatch.setattr(
+            scheduler,
+            "_catch_up_memory_projection_before_worker",
+            _noop_catch_up,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_input_builder_for_dispatch",
+            _fake_builder_for_dispatch,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            await scheduler.drain_once()
+
+            assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_memory_lag_repair_failure_closes_starting_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """worker startup memory lag 修复失败不得遗留 running / dispatching 状态。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
+    builder = _PersistentLagRepairRunInputBuilder()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def _noop_catch_up(record: PendingDispatchRecord) -> None:
+            """跳过 catch-up 以触发 builder lag repair 分支。
+
+            :param record: pending dispatch 摘要。
+            :returns: ``None``。
+            """
+
+            del record
+
+        def _fake_builder_for_dispatch(
+            *,
+            snapshot: AttemptDispatchSnapshot,
+            policy_snapshot: PolicySnapshot,
+            selected_business_tool_names: frozenset[str] | None,
+        ) -> _PersistentLagRepairRunInputBuilder:
+            """返回持续 lag repair 的测试 builder。
+
+            :param snapshot: dispatch snapshot。
+            :param policy_snapshot: policy snapshot。
+            :param selected_business_tool_names: 业务工具名集合。
+            :returns: 测试 builder。
+            """
+
+            del snapshot, policy_snapshot, selected_business_tool_names
+            return builder
+
+        monkeypatch.setattr(
+            scheduler,
+            "_catch_up_memory_projection_before_worker",
+            _noop_catch_up,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_input_builder_for_dispatch",
+            _fake_builder_for_dispatch,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            run, attempt, dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            assert result.timed_out == 1
+            assert builder.calls == 2
+            assert factory.created == 0
+            assert run.status == RunStatus.FAILED
+            assert attempt.status == AttemptStatus.FAILED
+            assert dispatch_record.status == DispatchRecordStatus.CANCELLED
+            assert dispatch_record.cancelled_event_id is not None
         finally:
             await scheduler.close()
 
@@ -1414,9 +1780,21 @@ async def test_dispatching_after_recheck_requires_waiting_for_lane(
     """scheduler durable recheck 只接受已进入 waiting_for_lane 的 dispatch。"""
 
     factory = _FakeWorkerFactory()
+    host_identity = HostInstanceIdentity(
+        host_instance_id="host-instance-dispatch-recheck",
+        pid=1,
+        process_start_token="process-token-dispatch-recheck",
+        boot_id=None,
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            host_handle_id="host-handle-dispatch-recheck",
+            host_instance_identity=host_identity,
+        )
         claim = await scheduler._lane_controller.acquire(
             _LANE_NAME,
             timeout_seconds=0,
@@ -1426,6 +1804,8 @@ async def test_dispatching_after_recheck_requires_waiting_for_lane(
             wait_row = scheduler._mark_waiting_for_lane(_pending_dispatch(seeded))
             assert wait_row is not None
             assert wait_row.status == DispatchRecordStatus.WAITING_FOR_LANE
+            assert wait_row.owner_host_instance_id == scheduler.host_instance_id
+            assert wait_row.owner_host_instance_id != "host-handle-dispatch-recheck"
             dispatch_record = scheduler._mark_dispatching_after_recheck(
                 _pending_dispatch(seeded),
                 claim.token,
@@ -1436,6 +1816,11 @@ async def test_dispatching_after_recheck_requires_waiting_for_lane(
             assert dispatch_record.waiting_for_lane_at is not None
             assert dispatch_record.lane_name == _LANE_NAME
             assert dispatch_record.lane_claim_id == claim.token.claim_id
+            assert dispatch_record.owner_host_instance_id == scheduler.host_instance_id
+            assert (
+                dispatch_record.owner_host_instance_id
+                != "host-handle-dispatch-recheck"
+            )
         finally:
             await claim.token.release()
             await scheduler.close()
@@ -1598,6 +1983,21 @@ async def test_worker_startup_closeout_error_still_releases_lane(
             assert "original_error_type=RuntimeError" in caplog.text
         finally:
             await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_run_cancellation_token_fails_closed_on_retry_exhausted() -> None:
+    """durable read 重试耗尽时，compaction 取消 token 必须 fail closed。"""
+
+    token = _DurableRunCancellationToken(
+        transaction_runner=_RetryExhaustedReadRunner(),
+        run_id="run-durable-unavailable",
+        expected_status=RunStatus.ACCEPTED,
+        expected_input_event_sequence=1,
+    )
+
+    assert token.is_cancelled() is True
+    assert token.cancel_reason() == "durable_unavailable"
 
 
 @pytest.mark.asyncio
@@ -1842,7 +2242,7 @@ async def test_scheduler_close_suppresses_handle_close_exception(
         assert result.dispatched == 1
         with caplog.at_level("WARNING", logger="dayu.host.dispatch"):
             await scheduler.close()
-        assert "active worker cancel failed; continuing" in caplog.text
+        assert "active worker cancel hook failed; continuing" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1852,7 +2252,7 @@ async def test_scheduler_close_lets_active_task_own_handle_close(
     """scheduler close 只发 cancel，handle close 由 active task finally 执行一次。"""
 
     handle = _CloseCountingHandle()
-    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    factory = _FakeWorkerFactory(accepted_handle=handle)
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
         scheduler = await _open_scheduler(tmp_path, store, factory)
@@ -1873,7 +2273,7 @@ async def test_scheduler_close_during_active_events_releases_all_resources(
 
     handle = _ControlledBlockingHandle()
     registry = ActiveWorkerRegistry()
-    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    factory = _FakeWorkerFactory(accepted_handle=handle)
     lane_db_path = tmp_path / "lane-close-active.sqlite3"
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
@@ -1889,8 +2289,14 @@ async def test_scheduler_close_during_active_events_releases_all_resources(
         await handle.events_started.wait()
 
         assert result.dispatched == 1
+        assert len(factory.accepted_requests) == 1
         await scheduler.close()
 
+        assert factory.accepted_requests[0].cancellation_token.is_cancelled()
+        assert (
+            factory.accepted_requests[0].cancellation_token.cancel_reason()
+            == "scheduler_close"
+        )
         assert handle.cancel_count == 1
         assert handle.close_count == 1
         assert handle.events_finalized.is_set()
@@ -2171,6 +2577,125 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
             assert _run_status(store.transaction_runner, seeded.run_id) == (
                 RunStatus.RUNNING
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_governed_start_sets_dispatch_owner_immediately(
+    tmp_path: Path,
+) -> None:
+    """标准 governed start 在创建 dispatch record 时立即写入 owner。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: dispatch record owner 未立即写入 scheduler
+        instance id 时抛出。
+    """
+
+    host_identity = HostInstanceIdentity(
+        host_instance_id="host-instance-governed-start",
+        pid=1,
+        process_start_token="process-token-governed-start",
+        boot_id=None,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-governed-owner",
+            display_text="需要分析当前季度收入。",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            host_handle_id="host-handle-governed-start",
+            host_instance_identity=host_identity,
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            pending = _start_governed_for_test(
+                store.transaction_runner, scheduler, run
+            )
+            dispatch_record = _read_dispatch_record_by_attempt_id(
+                store.transaction_runner, pending.attempt_id
+            )
+
+            assert dispatch_record.owner_host_instance_id == scheduler.host_instance_id
+            assert dispatch_record.owner_host_instance_id is not None
+            assert (
+                dispatch_record.owner_host_instance_id
+                != "host-handle-governed-start"
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_uses_selected_material_not_session_start_range(
+    tmp_path: Path,
+) -> None:
+    """proactive request 使用 selected ordinary material，不从 Session 起点扫描。"""
+
+    compactor = _RequestCapturingCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-selected-material",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert len(compactor.requests) == 1
+            request = compactor.requests[0]
+            assert request.segment_selection.input_cursor == (
+                _run_input_sequence(store.transaction_runner, seeded.run_id)
+            )
+            assert request.material_source_refs == (
+                f"event-input-{seeded.run_id}",
+            )
+            assert request.segment_selection.selected_block_ids == ()
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_material_pack_not_larger_than_ordinary_material_for_same_view(
+    tmp_path: Path,
+) -> None:
+    """proactive material pack 与 ordinary material 使用同一去重视图。"""
+
+    compactor = _RequestCapturingCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-material-size",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            request = compactor.requests[0]
+            ordinary_chars = len(_soft_threshold_prompt())
+            pack_chars = len(str(request.llm_material_json()))
+            assert pack_chars <= ordinary_chars + 512
         finally:
             await scheduler.close()
 
@@ -2807,6 +3332,7 @@ async def _open_scheduler(
     context_compactor: ContextCompactor | None = None,
     compact_artifact_root: Path | None = None,
     host_handle_id: str = "host-test",
+    host_instance_identity: HostInstanceIdentity | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -2824,37 +3350,89 @@ async def _open_scheduler(
     :param context_compactor: 可选 context compactor。
     :param compact_artifact_root: 可选 compact artifact 根目录。
     :param host_handle_id: scheduler 使用的 Host handle id。
+    :param host_instance_identity: 可选 Host instance 身份；用于测试 handle
+        与 instance id 不同的 owner 写入路径。
     :returns: scheduler。
+    :raises Exception: lane controller 或 durable host instance 注册失败时透传。
     """
 
-    return await HostDispatchScheduler.open(
-        transaction_runner=store.transaction_runner,
-        local_execution=HostLocalExecutionOptions(
-            lane_db_path=lane_db_path if lane_db_path is not None else tmp_path / "lane.sqlite3",
-            lane_name=_LANE_NAME,
-            lane_capacity=1,
-            lane_default_timeout_seconds=lane_default_timeout_seconds,
-            lane_claim_ttl_seconds=1.0,
-            lane_heartbeat_interval_seconds=0.1,
-            worker_startup_timeout_seconds=worker_startup_timeout_seconds,
-            dispatch_poll_interval_seconds=0.01,
-            runner_spec=_runner_spec(),
-            runner_options=RunnerCallOptions(
-                temperature=None, max_tokens=None, top_p=None, stream=False
-            ),
-            agent_policy=(
-                agent_policy if agent_policy is not None else _agent_policy(False)
-            ),
-            worker_factory=factory,
-            tooling_options=tooling_options,
-            context_budget_policy=context_budget_policy,
-            context_compactor=context_compactor,
-            compact_artifact_root=compact_artifact_root,
+    local_execution = HostLocalExecutionOptions(
+        lane_db_path=(
+            lane_db_path if lane_db_path is not None else tmp_path / "lane.sqlite3"
         ),
+        lane_name=_LANE_NAME,
+        lane_capacity=1,
+        lane_default_timeout_seconds=lane_default_timeout_seconds,
+        lane_claim_ttl_seconds=1.0,
+        lane_heartbeat_interval_seconds=0.1,
+        worker_startup_timeout_seconds=worker_startup_timeout_seconds,
+        dispatch_poll_interval_seconds=0.01,
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None, max_tokens=None, top_p=None, stream=False
+        ),
+        agent_policy=agent_policy if agent_policy is not None else _agent_policy(False),
+        worker_factory=factory,
+        tooling_options=tooling_options,
+        context_budget_policy=context_budget_policy,
+        context_compactor=context_compactor,
+        compact_artifact_root=compact_artifact_root,
+    )
+    if host_instance_identity is None:
+        return await HostDispatchScheduler.open(
+            transaction_runner=store.transaction_runner,
+            local_execution=local_execution,
+            host_handle_id=host_handle_id,
+            active_registry=active_registry,
+            projection_catchup_port=projection_catchup,
+        )
+    _register_host_instance(store.transaction_runner, host_instance_identity)
+    lane_controller = await LaneController.open(
+        [
+            LaneConfig(
+                name=local_execution.lane_name,
+                capacity=local_execution.lane_capacity,
+                default_timeout_seconds=local_execution.lane_default_timeout_seconds,
+                claim_ttl_seconds=local_execution.lane_claim_ttl_seconds,
+                heartbeat_interval_seconds=(
+                    local_execution.lane_heartbeat_interval_seconds
+                ),
+            )
+        ],
+        coordinator=SQLiteLaneCoordinatorConfig(db_path=local_execution.lane_db_path),
+        owner=LaneOwner(
+            owner_id=f"lane-owner-{host_handle_id}",
+            pid=host_instance_identity.pid,
+            process_start_token=host_instance_identity.process_start_token,
+        ),
+    )
+    return HostDispatchScheduler(
+        transaction_runner=store.transaction_runner,
+        event_log_store=EventLogStore(),
+        local_execution=local_execution,
+        lane_controller=lane_controller,
         host_handle_id=host_handle_id,
+        host_instance_identity=host_instance_identity,
         active_registry=active_registry,
         projection_catchup_port=projection_catchup,
     )
+
+
+def _register_host_instance(
+    transaction_runner: HostTransactionRunner, identity: HostInstanceIdentity
+) -> None:
+    """注册测试 scheduler 的 Host instance row。
+
+    :param transaction_runner: Host transaction runner。
+    :param identity: 待注册的 Host instance 身份。
+    :returns: ``None``。
+    :raises Exception: durable host instance 注册失败时透传。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        register_current_instance(transaction, identity)
+
+    transaction_runner.run_write(_operation)
 
 
 def _runner_spec() -> RunnerSpec:
@@ -3336,6 +3914,64 @@ def _read_rows(
     return transaction_runner.run_read(_operation)
 
 
+def _read_run(transaction_runner: HostTransactionRunner, run_id: str) -> RunRow:
+    """读取指定 Run row。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Run row。
+    :raises AssertionError: Run 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> RunRow:
+        row = read_run_by_id(transaction, run_id)
+        assert row is not None
+        return row
+
+    return transaction_runner.run_read(_operation)
+
+
+def _read_dispatch_record_by_attempt_id(
+    transaction_runner: HostTransactionRunner, attempt_id: str
+) -> DispatchRecordRow:
+    """读取指定 Attempt 对应的 dispatch record。
+
+    :param transaction_runner: transaction runner。
+    :param attempt_id: Attempt id。
+    :returns: Dispatch record row。
+    :raises AssertionError: dispatch record 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> DispatchRecordRow:
+        row = read_dispatch_record_by_attempt_id(transaction, attempt_id)
+        assert row is not None
+        return row
+
+    return transaction_runner.run_read(_operation)
+
+
+def _start_governed_for_test(
+    transaction_runner: HostTransactionRunner,
+    scheduler: HostDispatchScheduler,
+    run: RunRow,
+) -> PendingDispatchRecord:
+    """在测试事务内执行标准 governed start。
+
+    :param transaction_runner: transaction runner。
+    :param scheduler: 待测试的 scheduler。
+    :param run: 待启动 Run row。
+    :returns: 新创建的 pending dispatch 摘要。
+    :raises AssertionError: governed start CAS 未创建 dispatch 时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> PendingDispatchRecord | None:
+        return scheduler._start_governed_in_transaction(transaction, run)
+
+    pending = transaction_runner.run_write(_operation)
+    assert pending is not None
+    return pending
+
+
 def _run_status(transaction_runner: HostTransactionRunner, run_id: str) -> RunStatus:
     """读取 Run 状态。
 
@@ -3349,6 +3985,25 @@ def _run_status(transaction_runner: HostTransactionRunner, run_id: str) -> RunSt
         row = read_run_by_id(transaction, run_id)
         assert row is not None
         return row.status
+
+    return transaction_runner.run_read(_operation)
+
+
+def _run_input_sequence(
+    transaction_runner: HostTransactionRunner, run_id: str
+) -> int:
+    """读取 Run input event sequence。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Run input event sequence。
+    :raises AssertionError: Run 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        row = read_run_by_id(transaction, run_id)
+        assert row is not None
+        return row.input_event_sequence
 
     return transaction_runner.run_read(_operation)
 

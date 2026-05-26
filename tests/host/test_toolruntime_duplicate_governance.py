@@ -46,10 +46,9 @@ from dayu.host.tool_runtime import (
     ToolRuntimePolicyView,
 )
 from dayu.host.tooling import (
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _SESSION_ID = "session-duplicate"
 _RUN_ID = "run-duplicate"
@@ -59,7 +58,7 @@ _ITERATION_ID = "iteration-duplicate"
 _POLICY_DIGEST = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -711,7 +710,7 @@ def _request(
             session_id=_SESSION_ID,
             iteration_id=_ITERATION_ID,
             timeout_seconds=10.0,
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=_OpenCancellationToken(),
             correlation_id="correlation-duplicate",
         ),
     )

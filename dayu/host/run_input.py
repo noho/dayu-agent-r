@@ -43,6 +43,23 @@ from dayu.host._event_payload import (
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.compact_payload import (
+    optional_text_list_field,
+    preserved_canonical_evidence_refs,
+    preserved_fact_refs_summary,
+)
+from dayu.host.compact_material import (
+    RunInputMaterialBlock,
+    run_input_material_block,
+)
+from dayu.host.compaction_evidence import (
+    SelectedEvidenceBlockRef,
+    collect_selected_compaction_request_evidence_inputs,
+)
+from dayu.host.compaction import (
+    CompactMaterialBlockKind,
+    CompactMaterialSection,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogRow,
@@ -82,7 +99,7 @@ from dayu.host.memory import (
     MemoryRepairRequest,
     MemorySnapshotCursor,
     OpaqueMemoryRef,
-    VerifiedFactView,
+    EvidenceBackedFactView,
     WorkingAssumptionView,
     build_inline_delta_repair_diagnostic,
     build_memory_budget_diagnostic,
@@ -111,14 +128,23 @@ _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
-_PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
-_PAYLOAD_FIELD_TOOL_FACT_REFS = "tool_fact_refs"
 _PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
 _PAYLOAD_FIELD_GOAL = "goal"
 _PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
 _PAYLOAD_FIELD_USER_CONSTRAINTS = "user_constraints"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _COMPACT_SUMMARY_MAX_CHARS = 1200
+_MEMORY_USER_GOALS_HEADER = "Memory user goals and constraints:"
+_MEMORY_CONFIRMED_SUBJECTS_HEADER = (
+    "Memory confirmed subjects and methodology:"
+)
+_MEMORY_EVIDENCE_BACKED_FACTS_HEADER = "Memory evidence-backed facts:"
+_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER = (
+    "Memory open questions and working assumptions:"
+)
+_MEMORY_MINIMUM_PRESERVE_HEADER = "Memory minimum preserve continuity:"
+_MEMORY_EPISODE_SUMMARIES_HEADER = "Memory episode summaries:"
+_ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT = 8
 _MEMORY_EVENT_TYPES = frozenset(
     (
         _EVENT_TYPE_USER_INPUT_ACCEPTED,
@@ -186,12 +212,15 @@ class MemorySnapshotView:
     :param memory_snapshot_cursor: memory snapshot cursor；no-op provider 为 ``None``。
     :param policy_digest: memory policy digest；no-op provider 为 ``None``。
     :param diagnostics: memory provider 产生或透传的 diagnostics。
+    :param represented_evidence_refs: 已被 stable evidence-backed fact 表示的
+        accepted evidence refs。
     """
 
     messages: tuple[AgentMessage, ...]
     memory_snapshot_cursor: str | None
     policy_digest: str | None
     diagnostics: tuple[MemoryDiagnostic, ...]
+    represented_evidence_refs: tuple[str, ...] = ()
 
 
 class MemoryProjectionRepairRequired(HostDurableError):
@@ -263,11 +292,14 @@ class CompactArtifactView:
     :param messages: compact artifact messages；Phase 5 noop 为空。
     :param compact_artifact_ref: compact artifact ref；Phase 5 noop 为 ``None``。
     :param compact_artifact_digest: compact artifact digest；Phase 5 noop 为 ``None``。
+    :param represented_evidence_refs: 已被 accepted compact artifact 表示的
+        canonical evidence refs。
     """
 
     messages: tuple[AgentMessage, ...]
     compact_artifact_ref: str | None
     compact_artifact_digest: str | None
+    represented_evidence_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +400,28 @@ class CompactArtifactProvider(Protocol):
         :param snapshot: Attempt dispatch snapshot。
         :param current_facts: 当前 Run facts。
         :returns: Compact artifact view。
+        """
+        ...
+
+
+class AcceptedToolEvidenceMaterialProvider(Protocol):
+    """Accepted tool evidence material provider 协议。"""
+
+    def load_accepted_tool_evidence_materials(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+        memory: MemorySnapshotView,
+        compact: CompactArtifactView,
+    ) -> tuple[RunInputMaterialBlock, ...]:
+        """读取当前 Attempt 可用于 compact 的 accepted tool evidence material。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :param memory: 当前 memory provider view。
+        :param compact: 当前 compact artifact provider view。
+        :returns: evidence material blocks。
+        :raises HostDurableError: evidence payload 损坏时抛出。
         """
         ...
 
@@ -936,6 +990,198 @@ class NoopCompactArtifactProvider:
         )
 
 
+class NoopAcceptedToolEvidenceMaterialProvider:
+    """不读取 accepted tool evidence 的 material provider。"""
+
+    def load_accepted_tool_evidence_materials(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+        memory: MemorySnapshotView,
+        compact: CompactArtifactView,
+    ) -> tuple[RunInputMaterialBlock, ...]:
+        """返回空 evidence material。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :param memory: 当前 memory provider view。
+        :param compact: 当前 compact artifact provider view。
+        :returns: 空 material tuple。
+        """
+
+        del snapshot, current_facts, memory, compact
+        return ()
+
+
+class DurableAcceptedToolEvidenceMaterialProvider:
+    """基于 EventLog 读取当前 Attempt 前 accepted tool evidence material。
+
+    Provider 只读取当前 Session、当前 Attempt start cursor 之前的最近
+    ``TOOL_RESULT_ACCEPTED`` 事件，并用固定上限约束读取规模。raw evidence
+    payload 解析复用 ``compaction_evidence`` 的 accepted envelope 逻辑，避免
+    在 RunInputBuilder 内重复解释工具结果结构。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param max_evidence_blocks: 单次最多暴露给 compactor 的 accepted evidence 数。
+    """
+
+    def __init__(
+        self,
+        transaction_runner: HostTransactionRunner,
+        *,
+        max_evidence_blocks: int = _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT,
+    ) -> None:
+        """初始化 provider。
+
+        :param transaction_runner: Host durable transaction runner。
+        :param max_evidence_blocks: accepted evidence material 上限。
+        :returns: ``None``。
+        :raises ValueError: 上限非正数时抛出。
+        """
+
+        if max_evidence_blocks <= 0:
+            raise ValueError("max_evidence_blocks must be positive")
+        self._transaction_runner = transaction_runner
+        self._event_log_store = EventLogStore()
+        self._max_evidence_blocks = max_evidence_blocks
+
+    def load_accepted_tool_evidence_materials(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+        memory: MemorySnapshotView,
+        compact: CompactArtifactView,
+    ) -> tuple[RunInputMaterialBlock, ...]:
+        """读取 bounded accepted tool evidence material。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :param memory: 当前 memory provider view。
+        :param compact: 当前 compact artifact provider view。
+        :returns: evidence material blocks。
+        :raises HostDurableError: EventLog 或 evidence payload 损坏时抛出。
+        """
+
+        return self._transaction_runner.run_read(
+            lambda transaction: self._load_accepted_tool_evidence_materials_tx(
+                transaction,
+                snapshot=snapshot,
+                current_facts=current_facts,
+                represented_evidence_refs=_represented_evidence_refs(
+                    memory, compact
+                ),
+            )
+        )
+
+    def _load_accepted_tool_evidence_materials_tx(
+        self,
+        transaction: HostTransaction,
+        *,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+        represented_evidence_refs: tuple[str, ...],
+    ) -> tuple[RunInputMaterialBlock, ...]:
+        """在 read transaction 内读取 accepted evidence material。
+
+        :param transaction: Host transaction。
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :param represented_evidence_refs: 已由 memory / compact 表示的 evidence refs。
+        :returns: evidence material blocks。
+        """
+
+        return build_accepted_tool_evidence_material_blocks(
+            transaction,
+            self._event_log_store,
+            session_id=snapshot.session_id,
+            before_event_sequence=current_facts.attempt.started_event_sequence,
+            represented_evidence_refs=represented_evidence_refs,
+            max_evidence_blocks=self._max_evidence_blocks,
+        )
+
+
+def build_accepted_tool_evidence_material_blocks(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    session_id: str,
+    before_event_sequence: int,
+    represented_evidence_refs: tuple[str, ...] = (),
+    max_evidence_blocks: int = _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """从 bounded EventLog window 构造 accepted tool evidence material。
+
+    本 helper 只读取当前 Session 中 ``before_event_sequence`` 之前最近的
+    ``TOOL_RESULT_ACCEPTED``，并复用 compaction evidence reader 解析 raw
+    accepted evidence；canonical refs 只写入 material block 内部 provenance
+    字段，不进入 LLM-facing material JSON。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog store。
+    :param session_id: 当前 Session id。
+    :param before_event_sequence: 当前输入 / Attempt cursor 的排他上界。
+    :param represented_evidence_refs: 已由 stable facts 或 compact artifact 表示
+        的 accepted evidence refs。
+    :param max_evidence_blocks: 单次最多读取的 accepted evidence 数。
+    :returns: evidence material blocks。
+    :raises HostDurableError: EventLog 或 evidence payload 损坏时抛出。
+    """
+
+    rows = _recent_accepted_tool_result_rows(
+        transaction,
+        event_log_store,
+        session_id=session_id,
+        before_event_sequence=before_event_sequence,
+        limit=max_evidence_blocks,
+    )
+    if len(rows) == 0:
+        return ()
+    selected_refs = tuple(
+        SelectedEvidenceBlockRef(
+            block_id=f"accepted-tool-evidence:{row.event_id}",
+            tool_result_event_ref=row.event_id,
+        )
+        for row in rows
+    )
+    inputs = collect_selected_compaction_request_evidence_inputs(
+        transaction,
+        event_log_store,
+        session_id=session_id,
+        selected_evidence_block_refs=selected_refs,
+    )
+    sequence_by_event_id = {row.event_id: row.event_sequence for row in rows}
+    represented = frozenset(represented_evidence_refs)
+    blocks: list[RunInputMaterialBlock] = []
+    for index, material in enumerate(inputs.evidence_materials):
+        if material.accepted_evidence_id in represented:
+            continue
+        blocks.append(
+            run_input_material_block(
+                block_id=(
+                    "accepted-tool-evidence:"
+                    f"{material.tool_result_event_ref}:"
+                    f"{material.accepted_evidence_id}"
+                ),
+                section=CompactMaterialSection.EVIDENCE_INPUT,
+                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+                text=material.raw_result_text,
+                canonical_source_refs=(material.canonical_source_ref,),
+                event_sequence=sequence_by_event_id[material.tool_result_event_ref],
+                event_sub_index=index,
+                accepted_evidence_id=material.accepted_evidence_id,
+                tool_result_event_ref=material.tool_result_event_ref,
+                tool_call_event_ref=material.tool_call_event_ref,
+                payload_refs=material.payload_refs,
+                artifact_refs=material.artifact_refs,
+                source_locator_refs=material.source_locator_refs,
+                readable_tool_name=material.readable_tool_name,
+                readable_query_text=material.readable_query_text,
+                readable_source_text=material.readable_source_text,
+            )
+        )
+    return tuple(blocks)
+
+
 class DurableCompactArtifactProvider:
     """基于 EventLog 读取 accepted compact artifact 的 provider。
 
@@ -1020,6 +1266,7 @@ class DurableCompactArtifactProvider:
             messages=(message,),
             compact_artifact_ref=artifact_ref,
             compact_artifact_digest=artifact_digest,
+            represented_evidence_refs=preserved_canonical_evidence_refs(payload),
         )
 
 
@@ -1258,6 +1505,9 @@ class RunInputBuilder:
         session_continuity_provider: SessionContinuityProvider,
         memory_snapshot_provider: MemorySnapshotProvider,
         compact_artifact_provider: CompactArtifactProvider,
+        accepted_tool_evidence_material_provider: (
+            AcceptedToolEvidenceMaterialProvider
+        ),
         tool_schema_snapshot_provider: ToolSchemaSnapshotProvider,
         tool_executor_provider: ToolExecutorProvider,
         scene_parameter_provider: SceneParameterProvider,
@@ -1270,6 +1520,8 @@ class RunInputBuilder:
         :param session_continuity_provider: Session continuity provider。
         :param memory_snapshot_provider: Memory snapshot provider。
         :param compact_artifact_provider: Compact artifact provider。
+        :param accepted_tool_evidence_material_provider: accepted tool
+            evidence material provider。
         :param tool_schema_snapshot_provider: Tool schema snapshot provider。
         :param tool_executor_provider: ToolExecutor provider。
         :param scene_parameter_provider: Scene parameter provider。
@@ -1282,6 +1534,9 @@ class RunInputBuilder:
         self._session_continuity_provider = session_continuity_provider
         self._memory_snapshot_provider = memory_snapshot_provider
         self._compact_artifact_provider = compact_artifact_provider
+        self._accepted_tool_evidence_material_provider = (
+            accepted_tool_evidence_material_provider
+        )
         self._tool_schema_snapshot_provider = tool_schema_snapshot_provider
         self._tool_executor_provider = tool_executor_provider
         self._scene_parameter_provider = scene_parameter_provider
@@ -1352,6 +1607,46 @@ class RunInputBuilder:
             cancellation_token=attempt_snapshot.cancellation_token,
         )
 
+    def build_material_blocks(
+        self, attempt_snapshot: AttemptDispatchSnapshot
+    ) -> tuple[RunInputMaterialBlock, ...]:
+        """构造与 ordinary Run input 同源的 compact material block view。
+
+        本方法是 Host internal helper，供 Context Governance / compact builder
+        复用 RunInputBuilder 的普通输入 material source；它不改变
+        ``AgentRunRequest`` public shape。
+
+        :param attempt_snapshot: Attempt dispatch snapshot。
+        :returns: ordinary input material blocks。
+        :raises HostDurableError: durable facts 缺失或 provider 读取失败时抛出。
+        """
+
+        current_facts = self._current_run_provider.load_current_run_facts(
+            attempt_snapshot
+        )
+        continuity = self._session_continuity_provider.load_session_continuity(
+            attempt_snapshot, current_facts
+        )
+        memory = self._memory_snapshot_provider.load_memory_snapshot(
+            attempt_snapshot, current_facts
+        )
+        compact = self._compact_artifact_provider.load_compact_artifact(
+            attempt_snapshot, current_facts
+        )
+        evidence = (
+            self._accepted_tool_evidence_material_provider
+            .load_accepted_tool_evidence_materials(
+                attempt_snapshot, current_facts, memory, compact
+            )
+        )
+        return build_run_input_material_blocks(
+            current_facts=current_facts,
+            memory=memory,
+            compact=compact,
+            continuity=continuity,
+            accepted_tool_evidence=evidence,
+        )
+
 
 def create_no_tool_run_input_builder(
     *,
@@ -1388,6 +1683,9 @@ def create_no_tool_run_input_builder(
             NoopCompactArtifactProvider()
             if compact_artifact_provider is None
             else compact_artifact_provider
+        ),
+        accepted_tool_evidence_material_provider=(
+            DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)
         ),
         tool_schema_snapshot_provider=NoopToolSchemaSnapshotProvider(),
         tool_executor_provider=NoToolExecutorProvider(),
@@ -1430,6 +1728,9 @@ def create_tool_enabled_run_input_builder(
             NoopCompactArtifactProvider()
             if compact_artifact_provider is None
             else compact_artifact_provider
+        ),
+        accepted_tool_evidence_material_provider=(
+            DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)
         ),
         tool_schema_snapshot_provider=ToolRuntimeSchemaSnapshotProvider(
             handle_provider
@@ -1557,6 +1858,7 @@ def _memory_snapshot_view(
         memory_snapshot_cursor=_memory_cursor_ref(snapshot.cursor),
         policy_digest=snapshot.policy_digest,
         diagnostics=snapshot.diagnostics + rendered.diagnostics,
+        represented_evidence_refs=_memory_represented_evidence_refs(snapshot),
     )
 
 
@@ -1565,7 +1867,7 @@ def _memory_messages(
     render_scope: _CurrentMemoryRenderScope,
     policy: MemoryProjectionPolicy,
 ) -> _RenderedMemoryMessages:
-    """按 P9 固定顺序渲染 memory messages。
+    """按稳定优先级渲染 memory messages。
 
     :param snapshot: memory snapshot。
     :param render_scope: 当前 Run memory 渲染排除范围。
@@ -1585,6 +1887,11 @@ def _memory_messages(
             snapshot.conversation_continuity.items, render_scope
         )
     )
+    minimum_preserve = _memory_minimum_preserve_message(
+        snapshot.conversation_continuity.items, render_scope
+    )
+    if minimum_preserve is not None:
+        messages.append(minimum_preserve)
     episode = _memory_episode_summary_message(
         snapshot.conversation_continuity.items, render_scope
     )
@@ -1610,12 +1917,17 @@ def _memory_stable_blocks(
     goals = _memory_goal_and_constraint_message(snapshot, render_scope)
     if goals is not None:
         blocks.append(_MemoryStableBlock(block_id="stable:goals", message=goals))
+    facts = _memory_evidence_backed_fact_message(snapshot.evidence_backed_facts)
+    if facts is not None:
+        blocks.append(
+            _MemoryStableBlock(
+                block_id="stable:evidence_backed_facts",
+                message=facts,
+            )
+        )
     subjects = _memory_subject_message(snapshot)
     if subjects is not None:
         blocks.append(_MemoryStableBlock(block_id="stable:subjects", message=subjects))
-    facts = _memory_verified_fact_message(snapshot.verified_facts)
-    if facts is not None:
-        blocks.append(_MemoryStableBlock(block_id="stable:verified_facts", message=facts))
     assumptions = _memory_question_and_assumption_message(snapshot)
     if assumptions is not None:
         blocks.append(
@@ -1674,7 +1986,7 @@ def _memory_goal_and_constraint_message(
     :returns: system message；无内容时返回 ``None``。
     """
 
-    lines: list[str] = ["Memory user goals and constraints:"]
+    lines: list[str] = [_MEMORY_USER_GOALS_HEADER]
     if (
         snapshot.pinned_state.current_goal is not None
         and snapshot.pinned_state.current_goal != render_scope.user_prompt
@@ -1703,7 +2015,7 @@ def _memory_subject_message(
 
     if not snapshot.pinned_state.confirmed_subjects:
         return None
-    lines = ["Memory confirmed subjects and methodology:"]
+    lines = [_MEMORY_CONFIRMED_SUBJECTS_HEADER]
     for ref in snapshot.pinned_state.confirmed_subjects:
         lines.append(f"confirmed_subject={_opaque_ref_text(ref)}")
     return SystemMessage(
@@ -1712,26 +2024,27 @@ def _memory_subject_message(
     )
 
 
-def _memory_verified_fact_message(
-    facts: tuple[VerifiedFactView, ...],
+def _memory_evidence_backed_fact_message(
+    facts: tuple[EvidenceBackedFactView, ...],
 ) -> SystemMessage | None:
-    """渲染 tool-verified facts memory block。
+    """渲染 evidence-backed facts memory block。
 
-    :param facts: verified fact 元组。
+    :param facts: evidence-backed fact 元组。
     :returns: system message；无内容时返回 ``None``。
     """
 
     if not facts:
         return None
-    lines = ["Memory tool-verified facts:"]
+    lines = [_MEMORY_EVIDENCE_BACKED_FACTS_HEADER]
     for fact in facts:
         lines.append(
             "fact="
-            f"{fact.fact_summary}; "
-            f"tool={fact.provenance.producer_name}; "
+            f"claim_text={fact.claim_text}; "
+            f"evidence_refs={','.join(fact.evidence_refs)}; "
+            f"evidence_kind={fact.evidence_kind.value}; "
+            f"extraction_operation_ref={fact.extraction_operation_ref}; "
             f"event_id={fact.provenance.event_id}; "
-            f"event_sequence={fact.provenance.event_sequence}; "
-            f"digest_ref={fact.provenance.digest_ref}"
+            f"event_sequence={fact.provenance.event_sequence}"
         )
     return SystemMessage(
         role=AgentMessageRole.SYSTEM,
@@ -1748,7 +2061,7 @@ def _memory_question_and_assumption_message(
     :returns: system message；无内容时返回 ``None``。
     """
 
-    lines: list[str] = ["Memory open questions and working assumptions:"]
+    lines: list[str] = [_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER]
     for question in snapshot.pinned_state.open_questions:
         lines.append(f"open_question={question}")
     for assumption in snapshot.working_assumptions:
@@ -1779,7 +2092,11 @@ def _memory_raw_turn_messages(
 
     messages: list[AgentMessage] = []
     for item in items:
-        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY:
+        if item.item_kind not in (
+            ConversationContinuityKind.RAW_USER_TURN,
+            ConversationContinuityKind.RAW_ASSISTANT_TURN,
+            ConversationContinuityKind.ASSISTANT_CONCLUSION,
+        ):
             continue
         if _is_current_run_user_input_memory_item(item, render_scope):
             continue
@@ -1798,6 +2115,40 @@ def _memory_raw_turn_messages(
                 )
             )
     return tuple(messages)
+
+
+def _memory_minimum_preserve_message(
+    items: tuple[ConversationContinuityItem, ...],
+    render_scope: _CurrentMemoryRenderScope,
+) -> SystemMessage | None:
+    """渲染 minimum preserve continuity block。
+
+    :param items: continuity items。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :returns: system message；无 minimum preserve item 时返回 ``None``。
+    """
+
+    preserve_items = tuple(
+        item
+        for item in items
+        if item.item_kind is ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
+        and not _is_current_run_user_input_memory_item(item, render_scope)
+    )
+    if not preserve_items:
+        return None
+    lines = [_MEMORY_MINIMUM_PRESERVE_HEADER]
+    for item in preserve_items:
+        lines.append(
+            "continuity_item="
+            f"label={item.label}; "
+            f"text={_continuity_item_text(item)}; "
+            f"source_refs={','.join(item.source_refs)}; "
+            f"preserve_reason={_preserve_reason_text(item)}"
+        )
+    return SystemMessage(
+        role=AgentMessageRole.SYSTEM,
+        content="\n".join(lines),
+    )
 
 
 def _memory_episode_summary_message(
@@ -1819,7 +2170,7 @@ def _memory_episode_summary_message(
     )
     if not episode_items:
         return None
-    lines = ["Memory episode summaries:"]
+    lines = [_MEMORY_EPISODE_SUMMARIES_HEADER]
     for item in episode_items:
         lines.append(f"episode_summary={_continuity_item_text(item)}")
     return SystemMessage(
@@ -1842,6 +2193,18 @@ def _continuity_item_text(item: ConversationContinuityItem) -> str:
     return f"event_ref={item.event_id}"
 
 
+def _preserve_reason_text(item: ConversationContinuityItem) -> str:
+    """读取 minimum preserve reason 的可渲染文本。
+
+    :param item: continuity item。
+    :returns: preserve reason 文本。
+    """
+
+    if item.preserve_reason is None:
+        return "unspecified"
+    return item.preserve_reason.value
+
+
 def _is_current_run_user_input_memory_item(
     item: ConversationContinuityItem, render_scope: _CurrentMemoryRenderScope
 ) -> bool:
@@ -1857,6 +2220,206 @@ def _is_current_run_user_input_memory_item(
     if item.event_id == render_scope.user_input_event_id:
         return True
     return False
+
+
+def build_run_input_material_blocks(
+    *,
+    current_facts: CurrentRunFacts,
+    memory: MemorySnapshotView,
+    compact: CompactArtifactView,
+    continuity: SessionContinuityView,
+    accepted_tool_evidence: tuple[RunInputMaterialBlock, ...] = (),
+) -> tuple[RunInputMaterialBlock, ...]:
+    """构造 ordinary Run input 的共享 material block list。
+
+    :param current_facts: 当前 Run durable facts。
+    :param memory: memory snapshot provider view。
+    :param compact: compact artifact provider view。
+    :param continuity: session continuity provider view。
+    :param accepted_tool_evidence: 当前 Attempt 前可用于 compact 的 accepted
+        tool evidence material blocks。
+    :returns: RunInputBuilder 与 compact builder 共用的 material blocks。
+    """
+
+    blocks: list[RunInputMaterialBlock] = []
+    for index, message in enumerate(memory.messages):
+        content = _run_input_message_content(message)
+        blocks.append(
+            run_input_material_block(
+                block_id=f"memory:{index}",
+                section=_material_section_for_message(message),
+                kind=_memory_material_kind(message),
+                text=content,
+                canonical_source_refs=(_memory_material_source_ref(memory),),
+                event_sequence=None,
+                event_sub_index=index,
+            )
+        )
+    compact_source_ref = _compact_material_source_ref(compact)
+    for index, message in enumerate(compact.messages):
+        blocks.append(
+            run_input_material_block(
+                block_id=f"compact:{index}",
+                section=CompactMaterialSection.HISTORY_INPUT,
+                kind=CompactMaterialBlockKind.EPISODE_SUMMARY,
+                text=_run_input_message_content(message),
+                canonical_source_refs=(compact_source_ref,),
+                event_sequence=None,
+                event_sub_index=index,
+                already_represented=True,
+            )
+        )
+    for index, message in enumerate(continuity.messages):
+        blocks.append(
+            run_input_material_block(
+                block_id=f"continuity:{index}",
+                section=CompactMaterialSection.HISTORY_INPUT,
+                kind=_history_material_kind(message),
+                text=_run_input_message_content(message),
+                canonical_source_refs=(f"message:continuity:{index}",),
+                event_sequence=None,
+                event_sub_index=index,
+            )
+        )
+    blocks.extend(accepted_tool_evidence)
+    blocks.append(
+        run_input_material_block(
+            block_id=f"current:{current_facts.user_input_event.event_id}",
+            section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            text=current_facts.user_prompt,
+            canonical_source_refs=(current_facts.user_input_event.event_id,),
+            event_sequence=current_facts.user_input_event.event_sequence,
+        )
+    )
+    return tuple(blocks)
+
+
+def _run_input_message_content(message: AgentMessage) -> str:
+    """读取 AgentMessage 文本内容。
+
+    :param message: Agent message。
+    :returns: message content。
+    :raises TypeError: message 类型非法时抛出。
+    """
+
+    if isinstance(message, SystemMessage):
+        return message.content
+    if isinstance(message, UserMessage):
+        return message.content
+    if isinstance(message, AssistantMessage):
+        if message.content is None:
+            raise TypeError("assistant material message content must be non-empty")
+        return message.content
+    raise TypeError("unsupported AgentMessage type for material block")
+
+
+def _material_section_for_message(message: AgentMessage) -> CompactMaterialSection:
+    """根据 message role 判断 material section。
+
+    :param message: Agent message。
+    :returns: material section。
+    """
+
+    if isinstance(message, SystemMessage):
+        return CompactMaterialSection.STABLE_INPUT
+    return CompactMaterialSection.HISTORY_INPUT
+
+
+def _memory_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
+    """根据 memory message 内容选择 material kind。
+
+    :param message: memory message。
+    :returns: material block kind。
+    """
+
+    content = _run_input_message_content(message)
+    if content.startswith(_MEMORY_EVIDENCE_BACKED_FACTS_HEADER):
+        return CompactMaterialBlockKind.EVIDENCE_BACKED_FACT
+    if content.startswith(_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER):
+        return CompactMaterialBlockKind.WORKING_ASSUMPTION
+    if content.startswith(_MEMORY_EPISODE_SUMMARIES_HEADER):
+        return CompactMaterialBlockKind.EPISODE_SUMMARY
+    if isinstance(message, UserMessage):
+        return CompactMaterialBlockKind.RAW_USER_TURN
+    if isinstance(message, AssistantMessage):
+        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
+    return CompactMaterialBlockKind.PINNED_STATE
+
+
+def _history_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
+    """根据 continuity message role 选择 history material kind。
+
+    :param message: continuity message。
+    :returns: material block kind。
+    """
+
+    if isinstance(message, UserMessage):
+        return CompactMaterialBlockKind.RAW_USER_TURN
+    if isinstance(message, AssistantMessage):
+        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
+    return CompactMaterialBlockKind.EPISODE_SUMMARY
+
+
+def _memory_material_source_ref(memory: MemorySnapshotView) -> str:
+    """返回 memory material canonical source ref。
+
+    :param memory: memory snapshot view。
+    :returns: source ref。
+    """
+
+    if memory.memory_snapshot_cursor is not None:
+        return f"memory:{memory.memory_snapshot_cursor}"
+    return "memory:no-snapshot"
+
+
+def _memory_represented_evidence_refs(
+    snapshot: ConversationMemorySnapshot,
+) -> tuple[str, ...]:
+    """返回 stable memory facts 已表示的 accepted evidence refs。
+
+    :param snapshot: memory snapshot。
+    :returns: 去重后的 accepted evidence refs。
+    """
+
+    refs: list[str] = []
+    for fact in snapshot.evidence_backed_facts:
+        refs.extend(fact.evidence_refs)
+    return tuple(dict.fromkeys(refs))
+
+
+def _compact_material_source_ref(compact: CompactArtifactView) -> str:
+    """返回 compact artifact material canonical source ref。
+
+    :param compact: compact artifact view。
+    :returns: source ref。
+    """
+
+    if compact.compact_artifact_ref is not None:
+        return f"compact:{compact.compact_artifact_ref}"
+    if compact.compact_artifact_digest is not None:
+        return f"compact:{compact.compact_artifact_digest}"
+    return "compact:no-artifact"
+
+
+def _represented_evidence_refs(
+    memory: MemorySnapshotView, compact: CompactArtifactView
+) -> tuple[str, ...]:
+    """合并 memory 与 compact artifact 已表示的 evidence refs。
+
+    :param memory: memory provider view。
+    :param compact: compact artifact provider view。
+    :returns: 去重后的 accepted evidence refs。
+    """
+
+    return tuple(
+        dict.fromkeys(
+            (
+                *memory.represented_evidence_refs,
+                *compact.represented_evidence_refs,
+            )
+        )
+    )
 
 
 def _opaque_ref_text(ref: OpaqueMemoryRef) -> str:
@@ -2016,6 +2579,66 @@ def _latest_compacted_event_before_attempt(
     return event
 
 
+def _recent_accepted_tool_result_rows(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    session_id: str,
+    before_event_sequence: int,
+    limit: int,
+) -> tuple[EventLogRow, ...]:
+    """读取当前 Attempt 前最近的 accepted tool result rows。
+
+    查询先按倒序取固定上限，再恢复为 event_sequence 升序，保证读取有界且
+    selection / prompt label 分配稳定。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog store。
+    :param session_id: 当前 Session id。
+    :param before_event_sequence: 当前 Attempt started event sequence。
+    :param limit: 最大读取 row 数。
+    :returns: 稳定升序的 EventLog rows。
+    :raises HostDurableError: 参数非法或 row 消失时抛出。
+    """
+
+    if before_event_sequence <= 0:
+        raise HostDurableError("before_event_sequence must be positive")
+    if limit <= 0:
+        raise HostDurableError("accepted tool evidence limit must be positive")
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+          AND event_type = ?
+          AND event_class = ?
+          AND event_sequence < ?
+        ORDER BY event_sequence DESC
+        LIMIT ?
+        """,
+        (
+            session_id,
+            _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+            EventClass.CANONICAL_FACT.value,
+            before_event_sequence,
+            limit,
+        ),
+    )
+    result: list[EventLogRow] = []
+    for row in reversed(rows):
+        event_id = _required_host_row_text(row, field_name="event_id")
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError("accepted tool evidence event disappeared")
+        result.append(
+            _require_event(
+                event,
+                expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+            )
+        )
+    return tuple(result)
+
+
 def _compact_artifact_message_content(
     *,
     compacted_event: EventLogRow,
@@ -2037,7 +2660,7 @@ def _compact_artifact_message_content(
     summary = _optional_summary_text_from_compacted_payload(
         payload, max_summary_chars=max_summary_chars
     )
-    preserved_fact_refs = _preserved_tool_fact_refs_text(payload)
+    preserved_fact_refs = preserved_fact_refs_summary(payload)
     lines = [
         "Accepted compact artifact is available for this run.",
         f"compact_artifact_ref={artifact_ref}",
@@ -2066,8 +2689,8 @@ def _optional_summary_text_from_compacted_payload(
         return None
     candidate_id = _optional_mapping_text(value, _PAYLOAD_FIELD_CANDIDATE_ID)
     goal = _optional_mapping_text(value, _PAYLOAD_FIELD_GOAL)
-    constraints = _optional_text_list(value, _PAYLOAD_FIELD_USER_CONSTRAINTS)
-    questions = _optional_text_list(value, _PAYLOAD_FIELD_OPEN_QUESTIONS)
+    constraints = optional_text_list_field(value, _PAYLOAD_FIELD_USER_CONSTRAINTS)
+    questions = optional_text_list_field(value, _PAYLOAD_FIELD_OPEN_QUESTIONS)
     parts = []
     if candidate_id is not None:
         parts.append(f"candidate_id={candidate_id}")
@@ -2083,19 +2706,6 @@ def _optional_summary_text_from_compacted_payload(
     if len(text) <= max_summary_chars:
         return text
     return text[:max_summary_chars]
-
-
-def _preserved_tool_fact_refs_text(payload: Mapping[str, JsonValue]) -> str:
-    """渲染 preserved tool fact refs。
-
-    :param payload: compacted payload。
-    :returns: 稳定文本。
-    """
-
-    value = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
-    if not isinstance(value, Mapping):
-        return ""
-    return ",".join(_optional_text_list(value, _PAYLOAD_FIELD_TOOL_FACT_REFS))
 
 
 def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:
@@ -2127,26 +2737,6 @@ def _optional_mapping_text(
     if isinstance(value, str) and value.strip() != "":
         return value
     return None
-
-
-def _optional_text_list(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
-    """从 mapping 读取文本列表。
-
-    :param payload: payload 映射。
-    :param field_name: 字段名。
-    :returns: 文本 tuple；字段非法时返回空 tuple。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        return ()
-    result: list[str] = []
-    for item in value:
-        if isinstance(item, str) and item.strip() != "":
-            result.append(item)
-    return tuple(result)
 
 
 def _required_host_row_text(row: HostRow, *, field_name: str) -> str:
@@ -2460,10 +3050,12 @@ def _tools_scene_line(tool_execution_mode: ToolExecutionMode) -> str:
 __all__ = [
     "CompactArtifactProvider",
     "CompactArtifactView",
+    "AcceptedToolEvidenceMaterialProvider",
     "CurrentRunFactProvider",
     "CurrentRunFacts",
     "DefaultSceneParameterProvider",
     "DurableCompactArtifactProvider",
+    "DurableAcceptedToolEvidenceMaterialProvider",
     "DurableCurrentRunFactProvider",
     "DurableMemorySnapshotProvider",
     "DurableSessionContinuityProvider",
@@ -2473,6 +3065,7 @@ __all__ = [
     "NoToolExecutor",
     "NoToolExecutorProvider",
     "NoopCompactArtifactProvider",
+    "NoopAcceptedToolEvidenceMaterialProvider",
     "NoopMemorySnapshotProvider",
     "NoopToolSchemaSnapshotProvider",
     "PolicySnapshot",
@@ -2490,6 +3083,8 @@ __all__ = [
     "ToolRuntimeSchemaSnapshotProvider",
     "ToolSchemaSnapshot",
     "ToolSchemaSnapshotProvider",
+    "build_accepted_tool_evidence_material_blocks",
+    "build_run_input_material_blocks",
     "create_no_tool_run_input_builder",
     "create_tool_enabled_run_input_builder",
 ]

@@ -19,11 +19,10 @@ from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.provider_extensions import provider_request_extension_from_json
-from dayu.host import (
+from dayu.host.api import (
     CompactorRunnerBaseline,
     FollowupBehavior,
     HostCallContext,
-    HostToolingOptions,
     OpenHostOptions,
     OrdinaryRunExecutionBaseline,
     SubmitFollowupRequest,
@@ -31,6 +30,7 @@ from dayu.host import (
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import MemoryProjectionPolicy
+from dayu.host.tooling import HostToolingOptions
 from dayu.runtime.assembly import (
     AgentPolicyDefaults,
     ExecutionProfileCompatibilityDiagnostic,
@@ -56,7 +56,12 @@ from dayu.runtime.config_loader import (
     ToolDiscoveryProviderConfig,
 )
 from dayu.runtime.location import RuntimeLocations
-from dayu.runtime.scene_prepare import PreparedSceneInputs
+from dayu.runtime.scene_prepare import (
+    PreparedSceneInputs,
+    ScenePrepareRequest,
+    SceneToolCatalog,
+    prepare_scene,
+)
 from dayu.runtime.tools_discovery import (
     PackageEntryPointProvider,
     PythonImportPathProvider,
@@ -68,6 +73,7 @@ _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}"
 )
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
+_COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT: Final[int] = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +205,20 @@ class ServiceOpenHostAssemblyResult:
     effective_tool_bundle: ToolBundle
 
 
+@dataclass(frozen=True, slots=True)
+class _CompactorScenePrompts:
+    """Compactor scene / baseline 装配后的 compactor 输入。
+
+    :param system_prompt: compactor system prompt。
+    :param user_prompt_template: compactor user prompt template。
+    :param agent_policy: compactor Agent policy。
+    """
+
+    system_prompt: str
+    user_prompt_template: str
+    agent_policy: AgentPolicy
+
+
 def discover_service_tools(config: RuntimeConfig) -> ServiceDiscoveredTools:
     """按 runtime config 执行工具发现。
 
@@ -255,6 +275,17 @@ def compose_open_host_options(
         tool_bundle=request.discovered_tools.tool_bundle,
         execution_profile=execution_profile,
     )
+    compactor_scene_inputs = _prepare_compactor_scene_inputs(
+        request,
+        execution_profile=execution_profile,
+    )
+    compactor_prompts = _compactor_prompts_from_scene_inputs(
+        compactor_scene_inputs,
+        user_prompt_template=_read_compactor_user_prompt_template(
+            request,
+            execution_profile=execution_profile,
+        ),
+    )
     ordinary_selection = select_runner_option_hint(
         models=config.models,
         execution_baseline=execution_profile.run_baseline,
@@ -299,6 +330,7 @@ def compose_open_host_options(
         compactor_selection=compactor_selection,
         agent_policy_config=agent_policy_config,
         effective_tool_bundle=effective_tool_bundle,
+        compactor_prompts=compactor_prompts,
     )
     diagnostics = _assembly_diagnostics(
         locations=request.locations,
@@ -377,6 +409,7 @@ def _compose_options(
     compactor_selection: RunnerOptionHintSelection,
     agent_policy_config: MergedAgentPolicyConfig,
     effective_tool_bundle: ToolBundle,
+    compactor_prompts: _CompactorScenePrompts,
 ) -> OpenHostOptions:
     """组合 ``OpenHostOptions``。
 
@@ -388,6 +421,7 @@ def _compose_options(
     :param compactor_selection: compactor runner 选择。
     :param agent_policy_config: 合并后的 AgentPolicy 配置。
     :param effective_tool_bundle: 已补齐截断默认值的工具 bundle。
+    :param compactor_prompts: compactor scene / baseline 装配后的输入。
     :returns: Host public opener options。
     :raises ValueError: worker backend 或 secret 映射失败时抛出。
     """
@@ -466,6 +500,9 @@ def _compose_options(
             compactor_runner_options=_runner_options_from_hint(
                 compactor_selection.runner_option_hint
             ),
+            compactor_agent_policy=compactor_prompts.agent_policy,
+            compactor_system_prompt=compactor_prompts.system_prompt,
+            compactor_user_prompt_template=compactor_prompts.user_prompt_template,
             compact_artifact_root=_resolve_project_path(
                 request.workspace_root,
                 execution_profile.compactor_baseline.artifact_root,
@@ -481,6 +518,173 @@ def _compose_options(
         ),
         enable_truncation_manager=(
             execution_profile.tool_truncation_policy.enabled
+        ),
+    )
+
+
+def _prepare_compactor_scene_inputs(
+    request: ServiceOpenHostAssemblyRequest,
+    *,
+    execution_profile: ExecutionProfileConfig,
+) -> PreparedSceneInputs:
+    """装配 Host-owned compactor 使用的 configured compactor scene。
+
+    :param request: Service open_host assembly 请求。
+    :param execution_profile: 选中的 execution profile。
+    :returns: compactor scene 装配输出。
+    :raises ScenePrepareError: compactor scene asset 违反 scene contract 时抛出。
+    """
+
+    return prepare_scene(
+        ScenePrepareRequest(
+            scene_id=execution_profile.compactor_baseline.scene_id,
+            scene_manifest_root=request.locations.scene_manifest_root,
+            prompt_asset_root=request.locations.prompt_asset_root,
+            context_slot_values={},
+            available_tools=SceneToolCatalog.from_tool_bundle(
+                request.discovered_tools.tool_bundle
+            ),
+        )
+    )
+
+
+def _compactor_prompts_from_scene_inputs(
+    scene_inputs: PreparedSceneInputs,
+    *,
+    user_prompt_template: str,
+) -> _CompactorScenePrompts:
+    """从 compactor scene 与 baseline prompt asset 中读取 compactor 输入。
+
+    :param scene_inputs: compactor scene 装配输出。
+    :param user_prompt_template: compactor baseline 指向的 user prompt template。
+    :returns: compactor prompt 与 Agent policy。
+    :raises ValueError: compactor scene 未提供恰好一个 system prompt
+        fragment，或未声明完整 Agent policy 时抛出。
+    """
+
+    if len(scene_inputs.system_messages) != _COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT:
+        raise ValueError(
+            "compactor scene must provide exactly one system prompt fragment"
+        )
+    return _CompactorScenePrompts(
+        system_prompt=scene_inputs.system_messages[0],
+        user_prompt_template=user_prompt_template,
+        agent_policy=_compactor_agent_policy_from_scene_inputs(scene_inputs),
+    )
+
+
+def _read_compactor_user_prompt_template(
+    request: ServiceOpenHostAssemblyRequest,
+    *,
+    execution_profile: ExecutionProfileConfig,
+) -> str:
+    """读取 compactor baseline 指向的 user prompt template。
+
+    :param request: Service Host opener assembly 请求。
+    :param execution_profile: 选中的 execution profile。
+    :returns: user prompt template 文本。
+    :raises ValueError: 路径是绝对路径或逃逸 prompt asset root 时抛出。
+    :raises OSError: prompt asset 文件读取失败时抛出。
+    """
+
+    template_path = _resolve_prompt_asset_path(
+        request.locations.prompt_asset_root,
+        execution_profile.compactor_baseline.user_prompt_template_path,
+        field_name="compactor_baseline.user_prompt_template_path",
+    )
+    return template_path.read_text(encoding="utf-8")
+
+
+def _resolve_prompt_asset_path(
+    prompt_asset_root: pathlib.Path,
+    configured_path: str,
+    *,
+    field_name: str,
+) -> pathlib.Path:
+    """解析 prompt asset 相对路径并禁止逃逸根目录。
+
+    :param prompt_asset_root: prompt asset 根目录。
+    :param configured_path: 配置中的相对路径。
+    :param field_name: 错误消息字段名。
+    :returns: 解析后的 prompt asset 路径。
+    :raises ValueError: 路径为空、绝对路径或逃逸根目录时抛出。
+    """
+
+    _require_non_empty_text(configured_path, field_name=field_name)
+    path = pathlib.Path(configured_path)
+    if path.is_absolute():
+        raise ValueError(f"{field_name} must be relative")
+    resolved_root = prompt_asset_root.resolve()
+    resolved_path = (resolved_root / path).resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} escapes prompt asset root") from exc
+    return resolved_path
+
+
+def _require_non_empty_text(value: str, *, field_name: str) -> str:
+    """校验必填文本字段非空。
+
+    :param value: 待校验文本。
+    :param field_name: 错误消息中的字段名。
+    :returns: 原文本。
+    :raises ValueError: 文本为空时抛出。
+    """
+
+    if value.strip() == "":
+        raise ValueError(f"{field_name} must not be empty")
+    return value
+
+
+def _compactor_agent_policy_from_scene_inputs(
+    scene_inputs: PreparedSceneInputs,
+) -> AgentPolicy:
+    """从 compactor scene agent_policy 生成完整 AgentPolicy。
+
+    :param scene_inputs: compactor scene 装配输出。
+    :returns: compactor Agent policy。
+    :raises ValueError: scene 未声明完整 compactor Agent policy 时抛出。
+    """
+
+    override = scene_inputs.agent_policy_override
+    if override is None:
+        raise ValueError("compactor scene must declare agent_policy")
+    if override.max_iterations is None:
+        raise ValueError("compactor scene agent_policy.max_iterations is required")
+    if override.continuation_max_attempts is None:
+        raise ValueError(
+            "compactor scene agent_policy.continuation_max_attempts is required"
+        )
+    if override.allow_tool_calls is None:
+        raise ValueError("compactor scene agent_policy.allow_tool_calls is required")
+    if override.tool_execution_timeout_seconds is None:
+        raise ValueError(
+            "compactor scene agent_policy.tool_execution_timeout_seconds is required"
+        )
+    if override.fallback_mode is None:
+        raise ValueError("compactor scene agent_policy.fallback_mode is required")
+    if override.fallback_prompt is None:
+        raise ValueError("compactor scene agent_policy.fallback_prompt is required")
+    if override.continuation_prompt is None:
+        raise ValueError(
+            "compactor scene agent_policy.continuation_prompt is required"
+        )
+    if override.max_consecutive_failed_tool_batches is None:
+        raise ValueError(
+            "compactor scene agent_policy.max_consecutive_failed_tool_batches "
+            "is required"
+        )
+    return AgentPolicy(
+        max_iterations=override.max_iterations,
+        continuation_max_attempts=override.continuation_max_attempts,
+        allow_tool_calls=override.allow_tool_calls,
+        tool_execution_timeout_seconds=override.tool_execution_timeout_seconds,
+        fallback_mode=_agent_fallback_mode_from_config(override.fallback_mode.value),
+        fallback_prompt=override.fallback_prompt,
+        continuation_prompt=override.continuation_prompt,
+        max_consecutive_failed_tool_batches=(
+            override.max_consecutive_failed_tool_batches
         ),
     )
 
@@ -850,7 +1054,7 @@ def _memory_projection_policy_from_config(
     return MemoryProjectionPolicy(
         context_window_size=context_window_size,
         max_pinned_items=policy.max_pinned_items,
-        max_verified_facts=policy.max_verified_facts,
+        max_evidence_backed_facts=policy.max_evidence_backed_facts,
         max_working_assumptions=policy.max_working_assumptions,
         recent_raw_turns_floor=policy.recent_raw_turns_floor,
         raw_turn_context_ratio=policy.raw_turn_context_ratio,
@@ -897,13 +1101,19 @@ def _resolve_project_path(
     :param workspace_root: workspace / 项目根目录。
     :param configured_path: 配置中的路径字符串。
     :returns: 解析后的路径。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: 相对路径逃逸 workspace root 时抛出。
     """
 
     path = pathlib.Path(configured_path)
     if path.is_absolute():
         return path
-    return workspace_root / path
+    resolved_root = workspace_root.resolve()
+    resolved_path = (resolved_root / path).resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("configured project path escapes workspace root") from exc
+    return resolved_path
 
 
 def _provider_extension_status(model: ModelConfig) -> str:

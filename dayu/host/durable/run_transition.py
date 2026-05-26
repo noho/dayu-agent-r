@@ -4740,6 +4740,7 @@ def _invalid_startup_orphan_precondition(
             dispatch_record=dispatch_record,
         )
     heartbeat_stale = request.occurred_at - heartbeat_at > request.stale_after
+    owner_closed = owner.status is HostInstanceStatus.STOPPED
     if (
         run.status != request.expected_run_status
         or run.current_attempt_id != attempt.attempt_id
@@ -4760,9 +4761,13 @@ def _invalid_startup_orphan_precondition(
         or dispatch_record.owner_host_instance_id != request.owner_host_instance_id
         or dispatch_record.cancelled_event_id is not None
         or dispatch_record.cancelled_event_sequence is not None
-        or owner.status != HostInstanceStatus.RUNNING
+        or owner.status not in (
+            HostInstanceStatus.RUNNING,
+            HostInstanceStatus.STOPPING,
+            HostInstanceStatus.STOPPED,
+        )
         or owner.heartbeat_at != request.owner_heartbeat_at
-        or not heartbeat_stale
+        or (not owner_closed and not heartbeat_stale)
     ):
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,

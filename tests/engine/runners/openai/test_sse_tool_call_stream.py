@@ -95,7 +95,7 @@ async def test_tool_call_position_ignores_non_dict_elements() -> None:
     ]
     assert len(deltas) == 1
     assert isinstance(deltas[0].data, RunnerToolCallDeltaData)
-    assert deltas[0].data.tool_call_index == 0
+    assert deltas[0].data.tool_call_index == -1
     completed = [
         e for e in events
         if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
@@ -165,7 +165,7 @@ async def test_bool_index_tool_calls_stay_separate_by_id() -> None:
             assert isinstance(event.data, RunnerToolCallDeltaData)
             deltas.append(event.data)
     assert len(deltas) == 4
-    assert [delta.tool_call_index for delta in deltas] == [0, 1, 0, 1]
+    assert [delta.tool_call_index for delta in deltas] == [-1, -2, -1, -2]
 
     completed_events = [
         event for event in events
@@ -231,7 +231,7 @@ def test_aggregator_rejects_bool_index_and_falls_back_to_id() -> None:
 
     resolved_index = aggregator.feed(delta)
 
-    assert resolved_index == 0
+    assert resolved_index == -1
     assert resolved_index is not True
     result = aggregator.finalize()
     assert result.fatal_errors == ()

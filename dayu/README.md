@@ -16,7 +16,7 @@ Dayu 是生产级买方财报分析 Agent，核心范式是“宿主强约束下
 - durable facts 可恢复，EventLog 与同事务状态索引是 Host 治理事实真源。
 - 同一 Session 内执行并发受 Host admission 约束，远端执行环境不拥有 Host 状态。
 - Engine 只执行单次 `AgentRunRequest`，不持有 Session / Run 生命周期，也不恢复旧 Agent、Runner 或 EngineWorker。
-- 工具事实必须经过 Host / ToolRuntime 治理与 accept barrier；assistant final answer 不自动成为 verified fact。
+- 工具事实必须经过 Host / ToolRuntime 治理与 accept barrier；assistant final answer 不自动成为 evidence-backed fact。
 - 财报文档存取只通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 
 ## 整体架构
@@ -58,7 +58,7 @@ Runner 实现类不属于 `dayu.engine` 包根公共 API。Engine 只接收 `too
 
 Host 是 Session / Run / Attempt / EventLog / admission / cancel / resume / retry / replay / memory / context governance / tool governance 的治理真源。Projection、timeline、audit、usage、tool trace、outbox 与 memory snapshot 都是已提交 EventLog 的派生视图，不能反向成为恢复或状态迁移真源。
 
-Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `CompactorRunnerBaseline` 装配。业务侧传入 compactor 运行基线；Host 在自己的 Context Governance 边界内构造 compaction request、校验 candidate，并写入 compact artifact 与 canonical event。
+Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `CompactorRunnerBaseline` 装配。Service / composition root 按 execution profile 的 `compactor_baseline.scene_id` 装配 compactor system prompt 与 AgentPolicy，按 `compactor_baseline.user_prompt_template_path` 读取 user prompt template 后传入 Host；Host 在自己的 Context Governance 边界内构造 compaction request、替换 template 中的 request 数据块、校验 candidate，并写入 compact artifact 与 canonical event。
 
 ### `dayu.service`
 
@@ -98,7 +98,7 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 - `Host event stream`：Host 面向 UI / CLI / Web / GUI 暴露的订阅与补读事件流，来自 EventLog cursor。
 - `ToolBundle`：外部装配好的业务工具声明集合，通过 `HostToolingOptions` 显式传给 Host construction。
 - `ToolRuntime`：Host-owned 工具治理模块，负责工具执行、截断、等待、重复调用治理、诊断与工具事实 accept barrier。
-- `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 compact 事件的治理 orchestrator。
+- `Context Governance`：Host 对上下文预算、compaction、pinned state、accepted tool evidence、open questions、assumptions 和 compact 事件的治理 orchestrator。
 
 `turn` 不用于描述 Engine / Runner 执行路径；如需表达用户视角的多轮对话，应明确其与 `Session`、`Run` 的关系。`resume` 不表示恢复旧 Agent / Runner / EngineWorker 实例，而是基于 canonical EventLog facts 构造新的 `AgentRunRequest` 并创建新的 Attempt。
 
@@ -127,7 +127,7 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 - 新 provider request extension DSL：在 `dayu.engine.provider_extensions` 中映射到 Engine `ProviderRequestExtension` 封闭联合；不要把 Engine contract 解析 helper 放进 `dayu.runtime`。
 - 新财报数据能力：在 `dayu.fins.storage` 仓储协议与实现内扩展文档存取；工具或 Service 通过仓储协议访问，不旁路读取文件或数据库。
 - 新本地执行能力：实现 `LocalEngineWorkerFactory` / `LocalEngineWorker`，并通过 `OpenHostOptions` 装配到 Host。
-- 新上下文压缩能力：通过 Host 的预算治理配置和 `CompactorRunnerBaseline` 装配 Host-owned LLM compaction；不要把 compaction 生命周期放到 Service 或 UI。
+- 新上下文压缩能力：通过 Host 的预算治理配置和 `CompactorRunnerBaseline` 装配 Host-owned LLM compaction；compactor system prompt 与 AgentPolicy 由 Service 从 scene asset 装配，user prompt template 由 Service 从 compactor baseline prompt asset 读取，compaction 生命周期仍属于 Host，不放到 Service 或 UI。
 - 新运行期通用能力：优先放入 `dayu.runtime`，并保持层中立 import 边界。
 - 新 projection / sink / trace 能力：消费 committed EventLog 与 checkpoint，不写 Host canonical facts，不改变 Run / Attempt 治理状态。
 

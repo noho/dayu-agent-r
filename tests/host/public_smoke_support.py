@@ -82,11 +82,10 @@ from dayu.host import (
     ResolveWaitRequest,
     RunStatus,
     SubmitFollowupRequest,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     WaitAdapterKey,
     WaitResolutionSource,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.api import AuthorizationClaim
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import (
@@ -272,7 +271,7 @@ class FinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消。
 
         :param reason: 取消原因。
@@ -518,7 +517,7 @@ class _AgentBackedHandle:
 
         await self._runner.close()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消。
 
         :param reason: 取消原因。

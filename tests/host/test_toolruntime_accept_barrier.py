@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from dayu.host.api import EnsureSessionRequest
+from dayu.contracts.json_value import JsonValue
+from dayu.host.api import EnsureSessionRequest, HostPayloadRef
 from dayu.host._event_payload import payload_object
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -42,6 +44,8 @@ from dayu.host.durable.state import (
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.evidence import accepted_evidence_envelope_from_json_value
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     default_memory_projection_policy,
@@ -67,6 +71,8 @@ from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "tool-accept-test"})
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
+_PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +160,134 @@ def test_tool_fact_accept_survives_projection_catchup_failure(
         assert all(record.levelname == "WARNING" for record in caplog.records)
 
 
+def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
+    tmp_path: Path,
+) -> None:
+    """新 accepted result payload 携带稳定 accepted evidence envelope。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(seeded, tool_call_id="tool-call-evidence")
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        result_rows = _tool_result_events(store.transaction_runner)
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert result.tool_result_event_ref is not None
+        assert len(result_rows) == 1
+        payload = payload_object(result_rows[0])
+        envelope_json = payload["accepted_evidence_envelope"]
+        envelope = accepted_evidence_envelope_from_json_value(envelope_json)
+        assert envelope.evidence_id == (
+            f"evidence:{result.tool_result_event_ref.event_id}"
+        )
+        assert envelope.producer_event_ref == result.tool_result_event_ref.event_id
+        assert envelope.tool_name == "lookup"
+        assert envelope.tool_call_id == "tool-call-evidence"
+        assert envelope.tool_query.tool_call_requested_event_ref == (
+            result.tool_call_requested_event_ref.event_id
+        )
+        assert envelope.tool_query.normalized_arguments_digest == (
+            candidate.normalized_arguments_digest
+        )
+        assert envelope.tool_query.semantic_input_digest == (
+            candidate.semantic_input_digest
+        )
+        assert envelope.result_ref.payload_ref is None
+        assert envelope.result_ref.payload_digest == candidate.payload_digest
+        assert envelope.result_ref.outcome_digest == candidate.outcome_digest
+        assert envelope.result_ref.truncation_applied is False
+        assert envelope.source_refs == ()
+        assert envelope.locator_refs == ()
+        assert payload["raw_tool_outcome"] == candidate.raw_tool_outcome
+        assert "result_preview" not in payload
+
+
+def test_tool_result_accepted_large_payload_uses_sqlite_payload_descriptor(
+    tmp_path: Path,
+) -> None:
+    """大工具结果冷热分离，EventLog inline 只保留热元数据与 descriptor ref。"""
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = replace(
+            _completed_candidate(seeded, tool_call_id="tool-call-large-payload"),
+            raw_tool_outcome=_large_raw_tool_outcome("tool-call-large-payload"),
+            outcome_digest=sha256_digest_json({"outcome": "tool-call-large-payload"}),
+            payload_digest=sha256_digest_json({"payload": "tool-call-large-payload"}),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        result_rows = _tool_result_events(store.transaction_runner)
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert result.tool_result_event_ref is not None
+        assert result.result_payload_ref is not None
+        assert len(result_rows) == 1
+        row = result_rows[0]
+        assert row.payload_ref == result.result_payload_ref.payload_ref
+        assert row.payload_digest == result.result_payload_ref.payload_digest
+        inline_payload = payload_object(row)
+        assert _PAYLOAD_FIELD_RAW_TOOL_OUTCOME not in inline_payload
+        assert inline_payload["payload_ref"] == {
+            "payload_ref": row.payload_ref,
+            "payload_digest": row.payload_digest,
+        }
+
+        cold_payload = _read_event_payload(store.transaction_runner, row)
+        envelope = accepted_evidence_envelope_from_json_value(
+            cold_payload[_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE]
+        )
+        assert cold_payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] == candidate.raw_tool_outcome
+        assert envelope.result_ref.payload_ref == row.payload_ref
+        assert envelope.result_ref.payload_digest is None
+        assert envelope.result_ref.outcome_digest == candidate.outcome_digest
+
+
+def test_accept_rejects_missing_payload_descriptor_before_writing_events(
+    tmp_path: Path,
+) -> None:
+    """accept barrier 在写 accepted events 前拒绝缺失 payload descriptor。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        payload_digest = sha256_digest_json({"payload": "missing-descriptor"})
+        candidate = replace(
+            _completed_candidate(seeded, tool_call_id="tool-call-missing-payload"),
+            payload_digest=payload_digest,
+            payload_ref=HostPayloadRef(
+                payload_ref="payload:missing-descriptor",
+                payload_digest=payload_digest,
+            ),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+
+        assert isinstance(result, ToolFactRejectedAck)
+        assert result.reason_code is ToolAcceptRejectReason.PAYLOAD_REFERENCE_INVALID
+        assert _tool_events(store.transaction_runner) == ()
+
+
+def test_accepted_evidence_envelope_codec_rejects_partial_object() -> None:
+    """accepted evidence envelope JSON codec 拒绝不完整对象。"""
+
+    with pytest.raises(ValueError, match="unexpected JSON fields"):
+        accepted_evidence_envelope_from_json_value(
+            {"evidence_id": "evidence:event-tool-result"}
+        )
+
+
 def test_tool_fact_accept_logs_ids_without_tool_payload(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -187,14 +321,14 @@ def test_tool_fact_accept_logs_ids_without_tool_payload(
         assert "{\"payload\":" not in caplog.text
 
 
-def test_tool_fact_accept_concrete_memory_catchup_projects_verified_fact(
+def test_tool_fact_accept_concrete_memory_catchup_does_not_project_fact(
     tmp_path: Path,
 ) -> None:
-    """TOOL_RESULT_ACCEPTED commit 后 concrete catch-up 会写入 verified fact。
+    """TOOL_RESULT_ACCEPTED commit 后 concrete catch-up 不直接写入 fact。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
-    :raises AssertionError: accepted 工具事实未被 memory catch-up 投影时抛出。
+    :raises AssertionError: accepted 工具事实被 memory catch-up 直接投影时抛出。
     """
 
     policy = default_memory_projection_policy()
@@ -224,8 +358,8 @@ def test_tool_fact_accept_concrete_memory_catchup_projects_verified_fact(
         assert isinstance(result, ToolFactAcceptedAck)
         assert result.tool_result_event_ref is not None
         assert snapshot is not None
-        assert len(snapshot.snapshot.verified_facts) == 1
-        assert snapshot.snapshot.verified_facts[0].provenance.event_id == (
+        assert snapshot.snapshot.evidence_backed_facts == ()
+        assert snapshot.snapshot.cursor.checkpoint_event_id == (
             result.tool_result_event_ref.event_id
         )
 
@@ -440,16 +574,22 @@ def test_accept_retry_policy_and_timeout_guard_invalid_values() -> None:
         )
 
 
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
+def _options(
+    tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536
+) -> HostDurableStoreOptions:
     """构造测试 durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
     :returns: Host durable store options。
     """
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.25,
             write_busy_retry_count=3,
@@ -606,6 +746,7 @@ def _completed_candidate(
         payload_digest=sha256_digest_json({"payload": tool_call_id}),
         payload_ref=None,
         truncation=None,
+        raw_tool_outcome=_raw_tool_outcome(tool_call_id),
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),
@@ -648,6 +789,7 @@ def _reuse_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
+        raw_tool_outcome=None,
         duplicate_key="duplicate-lookup-MSFT",
         duplicate_decision=DuplicateDecisionKind.REUSE,
         reuse_prior_event_refs=(prior_ref,),
@@ -695,6 +837,7 @@ def _fact_kind_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
+        raw_tool_outcome=_raw_tool_outcome(tool_call_id),
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),
@@ -708,6 +851,69 @@ def _fact_kind_candidate(
         accept_idempotency_key=f"accept-{tool_call_id}",
         semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
     )
+
+
+def _raw_tool_outcome(tool_call_id: str) -> JsonValue:
+    """构造测试用 raw tool outcome。
+
+    :param tool_call_id: 工具调用 id。
+    :returns: raw outcome JSON。
+    """
+
+    return {
+        "kind": "completed",
+        "result": {
+            "ok": True,
+            "value": {"tool_call_id": tool_call_id},
+            "meta": None,
+        },
+    }
+
+
+def _large_raw_tool_outcome(tool_call_id: str) -> JsonValue:
+    """构造超过 inline 阈值的 raw tool outcome。
+
+    :param tool_call_id: 工具调用 id。
+    :returns: 大 raw outcome JSON。
+    """
+
+    return {
+        "kind": "completed",
+        "result": {
+            "ok": True,
+            "value": {
+                "tool_call_id": tool_call_id,
+                "large_text": "X" * 10000,
+            },
+            "meta": None,
+        },
+    }
+
+
+def _read_event_payload(
+    transaction_runner: HostTransactionRunner, row: EventLogRow
+) -> Mapping[str, JsonValue]:
+    """读取 EventLog row 的完整 payload，必要时跟随 descriptor。
+
+    :param transaction_runner: Host transaction runner。
+    :param row: EventLog row。
+    :returns: 完整 payload JSON object。
+    """
+
+    def _operation(transaction: HostTransaction) -> Mapping[str, JsonValue]:
+        """读取完整 payload。
+
+        :param transaction: Host transaction。
+        :returns: 完整 payload JSON object。
+        """
+
+        return event_payload_object(
+            transaction,
+            row,
+            payload_label="TOOL_RESULT_ACCEPTED",
+        )
+
+    return transaction_runner.run_read(_operation)
 
 
 def _tool_events(transaction_runner: HostTransactionRunner) -> tuple[EventLogRow, ...]:

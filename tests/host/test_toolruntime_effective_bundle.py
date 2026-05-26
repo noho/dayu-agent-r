@@ -31,10 +31,9 @@ from dayu.host.tool_runtime import (
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _POLICY_DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 

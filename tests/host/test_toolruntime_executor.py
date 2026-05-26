@@ -75,10 +75,9 @@ from dayu.host.wait_adapter import (
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.tooling import (
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _SESSION_ID = "session-toolruntime"
 _RUN_ID = "run-toolruntime"
@@ -92,7 +91,7 @@ _OVERSIZED_INLINE_TEXT_LENGTH = 70010
 _OVERSIZED_TRUNCATED_TEXT_LIMIT = 70000
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -481,6 +480,14 @@ async def test_oversized_tool_result_returns_completed_outcome_without_default_g
     candidate = accept_port.candidates[0]
     assert candidate.tool_fact_kind is ToolFactKind.COMPLETED
     assert candidate.policy_decision.kind is ToolPolicyDecisionKind.ALLOW
+    assert candidate.raw_tool_outcome == {
+        "kind": "completed",
+        "result": {
+            "ok": True,
+            "value": oversized_value,
+            "meta": None,
+        },
+    }
     assert isinstance(record.outcome, ToolCompletedOutcome)
     assert record.outcome.result.value == oversized_value
 
@@ -1081,7 +1088,7 @@ def _request(
             cancellation_token=(
                 cancellation_token
                 if cancellation_token is not None
-                else _NeverCancelledToken()
+                else _OpenCancellationToken()
             ),
             correlation_id="correlation-toolruntime",
         ),
@@ -1222,6 +1229,14 @@ def _accepted_ack_for_call(tool_call_id: str) -> ToolFactAcceptedAck:
         payload_digest=sha256_digest_json({"payload": tool_call_id}),
         payload_ref=None,
         truncation=None,
+        raw_tool_outcome={
+            "kind": "completed",
+            "result": {
+                "ok": True,
+                "value": {"tool_call_id": tool_call_id},
+                "meta": None,
+            },
+        },
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),

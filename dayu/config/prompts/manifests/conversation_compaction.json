@@ -11,6 +11,16 @@
     "default_model_id": "mimo-v2.5-pro-thinking-plan",
     "runner_option_hint_id": "conversation_compaction"
   },
+  "agent_policy": {
+    "max_iterations": 1,
+    "continuation_max_attempts": 0,
+    "allow_tool_calls": false,
+    "tool_execution_timeout_seconds": 1.0,
+    "fallback_mode": "raise_error",
+    "fallback_prompt": "Compactor is not allowed to fallback-answer.",
+    "continuation_prompt": "Continue the strict JSON object without repeating content already emitted.",
+    "max_consecutive_failed_tool_batches": 1
+  },
   "tool_selection": {
     "mode": "none",
     "tool_names": [],
@@ -22,7 +32,7 @@
   },
   "fragments": [
     {
-      "id": "conversation_compaction_scene",
+      "id": "conversation_compaction_system",
       "path": "scenes/conversation_compaction.md",
       "order": 100,
       "required": true

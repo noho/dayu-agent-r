@@ -736,19 +736,20 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_ITEMS} (
   item_id TEXT PRIMARY KEY,
   snapshot_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
-  item_kind TEXT NOT NULL CHECK (
+    item_kind TEXT NOT NULL CHECK (
     item_kind IN (
-      'verified_fact',
+      'evidence_backed_fact',
       'working_assumption',
       'raw_user_turn',
       'raw_assistant_turn',
       'assistant_conclusion',
-      'episode_summary'
+      'episode_summary',
+      'minimum_preserve_item'
     )
   ),
   claim_status TEXT NOT NULL CHECK (
     claim_status IN (
-      'tool_verified',
+      'evidence_backed',
       'assumption',
       'candidate',
       'conflicted',
@@ -787,14 +788,16 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
   snapshot_id TEXT NULL,
   reason TEXT NOT NULL CHECK (
     reason IN (
-      'missing_fact_summary_fallback',
+      'evidence_backed_fact_candidate_invalid',
       'inline_delta_repair_included',
       'snapshot_missing',
       'snapshot_damaged',
       'unsupported_event_type',
       'snapshot_lag_over_threshold',
       'budget_limit_reached',
-      'empty_event_log_snapshot'
+      'empty_event_log_snapshot',
+      'evidence_backed_fact_superseded',
+      'minimum_preserve_item_covered'
     )
   ),
   event_sequence INTEGER NULL CHECK (

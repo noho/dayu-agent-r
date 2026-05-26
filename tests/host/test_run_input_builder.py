@@ -88,6 +88,13 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.compaction import (
+    CompactMaterialBlockKind,
+    CompactMaterialSection,
+    EvidenceBackedFactKind,
+    MinimumPreserveReason,
+)
+from dayu.host.compact_payload import preserved_fact_refs_summary
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
     DurableCurrentRunFactProvider,
@@ -119,7 +126,7 @@ from dayu.host.memory import (
     MemorySnapshotCursor,
     OpaqueMemoryRef,
     PinnedStateView,
-    VerifiedFactView,
+    EvidenceBackedFactView,
     WorkingAssumptionView,
     build_conversation_memory_snapshot_from_events,
     calculate_memory_snapshot_digest,
@@ -133,10 +140,9 @@ from dayu.host.tool_runtime import (
     ToolRuntimeBuildRequest,
 )
 from dayu.host.tooling import (
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "run-input-test"})
@@ -157,7 +163,7 @@ class _SeededRun:
     dispatch_record_id: str
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -505,12 +511,28 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
 
         assert contents[0] == _expected_system_content()
         assert contents[1].startswith("Memory user goals and constraints:")
-        assert contents[2].startswith("Memory confirmed subjects and methodology:")
-        assert contents[3].startswith("Memory tool-verified facts:")
+        assert contents[2].startswith("Memory evidence-backed facts:")
+        assert "claim_text=Revenue increased year over year" in contents[2]
+        assert "evidence_refs=evidence:memory-tool" in contents[2]
+        assert "evidence_kind=observed_value" in contents[2]
+        assert "extraction_operation_ref=event:event-memory-episode" in contents[2]
+        assert "event_id=event-memory-episode" in contents[2]
+        assert "event_sequence=5" in contents[2]
+        assert "digest_ref=" not in contents[2]
+        assert "fact_summary=" not in contents[2]
+        assert contents[3].startswith("Memory confirmed subjects and methodology:")
         assert contents[4].startswith("Memory open questions and working assumptions:")
         assert contents[5] == "recent raw user"
         assert contents[6] == "recent assistant conclusion"
-        assert contents[7].startswith("Memory episode summaries:")
+        assert contents[7].startswith("Memory minimum preserve continuity:")
+        assert "label=factor-2" in contents[7]
+        assert "text=second factor: margin mix" in contents[7]
+        assert "source_refs=event-memory-raw-user" in contents[7]
+        assert (
+            "preserve_reason=needed_for_ordered_item_reference"
+            in contents[7]
+        )
+        assert contents[8].startswith("Memory episode summaries:")
         assert contents[-1] == "current prompt"
         assert all("inline delta" not in content for content in contents)
         assert all(
@@ -545,14 +567,56 @@ def test_memory_provider_applies_stable_layer_budget(tmp_path: Path) -> None:
         contents = tuple(_message_content(message) for message in request.messages)
 
         assert all(
-            not content.startswith("Memory tool-verified facts:")
+            not content.startswith("Memory evidence-backed facts:")
             for content in contents
         )
         assert "recent raw user" in contents
         assert contents[-1] == "current prompt"
         assert any(
             diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
-            and diagnostic.item_id == "stable:verified_facts"
+            and diagnostic.item_id == "stable:evidence_backed_facts"
+            for diagnostic in memory_view.diagnostics
+        )
+
+
+def test_stable_budget_prioritizes_evidence_backed_facts_over_subjects(
+    tmp_path: Path,
+) -> None:
+    """stable 预算紧张时 confirmed subjects 不能饿死 evidence-backed facts。"""
+
+    policy = _memory_policy(stable_layer_size_units=512)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        snapshot = _stable_budget_pressure_snapshot(session_id, policy, cursor)
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        request = _build_request_with_memory(store, seeded, policy)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert any(
+            content.startswith("Memory evidence-backed facts:")
+            for content in contents
+        )
+        assert all(
+            not content.startswith("Memory confirmed subjects and methodology:")
+            for content in contents
+        )
+        assert any(
+            diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+            and diagnostic.item_id == "stable:subjects"
             for diagnostic in memory_view.diagnostics
         )
 
@@ -583,6 +647,32 @@ def test_noop_memory_snapshot_provider_returns_empty_typed_view(
         assert view.memory_snapshot_cursor is None
         assert view.policy_digest is None
         assert view.diagnostics == ()
+
+
+def test_run_input_builder_exposes_shared_material_block_source(
+    tmp_path: Path,
+) -> None:
+    """RunInputBuilder 暴露与 compact builder 共用的 ordinary material view。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+        )
+
+        blocks = builder.build_material_blocks(_attempt_snapshot(seeded))
+
+        assert len(blocks) == 1
+        assert blocks[0].section is CompactMaterialSection.CURRENT_INPUT_ANCHOR
+        assert blocks[0].kind is CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR
+        assert blocks[0].text == "current prompt"
+        assert blocks[0].canonical_source_refs == ("event-current-input",)
 
 
 def test_covered_memory_snapshot_filters_current_user_input(
@@ -682,7 +772,7 @@ def test_inline_delta_applies_stable_layer_budget(tmp_path: Path) -> None:
         )
         assert any(
             diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
-            and diagnostic.item_id == "stable:verified_facts"
+            and diagnostic.item_id == "stable:evidence_backed_facts"
             for diagnostic in memory_view.diagnostics
         )
 
@@ -935,6 +1025,197 @@ def test_run_input_memory_messages_include_context_compacted_projection(
         assert contents[-1] == "current prompt"
 
 
+def test_gross_margin_followup_uses_post_compaction_evidence_backed_facts(
+    tmp_path: Path,
+) -> None:
+    """毛利率追问通过 post-compaction facts 读取收入与毛利。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_compacted_gross_margin_facts(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("请基于已确认的收入和毛利计算毛利率"),
+        )
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+        fact_blocks = tuple(
+            content
+            for content in contents
+            if content.startswith("Memory evidence-backed facts:")
+        )
+
+        assert len(fact_blocks) == 1
+        assert "claim_text=Revenue was 100." in fact_blocks[0]
+        assert "claim_text=Gross profit was 40." in fact_blocks[0]
+        assert "evidence_refs=evidence:memory-tool" in fact_blocks[0]
+        assert all(
+            "older raw says revenue 100 and gross profit 40" not in content
+            for content in contents
+        )
+        assert contents[-1] == "请基于已确认的收入和毛利计算毛利率"
+
+
+def test_run_input_builder_renders_claim_text_and_evidence_refs_not_digest_only(
+    tmp_path: Path,
+) -> None:
+    """RunInputBuilder 渲染 stable facts 时必须包含 claim_text 与 evidence_refs。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_compacted_gross_margin_facts(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("继续分析收入质量"),
+        )
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        fact_blocks = tuple(
+            _message_content(message)
+            for message in request.messages
+            if _message_content(message).startswith("Memory evidence-backed facts:")
+        )
+
+        assert len(fact_blocks) == 1
+        assert "claim_text=Revenue was 100." in fact_blocks[0]
+        assert "claim_text=Gross profit was 40." in fact_blocks[0]
+        assert "evidence_refs=evidence:memory-tool" in fact_blocks[0]
+        assert "digest_ref=" not in fact_blocks[0]
+        assert "fact_summary=" not in fact_blocks[0]
+
+
+def test_no_compaction_recent_raw_turns_continuity_still_works(
+    tmp_path: Path,
+) -> None:
+    """未发生 compact 时，memory recent raw turns 仍提供连续性。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-no-compact",
+            user_text="上轮问题：收入增长来自哪里？",
+            answer_text="上轮回答：收入增长主要来自订阅业务。",
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("继续说明这个增长因素"),
+        )
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert "上轮问题：收入增长来自哪里？" in contents
+        assert "上轮回答：收入增长主要来自订阅业务。" in contents
+        assert all(
+            not content.startswith("Memory evidence-backed facts:")
+            for content in contents
+        )
+        assert contents[-1] == "继续说明这个增长因素"
+
+
+def test_compact_artifact_preserved_fact_refs_reads_canonical_evidence_key() -> None:
+    """compact artifact message 从 canonical evidence refs 字段读取 refs。"""
+
+    payload: dict[str, JsonValue] = {
+        "preserved_fact_refs": {
+            "canonical_evidence_refs": ["evidence:memory-tool"],
+            "evidence_backed_fact_refs": ["fact:memory-revenue"],
+        }
+    }
+
+    assert preserved_fact_refs_summary(payload) == (
+        "canonical_evidence_refs=evidence:memory-tool; "
+        "evidence_backed_fact_refs=fact:memory-revenue"
+    )
+
+
+def test_minimum_preserve_resolves_second_factor_without_full_long_input(
+    tmp_path: Path,
+) -> None:
+    """长输入 compact 后只靠 minimum preserve 解析“第二个因素”。"""
+
+    policy = _memory_policy()
+    long_input = (
+        "第一因素是收入确认节奏。" * 20
+        + "第二个因素是毛利率受云业务拖累。"
+        + "第三因素是费用投放。" * 20
+    )
+    preserve_text = "第二个因素：毛利率受云业务拖累"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        source_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-long-input",
+            event_id="event-long-input",
+            text=long_input,
+        )
+        compact_event = _append_minimum_preserve_compact_marker(
+            store.transaction_runner,
+            session_id=session_id,
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("第二个因素具体影响是什么？"),
+        )
+        cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        snapshot = _minimum_preserve_only_snapshot(
+            session_id=session_id,
+            policy=policy,
+            cursor=cursor,
+            source_event=source_event,
+            producer_event=compact_event,
+            preserve_text=preserve_text,
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+        preserve_blocks = tuple(
+            content
+            for content in contents
+            if content.startswith("Memory minimum preserve continuity:")
+        )
+
+        assert len(preserve_blocks) == 1
+        assert "label=第二个因素" in preserve_blocks[0]
+        assert f"text={preserve_text}" in preserve_blocks[0]
+        assert "source_refs=event-long-input" in preserve_blocks[0]
+        assert all(long_input not in content for content in contents)
+        assert contents[-1] == "第二个因素具体影响是什么？"
+
+
 def test_memory_messages_are_stable_for_same_eventlog_and_policy(
     tmp_path: Path,
 ) -> None:
@@ -1107,7 +1388,7 @@ def _memory_policy(
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
         raw_turn_context_ratio=0.125,
@@ -1220,27 +1501,30 @@ def _rich_memory_snapshot(
             user_constraints=("use reported currency",),
             open_questions=("what changed in margin?",),
         ),
-        verified_facts=(
-            VerifiedFactView(
-                item_id="memory-item:verified:test",
-                fact_summary="tool verified revenue increased",
-                claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+        evidence_backed_facts=(
+            EvidenceBackedFactView(
+                item_id="memory-item:evidence-backed:test",
+                claim_text="Revenue increased year over year",
+                evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+                evidence_refs=("evidence:memory-tool",),
+                attributes={},
                 provenance=MemoryProvenanceRef(
-                    producer_kind=MemoryProducerKind.TOOL,
-                    producer_name="filing.lookup",
-                    event_id="event-memory-tool",
-                    event_sequence=1,
+                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                    producer_name="conversation_memory",
+                    event_id="event-memory-episode",
+                    event_sequence=5,
                     run_id="run-memory",
-                    attempt_id="attempt-memory",
-                    execution_id="execution-memory",
+                    attempt_id=None,
+                    execution_id=None,
                     tool_result_ref="event-memory-tool",
-                    payload_ref="payload-memory-tool",
+                    payload_ref="compact-artifact:test",
                     digest_ref=_DIGEST_A,
                     source_refs=(),
                 ),
-                evidence_anchor=None,
-                subject_refs=(),
-                included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+                extraction_operation_ref="event:event-memory-episode",
+                compact_artifact_ref="compact-artifact:test",
+                candidate_id="fact-memory-revenue",
+                included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
                 excluded_reason=None,
                 size_units=MemorySizeUnits(31),
             ),
@@ -1271,6 +1555,9 @@ def _rich_memory_snapshot(
                     event_sequence=3,
                     run_id="run-memory",
                     summary_text="recent raw user",
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
@@ -1286,11 +1573,34 @@ def _rich_memory_snapshot(
                     event_sequence=4,
                     run_id="run-memory",
                     summary_text="recent assistant conclusion",
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
                     excluded_reason=None,
                     size_units=MemorySizeUnits(27),
+                ),
+                ConversationContinuityItem(
+                    item_id="memory-item:minimum-preserve:test",
+                    item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
+                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                    event_id="event-memory-episode",
+                    event_sequence=5,
+                    run_id="run-memory",
+                    summary_text="second factor: margin mix",
+                    label="factor-2",
+                    source_refs=("event-memory-raw-user",),
+                    preserve_reason=(
+                        MinimumPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
+                    ),
+                    payload_ref=None,
+                    payload_digest=None,
+                    included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
+                    excluded_reason=None,
+                    size_units=MemorySizeUnits(25),
                 ),
                 ConversationContinuityItem(
                     item_id="memory-item:episode:test",
@@ -1301,6 +1611,9 @@ def _rich_memory_snapshot(
                     event_sequence=5,
                     run_id=None,
                     summary_text="episode navigation only",
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.EPISODE_SUMMARY,
@@ -1319,13 +1632,50 @@ def _rich_memory_snapshot(
         cursor=snapshot_without_digest.cursor,
         policy_digest=snapshot_without_digest.policy_digest,
         pinned_state=snapshot_without_digest.pinned_state,
-        verified_facts=snapshot_without_digest.verified_facts,
+        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
         working_assumptions=snapshot_without_digest.working_assumptions,
         conversation_continuity=snapshot_without_digest.conversation_continuity,
         diagnostics=snapshot_without_digest.diagnostics,
         built_at=snapshot_without_digest.built_at,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )
+
+
+def _stable_budget_pressure_snapshot(
+    session_id: str,
+    policy: MemoryProjectionPolicy,
+    cursor: MemorySnapshotCursor,
+) -> ConversationMemorySnapshot:
+    """构造 subjects 大于预算但 fact 可独立放入的 snapshot。
+
+    :param session_id: Session id。
+    :param policy: memory projection policy。
+    :param cursor: snapshot cursor。
+    :returns: memory snapshot。
+    """
+
+    snapshot = _rich_memory_snapshot(session_id, policy, cursor)
+    subjects = tuple(
+        OpaqueMemoryRef(
+            ref_kind=HostNeutralRefKind.SUBJECT,
+            ref_id=f"subject:budget-pressure-{index}",
+            digest=_DIGEST_A,
+        )
+        for index in range(12)
+    )
+    pinned_state = replace(
+        snapshot.pinned_state,
+        current_goal=None,
+        confirmed_subjects=subjects,
+        user_constraints=(),
+        open_questions=(),
+    )
+    updated = replace(
+        snapshot,
+        pinned_state=pinned_state,
+        working_assumptions=(),
+    )
+    return replace(updated, snapshot_digest=calculate_memory_snapshot_digest(updated))
 
 
 def _current_input_memory_snapshot(
@@ -1358,7 +1708,7 @@ def _current_input_memory_snapshot(
             user_constraints=(current_prompt,),
             open_questions=(),
         ),
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=ConversationContinuityView(
             items=(
@@ -1371,6 +1721,9 @@ def _current_input_memory_snapshot(
                     event_sequence=current_input.event_sequence,
                     run_id=current_input.run_id,
                     summary_text=current_prompt,
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
@@ -1389,7 +1742,84 @@ def _current_input_memory_snapshot(
         cursor=snapshot_without_digest.cursor,
         policy_digest=snapshot_without_digest.policy_digest,
         pinned_state=snapshot_without_digest.pinned_state,
-        verified_facts=snapshot_without_digest.verified_facts,
+        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
+        working_assumptions=snapshot_without_digest.working_assumptions,
+        conversation_continuity=snapshot_without_digest.conversation_continuity,
+        diagnostics=snapshot_without_digest.diagnostics,
+        built_at=snapshot_without_digest.built_at,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def _minimum_preserve_only_snapshot(
+    *,
+    session_id: str,
+    policy: MemoryProjectionPolicy,
+    cursor: MemorySnapshotCursor,
+    source_event: EventLogRow,
+    producer_event: EventLogRow,
+    preserve_text: str,
+) -> ConversationMemorySnapshot:
+    """构造只保留 minimum preserve item 的 memory snapshot。
+
+    :param session_id: Session id。
+    :param policy: memory projection policy。
+    :param cursor: snapshot cursor。
+    :param source_event: compact 前长输入 source event。
+    :param producer_event: 生成 minimum preserve item 的 compact event。
+    :param preserve_text: minimum preserve item 文本。
+    :returns: memory snapshot。
+    """
+
+    policy_digest = digest_memory_projection_policy(policy)
+    snapshot_without_digest = ConversationMemorySnapshot(
+        snapshot_id=f"memory-snapshot-minimum-preserve-{session_id}",
+        session_id=session_id,
+        cursor=cursor,
+        policy_digest=policy_digest,
+        pinned_state=PinnedStateView(
+            current_goal=None,
+            confirmed_subjects=(),
+            user_constraints=(),
+            open_questions=(),
+        ),
+        evidence_backed_facts=(),
+        working_assumptions=(),
+        conversation_continuity=ConversationContinuityView(
+            items=(
+                ConversationContinuityItem(
+                    item_id="memory-item:minimum-preserve:second-factor",
+                    item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
+                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                    event_id=producer_event.event_id,
+                    event_sequence=producer_event.event_sequence,
+                    run_id=producer_event.run_id,
+                    summary_text=preserve_text,
+                    label="第二个因素",
+                    source_refs=(source_event.event_id,),
+                    preserve_reason=(
+                        MinimumPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
+                    ),
+                    payload_ref=None,
+                    payload_digest=None,
+                    included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
+                    excluded_reason=None,
+                    size_units=MemorySizeUnits(len(preserve_text)),
+                ),
+            )
+        ),
+        diagnostics=(),
+        built_at="2026-05-15T01:02:03.000000Z",
+        snapshot_digest="pending",
+    )
+    return ConversationMemorySnapshot(
+        snapshot_id=snapshot_without_digest.snapshot_id,
+        session_id=snapshot_without_digest.session_id,
+        cursor=snapshot_without_digest.cursor,
+        policy_digest=snapshot_without_digest.policy_digest,
+        pinned_state=snapshot_without_digest.pinned_state,
+        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
         working_assumptions=snapshot_without_digest.working_assumptions,
         conversation_continuity=snapshot_without_digest.conversation_continuity,
         diagnostics=snapshot_without_digest.diagnostics,
@@ -1519,6 +1949,121 @@ def _append_rich_memory_source_events(
         )
 
     transaction_runner.run_write(operation)
+
+
+def _append_compacted_gross_margin_facts(
+    transaction_runner: HostTransactionRunner, session_id: str
+) -> None:
+    """追加 gross-margin follow-up 需要的 compacted facts。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加 canonical evidence 与 compacted fact candidate events。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-gross-tool",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory-gross",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={
+                    "tool_name": "filing.lookup",
+                    "tool_call_id": "call-memory-gross",
+                    "tool_fact_kind": "completed",
+                    "outcome_digest": _DIGEST_A,
+                    "payload_digest": _DIGEST_B,
+                },
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-gross-compact",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory-gross",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="gross margin episode navigation only",
+                    pinned_patch={"candidate_id": "patch-gross-margin"},
+                    fact_candidates=[
+                        {
+                            "candidate_id": "fact-revenue",
+                            "claim_text": "Revenue was 100.",
+                            "evidence_kind": "observed_value",
+                            "evidence_refs": ["evidence:memory-tool"],
+                            "attributes": {},
+                        },
+                        {
+                            "candidate_id": "fact-gross-profit",
+                            "claim_text": "Gross profit was 40.",
+                            "evidence_kind": "observed_value",
+                            "evidence_refs": ["evidence:memory-tool"],
+                            "attributes": {},
+                        },
+                    ],
+                ),
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _append_minimum_preserve_compact_marker(
+    transaction_runner: HostTransactionRunner, *, session_id: str
+) -> EventLogRow:
+    """追加 minimum preserve snapshot 的 compact producer event。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :returns: compact producer EventLog row。
+    """
+
+    def operation(transaction: HostTransaction) -> EventLogRow:
+        """追加 compact marker event。
+
+        :param transaction: Host transaction。
+        :returns: compact producer EventLog row。
+        """
+
+        return EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-compact-second-factor",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-long-input",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="long input compacted to minimum preserve",
+                    pinned_patch={"candidate_id": "patch-second-factor"},
+                    fact_candidates=[],
+                    minimum_preserve_items=[
+                        {
+                            "item_id": "preserve-second-factor",
+                            "label": "第二个因素",
+                            "text": "第二个因素：毛利率受云业务拖累",
+                            "source_refs": ["event-long-input"],
+                            "preserve_reason": (
+                                "needed_for_ordered_item_reference"
+                            ),
+                        }
+                    ],
+                ),
+            ),
+        ).row
+
+    return transaction_runner.run_write(operation)
 
 
 def _read_event_by_id(
@@ -2272,7 +2817,7 @@ def _token() -> CancellationToken:
     :returns: 未取消 token。
     """
 
-    return _NeverCancelledToken()
+    return _OpenCancellationToken()
 
 
 def _policy_snapshot(*, allow_tool_calls: bool = False) -> PolicySnapshot:
@@ -2736,60 +3281,104 @@ def _compact_payload(
     *,
     summary_text: str,
     pinned_patch: dict[str, JsonValue],
+    fact_candidates: list[JsonValue] | None = None,
+    minimum_preserve_items: list[JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     """构造测试用 CONTEXT_COMPACTED payload。
 
     :param summary_text: episode summary 文本。
     :param pinned_patch: pinned patch candidate。
+    :param fact_candidates: 可选 evidence-backed fact candidates。
+    :param minimum_preserve_items: 可选 minimum preserve item candidates。
     :returns: compacted payload。
     """
 
-    return {
+    resolved_fact_candidates: list[JsonValue]
+    if fact_candidates is None:
+        resolved_fact_candidates = [
+            {
+                "candidate_id": "fact-memory-revenue",
+                "claim_text": "Revenue increased year over year",
+                "evidence_kind": "observed_value",
+                "evidence_refs": ["evidence:memory-tool"],
+                "attributes": {},
+            }
+        ]
+    else:
+        resolved_fact_candidates = fact_candidates
+    resolved_minimum_preserve_items: list[JsonValue]
+    if minimum_preserve_items is None:
+        resolved_minimum_preserve_items = [
+            {
+                "item_id": "preserve-factor-2",
+                "label": "factor-2",
+                "text": "second factor: margin mix",
+                "source_refs": ["event-memory-raw-user"],
+                "preserve_reason": "needed_for_ordered_item_reference",
+            }
+        ]
+    else:
+        resolved_minimum_preserve_items = minimum_preserve_items
+
+    episode_summary: dict[str, JsonValue] = {
+        "candidate_id": "summary-memory",
+        "summary_text": summary_text,
+        "episode_title": "episode",
+        "goal": "compact goal",
+        "completed_actions": [],
+        "confirmed_fact_refs": [],
+        "confirmed_fact_summaries": [],
+        "user_constraints": [],
+        "open_questions": ["compact open question"],
+        "next_step": None,
+        "tool_finding_refs": [],
+        "source_event_refs": ["event-memory-raw-user"],
+        "evidence_refs": ["evidence-1"],
+        "proposed_evidence_backed_fact_refs": [],
+    }
+    preservation_evidence: list[JsonValue] = [
+        {
+            "evidence_id": "evidence-1",
+            "material_source_refs": ["event-memory-raw-user"],
+            "canonical_evidence_refs": ["evidence:memory-tool"],
+            "evidence_backed_fact_refs": [],
+            "memory_snapshot_cursor": None,
+            "compact_input_range": None,
+        }
+    ]
+    preserved_fact_refs: dict[str, JsonValue] = {
+        "canonical_evidence_refs": ["evidence:memory-tool"],
+        "evidence_backed_fact_refs": [],
+    }
+    quality_check_result: dict[str, JsonValue] = {
+        "accepted": True,
+        "rejection_reasons": [],
+        "current_user_input_retained": True,
+        "canonical_evidence_refs_retained": True,
+        "evidence_backed_fact_candidates_accepted": True,
+        "minimum_preserve_items_accepted": True,
+        "evidence_anchors_retained": True,
+        "open_questions_retained": True,
+        "retained_canonical_evidence_refs": ["evidence:memory-tool"],
+        "dropped_ranges": [],
+        "summarized_ranges": [],
+    }
+    payload: dict[str, JsonValue] = {
         "compact_artifact_ref": "compact-artifact:test",
         "compact_artifact_digest": _DIGEST_A,
-        "episode_summary_candidate": {
-            "candidate_id": "summary-memory",
-            "summary_text": summary_text,
-            "episode_title": "episode",
-            "goal": "compact goal",
-            "completed_actions": [],
-            "confirmed_fact_refs": [],
-            "confirmed_fact_summaries": [],
-            "user_constraints": [],
-            "open_questions": ["compact open question"],
-            "next_step": None,
-            "tool_finding_refs": [],
-            "source_event_refs": ["event-memory-raw-user"],
-            "evidence_refs": ["evidence-1"],
-            "proposed_verified_fact_refs": [],
-        },
+        "episode_summary_candidate": episode_summary,
         "pinned_state_patch_candidate": pinned_patch,
-        "preservation_evidence": [
-            {
-                "evidence_id": "evidence-1",
-                "input_event_refs": ["event-memory-raw-user"],
-                "tool_fact_refs": [],
-                "memory_snapshot_cursor": None,
-                "compact_input_range": None,
-            }
-        ],
-        "preserved_fact_refs": {"tool_fact_refs": [], "verified_fact_refs": []},
+        "evidence_backed_fact_candidates": resolved_fact_candidates,
+        "minimum_preserve_item_candidates": resolved_minimum_preserve_items,
+        "preservation_evidence": preservation_evidence,
+        "preserved_fact_refs": preserved_fact_refs,
         "dropped_ranges": [],
         "summarized_ranges": [],
         "evidence_anchors_retained": True,
-        "quality_check_result": {
-            "accepted": True,
-            "rejection_reasons": [],
-            "current_user_input_retained": True,
-            "accepted_tool_fact_refs_retained": True,
-            "evidence_anchors_retained": True,
-            "open_questions_retained": True,
-            "retained_evidence_refs": ["evidence-1"],
-            "dropped_ranges": [],
-            "summarized_ranges": [],
-        },
+        "quality_check_result": quality_check_result,
         "budget_after_compact": 128,
     }
+    return payload
 
 
 def _message_content(message: AgentMessage) -> str:

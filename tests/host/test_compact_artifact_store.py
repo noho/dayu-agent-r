@@ -12,12 +12,19 @@ from dayu.host.compact_artifact import (
     CompactArtifactWriteRequest,
     compact_artifact_json,
 )
+from dayu.host.compact_material import (
+    InitialEvidenceMaterial,
+    InitialHistoryMaterial,
+    build_initial_material_pack,
+    initial_segment_selection,
+)
 from dayu.host.compaction import (
     CompactQualityIssue,
     CompactQualityCheckResult,
+    CompactMaterialBlockKind,
+    CompactSegmentTrigger,
     CompactionCandidate,
     CompactionRequest,
-    CurrentMessageSummary,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import check_compaction_candidate
@@ -34,6 +41,12 @@ from dayu.host.durable.options import (
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+)
+from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 
@@ -160,10 +173,12 @@ async def test_compact_artifact_write_request_rejects_unaccepted_quality_result(
         accepted=False,
         rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
         current_user_input_retained=False,
-        accepted_tool_fact_refs_retained=True,
+        canonical_evidence_refs_retained=True,
+        evidence_backed_fact_candidates_accepted=True,
+        minimum_preserve_items_accepted=True,
         evidence_anchors_retained=True,
         open_questions_retained=True,
-        retained_evidence_refs=(),
+        retained_canonical_evidence_refs=(),
         dropped_ranges=(),
         summarized_ranges=(),
     )
@@ -265,7 +280,7 @@ async def _candidate_bundle() -> tuple[
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     quality_result = check_compaction_candidate(request, candidate)
     assert quality_result.accepted is True
     return request, candidate, quality_result
@@ -283,15 +298,14 @@ def _request() -> CompactionRequest:
         run_id="run-1",
         attempt_id=None,
         execution_id=None,
-        input_event_refs=("event-old", "event-current"),
         memory_snapshot_cursor=7,
-        current_message_summary=CurrentMessageSummary(
-            current_user_input_ref="event-current",
-            summary_text="分析 A 公司 2025 年年报",
-            source_event_refs=("event-current",),
+        material_pack=_material_pack(),
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            material_pack=_material_pack(),
         ),
-        tool_fact_refs=("tool-fact-1", "tool-fact-2"),
-        verified_fact_refs=("tool-fact-1",),
+        evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("event-current",),
         older_raw_turn_refs=("event-old",),
         existing_episode_summary_refs=("summary-prev",),
@@ -304,4 +318,83 @@ def _request() -> CompactionRequest:
             estimator_digest="estimate-digest",
             overage_reason=None,
         ),
+    )
+
+
+def _material_pack():
+    """构造标准 material pack。
+
+    :returns: material pack。
+    """
+
+    return build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="分析 A 公司 2025 年年报",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-old",
+                text="上一轮回答摘要",
+                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            ),
+        ),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-1",
+                accepted_evidence_id="evidence:accepted-1",
+                tool_result_event_ref="event-tool-result-accepted-1",
+                tool_call_event_ref="event-tool-call-accepted-1",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text="canonical evidence raw content accepted-1",
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:accepted-1",),
+            ),
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-2",
+                accepted_evidence_id="evidence:accepted-2",
+                tool_result_event_ref="event-tool-result-accepted-2",
+                tool_call_event_ref="event-tool-call-accepted-2",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text="canonical evidence raw content accepted-2",
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:accepted-2",),
+            ),
+        ),
+    )
+
+
+def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
+    """构造 compact artifact 测试用 canonical evidence envelope。
+
+    :param suffix: evidence 与 producer ref 后缀。
+    :returns: canonical evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{suffix}",
+        producer_event_ref=f"event-tool-result-{suffix}",
+        tool_name="fins.search",
+        tool_call_id=f"tool-call-{suffix}",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=f"event-tool-call-{suffix}",
+            normalized_arguments_digest=(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            semantic_input_digest=(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=f"payload:{suffix}",
+            payload_digest=(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ),
+            outcome_digest=(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
     )

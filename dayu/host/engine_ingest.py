@@ -56,12 +56,22 @@ from dayu.host.admission import (
 )
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.compact_artifact import CompactArtifactStore, CompactArtifactWriteRequest
+from dayu.host.compact_material import (
+    RunInputMaterialBlock,
+    build_compact_material_pack,
+    run_input_material_block,
+    select_compact_segment,
+    selected_material_source_refs,
+)
 from dayu.host.compaction import (
     CompactQualityCheckResult,
+    CompactMaterialBlockKind,
+    CompactMaterialSection,
+    CompactSegmentSelection,
+    CompactSegmentTrigger,
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
-    CurrentMessageSummary,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
@@ -149,6 +159,13 @@ from dayu.host._event_payload import (
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
+from dayu.host.run_input import (
+    CompactArtifactView,
+    CurrentRunFacts,
+    MemorySnapshotView,
+    SessionContinuityView,
+    build_run_input_material_blocks,
+)
 from dayu.host.payload_resolution import event_payload_object
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
@@ -347,12 +364,27 @@ class _ReactiveRecoveryAccepted:
 
 @dataclass(frozen=True, slots=True)
 class _ReactiveCompactPending:
-    """已写入 request/closeout、待事务外执行的 reactive compact。"""
+    """已写入 request/closeout、待事务外执行的 reactive compact。
+
+    :param result_prefix: request / closeout 已提交后的结果前缀。
+    :param context: Engine event durable context。
+    :param expected_input_event_sequence: 冻结 ordinary material list 对应 cursor。
+    :param display_text: 当前输入展示文本。
+    :param frozen_material_blocks: overflow 时冻结的 ordinary input material list。
+    :param frozen_material_list_digest: 冻结 material list digest。
+    :param frozen_material_refs: 冻结 material source refs。
+    :param operation_id: request fact event id。
+    :param estimate: reactive compact 前估算。
+    :param decision: reactive compact 前预算决策。
+    """
 
     result_prefix: EngineIngestResult
     context: _ValidatedCandidate
     expected_input_event_sequence: int
     display_text: str
+    frozen_material_blocks: tuple[RunInputMaterialBlock, ...]
+    frozen_material_list_digest: str
+    frozen_material_refs: tuple[str, ...]
     operation_id: str
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
@@ -855,6 +887,7 @@ class EngineEventIngestor:
         if (
             run.session_id != envelope.session_id
             or run.run_id != envelope.run_id
+            or run.current_attempt_id != envelope.attempt_id
             or attempt.run_id != envelope.run_id
             or attempt.execution_id != envelope.execution_id
             or dispatch_record.dispatch_record_id != envelope.dispatch_record_id
@@ -1142,12 +1175,21 @@ class EngineEventIngestor:
                 message="Run already used its reactive compaction budget",
                 estimate=estimate,
             )
+        frozen_material_blocks = _frozen_reactive_material_blocks(
+            transaction=transaction,
+            context=context,
+            display_text=display_text,
+        )
+        frozen_material_list_digest = _material_list_digest(frozen_material_blocks)
+        frozen_material_refs = _material_source_refs(frozen_material_blocks)
         requested = self._append_reactive_compaction_requested_event(
             transaction,
             context=context,
             data=data,
             estimate=estimate,
             decision=decision,
+            frozen_material_list_digest=frozen_material_list_digest,
+            frozen_material_refs=frozen_material_refs,
         )
         closeout = self._close_attempt_for_context_recovery(
             transaction,
@@ -1169,6 +1211,9 @@ class EngineEventIngestor:
             context=context,
             expected_input_event_sequence=context.run.input_event_sequence,
             display_text=display_text,
+            frozen_material_blocks=frozen_material_blocks,
+            frozen_material_list_digest=frozen_material_list_digest,
+            frozen_material_refs=frozen_material_refs,
             operation_id=requested.event_id,
             estimate=estimate,
             decision=decision,
@@ -1338,6 +1383,8 @@ class EngineEventIngestor:
         data: ContextCompactionRequestedData,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
+        frozen_material_list_digest: str,
+        frozen_material_refs: tuple[str, ...],
     ) -> EventLogRow:
         """追加 reactive ``CONTEXT_COMPACTION_REQUESTED`` fact。
 
@@ -1346,6 +1393,8 @@ class EngineEventIngestor:
         :param data: Engine context compaction requested data。
         :param estimate: Host budget estimate。
         :param decision: Host budget decision。
+        :param frozen_material_list_digest: overflow material list digest。
+        :param frozen_material_refs: overflow material source refs。
         :returns: EventLog row。
         """
 
@@ -1388,6 +1437,8 @@ class EngineEventIngestor:
                     provider_error_ref=_engine_event_ref(candidate),
                     attempt_id=context.attempt.attempt_id,
                     execution_id=context.attempt.execution_id,
+                    frozen_material_list_digest=frozen_material_list_digest,
+                    frozen_material_refs=frozen_material_refs,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1404,6 +1455,7 @@ class EngineEventIngestor:
         """
 
         request = _reactive_compaction_request(pending)
+        pass_queue = _reactive_compaction_pass_queue(pending, request)
         compactor = self._context_compactor
         artifact_root = self._compact_artifact_root
         if compactor is None or artifact_root is None:
@@ -1424,6 +1476,10 @@ class EngineEventIngestor:
                 request=request,
                 compactor=compactor,
                 max_attempts=attempts,
+                cancellation_token=(
+                    pending.context.candidate.envelope.cancellation_token
+                ),
+                pass_queue=pass_queue,
             )
 
         def _operation(
@@ -2965,26 +3021,288 @@ def _reactive_compaction_request(
     """
 
     context = pending.context
+    segment_selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.REACTIVE,
+        input_cursor=context.run.input_event_sequence,
+        memory_snapshot_cursor=None,
+        policy_digest=pending.frozen_material_list_digest,
+        material_blocks=pending.frozen_material_blocks,
+    )
+    material_pack = build_compact_material_pack(
+        selected_segment=segment_selection,
+        material_blocks=pending.frozen_material_blocks,
+        memory_snapshot=None,
+        inline_delta_repair_view=None,
+        current_input_ref=context.run.input_event_id,
+        current_input_text=pending.display_text,
+    )
     return CompactionRequest(
         trigger_source=ContextCompactionTriggerSource.REACTIVE,
         session_id=context.run.session_id,
         run_id=context.run.run_id,
         attempt_id=context.attempt.attempt_id,
         execution_id=context.attempt.execution_id,
-        input_event_refs=(context.run.input_event_id,),
         memory_snapshot_cursor=None,
-        current_message_summary=CurrentMessageSummary(
-            current_user_input_ref=context.run.input_event_id,
-            summary_text=pending.display_text,
-            source_event_refs=(context.run.input_event_id,),
-        ),
-        tool_fact_refs=(),
-        verified_fact_refs=(),
+        material_pack=material_pack,
+        segment_selection=segment_selection,
+        evidence_backed_fact_refs=(),
         recent_raw_turn_refs=(context.run.input_event_id,),
-        older_raw_turn_refs=(),
+        older_raw_turn_refs=selected_material_source_refs(
+            material_blocks=pending.frozen_material_blocks,
+            selected_block_ids=segment_selection.selected_block_ids,
+        ),
         existing_episode_summary_refs=(),
         budget_before_compact=pending.estimate,
     )
+
+
+def _reactive_compaction_pass_queue(
+    pending: _ReactiveCompactPending, root_request: CompactionRequest
+) -> tuple[CompactionRequest, ...]:
+    """按冻结 material list 构造 reactive multi-pass request 队列。
+
+    :param pending: reactive compact pending 摘要。
+    :param root_request: 覆盖完整 selected segment 的 root request。
+    :returns: pass request 队列；单 pass 时为空以复用 operation 默认语义。
+    """
+
+    selected = root_request.segment_selection.selected_block_ids
+    if len(selected) <= 1:
+        return ()
+    pass_requests: list[CompactionRequest] = []
+    for block_id in selected:
+        selection = _single_block_segment_selection(
+            root_request=root_request,
+            block_id=block_id,
+            material_blocks=pending.frozen_material_blocks,
+        )
+        material_pack = build_compact_material_pack(
+            selected_segment=selection,
+            material_blocks=pending.frozen_material_blocks,
+            memory_snapshot=None,
+            inline_delta_repair_view=None,
+            current_input_ref=pending.context.run.input_event_id,
+            current_input_text=pending.display_text,
+        )
+        pass_requests.append(
+            CompactionRequest(
+                trigger_source=root_request.trigger_source,
+                session_id=root_request.session_id,
+                run_id=root_request.run_id,
+                attempt_id=root_request.attempt_id,
+                execution_id=root_request.execution_id,
+                memory_snapshot_cursor=root_request.memory_snapshot_cursor,
+                material_pack=material_pack,
+                segment_selection=selection,
+                evidence_backed_fact_refs=(),
+                recent_raw_turn_refs=root_request.recent_raw_turn_refs,
+                older_raw_turn_refs=selected_material_source_refs(
+                    material_blocks=pending.frozen_material_blocks,
+                    selected_block_ids=selection.selected_block_ids,
+                ),
+                existing_episode_summary_refs=(),
+                budget_before_compact=root_request.budget_before_compact,
+            )
+        )
+    return tuple(pass_requests)
+
+
+def _single_block_segment_selection(
+    *,
+    root_request: CompactionRequest,
+    block_id: str,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+) -> CompactSegmentSelection:
+    """构造只包含单个 selected block 的 reactive selection。
+
+    :param root_request: root compaction request。
+    :param block_id: 本 pass 选中的 block id。
+    :param material_blocks: 冻结 ordinary material blocks。
+    :returns: 单 block segment selection。
+    :raises ValueError: block id 不在冻结列表时抛出。
+    """
+
+    known = {block.block_id for block in material_blocks}
+    if block_id not in known:
+        raise ValueError("reactive pass block_id is not in frozen material list")
+    excluded = {
+        block.block_id: "not_in_pass"
+        for block in material_blocks
+        if block.block_id != block_id
+    }
+    digest = sha256_digest_json(
+        {
+            "root_selection_digest": root_request.segment_selection.selection_digest,
+            "selected_block_ids": [block_id],
+            "excluded_reason_codes": excluded,
+        }
+    )
+    return CompactSegmentSelection(
+        selected_block_ids=(block_id,),
+        excluded_protected_ids=(),
+        trigger_source=CompactSegmentTrigger.REACTIVE,
+        input_cursor=root_request.segment_selection.input_cursor,
+        memory_snapshot_cursor=root_request.segment_selection.memory_snapshot_cursor,
+        policy_digest=root_request.segment_selection.policy_digest,
+        deterministic_reason_codes=("reactive_single_pass_block",),
+        selection_digest=digest,
+        excluded_reason_codes=excluded,
+    )
+
+
+def _frozen_reactive_material_blocks(
+    *,
+    transaction: HostTransaction,
+    context: _ValidatedCandidate,
+    display_text: str,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """冻结 reactive overflow 对应 ordinary input material list。
+
+    :param transaction: 当前 Host transaction。
+    :param context: 已校验 Engine event context。
+    :param display_text: 当前输入展示文本。
+    :returns: 冻结 material blocks。
+    """
+
+    input_event = _require_event_row(
+        transaction,
+        event_log_store=EventLogStore(),
+        event_id=context.run.input_event_id,
+        expected_type="USER_INPUT_ACCEPTED",
+    )
+    accepted_event = _require_event_row(
+        transaction,
+        event_log_store=EventLogStore(),
+        event_id=context.run.accepted_event_id,
+        expected_type="RUN_ACCEPTED",
+    )
+    if context.run.started_event_id is None:
+        return _current_only_material_blocks(
+            run=context.run,
+            input_event=input_event,
+            display_text=display_text,
+        )
+    started_event = _require_event_row(
+        transaction,
+        event_log_store=EventLogStore(),
+        event_id=context.run.started_event_id,
+        expected_type="RUN_STARTED",
+    )
+    current_facts = CurrentRunFacts(
+        run=context.run,
+        attempt=context.attempt,
+        dispatch_record=context.dispatch_record,
+        user_input_event=input_event,
+        run_accepted_event=accepted_event,
+        run_started_event=started_event,
+        user_prompt=display_text,
+        system_prompt=None,
+        operation_kind="run",
+    )
+    return build_run_input_material_blocks(
+        current_facts=current_facts,
+        memory=MemorySnapshotView(
+            messages=(),
+            memory_snapshot_cursor=None,
+            policy_digest=None,
+            diagnostics=(),
+        ),
+        compact=CompactArtifactView(
+            messages=(),
+            compact_artifact_ref=None,
+            compact_artifact_digest=None,
+        ),
+        continuity=SessionContinuityView(messages=()),
+    )
+
+
+def _current_only_material_blocks(
+    *,
+    run: RunRow,
+    input_event: EventLogRow,
+    display_text: str,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """构造 current-input-only material list。
+
+    :param run: 当前 Run row。
+    :param input_event: 当前输入 EventLog row。
+    :param display_text: 当前输入展示文本。
+    :returns: material blocks。
+    """
+
+    return (
+        run_input_material_block(
+            block_id=f"current:{run.input_event_id}",
+            section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            text=display_text,
+            canonical_source_refs=(run.input_event_id,),
+            event_sequence=input_event.event_sequence,
+        ),
+    )
+
+
+def _require_event_row(
+    transaction: HostTransaction,
+    *,
+    event_log_store: EventLogStore,
+    event_id: str,
+    expected_type: str,
+) -> EventLogRow:
+    """读取并校验 EventLog row。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param event_id: 事件 id。
+    :param expected_type: 期望 event type。
+    :returns: EventLog row。
+    :raises HostDurableError: 事件缺失或类型不匹配时抛出。
+    """
+
+    row = event_log_store.read_event_by_id(transaction, event_id)
+    if row is None or row.event_type != expected_type:
+        raise HostDurableError(f"required event is missing: {expected_type}")
+    return row
+
+
+def _material_list_digest(
+    material_blocks: tuple[RunInputMaterialBlock, ...]
+) -> str:
+    """计算冻结 material list digest。
+
+    :param material_blocks: 冻结 material blocks。
+    :returns: canonical sha256 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "blocks": [
+                {
+                    "block_id": block.block_id,
+                    "section": block.section.value,
+                    "kind": block.kind.value,
+                    "content_digest": block.content_digest,
+                    "canonical_source_refs": list(block.canonical_source_refs),
+                }
+                for block in material_blocks
+            ]
+        }
+    )
+
+
+def _material_source_refs(
+    material_blocks: tuple[RunInputMaterialBlock, ...]
+) -> tuple[str, ...]:
+    """返回 material list 覆盖的 canonical source refs。
+
+    :param material_blocks: material blocks。
+    :returns: 去重后的 source refs。
+    """
+
+    refs: list[str] = []
+    for block in material_blocks:
+        refs.extend(block.canonical_source_refs)
+    return tuple(dict.fromkeys(refs))
 
 
 def _event_request(

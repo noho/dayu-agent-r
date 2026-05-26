@@ -7,10 +7,12 @@ boundary，不调用 LLM、不写 EventLog、不更新 memory projection。
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
@@ -20,7 +22,32 @@ from dayu.host._public_validation import (
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.evidence import OpaqueEvidenceRef
+
+MAX_EVIDENCE_BACKED_FACT_CANDIDATES = 64
+"""单个 compact candidate 允许输出的 evidence-backed fact candidate 上限。"""
+
+MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES = 32
+"""单个 compact candidate 允许输出的 minimum preserve item candidate 上限。"""
+
+MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS = 2000
+"""Evidence-backed fact claim_text 字符数上限。"""
+
+MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS = 1200
+"""Minimum preserve item text 字符数上限。"""
+
+MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS = 120
+"""Minimum preserve item label 字符数上限。"""
+
+MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS = 4096
+"""Evidence-backed fact attributes canonical JSON 字符数上限。"""
+
+MAX_EVIDENCE_REFS_PER_FACT = 16
+"""单个 evidence-backed fact candidate 允许引用的 canonical evidence refs 上限。"""
+
+MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM = 16
+"""单个 minimum preserve item candidate 允许引用的 source refs 上限。"""
 
 
 class PinnedPatchOperation(StrEnum):
@@ -35,13 +62,75 @@ class CompactQualityIssue(StrEnum):
     """Compact quality check 拒绝原因。"""
 
     CURRENT_USER_INPUT_MISSING = "current_user_input_missing"
-    TOOL_FACT_REFS_MISSING = "tool_fact_refs_missing"
-    SUMMARY_PRETENDS_VERIFIED_FACT = "summary_pretends_verified_fact"
+    ACCEPTED_EVIDENCE_REFS_MISSING = "canonical_evidence_refs_missing"
+    SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT = "summary_pretends_evidence_backed_fact"
+    EVIDENCE_LABELS_MISSING = "evidence_labels_missing"
     PRESERVATION_EVIDENCE_MISSING = "preservation_evidence_missing"
     EVIDENCE_ANCHOR_NOT_RETAINED = "evidence_anchor_not_retained"
     PINNED_PATCH_TRI_STATE_INVALID = "pinned_patch_tri_state_invalid"
     PINNED_PATCH_EVIDENCE_REF_MISSING = "pinned_patch_evidence_ref_missing"
     COMPACT_RANGE_OUTSIDE_REQUEST = "compact_range_outside_request"
+    EVIDENCE_BACKED_FACT_CANDIDATE_INVALID = (
+        "evidence_backed_fact_candidate_invalid"
+    )
+    ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING = (
+        "accepted_evidence_fact_candidate_missing"
+    )
+    MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID = (
+        "minimum_preserve_item_candidate_invalid"
+    )
+    OPEN_QUESTIONS_MISSING = "open_questions_missing"
+
+
+class EvidenceBackedFactKind(StrEnum):
+    """Evidence-backed fact candidate 的 Host-neutral 类型。"""
+
+    OBSERVED_VALUE = "observed_value"
+    QUOTED_STATEMENT = "quoted_statement"
+    TABLE_VALUE = "table_value"
+    DERIVED_FROM_EVIDENCE = "derived_from_evidence"
+
+
+class CompactMaterialSection(StrEnum):
+    """Compact material pack 的 LLM-facing section。"""
+
+    STABLE_INPUT = "stable_input"
+    HISTORY_INPUT = "history_input"
+    EVIDENCE_INPUT = "evidence_input"
+    CURRENT_INPUT_ANCHOR = "current_input_anchor"
+
+
+class CompactMaterialBlockKind(StrEnum):
+    """Compact material block 的 Host-neutral 类型。"""
+
+    PINNED_STATE = "pinned_state"
+    EVIDENCE_BACKED_FACT = "evidence_backed_fact"
+    WORKING_ASSUMPTION = "working_assumption"
+    OPEN_QUESTION = "open_question"
+    RAW_USER_TURN = "raw_user_turn"
+    RAW_ASSISTANT_TURN = "raw_assistant_turn"
+    EPISODE_SUMMARY = "episode_summary"
+    ACCEPTED_TOOL_EVIDENCE = "accepted_tool_evidence"
+    CURRENT_INPUT_ANCHOR = "current_input_anchor"
+
+
+class CompactSegmentTrigger(StrEnum):
+    """Compact segment selection 的触发来源。"""
+
+    PROACTIVE = "proactive"
+    REACTIVE = "reactive"
+
+
+PromptLocalMaterialLabel = str
+"""Prompt-local material label 的类型别名。"""
+
+
+class MinimumPreserveReason(StrEnum):
+    """Minimum preserve item 的保留原因。"""
+
+    NEEDED_FOR_RECENT_REFERENCE = "needed_for_recent_reference"
+    NEEDED_FOR_ORDERED_ITEM_REFERENCE = "needed_for_ordered_item_reference"
+    NEEDED_FOR_LOCAL_FOLLOWUP = "needed_for_local_followup"
 
 
 def _empty_string_tuple() -> tuple[str, ...]:
@@ -51,56 +140,6 @@ def _empty_string_tuple() -> tuple[str, ...]:
     """
 
     return ()
-
-
-@dataclass(frozen=True, slots=True)
-class CurrentMessageSummary:
-    """当前用户输入摘要。
-
-    :param current_user_input_ref: 当前 ``USER_INPUT_ACCEPTED`` event ref。
-    :param summary_text: 当前用户输入的短摘要。
-    :param source_event_refs: 摘要覆盖的输入 event refs。
-    """
-
-    current_user_input_ref: str
-    summary_text: str
-    source_event_refs: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        """校验当前消息摘要字段。
-
-        :returns: ``None``。
-        :raises TypeError: tuple 字段类型非法时抛出。
-        :raises ValueError: 文本字段为空时抛出。
-        """
-
-        _require_non_empty(
-            self.current_user_input_ref,
-            field_name="CurrentMessageSummary.current_user_input_ref",
-        )
-        _require_non_empty(
-            self.summary_text, field_name="CurrentMessageSummary.summary_text"
-        )
-        _require_string_tuple(
-            self.source_event_refs,
-            field_name="CurrentMessageSummary.source_event_refs",
-        )
-        if self.current_user_input_ref not in self.source_event_refs:
-            raise ValueError(
-                "CurrentMessageSummary.source_event_refs must include current user input"
-            )
-
-    def to_json(self) -> JsonValue:
-        """转换为 canonical JSON 兼容值。
-
-        :returns: JSON object。
-        """
-
-        return {
-            "current_user_input_ref": self.current_user_input_ref,
-            "summary_text": self.summary_text,
-            "source_event_refs": _string_list_json(self.source_event_refs),
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +184,629 @@ class CompactInputRange:
 
 
 @dataclass(frozen=True, slots=True)
+class PromptLocalProvenanceEntry:
+    """Prompt-local label 到 canonical provenance 的内部映射。
+
+    :param label: prompt-local label。
+    :param section: material section。
+    :param kind: material block kind。
+    :param canonical_source_refs: canonical source refs。
+    :param source_event_refs: 来源 EventLog refs。
+    :param content_digest: material 内容 digest。
+    :param accepted_evidence_id: evidence entry 对应的 canonical evidence id。
+    :param tool_result_event_ref: evidence entry 对应 TOOL_RESULT_ACCEPTED ref。
+    :param tool_call_event_ref: evidence entry 对应 TOOL_CALL_REQUESTED ref。
+    :param payload_refs: payload / artifact refs。
+    :param artifact_refs: artifact refs。
+    :param source_locator_refs: source locator refs。
+    :param chunk_parent_label: evidence chunk 的父 label。
+    :param chunk_ordinal: evidence chunk ordinal。
+    """
+
+    label: PromptLocalMaterialLabel
+    section: CompactMaterialSection
+    kind: CompactMaterialBlockKind
+    canonical_source_refs: tuple[str, ...]
+    source_event_refs: tuple[str, ...]
+    content_digest: str
+    accepted_evidence_id: str | None
+    tool_result_event_ref: str | None
+    tool_call_event_ref: str | None
+    payload_refs: tuple[str, ...]
+    artifact_refs: tuple[str, ...]
+    source_locator_refs: tuple[OpaqueEvidenceRef, ...]
+    chunk_parent_label: PromptLocalMaterialLabel | None = None
+    chunk_ordinal: int | None = None
+
+    def __post_init__(self) -> None:
+        """校验 provenance entry。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(self.label, field_name="PromptLocalProvenanceEntry.label")
+        if not isinstance(self.section, CompactMaterialSection):
+            raise TypeError("PromptLocalProvenanceEntry.section is invalid")
+        if not isinstance(self.kind, CompactMaterialBlockKind):
+            raise TypeError("PromptLocalProvenanceEntry.kind is invalid")
+        _require_string_tuple(
+            self.canonical_source_refs,
+            field_name="PromptLocalProvenanceEntry.canonical_source_refs",
+        )
+        _require_string_tuple(
+            self.source_event_refs,
+            field_name="PromptLocalProvenanceEntry.source_event_refs",
+        )
+        _require_non_empty(
+            self.content_digest,
+            field_name="PromptLocalProvenanceEntry.content_digest",
+        )
+        _require_optional_non_empty(
+            self.accepted_evidence_id,
+            field_name="PromptLocalProvenanceEntry.accepted_evidence_id",
+        )
+        _require_optional_non_empty(
+            self.tool_result_event_ref,
+            field_name="PromptLocalProvenanceEntry.tool_result_event_ref",
+        )
+        _require_optional_non_empty(
+            self.tool_call_event_ref,
+            field_name="PromptLocalProvenanceEntry.tool_call_event_ref",
+        )
+        _require_string_tuple(
+            self.payload_refs, field_name="PromptLocalProvenanceEntry.payload_refs"
+        )
+        _require_string_tuple(
+            self.artifact_refs, field_name="PromptLocalProvenanceEntry.artifact_refs"
+        )
+        _require_opaque_ref_tuple(
+            self.source_locator_refs,
+            field_name="PromptLocalProvenanceEntry.source_locator_refs",
+        )
+        _require_optional_non_empty(
+            self.chunk_parent_label,
+            field_name="PromptLocalProvenanceEntry.chunk_parent_label",
+        )
+        if self.chunk_ordinal is not None:
+            _require_non_negative_int(
+                self.chunk_ordinal,
+                field_name="PromptLocalProvenanceEntry.chunk_ordinal",
+            )
+        if self.section is CompactMaterialSection.EVIDENCE_INPUT:
+            if self.accepted_evidence_id is None:
+                raise ValueError(
+                    "PromptLocalProvenanceEntry.accepted_evidence_id is required"
+                )
+            _require_non_empty(
+                self.accepted_evidence_id,
+                field_name="PromptLocalProvenanceEntry.accepted_evidence_id",
+            )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "label": self.label,
+            "section": self.section.value,
+            "kind": self.kind.value,
+            "canonical_source_refs": _string_list_json(self.canonical_source_refs),
+            "source_event_refs": _string_list_json(self.source_event_refs),
+            "content_digest": self.content_digest,
+            "accepted_evidence_id": self.accepted_evidence_id,
+            "tool_result_event_ref": self.tool_result_event_ref,
+            "tool_call_event_ref": self.tool_call_event_ref,
+            "payload_refs": _string_list_json(self.payload_refs),
+            "artifact_refs": _string_list_json(self.artifact_refs),
+            "source_locator_refs": _opaque_ref_list_json(self.source_locator_refs),
+            "chunk_parent_label": self.chunk_parent_label,
+            "chunk_ordinal": self.chunk_ordinal,
+        }
+
+
+PromptLocalEvidenceMap = Mapping[
+    PromptLocalMaterialLabel, PromptLocalProvenanceEntry
+]
+"""Evidence label 到 provenance entry 的只读 typed view。"""
+
+
+@dataclass(frozen=True, slots=True)
+class CompactMaterialBlock:
+    """Compact material pack 的普通 material block。
+
+    :param block_label: prompt-local block label。
+    :param section: material section。
+    :param kind: material block kind。
+    :param text: 有界可读文本。
+    :param size_units: 文本 size units。
+    :param source_labels: 该 block 引用的 prompt-local source labels。
+    :param canonical_source_refs: canonical source refs。
+    :param content_digest: 文本 digest。
+    """
+
+    block_label: PromptLocalMaterialLabel
+    section: CompactMaterialSection
+    kind: CompactMaterialBlockKind
+    text: str
+    size_units: int
+    source_labels: tuple[PromptLocalMaterialLabel, ...]
+    canonical_source_refs: tuple[str, ...]
+    content_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 material block。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(self.block_label, field_name="CompactMaterialBlock.block_label")
+        if not isinstance(self.section, CompactMaterialSection):
+            raise TypeError("CompactMaterialBlock.section is invalid")
+        if not isinstance(self.kind, CompactMaterialBlockKind):
+            raise TypeError("CompactMaterialBlock.kind is invalid")
+        _require_non_empty(self.text, field_name="CompactMaterialBlock.text")
+        _require_non_negative_int(
+            self.size_units, field_name="CompactMaterialBlock.size_units"
+        )
+        _require_string_tuple(
+            self.source_labels, field_name="CompactMaterialBlock.source_labels"
+        )
+        _require_string_tuple(
+            self.canonical_source_refs,
+            field_name="CompactMaterialBlock.canonical_source_refs",
+        )
+        _require_non_empty(
+            self.content_digest, field_name="CompactMaterialBlock.content_digest"
+        )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "block_label": self.block_label,
+            "section": self.section.value,
+            "kind": self.kind.value,
+            "text": self.text,
+            "size_units": self.size_units,
+            "source_labels": _string_list_json(self.source_labels),
+            "canonical_source_refs": _string_list_json(self.canonical_source_refs),
+            "content_digest": self.content_digest,
+        }
+
+    def llm_json(self) -> JsonValue:
+        """转换为 LLM-facing JSON。
+
+        :returns: 不含 canonical provenance key 的 JSON object。
+        """
+
+        return {
+            "label": self.block_label,
+            "kind": self.kind.value,
+            "text": self.text,
+            "source_labels": _string_list_json(self.source_labels),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompactEvidenceBlock:
+    """Compact material pack 的 evidence material block。
+
+    :param evidence_label: prompt-local evidence label。
+    :param readable_tool_name: LLM 可读工具名。
+    :param readable_query_text: LLM 可读查询文本。
+    :param raw_result_text: digest-checked raw result 文本。
+    :param readable_source_text: LLM 可读来源文本。
+    :param size_units: 文本 size units。
+    :param canonical_source_refs: canonical source refs。
+    :param content_digest: 文本 digest。
+    """
+
+    evidence_label: PromptLocalMaterialLabel
+    readable_tool_name: str
+    readable_query_text: str
+    raw_result_text: str
+    readable_source_text: str
+    size_units: int
+    canonical_source_refs: tuple[str, ...]
+    content_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 evidence material block。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(
+            self.evidence_label, field_name="CompactEvidenceBlock.evidence_label"
+        )
+        _require_non_empty(
+            self.readable_tool_name,
+            field_name="CompactEvidenceBlock.readable_tool_name",
+        )
+        _require_non_empty(
+            self.readable_query_text,
+            field_name="CompactEvidenceBlock.readable_query_text",
+        )
+        _require_non_empty(
+            self.raw_result_text, field_name="CompactEvidenceBlock.raw_result_text"
+        )
+        _require_non_empty(
+            self.readable_source_text,
+            field_name="CompactEvidenceBlock.readable_source_text",
+        )
+        _require_non_negative_int(
+            self.size_units, field_name="CompactEvidenceBlock.size_units"
+        )
+        _require_string_tuple(
+            self.canonical_source_refs,
+            field_name="CompactEvidenceBlock.canonical_source_refs",
+        )
+        _require_non_empty(
+            self.content_digest, field_name="CompactEvidenceBlock.content_digest"
+        )
+
+    @property
+    def block_label(self) -> PromptLocalMaterialLabel:
+        """返回 evidence block label。
+
+        :returns: prompt-local evidence label。
+        """
+
+        return self.evidence_label
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "evidence_label": self.evidence_label,
+            "readable_tool_name": self.readable_tool_name,
+            "readable_query_text": self.readable_query_text,
+            "raw_result_text": self.raw_result_text,
+            "readable_source_text": self.readable_source_text,
+            "size_units": self.size_units,
+            "canonical_source_refs": _string_list_json(self.canonical_source_refs),
+            "content_digest": self.content_digest,
+        }
+
+    def llm_json(self) -> JsonValue:
+        """转换为 LLM-facing JSON。
+
+        :returns: 不含 canonical provenance key 的 JSON object。
+        """
+
+        return {
+            "label": self.evidence_label,
+            "kind": CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE.value,
+            "tool_name": self.readable_tool_name,
+            "query_text": self.readable_query_text,
+            "result_text": self.raw_result_text,
+            "source_text": self.readable_source_text,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentInputAnchor:
+    """当前用户输入的 prompt-local anchor。
+
+    :param anchor_label: prompt-local current anchor label。
+    :param anchor_text: 有界当前输入文本。
+    :param truncated: anchor_text 是否截断。
+    :param canonical_source_refs: canonical source refs。
+    :param content_digest: 完整 current input digest。
+    """
+
+    anchor_label: PromptLocalMaterialLabel
+    anchor_text: str
+    truncated: bool
+    canonical_source_refs: tuple[str, ...]
+    content_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 current input anchor。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(
+            self.anchor_label, field_name="CurrentInputAnchor.anchor_label"
+        )
+        _require_non_empty(
+            self.anchor_text, field_name="CurrentInputAnchor.anchor_text"
+        )
+        _require_bool(self.truncated, field_name="CurrentInputAnchor.truncated")
+        _require_string_tuple(
+            self.canonical_source_refs,
+            field_name="CurrentInputAnchor.canonical_source_refs",
+        )
+        _require_non_empty(
+            self.content_digest, field_name="CurrentInputAnchor.content_digest"
+        )
+
+    @property
+    def block_label(self) -> PromptLocalMaterialLabel:
+        """返回 current anchor label。
+
+        :returns: prompt-local current anchor label。
+        """
+
+        return self.anchor_label
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "anchor_label": self.anchor_label,
+            "anchor_text": self.anchor_text,
+            "truncated": self.truncated,
+            "canonical_source_refs": _string_list_json(self.canonical_source_refs),
+            "content_digest": self.content_digest,
+        }
+
+    def llm_json(self) -> JsonValue:
+        """转换为 LLM-facing JSON。
+
+        :returns: 不含 canonical provenance key 的 JSON object。
+        """
+
+        return {
+            "label": self.anchor_label,
+            "kind": CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR.value,
+            "text": self.anchor_text,
+            "truncated": self.truncated,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompactSegmentSelection:
+    """Compaction selected segment 摘要。
+
+    :param selected_block_ids: 已选择 block ids。
+    :param excluded_protected_ids: 被保护排除的 block ids。
+    :param trigger_source: segment selection 触发来源。
+    :param input_cursor: 输入 cursor。
+    :param memory_snapshot_cursor: memory snapshot cursor。
+    :param policy_digest: policy digest。
+    :param deterministic_reason_codes: deterministic reason codes。
+    :param excluded_reason_codes: 被排除 block id 到 reason code 的映射。
+    :param selection_digest: selection canonical digest。
+    """
+
+    selected_block_ids: tuple[str, ...]
+    excluded_protected_ids: tuple[str, ...]
+    trigger_source: CompactSegmentTrigger
+    input_cursor: int
+    memory_snapshot_cursor: int | None
+    policy_digest: str
+    deterministic_reason_codes: tuple[str, ...]
+    selection_digest: str
+    excluded_reason_codes: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """校验 segment selection。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_string_tuple(
+            self.selected_block_ids,
+            field_name="CompactSegmentSelection.selected_block_ids",
+        )
+        _require_string_tuple(
+            self.excluded_protected_ids,
+            field_name="CompactSegmentSelection.excluded_protected_ids",
+        )
+        if not isinstance(self.trigger_source, CompactSegmentTrigger):
+            raise TypeError("CompactSegmentSelection.trigger_source is invalid")
+        _require_non_negative_int(
+            self.input_cursor, field_name="CompactSegmentSelection.input_cursor"
+        )
+        if self.memory_snapshot_cursor is not None:
+            _require_non_negative_int(
+                self.memory_snapshot_cursor,
+                field_name="CompactSegmentSelection.memory_snapshot_cursor",
+            )
+        _require_non_empty(
+            self.policy_digest, field_name="CompactSegmentSelection.policy_digest"
+        )
+        _require_string_tuple(
+            self.deterministic_reason_codes,
+            field_name="CompactSegmentSelection.deterministic_reason_codes",
+        )
+        _require_string_mapping(
+            self.excluded_reason_codes,
+            field_name="CompactSegmentSelection.excluded_reason_codes",
+        )
+        _require_non_empty(
+            self.selection_digest,
+            field_name="CompactSegmentSelection.selection_digest",
+        )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "selected_block_ids": _string_list_json(self.selected_block_ids),
+            "excluded_protected_ids": _string_list_json(self.excluded_protected_ids),
+            "trigger_source": self.trigger_source.value,
+            "input_cursor": self.input_cursor,
+            "memory_snapshot_cursor": self.memory_snapshot_cursor,
+            "policy_digest": self.policy_digest,
+            "deterministic_reason_codes": _string_list_json(
+                self.deterministic_reason_codes
+            ),
+            "excluded_reason_codes": _string_mapping_json(
+                self.excluded_reason_codes
+            ),
+            "selection_digest": self.selection_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompactMaterialPack:
+    """Compactor LLM-facing material pack 与内部 provenance map。
+
+    :param stable_input: stable input blocks。
+    :param history_input: history input blocks。
+    :param evidence_input: evidence input blocks。
+    :param current_input_anchor: 当前输入 anchor。
+    :param provenance_map: prompt-local label 到 canonical provenance 的完整映射。
+    """
+
+    stable_input: tuple[CompactMaterialBlock, ...]
+    history_input: tuple[CompactMaterialBlock, ...]
+    evidence_input: tuple[CompactEvidenceBlock, ...]
+    current_input_anchor: CurrentInputAnchor
+    provenance_map: Mapping[PromptLocalMaterialLabel, PromptLocalProvenanceEntry]
+
+    def __post_init__(self) -> None:
+        """校验 material pack 与 one-section guard。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_material_block_tuple(
+            self.stable_input,
+            field_name="CompactMaterialPack.stable_input",
+            section=CompactMaterialSection.STABLE_INPUT,
+        )
+        _require_material_block_tuple(
+            self.history_input,
+            field_name="CompactMaterialPack.history_input",
+            section=CompactMaterialSection.HISTORY_INPUT,
+        )
+        _require_evidence_block_tuple(
+            self.evidence_input,
+            field_name="CompactMaterialPack.evidence_input",
+        )
+        if not isinstance(self.current_input_anchor, CurrentInputAnchor):
+            raise TypeError(
+                "CompactMaterialPack.current_input_anchor must be CurrentInputAnchor"
+            )
+        _require_provenance_mapping(self.provenance_map)
+        _require_one_section_per_canonical_content(self)
+
+    @property
+    def all_labels(self) -> tuple[PromptLocalMaterialLabel, ...]:
+        """返回 material pack 中所有 prompt-local labels。
+
+        :returns: label tuple。
+        """
+
+        labels: list[PromptLocalMaterialLabel] = []
+        labels.extend(block.block_label for block in self.stable_input)
+        labels.extend(block.block_label for block in self.history_input)
+        labels.extend(block.block_label for block in self.evidence_input)
+        labels.append(self.current_input_anchor.anchor_label)
+        return tuple(labels)
+
+    @property
+    def evidence_labels(self) -> tuple[PromptLocalMaterialLabel, ...]:
+        """返回 evidence material labels。
+
+        :returns: evidence label tuple。
+        """
+
+        return tuple(block.evidence_label for block in self.evidence_input)
+
+    @property
+    def material_source_refs(self) -> tuple[str, ...]:
+        """返回 material pack 覆盖的 canonical source refs。
+
+        :returns: 去重后的 canonical source refs。
+        """
+
+        refs: list[str] = []
+        ordered_labels = (
+            self.current_input_anchor.anchor_label,
+            *[block.block_label for block in self.history_input],
+            *[block.block_label for block in self.stable_input],
+            *[block.block_label for block in self.evidence_input],
+        )
+        for label in ordered_labels:
+            entry = self.provenance_map[label]
+            refs.extend(entry.canonical_source_refs)
+        return tuple(dict.fromkeys(refs))
+
+    @property
+    def canonical_evidence_refs(self) -> tuple[str, ...]:
+        """返回 evidence labels 映射到的 canonical canonical evidence ids。
+
+        :returns: canonical evidence id tuple。
+        """
+
+        refs: list[str] = []
+        for label in self.evidence_labels:
+            evidence_id = self.provenance_map[label].accepted_evidence_id
+            if evidence_id is not None:
+                refs.append(evidence_id)
+        return tuple(dict.fromkeys(refs))
+
+    def evidence_map(self) -> PromptLocalEvidenceMap:
+        """返回 evidence-only prompt-local provenance view。
+
+        :returns: evidence label 到 provenance entry 的只读 mapping。
+        """
+
+        return {
+            label: self.provenance_map[label]
+            for label in self.evidence_labels
+        }
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "stable_input": _material_block_list_json(self.stable_input),
+            "history_input": _material_block_list_json(self.history_input),
+            "evidence_input": _evidence_block_list_json(self.evidence_input),
+            "current_input_anchor": self.current_input_anchor.to_json(),
+            "provenance_map": _provenance_map_json(self.provenance_map),
+        }
+
+    def llm_json(self) -> JsonValue:
+        """转换为 LLM-facing material JSON。
+
+        :returns: 不含 Host provenance key 的 JSON object。
+        """
+
+        return {
+            "stable_input": _material_block_llm_list_json(self.stable_input),
+            "history_input": _material_block_llm_list_json(self.history_input),
+            "evidence_input": _evidence_block_llm_list_json(self.evidence_input),
+            "current_input_anchor": self.current_input_anchor.llm_json(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CompactionRequest:
     """Context compaction 请求。
 
@@ -153,11 +815,10 @@ class CompactionRequest:
     :param run_id: Run id。
     :param attempt_id: reactive compact 对应 Attempt id；proactive 时为 ``None``。
     :param execution_id: reactive compact 对应 execution id；proactive 时为 ``None``。
-    :param input_event_refs: compact 输入 event refs。
     :param memory_snapshot_cursor: memory snapshot cursor；无 snapshot 时为 ``None``。
-    :param current_message_summary: 当前用户输入摘要。
-    :param tool_fact_refs: accepted tool fact refs。
-    :param verified_fact_refs: 已验证事实 refs。
+    :param material_pack: LLM-facing material pack 与内部 provenance map。
+    :param segment_selection: compact segment selection 摘要。
+    :param evidence_backed_fact_refs: 已存在 evidence-backed fact refs。
     :param recent_raw_turn_refs: 必须保留的近期 raw turn refs。
     :param older_raw_turn_refs: 可摘要的较旧 raw turn refs。
     :param existing_episode_summary_refs: 已存在 episode summary refs。
@@ -169,11 +830,10 @@ class CompactionRequest:
     run_id: str
     attempt_id: str | None
     execution_id: str | None
-    input_event_refs: tuple[str, ...]
     memory_snapshot_cursor: int | None
-    current_message_summary: CurrentMessageSummary
-    tool_fact_refs: tuple[str, ...]
-    verified_fact_refs: tuple[str, ...]
+    material_pack: CompactMaterialPack
+    segment_selection: CompactSegmentSelection
+    evidence_backed_fact_refs: tuple[str, ...]
     recent_raw_turn_refs: tuple[str, ...]
     older_raw_turn_refs: tuple[str, ...]
     existing_episode_summary_refs: tuple[str, ...]
@@ -206,30 +866,26 @@ class CompactionRequest:
                 raise ValueError(
                     "CompactionRequest.execution_id is required for reactive compaction"
                 )
-        _require_string_tuple(
-            self.input_event_refs, field_name="CompactionRequest.input_event_refs"
-        )
-        if not isinstance(self.current_message_summary, CurrentMessageSummary):
-            raise TypeError(
-                "CompactionRequest.current_message_summary must be CurrentMessageSummary"
-            )
-        if (
-            self.current_message_summary.current_user_input_ref
-            not in self.input_event_refs
-        ):
-            raise ValueError(
-                "CompactionRequest.input_event_refs must include current input"
-            )
         if self.memory_snapshot_cursor is not None:
             _require_non_negative_int(
                 self.memory_snapshot_cursor,
                 field_name="CompactionRequest.memory_snapshot_cursor",
             )
-        _require_string_tuple(
-            self.tool_fact_refs, field_name="CompactionRequest.tool_fact_refs"
+        if not isinstance(self.material_pack, CompactMaterialPack):
+            raise TypeError("CompactionRequest.material_pack must be CompactMaterialPack")
+        if not isinstance(self.segment_selection, CompactSegmentSelection):
+            raise TypeError(
+                "CompactionRequest.segment_selection must be CompactSegmentSelection"
+            )
+        if self.current_input_ref not in self.material_source_refs:
+            raise ValueError("CompactionRequest.material_pack must include current input")
+        _require_unique_string_tuple(
+            self.canonical_evidence_refs,
+            field_name="CompactionRequest.canonical_evidence_refs",
         )
         _require_string_tuple(
-            self.verified_fact_refs, field_name="CompactionRequest.verified_fact_refs"
+            self.evidence_backed_fact_refs,
+            field_name="CompactionRequest.evidence_backed_fact_refs",
         )
         _require_string_tuple(
             self.recent_raw_turn_refs,
@@ -268,11 +924,15 @@ class CompactionRequest:
             "run_id": self.run_id,
             "attempt_id": self.attempt_id,
             "execution_id": self.execution_id,
-            "input_event_refs": _string_list_json(self.input_event_refs),
             "memory_snapshot_cursor": self.memory_snapshot_cursor,
-            "current_message_summary": self.current_message_summary.to_json(),
-            "tool_fact_refs": _string_list_json(self.tool_fact_refs),
-            "verified_fact_refs": _string_list_json(self.verified_fact_refs),
+            "material_pack": self.material_pack.to_json(),
+            "segment_selection": self.segment_selection.to_json(),
+            "canonical_evidence_refs": _string_list_json(
+                self.canonical_evidence_refs
+            ),
+            "evidence_backed_fact_refs": _string_list_json(
+                self.evidence_backed_fact_refs
+            ),
             "recent_raw_turn_refs": _string_list_json(self.recent_raw_turn_refs),
             "older_raw_turn_refs": _string_list_json(self.older_raw_turn_refs),
             "existing_episode_summary_refs": _string_list_json(
@@ -283,6 +943,54 @@ class CompactionRequest:
             ),
         }
 
+    def llm_material_json(self) -> JsonValue:
+        """返回只可暴露给 LLM 的 material JSON。
+
+        :returns: 不含 EventLog / payload / digest / cursor 的 material JSON。
+        """
+
+        return self.material_pack.llm_json()
+
+    @property
+    def canonical_evidence_refs(self) -> tuple[str, ...]:
+        """返回请求 material pack 内 canonical evidence ids。
+
+        :returns: canonical evidence id tuple。
+        """
+
+        return self.material_pack.canonical_evidence_refs
+
+    @property
+    def material_source_refs(self) -> tuple[str, ...]:
+        """返回请求 material pack 覆盖的 canonical source refs。
+
+        :returns: canonical source refs。
+        """
+
+        return self.material_pack.material_source_refs
+
+    @property
+    def current_input_ref(self) -> str:
+        """返回当前输入的 canonical source ref。
+
+        :returns: current input canonical source ref。
+        :raises ValueError: current input anchor 缺少 canonical source ref 时抛出。
+        """
+
+        refs = self.material_pack.current_input_anchor.canonical_source_refs
+        if len(refs) == 0:
+            raise ValueError("current input anchor must include canonical source ref")
+        return refs[0]
+
+    @property
+    def current_input_text(self) -> str:
+        """返回当前输入 anchor 文本。
+
+        :returns: 当前输入有界文本。
+        """
+
+        return self.material_pack.current_input_anchor.anchor_text
+
 
 @dataclass(frozen=True, slots=True)
 class EpisodeSummaryCandidate:
@@ -292,7 +1000,7 @@ class EpisodeSummaryCandidate:
     :param episode_title: episode 标题。
     :param goal: 用户目标摘要。
     :param completed_actions: 已完成动作摘要。
-    :param confirmed_fact_refs: 输入中已有 confirmed / verified fact refs。
+    :param confirmed_fact_refs: 输入中已有 confirmed / evidence-backed fact refs。
     :param confirmed_fact_summaries: confirmed facts 的可读摘要。
     :param user_constraints: 用户约束摘要。
     :param open_questions: 未决问题。
@@ -300,7 +1008,7 @@ class EpisodeSummaryCandidate:
     :param tool_finding_refs: 工具发现 refs。
     :param source_event_refs: summary 覆盖的输入 event refs。
     :param evidence_refs: preservation evidence refs。
-    :param proposed_verified_fact_refs: compactor 试图新建的 verified fact refs；正常应为空。
+    :param proposed_evidence_backed_fact_refs: compactor 试图新建的 stable fact refs；正常应为空。
     """
 
     candidate_id: str
@@ -315,7 +1023,7 @@ class EpisodeSummaryCandidate:
     tool_finding_refs: tuple[str, ...]
     source_event_refs: tuple[str, ...]
     evidence_refs: tuple[str, ...]
-    proposed_verified_fact_refs: tuple[str, ...] = field(
+    proposed_evidence_backed_fact_refs: tuple[str, ...] = field(
         default_factory=_empty_string_tuple
     )
 
@@ -371,8 +1079,10 @@ class EpisodeSummaryCandidate:
             field_name="EpisodeSummaryCandidate.evidence_refs",
         )
         _require_string_tuple(
-            self.proposed_verified_fact_refs,
-            field_name="EpisodeSummaryCandidate.proposed_verified_fact_refs",
+            self.proposed_evidence_backed_fact_refs,
+            field_name=(
+                "EpisodeSummaryCandidate.proposed_evidence_backed_fact_refs"
+            ),
         )
 
     def to_json(self) -> JsonValue:
@@ -396,8 +1106,8 @@ class EpisodeSummaryCandidate:
             "tool_finding_refs": _string_list_json(self.tool_finding_refs),
             "source_event_refs": _string_list_json(self.source_event_refs),
             "evidence_refs": _string_list_json(self.evidence_refs),
-            "proposed_verified_fact_refs": _string_list_json(
-                self.proposed_verified_fact_refs
+            "proposed_evidence_backed_fact_refs": _string_list_json(
+                self.proposed_evidence_backed_fact_refs
             ),
         }
 
@@ -580,15 +1290,15 @@ class PreservationEvidence:
     """Compact preservation evidence。
 
     :param evidence_id: evidence id。
-    :param input_event_refs: evidence 覆盖的输入 event refs。
-    :param tool_fact_refs: evidence 覆盖的 tool fact refs。
+    :param material_source_refs: evidence 覆盖的 material source refs。
+    :param canonical_evidence_refs: evidence 覆盖的 canonical evidence refs。
     :param memory_snapshot_cursor: evidence 对应 memory cursor；无时为 ``None``。
     :param compact_input_range: evidence 对应 compact 输入范围；无时为 ``None``。
     """
 
     evidence_id: str
-    input_event_refs: tuple[str, ...]
-    tool_fact_refs: tuple[str, ...]
+    material_source_refs: tuple[str, ...]
+    canonical_evidence_refs: tuple[str, ...]
     memory_snapshot_cursor: int | None
     compact_input_range: CompactInputRange | None
 
@@ -604,10 +1314,12 @@ class PreservationEvidence:
             self.evidence_id, field_name="PreservationEvidence.evidence_id"
         )
         _require_string_tuple(
-            self.input_event_refs, field_name="PreservationEvidence.input_event_refs"
+            self.material_source_refs,
+            field_name="PreservationEvidence.material_source_refs",
         )
         _require_string_tuple(
-            self.tool_fact_refs, field_name="PreservationEvidence.tool_fact_refs"
+            self.canonical_evidence_refs,
+            field_name="PreservationEvidence.canonical_evidence_refs",
         )
         if self.memory_snapshot_cursor is not None:
             _require_non_negative_int(
@@ -629,14 +1341,151 @@ class PreservationEvidence:
 
         return {
             "evidence_id": self.evidence_id,
-            "input_event_refs": _string_list_json(self.input_event_refs),
-            "tool_fact_refs": _string_list_json(self.tool_fact_refs),
+            "material_source_refs": _string_list_json(self.material_source_refs),
+            "canonical_evidence_refs": _string_list_json(
+                self.canonical_evidence_refs
+            ),
             "memory_snapshot_cursor": self.memory_snapshot_cursor,
             "compact_input_range": (
                 None
                 if self.compact_input_range is None
                 else self.compact_input_range.to_json()
             ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceBackedFactCandidate:
+    """Compactor 输出的 evidence-backed fact 候选。
+
+    :param candidate_id: candidate-local id，只用于诊断与去重。
+    :param claim_text: 可进入 memory 的事实声明文本。
+    :param evidence_kind: 事实声明类型。
+    :param evidence_refs: 支撑该声明的 canonical evidence ids。
+    :param attributes: Host 不解释的 JSON attributes。
+    """
+
+    candidate_id: str
+    claim_text: str
+    evidence_kind: EvidenceBackedFactKind
+    evidence_refs: tuple[str, ...]
+    attributes: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        """校验 evidence-backed fact candidate 基础边界。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(
+            self.candidate_id,
+            field_name="EvidenceBackedFactCandidate.candidate_id",
+        )
+        _require_bounded_non_empty_text(
+            self.claim_text,
+            field_name="EvidenceBackedFactCandidate.claim_text",
+            max_chars=MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
+        )
+        if not isinstance(self.evidence_kind, EvidenceBackedFactKind):
+            raise TypeError(
+                "EvidenceBackedFactCandidate.evidence_kind must be "
+                "EvidenceBackedFactKind"
+            )
+        _require_bounded_string_tuple(
+            self.evidence_refs,
+            field_name="EvidenceBackedFactCandidate.evidence_refs",
+            max_items=MAX_EVIDENCE_REFS_PER_FACT,
+            require_non_empty=True,
+        )
+        _require_json_mapping(
+            self.attributes,
+            field_name="EvidenceBackedFactCandidate.attributes",
+        )
+        attributes_json = canonical_json_dumps(self.attributes)
+        if len(attributes_json) > MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS:
+            raise ValueError(
+                "EvidenceBackedFactCandidate.attributes exceeds maximum size"
+            )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "candidate_id": self.candidate_id,
+            "claim_text": self.claim_text,
+            "evidence_kind": self.evidence_kind.value,
+            "evidence_refs": _string_list_json(self.evidence_refs),
+            "attributes": self.attributes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinimumPreserveItemCandidate:
+    """Compactor 输出的最小连续性保留候选。
+
+    :param item_id: item-local id，只用于诊断与去重。
+    :param label: 短标签。
+    :param text: 需要保留的连续性文本。
+    :param source_refs: compact 输入范围内的来源 event refs。
+    :param preserve_reason: 保留原因。
+    """
+
+    item_id: str
+    label: str
+    text: str
+    source_refs: tuple[str, ...]
+    preserve_reason: MinimumPreserveReason
+
+    def __post_init__(self) -> None:
+        """校验 minimum preserve item candidate 基础边界。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(
+            self.item_id, field_name="MinimumPreserveItemCandidate.item_id"
+        )
+        _require_bounded_non_empty_text(
+            self.label,
+            field_name="MinimumPreserveItemCandidate.label",
+            max_chars=MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS,
+        )
+        _require_bounded_non_empty_text(
+            self.text,
+            field_name="MinimumPreserveItemCandidate.text",
+            max_chars=MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+        )
+        _require_bounded_string_tuple(
+            self.source_refs,
+            field_name="MinimumPreserveItemCandidate.source_refs",
+            max_items=MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM,
+            require_non_empty=True,
+        )
+        if not isinstance(self.preserve_reason, MinimumPreserveReason):
+            raise TypeError(
+                "MinimumPreserveItemCandidate.preserve_reason must be "
+                "MinimumPreserveReason"
+            )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "item_id": self.item_id,
+            "label": self.label,
+            "text": self.text,
+            "source_refs": _string_list_json(self.source_refs),
+            "preserve_reason": self.preserve_reason.value,
         }
 
 
@@ -648,10 +1497,12 @@ class CompactionCandidate:
     :param episode_summary_candidate: episode summary 候选。
     :param pinned_state_patch_candidate: pinned state patch 候选。
     :param preservation_evidence: preservation evidence 集合。
+    :param evidence_backed_fact_candidates: evidence-backed fact 候选集合。
+    :param minimum_preserve_item_candidates: minimum preserve item 候选集合。
     :param retained_current_user_input_ref: 被保留的当前用户输入 ref。
-    :param preserved_input_event_refs: 被保留的输入 event refs。
-    :param preserved_tool_fact_refs: 被保留的 accepted tool fact refs。
-    :param preserved_verified_fact_refs: 被保留的 verified fact refs。
+    :param preserved_material_source_refs: 被保留的 material source refs。
+    :param preserved_canonical_evidence_refs: 被保留的 canonical evidence refs。
+    :param preserved_evidence_backed_fact_refs: 被保留的 evidence-backed fact refs。
     :param dropped_ranges: 被丢弃的输入范围。
     :param summarized_ranges: 被摘要的输入范围。
     :param budget_after_compact: compact 后预算 token 估算。
@@ -661,10 +1512,12 @@ class CompactionCandidate:
     episode_summary_candidate: EpisodeSummaryCandidate
     pinned_state_patch_candidate: PinnedStatePatchCandidate
     preservation_evidence: tuple[PreservationEvidence, ...]
+    evidence_backed_fact_candidates: tuple[EvidenceBackedFactCandidate, ...]
+    minimum_preserve_item_candidates: tuple[MinimumPreserveItemCandidate, ...]
     retained_current_user_input_ref: str | None
-    preserved_input_event_refs: tuple[str, ...]
-    preserved_tool_fact_refs: tuple[str, ...]
-    preserved_verified_fact_refs: tuple[str, ...]
+    preserved_material_source_refs: tuple[str, ...]
+    preserved_canonical_evidence_refs: tuple[str, ...]
+    preserved_evidence_backed_fact_refs: tuple[str, ...]
     dropped_ranges: tuple[CompactInputRange, ...]
     summarized_ranges: tuple[CompactInputRange, ...]
     budget_after_compact: int
@@ -694,21 +1547,29 @@ class CompactionCandidate:
             self.preservation_evidence,
             field_name="CompactionCandidate.preservation_evidence",
         )
+        _require_fact_candidate_tuple(
+            self.evidence_backed_fact_candidates,
+            field_name="CompactionCandidate.evidence_backed_fact_candidates",
+        )
+        _require_minimum_preserve_candidate_tuple(
+            self.minimum_preserve_item_candidates,
+            field_name="CompactionCandidate.minimum_preserve_item_candidates",
+        )
         _require_optional_non_empty(
             self.retained_current_user_input_ref,
             field_name="CompactionCandidate.retained_current_user_input_ref",
         )
         _require_string_tuple(
-            self.preserved_input_event_refs,
-            field_name="CompactionCandidate.preserved_input_event_refs",
+            self.preserved_material_source_refs,
+            field_name="CompactionCandidate.preserved_material_source_refs",
         )
         _require_string_tuple(
-            self.preserved_tool_fact_refs,
-            field_name="CompactionCandidate.preserved_tool_fact_refs",
+            self.preserved_canonical_evidence_refs,
+            field_name="CompactionCandidate.preserved_canonical_evidence_refs",
         )
         _require_string_tuple(
-            self.preserved_verified_fact_refs,
-            field_name="CompactionCandidate.preserved_verified_fact_refs",
+            self.preserved_evidence_backed_fact_refs,
+            field_name="CompactionCandidate.preserved_evidence_backed_fact_refs",
         )
         _require_range_tuple(
             self.dropped_ranges, field_name="CompactionCandidate.dropped_ranges"
@@ -744,15 +1605,23 @@ class CompactionCandidate:
             "preservation_evidence": _evidence_list_json(
                 self.preservation_evidence
             ),
+            "evidence_backed_fact_candidates": _fact_candidate_list_json(
+                self.evidence_backed_fact_candidates
+            ),
+            "minimum_preserve_item_candidates": (
+                _minimum_preserve_candidate_list_json(
+                    self.minimum_preserve_item_candidates
+                )
+            ),
             "retained_current_user_input_ref": self.retained_current_user_input_ref,
-            "preserved_input_event_refs": _string_list_json(
-                self.preserved_input_event_refs
+            "preserved_material_source_refs": _string_list_json(
+                self.preserved_material_source_refs
             ),
-            "preserved_tool_fact_refs": _string_list_json(
-                self.preserved_tool_fact_refs
+            "preserved_canonical_evidence_refs": _string_list_json(
+                self.preserved_canonical_evidence_refs
             ),
-            "preserved_verified_fact_refs": _string_list_json(
-                self.preserved_verified_fact_refs
+            "preserved_evidence_backed_fact_refs": _string_list_json(
+                self.preserved_evidence_backed_fact_refs
             ),
             "dropped_ranges": _range_list_json(self.dropped_ranges),
             "summarized_ranges": _range_list_json(self.summarized_ranges),
@@ -767,10 +1636,12 @@ class CompactQualityCheckResult:
     :param accepted: 候选是否通过 quality check。
     :param rejection_reasons: 拒绝原因集合。
     :param current_user_input_retained: 当前用户输入是否保留。
-    :param accepted_tool_fact_refs_retained: accepted tool fact refs 是否全部保留。
+    :param canonical_evidence_refs_retained: canonical evidence refs 是否全部保留。
+    :param evidence_backed_fact_candidates_accepted: fact candidates 是否通过。
+    :param minimum_preserve_items_accepted: minimum preserve candidates 是否通过。
     :param evidence_anchors_retained: evidence anchors 是否保留。
     :param open_questions_retained: open questions / assumptions 是否保留。
-    :param retained_evidence_refs: 被接受的 evidence refs。
+    :param retained_canonical_evidence_refs: 被接受的 canonical evidence refs。
     :param dropped_ranges: 被丢弃的输入范围。
     :param summarized_ranges: 被摘要的输入范围。
     """
@@ -778,10 +1649,12 @@ class CompactQualityCheckResult:
     accepted: bool
     rejection_reasons: tuple[CompactQualityIssue, ...]
     current_user_input_retained: bool
-    accepted_tool_fact_refs_retained: bool
+    canonical_evidence_refs_retained: bool
+    evidence_backed_fact_candidates_accepted: bool
+    minimum_preserve_items_accepted: bool
     evidence_anchors_retained: bool
     open_questions_retained: bool
-    retained_evidence_refs: tuple[str, ...]
+    retained_canonical_evidence_refs: tuple[str, ...]
     dropped_ranges: tuple[CompactInputRange, ...]
     summarized_ranges: tuple[CompactInputRange, ...]
 
@@ -804,8 +1677,19 @@ class CompactQualityCheckResult:
             field_name="CompactQualityCheckResult.current_user_input_retained",
         )
         _require_bool(
-            self.accepted_tool_fact_refs_retained,
-            field_name="CompactQualityCheckResult.accepted_tool_fact_refs_retained",
+            self.canonical_evidence_refs_retained,
+            field_name="CompactQualityCheckResult.canonical_evidence_refs_retained",
+        )
+        _require_bool(
+            self.evidence_backed_fact_candidates_accepted,
+            field_name=(
+                "CompactQualityCheckResult."
+                "evidence_backed_fact_candidates_accepted"
+            ),
+        )
+        _require_bool(
+            self.minimum_preserve_items_accepted,
+            field_name="CompactQualityCheckResult.minimum_preserve_items_accepted",
         )
         _require_bool(
             self.evidence_anchors_retained,
@@ -816,8 +1700,8 @@ class CompactQualityCheckResult:
             field_name="CompactQualityCheckResult.open_questions_retained",
         )
         _require_string_tuple(
-            self.retained_evidence_refs,
-            field_name="CompactQualityCheckResult.retained_evidence_refs",
+            self.retained_canonical_evidence_refs,
+            field_name="CompactQualityCheckResult.retained_canonical_evidence_refs",
         )
         _require_range_tuple(
             self.dropped_ranges,
@@ -846,12 +1730,20 @@ class CompactQualityCheckResult:
                 _enum_value for _enum_value in self._rejection_reason_values()
             ],
             "current_user_input_retained": self.current_user_input_retained,
-            "accepted_tool_fact_refs_retained": (
-                self.accepted_tool_fact_refs_retained
+            "canonical_evidence_refs_retained": (
+                self.canonical_evidence_refs_retained
+            ),
+            "evidence_backed_fact_candidates_accepted": (
+                self.evidence_backed_fact_candidates_accepted
+            ),
+            "minimum_preserve_items_accepted": (
+                self.minimum_preserve_items_accepted
             ),
             "evidence_anchors_retained": self.evidence_anchors_retained,
             "open_questions_retained": self.open_questions_retained,
-            "retained_evidence_refs": _string_list_json(self.retained_evidence_refs),
+            "retained_canonical_evidence_refs": _string_list_json(
+                self.retained_canonical_evidence_refs
+            ),
             "dropped_ranges": _range_list_json(self.dropped_ranges),
             "summarized_ranges": _range_list_json(self.summarized_ranges),
         }
@@ -875,10 +1767,13 @@ class ContextCompactor(Protocol):
     必须由 quality checker 通过后才可写 compact artifact / canonical event。
     """
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """生成 compaction candidate。
 
         :param request: Host 构造的 compaction 请求。
+        :param cancellation_token: Host 注入的真实取消 token。
         :returns: compaction candidate。
         :raises RuntimeError: compactor 后端失败时可抛出运行时错误。
         """
@@ -917,6 +1812,215 @@ def _require_string_tuple(value: tuple[str, ...], *, field_name: str) -> None:
         _require_non_empty(item, field_name=field_name)
 
 
+def _require_string_mapping(
+    value: Mapping[str, str], *, field_name: str
+) -> None:
+    """校验字符串到字符串的只读 mapping。
+
+    :param value: 待校验 mapping。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段、key 或 value 类型非法时抛出。
+    :raises ValueError: key 或 value 为空时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be mapping")
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{field_name} keys must be str")
+        if not isinstance(item, str):
+            raise TypeError(f"{field_name} values must be str")
+        _require_non_empty(key, field_name=field_name)
+        _require_non_empty(item, field_name=field_name)
+
+
+def _require_unique_string_tuple(
+    value: tuple[str, ...], *, field_name: str
+) -> None:
+    """校验字符串 tuple 且元素不重复。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 元素为空或重复时抛出。
+    """
+
+    _require_string_tuple(value, field_name=field_name)
+    if len(set(value)) != len(value):
+        raise ValueError(f"{field_name} items must be unique")
+
+
+def _require_bounded_string_tuple(
+    value: tuple[str, ...],
+    *,
+    field_name: str,
+    max_items: int,
+    require_non_empty: bool,
+) -> None:
+    """校验字符串 tuple 数量边界。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :param max_items: 最大元素数量。
+    :param require_non_empty: 是否要求至少一个元素。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 元素为空、数量非法或重复时抛出。
+    """
+
+    _require_unique_string_tuple(value, field_name=field_name)
+    if require_non_empty and len(value) == 0:
+        raise ValueError(f"{field_name} must be non-empty")
+    if len(value) > max_items:
+        raise ValueError(f"{field_name} exceeds maximum item count")
+
+
+def _require_bounded_non_empty_text(
+    value: str, *, field_name: str, max_chars: int
+) -> None:
+    """校验有界非空文本。
+
+    :param value: 待校验文本。
+    :param field_name: 错误字段名。
+    :param max_chars: 最大字符数。
+    :returns: ``None``。
+    :raises TypeError: 文本类型非法时抛出。
+    :raises ValueError: 文本为空或超长时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be str")
+    if value.strip() == "":
+        raise ValueError(f"{field_name} must be non-empty")
+    if len(value) > max_chars:
+        raise ValueError(f"{field_name} exceeds maximum length")
+
+
+def _require_json_mapping(
+    value: Mapping[str, JsonValue], *, field_name: str
+) -> None:
+    """校验 JSON object mapping。
+
+    :param value: 待校验 JSON object。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: value 或 key 类型非法时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be mapping")
+    for key in value:
+        if not isinstance(key, str):
+            raise TypeError(f"{field_name} keys must be str")
+
+
+def _require_material_block_tuple(
+    value: tuple[CompactMaterialBlock, ...],
+    *,
+    field_name: str,
+    section: CompactMaterialSection,
+) -> None:
+    """校验 material block tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :param section: 期望 section。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 元素 section 非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, CompactMaterialBlock):
+            raise TypeError(f"{field_name} items must be CompactMaterialBlock")
+        if item.section is not section:
+            raise ValueError(f"{field_name} items must belong to {section.value}")
+
+
+def _require_evidence_block_tuple(
+    value: tuple[CompactEvidenceBlock, ...], *, field_name: str
+) -> None:
+    """校验 evidence material block tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, CompactEvidenceBlock):
+            raise TypeError(f"{field_name} items must be CompactEvidenceBlock")
+
+
+def _require_provenance_mapping(
+    value: Mapping[PromptLocalMaterialLabel, PromptLocalProvenanceEntry],
+) -> None:
+    """校验 prompt-local provenance mapping。
+
+    :param value: 待校验 mapping。
+    :returns: ``None``。
+    :raises TypeError: mapping 或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError("CompactMaterialPack.provenance_map must be mapping")
+    for key, entry in value.items():
+        if not isinstance(key, str):
+            raise TypeError("CompactMaterialPack.provenance_map keys must be str")
+        if not isinstance(entry, PromptLocalProvenanceEntry):
+            raise TypeError(
+                "CompactMaterialPack.provenance_map values must be "
+                "PromptLocalProvenanceEntry"
+            )
+        if key != entry.label:
+            raise ValueError("CompactMaterialPack.provenance_map key mismatch")
+
+
+def _require_one_section_per_canonical_content(pack: CompactMaterialPack) -> None:
+    """校验同一 canonical content 不跨 section 重复出现。
+
+    :param pack: material pack。
+    :returns: ``None``。
+    :raises ValueError: 同一 canonical source refs + digest 跨 section 重复时抛出。
+    """
+
+    seen: dict[tuple[tuple[str, ...], str], CompactMaterialSection] = {}
+    for label in pack.all_labels:
+        entry = pack.provenance_map[label]
+        key = (tuple(sorted(entry.canonical_source_refs)), entry.content_digest)
+        existing_section = seen.get(key)
+        if existing_section is None:
+            seen[key] = entry.section
+            continue
+        if existing_section is not entry.section:
+            raise ValueError("material pack canonical content appears in two sections")
+
+
+def _require_opaque_ref_tuple(
+    value: tuple[OpaqueEvidenceRef, ...], *, field_name: str
+) -> None:
+    """校验 opaque evidence ref tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, OpaqueEvidenceRef):
+            raise TypeError(f"{field_name} items must be OpaqueEvidenceRef")
+
+
 def _require_tuple_patch_field(
     value: PinnedStringTupleFieldPatch, *, field_name: str
 ) -> None:
@@ -948,6 +2052,52 @@ def _require_evidence_tuple(
     for item in value:
         if not isinstance(item, PreservationEvidence):
             raise TypeError(f"{field_name} items must be PreservationEvidence")
+
+
+def _require_fact_candidate_tuple(
+    value: tuple[EvidenceBackedFactCandidate, ...], *, field_name: str
+) -> None:
+    """校验 evidence-backed fact candidate tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 数量超过上限时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    if len(value) > MAX_EVIDENCE_BACKED_FACT_CANDIDATES:
+        raise ValueError(f"{field_name} exceeds maximum item count")
+    for item in value:
+        if not isinstance(item, EvidenceBackedFactCandidate):
+            raise TypeError(
+                f"{field_name} items must be EvidenceBackedFactCandidate"
+            )
+
+
+def _require_minimum_preserve_candidate_tuple(
+    value: tuple[MinimumPreserveItemCandidate, ...], *, field_name: str
+) -> None:
+    """校验 minimum preserve item candidate tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 数量超过上限时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    if len(value) > MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES:
+        raise ValueError(f"{field_name} exceeds maximum item count")
+    for item in value:
+        if not isinstance(item, MinimumPreserveItemCandidate):
+            raise TypeError(
+                f"{field_name} items must be MinimumPreserveItemCandidate"
+            )
 
 
 def _require_range_tuple(
@@ -1012,6 +2162,113 @@ def _string_list_json(values: tuple[str, ...]) -> list[JsonValue]:
     return result
 
 
+def _string_mapping_json(values: Mapping[str, str]) -> JsonValue:
+    """把字符串 mapping 转换为按 key 排序的 JSON object。
+
+    :param values: 字符串 mapping。
+    :returns: JSON object。
+    """
+
+    result: dict[str, JsonValue] = {}
+    for key in sorted(values):
+        result[key] = values[key]
+    return result
+
+
+def _material_block_list_json(
+    values: tuple[CompactMaterialBlock, ...]
+) -> list[JsonValue]:
+    """把 material block tuple 转换为 JSON 数组。
+
+    :param values: material block tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _material_block_llm_list_json(
+    values: tuple[CompactMaterialBlock, ...]
+) -> list[JsonValue]:
+    """把 material block tuple 转换为 LLM-facing JSON 数组。
+
+    :param values: material block tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.llm_json())
+    return result
+
+
+def _evidence_block_list_json(
+    values: tuple[CompactEvidenceBlock, ...]
+) -> list[JsonValue]:
+    """把 evidence material block tuple 转换为 JSON 数组。
+
+    :param values: evidence block tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _evidence_block_llm_list_json(
+    values: tuple[CompactEvidenceBlock, ...]
+) -> list[JsonValue]:
+    """把 evidence material block tuple 转换为 LLM-facing JSON 数组。
+
+    :param values: evidence block tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.llm_json())
+    return result
+
+
+def _provenance_map_json(
+    values: Mapping[PromptLocalMaterialLabel, PromptLocalProvenanceEntry],
+) -> JsonValue:
+    """把 provenance map 转换为 JSON object。
+
+    :param values: provenance mapping。
+    :returns: JSON object。
+    """
+
+    result: dict[str, JsonValue] = {}
+    for key, value in values.items():
+        result[key] = value.to_json()
+    return result
+
+
+def _opaque_ref_list_json(values: tuple[OpaqueEvidenceRef, ...]) -> list[JsonValue]:
+    """把 opaque evidence ref tuple 转换为 JSON 数组。
+
+    :param values: opaque evidence refs。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(
+            {
+                "ref_kind": value.ref_kind,
+                "ref_id": value.ref_id,
+                "digest": value.digest,
+            }
+        )
+    return result
+
+
 def _range_list_json(values: tuple[CompactInputRange, ...]) -> list[JsonValue]:
     """把 compact range tuple 转换为 JSON 数组。
 
@@ -1029,6 +2286,36 @@ def _evidence_list_json(values: tuple[PreservationEvidence, ...]) -> list[JsonVa
     """把 preservation evidence tuple 转换为 JSON 数组。
 
     :param values: evidence tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _fact_candidate_list_json(
+    values: tuple[EvidenceBackedFactCandidate, ...],
+) -> list[JsonValue]:
+    """把 evidence-backed fact candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _minimum_preserve_candidate_list_json(
+    values: tuple[MinimumPreserveItemCandidate, ...],
+) -> list[JsonValue]:
+    """把 minimum preserve item candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
     :returns: JSON 数组。
     """
 
@@ -1059,18 +2346,40 @@ def _budget_estimate_json(estimate: BudgetEstimate) -> JsonValue:
 
 
 __all__ = [
+    "CompactEvidenceBlock",
     "CompactInputRange",
+    "CompactMaterialBlock",
+    "CompactMaterialBlockKind",
+    "CompactMaterialPack",
+    "CompactMaterialSection",
     "CompactQualityCheckResult",
     "CompactQualityIssue",
+    "CompactSegmentSelection",
+    "CompactSegmentTrigger",
     "CompactionCandidate",
     "CompactionRequest",
     "ContextCompactor",
-    "CurrentMessageSummary",
+    "CurrentInputAnchor",
     "EpisodeSummaryCandidate",
+    "EvidenceBackedFactCandidate",
+    "EvidenceBackedFactKind",
+    "MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS",
+    "MAX_EVIDENCE_BACKED_FACT_CANDIDATES",
+    "MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS",
+    "MAX_EVIDENCE_REFS_PER_FACT",
+    "MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES",
+    "MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS",
+    "MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS",
+    "MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM",
+    "MinimumPreserveItemCandidate",
+    "MinimumPreserveReason",
     "PinnedPatchOperation",
     "PinnedStatePatchCandidate",
     "PinnedStringTupleFieldPatch",
     "PinnedTextFieldPatch",
+    "PromptLocalEvidenceMap",
+    "PromptLocalMaterialLabel",
+    "PromptLocalProvenanceEntry",
     "PreservationEvidence",
     "missing_string_tuple_patch",
     "missing_text_patch",

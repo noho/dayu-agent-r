@@ -38,6 +38,38 @@ def event_payload_object(
     )
 
 
+def event_payload_object_for_result_ref(
+    transaction: HostTransaction,
+    event: EventLogRow,
+    *,
+    expected_payload_ref: str | None,
+    expected_payload_digest: str | None,
+    payload_label: str,
+) -> Mapping[str, JsonValue]:
+    """按 accepted result ref 读取 EventLog payload object。
+
+    :param transaction: 当前 Host transaction。
+    :param event: EventLog row。
+    :param expected_payload_ref: accepted envelope 中声明的 payload descriptor ref。
+    :param expected_payload_digest: accepted envelope 中声明的 payload digest。
+    :param payload_label: 错误消息中的 payload 名称。
+    :returns: payload JSON object。
+    :raises HostDurableError: EventLog payload ref / digest 与 accepted result ref
+        不一致，或 payload descriptor / JSON 非法时抛出。
+    """
+
+    if event.payload_ref != expected_payload_ref:
+        raise HostDurableError(f"{payload_label} payload ref mismatch")
+    if event.payload_ref is not None and expected_payload_digest is not None:
+        if event.payload_digest != expected_payload_digest:
+            raise HostDurableError(f"{payload_label} payload digest mismatch")
+    return event_payload_object(
+        transaction,
+        event,
+        payload_label=payload_label,
+    )
+
+
 def sqlite_payload_object(
     transaction: HostTransaction,
     *,
@@ -100,5 +132,6 @@ def _json_object(payload_json: str, *, payload_label: str) -> Mapping[str, JsonV
 
 __all__ = [
     "event_payload_object",
+    "event_payload_object_for_result_ref",
     "sqlite_payload_object",
 ]

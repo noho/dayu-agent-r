@@ -9,19 +9,24 @@ import pytest
 
 from dayu.host.context_policy import (
     DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION,
+    DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
     ContextBudgetPolicy,
     default_context_budget_policy,
 )
 
 
 def test_default_context_budget_policy_sets_compaction_attempt_budget() -> None:
-    """默认 policy 带正整数 compaction operation attempt 上限。"""
+    """默认 policy 带正整数 compaction operation 与 reactive 上限。"""
 
     policy = default_context_budget_policy(context_window_size=1000)
 
     assert (
         policy.max_compaction_attempts_per_operation
         == DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION
+    )
+    assert (
+        policy.max_reactive_compactions_per_run
+        == DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN
     )
 
 

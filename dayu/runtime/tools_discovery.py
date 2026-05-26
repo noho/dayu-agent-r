@@ -232,14 +232,13 @@ class ToolsDiscovery:
             if not binding.spec.enabled:
                 continue
             output = binding.provider(binding.spec)
-            provider_id = _require_provider_identity(output.provider_id)
-            if provider_id in provider_ids:
-                raise ToolsDiscoveryError(f"duplicate provider identity: {provider_id}")
-            provider_ids.add(provider_id)
-            _validate_provider_output(
+            provider_id = _validate_provider_output(
                 spec=binding.spec,
                 output=output,
             )
+            if provider_id in provider_ids:
+                raise ToolsDiscoveryError(f"duplicate provider identity: {provider_id}")
+            provider_ids.add(provider_id)
             _validate_reserved_tool_names(output.definitions)
             normalized_source_refs = _normalize_source_refs_with_digest(
                 source_refs=output.source_refs,
@@ -530,24 +529,26 @@ def _validate_provider_output(
     *,
     spec: ToolsDiscoveryProviderSpec,
     output: ToolsDiscoveryProviderOutput,
-) -> None:
+) -> str:
     """校验 provider 输出的最小完整性。
 
     :param spec: provider 显式配置。
     :param output: provider 输出。
-    :returns: 无返回值。
-    :raises ToolsDiscoveryError: source refs 为空、version 为空字符串，或空工具
-        输出未显式允许时抛出。
+    :returns: 去除首尾空白后的 provider 身份。
+    :raises ToolsDiscoveryError: provider 身份为空、source refs 为空、version
+        为空字符串，或空工具输出未显式允许时抛出。
     """
 
+    provider_id = _require_provider_identity(output.provider_id)
     _require_optional_non_empty_text(
         output.version_ref,
         field_name="ToolsDiscoveryProviderOutput.version_ref",
     )
     if not output.source_refs:
-        raise ToolsDiscoveryError(f"provider {output.provider_id} must return non-empty source_refs")
+        raise ToolsDiscoveryError(f"provider {provider_id} must return non-empty source_refs")
     if not output.definitions and not spec.allow_empty:
-        raise ToolsDiscoveryError(f"provider {output.provider_id} returned empty tools")
+        raise ToolsDiscoveryError(f"provider {provider_id} returned empty tools")
+    return provider_id
 
 
 def _validate_unique_tool_names(definitions: tuple[ToolDefinition, ...]) -> None:

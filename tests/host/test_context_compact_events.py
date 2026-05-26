@@ -16,6 +16,10 @@ from dayu.host.compaction import (
     CompactQualityCheckResult,
     CompactionCandidate,
     EpisodeSummaryCandidate,
+    EvidenceBackedFactCandidate,
+    EvidenceBackedFactKind,
+    MinimumPreserveItemCandidate,
+    MinimumPreserveReason,
     PinnedPatchOperation,
     PinnedStatePatchCandidate,
     PinnedStringTupleFieldPatch,
@@ -150,15 +154,27 @@ def test_compacted_payload_rejects_summary_without_preservation_evidence() -> No
         validate_context_compacted_payload(payload)
 
 
-def test_compacted_payload_rejects_summary_proposed_verified_fact_refs() -> None:
-    """accepted compact summary 不能提议新建 verified fact。"""
+def test_compacted_payload_rejects_summary_proposed_evidence_backed_fact_refs() -> None:
+    """accepted compact summary 不能提议新建 evidence-backed fact。"""
+
+    payload = dict(_valid_compacted_payload())
+    summary = _payload_mapping(payload["episode_summary_candidate"])
+    summary["proposed_evidence_backed_fact_refs"] = ["fake-fact"]
+    payload["episode_summary_candidate"] = summary
+
+    with pytest.raises(ValueError, match="must not propose evidence-backed facts"):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_rejects_old_summary_proposed_verified_fact_refs() -> None:
+    """accepted compact summary 拒绝旧 proposed_verified_fact_refs key。"""
 
     payload = dict(_valid_compacted_payload())
     summary = _payload_mapping(payload["episode_summary_candidate"])
     summary["proposed_verified_fact_refs"] = ["fake-fact"]
     payload["episode_summary_candidate"] = summary
 
-    with pytest.raises(ValueError, match="must not propose verified facts"):
+    with pytest.raises(ValueError, match="old proposed verified fact refs"):
         validate_context_compacted_payload(payload)
 
 
@@ -228,10 +244,12 @@ def test_compacted_payload_rejects_rejected_quality_result() -> None:
                 accepted=False,
                 rejection_reasons=(CompactQualityIssue.PRESERVATION_EVIDENCE_MISSING,),
                 current_user_input_retained=True,
-                accepted_tool_fact_refs_retained=True,
+                canonical_evidence_refs_retained=True,
+                evidence_backed_fact_candidates_accepted=True,
+                minimum_preserve_items_accepted=True,
                 evidence_anchors_retained=True,
                 open_questions_retained=True,
-                retained_evidence_refs=("evidence-1",),
+                retained_canonical_evidence_refs=("evidence:accepted-1",),
                 dropped_ranges=(),
                 summarized_ranges=(),
             ),
@@ -479,16 +497,34 @@ def _candidate() -> CompactionCandidate:
         preservation_evidence=(
             PreservationEvidence(
                 evidence_id="evidence-1",
-                input_event_refs=("event-user-1",),
-                tool_fact_refs=("event-tool-1",),
+                material_source_refs=("event-user-1",),
+                canonical_evidence_refs=("evidence:accepted-1",),
                 memory_snapshot_cursor=3,
                 compact_input_range=input_range,
             ),
         ),
+        evidence_backed_fact_candidates=(
+            EvidenceBackedFactCandidate(
+                candidate_id="fact-candidate-1",
+                claim_text="Revenue increased.",
+                evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+                evidence_refs=("evidence:accepted-1",),
+                attributes={},
+            ),
+        ),
+        minimum_preserve_item_candidates=(
+            MinimumPreserveItemCandidate(
+                item_id="preserve-1",
+                label="current input",
+                text="compare revenue",
+                source_refs=("event-user-2",),
+                preserve_reason=MinimumPreserveReason.NEEDED_FOR_RECENT_REFERENCE,
+            ),
+        ),
         retained_current_user_input_ref="event-user-2",
-        preserved_input_event_refs=("event-user-1", "event-user-2"),
-        preserved_tool_fact_refs=("event-tool-1",),
-        preserved_verified_fact_refs=("event-tool-1",),
+        preserved_material_source_refs=("event-user-1", "event-user-2"),
+        preserved_canonical_evidence_refs=("evidence:accepted-1",),
+        preserved_evidence_backed_fact_refs=("fact-existing-1",),
         dropped_ranges=(),
         summarized_ranges=(input_range,),
         budget_after_compact=512,
@@ -517,10 +553,12 @@ def _quality_result() -> CompactQualityCheckResult:
         accepted=True,
         rejection_reasons=(),
         current_user_input_retained=True,
-        accepted_tool_fact_refs_retained=True,
+        canonical_evidence_refs_retained=True,
+        evidence_backed_fact_candidates_accepted=True,
+        minimum_preserve_items_accepted=True,
         evidence_anchors_retained=True,
         open_questions_retained=True,
-        retained_evidence_refs=("evidence-1",),
+        retained_canonical_evidence_refs=("evidence:accepted-1",),
         dropped_ranges=(),
         summarized_ranges=(),
     )

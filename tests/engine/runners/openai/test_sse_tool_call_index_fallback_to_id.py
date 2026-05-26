@@ -42,3 +42,40 @@ async def test_missing_index_falls_back_to_id() -> None:
     assert tc.tool_call_id == "call-z"
     assert tc.name == "do"
     assert tc.arguments == {"k": 1}
+
+
+@pytest.mark.asyncio
+async def test_synthetic_index_does_not_collide_with_later_native_index() -> None:
+    """缺 index 合成 key 不得与后续 provider 原生 index=0 碰撞。"""
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"id":"call-synthetic","type":"function",'
+            b'"function":{"name":"missing","arguments":"{}"}}]}}]}\n\n'
+        ),
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":0,"id":"call-native","type":"function",'
+            b'"function":{"name":"native","arguments":"{}"}}]}}]}\n\n'
+        ),
+        b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    events = await parse_sse(chunks)
+    completed = [
+        e for e in events
+        if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
+    ]
+
+    assert len(completed) == 1
+    data = completed[0].data
+    assert isinstance(data, RunnerToolCallsCompletedData)
+    assert {
+        (tool_call.tool_call_id, tool_call.name)
+        for tool_call in data.tool_calls
+    } == {
+        ("call-synthetic", "missing"),
+        ("call-native", "native"),
+    }

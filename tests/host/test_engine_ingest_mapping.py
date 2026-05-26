@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import ToolCallRequest
@@ -67,7 +68,7 @@ from dayu.host.context_policy import (
     ContextBudgetPolicy,
     context_budget_policy_from_threshold_tokens,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
@@ -93,17 +94,24 @@ from dayu.host.durable.run_transition import (
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
+    AttemptRow,
+    DispatchRecordRow,
     DispatchRecordStatus,
     RunStartReason,
     WaitResumePolicy,
     WorkerKind,
+    insert_attempt,
+    insert_dispatch_record,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    steer_active_run_row,
+    steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
@@ -135,34 +143,6 @@ class _SeededRun:
     dispatch_record_id: str
 
 
-class _NeverCancelledToken:
-    """测试用未取消 token。"""
-
-    def is_cancelled(self) -> bool:
-        """返回取消状态。
-
-        :returns: 始终为 ``False``。
-        """
-
-        return False
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 始终为 ``None``。
-        """
-
-        return None
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 始终为 ``None``。
-        """
-
-        return None
-
-
 class _TransactionReadableCompactor(ContextCompactor):
     """测试 compactor 调用期可开启独立读事务。"""
 
@@ -177,10 +157,13 @@ class _TransactionReadableCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """执行 compact 并验证当前不在外层 write transaction 内。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: fake compaction candidate。
         """
 
@@ -189,7 +172,7 @@ class _TransactionReadableCompactor(ContextCompactor):
             lambda transaction: read_run_by_id(transaction, request.run_id)
         )
         assert row is not None
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _InputSequenceAdvancingCompactor(ContextCompactor):
@@ -206,29 +189,36 @@ class _InputSequenceAdvancingCompactor(ContextCompactor):
         self._fake = FakeContextCompactor()
         self.calls = 0
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """推进 durable input sequence 后返回旧 snapshot 的 fake candidate。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: 基于旧 request 的 fake compaction candidate。
         """
 
         self.calls += 1
         _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _RaisingCompactor(ContextCompactor):
     """测试用失败 compactor。"""
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """抛出 proposal 失败。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: 不返回。
         :raises RuntimeError: 始终抛出 proposal failure。
         """
 
+        del cancellation_token
         raise RuntimeError(f"proposal failed for {request.run_id}")
 
 
@@ -451,6 +441,8 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert requested_payload["provider_request_id"] is None
         assert requested_payload["attempt_id"] == seeded.attempt_id
         assert requested_payload["execution_id"] == seeded.execution_id
+        assert requested_payload["frozen_material_refs"] == ["event-input-ingest"]
+        assert isinstance(requested_payload["frozen_material_list_digest"], str)
         assert isinstance(requested_payload["estimator_digest"], str)
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
@@ -458,6 +450,28 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert len(wakeup.dispatches) == 1
         assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
+
+
+@pytest.mark.asyncio
+async def test_reactive_freezes_overflow_material_list_before_compaction(
+    tmp_path: Path,
+) -> None:
+    """reactive pending record 保存冻结 ordinary material digest 与 refs。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=47))
+
+        requested = result.events[0]
+        payload = _payload(requested)
+        assert requested.event_type == CONTEXT_COMPACTION_REQUESTED
+        assert payload["frozen_material_refs"] == ["event-input-ingest"]
+        assert payload["frozen_material_list_digest"] != payload["estimator_digest"]
 
 
 @pytest.mark.asyncio
@@ -655,7 +669,7 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         )
 
         assert stale.status == EngineIngestStatus.REJECTED
-        assert _payload(stale.events[0])["reason"] == "terminal_already_closed"
+        assert _payload(stale.events[0])["reason"] == "stale_execution_id"
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
         current_attempt = _current_attempt_id(store.transaction_runner, seeded.run_id)
         assert current_attempt != seeded.attempt_id
@@ -664,11 +678,115 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         )
 
 
+def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
+    tmp_path: Path,
+) -> None:
+    """steer 后旧 Attempt 的 EngineEvent 不得污染当前 Run EventLog。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        current = _steer_to_new_running_attempt(store.transaction_runner, seeded)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        stale = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=51,
+                data=ContentDeltaData(iteration_id="iter-stale", delta="old"),
+                event_type=EngineEventType.CONTENT_DELTA,
+            )
+        )
+        accepted = ingestor.ingest(
+            _candidate(
+                current,
+                worker_event_index=1,
+                data=ContentDeltaData(iteration_id="iter-current", delta="new"),
+                event_type=EngineEventType.CONTENT_DELTA,
+            )
+        )
+
+        assert stale.status == EngineIngestStatus.REJECTED
+        assert _payload(stale.events[0])["reason"] == "stale_execution_id"
+        assert accepted.status == EngineIngestStatus.ACCEPTED
+        assert accepted.events[0].attempt_id == current.attempt_id
+        assert _payload(accepted.events[0])["delta"] == "new"
+
+
 @pytest.mark.asyncio
 async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
     tmp_path: Path,
 ) -> None:
-    """committed reactive request 数达到上限时失败收口且不创建 recovery Attempt。"""
+    """配置为一次 reactive 时，已有 request 会触发失败收口。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_reactive_requested_fact(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-existing-reactive-request",
+            corrupted=False,
+        )
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(
+                max_reactive_compactions_per_run=1
+            ),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
+
+        assert CONTEXT_COMPACTION_REQUESTED not in (
+            event.event_type for event in result.events
+        )
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.FAILED
+        assert attempt_status == AttemptStatus.FAILED
+        failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
+        assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_reactive_repeated_overflow_respects_max_reactive_compactions_per_run(
+    tmp_path: Path,
+) -> None:
+    """重复 overflow 达到 reactive 上限后 fail closed 且不无限 retry。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_reactive_requested_fact(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-existing-reactive-request-repeat",
+            corrupted=False,
+        )
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(
+                max_reactive_compactions_per_run=1
+            ),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=48))
+
+        assert result.terminal_closeout is True
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+        assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+
+
+@pytest.mark.asyncio
+async def test_reactive_compact_count_allows_second_operation(
+    tmp_path: Path,
+) -> None:
+    """默认两次 reactive 上限允许第二条 compact request。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 第二次 reactive compact 被错误阻断时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -686,15 +804,16 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
             compact_artifact_root=tmp_path / "compact-artifacts",
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
 
-        assert CONTEXT_COMPACTION_REQUESTED not in (
-            event.event_type for event in result.events
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
+        assert (
+            _event_count(store.transaction_runner, CONTEXT_COMPACTION_REQUESTED)
+            == 2
         )
-        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
-        assert run_status == RunStatus.FAILED
+        assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.FAILED
-        failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-        assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
 
 
 @pytest.mark.asyncio
@@ -1028,8 +1147,8 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
-        assert result.reason == "terminal_already_closed"
-        assert _payload(result.events[0])["reason"] == "terminal_already_closed"
+        assert result.reason == "stale_execution_id"
+        assert _payload(result.events[0])["reason"] == "stale_execution_id"
         assert _canonical_tool_event_count(store.transaction_runner) == 2
 
 
@@ -1863,6 +1982,183 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
     return seeded
 
 
+def _steer_to_new_running_attempt(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> _SeededRun:
+    """把 seeded active Run 切换为 steer 后的新 running Attempt。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: 原 active Run 摘要。
+    :returns: steer 后的新 current Attempt 摘要。
+    """
+
+    current = _SeededRun(
+        session_id=seeded.session_id,
+        run_id=seeded.run_id,
+        attempt_id="attempt-ingest-steered-current",
+        execution_id="execution-ingest-steered-current",
+        dispatch_record_id="dispatch-ingest-steered-current",
+    )
+
+    def _event(
+        transaction: HostTransaction,
+        *,
+        event_id: str,
+        event_type: str,
+        attempt_id: str | None,
+        execution_id: str | None,
+        payload_json: JsonValue,
+    ) -> EventLogRow:
+        """追加 steer 测试 setup 事件。
+
+        :param transaction: Host transaction。
+        :param event_id: 事件 id。
+        :param event_type: 事件类型。
+        :param attempt_id: Attempt id。
+        :param execution_id: execution id。
+        :param payload_json: JSON payload。
+        :returns: 新写入的 EventLog row。
+        """
+
+        return EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=attempt_id,
+                execution_id=execution_id,
+                event_type=event_type,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-ingest-steer",
+                idempotency_key=f"idem-{event_id}",
+                policy_decision=None,
+                reason=None,
+                payload_json=payload_json,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+
+    def _operation(transaction: HostTransaction) -> None:
+        timestamp = format_utc_timestamp(_NOW)
+        input_event = _event(
+            transaction,
+            event_id="event-input-ingest-steer",
+            event_type="USER_INPUT_ACCEPTED",
+            attempt_id=None,
+            execution_id=None,
+            payload_json={"display_text": "steer"},
+        )
+        steered_event = _event(
+            transaction,
+            event_id="event-attempt-steered-ingest",
+            event_type="ATTEMPT_STEERED",
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            payload_json={"reason": "steered"},
+        )
+        run_started_event = _event(
+            transaction,
+            event_id="event-run-started-ingest-steer",
+            event_type="RUN_STARTED",
+            attempt_id=None,
+            execution_id=None,
+            payload_json={"reason": "steer"},
+        )
+        attempt_started_event = _event(
+            transaction,
+            event_id="event-attempt-started-ingest-steer",
+            event_type="ATTEMPT_STARTED",
+            attempt_id=current.attempt_id,
+            execution_id=current.execution_id,
+            payload_json={"reason": "steer"},
+        )
+        steer_running_attempt_row(
+            transaction,
+            attempt_id=seeded.attempt_id,
+            terminal_event_id=steered_event.event_id,
+            terminal_event_sequence=steered_event.event_sequence,
+            terminal_at=timestamp,
+        )
+        insert_attempt(
+            transaction,
+            AttemptRow(
+                attempt_id=current.attempt_id,
+                run_id=current.run_id,
+                execution_id=current.execution_id,
+                status=AttemptStatus.STARTING,
+                started_event_id=attempt_started_event.event_id,
+                started_event_sequence=attempt_started_event.event_sequence,
+                terminal_event_id=None,
+                terminal_event_sequence=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+                terminal_at=None,
+            ),
+        )
+        insert_dispatch_record(
+            transaction,
+            DispatchRecordRow(
+                dispatch_record_id=current.dispatch_record_id,
+                run_id=current.run_id,
+                attempt_id=current.attempt_id,
+                execution_id=current.execution_id,
+                status=DispatchRecordStatus.DISPATCHING,
+                worker_kind=WorkerKind.LOCAL,
+                execution_target="target-ingest",
+                owner_host_instance_id="host-test",
+                created_event_id=attempt_started_event.event_id,
+                created_event_sequence=attempt_started_event.event_sequence,
+                waiting_for_lane_at=timestamp,
+                lane_name="llm",
+                lane_claim_id="claim-test-steer",
+                lane_owner_id="owner-test-steer",
+                lane_acquired_at=timestamp,
+                dispatching_at=timestamp,
+                worker_accepted_at=None,
+                worker_accept_event_id=None,
+                worker_accept_event_sequence=None,
+                cancelled_event_id=None,
+                cancelled_event_sequence=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+                cancelled_at=None,
+            ),
+        )
+        steer_active_run_row(
+            transaction,
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            previous_attempt_id=seeded.attempt_id,
+            next_attempt_id=current.attempt_id,
+            input_event_id=input_event.event_id,
+            input_event_sequence=input_event.event_sequence,
+            started_event_id=run_started_event.event_id,
+            started_event_sequence=run_started_event.event_sequence,
+            updated_at=timestamp,
+        )
+        accept_worker_running_in_transaction(
+            transaction,
+            EventLogStore(),
+            AcceptWorkerRunningInput(
+                run_id=current.run_id,
+                attempt_id=current.attempt_id,
+                attempt_running_event_id="event-attempt-running-ingest-steer",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                worker_accept_reason="accepted",
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+    return current
+
+
 def _candidate(
     seeded: _SeededRun,
     *,
@@ -1889,7 +2185,7 @@ def _candidate(
             worker_kind=WorkerKind.LOCAL,
             execution_target="target-ingest",
             local_worker_id="local-worker-ingest",
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=StubCancellationToken(),
         ),
         worker_event_index=worker_event_index,
         engine_event=EngineEvent(
@@ -1943,13 +2239,16 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
         worker_kind=WorkerKind.LOCAL,
         execution_target="target-ingest",
         local_worker_id="local-worker-ingest",
-        cancellation_token=_NeverCancelledToken(),
+        cancellation_token=StubCancellationToken(),
     )
 
 
-def _reactive_policy() -> ContextBudgetPolicy:
+def _reactive_policy(
+    *, max_reactive_compactions_per_run: int = 2
+) -> ContextBudgetPolicy:
     """构造测试 reactive context budget policy。
 
+    :param max_reactive_compactions_per_run: 单个 Run reactive compact 上限。
     :returns: Context budget policy。
     """
 
@@ -1957,6 +2256,7 @@ def _reactive_policy() -> ContextBudgetPolicy:
         context_window_size=100,
         soft_threshold_tokens=45,
         hard_threshold_tokens=80,
+        max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         policy_ref=_REACTIVE_POLICY_REF,
     )
 

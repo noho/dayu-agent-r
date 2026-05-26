@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -39,7 +39,17 @@ from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
 )
-from dayu.host.durable.schema import TABLE_EVENT_LOG, TABLE_HOST_MEMORY_SNAPSHOTS
+from dayu.host.compaction import (
+    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
+    MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+    EvidenceBackedFactKind,
+    MinimumPreserveReason,
+)
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_HOST_MEMORY_ITEMS,
+    TABLE_HOST_MEMORY_SNAPSHOTS,
+)
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -61,11 +71,13 @@ from dayu.host.memory import (
     MemorySnapshotCursor,
     OpaqueMemoryRef,
     PinnedStateView,
-    VerifiedFactView,
+    EvidenceBackedFactView,
     WorkingAssumptionView,
     build_empty_conversation_memory_snapshot,
     build_conversation_memory_snapshot_from_events,
     calculate_memory_snapshot_digest,
+    conversation_memory_snapshot_from_json_value,
+    conversation_memory_snapshot_to_json_value,
     digest_memory_projection_policy,
     estimate_memory_size_units,
     project_conversation_memory_event,
@@ -87,6 +99,7 @@ _FORBIDDEN_BUSINESS_TERMS = (
     "business_line",
     "technology_release",
 )
+_SMALL_FACT_BUDGET = 2
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -114,7 +127,7 @@ def _policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
         raw_turn_context_ratio=0.125,
@@ -140,7 +153,7 @@ def _low_history_policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
         raw_turn_context_ratio=0.125,
@@ -166,7 +179,7 @@ def _assistant_budget_policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=1,
         raw_turn_context_ratio=0.125,
@@ -192,7 +205,7 @@ def _zero_recent_floor_policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=0,
         raw_turn_context_ratio=0.125,
@@ -207,6 +220,15 @@ def _zero_recent_floor_policy() -> MemoryProjectionPolicy:
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
     )
+
+
+def _small_fact_budget_policy() -> MemoryProjectionPolicy:
+    """构造 evidence-backed facts 小预算测试 policy。
+
+    :returns: memory projection policy。
+    """
+
+    return replace(_policy(), max_evidence_backed_facts=_SMALL_FACT_BUDGET)
 
 
 def _memory_event(
@@ -310,12 +332,18 @@ def _compact_payload(
     summary_text: str,
     confirmed_fact_refs: tuple[str, ...] = (),
     pinned_patch: dict[str, JsonValue] | None = None,
+    fact_candidates: list[JsonValue] | None = None,
+    minimum_preserve_items: list[JsonValue] | None = None,
+    canonical_evidence_refs: tuple[str, ...] = ("evidence-1",),
 ) -> dict[str, JsonValue]:
     """构造测试用 CONTEXT_COMPACTED payload。
 
     :param summary_text: episode summary 文本。
-    :param confirmed_fact_refs: summary 引用的既有 tool fact refs。
+    :param confirmed_fact_refs: summary 引用的 evidence-backed fact refs。
     :param pinned_patch: 可选 pinned patch candidate。
+    :param fact_candidates: 可选 evidence-backed fact candidates。
+    :param minimum_preserve_items: 可选 minimum preserve item candidates。
+    :param canonical_evidence_refs: compact payload 保留的 canonical evidence refs。
     :returns: compacted canonical payload。
     """
 
@@ -337,21 +365,28 @@ def _compact_payload(
             "tool_finding_refs": list(confirmed_fact_refs),
             "source_event_refs": ["event-input"],
             "evidence_refs": ["evidence-1"],
-            "proposed_verified_fact_refs": [],
+            "proposed_evidence_backed_fact_refs": [],
         },
         "pinned_state_patch_candidate": patch,
+        "evidence_backed_fact_candidates": (
+            [] if fact_candidates is None else fact_candidates
+        ),
+        "minimum_preserve_item_candidates": (
+            [] if minimum_preserve_items is None else minimum_preserve_items
+        ),
         "preservation_evidence": [
             {
                 "evidence_id": "evidence-1",
-                "input_event_refs": ["event-input"],
-                "tool_fact_refs": list(confirmed_fact_refs),
+                "material_source_refs": ["event-input"],
+                "canonical_evidence_refs": list(canonical_evidence_refs),
+                "evidence_backed_fact_refs": list(confirmed_fact_refs),
                 "memory_snapshot_cursor": None,
                 "compact_input_range": None,
             }
         ],
         "preserved_fact_refs": {
-            "tool_fact_refs": list(confirmed_fact_refs),
-            "verified_fact_refs": list(confirmed_fact_refs),
+            "canonical_evidence_refs": list(canonical_evidence_refs),
+            "evidence_backed_fact_refs": list(confirmed_fact_refs),
         },
         "dropped_ranges": [],
         "summarized_ranges": [],
@@ -360,10 +395,12 @@ def _compact_payload(
             "accepted": True,
             "rejection_reasons": [],
             "current_user_input_retained": True,
-            "accepted_tool_fact_refs_retained": True,
+            "canonical_evidence_refs_retained": True,
+            "evidence_backed_fact_candidates_accepted": True,
+            "minimum_preserve_items_accepted": True,
             "evidence_anchors_retained": True,
             "open_questions_retained": True,
-            "retained_evidence_refs": ["evidence-1"],
+            "retained_canonical_evidence_refs": list(canonical_evidence_refs),
             "dropped_ranges": [],
             "summarized_ranges": [],
         },
@@ -388,6 +425,54 @@ def _missing_pinned_patch() -> dict[str, JsonValue]:
         "confirmed_subjects": dict(missing_field),
         "user_constraints": dict(missing_field),
         "open_questions": dict(missing_field),
+    }
+
+
+def _fact_candidate(
+    *,
+    candidate_id: str = "fact-candidate-1",
+    claim_text: str = "Canonical evidence supports revenue growth.",
+    evidence_refs: tuple[str, ...] = ("evidence-1",),
+) -> dict[str, JsonValue]:
+    """构造 evidence-backed fact candidate JSON。
+
+    :param candidate_id: candidate-local id。
+    :param claim_text: fact claim 文本。
+    :param evidence_refs: canonical evidence refs。
+    :returns: fact candidate JSON。
+    """
+
+    return {
+        "candidate_id": candidate_id,
+        "claim_text": claim_text,
+        "evidence_kind": EvidenceBackedFactKind.OBSERVED_VALUE.value,
+        "evidence_refs": list(evidence_refs),
+        "attributes": {"source": "test"},
+    }
+
+
+def _minimum_preserve_item(
+    *,
+    item_id: str = "minimum-item-1",
+    label: str = "factor",
+    text: str = "the second factor",
+    source_refs: tuple[str, ...] = ("event-input",),
+) -> dict[str, JsonValue]:
+    """构造 minimum preserve item candidate JSON。
+
+    :param item_id: item-local id。
+    :param label: continuity label。
+    :param text: continuity 文本。
+    :param source_refs: 来源 refs。
+    :returns: minimum preserve item candidate JSON。
+    """
+
+    return {
+        "item_id": item_id,
+        "label": label,
+        "text": text,
+        "source_refs": list(source_refs),
+        "preserve_reason": MinimumPreserveReason.NEEDED_FOR_LOCAL_FOLLOWUP.value,
     }
 
 
@@ -475,20 +560,20 @@ def _damage_latest_memory_snapshot(
 
 
 def _tool_provenance() -> MemoryProvenanceRef:
-    """构造 TOOL provenance。
+    """构造 compact HOST_PROJECTION provenance。
 
-    :returns: TOOL provenance ref。
+    :returns: compact provenance ref。
     """
 
     return MemoryProvenanceRef(
-        producer_kind=MemoryProducerKind.TOOL,
-        producer_name="tool-a",
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        producer_name="host_projection",
         event_id="event-1",
         event_sequence=1,
         run_id="run-1",
         attempt_id="attempt-1",
         execution_id="execution-1",
-        tool_result_ref="event-1",
+        tool_result_ref=None,
         payload_ref="payload-1",
         digest_ref="sha256:1111111111111111111111111111111111111111111111111111111111111111",
         source_refs=(),
@@ -513,6 +598,35 @@ def _user_provenance() -> MemoryProvenanceRef:
         payload_ref=None,
         digest_ref="sha256:2222222222222222222222222222222222222222222222222222222222222222",
         source_refs=(),
+    )
+
+
+def _working_assumption(
+    *,
+    item_id: str,
+    assumption_summary: str,
+    event_sequence: int,
+) -> WorkingAssumptionView:
+    """构造测试用 working assumption view。
+
+    :param item_id: memory item id。
+    :param assumption_summary: assumption 摘要。
+    :param event_sequence: 来源 EventLog sequence。
+    :returns: working assumption view。
+    """
+
+    return WorkingAssumptionView(
+        item_id=item_id,
+        assumption_summary=assumption_summary,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        producer_kind=MemoryProducerKind.ASSISTANT,
+        event_id=f"event-assumption-{event_sequence}",
+        event_sequence=event_sequence,
+        run_id=f"run-assumption-{event_sequence}",
+        subject_refs=(),
+        included_reason=MemoryIncludedReason.WORKING_ASSUMPTION,
+        excluded_reason=None,
+        size_units=MemorySizeUnits(units=1),
     )
 
 
@@ -741,6 +855,47 @@ class _ReadDiagnosticOperation:
         return read_memory_diagnostic(transaction, self._diagnostic_id)
 
 
+class _ForceOldVerifiedFactItemKindOperation:
+    """强制写入旧 verified_fact item kind 的测试 operation。
+
+    :param snapshot_id: snapshot id。
+    """
+
+    def __init__(self, snapshot_id: str) -> None:
+        """初始化 operation。
+
+        :param snapshot_id: snapshot id。
+        :returns: ``None``。
+        """
+
+        self._snapshot_id = snapshot_id
+
+    def __call__(self, transaction: HostTransaction) -> None:
+        """临时关闭 CHECK 约束以模拟旧 durable row。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute("PRAGMA ignore_check_constraints = ON", ())
+        try:
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_MEMORY_ITEMS}
+                SET item_kind = ?
+                WHERE snapshot_id = ?
+                  AND item_kind = ?
+                """,
+                (
+                    "verified_fact",
+                    self._snapshot_id,
+                    "evidence_backed_fact",
+                ),
+            )
+        finally:
+            transaction.execute("PRAGMA ignore_check_constraints = OFF", ())
+
+
 def test_empty_event_log_snapshot_can_be_created_and_read(
     tmp_path: Path,
 ) -> None:
@@ -756,7 +911,7 @@ def test_empty_event_log_snapshot_can_be_created_and_read(
 
         assert written.snapshot.snapshot_id == "snapshot-empty"
         assert read_back is not None
-        assert read_back.snapshot.verified_facts == ()
+        assert read_back.snapshot.evidence_backed_facts == ()
         assert read_back.snapshot.working_assumptions == ()
         assert read_back.snapshot.conversation_continuity.items == ()
         assert read_back.snapshot.cursor.checkpoint_event_sequence == 0
@@ -780,8 +935,8 @@ def test_snapshot_and_checkpoint_rollback_together(tmp_path: Path) -> None:
         assert checkpoint is None
 
 
-def test_typed_contracts_reject_invalid_ids_cursor_and_verified_fact() -> None:
-    """typed contracts 拒绝空 id、非法 cursor 与非 TOOL verified fact。"""
+def test_typed_contracts_reject_invalid_ids_cursor_and_evidence_fact() -> None:
+    """typed contracts 拒绝空 id、非法 cursor 与非法 evidence-backed fact。"""
 
     with pytest.raises(ValueError):
         OpaqueMemoryRef(ref_kind=HostNeutralRefKind.SUBJECT, ref_id="")
@@ -800,26 +955,47 @@ def test_typed_contracts_reject_invalid_ids_cursor_and_verified_fact() -> None:
             session_id=_SESSION_ID,
         )
     with pytest.raises(ValueError):
-        VerifiedFactView(
+        EvidenceBackedFactView(
             item_id="fact-1",
-            fact_summary="summary",
-            claim_status=MemoryClaimStatus.ASSUMPTION,
+            claim_text="summary",
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=(),
+            attributes={},
             provenance=_tool_provenance(),
-            evidence_anchor=None,
-            subject_refs=(),
-            included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+            extraction_operation_ref="event:event-1",
+            compact_artifact_ref=None,
+            candidate_id="candidate-1",
+            included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
             excluded_reason=None,
             size_units=MemorySizeUnits(units=7),
         )
     with pytest.raises(ValueError):
-        VerifiedFactView(
+        EvidenceBackedFactView(
             item_id="fact-1",
-            fact_summary="summary",
-            claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+            claim_text="summary",
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=("evidence-1",),
+            attributes={},
             provenance=_user_provenance(),
-            evidence_anchor=None,
-            subject_refs=(),
-            included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+            extraction_operation_ref="event:event-1",
+            compact_artifact_ref=None,
+            candidate_id="candidate-1",
+            included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
+            excluded_reason=None,
+            size_units=MemorySizeUnits(units=7),
+        )
+    with pytest.raises(ValueError, match="claim_text"):
+        EvidenceBackedFactView(
+            item_id="fact-1",
+            claim_text="x" * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1),
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=("evidence-1",),
+            attributes={},
+            provenance=_tool_provenance(),
+            extraction_operation_ref="event:event-1",
+            compact_artifact_ref=None,
+            candidate_id="candidate-1",
+            included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
             excluded_reason=None,
             size_units=MemorySizeUnits(units=7),
         )
@@ -840,13 +1016,130 @@ def test_pinned_state_open_questions_are_not_duplicated() -> None:
     assert "open_questions" not in {
         field.name for field in fields(WorkingAssumptionView)
     }
-    with pytest.raises(ValueError):
-        PinnedStateView(
-            current_goal=None,
-            confirmed_subjects=(),
-            user_constraints=(),
-            open_questions=("question", "question"),
-        )
+
+    normalized_duplicate = PinnedStateView(
+        current_goal=None,
+        confirmed_subjects=(),
+        user_constraints=(),
+        open_questions=("Question", "  question  "),
+    )
+    assert normalized_duplicate.open_questions == ("  question  ",)
+
+
+def test_working_assumptions_deduplicate_normalized_summary_before_limit() -> None:
+    """Working assumptions 先按 normalized summary 去重，再进入预算裁剪。"""
+
+    policy = replace(_policy(), max_working_assumptions=2)
+    policy_digest = digest_memory_projection_policy(policy)
+    base = build_empty_conversation_memory_snapshot(
+        snapshot_id="memory-snapshot-working-assumptions",
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy_digest=policy_digest,
+        built_at=_NOW,
+    )
+    previous = replace(
+        base,
+        cursor=MemorySnapshotCursor(
+            consumer_id=_CONSUMER_ID,
+            checkpoint_event_sequence=3,
+            checkpoint_event_id="event-assumption-3",
+            session_id=_SESSION_ID,
+        ),
+        working_assumptions=(
+            _working_assumption(
+                item_id="assumption-cash",
+                assumption_summary="cash runway needs verification",
+                event_sequence=1,
+            ),
+            _working_assumption(
+                item_id="assumption-margin-old",
+                assumption_summary="Verify margin bridge",
+                event_sequence=2,
+            ),
+            _working_assumption(
+                item_id="assumption-margin-new",
+                assumption_summary="  verify   MARGIN bridge  ",
+                event_sequence=3,
+            ),
+        ),
+    )
+
+    snapshot = project_conversation_memory_event(
+        previous_snapshot=previous,
+        event=_memory_event(
+            event_sequence=4,
+            event_id="event-user-after-assumptions",
+            event_type="USER_INPUT_ACCEPTED",
+            payload={"display_text": "continue analysis"},
+            attempt_id=None,
+            execution_id=None,
+        ),
+        policy=policy,
+        built_at=_NOW,
+        consumer_id=_CONSUMER_ID,
+    )
+
+    assert tuple(
+        (item.item_id, item.assumption_summary)
+        for item in snapshot.working_assumptions
+    ) == (
+        ("assumption-cash", "cash runway needs verification"),
+        ("assumption-margin-new", "  verify   MARGIN bridge  "),
+    )
+
+
+def test_open_questions_deduplicate_normalized_text_before_pinned_limit() -> None:
+    """Open questions 先按 normalized text 去重，再进入 pinned 数量裁剪。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-open-question-dedup",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="open question dedup summary",
+                    pinned_patch={
+                        "candidate_id": "patch-open-question-dedup",
+                        "current_goal": {
+                            "operation": "missing",
+                            "value": None,
+                            "evidence_refs": [],
+                        },
+                        "confirmed_subjects": {
+                            "operation": "missing",
+                            "value": None,
+                            "evidence_refs": [],
+                        },
+                        "user_constraints": {
+                            "operation": "missing",
+                            "value": None,
+                            "evidence_refs": [],
+                        },
+                        "open_questions": {
+                            "operation": "replace",
+                            "value": [
+                                "what are the covenants?",
+                                "Verify margin bridge",
+                                "  verify   MARGIN bridge  ",
+                            ],
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=replace(_policy(), max_pinned_items=2),
+    )
+
+    assert snapshot.pinned_state.open_questions == (
+        "what are the covenants?",
+        "  verify   MARGIN bridge  ",
+    )
 
 
 def test_host_neutral_ref_kind_rejects_business_specific_kind() -> None:
@@ -878,7 +1171,7 @@ def test_memory_contracts_do_not_expose_business_specific_fields() -> None:
             OpaqueMemoryRef,
             MemoryProvenanceRef,
             PinnedStateView,
-            VerifiedFactView,
+            EvidenceBackedFactView,
             WorkingAssumptionView,
             ConversationContinuityItem,
             MemoryDiagnostic,
@@ -931,6 +1224,41 @@ def test_memory_diagnostic_contract_round_trips_through_durable_store(
         assert read_back.session_id == _SESSION_ID
 
 
+@pytest.mark.parametrize(
+    "reason",
+    (
+        MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_SUPERSEDED,
+        MemoryDiagnosticReason.MINIMUM_PRESERVE_ITEM_COVERED,
+    ),
+)
+def test_new_memory_diagnostic_reasons_are_persistable(
+    tmp_path: Path, reason: MemoryDiagnosticReason
+) -> None:
+    """新增 memory diagnostic reason 必须通过 SQLite CHECK 并可读回。"""
+
+    diagnostic = MemoryDiagnostic(
+        diagnostic_id=f"diagnostic-{reason.value}",
+        reason=reason,
+        message=f"{reason.value} persisted",
+        event_sequence=1,
+        item_id="memory-item:test",
+        policy_digest=digest_memory_projection_policy(_policy()),
+        recorded_at=_NOW,
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        written = store.transaction_runner.run_write(
+            _WriteDiagnosticOperation(diagnostic)
+        )
+        read_back = store.transaction_runner.run_read(
+            _ReadDiagnosticOperation(diagnostic.diagnostic_id)
+        )
+
+        assert written.diagnostic.reason is reason
+        assert read_back is not None
+        assert read_back.diagnostic.reason is reason
+
+
 def test_snapshot_digest_ignores_nondeterministic_diagnostic_fields() -> None:
     """snapshot digest 不受 diagnostic_id 与 recorded_at 影响。"""
 
@@ -951,7 +1279,7 @@ def test_snapshot_digest_ignores_nondeterministic_diagnostic_fields() -> None:
             user_constraints=("constraint",),
             open_questions=("question",),
         ),
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=ConversationContinuityView(items=()),
         diagnostics=(
@@ -974,7 +1302,7 @@ def test_snapshot_digest_ignores_nondeterministic_diagnostic_fields() -> None:
         cursor=first.cursor,
         policy_digest=policy_digest,
         pinned_state=first.pinned_state,
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=first.conversation_continuity,
         diagnostics=(
@@ -1030,6 +1358,9 @@ def test_p9_contracts_do_not_synthesize_conflict_stale_or_superseded() -> None:
                 event_sequence=1,
                 run_id="run-1",
                 summary_text="summary",
+                label=None,
+                source_refs=(),
+                preserve_reason=None,
                 payload_ref=None,
                 payload_digest=None,
                 included_reason=None,
@@ -1038,8 +1369,8 @@ def test_p9_contracts_do_not_synthesize_conflict_stale_or_superseded() -> None:
             )
 
 
-def test_final_answer_enters_continuity_not_verified_fact() -> None:
-    """RUN_SUCCEEDED final_answer 只进入 continuity，不进入 verified facts。"""
+def test_final_answer_enters_continuity_not_evidence_fact() -> None:
+    """RUN_SUCCEEDED final_answer 只进入 continuity，不进入 evidence-backed facts。"""
 
     snapshot = _build_snapshot(
         (
@@ -1055,7 +1386,7 @@ def test_final_answer_enters_continuity_not_verified_fact() -> None:
         )
     )
 
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     item = snapshot.conversation_continuity.items[0]
     assert item.item_kind is ConversationContinuityKind.ASSISTANT_CONCLUSION
@@ -1064,8 +1395,8 @@ def test_final_answer_enters_continuity_not_verified_fact() -> None:
     assert item.summary_text == "assistant conclusion"
 
 
-def test_user_input_never_enters_verified_facts() -> None:
-    """USER_INPUT_ACCEPTED 可进入 pinned / continuity，但不得成为 verified fact。"""
+def test_user_input_never_enters_evidence_backed_facts() -> None:
+    """USER_INPUT_ACCEPTED 可进入 pinned / continuity，但不得成为 evidence fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1081,7 +1412,7 @@ def test_user_input_never_enters_verified_facts() -> None:
         )
     )
 
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert snapshot.pinned_state.user_constraints == ("use fiscal year 2025",)
     assert len(snapshot.conversation_continuity.items) == 1
     assert (
@@ -1091,6 +1422,52 @@ def test_user_input_never_enters_verified_facts() -> None:
     assert (
         snapshot.conversation_continuity.items[0].producer_kind
         is MemoryProducerKind.USER
+    )
+
+
+def test_final_answer_user_input_summary_do_not_become_evidence_backed_fact() -> None:
+    """final answer、user input 与 episode summary 都不得升级为 stable fact。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user-claim-like",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "revenue was 100 according to me"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-final-answer-claim-like",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "assistant says revenue was 100"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-summary-claim-like",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary says revenue was 100"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.evidence_backed_facts == ()
+    assert any(
+        item.item_kind is ConversationContinuityKind.ASSISTANT_CONCLUSION
+        and item.summary_text == "assistant says revenue was 100"
+        for item in snapshot.conversation_continuity.items
+    )
+    assert any(
+        item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+        and item.summary_text == "summary says revenue was 100"
+        for item in snapshot.conversation_continuity.items
     )
 
 
@@ -1170,8 +1547,8 @@ def test_current_goal_preserved_when_projecting_later_user_delta() -> None:
     )
 
 
-def test_tool_result_accepted_produces_verified_fact_with_refs() -> None:
-    """TOOL_RESULT_ACCEPTED 生成带 producer 与 provenance refs 的 verified fact。"""
+def test_tool_result_accepted_does_not_project_evidence_backed_fact() -> None:
+    """TOOL_RESULT_ACCEPTED 只推进 cursor，不直接生成 evidence-backed fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1187,31 +1564,13 @@ def test_tool_result_accepted_produces_verified_fact_with_refs() -> None:
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    fact = snapshot.verified_facts[0]
-    assert fact.fact_summary == "tool supplied neutral summary"
-    assert fact.claim_status is MemoryClaimStatus.TOOL_VERIFIED
-    assert fact.provenance.producer_kind is MemoryProducerKind.TOOL
-    assert fact.provenance.producer_name == "filing.lookup"
-    assert fact.provenance.event_id == "event-tool-result"
-    assert fact.provenance.event_sequence == 2
-    assert fact.provenance.run_id == "run-1"
-    assert fact.provenance.attempt_id == "attempt-1"
-    assert fact.provenance.execution_id == "execution-1"
-    assert fact.provenance.tool_result_ref == "event-tool-result"
-    assert fact.provenance.payload_ref == "payload-tool-1"
-    assert fact.provenance.digest_ref == _DIGEST_B
-    assert fact.evidence_anchor is not None
-    assert fact.evidence_anchor.ref_id == "payload:payload-tool-1"
-    assert any(
-        ref.ref_kind is HostNeutralRefKind.PAYLOAD
-        and ref.ref_id == "payload:payload-tool-1"
-        for ref in fact.provenance.source_refs
-    )
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
+    assert snapshot.cursor.checkpoint_event_id == "event-tool-result"
 
 
-def test_missing_tool_fact_summary_uses_neutral_fallback_diagnostic() -> None:
-    """缺失工具 fact summary 时使用中立 fallback 并记录 diagnostic。"""
+def test_missing_tool_fact_summary_does_not_use_neutral_fallback() -> None:
+    """缺失工具 fact summary 时不生成 fallback fact 或 diagnostic。"""
 
     snapshot = _build_snapshot(
         (
@@ -1224,19 +1583,12 @@ def test_missing_tool_fact_summary_uses_neutral_fallback_diagnostic() -> None:
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    fact = snapshot.verified_facts[0]
-    assert "tool_name=filing.lookup" in fact.fact_summary
-    assert "payload_ref=payload-tool-1" in fact.fact_summary
-    assert all(term not in fact.fact_summary for term in _FORBIDDEN_BUSINESS_TERMS)
-    assert tuple(diagnostic.reason for diagnostic in snapshot.diagnostics) == (
-        MemoryDiagnosticReason.MISSING_FACT_SUMMARY_FALLBACK,
-    )
-    assert snapshot.diagnostics[0].item_id == fact.item_id
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
 
 
-def test_missing_tool_name_uses_unknown_tool_producer() -> None:
-    """缺失 tool_name 时 TOOL producer 使用中立 unknown tool 名称。"""
+def test_missing_tool_name_does_not_project_unknown_tool_producer() -> None:
+    """缺失 tool_name 时也不从 TOOL_RESULT_ACCEPTED 生成 producer fact。"""
 
     payload = _tool_payload(summary=None)
     del payload["tool_name"]
@@ -1251,14 +1603,12 @@ def test_missing_tool_name_uses_unknown_tool_producer() -> None:
         )
     )
 
-    fact = snapshot.verified_facts[0]
-    assert fact.provenance.producer_kind is MemoryProducerKind.TOOL
-    assert fact.provenance.producer_name == "unknown_tool"
-    assert "tool_name=unknown_tool" in fact.fact_summary
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
 
 
-def test_invalid_source_refs_are_skipped_without_dropping_fact() -> None:
-    """Malformed source_refs 不应导致 TOOL_RESULT_ACCEPTED 投影失败。"""
+def test_invalid_source_refs_do_not_create_tool_result_fact() -> None:
+    """Malformed source_refs 不应导致 TOOL_RESULT_ACCEPTED 生成 fact。"""
 
     payload = _tool_payload(summary="summary with malformed refs")
     payload["source_refs"] = [
@@ -1276,10 +1626,8 @@ def test_invalid_source_refs_are_skipped_without_dropping_fact() -> None:
         )
     )
 
-    fact = snapshot.verified_facts[0]
-    assert fact.fact_summary == "summary with malformed refs"
-    assert any(ref.ref_id == "good-ref" for ref in fact.provenance.source_refs)
-    assert all(ref.ref_id != "bad-ref" for ref in fact.provenance.source_refs)
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
 
 
 def test_projection_ignores_reserved_claim_status_from_payload() -> None:
@@ -1300,9 +1648,6 @@ def test_projection_ignores_reserved_claim_status_from_payload() -> None:
 
     statuses = {
         item.claim_status
-        for item in snapshot.verified_facts
-    } | {
-        item.claim_status
         for item in snapshot.working_assumptions
     } | {
         item.claim_status
@@ -1311,11 +1656,11 @@ def test_projection_ignores_reserved_claim_status_from_payload() -> None:
     assert MemoryClaimStatus.CONFLICTED not in statuses
     assert MemoryClaimStatus.STALE not in statuses
     assert MemoryClaimStatus.SUPERSEDED not in statuses
-    assert statuses == {MemoryClaimStatus.TOOL_VERIFIED}
+    assert statuses == set()
 
 
 def test_episode_summary_does_not_replace_evidence_anchor() -> None:
-    """Episode summary 只是 continuity navigation，不替代工具 evidence anchor。"""
+    """Episode summary 只是 continuity navigation，不从 tool result 补 fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1337,9 +1682,7 @@ def test_episode_summary_does_not_replace_evidence_anchor() -> None:
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    assert snapshot.verified_facts[0].evidence_anchor is not None
-    assert snapshot.verified_facts[0].evidence_anchor.ref_id == "payload:payload-tool-1"
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     assert (
         snapshot.conversation_continuity.items[0].item_kind
@@ -1364,13 +1707,649 @@ def test_context_compacted_episode_summary_becomes_assumption_continuity() -> No
         )
     )
 
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     item = snapshot.conversation_continuity.items[0]
     assert item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
     assert item.claim_status is MemoryClaimStatus.ASSUMPTION
     assert item.producer_kind is MemoryProducerKind.HOST_PROJECTION
     assert item.summary_text == "accepted compact summary"
+
+
+def test_context_compacted_fact_candidates_materialize_evidence_backed_facts() -> None:
+    """accepted compact fact candidates 物化 claim_text 与 evidence_refs。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary with accepted fact",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="candidate-local-only",
+                            claim_text="Revenue increased based on canonical evidence.",
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert len(snapshot.evidence_backed_facts) == 1
+    fact = snapshot.evidence_backed_facts[0]
+    assert fact.claim_text == "Revenue increased based on canonical evidence."
+    assert fact.evidence_refs == ("evidence-1",)
+    assert fact.evidence_kind is EvidenceBackedFactKind.OBSERVED_VALUE
+    assert fact.provenance.event_id == "event-compact-fact"
+    assert fact.provenance.event_sequence == 1
+    assert fact.provenance.producer_kind is MemoryProducerKind.HOST_PROJECTION
+    assert fact.candidate_id == "candidate-local-only"
+    assert fact.candidate_id != fact.provenance.event_id
+
+
+def test_context_compacted_summary_can_reference_same_event_materialized_fact() -> None:
+    """compact summary fact refs 可覆盖同一 compact event 物化的新 facts。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-summary-fact-coverage",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary cites compact materialized fact",
+                    confirmed_fact_refs=("fact-candidate-coverage",),
+                    fact_candidates=[
+                        _fact_candidate(candidate_id="fact-candidate-coverage")
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert len(snapshot.evidence_backed_facts) == 1
+    assert snapshot.conversation_continuity.items[0].summary_text == (
+        "summary cites compact materialized fact"
+    )
+
+
+def test_compaction_confirmed_facts_do_not_drift_or_create_summary_fact() -> None:
+    """summary 引用 facts / evidence 时不得改写 facts 或自行建 fact。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-gross-margin-facts",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text=(
+                        "summary references revenue and gross profit facts"
+                    ),
+                    confirmed_fact_refs=("fact-revenue", "fact-gross-profit"),
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-revenue",
+                            claim_text="Revenue was 100.",
+                        ),
+                        _fact_candidate(
+                            candidate_id="fact-gross-profit",
+                            claim_text="Gross profit was 40.",
+                        ),
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert tuple(fact.candidate_id for fact in snapshot.evidence_backed_facts) == (
+        "fact-revenue",
+        "fact-gross-profit",
+    )
+    assert tuple(fact.claim_text for fact in snapshot.evidence_backed_facts) == (
+        "Revenue was 100.",
+        "Gross profit was 40.",
+    )
+    assert tuple(fact.evidence_refs for fact in snapshot.evidence_backed_facts) == (
+        ("evidence-1",),
+        ("evidence-1",),
+    )
+    assert len(snapshot.evidence_backed_facts) == 2
+    assert len(snapshot.conversation_continuity.items) == 1
+    summary = snapshot.conversation_continuity.items[0]
+    assert summary.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+    assert summary.claim_status is MemoryClaimStatus.ASSUMPTION
+    assert summary.summary_text == "summary references revenue and gross profit facts"
+
+
+def test_evidence_backed_fact_budget_keeps_latest_facts_and_records_diagnostic() -> None:
+    """max_evidence_backed_facts 保留最新 facts 并记录 budget diagnostic。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-fact-1",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary one",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-oldest",
+                            claim_text="oldest fact",
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-fact-2",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary two",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-kept-one",
+                            claim_text="kept fact one",
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-compact-fact-3",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary three",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-kept-two",
+                            claim_text="kept fact two",
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=_small_fact_budget_policy(),
+    )
+
+    assert tuple(fact.claim_text for fact in snapshot.evidence_backed_facts) == (
+        "kept fact one",
+        "kept fact two",
+    )
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+        and diagnostic.message == "evidence-backed facts limited by memory policy"
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_memory_projection_materializes_pinned_state_current_value_not_patch_log() -> None:
+    """compact 后 pinned state 只暴露当前物化值，不保留 patch log。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-goal-one",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="first goal compact",
+                    pinned_patch={
+                        "candidate_id": "patch-goal-one",
+                        "current_goal": {
+                            "operation": "replace",
+                            "value": "analyze revenue",
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-goal-two",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="second goal compact",
+                    pinned_patch={
+                        "candidate_id": "patch-goal-two",
+                        "current_goal": {
+                            "operation": "replace",
+                            "value": "analyze margin",
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.pinned_state.current_goal == "analyze margin"
+    assert snapshot.pinned_state.user_constraints == ()
+    assert all("analyze revenue" != item for item in snapshot.pinned_state.open_questions)
+
+
+def test_evidence_backed_fact_working_set_is_bounded_and_deterministic() -> None:
+    """fact working set 按 dedupe key 去重，并只保留 policy bounded 集合。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-duplicate-old",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="old duplicate",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-duplicate-old",
+                            claim_text="Revenue   was 100.",
+                            evidence_refs=("evidence-2", "evidence-1"),
+                        )
+                    ],
+                    canonical_evidence_refs=("evidence-1", "evidence-2"),
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-duplicate-new",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="new duplicate",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-duplicate-new",
+                            claim_text=" revenue was 100. ",
+                            evidence_refs=("evidence-1", "evidence-2"),
+                        )
+                    ],
+                    canonical_evidence_refs=("evidence-1", "evidence-2"),
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-compact-second-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="second fact",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-second",
+                            claim_text="Gross profit was 40.",
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=_small_fact_budget_policy(),
+    )
+
+    assert tuple(fact.candidate_id for fact in snapshot.evidence_backed_facts) == (
+        "fact-duplicate-new",
+        "fact-second",
+    )
+    assert tuple(
+        fact.provenance.event_sequence for fact in snapshot.evidence_backed_facts
+    ) == (2, 3)
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_SUPERSEDED
+        and diagnostic.item_id is not None
+        and "fact-duplicate-old" in diagnostic.item_id
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_episode_summaries_are_policy_bounded_not_append_only_rendered() -> None:
+    """episode summaries 只保留 policy bounded recent working set。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-summary-one",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary one"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-summary-two",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary two"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-compact-summary-three",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary three"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=4,
+                event_id="event-compact-summary-four",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary four"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    summaries = tuple(
+        item.summary_text
+        for item in snapshot.conversation_continuity.items
+        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+    )
+    assert summaries == ("summary three", "summary four")
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_minimum_preserve_expires_when_covered_by_stable_or_summary() -> None:
+    """minimum preserve 被后续 summary 覆盖后退出 continuity working set。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-preserve-before-summary",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="preserve producer",
+                    minimum_preserve_items=[
+                        _minimum_preserve_item(
+                            item_id="covered-preserve",
+                            source_refs=("event-input",),
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-covering-summary",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="covering summary"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert all(
+        item.item_kind is not ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
+        for item in snapshot.conversation_continuity.items
+    )
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.MINIMUM_PRESERVE_ITEM_COVERED
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_context_compacted_invalid_fact_candidates_record_diagnostic_only() -> None:
+    """invalid fact candidates 只产生 diagnostic，不合成 fallback fact。"""
+
+    payload = _compact_payload(
+        summary_text="summary with invalid fact candidate",
+        fact_candidates=[
+            _fact_candidate(
+                claim_text="Invalid evidence ref candidate.",
+                evidence_refs=("missing-evidence",),
+            )
+        ],
+    )
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-invalid-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=payload,
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.evidence_backed_facts == ()
+    assert any(
+        diagnostic.reason
+        is MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_invalid_fact_candidate_diagnostic_survives_durable_snapshot_write(
+    tmp_path: Path,
+) -> None:
+    """invalid fact candidate diagnostic 可通过 durable CHECK 并持久化。"""
+
+    policy = _policy()
+    consumer = ConversationMemoryProjectionConsumer(policy)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-compact-invalid-durable-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary with invalid durable fact candidate",
+                    fact_candidates=[
+                        _fact_candidate(
+                            claim_text="Invalid durable evidence ref candidate.",
+                            evidence_refs=("missing-evidence",),
+                        )
+                    ],
+                ),
+            )
+        )
+
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId(CONVERSATION_MEMORY_CONSUMER_ID),
+            limit=10,
+        )
+        read_back = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+
+        assert result.events_applied == 1
+        assert read_back is not None
+        assert read_back.snapshot.evidence_backed_facts == ()
+        assert any(
+            diagnostic.reason
+            is MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID
+            for diagnostic in read_back.snapshot.diagnostics
+        )
+
+
+def test_fact_candidate_error_does_not_mask_non_fact_candidate_error() -> None:
+    """fact candidate 错误不得掩盖 minimum preserve 等非 fact 字段错误。"""
+
+    payload = _compact_payload(
+        summary_text="summary with multiple invalid candidate fields",
+        fact_candidates=[
+            _fact_candidate(
+                claim_text="Invalid evidence ref candidate.",
+                evidence_refs=("missing-evidence",),
+            )
+        ],
+        minimum_preserve_items=[
+            _minimum_preserve_item(
+                text="x" * (MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS + 1)
+            )
+        ],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="minimum preserve text exceeds maximum length",
+    ):
+        _build_snapshot(
+            (
+                _memory_event(
+                    event_sequence=1,
+                    event_id="event-compact-invalid-non-fact",
+                    event_type="CONTEXT_COMPACTED",
+                    payload=payload,
+                    run_id="run-compact",
+                    attempt_id=None,
+                    execution_id=None,
+                ),
+            )
+        )
+
+
+def test_overlong_fact_candidate_records_diagnostic_without_fact() -> None:
+    """超长 claim_text 只记录 diagnostic，不进入 stable facts。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-overlong-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary with overlong fact",
+                    fact_candidates=[
+                        _fact_candidate(
+                            claim_text=(
+                                "x"
+                                * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1)
+                            )
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.evidence_backed_facts == ()
+    assert any(
+        diagnostic.reason
+        is MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_context_compacted_missing_fact_candidates_record_diagnostic_only() -> None:
+    """缺失 fact candidate 字段只产生 diagnostic，不回退生成 fact。"""
+
+    payload = _compact_payload(summary_text="summary without fact candidate field")
+    del payload["evidence_backed_fact_candidates"]
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-missing-fact-candidates",
+                event_type="CONTEXT_COMPACTED",
+                payload=payload,
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.evidence_backed_facts == ()
+    assert any(
+        diagnostic.reason
+        is MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_minimum_preserve_candidates_create_continuity_items_only() -> None:
+    """minimum preserve candidates 只物化 continuity，不产生 facts。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-minimum-preserve",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary with minimum preserve",
+                    minimum_preserve_items=[
+                        _minimum_preserve_item(
+                            label="second factor",
+                            text="Keep reference to the second factor.",
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.evidence_backed_facts == ()
+    preserve_items = tuple(
+        item
+        for item in snapshot.conversation_continuity.items
+        if item.item_kind is ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
+    )
+    assert len(preserve_items) == 1
+    assert preserve_items[0].summary_text == "Keep reference to the second factor."
+    assert preserve_items[0].label == "second factor"
+    assert preserve_items[0].source_refs == ("event-input",)
+    assert (
+        preserve_items[0].preserve_reason
+        is MinimumPreserveReason.NEEDED_FOR_LOCAL_FOLLOWUP
+    )
 
 
 def test_context_compacted_pinned_patch_updates_clears_and_preserves() -> None:
@@ -1492,8 +2471,8 @@ def test_context_compacted_rejects_free_form_confirmed_subject_patch() -> None:
         )
 
 
-def test_context_compacted_summary_fact_refs_do_not_create_verified_facts() -> None:
-    """summary 可引用已有工具事实，但不能新建 verified fact。"""
+def test_context_compacted_summary_fact_refs_do_not_create_evidence_backed_facts() -> None:
+    """summary fact refs 不会让 TOOL_RESULT_ACCEPTED 直接生成 fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1509,7 +2488,6 @@ def test_context_compacted_summary_fact_refs_do_not_create_verified_facts() -> N
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
                     summary_text="summary cites tool fact",
-                    confirmed_fact_refs=("event-tool-for-summary",),
                 ),
                 run_id="run-compact",
                 attempt_id=None,
@@ -1518,8 +2496,7 @@ def test_context_compacted_summary_fact_refs_do_not_create_verified_facts() -> N
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    assert snapshot.verified_facts[0].provenance.event_id == "event-tool-for-summary"
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     assert snapshot.conversation_continuity.items[0].summary_text == (
         "summary cites tool fact"
@@ -1677,6 +2654,48 @@ def test_recent_raw_turns_floor_zero_keeps_no_raw_floor() -> None:
     assert continuity_texts == ("u3",)
 
 
+def test_recent_raw_turns_support_followup_without_becoming_stable_fact() -> None:
+    """recent raw turns 可支持未 compact 追问，但 compact 后不是真源事实。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user-raw-fact-like",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "the second factor is margin"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-no-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="navigation only",
+                    minimum_preserve_items=[
+                        _minimum_preserve_item(text="the second factor")
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.evidence_backed_facts == ()
+    assert any(
+        item.item_kind is ConversationContinuityKind.RAW_USER_TURN
+        and item.summary_text == "the second factor is margin"
+        for item in snapshot.conversation_continuity.items
+    )
+    assert any(
+        item.item_kind is ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
+        for item in snapshot.conversation_continuity.items
+    )
+
+
 def test_unknown_event_type_records_diagnostic_and_advances_cursor() -> None:
     """未知 event type 不应静默忽略，且 snapshot cursor 覆盖该事件。"""
 
@@ -1695,7 +2714,7 @@ def test_unknown_event_type_records_diagnostic_and_advances_cursor() -> None:
     )
 
     assert snapshot.cursor.checkpoint_event_sequence == 7
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert snapshot.conversation_continuity.items == ()
     assert len(snapshot.diagnostics) == 1
     assert (
@@ -1709,7 +2728,7 @@ def test_unknown_event_type_records_diagnostic_and_advances_cursor() -> None:
 
 
 def test_snapshot_rebuild_preserves_provenance_and_digest_is_deterministic() -> None:
-    """固定 events 与 policy rebuild 后 provenance 不丢且 digest 稳定。"""
+    """固定 events 与 policy rebuild 后 digest 稳定且不投影 tool result fact。"""
 
     events = (
         _memory_event(
@@ -1738,8 +2757,8 @@ def test_snapshot_rebuild_preserves_provenance_and_digest_is_deterministic() -> 
     )
 
     assert first.snapshot_digest == second.snapshot_digest
-    assert first.verified_facts[0].provenance == second.verified_facts[0].provenance
-    assert first.verified_facts[0].provenance.payload_ref == "payload-tool-1"
+    assert first.evidence_backed_facts == ()
+    assert second.evidence_backed_facts == ()
     assert first.cursor.checkpoint_event_sequence == 2
     assert second.cursor.checkpoint_event_sequence == 2
 
@@ -1799,9 +2818,7 @@ def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
 
         assert result.events_applied == 3
         assert read_back is not None
-        assert read_back.snapshot.verified_facts[0].fact_summary == (
-            "durable tool summary"
-        )
+        assert read_back.snapshot.evidence_backed_facts == ()
         assert read_back.snapshot.pinned_state.current_goal == "durable compact goal"
         assert tuple(
             item.summary_text
@@ -1811,6 +2828,184 @@ def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
         assert read_back.snapshot.cursor.checkpoint_event_sequence == 3
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == 3
+
+
+def test_durable_roundtrip_uses_evidence_backed_facts_and_item_kind(
+    tmp_path: Path,
+) -> None:
+    """durable snapshot roundtrip 使用 evidence_backed_facts 与新 item kind。"""
+
+    policy = _policy()
+    consumer = ConversationMemoryProjectionConsumer(policy)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-compact-durable-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="durable compact fact summary",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="durable-fact-candidate",
+                            claim_text="Durable fact claim.",
+                        )
+                    ],
+                    minimum_preserve_items=[
+                        _minimum_preserve_item(
+                            item_id="durable-minimum-preserve",
+                            label="durable continuity",
+                            text="Durable minimum preserve continuity.",
+                        )
+                    ],
+                ),
+            )
+        )
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId(CONVERSATION_MEMORY_CONSUMER_ID),
+            limit=10,
+        )
+
+        read_back = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+        row = store.transaction_runner.run_read(
+            lambda transaction: transaction.fetchone(
+                f"""
+                SELECT snapshot_json
+                FROM {TABLE_HOST_MEMORY_SNAPSHOTS}
+                WHERE snapshot_id = ?
+                """,
+                (
+                    "" if read_back is None else read_back.snapshot.snapshot_id,
+                ),
+            )
+        )
+        fact_item_kind = store.transaction_runner.run_read(
+            lambda transaction: transaction.fetchone(
+                f"""
+                SELECT item_kind
+                FROM {TABLE_HOST_MEMORY_ITEMS}
+                WHERE snapshot_id = ?
+                  AND item_kind = ?
+                """,
+                (
+                    "" if read_back is None else read_back.snapshot.snapshot_id,
+                    "evidence_backed_fact",
+                ),
+            )
+        )
+        minimum_preserve_item_kind = store.transaction_runner.run_read(
+            lambda transaction: transaction.fetchone(
+                f"""
+                SELECT item_kind
+                FROM {TABLE_HOST_MEMORY_ITEMS}
+                WHERE snapshot_id = ?
+                  AND item_kind = ?
+                """,
+                (
+                    "" if read_back is None else read_back.snapshot.snapshot_id,
+                    "minimum_preserve_item",
+                ),
+            )
+        )
+
+        assert read_back is not None
+        assert len(read_back.snapshot.evidence_backed_facts) == 1
+        assert read_back.snapshot.evidence_backed_facts[0].claim_text == (
+            "Durable fact claim."
+        )
+        assert any(
+            item.item_kind is ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
+            and item.summary_text == "Durable minimum preserve continuity."
+            for item in read_back.snapshot.conversation_continuity.items
+        )
+        assert row is not None
+        snapshot_json = row.get("snapshot_json")
+        assert isinstance(snapshot_json, str)
+        assert "evidence_backed_facts" in snapshot_json
+        assert "verified_facts" not in snapshot_json
+        assert fact_item_kind is not None
+        assert fact_item_kind.get("item_kind") == "evidence_backed_fact"
+        assert minimum_preserve_item_kind is not None
+        assert (
+            minimum_preserve_item_kind.get("item_kind")
+            == "minimum_preserve_item"
+        )
+
+
+def test_old_snapshot_verified_facts_key_fails_closed() -> None:
+    """旧 verified_facts snapshot JSON key 必须明确失败。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user-old-key",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "user"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+    value = conversation_memory_snapshot_to_json_value(snapshot)
+    assert isinstance(value, dict)
+    value["verified_facts"] = []
+
+    with pytest.raises(ValueError, match="old verified_facts snapshot key"):
+        conversation_memory_snapshot_from_json_value(value)
+
+
+def test_old_durable_verified_fact_item_kind_fails_closed(tmp_path: Path) -> None:
+    """旧 durable item kind verified_fact 必须明确失败。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-old-kind",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary",
+                    fact_candidates=[_fact_candidate()],
+                ),
+            ),
+        )
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-compact-old-kind",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary",
+                    fact_candidates=[_fact_candidate()],
+                ),
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: write_memory_snapshot_with_checkpoint(
+                transaction,
+                snapshot,
+                now=_NOW,
+            )
+        )
+        store.transaction_runner.run_write(
+            _ForceOldVerifiedFactItemKindOperation(snapshot.snapshot_id)
+        )
+
+        with pytest.raises(
+            HostDurableError,
+            match="old durable memory item kind verified_fact",
+        ):
+            store.transaction_runner.run_read(
+                _ReadLatestSnapshotOperation(
+                    digest_memory_projection_policy(_policy())
+                )
+            )
 
 
 def test_memory_projection_filter_includes_compacted_but_not_failed() -> None:
@@ -1885,7 +3080,7 @@ def test_preview_reasoning_and_display_only_events_do_not_enter_memory(
         assert result.events_matched == 1
         assert read_back is not None
         assert read_back.snapshot.pinned_state.current_goal == "canonical user fact"
-        assert read_back.snapshot.verified_facts == ()
+        assert read_back.snapshot.evidence_backed_facts == ()
         assert tuple(
             item.summary_text
             for item in read_back.snapshot.conversation_continuity.items
@@ -2061,13 +3256,7 @@ def test_rebuild_conversation_memory_projection_is_stable_and_does_not_append_ev
         assert first_snapshot.snapshot.snapshot_digest == (
             second_snapshot.snapshot.snapshot_digest
         )
-        assert first_snapshot.snapshot.verified_facts[0].provenance.event_id == (
-            "event-tool-rebuild-service"
-        )
-        assert first_snapshot.snapshot.verified_facts[0].provenance.event_sequence == 1
-        assert first_snapshot.snapshot.verified_facts[0].provenance.payload_ref == (
-            "payload-tool-1"
-        )
+        assert first_snapshot.snapshot.evidence_backed_facts == ()
         assert before_count == after_count
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == (

@@ -78,10 +78,9 @@ from dayu.host.tool_runtime import (
 )
 from dayu.host.tooling import (
     HostToolingOptions,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.wait_adapter import (
     WaitAdapterBinding,
     WaitAdapterRegistry,
@@ -103,7 +102,7 @@ _RESUME_TOKEN = "external-job-phase7-integration"
 _TOOL_NAME = "awaiting_tool"
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -198,7 +197,7 @@ class _HoldingWorkerHandle:
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -485,7 +484,7 @@ def _awaiting_tool_request(seeded: _SeededWaitingRun) -> BatchToolExecutionReque
             session_id=seeded.session_id,
             iteration_id=_ITERATION_ID,
             timeout_seconds=10.0,
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=_OpenCancellationToken(),
             correlation_id="phase7-waiting-integration",
         ),
     )

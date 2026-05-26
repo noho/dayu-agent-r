@@ -87,10 +87,9 @@ from dayu.host.run_input import PolicySnapshot, create_tool_enabled_run_input_bu
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _ITERATION_ID = "iteration-phase6-toolruntime"
@@ -109,7 +108,7 @@ class _SeededRun:
     dispatch_record_id: str
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -528,7 +527,7 @@ def _tool_request(
             session_id=seeded.session_id,
             iteration_id=_ITERATION_ID,
             timeout_seconds=10.0,
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=_OpenCancellationToken(),
             correlation_id="correlation-fetch-more",
         ),
     )
@@ -631,7 +630,7 @@ def _snapshot(seeded: _SeededRun) -> AttemptDispatchSnapshot:
         dispatch_record_id=seeded.dispatch_record_id,
         execution_target="target-phase6",
         policy_snapshot_ref="phase6-policy",
-        cancellation_token=_NeverCancelledToken(),
+        cancellation_token=_OpenCancellationToken(),
     )
 
 

@@ -649,12 +649,12 @@ class LocalWorkerHandle(Protocol):
 
         ...
 
-    def cancel(self, reason: str) -> None:
-        """向 worker 发起 best-effort 取消。
+    def on_cancel(self, reason: str) -> None:
+        """在 Host 已发出取消信号后通知 worker handle。
 
         :param reason: 取消原因。
         :returns: ``None``。
-        :raises RuntimeError: 具体实现取消失败时可抛出运行时错误。
+        :raises RuntimeError: 具体实现处理取消通知失败时可抛出运行时错误。
         """
 
         ...
@@ -925,12 +925,20 @@ class CompactorRunnerBaseline:
 
     :param compactor_runner_spec: compactor 独立 Runner 规约。
     :param compactor_runner_options: compactor 独立 Runner 调用参数。
+    :param compactor_agent_policy: compactor 独立 Agent policy。
+    :param compactor_system_prompt: Service 从 compactor scene 装配的
+        system prompt。
+    :param compactor_user_prompt_template: Service 从 compactor baseline 指定
+        prompt asset 装配的 user prompt template。
     :param compact_artifact_root: compact artifact 写入根目录。
     :param compact_artifact_create_parent_dirs: artifact 根目录缺失时是否创建。
     """
 
     compactor_runner_spec: RunnerSpec
     compactor_runner_options: RunnerCallOptions
+    compactor_agent_policy: AgentPolicy
+    compactor_system_prompt: str
+    compactor_user_prompt_template: str
     compact_artifact_root: pathlib.Path
     compact_artifact_create_parent_dirs: bool = True
 
@@ -951,6 +959,19 @@ class CompactorRunnerBaseline:
                 "CompactorRunnerBaseline.compactor_runner_options must be "
                 "RunnerCallOptions"
             )
+        if not isinstance(self.compactor_agent_policy, AgentPolicy):
+            raise TypeError(
+                "CompactorRunnerBaseline.compactor_agent_policy must be "
+                "AgentPolicy"
+            )
+        _require_non_empty(
+            self.compactor_system_prompt,
+            field_name="CompactorRunnerBaseline.compactor_system_prompt",
+        )
+        _require_non_empty(
+            self.compactor_user_prompt_template,
+            field_name="CompactorRunnerBaseline.compactor_user_prompt_template",
+        )
         _require_path(
             self.compact_artifact_root,
             field_name="CompactorRunnerBaseline.compact_artifact_root",

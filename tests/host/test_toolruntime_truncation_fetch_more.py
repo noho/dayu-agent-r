@@ -50,9 +50,8 @@ from dayu.host.tool_runtime import (
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 
 _SESSION_ID = "session-truncation"
@@ -65,7 +64,7 @@ _DEFAULT_TEXT_CHARS_LIMIT = 8
 _DEFAULT_TTL_SECONDS = 30
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -605,7 +604,7 @@ def _request(*calls: ToolCallRequest) -> BatchToolExecutionRequest:
             session_id=_SESSION_ID,
             iteration_id=_ITERATION_ID,
             timeout_seconds=10.0,
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=_OpenCancellationToken(),
             correlation_id="correlation-truncation",
         ),
     )

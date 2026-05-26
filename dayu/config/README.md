@@ -82,9 +82,9 @@ dayu/config/
 - `context_window_class`：profile 面向的上下文窗口分档，当前只允许 `256k` 与 `1m`。
 - `min_context_window_tokens`：profile 要求的最小模型上下文窗口 token 数，`256k` 为 `262144`，`1m` 为 `1000000`。
 - `run_baseline`：普通 Run 默认 `model_id` 与 `runner_option_hint_id`。
-- `compactor_baseline`：compactor 默认 `model_id`、`runner_option_hint_id` 与 `artifact_root`。
+- `compactor_baseline`：compactor 默认 `model_id`、`scene_id`、`runner_option_hint_id`、`user_prompt_template_path` 与 `artifact_root`。
 - `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
-- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
+- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`，其中 `max_evidence_backed_facts` 限制 stable evidence-backed facts 的数量。
 - `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
 
@@ -154,6 +154,10 @@ provider 字段：
 Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取、拼接或渲染 scene manifest。`prompts/tasks/`、contract 文件、workflow 产物和未被 scene manifest 直接引用的模板不属于当前包内默认资产范围。
 
 Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
+
+`conversation_compaction` 是 Host-owned compactor 的专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为 Host runtime request 数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
+
+Service assembly 不硬编码 compactor scene 名或 user template 路径；它从当前 execution profile 的 `compactor_baseline.scene_id` 读取 scene id，通过 ScenePrepare 装配 system prompt 与 AgentPolicy，并从 `compactor_baseline.user_prompt_template_path` 读取 user prompt template。
 
 `model` 只使用 `default_model_id` 与 `runner_option_hint_id`。`agent_policy` 是可选 typed override block，只允许覆盖 `max_iterations`、`continuation_max_attempts`、`allow_tool_calls`、`tool_execution_timeout_seconds`、`fallback_mode`、`fallback_prompt`、`continuation_prompt` 与 `max_consecutive_failed_tool_batches`。旧 `conversation`、泛化 `runtime`、`model.default_name`、`model.temperature_profile` 与 `prompt_mt` scene 均不属于当前 schema。
 

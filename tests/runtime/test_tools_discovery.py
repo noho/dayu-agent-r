@@ -190,6 +190,23 @@ def _entry_point_provider(
     )
 
 
+def _blank_identity_provider(
+    spec: ToolsDiscoveryProviderSpec,
+) -> ToolsDiscoveryProviderOutput:
+    """空身份解析测试 provider。
+
+    :param spec: provider 显式配置。
+    :returns: provider 输出。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _output(
+        provider_id="  ",
+        source_id=spec.spec_id,
+        tool_names=("blank_identity_tool",),
+    )
+
+
 def test_fake_provider_callable_aggregation_success() -> None:
     """已解析 provider callable 可以聚合为 ``ToolBundle`` 与 provider report。"""
 
@@ -321,6 +338,24 @@ def test_duplicate_provider_identity_fails() -> None:
             (
                 ToolsDiscoveryProviderBinding(spec=_spec("left"), provider=left),
                 ToolsDiscoveryProviderBinding(spec=_spec("right"), provider=right),
+            )
+        )
+
+
+def test_empty_provider_identity_fails_inside_output_validation() -> None:
+    """provider 输出身份为空必须在输出校验阶段失败。
+
+    :returns: ``None``。
+    :raises AssertionError: 空 provider identity 未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ToolsDiscoveryError, match="provider identity"):
+        ToolsDiscovery().discover_from_bindings(
+            (
+                ToolsDiscoveryProviderBinding(
+                    spec=_spec("blank"),
+                    provider=_blank_identity_provider,
+                ),
             )
         )
 

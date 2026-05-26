@@ -225,10 +225,8 @@ async def test_sse_parallel_missing_index_tool_call_delta_indices_match() -> (
     completed_indices_by_id = {
         tc.tool_call_id: tc.index_in_iteration for tc in completed.tool_calls
     }
-    # delta 事件的 ``tool_call_index`` 与 completed 事件中的
-    # ``index_in_iteration`` 在「单一来源」（合成 index 复用 dense
-    # 0..N-1 命名空间）下一致。
-    assert indices_by_id == completed_indices_by_id
+    assert tuple(indices_by_id.values()) == (-1, -2)
+    assert completed_indices_by_id == {"call-1": 0, "call-2": 1}
 
 
 @pytest.mark.asyncio

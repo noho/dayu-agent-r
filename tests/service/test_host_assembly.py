@@ -8,22 +8,55 @@ from pathlib import Path
 
 import pytest
 
-from dayu.contracts import JsonValue
-from dayu.engine import AgentFallbackMode
-from dayu.host import FollowupBehavior, HostCallContext, OperationContext
-from dayu.host.api import AuthorizationClaim
+from dayu.contracts import (
+    BatchToolExecutionContext,
+    JsonValue,
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolBundle,
+    ToolBundleSourceKind,
+    ToolCallRequest,
+    ToolCancelledOutcome,
+    ToolDefinition,
+    ToolExecutionOutcome,
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+)
+from dayu.engine import AgentFallbackMode, AgentPolicy
+from dayu.host.api import (
+    AuthorizationClaim,
+    FollowupBehavior,
+    HostCallContext,
+    OperationContext,
+)
 from dayu.runtime.config_loader import ConfigLoader
-from dayu.runtime.location import resolve_runtime_locations
+from dayu.runtime.config_loader import (
+    ToolDiscoveryEntryPointConfig,
+    ToolDiscoveryProviderConfig,
+)
+from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
 from dayu.runtime.assembly import RuntimeAssemblySelectionError
 from dayu.runtime.scene_prepare import (
+    PreparedSceneInputs,
+    SceneAgentFallbackMode,
+    SceneAgentPolicyOverride,
     ScenePrepareRequest,
     SceneToolCatalog,
+    SceneToolSelectionMode,
+    SceneToolSelectionResult,
     prepare_scene,
 )
 from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
     ServiceOpenHostAssemblyRequest,
     _agent_fallback_mode_from_config,
+    _compactor_agent_policy_from_scene_inputs,
+    _compactor_prompts_from_scene_inputs,
+    _render_headers,
+    _resolve_prompt_asset_path,
+    _resolve_project_path,
+    _tool_discovery_specs,
+    _tooling_options_from_discovery,
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
@@ -31,9 +64,29 @@ from dayu.service.host_assembly import (
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _SCENE_ID = "smoke_host_public_multiturn"
+_CUSTOM_COMPACTOR_SCENE_ID = "custom_compactor_scene"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+
+
+def _complete_compactor_agent_policy_override() -> SceneAgentPolicyOverride:
+    """构造完整 compactor scene AgentPolicy override。
+
+    :returns: 完整的 scene agent policy override。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return SceneAgentPolicyOverride(
+        max_iterations=1,
+        continuation_max_attempts=0,
+        allow_tool_calls=False,
+        tool_execution_timeout_seconds=1.0,
+        fallback_mode=SceneAgentFallbackMode.RAISE_ERROR,
+        fallback_prompt="Compactor is not allowed to fallback-answer.",
+        continuation_prompt="Continue strict JSON.",
+        max_consecutive_failed_tool_batches=1,
+    )
 
 
 def test_compose_open_host_options_uses_runtime_tuning_from_config(
@@ -95,13 +148,36 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.payload_inline_threshold_bytes == 2048
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
+    assert result.options.memory_projection_policy.max_evidence_backed_facts == 256
     assert result.options.ordinary_run_baseline.runner_spec.headers[
         "Authorization"
     ] == f"Bearer {_API_KEY}"
     assert result.options.ordinary_run_baseline.runner_options.max_tokens is None
     compactor_baseline = result.options.compactor_runner_baseline
     assert compactor_baseline is not None
+    assert compactor_baseline.compactor_runner_options.temperature == 0.4
     assert compactor_baseline.compactor_runner_options.max_tokens is None
+    assert compactor_baseline.compactor_runner_options.top_p == 1.0
+    assert compactor_baseline.compactor_runner_options.stream is False
+    assert compactor_baseline.compactor_agent_policy == AgentPolicy(
+        max_iterations=1,
+        continuation_max_attempts=0,
+        allow_tool_calls=False,
+        tool_execution_timeout_seconds=1.0,
+        fallback_mode=AgentFallbackMode.RAISE_ERROR,
+        fallback_prompt="Compactor is not allowed to fallback-answer.",
+        continuation_prompt=(
+            "Continue the strict JSON object without repeating content "
+            "already emitted."
+        ),
+        max_consecutive_failed_tool_batches=1,
+    )
+    assert "Host-owned context compaction" in (
+        compactor_baseline.compactor_system_prompt
+    )
+    assert "<<compaction_request>>" in (
+        compactor_baseline.compactor_user_prompt_template
+    )
     assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
     assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
     assert result.diagnostics.model_source == "run_override"
@@ -118,6 +194,88 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.diagnostics.tool_selection == (
         "mode=select,tools=record_smoke_fact"
     )
+
+
+def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
+    tmp_path: Path,
+) -> None:
+    """Service helper 必须从 compactor_baseline 读取 compactor scene id。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: helper 仍使用硬编码 compactor scene 时抛出。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = discover_service_tools(config)
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "service-assembly-test",
+            },
+            available_tools=SceneToolCatalog.from_tool_bundle(
+                discovered_tools.tool_bundle
+            ),
+        )
+    )
+    custom_locations = _custom_compactor_scene_locations(tmp_path)
+    profile = config.execution_profiles.execution_profiles["standard-256k"]
+    custom_profile = replace(
+        profile,
+        compactor_baseline=replace(
+            profile.compactor_baseline,
+            scene_id=_CUSTOM_COMPACTOR_SCENE_ID,
+            user_prompt_template_path="scenes/custom_compactor_user.md",
+        ),
+    )
+    custom_profiles = dict(config.execution_profiles.execution_profiles)
+    custom_profiles["standard-256k"] = custom_profile
+    custom_config = replace(
+        config,
+        execution_profiles=replace(
+            config.execution_profiles,
+            execution_profiles=custom_profiles,
+        ),
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=custom_config,
+            locations=custom_locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    compactor_baseline = result.options.compactor_runner_baseline
+    assert compactor_baseline is not None
+    assert compactor_baseline.compactor_system_prompt == (
+        "custom compactor system prompt"
+    )
+    assert compactor_baseline.compactor_user_prompt_template == (
+        "custom compactor user prompt <<compaction_request>>"
+    )
+    assert compactor_baseline.compactor_agent_policy.max_iterations == 1
+    assert compactor_baseline.compactor_agent_policy.allow_tool_calls is False
 
 
 def test_compose_submit_followup_request_uses_prepared_system_prompt(
@@ -169,6 +327,105 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
     assert request.tool_names == frozenset({"record_smoke_fact"})
 
 
+def test_compactor_prompt_scene_requires_one_system_fragment() -> None:
+    """Compactor scene prompt 必须只提供 system prompt fragment。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未 fail-fast 时抛出。
+    """
+
+    scene_inputs = PreparedSceneInputs(
+        system_messages=("system", "extra"),
+        system_prompt="system\n\nextra",
+        tool_selection=SceneToolSelectionResult(
+            mode=SceneToolSelectionMode.NONE,
+            tool_names=frozenset(),
+        ),
+        model_hints=None,
+        agent_policy_override=None,
+        fragment_refs=(),
+        source_refs=(),
+        content_digest="sha256:test",
+        capability_tags=(),
+    )
+
+    with pytest.raises(ValueError, match="one system prompt"):
+        _compactor_prompts_from_scene_inputs(
+            scene_inputs,
+            user_prompt_template="user <<compaction_request>>",
+        )
+
+
+def test_compactor_prompt_scene_requires_agent_policy() -> None:
+    """Compactor scene 必须声明完整 AgentPolicy。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未 fail-fast 时抛出。
+    """
+
+    scene_inputs = PreparedSceneInputs(
+        system_messages=("system",),
+        system_prompt="system",
+        tool_selection=SceneToolSelectionResult(
+            mode=SceneToolSelectionMode.NONE,
+            tool_names=frozenset(),
+        ),
+        model_hints=None,
+        agent_policy_override=None,
+        fragment_refs=(),
+        source_refs=(),
+        content_digest="sha256:test",
+        capability_tags=(),
+    )
+
+    with pytest.raises(ValueError, match="agent_policy"):
+        _compactor_prompts_from_scene_inputs(
+            scene_inputs,
+            user_prompt_template="user <<compaction_request>>",
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    (
+        (
+            replace(_complete_compactor_agent_policy_override(), max_iterations=None),
+            "max_iterations",
+        ),
+        (
+            replace(
+                _complete_compactor_agent_policy_override(),
+                fallback_mode=None,
+            ),
+            "fallback_mode",
+        ),
+        (
+            replace(
+                _complete_compactor_agent_policy_override(),
+                max_consecutive_failed_tool_batches=None,
+            ),
+            "max_consecutive_failed_tool_batches",
+        ),
+    ),
+)
+def test_compactor_agent_policy_requires_selected_fields(
+    override: SceneAgentPolicyOverride,
+    message: str,
+) -> None:
+    """Compactor scene AgentPolicy 缺必填字段时必须 fail-fast。
+
+    :param override: 被测 scene agent policy override。
+    :param message: 预期错误消息片段。
+    :returns: ``None``。
+    :raises AssertionError: helper 未拒绝缺失必填字段时抛出。
+    """
+
+    scene_inputs = _compactor_scene_inputs(agent_policy_override=override)
+
+    with pytest.raises(ValueError, match=message):
+        _compactor_agent_policy_from_scene_inputs(scene_inputs)
+
+
 def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
     """fallback mode 映射复用 Engine enum 原生值校验。
 
@@ -187,6 +444,145 @@ def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
     )
     with pytest.raises(ValueError):
         _agent_fallback_mode_from_config("unsupported")
+
+
+@pytest.mark.parametrize("env", ({}, {"DEEPSEEK_API_KEY": "   "}))
+def test_render_headers_requires_api_key_env(env: dict[str, str]) -> None:
+    """Header 渲染必须拒绝缺失或空白 API key。
+
+    :param env: 测试用 env 映射。
+    :returns: ``None``。
+    :raises AssertionError: 缺失或空白 secret 未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="missing env DEEPSEEK_API_KEY"):
+        _render_headers(
+            {"Authorization": "Bearer {{DEEPSEEK_API_KEY}}"},
+            api_key_ref="DEEPSEEK_API_KEY",
+            env=env,
+        )
+
+
+def test_render_headers_rejects_unresolved_placeholder() -> None:
+    """Header 渲染必须拒绝未解析 env 占位符。
+
+    :returns: ``None``。
+    :raises AssertionError: 未解析占位符未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="unresolved env placeholder"):
+        _render_headers(
+            {"Authorization": "Bearer {{DEEPSEEK_API_KEY}} {{OTHER_KEY}}"},
+            api_key_ref="DEEPSEEK_API_KEY",
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured_path", "message"),
+    (
+        ("", "must not be empty"),
+        ("/tmp/dayu-prompt.md", "must be relative"),
+        ("../outside.md", "escapes prompt asset root"),
+    ),
+)
+def test_resolve_prompt_asset_path_rejects_invalid_paths(
+    tmp_path: Path,
+    configured_path: str,
+    message: str,
+) -> None:
+    """Prompt asset path 必须是非空且不逃逸根目录的相对路径。
+
+    :param tmp_path: pytest 临时目录。
+    :param configured_path: 被测配置路径。
+    :param message: 预期错误消息片段。
+    :returns: ``None``。
+    :raises AssertionError: 非法路径未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match=message):
+        _resolve_prompt_asset_path(
+            tmp_path,
+            configured_path,
+            field_name="test.prompt_path",
+        )
+
+
+def test_tooling_options_from_discovery_empty_bundle_returns_none() -> None:
+    """空工具 bundle 不装配 HostToolingOptions。
+
+    :returns: ``None``。
+    :raises AssertionError: 空 bundle 返回非空 tooling options 时抛出。
+    """
+
+    result = _tooling_options_from_discovery(
+        tool_bundle=ToolBundle(definitions=()),
+        source_refs=(),
+    )
+
+    assert result is None
+
+
+def test_tooling_options_from_discovery_requires_source_refs() -> None:
+    """非空工具 bundle 必须携带 source refs。
+
+    :returns: ``None``。
+    :raises AssertionError: 缺少 source refs 未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="source refs"):
+        _tooling_options_from_discovery(
+            tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_fact"),)),
+            source_refs=(),
+        )
+
+
+def test_tool_discovery_specs_requires_provider_location() -> None:
+    """工具发现 provider 必须声明 import_path 或 entry_point。
+
+    :returns: ``None``。
+    :raises AssertionError: 缺少 provider 解析位置未 fail-fast 时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="missing-location",
+        import_path=None,
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.CONFIG_BINDING,
+        source_id="missing-location",
+        enabled=True,
+        allow_empty=False,
+    )
+
+    with pytest.raises(ValueError, match="import_path or entry_point"):
+        _tool_discovery_specs((provider,))
+
+
+def test_tool_discovery_specs_uses_entry_point_location() -> None:
+    """工具发现 provider 可以使用 entry point 位置。
+
+    :returns: ``None``。
+    :raises AssertionError: entry point 未映射为 discovery spec 时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="entry-provider",
+        import_path=None,
+        entry_point=ToolDiscoveryEntryPointConfig(
+            group="dayu.test_tools",
+            name="provider",
+        ),
+        source_kind=ToolBundleSourceKind.PACKAGE_ENTRYPOINT,
+        source_id="dayu.test_tools:provider",
+        enabled=True,
+        allow_empty=False,
+    )
+
+    specs = _tool_discovery_specs((provider,))
+
+    assert len(specs) == 1
+    assert specs[0].spec_id == "entry-provider"
+    assert specs[0].enabled is True
 
 
 def test_truncation_manager_enabled_is_derived_from_execution_profile(
@@ -368,6 +764,21 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
     )
 
 
+def test_resolve_project_path_rejects_relative_escape(tmp_path: Path) -> None:
+    """Service project path 相对配置不得逃逸 workspace root。"""
+
+    with pytest.raises(ValueError, match="escapes workspace root"):
+        _resolve_project_path(tmp_path, "../outside.sqlite3")
+
+
+def test_resolve_project_path_keeps_absolute_path(tmp_path: Path) -> None:
+    """Service project path 绝对路径保持原有语义。"""
+
+    absolute_path = tmp_path.parent / "outside.sqlite3"
+
+    assert _resolve_project_path(tmp_path, str(absolute_path)) == absolute_path
+
+
 def _write_tool_discovery_overlay(workspace_root: Path) -> None:
     """写入启用 smoke provider 的 workspace tool discovery overlay。
 
@@ -466,7 +877,11 @@ def _write_execution_profile_overlay(
                     },
                     "compactor_baseline": {
                         "model_id": model_id,
+                        "scene_id": "conversation_compaction",
                         "runner_option_hint_id": "conversation_compaction",
+                        "user_prompt_template_path": (
+                            "scenes/conversation_compaction_user.md"
+                        ),
                         "artifact_root": "workspace/.dayu/artifacts/compaction",
                     },
                     "context_budget_policy": {
@@ -479,7 +894,7 @@ def _write_execution_profile_overlay(
                     },
                     "memory_projection_policy": {
                         "max_pinned_items": 32,
-                        "max_verified_facts": 256,
+                        "max_evidence_backed_facts": 256,
                         "max_working_assumptions": 128,
                         "recent_raw_turns_floor": 4,
                         "raw_turn_context_ratio": 0.02,
@@ -526,6 +941,79 @@ def _write_execution_profile_overlay(
     )
 
 
+def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
+    """写入只包含自定义 compactor scene 的 prompt 根目录。
+
+    :param workspace_root: pytest 临时 workspace root。
+    :returns: 指向自定义 prompt 根目录的 RuntimeLocations。
+    :raises OSError: 测试 prompt 文件写入失败时抛出。
+    """
+
+    prompt_root = workspace_root / "custom-prompts"
+    manifest_root = prompt_root / "manifests"
+    scene_root = prompt_root / "scenes"
+    _write_json(
+        manifest_root / f"{_CUSTOM_COMPACTOR_SCENE_ID}.json",
+        {
+            "schema_version": 1,
+            "scene": _CUSTOM_COMPACTOR_SCENE_ID,
+            "version": "v1",
+            "description": "自定义 compactor scene",
+            "capability_tags": ["conversation_compaction"],
+            "extends": [],
+            "model": {
+                "default_model_id": _MODEL_ID,
+                "runner_option_hint_id": "conversation_compaction",
+            },
+            "agent_policy": {
+                "max_iterations": 1,
+                "continuation_max_attempts": 0,
+                "allow_tool_calls": False,
+                "tool_execution_timeout_seconds": 1.0,
+                "fallback_mode": "raise_error",
+                "fallback_prompt": "Compactor is not allowed to fallback-answer.",
+                "continuation_prompt": (
+                    "Continue the strict JSON object without repeating content "
+                    "already emitted."
+                ),
+                "max_consecutive_failed_tool_batches": 1,
+            },
+            "tool_selection": {
+                "mode": "none",
+                "tool_names": [],
+                "tool_tags_any": [],
+                "allow_empty": False,
+            },
+            "defaults": {
+                "missing_required_fragment": "fail_closed",
+            },
+            "fragments": [
+                {
+                    "id": "custom_compactor_system",
+                    "path": "scenes/custom_compactor_system.md",
+                    "order": 100,
+                    "required": True,
+                },
+            ],
+            "context_slots": [],
+        },
+    )
+    scene_root.mkdir(parents=True, exist_ok=True)
+    (scene_root / "custom_compactor_system.md").write_text(
+        "custom compactor system prompt",
+        encoding="utf-8",
+    )
+    (scene_root / "custom_compactor_user.md").write_text(
+        "custom compactor user prompt <<compaction_request>>",
+        encoding="utf-8",
+    )
+    return RuntimeLocations(
+        config_overlay_dir=None,
+        prompt_asset_root=prompt_root,
+        scene_manifest_root=manifest_root,
+    )
+
+
 def _host_context(request_id: str) -> HostCallContext:
     """构造测试用 HostCallContext。
 
@@ -550,6 +1038,85 @@ def _host_context(request_id: str) -> HostCallContext:
             scenario="phase12_2_service_assembly",
             correlation_id=None,
         ),
+    )
+
+
+def _compactor_scene_inputs(
+    *, agent_policy_override: SceneAgentPolicyOverride | None
+) -> PreparedSceneInputs:
+    """构造测试用 compactor scene inputs。
+
+    :param agent_policy_override: compactor scene agent policy override。
+    :returns: PreparedSceneInputs。
+    :raises ValueError: 字段非法时由底层 dataclass 抛出。
+    """
+
+    return PreparedSceneInputs(
+        system_messages=("system",),
+        system_prompt="system",
+        tool_selection=SceneToolSelectionResult(
+            mode=SceneToolSelectionMode.NONE,
+            tool_names=frozenset(),
+        ),
+        model_hints=None,
+        agent_policy_override=agent_policy_override,
+        fragment_refs=(),
+        source_refs=(),
+        content_digest="sha256:test",
+        capability_tags=(),
+    )
+
+
+async def _noop_tool(
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+) -> ToolExecutionOutcome:
+    """测试用空工具 callable。
+
+    :param call: 工具调用请求。
+    :param context: 批式工具执行上下文。
+    :returns: 取消 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    del call
+    del context
+    return ToolCancelledOutcome(
+        reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
+        message="tool disabled in service assembly test",
+        hint=None,
+        meta=None,
+    )
+
+
+def _tool_definition(name: str) -> ToolDefinition:
+    """构造测试用工具定义。
+
+    :param name: 工具名。
+    :returns: 工具定义。
+    :raises ValueError: 工具声明名称与 schema 名称不一致时抛出。
+    """
+
+    properties: dict[str, JsonValue] = {}
+    return ToolDefinition(
+        name=name,
+        schema=ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=name,
+                description=f"{name} test tool",
+                parameters=ToolParametersSchema(
+                    type="object",
+                    properties=properties,
+                    required=(),
+                    additional_properties=False,
+                ),
+            ),
+        ),
+        callable=_noop_tool,
+        truncate=None,
+        display=None,
+        tags=(),
     )
 
 
