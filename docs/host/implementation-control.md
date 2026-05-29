@@ -226,7 +226,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前状态：PR 68 已 merge 到 `main`，merge commit 为 `b9bd625`。当前工作分支为
 `feat/phase-13-audit-trace-outbox`，从 clean `main` 创建。Phase 13 design discussion 已由用户确认；controller
 adjudication artifact 为 `docs/reviews/phase13-design-discussion-controller-adjudication-20260529.md`。
-当前 gate：Phase 13 implementation。
+当前 gate：Phase 13 Slice 1 accepted slice commit。
 Plan artifact 为 `docs/host/phase13-audit-tool-trace-outbox-plan.md`。Plan review artifacts 为
 `docs/reviews/phase13-plan-review-mimo-20260529.md` 与 `docs/reviews/phase13-plan-review-ds-20260529.md`；
 controller adjudication 为 `docs/reviews/phase13-plan-review-controller-adjudication-20260529.md`。Controller 接受
@@ -235,8 +235,15 @@ DS-F1 为 blocking plan finding，接受 MiMo-F1 / MiMo-F2、DS-F2 / DS-F3 / DS-
 `docs/reviews/phase13-plan-fix-codex-20260529.md`。Plan re-review artifacts 为
 `docs/reviews/phase13-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase13-plan-rereview-ds-20260529.md`；
 controller re-review adjudication 为 `docs/reviews/phase13-plan-rereview-controller-adjudication-20260529.md`。
-两路 re-review 均 PASS，无 blocking findings。Accepted plan commit 为 `9e79f5e`。下一步：按 accepted plan
-派发 Phase 13 Slice 1 `LogAuditSink JSONL` implementation；implementation specialist 不得越过 slice scope。
+两路 re-review 均 PASS，无 blocking findings。Accepted plan commit 为 `9e79f5e`。Phase 13 Slice 1
+`LogAuditSink JSONL` implementation 已完成，artifact 为
+`docs/reviews/phase13-slice1-implementation-codex-20260529.md`；validation 为 focused pytest 22 passed、
+`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` passed。下一步：派发 AgentMiMo 与
+AgentDS 做 Slice 1 code review；code review artifacts 为
+`docs/reviews/phase13-slice1-code-review-mimo-20260529.md` 与
+`docs/reviews/phase13-slice1-code-review-ds-20260529.md`。两路 review 均 PASS，无 blocking findings；controller
+adjudication 为 `docs/reviews/phase13-slice1-code-review-controller-adjudication-20260529.md`。下一步：创建
+accepted Slice 1 local commit。
 
 ## Phase Map
 
@@ -2341,6 +2348,19 @@ Controller re-review adjudication artifact 为
 
 Accepted plan local commit 已创建：`9e79f5e` (`gateflow: accept plan for phase 13 projections`)。当前 gate 进入
 Phase 13 implementation，下一步派发 Slice 1 `LogAuditSink JSONL` implementation。
+
+Phase 13 Slice 1 `LogAuditSink JSONL` implementation 已完成。Implementation artifact 为
+`docs/reviews/phase13-slice1-implementation-codex-20260529.md`。Changed files:
+`dayu/host/audit.py`、`dayu/host/durable/audit.py`、`dayu/host/durable/schema.py`、`dayu/host/open_host.py`、
+`tests/host/test_audit_sink.py`、`tests/host/test_durable_schema.py`。Validation: focused pytest 22 passed；
+`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。当前 gate 进入 Slice 1 code review。
+
+Phase 13 Slice 1 code review 已完成。MiMo artifact 为
+`docs/reviews/phase13-slice1-code-review-mimo-20260529.md`；DS artifact 为
+`docs/reviews/phase13-slice1-code-review-ds-20260529.md`。两路 verdict 均为 PASS，无 blocking findings。
+Controller adjudication artifact 为
+`docs/reviews/phase13-slice1-code-review-controller-adjudication-20260529.md`。MiMo P3 与 DS Minor findings 均裁决为
+non-blocking residual / later hardening，不要求当前 fix pass。当前 gate 进入 accepted Slice 1 commit。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 

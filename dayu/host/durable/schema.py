@@ -2,8 +2,9 @@
 
 本模块是 Host durable schema convention 的唯一 DDL 真源。它创建 Phase 2
 foundation tables、Phase 3 Session / Run / Attempt durable state tables，
-Phase 8 projection / read model tables，以及 Phase 9 memory projection
-tables；不承载 command、admission、outbox 或 purge 相关逻辑。
+Phase 8 projection / read model tables、Phase 9 memory projection tables，
+以及 Phase 13 audit sink-local marker table；不承载 command、admission、
+outbox 或 purge 相关逻辑。
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 10
+HOST_SCHEMA_VERSION = 11
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -43,6 +44,7 @@ TABLE_HOST_SESSION_TIMELINE_ITEMS = "host_session_timeline_items"
 TABLE_HOST_MEMORY_SNAPSHOTS = "host_memory_snapshots"
 TABLE_HOST_MEMORY_ITEMS = "host_memory_items"
 TABLE_HOST_MEMORY_DIAGNOSTICS = "host_memory_diagnostics"
+TABLE_HOST_AUDIT_SINK_MARKERS = "host_audit_sink_markers"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION = "host_runs_one_accepted_per_session"
@@ -105,11 +107,15 @@ MEMORY_PROJECTION_TABLES: tuple[str, ...] = (
 )
 """Phase 9 memory projection-owned table 名称集合。"""
 
+AUDIT_PROJECTION_TABLES: tuple[str, ...] = (TABLE_HOST_AUDIT_SINK_MARKERS,)
+"""Phase 13 audit sink-local marker table 名称集合。"""
+
 HOST_DURABLE_TABLES: tuple[str, ...] = (
     FOUNDATION_TABLES
     + PHASE3_STATE_TABLES
     + PROJECTION_TABLES
     + MEMORY_PROJECTION_TABLES
+    + AUDIT_PROJECTION_TABLES
 )
 """当前 fresh bootstrap 应创建的 Host durable table 名称集合。"""
 
@@ -811,6 +817,17 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
 )
 """
 
+_HOST_AUDIT_SINK_MARKERS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_AUDIT_SINK_MARKERS} (
+  event_id TEXT PRIMARY KEY,
+  event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
+  line_digest TEXT NOT NULL,
+  written_at TEXT NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence)
+)
+"""
+
 # ``recovering`` 由 Phase 11 recovery owner 写入；当前 P9 transition
 # 代码尚不写入该状态，schema 与 active Run 单例约束先保留识别能力。
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
@@ -939,6 +956,9 @@ MEMORY_PROJECTION_DDL: tuple[str, ...] = (
 )
 """按外键依赖顺序排列的 Phase 9 memory projection table DDL。"""
 
+AUDIT_PROJECTION_DDL: tuple[str, ...] = (_HOST_AUDIT_SINK_MARKERS_DDL,)
+"""按外键依赖顺序排列的 Phase 13 audit sink-local marker DDL。"""
+
 PROJECTION_INDEX_DDL: tuple[str, ...] = (
     _HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE_INDEX_DDL,
     _HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE_INDEX_DDL,
@@ -958,6 +978,7 @@ HOST_DURABLE_DDL: tuple[str, ...] = (
     + PHASE3_STATE_DDL
     + PROJECTION_DDL
     + MEMORY_PROJECTION_DDL
+    + AUDIT_PROJECTION_DDL
     + FOUNDATION_INDEX_DDL
     + PHASE3_INDEX_DDL
     + PROJECTION_INDEX_DDL

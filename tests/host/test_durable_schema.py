@@ -15,6 +15,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import (
+    AUDIT_PROJECTION_TABLES,
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
     INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
@@ -28,6 +29,7 @@ from dayu.host.durable.schema import (
     INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE,
     INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE,
     TABLE_EVENT_LOG,
+    TABLE_HOST_AUDIT_SINK_MARKERS,
     TABLE_HOST_INSTANCES,
     TABLE_HOST_MEMORY_DIAGNOSTICS,
     TABLE_HOST_MEMORY_ITEMS,
@@ -218,7 +220,7 @@ def _insert_payload_descriptor_probe(
 def test_fresh_db_creates_foundation_phase8_and_memory_tables(
     tmp_path: Path,
 ) -> None:
-    """fresh DB bootstrap 创建 foundation、state、projection 与 memory tables。"""
+    """fresh DB bootstrap 创建 foundation、state、projection、memory 与 audit tables。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -230,6 +232,7 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
             assert set(MEMORY_PROJECTION_TABLES).issubset(
                 _table_names(connection)
             )
+            assert set(AUDIT_PROJECTION_TABLES).issubset(_table_names(connection))
             assert _pragma_int(connection, "PRAGMA user_version") == (
                 HOST_SCHEMA_VERSION
             )
@@ -679,6 +682,21 @@ def test_memory_projection_tables_and_indexes_are_created(
             connection.close()
 
 
+def test_audit_sink_marker_table_is_created(tmp_path: Path) -> None:
+    """fresh schema 创建 audit sink-local marker table。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert TABLE_HOST_AUDIT_SINK_MARKERS in _table_names(connection)
+            assert _primary_key_columns(
+                connection, TABLE_HOST_AUDIT_SINK_MARKERS
+            ) == ("event_id",)
+        finally:
+            connection.close()
+
+
 def test_projection_schema_constraints_reject_invalid_rows(
     tmp_path: Path,
 ) -> None:
@@ -841,6 +859,38 @@ def test_projection_schema_constraints_reject_invalid_rows(
                 )
                 """
             )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_AUDIT_SINK_MARKERS} (
+                      event_id,
+                      event_sequence,
+                      line_digest,
+                      written_at
+                    ) VALUES (
+                      'event-1',
+                      0,
+                      'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_AUDIT_SINK_MARKERS} (
+                      event_id,
+                      event_sequence,
+                      line_digest,
+                      written_at
+                    ) VALUES (
+                      'missing-event',
+                      1,
+                      'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
         finally:
             connection.close()
 
@@ -1006,7 +1056,7 @@ def test_memory_schema_constraints_reject_invalid_rows(
 def test_schema_does_not_create_unowned_future_sink_tables(
     tmp_path: Path,
 ) -> None:
-    """Phase 9 bootstrap 不得预创建未归属的 future sink tables。"""
+    """Phase 13 bootstrap 不得预创建未归属的 future sink tables。"""
 
     forbidden_fragments = (
         "outbox",
