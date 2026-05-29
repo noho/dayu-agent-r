@@ -224,6 +224,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 15 Retention / Purge / Production Hardening。
 当前状态：Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS。
+Accepted plan commit 为 `5fae495`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`；Controller design discussion artifact 为
 `docs/reviews/phase15-design-discussion-controller-20260529.md`；plan review artifacts 为
 `docs/reviews/phase15-plan-review-mimo-20260529.md` 与 `docs/reviews/phase15-plan-review-ds-20260529.md`；Controller
@@ -232,8 +233,8 @@ adjudication artifact 为 `docs/reviews/phase15-plan-review-controller-adjudicat
 `docs/reviews/phase15-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-plan-rereview-ds-20260529.md`。Phase 13 Audit /
 Tool Trace / Outbox Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits
 与 PR 69 记录见 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 accepted plan commit。
-下一步：创建 accepted plan 本地 checkpoint 后进入 Phase 15 implementation Slice P15-S1。P15 不以 Phase 14 completion 为进入
+当前 gate：Phase 15 implementation Slice P15-S1。
+下一步：派发 implementation specialist 实现 Slice P15-S1 Purge Tombstone Schema And Durable Primitives。P15 不以 Phase 14 completion 为进入
 前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
@@ -2308,7 +2309,8 @@ adjudication artifact 为 `docs/reviews/phase15-plan-review-controller-adjudicat
 clarity / FK / idempotency / audit / projection reset finding 并进入 plan fix。Plan fix artifact 为
 `docs/reviews/phase15-plan-fix-codex-20260529.md`。Plan re-review artifacts 为
 `docs/reviews/phase15-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-plan-rereview-ds-20260529.md`，两份 re-review
-均确认 ADJ-001 到 ADJ-008 全部已修复、无新 blocker，plan 现为 code-generation-ready。
+均确认 ADJ-001 到 ADJ-008 全部已修复、无新 blocker，plan 现为 code-generation-ready。Accepted plan commit 为
+`5fae495`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
