@@ -228,7 +228,7 @@ Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction
 Read-after-purge Semantics、P15-S4 Audit JSONL Retention And Tombstone Audit Record 与 P15-S5 Projection Cleanup, Rebuild
 Confidence, And Local Hardening 均已通过 code review / re-review / controller validation，进入 accepted slice commit。
 Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
-commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`。
+commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`；Accepted S5 commit 为 `ce6de0d`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
 `docs/reviews/phase15-s3-implementation-codex-20260529.md`、
 `docs/reviews/phase15-s3-code-review-mimo-20260529.md`、
@@ -2391,8 +2391,7 @@ Fix artifact 为 `docs/reviews/phase15-s5-fix-codex-20260529.md`。Re-review art
 tests/host/test_recovery_scan.py tests/host/test_recovery_multiprocess.py tests/host/test_admission_multiprocess.py
 tests/host/test_purge_session.py -q` 为 74 passed；`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings /
 0 informations；`git diff --check` clean。README 检查结论：S5 只新增 local hardening 与 tests，未改变 public API shape、
-OpenHostOptions、命令用法、配置入口或稳定文档职责，S6 docs 仍为下一 slice owner。Accepted S5 commit 将在本条记录提交后由 git
-commit 记录。
+OpenHostOptions、命令用法、配置入口或稳定文档职责，S6 docs 仍为下一 slice owner。Accepted S5 commit 为 `ce6de0d`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
