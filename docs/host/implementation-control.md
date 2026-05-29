@@ -238,10 +238,10 @@ Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.m
 `docs/reviews/phase15-s3-code-review-controller-adjudication-20260529.md`。Phase 13 Audit / Tool Trace / Outbox
 Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits 与 PR 69 记录见
 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 aggregate deepreview。
-下一步：派发 AgentMiMo 与 AgentDS 对 Phase 15 全量 diff 做 aggregate deepreview。P15 不以 Phase 14
-completion 为进入前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归
-Issue #73。
+当前 gate：ready-to-open-draft-PR。
+下一步：用户已授权到达 `ready-to-open-draft-PR` 后自动进入 draft PR gate；按仓库发布约定 push 当前分支到 `github` remote，创建 draft
+PR，并推进 PR review / fix / re-review 直到 `draft-PR-pass`。P15 不以 Phase 14 completion 为进入前置；任何 remote-dependent smoke /
+hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
 
@@ -2407,6 +2407,19 @@ tests/host/test_memory_projection.py tests/host/test_tool_trace_projection.py te
 tests/host/test_open_host_runtime.py tests/host/test_import_boundary.py tests/host/test_package_exports.py
 tests/host/test_weak_typing_guard.py -q` 为 227 passed；`python -m pyright dayu/ tests/ utils/` 为 0 errors / 0 warnings /
 0 informations；`git diff --check` clean。Accepted S6 commit 为 `6209170`。当前 gate 进入 Phase 15 aggregate deepreview。
+
+Phase 15 aggregate deepreview 已完成。Aggregate review artifacts 为
+`docs/reviews/phase15-aggregate-deepreview-mimo-20260529.md` 与
+`docs/reviews/phase15-aggregate-deepreview-ds-20260529.md`。Controller adjudication artifact 为
+`docs/reviews/phase15-aggregate-deepreview-controller-adjudication-20260529.md`，裁决接受 1 项 dead-code cleanup finding；其它
+observations 均为 non-blocking residual / intentional design。Aggregate fix artifact 为
+`docs/reviews/phase15-aggregate-fix-codex-20260529.md`。Aggregate re-review artifacts 为
+`docs/reviews/phase15-aggregate-rereview-mimo-20260529.md` 与
+`docs/reviews/phase15-aggregate-rereview-ds-20260529.md`，两份 re-review 均确认 AGG-ADJ-001 已修复且无新 blocker。
+Controller re-review adjudication artifact 为 `docs/reviews/phase15-aggregate-rereview-controller-adjudication-20260529.md`。
+Controller final validation：`pytest tests/host -q` 为 1011 passed / 1 skipped；`python -m pyright dayu/ tests/ utils/` 为 0
+errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 `ready-to-open-draft-PR`。Aggregate review commit
+将在本条记录提交后由 git commit 记录。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 

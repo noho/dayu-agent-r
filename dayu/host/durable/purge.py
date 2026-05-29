@@ -261,52 +261,6 @@ class PurgeDeleteCounts:
 
 
 @dataclass(frozen=True, slots=True)
-class PurgePreconditionSnapshot:
-    """purge 前置条件摘要输入的已冻结快照。
-
-    :param session_id: 目标 Session id。
-    :param session_status: purge 前 Session 状态。
-    :param session_created_event_id: Session 创建事件 id。
-    :param session_created_event_sequence: Session 创建事件 sequence。
-    :param session_closed_event_id: Session 关闭事件 id。
-    :param session_closed_event_sequence: Session 关闭事件 sequence。
-    :param slot_count: 目标 Session slot row 数量。
-    :param run_count: 目标 Session Run row 数量。
-    :param attempt_count: 目标 Session Attempt row 数量。
-    :param wait_record_count: 目标 Session wait record row 数量。
-    :param event_log_min_sequence: 目标 EventLog 最小 sequence。
-    :param event_log_max_sequence: 目标 EventLog 最大 sequence。
-    :param event_log_count: 目标 EventLog row 数量。
-    :param payload_ref_count: 目标 durable payload ref 数量。
-    :param command_idempotency_count: 目标旧 command 幂等 row 数量。
-    :param projection_row_count: 目标 projection row 数量。
-    :param memory_row_count: 目标 memory row 数量。
-    :param outbox_row_count: 目标 outbox row 数量。
-    :param tool_trace_hot_row_count: 目标 tool trace hot row 数量。
-    """
-
-    session_id: str
-    session_status: str
-    session_created_event_id: str
-    session_created_event_sequence: int
-    session_closed_event_id: str
-    session_closed_event_sequence: int
-    slot_count: int
-    run_count: int
-    attempt_count: int
-    wait_record_count: int
-    event_log_min_sequence: int | None
-    event_log_max_sequence: int | None
-    event_log_count: int
-    payload_ref_count: int
-    command_idempotency_count: int
-    projection_row_count: int
-    memory_row_count: int
-    outbox_row_count: int
-    tool_trace_hot_row_count: int
-
-
-@dataclass(frozen=True, slots=True)
 class PurgeTombstoneRow:
     """已持久化 purge tombstone row。
 
@@ -2298,19 +2252,6 @@ def _in_clause(column_name: str, values: tuple[str | int, ...]) -> str:
     return f"{column_name} IN ({placeholders})"
 
 
-def _placeholders(values: tuple[str | int, ...]) -> str:
-    """构造 SQL 参数占位符列表。
-
-    :param values: 参数值元组。
-    :returns: 逗号分隔的 ``?`` 占位符。
-    :raises HostDurableError: ``values`` 为空时抛出。
-    """
-
-    if len(values) == 0:
-        raise HostDurableError("placeholder list requires at least one value")
-    return ", ".join("?" for _ in values)
-
-
 def _assert_deleted(label: str, actual: int, expected: int) -> None:
     """校验关键删除 rowcount。
 
@@ -2673,7 +2614,6 @@ __all__ = [
     "PURGE_IDEMPOTENCY_SCOPE_KIND",
     "PurgeDeleteCounts",
     "PurgeCommitCleanupRefs",
-    "PurgePreconditionSnapshot",
     "PurgeReplayDecision",
     "PurgeReplayDecisionKind",
     "PurgeSessionAlreadyPurgedError",

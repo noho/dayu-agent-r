@@ -182,7 +182,6 @@ INTERNAL_PURGE_DURABLE_EXPORTS: frozenset[str] = frozenset(
         "PURGE_IDEMPOTENCY_SCOPE_KIND",
         "PurgeCommitCleanupRefs",
         "PurgeDeleteCounts",
-        "PurgePreconditionSnapshot",
         "PurgeReplayDecision",
         "PurgeReplayDecisionKind",
         "PurgeSessionAlreadyPurgedError",
