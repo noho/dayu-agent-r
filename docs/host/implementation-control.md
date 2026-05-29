@@ -2419,7 +2419,7 @@ observations 均为 non-blocking residual / intentional design。Aggregate fix a
 Controller re-review adjudication artifact 为 `docs/reviews/phase15-aggregate-rereview-controller-adjudication-20260529.md`。
 Controller final validation：`pytest tests/host -q` 为 1011 passed / 1 skipped；`python -m pyright dayu/ tests/ utils/` 为 0
 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 `ready-to-open-draft-PR`。Aggregate review commit
-将在本条记录提交后由 git commit 记录。
+为 `151995b`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
