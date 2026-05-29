@@ -312,7 +312,8 @@ Full-repo review fix re-review artifacts 为 `docs/reviews/repo-review-fix-rerev
 `docs/reviews/repo-review-fix-rereview-ds-20260529.md`。两路 verdict 均 PASS，确认 FR-F1 至 FR-F5 fixed，无新增
 blocking findings。Controller adjudication 为
 `docs/reviews/repo-review-fix-rereview-controller-adjudication-20260529.md`。当前 gate：full-repo review PASS
-accepted commit and push。Accepted full-repo review fix commit 为 `f87e947`。当前 gate：full-repo-review-PASS push。
+accepted commit and push。Accepted full-repo review fix commit 为 `f87e947`；PASS bookkeeping commit 为 `bb661a2`，已
+push 到 PR 69 branch。当前 gate：full-repo-review-PASS。
 
 ## Phase Map
 
