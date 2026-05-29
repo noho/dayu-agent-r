@@ -32,6 +32,7 @@ from dayu.host.durable.idempotency import (
     IdempotencyScope,
     IdempotencyStore,
 )
+from dayu.host.durable.projection import reset_projection_refs_for_deleted_events
 from dayu.host.durable.schema import TABLE_HOST_PURGE_TOMBSTONES
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
@@ -43,8 +44,6 @@ from dayu.host.durable.schema import (
     TABLE_HOST_MEMORY_SNAPSHOTS,
     TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY,
     TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
-    TABLE_HOST_PROJECTION_CHECKPOINTS,
-    TABLE_HOST_PROJECTION_FAILURES,
     TABLE_HOST_RUN_RESULTS,
     TABLE_HOST_RUNS,
     TABLE_HOST_SESSION_SLOTS,
@@ -1445,29 +1444,10 @@ def _delete_session_matrix(
         TABLE_HOST_SESSION_TIMELINE_ITEMS,
         session_id,
     )
-    _raise_for_unsupported_projection_reset_refs(
+    projection_reset = reset_projection_refs_for_deleted_events(
         transaction,
-        TABLE_HOST_PROJECTION_CHECKPOINTS,
-        "checkpoint_event_id",
-        event_ids,
-    )
-    _raise_for_unsupported_projection_reset_refs(
-        transaction,
-        TABLE_HOST_PROJECTION_FAILURES,
-        "failed_event_id",
-        event_ids,
-    )
-    projection_checkpoints = _delete_allowed_projection_reset_refs(
-        transaction,
-        TABLE_HOST_PROJECTION_CHECKPOINTS,
-        "checkpoint_event_id",
-        event_ids,
-    )
-    projection_failures = _delete_allowed_projection_reset_refs(
-        transaction,
-        TABLE_HOST_PROJECTION_FAILURES,
-        "failed_event_id",
-        event_ids,
+        event_ids=event_ids,
+        rebuildable_consumer_ids=_PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS,
     )
     idempotency_records = _delete_old_idempotency_records(
         transaction,
@@ -1515,8 +1495,8 @@ def _delete_session_matrix(
         host_tool_trace_hot=tool_trace_hot,
         host_outbox_terminal_items=outbox_items,
         host_outbox_drain_idempotency=outbox_drain,
-        host_projection_checkpoints=projection_checkpoints,
-        host_projection_failures=projection_failures,
+        host_projection_checkpoints=projection_reset.deleted_checkpoints,
+        host_projection_failures=projection_reset.deleted_failures,
     )
 
 
@@ -1827,72 +1807,6 @@ def _delete_old_idempotency_records(
            OR (scope_id = ? AND {scope_clause})
         """,
         event_ids + event_sequences + (session_id,) + _SESSION_FACT_SCOPE_KINDS,
-    ).rowcount
-
-
-def _raise_for_unsupported_projection_reset_refs(
-    transaction: HostTransaction,
-    table_name: str,
-    event_id_column_name: str,
-    event_ids: tuple[str, ...],
-) -> None:
-    """检查 target EventLog 上是否存在不可 reset 的 projection consumer row。
-
-    :param transaction: Host transaction。
-    :param table_name: projection checkpoint/failure 表名。
-    :param event_id_column_name: 指向 EventLog id 的列名。
-    :param event_ids: 目标 EventLog ids。
-    :returns: ``None``。
-    :raises HostDurableError: 非白名单 consumer 引用目标 EventLog 时抛出。
-    """
-
-    if len(event_ids) == 0:
-        return
-    row = transaction.fetchone(
-        f"""
-        SELECT consumer_id
-        FROM {table_name}
-        WHERE {_in_clause(event_id_column_name, event_ids)}
-          AND consumer_id NOT IN (
-            {_placeholders(_PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS)}
-          )
-        LIMIT 1
-        """,
-        event_ids + _PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS,
-    )
-    if row is not None:
-        consumer_id = _require_text(row.get("consumer_id"), field_name="consumer_id")
-        raise HostDurableError(
-            f"projection consumer cannot be reset during purge: {consumer_id}"
-        )
-
-
-def _delete_allowed_projection_reset_refs(
-    transaction: HostTransaction,
-    table_name: str,
-    event_id_column_name: str,
-    event_ids: tuple[str, ...],
-) -> int:
-    """删除白名单 consumer 且引用目标 EventLog 的 projection reset rows。
-
-    :param transaction: Host transaction。
-    :param table_name: projection checkpoint/failure 表名。
-    :param event_id_column_name: 指向 EventLog id 的列名。
-    :param event_ids: 目标 EventLog ids。
-    :returns: 删除 row 数量。
-    """
-
-    if len(event_ids) == 0:
-        return 0
-    return transaction.execute(
-        f"""
-        DELETE FROM {table_name}
-        WHERE {_in_clause(event_id_column_name, event_ids)}
-          AND consumer_id IN (
-            {_placeholders(_PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS)}
-          )
-        """,
-        event_ids + _PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS,
     ).rowcount
 
 

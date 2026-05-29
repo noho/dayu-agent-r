@@ -38,6 +38,7 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_non_terminal_runs,
+    read_session_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.recovery_process import (
@@ -238,6 +239,8 @@ class StartupRecoveryScanner:
         :returns: 单个 Run 的分类结果。
         """
 
+        if read_session_by_id(transaction, run.session_id) is None:
+            return _action(run, StartupRecoveryDecision.NOT_FOUND, "session_missing")
         if run.status is RunStatus.ACCEPTED:
             _append_unseen_session_id(
                 queue_promotion_sessions,

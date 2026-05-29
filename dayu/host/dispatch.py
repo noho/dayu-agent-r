@@ -84,6 +84,7 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_attempt_id,
     read_earliest_queued_run,
     read_run_by_id,
+    read_session_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host._execution_config_projection import (
@@ -2162,11 +2163,16 @@ class HostDispatchScheduler:
             dispatch_record = read_dispatch_record_by_id(
                 transaction, record.dispatch_record_id
             )
+            session_exists = (
+                run is not None
+                and read_session_by_id(transaction, run.session_id) is not None
+            )
             if not _is_dispatchable_recheck(
                 run=run,
                 attempt=attempt,
                 dispatch_record=dispatch_record,
                 record=record,
+                session_exists=session_exists,
             ):
                 return None
             result = mark_dispatching_after_lane_row(
@@ -3073,6 +3079,7 @@ def _is_dispatchable_recheck(
     attempt: AttemptRow | None,
     dispatch_record: DispatchRecordRow | None,
     record: PendingDispatchRecord,
+    session_exists: bool,
 ) -> bool:
     """判断 lane acquired 后 durable facts 是否仍可 dispatch。
 
@@ -3080,6 +3087,7 @@ def _is_dispatchable_recheck(
     :param attempt: Attempt row。
     :param dispatch_record: dispatch row。
     :param record: pending dispatch 摘要。
+    :param session_exists: Run 所属 Session row 是否仍存在。
     :returns: 可 dispatch 时返回 ``True``。
     """
 
@@ -3087,6 +3095,7 @@ def _is_dispatchable_recheck(
         run is not None
         and attempt is not None
         and dispatch_record is not None
+        and session_exists
         and run.status == RunStatus.RUNNING
         and run.current_attempt_id == record.attempt_id
         and attempt.status == AttemptStatus.STARTING
@@ -3155,6 +3164,8 @@ def _read_startable_run(
     :returns: accepted Run、无 active 时的最早 queued Run，或 ``None``。
     """
 
+    if read_session_by_id(transaction, session_id) is None:
+        return None
     accepted = read_accepted_run_for_session(transaction, session_id)
     if accepted is not None:
         return accepted

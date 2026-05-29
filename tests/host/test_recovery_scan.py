@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,6 +33,11 @@ from dayu.host.durable.run_transition import (
     create_running_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_HOST_SESSIONS,
+    TABLE_HOST_SESSION_SLOTS,
+)
 from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunStartReason,
@@ -307,6 +313,39 @@ def test_scan_recovering_loses_when_eventlog_recovery_limit_reached_despite_proj
         assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
 
 
+def test_scan_skips_non_terminal_run_when_session_row_is_missing(
+    tmp_path: Path,
+) -> None:
+    """验证 Session row 缺失时 recovery 不根据残留 Run row 创建恢复事实。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: recovery 写入恢复事实或改变残留 Run 状态时由断言抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+    _delete_session_rows_without_foreign_keys(options.db_path)
+
+    with open_host_durable_store(options) as store:
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.NOT_FOUND,
+        )
+        assert tuple(action.reason for action in result.actions) == (
+            "session_missing",
+        )
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.RUNNING.value
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_ATTEMPT_LOST) == 0
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_RECOVERING) == 0
+
+
 def _policy() -> StartupRecoveryPolicy:
     """构造测试 recovery policy。
 
@@ -318,6 +357,20 @@ def _policy() -> StartupRecoveryPolicy:
         stale_after=timedelta(seconds=30),
         recovery_dispatch_limit=1,
     )
+
+
+def _delete_session_rows_without_foreign_keys(db_path: Path) -> None:
+    """删除 Session row 以模拟 purge/missing Session 的残留 Run 防御场景。
+
+    :param db_path: Host durable SQLite 路径。
+    :returns: ``None``。
+    :raises sqlite3.Error: SQLite 打开或执行删除语句失败时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(f"DELETE FROM {TABLE_HOST_SESSION_SLOTS}")
+        connection.execute(f"DELETE FROM {TABLE_HOST_SESSIONS}")
 
 
 def _seed_running_dispatching_run(
@@ -809,6 +862,39 @@ def _event_types(transaction: HostTransaction) -> tuple[str, ...]:
         "SELECT event_type FROM event_log ORDER BY event_sequence ASC"
     )
     return tuple(_required_text(row, "event_type") for row in rows)
+
+
+def _event_type_count(
+    transaction_runner: HostTransactionRunner, event_type: str
+) -> int:
+    """统计指定 EventLog event type 数量。
+
+    :param transaction_runner: Host transaction runner。
+    :param event_type: 目标 event type。
+    :returns: 匹配 row 数量。
+    :raises AssertionError: count 查询未返回 row 或 row 类型不符合预期时抛出。
+    """
+
+    def operation(transaction: HostTransaction) -> int:
+        """执行 event type 计数。
+
+        :param transaction: Host transaction。
+        :returns: 匹配 row 数量。
+        :raises AssertionError: count 查询未返回 row 或 row 类型不符合预期时抛出。
+        """
+
+        row = transaction.fetchone(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM {TABLE_EVENT_LOG}
+            WHERE event_type = ?
+            """,
+            (event_type,),
+        )
+        assert row is not None
+        return _required_int(row, "count")
+
+    return transaction_runner.run_read(operation)
 
 
 def _event_payload_by_type(

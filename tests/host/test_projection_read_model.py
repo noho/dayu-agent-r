@@ -14,14 +14,18 @@ from dayu.host import (
     AuthorizationClaim,
     CancelMode,
     CancelRunRequest,
+    CloseSessionRequest,
     FollowupBehavior,
     HostCallContext,
     OperationContext,
     OrdinaryRunExecutionBaseline,
+    PurgeSessionRequest,
     RunStatus,
     SubmitFollowupRequest,
     cancel_run,
+    close_session,
     ensure_session,
+    purge_session,
     submit_followup,
 )
 from dayu.host.api import HostInput
@@ -56,6 +60,7 @@ from dayu.host.durable.read_model import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.schema import (
     TABLE_HOST_PROJECTION_CHECKPOINTS,
+    TABLE_HOST_RUNS,
     TABLE_HOST_RUN_RESULTS,
     TABLE_HOST_SESSION_TIMELINE_ITEMS,
 )
@@ -286,6 +291,36 @@ def _cancel_request(client_request_id: str) -> CancelRunRequest:
     )
 
 
+def _close_request(client_request_id: str) -> CloseSessionRequest:
+    """构造 close_session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: close session 请求。
+    :raises ValueError: 请求字段非法时由 dataclass 校验抛出。
+    """
+
+    return CloseSessionRequest(
+        context=_context(request_id=f"trace-{client_request_id}"),
+        client_request_id=client_request_id,
+        reason="projection_read_model_rebuild_test",
+    )
+
+
+def _purge_request(client_request_id: str) -> PurgeSessionRequest:
+    """构造 purge_session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: purge session 请求。
+    :raises ValueError: 请求字段非法时由 dataclass 校验抛出。
+    """
+
+    return PurgeSessionRequest(
+        context=_context(request_id=f"trace-{client_request_id}"),
+        client_request_id=client_request_id,
+        reason="projection_read_model_rebuild_test",
+    )
+
+
 def _session_id(host: HostCommandHandle) -> str:
     """创建或读取测试 Session id。
 
@@ -296,6 +331,21 @@ def _session_id(host: HostCommandHandle) -> str:
     return ensure_session(
         host,
         EnsureSessionRequest(scope="workspace", slot_key="slot-read-model", metadata=()),
+    ).session_id
+
+
+def _session_id_for_slot(host: HostCommandHandle, slot_key: str) -> str:
+    """按指定 slot 创建或读取测试 Session id。
+
+    :param host: Host command handle。
+    :param slot_key: slot key。
+    :returns: Session id。
+    :raises HostApiError: ensure_session public command 失败时抛出。
+    """
+
+    return ensure_session(
+        host,
+        EnsureSessionRequest(scope="workspace", slot_key=slot_key, metadata=()),
     ).session_id
 
 
@@ -363,6 +413,7 @@ def _delete_checkpoint(transaction_runner: HostTransactionRunner) -> None:
 
     :param transaction_runner: Host transaction runner。
     :returns: ``None``。
+    :raises HostDurableError: durable transaction 执行失败时抛出。
     """
 
     transaction_runner.run_write(
@@ -380,12 +431,55 @@ def _delete_minimal_read_model_owned_rows(
 
     :param transaction_runner: Host transaction runner。
     :returns: ``None``。
+    :raises HostDurableError: durable transaction 执行失败时抛出。
     """
 
     transaction_runner.run_write(
         lambda transaction: (
             transaction.execute(f"DELETE FROM {TABLE_HOST_SESSION_TIMELINE_ITEMS}"),
             transaction.execute(f"DELETE FROM {TABLE_HOST_RUN_RESULTS}"),
+        )
+    )
+
+
+def _mark_run_terminal_for_projection_test(
+    transaction_runner: HostTransactionRunner,
+    *,
+    run_id: str,
+    terminal_event: EventLogRow,
+) -> None:
+    """把测试 Run durable row 标记为 terminal。
+
+    该 helper 只服务 projection rebuild 测试，用真实 terminal EventLog row
+    填充 Run governance index，使后续 close/purge 前置条件不依赖 read model。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :param terminal_event: terminal EventLog row。
+    :returns: ``None``。
+    :raises AssertionError: 测试期望的 durable update 未发生时由调用方断言暴露。
+    """
+
+    transaction_runner.run_write(
+        lambda transaction: transaction.execute(
+            f"""
+            UPDATE {TABLE_HOST_RUNS}
+            SET
+              status = ?,
+              terminal_event_id = ?,
+              terminal_event_sequence = ?,
+              terminal_at = ?,
+              updated_at = ?
+            WHERE run_id = ?
+            """,
+            (
+                RunStatus.SUCCEEDED.value,
+                terminal_event.event_id,
+                terminal_event.event_sequence,
+                terminal_event.occurred_at,
+                terminal_event.occurred_at,
+                run_id,
+            ),
         )
     )
 
@@ -985,6 +1079,116 @@ def test_minimal_read_model_reset_replays_fixed_consumer_owned_tables(
         assert repair.failures == 0
         assert _stable_run_result(before_result) == _stable_run_result(after_result)
         assert _stable_timeline(before_timeline) == _stable_timeline(after_timeline)
+    finally:
+        host.close()
+
+
+def test_rebuild_after_purge_replays_remaining_eventlog_only(tmp_path: Path) -> None:
+    """验证 purge 后 minimal read model 只从剩余 EventLog 重建。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 被 purge Session 被重建或保留 Session 丢失时由断言抛出。
+    """
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        purged_session_id = _session_id_for_slot(host, "slot-purged-rebuild")
+        preserved_session_id = _session_id_for_slot(host, "slot-preserved-rebuild")
+        purged_run = start_run(
+            host,
+            _start_request(
+                purged_session_id,
+                "start-purged-rebuild",
+                display_text="purged input",
+            ),
+        )
+        preserved_run = start_run(
+            host,
+            _start_request(
+                preserved_session_id,
+                "start-preserved-rebuild",
+                display_text="preserved input",
+            ),
+        )
+        transaction_runner = host._transaction_runner()
+        purged_terminal = _append_event(
+            transaction_runner,
+            event_id="event-terminal-purged-rebuild",
+            session_id=purged_session_id,
+            run_id=purged_run.run_id,
+            event_type="RUN_SUCCEEDED",
+            payload={
+                "terminal_summary_ref": "summary-purged-rebuild",
+                "terminal_summary_digest": _DIGEST_A,
+            },
+        )
+        preserved_terminal = _append_event(
+            transaction_runner,
+            event_id="event-terminal-preserved-rebuild",
+            session_id=preserved_session_id,
+            run_id=preserved_run.run_id,
+            event_type="RUN_SUCCEEDED",
+            payload={
+                "terminal_summary_ref": "summary-preserved-rebuild",
+                "terminal_summary_digest": _DIGEST_B,
+            },
+        )
+        _mark_run_terminal_for_projection_test(
+            transaction_runner,
+            run_id=purged_run.run_id,
+            terminal_event=purged_terminal,
+        )
+        _mark_run_terminal_for_projection_test(
+            transaction_runner,
+            run_id=preserved_run.run_id,
+            terminal_event=preserved_terminal,
+        )
+        close_session(
+            host,
+            purged_session_id,
+            _close_request("close-purged-rebuild"),
+        )
+        close_session(
+            host,
+            preserved_session_id,
+            _close_request("close-preserved-rebuild"),
+        )
+        repair_minimal_read_models(
+            transaction_runner, reset_checkpoint=True, batch_size=4
+        )
+        purge_session(
+            host,
+            purged_session_id,
+            _purge_request("purge-projection-rebuild"),
+        )
+
+        _delete_minimal_read_model_owned_rows(transaction_runner)
+        _delete_checkpoint(transaction_runner)
+        repair = repair_minimal_read_models(
+            transaction_runner, reset_checkpoint=False, batch_size=4
+        )
+        purged_result = transaction_runner.run_read(
+            lambda transaction: read_run_result(transaction, purged_run.run_id)
+        )
+        preserved_result = transaction_runner.run_read(
+            lambda transaction: read_run_result(transaction, preserved_run.run_id)
+        )
+        purged_timeline = transaction_runner.run_read(
+            lambda transaction: read_session_timeline_items(
+                transaction, purged_session_id
+            )
+        )
+        preserved_texts = _read_user_input_texts(
+            transaction_runner, preserved_session_id
+        )
+
+        assert repair.failures == 0
+        assert purged_result is None
+        assert purged_timeline == ()
+        assert preserved_result is not None
+        assert preserved_result.run_id == preserved_run.run_id
+        assert preserved_texts == ("preserved input",)
     finally:
         host.close()
 

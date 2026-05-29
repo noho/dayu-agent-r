@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Awaitable
 from dataclasses import dataclass, replace
+from multiprocessing import Process
 from pathlib import Path
-from typing import cast
+from typing import Protocol, TypeVar, cast
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host import open_host
 from dayu.host.audit import (
     audit_json_line_marks_purged_source_eventlog_facts,
     default_log_audit_sink_options,
@@ -21,6 +25,9 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     OperationContext,
     PurgeSessionRequest,
+    PurgeSessionResult,
+    ReplayRunRequest,
+    RetryRunRequest,
 )
 from dayu.host.command import create_host_command_handle, purge_session
 from dayu.host.durable.connection import open_host_durable_store
@@ -80,6 +87,10 @@ from dayu.host.durable.schema import (
     TABLE_SQLITE_PAYLOADS,
 )
 from dayu.host.durable.transaction import HostTransaction
+from tests.host.public_smoke_support import (
+    deterministic_runner_spec,
+    open_host_options,
+)
 
 _SESSION_ID = "session-purged-1"
 _CLIENT_REQUEST_ID = "purge-request-1"
@@ -125,6 +136,25 @@ _NON_TERMINAL_RUN_STATUSES = (
     _RUN_STATUS_CANCELLING,
     _RUN_STATUS_RECOVERING,
 )
+_PROCESS_JOIN_TIMEOUT_SECONDS = 5.0
+_AwaitedT = TypeVar("_AwaitedT")
+
+
+class _PurgeCapableHost(Protocol):
+    """测试内收窄的 purge-capable public Host 协议。"""
+
+    async def purge_session(
+        self, session_id: str, request: PurgeSessionRequest
+    ) -> PurgeSessionResult:
+        """清理已关闭 Session 的本地可恢复事实。
+
+        :param session_id: 目标 Session id。
+        :param request: purge 请求。
+        :returns: purge 结果。
+        :raises HostApiError: purge 前置条件不满足或 durable 操作失败时抛出。
+        """
+
+        ...
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -167,10 +197,36 @@ def _command_options(tmp_path: Path) -> HostCommandHandleOptions:
     )
 
 
+def _public_open_durable_options(root_path: Path) -> HostDurableStoreOptions:
+    """构造与 public open_host smoke 同路径的 durable store options。
+
+    :param root_path: 测试根目录。
+    :returns: Host durable store options。
+    :raises ValueError: durable options 字段非法时由 dataclass 校验抛出。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=root_path / "host.sqlite3",
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=root_path / "artifacts",
+            create_artifact_root=True,
+        ),
+        create_parent_dirs=True,
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=1.0,
+            write_busy_retry_count=8,
+            write_retry_initial_delay_seconds=0.001,
+            write_retry_backoff_multiplier=1.2,
+            write_retry_max_delay_seconds=0.02,
+        ),
+    )
+
+
 def _purge_api_request() -> PurgeSessionRequest:
     """构造 public purge_session 请求。
 
     :returns: public purge session request。
+    :raises ValueError: 请求字段非法时由 dataclass 校验抛出。
     """
 
     return PurgeSessionRequest(
@@ -194,6 +250,65 @@ def _purge_api_request() -> PurgeSessionRequest:
     )
 
 
+def _retry_api_request(client_request_id: str) -> RetryRunRequest:
+    """构造 retry_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: retry run 请求。
+    :raises ValueError: 请求字段非法时由 dataclass 校验抛出。
+    """
+
+    return RetryRunRequest(
+        context=HostCallContext(
+            actor="user-1",
+            source="host-api",
+            request_id=client_request_id,
+            authorization_claims=(),
+            operation_context=OperationContext(
+                operation_name="retry_run",
+                operation_kind="recovery",
+                business_domain="host",
+                business_object_type="run",
+                business_object_id=_PARENT_RUN_ID,
+                scenario="test",
+                correlation_id="correlation-retry-1",
+            ),
+        ),
+        client_request_id=client_request_id,
+        reason="purge_multiprocess_read_after_purge",
+    )
+
+
+def _replay_api_request(client_request_id: str) -> ReplayRunRequest:
+    """构造 replay_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: replay run 请求。
+    :raises ValueError: 请求字段非法时由 dataclass 校验抛出。
+    """
+
+    return ReplayRunRequest(
+        context=HostCallContext(
+            actor="user-1",
+            source="host-api",
+            request_id=client_request_id,
+            authorization_claims=(),
+            operation_context=OperationContext(
+                operation_name="replay_run",
+                operation_kind="repair",
+                business_domain="host",
+                business_object_type="run",
+                business_object_id=_PARENT_RUN_ID,
+                scenario="test",
+                correlation_id="correlation-replay-1",
+            ),
+        ),
+        client_request_id=client_request_id,
+        reason="purge_multiprocess_read_after_purge",
+        repair_instruction="verify purge fail closed",
+    )
+
+
 def _json_lines(path: Path) -> list[dict[str, JsonValue]]:
     """读取 JSONL object 行。
 
@@ -209,6 +324,21 @@ def _json_lines(path: Path) -> list[dict[str, JsonValue]]:
             assert isinstance(parsed, dict)
             result.append(cast(dict[str, JsonValue], parsed))
     return result
+
+
+def _json_object_file(path: Path) -> dict[str, JsonValue]:
+    """读取 JSON object 文件。
+
+    :param path: JSON 文件路径。
+    :returns: 已解析 JSON object。
+    :raises AssertionError: 文件内容不是 JSON object 时抛出。
+    :raises OSError: 文件读取失败时抛出。
+    :raises json.JSONDecodeError: 文件内容不是合法 JSON 时抛出。
+    """
+
+    parsed = cast(JsonValue, json.loads(path.read_text(encoding="utf-8")))
+    assert isinstance(parsed, dict)
+    return cast(dict[str, JsonValue], parsed)
 
 
 def _counts() -> PurgeDeleteCounts:
@@ -369,6 +499,140 @@ class _FailingAuditRecorder:
         """
 
         raise OSError("audit append failed")
+
+
+def _purge_in_independent_process(
+    root_path_text: str, result_marker_text: str
+) -> None:
+    """独立进程 A：打开 public Host handle 并执行 purge。
+
+    :param root_path_text: 测试根目录文本路径。
+    :param result_marker_text: 结果 marker 文本路径。
+    :returns: ``None``。
+    :raises Exception: 子进程内 public Host 打开、purge 或结果写入失败时透传。
+    """
+
+    asyncio.run(
+        _purge_in_independent_process_async(
+            root_path=Path(root_path_text),
+            result_marker=Path(result_marker_text),
+        )
+    )
+
+
+async def _purge_in_independent_process_async(
+    *, root_path: Path, result_marker: Path
+) -> None:
+    """独立进程 A 的异步 purge 主体。
+
+    :param root_path: 测试根目录。
+    :param result_marker: 结果 marker 路径。
+    :returns: ``None``。
+    :raises Exception: public Host 打开、purge 或结果写入失败时透传。
+    """
+
+    options = open_host_options(
+        root_path,
+        runner_spec=deterministic_runner_spec("p15-s5-purge"),
+        worker_factory=None,
+        allow_tool_calls=False,
+    )
+    async with open_host(options) as host:
+        result = await cast(_PurgeCapableHost, host).purge_session(
+            _SESSION_ID, _purge_api_request()
+        )
+    result_marker.write_text(
+        json.dumps(
+            {
+                "purged": result.purged,
+                "tombstone_ref": result.purge_tombstone_ref,
+                "deleted_counts_digest": result.deleted_counts_digest,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _read_after_purge_in_independent_process(
+    root_path_text: str, result_marker_text: str
+) -> None:
+    """独立进程 B：打开 public Host handle 并验证 purge 后 fail closed。
+
+    :param root_path_text: 测试根目录文本路径。
+    :param result_marker_text: 结果 marker 文本路径。
+    :returns: ``None``。
+    :raises Exception: 子进程内 public Host 打开、fail-closed 验证或结果写入失败时透传。
+    """
+
+    asyncio.run(
+        _read_after_purge_in_independent_process_async(
+            root_path=Path(root_path_text),
+            result_marker=Path(result_marker_text),
+        )
+    )
+
+
+async def _read_after_purge_in_independent_process_async(
+    *, root_path: Path, result_marker: Path
+) -> None:
+    """独立进程 B 的异步读后验证主体。
+
+    :param root_path: 测试根目录。
+    :param result_marker: 结果 marker 路径。
+    :returns: ``None``。
+    :raises AssertionError: 任一 public async read path 未按 HostApiError fail closed 时抛出。
+    :raises Exception: public Host 打开或结果写入失败时透传。
+    """
+
+    options = open_host_options(
+        root_path,
+        runner_spec=deterministic_runner_spec("p15-s5-read-after-purge"),
+        worker_factory=None,
+        allow_tool_calls=False,
+    )
+    observed: dict[str, JsonValue] = {}
+    async with open_host(options) as host:
+        observed["get_session"] = await _host_api_error_code(
+            host.get_session(_SESSION_ID)
+        )
+        observed["get_run"] = await _host_api_error_code(
+            host.get_run(_PARENT_RUN_ID)
+        )
+        observed["retry_run"] = await _host_api_error_code(
+            host.retry_run(
+                _PARENT_RUN_ID,
+                _retry_api_request("retry-after-purge-process"),
+            )
+        )
+        observed["replay_run"] = await _host_api_error_code(
+            host.replay_run(
+                _PARENT_RUN_ID,
+                _replay_api_request("replay-after-purge-process"),
+            )
+        )
+        try:
+            host.watch_session_events(_SESSION_ID)
+        except HostApiError as exc:
+            observed["watch_session_events"] = exc.code.value
+        else:
+            observed["watch_session_events"] = "unexpected_success"
+    result_marker.write_text(json.dumps(observed, sort_keys=True), encoding="utf-8")
+
+
+async def _host_api_error_code(awaitable: Awaitable[_AwaitedT]) -> str:
+    """读取 awaitable 的 HostApiError code。
+
+    :param awaitable: public Host async method 返回的 awaitable。
+    :returns: 捕获到的 HostApiError code。
+    :raises AssertionError: awaitable 未抛 HostApiError 时抛出。
+    """
+
+    try:
+        await awaitable
+    except HostApiError as exc:
+        return exc.code.value
+    raise AssertionError("expected HostApiError")
 
 
 class _InsertAndReadTombstoneOperation:
@@ -2661,6 +2925,51 @@ def test_public_purge_session_audit_append_failure_fails_before_success(
     assert exc_info.value.retryable is True
     assert tombstone is None
     assert event_count == 12
+
+
+def test_public_purge_is_observed_by_independent_process_read_paths(
+    tmp_path: Path,
+) -> None:
+    """验证独立进程 purge 后，另一进程 public read/retry/replay/watch 均 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 任一子进程失败或 fail-closed 结果不符合预期时由断言抛出。
+    """
+
+    purge_marker = tmp_path / "purge-process-result.json"
+    read_marker = tmp_path / "read-process-result.json"
+    with open_host_durable_store(_public_open_durable_options(tmp_path)) as store:
+        store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
+
+    purge_process = Process(
+        target=_purge_in_independent_process,
+        args=(str(tmp_path), str(purge_marker)),
+    )
+    purge_process.start()
+    purge_process.join(_PROCESS_JOIN_TIMEOUT_SECONDS)
+    assert purge_process.exitcode == 0
+    assert purge_marker.exists()
+
+    read_process = Process(
+        target=_read_after_purge_in_independent_process,
+        args=(str(tmp_path), str(read_marker)),
+    )
+    read_process.start()
+    read_process.join(_PROCESS_JOIN_TIMEOUT_SECONDS)
+    assert read_process.exitcode == 0
+
+    purge_result = _json_object_file(purge_marker)
+    read_result = _json_object_file(read_marker)
+    assert purge_result["purged"] is True
+    assert isinstance(purge_result["tombstone_ref"], str)
+    assert read_result == {
+        "get_run": HostApiErrorCode.NOT_FOUND.value,
+        "get_session": HostApiErrorCode.NOT_FOUND.value,
+        "replay_run": HostApiErrorCode.NOT_FOUND.value,
+        "retry_run": HostApiErrorCode.NOT_FOUND.value,
+        "watch_session_events": HostApiErrorCode.NOT_FOUND.value,
+    }
 
 
 def test_purge_session_durable_rejects_open_session(tmp_path: Path) -> None:

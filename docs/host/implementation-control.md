@@ -225,8 +225,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 work unit：Phase 15 Retention / Purge / Production Hardening。
 当前状态：Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS；P15-S1
 Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction Helper、P15-S3 Public Command Wiring And
-Read-after-purge Semantics 与 P15-S4 Audit JSONL Retention And Tombstone Audit Record 均已通过 code review / re-review /
-controller validation，进入 accepted slice commit。
+Read-after-purge Semantics、P15-S4 Audit JSONL Retention And Tombstone Audit Record 与 P15-S5 Projection Cleanup, Rebuild
+Confidence, And Local Hardening 均已通过 code review / re-review / controller validation，进入 accepted slice commit。
 Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
 commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
@@ -236,8 +236,8 @@ Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.m
 `docs/reviews/phase15-s3-code-review-controller-adjudication-20260529.md`。Phase 13 Audit / Tool Trace / Outbox
 Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits 与 PR 69 记录见
 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 implementation Slice P15-S5。
-下一步：派发 implementation specialist 实现 Slice P15-S5 Projection Cleanup, Rebuild Confidence, And Local Hardening。P15 不以 Phase 14
+当前 gate：Phase 15 implementation Slice P15-S6。
+下一步：派发 implementation specialist 实现 Slice P15-S6 Docs, Import Boundaries, Full Validation。P15 不以 Phase 14
 completion 为进入前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归
 Issue #73。
 
@@ -2377,6 +2377,22 @@ dayu/host/open_host.py tests/host` 为 0 errors / 0 warnings / 0 informations；
 S4 只补齐 internal fail-before-success invariant、fresh schema storage contract 与 audit path helper 复用，未改变 public API
 shape、OpenHostOptions、命令用法或配置入口，`dayu/host/README.md` 与 `tests/README.md` 无需更新。Accepted S4 commit 为
 `eb83a12`。
+
+Slice P15-S5 Projection Cleanup, Rebuild Confidence, And Local Hardening implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s5-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s5-code-review-mimo-20260529.md` 与
+`docs/reviews/phase15-s5-code-review-ds-20260529.md`；两份 review 均确认行为 PASS / 无 blocker。Controller adjudication artifact
+为 `docs/reviews/phase15-s5-code-review-controller-adjudication-20260529.md`，裁决接受 1 项新增测试/helper docstring 完整性 finding。
+Fix artifact 为 `docs/reviews/phase15-s5-fix-codex-20260529.md`。Re-review artifacts 为
+`docs/reviews/phase15-s5-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-s5-rereview-ds-20260529.md`，两份 re-review
+均确认 S5-ADJ-001 已修复且无新 blocker。Controller re-review adjudication artifact 为
+`docs/reviews/phase15-s5-rereview-controller-adjudication-20260529.md`。Controller 本地验证：
+`pytest tests/host/test_projection_checkpoint.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py
+tests/host/test_recovery_scan.py tests/host/test_recovery_multiprocess.py tests/host/test_admission_multiprocess.py
+tests/host/test_purge_session.py -q` 为 74 passed；`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。README 检查结论：S5 只新增 local hardening 与 tests，未改变 public API shape、
+OpenHostOptions、命令用法、配置入口或稳定文档职责，S6 docs 仍为下一 slice owner。Accepted S5 commit 将在本条记录提交后由 git
+commit 记录。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
