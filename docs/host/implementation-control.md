@@ -229,7 +229,8 @@ Read-after-purge Semantics、P15-S4 Audit JSONL Retention And Tombstone Audit Re
 Confidence, And Local Hardening 与 P15-S6 Docs, Import Boundaries, Full Validation 均已通过 code review / re-review /
 controller validation，进入 accepted slice commit。
 Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
-commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`；Accepted S5 commit 为 `ce6de0d`。
+commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`；Accepted S5 commit 为 `ce6de0d`；Accepted S6 commit 为
+`6209170`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
 `docs/reviews/phase15-s3-implementation-codex-20260529.md`、
 `docs/reviews/phase15-s3-code-review-mimo-20260529.md`、
@@ -2405,8 +2406,7 @@ tests/host/test_projection_read_model.py tests/host/test_projection_checkpoint.p
 tests/host/test_memory_projection.py tests/host/test_tool_trace_projection.py tests/host/test_outbox_durable.py
 tests/host/test_open_host_runtime.py tests/host/test_import_boundary.py tests/host/test_package_exports.py
 tests/host/test_weak_typing_guard.py -q` 为 227 passed；`python -m pyright dayu/ tests/ utils/` 为 0 errors / 0 warnings /
-0 informations；`git diff --check` clean。Accepted S6 commit 将在本条记录提交后由 git commit 记录。当前 gate 进入 Phase 15
-aggregate deepreview。
+0 informations；`git diff --check` clean。Accepted S6 commit 为 `6209170`。当前 gate 进入 Phase 15 aggregate deepreview。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
