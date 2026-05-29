@@ -19,12 +19,16 @@ from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
     INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
+    INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN,
+    INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE,
+    INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE,
     INDEX_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF,
     INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST,
     INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE,
     INDEX_HOST_TOOL_TRACE_HOT_TOOL_CALL,
     INDEX_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE,
     MEMORY_PROJECTION_TABLES,
+    OUTBOX_PROJECTION_TABLES,
     PHASE3_STATE_TABLES,
     PROJECTION_TABLES,
     TOOL_TRACE_PROJECTION_TABLES,
@@ -40,6 +44,8 @@ from dayu.host.durable.schema import (
     TABLE_HOST_MEMORY_DIAGNOSTICS,
     TABLE_HOST_MEMORY_ITEMS,
     TABLE_HOST_MEMORY_SNAPSHOTS,
+    TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY,
+    TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
     TABLE_HOST_PROJECTION_CHECKPOINTS,
     TABLE_HOST_PROJECTION_FAILURES,
     TABLE_HOST_RUN_RESULTS,
@@ -243,6 +249,9 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
             assert set(TOOL_TRACE_PROJECTION_TABLES).issubset(
                 _table_names(connection)
             )
+            assert set(OUTBOX_PROJECTION_TABLES).issubset(
+                _table_names(connection)
+            )
             assert _pragma_int(connection, "PRAGMA user_version") == (
                 HOST_SCHEMA_VERSION
             )
@@ -282,10 +291,10 @@ def test_schema_mismatch_raises_structured_error(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_host_schema_version_is_phase13_tool_trace_version() -> None:
-    """当前 committed Host schema version 是 Slice 2 的 fresh schema 12。"""
+def test_host_schema_version_is_phase13_outbox_version() -> None:
+    """当前 committed Host schema version 是 Slice 3 的 fresh schema 13。"""
 
-    assert HOST_SCHEMA_VERSION == 12
+    assert HOST_SCHEMA_VERSION == 13
 
 
 def test_wait_record_snapshot_columns_are_all_or_none(tmp_path: Path) -> None:
@@ -739,6 +748,36 @@ def test_tool_trace_hot_table_and_indexes_are_created(tmp_path: Path) -> None:
             connection.close()
 
 
+def test_outbox_tables_and_indexes_are_created(tmp_path: Path) -> None:
+    """fresh schema 创建 Outbox terminal item / drain idempotency tables 与索引。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert TABLE_HOST_OUTBOX_TERMINAL_ITEMS in _table_names(connection)
+            assert TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY in _table_names(connection)
+            assert _primary_key_columns(
+                connection,
+                TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
+            ) == ("item_id",)
+            assert _primary_key_columns(
+                connection,
+                TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY,
+            ) == ("session_id", "drain_request_id")
+            indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_OUTBOX_TERMINAL_ITEMS})"
+            ).fetchall()
+            index_names = {str(row[1]) for row in indexes}
+            assert {
+                INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE,
+                INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE,
+                INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN,
+            }.issubset(index_names)
+        finally:
+            connection.close()
+
+
 def test_projection_schema_constraints_reject_invalid_rows(
     tmp_path: Path,
 ) -> None:
@@ -987,6 +1026,72 @@ def test_projection_schema_constraints_reject_invalid_rows(
                     )
                     """
                 )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_OUTBOX_TERMINAL_ITEMS} (
+                      item_id,
+                      idempotency_key,
+                      terminal_event_id,
+                      event_sequence,
+                      session_id,
+                      run_id,
+                      terminal_status,
+                      dedupe_key,
+                      result_ref,
+                      result_digest,
+                      item_state,
+                      projected_at,
+                      updated_at
+                    ) VALUES (
+                      'outbox-invalid-status',
+                      'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+                      'event-1',
+                      1,
+                      'session-1',
+                      'run-1',
+                      'lost',
+                      'event-1',
+                      'result-ref',
+                      NULL,
+                      'pending',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_OUTBOX_TERMINAL_ITEMS} (
+                      item_id,
+                      idempotency_key,
+                      terminal_event_id,
+                      event_sequence,
+                      session_id,
+                      run_id,
+                      terminal_status,
+                      dedupe_key,
+                      item_state,
+                      projected_at,
+                      updated_at,
+                      drained_at
+                    ) VALUES (
+                      'outbox-invalid-drain-state',
+                      'sha256:3333333333333333333333333333333333333333333333333333333333333333',
+                      'event-1',
+                      1,
+                      'session-1',
+                      'run-1',
+                      'succeeded',
+                      'event-1',
+                      'pending',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
         finally:
             connection.close()
 
@@ -1149,15 +1254,12 @@ def test_memory_schema_constraints_reject_invalid_rows(
             connection.close()
 
 
-def test_schema_does_not_create_unowned_future_sink_tables(
+def test_schema_does_not_create_unowned_future_purge_tables(
     tmp_path: Path,
 ) -> None:
-    """Phase 13 bootstrap 不得预创建未归属的 future sink tables。"""
+    """Phase 13 bootstrap 不得预创建未归属的 future purge tables。"""
 
-    forbidden_fragments = (
-        "outbox",
-        "purge",
-    )
+    forbidden_fragments = ("purge",)
     options = _options(tmp_path)
     unexpected: set[str] = set()
     with open_host_durable_store(options) as store:
