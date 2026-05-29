@@ -223,13 +223,18 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 15 Retention / Purge / Production Hardening。
-当前状态：Phase 13 Audit / Tool Trace / Outbox Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、
-review artifacts、accepted commits 与 PR 69 记录见 `历史记录` 和 `docs/reviews/`。
-Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 design discussion / plan gate。
-下一步：基于 `docs/host/design.md` 与本总控文档细化 Phase 15 scope，生成 implementation-ready plan。P15 不以
-Phase 14 completion 为进入前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess /
-recovery coverage，或继续归 Issue #73。
+当前状态：Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS。
+Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`；Controller design discussion artifact 为
+`docs/reviews/phase15-design-discussion-controller-20260529.md`；plan review artifacts 为
+`docs/reviews/phase15-plan-review-mimo-20260529.md` 与 `docs/reviews/phase15-plan-review-ds-20260529.md`；Controller
+adjudication artifact 为 `docs/reviews/phase15-plan-review-controller-adjudication-20260529.md`；plan fix artifact 为
+`docs/reviews/phase15-plan-fix-codex-20260529.md`；plan re-review artifacts 为
+`docs/reviews/phase15-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-plan-rereview-ds-20260529.md`。Phase 13 Audit /
+Tool Trace / Outbox Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits
+与 PR 69 记录见 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
+当前 gate：Phase 15 accepted plan commit。
+下一步：创建 accepted plan 本地 checkpoint 后进入 Phase 15 implementation Slice P15-S1。P15 不以 Phase 14 completion 为进入
+前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
 
@@ -2286,6 +2291,24 @@ Owner / destination：后续 Conversation Memory / Context Governance hardening 
 - public memory scenario smoke residuals：`utils/smoke_host_public_conversation_memory_scenarios.py` 只通过 public answer 间接验证 conversation memory 语义，不读取 durable DB / EventLog / memory 表 / compact payload；`--suite all --pressure-mode off` 已通过；`_PROVIDER_IMPORT_DISPLAY_PATH` 继承 `__main__` display path pattern，若未来改为解析 import path 的 discovery 模式，需与既有 `smoke_host_public_multiturn.py` 一并统一。
 
 ## 历史记录
+
+### 2026-05-29 Phase 15 design discussion completed
+
+用户要求按 `$phaseflow` 推进 Phase 15，并授权到达 `ready-to-open-draft-PR` 后自动进入 draft PR gate。Controller 从 clean
+`main` 创建工作分支 `feat/host-phase15-retention-purge-hardening`。Phase 15 design discussion 已完成，artifact 为
+`docs/reviews/phase15-design-discussion-controller-20260529.md`。结论：`docs/host/design.md` 已足以支撑进入 plan，
+无需先修改设计真源；P15 plan 必须在冻结 public API envelope 内实现 `purge_session` destructive cleanup、purge tombstone、
+audit JSONL retention、projection cleanup / rebuild confidence 与 local production hardening，remote-dependent smoke 继续归
+Issue #73。
+
+Planning specialist AgentCodex 已生成 handoff implementation-ready plan：
+`docs/host/phase15-retention-purge-production-hardening-plan.md`。Plan review artifacts 为
+`docs/reviews/phase15-plan-review-mimo-20260529.md` 与 `docs/reviews/phase15-plan-review-ds-20260529.md`。Controller
+adjudication artifact 为 `docs/reviews/phase15-plan-review-controller-adjudication-20260529.md`，裁决接受 8 个 plan
+clarity / FK / idempotency / audit / projection reset finding 并进入 plan fix。Plan fix artifact 为
+`docs/reviews/phase15-plan-fix-codex-20260529.md`。Plan re-review artifacts 为
+`docs/reviews/phase15-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-plan-rereview-ds-20260529.md`，两份 re-review
+均确认 ADJ-001 到 ADJ-008 全部已修复、无新 blocker，plan 现为 code-generation-ready。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
