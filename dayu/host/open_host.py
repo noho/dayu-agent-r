@@ -21,6 +21,7 @@ from dayu.host.audit import (
     DEFAULT_LOG_AUDIT_CATCHUP_BATCH_SIZE,
     LogAuditSinkOptions,
     catch_up_log_audit_sink_projection,
+    default_log_audit_sink_options,
 )
 from dayu.host.admission import create_host_admission_service
 from dayu.host.api import (
@@ -109,15 +110,6 @@ _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS = 1024
 
 _SESSION_WATCH_POLL_INTERVAL_SECONDS = 0.02
 """session live watch 未读取到新事件时的轻量轮询间隔。"""
-
-_AUDIT_ARTIFACT_DIRECTORY_NAME = "audit"
-"""artifact_root 下 audit artifact 目录名。"""
-
-_AUDIT_JSONL_FILE_NAME = "host-audit.jsonl"
-"""默认 audit JSONL 文件名。"""
-
-_AUDIT_LOCK_FILE_SUFFIX = ".lock"
-"""默认 audit JSONL lock 文件名后缀。"""
 
 _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME = "tool-trace"
 """artifact_root 下 Tool Trace artifact 目录名。"""
@@ -644,8 +636,9 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             )
             audit_projection_catchup_port = _LogAuditProjectionCatchupPort(
                 durable_store=durable_store,
-                options=_log_audit_sink_options_from_open_host_options(
-                    self._options
+                options=default_log_audit_sink_options(
+                    self._options.artifact_root,
+                    create_parent_dirs=self._options.create_parent_dirs,
                 ),
             )
             tool_trace_projection_catchup_port = _ToolTraceProjectionCatchupPort(
@@ -917,49 +910,6 @@ def _local_execution_options_from_open_host_options(
         ),
         tooling_options=options.tooling_options,
         enable_truncation_manager=options.enable_truncation_manager,
-    )
-
-
-def _log_audit_sink_options_from_open_host_options(
-    options: OpenHostOptions,
-) -> LogAuditSinkOptions:
-    """从 public opener options 派生内部 audit sink options。
-
-    :param options: public opener options。
-    :returns: LogAuditSink options；不新增 public ``OpenHostOptions`` 字段。
-    :raises TypeError: 派生出的路径配置类型非法时抛出。
-    :raises ValueError: 派生出的路径为空时抛出。
-    """
-
-    audit_jsonl_path = _default_audit_jsonl_path(options.artifact_root)
-    return LogAuditSinkOptions(
-        audit_jsonl_path=audit_jsonl_path,
-        create_parent_dirs=options.create_parent_dirs,
-        lock_path=_default_audit_lock_path(audit_jsonl_path),
-    )
-
-
-def _default_audit_jsonl_path(artifact_root: Path) -> Path:
-    """从 artifact_root 派生默认 audit JSONL 路径。
-
-    :param artifact_root: Host artifact root。
-    :returns: 默认 audit JSONL 路径。
-    :raises: 无。
-    """
-
-    return artifact_root / _AUDIT_ARTIFACT_DIRECTORY_NAME / _AUDIT_JSONL_FILE_NAME
-
-
-def _default_audit_lock_path(audit_jsonl_path: Path) -> Path:
-    """从 audit JSONL 路径派生相邻 lock 文件路径。
-
-    :param audit_jsonl_path: audit JSONL 路径。
-    :returns: 相邻 lock 文件路径。
-    :raises: 无。
-    """
-
-    return audit_jsonl_path.with_name(
-        audit_jsonl_path.name + _AUDIT_LOCK_FILE_SUFFIX
     )
 
 

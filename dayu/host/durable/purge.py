@@ -1,8 +1,9 @@
 """Host purge tombstone durable primitive。
 
-本模块只负责 purge tombstone row codec、稳定 digest 与 purge command 的
-durable 幂等 replay 判定。它不实现 public ``purge_session``，不删除
-Session / EventLog facts，也不写 audit JSONL。
+本模块负责 purge tombstone row codec、稳定 digest、purge command 的
+durable 幂等 replay 判定以及删除事务编排。它不实现 public
+``purge_session``，也不直接写 audit JSONL；调用方必须提供显式 audit
+recorder，使 tombstone 写入前已经得到 append-only audit record ref/digest。
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import cast
+from typing import Protocol, cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.durable._validation import (
@@ -343,8 +344,8 @@ class PurgeTombstoneRow:
     deleted_counts: PurgeDeleteCounts
     deleted_counts_digest: str
     deleted_refs_digest: str
-    audit_record_ref: str | None
-    audit_record_digest: str | None
+    audit_record_ref: str
+    audit_record_digest: str
     request_context: Mapping[str, JsonValue]
 
 
@@ -361,8 +362,7 @@ class PurgeSessionDeleteRequest:
     :param operation_context_refs: 操作上下文 refs JSON object。
     :param reason: purge 原因。
     :param purged_at: purge timestamp，调用方提供的 UTC 文本。
-    :param audit_record_ref: purge audit record 引用；P15-S2 未写 JSONL 时为 ``None``。
-    :param audit_record_digest: purge audit record digest；P15-S2 未写 JSONL 时为 ``None``。
+    :param audit_recorder: purge tombstone audit record 写入端口。
     :param request_context: 请求上下文 refs JSON object。
     """
 
@@ -375,9 +375,74 @@ class PurgeSessionDeleteRequest:
     operation_context_refs: Mapping[str, JsonValue]
     reason: str
     purged_at: str
-    audit_record_ref: str | None
-    audit_record_digest: str | None
+    audit_recorder: "PurgeTombstoneAuditRecorder"
     request_context: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeTombstoneAuditRecordRequest:
+    """purge tombstone audit record 写入请求。
+
+    :param tombstone_id: 本次 purge 的稳定 tombstone id。
+    :param session_id: 被 purge 的 Session id。
+    :param client_request_id: purge 请求幂等 key。
+    :param actor: 发起方标识。
+    :param source: 来源标识。
+    :param operation_context_digest: 操作上下文 digest。
+    :param operation_context_refs: 操作上下文 refs JSON object。
+    :param reason: purge 原因。
+    :param precondition_digest: purge 前置条件 digest。
+    :param deleted_counts: 删除矩阵分项计数。
+    :param deleted_counts_digest: 删除计数 digest。
+    :param deleted_refs_digest: 删除对象 refs digest。
+    :param request_context: 请求上下文 refs JSON object。
+    """
+
+    tombstone_id: str
+    session_id: str
+    client_request_id: str
+    actor: str | None
+    source: str | None
+    operation_context_digest: str | None
+    operation_context_refs: Mapping[str, JsonValue]
+    reason: str
+    precondition_digest: str
+    deleted_counts: PurgeDeleteCounts
+    deleted_counts_digest: str
+    deleted_refs_digest: str
+    request_context: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeTombstoneAuditRecordResult:
+    """purge tombstone audit record 写入结果。
+
+    :param audit_record_ref: append-only audit JSONL 中的稳定 record ref。
+    :param audit_record_digest: 已追加 audit JSONL line digest。
+    """
+
+    audit_record_ref: str
+    audit_record_digest: str
+
+
+class PurgeTombstoneAuditRecorder(Protocol):
+    """purge tombstone audit record 写入端口。
+
+    该端口只表达 durable purge 在 tombstone 成功前需要取得的 audit
+    ref/digest，不规定 JSONL、文件锁或其它具体存储实现。
+    """
+
+    def record_purge_tombstone_audit(
+        self, request: PurgeTombstoneAuditRecordRequest
+    ) -> PurgeTombstoneAuditRecordResult:
+        """写入 purge tombstone audit record。
+
+        :param request: purge tombstone audit 写入请求。
+        :returns: audit record ref 与 line digest。
+        :raises HostDurableError: audit record 语义冲突时抛出。
+        :raises Exception: 底层 append-only audit sink 写入失败时透传给 transaction runner 回滚。
+        """
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -813,18 +878,6 @@ def _validate_purge_delete_request(request: PurgeSessionDeleteRequest) -> None:
     )
     _require_non_empty_text(request.reason, field_name="reason")
     _require_non_empty_text(request.purged_at, field_name="purged_at")
-    _require_optional_non_empty_text(
-        request.audit_record_ref,
-        field_name="audit_record_ref",
-    )
-    _require_optional_sha256_digest(
-        request.audit_record_digest,
-        field_name="audit_record_digest",
-    )
-    if (request.audit_record_ref is None) != (request.audit_record_digest is None):
-        raise HostDurableError(
-            "audit_record_ref and audit_record_digest must be both set or both unset"
-        )
 
 
 def _result_for_replay_decision(
@@ -1556,6 +1609,25 @@ def _insert_tombstone_and_idempotency(
         client_request_id=request.client_request_id,
         semantic_request_digest=request.semantic_request_digest,
     )
+    deleted_counts_digest = build_deleted_counts_digest(deleted_counts)
+    audit_record = request.audit_recorder.record_purge_tombstone_audit(
+        PurgeTombstoneAuditRecordRequest(
+            tombstone_id=tombstone_id,
+            session_id=request.session_id,
+            client_request_id=request.client_request_id,
+            actor=request.actor,
+            source=request.source,
+            operation_context_digest=request.operation_context_digest,
+            operation_context_refs=request.operation_context_refs,
+            reason=request.reason,
+            precondition_digest=precondition_digest,
+            deleted_counts=deleted_counts,
+            deleted_counts_digest=deleted_counts_digest,
+            deleted_refs_digest=deleted_refs_digest,
+            request_context=request.request_context,
+        )
+    )
+    _validate_audit_record_result(audit_record)
     tombstone = insert_purge_tombstone(
         transaction,
         PurgeTombstoneRow(
@@ -1571,10 +1643,10 @@ def _insert_tombstone_and_idempotency(
             purged_at=request.purged_at,
             precondition_digest=precondition_digest,
             deleted_counts=deleted_counts,
-            deleted_counts_digest=build_deleted_counts_digest(deleted_counts),
+            deleted_counts_digest=deleted_counts_digest,
             deleted_refs_digest=deleted_refs_digest,
-            audit_record_ref=request.audit_record_ref,
-            audit_record_digest=request.audit_record_digest,
+            audit_record_ref=audit_record.audit_record_ref,
+            audit_record_digest=audit_record.audit_record_digest,
             request_context=request.request_context,
         ),
     )
@@ -1612,6 +1684,23 @@ def _build_tombstone_id(
         }
     )
     return f"{_TOMBSTONE_ID_PREFIX}{digest.removeprefix('sha256:')}"
+
+
+def _validate_audit_record_result(
+    result: PurgeTombstoneAuditRecordResult,
+) -> None:
+    """校验 purge audit record 写入结果。
+
+    :param result: audit recorder 返回的结果。
+    :returns: ``None``。
+    :raises HostDurableError: ref 为空或 digest 非 sha256 时抛出。
+    """
+
+    _require_non_empty_text(result.audit_record_ref, field_name="audit_record_ref")
+    _require_sha256_digest(
+        result.audit_record_digest,
+        field_name="audit_record_digest",
+    )
 
 
 def _counts_with_payload_cleanup(
@@ -2404,11 +2493,11 @@ def _tombstone_from_row(row: HostRow) -> PurgeTombstoneRow:
             row.get("deleted_refs_digest"),
             field_name="deleted_refs_digest",
         ),
-        audit_record_ref=_optional_text(
+        audit_record_ref=_required_non_empty_text_value(
             row.get("audit_record_ref"),
             field_name="audit_record_ref",
         ),
-        audit_record_digest=_optional_text(
+        audit_record_digest=_required_sha256_digest_value(
             row.get("audit_record_digest"),
             field_name="audit_record_digest",
         ),
@@ -2552,6 +2641,34 @@ def _required_count(source: Mapping[str, JsonValue], field_name: str) -> int:
     return value
 
 
+def _required_non_empty_text_value(value: SQLiteScalar, *, field_name: str) -> str:
+    """读取 durable row 中的必填非空文本值。
+
+    :param value: SQLite scalar。
+    :param field_name: 错误消息中的字段名。
+    :returns: 非空文本值。
+    :raises HostDurableError: 值不是文本或为空时抛出。
+    """
+
+    text = _require_text(value, field_name=field_name)
+    _require_non_empty_text(text, field_name=field_name)
+    return text
+
+
+def _required_sha256_digest_value(value: SQLiteScalar, *, field_name: str) -> str:
+    """读取 durable row 中的必填 sha256 digest 文本。
+
+    :param value: SQLite scalar。
+    :param field_name: 错误消息中的字段名。
+    :returns: sha256 digest 文本。
+    :raises HostDurableError: 值不是文本或不是 sha256 digest 时抛出。
+    """
+
+    text = _require_text(value, field_name=field_name)
+    _require_sha256_digest(text, field_name=field_name)
+    return text
+
+
 def _validate_delete_counts(counts: PurgeDeleteCounts) -> None:
     """校验 deleted counts 全部为非负整数。
 
@@ -2627,20 +2744,14 @@ def _validate_tombstone(tombstone: PurgeTombstoneRow) -> None:
         tombstone.deleted_refs_digest,
         field_name="deleted_refs_digest",
     )
-    _require_optional_non_empty_text(
+    _require_non_empty_text(
         tombstone.audit_record_ref,
         field_name="audit_record_ref",
     )
-    _require_optional_sha256_digest(
+    _require_sha256_digest(
         tombstone.audit_record_digest,
         field_name="audit_record_digest",
     )
-    if (tombstone.audit_record_ref is None) != (
-        tombstone.audit_record_digest is None
-    ):
-        raise HostDurableError(
-            "audit_record_ref and audit_record_digest must be both set or both unset"
-        )
 
 
 __all__ = [
@@ -2657,6 +2768,9 @@ __all__ = [
     "PurgeSessionInvalidStateError",
     "PurgeSessionNotFoundError",
     "PurgeTombstoneRow",
+    "PurgeTombstoneAuditRecorder",
+    "PurgeTombstoneAuditRecordRequest",
+    "PurgeTombstoneAuditRecordResult",
     "build_deleted_counts_digest",
     "build_purge_semantic_digest",
     "insert_purge_tombstone",

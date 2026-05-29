@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.audit import (
+    audit_json_line_marks_purged_source_eventlog_facts,
+    default_log_audit_sink_options,
+)
+from dayu.host.api import (
+    HostApiError,
+    HostApiErrorCode,
+    HostCallContext,
+    HostCommandHandleOptions,
+    OperationContext,
+    PurgeSessionRequest,
+)
+from dayu.host.command import create_host_command_handle, purge_session
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.idempotency import (
@@ -31,6 +46,8 @@ from dayu.host.durable.purge import (
     PurgeSessionInvalidStateError,
     PurgeSessionNotFoundError,
     PurgeTombstoneRow,
+    PurgeTombstoneAuditRecordRequest,
+    PurgeTombstoneAuditRecordResult,
     build_deleted_counts_digest,
     build_purge_semantic_digest,
     insert_purge_tombstone,
@@ -72,6 +89,7 @@ _PURGED_AT = "2026-05-29T00:00:00.000000Z"
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 _DIGEST_C = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+_AUDIT_RECORD_REF = "audit-jsonl:purge-tombstone:purge-tombstone-1"
 _OTHER_SESSION_ID = "session-preserved-1"
 _PARENT_RUN_ID = "run-parent-1"
 _CHILD_RUN_ID = "run-child-1"
@@ -123,6 +141,74 @@ def _options(tmp_path: Path) -> HostDurableStoreOptions:
         ),
         sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=0.25),
     )
+
+
+def _command_options(tmp_path: Path) -> HostCommandHandleOptions:
+    """构造测试用 Host command handle options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Host command handle options。
+    """
+
+    durable_options = _options(tmp_path)
+    return HostCommandHandleOptions(
+        host_handle_id="host-purge-session-test",
+        db_path=durable_options.db_path,
+        artifact_root=durable_options.payload_policy.artifact_root,
+        create_parent_dirs=True,
+        sqlite_busy_timeout_seconds=1.0,
+        sqlite_write_busy_retry_count=3,
+        sqlite_write_retry_initial_delay_seconds=0.001,
+        sqlite_write_retry_backoff_multiplier=1.2,
+        sqlite_write_retry_max_delay_seconds=0.01,
+        payload_inline_threshold_bytes=4096,
+        context_window_size=8192,
+        reserved_output_tokens=1024,
+    )
+
+
+def _purge_api_request() -> PurgeSessionRequest:
+    """构造 public purge_session 请求。
+
+    :returns: public purge session request。
+    """
+
+    return PurgeSessionRequest(
+        context=HostCallContext(
+            actor="user-1",
+            source="host-api",
+            request_id="request-purge-1",
+            authorization_claims=(),
+            operation_context=OperationContext(
+                operation_name="purge_session",
+                operation_kind="retention",
+                business_domain="host",
+                business_object_type="session",
+                business_object_id=_SESSION_ID,
+                scenario="test",
+                correlation_id="correlation-purge-1",
+            ),
+        ),
+        client_request_id=_CLIENT_REQUEST_ID,
+        reason=_REASON,
+    )
+
+
+def _json_lines(path: Path) -> list[dict[str, JsonValue]]:
+    """读取 JSONL object 行。
+
+    :param path: JSONL 文件路径。
+    :returns: 已解析 JSON object 列表。
+    :raises AssertionError: 任一行不是 JSON object 时抛出。
+    """
+
+    result: list[dict[str, JsonValue]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            parsed = cast(JsonValue, json.loads(raw_line))
+            assert isinstance(parsed, dict)
+            result.append(cast(dict[str, JsonValue], parsed))
+    return result
 
 
 def _counts() -> PurgeDeleteCounts:
@@ -221,10 +307,68 @@ def _tombstone(
         deleted_counts=counts,
         deleted_counts_digest=build_deleted_counts_digest(counts),
         deleted_refs_digest=_DIGEST_C,
-        audit_record_ref=None,
-        audit_record_digest=None,
+        audit_record_ref=_AUDIT_RECORD_REF,
+        audit_record_digest=_DIGEST_A,
         request_context=_request_context(),
     )
+
+
+class _RecordingAuditRecorder:
+    """记录 durable purge audit 请求的测试 recorder。
+
+    :param audit_record_ref: 返回给 tombstone 的 audit record ref。
+    :param audit_record_digest: 返回给 tombstone 的 audit record digest。
+    :param requests: 已收到的 audit 写入请求。
+    """
+
+    def __init__(
+        self,
+        *,
+        audit_record_ref: str = _AUDIT_RECORD_REF,
+        audit_record_digest: str = _DIGEST_A,
+    ) -> None:
+        """初始化测试 recorder。
+
+        :param audit_record_ref: 返回给 tombstone 的 audit record ref。
+        :param audit_record_digest: 返回给 tombstone 的 audit record digest。
+        :returns: ``None``。
+        """
+
+        self.audit_record_ref = audit_record_ref
+        self.audit_record_digest = audit_record_digest
+        self.requests: tuple[PurgeTombstoneAuditRecordRequest, ...] = ()
+
+    def record_purge_tombstone_audit(
+        self, request: PurgeTombstoneAuditRecordRequest
+    ) -> PurgeTombstoneAuditRecordResult:
+        """记录请求并返回稳定 audit ref/digest。
+
+        :param request: purge tombstone audit 写入请求。
+        :returns: 测试用 audit record ref 与 digest。
+        :raises: 无。
+        """
+
+        self.requests = self.requests + (request,)
+        return PurgeTombstoneAuditRecordResult(
+            audit_record_ref=self.audit_record_ref,
+            audit_record_digest=self.audit_record_digest,
+        )
+
+
+class _FailingAuditRecorder:
+    """始终失败的 purge audit recorder。"""
+
+    def record_purge_tombstone_audit(
+        self, request: PurgeTombstoneAuditRecordRequest
+    ) -> PurgeTombstoneAuditRecordResult:
+        """模拟 audit append 失败。
+
+        :param request: purge tombstone audit 写入请求。
+        :returns: 不返回；始终抛出。
+        :raises OSError: 始终抛出，用于验证事务 rollback。
+        """
+
+        raise OSError("audit append failed")
 
 
 class _InsertAndReadTombstoneOperation:
@@ -514,6 +658,17 @@ class _SeedOpenSessionOperation:
 class _PurgeMatrixOperation:
     """执行 purge_session_durable 的测试 operation。"""
 
+    def __init__(
+        self, audit_recorder: _RecordingAuditRecorder | _FailingAuditRecorder | None = None
+    ) -> None:
+        """初始化 purge matrix operation。
+
+        :param audit_recorder: 可选测试 audit recorder。
+        :returns: ``None``。
+        """
+
+        self._audit_recorder = audit_recorder
+
     def __call__(self, transaction: HostTransaction) -> PurgeSessionDeleteResult:
         """执行 purge delete matrix helper。
 
@@ -521,7 +676,10 @@ class _PurgeMatrixOperation:
         :returns: purge delete result。
         """
 
-        return purge_session_durable(transaction, _delete_request())
+        return purge_session_durable(
+            transaction,
+            _delete_request(self._audit_recorder),
+        )
 
 
 class _ReadTableCountOperation:
@@ -717,12 +875,18 @@ class _TargetEvents:
     child_attempt_terminal: tuple[str, int]
 
 
-def _delete_request() -> PurgeSessionDeleteRequest:
+def _delete_request(
+    audit_recorder: _RecordingAuditRecorder | _FailingAuditRecorder | None = None,
+) -> PurgeSessionDeleteRequest:
     """构造 purge delete matrix 请求。
 
+    :param audit_recorder: 可选测试 audit recorder；未提供时使用成功 recorder。
     :returns: purge delete request。
     """
 
+    effective_audit_recorder = (
+        _RecordingAuditRecorder() if audit_recorder is None else audit_recorder
+    )
     return PurgeSessionDeleteRequest(
         session_id=_SESSION_ID,
         client_request_id=_CLIENT_REQUEST_ID,
@@ -733,8 +897,7 @@ def _delete_request() -> PurgeSessionDeleteRequest:
         operation_context_refs=_operation_context_refs(),
         reason=_REASON,
         purged_at=_PURGED_AT,
-        audit_record_ref=None,
-        audit_record_digest=None,
+        audit_recorder=effective_audit_recorder,
         request_context=_request_context(),
     )
 
@@ -2250,21 +2413,29 @@ def _event_sequence_for_id(transaction: HostTransaction, event_id: str) -> int:
     return sequence
 
 
-def test_insert_tombstone_rejects_unpaired_audit_record_ref(
+def test_insert_tombstone_rejects_invalid_audit_record_ref(
     tmp_path: Path,
 ) -> None:
-    """tombstone validation 拒绝 audit_record_ref / digest 单边存在。"""
+    """tombstone validation 拒绝空 audit_record_ref。"""
 
-    ref_only = replace(_tombstone(), audit_record_ref="audit-record-1")
-    digest_only = replace(_tombstone(), audit_record_digest=_DIGEST_A)
+    malformed = replace(_tombstone(), audit_record_ref="")
     with open_host_durable_store(_options(tmp_path)) as store:
         with pytest.raises(HostDurableError):
             store.transaction_runner.run_write(
-                _InsertMalformedTombstoneOperation(ref_only)
+                _InsertMalformedTombstoneOperation(malformed)
             )
+
+
+def test_insert_tombstone_rejects_invalid_audit_record_digest(
+    tmp_path: Path,
+) -> None:
+    """tombstone validation 拒绝非 sha256 audit_record_digest。"""
+
+    malformed = replace(_tombstone(), audit_record_digest="not-a-digest")
+    with open_host_durable_store(_options(tmp_path)) as store:
         with pytest.raises(HostDurableError):
             store.transaction_runner.run_write(
-                _InsertMalformedTombstoneOperation(digest_only)
+                _InsertMalformedTombstoneOperation(malformed)
             )
 
 
@@ -2277,9 +2448,10 @@ def test_purge_session_durable_deletes_matrix_and_preserves_replay(
     replay: PurgeSessionDeleteResult | None = None
     purge_idempotency: tuple[str, str | None, int | None] | None = None
     out_of_scope_idempotency_exists = False
+    audit_recorder = _RecordingAuditRecorder()
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
-        result = store.transaction_runner.run_write(_PurgeMatrixOperation())
+        result = store.transaction_runner.run_write(_PurgeMatrixOperation(audit_recorder))
         replay = store.transaction_runner.run_write(_PurgeMatrixOperation())
         purge_idempotency = store.transaction_runner.run_read(
             _ReadPurgeIdempotencyOperation()
@@ -2366,9 +2538,129 @@ def test_purge_session_durable_deletes_matrix_and_preserves_replay(
     assert result.tombstone.deleted_counts_digest == build_deleted_counts_digest(
         result.deleted_counts
     )
+    assert result.tombstone.audit_record_ref == _AUDIT_RECORD_REF
+    assert result.tombstone.audit_record_digest == _DIGEST_A
+    assert len(audit_recorder.requests) == 1
+    assert audit_recorder.requests[0].session_id == _SESSION_ID
+    assert audit_recorder.requests[0].deleted_counts_digest == (
+        result.tombstone.deleted_counts_digest
+    )
     assert purge_idempotency[0] == result.tombstone.tombstone_id
     assert purge_idempotency[1] is None
     assert purge_idempotency[2] is None
+
+
+def test_purge_session_durable_audit_failure_rolls_back_tombstone(
+    tmp_path: Path,
+) -> None:
+    """audit 写入失败时 purge helper 回滚删除矩阵且不写 tombstone。"""
+
+    tombstone: PurgeTombstoneRow | None = None
+    event_count = 0
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
+        with pytest.raises(OSError, match="audit append failed"):
+            store.transaction_runner.run_write(
+                _PurgeMatrixOperation(_FailingAuditRecorder())
+            )
+        tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
+        event_count = store.transaction_runner.run_read(
+            _ReadTableCountOperation(
+                TABLE_EVENT_LOG,
+                where_sql="WHERE session_id = ?",
+                parameters=(_SESSION_ID,),
+            )
+        )
+
+    assert tombstone is None
+    assert event_count == 12
+
+
+def test_public_purge_session_appends_tombstone_audit_jsonl(
+    tmp_path: Path,
+) -> None:
+    """public purge 成功前追加 tombstone audit line 并把 ref/digest 写入 tombstone。"""
+
+    tombstone: PurgeTombstoneRow | None = None
+    durable_options = _options(tmp_path)
+    audit_options = default_log_audit_sink_options(
+        durable_options.payload_policy.artifact_root,
+        create_parent_dirs=True,
+    )
+    audit_options.audit_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_line = (
+        '{"event_id":"event-existing","line_digest":"sha256:'
+        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}\n'
+    )
+    audit_options.audit_jsonl_path.write_text(existing_line, encoding="utf-8")
+
+    with open_host_durable_store(durable_options) as store:
+        store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
+
+    handle = create_host_command_handle(_command_options(tmp_path))
+    try:
+        result = purge_session(handle, _SESSION_ID, _purge_api_request())
+    finally:
+        handle.close()
+
+    with open_host_durable_store(durable_options) as store:
+        tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
+
+    lines = _json_lines(audit_options.audit_jsonl_path)
+    purge_line = lines[1]
+    assert result.purged is True
+    assert lines[0]["event_id"] == "event-existing"
+    assert audit_json_line_marks_purged_source_eventlog_facts(purge_line)
+    assert purge_line["session_id"] == _SESSION_ID
+    assert purge_line["purge_tombstone_ref"] == result.purge_tombstone_ref
+    assert purge_line["deleted_counts_digest"] == result.deleted_counts_digest
+    assert purge_line["reason"] == _REASON
+    assert purge_line["actor"] == "user-1"
+    assert purge_line["source"] == "host-api"
+    assert purge_line["source_eventlog_facts_purged"] is True
+    assert tombstone is not None
+    assert tombstone.audit_record_ref == purge_line["audit_record_ref"]
+    assert tombstone.audit_record_digest == purge_line["line_digest"]
+
+
+def test_public_purge_session_audit_append_failure_fails_before_success(
+    tmp_path: Path,
+) -> None:
+    """public purge audit append 失败时返回错误且不留下 successful tombstone。"""
+
+    tombstone: PurgeTombstoneRow | None = None
+    event_count = 0
+    durable_options = _options(tmp_path)
+    audit_options = default_log_audit_sink_options(
+        durable_options.payload_policy.artifact_root,
+        create_parent_dirs=True,
+    )
+    audit_options.audit_jsonl_path.parent.parent.mkdir(parents=True, exist_ok=True)
+    audit_options.audit_jsonl_path.parent.write_text("not a directory", encoding="utf-8")
+    with open_host_durable_store(durable_options) as store:
+        store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
+
+    handle = create_host_command_handle(_command_options(tmp_path))
+    try:
+        with pytest.raises(HostApiError) as exc_info:
+            purge_session(handle, _SESSION_ID, _purge_api_request())
+    finally:
+        handle.close()
+
+    with open_host_durable_store(durable_options) as store:
+        tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
+        event_count = store.transaction_runner.run_read(
+            _ReadTableCountOperation(
+                TABLE_EVENT_LOG,
+                where_sql="WHERE session_id = ?",
+                parameters=(_SESSION_ID,),
+            )
+        )
+
+    assert exc_info.value.code is HostApiErrorCode.INTERNAL_ERROR
+    assert exc_info.value.retryable is True
+    assert tombstone is None
+    assert event_count == 12
 
 
 def test_purge_session_durable_rejects_open_session(tmp_path: Path) -> None:

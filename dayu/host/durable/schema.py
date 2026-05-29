@@ -985,14 +985,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_PURGE_TOMBSTONES} (
   deleted_counts_json TEXT NOT NULL,
   deleted_counts_digest TEXT NOT NULL,
   deleted_refs_digest TEXT NOT NULL,
-  audit_record_ref TEXT NULL,
-  audit_record_digest TEXT NULL,
-  request_context_json TEXT NOT NULL,
-  CHECK (
-    (audit_record_ref IS NULL AND audit_record_digest IS NULL)
-    OR
-    (audit_record_ref IS NOT NULL AND audit_record_digest IS NOT NULL)
-  )
+  audit_record_ref TEXT NOT NULL,
+  audit_record_digest TEXT NOT NULL,
+  request_context_json TEXT NOT NULL
 )
 """
 

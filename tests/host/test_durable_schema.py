@@ -318,6 +318,12 @@ def test_purge_tombstone_table_has_no_session_or_event_log_fk(
                 connection,
                 TABLE_HOST_PURGE_TOMBSTONES,
             ) == ("tombstone_id",)
+            table_info = connection.execute(
+                f"PRAGMA table_info({TABLE_HOST_PURGE_TOMBSTONES})"
+            ).fetchall()
+            not_null_columns = {str(row[1]) for row in table_info if int(row[3]) == 1}
+            assert "audit_record_ref" in not_null_columns
+            assert "audit_record_digest" in not_null_columns
 
             tombstone_fks = connection.execute(
                 f"PRAGMA foreign_key_list({TABLE_HOST_PURGE_TOMBSTONES})"

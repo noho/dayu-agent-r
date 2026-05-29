@@ -224,8 +224,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 15 Retention / Purge / Production Hardening。
 当前状态：Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS；P15-S1
-Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction Helper 与 P15-S3 Public Command Wiring And
-Read-after-purge Semantics 均已通过 code review / controller validation，进入 accepted slice commit。
+Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction Helper、P15-S3 Public Command Wiring And
+Read-after-purge Semantics 与 P15-S4 Audit JSONL Retention And Tombstone Audit Record 均已通过 code review / re-review /
+controller validation，进入 accepted slice commit。
 Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
 commit 为 `17c5c00`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
@@ -235,8 +236,8 @@ Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.m
 `docs/reviews/phase15-s3-code-review-controller-adjudication-20260529.md`。Phase 13 Audit / Tool Trace / Outbox
 Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits 与 PR 69 记录见
 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 implementation Slice P15-S4。
-下一步：派发 implementation specialist 实现 Slice P15-S4 Audit JSONL Retention And Tombstone Audit Record。P15 不以 Phase 14
+当前 gate：Phase 15 implementation Slice P15-S5。
+下一步：派发 implementation specialist 实现 Slice P15-S5 Projection Cleanup, Rebuild Confidence, And Local Hardening。P15 不以 Phase 14
 completion 为进入前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归
 Issue #73。
 
@@ -2224,9 +2225,9 @@ Owner / destination：GitHub Issue #73；未来重新进入 Phase 14 design / pl
 
 Owner / destination：Phase 15 Retention / Purge / Production Hardening，或在 P15 前拆出独立 hardening PR。
 
-- P15-S4 audit fail-before-success：P15-S3 已接通 public purge，但 tombstone 暂无 audit JSONL ref/digest；S4 必须保证 public
-  `purge_session` 成功返回前已经追加 purge tombstone audit JSONL line，并把 ref/digest 纳入 tombstone，禁止留下 audit-pending
-  successful tombstone 路径。
+- audit JSONL orphan residual：P15-S4 已保证 public `purge_session` 成功返回前写入 purge tombstone audit line 并把 ref/digest
+  纳入 tombstone；仍保留跨介质残余风险：audit JSONL append 成功后 SQLite commit 失败可能留下 tombstone-less audit line。Owner
+  / destination：P15-S6 docs / audit tooling follow-up。
 - `purge_session` destructive cleanup、audit tombstone、payload / memory / projection / outbox / tool trace 清理、projection rebuild tooling 与 retention matrix。
 - startup / recovery / crash E2E 压测、watch 轮询性能、SQLite 多进程写入压力、schema bootstrap / DDL 原子性、after-commit 多错误聚合、projection catch-up 批处理与 heavy sink runner。
 - dispatch / recovery production hardening：dispatch owner 写入时机与 owner id 真源已由 PR 68 post-draft fullrepo B1 / B2 fix 修复；剩余项为 liveness proof 压测、promotion deferred result 语义、startup timeout closeout diagnostic 字段、recovery orphan proof 覆盖、`ActiveWorkerRegistry` asyncio path 同步原语、`cancel_all` 快照窗口与 scheduler close task-cancel defense-in-depth 验证，以及 worker startup / fatal stream 事件序列与 cancel / closeout diagnostic 矩阵。
@@ -2358,6 +2359,24 @@ tests/host/test_open_host_runtime.py tests/host/test_purge_session.py -q` 为 69
 dayu/host/command.py dayu/host/open_host.py dayu/host/read_api.py tests/host` 为 0 errors / 0 warnings / 0 informations；
 `git diff --check` clean。README 检查结论：S3 已让包根 `purge_session` 从 structured unsupported 变为可用，已同步
 `dayu/host/README.md` 与 `tests/README.md` 的当前事实。Accepted S3 commit 为 `17c5c00`。
+
+Slice P15-S4 Audit JSONL Retention And Tombstone Audit Record implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s4-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s4-code-review-mimo-20260529.md` 与
+`docs/reviews/phase15-s4-code-review-ds-20260529.md`；MiMo PASS / 0 blocking findings，DS finding 经 Controller
+adjudication artifact `docs/reviews/phase15-s4-code-review-controller-adjudication-20260529.md` 裁决接受 3 项
+schema/type/codec、audit path duplication 与 redundant mkdir finding，另将 audit JSONL orphan line 作为 residual 追踪。
+Fix artifact 为 `docs/reviews/phase15-s4-fix-codex-20260529.md`。Re-review artifacts 为
+`docs/reviews/phase15-s4-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-s4-rereview-ds-20260529.md`，两份 re-review
+均确认 S4-ADJ-001 到 S4-ADJ-003 已修复且无新 blocker。Controller re-review adjudication artifact 为
+`docs/reviews/phase15-s4-rereview-controller-adjudication-20260529.md`。Controller 本地验证：
+`pytest tests/host/test_audit_sink.py tests/host/test_purge_session.py tests/host/test_durable_schema.py
+tests/host/test_open_host_runtime.py -q` 为 63 passed；`python -m pyright dayu/host/audit.py
+dayu/host/durable/audit.py dayu/host/durable/purge.py dayu/host/durable/schema.py dayu/host/command.py
+dayu/host/open_host.py tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。README 检查结论：
+S4 只补齐 internal fail-before-success invariant、fresh schema storage contract 与 audit path helper 复用，未改变 public API
+shape、OpenHostOptions、命令用法或配置入口，`dayu/host/README.md` 与 `tests/README.md` 无需更新。Accepted S4 commit 将在本条记录
+提交后由 git commit 记录。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 

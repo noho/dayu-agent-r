@@ -15,6 +15,11 @@ from typing import NoReturn
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.audit import (
+    LogAuditSinkOptions,
+    append_purge_tombstone_audit_record,
+    default_log_audit_sink_options,
+)
 from dayu.host.admission import (
     HostAdmissionService,
     PendingDispatchRecord,
@@ -80,6 +85,8 @@ from dayu.host.durable.purge import (
     PurgeSessionDeleteResult,
     PurgeSessionInvalidStateError,
     PurgeSessionNotFoundError,
+    PurgeTombstoneAuditRecordRequest,
+    PurgeTombstoneAuditRecordResult,
     build_purge_semantic_digest,
     purge_session_durable,
 )
@@ -110,6 +117,7 @@ from dayu.host.dispatch import (
     ActiveWorkerRegistry,
 )
 from dayu.host.waiting import DefaultHostResolveWaitService
+from dayu.runtime.filelock import RuntimeFileLockError
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_HANDLE_ID_PREFIX = "host-command"
@@ -200,6 +208,23 @@ class HostCommandHandle:
             return self._durable_store.transaction_runner
         except HostDurableError as exc:
             raise _host_api_error_from_durable_error(exc) from exc
+
+    def _audit_sink_options(self) -> LogAuditSinkOptions:
+        """从当前 handle 持有的 durable store 派生 audit sink options。
+
+        :returns: append-only audit JSONL sink options。
+        :raises HostApiError: handle 已关闭或 durable store 配置不可读取时抛出。
+        """
+
+        self._raise_if_closed()
+        try:
+            options = self._durable_store.options
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
+        return default_log_audit_sink_options(
+            options.payload_policy.artifact_root,
+            create_parent_dirs=options.payload_policy.create_artifact_root,
+        )
 
     def _run_read(self, operation: HostReadTransactionOperation[T]) -> T:
         """在 handle 私有 store 上执行 read transaction。
@@ -761,6 +786,7 @@ def purge_session(
         operation = _PurgeSessionOperation(
             session_id=session_id,
             request=request,
+            audit_sink_options=host._audit_sink_options(),
         )
         result = host._transaction_runner().run_write(operation)
     except PurgeSessionInvalidStateError as exc:
@@ -783,6 +809,12 @@ def purge_session(
         ) from exc
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
+    except (OSError, RuntimeFileLockError) as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Host purge audit append failed",
+            retryable=True,
+        ) from exc
     return PurgeSessionResult(
         session_id=result.tombstone.session_id,
         purged=True,
@@ -797,6 +829,7 @@ class _PurgeSessionOperation:
 
     session_id: str
     request: PurgeSessionRequest
+    audit_sink_options: LogAuditSinkOptions
 
     def __call__(self, transaction: HostTransaction) -> PurgeSessionDeleteResult:
         """执行 purge durable helper。
@@ -830,11 +863,34 @@ class _PurgeSessionOperation:
                 operation_context_refs=operation_context_refs,
                 reason=self.request.reason,
                 purged_at=format_utc_timestamp(datetime.now(UTC)),
-                audit_record_ref=None,
-                audit_record_digest=None,
+                audit_recorder=_PurgeAuditJsonlRecorder(self.audit_sink_options),
                 request_context=request_context,
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _PurgeAuditJsonlRecorder:
+    """public purge command 使用的 JSONL audit recorder。
+
+    :param options: audit JSONL sink options。
+    """
+
+    options: LogAuditSinkOptions
+
+    def record_purge_tombstone_audit(
+        self, request: PurgeTombstoneAuditRecordRequest
+    ) -> PurgeTombstoneAuditRecordResult:
+        """追加 purge tombstone audit JSONL line。
+
+        :param request: purge tombstone audit 写入请求。
+        :returns: audit record ref 与 line digest。
+        :raises HostDurableError: audit source key digest 冲突时抛出。
+        :raises OSError: audit JSONL 文件写入失败时抛出。
+        :raises RuntimeFileLockError: audit JSONL 文件锁失败时抛出。
+        """
+
+        return append_purge_tombstone_audit_record(self.options, request)
 
 
 def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:
