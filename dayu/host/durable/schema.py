@@ -3,8 +3,8 @@
 本模块是 Host durable schema convention 的唯一 DDL 真源。它创建 Phase 2
 foundation tables、Phase 3 Session / Run / Attempt durable state tables，
 Phase 8 projection / read model tables、Phase 9 memory projection tables，
-以及 Phase 13 audit sink-local marker table；不承载 command、admission、
-outbox 或 purge 相关逻辑。
+以及 Phase 13 audit / tool trace projection-owned tables；不承载 command、
+admission、outbox 或 purge 相关逻辑。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 11
+HOST_SCHEMA_VERSION = 12
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -45,6 +45,7 @@ TABLE_HOST_MEMORY_SNAPSHOTS = "host_memory_snapshots"
 TABLE_HOST_MEMORY_ITEMS = "host_memory_items"
 TABLE_HOST_MEMORY_DIAGNOSTICS = "host_memory_diagnostics"
 TABLE_HOST_AUDIT_SINK_MARKERS = "host_audit_sink_markers"
+TABLE_HOST_TOOL_TRACE_HOT = "host_tool_trace_hot"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION = "host_runs_one_accepted_per_session"
@@ -72,6 +73,13 @@ INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON = (
     "host_memory_diagnostics_session_reason"
 )
 INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE = "event_log_run_type_sequence"
+INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE = "host_tool_trace_hot_run_sequence"
+INDEX_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE = "host_tool_trace_hot_tool_sequence"
+INDEX_HOST_TOOL_TRACE_HOT_TOOL_CALL = "host_tool_trace_hot_tool_call"
+INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST = (
+    "host_tool_trace_hot_provider_request"
+)
+INDEX_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF = "host_tool_trace_hot_diagnostic_ref"
 
 FOUNDATION_TABLES: tuple[str, ...] = (
     TABLE_EVENT_LOG,
@@ -110,12 +118,16 @@ MEMORY_PROJECTION_TABLES: tuple[str, ...] = (
 AUDIT_PROJECTION_TABLES: tuple[str, ...] = (TABLE_HOST_AUDIT_SINK_MARKERS,)
 """Phase 13 audit sink-local marker table 名称集合。"""
 
+TOOL_TRACE_PROJECTION_TABLES: tuple[str, ...] = (TABLE_HOST_TOOL_TRACE_HOT,)
+"""Phase 13 tool trace projection-owned table 名称集合。"""
+
 HOST_DURABLE_TABLES: tuple[str, ...] = (
     FOUNDATION_TABLES
     + PHASE3_STATE_TABLES
     + PROJECTION_TABLES
     + MEMORY_PROJECTION_TABLES
     + AUDIT_PROJECTION_TABLES
+    + TOOL_TRACE_PROJECTION_TABLES
 )
 """当前 fresh bootstrap 应创建的 Host durable table 名称集合。"""
 
@@ -828,6 +840,54 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_AUDIT_SINK_MARKERS} (
 )
 """
 
+_HOST_TOOL_TRACE_HOT_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_TOOL_TRACE_HOT} (
+  trace_id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL UNIQUE,
+  event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
+  event_type TEXT NOT NULL,
+  event_class TEXT NOT NULL CHECK (
+    event_class IN (
+      'canonical_fact',
+      'preview',
+      'diagnostic',
+      'projection_signal'
+    )
+  ),
+  session_id TEXT NOT NULL,
+  run_id TEXT NULL,
+  attempt_id TEXT NULL,
+  execution_id TEXT NULL,
+  tool_call_id TEXT NULL,
+  tool_name TEXT NULL,
+  provider_request_id TEXT NULL,
+  diagnostic_ref TEXT NULL,
+  normalized_arguments_digest TEXT NULL,
+  semantic_input_digest TEXT NULL,
+  result_digest TEXT NULL,
+  payload_ref TEXT NULL,
+  payload_digest TEXT NULL,
+  policy_decision_json TEXT NULL,
+  trace_summary_json TEXT NOT NULL,
+  cold_trace_ref TEXT NULL,
+  cold_trace_digest TEXT NULL,
+  projected_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  CHECK (
+    (payload_ref IS NULL AND payload_digest IS NULL)
+    OR
+    (payload_ref IS NOT NULL AND payload_digest IS NOT NULL)
+  ),
+  CHECK (
+    (cold_trace_ref IS NULL AND cold_trace_digest IS NULL)
+    OR
+    (cold_trace_ref IS NOT NULL AND cold_trace_digest IS NOT NULL)
+  )
+)
+"""
+
 # ``recovering`` 由 Phase 11 recovery owner 写入；当前 P9 transition
 # 代码尚不写入该状态，schema 与 active Run 单例约束先保留识别能力。
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
@@ -906,6 +966,36 @@ CREATE INDEX IF NOT EXISTS {INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON}
 ON {TABLE_HOST_MEMORY_DIAGNOSTICS}(session_id, reason, recorded_at)
 """
 
+_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE}
+ON {TABLE_HOST_TOOL_TRACE_HOT}(run_id, event_sequence)
+WHERE run_id IS NOT NULL
+"""
+
+_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE}
+ON {TABLE_HOST_TOOL_TRACE_HOT}(tool_name, event_sequence)
+WHERE tool_name IS NOT NULL
+"""
+
+_HOST_TOOL_TRACE_HOT_TOOL_CALL_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_TOOL_TRACE_HOT_TOOL_CALL}
+ON {TABLE_HOST_TOOL_TRACE_HOT}(tool_call_id)
+WHERE tool_call_id IS NOT NULL
+"""
+
+_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST}
+ON {TABLE_HOST_TOOL_TRACE_HOT}(provider_request_id)
+WHERE provider_request_id IS NOT NULL
+"""
+
+_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF}
+ON {TABLE_HOST_TOOL_TRACE_HOT}(diagnostic_ref)
+WHERE diagnostic_ref IS NOT NULL
+"""
+
 FOUNDATION_DDL: tuple[str, ...] = (
     _SQLITE_PAYLOADS_DDL,
     _PAYLOAD_DESCRIPTORS_DDL,
@@ -959,6 +1049,9 @@ MEMORY_PROJECTION_DDL: tuple[str, ...] = (
 AUDIT_PROJECTION_DDL: tuple[str, ...] = (_HOST_AUDIT_SINK_MARKERS_DDL,)
 """按外键依赖顺序排列的 Phase 13 audit sink-local marker DDL。"""
 
+TOOL_TRACE_PROJECTION_DDL: tuple[str, ...] = (_HOST_TOOL_TRACE_HOT_DDL,)
+"""按外键依赖顺序排列的 Phase 13 tool trace projection DDL。"""
+
 PROJECTION_INDEX_DDL: tuple[str, ...] = (
     _HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE_INDEX_DDL,
     _HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE_INDEX_DDL,
@@ -973,16 +1066,27 @@ MEMORY_PROJECTION_INDEX_DDL: tuple[str, ...] = (
 )
 """Phase 9 memory projection index DDL。"""
 
+TOOL_TRACE_PROJECTION_INDEX_DDL: tuple[str, ...] = (
+    _HOST_TOOL_TRACE_HOT_RUN_SEQUENCE_INDEX_DDL,
+    _HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE_INDEX_DDL,
+    _HOST_TOOL_TRACE_HOT_TOOL_CALL_INDEX_DDL,
+    _HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST_INDEX_DDL,
+    _HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF_INDEX_DDL,
+)
+"""Phase 13 tool trace projection index DDL。"""
+
 HOST_DURABLE_DDL: tuple[str, ...] = (
     FOUNDATION_DDL
     + PHASE3_STATE_DDL
     + PROJECTION_DDL
     + MEMORY_PROJECTION_DDL
     + AUDIT_PROJECTION_DDL
+    + TOOL_TRACE_PROJECTION_DDL
     + FOUNDATION_INDEX_DDL
     + PHASE3_INDEX_DDL
     + PROJECTION_INDEX_DDL
     + MEMORY_PROJECTION_INDEX_DDL
+    + TOOL_TRACE_PROJECTION_INDEX_DDL
 )
 """当前 Host durable fresh bootstrap 全量 DDL。"""
 

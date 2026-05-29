@@ -76,6 +76,11 @@ from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
 from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.tool_trace import (
+    DEFAULT_TOOL_TRACE_CATCHUP_BATCH_SIZE,
+    ToolTraceSinkOptions,
+    catch_up_tool_trace_projection,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_OPEN_HOST_ID_PREFIX = "open-host"
@@ -97,6 +102,15 @@ _AUDIT_JSONL_FILE_NAME = "host-audit.jsonl"
 
 _AUDIT_LOCK_FILE_SUFFIX = ".lock"
 """默认 audit JSONL lock 文件名后缀。"""
+
+_TOOL_TRACE_ARTIFACT_DIRECTORY_NAME = "tool-trace"
+"""artifact_root 下 Tool Trace artifact 目录名。"""
+
+_TOOL_TRACE_COLD_JSONL_FILE_NAME = "tool-trace-cold.jsonl"
+"""默认 Tool Trace cold JSONL 文件名。"""
+
+_TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
+"""默认 Tool Trace cold JSONL lock 文件名后缀。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +173,32 @@ class _LogAuditProjectionCatchupPort(ProjectionCatchupPort):
             self.durable_store.transaction_runner,
             options=self.options,
             batch_size=DEFAULT_LOG_AUDIT_CATCHUP_BATCH_SIZE,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolTraceProjectionCatchupPort(ProjectionCatchupPort):
+    """Tool Trace projection catch-up 端口。
+
+    :param durable_store: 当前 opener 持有的 durable store。
+    :param options: Tool Trace sink options。
+    :raises: 无。
+    """
+
+    durable_store: HostDurableStore
+    options: ToolTraceSinkOptions
+
+    def catch_up_projection(self) -> None:
+        """追平 Tool Trace hot / cold projection。
+
+        :returns: ``None``。
+        :raises HostDurableError: durable projection catch-up 失败时抛出。
+        """
+
+        catch_up_tool_trace_projection(
+            self.durable_store.transaction_runner,
+            options=self.options,
+            batch_size=DEFAULT_TOOL_TRACE_CATCHUP_BATCH_SIZE,
         )
 
 
@@ -515,10 +555,17 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     self._options
                 ),
             )
+            tool_trace_projection_catchup_port = _ToolTraceProjectionCatchupPort(
+                durable_store=durable_store,
+                options=_tool_trace_sink_options_from_open_host_options(
+                    self._options
+                ),
+            )
             close_projection_catchup_port = _CompositeProjectionCatchupPort(
                 ports=(
                     memory_projection_catchup_port,
                     audit_projection_catchup_port,
+                    tool_trace_projection_catchup_port,
                 )
             )
             scheduler = await HostDispatchScheduler.open(
@@ -816,6 +863,53 @@ def _default_audit_lock_path(audit_jsonl_path: Path) -> Path:
 
     return audit_jsonl_path.with_name(
         audit_jsonl_path.name + _AUDIT_LOCK_FILE_SUFFIX
+    )
+
+
+def _tool_trace_sink_options_from_open_host_options(
+    options: OpenHostOptions,
+) -> ToolTraceSinkOptions:
+    """从 public opener options 派生内部 Tool Trace sink options。
+
+    :param options: public opener options。
+    :returns: ToolTraceSink options；不新增 public ``OpenHostOptions`` 字段。
+    :raises TypeError: 派生出的路径配置类型非法时抛出。
+    :raises ValueError: 派生出的路径为空时抛出。
+    """
+
+    cold_jsonl_path = _default_tool_trace_cold_jsonl_path(options.artifact_root)
+    return ToolTraceSinkOptions(
+        cold_jsonl_path=cold_jsonl_path,
+        create_parent_dirs=options.create_parent_dirs,
+        lock_path=_default_tool_trace_lock_path(cold_jsonl_path),
+    )
+
+
+def _default_tool_trace_cold_jsonl_path(artifact_root: Path) -> Path:
+    """从 artifact_root 派生默认 Tool Trace cold JSONL 路径。
+
+    :param artifact_root: Host artifact root。
+    :returns: 默认 Tool Trace cold JSONL 路径。
+    :raises: 无。
+    """
+
+    return (
+        artifact_root
+        / _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME
+        / _TOOL_TRACE_COLD_JSONL_FILE_NAME
+    )
+
+
+def _default_tool_trace_lock_path(cold_jsonl_path: Path) -> Path:
+    """从 Tool Trace cold JSONL 路径派生相邻 lock 文件路径。
+
+    :param cold_jsonl_path: Tool Trace cold JSONL 路径。
+    :returns: 相邻 lock 文件路径。
+    :raises: 无。
+    """
+
+    return cold_jsonl_path.with_name(
+        cold_jsonl_path.name + _TOOL_TRACE_LOCK_FILE_SUFFIX
     )
 
 

@@ -19,9 +19,15 @@ from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
     INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
+    INDEX_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF,
+    INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST,
+    INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE,
+    INDEX_HOST_TOOL_TRACE_HOT_TOOL_CALL,
+    INDEX_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE,
     MEMORY_PROJECTION_TABLES,
     PHASE3_STATE_TABLES,
     PROJECTION_TABLES,
+    TOOL_TRACE_PROJECTION_TABLES,
     INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON,
     INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE,
     INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR,
@@ -38,6 +44,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_PROJECTION_FAILURES,
     TABLE_HOST_RUN_RESULTS,
     TABLE_HOST_SESSION_TIMELINE_ITEMS,
+    TABLE_HOST_TOOL_TRACE_HOT,
     TABLE_HOST_WAIT_RECORDS,
     INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL,
     INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB,
@@ -220,7 +227,7 @@ def _insert_payload_descriptor_probe(
 def test_fresh_db_creates_foundation_phase8_and_memory_tables(
     tmp_path: Path,
 ) -> None:
-    """fresh DB bootstrap 创建 foundation、state、projection、memory 与 audit tables。"""
+    """fresh DB bootstrap 创建 foundation、state、projection、memory 与 Phase 13 tables。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -233,6 +240,9 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
                 _table_names(connection)
             )
             assert set(AUDIT_PROJECTION_TABLES).issubset(_table_names(connection))
+            assert set(TOOL_TRACE_PROJECTION_TABLES).issubset(
+                _table_names(connection)
+            )
             assert _pragma_int(connection, "PRAGMA user_version") == (
                 HOST_SCHEMA_VERSION
             )
@@ -270,6 +280,12 @@ def test_schema_mismatch_raises_structured_error(tmp_path: Path) -> None:
             bootstrap_host_durable_store(connection)
     finally:
         connection.close()
+
+
+def test_host_schema_version_is_phase13_tool_trace_version() -> None:
+    """当前 committed Host schema version 是 Slice 2 的 fresh schema 12。"""
+
+    assert HOST_SCHEMA_VERSION == 12
 
 
 def test_wait_record_snapshot_columns_are_all_or_none(tmp_path: Path) -> None:
@@ -697,6 +713,32 @@ def test_audit_sink_marker_table_is_created(tmp_path: Path) -> None:
             connection.close()
 
 
+def test_tool_trace_hot_table_and_indexes_are_created(tmp_path: Path) -> None:
+    """fresh schema 创建 Tool Trace hot projection table 与查询索引。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert TABLE_HOST_TOOL_TRACE_HOT in _table_names(connection)
+            assert _primary_key_columns(connection, TABLE_HOST_TOOL_TRACE_HOT) == (
+                "trace_id",
+            )
+            indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_TOOL_TRACE_HOT})"
+            ).fetchall()
+            index_names = {str(row[1]) for row in indexes}
+            assert {
+                INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE,
+                INDEX_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE,
+                INDEX_HOST_TOOL_TRACE_HOT_TOOL_CALL,
+                INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST,
+                INDEX_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF,
+            }.issubset(index_names)
+        finally:
+            connection.close()
+
+
 def test_projection_schema_constraints_reject_invalid_rows(
     tmp_path: Path,
 ) -> None:
@@ -887,6 +929,60 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       'missing-event',
                       1,
                       'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_TOOL_TRACE_HOT} (
+                      trace_id,
+                      event_id,
+                      event_sequence,
+                      event_type,
+                      event_class,
+                      session_id,
+                      trace_summary_json,
+                      cold_trace_ref,
+                      projected_at,
+                      updated_at
+                    ) VALUES (
+                      'trace-invalid-cold-ref',
+                      'event-1',
+                      1,
+                      'TOOL_RESULT_ACCEPTED',
+                      'canonical_fact',
+                      'session-1',
+                      '{{}}',
+                      'cold-ref',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_TOOL_TRACE_HOT} (
+                      trace_id,
+                      event_id,
+                      event_sequence,
+                      event_type,
+                      event_class,
+                      session_id,
+                      trace_summary_json,
+                      projected_at,
+                      updated_at
+                    ) VALUES (
+                      'trace-missing-event',
+                      'missing-event',
+                      1,
+                      'TOOL_RESULT_ACCEPTED',
+                      'canonical_fact',
+                      'session-1',
+                      '{{}}',
+                      '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
                     """
