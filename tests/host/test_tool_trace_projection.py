@@ -21,6 +21,11 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import (
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+    write_sqlite_payload,
+)
 from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
@@ -31,7 +36,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_TOOL_TRACE_HOT,
 )
 from dayu.host.durable.tool_trace import read_tool_trace_hot_row
-from dayu.host.durable.transaction import HostTransactionRunner
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.open_host import _default_tool_trace_cold_jsonl_path
 from dayu.host.projection import ProjectionRunner
 from dayu.host.tool_trace import (
@@ -81,29 +86,79 @@ def _append_tool_event(
     """
 
     return transaction_runner.run_write(
-        lambda transaction: append_event(
+        lambda transaction: _append_tool_event_in_transaction(
             transaction,
-            EventLogAppendRequest(
-                event_id=event_id,
-                event_class=event_class,
-                session_id="session-1",
-                run_id="run-1",
-                attempt_id="attempt-1",
-                execution_id="execution-1",
-                event_type=event_type,
-                occurred_at=_FIXED_NOW,
-                actor="host",
-                source="unit-test",
-                client_request_id=None,
-                idempotency_key=None,
-                policy_decision={"decision": "accepted"},
-                reason={"reason": "test"},
-                payload_json=payload,
-                payload_ref=payload_ref,
-                payload_digest=payload_digest,
-            ),
-        ).row
+            event_id=event_id,
+            event_type=event_type,
+            payload=payload,
+            event_class=event_class,
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
+        )
     )
+
+
+def _append_tool_event_in_transaction(
+    transaction: HostTransaction,
+    *,
+    event_id: str,
+    event_type: str,
+    payload: JsonValue,
+    event_class: EventClass,
+    payload_ref: str | None,
+    payload_digest: str | None,
+) -> EventLogRow:
+    """在单个 transaction 内追加 Tool Trace 测试 EventLog row。
+
+    :param transaction: Host durable transaction。
+    :param event_id: EventLog id。
+    :param event_type: EventLog type。
+    :param payload: inline payload。
+    :param event_class: EventLog class。
+    :param payload_ref: 可选 payload descriptor ref。
+    :param payload_digest: 可选 payload digest。
+    :returns: 已追加 EventLog row。
+    """
+
+    actual_payload_ref = payload_ref
+    actual_payload_digest = payload_digest
+    if payload_ref is not None:
+        descriptor = write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref=payload_ref,
+                payload_id=f"{event_id}-payload",
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json={"event_id": event_id, "source": "event-log-payload"},
+                media_type="application/json",
+                metadata={"kind": "test"},
+                expected_digest=payload_digest,
+            ),
+        )
+        actual_payload_ref = descriptor.payload_ref
+        actual_payload_digest = descriptor.payload_digest
+    return append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=event_class,
+            session_id="session-1",
+            run_id="run-1",
+            attempt_id="attempt-1",
+            execution_id="execution-1",
+            event_type=event_type,
+            occurred_at=_FIXED_NOW,
+            actor="host",
+            source="unit-test",
+            client_request_id=None,
+            idempotency_key=None,
+            policy_decision={"decision": "accepted"},
+            reason={"reason": "test"},
+            payload_json=payload,
+            payload_ref=actual_payload_ref,
+            payload_digest=actual_payload_digest,
+        ),
+    ).row
 
 
 def _run_trace_once(
@@ -239,9 +294,24 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
                 "normalized_arguments_digest": "sha256:args",
                 "semantic_input_digest": "sha256:semantic",
                 "outcome_digest": "sha256:outcome",
-                "payload_digest": "sha256:payload",
+                "payload_ref": {
+                    "payload_ref": "artifact://tool-result",
+                    "payload_digest": (
+                        "sha256:"
+                        "1111111111111111111111111111111111111111111111111111111111111111"
+                    ),
+                },
                 "diagnostic_refs": [{"ref_id": "diag-result"}],
+                "operation_context": {
+                    "operation_name": "analyze_filing",
+                    "business_domain": "financial_report",
+                    "business_object_id": "AAPL-10K-2025",
+                },
+                "raw_result": {
+                    "unbounded_text": "raw payload must stay in EventLog only"
+                },
             },
+            payload_ref="artifact://event-log-payload",
         )
 
         _run_trace_once(store.transaction_runner, cold_path)
@@ -270,11 +340,32 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         assert result_row is not None
         assert result_row.result_digest == "sha256:outcome"
         assert result_row.diagnostic_ref == "diag-result"
-    assert [line["event_id"] for line in _json_lines(cold_path)] == [
-        "event-requested",
-        "event-governed",
-        "event-result",
-    ]
+        cold_lines = _json_lines(cold_path)
+        assert [line["event_id"] for line in cold_lines] == [
+            "event-requested",
+            "event-governed",
+            "event-result",
+        ]
+        result_line = cold_lines[2]
+        assert "payload" not in result_line
+        assert "raw_result" not in json.dumps(result_line, sort_keys=True)
+        assert result_line["payload_ref"] == "artifact://tool-result"
+        assert result_line["payload_digest"] == (
+            "sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        )
+        assert result_line["source_payload_ref"] == "artifact://event-log-payload"
+        assert result_line["source_payload_digest"] == result.payload_digest
+        assert result_line["diagnostic_refs"] == ["diag-result"]
+        assert result_line["operation_context_refs"] == [
+            "analyze_filing",
+            "financial_report",
+            "AAPL-10K-2025",
+        ]
+        assert isinstance(result_line["operation_context_digest"], str)
+        assert result_line["trace_summary"] == result_row.trace_summary
+        assert result_line["cold_trace_ref"] == "tool-trace-cold:event-result"
+        assert result_line["cold_trace_digest"] == result_line["line_digest"]
 
 
 def test_cold_writer_failure_records_projection_failure_without_checkpoint(

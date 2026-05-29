@@ -280,8 +280,17 @@ projection checkpoint/failure/latest watermark 读取下沉到 `dayu/host/durabl
 Aggregate re-review artifacts 为 `docs/reviews/phase13-aggregate-rereview-mimo-20260529.md` 与
 `docs/reviews/phase13-aggregate-rereview-ds-20260529.md`。两路 re-review 均 PASS，确认 F001 fixed，无新增
 blocking findings。Controller re-review adjudication 为
-`docs/reviews/phase13-aggregate-rereview-controller-adjudication-20260529.md`。当前 gate：Phase 13
-ready-to-open-draft-PR。Accepted aggregate review commit 为 `85c3358`。
+`docs/reviews/phase13-aggregate-rereview-controller-adjudication-20260529.md`。当前 gate：Phase 13 draft-PR-review。Accepted aggregate review commit 为 `85c3358`。
+Draft PR 为 PR 69 (`feat/phase-13-audit-trace-outbox` → `main`)。Draft PR review artifacts 为
+`docs/reviews/pr-69-review-mimo-20260529.md` 与 `docs/reviews/pr-69-review-ds-20260529.md`。Controller adjudication
+artifact 为 `docs/reviews/pr-69-review-controller-adjudication-20260529.md`。当前 gate：PR 69 draft PR fix。
+Accepted blocking findings：PR-F1 Tool Trace cold JSONL 复制完整 raw payload，违反 typed whitelist / ref-first
+边界；PR-F2 PR 全量 `git diff --check main...HEAD` 在已提交 review artifact 中发现 trailing whitespace。
+PR fix artifact 为 `docs/reviews/pr-69-fix-codex-20260529.md`。PR fix re-review artifacts 为
+`docs/reviews/pr-69-fix-rereview-mimo-20260529.md` 与 `docs/reviews/pr-69-fix-rereview-ds-20260529.md`。两路
+re-review 均 PASS，确认 PR-F1 / PR-F2 fixed，无新增 blocking findings。Controller re-review adjudication 为
+`docs/reviews/pr-69-fix-rereview-controller-adjudication-20260529.md`。当前 gate：PR 69 accepted PR review commit
+and push。
 
 ## Phase Map
 

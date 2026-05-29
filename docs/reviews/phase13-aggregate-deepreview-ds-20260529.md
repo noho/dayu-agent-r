@@ -128,7 +128,7 @@ All three consumers follow the same pattern, consistent with Phase 8 projection 
 3. **Event apply**: per-event `apply(event)` → `ProjectionApplyResult`
 4. **Checkpoint advance**: only after successful apply, in same or subsequent transaction
 5. **Failure recording**: write `host_projection_failures` without advancing checkpoint
-6. **Normal replay idempotency**: 
+6. **Normal replay idempotency**:
    - Audit: `insert_audit_sink_marker_if_absent` → `DUPLICATE` on same `event_id`
    - Tool Trace: `insert_tool_trace_hot_row_if_absent` → `DUPLICATE` on same `trace_id` (= `event_id`)
    - Outbox: `insert_outbox_terminal_item_if_absent` → `DUPLICATE` on same `idempotency_key`
@@ -170,7 +170,7 @@ The residual risk is accurately documented and owned. Consumer code uses `event_
 # api.py — unchanged signature
 def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
 
-# open_host.py — unchanged signature  
+# open_host.py — unchanged signature
 def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
 ```
 

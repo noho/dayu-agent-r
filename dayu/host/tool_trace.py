@@ -101,7 +101,6 @@ _FIELD_RUN_ID = "run_id"
 _FIELD_OPERATION_CONTEXT_REFS = "operation_context_refs"
 _FIELD_OPERATION_CONTEXT_DIGEST = "operation_context_digest"
 _FIELD_TRACE_SUMMARY = "trace_summary"
-_FIELD_PAYLOAD = "payload"
 _FIELD_SOURCE_PAYLOAD_REF = "source_payload_ref"
 _FIELD_SOURCE_PAYLOAD_DIGEST = "source_payload_digest"
 _OPERATION_CONTEXT_REF_FIELDS: tuple[str, ...] = (
@@ -691,7 +690,6 @@ def _build_cold_line(
         _FIELD_SOURCE_PAYLOAD_DIGEST: event_row.payload_digest,
         _FIELD_POLICY_DECISION: event_row.policy_decision_json,
         _FIELD_TRACE_SUMMARY: extracted.trace_summary,
-        _FIELD_PAYLOAD: event.payload,
     }
     line_digest = sha256_digest_json(fields_without_digest)
     fields: dict[str, JsonValue] = dict(fields_without_digest)
