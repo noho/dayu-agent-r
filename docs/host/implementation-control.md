@@ -226,7 +226,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前状态：Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS；P15-S1
 Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction Helper 与 P15-S3 Public Command Wiring And
 Read-after-purge Semantics 均已通过 code review / controller validation，进入 accepted slice commit。
-Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`。
+Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
+commit 为 `17c5c00`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
 `docs/reviews/phase15-s3-implementation-codex-20260529.md`、
 `docs/reviews/phase15-s3-code-review-mimo-20260529.md`、
@@ -2356,7 +2357,7 @@ S3 fix pass；DS audit fail-before-success observation 接受为 S4 handoff risk
 tests/host/test_open_host_runtime.py tests/host/test_purge_session.py -q` 为 69 passed；`python -m pyright
 dayu/host/command.py dayu/host/open_host.py dayu/host/read_api.py tests/host` 为 0 errors / 0 warnings / 0 informations；
 `git diff --check` clean。README 检查结论：S3 已让包根 `purge_session` 从 structured unsupported 变为可用，已同步
-`dayu/host/README.md` 与 `tests/README.md` 的当前事实。Accepted S3 commit 将在本条记录提交后由 git commit 记录。
+`dayu/host/README.md` 与 `tests/README.md` 的当前事实。Accepted S3 commit 为 `17c5c00`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
