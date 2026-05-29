@@ -226,7 +226,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前状态：PR 68 已 merge 到 `main`，merge commit 为 `b9bd625`。当前工作分支为
 `feat/phase-13-audit-trace-outbox`，从 clean `main` 创建。Phase 13 design discussion 已由用户确认；controller
 adjudication artifact 为 `docs/reviews/phase13-design-discussion-controller-adjudication-20260529.md`。
-当前 gate：Phase 13 Slice 2 accepted slice commit。
+当前 gate：Phase 13 Slice 3 implementation。
 Plan artifact 为 `docs/host/phase13-audit-tool-trace-outbox-plan.md`。Plan review artifacts 为
 `docs/reviews/phase13-plan-review-mimo-20260529.md` 与 `docs/reviews/phase13-plan-review-ds-20260529.md`；
 controller adjudication 为 `docs/reviews/phase13-plan-review-controller-adjudication-20260529.md`。Controller 接受
@@ -250,7 +250,9 @@ commit 为 `7432f02`。Phase 13 Slice 2 `Tool Trace Hot JSON / Cold JSONL` imple
 `docs/reviews/phase13-slice2-code-review-mimo-20260529.md` 与
 `docs/reviews/phase13-slice2-code-review-ds-20260529.md`。两路 review 均 PASS，无 blocking findings；controller
 adjudication 为 `docs/reviews/phase13-slice2-code-review-controller-adjudication-20260529.md`。下一步：创建
-accepted Slice 2 local commit。
+accepted Slice 2 local commit。Accepted Slice 2 commit 为 `0a675a5`。下一步：按 accepted plan 派发 Slice 3
+`OutboxSink Durable Projection` implementation；当前 committed schema version 为 12，Slice 3 schema change 必须 fresh bump
+到 13。
 
 ## Phase Map
 
@@ -2385,6 +2387,10 @@ Phase 13 Slice 2 code review 已完成。MiMo artifact 为
 Controller adjudication artifact 为
 `docs/reviews/phase13-slice2-code-review-controller-adjudication-20260529.md`。低优先级 findings 均裁决为
 non-blocking residual / later hardening，不要求当前 fix pass。当前 gate 进入 accepted Slice 2 commit。
+
+Accepted Slice 2 commit 已创建：`0a675a5` (`gateflow: accept phase 13 slice 2`)。当前 gate 进入 Phase 13
+Slice 3 `OutboxSink Durable Projection` implementation。当前 committed Host schema version 为 12；Slice 3 如新增
+outbox durable tables，必须 fresh schema bump 到 13。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 
