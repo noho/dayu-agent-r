@@ -233,8 +233,8 @@ adjudication artifact 为 `docs/reviews/phase15-plan-review-controller-adjudicat
 `docs/reviews/phase15-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-plan-rereview-ds-20260529.md`。Phase 13 Audit /
 Tool Trace / Outbox Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits
 与 PR 69 记录见 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 S1 accepted slice commit。
-下一步：创建 S1 accepted slice 本地 checkpoint 后进入 Slice P15-S2 Delete Matrix Transaction Helper。P15 不以 Phase 14 completion 为进入
+当前 gate：Phase 15 implementation Slice P15-S2。
+下一步：派发 implementation specialist 实现 Slice P15-S2 Delete Matrix Transaction Helper。P15 不以 Phase 14 completion 为进入
 前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
@@ -2323,7 +2323,8 @@ PASS / 0 findings，DS finding 经 Controller adjudication artifact
 `pytest tests/host/test_durable_schema.py tests/host/test_purge_session.py tests/host/test_weak_typing_guard.py -q` 为
 31 passed；`python -m pyright dayu/host/durable/schema.py dayu/host/durable/purge.py tests/host/test_durable_schema.py
 tests/host/test_purge_session.py` 为 0 errors。README 检查结论：S1 未接 public `purge_session`，现有
-`dayu/host/README.md` structured unsupported 描述仍正确；`tests/README.md` 无需机械更新。
+`dayu/host/README.md` structured unsupported 描述仍正确；`tests/README.md` 无需机械更新。Accepted S1 commit 为
+`f607655`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
