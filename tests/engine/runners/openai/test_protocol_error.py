@@ -591,6 +591,35 @@ async def test_sse_all_non_object_choices_end_with_protocol_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sse_all_non_object_choices_with_usage_protocol_error() -> None:
+    """非空 choices 全不可解析时，即使 usage 合法也必须协议错误收口。"""
+
+    payload_json = json.dumps(
+        {
+            "choices": ["bad-choice", None],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 0,
+                "total_tokens": 5,
+            },
+        },
+        separators=(",", ":"),
+    )
+    events = await parse_sse([_sse_json_chunk(payload_json), b"data: [DONE]\n\n"])
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_missing_choices"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
 async def test_sse_tool_call_missing_id_emits_missing_id_error() -> None:
     """tool_call 始终缺失 ``id`` → fatal 错误 + Done(ERROR)，无 ToolCallsCompleted。"""
 

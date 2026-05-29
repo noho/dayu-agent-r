@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -329,7 +330,7 @@ class ToolTraceProjectionConsumer:
         )
 
     def _append_line(self, line: ToolTraceColdLine) -> None:
-        """向 Tool Trace cold JSONL 文件追加单行。
+        """向 Tool Trace cold JSONL 文件幂等追加单行。
 
         :param line: 已构造的 cold line。
         :returns: ``None``。
@@ -339,15 +340,29 @@ class ToolTraceProjectionConsumer:
 
         if self._options.create_parent_dirs:
             self._options.cold_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        source_keys = (
+            (_FIELD_EVENT_ID, _required_line_text(line, _FIELD_EVENT_ID)),
+            (_FIELD_COLD_TRACE_REF, _required_line_text(line, _FIELD_COLD_TRACE_REF)),
+        )
         if self._options.lock_path is None:
-            _append_text(self._options.cold_jsonl_path, line.to_jsonl_text())
+            _append_text_if_absent(
+                self._options.cold_jsonl_path,
+                line.to_jsonl_text(),
+                line_digest=line.line_digest,
+                source_keys=source_keys,
+            )
             return
         with file_lock(
             self._options.lock_path,
             timeout_seconds=_LOCK_TIMEOUT_SECONDS,
             create_parent_dirs=self._options.create_parent_dirs,
         ):
-            _append_text(self._options.cold_jsonl_path, line.to_jsonl_text())
+            _append_text_if_absent(
+                self._options.cold_jsonl_path,
+                line.to_jsonl_text(),
+                line_digest=line.line_digest,
+                source_keys=source_keys,
+            )
 
 
 def catch_up_tool_trace_projection(
@@ -938,6 +953,29 @@ def _cold_trace_ref(event_id: str) -> str:
     return f"tool-trace-cold:{event_id}"
 
 
+def _append_text_if_absent(
+    path: Path,
+    text: str,
+    *,
+    line_digest: str,
+    source_keys: tuple[tuple[str, str], ...],
+) -> None:
+    """目标 JSONL 不含同一 digest 或 source key 冲突时追加文本。
+
+    :param path: 目标 JSONL 路径。
+    :param text: 待追加文本。
+    :param line_digest: 当前行 digest。
+    :param source_keys: 当前行的稳定 source key 集合。
+    :returns: ``None``。
+    :raises HostDurableError: 已存在相同 source key 但 digest 不同时抛出。
+    :raises OSError: 文件打开或写入失败时抛出。
+    """
+
+    if _jsonl_contains_line(path, line_digest=line_digest, source_keys=source_keys):
+        return
+    _append_text(path, text)
+
+
 def _append_text(path: Path, text: str) -> None:
     """向文件追加 UTF-8 文本。
 
@@ -950,6 +988,75 @@ def _append_text(path: Path, text: str) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
+
+
+def _jsonl_contains_line(
+    path: Path,
+    *,
+    line_digest: str,
+    source_keys: tuple[tuple[str, str], ...],
+) -> bool:
+    """检查 JSONL 中是否已有同一 line digest。
+
+    :param path: JSONL 文件路径。
+    :param line_digest: 当前行 digest。
+    :param source_keys: 当前行的稳定 source key 集合。
+    :returns: 已存在同一 line digest 时返回 ``True``。
+    :raises HostDurableError: 已存在相同 source key 但 digest 不同时抛出。
+    :raises OSError: 读取文件失败时抛出。
+    """
+
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            existing = _json_object_from_jsonl_line(raw_line)
+            if existing is None:
+                continue
+            existing_digest = existing.get(_FIELD_LINE_DIGEST)
+            if existing_digest == line_digest:
+                return True
+            for field_name, field_value in source_keys:
+                if existing.get(field_name) == field_value:
+                    raise HostDurableError(
+                        "tool trace JSONL source key conflicts with line digest"
+                    )
+    return False
+
+
+def _json_object_from_jsonl_line(raw_line: str) -> Mapping[str, JsonValue] | None:
+    """把单行 JSONL 解析为 JSON object。
+
+    :param raw_line: 原始 JSONL 行。
+    :returns: JSON object；空行、非法 JSON 或非 object 行返回 ``None``。
+    :raises: 无。
+    """
+
+    stripped = raw_line.strip()
+    if stripped == "":
+        return None
+    try:
+        value = cast(JsonValue, json.loads(stripped))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _required_line_text(line: ToolTraceColdLine, field_name: str) -> str:
+    """读取 Tool Trace cold line 中的必填文本字段。
+
+    :param line: Tool Trace cold JSONL 行。
+    :param field_name: 字段名。
+    :returns: 非空文本字段值。
+    :raises HostDurableError: 字段缺失或不是非空文本时抛出。
+    """
+
+    value = line.fields.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"tool trace cold line field {field_name} must be text")
 
 
 def _require_path(path: Path, *, field_name: str) -> None:

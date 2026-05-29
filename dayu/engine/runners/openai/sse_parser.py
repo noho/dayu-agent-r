@@ -411,7 +411,7 @@ class SSEParser:
                 handled_choice = True
                 async for event in self._handle_choice(choice):
                     yield event
-            if not handled_choice and not has_valid_usage:
+            if not handled_choice:
                 _LOGGER.warning(
                     "sse.protocol_error code=%s choices_type=list "
                     "valid_choice_count=0",

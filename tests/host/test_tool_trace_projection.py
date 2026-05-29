@@ -465,9 +465,64 @@ def test_projection_rebuild_from_event_log_restores_hot_rows(
 
         assert rebuilt is not None
         assert rebuilt.tool_call_id == "tool-call-1"
+        assert [line["event_id"] for line in _json_lines(cold_path)] == [
+            "event-requested"
+        ]
         assert event_count_after == 1
         assert run_count_after == 0
         assert attempt_count_after == 0
+
+
+def test_cold_jsonl_source_key_digest_conflict_records_failure_without_hot_row(
+    tmp_path: Path,
+) -> None:
+    """cold JSONL 同 source key 但 digest 不同时记录 failure，且不补 hot row。"""
+
+    cold_path = tmp_path / "trace" / "cold.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-requested",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": "tool-call-1",
+                "tool_name": "lookup_filing",
+                "normalized_arguments_digest": "sha256:args",
+            },
+        )
+        catch_up_tool_trace_projection(
+            store.transaction_runner,
+            options=ToolTraceSinkOptions(cold_jsonl_path=cold_path),
+        )
+        lines = _json_lines(cold_path)
+        assert len(lines) == 1
+        conflict_line = dict(lines[0])
+        conflict_line["line_digest"] = "sha256:conflicting"
+        conflict_line["cold_trace_digest"] = "sha256:conflicting"
+        cold_path.write_text(
+            json.dumps(conflict_line, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        _reset_tool_trace_projection(store.transaction_runner)
+        result = catch_up_tool_trace_projection(
+            store.transaction_runner,
+            options=ToolTraceSinkOptions(cold_jsonl_path=cold_path),
+        )
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        failure = store.transaction_runner.run_read(
+            lambda transaction: read_projection_failure(
+                transaction, TOOL_TRACE_CONSUMER_ID.value
+            )
+        )
+
+        assert result.failures == 1
+        assert hot_row is None
+        assert failure is not None
+        assert failure.failed_event_id == event.event_id
+        assert _json_lines(cold_path)[0]["line_digest"] == "sha256:conflicting"
 
 
 def test_default_tool_trace_path_is_derived_from_artifact_root(

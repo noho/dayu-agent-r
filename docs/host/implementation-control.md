@@ -293,6 +293,27 @@ re-review 均 PASS，确认 PR-F1 / PR-F2 fixed，无新增 blocking findings。
 and push。Accepted PR review fix commit 为 `27b4c0c`；`git diff --check main...HEAD` 已通过。当前 gate：PR 69
 draft-PR-pass。
 
+用户追加全仓 review gate 已启动。AgentMiMo artifact 为 `docs/reviews/repo-review-20260529-133403.md`，AgentDS
+artifact 为 `docs/reviews/repo-review-20260529-132719.md`。Controller adjudication 为
+`docs/reviews/repo-review-controller-adjudication-20260529.md`。当前 gate：full-repo review fix。Accepted blocking
+findings：FR-F1 Audit / Tool Trace JSONL 文件侧幂等缺失；FR-F2 Outbox projection read state 使用全局 EventLog
+watermark 误判 LAGGED；FR-F3 Outbox drain 缺 per-item pending CAS；FR-F4 SSE parser 对非空 choices 全不可解析但
+usage 合法的 chunk 未显式 protocol error；FR-F5 startup orphan recoverable closeout 允许与 durable CAS 不一致的
+`expected_run_status=CANCELLING` 组合。Deferred findings 与风险追踪见 controller adjudication。下一步：派发
+AgentCodex 修复 accepted blockers，并由 AgentMiMo / AgentDS re-review 到 PASS。
+
+Full-repo review fix 已完成，artifact 为 `docs/reviews/repo-review-fix-codex-20260529.md`。Fix 覆盖 FR-F1 至
+FR-F5：Audit / Tool Trace JSONL 文件侧幂等与 digest 冲突检测、Outbox terminal projection watermark、Outbox
+drain pending CAS、SSE invalid choices protocol error、startup orphan recoverable closeout 合约测试。Controller
+复跑 validation：focused pytest 84 passed；`pyright` 0 errors；`git diff --check` passed。当前 gate：full-repo
+review fix re-review；下一步派发 AgentMiMo 与 AgentDS 复审。
+
+Full-repo review fix re-review artifacts 为 `docs/reviews/repo-review-fix-rereview-mimo-20260529.md` 与
+`docs/reviews/repo-review-fix-rereview-ds-20260529.md`。两路 verdict 均 PASS，确认 FR-F1 至 FR-F5 fixed，无新增
+blocking findings。Controller adjudication 为
+`docs/reviews/repo-review-fix-rereview-controller-adjudication-20260529.md`。当前 gate：full-repo review PASS
+accepted commit and push。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。

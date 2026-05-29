@@ -35,6 +35,7 @@ from dayu.host.durable.projection import (
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_HOST_ATTEMPTS,
+    TABLE_HOST_AUDIT_SINK_MARKERS,
     TABLE_HOST_RUNS,
 )
 from dayu.host.durable.transaction import HostTransactionRunner
@@ -308,6 +309,96 @@ def test_marker_prevents_duplicate_append_when_checkpoint_replays(
         assert checkpoint.checkpoint_event_sequence == event.event_sequence
 
     assert [line["event_id"] for line in _json_lines(audit_path)] == ["event-1"]
+
+
+def test_jsonl_existing_line_prevents_duplicate_when_marker_missing(
+    tmp_path: Path,
+) -> None:
+    """JSONL 已写但 marker 缺失时 replay 只补 marker，不重复追加行。"""
+
+    audit_path = tmp_path / "audit" / "host-audit.jsonl"
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        event = _append_event(store.transaction_runner, event_id="event-1")
+        _run_audit_once(store.transaction_runner, audit_path)
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                transaction.execute(
+                    f"DELETE FROM {TABLE_HOST_AUDIT_SINK_MARKERS}"
+                ),
+                transaction.execute(
+                    "DELETE FROM host_projection_checkpoints WHERE consumer_id = ?",
+                    (LOG_AUDIT_SINK_CONSUMER_ID.value,),
+                ),
+            )
+        )
+
+        _run_audit_once(store.transaction_runner, audit_path)
+        marker = store.transaction_runner.run_read(
+            lambda transaction: read_audit_sink_marker(transaction, event.event_id)
+        )
+
+        assert marker is not None
+        assert [line["event_id"] for line in _json_lines(audit_path)] == ["event-1"]
+
+
+def test_jsonl_source_key_digest_conflict_records_failure_without_marker(
+    tmp_path: Path,
+) -> None:
+    """JSONL 同 event_id 但 digest 不同时记录 failure，且不补 marker。"""
+
+    audit_path = tmp_path / "audit" / "host-audit.jsonl"
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        event = _append_event(store.transaction_runner, event_id="event-1")
+        _run_audit_once(store.transaction_runner, audit_path)
+        lines = _json_lines(audit_path)
+        assert len(lines) == 1
+        conflict_line = dict(lines[0])
+        conflict_line["line_digest"] = "sha256:conflicting"
+        audit_path.write_text(
+            json.dumps(conflict_line, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                transaction.execute(
+                    f"DELETE FROM {TABLE_HOST_AUDIT_SINK_MARKERS}"
+                ),
+                transaction.execute(
+                    "DELETE FROM host_projection_checkpoints WHERE consumer_id = ?",
+                    (LOG_AUDIT_SINK_CONSUMER_ID.value,),
+                ),
+            )
+        )
+
+        runner = ProjectionRunner(
+            store.transaction_runner,
+            (
+                LogAuditSink(
+                    LogAuditSinkOptions(
+                        audit_jsonl_path=audit_path,
+                        create_parent_dirs=True,
+                        lock_path=None,
+                    )
+                ),
+            ),
+        )
+        result = runner.run_once(LOG_AUDIT_SINK_CONSUMER_ID, limit=1)
+        marker = store.transaction_runner.run_read(
+            lambda transaction: read_audit_sink_marker(transaction, event.event_id)
+        )
+        failure = store.transaction_runner.run_read(
+            lambda transaction: read_projection_failure(
+                transaction, LOG_AUDIT_SINK_CONSUMER_ID.value
+            )
+        )
+
+        assert result.failures == 1
+        assert marker is None
+        assert failure is not None
+        assert failure.failed_event_id == event.event_id
+        assert _json_lines(audit_path)[0]["line_digest"] == "sha256:conflicting"
 
 
 def test_file_write_failure_records_projection_failure_without_checkpoint(

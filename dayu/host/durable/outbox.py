@@ -44,6 +44,11 @@ OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT = 1000
 _MIN_EVENT_CURSOR = 0
 _MIN_EVENT_SEQUENCE = 1
 _MIN_LIMIT = 1
+_EVENT_CLASS_CANONICAL_FACT = "canonical_fact"
+_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
+_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
+_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _TERMINAL_STATUS_SUCCEEDED = "succeeded"
 _TERMINAL_STATUS_FAILED = "failed"
 _TERMINAL_STATUS_CANCELLED = "cancelled"
@@ -63,6 +68,12 @@ _TERMINAL_STATUSES = frozenset(
     )
 )
 _ITEM_STATES = frozenset((_ITEM_STATE_PENDING, _ITEM_STATE_DRAINED))
+_TERMINAL_EVENT_TYPES = (
+    _EVENT_TYPE_RUN_SUCCEEDED,
+    _EVENT_TYPE_RUN_FAILED,
+    _EVENT_TYPE_RUN_CANCELLED,
+    _EVENT_TYPE_RUN_LOST,
+)
 
 
 class OutboxTerminalItemWriteStatus(StrEnum):
@@ -371,7 +382,7 @@ def read_outbox_terminal_projection_state(
 
     本 helper 是 public outbox read / drain API 访问 projection checkpoint 与
     failure row 的唯一 durable 入口。它只读取 projection-owned 状态与
-    EventLog 最新水位，不读取或修改 Run / Attempt truth。
+    Outbox terminal canonical fact 最新水位，不读取或修改 Run / Attempt truth。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param consumer_id: Outbox terminal projection consumer id。
@@ -400,7 +411,7 @@ def read_outbox_terminal_projection_state(
             error_code=failure.last_error_code,
             error_message=failure.last_error_message,
         )
-    if checkpoint_event_sequence < _latest_event_sequence(transaction):
+    if checkpoint_event_sequence < _latest_outbox_terminal_event_sequence(transaction):
         return OutboxTerminalProjectionReadState(
             checkpoint_event_sequence=checkpoint_event_sequence,
             status=OutboxTerminalProjectionStatus.LAGGED,
@@ -489,7 +500,7 @@ def drain_outbox_terminal_items(
         created_at=drained_at,
     )
     for item_id in item_ids:
-        transaction.execute(
+        result = transaction.execute(
             f"""
             UPDATE {TABLE_HOST_OUTBOX_TERMINAL_ITEMS}
             SET item_state = ?,
@@ -497,6 +508,7 @@ def drain_outbox_terminal_items(
                 last_drain_request_id = ?,
                 updated_at = ?
             WHERE item_id = ?
+              AND item_state = ?
             """,
             (
                 _ITEM_STATE_DRAINED,
@@ -504,8 +516,11 @@ def drain_outbox_terminal_items(
                 drain_request_id,
                 drained_at,
                 item_id,
+                _ITEM_STATE_PENDING,
             ),
         )
+        if result.rowcount != 1:
+            raise HostDurableError("outbox drain item pending CAS failed")
     return _page_for_drained_item_ids(
         transaction,
         session_id=session_id,
@@ -719,16 +734,22 @@ def _has_terminal_item_after(
     return row is not None
 
 
-def _latest_event_sequence(transaction: HostTransaction) -> int:
-    """读取当前 EventLog 最新全局序号。
+def _latest_outbox_terminal_event_sequence(transaction: HostTransaction) -> int:
+    """读取当前最新 Outbox terminal canonical fact 序号。
 
     :param transaction: 调用方提供的 Host durable transaction。
-    :returns: 最新 ``event_sequence``；无事件时为 ``0``。
+    :returns: 最新 terminal ``event_sequence``；无事件时为 ``0``。
     :raises HostDurableError: schema 中序号类型非法时抛出。
     """
 
     row = transaction.fetchone(
-        f"SELECT COALESCE(MAX(event_sequence), 0) AS latest FROM {TABLE_EVENT_LOG}"
+        f"""
+        SELECT COALESCE(MAX(event_sequence), 0) AS latest
+        FROM {TABLE_EVENT_LOG}
+        WHERE event_class = ?
+          AND event_type IN (?, ?, ?, ?)
+        """,
+        (_EVENT_CLASS_CANONICAL_FACT, *_TERMINAL_EVENT_TYPES),
     )
     if row is None:
         return 0

@@ -9,7 +9,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.connection import open_host_durable_store
-from dayu.host.durable.errors import HostIdempotencyConflictError
+from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -23,14 +23,20 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.outbox import (
     OutboxTerminalItemRow,
+    OutboxTerminalProjectionStatus,
     drain_outbox_terminal_items,
     insert_outbox_terminal_item_if_absent,
+    read_outbox_terminal_projection_state,
     read_outbox_terminal_item_by_event_id,
     read_outbox_terminal_items_after,
 )
+from dayu.host.durable.projection import advance_projection_checkpoint
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostTransactionRunner
-from dayu.host.outbox import build_outbox_terminal_item_identity
+from dayu.host.outbox import (
+    OUTBOX_TERMINAL_CONSUMER_ID,
+    build_outbox_terminal_item_identity,
+)
 
 _FIXED_NOW = datetime(2026, 5, 29, 2, 3, 4, tzinfo=UTC)
 _NOW_TEXT = "2026-05-29T02:03:04.000000Z"
@@ -58,6 +64,7 @@ def _append_event(
     event_id: str,
     run_id: str,
     payload: JsonValue,
+    event_type: str = "RUN_SUCCEEDED",
 ) -> EventLogRow:
     """追加 Outbox durable 测试用 EventLog row。
 
@@ -65,6 +72,7 @@ def _append_event(
     :param event_id: EventLog id。
     :param run_id: Run id。
     :param payload: inline payload。
+    :param event_type: EventLog type。
     :returns: 已追加 EventLog row。
     """
 
@@ -78,7 +86,7 @@ def _append_event(
                 run_id=run_id,
                 attempt_id=None,
                 execution_id=None,
-                event_type="RUN_SUCCEEDED",
+                event_type=event_type,
                 occurred_at=_FIXED_NOW,
                 actor="host",
                 source="unit-test",
@@ -281,6 +289,98 @@ def test_drain_is_idempotent_and_does_not_write_eventlog(
         assert stored.item_state == "drained"
         assert stored.last_drain_request_id == "drain-request-1"
         assert _event_log_count(store.transaction_runner) == before_event_count
+
+
+def test_projection_state_ignores_non_terminal_eventlog_tail(
+    tmp_path: Path,
+) -> None:
+    """checkpoint 追上 terminal fact 后，后续非 terminal EventLog 不应报告 lag。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        terminal = _append_event(
+            store.transaction_runner,
+            event_id="event-terminal-1",
+            run_id="run-1",
+            payload={
+                "terminal_summary_ref": "summary-event-terminal-1",
+                "terminal_summary_digest": _SUMMARY_DIGEST,
+            },
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: advance_projection_checkpoint(
+                transaction,
+                OUTBOX_TERMINAL_CONSUMER_ID.value,
+                event_sequence=terminal.event_sequence,
+                event_id=terminal.event_id,
+                now=_NOW_TEXT,
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-non-terminal",
+            run_id="run-1",
+            payload={},
+            event_type="RUN_ACCEPTED",
+        )
+
+        state = store.transaction_runner.run_read(
+            lambda transaction: read_outbox_terminal_projection_state(
+                transaction,
+                OUTBOX_TERMINAL_CONSUMER_ID.value,
+                catchup_error=None,
+            )
+        )
+
+        assert state.checkpoint_event_sequence == terminal.event_sequence
+        assert state.status is OutboxTerminalProjectionStatus.CAUGHT_UP
+
+
+def test_drain_pending_cas_prevents_second_request_metadata_overwrite(
+    tmp_path: Path,
+) -> None:
+    """不同 drain_request_id 不得覆盖已 drained item 的 metadata。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        first = _insert_item(
+            store.transaction_runner,
+            event_id="event-terminal-1",
+            run_id="run-1",
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: drain_outbox_terminal_items(
+                transaction,
+                "session-1",
+                after_event_sequence=0,
+                seen_terminal_event_ids=(),
+                limit=1,
+                drain_request_id="drain-request-1",
+                drained_at=_DRAINED_AT,
+            )
+        )
+
+        with pytest.raises(HostDurableError, match="pending CAS failed"):
+            store.transaction_runner.run_write(
+                lambda transaction: drain_outbox_terminal_items(
+                    transaction,
+                    "session-1",
+                    after_event_sequence=0,
+                    seen_terminal_event_ids=(),
+                    limit=1,
+                    drain_request_id="drain-request-2",
+                    drained_at="2026-05-29T02:05:06.000000Z",
+                )
+            )
+        stored = store.transaction_runner.run_read(
+            lambda transaction: read_outbox_terminal_item_by_event_id(
+                transaction,
+                first.terminal_event_id,
+            )
+        )
+
+        assert stored is not None
+        assert stored.item_state == "drained"
+        assert stored.drained_at == _DRAINED_AT
+        assert stored.last_drain_request_id == "drain-request-1"
 
 
 def test_drain_request_idempotency_conflict(tmp_path: Path) -> None:
