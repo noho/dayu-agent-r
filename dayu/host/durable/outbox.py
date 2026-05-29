@@ -24,7 +24,12 @@ from dayu.host.durable._validation import (
 )
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictError
+from dayu.host.durable.projection import (
+    read_projection_checkpoint,
+    read_projection_failure,
+)
 from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
     TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY,
     TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
 )
@@ -65,6 +70,14 @@ class OutboxTerminalItemWriteStatus(StrEnum):
 
     INSERTED = "inserted"
     DUPLICATE = "duplicate"
+
+
+class OutboxTerminalProjectionStatus(StrEnum):
+    """Outbox terminal projection 读取状态。"""
+
+    CAUGHT_UP = "caught_up"
+    LAGGED = "lagged"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +142,34 @@ class OutboxTerminalItemsPage:
     next_event_sequence: int
     scanned_watermark: int
     has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxTerminalProjectionCatchupError:
+    """Outbox terminal projection catch-up 运行时失败摘要。
+
+    :param error_code: catch-up 异常类型名。
+    :param error_message: catch-up 异常消息。
+    """
+
+    error_code: str
+    error_message: str
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxTerminalProjectionReadState:
+    """Outbox terminal projection checkpoint / failure 读取结果。
+
+    :param checkpoint_event_sequence: projection 已确认消费的 EventLog sequence。
+    :param status: projection 当前追平状态。
+    :param error_code: 失败码；无失败时为 ``None``。
+    :param error_message: 失败消息；无失败时为 ``None``。
+    """
+
+    checkpoint_event_sequence: int
+    status: OutboxTerminalProjectionStatus
+    error_code: str | None
+    error_message: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +358,60 @@ def read_outbox_terminal_items_after(
         next_event_sequence=scanned_watermark,
         scanned_watermark=scanned_watermark,
         has_more=has_more,
+    )
+
+
+def read_outbox_terminal_projection_state(
+    transaction: HostTransaction,
+    consumer_id: str,
+    *,
+    catchup_error: OutboxTerminalProjectionCatchupError | None,
+) -> OutboxTerminalProjectionReadState:
+    """读取 Outbox terminal projection checkpoint / failure 状态。
+
+    本 helper 是 public outbox read / drain API 访问 projection checkpoint 与
+    failure row 的唯一 durable 入口。它只读取 projection-owned 状态与
+    EventLog 最新水位，不读取或修改 Run / Attempt truth。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param consumer_id: Outbox terminal projection consumer id。
+    :param catchup_error: 调用层捕获到的 catch-up 运行时失败摘要。
+    :returns: Outbox terminal projection 状态。
+    :raises HostDurableError: consumer id 无效或 durable row 类型非法时抛出。
+    """
+
+    _require_non_empty_text(consumer_id, field_name="consumer_id")
+    checkpoint = read_projection_checkpoint(transaction, consumer_id)
+    checkpoint_event_sequence = (
+        0 if checkpoint is None else checkpoint.checkpoint_event_sequence
+    )
+    if catchup_error is not None:
+        return OutboxTerminalProjectionReadState(
+            checkpoint_event_sequence=checkpoint_event_sequence,
+            status=OutboxTerminalProjectionStatus.FAILED,
+            error_code=catchup_error.error_code,
+            error_message=catchup_error.error_message,
+        )
+    failure = read_projection_failure(transaction, consumer_id)
+    if failure is not None:
+        return OutboxTerminalProjectionReadState(
+            checkpoint_event_sequence=checkpoint_event_sequence,
+            status=OutboxTerminalProjectionStatus.FAILED,
+            error_code=failure.last_error_code,
+            error_message=failure.last_error_message,
+        )
+    if checkpoint_event_sequence < _latest_event_sequence(transaction):
+        return OutboxTerminalProjectionReadState(
+            checkpoint_event_sequence=checkpoint_event_sequence,
+            status=OutboxTerminalProjectionStatus.LAGGED,
+            error_code=None,
+            error_message=None,
+        )
+    return OutboxTerminalProjectionReadState(
+        checkpoint_event_sequence=checkpoint_event_sequence,
+        status=OutboxTerminalProjectionStatus.CAUGHT_UP,
+        error_code=None,
+        error_message=None,
     )
 
 
@@ -624,6 +719,25 @@ def _has_terminal_item_after(
     return row is not None
 
 
+def _latest_event_sequence(transaction: HostTransaction) -> int:
+    """读取当前 EventLog 最新全局序号。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :returns: 最新 ``event_sequence``；无事件时为 ``0``。
+    :raises HostDurableError: schema 中序号类型非法时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"SELECT COALESCE(MAX(event_sequence), 0) AS latest FROM {TABLE_EVENT_LOG}"
+    )
+    if row is None:
+        return 0
+    latest = row.get("latest")
+    if not isinstance(latest, int):
+        raise HostDurableError("latest EventLog sequence is invalid")
+    return latest
+
+
 def _drain_request_digest(
     *,
     session_id: str,
@@ -868,9 +982,13 @@ __all__ = [
     "OutboxTerminalItemWriteResult",
     "OutboxTerminalItemWriteStatus",
     "OutboxTerminalItemsPage",
+    "OutboxTerminalProjectionCatchupError",
+    "OutboxTerminalProjectionReadState",
+    "OutboxTerminalProjectionStatus",
     "drain_outbox_terminal_items",
     "insert_outbox_terminal_item_if_absent",
     "outbox_terminal_drain_request_digest",
+    "read_outbox_terminal_projection_state",
     "read_outbox_terminal_item_by_event_id",
     "read_outbox_terminal_item_by_id",
     "read_outbox_terminal_items_after",

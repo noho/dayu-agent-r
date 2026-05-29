@@ -226,7 +226,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前状态：PR 68 已 merge 到 `main`，merge commit 为 `b9bd625`。当前工作分支为
 `feat/phase-13-audit-trace-outbox`，从 clean `main` 创建。Phase 13 design discussion 已由用户确认；controller
 adjudication artifact 为 `docs/reviews/phase13-design-discussion-controller-adjudication-20260529.md`。
-当前 gate：Phase 13 aggregate deepreview。
+当前 gate：Phase 13 ready-to-open-draft-PR。
 Plan artifact 为 `docs/host/phase13-audit-tool-trace-outbox-plan.md`。Plan review artifacts 为
 `docs/reviews/phase13-plan-review-mimo-20260529.md` 与 `docs/reviews/phase13-plan-review-ds-20260529.md`；
 controller adjudication 为 `docs/reviews/phase13-plan-review-controller-adjudication-20260529.md`。Controller 接受
@@ -267,7 +267,21 @@ AgentDS 做 Slice 4 code review；code review artifacts 为
 adjudication 为 `docs/reviews/phase13-slice4-code-review-controller-adjudication-20260529.md`。下一步：创建
 accepted Slice 4 local commit。Accepted Slice 4 commit 为 `1d9e732`。Phase 13 aggregate validation 已通过：
 plan-listed pytest 96 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` passed。
-下一步：派发 AgentMiMo 与 AgentDS 做 ready-to-open-draft-PR 前 aggregate deepreview。
+下一步：派发 AgentMiMo 与 AgentDS 做 ready-to-open-draft-PR 前 aggregate deepreview。Aggregate deepreview
+artifacts 为 `docs/reviews/phase13-aggregate-deepreview-mimo-20260529.md` 与
+`docs/reviews/phase13-aggregate-deepreview-ds-20260529.md`。Controller adjudication 为
+`docs/reviews/phase13-aggregate-deepreview-controller-adjudication-20260529.md`。AgentMiMo F001 已复现并裁决为
+blocking；当前进入 aggregate fix gate。
+Aggregate fix 已完成，artifact 为 `docs/reviews/phase13-aggregate-fix-codex-20260529.md`。Fix 将 Outbox
+projection checkpoint/failure/latest watermark 读取下沉到 `dayu/host/durable/outbox.py`，`dayu/host/read_api.py`
+不再直接 import `dayu.host.durable.projection`。Validation：import-boundary + public outbox + durable outbox focused tests
+10 passed；aggregate host suite with import boundary 108 passed；`python -m pyright dayu/host tests/host` 0 errors；
+`git diff --check` passed。当前 gate 进入 aggregate re-review。
+Aggregate re-review artifacts 为 `docs/reviews/phase13-aggregate-rereview-mimo-20260529.md` 与
+`docs/reviews/phase13-aggregate-rereview-ds-20260529.md`。两路 re-review 均 PASS，确认 F001 fixed，无新增
+blocking findings。Controller re-review adjudication 为
+`docs/reviews/phase13-aggregate-rereview-controller-adjudication-20260529.md`。当前 gate：Phase 13
+ready-to-open-draft-PR。
 
 ## Phase Map
 
@@ -2447,6 +2461,34 @@ Accepted Slice 4 commit 已创建：`1d9e732` (`gateflow: accept phase 13 slice 
 已通过：plan-listed pytest 96 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check`
 passed。当前 gate 进入 Phase 13 aggregate deepreview。Aggregate review 必须由 AgentMiMo 与 AgentDS 独立完成；
 通过并裁决后，Phase 13 才能进入 `ready-to-open-draft-PR`。
+
+Phase 13 AgentMiMo aggregate deepreview 已完成。Review artifact 为
+`docs/reviews/phase13-aggregate-deepreview-mimo-20260529.md`。Verdict：PASS with 1 BLOCKING finding。
+四 slice 完整实现 plan，架构边界正确（Audit/Tool Trace/Outbox 均为 projection/sink，不反向成为 truth），
+schema version 自洽，projection checkpoint/failure/idempotency 遵循框架约定，Outbox public read/drain 是唯一
+additive public extension，watch_session_events 仍为 live-only，类型安全通过 pyright。
+Blocking finding F001：`read_api.py` 违反 import 边界，直接导入 `dayu.host.durable.projection` 读取 Outbox
+projection state；修复方案为将 projection state 读取下沉到 `durable/outbox.py` helper。
+AgentDS aggregate deepreview 已完成。Review artifact 为
+`docs/reviews/phase13-aggregate-deepreview-ds-20260529.md`。Verdict：PASS，无 blocking findings。Controller 复现
+AgentMiMo F001：`tests/host/test_import_boundary.py::test_read_api_stream_does_not_reference_projection_or_fanout_truth`
+失败，原因是 `dayu/host/read_api.py` 直接导入 `dayu.host.durable.projection`。Controller adjudication artifact 为
+`docs/reviews/phase13-aggregate-deepreview-controller-adjudication-20260529.md`，裁决 F001 为 accepted blocking。
+当前 gate：Phase 13 aggregate fix；下一步派发 AgentCodex 将 projection state 查询下沉到 `dayu/host/durable/outbox.py`，
+并移除 `read_api.py` 对 `dayu.host.durable.projection` 的直接依赖。
+
+Phase 13 aggregate fix 已完成。Fix artifact 为 `docs/reviews/phase13-aggregate-fix-codex-20260529.md`。
+Changed files: `dayu/host/durable/outbox.py`、`dayu/host/read_api.py`。Validation: import-boundary + public outbox +
+durable outbox focused tests 10 passed；aggregate host suite with import boundary 108 passed；`python -m pyright
+dayu/host tests/host` 0 errors；`git diff --check` passed。当前 gate 进入 Phase 13 aggregate re-review；必须由
+AgentMiMo 与 AgentDS 确认 F001 fixed 后，才能进入 `ready-to-open-draft-PR`。
+
+Phase 13 aggregate re-review 已完成。Re-review artifacts 为
+`docs/reviews/phase13-aggregate-rereview-mimo-20260529.md` 与
+`docs/reviews/phase13-aggregate-rereview-ds-20260529.md`。两路 verdict 均为 PASS，F001 fixed，无新增 blocking
+findings。Controller re-review adjudication artifact 为
+`docs/reviews/phase13-aggregate-rereview-controller-adjudication-20260529.md`。当前 gate：Phase 13
+`ready-to-open-draft-PR`。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 

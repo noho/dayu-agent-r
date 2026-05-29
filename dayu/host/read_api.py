@@ -44,17 +44,14 @@ from dayu.host.durable.event_log import EventClass, EventLogRow, read_events_aft
 from dayu.host.durable.outbox import (
     OutboxTerminalItemRow,
     OutboxTerminalItemsPage,
+    OutboxTerminalProjectionCatchupError,
+    OutboxTerminalProjectionReadState,
+    OutboxTerminalProjectionStatus,
     drain_outbox_terminal_items as _drain_outbox_terminal_items,
-)
-from dayu.host.durable.outbox import (
     read_outbox_terminal_items_after as _read_outbox_terminal_items_after,
+    read_outbox_terminal_projection_state as _read_outbox_terminal_projection_state,
 )
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
-from dayu.host.durable.projection import (
-    ProjectionCheckpointRow,
-    read_projection_checkpoint,
-    read_projection_failure,
-)
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_SQLITE_PAYLOADS,
@@ -416,30 +413,12 @@ class _RequireSessionExistsOperation:
 
 
 @dataclass(frozen=True, slots=True)
-class _OutboxCatchupError:
-    """Outbox catch-up 运行时失败摘要。"""
-
-    error_code: str
-    error_message: str
-
-
-@dataclass(frozen=True, slots=True)
-class _OutboxProjectionReadState:
-    """Outbox projection 状态读取结果。"""
-
-    checkpoint: OutboxTerminalCursor
-    status: OutboxProjectionStatus
-    error_code: str | None
-    error_message: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class _ReadOutboxTerminalItemsOperation:
     """read_outbox_terminal_items read transaction body。"""
 
     session_id: str
     request: ReadOutboxTerminalItemsRequest
-    catchup_error: _OutboxCatchupError | None
+    catchup_error: OutboxTerminalProjectionCatchupError | None
 
     def __call__(self, transaction: HostTransaction) -> OutboxTerminalItemsBatch:
         """读取 Outbox terminal item batch。
@@ -458,8 +437,9 @@ class _ReadOutboxTerminalItemsOperation:
             seen_terminal_event_ids=self.request.seen_terminal_event_ids,
             limit=self.request.limit,
         )
-        projection_state = _read_outbox_projection_state(
+        projection_state = _read_outbox_terminal_projection_state(
             transaction,
+            OUTBOX_TERMINAL_CONSUMER_ID.value,
             catchup_error=self.catchup_error,
         )
         return _outbox_batch_from_page(page, projection_state)
@@ -471,7 +451,7 @@ class _DrainOutboxTerminalItemsOperation:
 
     session_id: str
     request: DrainOutboxTerminalItemsRequest
-    catchup_error: _OutboxCatchupError | None
+    catchup_error: OutboxTerminalProjectionCatchupError | None
 
     def __call__(self, transaction: HostTransaction) -> OutboxTerminalItemsBatch:
         """执行 Outbox terminal item drain。
@@ -494,8 +474,9 @@ class _DrainOutboxTerminalItemsOperation:
             drain_request_id=self.request.drain_request_id,
             drained_at=format_utc_timestamp(datetime.now(UTC)),
         )
-        projection_state = _read_outbox_projection_state(
+        projection_state = _read_outbox_terminal_projection_state(
             transaction,
+            OUTBOX_TERMINAL_CONSUMER_ID.value,
             catchup_error=self.catchup_error,
         )
         return _outbox_batch_from_page(page, projection_state)
@@ -595,7 +576,7 @@ def _latest_event_sequence(transaction: HostTransaction) -> int:
 
 def _catch_up_outbox_terminal_projection_best_effort(
     host: HostCommandHandle,
-) -> _OutboxCatchupError | None:
+) -> OutboxTerminalProjectionCatchupError | None:
     """best-effort 追平 Outbox terminal projection。
 
     :param host: Host command handle。
@@ -606,81 +587,16 @@ def _catch_up_outbox_terminal_projection_best_effort(
     try:
         catch_up_outbox_terminal_projection(host._transaction_runner())
     except Exception as exc:
-        return _OutboxCatchupError(
+        return OutboxTerminalProjectionCatchupError(
             error_code=exc.__class__.__name__,
             error_message=str(exc) or "<empty outbox catch-up error>",
         )
     return None
 
 
-def _read_outbox_projection_state(
-    transaction: HostTransaction,
-    *,
-    catchup_error: _OutboxCatchupError | None,
-) -> _OutboxProjectionReadState:
-    """读取 Outbox projection checkpoint / failure 状态。
-
-    :param transaction: 当前 Host transaction。
-    :param catchup_error: catch-up 调用层捕获到的运行时失败摘要。
-    :returns: public batch 可直接使用的 projection 状态。
-    :raises HostDurableError: checkpoint 或 failure row 类型非法时抛出。
-    """
-
-    checkpoint = read_projection_checkpoint(
-        transaction,
-        OUTBOX_TERMINAL_CONSUMER_ID.value,
-    )
-    checkpoint_cursor = OutboxTerminalCursor(
-        event_sequence=_checkpoint_sequence(checkpoint)
-    )
-    if catchup_error is not None:
-        return _OutboxProjectionReadState(
-            checkpoint=checkpoint_cursor,
-            status=OutboxProjectionStatus.FAILED,
-            error_code=catchup_error.error_code,
-            error_message=catchup_error.error_message,
-        )
-    failure = read_projection_failure(
-        transaction,
-        OUTBOX_TERMINAL_CONSUMER_ID.value,
-    )
-    if failure is not None:
-        return _OutboxProjectionReadState(
-            checkpoint=checkpoint_cursor,
-            status=OutboxProjectionStatus.FAILED,
-            error_code=failure.last_error_code,
-            error_message=failure.last_error_message,
-        )
-    if checkpoint_cursor.event_sequence < _latest_event_sequence(transaction):
-        return _OutboxProjectionReadState(
-            checkpoint=checkpoint_cursor,
-            status=OutboxProjectionStatus.LAGGED,
-            error_code=None,
-            error_message=None,
-        )
-    return _OutboxProjectionReadState(
-        checkpoint=checkpoint_cursor,
-        status=OutboxProjectionStatus.CAUGHT_UP,
-        error_code=None,
-        error_message=None,
-    )
-
-
-def _checkpoint_sequence(checkpoint: ProjectionCheckpointRow | None) -> int:
-    """提取 projection checkpoint sequence。
-
-    :param checkpoint: 可选 checkpoint row。
-    :returns: checkpoint sequence；row 不存在时为 ``0``。
-    """
-
-    if checkpoint is None:
-        return 0
-    return checkpoint.checkpoint_event_sequence
-
-
 def _outbox_batch_from_page(
     page: OutboxTerminalItemsPage,
-    projection_state: _OutboxProjectionReadState,
+    projection_state: OutboxTerminalProjectionReadState,
 ) -> OutboxTerminalItemsBatch:
     """把 durable outbox page 映射为 public batch。
 
@@ -698,12 +614,32 @@ def _outbox_batch_from_page(
         scanned_watermark=OutboxTerminalCursor(
             event_sequence=page.scanned_watermark,
         ),
-        projection_checkpoint=projection_state.checkpoint,
-        projection_status=projection_state.status,
+        projection_checkpoint=OutboxTerminalCursor(
+            event_sequence=projection_state.checkpoint_event_sequence,
+        ),
+        projection_status=_outbox_projection_status_from_durable(
+            projection_state.status
+        ),
         projection_error_code=projection_state.error_code,
         projection_error_message=projection_state.error_message,
         has_more=page.has_more,
     )
+
+
+def _outbox_projection_status_from_durable(
+    status: OutboxTerminalProjectionStatus,
+) -> OutboxProjectionStatus:
+    """把 durable Outbox projection 状态映射为 public enum。
+
+    :param status: durable outbox helper 返回的 projection 状态。
+    :returns: public Outbox projection 状态。
+    :raises HostDurableError: durable 状态无法映射为 public enum 时抛出。
+    """
+
+    try:
+        return OutboxProjectionStatus(status.value)
+    except ValueError as exc:
+        raise HostDurableError("outbox projection status is invalid") from exc
 
 
 def _outbox_item_from_row(row: OutboxTerminalItemRow) -> OutboxTerminalItem:
