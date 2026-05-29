@@ -226,7 +226,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前状态：PR 68 已 merge 到 `main`，merge commit 为 `b9bd625`。当前工作分支为
 `feat/phase-13-audit-trace-outbox`，从 clean `main` 创建。Phase 13 design discussion 已由用户确认；controller
 adjudication artifact 为 `docs/reviews/phase13-design-discussion-controller-adjudication-20260529.md`。
-当前 gate：Phase 13 Slice 3 accepted commit。
+当前 gate：Phase 13 Slice 4 implementation。
 Plan artifact 为 `docs/host/phase13-audit-tool-trace-outbox-plan.md`。Plan review artifacts 为
 `docs/reviews/phase13-plan-review-mimo-20260529.md` 与 `docs/reviews/phase13-plan-review-ds-20260529.md`；
 controller adjudication 为 `docs/reviews/phase13-plan-review-controller-adjudication-20260529.md`。Controller 接受
@@ -256,8 +256,9 @@ accepted Slice 2 local commit。Accepted Slice 2 commit 为 `0a675a5`。Phase 13
 `python -m pyright dayu/host tests/host` 0 errors、`git diff --check` passed。AgentMiMo 与 AgentDS code review
 均已完成，artifacts 为 `docs/reviews/phase13-slice3-code-review-mimo-20260529.md` 与
 `docs/reviews/phase13-slice3-code-review-ds-20260529.md`，verdict 均 PASS，无 blocking findings。Controller
-adjudication 为 `docs/reviews/phase13-slice3-code-review-controller-adjudication-20260529.md`。下一步：创建
-accepted Slice 3 local commit。
+adjudication 为 `docs/reviews/phase13-slice3-code-review-controller-adjudication-20260529.md`。Accepted Slice 3
+commit 为 `1a37946`。下一步：按 accepted plan 派发 Slice 4 `Public Outbox Read / Drain API And Offline Smoke`
+implementation。
 
 ## Phase Map
 
@@ -2412,6 +2413,11 @@ AgentDS Slice 3 code review 已完成。Artifact 为
 `docs/reviews/phase13-slice3-code-review-ds-20260529.md`。Verdict PASS，无 blocking findings；两个 advisory
 observations（catch-up helper 循环冗余、seen ids 较多时 scan limit 浪费）不阻塞。Controller adjudication artifact 为
 `docs/reviews/phase13-slice3-code-review-controller-adjudication-20260529.md`。当前 gate 进入 accepted Slice 3 commit。
+
+Accepted Slice 3 commit 已创建：`1a37946` (`gateflow: accept phase 13 slice 3`)。当前 gate 进入 Phase 13
+Slice 4 `Public Outbox Read / Drain API And Offline Smoke` implementation。Slice 4 必须只接 additive public read/drain
+API 与 offline smoke，不得引入 `OpenHostOptions` 字段、`wait_final_answer`、`get_run_result`、payload reader 或 timeline
+replay API。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 
