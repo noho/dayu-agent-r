@@ -77,13 +77,18 @@ class ToolCallRequest:
 
         :returns: ``None``。
         :raises ValueError: ``tool_call_id`` 或 ``name`` 为空 / 纯空白，
-            或 ``index_in_iteration`` 为负数时抛出。
+            ``arguments`` 含空白 key / 非 JSON 兼容值，或
+            ``index_in_iteration`` 为负数时抛出。
         """
 
         if self.tool_call_id.strip() == "":
             raise ValueError("ToolCallRequest.tool_call_id must be non-empty")
         if self.name.strip() == "":
             raise ValueError("ToolCallRequest.name must be non-empty")
+        for key, value in self.arguments.items():
+            if key.strip() == "":
+                raise ValueError("ToolCallRequest.arguments keys must be non-empty")
+            _validate_json_value(value, field_path=f"arguments.{key}")
         if self.index_in_iteration < 0:
             raise ValueError(
                 "ToolCallRequest.index_in_iteration must be non-negative"
@@ -142,6 +147,38 @@ class BatchToolExecutionContext:
                 "BatchToolExecutionContext.timeout_seconds must be None or"
                 " a finite positive number"
             )
+
+
+def _validate_json_value(value: JsonValue, *, field_path: str) -> None:
+    """递归校验工具调用参数值满足 JSON 运行时边界。
+
+    :param value: 待校验 JSON 值。
+    :param field_path: 错误消息中的字段路径。
+    :returns: ``None``。
+    :raises ValueError: 浮点数非有限、对象 key 为空白或值不是 JSON
+        兼容结构时抛出。
+    """
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field_path} must be finite JSON number")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, field_path=f"{field_path}[{index}]")
+        return
+    if isinstance(value, Mapping):
+        for key, nested_value in value.items():
+            if key.strip() == "":
+                raise ValueError(f"{field_path} object keys must be non-empty")
+            _validate_json_value(
+                nested_value,
+                field_path=f"{field_path}.{key}",
+            )
+        return
+    raise ValueError(f"{field_path} must be JSON-compatible")
 
 
 @dataclass(frozen=True, slots=True)

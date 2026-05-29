@@ -100,9 +100,12 @@ class ToolDefinition:
         """校验工具声明的 LLM schema 名称同源。
 
         :returns: 无返回值。
-        :raises ValueError: ``name`` 与 ``schema.function.name`` 不一致时抛出。
+        :raises ValueError: ``name`` 为空，或 ``name`` 与
+            ``schema.function.name`` 不一致时抛出。
         """
 
+        if self.name.strip() == "":
+            raise ValueError("ToolDefinition name must be non-empty")
         if self.name != self.schema.function.name:
             raise ValueError(
                 "ToolDefinition name must match schema.function.name"
@@ -131,9 +134,11 @@ class ToolBundle:
         """校验 bundle 内工具名唯一。
 
         :returns: 无返回值。
-        :raises ValueError: 出现重复工具名时抛出。
+        :raises ValueError: 工具集合为空或出现重复工具名时抛出。
         """
 
+        if not self.definitions:
+            raise ValueError("ToolBundle.definitions must be non-empty")
         names: set[str] = set()
         for definition in self.definitions:
             if definition.name in names:

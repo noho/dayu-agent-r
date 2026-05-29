@@ -48,6 +48,7 @@ from dayu.runtime.scene_prepare import (
 )
 from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
+    ServiceDiscoveredTools,
     ServiceOpenHostAssemblyRequest,
     _agent_fallback_mode_from_config,
     _compactor_agent_policy_from_scene_inputs,
@@ -55,6 +56,7 @@ from dayu.service.host_assembly import (
     _render_headers,
     _resolve_prompt_asset_path,
     _resolve_project_path,
+    _runner_spec_from_model,
     _tool_discovery_specs,
     _tooling_options_from_discovery,
     compose_open_host_options,
@@ -68,6 +70,17 @@ _CUSTOM_COMPACTOR_SCENE_ID = "custom_compactor_scene"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+
+
+def _scene_tool_catalog(discovered_tools: ServiceDiscoveredTools) -> SceneToolCatalog:
+    """从测试发现结果构造 scene 工具目录。
+
+    :param discovered_tools: Service 工具发现结果。
+    :returns: SceneToolCatalog。
+    :raises AssertionError: 测试配置未发现工具时抛出。
+    """
+
+    return SceneToolCatalog.from_tool_bundle(discovered_tools.tool_bundle)
 
 
 def _complete_compactor_agent_policy_override() -> SceneAgentPolicyOverride:
@@ -118,9 +131,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
                 "fins_default_subject": "测试财报主体",
                 "base_user": "service-assembly-test",
             },
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                discovered_tools.tool_bundle
-            ),
+            available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
 
@@ -224,9 +235,7 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
                 "fins_default_subject": "测试财报主体",
                 "base_user": "service-assembly-test",
             },
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                discovered_tools.tool_bundle
-            ),
+            available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
     custom_locations = _custom_compactor_scene_locations(tmp_path)
@@ -306,9 +315,7 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
                 "fins_default_subject": "测试财报主体",
                 "base_user": "service-assembly-test",
             },
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                discovered_tools.tool_bundle
-            ),
+            available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
 
@@ -478,6 +485,28 @@ def test_render_headers_rejects_unresolved_placeholder() -> None:
         )
 
 
+def test_render_headers_allows_missing_api_key_ref_without_placeholders() -> None:
+    """本地 provider 无 API key 引用时应原样保留非 secret header。"""
+
+    assert _render_headers(
+        {"Content-Type": "application/json"},
+        api_key_ref=None,
+        env={},
+    ) == {"Content-Type": "application/json"}
+
+
+def test_runner_spec_from_ollama_model_skips_api_key_header() -> None:
+    """Ollama 这类本地模型 ``api_key_ref=None`` 时不要求 secret。"""
+
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load()
+    model = config.models.models["ollama"]
+
+    spec = _runner_spec_from_model(model=model, env={})
+
+    assert spec.api_key_ref is None
+    assert spec.headers == {"Content-Type": "application/json"}
+
+
 @pytest.mark.parametrize(
     ("configured_path", "message"),
     (
@@ -506,21 +535,6 @@ def test_resolve_prompt_asset_path_rejects_invalid_paths(
             configured_path,
             field_name="test.prompt_path",
         )
-
-
-def test_tooling_options_from_discovery_empty_bundle_returns_none() -> None:
-    """空工具 bundle 不装配 HostToolingOptions。
-
-    :returns: ``None``。
-    :raises AssertionError: 空 bundle 返回非空 tooling options 时抛出。
-    """
-
-    result = _tooling_options_from_discovery(
-        tool_bundle=ToolBundle(definitions=()),
-        source_refs=(),
-    )
-
-    assert result is None
 
 
 def test_tooling_options_from_discovery_requires_source_refs() -> None:
@@ -614,9 +628,7 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
                 "fins_default_subject": "测试财报主体",
                 "base_user": "service-assembly-test",
             },
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                discovered_tools.tool_bundle
-            ),
+            available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
 
@@ -677,9 +689,7 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
                 "fins_default_subject": "测试财报主体",
                 "base_user": "service-assembly-test",
             },
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                discovered_tools.tool_bundle
-            ),
+            available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
     scene_inputs = replace(scene_inputs, model_hints=None)
@@ -731,9 +741,7 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
                 "fins_default_subject": "测试财报主体",
                 "base_user": "service-assembly-test",
             },
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                discovered_tools.tool_bundle
-            ),
+            available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
 

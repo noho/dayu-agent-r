@@ -136,6 +136,32 @@ def test_tool_call_request_rejects_negative_index() -> None:
         )
 
 
+def test_tool_call_request_rejects_blank_argument_key() -> None:
+    """``arguments`` 顶层 key 为空白时必须在构造期拒绝。"""
+
+    with pytest.raises(ValueError, match="arguments keys"):
+        ToolCallRequest(
+            tool_call_id="id-1",
+            name="get_value",
+            arguments={" ": "v"},
+            index_in_iteration=0,
+            provider_state=None,
+        )
+
+
+def test_tool_call_request_rejects_non_finite_argument_number() -> None:
+    """``arguments`` 中非有限 JSON number 必须在构造期拒绝。"""
+
+    with pytest.raises(ValueError, match="finite JSON number"):
+        ToolCallRequest(
+            tool_call_id="id-1",
+            name="get_value",
+            arguments={"score": float("nan")},
+            index_in_iteration=0,
+            provider_state=None,
+        )
+
+
 def test_tool_call_request_with_gemini_provider_state_equality() -> None:
     """构造时携带 Gemini 续航状态 → 等值与字段值正确。"""
 

@@ -168,7 +168,7 @@ def runner_spec_from_json(value: Mapping[str, JsonValue]) -> RunnerSpec:
         provider=required_json_text(value, field_name="provider"),
         model=required_json_text(value, field_name="model"),
         endpoint=required_json_text(value, field_name="endpoint"),
-        api_key_ref=required_json_text(value, field_name="api_key_ref"),
+        api_key_ref=optional_json_text(value, field_name="api_key_ref"),
         headers=_headers_from_json(value.get("headers")),
         supports_tool_calling=required_json_bool(
             value, field_name="supports_tool_calling"

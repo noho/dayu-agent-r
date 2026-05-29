@@ -13,7 +13,7 @@ import importlib.metadata as importlib_metadata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Protocol, TypeAlias, cast
+from typing import Final, Protocol, TypeAlias, cast
 
 from dayu.contracts import (
     JsonValue,
@@ -21,11 +21,45 @@ from dayu.contracts import (
     ToolBundleSourceRef,
     ToolDefinition,
 )
+from dayu.contracts.tool_schema import ToolSchema, ToolTruncateSpec
 from dayu.runtime._digest import canonical_json_digest, normalize_json_value
 
 _IMPORT_PATH_SEPARATOR = ":"
 _ATTRIBUTE_PATH_SEPARATOR = "."
 _RESERVED_FRAMEWORK_TOOL_NAMES: frozenset[str] = frozenset({"fetch_more"})
+
+
+@dataclass(frozen=True, slots=True)
+class _NoToolBundle:
+    """工具发现 no-tool sentinel。
+
+    公共 ``ToolBundle`` 构造期拒绝空集合；工具发现内部用该 sentinel 表达
+    provider 均禁用或显式允许空输出的 no-tool 结果，避免向下游传递空
+    ``ToolBundle`` 实例。
+
+    :param definitions: 固定为空的工具定义元组。
+    """
+
+    definitions: tuple[ToolDefinition, ...] = ()
+
+    def to_tool_schemas(self) -> tuple[ToolSchema, ...]:
+        """返回空 schema 元组。
+
+        :returns: 空 ``ToolSchema`` 元组。
+        """
+
+        return ()
+
+    def truncate_specs(self) -> Mapping[str, ToolTruncateSpec]:
+        """返回空截断声明映射。
+
+        :returns: 空映射。
+        """
+
+        return {}
+
+
+_NO_TOOL_BUNDLE: Final[ToolBundle] = cast(ToolBundle, _NoToolBundle())
 
 
 class ToolsDiscoveryError(ValueError):
@@ -180,7 +214,8 @@ class ToolsDiscoveryProviderReport:
 class ToolsDiscoveryResult:
     """工具发现聚合结果。
 
-    :param tool_bundle: 聚合后的业务工具 bundle。
+    :param tool_bundle: 聚合后的业务工具 bundle；没有发现工具时为 no-tool
+        sentinel，其 ``definitions`` 为空。
     :param provider_reports: provider 级别报告，不包含 callable 或 adapter。
     :param source_refs: 按 provider 输出顺序拼接的来源引用。
     """
@@ -257,8 +292,13 @@ class ToolsDiscovery:
             definitions.extend(output.definitions)
             source_refs.extend(normalized_source_refs)
         _validate_unique_tool_names(tuple(definitions))
+        tool_bundle = (
+            _NO_TOOL_BUNDLE
+            if not definitions
+            else ToolBundle(definitions=tuple(definitions))
+        )
         return ToolsDiscoveryResult(
-            tool_bundle=ToolBundle(definitions=tuple(definitions)),
+            tool_bundle=tool_bundle,
             provider_reports=tuple(reports),
             source_refs=tuple(source_refs),
         )

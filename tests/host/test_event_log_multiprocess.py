@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from multiprocessing import Process
 from pathlib import Path
 
+import pytest
+
+from dayu.host.durable import event_log as event_log_module
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
+    EventLogRow,
     append_event,
 )
+from dayu.host.durable.errors import HostEventIdentityConflictError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -23,6 +29,15 @@ from dayu.host.durable.transaction import HostTransaction
 _PROCESS_COUNT = 4
 _EVENTS_PER_PROCESS = 12
 _EXPECTED_TOTAL_EVENTS = _PROCESS_COUNT * _EVENTS_PER_PROCESS
+_STRESS_PROCESS_COUNT = 8
+_STRESS_ROUNDS = 20
+_STRESS_START_DELAY_SECONDS = 0.2
+_STRESS_WAIT_INTERVAL_SECONDS = 0.001
+_STRESS_RESULT_SEPARATOR = ":"
+_STRESS_RESULT_INSERTED = "inserted"
+_STRESS_RESULT_CONFLICT = "conflict"
+_STRESS_EVENT_ID_PREFIX = "event-stress"
+_STRESS_RESULT_FILE_PREFIX = "worker"
 
 
 def _options(db_path: Path, artifact_root: Path) -> HostDurableStoreOptions:
@@ -76,6 +91,35 @@ def _request(worker_index: int, event_index: int) -> EventLogAppendRequest:
     )
 
 
+def _fixed_event_request(event_id: str, payload_value: str) -> EventLogAppendRequest:
+    """构造指定 event_id 的测试事件。
+
+    :param event_id: EventLog event id。
+    :param payload_value: inline payload 差异值。
+    :returns: EventLog append 请求。
+    """
+
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-race",
+        run_id="run-race",
+        attempt_id=None,
+        execution_id=None,
+        event_type="host.race",
+        occurred_at=datetime(2026, 5, 14, 1, 2, 3, tzinfo=UTC),
+        actor="host",
+        source="race-test",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason=None,
+        payload_json={"value": payload_value},
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
 def _append_worker(
     db_path_text: str,
     artifact_root_text: str,
@@ -105,6 +149,65 @@ def _append_worker(
                 append_event(transaction, _request(worker_index, event_index))
 
             store.transaction_runner.run_write(operation)
+
+
+def _same_event_id_stress_worker(
+    db_path_text: str,
+    artifact_root_text: str,
+    result_dir_text: str,
+    worker_index: int,
+    round_count: int,
+    start_at: float,
+) -> None:
+    """子进程 worker：真实并发写入同一批 ``event_id``。
+
+    :param db_path_text: SQLite DB 路径文本。
+    :param artifact_root_text: artifact 根目录文本。
+    :param result_dir_text: 子进程结果目录文本。
+    :param worker_index: worker 序号。
+    :param round_count: 压测轮数。
+    :param start_at: 基于 ``time.monotonic()`` 的统一启动时间。
+    :returns: ``None``。
+    :raises Exception: 非预期 durable 错误会向子进程外抛出，使父进程通过
+        exit code 失败。
+    """
+
+    while time.monotonic() < start_at:
+        time.sleep(_STRESS_WAIT_INTERVAL_SECONDS)
+
+    options = _options(Path(db_path_text), Path(artifact_root_text))
+    results: list[str] = []
+    with open_host_durable_store(options) as store:
+        for round_index in range(round_count):
+            event_id = f"{_STRESS_EVENT_ID_PREFIX}-{round_index}"
+            payload_value = f"worker-{worker_index}-round-{round_index}"
+
+            def operation(transaction: HostTransaction) -> None:
+                """追加当前压测轮次的同 ``event_id`` 异体事件。
+
+                :param transaction: Host transaction。
+                :returns: ``None``。
+                """
+
+                append_event(
+                    transaction,
+                    _fixed_event_request(event_id, payload_value),
+                )
+
+            try:
+                store.transaction_runner.run_write(operation)
+            except HostEventIdentityConflictError:
+                result = _STRESS_RESULT_CONFLICT
+            else:
+                result = _STRESS_RESULT_INSERTED
+            results.append(
+                _STRESS_RESULT_SEPARATOR.join((str(round_index), result))
+            )
+
+    result_path = (
+        Path(result_dir_text) / f"{_STRESS_RESULT_FILE_PREFIX}-{worker_index}.txt"
+    )
+    result_path.write_text("\n".join(results), encoding="utf-8")
 
 
 def test_multiprocess_append_allocates_unique_global_sequences(
@@ -155,3 +258,112 @@ def test_multiprocess_append_allocates_unique_global_sequences(
     assert len(frozenset(sequences)) == _EXPECTED_TOTAL_EVENTS
     assert len(frozenset(event_ids)) == _EXPECTED_TOTAL_EVENTS
     assert sequences == tuple(sorted(sequences))
+
+
+def test_multiprocess_same_event_id_stress_classifies_conflicts(
+    tmp_path: Path,
+) -> None:
+    """真实多进程并发写同 ``event_id`` 时每轮只允许一个成功写入。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 子进程失败、结果缺失或冲突分类不符合预期时抛出。
+    """
+
+    db_path = tmp_path / "durable.sqlite3"
+    artifact_root = tmp_path / "artifacts"
+    result_dir = tmp_path / "stress-results"
+    result_dir.mkdir()
+    with open_host_durable_store(_options(db_path, artifact_root)):
+        pass
+
+    start_at = time.monotonic() + _STRESS_START_DELAY_SECONDS
+    processes = tuple(
+        Process(
+            target=_same_event_id_stress_worker,
+            args=(
+                str(db_path),
+                str(artifact_root),
+                str(result_dir),
+                worker_index,
+                _STRESS_ROUNDS,
+                start_at,
+            ),
+        )
+        for worker_index in range(_STRESS_PROCESS_COUNT)
+    )
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+
+    inserted_by_round = [0 for _ in range(_STRESS_ROUNDS)]
+    conflict_by_round = [0 for _ in range(_STRESS_ROUNDS)]
+    for worker_index in range(_STRESS_PROCESS_COUNT):
+        result_path = (
+            result_dir / f"{_STRESS_RESULT_FILE_PREFIX}-{worker_index}.txt"
+        )
+        result_lines = result_path.read_text(encoding="utf-8").splitlines()
+        assert len(result_lines) == _STRESS_ROUNDS
+        for line in result_lines:
+            round_text, result = line.split(_STRESS_RESULT_SEPARATOR)
+            round_index = int(round_text)
+            if result == _STRESS_RESULT_INSERTED:
+                inserted_by_round[round_index] += 1
+            elif result == _STRESS_RESULT_CONFLICT:
+                conflict_by_round[round_index] += 1
+            else:
+                raise AssertionError(f"unexpected stress result: {result}")
+
+    for round_index in range(_STRESS_ROUNDS):
+        assert inserted_by_round[round_index] == 1
+        assert conflict_by_round[round_index] == _STRESS_PROCESS_COUNT - 1
+
+
+def test_append_event_reclassifies_insert_unique_race_as_identity_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """INSERT 阶段撞上同 event_id 异体 row 时返回领域冲突错误。"""
+
+    db_path = tmp_path / "durable.sqlite3"
+    artifact_root = tmp_path / "artifacts"
+    original_read_event_by_id = event_log_module.read_event_by_id
+    injected = False
+
+    def racing_read_event_by_id(
+        transaction: HostTransaction, event_id: str
+    ) -> EventLogRow | None:
+        """在首次读取后插入同 event_id 异体 row，模拟 read/insert 交错。
+
+        :param transaction: Host transaction。
+        :param event_id: EventLog event id。
+        :returns: 首次返回 ``None``，后续走原始读取。
+        """
+
+        nonlocal injected
+        if not injected:
+            injected = True
+            append_event(transaction, _fixed_event_request(event_id, "winner"))
+            return None
+        return original_read_event_by_id(transaction, event_id)
+
+    monkeypatch.setattr(
+        event_log_module,
+        "read_event_by_id",
+        racing_read_event_by_id,
+    )
+    with open_host_durable_store(_options(db_path, artifact_root)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """追加同 event_id 异体事件。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            append_event(transaction, _fixed_event_request("event-race", "loser"))
+
+        with pytest.raises(HostEventIdentityConflictError):
+            store.transaction_runner.run_write(operation)

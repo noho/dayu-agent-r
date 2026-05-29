@@ -555,6 +555,10 @@ def merge_agent_policy_config(
         ),
         default_value=code_default.fallback_mode,
     )
+    _validate_fallback_mode(
+        fallback_mode.value,
+        context=f"{fallback_mode.source}.{_FIELD_FALLBACK_MODE}",
+    )
     fallback_prompt = _select_value(
         run_value=None if run_override is None else run_override.fallback_prompt,
         scene_value=None if scene_override is None else scene_override.fallback_prompt,

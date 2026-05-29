@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+
+import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.admission import PendingDispatchRecord
@@ -263,6 +266,29 @@ def test_scan_accepted_does_not_mutate_or_create_attempt(tmp_path: Path) -> None
         assert wakeup.dispatches == []
         assert wakeup.promoted_sessions == list(result.queue_promotion_sessions)
         assert after == before
+
+
+def test_scan_accepted_without_wakeup_port_logs_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ACCEPTED 需要 promotion 但无 wakeup port 时必须给出 ERROR 诊断。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_unstarted_run(store.transaction_runner, "run-1", RunStatus.ACCEPTED)
+        caplog.set_level(logging.ERROR, logger="dayu.host.recovery")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.ACCEPTED_WAKE,
+        )
+        assert len(result.queue_promotion_sessions) == 1
+        assert "host.recovery.queue_promotion_wakeup_unavailable" in caplog.text
 
 
 def test_scan_queued_does_not_mutate_or_create_attempt(tmp_path: Path) -> None:

@@ -420,7 +420,8 @@ def _compose_options(
     :param ordinary_selection: 普通 Run runner 选择。
     :param compactor_selection: compactor runner 选择。
     :param agent_policy_config: 合并后的 AgentPolicy 配置。
-    :param effective_tool_bundle: 已补齐截断默认值的工具 bundle。
+    :param effective_tool_bundle: 已补齐截断默认值的工具 bundle；没有业务工具时
+        为 ``None``。
     :param compactor_prompts: compactor scene / baseline 装配后的输入。
     :returns: Host public opener options。
     :raises ValueError: worker backend 或 secret 映射失败时抛出。
@@ -806,6 +807,8 @@ def _tool_bundle_with_effective_truncation(
     :raises ValueError: 截断声明与 policy 默认值组合非法时抛出。
     """
 
+    if not tool_bundle.definitions:
+        return tool_bundle
     if not execution_profile.tool_truncation_policy.enabled:
         return tool_bundle
     definitions: list[ToolDefinition] = []
@@ -908,11 +911,10 @@ def _runner_spec_from_model(
     :param model: 模型配置。
     :param env: 环境变量映射。
     :returns: RunnerSpec。
-    :raises ValueError: API key 引用缺失或环境变量缺失时抛出。
+    :raises ValueError: 需要 API key 但环境变量缺失，或 header 存在未解析
+        占位符时抛出。
     """
 
-    if model.api_key_ref is None:
-        raise ValueError(f"model {model.model_id} must declare api_key_ref")
     return RunnerSpec(
         provider=model.provider,
         model=model.model,
@@ -937,23 +939,31 @@ def _runner_spec_from_model(
 
 
 def _render_headers(
-    headers: Mapping[str, str], *, api_key_ref: str, env: Mapping[str, str]
+    headers: Mapping[str, str], *, api_key_ref: str | None, env: Mapping[str, str]
 ) -> dict[str, str]:
     """渲染 provider headers 中的环境变量占位符。
 
     :param headers: 配置 headers。
-    :param api_key_ref: API key 环境变量名。
+    :param api_key_ref: API key 环境变量名；``None`` 表示无需注入 API key。
     :param env: 环境变量映射。
     :returns: 渲染后的 headers。
-    :raises ValueError: API key 缺失或 header 存在未解析占位符时抛出。
+    :raises ValueError: 需要 API key 但环境变量缺失，或 header 存在未解析
+        占位符时抛出。
     """
 
-    api_key = env.get(api_key_ref)
-    if api_key is None or api_key.strip() == "":
-        raise ValueError(f"missing env {api_key_ref}")
+    api_key: str | None = None
+    if api_key_ref is not None:
+        api_key = env.get(api_key_ref)
+        if api_key is None or api_key.strip() == "":
+            raise ValueError(f"missing env {api_key_ref}")
     rendered: dict[str, str] = {}
     for name, value in headers.items():
-        rendered_value = value.replace(f"{{{{{api_key_ref}}}}}", api_key.strip())
+        rendered_value = value
+        if api_key_ref is not None and api_key is not None:
+            rendered_value = value.replace(
+                f"{{{{{api_key_ref}}}}}",
+                api_key.strip(),
+            )
         unresolved = _ENV_PLACEHOLDER_PATTERN.search(rendered_value)
         if unresolved is not None:
             raise ValueError(
@@ -1078,7 +1088,7 @@ def _tooling_options_from_discovery(
 
     :param tool_bundle: 已发现业务工具 bundle。
     :param source_refs: 工具来源引用。
-    :returns: HostToolingOptions；没有工具时返回 ``None``。
+    :returns: HostToolingOptions。
     :raises ValueError: source refs 缺失但工具非空时抛出。
     """
 

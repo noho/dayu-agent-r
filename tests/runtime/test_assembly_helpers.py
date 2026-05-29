@@ -11,6 +11,7 @@ import pytest
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.runtime.assembly import (
     AgentPolicyDefaults,
+    AgentPolicyOverrideConfig,
     RuntimeAssemblyFieldError,
     RuntimeAssemblySelectionError,
     effective_tool_truncate_spec_from_policy,
@@ -176,6 +177,18 @@ def test_merge_agent_policy_config_uses_typed_allowlist_precedence() -> None:
     assert merged.field_sources["max_iterations"] == "scene_override"
     assert merged.field_sources["allow_tool_calls"] == "run_override"
     assert merged.field_sources["continuation_prompt"] == "execution_profile"
+
+
+def test_merge_agent_policy_config_revalidates_selected_fallback_mode() -> None:
+    """直接构造 typed override 绕过解析器时，最终 fallback_mode 仍需校验。"""
+
+    with pytest.raises(RuntimeAssemblyFieldError, match="unsupported value"):
+        merge_agent_policy_config(
+            code_default=_agent_policy_defaults(),
+            execution_profile=None,
+            scene_override=None,
+            run_override=AgentPolicyOverrideConfig(fallback_mode="finalize"),
+        )
 
 
 def test_merge_agent_policy_config_field_sources_is_runtime_immutable() -> None:

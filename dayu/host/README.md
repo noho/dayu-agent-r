@@ -193,7 +193,7 @@ submit_followup(queue)
 
 runtime lane 只表达资源容量，不表达 Host ownership、lease、fencing、EventLog ordering 或 recovery proof。worker accept 前后都要依赖 durable recheck 与 Host state transition；worker stream 的 finally 路径负责 active registry 注销、worker handle close 与 lane release。
 
-Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：`STOPPED` owner 可直接证明当前 active dispatch 已 orphan；`STOPPING` owner 必须继续满足 stale heartbeat 与 pid missing / identity mismatch 等进程证据，避免抢正在关闭的旧 Host；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，其中 `ACCEPTED` 与 `QUEUED` 会在 scan 事务提交后唤醒 queue promotion，让 pre-start governance 重新接管；`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt；可恢复的 `RUNNING` orphan 或既有 `RECOVERING` Run 会在 recovery dispatch count 未超限时创建新的 Attempt / execution / dispatch record 并唤醒 scheduler，超限或不可恢复时转为 `LOST`。
+Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：`STOPPED` owner 可直接证明当前 active dispatch 已 orphan；`STOPPING` owner 必须继续满足 stale heartbeat 与 pid missing / identity mismatch 等进程证据，避免抢正在关闭的旧 Host；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态；durable row 中非正 pid 直接按 pid missing positive orphan proof 处理。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，其中 `ACCEPTED` 与 `QUEUED` 会在 scan 事务提交后唤醒 queue promotion，让 pre-start governance 重新接管；缺少 wakeup port 但存在待 promotion session 时记录 ERROR 诊断；`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt；可恢复的 `RUNNING` orphan 或既有 `RECOVERING` Run 会在 recovery dispatch count 未超限时创建新的 Attempt / execution / dispatch record 并唤醒 scheduler，超限或不可恢复时转为 `LOST`。
 
 worker startup timeout、worker accept failure、worker stream crash 和未知 terminal 都由 Host closeout 为结构化终态或 diagnostic。worker stream 在 Host 已请求 active cancel 后 clean EOF 时，Host 以 cancel terminal 收口；非取消 clean EOF 仍按 lost closeout 处理。terminal closeout 后会触发同 Session queued Run promotion。
 
@@ -201,7 +201,7 @@ worker startup timeout、worker accept failure、worker stream crash 和未知 t
 
 EventLog 是 append-only ledger。`canonical_fact` 子集是恢复、memory、tool governance、terminal summary 和状态索引的事实来源；非 canonical 的展示事件、`diagnostic` 与 `projection_signal` 只能服务展示、诊断或投影追平。
 
-`event_sequence` 是 Host 全局单调游标，供 read model、watch、projection catch-up、memory snapshot cursor 和 outbox 类能力对齐。EventLog append 与必要状态索引更新必须在同一 transaction 内完成。
+`event_sequence` 是 Host 全局单调游标，供 read model、watch、projection catch-up、memory snapshot cursor 和 outbox 类能力对齐。EventLog append 与必要状态索引更新必须在同一 transaction 内完成。同一 `event_id` 重放时，事件体 digest 相同会幂等返回既有 row，digest 不同会抛出 event identity conflict；INSERT 阶段撞上并发同 id row 也按同一规则重新分类。
 
 `watch_session_events(session_id)` 是普通 Service-facing session-level live event entry，返回 Host-owned typed `HostEvent` async iterator。它不接收 cursor，不做离线补读；terminal event 不结束 iterator；consumer 取消订阅只关闭本次 watch，不取消 Run、不写 EventLog。
 
@@ -218,7 +218,7 @@ Outbox terminal read / drain 是离线 terminal notification 补读入口，不�
 
 ## ToolRuntime
 
-`HostToolingOptions` 是 Host construction 阶段接收业务工具的 typed boundary。业务工具发现、provider 绑定、包入口扫描和 Service composition 发生在 Host 外部；Host 只接收已经装配好的 `ToolBundle` 与来源引用，不导入具体财报工具模块。
+`HostToolingOptions` 是 Host construction 阶段接收业务工具的 typed boundary。业务工具发现、provider 绑定、包入口扫描和 Service composition 发生在 Host 外部；Host 只接收已经装配好的非空 `ToolBundle` 与来源引用，不导入具体财报工具模块。没有业务工具时不构造空 `ToolBundle`，而是不传 `HostToolingOptions`。
 
 ToolRuntime 的稳定语义：
 
@@ -288,7 +288,7 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 - 低层 command handle factory 与 command handle options。
 - 内部新 Run admission primitive 和 `start_run`。
 - run-level `stream_run_events`。
-- durable store、transaction runner、schema、state row codec、payload table helper。
+- durable store、transaction runner、schema、state row codec、payload table helper；store close 会拒绝活跃 transaction，避免 SQLite 隐式 rollback 未提交写入。
 - dispatch scheduler、ToolRuntime factory、projection runner、memory repair runner。
 - recovery scanner、orphan proof classifier、Host instance liveness helper 与 startup recovery diagnostic。
 - `HostLocalExecutionOptions`、low-level local execution composition helper 与 run input provider internals。

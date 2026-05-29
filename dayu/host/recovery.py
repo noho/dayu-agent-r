@@ -10,6 +10,7 @@ transition helper 完成旧 Attempt closeout。Slice 3 起，本模块还负责�
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -71,6 +72,7 @@ _REASON_RECOVERY_DISPATCH_LIMIT_EXCEEDED = (
 _REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP = (
     "startup_recovery_dispatch_pending_follow_up"
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class StartupRecoveryDecision(StrEnum):
@@ -215,6 +217,13 @@ class StartupRecoveryScanner:
                 self.dispatch_wakeup_port.wake_dispatch(pending_dispatch)
             for session_id in result.queue_promotion_sessions:
                 self.dispatch_wakeup_port.wake_queue_promotion(session_id)
+        elif result.queue_promotion_sessions:
+            _LOGGER.error(
+                "host.recovery.queue_promotion_wakeup_unavailable "
+                "session_count=%s sessions=%s",
+                len(result.queue_promotion_sessions),
+                ",".join(result.queue_promotion_sessions),
+            )
         return result
 
     def _classify_run(

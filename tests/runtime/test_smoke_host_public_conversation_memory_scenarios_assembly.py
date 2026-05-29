@@ -126,6 +126,7 @@ def test_runtime_assembly_adds_builtin_mock_tool_and_selects_manual_smoke(
         f"spec=host-public-conversation-memory-scenarios-smoke,version=v1,tools={_TOOL_NAME}",
     )
     assert isinstance(assembly.smoke_tool, MockFinanceMemoryTool)
+    assert assembly.effective_tool_bundle is not None
     definitions = assembly.effective_tool_bundle.definitions
     smoke_definitions = tuple(item for item in definitions if item.name == _TOOL_NAME)
     assert len(smoke_definitions) == 1
@@ -561,4 +562,3 @@ def test_find_mock_tool_uses_discovered_bundle_shape() -> None:
 
     assert len(discovered_bundle.definitions) == 1
     assert isinstance(discovered_bundle.definitions[0].callable, MockFinanceMemoryTool)
-

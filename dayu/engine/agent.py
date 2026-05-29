@@ -1310,6 +1310,7 @@ class _AsyncAgent:
             return None
         if isinstance(data, RunnerDoneData):
             state.done_seen = True
+            finish_reason = data.finish_reason
             if (
                 state.finish_reason is not None
                 and state.finish_reason is not data.finish_reason
@@ -1325,7 +1326,9 @@ class _AsyncAgent:
                     data.finish_reason.value,
                     data.provider_request_id,
                 )
-            state.finish_reason = data.finish_reason
+                finish_reason = state.finish_reason
+            else:
+                state.finish_reason = data.finish_reason
             state.provider_request_id = data.provider_request_id
             _LOGGER.debug(
                 "engine.agent.runner_event_classified session_id=%s "
@@ -1335,14 +1338,14 @@ class _AsyncAgent:
                 self._request.run_id,
                 iteration_id,
                 runner_event.type.value,
-                data.finish_reason.value,
+                finish_reason.value,
                 data.provider_request_id,
             )
             return self._make_event(
                 event_type=EngineEventType.ITERATION_COMPLETED,
                 data=IterationCompletedData(
                     iteration_id=iteration_id,
-                    finish_reason=data.finish_reason,
+                    finish_reason=finish_reason,
                     provider_request_id=data.provider_request_id,
                 ),
                 occurred_at=runner_event.occurred_at,

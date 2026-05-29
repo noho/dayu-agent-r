@@ -353,27 +353,30 @@ def test_non_string_context_slot_value_fails_fast(tmp_path: Path) -> None:
         )
 
 
-def test_unresolved_placeholder_fails_fast(tmp_path: Path) -> None:
-    """渲染后残留未解析 placeholder 必须失败。"""
+def test_literal_double_braces_without_placeholder_pattern_are_preserved(
+    tmp_path: Path,
+) -> None:
+    """不构成完整 placeholder 的双花括号字面量必须保留。"""
 
-    _write_text(tmp_path / "prompts" / "base.md", "残留{{ company")
+    _write_text(tmp_path / "prompts" / "base.md", "代码示例：{{ company")
     _write_json(
-        tmp_path / "manifests" / "broken.json",
+        tmp_path / "manifests" / "literal.json",
         _manifest(
-            "broken",
+            "literal",
             fragments=[_fragment("base", "base.md", 1)],
             context_slots=[_slot("company")],
         ),
     )
 
-    with pytest.raises(ScenePrepareError, match="unresolved placeholder"):
-        prepare_scene(
-            _request(
-                tmp_path,
-                "broken",
-                context_slot_values={"company": "Dayu Corp"},
-            )
+    result = prepare_scene(
+        _request(
+            tmp_path,
+            "literal",
+            context_slot_values={"company": "Dayu Corp"},
         )
+    )
+
+    assert result.system_messages == ("代码示例：{{ company",)
 
 
 def test_single_inheritance_merges_parent_first_and_child_overrides(

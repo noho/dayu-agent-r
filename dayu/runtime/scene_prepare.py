@@ -1062,11 +1062,7 @@ def _render_fragment_content(
         context_slot_values=context_slot_values,
         fragment_id=fragment_id,
     )
-    if (
-        _UNRESOLVED_PLACEHOLDER_PATTERN.search(rendered) is not None
-        or "{{" in rendered
-        or "}}" in rendered
-    ):
+    if _UNRESOLVED_PLACEHOLDER_PATTERN.search(rendered) is not None:
         raise ScenePrepareError(f"unresolved placeholder remains in fragment {fragment_id}")
     return rendered
 

@@ -233,6 +233,17 @@ class HostTransactionRunner:
         self._connection = connection
         self._sqlite_policy = sqlite_policy
         self._payload_inline_threshold_bytes = payload_inline_threshold_bytes
+        self._active_transaction_count = 0
+
+    @property
+    def has_active_transaction(self) -> bool:
+        """返回当前 runner 是否持有未收口 transaction。
+
+        :returns: 存在已 ``BEGIN`` 且尚未 commit / rollback 的 transaction
+            时返回 ``True``，否则返回 ``False``。
+        """
+
+        return self._active_transaction_count > 0
 
     def run_write(
         self,
@@ -260,15 +271,19 @@ class HostTransactionRunner:
             attempt += 1
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                result = operation(
-                    HostTransaction(
-                        self._connection,
-                        payload_inline_threshold_bytes=(
-                            self._payload_inline_threshold_bytes
-                        ),
+                self._active_transaction_count += 1
+                try:
+                    result = operation(
+                        HostTransaction(
+                            self._connection,
+                            payload_inline_threshold_bytes=(
+                                self._payload_inline_threshold_bytes
+                            ),
+                        )
                     )
-                )
-                self._connection.execute("COMMIT")
+                    self._connection.execute("COMMIT")
+                finally:
+                    self._active_transaction_count -= 1
             except sqlite3.Error as exc:
                 _rollback(self._connection)
                 durable_error = _classify_sqlite_error(exc)
@@ -312,15 +327,19 @@ class HostTransactionRunner:
             attempt += 1
             try:
                 self._connection.execute("BEGIN")
-                result = operation(
-                    HostTransaction(
-                        self._connection,
-                        payload_inline_threshold_bytes=(
-                            self._payload_inline_threshold_bytes
-                        ),
+                self._active_transaction_count += 1
+                try:
+                    result = operation(
+                        HostTransaction(
+                            self._connection,
+                            payload_inline_threshold_bytes=(
+                                self._payload_inline_threshold_bytes
+                            ),
+                        )
                     )
-                )
-                self._connection.execute("COMMIT")
+                    self._connection.execute("COMMIT")
+                finally:
+                    self._active_transaction_count -= 1
             except sqlite3.Error as exc:
                 _rollback(self._connection)
                 if _is_busy_or_locked(exc):
