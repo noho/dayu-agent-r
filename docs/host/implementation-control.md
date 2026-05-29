@@ -233,8 +233,8 @@ adjudication artifact 为 `docs/reviews/phase15-plan-review-controller-adjudicat
 `docs/reviews/phase15-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-plan-rereview-ds-20260529.md`。Phase 13 Audit /
 Tool Trace / Outbox Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits
 与 PR 69 记录见 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 S2 accepted slice commit。
-下一步：创建 S2 accepted slice 本地 checkpoint 后进入 Slice P15-S3 Public Command Wiring And Read-after-purge Semantics。P15 不以 Phase 14 completion 为进入
+当前 gate：Phase 15 implementation Slice P15-S3。
+下一步：派发 implementation specialist 实现 Slice P15-S3 Public Command Wiring And Read-after-purge Semantics。P15 不以 Phase 14 completion 为进入
 前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
@@ -2339,7 +2339,7 @@ tests/host/test_memory_projection.py tests/host/test_tool_trace_projection.py te
 112 passed；`python -m pyright dayu/host/durable/purge.py dayu/host/durable/payload.py dayu/host/durable/read_model.py
 dayu/host/durable/memory.py dayu/host/durable/tool_trace.py dayu/host/durable/outbox.py dayu/host/durable/audit.py tests/host`
 为 0 errors。README 检查结论：S2 仍只新增 internal durable transaction helper，public `purge_session` 尚未接线，
-README 暂不更新。
+README 暂不更新。Accepted S2 commit 为 `dac3a85`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
