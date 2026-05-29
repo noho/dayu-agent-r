@@ -2,9 +2,9 @@
 
 本模块是 Host durable schema convention 的唯一 DDL 真源。它创建 Phase 2
 foundation tables、Phase 3 Session / Run / Attempt durable state tables，
-Phase 8 projection / read model tables、Phase 9 memory projection tables，
-以及 Phase 13 audit / tool trace / outbox projection-owned tables；不承载
-command、admission 或 purge 相关逻辑。
+Phase 8 projection / read model tables、Phase 9 memory projection tables、
+Phase 13 audit / tool trace / outbox projection-owned tables，以及 Phase 15
+purge tombstone governance table；不承载 command、admission 或删除矩阵逻辑。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 13
+HOST_SCHEMA_VERSION = 14
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -48,6 +48,7 @@ TABLE_HOST_AUDIT_SINK_MARKERS = "host_audit_sink_markers"
 TABLE_HOST_TOOL_TRACE_HOT = "host_tool_trace_hot"
 TABLE_HOST_OUTBOX_TERMINAL_ITEMS = "host_outbox_terminal_items"
 TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY = "host_outbox_drain_idempotency"
+TABLE_HOST_PURGE_TOMBSTONES = "host_purge_tombstones"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION = "host_runs_one_accepted_per_session"
@@ -89,6 +90,7 @@ INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE = (
     "host_outbox_terminal_items_state_sequence"
 )
 INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN = "host_outbox_terminal_items_run"
+INDEX_HOST_PURGE_TOMBSTONES_SESSION = "host_purge_tombstones_session"
 
 FOUNDATION_TABLES: tuple[str, ...] = (
     TABLE_EVENT_LOG,
@@ -136,6 +138,9 @@ OUTBOX_PROJECTION_TABLES: tuple[str, ...] = (
 )
 """Phase 13 outbox projection-owned table 名称集合。"""
 
+PURGE_GOVERNANCE_TABLES: tuple[str, ...] = (TABLE_HOST_PURGE_TOMBSTONES,)
+"""Phase 15 purge tombstone governance table 名称集合。"""
+
 HOST_DURABLE_TABLES: tuple[str, ...] = (
     FOUNDATION_TABLES
     + PHASE3_STATE_TABLES
@@ -144,6 +149,7 @@ HOST_DURABLE_TABLES: tuple[str, ...] = (
     + AUDIT_PROJECTION_TABLES
     + TOOL_TRACE_PROJECTION_TABLES
     + OUTBOX_PROJECTION_TABLES
+    + PURGE_GOVERNANCE_TABLES
 )
 """当前 fresh bootstrap 应创建的 Host durable table 名称集合。"""
 
@@ -963,6 +969,33 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY} (
 )
 """
 
+_HOST_PURGE_TOMBSTONES_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_PURGE_TOMBSTONES} (
+  tombstone_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  client_request_id TEXT NOT NULL,
+  semantic_request_digest TEXT NOT NULL,
+  actor TEXT NULL,
+  source TEXT NULL,
+  operation_context_digest TEXT NULL,
+  operation_context_refs_json TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  purged_at TEXT NOT NULL,
+  precondition_digest TEXT NOT NULL,
+  deleted_counts_json TEXT NOT NULL,
+  deleted_counts_digest TEXT NOT NULL,
+  deleted_refs_digest TEXT NOT NULL,
+  audit_record_ref TEXT NULL,
+  audit_record_digest TEXT NULL,
+  request_context_json TEXT NOT NULL,
+  CHECK (
+    (audit_record_ref IS NULL AND audit_record_digest IS NULL)
+    OR
+    (audit_record_ref IS NOT NULL AND audit_record_digest IS NOT NULL)
+  )
+)
+"""
+
 # ``recovering`` 由 Phase 11 recovery owner 写入；当前 P9 transition
 # 代码尚不写入该状态，schema 与 active Run 单例约束先保留识别能力。
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
@@ -1086,6 +1119,11 @@ CREATE INDEX IF NOT EXISTS {INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN}
 ON {TABLE_HOST_OUTBOX_TERMINAL_ITEMS}(run_id)
 """
 
+_HOST_PURGE_TOMBSTONES_SESSION_INDEX_DDL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_PURGE_TOMBSTONES_SESSION}
+ON {TABLE_HOST_PURGE_TOMBSTONES}(session_id)
+"""
+
 FOUNDATION_DDL: tuple[str, ...] = (
     _SQLITE_PAYLOADS_DDL,
     _PAYLOAD_DESCRIPTORS_DDL,
@@ -1148,6 +1186,9 @@ OUTBOX_PROJECTION_DDL: tuple[str, ...] = (
 )
 """按外键依赖顺序排列的 Phase 13 outbox projection DDL。"""
 
+PURGE_GOVERNANCE_DDL: tuple[str, ...] = (_HOST_PURGE_TOMBSTONES_DDL,)
+"""按外键依赖顺序排列的 Phase 15 purge tombstone governance DDL。"""
+
 PROJECTION_INDEX_DDL: tuple[str, ...] = (
     _HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE_INDEX_DDL,
     _HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE_INDEX_DDL,
@@ -1178,6 +1219,11 @@ OUTBOX_PROJECTION_INDEX_DDL: tuple[str, ...] = (
 )
 """Phase 13 outbox projection index DDL。"""
 
+PURGE_GOVERNANCE_INDEX_DDL: tuple[str, ...] = (
+    _HOST_PURGE_TOMBSTONES_SESSION_INDEX_DDL,
+)
+"""Phase 15 purge tombstone governance index DDL。"""
+
 HOST_DURABLE_DDL: tuple[str, ...] = (
     FOUNDATION_DDL
     + PHASE3_STATE_DDL
@@ -1186,12 +1232,14 @@ HOST_DURABLE_DDL: tuple[str, ...] = (
     + AUDIT_PROJECTION_DDL
     + TOOL_TRACE_PROJECTION_DDL
     + OUTBOX_PROJECTION_DDL
+    + PURGE_GOVERNANCE_DDL
     + FOUNDATION_INDEX_DDL
     + PHASE3_INDEX_DDL
     + PROJECTION_INDEX_DDL
     + MEMORY_PROJECTION_INDEX_DDL
     + TOOL_TRACE_PROJECTION_INDEX_DDL
     + OUTBOX_PROJECTION_INDEX_DDL
+    + PURGE_GOVERNANCE_INDEX_DDL
 )
 """当前 Host durable fresh bootstrap 全量 DDL。"""
 
