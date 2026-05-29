@@ -226,7 +226,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前状态：PR 68 已 merge 到 `main`，merge commit 为 `b9bd625`。当前工作分支为
 `feat/phase-13-audit-trace-outbox`，从 clean `main` 创建。Phase 13 design discussion 已由用户确认；controller
 adjudication artifact 为 `docs/reviews/phase13-design-discussion-controller-adjudication-20260529.md`。
-当前 gate：Phase 13 Slice 4 accepted commit。
+当前 gate：Phase 13 aggregate deepreview。
 Plan artifact 为 `docs/host/phase13-audit-tool-trace-outbox-plan.md`。Plan review artifacts 为
 `docs/reviews/phase13-plan-review-mimo-20260529.md` 与 `docs/reviews/phase13-plan-review-ds-20260529.md`；
 controller adjudication 为 `docs/reviews/phase13-plan-review-controller-adjudication-20260529.md`。Controller 接受
@@ -265,7 +265,9 @@ AgentDS 做 Slice 4 code review；code review artifacts 为
 `docs/reviews/phase13-slice4-code-review-mimo-20260529.md` 与
 `docs/reviews/phase13-slice4-code-review-ds-20260529.md`。两路 review 均 PASS，无 blocking findings；controller
 adjudication 为 `docs/reviews/phase13-slice4-code-review-controller-adjudication-20260529.md`。下一步：创建
-accepted Slice 4 local commit。
+accepted Slice 4 local commit。Accepted Slice 4 commit 为 `1d9e732`。Phase 13 aggregate validation 已通过：
+plan-listed pytest 96 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` passed。
+下一步：派发 AgentMiMo 与 AgentDS 做 ready-to-open-draft-PR 前 aggregate deepreview。
 
 ## Phase Map
 
@@ -2440,6 +2442,11 @@ AgentMiMo 与 AgentDS Slice 4 code review 已完成。Artifacts 为
 adjudication artifact 为 `docs/reviews/phase13-slice4-code-review-controller-adjudication-20260529.md`。低优先级
 observations 均裁决为 non-blocking residual / test-hardening，不要求当前 fix pass。当前 gate 进入 accepted
 Slice 4 commit。
+
+Accepted Slice 4 commit 已创建：`1d9e732` (`gateflow: accept phase 13 slice 4`)。Phase 13 aggregate validation
+已通过：plan-listed pytest 96 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check`
+passed。当前 gate 进入 Phase 13 aggregate deepreview。Aggregate review 必须由 AgentMiMo 与 AgentDS 独立完成；
+通过并裁决后，Phase 13 才能进入 `ready-to-open-draft-PR`。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 
