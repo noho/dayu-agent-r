@@ -29,6 +29,7 @@ from dayu.host import (
     HostCallContext,
     HostEvent,
     HostEventKind,
+    HostTerminalStatus,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
@@ -50,6 +51,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.outbox import read_outbox_terminal_items_after
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.memory import default_memory_projection_policy
@@ -388,6 +390,41 @@ async def test_submit_followup_queue_auto_wakes_scheduler(
     assert len(factory.accepted_snapshots) == 1
     assert factory.accepted_snapshots[0].run_id == followup.accepted_run_id
     assert factory.accepted_requests[0].disable_tools is True
+
+
+@pytest.mark.asyncio
+async def test_open_host_close_flushes_outbox_projection(
+    tmp_path: pathlib.Path,
+) -> None:
+    """open_host close projection flush 包含 Outbox terminal projection。"""
+
+    factory = _FinalAnswerWorkerFactory()
+    options = _options(tmp_path, factory)
+
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-outbox-close-flush"),
+        )
+        await _wait_for_run_status(
+            host,
+            followup.accepted_run_id,
+            RunStatus.SUCCEEDED,
+        )
+
+    with open_host_durable_store(_durable_options_from_open_options(options)) as store:
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_outbox_terminal_items_after(
+                transaction,
+                session.session_id,
+                after_event_sequence=0,
+                seen_terminal_event_ids=(),
+                limit=10,
+            )
+        )
+        assert tuple(row.run_id for row in page.rows) == (followup.accepted_run_id,)
+        assert page.rows[0].terminal_status == HostTerminalStatus.SUCCEEDED.value
 
 
 @pytest.mark.asyncio

@@ -222,16 +222,18 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：PR 68 Phase 12.5 / 12.6 conversation memory, compaction continuity, public memory smoke, public memory scenario smoke, draft PR gate 与 post-draft fullrepo review。
-当前状态：PR 68 保持 open draft；branch `feat/phase-12-5-conversation-memory-optimize` 已 push 到 GitHub，post-draft fullrepo accepted fix commit 为 `caefa67`。P12.6 已 post-draft full-repo review pass；随后按用户要求追加 public conversation memory smoke，并再次推进到 draft-PR-pass + post-draft fullrepo review pass。当前本地又按 `dayu-agent/docs/conversation_memory_test.md` 借鉴新增 Host public conversation memory scenario smoke，已完成 plan、slice implementation / review、aggregate deepreview 与 controller adjudication，尚未 push 到 PR 68。
-当前 gate：draft-PR-pass + local scenario-smoke `ready-to-open-draft-PR`。既有 public memory smoke artifacts 为 `docs/reviews/gateflow-plan-conversation-memory-smoke-20260526.md`、`docs/reviews/gateflow-code-review-conversation-memory-smoke-mimo-20260526.md`、`docs/reviews/gateflow-code-review-conversation-memory-smoke-ds-20260526.md`、`docs/reviews/gateflow-aggregate-deepreview-conversation-memory-optimize-mimo-20260526.md`、`docs/reviews/gateflow-aggregate-deepreview-conversation-memory-optimize-ds-20260526.md` 与 `docs/reviews/gateflow-aggregate-deepreview-controller-adjudication-20260526.md`。新增 scenario smoke artifacts 为 `docs/reviews/gateflow-plan-public-memory-scenario-smoke-20260526.md`、`docs/reviews/gateflow-plan-controller-adjudication-public-memory-scenario-smoke-20260526.md`、`docs/reviews/gateflow-implementation-public-memory-scenario-smoke-s1a-codex-20260526.md`、`docs/reviews/gateflow-implementation-public-memory-scenario-smoke-s1b-codex-20260526.md`、`docs/reviews/gateflow-implementation-public-memory-scenario-smoke-s2-codex-20260526.md`、`docs/reviews/gateflow-implementation-public-memory-scenario-smoke-s3-codex-20260526.md`、`docs/reviews/gateflow-implementation-public-memory-scenario-smoke-s4-codex-20260526.md`、`docs/reviews/gateflow-aggregate-deepreview-public-memory-scenario-smoke-ds-20260526.md` 与 `docs/reviews/gateflow-aggregate-deepreview-controller-adjudication-public-memory-scenario-smoke-20260526.md`。Draft PR review artifacts 为 `docs/reviews/pr-68-draft-review-conversation-memory-optimize-mimo-20260526.md`、`docs/reviews/pr-68-draft-review-conversation-memory-optimize-ds-20260526.md` 与 `docs/reviews/pr-68-draft-review-controller-adjudication-20260526.md`。Post-draft fullrepo review artifacts 为 `docs/reviews/pr-68-postdraft-fullrepo-review-mimo-20260526.md` 与 `docs/reviews/pr-68-postdraft-fullrepo-review-ds-20260526.md`；accepted B1 / B2 owner fix artifact 为 `docs/reviews/pr-68-postdraft-fullrepo-fix-codex-20260526.md`；re-review artifacts 为 `docs/reviews/pr-68-postdraft-fullrepo-fix-rereview-mimo-20260526.md` 与 `docs/reviews/pr-68-postdraft-fullrepo-fix-rereview-ds-20260526.md`；scene migration validation fix artifacts 为 `docs/reviews/pr-68-postdraft-fullrepo-validation-fix-codex-20260526.md`、`docs/reviews/pr-68-postdraft-fullrepo-validation-fix-rereview-mimo-20260526.md` 与 `docs/reviews/pr-68-postdraft-fullrepo-validation-fix-rereview-ds-20260526.md`；controller adjudication 为 `docs/reviews/pr-68-postdraft-fullrepo-fix-controller-adjudication-20260526.md`。Validation：post-draft affected tests 159 passed；`python -m pyright dayu/ tests/ utils/` 0 errors；public memory smoke `SMOKE PASS public Host conversation memory finance continuity`；scenario smoke affected tests 17 passed；scenario smoke all `SMOKE PASS public Host conversation memory scenario smoke`；full `pyright` 0 errors；`git diff --check` passed。MiMo fullrepo review attempted full `tests/` and reported 1089/1090 passed, one external-network-dependent failure unrelated to accepted fixes。
-下一步：若继续 PR gate，则推送本地 scenario-smoke commits 到 PR 68 并追加 PR-level review；否则等待用户额外授权 merge、mark ready for review、request reviewers 或删除分支。PR 68 post-draft fullrepo residuals 与新增 scenario-smoke residuals 已写入下方 `追踪区`，不得只依赖 `docs/reviews/` artifacts。
-
-当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix、post-draft raw evidence compaction fix、post-draft compactor scene prompt fix、post-draft compactor baseline scene id fix、post-draft compactor AgentPolicy / user prompt template ownership fix、post-draft reactive compaction budget hardening fix、post-draft manual full-repo review repair、post-draft second manual full-repo review repair 与 post-draft third manual full-repo review repair 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。Compactor system prompt 与 AgentPolicy 由 Service assembly 按 `execution_profiles.json.compactor_baseline.scene_id` 装配，compactor user prompt template 由 Service assembly 按 `execution_profiles.json.compactor_baseline.user_prompt_template_path` 读取，三者均以 typed `CompactorRunnerBaseline` 传入 Host；compactor 温度、top_p 与 stream 继续由 `execution_profiles.json.compactor_baseline.runner_option_hint_id` 指向 `models.json.runtime_hints.runner_option_hints.conversation_compaction`。Reactive compaction 不引入 raw evidence aggregate prompt budget guard，不让不准 token 估算阻断 reactive recovery；reactive path 通过真实 recovery dispatch / Engine overflow 闭环最多执行 `max_reactive_compactions_per_run` 次 compact，默认上限为 2，超过上限后 fail closed。Latest manual full-repo review artifacts 为 `docs/reviews/repo-review-20260523-215141.md` 与 `docs/reviews/repo-review-20260523-215152.md`；repair artifact 为 `docs/reviews/pr-68-third-manual-fullrepo-fix-codex-20260523.md`；controller adjudication artifact 为 `docs/reviews/pr-68-third-manual-fullrepo-fix-controller-adjudication-20260523.md`；latest re-review artifacts 为 `docs/reviews/pr-68-third-manual-fullrepo-fix-rereview-mimo-20260523.md` 与 `docs/reviews/pr-68-third-manual-fullrepo-fix-rereview-ds-20260523.md`，两者均 PASS 且无 blocking findings。Controller validation：affected pytest 103 passed；`pyright dayu tests` 0 errors；`git diff --check` passed。剩余风险为大 session rebuild performance，以及 manual full-repo reviews 中已转交后续 owner 的 dispatch / recovery、durable layering、memory semantics、Engine runner / provider、ToolRuntime 与 production hardening items。
+当前 work unit：Phase 15 Retention / Purge / Production Hardening。
+当前状态：Phase 13 Audit / Tool Trace / Outbox Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、
+review artifacts、accepted commits 与 PR 69 记录见 `历史记录` 和 `docs/reviews/`。
+Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
+当前 gate：Phase 15 design discussion / plan gate。
+下一步：基于 `docs/host/design.md` 与本总控文档细化 Phase 15 scope，生成 implementation-ready plan。P15 不以
+Phase 14 completion 为进入前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess /
+recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
 
-Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
+Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze 与 recovery。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 14 RemoteProxy / RemoteStub 暂不实现并由 Issue #73 追踪，当前推进顺序从已完成的 Phase 13 直接进入 Phase 15。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
 
 ### Phase 0. Engine Context Compaction Event 语义前置
 
@@ -2033,6 +2035,9 @@ Plan 必须额外收口的 readiness review checklist：
 目标：
 - 在 LocalProxy 语义基准上实现 RemoteProxy / RemoteStub transport substitution，保持 Host 治理真源、execution_id late event rejection 与 tool fact accept ack。
 
+当前状态：
+- 暂不实现；deferred 到 GitHub Issue #73。Phase 15 不等待本 phase 完成。
+
 对应设计章节：
 - `docs/host/design.md` §17 WorkerProxy / EngineWorker
 - `docs/host/design.md` §18 ToolRuntime
@@ -2101,7 +2106,8 @@ Plan 必须额外收口的 readiness review checklist：
 - `docs/host/design.md` §28 第一版 Non-goals
 
 前置条件：
-- Phase 8 projection core、Phase 11 recovery、Phase 13 Audit / Tool Trace / Outbox、Phase 14 remote 已完成。
+- Phase 8 projection core、Phase 11 recovery、Phase 13 Audit / Tool Trace / Outbox 已完成。
+- Phase 14 RemoteProxy / RemoteStub 已明确 deferred 到 Issue #73；P15 不以 remote completion 为进入前置。
 - Core Host Public Interface Freeze 已生效：P15 不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义或 `HostEvent` terminal final answer view。
 
 进入条件：
@@ -2123,7 +2129,7 @@ Plan 必须额外收口的 readiness review checklist：
 关键设计问题：
 - 必须确认 purge 对 EventLog / payload / projection / outbox / tool trace hot data / audit JSONL 的最终清理矩阵。
 - 必须确认第一版 residual risks 的接受、后续 issue 或当前修复归属。
-- 必须确认 purge / tombstone / projection rebuild slices 是否可以在 Remote smoke 之前独立完成；remote smoke / release closeout slice 依赖 Phase 14。
+- 必须确认 purge / tombstone / projection rebuild slices 的 release-blocking 范围；remote-dependent smoke 不进入当前 P15 scope，继续归 Issue #73。
 
 交付物：
 - phase design refinement
@@ -2135,7 +2141,7 @@ Plan 必须额外收口的 readiness review checklist：
 建议 slice 切分：
 - Slice 1: purge delete matrix and tombstone audit。
 - Slice 2: projection rebuild / consistency checks。
-- Slice 3: multi-process / remote / recovery production smoke。
+- Slice 3: multi-process / recovery production smoke；remote-dependent smoke deferred 到 Issue #73。
 - Slice 4: README / docs / residual risk closeout。
 
 验证要求：
@@ -2197,17 +2203,9 @@ Owner / destination：后续 Fins / tool provider work unit。
 - P12.5 若冻结 accepted evidence envelope / evidence_backed_fact contract，财报工具需保证 tool result accept path 可形成 accepted evidence envelope；最终 `evidence_backed_facts` 由 Host-governed compact extraction 生成。
 - 财报仓储仍由 `dayu.fins.storage` 协议 owner 负责；Host memory 不保存财报原文，不解释财报业务语义。
 
-#### Phase 13 Audit / Tool Trace / Outbox tracking
-
-Owner / destination：Phase 13 Audit / Tool Trace / Outbox Projections。
-
-- 复用 P12 产生的 ToolBundle / scene source refs 与 content digest，进入 audit、tool trace 或 diagnostic refs；不得让 Host / Engine 重新解释 provider 或 scene assets。
-- 落地 durable tool trace hot / cold storage、provider request 排错链、terminal delivery outbox、projection concrete sinks 与 outbox read / drain API。
-- 接收 ToolRuntime / Engine / Context Governance 的 observability backlog：executor 普通异常诊断、tool accept failure diagnostic refs、usage / provider request 可观测性、compact artifact / memory refs 可审计性。
-
 #### Phase 14 RemoteProxy tracking
 
-Owner / destination：Phase 14 RemoteProxy / RemoteStub。
+Owner / destination：GitHub Issue #73；未来重新进入 Phase 14 design / plan gate。
 
 - 远程执行只传输 immutable attempt snapshot 与 EngineEvent stream；RemoteStub 不拥有 Host durable truth。
 - 远程 worker disconnect、late event、duplicate event、cancel propagation、tool accept ack over remote 与 remote wire protocol 细节均归 Phase 14。
@@ -2288,6 +2286,171 @@ Owner / destination：后续 Conversation Memory / Context Governance hardening 
 - public memory scenario smoke residuals：`utils/smoke_host_public_conversation_memory_scenarios.py` 只通过 public answer 间接验证 conversation memory 语义，不读取 durable DB / EventLog / memory 表 / compact payload；`--suite all --pressure-mode off` 已通过；`_PROVIDER_IMPORT_DISPLAY_PATH` 继承 `__main__` display path pattern，若未来改为解析 import path 的 discovery 模式，需与既有 `smoke_host_public_multiturn.py` 一并统一。
 
 ## 历史记录
+
+### 2026-05-29 PR 68 merged and Phase 13 started
+
+用户确认 PR 68 已 merge，并要求进入 Phase 13。Controller 已核验 PR 68 state 为 `MERGED`，merge commit 为
+`b9bd625`，本地 `main` clean 且包含该 merge commit。Phase 12.5 / 12.6 conversation memory、compaction
+continuity、public memory smoke 与 public memory scenario smoke 的 draft PR gate 工作已归档为完成；PR 68 post-draft
+fullrepo residuals 与 scenario-smoke residuals 继续以 `Open Questions 与风险追踪` 中已分配 owner 的条目为准。
+
+Controller 已从 clean `main` 创建工作分支 `feat/phase-13-audit-trace-outbox`。当前 gate 切换为 Phase 13 discussion /
+design refinement；尚未进入 plan、implementation 或 review gate。Phase 13 必须先确认 Audit / Tool Trace / Outbox 只是
+projection / sink，不参与 Host command path 成功条件，不反向成为 recovery、resume、memory 或 Run 状态迁移真源。
+
+用户随后确认 Phase 13 design discussion 裁决：Audit / Tool Trace / Outbox 保持 projection / sink；Outbox 只补离线
+terminal / final answer notification，不补完整 timeline，不改变 `watch_session_events(...)` live-only 语义；Outbox
+read / drain API 作为唯一 additive public extension 进入 Phase 13 plan；LogAuditSink 第一版为 append-only JSONL；
+Tool Trace 第一版为 hot JSON projection + cold JSONL writer。Controller adjudication artifact 为
+`docs/reviews/phase13-design-discussion-controller-adjudication-20260529.md`。当前 gate 进入 Phase 13 handoff
+implementation-ready plan。
+
+Planning specialist AgentCodex 已生成 handoff implementation-ready plan：
+`docs/host/phase13-audit-tool-trace-outbox-plan.md`。Plan 声明 blocking open questions 为 None，建议 slices 为：
+LogAuditSink JSONL、Tool Trace hot JSON / cold JSONL、OutboxSink durable projection、Public Outbox read / drain API
+and offline smoke。Controller 已将当前 gate 推进为 Phase 13 plan review；待 AgentMiMo 与 AgentDS 双路 review。
+
+Phase 13 plan review 已完成。MiMo artifact 为 `docs/reviews/phase13-plan-review-mimo-20260529.md`，verdict 为
+PASS with recommended findings；DS artifact 为 `docs/reviews/phase13-plan-review-ds-20260529.md`，verdict 为
+CONDITIONAL PASS with one blocking finding。Controller adjudication artifact 为
+`docs/reviews/phase13-plan-review-controller-adjudication-20260529.md`。当前 gate 回到 Phase 13 plan fix；
+accepted blocking finding 为 `read_outbox_terminal_items` side-effect boundary 自相矛盾。Accepted plan clarifications
+包括 Outbox dedupe / idempotency key 边界、purge / retention Phase 15 owner、tool trace diagnostic whitelist、audit marker
+table naming、RUN_LOST skip 语义、tool trace query helper pagination 与 projection-lag anti-leak test。
+
+Planning specialist 已修复 plan 并输出 fix artifact：`docs/reviews/phase13-plan-fix-codex-20260529.md`。Fix 修改
+`docs/host/phase13-audit-tool-trace-outbox-plan.md`，覆盖全部 accepted findings；`git diff --check` passed。
+当前 gate 进入 Phase 13 plan re-review。
+
+Phase 13 plan re-review 已通过。MiMo re-review artifact 为
+`docs/reviews/phase13-plan-rereview-mimo-20260529.md`；DS re-review artifact 为
+`docs/reviews/phase13-plan-rereview-ds-20260529.md`。两者均确认 accepted findings fixed，verdict PASS。
+Controller re-review adjudication artifact 为
+`docs/reviews/phase13-plan-rereview-controller-adjudication-20260529.md`。当前 gate 进入 accepted plan commit。
+
+Accepted plan local commit 已创建：`9e79f5e` (`gateflow: accept plan for phase 13 projections`)。当前 gate 进入
+Phase 13 implementation，下一步派发 Slice 1 `LogAuditSink JSONL` implementation。
+
+Phase 13 Slice 1 `LogAuditSink JSONL` implementation 已完成。Implementation artifact 为
+`docs/reviews/phase13-slice1-implementation-codex-20260529.md`。Changed files:
+`dayu/host/audit.py`、`dayu/host/durable/audit.py`、`dayu/host/durable/schema.py`、`dayu/host/open_host.py`、
+`tests/host/test_audit_sink.py`、`tests/host/test_durable_schema.py`。Validation: focused pytest 22 passed；
+`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。当前 gate 进入 Slice 1 code review。
+
+Phase 13 Slice 1 code review 已完成。MiMo artifact 为
+`docs/reviews/phase13-slice1-code-review-mimo-20260529.md`；DS artifact 为
+`docs/reviews/phase13-slice1-code-review-ds-20260529.md`。两路 verdict 均为 PASS，无 blocking findings。
+Controller adjudication artifact 为
+`docs/reviews/phase13-slice1-code-review-controller-adjudication-20260529.md`。MiMo P3 与 DS Minor findings 均裁决为
+non-blocking residual / later hardening，不要求当前 fix pass。当前 gate 进入 accepted Slice 1 commit。
+
+Accepted Slice 1 commit 已创建：`7432f02` (`gateflow: accept phase 13 slice 1`)。当前 gate 进入 Phase 13
+Slice 2 `Tool Trace Hot JSON / Cold JSONL` implementation。
+
+Phase 13 Slice 2 `Tool Trace Hot JSON / Cold JSONL` implementation 已完成。Implementation artifact 为
+`docs/reviews/phase13-slice2-implementation-codex-20260529.md`。Changed files:
+`dayu/host/tool_trace.py`、`dayu/host/durable/tool_trace.py`、`dayu/host/durable/schema.py`、`dayu/host/open_host.py`、
+`tests/host/test_tool_trace_projection.py`、`tests/host/test_tool_trace_queries.py`、`tests/host/test_durable_schema.py`。
+Validation: focused pytest 25 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。
+当前 gate 进入 Slice 2 code review。
+
+Phase 13 Slice 2 code review 已完成。MiMo artifact 为
+`docs/reviews/phase13-slice2-code-review-mimo-20260529.md`；DS artifact 为
+`docs/reviews/phase13-slice2-code-review-ds-20260529.md`。两路 verdict 均为 PASS，无 blocking findings。
+Controller adjudication artifact 为
+`docs/reviews/phase13-slice2-code-review-controller-adjudication-20260529.md`。低优先级 findings 均裁决为
+non-blocking residual / later hardening，不要求当前 fix pass。当前 gate 进入 accepted Slice 2 commit。
+
+Accepted Slice 2 commit 已创建：`0a675a5` (`gateflow: accept phase 13 slice 2`)。当前 gate 进入 Phase 13
+Slice 3 `OutboxSink Durable Projection` implementation。当前 committed Host schema version 为 12；Slice 3 如新增
+outbox durable tables，必须 fresh schema bump 到 13。
+
+Phase 13 Slice 3 `OutboxSink Durable Projection` implementation 已完成。Implementation artifact 为
+`docs/reviews/phase13-slice3-implementation-codex-20260529.md`。Changed files:
+`dayu/host/outbox.py`、`dayu/host/durable/outbox.py`、`dayu/host/durable/schema.py`、
+`tests/host/test_outbox_projection.py`、`tests/host/test_outbox_durable.py`、`tests/host/test_durable_schema.py`。
+Validation: focused pytest 26 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。
+当前 gate 进入 Slice 3 code review。
+
+AgentMiMo Slice 3 code review 已完成。Artifact 为
+`docs/reviews/phase13-slice3-code-review-mimo-20260529.md`。Verdict PASS，无 blocking findings；
+两个 nonblocking findings（`event_sequence` 外键冗余、边界常量测试缺失）不阻塞。下一步：AgentDS code review。
+
+AgentDS Slice 3 code review 已完成。Artifact 为
+`docs/reviews/phase13-slice3-code-review-ds-20260529.md`。Verdict PASS，无 blocking findings；两个 advisory
+observations（catch-up helper 循环冗余、seen ids 较多时 scan limit 浪费）不阻塞。Controller adjudication artifact 为
+`docs/reviews/phase13-slice3-code-review-controller-adjudication-20260529.md`。当前 gate 进入 accepted Slice 3 commit。
+
+Accepted Slice 3 commit 已创建：`1a37946` (`gateflow: accept phase 13 slice 3`)。当前 gate 进入 Phase 13
+Slice 4 `Public Outbox Read / Drain API And Offline Smoke` implementation。Slice 4 必须只接 additive public read/drain
+API 与 offline smoke，不得引入 `OpenHostOptions` 字段、`wait_final_answer`、`get_run_result`、payload reader 或 timeline
+replay API。
+
+Phase 13 Slice 4 `Public Outbox Read / Drain API And Offline Smoke` implementation 已完成。Implementation artifact 为
+`docs/reviews/phase13-slice4-implementation-codex-20260529.md`。Changed files:
+`dayu/host/api.py`、`dayu/host/__init__.py`、`dayu/host/open_host.py`、`dayu/host/read_api.py`、
+`tests/host/test_public_outbox_api.py`、`tests/host/test_public_offline_outbox_smoke.py`、
+`tests/host/test_package_exports.py`、`tests/host/test_open_host_runtime.py`、`dayu/host/README.md`。
+Validation: focused pytest 23 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。
+当前 gate 进入 Slice 4 code review。
+
+AgentMiMo 与 AgentDS Slice 4 code review 已完成。Artifacts 为
+`docs/reviews/phase13-slice4-code-review-mimo-20260529.md` 与
+`docs/reviews/phase13-slice4-code-review-ds-20260529.md`。Verdict 均为 PASS，无 blocking findings。Controller
+adjudication artifact 为 `docs/reviews/phase13-slice4-code-review-controller-adjudication-20260529.md`。低优先级
+observations 均裁决为 non-blocking residual / test-hardening，不要求当前 fix pass。当前 gate 进入 accepted
+Slice 4 commit。
+
+Accepted Slice 4 commit 已创建：`1d9e732` (`gateflow: accept phase 13 slice 4`)。Phase 13 aggregate validation
+已通过：plan-listed pytest 96 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check`
+passed。当前 gate 进入 Phase 13 aggregate deepreview。Aggregate review 必须由 AgentMiMo 与 AgentDS 独立完成；
+通过并裁决后，Phase 13 才能进入 `ready-to-open-draft-PR`。
+
+Phase 13 AgentMiMo aggregate deepreview 已完成。Review artifact 为
+`docs/reviews/phase13-aggregate-deepreview-mimo-20260529.md`。Verdict：PASS with 1 BLOCKING finding。
+四 slice 完整实现 plan，架构边界正确（Audit/Tool Trace/Outbox 均为 projection/sink，不反向成为 truth），
+schema version 自洽，projection checkpoint/failure/idempotency 遵循框架约定，Outbox public read/drain 是唯一
+additive public extension，watch_session_events 仍为 live-only，类型安全通过 pyright。
+Blocking finding F001：`read_api.py` 违反 import 边界，直接导入 `dayu.host.durable.projection` 读取 Outbox
+projection state；修复方案为将 projection state 读取下沉到 `durable/outbox.py` helper。
+AgentDS aggregate deepreview 已完成。Review artifact 为
+`docs/reviews/phase13-aggregate-deepreview-ds-20260529.md`。Verdict：PASS，无 blocking findings。Controller 复现
+AgentMiMo F001：`tests/host/test_import_boundary.py::test_read_api_stream_does_not_reference_projection_or_fanout_truth`
+失败，原因是 `dayu/host/read_api.py` 直接导入 `dayu.host.durable.projection`。Controller adjudication artifact 为
+`docs/reviews/phase13-aggregate-deepreview-controller-adjudication-20260529.md`，裁决 F001 为 accepted blocking。
+当前 gate：Phase 13 aggregate fix；下一步派发 AgentCodex 将 projection state 查询下沉到 `dayu/host/durable/outbox.py`，
+并移除 `read_api.py` 对 `dayu.host.durable.projection` 的直接依赖。
+
+Phase 13 aggregate fix 已完成。Fix artifact 为 `docs/reviews/phase13-aggregate-fix-codex-20260529.md`。
+Changed files: `dayu/host/durable/outbox.py`、`dayu/host/read_api.py`。Validation: import-boundary + public outbox +
+durable outbox focused tests 10 passed；aggregate host suite with import boundary 108 passed；`python -m pyright
+dayu/host tests/host` 0 errors；`git diff --check` passed。当前 gate 进入 Phase 13 aggregate re-review；必须由
+AgentMiMo 与 AgentDS 确认 F001 fixed 后，才能进入 `ready-to-open-draft-PR`。
+
+Phase 13 aggregate re-review 已完成。Re-review artifacts 为
+`docs/reviews/phase13-aggregate-rereview-mimo-20260529.md` 与
+`docs/reviews/phase13-aggregate-rereview-ds-20260529.md`。两路 verdict 均为 PASS，F001 fixed，无新增 blocking
+findings。Controller re-review adjudication artifact 为
+`docs/reviews/phase13-aggregate-rereview-controller-adjudication-20260529.md`。当前 gate：Phase 13
+`ready-to-open-draft-PR`。
+
+Accepted aggregate review commit 已创建：`85c3358` (`gateflow: accept phase 13 aggregate review`)。Phase 13
+plan、implementation slices、slice reviews、aggregate validation、aggregate deepreview、aggregate fix 与 aggregate re-review
+均已完成。当前 gate：`ready-to-open-draft-PR`。Residual risks / owners：JSONL 与 SQLite checkpoint 跨介质
+exactly-once 归 Phase 15；Outbox drain 非 channel delivery success 归 Service / channel adapter owner；purge tombstone
+audit record、outbox cleanup、tool trace cleanup、projection cleanup 归 Phase 15；external audit、long-term archival、heavy
+sink runner / batch transaction hardening 归 Phase 15+ production hardening。用户已授权到达 `ready-to-open-draft-PR`
+后自动进入 draft PR gate 并推进到 `draft-PR-pass`。
+
+PR 69 draft PR gate 已完成。PR URL: `https://github.com/noho/dayu-agent-r/pull/69`。PR created as draft，branch
+`feat/phase-13-audit-trace-outbox` pushed to `github` remote；GitHub reported no checks on branch。PR review artifacts:
+`docs/reviews/pr-69-review-mimo-20260529.md`、`docs/reviews/pr-69-review-ds-20260529.md`、
+`docs/reviews/pr-69-review-controller-adjudication-20260529.md`。Accepted PR review fix artifact:
+`docs/reviews/pr-69-fix-codex-20260529.md`；fix re-review artifacts:
+`docs/reviews/pr-69-fix-rereview-mimo-20260529.md`、`docs/reviews/pr-69-fix-rereview-ds-20260529.md`、
+`docs/reviews/pr-69-fix-rereview-controller-adjudication-20260529.md`。Accepted PR review fix commit 为 `27b4c0c`。
+Final validation：tool trace focused tests 6 passed；aggregate host suite 108 passed；`python -m pyright dayu/host tests/host`
+0 errors；`git diff --check` clean；`git diff --check main...HEAD` clean。当前 gate：draft-PR-pass。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 

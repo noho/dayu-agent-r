@@ -13,15 +13,22 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from uuid import uuid4
 
+from dayu.host.audit import (
+    DEFAULT_LOG_AUDIT_CATCHUP_BATCH_SIZE,
+    LogAuditSinkOptions,
+    catch_up_log_audit_sink_projection,
+)
 from dayu.host.admission import create_host_admission_service
 from dayu.host.api import (
     CancelRunRequest,
     CancelSessionRunsRequest,
     CloseSessionRequest,
     CreateSessionRequest,
+    DrainOutboxTerminalItemsRequest,
     EnsureSessionRequest,
     FollowupSnapshot,
     Host,
@@ -29,7 +36,9 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     HostEvent,
     HostLocalExecutionOptions,
+    OutboxTerminalItemsBatch,
     OpenHostOptions,
+    ReadOutboxTerminalItemsRequest,
     ReplayRunRequest,
     ResolveWaitRequest,
     RetryRunRequest,
@@ -60,9 +69,19 @@ from dayu.host.durable.connection import (
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.llm_compaction import LLMContextCompactor
+from dayu.host.outbox import (
+    DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE,
+    catch_up_outbox_terminal_projection,
+)
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import get_run as _get_run
 from dayu.host.read_api import get_session as _get_session
+from dayu.host.read_api import (
+    drain_outbox_terminal_items as _drain_outbox_terminal_items,
+)
+from dayu.host.read_api import (
+    read_outbox_terminal_items as _read_outbox_terminal_items,
+)
 from dayu.host.read_api import (
     read_session_host_events_after as _read_session_host_events_after,
 )
@@ -70,6 +89,11 @@ from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
 from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.tool_trace import (
+    DEFAULT_TOOL_TRACE_CATCHUP_BATCH_SIZE,
+    ToolTraceSinkOptions,
+    catch_up_tool_trace_projection,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_OPEN_HOST_ID_PREFIX = "open-host"
@@ -82,6 +106,24 @@ _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS = 1024
 
 _SESSION_WATCH_POLL_INTERVAL_SECONDS = 0.02
 """session live watch 未读取到新事件时的轻量轮询间隔。"""
+
+_AUDIT_ARTIFACT_DIRECTORY_NAME = "audit"
+"""artifact_root 下 audit artifact 目录名。"""
+
+_AUDIT_JSONL_FILE_NAME = "host-audit.jsonl"
+"""默认 audit JSONL 文件名。"""
+
+_AUDIT_LOCK_FILE_SUFFIX = ".lock"
+"""默认 audit JSONL lock 文件名后缀。"""
+
+_TOOL_TRACE_ARTIFACT_DIRECTORY_NAME = "tool-trace"
+"""artifact_root 下 Tool Trace artifact 目录名。"""
+
+_TOOL_TRACE_COLD_JSONL_FILE_NAME = "tool-trace-cold.jsonl"
+"""默认 Tool Trace cold JSONL 文件名。"""
+
+_TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
+"""默认 Tool Trace cold JSONL lock 文件名后缀。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +161,102 @@ class _MemoryProjectionCatchupPort(ProjectionCatchupPort):
             policy=self.options.memory_projection_policy,
             batch_size=self.options.memory_projection_catchup_batch_size,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _LogAuditProjectionCatchupPort(ProjectionCatchupPort):
+    """LogAuditSink projection catch-up 端口。
+
+    :param durable_store: 当前 opener 持有的 durable store。
+    :param options: audit sink options。
+    :raises: 无。
+    """
+
+    durable_store: HostDurableStore
+    options: LogAuditSinkOptions
+
+    def catch_up_projection(self) -> None:
+        """追平 audit JSONL projection。
+
+        :returns: ``None``。
+        :raises HostDurableError: durable projection catch-up 失败时抛出。
+        """
+
+        catch_up_log_audit_sink_projection(
+            self.durable_store.transaction_runner,
+            options=self.options,
+            batch_size=DEFAULT_LOG_AUDIT_CATCHUP_BATCH_SIZE,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolTraceProjectionCatchupPort(ProjectionCatchupPort):
+    """Tool Trace projection catch-up 端口。
+
+    :param durable_store: 当前 opener 持有的 durable store。
+    :param options: Tool Trace sink options。
+    :raises: 无。
+    """
+
+    durable_store: HostDurableStore
+    options: ToolTraceSinkOptions
+
+    def catch_up_projection(self) -> None:
+        """追平 Tool Trace hot / cold projection。
+
+        :returns: ``None``。
+        :raises HostDurableError: durable projection catch-up 失败时抛出。
+        """
+
+        catch_up_tool_trace_projection(
+            self.durable_store.transaction_runner,
+            options=self.options,
+            batch_size=DEFAULT_TOOL_TRACE_CATCHUP_BATCH_SIZE,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboxTerminalProjectionCatchupPort(ProjectionCatchupPort):
+    """Outbox terminal projection catch-up 端口。
+
+    :param durable_store: 当前 opener 持有的 durable store。
+    :raises: 无。
+    """
+
+    durable_store: HostDurableStore
+
+    def catch_up_projection(self) -> None:
+        """追平 Outbox terminal delivery queue projection。
+
+        :returns: ``None``。
+        :raises HostDurableError: durable projection catch-up 失败时抛出。
+        """
+
+        catch_up_outbox_terminal_projection(
+            self.durable_store.transaction_runner,
+            batch_size=DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CompositeProjectionCatchupPort(ProjectionCatchupPort):
+    """顺序执行多个 projection catch-up port。
+
+    :param ports: 按顺序执行的 projection catch-up ports。
+    :raises: 无。
+    """
+
+    ports: tuple[ProjectionCatchupPort, ...]
+
+    def catch_up_projection(self) -> None:
+        """顺序追平所有子 projection。
+
+        :returns: ``None``。
+        :raises Exception: 任一子 port 发生未处理错误时透传。
+        """
+
+        for port in self.ports:
+            port.catch_up_projection()
 
 
 class _PublicHostHandle:
@@ -207,6 +345,46 @@ class _PublicHostHandle:
 
         self._raise_if_closed()
         return _get_run(self._command_handle, run_id)
+
+    async def read_outbox_terminal_items(
+        self,
+        session_id: str,
+        request: ReadOutboxTerminalItemsRequest,
+    ) -> OutboxTerminalItemsBatch:
+        """读取 Session 的 Outbox terminal items。
+
+        :param session_id: 目标 Session id。
+        :param request: Outbox terminal read 请求。
+        :returns: Outbox terminal item 批次。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        """
+
+        self._raise_if_closed()
+        return _read_outbox_terminal_items(
+            self._command_handle,
+            session_id,
+            request,
+        )
+
+    async def drain_outbox_terminal_items(
+        self,
+        session_id: str,
+        request: DrainOutboxTerminalItemsRequest,
+    ) -> OutboxTerminalItemsBatch:
+        """幂等 drain Session 的 Outbox terminal items。
+
+        :param session_id: 目标 Session id。
+        :param request: Outbox terminal drain 请求。
+        :returns: Outbox terminal item 批次。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        """
+
+        self._raise_if_closed()
+        return _drain_outbox_terminal_items(
+            self._command_handle,
+            session_id,
+            request,
+        )
 
     async def submit_followup(
         self, session_id: str, request: SubmitFollowupRequest
@@ -443,16 +621,39 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         scheduler: HostDispatchScheduler | None = None
         try:
             active_registry = ActiveWorkerRegistry()
-            projection_catchup_port = _MemoryProjectionCatchupPort(
+            memory_projection_catchup_port = _MemoryProjectionCatchupPort(
                 durable_store=durable_store,
                 options=self._options,
+            )
+            audit_projection_catchup_port = _LogAuditProjectionCatchupPort(
+                durable_store=durable_store,
+                options=_log_audit_sink_options_from_open_host_options(
+                    self._options
+                ),
+            )
+            tool_trace_projection_catchup_port = _ToolTraceProjectionCatchupPort(
+                durable_store=durable_store,
+                options=_tool_trace_sink_options_from_open_host_options(
+                    self._options
+                ),
+            )
+            outbox_projection_catchup_port = _OutboxTerminalProjectionCatchupPort(
+                durable_store=durable_store,
+            )
+            close_projection_catchup_port = _CompositeProjectionCatchupPort(
+                ports=(
+                    memory_projection_catchup_port,
+                    audit_projection_catchup_port,
+                    tool_trace_projection_catchup_port,
+                    outbox_projection_catchup_port,
+                )
             )
             scheduler = await HostDispatchScheduler.open(
                 transaction_runner=durable_store.transaction_runner,
                 local_execution=local_execution,
                 host_handle_id=host_handle_id,
                 active_registry=active_registry,
-                projection_catchup_port=projection_catchup_port,
+                projection_catchup_port=memory_projection_catchup_port,
             )
             StartupRecoveryScanner(
                 transaction_runner=durable_store.transaction_runner,
@@ -463,7 +664,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
                 wakeup_port=scheduler,
-                projection_catchup_port=projection_catchup_port,
+                projection_catchup_port=memory_projection_catchup_port,
                 ordinary_run_baseline=self._options.ordinary_run_baseline,
                 tooling_options=self._options.tooling_options,
             )
@@ -477,7 +678,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 command_handle=command_handle,
                 host_handle_id=host_handle_id,
                 scheduler=scheduler,
-                projection_catchup_port=projection_catchup_port,
+                projection_catchup_port=close_projection_catchup_port,
             )
             _LOGGER.info(
                 "host.open.ready host_handle_id=%s",
@@ -699,6 +900,96 @@ def _local_execution_options_from_open_host_options(
         ),
         tooling_options=options.tooling_options,
         enable_truncation_manager=options.enable_truncation_manager,
+    )
+
+
+def _log_audit_sink_options_from_open_host_options(
+    options: OpenHostOptions,
+) -> LogAuditSinkOptions:
+    """从 public opener options 派生内部 audit sink options。
+
+    :param options: public opener options。
+    :returns: LogAuditSink options；不新增 public ``OpenHostOptions`` 字段。
+    :raises TypeError: 派生出的路径配置类型非法时抛出。
+    :raises ValueError: 派生出的路径为空时抛出。
+    """
+
+    audit_jsonl_path = _default_audit_jsonl_path(options.artifact_root)
+    return LogAuditSinkOptions(
+        audit_jsonl_path=audit_jsonl_path,
+        create_parent_dirs=options.create_parent_dirs,
+        lock_path=_default_audit_lock_path(audit_jsonl_path),
+    )
+
+
+def _default_audit_jsonl_path(artifact_root: Path) -> Path:
+    """从 artifact_root 派生默认 audit JSONL 路径。
+
+    :param artifact_root: Host artifact root。
+    :returns: 默认 audit JSONL 路径。
+    :raises: 无。
+    """
+
+    return artifact_root / _AUDIT_ARTIFACT_DIRECTORY_NAME / _AUDIT_JSONL_FILE_NAME
+
+
+def _default_audit_lock_path(audit_jsonl_path: Path) -> Path:
+    """从 audit JSONL 路径派生相邻 lock 文件路径。
+
+    :param audit_jsonl_path: audit JSONL 路径。
+    :returns: 相邻 lock 文件路径。
+    :raises: 无。
+    """
+
+    return audit_jsonl_path.with_name(
+        audit_jsonl_path.name + _AUDIT_LOCK_FILE_SUFFIX
+    )
+
+
+def _tool_trace_sink_options_from_open_host_options(
+    options: OpenHostOptions,
+) -> ToolTraceSinkOptions:
+    """从 public opener options 派生内部 Tool Trace sink options。
+
+    :param options: public opener options。
+    :returns: ToolTraceSink options；不新增 public ``OpenHostOptions`` 字段。
+    :raises TypeError: 派生出的路径配置类型非法时抛出。
+    :raises ValueError: 派生出的路径为空时抛出。
+    """
+
+    cold_jsonl_path = _default_tool_trace_cold_jsonl_path(options.artifact_root)
+    return ToolTraceSinkOptions(
+        cold_jsonl_path=cold_jsonl_path,
+        create_parent_dirs=options.create_parent_dirs,
+        lock_path=_default_tool_trace_lock_path(cold_jsonl_path),
+    )
+
+
+def _default_tool_trace_cold_jsonl_path(artifact_root: Path) -> Path:
+    """从 artifact_root 派生默认 Tool Trace cold JSONL 路径。
+
+    :param artifact_root: Host artifact root。
+    :returns: 默认 Tool Trace cold JSONL 路径。
+    :raises: 无。
+    """
+
+    return (
+        artifact_root
+        / _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME
+        / _TOOL_TRACE_COLD_JSONL_FILE_NAME
+    )
+
+
+def _default_tool_trace_lock_path(cold_jsonl_path: Path) -> Path:
+    """从 Tool Trace cold JSONL 路径派生相邻 lock 文件路径。
+
+    :param cold_jsonl_path: Tool Trace cold JSONL 路径。
+    :returns: 相邻 lock 文件路径。
+    :raises: 无。
+    """
+
+    return cold_jsonl_path.with_name(
+        cold_jsonl_path.name + _TOOL_TRACE_LOCK_FILE_SUFFIX
     )
 
 

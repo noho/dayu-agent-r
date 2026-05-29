@@ -1589,6 +1589,51 @@ def test_startup_orphan_closeout_marks_attempt_lost_then_run_recovering(
         )
 
 
+def test_startup_orphan_recoverable_rejects_cancelling_expected_status(
+    tmp_path: Path,
+) -> None:
+    """recoverable startup orphan closeout 不接受 CANCELLING 期望状态。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+        before_attempt_lost_events = store.transaction_runner.run_read(
+            lambda transaction: _count_events(transaction, _EVENT_TYPE_ATTEMPT_LOST)
+        )
+
+        def operation(transaction: HostTransaction) -> None:
+            """执行非法 recoverable closeout 组合。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostDurableError: recoverable + CANCELLING 组合非法。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            _make_host_instance_stale_tx(transaction)
+            close_startup_orphan_attempt_in_transaction(
+                transaction,
+                EventLogStore(),
+                _startup_orphan_input(
+                    expected_run_status=RunStatus.CANCELLING,
+                    expected_attempt_status=AttemptStatus.STARTING,
+                    recoverable=True,
+                    reason="startup_orphan_attempt_lost",
+                    owner_heartbeat_at="2026-05-14T01:01:00.000000Z",
+                ),
+            )
+
+        with pytest.raises(
+            HostDurableError,
+            match="only running orphan Run can become recovering",
+        ):
+            store.transaction_runner.run_write(operation)
+        after_attempt_lost_events = store.transaction_runner.run_read(
+            lambda transaction: _count_events(transaction, _EVENT_TYPE_ATTEMPT_LOST)
+        )
+
+        assert after_attempt_lost_events == before_attempt_lost_events
+
+
 def test_startup_orphan_closeout_cas_rechecks_owner_heartbeat(
     tmp_path: Path,
 ) -> None:

@@ -58,6 +58,8 @@ HOST_WAIT_SNAPSHOT_ID_MAX_LENGTH = 256
 HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH = 512
 HOST_WAIT_PROVIDER_STATUS_REF_MAX_LENGTH = 512
 HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH = 256
+HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT = 500
+HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT = 1000
 
 _WAIT_ADAPTER_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _SHA256_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -2516,6 +2518,32 @@ class HostTerminalStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class OutboxTerminalItemState(StrEnum):
+    """Outbox terminal item 队列状态。
+
+    成员只表达 Host outbox projection 内部 drain 状态，不表达任何 Service /
+    UI / channel 投递成功事实。
+    """
+
+    PENDING = "pending"
+    DRAINED = "drained"
+
+
+class OutboxProjectionStatus(StrEnum):
+    """Outbox projection 对调用方可见的追平状态。
+
+    成员：
+
+    - ``CAUGHT_UP``：Outbox projection checkpoint 已追到当前 EventLog 水位。
+    - ``LAGGED``：projection checkpoint 落后，调用方不能把空结果视为完整。
+    - ``FAILED``：最近一次 projection catch-up 失败或存在 failure row。
+    """
+
+    CAUGHT_UP = "caught_up"
+    LAGGED = "lagged"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class HostFinalAnswerView:
     """terminal Host event 中内联的最终回答视图。
@@ -2559,6 +2587,287 @@ class HostFinalAnswerView:
             raise ValueError(
                 "HostFinalAnswerView.terminal_status must be succeeded"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxTerminalCursor:
+    """Outbox terminal 补读游标。
+
+    :param event_sequence: 调用方已经处理的 terminal EventLog sequence 水位。
+    """
+
+    event_sequence: int
+
+    def __post_init__(self) -> None:
+        """校验 Outbox terminal 游标。
+
+        :returns: ``None``。
+        :raises TypeError: ``event_sequence`` 不是严格整数时抛出。
+        :raises ValueError: ``event_sequence`` 为负数时抛出。
+        """
+
+        _require_non_negative_int(
+            self.event_sequence,
+            field_name="OutboxTerminalCursor.event_sequence",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxTerminalItem:
+    """Outbox terminal delivery queue 的 public item。
+
+    :param item_id: Outbox item 稳定 id。
+    :param idempotency_key: projection 内部幂等键，调用方不应依赖它去重。
+    :param terminal_event_id: source terminal EventLog id。
+    :param event_sequence: source terminal EventLog sequence。
+    :param session_id: source Session id。
+    :param run_id: source Run id。
+    :param terminal_status: terminal 状态。
+    :param dedupe_key: 与 live ``HostEvent.dedupe_key`` 对齐的去重键。
+    :param final_answer: 成功终态的最终回答视图；其它终态为 ``None``。
+    :param error_message: 失败终态展示消息。
+    :param cancel_reason: 取消终态原因。
+    :param result_ref: 可选结果 payload 引用。
+    :param result_digest: 可选结果 payload digest。
+    :param terminal_summary_ref: 可选 terminal summary 引用。
+    :param terminal_summary_digest: 可选 terminal summary digest。
+    :param projected_at: item 首次投影时间，必须为 UTC-aware datetime。
+    :param item_state: outbox queue item 状态。
+    """
+
+    item_id: str
+    idempotency_key: str
+    terminal_event_id: str
+    event_sequence: int
+    session_id: str
+    run_id: str
+    terminal_status: HostTerminalStatus
+    dedupe_key: str
+    final_answer: HostFinalAnswerView | None
+    error_message: str | None
+    cancel_reason: str | None
+    result_ref: str | None
+    result_digest: str | None
+    terminal_summary_ref: str | None
+    terminal_summary_digest: str | None
+    projected_at: datetime
+    item_state: OutboxTerminalItemState
+
+    def __post_init__(self) -> None:
+        """校验 public Outbox terminal item 字段。
+
+        :returns: ``None``。
+        :raises TypeError: enum、datetime 或 final answer 字段类型非法时抛出。
+        :raises ValueError: 必填文本为空、sequence 非法或 terminal payload 组合非法时抛出。
+        """
+
+        _require_non_empty(self.item_id, field_name="OutboxTerminalItem.item_id")
+        _require_non_empty(
+            self.idempotency_key,
+            field_name="OutboxTerminalItem.idempotency_key",
+        )
+        _require_non_empty(
+            self.terminal_event_id,
+            field_name="OutboxTerminalItem.terminal_event_id",
+        )
+        _require_non_negative_int(
+            self.event_sequence,
+            field_name="OutboxTerminalItem.event_sequence",
+        )
+        _require_non_empty(
+            self.session_id, field_name="OutboxTerminalItem.session_id"
+        )
+        _require_non_empty(self.run_id, field_name="OutboxTerminalItem.run_id")
+        if not isinstance(self.terminal_status, HostTerminalStatus):
+            raise TypeError(
+                "OutboxTerminalItem.terminal_status must be HostTerminalStatus"
+            )
+        _require_non_empty(
+            self.dedupe_key, field_name="OutboxTerminalItem.dedupe_key"
+        )
+        if self.dedupe_key != self.terminal_event_id:
+            raise ValueError(
+                "OutboxTerminalItem.dedupe_key must equal terminal_event_id"
+            )
+        if self.final_answer is not None and not isinstance(
+            self.final_answer, HostFinalAnswerView
+        ):
+            raise TypeError(
+                "OutboxTerminalItem.final_answer must be HostFinalAnswerView"
+            )
+        _require_optional_non_empty(
+            self.error_message, field_name="OutboxTerminalItem.error_message"
+        )
+        _require_optional_non_empty(
+            self.cancel_reason, field_name="OutboxTerminalItem.cancel_reason"
+        )
+        _require_optional_non_empty(
+            self.result_ref, field_name="OutboxTerminalItem.result_ref"
+        )
+        _require_optional_sha256_digest(
+            self.result_digest, field_name="OutboxTerminalItem.result_digest"
+        )
+        _require_optional_non_empty(
+            self.terminal_summary_ref,
+            field_name="OutboxTerminalItem.terminal_summary_ref",
+        )
+        _require_optional_sha256_digest(
+            self.terminal_summary_digest,
+            field_name="OutboxTerminalItem.terminal_summary_digest",
+        )
+        if (self.result_ref is None) != (self.result_digest is None):
+            raise ValueError("OutboxTerminalItem result ref and digest must pair")
+        if (self.terminal_summary_ref is None) != (
+            self.terminal_summary_digest is None
+        ):
+            raise ValueError("OutboxTerminalItem summary ref and digest must pair")
+        _require_utc_datetime(
+            self.projected_at, field_name="OutboxTerminalItem.projected_at"
+        )
+        if not isinstance(self.item_state, OutboxTerminalItemState):
+            raise TypeError(
+                "OutboxTerminalItem.item_state must be OutboxTerminalItemState"
+            )
+        _validate_outbox_terminal_payload(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ReadOutboxTerminalItemsRequest:
+    """读取 Outbox terminal items 的 public 请求。
+
+    :param after: 严格返回该 terminal cursor 之后的 item。
+    :param seen_terminal_event_ids: 调用方已通过 live watch 或本地记录展示过的 terminal ids。
+    :param limit: 本次返回 item 上限。
+    """
+
+    after: OutboxTerminalCursor
+    seen_terminal_event_ids: tuple[str, ...]
+    limit: int
+
+    def __post_init__(self) -> None:
+        """校验 Outbox read 请求。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: limit 越界、seen id 为空或重复时抛出。
+        """
+
+        _validate_outbox_read_page_fields(
+            self.after,
+            self.seen_terminal_event_ids,
+            self.limit,
+            request_name="ReadOutboxTerminalItemsRequest",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DrainOutboxTerminalItemsRequest:
+    """幂等 drain Outbox terminal items 的 public 请求。
+
+    :param context: Host 调用上下文，只表达调用责任链，不表达 channel 投递目标。
+    :param after: 严格 drain 该 terminal cursor 之后的 item。
+    :param seen_terminal_event_ids: 调用方已展示过的 terminal ids。
+    :param limit: 本次返回 item 上限。
+    :param drain_request_id: drain 幂等请求 id。
+    """
+
+    context: HostCallContext
+    after: OutboxTerminalCursor
+    seen_terminal_event_ids: tuple[str, ...]
+    limit: int
+    drain_request_id: str
+
+    def __post_init__(self) -> None:
+        """校验 Outbox drain 请求。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: limit 越界、seen id 为空或重复、幂等 id 为空时抛出。
+        """
+
+        if not isinstance(self.context, HostCallContext):
+            raise TypeError(
+                "DrainOutboxTerminalItemsRequest.context must be HostCallContext"
+            )
+        _validate_outbox_read_page_fields(
+            self.after,
+            self.seen_terminal_event_ids,
+            self.limit,
+            request_name="DrainOutboxTerminalItemsRequest",
+        )
+        _require_non_empty(
+            self.drain_request_id,
+            field_name="DrainOutboxTerminalItemsRequest.drain_request_id",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxTerminalItemsBatch:
+    """Outbox terminal read / drain 返回批次。
+
+    :param items: 当前批次返回的 terminal items。
+    :param next_cursor: 调用方可保存的推荐 terminal watermark。
+    :param scanned_watermark: 本次查询实际扫描到的最高 terminal sequence。
+    :param projection_checkpoint: Outbox projection 当前 checkpoint。
+    :param projection_status: Outbox projection catch-up 状态。
+    :param projection_error_code: projection 失败码；无失败时为 ``None``。
+    :param projection_error_message: projection 失败消息；无失败时为 ``None``。
+    :param has_more: 当前 cursor 后是否还有同 Session item。
+    """
+
+    items: tuple[OutboxTerminalItem, ...]
+    next_cursor: OutboxTerminalCursor
+    scanned_watermark: OutboxTerminalCursor
+    projection_checkpoint: OutboxTerminalCursor
+    projection_status: OutboxProjectionStatus
+    projection_error_code: str | None
+    projection_error_message: str | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        """校验 Outbox terminal batch 字段。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 错误字段或 item 元组非法时抛出。
+        """
+
+        if not isinstance(self.items, tuple):
+            raise TypeError("OutboxTerminalItemsBatch.items must be tuple")
+        for item in self.items:
+            if not isinstance(item, OutboxTerminalItem):
+                raise TypeError(
+                    "OutboxTerminalItemsBatch.items must contain OutboxTerminalItem"
+                )
+        if not isinstance(self.next_cursor, OutboxTerminalCursor):
+            raise TypeError(
+                "OutboxTerminalItemsBatch.next_cursor must be OutboxTerminalCursor"
+            )
+        if not isinstance(self.scanned_watermark, OutboxTerminalCursor):
+            raise TypeError(
+                "OutboxTerminalItemsBatch.scanned_watermark must be "
+                "OutboxTerminalCursor"
+            )
+        if not isinstance(self.projection_checkpoint, OutboxTerminalCursor):
+            raise TypeError(
+                "OutboxTerminalItemsBatch.projection_checkpoint must be "
+                "OutboxTerminalCursor"
+            )
+        if not isinstance(self.projection_status, OutboxProjectionStatus):
+            raise TypeError(
+                "OutboxTerminalItemsBatch.projection_status must be "
+                "OutboxProjectionStatus"
+            )
+        _require_optional_non_empty(
+            self.projection_error_code,
+            field_name="OutboxTerminalItemsBatch.projection_error_code",
+        )
+        _require_optional_non_empty(
+            self.projection_error_message,
+            field_name="OutboxTerminalItemsBatch.projection_error_message",
+        )
+        if not isinstance(self.has_more, bool):
+            raise TypeError("OutboxTerminalItemsBatch.has_more must be bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2659,6 +2968,70 @@ def _terminal_status_for_event_kind(kind: HostEventKind) -> HostTerminalStatus:
     if kind == HostEventKind.CANCELLED:
         return HostTerminalStatus.CANCELLED
     raise ValueError("HostEventKind.PROGRESS has no terminal status")
+
+
+def _validate_outbox_terminal_payload(item: OutboxTerminalItem) -> None:
+    """校验 Outbox terminal item 的 terminal payload 组合。
+
+    :param item: 待校验 Outbox terminal item。
+    :returns: ``None``。
+    :raises ValueError: terminal 状态与 final answer / error / cancel 字段组合不一致时抛出。
+    """
+
+    if item.terminal_status is HostTerminalStatus.SUCCEEDED:
+        if item.error_message is not None or item.cancel_reason is not None:
+            raise ValueError(
+                "OutboxTerminalItem succeeded item cannot carry error or cancel"
+            )
+        return
+    if item.final_answer is not None:
+        raise ValueError(
+            "OutboxTerminalItem failed or cancelled item must not carry final_answer"
+        )
+
+
+def _validate_outbox_read_page_fields(
+    after: OutboxTerminalCursor,
+    seen_terminal_event_ids: tuple[str, ...],
+    limit: int,
+    *,
+    request_name: str,
+) -> None:
+    """校验 Outbox read / drain 共享分页字段。
+
+    :param after: 请求游标。
+    :param seen_terminal_event_ids: seen terminal event id 元组。
+    :param limit: 返回数量上限。
+    :param request_name: 错误消息中的请求类型名。
+    :returns: ``None``。
+    :raises TypeError: 字段类型非法时抛出。
+    :raises ValueError: limit 越界、seen id 为空或重复时抛出。
+    """
+
+    if not isinstance(after, OutboxTerminalCursor):
+        raise TypeError(f"{request_name}.after must be OutboxTerminalCursor")
+    if not isinstance(seen_terminal_event_ids, tuple):
+        raise TypeError(f"{request_name}.seen_terminal_event_ids must be tuple")
+    _require_positive_int(limit, field_name=f"{request_name}.limit")
+    if limit > HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT:
+        raise ValueError(
+            f"{request_name}.limit must be <= "
+            f"{HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT}"
+        )
+    if len(seen_terminal_event_ids) > HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT:
+        raise ValueError(
+            f"{request_name}.seen_terminal_event_ids length must be <= "
+            f"{HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT}"
+        )
+    seen: set[str] = set()
+    for terminal_event_id in seen_terminal_event_ids:
+        _require_non_empty(
+            terminal_event_id,
+            field_name=f"{request_name}.seen_terminal_event_ids",
+        )
+        if terminal_event_id in seen:
+            raise ValueError(f"{request_name}.seen_terminal_event_ids duplicated")
+        seen.add(terminal_event_id)
 
 
 class HostApiError(Exception):
@@ -2772,6 +3145,38 @@ class Host(Protocol):
         :returns: Run snapshot。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: Run 不存在或读取失败时抛出。
+        """
+
+        ...
+
+    async def read_outbox_terminal_items(
+        self,
+        session_id: str,
+        request: ReadOutboxTerminalItemsRequest,
+    ) -> OutboxTerminalItemsBatch:
+        """读取 Session 的 Outbox terminal items。
+
+        :param session_id: 目标 Session id。
+        :param request: Outbox terminal read 请求。
+        :returns: Outbox terminal item 批次与 projection 状态。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: Session 不存在或 durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def drain_outbox_terminal_items(
+        self,
+        session_id: str,
+        request: DrainOutboxTerminalItemsRequest,
+    ) -> OutboxTerminalItemsBatch:
+        """幂等 drain Session 的 Outbox terminal items。
+
+        :param session_id: 目标 Session id。
+        :param request: Outbox terminal drain 请求。
+        :returns: 本次 drain 的 Outbox terminal item 批次与 projection 状态。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: Session 不存在、幂等冲突或 durable 写入失败时抛出。
         """
 
         ...
@@ -2904,11 +3309,14 @@ __all__ = [
     "CancelSessionRunsRequest",
     "CloseSessionRequest",
     "CreateSessionRequest",
+    "DrainOutboxTerminalItemsRequest",
     "EnsureSessionRequest",
     "FollowupBehavior",
     "FollowupSnapshot",
     "HOST_EVENT_STREAM_DEFAULT_LIMIT",
     "HOST_EVENT_STREAM_MAX_LIMIT",
+    "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
+    "HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT",
     "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
     "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
     "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
@@ -2938,10 +3346,16 @@ __all__ = [
     "OperationContext",
     "OpenHostOptions",
     "OrdinaryRunExecutionBaseline",
+    "OutboxProjectionStatus",
     "OutboxSummary",
+    "OutboxTerminalCursor",
+    "OutboxTerminalItem",
+    "OutboxTerminalItemsBatch",
+    "OutboxTerminalItemState",
     "PurgeSessionRequest",
     "PurgeSessionResult",
     "CompactorRunnerBaseline",
+    "ReadOutboxTerminalItemsRequest",
     "ReplayRunRequest",
     "ResolveWaitCancelledOutcome",
     "ResolveWaitCompletedOutcome",
