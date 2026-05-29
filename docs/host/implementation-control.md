@@ -226,7 +226,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前状态：PR 68 已 merge 到 `main`，merge commit 为 `b9bd625`。当前工作分支为
 `feat/phase-13-audit-trace-outbox`，从 clean `main` 创建。Phase 13 design discussion 已由用户确认；controller
 adjudication artifact 为 `docs/reviews/phase13-design-discussion-controller-adjudication-20260529.md`。
-当前 gate：Phase 13 Slice 4 implementation。
+当前 gate：Phase 13 Slice 4 accepted commit。
 Plan artifact 为 `docs/host/phase13-audit-tool-trace-outbox-plan.md`。Plan review artifacts 为
 `docs/reviews/phase13-plan-review-mimo-20260529.md` 与 `docs/reviews/phase13-plan-review-ds-20260529.md`；
 controller adjudication 为 `docs/reviews/phase13-plan-review-controller-adjudication-20260529.md`。Controller 接受
@@ -258,7 +258,14 @@ accepted Slice 2 local commit。Accepted Slice 2 commit 为 `0a675a5`。Phase 13
 `docs/reviews/phase13-slice3-code-review-ds-20260529.md`，verdict 均 PASS，无 blocking findings。Controller
 adjudication 为 `docs/reviews/phase13-slice3-code-review-controller-adjudication-20260529.md`。Accepted Slice 3
 commit 为 `1a37946`。下一步：按 accepted plan 派发 Slice 4 `Public Outbox Read / Drain API And Offline Smoke`
-implementation。
+implementation。Slice 4 implementation 已完成，artifact 为
+`docs/reviews/phase13-slice4-implementation-codex-20260529.md`；validation 为 focused pytest 23 passed、
+`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` passed。下一步：派发 AgentMiMo 与
+AgentDS 做 Slice 4 code review；code review artifacts 为
+`docs/reviews/phase13-slice4-code-review-mimo-20260529.md` 与
+`docs/reviews/phase13-slice4-code-review-ds-20260529.md`。两路 review 均 PASS，无 blocking findings；controller
+adjudication 为 `docs/reviews/phase13-slice4-code-review-controller-adjudication-20260529.md`。下一步：创建
+accepted Slice 4 local commit。
 
 ## Phase Map
 
@@ -2418,6 +2425,21 @@ Accepted Slice 3 commit 已创建：`1a37946` (`gateflow: accept phase 13 slice 
 Slice 4 `Public Outbox Read / Drain API And Offline Smoke` implementation。Slice 4 必须只接 additive public read/drain
 API 与 offline smoke，不得引入 `OpenHostOptions` 字段、`wait_final_answer`、`get_run_result`、payload reader 或 timeline
 replay API。
+
+Phase 13 Slice 4 `Public Outbox Read / Drain API And Offline Smoke` implementation 已完成。Implementation artifact 为
+`docs/reviews/phase13-slice4-implementation-codex-20260529.md`。Changed files:
+`dayu/host/api.py`、`dayu/host/__init__.py`、`dayu/host/open_host.py`、`dayu/host/read_api.py`、
+`tests/host/test_public_outbox_api.py`、`tests/host/test_public_offline_outbox_smoke.py`、
+`tests/host/test_package_exports.py`、`tests/host/test_open_host_runtime.py`、`dayu/host/README.md`。
+Validation: focused pytest 23 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。
+当前 gate 进入 Slice 4 code review。
+
+AgentMiMo 与 AgentDS Slice 4 code review 已完成。Artifacts 为
+`docs/reviews/phase13-slice4-code-review-mimo-20260529.md` 与
+`docs/reviews/phase13-slice4-code-review-ds-20260529.md`。Verdict 均为 PASS，无 blocking findings。Controller
+adjudication artifact 为 `docs/reviews/phase13-slice4-code-review-controller-adjudication-20260529.md`。低优先级
+observations 均裁决为 non-blocking residual / test-hardening，不要求当前 fix pass。当前 gate 进入 accepted
+Slice 4 commit。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 

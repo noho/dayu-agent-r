@@ -51,13 +51,14 @@ Host 内部职责按语义分层：
 
 包根 `dayu.host` 当前导出这些稳定类别：
 
-- public constants：Host event stream limit 常量，以及 wait record、wait adapter、external job、provider status ref 等 wait / payload 引用字段的公共长度上限常量。
+- public constants：Host event stream limit 常量、Outbox terminal read / seen ids 上限常量，以及 wait record、wait adapter、external job、provider status ref 等 wait / payload 引用字段的公共长度上限常量。
 - opener / handle：`open_host`、`OpenHostOptions`、`Host`、`HostClosedError`。
 - construction baseline：`OrdinaryRunExecutionBaseline`、`CompactorRunnerBaseline`、`LocalEngineWorkerFactory`、`LocalEngineWorker`、`LocalWorkerHandle`。
 - session / deferred request and snapshot：`EnsureSessionRequest`、`CreateSessionRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、`SessionSnapshot`、`SessionSlotRef`、`SessionStatus`、`PurgeSessionResult`。
 - run request / snapshot：`SubmitFollowupRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`RetryRunRequest`、`ReplayRunRequest`、`RunSnapshot`、`FollowupSnapshot`、`RunStatus`、`AttemptStatus`、`FollowupBehavior`、`CancelMode`、`SourceRunRelation`。
 - wait request / outcome：`ResolveWaitRequest`、`ResolveWaitCompletedOutcome`、`ResolveWaitFailedOutcome`、`ResolveWaitCancelledOutcome`、`ResolveWaitLostOutcome`、`ResolveWaitOutcome`、`WaitResolutionSource`、`WaitAdapterKey`、`WaitProviderStatusRef`。
 - event / read view：`HostEvent`、`HostEventClass`、`HostEventKind`、`HostTerminalStatus`、`HostFinalAnswerView`、`HostStreamCursor`、`TerminalResultSummary`、`OutboxSummary`、`HostPayloadRef`。
+- outbox read / drain：`OutboxTerminalCursor`、`ReadOutboxTerminalItemsRequest`、`DrainOutboxTerminalItemsRequest`、`OutboxTerminalItem`、`OutboxTerminalItemsBatch`、`OutboxTerminalItemState`、`OutboxProjectionStatus`。
 - error / context：`HostApiError`、`HostApiErrorCode`、`HostApiErrorDetail`、`SteerConflictDetail`、`HostCallContext`、`OperationContext`、`AuthorizationClaim`、`HostMetadataEntry`。
 - tooling construction：`HostToolingOptions`、`FrameworkToolName`、`FrameworkToolPolicyView`、`default_framework_tool_policy_view`；工具来源引用类型由 `dayu.contracts.tool_source` 提供。
 
@@ -67,6 +68,8 @@ Host 内部职责按语义分层：
 - `create_session(request)`：显式创建新 Session，可选择重绑定 slot。
 - `get_session(session_id)`：读取 Session snapshot。
 - `get_run(run_id)`：读取 Run snapshot。
+- `read_outbox_terminal_items(session_id, request)`：按 terminal watermark 和 seen terminal ids 读取离线 terminal notification item，返回 projection checkpoint / lag / failure 状态；不写 EventLog，不改变 item drain state。
+- `drain_outbox_terminal_items(session_id, request)`：幂等 drain terminal notification item，只更新 Outbox projection queue state 与 drain idempotency row；不表示 channel delivery success，不写 EventLog。
 - `submit_followup(session_id, request)`：提交普通 queue 或 steer follow-up。
 - `cancel_run(run_id, request)`：取消单个可治理 Run，覆盖未启动、pre-dispatch、active、waiting 与 recovering 状态。
 - `cancel_session_runs(session_id, request)`：取消 Session 下可治理的非终态 Run，覆盖未启动、pre-dispatch、active、waiting 与 recovering 状态。
@@ -93,6 +96,7 @@ Host 内部职责按语义分层：
 - startup recovery scan，用于在 ready 前基于 durable truth 收口 positive orphan 并创建可恢复 Run 的 pending dispatch。
 - admission service，负责 public command 的 durable mutation。
 - memory projection catch-up port，供 dispatch 前与 close 阶段追平 memory projection。
+- audit、tool trace 与 outbox projection catch-up port，供 close flush 和 public outbox read / drain 前追平派生视图；这些 projection 失败只影响各自派生能力，不改变 Run / Attempt truth。
 - Host-owned LLM compactor baseline，包含 runner 配置、compactor AgentPolicy、compact artifact root、Service 按 execution profile compactor scene 装配的 system prompt，以及 Service 按 compactor baseline prompt asset 读取的 user prompt template，供 Context Governance 执行 compact。
 
 调用方不传入也不依赖 Host runtime 诊断 id，不直接持有 scheduler、durable store、active registry、compactor port 或 wakeup port。`Host.close()` 与 async context manager 退出只关闭当前 opener runtime；关闭时 scheduler 通过 active registry 先触发 Host 注入 Engine 的 cancellation token，再通知 `LocalWorkerHandle.on_cancel(reason)` hook，随后停止 active task 与本地资源。该流程不写用户 cancel facts；已 accepted 但未 terminal 的 Run 由下次 startup recovery 基于 Host instance lifecycle proof 或 stale `STOPPING` owner 的进程证据接管。重复关闭幂等；关闭后的 public handle 方法抛出 `HostClosedError`。
@@ -191,6 +195,8 @@ EventLog 是 append-only ledger。`canonical_fact` 子集是恢复、memory、to
 `event_sequence` 是 Host 全局单调游标，供 read model、watch、projection catch-up、memory snapshot cursor 和 outbox 类能力对齐。EventLog append 与必要状态索引更新必须在同一 transaction 内完成。
 
 `watch_session_events(session_id)` 是普通 Service-facing session-level live event entry，返回 Host-owned typed `HostEvent` async iterator。它不接收 cursor，不做离线补读；terminal event 不结束 iterator；consumer 取消订阅只关闭本次 watch，不取消 Run、不写 EventLog。
+
+Outbox terminal read / drain 是离线 terminal notification 补读入口，不是完整 timeline 或 final answer 通用读取接口。Service / channel adapter 应保存 terminal watermark 与 seen terminal ids，并用 `terminal_event_id` / `event_sequence` / `run_id` 对 Outbox item 和 live `HostEvent` 去重。`read_outbox_terminal_items` 返回匹配 item 和 projection 状态；`projection_status != CAUGHT_UP` 时，调用方不能把空结果解释为无遗漏。`drain_outbox_terminal_items` 的 side effect 只属于 Outbox projection queue state，不表达 UI、CLI、Web、WeChat 或其它 channel 投递成功。
 
 `HostEvent` 是比 EventLog 更克制的 public view：
 

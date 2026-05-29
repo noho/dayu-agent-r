@@ -28,6 +28,7 @@ from dayu.host.api import (
     CancelSessionRunsRequest,
     CloseSessionRequest,
     CreateSessionRequest,
+    DrainOutboxTerminalItemsRequest,
     EnsureSessionRequest,
     FollowupSnapshot,
     Host,
@@ -35,7 +36,9 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     HostEvent,
     HostLocalExecutionOptions,
+    OutboxTerminalItemsBatch,
     OpenHostOptions,
+    ReadOutboxTerminalItemsRequest,
     ReplayRunRequest,
     ResolveWaitRequest,
     RetryRunRequest,
@@ -66,9 +69,19 @@ from dayu.host.durable.connection import (
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.llm_compaction import LLMContextCompactor
+from dayu.host.outbox import (
+    DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE,
+    catch_up_outbox_terminal_projection,
+)
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import get_run as _get_run
 from dayu.host.read_api import get_session as _get_session
+from dayu.host.read_api import (
+    drain_outbox_terminal_items as _drain_outbox_terminal_items,
+)
+from dayu.host.read_api import (
+    read_outbox_terminal_items as _read_outbox_terminal_items,
+)
 from dayu.host.read_api import (
     read_session_host_events_after as _read_session_host_events_after,
 )
@@ -203,6 +216,29 @@ class _ToolTraceProjectionCatchupPort(ProjectionCatchupPort):
 
 
 @dataclass(frozen=True, slots=True)
+class _OutboxTerminalProjectionCatchupPort(ProjectionCatchupPort):
+    """Outbox terminal projection catch-up 端口。
+
+    :param durable_store: 当前 opener 持有的 durable store。
+    :raises: 无。
+    """
+
+    durable_store: HostDurableStore
+
+    def catch_up_projection(self) -> None:
+        """追平 Outbox terminal delivery queue projection。
+
+        :returns: ``None``。
+        :raises HostDurableError: durable projection catch-up 失败时抛出。
+        """
+
+        catch_up_outbox_terminal_projection(
+            self.durable_store.transaction_runner,
+            batch_size=DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _CompositeProjectionCatchupPort(ProjectionCatchupPort):
     """顺序执行多个 projection catch-up port。
 
@@ -309,6 +345,46 @@ class _PublicHostHandle:
 
         self._raise_if_closed()
         return _get_run(self._command_handle, run_id)
+
+    async def read_outbox_terminal_items(
+        self,
+        session_id: str,
+        request: ReadOutboxTerminalItemsRequest,
+    ) -> OutboxTerminalItemsBatch:
+        """读取 Session 的 Outbox terminal items。
+
+        :param session_id: 目标 Session id。
+        :param request: Outbox terminal read 请求。
+        :returns: Outbox terminal item 批次。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        """
+
+        self._raise_if_closed()
+        return _read_outbox_terminal_items(
+            self._command_handle,
+            session_id,
+            request,
+        )
+
+    async def drain_outbox_terminal_items(
+        self,
+        session_id: str,
+        request: DrainOutboxTerminalItemsRequest,
+    ) -> OutboxTerminalItemsBatch:
+        """幂等 drain Session 的 Outbox terminal items。
+
+        :param session_id: 目标 Session id。
+        :param request: Outbox terminal drain 请求。
+        :returns: Outbox terminal item 批次。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        """
+
+        self._raise_if_closed()
+        return _drain_outbox_terminal_items(
+            self._command_handle,
+            session_id,
+            request,
+        )
 
     async def submit_followup(
         self, session_id: str, request: SubmitFollowupRequest
@@ -561,11 +637,15 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     self._options
                 ),
             )
+            outbox_projection_catchup_port = _OutboxTerminalProjectionCatchupPort(
+                durable_store=durable_store,
+            )
             close_projection_catchup_port = _CompositeProjectionCatchupPort(
                 ports=(
                     memory_projection_catchup_port,
                     audit_projection_catchup_port,
                     tool_trace_projection_catchup_port,
+                    outbox_projection_catchup_port,
                 )
             )
             scheduler = await HostDispatchScheduler.open(

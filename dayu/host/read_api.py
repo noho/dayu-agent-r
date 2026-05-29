@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import (
     HOST_EVENT_STREAM_DEFAULT_LIMIT,
     HOST_EVENT_STREAM_MAX_LIMIT,
+    DrainOutboxTerminalItemsRequest,
     HostApiError,
     HostApiErrorCode,
     HostEventClass,
@@ -26,13 +28,33 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
+    OutboxProjectionStatus,
+    OutboxTerminalCursor,
+    OutboxTerminalItem,
+    OutboxTerminalItemsBatch,
+    OutboxTerminalItemState,
+    ReadOutboxTerminalItemsRequest,
     RunSnapshot,
     SessionSnapshot,
 )
 from dayu.host.command import HostCommandHandle
+from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, read_events_after
+from dayu.host.durable.outbox import (
+    OutboxTerminalItemRow,
+    OutboxTerminalItemsPage,
+    drain_outbox_terminal_items as _drain_outbox_terminal_items,
+)
+from dayu.host.durable.outbox import (
+    read_outbox_terminal_items_after as _read_outbox_terminal_items_after,
+)
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
+from dayu.host.durable.projection import (
+    ProjectionCheckpointRow,
+    read_projection_checkpoint,
+    read_projection_failure,
+)
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_SQLITE_PAYLOADS,
@@ -45,6 +67,10 @@ from dayu.host.durable.state import (
     session_snapshot_from_rows,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.outbox import (
+    OUTBOX_TERMINAL_CONSUMER_ID,
+    catch_up_outbox_terminal_projection,
+)
 
 _SESSION_WATCH_BATCH_LIMIT = 64
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
@@ -59,6 +85,7 @@ _PAYLOAD_FIELD_FILTERED = "filtered"
 _PAYLOAD_FIELD_DEGRADED = "degraded"
 _PAYLOAD_FIELD_MESSAGE = "message"
 _PAYLOAD_FIELD_REASON = "reason"
+_PAYLOAD_FIELD_TERMINAL_STATUS = "terminal_status"
 
 
 def get_session(host: HostCommandHandle, session_id: str) -> SessionSnapshot:
@@ -150,6 +177,64 @@ def stream_run_events(
             run_id=run_id,
             cursor=cursor,
             limit=limit,
+        )
+    )
+
+
+def read_outbox_terminal_items(
+    host: HostCommandHandle,
+    session_id: str,
+    request: ReadOutboxTerminalItemsRequest,
+) -> OutboxTerminalItemsBatch:
+    """读取 public Outbox terminal items。
+
+    本函数只接入 projection-owned outbox helper：先校验 Session 存在，再
+    best-effort 追平 OutboxSink，最后从 durable outbox projection rows 读取
+    batch。它不写 EventLog，不改变 Run / Attempt 状态，也不改变 item drain
+    state。
+
+    :param host: Host command handle。
+    :param session_id: 目标 Session id。
+    :param request: Outbox terminal read 请求。
+    :returns: Outbox terminal item 批次。
+    :raises HostApiError: handle 已关闭、Session 不存在或 durable 读取失败时抛出。
+    """
+
+    host._run_read(_RequireSessionExistsOperation(session_id=session_id))
+    catchup_error = _catch_up_outbox_terminal_projection_best_effort(host)
+    return host._run_read(
+        _ReadOutboxTerminalItemsOperation(
+            session_id=session_id,
+            request=request,
+            catchup_error=catchup_error,
+        )
+    )
+
+
+def drain_outbox_terminal_items(
+    host: HostCommandHandle,
+    session_id: str,
+    request: DrainOutboxTerminalItemsRequest,
+) -> OutboxTerminalItemsBatch:
+    """幂等 drain public Outbox terminal items。
+
+    本函数只更新 Outbox projection queue state 与 drain idempotency row。drain
+    不表达 channel 投递成功，不写 EventLog，不更新 Run / Attempt。
+
+    :param host: Host command handle。
+    :param session_id: 目标 Session id。
+    :param request: Outbox terminal drain 请求。
+    :returns: Outbox terminal item 批次。
+    :raises HostApiError: handle 已关闭、Session 不存在、幂等冲突或 durable 写入失败时抛出。
+    """
+
+    host._run_read(_RequireSessionExistsOperation(session_id=session_id))
+    catchup_error = _catch_up_outbox_terminal_projection_best_effort(host)
+    return host._run_write(
+        _DrainOutboxTerminalItemsOperation(
+            session_id=session_id,
+            request=request,
+            catchup_error=catchup_error,
         )
     )
 
@@ -313,6 +398,109 @@ class _StreamRunEventsOperation:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _RequireSessionExistsOperation:
+    """Outbox public API 进入 projection catch-up 前的 Session 校验。"""
+
+    session_id: str
+
+    def __call__(self, transaction: HostTransaction) -> None:
+        """执行 Session 存在性校验。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        :raises HostApiError: Session 不存在时抛出。
+        """
+
+        _require_session_exists(transaction, self.session_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboxCatchupError:
+    """Outbox catch-up 运行时失败摘要。"""
+
+    error_code: str
+    error_message: str
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboxProjectionReadState:
+    """Outbox projection 状态读取结果。"""
+
+    checkpoint: OutboxTerminalCursor
+    status: OutboxProjectionStatus
+    error_code: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadOutboxTerminalItemsOperation:
+    """read_outbox_terminal_items read transaction body。"""
+
+    session_id: str
+    request: ReadOutboxTerminalItemsRequest
+    catchup_error: _OutboxCatchupError | None
+
+    def __call__(self, transaction: HostTransaction) -> OutboxTerminalItemsBatch:
+        """读取 Outbox terminal item batch。
+
+        :param transaction: 当前 Host transaction。
+        :returns: Outbox terminal item 批次。
+        :raises HostApiError: Session 不存在时抛出。
+        :raises HostDurableError: durable outbox row 或 projection row 非法时抛出。
+        """
+
+        _require_session_exists(transaction, self.session_id)
+        page = _read_outbox_terminal_items_after(
+            transaction,
+            self.session_id,
+            after_event_sequence=self.request.after.event_sequence,
+            seen_terminal_event_ids=self.request.seen_terminal_event_ids,
+            limit=self.request.limit,
+        )
+        projection_state = _read_outbox_projection_state(
+            transaction,
+            catchup_error=self.catchup_error,
+        )
+        return _outbox_batch_from_page(page, projection_state)
+
+
+@dataclass(frozen=True, slots=True)
+class _DrainOutboxTerminalItemsOperation:
+    """drain_outbox_terminal_items write transaction body。"""
+
+    session_id: str
+    request: DrainOutboxTerminalItemsRequest
+    catchup_error: _OutboxCatchupError | None
+
+    def __call__(self, transaction: HostTransaction) -> OutboxTerminalItemsBatch:
+        """执行 Outbox terminal item drain。
+
+        :param transaction: 当前 Host transaction。
+        :returns: Outbox terminal item 批次。
+        :raises HostApiError: Session 不存在时抛出。
+        :raises HostIdempotencyConflictError: drain request id 复用但语义不同
+            时由 durable helper 抛出，外层 command handle 会映射为 public error。
+        :raises HostDurableError: durable outbox row 或 projection row 非法时抛出。
+        """
+
+        _require_session_exists(transaction, self.session_id)
+        page = _drain_outbox_terminal_items(
+            transaction,
+            self.session_id,
+            after_event_sequence=self.request.after.event_sequence,
+            seen_terminal_event_ids=self.request.seen_terminal_event_ids,
+            limit=self.request.limit,
+            drain_request_id=self.request.drain_request_id,
+            drained_at=format_utc_timestamp(datetime.now(UTC)),
+        )
+        projection_state = _read_outbox_projection_state(
+            transaction,
+            catchup_error=self.catchup_error,
+        )
+        return _outbox_batch_from_page(page, projection_state)
+
+
 def _resolve_stream_limit(limit: int | None) -> int:
     """解析并校验 public stream limit。
 
@@ -403,6 +591,195 @@ def _latest_event_sequence(transaction: HostTransaction) -> int:
     if not isinstance(latest, int):
         raise HostDurableError("latest EventLog sequence is invalid")
     return latest
+
+
+def _catch_up_outbox_terminal_projection_best_effort(
+    host: HostCommandHandle,
+) -> _OutboxCatchupError | None:
+    """best-effort 追平 Outbox terminal projection。
+
+    :param host: Host command handle。
+    :returns: catch-up 抛出未处理异常时返回摘要；成功或 runner 记录 failure row
+        时返回 ``None``。
+    """
+
+    try:
+        catch_up_outbox_terminal_projection(host._transaction_runner())
+    except Exception as exc:
+        return _OutboxCatchupError(
+            error_code=exc.__class__.__name__,
+            error_message=str(exc) or "<empty outbox catch-up error>",
+        )
+    return None
+
+
+def _read_outbox_projection_state(
+    transaction: HostTransaction,
+    *,
+    catchup_error: _OutboxCatchupError | None,
+) -> _OutboxProjectionReadState:
+    """读取 Outbox projection checkpoint / failure 状态。
+
+    :param transaction: 当前 Host transaction。
+    :param catchup_error: catch-up 调用层捕获到的运行时失败摘要。
+    :returns: public batch 可直接使用的 projection 状态。
+    :raises HostDurableError: checkpoint 或 failure row 类型非法时抛出。
+    """
+
+    checkpoint = read_projection_checkpoint(
+        transaction,
+        OUTBOX_TERMINAL_CONSUMER_ID.value,
+    )
+    checkpoint_cursor = OutboxTerminalCursor(
+        event_sequence=_checkpoint_sequence(checkpoint)
+    )
+    if catchup_error is not None:
+        return _OutboxProjectionReadState(
+            checkpoint=checkpoint_cursor,
+            status=OutboxProjectionStatus.FAILED,
+            error_code=catchup_error.error_code,
+            error_message=catchup_error.error_message,
+        )
+    failure = read_projection_failure(
+        transaction,
+        OUTBOX_TERMINAL_CONSUMER_ID.value,
+    )
+    if failure is not None:
+        return _OutboxProjectionReadState(
+            checkpoint=checkpoint_cursor,
+            status=OutboxProjectionStatus.FAILED,
+            error_code=failure.last_error_code,
+            error_message=failure.last_error_message,
+        )
+    if checkpoint_cursor.event_sequence < _latest_event_sequence(transaction):
+        return _OutboxProjectionReadState(
+            checkpoint=checkpoint_cursor,
+            status=OutboxProjectionStatus.LAGGED,
+            error_code=None,
+            error_message=None,
+        )
+    return _OutboxProjectionReadState(
+        checkpoint=checkpoint_cursor,
+        status=OutboxProjectionStatus.CAUGHT_UP,
+        error_code=None,
+        error_message=None,
+    )
+
+
+def _checkpoint_sequence(checkpoint: ProjectionCheckpointRow | None) -> int:
+    """提取 projection checkpoint sequence。
+
+    :param checkpoint: 可选 checkpoint row。
+    :returns: checkpoint sequence；row 不存在时为 ``0``。
+    """
+
+    if checkpoint is None:
+        return 0
+    return checkpoint.checkpoint_event_sequence
+
+
+def _outbox_batch_from_page(
+    page: OutboxTerminalItemsPage,
+    projection_state: _OutboxProjectionReadState,
+) -> OutboxTerminalItemsBatch:
+    """把 durable outbox page 映射为 public batch。
+
+    :param page: durable outbox page。
+    :param projection_state: projection 状态。
+    :returns: public Outbox terminal batch。
+    :raises HostDurableError: row 字段无法映射为 public 类型时抛出。
+    """
+
+    return OutboxTerminalItemsBatch(
+        items=tuple(_outbox_item_from_row(row) for row in page.rows),
+        next_cursor=OutboxTerminalCursor(
+            event_sequence=page.next_event_sequence,
+        ),
+        scanned_watermark=OutboxTerminalCursor(
+            event_sequence=page.scanned_watermark,
+        ),
+        projection_checkpoint=projection_state.checkpoint,
+        projection_status=projection_state.status,
+        projection_error_code=projection_state.error_code,
+        projection_error_message=projection_state.error_message,
+        has_more=page.has_more,
+    )
+
+
+def _outbox_item_from_row(row: OutboxTerminalItemRow) -> OutboxTerminalItem:
+    """把 durable outbox item row 映射为 public item。
+
+    :param row: durable outbox terminal item row。
+    :returns: public Outbox terminal item。
+    :raises HostDurableError: durable row 字段不是 public enum 或 timestamp 非法时抛出。
+    """
+
+    try:
+        terminal_status = HostTerminalStatus(row.terminal_status)
+        item_state = OutboxTerminalItemState(row.item_state)
+        projected_at = parse_utc_timestamp(row.projected_at)
+    except ValueError as exc:
+        raise HostDurableError("outbox terminal item row is invalid") from exc
+    return OutboxTerminalItem(
+        item_id=row.item_id,
+        idempotency_key=row.idempotency_key,
+        terminal_event_id=row.terminal_event_id,
+        event_sequence=row.event_sequence,
+        session_id=row.session_id,
+        run_id=row.run_id,
+        terminal_status=terminal_status,
+        dedupe_key=row.dedupe_key,
+        final_answer=_final_answer_from_outbox_json(row.final_answer_json),
+        error_message=row.error_message,
+        cancel_reason=row.cancel_reason,
+        result_ref=row.result_ref,
+        result_digest=row.result_digest,
+        terminal_summary_ref=row.terminal_summary_ref,
+        terminal_summary_digest=row.terminal_summary_digest,
+        projected_at=projected_at,
+        item_state=item_state,
+    )
+
+
+def _final_answer_from_outbox_json(value: str | None) -> HostFinalAnswerView | None:
+    """解析 Outbox row 中的 final answer JSON。
+
+    :param value: durable outbox final answer JSON 文本；无 final answer 时为
+        ``None``。
+    :returns: public final answer view 或 ``None``。
+    :raises HostDurableError: JSON 非法或字段类型非法时抛出。
+    """
+
+    if value is None:
+        return None
+    try:
+        parsed = cast(JsonValue, json.loads(value))
+    except json.JSONDecodeError as exc:
+        raise HostDurableError("outbox final answer JSON is invalid") from exc
+    if not isinstance(parsed, dict):
+        raise HostDurableError("outbox final answer JSON must be object")
+    content = parsed.get(_PAYLOAD_FIELD_CONTENT)
+    filtered = parsed.get(_PAYLOAD_FIELD_FILTERED)
+    degraded = parsed.get(_PAYLOAD_FIELD_DEGRADED)
+    finish_reason = parsed.get(_PAYLOAD_FIELD_FINISH_REASON)
+    terminal_status = parsed.get(_PAYLOAD_FIELD_TERMINAL_STATUS)
+    if not isinstance(content, str):
+        raise HostDurableError("outbox final answer content is invalid")
+    if not isinstance(filtered, bool):
+        raise HostDurableError("outbox final answer filtered is invalid")
+    if not isinstance(degraded, bool):
+        raise HostDurableError("outbox final answer degraded is invalid")
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        raise HostDurableError("outbox final answer finish_reason is invalid")
+    if terminal_status != HostTerminalStatus.SUCCEEDED.value:
+        raise HostDurableError("outbox final answer terminal_status is invalid")
+    return HostFinalAnswerView(
+        content=content,
+        filtered=filtered,
+        degraded=degraded,
+        finish_reason=finish_reason,
+        terminal_status=HostTerminalStatus.SUCCEEDED,
+    )
 
 
 def _host_event_from_row(
