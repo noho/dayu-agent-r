@@ -110,6 +110,21 @@ MEMORY_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.ui",
     "dayu.fins",
 )
+PURGE_DURABLE_MODULES: tuple[str, ...] = ("durable/purge.py",)
+PURGE_DURABLE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.config",
+    "dayu.engine",
+    "dayu.fins",
+    "dayu.runtime",
+    "dayu.service",
+    "dayu.ui",
+    "dayu.host.admission",
+    "dayu.host.audit",
+    "dayu.host.command",
+    "dayu.host.dispatch",
+    "dayu.host.open_host",
+    "dayu.host.recovery",
+)
 
 
 def _host_root() -> Path:
@@ -333,6 +348,26 @@ def test_memory_modules_do_not_import_upper_business_or_engine_layers() -> None:
             if _matches_prefix(module, MEMORY_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"memory forbidden imports: {violations}"
+
+
+def test_purge_durable_module_stays_low_level_host_owner() -> None:
+    """purge durable primitive 不得反向依赖上层或 public command owner。
+
+    :returns: ``None``。
+    :raises AssertionError: purge durable 模块导入上层、runtime 或 command /
+        audit / dispatch owner 时抛出。
+    """
+
+    host_root = _host_root()
+    violations: list[tuple[str, str]] = []
+    for relative_path in PURGE_DURABLE_MODULES:
+        file_path = host_root / relative_path
+        for module in _imported_module_names(
+            file_path.read_text(encoding="utf-8")
+        ):
+            if _matches_prefix(module, PURGE_DURABLE_FORBIDDEN_PREFIXES):
+                violations.append((str(file_path), module))
+    assert not violations, f"purge durable forbidden imports: {violations}"
 
 
 def test_engine_does_not_import_host_layer() -> None:

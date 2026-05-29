@@ -176,6 +176,34 @@ REMOVED_SERVICE_FACING_ALL_EXPORTS: frozenset[str] = frozenset(
     }
 )
 
+INTERNAL_PURGE_DURABLE_EXPORTS: frozenset[str] = frozenset(
+    {
+        "PURGE_IDEMPOTENCY_RESULT_KIND",
+        "PURGE_IDEMPOTENCY_SCOPE_KIND",
+        "PurgeCommitCleanupRefs",
+        "PurgeDeleteCounts",
+        "PurgePreconditionSnapshot",
+        "PurgeReplayDecision",
+        "PurgeReplayDecisionKind",
+        "PurgeSessionAlreadyPurgedError",
+        "PurgeSessionDeleteRequest",
+        "PurgeSessionDeleteResult",
+        "PurgeSessionInvalidStateError",
+        "PurgeSessionNotFoundError",
+        "PurgeTombstoneAuditRecordRequest",
+        "PurgeTombstoneAuditRecordResult",
+        "PurgeTombstoneAuditRecorder",
+        "PurgeTombstoneRow",
+        "build_deleted_counts_digest",
+        "build_purge_semantic_digest",
+        "insert_purge_tombstone",
+        "purge_session_durable",
+        "read_purge_tombstone_by_id",
+        "read_purge_tombstone_by_session_id",
+        "record_or_read_purge_idempotency",
+    }
+)
+
 
 def test_host_all_matches_current_public_contracts() -> None:
     """``dayu.host.__all__`` 匹配当前 public contract。"""
@@ -239,3 +267,10 @@ def test_removed_low_level_symbols_are_not_package_root_attributes() -> None:
     """低层历史入口不再作为 ``dayu.host`` 模块属性暴露。"""
 
     assert not (REMOVED_SERVICE_FACING_ALL_EXPORTS & frozenset(vars(host)))
+
+
+def test_purge_durable_symbols_are_not_package_root_exports() -> None:
+    """purge durable helper 不进入 ``dayu.host`` Service-facing 根命名空间。"""
+
+    assert not (INTERNAL_PURGE_DURABLE_EXPORTS & frozenset(host.__all__))
+    assert not (INTERNAL_PURGE_DURABLE_EXPORTS & frozenset(vars(host)))

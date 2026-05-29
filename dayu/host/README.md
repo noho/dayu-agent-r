@@ -77,10 +77,19 @@ Host 内部职责按语义分层：
 - `replay_run(run_id, request)`：基于成功源 Run 创建 no-tool 结构修复 Run。
 - `resolve_wait(wait_id, request)`：接收外部 wait result，并由 Host 恢复或收口 Run。
 - `close_session(session_id, request)`：关闭 Session 的新输入入口，不取消既有 Run。
+- `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 的 Host 本地可恢复事实，返回 purge tombstone ref 与删除计数摘要。
 - `watch_session_events(session_id)`：订阅 Session-level Host-owned typed events。
 - `close()`：关闭当前 opener runtime，向 active worker 传播 lifecycle cancel，但不写用户 cancel / failed terminal facts。
 
-包根函数式 command facade `purge_session(session_id, request)` 已实现第一版 destructive cleanup：仅允许清理已关闭且所有 Run 已终态的 Session，删除该 Session 的 Host 本地可恢复事实并保留 purge tombstone。重复同一请求在源事实删除后仍通过 tombstone 幂等重放；同 key 不同语义返回 `IDEMPOTENCY_CONFLICT`，不同请求清理同一已 purge Session 返回 `CONFLICT`。purge 后 `get_session`、`get_run`、`retry_run`、`replay_run` 与 live watch 不从 tombstone、projection、audit 或 outbox 重建事实，按现有缺失事实语义返回 `NOT_FOUND`。
+Service-facing purge 入口包含 `Host.purge_session(session_id, request)` 与包根函数式 command facade `purge_session(host, session_id, request)`。第一版 destructive cleanup 仅允许清理已 `CLOSED`、不存在 active / queued / waiting / cancelling / recovering Run、且所有 Run 已终态的 Session；前置条件不满足时返回 `INVALID_STATE`，不会部分删除。
+
+purge 成功后，Host 会删除目标 Session 的本地可恢复事实和派生视图数据，包括 Session / slot binding、Run、Attempt、目标 Session EventLog rows、payload descriptor / 本地 SQLite payload、memory snapshot、minimal read model、projection checkpoint / failure 中指向目标 EventLog 的可重建派生记录、outbox terminal projection、tool trace hot rows 和旧 command idempotency rows。共享 artifact 只在没有其它 durable ref 引用时清理。Host 同事务保留独立 purge tombstone 和 `purge_session` 幂等记录；tombstone 不位于被 purge 的 Session EventLog 中，也不参与 resume、retry、replay、memory、RunInputBuilder 或普通 read truth。
+
+重复同一请求在源事实删除后仍通过 tombstone 幂等重放；同 key 不同语义返回 `IDEMPOTENCY_CONFLICT`，不同请求清理同一已 purge Session 返回 `CONFLICT`。purge 后 `get_session`、`get_run`、`retry_run`、`replay_run` 与 live watch 不从 tombstone、projection、audit、outbox、tool trace 或 memory 重建事实，按现有缺失事实语义返回 `NOT_FOUND`。
+
+purge 不删除或重写已经写入的 append-only audit JSONL。成功 purge 会写入 purge tombstone audit record，并把 audit record ref / digest 写入 tombstone；既有 audit 行可以保留对已删除 EventLog rows 的 refs。audit / diagnostic 查询可以用 tombstone 解释源事实已被 purge，但普通 Service-facing 读取路径不能把 audit、projection 或 tombstone 当作 Session snapshot 来源。
+
+第一版 purge 的非目标是：不做 remote / wire protocol 变更，不新增 public error code，不把 purge 表达成 close、cancel、archive、memory forget 或 UI hide，不实现 retention scheduler、周期 GC、DB vacuum、audit JSONL rotation / compaction、外部 audit 投递或 tool trace cold JSONL retention policy。
 
 ## Opener 与 Options
 

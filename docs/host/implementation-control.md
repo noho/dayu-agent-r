@@ -225,8 +225,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 work unit：Phase 15 Retention / Purge / Production Hardening。
 当前状态：Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS；P15-S1
 Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction Helper、P15-S3 Public Command Wiring And
-Read-after-purge Semantics、P15-S4 Audit JSONL Retention And Tombstone Audit Record 与 P15-S5 Projection Cleanup, Rebuild
-Confidence, And Local Hardening 均已通过 code review / re-review / controller validation，进入 accepted slice commit。
+Read-after-purge Semantics、P15-S4 Audit JSONL Retention And Tombstone Audit Record、P15-S5 Projection Cleanup, Rebuild
+Confidence, And Local Hardening 与 P15-S6 Docs, Import Boundaries, Full Validation 均已通过 code review / re-review /
+controller validation，进入 accepted slice commit。
 Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
 commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`；Accepted S5 commit 为 `ce6de0d`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
@@ -236,8 +237,8 @@ Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.m
 `docs/reviews/phase15-s3-code-review-controller-adjudication-20260529.md`。Phase 13 Audit / Tool Trace / Outbox
 Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits 与 PR 69 记录见
 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 implementation Slice P15-S6。
-下一步：派发 implementation specialist 实现 Slice P15-S6 Docs, Import Boundaries, Full Validation。P15 不以 Phase 14
+当前 gate：Phase 15 aggregate deepreview。
+下一步：派发 AgentMiMo 与 AgentDS 对 Phase 15 全量 diff 做 aggregate deepreview。P15 不以 Phase 14
 completion 为进入前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归
 Issue #73。
 
@@ -2392,6 +2393,20 @@ tests/host/test_recovery_scan.py tests/host/test_recovery_multiprocess.py tests/
 tests/host/test_purge_session.py -q` 为 74 passed；`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings /
 0 informations；`git diff --check` clean。README 检查结论：S5 只新增 local hardening 与 tests，未改变 public API shape、
 OpenHostOptions、命令用法、配置入口或稳定文档职责，S6 docs 仍为下一 slice owner。Accepted S5 commit 为 `ce6de0d`。
+
+Slice P15-S6 Docs, Import Boundaries, Full Validation implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s6-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s6-code-review-mimo-20260529.md` 与
+`docs/reviews/phase15-s6-code-review-ds-20260529.md`；两份 review 均为 PASS / 0 findings。Controller adjudication artifact 为
+`docs/reviews/phase15-s6-code-review-controller-adjudication-20260529.md`。Controller 本地验证：
+`pytest tests/host/test_purge_session.py tests/host/test_durable_schema.py tests/host/test_command_handle.py
+tests/host/test_public_session_api.py tests/host/test_public_run_api.py tests/host/test_audit_sink.py
+tests/host/test_projection_read_model.py tests/host/test_projection_checkpoint.py tests/host/test_projection_runner.py
+tests/host/test_memory_projection.py tests/host/test_tool_trace_projection.py tests/host/test_outbox_durable.py
+tests/host/test_open_host_runtime.py tests/host/test_import_boundary.py tests/host/test_package_exports.py
+tests/host/test_weak_typing_guard.py -q` 为 227 passed；`python -m pyright dayu/ tests/ utils/` 为 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。Accepted S6 commit 将在本条记录提交后由 git commit 记录。当前 gate 进入 Phase 15
+aggregate deepreview。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
