@@ -17,11 +17,13 @@ from dayu.host import (
     HostCallContext,
     HostMetadataEntry,
     OperationContext,
+    PurgeSessionRequest,
     SessionStatus,
     close_session,
     create_session,
     ensure_session,
     get_session,
+    purge_session,
 )
 from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import HostCommandHandle, create_host_command_handle
@@ -224,6 +226,20 @@ def _close_request(client_request_id: str) -> CloseSessionRequest:
     )
 
 
+def _purge_request(client_request_id: str) -> PurgeSessionRequest:
+    """构造 purge session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: purge session 请求。
+    """
+
+    return PurgeSessionRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="public_session_api_purge",
+    )
+
+
 def test_ensure_session_repeat_returns_same_snapshot(tmp_path: Path) -> None:
     """重复 ensure_session 返回同一个 SessionSnapshot。"""
 
@@ -307,6 +323,31 @@ def test_get_session_missing_returns_not_found(tmp_path: Path) -> None:
     try:
         with pytest.raises(HostApiError) as exc_info:
             get_session(command_handle, "session-missing")
+        assert exc_info.value.code == HostApiErrorCode.NOT_FOUND
+        assert exc_info.value.retryable is False
+    finally:
+        command_handle.close()
+
+
+def test_get_session_after_purge_returns_not_found(tmp_path: Path) -> None:
+    """get_session 在 purge 后不从 tombstone 重建 Session snapshot。"""
+
+    command_handle = _open_handle(tmp_path)
+    try:
+        created = create_session(command_handle, _create_request("create-1"))
+        close_session(command_handle, created.session_id, _close_request("close-1"))
+        result = purge_session(
+            command_handle,
+            created.session_id,
+            _purge_request("purge-1"),
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            get_session(command_handle, created.session_id)
+
+        assert result.purged is True
+        assert result.purge_tombstone_ref is not None
+        assert result.deleted_counts_digest is not None
         assert exc_info.value.code == HostApiErrorCode.NOT_FOUND
         assert exc_info.value.retryable is False
     finally:

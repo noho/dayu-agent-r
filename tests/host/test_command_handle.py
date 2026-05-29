@@ -758,6 +758,40 @@ def test_deferred_public_facades_fail_closed_before_unsupported(
     assert _idempotency_count(options.db_path) == before_idempotency
 
 
+def test_purge_session_closed_empty_session_returns_tombstone_result(
+    tmp_path: Path,
+) -> None:
+    """purge_session 对已关闭无 Run Session 返回 frozen public result。"""
+
+    command_handle = create_host_command_handle(_options(tmp_path))
+    try:
+        created = create_session(command_handle, _create_request("create-purge"))
+        close_session(
+            command_handle,
+            created.session_id,
+            _close_request("close-purge"),
+        )
+
+        first = purge_session(
+            command_handle,
+            created.session_id,
+            _purge_request("purge-1"),
+        )
+        replay = purge_session(
+            command_handle,
+            created.session_id,
+            _purge_request("purge-1"),
+        )
+
+        assert first.session_id == created.session_id
+        assert first.purged is True
+        assert first.purge_tombstone_ref is not None
+        assert first.deleted_counts_digest is not None
+        assert replay == first
+    finally:
+        command_handle.close()
+
+
 def test_retryable_durable_transaction_busy_returns_public_error(
     tmp_path: Path,
 ) -> None:

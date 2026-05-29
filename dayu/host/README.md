@@ -80,7 +80,7 @@ Host 内部职责按语义分层：
 - `watch_session_events(session_id)`：订阅 Session-level Host-owned typed events。
 - `close()`：关闭当前 opener runtime，向 active worker 传播 lifecycle cancel，但不写用户 cancel / failed terminal facts。
 
-`purge_session`、`PurgeSessionRequest` 与 `PurgeSessionResult` 仍属于包根 deferred 契约；当前语义是 structured unsupported：返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，不写幂等记录，也不删除 Host durable facts。
+包根函数式 command facade `purge_session(session_id, request)` 已实现第一版 destructive cleanup：仅允许清理已关闭且所有 Run 已终态的 Session，删除该 Session 的 Host 本地可恢复事实并保留 purge tombstone。重复同一请求在源事实删除后仍通过 tombstone 幂等重放；同 key 不同语义返回 `IDEMPOTENCY_CONFLICT`，不同请求清理同一已 purge Session 返回 `CONFLICT`。purge 后 `get_session`、`get_run`、`retry_run`、`replay_run` 与 live watch 不从 tombstone、projection、audit 或 outbox 重建事实，按现有缺失事实语义返回 `NOT_FOUND`。
 
 ## Opener 与 Options
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import NoReturn
 from uuid import uuid4
 
@@ -54,7 +55,7 @@ from dayu.host._execution_config_projection import (
     optional_runner_options_json as _optional_runner_options_json,
     optional_runner_spec_json as _optional_runner_spec_json,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import (
     HostDurableStore,
     open_host_durable_store,
@@ -72,6 +73,15 @@ from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
+)
+from dayu.host.durable.purge import (
+    PurgeSessionAlreadyPurgedError,
+    PurgeSessionDeleteRequest,
+    PurgeSessionDeleteResult,
+    PurgeSessionInvalidStateError,
+    PurgeSessionNotFoundError,
+    build_purge_semantic_digest,
+    purge_session_durable,
 )
 from dayu.host.durable.session_lifecycle import (
     close_session as _close_session_in_durable,
@@ -736,19 +746,95 @@ def purge_session(
     session_id: str,
     request: PurgeSessionRequest,
 ) -> PurgeSessionResult:
-    """稳定拒绝 Phase 4 尚未实现的 Session purge。
+    """清理已关闭 Session 的 Host 本地可恢复事实。
 
-    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
-
-    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param host: Host command handle。
     :param session_id: 目标 Session id。
     :param request: purge session 请求。
-    :returns: 当前阶段不会返回。
-    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    :returns: purge tombstone 与删除计数摘要组成的 public result。
+    :raises HostApiError: handle 已关闭、Session 缺失、前置条件非法、幂等冲突、
+        已由不同请求 purge 或 durable 写入失败时抛出。
     """
 
     host._raise_if_closed()
-    _raise_unsupported_operation("purge_session")
+    try:
+        operation = _PurgeSessionOperation(
+            session_id=session_id,
+            request=request,
+        )
+        result = host._transaction_runner().run_write(operation)
+    except PurgeSessionInvalidStateError as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="purge_session requires a closed Session with terminal Runs",
+            retryable=False,
+        ) from exc
+    except PurgeSessionAlreadyPurgedError as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.CONFLICT,
+            message="Session has already been purged",
+            retryable=False,
+        ) from exc
+    except PurgeSessionNotFoundError as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Session not found",
+            retryable=False,
+        ) from exc
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
+    return PurgeSessionResult(
+        session_id=result.tombstone.session_id,
+        purged=True,
+        purge_tombstone_ref=result.tombstone.tombstone_id,
+        deleted_counts_digest=result.tombstone.deleted_counts_digest,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PurgeSessionOperation:
+    """purge_session write transaction body。"""
+
+    session_id: str
+    request: PurgeSessionRequest
+
+    def __call__(self, transaction: HostTransaction) -> PurgeSessionDeleteResult:
+        """执行 purge durable helper。
+
+        :param transaction: 当前 Host write transaction。
+        :returns: durable purge delete result。
+        :raises HostDurableError: purge 前置条件、幂等或 durable 写入失败时抛出。
+        """
+
+        operation_context_refs = _operation_context_json_value(
+            self.request.context.operation_context
+        )
+        request_context = _call_context_json_value(self.request.context)
+        operation_context_digest = sha256_digest_json(operation_context_refs)
+        semantic_digest = build_purge_semantic_digest(
+            session_id=self.session_id,
+            reason=self.request.reason,
+            operation_context_digest=operation_context_digest,
+            operation_context_refs=operation_context_refs,
+            request_context=request_context,
+        )
+        return purge_session_durable(
+            transaction,
+            PurgeSessionDeleteRequest(
+                session_id=self.session_id,
+                client_request_id=self.request.client_request_id,
+                semantic_request_digest=semantic_digest,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                operation_context_digest=operation_context_digest,
+                operation_context_refs=operation_context_refs,
+                reason=self.request.reason,
+                purged_at=format_utc_timestamp(datetime.now(UTC)),
+                audit_record_ref=None,
+                audit_record_digest=None,
+                request_context=request_context,
+            ),
+        )
 
 
 def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:
@@ -1115,7 +1201,7 @@ def _call_context_digest(context: HostCallContext) -> str:
     return sha256_digest_json(_call_context_json_value(context))
 
 
-def _call_context_json_value(context: HostCallContext) -> JsonValue:
+def _call_context_json_value(context: HostCallContext) -> dict[str, JsonValue]:
     """把 HostCallContext 转为 canonical JSON 值。
 
     :param context: Host call context。
@@ -1149,7 +1235,9 @@ def _authorization_claims_json_value(
     return values
 
 
-def _operation_context_json_value(context: OperationContext) -> JsonValue:
+def _operation_context_json_value(
+    context: OperationContext,
+) -> dict[str, JsonValue]:
     """把 OperationContext 转为 canonical JSON 值。
 
     :param context: 操作上下文。

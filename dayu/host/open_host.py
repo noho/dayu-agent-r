@@ -38,6 +38,8 @@ from dayu.host.api import (
     HostLocalExecutionOptions,
     OutboxTerminalItemsBatch,
     OpenHostOptions,
+    PurgeSessionRequest,
+    PurgeSessionResult,
     ReadOutboxTerminalItemsRequest,
     ReplayRunRequest,
     ResolveWaitRequest,
@@ -53,6 +55,7 @@ from dayu.host.command import (
     close_session as _close_session,
     create_session as _create_session,
     ensure_session as _ensure_session,
+    purge_session as _purge_session,
     resolve_wait as _resolve_wait,
     retry_run as _retry_run,
     replay_run as _replay_run,
@@ -483,6 +486,20 @@ class _PublicHostHandle:
 
         self._raise_if_closed()
         return _close_session(self._command_handle, session_id, request)
+
+    async def purge_session(
+        self, session_id: str, request: PurgeSessionRequest
+    ) -> PurgeSessionResult:
+        """清理已关闭 Session 的 Host 本地可恢复事实。
+
+        :param session_id: 目标 Session id。
+        :param request: purge session 请求。
+        :returns: purge tombstone 与删除计数摘要。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        """
+
+        self._raise_if_closed()
+        return _purge_session(self._command_handle, session_id, request)
 
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
