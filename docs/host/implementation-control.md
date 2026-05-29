@@ -281,7 +281,7 @@ Aggregate re-review artifacts 为 `docs/reviews/phase13-aggregate-rereview-mimo-
 `docs/reviews/phase13-aggregate-rereview-ds-20260529.md`。两路 re-review 均 PASS，确认 F001 fixed，无新增
 blocking findings。Controller re-review adjudication 为
 `docs/reviews/phase13-aggregate-rereview-controller-adjudication-20260529.md`。当前 gate：Phase 13
-ready-to-open-draft-PR。
+ready-to-open-draft-PR。Accepted aggregate review commit 为 `85c3358`。
 
 ## Phase Map
 
@@ -2489,6 +2489,14 @@ Phase 13 aggregate re-review 已完成。Re-review artifacts 为
 findings。Controller re-review adjudication artifact 为
 `docs/reviews/phase13-aggregate-rereview-controller-adjudication-20260529.md`。当前 gate：Phase 13
 `ready-to-open-draft-PR`。
+
+Accepted aggregate review commit 已创建：`85c3358` (`gateflow: accept phase 13 aggregate review`)。Phase 13
+plan、implementation slices、slice reviews、aggregate validation、aggregate deepreview、aggregate fix 与 aggregate re-review
+均已完成。当前 gate：`ready-to-open-draft-PR`。Residual risks / owners：JSONL 与 SQLite checkpoint 跨介质
+exactly-once 归 Phase 15；Outbox drain 非 channel delivery success 归 Service / channel adapter owner；purge tombstone
+audit record、outbox cleanup、tool trace cleanup、projection cleanup 归 Phase 15；external audit、long-term archival、heavy
+sink runner / batch transaction hardening 归 Phase 15+ production hardening。用户已授权到达 `ready-to-open-draft-PR`
+后自动进入 draft PR gate 并推进到 `draft-PR-pass`。
 
 ### 2026-05-24 P12.6 Slice 1 code re-review passed
 
