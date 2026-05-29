@@ -238,9 +238,8 @@ Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.m
 `docs/reviews/phase15-s3-code-review-controller-adjudication-20260529.md`。Phase 13 Audit / Tool Trace / Outbox
 Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits 与 PR 69 记录见
 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：ready-to-open-draft-PR。
-下一步：用户已授权到达 `ready-to-open-draft-PR` 后自动进入 draft PR gate；按仓库发布约定 push 当前分支到 `github` remote，创建 draft
-PR，并推进 PR review / fix / re-review 直到 `draft-PR-pass`。P15 不以 Phase 14 completion 为进入前置；任何 remote-dependent smoke /
+当前 gate：draft-PR-pass。
+下一步：Phase 15 draft PR 74 已创建并通过 PR-level review；等待用户后续 merge / mark ready / reviewer assignment 决策。P15 不以 Phase 14 completion 为进入前置；任何 remote-dependent smoke /
 hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
@@ -2420,6 +2419,11 @@ Controller re-review adjudication artifact 为 `docs/reviews/phase15-aggregate-r
 Controller final validation：`pytest tests/host -q` 为 1011 passed / 1 skipped；`python -m pyright dayu/ tests/ utils/` 为 0
 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 `ready-to-open-draft-PR`。Aggregate review commit
 为 `151995b`。
+
+Draft PR gate 已完成。当前分支已 push 到 `github/feat/host-phase15-retention-purge-hardening`，draft PR 为
+https://github.com/noho/dayu-agent-r/pull/74。`gh pr view 74` 显示 PR 为 OPEN / draft / mergeStateStatus CLEAN；`gh pr checks 74`
+显示当前 branch no checks reported。PR-level review artifacts 为 `docs/reviews/phase15-pr74-review-mimo-20260529.md` 与
+`docs/reviews/phase15-pr74-review-ds-20260529.md`，两份 review 均为 PASS / no blocker / ready。当前 gate：`draft-PR-pass`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
