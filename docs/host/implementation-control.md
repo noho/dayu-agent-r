@@ -228,7 +228,7 @@ Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction
 Read-after-purge Semantics 与 P15-S4 Audit JSONL Retention And Tombstone Audit Record 均已通过 code review / re-review /
 controller validation，进入 accepted slice commit。
 Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
-commit 为 `17c5c00`。
+commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`。
 Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
 `docs/reviews/phase15-s3-implementation-codex-20260529.md`、
 `docs/reviews/phase15-s3-code-review-mimo-20260529.md`、
@@ -2375,8 +2375,8 @@ tests/host/test_open_host_runtime.py -q` 为 63 passed；`python -m pyright dayu
 dayu/host/durable/audit.py dayu/host/durable/purge.py dayu/host/durable/schema.py dayu/host/command.py
 dayu/host/open_host.py tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。README 检查结论：
 S4 只补齐 internal fail-before-success invariant、fresh schema storage contract 与 audit path helper 复用，未改变 public API
-shape、OpenHostOptions、命令用法或配置入口，`dayu/host/README.md` 与 `tests/README.md` 无需更新。Accepted S4 commit 将在本条记录
-提交后由 git commit 记录。
+shape、OpenHostOptions、命令用法或配置入口，`dayu/host/README.md` 与 `tests/README.md` 无需更新。Accepted S4 commit 为
+`eb83a12`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
