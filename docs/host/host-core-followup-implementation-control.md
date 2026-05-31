@@ -123,7 +123,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | WU-RUNTIME-01 Slice 2 implementation handoff：补 Host audit / tool trace lock-path regression tests，不修改 Host production source |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md |
-| implementation commits | accepted plan: 929d01c；accepted slice1: pending local commit |
+| implementation commits | accepted plan: 929d01c；accepted slice1: 7b5b3aa |
 | review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-fix-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-20260601.md |
 | aggregate review artifacts | pending |
 | draft PR status | not opened |
