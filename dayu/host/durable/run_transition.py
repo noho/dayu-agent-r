@@ -2297,7 +2297,7 @@ def cancel_waiting_run_in_transaction(
         )
     attempt = read_attempt_by_id(transaction, run.current_attempt_id)
     active_waits = read_active_wait_records_for_run(transaction, run.run_id)
-    if attempt is None or attempt.status != AttemptStatus.SUSPENDED or not active_waits:
+    if attempt is None or attempt.status != AttemptStatus.SUSPENDED:
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,
             run=run,
@@ -2309,19 +2309,22 @@ def cancel_waiting_run_in_transaction(
         transaction, _cancel_requested_event_request(request, run)
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
-    wait_result = cancel_active_wait_records_for_run(
-        transaction,
-        run_id=run.run_id,
-        updated_event_id=cancel_request_event.event_id,
-        updated_event_sequence=cancel_request_event.event_sequence,
-        updated_at=terminal_at,
-        terminal_at=terminal_at,
-    )
-    if wait_result.status != StateMutationStatus.UPDATED:
-        _raise_after_event_append_mutation_failure(
-            mutation_name="cancel active wait records",
-            status=wait_result.status,
+    wait_ids: tuple[str, ...] = ()
+    if active_waits:
+        wait_result = cancel_active_wait_records_for_run(
+            transaction,
+            run_id=run.run_id,
+            updated_event_id=cancel_request_event.event_id,
+            updated_event_sequence=cancel_request_event.event_sequence,
+            updated_at=terminal_at,
+            terminal_at=terminal_at,
         )
+        if wait_result.status != StateMutationStatus.UPDATED:
+            _raise_after_event_append_mutation_failure(
+                mutation_name="cancel active wait records",
+                status=wait_result.status,
+            )
+        wait_ids = tuple(row.wait_id for row in wait_result.rows)
     run_cancelled_event = event_log_store.append_event(
         transaction,
         _waiting_run_cancelled_event_request(
@@ -2329,7 +2332,7 @@ def cancel_waiting_run_in_transaction(
             run=run,
             attempt=attempt,
             cancel_request_event_id=cancel_request_event.event_id,
-            wait_ids=tuple(row.wait_id for row in wait_result.rows),
+            wait_ids=wait_ids,
         ),
     ).row
     run_result = cancel_waiting_run_row(

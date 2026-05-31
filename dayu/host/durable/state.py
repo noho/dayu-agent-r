@@ -2495,7 +2495,11 @@ def cancel_queued_run_row(
           terminal_event_sequence = ?,
           updated_at = ?,
           terminal_at = ?
-        WHERE run_id = ? AND status = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
         """,
         (
             serialize_run_status(RunStatus.CANCELLED),
@@ -2557,6 +2561,9 @@ def cancel_running_run_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
         """,
         (
             serialize_run_status(RunStatus.CANCELLED),

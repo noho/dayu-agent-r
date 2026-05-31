@@ -28,6 +28,7 @@ from dayu.runtime.config_loader import (
     RunnerOptionHintConfig,
     ToolTruncationPolicyConfig,
 )
+from dayu.runtime._agent_policy_constants import AGENT_FALLBACK_MODES
 from dayu.runtime.scene_prepare import (
     SceneAgentFallbackMode,
     SceneAgentPolicyOverride,
@@ -67,9 +68,6 @@ _AGENT_POLICY_OVERRIDE_FIELDS: Final[frozenset[str]] = frozenset(
 )
 _MODEL_HINT_OVERRIDE_FIELDS: Final[frozenset[str]] = frozenset(
     {_FIELD_MODEL_ID, _FIELD_RUNNER_OPTION_HINT_ID}
-)
-_FALLBACK_MODES: Final[frozenset[str]] = frozenset(
-    mode.value for mode in SceneAgentFallbackMode
 )
 _CONTEXT_WINDOW_CLASS_256K: Final[str] = "256k"
 _CONTEXT_WINDOW_1M_MIN_TOKENS: Final[int] = 1_000_000
@@ -420,7 +418,7 @@ def parse_agent_policy_override_config(
         field_name=_FIELD_FALLBACK_MODE,
         context=source_name,
     )
-    if fallback_mode is not None and fallback_mode not in _FALLBACK_MODES:
+    if fallback_mode is not None and fallback_mode not in AGENT_FALLBACK_MODES:
         raise RuntimeAssemblyFieldError(
             f"{source_name}.{_FIELD_FALLBACK_MODE} has unsupported value: "
             f"{fallback_mode}"
@@ -931,7 +929,7 @@ def _validate_fallback_mode(value: str, *, context: str) -> None:
     :raises RuntimeAssemblyFieldError: 值不属于支持集合时抛出。
     """
 
-    if value not in _FALLBACK_MODES:
+    if value not in AGENT_FALLBACK_MODES:
         raise RuntimeAssemblyFieldError(f"{context} has unsupported value: {value}")
 
 

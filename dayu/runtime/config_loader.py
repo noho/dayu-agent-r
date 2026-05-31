@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Final, TypeAlias, cast
 
 from dayu.contracts import JsonValue, ToolBundleSourceKind
+from dayu.runtime._agent_policy_constants import AGENT_FALLBACK_MODES
 
 _MODELS_FILE: Final[str] = "models.json"
 _EXECUTION_PROFILES_FILE: Final[str] = "execution_profiles.json"
@@ -48,9 +49,6 @@ _FORBIDDEN_RECORD_ID_FIELDS: Final[frozenset[str]] = frozenset(
         "execution_profile_id",
         "provider_id",
     }
-)
-_AGENT_FALLBACK_MODES: Final[frozenset[str]] = frozenset(
-    {"force_answer", "raise_error"}
 )
 _EXECUTION_PROFILE_CONTEXT_WINDOW_CLASSES: Final[frozenset[str]] = frozenset(
     {"256k", "1m"}
@@ -1598,7 +1596,7 @@ def _parse_agent_policy(
         context=context,
     )
     fallback_mode = _require_str_field(record, field_name="fallback_mode", context=context)
-    if fallback_mode not in _AGENT_FALLBACK_MODES:
+    if fallback_mode not in AGENT_FALLBACK_MODES:
         raise ConfigFieldError(f"{context}.fallback_mode has unsupported value: {fallback_mode}")
     return AgentPolicyConfig(
         max_iterations=_require_positive_int_field(record, field_name="max_iterations", context=context),
