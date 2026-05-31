@@ -120,12 +120,12 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | implementation status | accepted-slice-committed |
 | active work unit | WU-AUDIT-01 |
 | default next work unit | WU-AUDIT-01 |
-| next entry point | aggregate deepreview：review 当前 branch 相对 main 的完整 diff |
+| next entry point | accepted deepreview checkpoint：记录 aggregate review 裁决后进入 ready-to-open-draft-PR |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
 | implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74 |
 | review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-code-review-mimo-20260531.md；docs/reviews/wu-audit-01-code-review-ds-20260531.md；docs/reviews/wu-audit-01-code-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-code-rereview-ds-20260531.md；docs/reviews/wu-audit-01-code-controller-adjudication-20260531.md |
-| aggregate review artifacts | none |
+| aggregate review artifacts | docs/reviews/wu-audit-01-aggregate-deepreview-mimo-20260531.md；docs/reviews/wu-audit-01-aggregate-deepreview-ds-20260531.md；docs/reviews/wu-audit-01-aggregate-controller-adjudication-20260531.md |
 | draft PR status | not-started |
 | blocking open questions | none |
 
@@ -170,6 +170,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|---|---|---|---|---|
 | RR-AUDIT-01 | WU-AUDIT-01 implementation | slice boundary | closed | WU-AUDIT-01 integrated implementation | code review 验证 integrated diff | 原 Slice 1 单独移除 durable audit recorder 会导致 `command.py` 旧调用触发 pyright / purge tests 失败；controller 已裁决合并最小 audit 闭环实现，不保留半成品切片。 |
 | RR-AUDIT-02 | WU-AUDIT-01 implementation | docs sync | closed | WU-AUDIT-01 current gate | none | `dayu/host/README.md` 已同步 purge_started / purge_completed / purge_failed 语义，`tests/README.md` 已同步测试覆盖描述；code re-review confirmed no old terminology remains in README scope. |
+| RR-AUDIT-03 | WU-AUDIT-01 aggregate deepreview | accepted residual behavior | closed | WU-AUDIT-01 current gate | none | completed append 失败后如果调用方不 retry，JSONL 会只有 started；SQLite tombstone 仍是真源，测试已覆盖同 key retry 补写 completed。 |
+| RR-AUDIT-04 | WU-AUDIT-01 aggregate deepreview | accepted residual behavior | closed | WU-AUDIT-01 current gate | none | `purge_failed` append 也是 best-effort；若失败则只留下 started，但 completed-only mark 语义保证不会误报 purge completed。 |
 
 ## 当前 Work Units
 
