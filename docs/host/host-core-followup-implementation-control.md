@@ -123,7 +123,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | WU-RUNTIME-01 implementation handoff：按 accepted plan 执行 Slice 1 / Slice 2，禁止扩大为 stale lock、async wrapper、durable lease 或 Host recovery |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md |
-| implementation commits | accepted plan: pending local commit |
+| implementation commits | accepted plan: 929d01c |
 | review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md |
 | aggregate review artifacts | pending |
 | draft PR status | not opened |
