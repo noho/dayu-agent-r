@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | draft-PR-pass |
-| active work unit | WU-AUDIT-01 |
-| default next work unit | WU-AUDIT-01 |
-| next entry point | draft-PR-pass：等待用户后续授权 merge / mark ready / request reviewers 或继续其它 work unit |
+| implementation status | current work unit completed：WU-AUDIT-01 |
+| active work unit | none selected |
+| default next work unit | WU-STRESS-01 |
+| next entry point | PR merge 后进入 discussion：确认 WU-STRESS-01 或由用户指定其它 work unit；随后进入代码核对 / plan / implementation / review |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
 | implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74；accepted deepreview: 4487262；accepted PR review: b8c7866 |
