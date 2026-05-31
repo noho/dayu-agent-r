@@ -123,7 +123,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | draft-PR-pass：等待用户后续授权 merge / mark ready / request reviewers 或继续其它 work unit |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
-| implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74；accepted deepreview: 4487262 |
+| implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74；accepted deepreview: 4487262；accepted PR review: b8c7866 |
 | review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-code-review-mimo-20260531.md；docs/reviews/wu-audit-01-code-review-ds-20260531.md；docs/reviews/wu-audit-01-code-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-code-rereview-ds-20260531.md；docs/reviews/wu-audit-01-code-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-pr-review-mimo-20260531.md；docs/reviews/wu-audit-01-pr-review-ds-20260531.md；docs/reviews/wu-audit-01-pr-review-controller-adjudication-20260531.md |
 | aggregate review artifacts | docs/reviews/wu-audit-01-aggregate-deepreview-mimo-20260531.md；docs/reviews/wu-audit-01-aggregate-deepreview-ds-20260531.md；docs/reviews/wu-audit-01-aggregate-controller-adjudication-20260531.md |
 | draft PR status | draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/99 |
