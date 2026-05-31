@@ -257,7 +257,6 @@ RuntimeFileLockOptions
 RuntimeFileLockToken
   lock_path: Path
   release() -> None
-  released: bool
 
 RuntimeFileLock
   acquire(timeout_seconds?: float) -> RuntimeFileLockToken
@@ -289,7 +288,8 @@ Stale lock / reentrancy / release：
 - 第一版不实现 stale lock 探测、锁文件删除、owner pid 解析、跨进程 owner takeover 或强制 break lock。发现疑似 stale lock 时只能 timeout / error，由调用方或运维路径处理。
 - lock marker 文件只属于第三方文件锁实现细节和普通文件互斥可见痕迹，不是 Host 治理真源。Host 不得用 marker 文件存在性判断 Run / Attempt owner、worker liveness、lease / fencing、EventLog ordering、recovery 或 takeover 条件；这些事实只能来自 Host durable store、EventLog、状态索引和事务。
 - wrapper 不承诺 reentrant lock 语义是设计意图，不是待补能力。调用方不得依赖同一线程 / 同一进程 / 同一 `RuntimeFileLock` 实例重复 acquire 的成功、失败、计数或 token 复用行为；测试不应断言第三方库的 reentrant 细节。
-- `RuntimeFileLockToken.release()` 必须幂等；重复 release 不得抛出误导性错误，也不得释放其它 token。
+- `RuntimeFileLockToken` 只暴露 `lock_path` 与 `release()`，不暴露 release 状态；它只是把 release 调用路由到本次获取的第三方 lock，不是 Host truth、lease 证明或 wrapper lifecycle truth。
+- `RuntimeFileLockToken.release()` 在第三方 release 成功后必须幂等；重复 release 不得抛出误导性错误，也不得释放其它 token。第三方 release 失败时不得把 token 标记为成功 release，后续调用必须仍能再次尝试底层 release。
 - context manager 退出必须 release；异常路径也必须 release。
 
 第三方依赖边界：
