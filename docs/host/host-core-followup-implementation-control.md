@@ -168,10 +168,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| RR-AUDIT-01 | WU-AUDIT-01 implementation | slice boundary | closed | WU-AUDIT-01 integrated implementation | code review 验证 integrated diff | 原 Slice 1 单独移除 durable audit recorder 会导致 `command.py` 旧调用触发 pyright / purge tests 失败；controller 已裁决合并最小 audit 闭环实现，不保留半成品切片。 |
-| RR-AUDIT-02 | WU-AUDIT-01 implementation | docs sync | closed | WU-AUDIT-01 current gate | none | `dayu/host/README.md` 已同步 purge_started / purge_completed / purge_failed 语义，`tests/README.md` 已同步测试覆盖描述；code re-review confirmed no old terminology remains in README scope. |
-| RR-AUDIT-03 | WU-AUDIT-01 aggregate deepreview | accepted residual behavior | closed | WU-AUDIT-01 current gate | none | completed append 失败后如果调用方不 retry，JSONL 会只有 started；SQLite tombstone 仍是真源，测试已覆盖同 key retry 补写 completed。 |
-| RR-AUDIT-04 | WU-AUDIT-01 aggregate deepreview | accepted residual behavior | closed | WU-AUDIT-01 current gate | none | `purge_failed` append 也是 best-effort；若失败则只留下 started，但 completed-only mark 语义保证不会误报 purge completed。 |
+| none | - | - | closed | - | - | 当前没有未分配 residual risk 或遗留问题。 |
 
 ## 当前 Work Units
 
