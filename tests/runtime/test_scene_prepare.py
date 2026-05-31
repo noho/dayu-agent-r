@@ -10,8 +10,10 @@ from typing import cast
 import pytest
 
 from dayu.contracts import JsonValue
+import dayu.runtime.scene_prepare as scene_prepare_module
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
+    SceneFragmentRef,
     ScenePrepareError,
     ScenePrepareRequest,
     SceneSourceKind,
@@ -19,6 +21,25 @@ from dayu.runtime.scene_prepare import (
     SceneToolInfo,
     prepare_scene,
 )
+
+
+def test_scene_fragment_ref_is_public_export() -> None:
+    """PreparedSceneInputs.fragment_refs 依赖的类型必须在 __all__ 中公开。"""
+
+    assert "SceneFragmentRef" in scene_prepare_module.__all__
+    assert SceneFragmentRef.__name__ == "SceneFragmentRef"
+
+
+def test_require_json_object_rejects_non_string_keys() -> None:
+    """scene JSON object 校验必须拒绝 Python runtime 传入的非字符串 key。"""
+
+    invalid_mapping = cast(JsonValue, {1: "value"})
+
+    with pytest.raises(ScenePrepareError, match="keys must be string"):
+        scene_prepare_module._require_json_object(
+            invalid_mapping,
+            context="scene",
+        )
 
 
 def _write_json(path: Path, value: JsonValue) -> None:
@@ -119,11 +140,7 @@ def _manifest(
         "description": f"{scene_id} test scene",
         "capability_tags": [] if capability_tags is None else capability_tags,
         "extends": [] if extends is None else extends,
-        "model": (
-            None
-            if model_is_null
-            else {"default_model_id": "analyst-model"} if model is None else model
-        ),
+        "model": (None if model_is_null else {"default_model_id": "analyst-model"} if model is None else model),
         "agent_policy": agent_policy,
         "tool_selection": (
             {"mode": "all", "tool_names": [], "tool_tags_any": [], "allow_empty": False}
@@ -222,9 +239,7 @@ def test_single_scene_assembly_outputs_stable_refs_and_digest(tmp_path: Path) ->
         "你是Dayu Corp财报分析员。",
         "分析Dayu Corp在2026年的收入。",
     )
-    assert result.system_prompt == (
-        "你是Dayu Corp财报分析员。\n\n分析Dayu Corp在2026年的收入。"
-    )
+    assert result.system_prompt == ("你是Dayu Corp财报分析员。\n\n分析Dayu Corp在2026年的收入。")
     assert tuple(ref.fragment_id for ref in result.fragment_refs) == ("base", "detail")
     assert tuple(ref.relative_path for ref in result.fragment_refs) == (
         "base.md",

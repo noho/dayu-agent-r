@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import dayu.host.compaction_operation as compaction_operation
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compact_material import (
@@ -19,6 +20,8 @@ from dayu.host.compact_material import (
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactSegmentTrigger,
+    CompactQualityCheckResult,
+    CompactQualityIssue,
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
@@ -79,9 +82,7 @@ class _FailOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """执行可重试 proposal。
 
         :param request: compaction request。
@@ -99,9 +100,7 @@ class _FailOnceCompactor(ContextCompactor):
 class _AlwaysFailingCompactor(ContextCompactor):
     """始终 proposal 失败的 compactor。"""
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """模拟 proposal failure。
 
         :param request: compaction request。
@@ -118,9 +117,7 @@ class _AlwaysFailingCompactor(ContextCompactor):
 class _SensitiveFailingCompactor(ContextCompactor):
     """始终抛出带敏感字段的 proposal 异常。"""
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """模拟 provider 错误消息携带 secret。
 
         :param request: compaction request。
@@ -132,8 +129,7 @@ class _SensitiveFailingCompactor(ContextCompactor):
         del request
         del cancellation_token
         raise RuntimeError(
-            "provider failed Bearer secret-token "
-            "api_key=plain-secret token=token-secret secret=raw-secret"
+            "provider failed Bearer secret-token " "api_key=plain-secret token=token-secret secret=raw-secret"
         )
 
 
@@ -150,9 +146,7 @@ class _CancelAfterFailureCompactor(ContextCompactor):
         self.calls = 0
         self._token = token
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """首次 proposal 失败并在重试前请求取消。
 
         :param request: compaction request。
@@ -180,9 +174,7 @@ class _QualityRejectOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """返回可修复 quality rejection 后的成功 candidate。
 
         :param request: compaction request。
@@ -209,9 +201,7 @@ class _HardThresholdOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """返回 hard-threshold rejection 后的成功 candidate。
 
         :param request: compaction request。
@@ -224,9 +214,7 @@ class _HardThresholdOnceCompactor(ContextCompactor):
         if self.calls == 1:
             return replace(
                 candidate,
-                budget_after_compact=(
-                    request.budget_before_compact.hard_threshold_tokens
-                ),
+                budget_after_compact=(request.budget_before_compact.hard_threshold_tokens),
             )
         return candidate
 
@@ -243,9 +231,7 @@ class _RecordingCompactor(ContextCompactor):
         self.requests: list[CompactionRequest] = []
         self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """记录 request 并返回 fake candidate。
 
         :param request: compaction request。
@@ -269,9 +255,7 @@ class _NoPreservedFactPassCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """返回已通过质量闸门但未声明 preserved fact refs 的候选。
 
         :param request: compaction request。
@@ -300,9 +284,7 @@ class _SecondPassFailingCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """第二次调用抛出 proposal failure。
 
         :param request: compaction request。
@@ -329,9 +311,7 @@ class _DistinctPassCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """返回带 pass 差异的 accepted candidate。
 
         :param request: compaction request。
@@ -449,10 +429,7 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
     assert compactor.calls == 2
     assert result.accepted_candidate is not None
     assert len(result.rejected_attempts) == 1
-    assert (
-        result.rejected_attempts[0].failure_category
-        == "hard_threshold_after_compact"
-    )
+    assert result.rejected_attempts[0].failure_category == "hard_threshold_after_compact"
     assert result.rejected_attempts[0].repairable is True
     assert result.failure_reason is None
 
@@ -562,9 +539,7 @@ async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> 
     assert len(compactor.requests) == 2
     assert result.accepted_candidate is not None
     assert result.accepted_candidate.candidate_id.startswith("merged:")
-    assert result.accepted_candidate.preserved_material_source_refs == (
-        request.material_source_refs
-    )
+    assert result.accepted_candidate.preserved_material_source_refs == (request.material_source_refs)
     assert result.failure_reason is None
 
 
@@ -584,9 +559,7 @@ async def test_reactive_multi_pass_merges_only_candidate_preserved_refs() -> Non
     )
 
     assert result.accepted_candidate is not None
-    assert result.accepted_candidate.preserved_canonical_evidence_refs == (
-        request.canonical_evidence_refs
-    )
+    assert result.accepted_candidate.preserved_canonical_evidence_refs == (request.canonical_evidence_refs)
     assert result.accepted_candidate.preserved_evidence_backed_fact_refs == ()
     assert result.failure_reason is None
 
@@ -642,6 +615,71 @@ async def test_reactive_multi_pass_merges_distinct_summary_and_patch() -> None:
         "pass-evidence:1",
         "pass-evidence:2",
     )
+
+
+@pytest.mark.asyncio
+async def test_multi_pass_merge_quality_reject_records_rejected_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """merge-level quality reject 必须写入 rejected_attempts 供诊断。"""
+
+    checks = 0
+
+    def fake_check(request: CompactionRequest, candidate: CompactionCandidate) -> CompactQualityCheckResult:
+        """前两个 pass 放行，merge 后拒绝。
+
+        :param request: compaction request。
+        :param candidate: compaction candidate。
+        :returns: quality check fake result。
+        """
+
+        nonlocal checks
+        del request, candidate
+        checks += 1
+        if checks < 3:
+            return CompactQualityCheckResult(
+                accepted=True,
+                rejection_reasons=(),
+                current_user_input_retained=True,
+                canonical_evidence_refs_retained=True,
+                evidence_backed_fact_candidates_accepted=True,
+                minimum_preserve_items_accepted=True,
+                evidence_anchors_retained=True,
+                open_questions_retained=True,
+                retained_canonical_evidence_refs=(),
+                dropped_ranges=(),
+                summarized_ranges=(),
+            )
+        return CompactQualityCheckResult(
+            accepted=False,
+            rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
+            current_user_input_retained=False,
+            canonical_evidence_refs_retained=True,
+            evidence_backed_fact_candidates_accepted=True,
+            minimum_preserve_items_accepted=True,
+            evidence_anchors_retained=True,
+            open_questions_retained=True,
+            retained_canonical_evidence_refs=(),
+            dropped_ranges=(),
+            summarized_ranges=(),
+        )
+
+    monkeypatch.setattr(compaction_operation, "check_compaction_candidate", fake_check)
+    request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
+
+    result = await run_compaction_operation(
+        request=request,
+        compactor=_RecordingCompactor(),
+        max_attempts=2,
+        cancellation_token=StubCancellationToken(),
+        pass_queue=(request, request),
+    )
+
+    assert result.accepted_candidate is None
+    assert result.failure_reason == "quality_check_rejected"
+    assert len(result.rejected_attempts) == 1
+    assert result.rejected_attempts[0].failure_category == "quality_check_rejected"
+    assert result.rejected_attempts[0].repairable is False
 
 
 @pytest.mark.asyncio
@@ -713,9 +751,7 @@ def test_selected_compaction_request_evidence_inputs_read_only_selected_refs(
                     payload={
                         "accepted_evidence_envelope": (
                             accepted_evidence_envelope_to_json_value(
-                                _accepted_evidence_envelope_for_event(
-                                    inside_event_id
-                                )
+                                _accepted_evidence_envelope_for_event(inside_event_id)
                             )
                         ),
                         "raw_tool_outcome": _raw_tool_outcome(inside_event_id),
@@ -741,9 +777,7 @@ def test_selected_compaction_request_evidence_inputs_read_only_selected_refs(
                     payload={
                         "accepted_evidence_envelope": (
                             accepted_evidence_envelope_to_json_value(
-                                _accepted_evidence_envelope_for_event(
-                                    outside_event_id
-                                )
+                                _accepted_evidence_envelope_for_event(outside_event_id)
                             )
                         ),
                         "raw_tool_outcome": _raw_tool_outcome(outside_event_id),
@@ -760,9 +794,7 @@ def test_selected_compaction_request_evidence_inputs_read_only_selected_refs(
                     payload={
                         "accepted_evidence_envelope": (
                             accepted_evidence_envelope_to_json_value(
-                                _accepted_evidence_envelope_for_event(
-                                    other_session_event_id
-                                )
+                                _accepted_evidence_envelope_for_event(other_session_event_id)
                             )
                         ),
                         "raw_tool_outcome": _raw_tool_outcome(other_session_event_id),
@@ -793,10 +825,7 @@ def test_selected_compaction_request_evidence_inputs_read_only_selected_refs(
                 ),
             )
             return (
-                tuple(
-                    material.accepted_evidence_id
-                    for material in inputs.evidence_materials
-                ),
+                tuple(material.accepted_evidence_id for material in inputs.evidence_materials),
                 tuple(
                     (
                         item.tool_result_event_ref,
@@ -809,18 +838,18 @@ def test_selected_compaction_request_evidence_inputs_read_only_selected_refs(
 
         assert store.transaction_runner.run_read(read_inputs) == (
             ("evidence:event-tool-result-inside",),
+            (
                 (
+                    "event-tool-result-inside",
                     (
-                        "event-tool-result-inside",
-                        (
-                            '{"kind":"completed","result":{"meta":null,"ok":true,'
-                            '"value":{"content":"raw content event-tool-result-inside",'
-                            '"event_id":"event-tool-result-inside"}}}'
-                        ),
-                        ("evidence:event-tool-result-inside",),
+                        '{"kind":"completed","result":{"meta":null,"ok":true,'
+                        '"value":{"content":"raw content event-tool-result-inside",'
+                        '"event_id":"event-tool-result-inside"}}}'
                     ),
+                    ("evidence:event-tool-result-inside",),
                 ),
-            )
+            ),
+        )
 
 
 def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
@@ -935,9 +964,7 @@ def test_missing_or_digest_mismatch_raw_evidence_fails_closed(
                     payload={
                         "accepted_evidence_envelope": (
                             accepted_evidence_envelope_to_json_value(
-                                _accepted_evidence_envelope_for_event(
-                                    missing_raw_event_id
-                                )
+                                _accepted_evidence_envelope_for_event(missing_raw_event_id)
                             )
                         )
                     },
@@ -1041,12 +1068,15 @@ def test_selected_compaction_request_evidence_inputs_allow_empty_without_envelop
             payload={"tool_name": "legacy-free"},
         )
 
-        assert _collect_selected_evidence_ids(
-            store,
-            event_log,
-            session_id=session_id,
-            event_id=event_id,
-        ) == ()
+        assert (
+            _collect_selected_evidence_ids(
+                store,
+                event_log,
+                session_id=session_id,
+                event_id=event_id,
+            )
+            == ()
+        )
 
 
 def test_compaction_request_evidence_inputs_reject_malformed_envelope(
@@ -1227,9 +1257,7 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
                     payload={
                         "accepted_evidence_envelope": (
                             accepted_evidence_envelope_to_json_value(
-                                _accepted_evidence_envelope_for_event(
-                                    first_event_id
-                                )
+                                _accepted_evidence_envelope_for_event(first_event_id)
                             )
                         ),
                         "raw_tool_outcome": _raw_tool_outcome(first_event_id),
@@ -1262,11 +1290,7 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
                     session_id=session_id,
                     event_type="TOOL_RESULT_ACCEPTED",
                     payload={
-                        "accepted_evidence_envelope": (
-                            accepted_evidence_envelope_to_json_value(
-                                duplicate_envelope
-                            )
-                        ),
+                        "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(duplicate_envelope)),
                         "raw_tool_outcome": _raw_tool_outcome(second_event_id),
                     },
                 ),
@@ -1296,14 +1320,9 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
                     ),
                 ),
             )
-            return tuple(
-                material.accepted_evidence_id
-                for material in inputs.evidence_materials
-            )
+            return tuple(material.accepted_evidence_id for material in inputs.evidence_materials)
 
-        assert store.transaction_runner.run_read(read_inputs) == (
-            "evidence:event-tool-result-duplicate-first",
-        )
+        assert store.transaction_runner.run_read(read_inputs) == ("evidence:event-tool-result-duplicate-first",)
 
 
 def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
@@ -1375,9 +1394,7 @@ def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
             event_type="CONTEXT_COMPACTED",
             payload={
                 "preserved_fact_refs": {
-                    "evidence_backed_fact_refs": (
-                        ["memory-item:evidence_backed_fact:existing:event-old"]
-                    )
+                    "evidence_backed_fact_refs": (["memory-item:evidence_backed_fact:existing:event-old"])
                 },
                 "evidence_backed_fact_candidates": [
                     {"candidate_id": "fact-new"},
@@ -1399,9 +1416,7 @@ def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
 
 def _request(
     *,
-    trigger_source: ContextCompactionTriggerSource = (
-        ContextCompactionTriggerSource.PROACTIVE
-    ),
+    trigger_source: ContextCompactionTriggerSource = (ContextCompactionTriggerSource.PROACTIVE),
 ) -> CompactionRequest:
     """构造标准 compaction request。
 
@@ -1419,11 +1434,7 @@ def _request(
         memory_snapshot_cursor=7,
         material_pack=_material_pack(),
         segment_selection=initial_segment_selection(
-            trigger_source=(
-                CompactSegmentTrigger.REACTIVE
-                if is_reactive
-                else CompactSegmentTrigger.PROACTIVE
-            ),
+            trigger_source=(CompactSegmentTrigger.REACTIVE if is_reactive else CompactSegmentTrigger.PROACTIVE),
             input_cursor=2,
             material_pack=_material_pack(),
         ),
@@ -1658,9 +1669,7 @@ def _collect_selected_evidence_ids(
                 ),
             ),
         )
-        return tuple(
-            material.accepted_evidence_id for material in inputs.evidence_materials
-        )
+        return tuple(material.accepted_evidence_id for material in inputs.evidence_materials)
 
     return store.transaction_runner.run_read(read_inputs)
 

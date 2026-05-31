@@ -69,9 +69,7 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderSpec,
 )
 
-_ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}"
-)
+_ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
 _COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT: Final[int] = 1
 
@@ -228,9 +226,7 @@ def discover_service_tools(config: RuntimeConfig) -> ServiceDiscoveredTools:
     :raises Exception: ``ToolsDiscovery`` provider 失败时向上抛出。
     """
 
-    discovery_result = ToolsDiscovery().discover(
-        _tool_discovery_specs(tuple(config.tool_discovery.providers.values()))
-    )
+    discovery_result = ToolsDiscovery().discover(_tool_discovery_specs(tuple(config.tool_discovery.providers.values())))
     return ServiceDiscoveredTools(
         tool_bundle=discovery_result.tool_bundle,
         source_refs=discovery_result.source_refs,
@@ -267,9 +263,7 @@ def compose_open_host_options(
         request.overrides.execution_profile_id,
     )
     host_runtime = config.host_runtime.runtimes[host_runtime_id]
-    execution_profile = config.execution_profiles.execution_profiles[
-        execution_profile_id
-    ]
+    execution_profile = config.execution_profiles.execution_profiles[execution_profile_id]
     lane = config.runtime_lanes.lanes[host_runtime.host_execution_lane_name]
     effective_tool_bundle = _tool_bundle_with_effective_truncation(
         tool_bundle=request.discovered_tools.tool_bundle,
@@ -297,9 +291,7 @@ def compose_open_host_options(
         models=config.models,
         execution_baseline=ExecutionBaselineConfig(
             model_id=execution_profile.compactor_baseline.model_id,
-            runner_option_hint_id=(
-                execution_profile.compactor_baseline.runner_option_hint_id
-            ),
+            runner_option_hint_id=(execution_profile.compactor_baseline.runner_option_hint_id),
         ),
         scene_model_hints=None,
         run_override=None,
@@ -314,9 +306,7 @@ def compose_open_host_options(
         model=compactor_selection.model,
     )
     agent_policy_config = merge_agent_policy_config(
-        code_default=_agent_policy_defaults_from_config(
-            execution_profile.agent_policy
-        ),
+        code_default=_agent_policy_defaults_from_config(execution_profile.agent_policy),
         execution_profile=execution_profile.agent_policy,
         scene_override=request.scene_inputs.agent_policy_override,
         run_override=None,
@@ -438,15 +428,9 @@ def _compose_options(
         create_parent_dirs=True,
         sqlite_busy_timeout_seconds=host_runtime.sqlite.busy_timeout_seconds,
         sqlite_write_busy_retry_count=host_runtime.sqlite.write_busy_retry_count,
-        sqlite_write_retry_initial_delay_seconds=(
-            host_runtime.sqlite.write_retry_initial_delay_seconds
-        ),
-        sqlite_write_retry_backoff_multiplier=(
-            host_runtime.sqlite.write_retry_backoff_multiplier
-        ),
-        sqlite_write_retry_max_delay_seconds=(
-            host_runtime.sqlite.write_retry_max_delay_seconds
-        ),
+        sqlite_write_retry_initial_delay_seconds=(host_runtime.sqlite.write_retry_initial_delay_seconds),
+        sqlite_write_retry_backoff_multiplier=(host_runtime.sqlite.write_retry_backoff_multiplier),
+        sqlite_write_retry_max_delay_seconds=(host_runtime.sqlite.write_retry_max_delay_seconds),
         payload_inline_threshold_bytes=host_runtime.payload_inline_threshold_bytes,
         lane_db_path=_resolve_project_path(
             request.workspace_root,
@@ -464,9 +448,7 @@ def _compose_options(
                 model=ordinary_selection.model,
                 env=request.env,
             ),
-            runner_options=_runner_options_from_hint(
-                ordinary_selection.runner_option_hint
-            ),
+            runner_options=_runner_options_from_hint(ordinary_selection.runner_option_hint),
             agent_policy=_agent_policy_from_merged(agent_policy_config),
         ),
         worker_factory=DefaultLocalEngineWorkerFactory(),
@@ -476,18 +458,12 @@ def _compose_options(
         ),
         context_budget_policy=default_context_budget_policy(
             context_window_size=ordinary_selection.model.context_window_tokens,
-            soft_threshold_context_ratio=(
-                execution_profile.context_budget_policy.soft_threshold_context_ratio
-            ),
-            hard_threshold_context_ratio=(
-                execution_profile.context_budget_policy.hard_threshold_context_ratio
-            ),
+            soft_threshold_context_ratio=(execution_profile.context_budget_policy.soft_threshold_context_ratio),
+            hard_threshold_context_ratio=(execution_profile.context_budget_policy.hard_threshold_context_ratio),
             max_proactive_compactions_per_run=(
                 execution_profile.context_budget_policy.max_proactive_compactions_per_run
             ),
-            max_reactive_compactions_per_run=(
-                execution_profile.context_budget_policy.max_reactive_compactions_per_run
-            ),
+            max_reactive_compactions_per_run=(execution_profile.context_budget_policy.max_reactive_compactions_per_run),
             max_compaction_attempts_per_operation=(
                 execution_profile.context_budget_policy.max_compaction_attempts_per_operation
             ),
@@ -498,9 +474,7 @@ def _compose_options(
                 model=compactor_selection.model,
                 env=request.env,
             ),
-            compactor_runner_options=_runner_options_from_hint(
-                compactor_selection.runner_option_hint
-            ),
+            compactor_runner_options=_runner_options_from_hint(compactor_selection.runner_option_hint),
             compactor_agent_policy=compactor_prompts.agent_policy,
             compactor_system_prompt=compactor_prompts.system_prompt,
             compactor_user_prompt_template=compactor_prompts.user_prompt_template,
@@ -514,12 +488,8 @@ def _compose_options(
             execution_profile=execution_profile,
             context_window_size=ordinary_selection.model.context_window_tokens,
         ),
-        memory_projection_catchup_batch_size=(
-            host_runtime.memory_projection_catch_up_batch_size
-        ),
-        enable_truncation_manager=(
-            execution_profile.tool_truncation_policy.enabled
-        ),
+        memory_projection_catchup_batch_size=(host_runtime.memory_projection_catch_up_batch_size),
+        enable_truncation_manager=(execution_profile.tool_truncation_policy.enabled),
     )
 
 
@@ -542,9 +512,7 @@ def _prepare_compactor_scene_inputs(
             scene_manifest_root=request.locations.scene_manifest_root,
             prompt_asset_root=request.locations.prompt_asset_root,
             context_slot_values={},
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                request.discovered_tools.tool_bundle
-            ),
+            available_tools=SceneToolCatalog.from_tool_bundle(request.discovered_tools.tool_bundle),
         )
     )
 
@@ -564,9 +532,7 @@ def _compactor_prompts_from_scene_inputs(
     """
 
     if len(scene_inputs.system_messages) != _COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT:
-        raise ValueError(
-            "compactor scene must provide exactly one system prompt fragment"
-        )
+        raise ValueError("compactor scene must provide exactly one system prompt fragment")
     return _CompactorScenePrompts(
         system_prompt=scene_inputs.system_messages[0],
         user_prompt_template=user_prompt_template,
@@ -654,28 +620,19 @@ def _compactor_agent_policy_from_scene_inputs(
     if override.max_iterations is None:
         raise ValueError("compactor scene agent_policy.max_iterations is required")
     if override.continuation_max_attempts is None:
-        raise ValueError(
-            "compactor scene agent_policy.continuation_max_attempts is required"
-        )
+        raise ValueError("compactor scene agent_policy.continuation_max_attempts is required")
     if override.allow_tool_calls is None:
         raise ValueError("compactor scene agent_policy.allow_tool_calls is required")
     if override.tool_execution_timeout_seconds is None:
-        raise ValueError(
-            "compactor scene agent_policy.tool_execution_timeout_seconds is required"
-        )
+        raise ValueError("compactor scene agent_policy.tool_execution_timeout_seconds is required")
     if override.fallback_mode is None:
         raise ValueError("compactor scene agent_policy.fallback_mode is required")
     if override.fallback_prompt is None:
         raise ValueError("compactor scene agent_policy.fallback_prompt is required")
     if override.continuation_prompt is None:
-        raise ValueError(
-            "compactor scene agent_policy.continuation_prompt is required"
-        )
+        raise ValueError("compactor scene agent_policy.continuation_prompt is required")
     if override.max_consecutive_failed_tool_batches is None:
-        raise ValueError(
-            "compactor scene agent_policy.max_consecutive_failed_tool_batches "
-            "is required"
-        )
+        raise ValueError("compactor scene agent_policy.max_consecutive_failed_tool_batches " "is required")
     return AgentPolicy(
         max_iterations=override.max_iterations,
         continuation_max_attempts=override.continuation_max_attempts,
@@ -684,15 +641,11 @@ def _compactor_agent_policy_from_scene_inputs(
         fallback_mode=_agent_fallback_mode_from_config(override.fallback_mode.value),
         fallback_prompt=override.fallback_prompt,
         continuation_prompt=override.continuation_prompt,
-        max_consecutive_failed_tool_batches=(
-            override.max_consecutive_failed_tool_batches
-        ),
+        max_consecutive_failed_tool_batches=(override.max_consecutive_failed_tool_batches),
     )
 
 
-def _select_host_runtime_id(
-    config: RuntimeConfig, explicit_runtime_id: str | None
-) -> str:
+def _select_host_runtime_id(config: RuntimeConfig, explicit_runtime_id: str | None) -> str:
     """选择 Host runtime id。
 
     :param config: runtime config 总视图。
@@ -701,19 +654,13 @@ def _select_host_runtime_id(
     :raises RuntimeAssemblySelectionError: id 不存在时抛出。
     """
 
-    runtime_id = (
-        explicit_runtime_id
-        if explicit_runtime_id is not None
-        else config.host_runtime.default_host_runtime_id
-    )
+    runtime_id = explicit_runtime_id if explicit_runtime_id is not None else config.host_runtime.default_host_runtime_id
     if runtime_id not in config.host_runtime.runtimes:
         raise RuntimeAssemblySelectionError(f"host runtime not found: {runtime_id}")
     return runtime_id
 
 
-def _select_execution_profile_id(
-    config: RuntimeConfig, explicit_profile_id: str | None
-) -> str:
+def _select_execution_profile_id(config: RuntimeConfig, explicit_profile_id: str | None) -> str:
     """选择 execution profile id。
 
     :param config: runtime config 总视图。
@@ -779,8 +726,7 @@ def _tool_discovery_specs(
             )
         else:
             raise ValueError(
-                "tool discovery provider must declare import_path or entry_point: "
-                f"{provider_config.provider_id}"
+                "tool discovery provider must declare import_path or entry_point: " f"{provider_config.provider_id}"
             )
         specs.append(
             ToolsDiscoveryProviderSpec(
@@ -861,9 +807,7 @@ def _assembly_diagnostics(
     :raises Exception: provider extension DSL 非法时由 helper 抛出。
     """
 
-    truncation_defaults = tool_truncation_policy_defaults(
-        execution_profile.tool_truncation_policy
-    )
+    truncation_defaults = tool_truncation_policy_defaults(execution_profile.tool_truncation_policy)
     return ServiceOpenHostAssemblyDiagnostics(
         config_overlay_dir=locations.config_overlay_dir,
         prompt_asset_root=locations.prompt_asset_root,
@@ -873,9 +817,7 @@ def _assembly_diagnostics(
         model_id=ordinary_selection.model_id,
         model_source=ordinary_selection.diagnostic.selected_model_source,
         runner_option_hint_id=ordinary_selection.runner_option_hint_id,
-        runner_option_hint_source=(
-            ordinary_selection.diagnostic.selected_runner_option_hint_source
-        ),
+        runner_option_hint_source=(ordinary_selection.diagnostic.selected_runner_option_hint_source),
         compactor_model_id=compactor_selection.model_id,
         compactor_runner_option_hint_id=compactor_selection.runner_option_hint_id,
         lane_name=lane.lane_name,
@@ -883,29 +825,19 @@ def _assembly_diagnostics(
         tool_selection=_format_tool_selection(scene_inputs),
         context_budget_policy_ref=execution_profile.context_budget_policy.policy_ref,
         agent_policy_sources=tuple(
-            f"{field_name}:{source}"
-            for field_name, source in sorted(
-                agent_policy_config.field_sources.items()
-            )
+            f"{field_name}:{source}" for field_name, source in sorted(agent_policy_config.field_sources.items())
         ),
         tool_truncation_policy=(
-            "enabled="
-            f"{truncation_defaults.enabled},ttl={truncation_defaults.default_ttl_seconds}"
+            "enabled=" f"{truncation_defaults.enabled},ttl={truncation_defaults.default_ttl_seconds}"
         ),
-        ordinary_provider_extension_status=_provider_extension_status(
-            ordinary_selection.model
-        ),
-        compactor_provider_extension_status=_provider_extension_status(
-            compactor_selection.model
-        ),
+        ordinary_provider_extension_status=_provider_extension_status(ordinary_selection.model),
+        compactor_provider_extension_status=_provider_extension_status(compactor_selection.model),
         ordinary_profile_compatibility=ordinary_profile_compatibility,
         compactor_profile_compatibility=compactor_profile_compatibility,
     )
 
 
-def _runner_spec_from_model(
-    *, model: ModelConfig, env: Mapping[str, str]
-) -> RunnerSpec:
+def _runner_spec_from_model(*, model: ModelConfig, env: Mapping[str, str]) -> RunnerSpec:
     """把 ModelConfig 映射为 Engine RunnerSpec。
 
     :param model: 模型配置。
@@ -930,17 +862,13 @@ def _runner_spec_from_model(
         supports_stream_usage=model.supports_stream_usage,
         default_timeout_seconds=model.default_timeout_seconds,
         max_retries=model.max_retries,
-        provider_request=provider_request_extension_from_json(
-            model.provider_request_extension
-        ),
+        provider_request=provider_request_extension_from_json(model.provider_request_extension),
         stream_idle_timeout_seconds=model.sse_idle_timeout_seconds,
         stream_idle_heartbeat_seconds=model.sse_heartbeat_seconds,
     )
 
 
-def _render_headers(
-    headers: Mapping[str, str], *, api_key_ref: str | None, env: Mapping[str, str]
-) -> dict[str, str]:
+def _render_headers(headers: Mapping[str, str], *, api_key_ref: str | None, env: Mapping[str, str]) -> dict[str, str]:
     """渲染 provider headers 中的环境变量占位符。
 
     :param headers: 配置 headers。
@@ -966,10 +894,7 @@ def _render_headers(
             )
         unresolved = _ENV_PLACEHOLDER_PATTERN.search(rendered_value)
         if unresolved is not None:
-            raise ValueError(
-                "header contains unresolved env placeholder: "
-                f"{name} -> {unresolved.group(1)}"
-            )
+            raise ValueError("header contains unresolved env placeholder: " f"{name} -> {unresolved.group(1)}")
         rendered[name] = rendered_value
     return rendered
 
@@ -1010,9 +935,7 @@ def _agent_policy_defaults_from_config(
         fallback_mode=profile.fallback_mode,
         fallback_prompt=profile.fallback_prompt,
         continuation_prompt=profile.continuation_prompt,
-        max_consecutive_failed_tool_batches=(
-            profile.max_consecutive_failed_tool_batches
-        ),
+        max_consecutive_failed_tool_batches=(profile.max_consecutive_failed_tool_batches),
     )
 
 
@@ -1032,9 +955,7 @@ def _agent_policy_from_merged(config: MergedAgentPolicyConfig) -> AgentPolicy:
         fallback_mode=_agent_fallback_mode_from_config(config.fallback_mode),
         fallback_prompt=config.fallback_prompt,
         continuation_prompt=config.continuation_prompt,
-        max_consecutive_failed_tool_batches=(
-            config.max_consecutive_failed_tool_batches
-        ),
+        max_consecutive_failed_tool_batches=(config.max_consecutive_failed_tool_batches),
     )
 
 
@@ -1088,7 +1009,7 @@ def _tooling_options_from_discovery(
 
     :param tool_bundle: 已发现业务工具 bundle。
     :param source_refs: 工具来源引用。
-    :returns: HostToolingOptions。
+    :returns: HostToolingOptions；没有业务工具时为 ``None``。
     :raises ValueError: source refs 缺失但工具非空时抛出。
     """
 
@@ -1103,9 +1024,7 @@ def _tooling_options_from_discovery(
     )
 
 
-def _resolve_project_path(
-    workspace_root: pathlib.Path, configured_path: str
-) -> pathlib.Path:
+def _resolve_project_path(workspace_root: pathlib.Path, configured_path: str) -> pathlib.Path:
     """把配置路径解析为 workspace-root 相对路径或绝对路径。
 
     :param workspace_root: workspace / 项目根目录。
@@ -1134,9 +1053,7 @@ def _provider_extension_status(model: ModelConfig) -> str:
     :raises Exception: provider extension DSL 非法时由 helper 抛出。
     """
 
-    extension = provider_request_extension_from_json(
-        model.provider_request_extension
-    )
+    extension = provider_request_extension_from_json(model.provider_request_extension)
     if extension is None:
         return f"model={model.model_id}:none"
     return f"model={model.model_id}:ok:{type(extension).__name__}"
@@ -1178,10 +1095,7 @@ def _format_provider_report(
 
     names = "-" if not tool_names else ",".join(tool_names)
     version = "-" if version_ref is None else version_ref
-    return (
-        f"provider={provider_id},spec={spec_id},"
-        f"version={version},tools={names}"
-    )
+    return f"provider={provider_id},spec={spec_id}," f"version={version},tools={names}"
 
 
 def _require_optional_non_empty_text(value: str | None, *, field_name: str) -> None:

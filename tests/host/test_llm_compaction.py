@@ -33,7 +33,11 @@ from dayu.host.compaction import (
     MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
     MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
 )
-from dayu.host.context_budget import BudgetEstimate
+from dayu.host.context_budget import (
+    BudgetEstimate,
+    DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
+    DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
+)
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
@@ -49,9 +53,7 @@ from tests.host.fake_cancellation import StubCancellationToken
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _TEST_SYSTEM_PROMPT = "test compactor system prompt"
-_TEST_USER_PROMPT_TEMPLATE = (
-    "test compactor user prompt\n\n<<compaction_request>>\n\nreturn strict json"
-)
+_TEST_USER_PROMPT_TEMPLATE = "test compactor user prompt\n\n<<compaction_request>>\n\nreturn strict json"
 _TEST_AGENT_POLICY = AgentPolicy(
     max_iterations=1,
     continuation_max_attempts=0,
@@ -306,19 +308,11 @@ async def test_parser_maps_prompt_local_evidence_label_to_canonical_ref(
     ).compact(_request(), StubCancellationToken())
 
     assert candidate.episode_summary_candidate.goal == "keep the current user request"
-    assert candidate.pinned_state_patch_candidate.current_goal.value == (
-        "keep the current user request"
-    )
+    assert candidate.pinned_state_patch_candidate.current_goal.value == ("keep the current user request")
     assert len(candidate.evidence_backed_fact_candidates) == 1
-    assert candidate.evidence_backed_fact_candidates[0].claim_text == (
-        "Canonical evidence shows revenue growth."
-    )
-    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == (
-        "evidence:accepted-1",
-    )
-    assert candidate.episode_summary_candidate.tool_finding_refs == (
-        "evidence:accepted-1",
-    )
+    assert candidate.evidence_backed_fact_candidates[0].claim_text == ("Canonical evidence shows revenue growth.")
+    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == ("evidence:accepted-1",)
+    assert candidate.episode_summary_candidate.tool_finding_refs == ("evidence:accepted-1",)
     assert len(candidate.minimum_preserve_item_candidates) == 1
     assert candidate.minimum_preserve_item_candidates[0].text == (
         "Current user asked to keep the financial analysis context."
@@ -334,7 +328,7 @@ async def test_parser_maps_prompt_local_evidence_label_to_canonical_ref(
 async def test_llm_context_compactor_budget_counts_preserved_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """compact 后预算必须覆盖 summary 以外的保留上下文。"""
+    """compact 后预算必须覆盖 summary 以外的保留上下文与 framing 开销。"""
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -346,7 +340,9 @@ async def test_llm_context_compactor_budget_counts_preserved_context(
         runner_options=_runner_options(),
     ).compact(_request(), StubCancellationToken())
 
-    assert candidate.budget_after_compact >= 80
+    assert candidate.budget_after_compact >= (
+        80 + DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS + DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS
+    )
 
 
 @pytest.mark.asyncio
@@ -385,9 +381,7 @@ async def test_llm_context_compactor_budget_counts_structured_output_text(
     )
     long_candidate = await compactor.compact(_request(), StubCancellationToken())
 
-    assert long_candidate.episode_summary_candidate.goal == (
-        short_candidate.episode_summary_candidate.goal
-    )
+    assert long_candidate.episode_summary_candidate.goal == (short_candidate.episode_summary_candidate.goal)
     assert long_candidate.budget_after_compact > short_candidate.budget_after_compact
 
 
@@ -451,9 +445,7 @@ async def test_llm_context_compactor_rejects_malformed_and_schema_invalid_json(
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(json.dumps({"episode_summary_candidate": {}}, sort_keys=True))
-        ),
+        _fake_run_factory(_final(json.dumps({"episode_summary_candidate": {}}, sort_keys=True))),
     )
     with pytest.raises(LLMCompactionProposalError, match="missing required key"):
         await compactor.compact(_request(), StubCancellationToken())
@@ -471,14 +463,7 @@ async def test_llm_context_compactor_rejects_overlong_structured_text(
     )
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(
-                _proposal_json(
-                    claim_text="x"
-                    * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1)
-                )
-            )
-        ),
+        _fake_run_factory(_final(_proposal_json(claim_text="x" * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1)))),
     )
     with pytest.raises(LLMCompactionProposalError, match="claim_text"):
         await compactor.compact(_request(), StubCancellationToken())
@@ -486,12 +471,7 @@ async def test_llm_context_compactor_rejects_overlong_structured_text(
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
         _fake_run_factory(
-            _final(
-                _proposal_json(
-                    minimum_preserve_text="x"
-                    * (MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS + 1)
-                )
-            )
+            _final(_proposal_json(minimum_preserve_text="x" * (MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS + 1)))
         ),
     )
     with pytest.raises(
@@ -509,9 +489,7 @@ async def test_llm_context_compactor_rejects_non_canonical_evidence_refs(
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(_proposal_json(fact_evidence_refs=("evidence:not-accepted",)))
-        ),
+        _fake_run_factory(_final(_proposal_json(fact_evidence_refs=("evidence:not-accepted",)))),
     )
     compactor = _llm_compactor(
         runner_spec=_runner_spec(),
@@ -534,9 +512,7 @@ async def test_parser_rejects_unknown_or_cross_section_labels(
     )
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(_proposal_json(preserved_material_labels=("C1", "missing-label")))
-        ),
+        _fake_run_factory(_final(_proposal_json(preserved_material_labels=("C1", "missing-label")))),
     )
     with pytest.raises(LLMCompactionProposalError, match="unknown label"):
         await compactor.compact(_request(), StubCancellationToken())
@@ -569,9 +545,7 @@ async def test_parser_accepts_parent_label_for_chunked_evidence(
         StubCancellationToken(),
     )
 
-    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == (
-        "evidence:accepted-1",
-    )
+    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == ("evidence:accepted-1",)
     assert candidate.preserved_canonical_evidence_refs == ("evidence:accepted-1",)
 
 
@@ -630,13 +604,7 @@ async def test_minimum_preserve_source_refs_must_be_material_labels(
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(
-                _proposal_json(
-                    minimum_preserve_source_labels=("payload:accepted-1",)
-                )
-            )
-        ),
+        _fake_run_factory(_final(_proposal_json(minimum_preserve_source_labels=("payload:accepted-1",)))),
     )
     compactor = _llm_compactor(
         runner_spec=_runner_spec(),
@@ -808,12 +776,8 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
         "input-2",
     )
     assert evidence.canonical_evidence_refs == ("evidence:accepted-1",)
-    assert candidate.episode_summary_candidate.evidence_refs == (
-        evidence.evidence_id,
-    )
-    assert candidate.pinned_state_patch_candidate.current_goal.evidence_refs == (
-        evidence.evidence_id,
-    )
+    assert candidate.episode_summary_candidate.evidence_refs == (evidence.evidence_id,)
+    assert candidate.pinned_state_patch_candidate.current_goal.evidence_refs == (evidence.evidence_id,)
 
 
 @pytest.mark.asyncio
@@ -995,9 +959,7 @@ def _material_pack_with_history_refs(
 def _proposal_json(
     *,
     claim_text: str = "Canonical evidence shows revenue growth.",
-    minimum_preserve_text: str = (
-        "Current user asked to keep the financial analysis context."
-    ),
+    minimum_preserve_text: str = ("Current user asked to keep the financial analysis context."),
     fact_evidence_refs: tuple[str, ...] = ("E1",),
     minimum_preserve_source_labels: tuple[str, ...] = ("C1",),
     preserved_material_labels: tuple[str, ...] = ("C1", "H1"),
@@ -1120,9 +1082,7 @@ def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
     )
 
 
-def _final(
-    content: str, *, finish_reason: FinishReason = FinishReason.STOP
-) -> EngineRunOutcomeFinalAnswer:
+def _final(content: str, *, finish_reason: FinishReason = FinishReason.STOP) -> EngineRunOutcomeFinalAnswer:
     """构造 final answer outcome。
 
     :param content: final answer 文本。
@@ -1140,9 +1100,7 @@ def _final(
     )
 
 
-def _runner_spec(
-    max_retries: int = 0, default_timeout_seconds: float = 1.0
-) -> RunnerSpec:
+def _runner_spec(max_retries: int = 0, default_timeout_seconds: float = 1.0) -> RunnerSpec:
     """构造 RunnerSpec。
 
     :param max_retries: runner retry 上限。

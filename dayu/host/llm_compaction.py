@@ -61,7 +61,11 @@ from dayu.host.compaction import (
     PromptLocalProvenanceEntry,
     PreservationEvidence,
 )
-from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
+from dayu.host.context_budget import (
+    DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
+    DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
+    DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
+)
 from dayu.host.opaque_ref import validate_host_neutral_opaque_ref_text
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
@@ -70,9 +74,7 @@ _MAX_SAFE_OUTCOME_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
 _BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
-_ASSIGNMENT_SECRET_PATTERN = re.compile(
-    r"(?i)((?:api[_-]?key|authorization|secret|token)\s*[:=]\s*)[^,\s}\]]+"
-)
+_ASSIGNMENT_SECRET_PATTERN = re.compile(r"(?i)((?:api[_-]?key|authorization|secret|token)\s*[:=]\s*)[^,\s}\]]+")
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
@@ -81,6 +83,8 @@ _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
     "Host post-compact run context includes compact summary, pinned state, "
     "current input, preserved refs, evidence-backed facts, and continuity items."
 )
+_POST_COMPACT_BASE_MESSAGE_COUNT = 2
+_POST_COMPACT_TOOL_SCHEMA_OVERHEAD_COUNT = 1
 _REQUIRED_PROPOSAL_KEYS = (
     "episode_summary_candidate",
     "pinned_state_patch_candidate",
@@ -131,9 +135,7 @@ class _RejectingToolExecutor(ToolExecutor):
     将其收口为协议失败。
     """
 
-    async def execute(
-        self, request: BatchToolExecutionRequest
-    ) -> BatchToolExecutionOutcome:
+    async def execute(self, request: BatchToolExecutionRequest) -> BatchToolExecutionOutcome:
         """拒绝 compactor 工具握手。
 
         :param request: Engine 发起的工具批式请求。
@@ -192,19 +194,14 @@ class LLMContextCompactor(ContextCompactor):
         if user_prompt_template.strip() == "":
             raise ValueError("user_prompt_template must be non-empty")
         if user_prompt_template.count(_COMPACTION_REQUEST_PLACEHOLDER) != 1:
-            raise ValueError(
-                "user_prompt_template must contain exactly one "
-                "<<compaction_request>> placeholder"
-            )
+            raise ValueError("user_prompt_template must contain exactly one " "<<compaction_request>> placeholder")
         self._runner_spec = runner_spec
         self._runner_options = runner_options
         self._agent_policy = agent_policy
         self._system_prompt = system_prompt
         self._user_prompt_template = user_prompt_template
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """执行一次 LLM compaction proposal。
 
         :param request: Host 构造的 immutable compaction request。
@@ -232,15 +229,11 @@ class LLMContextCompactor(ContextCompactor):
             )
         except TimeoutError as exc:
             _signal_timeout_cancellation(cancellation_token)
-            raise LLMCompactionProposalError(
-                _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE
-            ) from exc
+            raise LLMCompactionProposalError(_COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE) from exc
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
             raise LLMCompactionProposalError(_non_final_outcome_message(outcome))
         if outcome.finish_reason is FinishReason.LENGTH:
-            raise LLMCompactionProposalError(
-                "compactor proposal was truncated finish_reason=length"
-            )
+            raise LLMCompactionProposalError("compactor proposal was truncated finish_reason=length")
         return _candidate_from_final_answer(request, outcome.content)
 
 
@@ -285,9 +278,7 @@ def _agent_request(
     )
 
 
-async def _run_agent_request(
-    request: AgentRunRequest, *, timeout_seconds: float
-) -> AgentRunResult:
+async def _run_agent_request(request: AgentRunRequest, *, timeout_seconds: float) -> AgentRunResult:
     """运行 Engine async public runner。
 
     :param request: Engine AgentRunRequest。
@@ -353,12 +344,8 @@ def _safe_outcome_text(text: str) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
-    redacted = _BEARER_SECRET_PATTERN.sub(
-        f"Bearer {_REDACTED_SECRET}", text
-    )
-    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(
-        rf"\1{_REDACTED_SECRET}", redacted
-    )
+    redacted = _BEARER_SECRET_PATTERN.sub(f"Bearer {_REDACTED_SECRET}", text)
+    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(rf"\1{_REDACTED_SECRET}", redacted)
     if len(redacted) <= _MAX_SAFE_OUTCOME_MESSAGE_CHARS:
         return redacted
     return redacted[:_MAX_SAFE_OUTCOME_MESSAGE_CHARS] + _TRUNCATED_SUFFIX
@@ -398,9 +385,7 @@ def _compaction_request_prompt_block(request: CompactionRequest) -> str:
     )
 
 
-def _candidate_from_final_answer(
-    request: CompactionRequest, final_answer: str
-) -> CompactionCandidate:
+def _candidate_from_final_answer(request: CompactionRequest, final_answer: str) -> CompactionCandidate:
     """把 LLM strict JSON final answer 映射为 Host-owned candidate。
 
     :param request: Host compaction request。
@@ -414,9 +399,7 @@ def _candidate_from_final_answer(
         evidence = _preservation_evidence(request, proposal)
         evidence_refs = tuple(item.evidence_id for item in evidence)
         episode = _episode_summary_candidate(request, proposal, evidence_refs)
-        pinned_patch = _pinned_state_patch_candidate(
-            proposal, evidence_refs, run_id=request.run_id
-        )
+        pinned_patch = _pinned_state_patch_candidate(proposal, evidence_refs, run_id=request.run_id)
         fact_candidates = _evidence_backed_fact_candidates(request, proposal)
         preserve_items = _minimum_preserve_item_candidates(request, proposal)
         retained_current_input = _retained_current_user_input_ref(request, proposal)
@@ -467,9 +450,7 @@ def _candidate_from_final_answer(
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise LLMCompactionProposalError(
-            f"compactor proposal schema invalid: {exc}"
-        ) from exc
+        raise LLMCompactionProposalError(f"compactor proposal schema invalid: {exc}") from exc
 
 
 def _parse_proposal(final_answer: str) -> Mapping[str, JsonValue]:
@@ -486,19 +467,13 @@ def _parse_proposal(final_answer: str) -> Mapping[str, JsonValue]:
     try:
         parsed = json.loads(raw)
     except JSONDecodeError as exc:
-        raise LLMCompactionProposalError(
-            f"compactor proposal is not valid JSON: {exc.msg}"
-        ) from exc
+        raise LLMCompactionProposalError(f"compactor proposal is not valid JSON: {exc.msg}") from exc
     if not isinstance(parsed, Mapping):
-        raise LLMCompactionProposalError(
-            "compactor proposal top-level value must be object"
-        )
+        raise LLMCompactionProposalError("compactor proposal top-level value must be object")
     proposal = cast(Mapping[str, JsonValue], parsed)
     for key in _REQUIRED_PROPOSAL_KEYS:
         if key not in proposal:
-            raise LLMCompactionProposalError(
-                f"compactor proposal missing required key: {key}"
-            )
+            raise LLMCompactionProposalError(f"compactor proposal missing required key: {key}")
     return proposal
 
 
@@ -536,9 +511,7 @@ def _episode_summary_candidate(
         goal=_required_string(data, "goal"),
         completed_actions=_optional_string_tuple(data, "completed_actions"),
         confirmed_fact_refs=confirmed_fact_refs,
-        confirmed_fact_summaries=_optional_string_tuple(
-            data, "confirmed_fact_summaries"
-        ),
+        confirmed_fact_summaries=_optional_string_tuple(data, "confirmed_fact_summaries"),
         user_constraints=_optional_string_tuple(data, "user_constraints"),
         open_questions=_optional_string_tuple(data, "open_questions"),
         next_step=_optional_string_or_none(data, "next_step"),
@@ -566,12 +539,8 @@ def _pinned_state_patch_candidate(
     return PinnedStatePatchCandidate(
         candidate_id=f"llm-pinned-patch:{run_id}",
         current_goal=_text_patch(data, "current_goal", evidence_refs),
-        confirmed_subjects=_confirmed_subjects_patch(
-            data, "confirmed_subjects", evidence_refs
-        ),
-        user_constraints=_string_tuple_patch(
-            data, "user_constraints", evidence_refs
-        ),
+        confirmed_subjects=_confirmed_subjects_patch(data, "confirmed_subjects", evidence_refs),
+        user_constraints=_string_tuple_patch(data, "user_constraints", evidence_refs),
         open_questions=_string_tuple_patch(data, "open_questions", evidence_refs),
     )
 
@@ -605,9 +574,7 @@ def _evidence_backed_fact_candidates(
             EvidenceBackedFactCandidate(
                 candidate_id=_required_string(data, "candidate_id"),
                 claim_text=_required_string(data, "claim_text"),
-                evidence_kind=EvidenceBackedFactKind(
-                    _required_string(data, "evidence_kind")
-                ),
+                evidence_kind=EvidenceBackedFactKind(_required_string(data, "evidence_kind")),
                 evidence_refs=evidence_refs,
                 attributes=_required_mapping(data, "attributes"),
             )
@@ -644,17 +611,13 @@ def _minimum_preserve_item_candidates(
                 label=_required_string(data, "label"),
                 text=_required_string(data, "text"),
                 source_refs=source_refs,
-                preserve_reason=MinimumPreserveReason(
-                    _required_string(data, "preserve_reason")
-                ),
+                preserve_reason=MinimumPreserveReason(_required_string(data, "preserve_reason")),
             )
         )
     return tuple(candidates)
 
 
-def _retained_current_user_input_ref(
-    request: CompactionRequest, proposal: Mapping[str, JsonValue]
-) -> str | None:
+def _retained_current_user_input_ref(request: CompactionRequest, proposal: Mapping[str, JsonValue]) -> str | None:
     """读取并校验 retained current user input ref。
 
     :param request: Host compaction request。
@@ -669,9 +632,7 @@ def _retained_current_user_input_ref(
     if not isinstance(value, str):
         raise TypeError("retained_current_input_label must be string or null")
     if value != request.material_pack.current_input_anchor.anchor_label:
-        raise ValueError(
-            "retained_current_input_label must match request current input"
-        )
+        raise ValueError("retained_current_input_label must match request current input")
     return request.current_input_ref
 
 
@@ -774,9 +735,7 @@ def _validate_patch_value(
         raise ValueError(f"{field_name}.value must be null unless replace")
 
 
-def _evidence_refs_for_patch(
-    operation: PinnedPatchOperation, evidence_refs: tuple[str, ...]
-) -> tuple[str, ...]:
+def _evidence_refs_for_patch(operation: PinnedPatchOperation, evidence_refs: tuple[str, ...]) -> tuple[str, ...]:
     """根据 patch 操作返回 Host-owned evidence refs。
 
     :param operation: patch 操作。
@@ -875,9 +834,7 @@ def _single_range_endpoint_ref(refs: tuple[str, ...], *, field_name: str) -> str
     """
 
     if len(refs) != 1:
-        raise ValueError(
-            f"{field_name} must resolve to exactly one canonical source ref"
-        )
+        raise ValueError(f"{field_name} must resolve to exactly one canonical source ref")
     return refs[0]
 
 
@@ -974,17 +931,14 @@ def _evidence_parent_entry_for_label(
     matches = tuple(
         entry
         for entry in request.material_pack.provenance_map.values()
-        if entry.section is CompactMaterialSection.EVIDENCE_INPUT
-        and entry.chunk_parent_label == label
+        if entry.section is CompactMaterialSection.EVIDENCE_INPUT and entry.chunk_parent_label == label
     )
     if len(matches) == 0:
         return None
     return matches[0]
 
 
-def _required_mapping(
-    source: Mapping[str, JsonValue], key: str
-) -> Mapping[str, JsonValue]:
+def _required_mapping(source: Mapping[str, JsonValue], key: str) -> Mapping[str, JsonValue]:
     """读取必需 JSON object 字段。
 
     :param source: JSON object。
@@ -1058,9 +1012,7 @@ def _required_string(source: Mapping[str, JsonValue], key: str) -> str:
     return value
 
 
-def _optional_string_or_none(
-    source: Mapping[str, JsonValue], key: str
-) -> str | None:
+def _optional_string_or_none(source: Mapping[str, JsonValue], key: str) -> str | None:
     """读取可选字符串或 null 字段。
 
     :param source: JSON object。
@@ -1079,9 +1031,7 @@ def _optional_string_or_none(
     return value
 
 
-def _optional_string_tuple(
-    source: Mapping[str, JsonValue], key: str
-) -> tuple[str, ...]:
+def _optional_string_tuple(source: Mapping[str, JsonValue], key: str) -> tuple[str, ...]:
     """读取可选字符串数组字段。
 
     :param source: JSON object。
@@ -1095,9 +1045,7 @@ def _optional_string_tuple(
     return _string_tuple(source[key], key)
 
 
-def _required_string_tuple(
-    source: Mapping[str, JsonValue], key: str
-) -> tuple[str, ...]:
+def _required_string_tuple(source: Mapping[str, JsonValue], key: str) -> tuple[str, ...]:
     """读取必需字符串数组字段。
 
     :param source: JSON object。
@@ -1112,9 +1060,7 @@ def _required_string_tuple(
     return _string_tuple(source[key], key)
 
 
-def _optional_string_tuple_or_none(
-    source: Mapping[str, JsonValue], key: str
-) -> tuple[str, ...] | None:
+def _optional_string_tuple_or_none(source: Mapping[str, JsonValue], key: str) -> tuple[str, ...] | None:
     """读取字符串数组或 null 字段。
 
     :param source: JSON object。
@@ -1284,17 +1230,18 @@ def _budget_after_compact(
     :returns: 非负 token 估算。
     """
 
+    structured_fragments = _structured_output_texts(
+        episode,
+        pinned_patch,
+        fact_candidates,
+        preserve_items,
+    )
     structured_output_tokens = sum(
-        _estimate_text_tokens(fragment)
-        for fragment in _structured_output_texts(
-            episode,
-            pinned_patch,
-            fact_candidates,
-            preserve_items,
-        )
+        _estimate_text_tokens(fragment) + DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS for fragment in structured_fragments
     )
     preserved_tokens = _estimate_preserved_context_tokens(request)
-    return structured_output_tokens + preserved_tokens
+    tool_schema_overhead = DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS * _POST_COMPACT_TOOL_SCHEMA_OVERHEAD_COUNT
+    return structured_output_tokens + preserved_tokens + tool_schema_overhead
 
 
 def _structured_output_texts(
@@ -1379,15 +1326,15 @@ def _estimate_preserved_context_tokens(request: CompactionRequest) -> int:
     :returns: 保留上下文的保守 token 估算。
     """
 
-    typed_fragment_tokens = sum(
-        _estimate_text_tokens(fragment)
-        for fragment in (
-            _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE,
-            request.current_input_text,
-            request.current_input_ref,
-            *_preserved_ref_texts(request),
-        )
+    typed_fragments = (
+        _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE,
+        request.current_input_text,
+        request.current_input_ref,
+        *_preserved_ref_texts(request),
     )
+    typed_fragment_tokens = sum(
+        _estimate_text_tokens(fragment) + DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS for fragment in typed_fragments
+    ) + (DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS * _POST_COMPACT_BASE_MESSAGE_COUNT)
     return max(
         typed_fragment_tokens,
         _estimate_preserved_share_from_budget(request),

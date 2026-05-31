@@ -177,8 +177,8 @@ def test_tool_definition_rejects_empty_name() -> None:
         raise AssertionError("empty tool definition name was accepted")
 
 
-def test_tool_bundle_rejects_empty_definitions() -> None:
-    """空工具集合必须用 ``None`` 表达，不得构造空 ``ToolBundle``。"""
+def test_tool_bundle_rejects_public_empty_definitions() -> None:
+    """调用方默认不得直接构造空 ``ToolBundle``。"""
 
     try:
         ToolBundle(definitions=())
@@ -186,6 +186,17 @@ def test_tool_bundle_rejects_empty_definitions() -> None:
         assert str(exc) == "ToolBundle.definitions must be non-empty"
     else:
         raise AssertionError("empty tool bundle was accepted")
+
+
+def test_tool_bundle_internal_empty_constructor_keeps_real_type() -> None:
+    """框架 no-tool 路径可构造类型真实的空 ``ToolBundle``。"""
+
+    bundle = ToolBundle(definitions=(), _allow_empty=True)
+
+    assert isinstance(bundle, ToolBundle)
+    assert bundle.definitions == ()
+    assert bundle.to_tool_schemas() == ()
+    assert bundle.truncate_specs() == {}
 
 
 def test_tool_bundle_rejects_duplicate_tool_name() -> None:

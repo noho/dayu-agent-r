@@ -70,15 +70,9 @@ class CompactQualityIssue(StrEnum):
     PINNED_PATCH_TRI_STATE_INVALID = "pinned_patch_tri_state_invalid"
     PINNED_PATCH_EVIDENCE_REF_MISSING = "pinned_patch_evidence_ref_missing"
     COMPACT_RANGE_OUTSIDE_REQUEST = "compact_range_outside_request"
-    EVIDENCE_BACKED_FACT_CANDIDATE_INVALID = (
-        "evidence_backed_fact_candidate_invalid"
-    )
-    ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING = (
-        "accepted_evidence_fact_candidate_missing"
-    )
-    MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID = (
-        "minimum_preserve_item_candidate_invalid"
-    )
+    EVIDENCE_BACKED_FACT_CANDIDATE_INVALID = "evidence_backed_fact_candidate_invalid"
+    ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING = "accepted_evidence_fact_candidate_missing"
+    MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID = "minimum_preserve_item_candidate_invalid"
     OPEN_QUESTIONS_MISSING = "open_questions_missing"
 
 
@@ -163,12 +157,8 @@ class CompactInputRange:
         """
 
         _require_non_empty(self.range_ref, field_name="CompactInputRange.range_ref")
-        _require_non_empty(
-            self.start_input_ref, field_name="CompactInputRange.start_input_ref"
-        )
-        _require_non_empty(
-            self.end_input_ref, field_name="CompactInputRange.end_input_ref"
-        )
+        _require_non_empty(self.start_input_ref, field_name="CompactInputRange.start_input_ref")
+        _require_non_empty(self.end_input_ref, field_name="CompactInputRange.end_input_ref")
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -255,12 +245,8 @@ class PromptLocalProvenanceEntry:
             self.tool_call_event_ref,
             field_name="PromptLocalProvenanceEntry.tool_call_event_ref",
         )
-        _require_string_tuple(
-            self.payload_refs, field_name="PromptLocalProvenanceEntry.payload_refs"
-        )
-        _require_string_tuple(
-            self.artifact_refs, field_name="PromptLocalProvenanceEntry.artifact_refs"
-        )
+        _require_string_tuple(self.payload_refs, field_name="PromptLocalProvenanceEntry.payload_refs")
+        _require_string_tuple(self.artifact_refs, field_name="PromptLocalProvenanceEntry.artifact_refs")
         _require_opaque_ref_tuple(
             self.source_locator_refs,
             field_name="PromptLocalProvenanceEntry.source_locator_refs",
@@ -276,9 +262,7 @@ class PromptLocalProvenanceEntry:
             )
         if self.section is CompactMaterialSection.EVIDENCE_INPUT:
             if self.accepted_evidence_id is None:
-                raise ValueError(
-                    "PromptLocalProvenanceEntry.accepted_evidence_id is required"
-                )
+                raise ValueError("PromptLocalProvenanceEntry.accepted_evidence_id is required")
             _require_non_empty(
                 self.accepted_evidence_id,
                 field_name="PromptLocalProvenanceEntry.accepted_evidence_id",
@@ -308,9 +292,7 @@ class PromptLocalProvenanceEntry:
         }
 
 
-PromptLocalEvidenceMap = Mapping[
-    PromptLocalMaterialLabel, PromptLocalProvenanceEntry
-]
+PromptLocalEvidenceMap = Mapping[PromptLocalMaterialLabel, PromptLocalProvenanceEntry]
 """Evidence label 到 provenance entry 的只读 typed view。"""
 
 
@@ -351,19 +333,13 @@ class CompactMaterialBlock:
         if not isinstance(self.kind, CompactMaterialBlockKind):
             raise TypeError("CompactMaterialBlock.kind is invalid")
         _require_non_empty(self.text, field_name="CompactMaterialBlock.text")
-        _require_non_negative_int(
-            self.size_units, field_name="CompactMaterialBlock.size_units"
-        )
-        _require_string_tuple(
-            self.source_labels, field_name="CompactMaterialBlock.source_labels"
-        )
+        _require_non_negative_int(self.size_units, field_name="CompactMaterialBlock.size_units")
+        _require_string_tuple(self.source_labels, field_name="CompactMaterialBlock.source_labels")
         _require_string_tuple(
             self.canonical_source_refs,
             field_name="CompactMaterialBlock.canonical_source_refs",
         )
-        _require_non_empty(
-            self.content_digest, field_name="CompactMaterialBlock.content_digest"
-        )
+        _require_non_empty(self.content_digest, field_name="CompactMaterialBlock.content_digest")
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -427,9 +403,7 @@ class CompactEvidenceBlock:
         :raises ValueError: 字段值非法时抛出。
         """
 
-        _require_non_empty(
-            self.evidence_label, field_name="CompactEvidenceBlock.evidence_label"
-        )
+        _require_non_empty(self.evidence_label, field_name="CompactEvidenceBlock.evidence_label")
         _require_non_empty(
             self.readable_tool_name,
             field_name="CompactEvidenceBlock.readable_tool_name",
@@ -438,23 +412,17 @@ class CompactEvidenceBlock:
             self.readable_query_text,
             field_name="CompactEvidenceBlock.readable_query_text",
         )
-        _require_non_empty(
-            self.raw_result_text, field_name="CompactEvidenceBlock.raw_result_text"
-        )
+        _require_non_empty(self.raw_result_text, field_name="CompactEvidenceBlock.raw_result_text")
         _require_non_empty(
             self.readable_source_text,
             field_name="CompactEvidenceBlock.readable_source_text",
         )
-        _require_non_negative_int(
-            self.size_units, field_name="CompactEvidenceBlock.size_units"
-        )
+        _require_non_negative_int(self.size_units, field_name="CompactEvidenceBlock.size_units")
         _require_string_tuple(
             self.canonical_source_refs,
             field_name="CompactEvidenceBlock.canonical_source_refs",
         )
-        _require_non_empty(
-            self.content_digest, field_name="CompactEvidenceBlock.content_digest"
-        )
+        _require_non_empty(self.content_digest, field_name="CompactEvidenceBlock.content_digest")
 
     @property
     def block_label(self) -> PromptLocalMaterialLabel:
@@ -523,20 +491,14 @@ class CurrentInputAnchor:
         :raises ValueError: 字段值非法时抛出。
         """
 
-        _require_non_empty(
-            self.anchor_label, field_name="CurrentInputAnchor.anchor_label"
-        )
-        _require_non_empty(
-            self.anchor_text, field_name="CurrentInputAnchor.anchor_text"
-        )
+        _require_non_empty(self.anchor_label, field_name="CurrentInputAnchor.anchor_label")
+        _require_non_empty(self.anchor_text, field_name="CurrentInputAnchor.anchor_text")
         _require_bool(self.truncated, field_name="CurrentInputAnchor.truncated")
         _require_string_tuple(
             self.canonical_source_refs,
             field_name="CurrentInputAnchor.canonical_source_refs",
         )
-        _require_non_empty(
-            self.content_digest, field_name="CurrentInputAnchor.content_digest"
-        )
+        _require_non_empty(self.content_digest, field_name="CurrentInputAnchor.content_digest")
 
     @property
     def block_label(self) -> PromptLocalMaterialLabel:
@@ -618,17 +580,13 @@ class CompactSegmentSelection:
         )
         if not isinstance(self.trigger_source, CompactSegmentTrigger):
             raise TypeError("CompactSegmentSelection.trigger_source is invalid")
-        _require_non_negative_int(
-            self.input_cursor, field_name="CompactSegmentSelection.input_cursor"
-        )
+        _require_non_negative_int(self.input_cursor, field_name="CompactSegmentSelection.input_cursor")
         if self.memory_snapshot_cursor is not None:
             _require_non_negative_int(
                 self.memory_snapshot_cursor,
                 field_name="CompactSegmentSelection.memory_snapshot_cursor",
             )
-        _require_non_empty(
-            self.policy_digest, field_name="CompactSegmentSelection.policy_digest"
-        )
+        _require_non_empty(self.policy_digest, field_name="CompactSegmentSelection.policy_digest")
         _require_string_tuple(
             self.deterministic_reason_codes,
             field_name="CompactSegmentSelection.deterministic_reason_codes",
@@ -655,12 +613,8 @@ class CompactSegmentSelection:
             "input_cursor": self.input_cursor,
             "memory_snapshot_cursor": self.memory_snapshot_cursor,
             "policy_digest": self.policy_digest,
-            "deterministic_reason_codes": _string_list_json(
-                self.deterministic_reason_codes
-            ),
-            "excluded_reason_codes": _string_mapping_json(
-                self.excluded_reason_codes
-            ),
+            "deterministic_reason_codes": _string_list_json(self.deterministic_reason_codes),
+            "excluded_reason_codes": _string_mapping_json(self.excluded_reason_codes),
             "selection_digest": self.selection_digest,
         }
 
@@ -705,9 +659,7 @@ class CompactMaterialPack:
             field_name="CompactMaterialPack.evidence_input",
         )
         if not isinstance(self.current_input_anchor, CurrentInputAnchor):
-            raise TypeError(
-                "CompactMaterialPack.current_input_anchor must be CurrentInputAnchor"
-            )
+            raise TypeError("CompactMaterialPack.current_input_anchor must be CurrentInputAnchor")
         _require_provenance_mapping(self.provenance_map)
         _require_one_section_per_canonical_content(self)
 
@@ -773,10 +725,7 @@ class CompactMaterialPack:
         :returns: evidence label 到 provenance entry 的只读 mapping。
         """
 
-        return {
-            label: self.provenance_map[label]
-            for label in self.evidence_labels
-        }
+        return {label: self.provenance_map[label] for label in self.evidence_labels}
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -851,21 +800,13 @@ class CompactionRequest:
             raise TypeError("CompactionRequest.trigger_source is invalid")
         _require_non_empty(self.session_id, field_name="CompactionRequest.session_id")
         _require_non_empty(self.run_id, field_name="CompactionRequest.run_id")
-        _require_optional_non_empty(
-            self.attempt_id, field_name="CompactionRequest.attempt_id"
-        )
-        _require_optional_non_empty(
-            self.execution_id, field_name="CompactionRequest.execution_id"
-        )
+        _require_optional_non_empty(self.attempt_id, field_name="CompactionRequest.attempt_id")
+        _require_optional_non_empty(self.execution_id, field_name="CompactionRequest.execution_id")
         if self.trigger_source is ContextCompactionTriggerSource.REACTIVE:
             if self.attempt_id is None:
-                raise ValueError(
-                    "CompactionRequest.attempt_id is required for reactive compaction"
-                )
+                raise ValueError("CompactionRequest.attempt_id is required for reactive compaction")
             if self.execution_id is None:
-                raise ValueError(
-                    "CompactionRequest.execution_id is required for reactive compaction"
-                )
+                raise ValueError("CompactionRequest.execution_id is required for reactive compaction")
         if self.memory_snapshot_cursor is not None:
             _require_non_negative_int(
                 self.memory_snapshot_cursor,
@@ -874,9 +815,7 @@ class CompactionRequest:
         if not isinstance(self.material_pack, CompactMaterialPack):
             raise TypeError("CompactionRequest.material_pack must be CompactMaterialPack")
         if not isinstance(self.segment_selection, CompactSegmentSelection):
-            raise TypeError(
-                "CompactionRequest.segment_selection must be CompactSegmentSelection"
-            )
+            raise TypeError("CompactionRequest.segment_selection must be CompactSegmentSelection")
         if self.current_input_ref not in self.material_source_refs:
             raise ValueError("CompactionRequest.material_pack must include current input")
         _require_unique_string_tuple(
@@ -900,9 +839,7 @@ class CompactionRequest:
             field_name="CompactionRequest.existing_episode_summary_refs",
         )
         if not isinstance(self.budget_before_compact, BudgetEstimate):
-            raise TypeError(
-                "CompactionRequest.budget_before_compact must be BudgetEstimate"
-            )
+            raise TypeError("CompactionRequest.budget_before_compact must be BudgetEstimate")
 
     def digest(self) -> str:
         """计算 compaction request digest。
@@ -927,20 +864,12 @@ class CompactionRequest:
             "memory_snapshot_cursor": self.memory_snapshot_cursor,
             "material_pack": self.material_pack.to_json(),
             "segment_selection": self.segment_selection.to_json(),
-            "canonical_evidence_refs": _string_list_json(
-                self.canonical_evidence_refs
-            ),
-            "evidence_backed_fact_refs": _string_list_json(
-                self.evidence_backed_fact_refs
-            ),
+            "canonical_evidence_refs": _string_list_json(self.canonical_evidence_refs),
+            "evidence_backed_fact_refs": _string_list_json(self.evidence_backed_fact_refs),
             "recent_raw_turn_refs": _string_list_json(self.recent_raw_turn_refs),
             "older_raw_turn_refs": _string_list_json(self.older_raw_turn_refs),
-            "existing_episode_summary_refs": _string_list_json(
-                self.existing_episode_summary_refs
-            ),
-            "budget_before_compact": _budget_estimate_json(
-                self.budget_before_compact
-            ),
+            "existing_episode_summary_refs": _string_list_json(self.existing_episode_summary_refs),
+            "budget_before_compact": _budget_estimate_json(self.budget_before_compact),
         }
 
     def llm_material_json(self) -> JsonValue:
@@ -1023,9 +952,7 @@ class EpisodeSummaryCandidate:
     tool_finding_refs: tuple[str, ...]
     source_event_refs: tuple[str, ...]
     evidence_refs: tuple[str, ...]
-    proposed_evidence_backed_fact_refs: tuple[str, ...] = field(
-        default_factory=_empty_string_tuple
-    )
+    proposed_evidence_backed_fact_refs: tuple[str, ...] = field(default_factory=_empty_string_tuple)
 
     def __post_init__(self) -> None:
         """校验 episode summary 候选。
@@ -1035,9 +962,7 @@ class EpisodeSummaryCandidate:
         :raises ValueError: 文本字段为空时抛出。
         """
 
-        _require_non_empty(
-            self.candidate_id, field_name="EpisodeSummaryCandidate.candidate_id"
-        )
+        _require_non_empty(self.candidate_id, field_name="EpisodeSummaryCandidate.candidate_id")
         _require_non_empty(
             self.episode_title,
             field_name="EpisodeSummaryCandidate.episode_title",
@@ -1063,9 +988,7 @@ class EpisodeSummaryCandidate:
             self.open_questions,
             field_name="EpisodeSummaryCandidate.open_questions",
         )
-        _require_optional_non_empty(
-            self.next_step, field_name="EpisodeSummaryCandidate.next_step"
-        )
+        _require_optional_non_empty(self.next_step, field_name="EpisodeSummaryCandidate.next_step")
         _require_string_tuple(
             self.tool_finding_refs,
             field_name="EpisodeSummaryCandidate.tool_finding_refs",
@@ -1080,9 +1003,7 @@ class EpisodeSummaryCandidate:
         )
         _require_string_tuple(
             self.proposed_evidence_backed_fact_refs,
-            field_name=(
-                "EpisodeSummaryCandidate.proposed_evidence_backed_fact_refs"
-            ),
+            field_name=("EpisodeSummaryCandidate.proposed_evidence_backed_fact_refs"),
         )
 
     def to_json(self) -> JsonValue:
@@ -1097,18 +1018,14 @@ class EpisodeSummaryCandidate:
             "goal": self.goal,
             "completed_actions": _string_list_json(self.completed_actions),
             "confirmed_fact_refs": _string_list_json(self.confirmed_fact_refs),
-            "confirmed_fact_summaries": _string_list_json(
-                self.confirmed_fact_summaries
-            ),
+            "confirmed_fact_summaries": _string_list_json(self.confirmed_fact_summaries),
             "user_constraints": _string_list_json(self.user_constraints),
             "open_questions": _string_list_json(self.open_questions),
             "next_step": self.next_step,
             "tool_finding_refs": _string_list_json(self.tool_finding_refs),
             "source_event_refs": _string_list_json(self.source_event_refs),
             "evidence_refs": _string_list_json(self.evidence_refs),
-            "proposed_evidence_backed_fact_refs": _string_list_json(
-                self.proposed_evidence_backed_fact_refs
-            ),
+            "proposed_evidence_backed_fact_refs": _string_list_json(self.proposed_evidence_backed_fact_refs),
         }
 
 
@@ -1137,9 +1054,7 @@ class PinnedTextFieldPatch:
             raise TypeError("PinnedTextFieldPatch.operation is invalid")
         if self.value is not None:
             _require_non_empty(self.value, field_name="PinnedTextFieldPatch.value")
-        _require_string_tuple(
-            self.evidence_refs, field_name="PinnedTextFieldPatch.evidence_refs"
-        )
+        _require_string_tuple(self.evidence_refs, field_name="PinnedTextFieldPatch.evidence_refs")
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -1178,9 +1093,7 @@ class PinnedStringTupleFieldPatch:
         if not isinstance(self.operation, PinnedPatchOperation):
             raise TypeError("PinnedStringTupleFieldPatch.operation is invalid")
         if self.value is not None:
-            _require_string_tuple(
-                self.value, field_name="PinnedStringTupleFieldPatch.value"
-            )
+            _require_string_tuple(self.value, field_name="PinnedStringTupleFieldPatch.value")
         _require_string_tuple(
             self.evidence_refs,
             field_name="PinnedStringTupleFieldPatch.evidence_refs",
@@ -1194,9 +1107,7 @@ class PinnedStringTupleFieldPatch:
 
         return {
             "operation": self.operation.value,
-            "value": (
-                None if self.value is None else _string_list_json(self.value)
-            ),
+            "value": (None if self.value is None else _string_list_json(self.value)),
             "evidence_refs": _string_list_json(self.evidence_refs),
         }
 
@@ -1232,15 +1143,9 @@ class PinnedStatePatchCandidate:
 
     candidate_id: str
     current_goal: PinnedTextFieldPatch = field(default_factory=missing_text_patch)
-    confirmed_subjects: PinnedStringTupleFieldPatch = field(
-        default_factory=missing_string_tuple_patch
-    )
-    user_constraints: PinnedStringTupleFieldPatch = field(
-        default_factory=missing_string_tuple_patch
-    )
-    open_questions: PinnedStringTupleFieldPatch = field(
-        default_factory=missing_string_tuple_patch
-    )
+    confirmed_subjects: PinnedStringTupleFieldPatch = field(default_factory=missing_string_tuple_patch)
+    user_constraints: PinnedStringTupleFieldPatch = field(default_factory=missing_string_tuple_patch)
+    open_questions: PinnedStringTupleFieldPatch = field(default_factory=missing_string_tuple_patch)
 
     def __post_init__(self) -> None:
         """校验 pinned state patch 候选基础类型。
@@ -1250,13 +1155,9 @@ class PinnedStatePatchCandidate:
         :raises ValueError: candidate id 为空时抛出。
         """
 
-        _require_non_empty(
-            self.candidate_id, field_name="PinnedStatePatchCandidate.candidate_id"
-        )
+        _require_non_empty(self.candidate_id, field_name="PinnedStatePatchCandidate.candidate_id")
         if not isinstance(self.current_goal, PinnedTextFieldPatch):
-            raise TypeError(
-                "PinnedStatePatchCandidate.current_goal must be PinnedTextFieldPatch"
-            )
+            raise TypeError("PinnedStatePatchCandidate.current_goal must be PinnedTextFieldPatch")
         _require_tuple_patch_field(
             self.confirmed_subjects,
             field_name="PinnedStatePatchCandidate.confirmed_subjects",
@@ -1310,9 +1211,7 @@ class PreservationEvidence:
         :raises ValueError: 字段值非法时抛出。
         """
 
-        _require_non_empty(
-            self.evidence_id, field_name="PreservationEvidence.evidence_id"
-        )
+        _require_non_empty(self.evidence_id, field_name="PreservationEvidence.evidence_id")
         _require_string_tuple(
             self.material_source_refs,
             field_name="PreservationEvidence.material_source_refs",
@@ -1326,12 +1225,8 @@ class PreservationEvidence:
                 self.memory_snapshot_cursor,
                 field_name="PreservationEvidence.memory_snapshot_cursor",
             )
-        if self.compact_input_range is not None and not isinstance(
-            self.compact_input_range, CompactInputRange
-        ):
-            raise TypeError(
-                "PreservationEvidence.compact_input_range must be CompactInputRange"
-            )
+        if self.compact_input_range is not None and not isinstance(self.compact_input_range, CompactInputRange):
+            raise TypeError("PreservationEvidence.compact_input_range must be CompactInputRange")
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -1342,15 +1237,9 @@ class PreservationEvidence:
         return {
             "evidence_id": self.evidence_id,
             "material_source_refs": _string_list_json(self.material_source_refs),
-            "canonical_evidence_refs": _string_list_json(
-                self.canonical_evidence_refs
-            ),
+            "canonical_evidence_refs": _string_list_json(self.canonical_evidence_refs),
             "memory_snapshot_cursor": self.memory_snapshot_cursor,
-            "compact_input_range": (
-                None
-                if self.compact_input_range is None
-                else self.compact_input_range.to_json()
-            ),
+            "compact_input_range": (None if self.compact_input_range is None else self.compact_input_range.to_json()),
         }
 
 
@@ -1389,10 +1278,7 @@ class EvidenceBackedFactCandidate:
             max_chars=MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
         )
         if not isinstance(self.evidence_kind, EvidenceBackedFactKind):
-            raise TypeError(
-                "EvidenceBackedFactCandidate.evidence_kind must be "
-                "EvidenceBackedFactKind"
-            )
+            raise TypeError("EvidenceBackedFactCandidate.evidence_kind must be " "EvidenceBackedFactKind")
         _require_bounded_string_tuple(
             self.evidence_refs,
             field_name="EvidenceBackedFactCandidate.evidence_refs",
@@ -1405,9 +1291,7 @@ class EvidenceBackedFactCandidate:
         )
         attributes_json = canonical_json_dumps(self.attributes)
         if len(attributes_json) > MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS:
-            raise ValueError(
-                "EvidenceBackedFactCandidate.attributes exceeds maximum size"
-            )
+            raise ValueError("EvidenceBackedFactCandidate.attributes exceeds maximum size")
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -1449,9 +1333,7 @@ class MinimumPreserveItemCandidate:
         :raises ValueError: 字段值非法时抛出。
         """
 
-        _require_non_empty(
-            self.item_id, field_name="MinimumPreserveItemCandidate.item_id"
-        )
+        _require_non_empty(self.item_id, field_name="MinimumPreserveItemCandidate.item_id")
         _require_bounded_non_empty_text(
             self.label,
             field_name="MinimumPreserveItemCandidate.label",
@@ -1469,10 +1351,7 @@ class MinimumPreserveItemCandidate:
             require_non_empty=True,
         )
         if not isinstance(self.preserve_reason, MinimumPreserveReason):
-            raise TypeError(
-                "MinimumPreserveItemCandidate.preserve_reason must be "
-                "MinimumPreserveReason"
-            )
+            raise TypeError("MinimumPreserveItemCandidate.preserve_reason must be " "MinimumPreserveReason")
 
     def to_json(self) -> JsonValue:
         """转换为 canonical JSON 兼容值。
@@ -1530,19 +1409,11 @@ class CompactionCandidate:
         :raises ValueError: 字段值非法时抛出。
         """
 
-        _require_non_empty(
-            self.candidate_id, field_name="CompactionCandidate.candidate_id"
-        )
+        _require_non_empty(self.candidate_id, field_name="CompactionCandidate.candidate_id")
         if not isinstance(self.episode_summary_candidate, EpisodeSummaryCandidate):
-            raise TypeError(
-                "CompactionCandidate.episode_summary_candidate must be "
-                "EpisodeSummaryCandidate"
-            )
+            raise TypeError("CompactionCandidate.episode_summary_candidate must be " "EpisodeSummaryCandidate")
         if not isinstance(self.pinned_state_patch_candidate, PinnedStatePatchCandidate):
-            raise TypeError(
-                "CompactionCandidate.pinned_state_patch_candidate must be "
-                "PinnedStatePatchCandidate"
-            )
+            raise TypeError("CompactionCandidate.pinned_state_patch_candidate must be " "PinnedStatePatchCandidate")
         _require_evidence_tuple(
             self.preservation_evidence,
             field_name="CompactionCandidate.preservation_evidence",
@@ -1563,7 +1434,7 @@ class CompactionCandidate:
             self.preserved_material_source_refs,
             field_name="CompactionCandidate.preserved_material_source_refs",
         )
-        _require_string_tuple(
+        _require_unique_string_tuple(
             self.preserved_canonical_evidence_refs,
             field_name="CompactionCandidate.preserved_canonical_evidence_refs",
         )
@@ -1571,12 +1442,8 @@ class CompactionCandidate:
             self.preserved_evidence_backed_fact_refs,
             field_name="CompactionCandidate.preserved_evidence_backed_fact_refs",
         )
-        _require_range_tuple(
-            self.dropped_ranges, field_name="CompactionCandidate.dropped_ranges"
-        )
-        _require_range_tuple(
-            self.summarized_ranges, field_name="CompactionCandidate.summarized_ranges"
-        )
+        _require_range_tuple(self.dropped_ranges, field_name="CompactionCandidate.dropped_ranges")
+        _require_range_tuple(self.summarized_ranges, field_name="CompactionCandidate.summarized_ranges")
         _require_non_negative_int(
             self.budget_after_compact,
             field_name="CompactionCandidate.budget_after_compact",
@@ -1599,30 +1466,16 @@ class CompactionCandidate:
         return {
             "candidate_id": self.candidate_id,
             "episode_summary_candidate": self.episode_summary_candidate.to_json(),
-            "pinned_state_patch_candidate": (
-                self.pinned_state_patch_candidate.to_json()
-            ),
-            "preservation_evidence": _evidence_list_json(
-                self.preservation_evidence
-            ),
-            "evidence_backed_fact_candidates": _fact_candidate_list_json(
-                self.evidence_backed_fact_candidates
-            ),
+            "pinned_state_patch_candidate": (self.pinned_state_patch_candidate.to_json()),
+            "preservation_evidence": _evidence_list_json(self.preservation_evidence),
+            "evidence_backed_fact_candidates": _fact_candidate_list_json(self.evidence_backed_fact_candidates),
             "minimum_preserve_item_candidates": (
-                _minimum_preserve_candidate_list_json(
-                    self.minimum_preserve_item_candidates
-                )
+                _minimum_preserve_candidate_list_json(self.minimum_preserve_item_candidates)
             ),
             "retained_current_user_input_ref": self.retained_current_user_input_ref,
-            "preserved_material_source_refs": _string_list_json(
-                self.preserved_material_source_refs
-            ),
-            "preserved_canonical_evidence_refs": _string_list_json(
-                self.preserved_canonical_evidence_refs
-            ),
-            "preserved_evidence_backed_fact_refs": _string_list_json(
-                self.preserved_evidence_backed_fact_refs
-            ),
+            "preserved_material_source_refs": _string_list_json(self.preserved_material_source_refs),
+            "preserved_canonical_evidence_refs": _string_list_json(self.preserved_canonical_evidence_refs),
+            "preserved_evidence_backed_fact_refs": _string_list_json(self.preserved_evidence_backed_fact_refs),
             "dropped_ranges": _range_list_json(self.dropped_ranges),
             "summarized_ranges": _range_list_json(self.summarized_ranges),
             "budget_after_compact": self.budget_after_compact,
@@ -1682,10 +1535,7 @@ class CompactQualityCheckResult:
         )
         _require_bool(
             self.evidence_backed_fact_candidates_accepted,
-            field_name=(
-                "CompactQualityCheckResult."
-                "evidence_backed_fact_candidates_accepted"
-            ),
+            field_name=("CompactQualityCheckResult." "evidence_backed_fact_candidates_accepted"),
         )
         _require_bool(
             self.minimum_preserve_items_accepted,
@@ -1712,9 +1562,7 @@ class CompactQualityCheckResult:
             field_name="CompactQualityCheckResult.summarized_ranges",
         )
         if self.accepted and len(self.rejection_reasons) > 0:
-            raise ValueError(
-                "Accepted quality result must not include rejection reasons"
-            )
+            raise ValueError("Accepted quality result must not include rejection reasons")
         if not self.accepted and len(self.rejection_reasons) == 0:
             raise ValueError("Rejected quality result must include rejection reasons")
 
@@ -1726,24 +1574,14 @@ class CompactQualityCheckResult:
 
         return {
             "accepted": self.accepted,
-            "rejection_reasons": [
-                _enum_value for _enum_value in self._rejection_reason_values()
-            ],
+            "rejection_reasons": [_enum_value for _enum_value in self._rejection_reason_values()],
             "current_user_input_retained": self.current_user_input_retained,
-            "canonical_evidence_refs_retained": (
-                self.canonical_evidence_refs_retained
-            ),
-            "evidence_backed_fact_candidates_accepted": (
-                self.evidence_backed_fact_candidates_accepted
-            ),
-            "minimum_preserve_items_accepted": (
-                self.minimum_preserve_items_accepted
-            ),
+            "canonical_evidence_refs_retained": (self.canonical_evidence_refs_retained),
+            "evidence_backed_fact_candidates_accepted": (self.evidence_backed_fact_candidates_accepted),
+            "minimum_preserve_items_accepted": (self.minimum_preserve_items_accepted),
             "evidence_anchors_retained": self.evidence_anchors_retained,
             "open_questions_retained": self.open_questions_retained,
-            "retained_canonical_evidence_refs": _string_list_json(
-                self.retained_canonical_evidence_refs
-            ),
+            "retained_canonical_evidence_refs": _string_list_json(self.retained_canonical_evidence_refs),
             "dropped_ranges": _range_list_json(self.dropped_ranges),
             "summarized_ranges": _range_list_json(self.summarized_ranges),
         }
@@ -1767,9 +1605,7 @@ class ContextCompactor(Protocol):
     必须由 quality checker 通过后才可写 compact artifact / canonical event。
     """
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """生成 compaction candidate。
 
         :param request: Host 构造的 compaction 请求。
@@ -1812,9 +1648,7 @@ def _require_string_tuple(value: tuple[str, ...], *, field_name: str) -> None:
         _require_non_empty(item, field_name=field_name)
 
 
-def _require_string_mapping(
-    value: Mapping[str, str], *, field_name: str
-) -> None:
+def _require_string_mapping(value: Mapping[str, str], *, field_name: str) -> None:
     """校验字符串到字符串的只读 mapping。
 
     :param value: 待校验 mapping。
@@ -1835,9 +1669,7 @@ def _require_string_mapping(
         _require_non_empty(item, field_name=field_name)
 
 
-def _require_unique_string_tuple(
-    value: tuple[str, ...], *, field_name: str
-) -> None:
+def _require_unique_string_tuple(value: tuple[str, ...], *, field_name: str) -> None:
     """校验字符串 tuple 且元素不重复。
 
     :param value: 待校验 tuple。
@@ -1877,9 +1709,7 @@ def _require_bounded_string_tuple(
         raise ValueError(f"{field_name} exceeds maximum item count")
 
 
-def _require_bounded_non_empty_text(
-    value: str, *, field_name: str, max_chars: int
-) -> None:
+def _require_bounded_non_empty_text(value: str, *, field_name: str, max_chars: int) -> None:
     """校验有界非空文本。
 
     :param value: 待校验文本。
@@ -1898,9 +1728,7 @@ def _require_bounded_non_empty_text(
         raise ValueError(f"{field_name} exceeds maximum length")
 
 
-def _require_json_mapping(
-    value: Mapping[str, JsonValue], *, field_name: str
-) -> None:
+def _require_json_mapping(value: Mapping[str, JsonValue], *, field_name: str) -> None:
     """校验 JSON object mapping。
 
     :param value: 待校验 JSON object。
@@ -1941,9 +1769,7 @@ def _require_material_block_tuple(
             raise ValueError(f"{field_name} items must belong to {section.value}")
 
 
-def _require_evidence_block_tuple(
-    value: tuple[CompactEvidenceBlock, ...], *, field_name: str
-) -> None:
+def _require_evidence_block_tuple(value: tuple[CompactEvidenceBlock, ...], *, field_name: str) -> None:
     """校验 evidence material block tuple。
 
     :param value: 待校验 tuple。
@@ -1975,10 +1801,7 @@ def _require_provenance_mapping(
         if not isinstance(key, str):
             raise TypeError("CompactMaterialPack.provenance_map keys must be str")
         if not isinstance(entry, PromptLocalProvenanceEntry):
-            raise TypeError(
-                "CompactMaterialPack.provenance_map values must be "
-                "PromptLocalProvenanceEntry"
-            )
+            raise TypeError("CompactMaterialPack.provenance_map values must be " "PromptLocalProvenanceEntry")
         if key != entry.label:
             raise ValueError("CompactMaterialPack.provenance_map key mismatch")
 
@@ -2003,9 +1826,7 @@ def _require_one_section_per_canonical_content(pack: CompactMaterialPack) -> Non
             raise ValueError("material pack canonical content appears in two sections")
 
 
-def _require_opaque_ref_tuple(
-    value: tuple[OpaqueEvidenceRef, ...], *, field_name: str
-) -> None:
+def _require_opaque_ref_tuple(value: tuple[OpaqueEvidenceRef, ...], *, field_name: str) -> None:
     """校验 opaque evidence ref tuple。
 
     :param value: 待校验 tuple。
@@ -2021,9 +1842,7 @@ def _require_opaque_ref_tuple(
             raise TypeError(f"{field_name} items must be OpaqueEvidenceRef")
 
 
-def _require_tuple_patch_field(
-    value: PinnedStringTupleFieldPatch, *, field_name: str
-) -> None:
+def _require_tuple_patch_field(value: PinnedStringTupleFieldPatch, *, field_name: str) -> None:
     """校验字符串 tuple patch 字段。
 
     :param value: 待校验 patch。
@@ -2036,9 +1855,7 @@ def _require_tuple_patch_field(
         raise TypeError(f"{field_name} must be PinnedStringTupleFieldPatch")
 
 
-def _require_evidence_tuple(
-    value: tuple[PreservationEvidence, ...], *, field_name: str
-) -> None:
+def _require_evidence_tuple(value: tuple[PreservationEvidence, ...], *, field_name: str) -> None:
     """校验 preservation evidence tuple。
 
     :param value: 待校验 tuple。
@@ -2054,9 +1871,7 @@ def _require_evidence_tuple(
             raise TypeError(f"{field_name} items must be PreservationEvidence")
 
 
-def _require_fact_candidate_tuple(
-    value: tuple[EvidenceBackedFactCandidate, ...], *, field_name: str
-) -> None:
+def _require_fact_candidate_tuple(value: tuple[EvidenceBackedFactCandidate, ...], *, field_name: str) -> None:
     """校验 evidence-backed fact candidate tuple。
 
     :param value: 待校验 tuple。
@@ -2072,9 +1887,7 @@ def _require_fact_candidate_tuple(
         raise ValueError(f"{field_name} exceeds maximum item count")
     for item in value:
         if not isinstance(item, EvidenceBackedFactCandidate):
-            raise TypeError(
-                f"{field_name} items must be EvidenceBackedFactCandidate"
-            )
+            raise TypeError(f"{field_name} items must be EvidenceBackedFactCandidate")
 
 
 def _require_minimum_preserve_candidate_tuple(
@@ -2095,14 +1908,10 @@ def _require_minimum_preserve_candidate_tuple(
         raise ValueError(f"{field_name} exceeds maximum item count")
     for item in value:
         if not isinstance(item, MinimumPreserveItemCandidate):
-            raise TypeError(
-                f"{field_name} items must be MinimumPreserveItemCandidate"
-            )
+            raise TypeError(f"{field_name} items must be MinimumPreserveItemCandidate")
 
 
-def _require_range_tuple(
-    value: tuple[CompactInputRange, ...], *, field_name: str
-) -> None:
+def _require_range_tuple(value: tuple[CompactInputRange, ...], *, field_name: str) -> None:
     """校验 compact input range tuple。
 
     :param value: 待校验 tuple。
@@ -2118,9 +1927,7 @@ def _require_range_tuple(
             raise TypeError(f"{field_name} items must be CompactInputRange")
 
 
-def _require_quality_issue_tuple(
-    value: tuple[CompactQualityIssue, ...], *, field_name: str
-) -> None:
+def _require_quality_issue_tuple(value: tuple[CompactQualityIssue, ...], *, field_name: str) -> None:
     """校验 quality issue tuple。
 
     :param value: 待校验 tuple。
@@ -2175,9 +1982,7 @@ def _string_mapping_json(values: Mapping[str, str]) -> JsonValue:
     return result
 
 
-def _material_block_list_json(
-    values: tuple[CompactMaterialBlock, ...]
-) -> list[JsonValue]:
+def _material_block_list_json(values: tuple[CompactMaterialBlock, ...]) -> list[JsonValue]:
     """把 material block tuple 转换为 JSON 数组。
 
     :param values: material block tuple。
@@ -2190,9 +1995,7 @@ def _material_block_list_json(
     return result
 
 
-def _material_block_llm_list_json(
-    values: tuple[CompactMaterialBlock, ...]
-) -> list[JsonValue]:
+def _material_block_llm_list_json(values: tuple[CompactMaterialBlock, ...]) -> list[JsonValue]:
     """把 material block tuple 转换为 LLM-facing JSON 数组。
 
     :param values: material block tuple。
@@ -2205,9 +2008,7 @@ def _material_block_llm_list_json(
     return result
 
 
-def _evidence_block_list_json(
-    values: tuple[CompactEvidenceBlock, ...]
-) -> list[JsonValue]:
+def _evidence_block_list_json(values: tuple[CompactEvidenceBlock, ...]) -> list[JsonValue]:
     """把 evidence material block tuple 转换为 JSON 数组。
 
     :param values: evidence block tuple。
@@ -2220,9 +2021,7 @@ def _evidence_block_list_json(
     return result
 
 
-def _evidence_block_llm_list_json(
-    values: tuple[CompactEvidenceBlock, ...]
-) -> list[JsonValue]:
+def _evidence_block_llm_list_json(values: tuple[CompactEvidenceBlock, ...]) -> list[JsonValue]:
     """把 evidence material block tuple 转换为 LLM-facing JSON 数组。
 
     :param values: evidence block tuple。
@@ -2339,9 +2138,7 @@ def _budget_estimate_json(estimate: BudgetEstimate) -> JsonValue:
         "hard_threshold_tokens": estimate.hard_threshold_tokens,
         "safety_margin_tokens": estimate.safety_margin_tokens,
         "estimator_digest": estimate.estimator_digest,
-        "overage_reason": (
-            None if estimate.overage_reason is None else estimate.overage_reason.value
-        ),
+        "overage_reason": (None if estimate.overage_reason is None else estimate.overage_reason.value),
     }
 
 

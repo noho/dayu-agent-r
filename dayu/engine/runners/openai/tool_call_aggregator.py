@@ -38,9 +38,7 @@ from dayu.engine.runners.openai._types import _OpenAIToolCallDelta
 _GOOGLE_NAMESPACE: str = "google"
 _GEMINI_THOUGHT_SIGNATURE_KEY: str = "thought_signature"
 _GEMINI_THOUGHT_KEY: str = "thought"
-_KNOWN_GEMINI_KEYS: frozenset[str] = frozenset(
-    {_GEMINI_THOUGHT_SIGNATURE_KEY, _GEMINI_THOUGHT_KEY}
-)
+_KNOWN_GEMINI_KEYS: frozenset[str] = frozenset({_GEMINI_THOUGHT_SIGNATURE_KEY, _GEMINI_THOUGHT_KEY})
 PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS: int = 16
 PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS: int = 128
 
@@ -112,12 +110,8 @@ class ToolCallAggregateResult:
     """
 
     tool_calls: tuple[ToolCallRequest, ...]
-    fatal_errors: tuple[RunnerProtocolErrorData, ...] = field(
-        default_factory=tuple
-    )
-    warnings: tuple[RunnerProtocolErrorData, ...] = field(
-        default_factory=tuple
-    )
+    fatal_errors: tuple[RunnerProtocolErrorData, ...] = field(default_factory=tuple)
+    warnings: tuple[RunnerProtocolErrorData, ...] = field(default_factory=tuple)
 
 
 class ToolCallAggregator:
@@ -194,17 +188,41 @@ class ToolCallAggregator:
         # 无 ``id`` 也无 ``index``：若调用方提供了 ``pos``，且该位置已
         # 有 partial，则归到该 partial（OLD ``sse_parser.py`` 的 pos
         # fallback 行为）。
-        if (
-            position is not None
-            and position in self._index_by_position
-        ):
+        if position is not None and position in self._index_by_position:
             return self._index_by_position[position]
-        if (
-            position is not None
-            and position in self._partials_by_index
-        ):
+        if position is not None and position in self._partials_by_index:
             return position
         return None
+
+    def _remap_partial_index(self, *, source_index: int, target_index: int) -> None:
+        """把旧 partial 合并到 provider 后续给出的真实 index。
+
+        :param source_index: 先前由 id 归属到的旧 index。
+        :param target_index: 后续 delta 携带的 provider 原生 index。
+        :returns: ``None``。
+        """
+
+        if source_index == target_index:
+            return
+        source = self._partials_by_index.pop(source_index, None)
+        if source is None:
+            return
+        target = self._partials_by_index.get(target_index)
+        if target is None:
+            self._partials_by_index[target_index] = source
+        else:
+            target.tool_call_id = target.tool_call_id or source.tool_call_id
+            target.name = source.name + target.name
+            target.arguments_buffer = source.arguments_buffer + target.arguments_buffer
+            target.extra_content_seen = source.extra_content_seen or target.extra_content_seen
+            if target.provider_state is None:
+                target.provider_state = source.provider_state
+        for item_id, mapped_index in tuple(self._index_by_id.items()):
+            if mapped_index == source_index:
+                self._index_by_id[item_id] = target_index
+        for item_position, mapped_index in tuple(self._index_by_position.items()):
+            if mapped_index == source_index:
+                self._index_by_position[item_position] = target_index
 
     def feed(
         self,
@@ -239,15 +257,20 @@ class ToolCallAggregator:
                 )
             )
             return None
-        partial = self._partials_by_index.setdefault(
-            index, _PartialToolCall()
-        )
-        if position is not None:
-            self._index_by_position[position] = index
         delta_id = delta.get("id")
         if isinstance(delta_id, str) and delta_id:
+            existing_index = self._index_by_id.get(delta_id)
+            if existing_index is not None and existing_index != index:
+                self._remap_partial_index(
+                    source_index=existing_index,
+                    target_index=index,
+                )
+            self._index_by_id[delta_id] = index
+        partial = self._partials_by_index.setdefault(index, _PartialToolCall())
+        if position is not None:
+            self._index_by_position[position] = index
+        if isinstance(delta_id, str) and delta_id:
             partial.tool_call_id = delta_id
-            self._index_by_id.setdefault(delta_id, index)
         function = delta.get("function")
         if function is not None:
             name = function.get("name")
@@ -282,10 +305,7 @@ class ToolCallAggregator:
                 self._warnings.append(
                     RunnerProtocolErrorData(
                         error_code="tool_call_unknown_provider_namespace",
-                        message=(
-                            f"unknown provider namespace in tool call "
-                            f"extra_content: {namespace}"
-                        ),
+                        message=(f"unknown provider namespace in tool call " f"extra_content: {namespace}"),
                         provider_request_id=self._provider_request_id,
                         raw_payload=None,
                         partial_tool_calls=self.partial_summaries(),
@@ -297,10 +317,7 @@ class ToolCallAggregator:
                     self._warnings.append(
                         RunnerProtocolErrorData(
                             error_code="tool_call_unknown_gemini_key",
-                            message=(
-                                f"unknown google.* key in tool call "
-                                f"extra_content: {key}"
-                            ),
+                            message=(f"unknown google.* key in tool call " f"extra_content: {key}"),
                             provider_request_id=self._provider_request_id,
                             raw_payload=None,
                             partial_tool_calls=self.partial_summaries(),
@@ -344,9 +361,7 @@ class ToolCallAggregator:
                 self._fatal_errors.append(
                     RunnerProtocolErrorData(
                         error_code="tool_call_missing_name",
-                        message=(
-                            f"tool call {partial.tool_call_id} missing name"
-                        ),
+                        message=(f"tool call {partial.tool_call_id} missing name"),
                         provider_request_id=self._provider_request_id,
                         raw_payload=None,
                         partial_tool_calls=self.partial_summaries(),
@@ -383,33 +398,25 @@ class ToolCallAggregator:
         """
 
         summaries: list[PartialToolCallSummary] = []
-        for index in _sorted_partial_indices(self._partials_by_index)[
-            :PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS
-        ]:
+        for index in _sorted_partial_indices(self._partials_by_index)[:PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS]:
             partial = self._partials_by_index[index]
             arguments_sha256 = (
                 None
                 if partial.arguments_buffer == ""
-                else hashlib.sha256(
-                    partial.arguments_buffer.encode("utf-8")
-                ).hexdigest()
+                else hashlib.sha256(partial.arguments_buffer.encode("utf-8")).hexdigest()
             )
             summaries.append(
                 PartialToolCallSummary(
                     tool_call_index=index,
                     tool_call_id=_bounded_tool_call_id(partial.tool_call_id),
                     name_fragment=_bounded_name_fragment(partial.name),
-                    arguments_byte_size=len(
-                        partial.arguments_buffer.encode("utf-8")
-                    ),
+                    arguments_byte_size=len(partial.arguments_buffer.encode("utf-8")),
                     arguments_sha256=arguments_sha256,
                 )
             )
         return tuple(summaries)
 
-    def _parse_arguments(
-        self, buffer: str, *, tool_call_id: str
-    ) -> Mapping[str, JsonValue] | None:
+    def _parse_arguments(self, buffer: str, *, tool_call_id: str) -> Mapping[str, JsonValue] | None:
         """解析累积的 arguments JSON。"""
 
         if not buffer:
@@ -420,9 +427,7 @@ class ToolCallAggregator:
             self._fatal_errors.append(
                 RunnerProtocolErrorData(
                     error_code="tool_call_arguments_invalid_json",
-                    message=(
-                        f"tool call {tool_call_id} arguments invalid: {exc}"
-                    ),
+                    message=(f"tool call {tool_call_id} arguments invalid: {exc}"),
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self.partial_summaries(),
@@ -433,9 +438,7 @@ class ToolCallAggregator:
             self._fatal_errors.append(
                 RunnerProtocolErrorData(
                     error_code="tool_call_arguments_not_object",
-                    message=(
-                        f"tool call {tool_call_id} arguments is not an object"
-                    ),
+                    message=(f"tool call {tool_call_id} arguments is not an object"),
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self.partial_summaries(),

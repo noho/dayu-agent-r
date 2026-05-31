@@ -160,9 +160,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
     assert result.options.memory_projection_policy.max_evidence_backed_facts == 256
-    assert result.options.ordinary_run_baseline.runner_spec.headers[
-        "Authorization"
-    ] == f"Bearer {_API_KEY}"
+    assert result.options.ordinary_run_baseline.runner_spec.headers["Authorization"] == f"Bearer {_API_KEY}"
     assert result.options.ordinary_run_baseline.runner_options.max_tokens is None
     compactor_baseline = result.options.compactor_runner_baseline
     assert compactor_baseline is not None
@@ -177,34 +175,19 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
         tool_execution_timeout_seconds=1.0,
         fallback_mode=AgentFallbackMode.RAISE_ERROR,
         fallback_prompt="Compactor is not allowed to fallback-answer.",
-        continuation_prompt=(
-            "Continue the strict JSON object without repeating content "
-            "already emitted."
-        ),
+        continuation_prompt=("Continue the strict JSON object without repeating content " "already emitted."),
         max_consecutive_failed_tool_batches=1,
     )
-    assert "Host-owned context compaction" in (
-        compactor_baseline.compactor_system_prompt
-    )
-    assert "<<compaction_request>>" in (
-        compactor_baseline.compactor_user_prompt_template
-    )
+    assert "Host-owned context compaction" in (compactor_baseline.compactor_system_prompt)
+    assert "<<compaction_request>>" in (compactor_baseline.compactor_user_prompt_template)
     assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
     assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
     assert result.diagnostics.model_source == "run_override"
     assert result.diagnostics.execution_profile_id == "standard-256k"
     assert result.diagnostics.ordinary_profile_compatibility.status == "conservative"
-    assert (
-        result.diagnostics.ordinary_profile_compatibility.profile_id
-        == "standard-256k"
-    )
-    assert (
-        result.diagnostics.ordinary_profile_compatibility.selected_model_id
-        == _MODEL_ID
-    )
-    assert result.diagnostics.tool_selection == (
-        "mode=select,tools=record_smoke_fact"
-    )
+    assert result.diagnostics.ordinary_profile_compatibility.profile_id == "standard-256k"
+    assert result.diagnostics.ordinary_profile_compatibility.selected_model_id == _MODEL_ID
+    assert result.diagnostics.tool_selection == ("mode=select,tools=record_smoke_fact")
 
 
 def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
@@ -277,12 +260,8 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
 
     compactor_baseline = result.options.compactor_runner_baseline
     assert compactor_baseline is not None
-    assert compactor_baseline.compactor_system_prompt == (
-        "custom compactor system prompt"
-    )
-    assert compactor_baseline.compactor_user_prompt_template == (
-        "custom compactor user prompt <<compaction_request>>"
-    )
+    assert compactor_baseline.compactor_system_prompt == ("custom compactor system prompt")
+    assert compactor_baseline.compactor_user_prompt_template == ("custom compactor user prompt <<compaction_request>>")
     assert compactor_baseline.compactor_agent_policy.max_iterations == 1
     assert compactor_baseline.compactor_agent_policy.allow_tool_calls is False
 
@@ -441,14 +420,8 @@ def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
     :raises ValueError: 非法值未保持 ``ValueError`` 语义时抛出。
     """
 
-    assert (
-        _agent_fallback_mode_from_config("force_answer")
-        is AgentFallbackMode.FORCE_ANSWER
-    )
-    assert (
-        _agent_fallback_mode_from_config("raise_error")
-        is AgentFallbackMode.RAISE_ERROR
-    )
+    assert _agent_fallback_mode_from_config("force_answer") is AgentFallbackMode.FORCE_ANSWER
+    assert _agent_fallback_mode_from_config("raise_error") is AgentFallbackMode.RAISE_ERROR
     with pytest.raises(ValueError):
         _agent_fallback_mode_from_config("unsupported")
 
@@ -766,10 +739,7 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
     assert result.execution_profile.execution_profile_id == "standard-256k"
     assert result.diagnostics.model_id == _MODEL_ID
     assert result.diagnostics.ordinary_profile_compatibility.status == "conservative"
-    assert (
-        result.diagnostics.compactor_profile_compatibility.selected_model_id
-        == "deepseek-v4-flash"
-    )
+    assert result.diagnostics.compactor_profile_compatibility.selected_model_id == "deepseek-v4-flash"
 
 
 def test_resolve_project_path_rejects_relative_escape(tmp_path: Path) -> None:
@@ -800,9 +770,7 @@ def _write_tool_discovery_overlay(workspace_root: Path) -> None:
         {
             "providers": {
                 "financial-tools": {
-                    "import_path": (
-                        "utils.smoke_host_public_multiturn:discover_smoke_tools"
-                    ),
+                    "import_path": ("utils.smoke_host_public_multiturn:discover_smoke_tools"),
                     "entry_point": None,
                     "source_kind": "config_binding",
                     "source_id": "utils.smoke_host_public_multiturn",
@@ -887,9 +855,7 @@ def _write_execution_profile_overlay(
                         "model_id": model_id,
                         "scene_id": "conversation_compaction",
                         "runner_option_hint_id": "conversation_compaction",
-                        "user_prompt_template_path": (
-                            "scenes/conversation_compaction_user.md"
-                        ),
+                        "user_prompt_template_path": ("scenes/conversation_compaction_user.md"),
                         "artifact_root": "workspace/.dayu/artifacts/compaction",
                     },
                     "context_budget_policy": {
@@ -934,12 +900,10 @@ def _write_execution_profile_overlay(
                         "tool_execution_timeout_seconds": 120.0,
                         "fallback_mode": "force_answer",
                         "fallback_prompt": (
-                            "请基于已获得的信息直接回答问题。"
-                            "信息不足时必须说明不确定性，不得编造。"
+                            "请基于已获得的信息直接回答问题。" "信息不足时必须说明不确定性，不得编造。"
                         ),
                         "continuation_prompt": (
-                            "请从上一条回复被截断的位置继续输出，"
-                            "保持原有语言、格式和结构，不要重复已经输出的内容。"
+                            "请从上一条回复被截断的位置继续输出，" "保持原有语言、格式和结构，不要重复已经输出的内容。"
                         ),
                         "max_consecutive_failed_tool_batches": 2,
                     },
@@ -981,8 +945,7 @@ def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
                 "fallback_mode": "raise_error",
                 "fallback_prompt": "Compactor is not allowed to fallback-answer.",
                 "continuation_prompt": (
-                    "Continue the strict JSON object without repeating content "
-                    "already emitted."
+                    "Continue the strict JSON object without repeating content " "already emitted."
                 ),
                 "max_consecutive_failed_tool_batches": 1,
             },
@@ -1034,9 +997,7 @@ def _host_context(request_id: str) -> HostCallContext:
         actor="service-test",
         source="tests.service.test_host_assembly",
         request_id=request_id,
-        authorization_claims=(
-            AuthorizationClaim(name="role", value="service-test"),
-        ),
+        authorization_claims=(AuthorizationClaim(name="role", value="service-test"),),
         operation_context=OperationContext(
             operation_name="service_host_assembly_test",
             operation_kind="unit_test",
@@ -1049,9 +1010,7 @@ def _host_context(request_id: str) -> HostCallContext:
     )
 
 
-def _compactor_scene_inputs(
-    *, agent_policy_override: SceneAgentPolicyOverride | None
-) -> PreparedSceneInputs:
+def _compactor_scene_inputs(*, agent_policy_override: SceneAgentPolicyOverride | None) -> PreparedSceneInputs:
     """构造测试用 compactor scene inputs。
 
     :param agent_policy_override: compactor scene agent policy override。

@@ -58,9 +58,7 @@ async def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
     result = check_compaction_candidate(request, candidate)
 
     assert candidate.episode_summary_candidate.candidate_id == "fake-summary:run-1"
-    assert candidate.pinned_state_patch_candidate.current_goal.operation is (
-        PinnedPatchOperation.REPLACE
-    )
+    assert candidate.pinned_state_patch_candidate.current_goal.operation is (PinnedPatchOperation.REPLACE)
     assert len(candidate.preservation_evidence) == 1
     assert result.accepted is True
 
@@ -73,9 +71,7 @@ async def test_fake_compactor_observes_cancellation_token() -> None:
     """
 
     with pytest.raises(RuntimeError, match="compaction cancelled"):
-        await FakeContextCompactor().compact(
-            _request(), StubCancellationToken("cancelled-by-test")
-        )
+        await FakeContextCompactor().compact(_request(), StubCancellationToken("cancelled-by-test"))
 
 
 @pytest.mark.asyncio
@@ -95,15 +91,30 @@ async def test_fact_candidates_can_reference_evidence_materials() -> None:
         "evidence:accepted-1",
         "evidence:accepted-2",
     )
-    assert tuple(
-        fact.evidence_refs for fact in candidate.evidence_backed_fact_candidates
-    ) == (("evidence:accepted-1",), ("evidence:accepted-2",))
-    assert tuple(
-        fact.claim_text for fact in candidate.evidence_backed_fact_candidates
-    ) == (
+    assert tuple(fact.evidence_refs for fact in candidate.evidence_backed_fact_candidates) == (
+        ("evidence:accepted-1",),
+        ("evidence:accepted-2",),
+    )
+    assert tuple(fact.claim_text for fact in candidate.evidence_backed_fact_candidates) == (
         "Canonical evidence material: canonical evidence raw content accepted-1",
         "Canonical evidence material: canonical evidence raw content accepted-2",
     )
+
+
+@pytest.mark.asyncio
+async def test_candidate_rejects_duplicate_preserved_canonical_evidence_refs() -> None:
+    """候选保留的 canonical evidence refs 必须去重后再进入质量闸门。"""
+
+    candidate = await FakeContextCompactor().compact(_request(), StubCancellationToken())
+
+    with pytest.raises(ValueError, match="preserved_canonical_evidence_refs"):
+        replace(
+            candidate,
+            preserved_canonical_evidence_refs=(
+                "evidence:accepted-1",
+                "evidence:accepted-1",
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -161,9 +172,7 @@ async def test_quality_rejects_missing_canonical_evidence_refs() -> None:
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.ACCEPTED_EVIDENCE_REFS_MISSING in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.ACCEPTED_EVIDENCE_REFS_MISSING in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -182,9 +191,7 @@ async def test_quality_rejects_missing_preservation_evidence() -> None:
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.PRESERVATION_EVIDENCE_MISSING in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.PRESERVATION_EVIDENCE_MISSING in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -205,9 +212,7 @@ async def test_quality_rejects_missing_evidence_anchor_retention() -> None:
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.EVIDENCE_ANCHOR_NOT_RETAINED in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.EVIDENCE_ANCHOR_NOT_RETAINED in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -232,9 +237,7 @@ async def test_quality_rejects_invalid_pinned_patch_tri_state() -> None:
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.PINNED_PATCH_TRI_STATE_INVALID in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.PINNED_PATCH_TRI_STATE_INVALID in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -259,9 +262,7 @@ async def test_quality_rejects_pinned_patch_unknown_evidence_ref() -> None:
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.PINNED_PATCH_EVIDENCE_REF_MISSING in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.PINNED_PATCH_EVIDENCE_REF_MISSING in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -279,9 +280,7 @@ async def test_quality_accepts_clear_when_request_has_no_original_open_questions
         open_questions=PinnedStringTupleFieldPatch(
             operation=PinnedPatchOperation.CLEAR,
             value=None,
-            evidence_refs=(
-                candidate.pinned_state_patch_candidate.open_questions.evidence_refs
-            ),
+            evidence_refs=(candidate.pinned_state_patch_candidate.open_questions.evidence_refs),
         ),
     )
     candidate = replace(
@@ -337,9 +336,7 @@ async def test_quality_accepts_evidence_supported_clear_for_original_open_questi
         open_questions=PinnedStringTupleFieldPatch(
             operation=PinnedPatchOperation.CLEAR,
             value=None,
-            evidence_refs=(
-                candidate.pinned_state_patch_candidate.open_questions.evidence_refs
-            ),
+            evidence_refs=(candidate.pinned_state_patch_candidate.open_questions.evidence_refs),
         ),
     )
     candidate = replace(
@@ -373,9 +370,7 @@ async def test_quality_rejects_summary_pretending_to_create_evidence_backed_fact
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -396,9 +391,7 @@ async def test_quality_rejects_summary_confirmed_fact_ref_to_accepted_evidence()
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -419,9 +412,7 @@ async def test_quality_rejects_summary_confirmed_fact_ref_to_evidence_label() ->
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -441,9 +432,7 @@ async def test_quality_rejects_preserved_fact_ref_outside_request_subset() -> No
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -478,9 +467,7 @@ async def test_quality_rejects_fact_candidate_referencing_non_evidence_ref() -> 
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -499,9 +486,7 @@ async def test_quality_rejects_missing_fact_candidate_for_accepted_evidence() ->
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING in (result.rejection_reasons)
 
 
 def test_fact_candidate_rejects_empty_claim_text() -> None:
@@ -586,9 +571,7 @@ async def test_quality_rejects_minimum_preserve_source_outside_compact_input() -
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID in (result.rejection_reasons)
 
 
 @pytest.mark.asyncio
@@ -607,9 +590,7 @@ async def test_quality_rejects_compact_range_outside_request() -> None:
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.COMPACT_RANGE_OUTSIDE_REQUEST in (
-        result.rejection_reasons
-    )
+    assert CompactQualityIssue.COMPACT_RANGE_OUTSIDE_REQUEST in (result.rejection_reasons)
 
 
 def test_compaction_request_rejects_wrong_material_pack_type() -> None:
@@ -703,9 +684,7 @@ def test_compact_quality_result_rejects_rejected_without_rejection_reasons() -> 
 
 def _request(
     *,
-    trigger_source: ContextCompactionTriggerSource = (
-        ContextCompactionTriggerSource.PROACTIVE
-    ),
+    trigger_source: ContextCompactionTriggerSource = (ContextCompactionTriggerSource.PROACTIVE),
     attempt_id: str | None = None,
     execution_id: str | None = None,
     material_pack: CompactMaterialPack | None = None,
@@ -875,21 +854,13 @@ def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
         tool_call_id=f"tool-call-{suffix}",
         tool_query=AcceptedEvidenceToolQuery(
             tool_call_requested_event_ref=f"event-tool-call-{suffix}",
-            normalized_arguments_digest=(
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            semantic_input_digest=(
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ),
+            normalized_arguments_digest=("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            semantic_input_digest=("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         ),
         result_ref=AcceptedEvidenceResultRef(
             payload_ref=f"payload:{suffix}",
-            payload_digest=(
-                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-            ),
-            outcome_digest=(
-                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-            ),
+            payload_digest=("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+            outcome_digest=("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
             truncation_applied=False,
         ),
         source_refs=(),

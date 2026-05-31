@@ -53,9 +53,11 @@ from dayu.host.durable.transaction import HostRow
 from dayu.host.durable.transaction import HostTransaction
 
 _StatusT = TypeVar("_StatusT", bound=StrEnum)
-_TERMINAL_RUN_STATUSES = frozenset(
-    (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
-)
+TERMINAL_RUN_STATUSES = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST))
+"""Run 终态集合，作为 durable state / purge 等持久化逻辑的状态真源。"""
+
+NON_TERMINAL_RUN_STATUSES = frozenset(status for status in RunStatus if status not in TERMINAL_RUN_STATUSES)
+"""Run 非终态集合，由 :class:`RunStatus` 与终态集合派生。"""
 _WAIT_RECORD_SELECT_SQL = f"""
 SELECT
   wait_id,
@@ -336,9 +338,7 @@ class WaitSnapshotRef:
             format_utc_timestamp(self.captured_at)
         except ValueError as exc:
             raise HostDurableError("snapshot_captured_at must be UTC aware") from exc
-        _require_optional_non_empty_text(
-            self.snapshot_digest, field_name="snapshot_digest"
-        )
+        _require_optional_non_empty_text(self.snapshot_digest, field_name="snapshot_digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,9 +447,7 @@ def deserialize_session_status(value: str) -> SessionStatus:
     :raises HostDurableError: 文本为空或不属于 ``SessionStatus`` 时抛出。
     """
 
-    return _deserialize_str_enum(
-        value, enum_type=SessionStatus, enum_name="SessionStatus"
-    )
+    return _deserialize_str_enum(value, enum_type=SessionStatus, enum_name="SessionStatus")
 
 
 def serialize_run_status(status: RunStatus) -> str:
@@ -493,9 +491,7 @@ def deserialize_attempt_status(value: str) -> AttemptStatus:
     :raises HostDurableError: 文本为空或不属于 ``AttemptStatus`` 时抛出。
     """
 
-    return _deserialize_str_enum(
-        value, enum_type=AttemptStatus, enum_name="AttemptStatus"
-    )
+    return _deserialize_str_enum(value, enum_type=AttemptStatus, enum_name="AttemptStatus")
 
 
 def serialize_dispatch_record_status(status: DispatchRecordStatus) -> str:
@@ -565,9 +561,7 @@ def deserialize_run_start_reason(value: str) -> RunStartReason:
     :raises HostDurableError: 文本为空或不属于 ``RunStartReason`` 时抛出。
     """
 
-    return _deserialize_str_enum(
-        value, enum_type=RunStartReason, enum_name="RunStartReason"
-    )
+    return _deserialize_str_enum(value, enum_type=RunStartReason, enum_name="RunStartReason")
 
 
 def serialize_wait_record_status(status: WaitRecordStatus) -> str:
@@ -589,9 +583,7 @@ def deserialize_wait_record_status(value: str) -> WaitRecordStatus:
     :raises HostDurableError: 文本为空或不属于 ``WaitRecordStatus`` 时抛出。
     """
 
-    return _deserialize_str_enum(
-        value, enum_type=WaitRecordStatus, enum_name="WaitRecordStatus"
-    )
+    return _deserialize_str_enum(value, enum_type=WaitRecordStatus, enum_name="WaitRecordStatus")
 
 
 def serialize_wait_resume_policy(policy: WaitResumePolicy) -> str:
@@ -613,9 +605,7 @@ def deserialize_wait_resume_policy(value: str) -> WaitResumePolicy:
     :raises HostDurableError: 文本为空或不属于 ``WaitResumePolicy`` 时抛出。
     """
 
-    return _deserialize_str_enum(
-        value, enum_type=WaitResumePolicy, enum_name="WaitResumePolicy"
-    )
+    return _deserialize_str_enum(value, enum_type=WaitResumePolicy, enum_name="WaitResumePolicy")
 
 
 def serialize_wait_snapshot_ref(ref: WaitSnapshotRef | None) -> str | None:
@@ -695,9 +685,7 @@ def serialize_external_job_id(ref: ExternalJobRef | None) -> str | None:
     return ref.external_job_id
 
 
-def deserialize_external_job_ref(
-    adapter_key: WaitAdapterKey, external_job_id: str | None
-) -> ExternalJobRef | None:
+def deserialize_external_job_ref(adapter_key: WaitAdapterKey, external_job_id: str | None) -> ExternalJobRef | None:
     """从 adapter key 与外部 job id 列反序列化外部 job 引用。
 
     :param adapter_key: wait record adapter key。
@@ -721,22 +709,12 @@ def session_row_from_host_row(row: HostRow) -> SessionRow:
 
     return SessionRow(
         session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        status=deserialize_session_status(
-            _require_text(row.get("status"), field_name="status")
-        ),
+        status=deserialize_session_status(_require_text(row.get("status"), field_name="status")),
         metadata_json=_require_text(row.get("metadata_json"), field_name="metadata_json"),
-        created_event_id=_require_text(
-            row.get("created_event_id"), field_name="created_event_id"
-        ),
-        created_event_sequence=_require_int(
-            row.get("created_event_sequence"), field_name="created_event_sequence"
-        ),
-        closed_event_id=_optional_text(
-            row.get("closed_event_id"), field_name="closed_event_id"
-        ),
-        closed_event_sequence=_optional_int(
-            row.get("closed_event_sequence"), field_name="closed_event_sequence"
-        ),
+        created_event_id=_require_text(row.get("created_event_id"), field_name="created_event_id"),
+        created_event_sequence=_require_int(row.get("created_event_sequence"), field_name="created_event_sequence"),
+        closed_event_id=_optional_text(row.get("closed_event_id"), field_name="closed_event_id"),
+        closed_event_sequence=_optional_int(row.get("closed_event_sequence"), field_name="closed_event_sequence"),
         created_at=_require_text(row.get("created_at"), field_name="created_at"),
         closed_at=_optional_text(row.get("closed_at"), field_name="closed_at"),
     )
@@ -754,12 +732,8 @@ def session_slot_row_from_host_row(row: HostRow) -> SessionSlotRow:
         scope=_require_text(row.get("scope"), field_name="scope"),
         slot_key=_require_text(row.get("slot_key"), field_name="slot_key"),
         session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        bound_event_id=_require_text(
-            row.get("bound_event_id"), field_name="bound_event_id"
-        ),
-        bound_event_sequence=_require_int(
-            row.get("bound_event_sequence"), field_name="bound_event_sequence"
-        ),
+        bound_event_id=_require_text(row.get("bound_event_id"), field_name="bound_event_id"),
+        bound_event_sequence=_require_int(row.get("bound_event_sequence"), field_name="bound_event_sequence"),
         metadata_json=_require_text(row.get("metadata_json"), field_name="metadata_json"),
         updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
     )
@@ -773,58 +747,26 @@ def run_row_from_host_row(row: HostRow) -> RunRow:
     :raises HostDurableError: row 字段类型或状态 enum 值无效时抛出。
     """
 
-    source_relation_text = _optional_text(
-        row.get("source_run_relation"), field_name="source_run_relation"
-    )
+    source_relation_text = _optional_text(row.get("source_run_relation"), field_name="source_run_relation")
     return RunRow(
         run_id=_require_text(row.get("run_id"), field_name="run_id"),
         session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        status=deserialize_run_status(
-            _require_text(row.get("status"), field_name="status")
-        ),
-        client_request_id=_require_text(
-            row.get("client_request_id"), field_name="client_request_id"
-        ),
-        input_event_id=_require_text(
-            row.get("input_event_id"), field_name="input_event_id"
-        ),
-        input_event_sequence=_require_int(
-            row.get("input_event_sequence"), field_name="input_event_sequence"
-        ),
-        accepted_event_id=_require_text(
-            row.get("accepted_event_id"), field_name="accepted_event_id"
-        ),
-        accepted_event_sequence=_require_int(
-            row.get("accepted_event_sequence"), field_name="accepted_event_sequence"
-        ),
-        queued_event_id=_optional_text(
-            row.get("queued_event_id"), field_name="queued_event_id"
-        ),
-        queued_event_sequence=_optional_int(
-            row.get("queued_event_sequence"), field_name="queued_event_sequence"
-        ),
-        started_event_id=_optional_text(
-            row.get("started_event_id"), field_name="started_event_id"
-        ),
-        started_event_sequence=_optional_int(
-            row.get("started_event_sequence"), field_name="started_event_sequence"
-        ),
-        terminal_event_id=_optional_text(
-            row.get("terminal_event_id"), field_name="terminal_event_id"
-        ),
-        terminal_event_sequence=_optional_int(
-            row.get("terminal_event_sequence"), field_name="terminal_event_sequence"
-        ),
-        current_attempt_id=_optional_text(
-            row.get("current_attempt_id"), field_name="current_attempt_id"
-        ),
-        source_run_id=_optional_text(
-            row.get("source_run_id"), field_name="source_run_id"
-        ),
+        status=deserialize_run_status(_require_text(row.get("status"), field_name="status")),
+        client_request_id=_require_text(row.get("client_request_id"), field_name="client_request_id"),
+        input_event_id=_require_text(row.get("input_event_id"), field_name="input_event_id"),
+        input_event_sequence=_require_int(row.get("input_event_sequence"), field_name="input_event_sequence"),
+        accepted_event_id=_require_text(row.get("accepted_event_id"), field_name="accepted_event_id"),
+        accepted_event_sequence=_require_int(row.get("accepted_event_sequence"), field_name="accepted_event_sequence"),
+        queued_event_id=_optional_text(row.get("queued_event_id"), field_name="queued_event_id"),
+        queued_event_sequence=_optional_int(row.get("queued_event_sequence"), field_name="queued_event_sequence"),
+        started_event_id=_optional_text(row.get("started_event_id"), field_name="started_event_id"),
+        started_event_sequence=_optional_int(row.get("started_event_sequence"), field_name="started_event_sequence"),
+        terminal_event_id=_optional_text(row.get("terminal_event_id"), field_name="terminal_event_id"),
+        terminal_event_sequence=_optional_int(row.get("terminal_event_sequence"), field_name="terminal_event_sequence"),
+        current_attempt_id=_optional_text(row.get("current_attempt_id"), field_name="current_attempt_id"),
+        source_run_id=_optional_text(row.get("source_run_id"), field_name="source_run_id"),
         source_run_relation=_optional_source_run_relation(source_relation_text),
-        execution_target=_require_text(
-            row.get("execution_target"), field_name="execution_target"
-        ),
+        execution_target=_require_text(row.get("execution_target"), field_name="execution_target"),
         queue_policy=_require_text(row.get("queue_policy"), field_name="queue_policy"),
         created_at=_require_text(row.get("created_at"), field_name="created_at"),
         updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
@@ -844,21 +786,11 @@ def attempt_row_from_host_row(row: HostRow) -> AttemptRow:
         attempt_id=_require_text(row.get("attempt_id"), field_name="attempt_id"),
         run_id=_require_text(row.get("run_id"), field_name="run_id"),
         execution_id=_require_text(row.get("execution_id"), field_name="execution_id"),
-        status=deserialize_attempt_status(
-            _require_text(row.get("status"), field_name="status")
-        ),
-        started_event_id=_require_text(
-            row.get("started_event_id"), field_name="started_event_id"
-        ),
-        started_event_sequence=_require_int(
-            row.get("started_event_sequence"), field_name="started_event_sequence"
-        ),
-        terminal_event_id=_optional_text(
-            row.get("terminal_event_id"), field_name="terminal_event_id"
-        ),
-        terminal_event_sequence=_optional_int(
-            row.get("terminal_event_sequence"), field_name="terminal_event_sequence"
-        ),
+        status=deserialize_attempt_status(_require_text(row.get("status"), field_name="status")),
+        started_event_id=_require_text(row.get("started_event_id"), field_name="started_event_id"),
+        started_event_sequence=_require_int(row.get("started_event_sequence"), field_name="started_event_sequence"),
+        terminal_event_id=_optional_text(row.get("terminal_event_id"), field_name="terminal_event_id"),
+        terminal_event_sequence=_optional_int(row.get("terminal_event_sequence"), field_name="terminal_event_sequence"),
         created_at=_require_text(row.get("created_at"), field_name="created_at"),
         updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
         terminal_at=_optional_text(row.get("terminal_at"), field_name="terminal_at"),
@@ -874,59 +806,29 @@ def dispatch_record_row_from_host_row(row: HostRow) -> DispatchRecordRow:
     """
 
     return DispatchRecordRow(
-        dispatch_record_id=_require_text(
-            row.get("dispatch_record_id"), field_name="dispatch_record_id"
-        ),
+        dispatch_record_id=_require_text(row.get("dispatch_record_id"), field_name="dispatch_record_id"),
         run_id=_require_text(row.get("run_id"), field_name="run_id"),
         attempt_id=_require_text(row.get("attempt_id"), field_name="attempt_id"),
         execution_id=_require_text(row.get("execution_id"), field_name="execution_id"),
-        status=deserialize_dispatch_record_status(
-            _require_text(row.get("status"), field_name="status")
-        ),
-        worker_kind=deserialize_worker_kind(
-            _require_text(row.get("worker_kind"), field_name="worker_kind")
-        ),
-        execution_target=_require_text(
-            row.get("execution_target"), field_name="execution_target"
-        ),
-        owner_host_instance_id=_optional_text(
-            row.get("owner_host_instance_id"), field_name="owner_host_instance_id"
-        ),
-        created_event_id=_require_text(
-            row.get("created_event_id"), field_name="created_event_id"
-        ),
-        created_event_sequence=_require_int(
-            row.get("created_event_sequence"), field_name="created_event_sequence"
-        ),
-        waiting_for_lane_at=_optional_text(
-            row.get("waiting_for_lane_at"), field_name="waiting_for_lane_at"
-        ),
+        status=deserialize_dispatch_record_status(_require_text(row.get("status"), field_name="status")),
+        worker_kind=deserialize_worker_kind(_require_text(row.get("worker_kind"), field_name="worker_kind")),
+        execution_target=_require_text(row.get("execution_target"), field_name="execution_target"),
+        owner_host_instance_id=_optional_text(row.get("owner_host_instance_id"), field_name="owner_host_instance_id"),
+        created_event_id=_require_text(row.get("created_event_id"), field_name="created_event_id"),
+        created_event_sequence=_require_int(row.get("created_event_sequence"), field_name="created_event_sequence"),
+        waiting_for_lane_at=_optional_text(row.get("waiting_for_lane_at"), field_name="waiting_for_lane_at"),
         lane_name=_optional_text(row.get("lane_name"), field_name="lane_name"),
-        lane_claim_id=_optional_text(
-            row.get("lane_claim_id"), field_name="lane_claim_id"
-        ),
-        lane_owner_id=_optional_text(
-            row.get("lane_owner_id"), field_name="lane_owner_id"
-        ),
-        lane_acquired_at=_optional_text(
-            row.get("lane_acquired_at"), field_name="lane_acquired_at"
-        ),
-        dispatching_at=_optional_text(
-            row.get("dispatching_at"), field_name="dispatching_at"
-        ),
-        worker_accepted_at=_optional_text(
-            row.get("worker_accepted_at"), field_name="worker_accepted_at"
-        ),
-        worker_accept_event_id=_optional_text(
-            row.get("worker_accept_event_id"), field_name="worker_accept_event_id"
-        ),
+        lane_claim_id=_optional_text(row.get("lane_claim_id"), field_name="lane_claim_id"),
+        lane_owner_id=_optional_text(row.get("lane_owner_id"), field_name="lane_owner_id"),
+        lane_acquired_at=_optional_text(row.get("lane_acquired_at"), field_name="lane_acquired_at"),
+        dispatching_at=_optional_text(row.get("dispatching_at"), field_name="dispatching_at"),
+        worker_accepted_at=_optional_text(row.get("worker_accepted_at"), field_name="worker_accepted_at"),
+        worker_accept_event_id=_optional_text(row.get("worker_accept_event_id"), field_name="worker_accept_event_id"),
         worker_accept_event_sequence=_optional_int(
             row.get("worker_accept_event_sequence"),
             field_name="worker_accept_event_sequence",
         ),
-        cancelled_event_id=_optional_text(
-            row.get("cancelled_event_id"), field_name="cancelled_event_id"
-        ),
+        cancelled_event_id=_optional_text(row.get("cancelled_event_id"), field_name="cancelled_event_id"),
         cancelled_event_sequence=_optional_int(
             row.get("cancelled_event_sequence"), field_name="cancelled_event_sequence"
         ),
@@ -944,14 +846,10 @@ def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
     :raises HostDurableError: row 字段类型、状态 enum 或 typed ref 无效时抛出。
     """
 
-    adapter_key = _wait_adapter_key_from_text(
-        _require_text(row.get("adapter_key"), field_name="adapter_key")
-    )
+    adapter_key = _wait_adapter_key_from_text(_require_text(row.get("adapter_key"), field_name="adapter_key"))
     snapshot_ref = deserialize_wait_snapshot_ref(
         _optional_text(row.get("snapshot_ref"), field_name="snapshot_ref"),
-        _optional_text(
-            row.get("snapshot_captured_at"), field_name="snapshot_captured_at"
-        ),
+        _optional_text(row.get("snapshot_captured_at"), field_name="snapshot_captured_at"),
         _optional_text(row.get("snapshot_digest"), field_name="snapshot_digest"),
     )
     external_job_ref = deserialize_external_job_ref(
@@ -974,9 +872,7 @@ def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
         resume_token=_require_text(row.get("resume_token"), field_name="resume_token"),
         snapshot_ref=snapshot_ref,
         external_job_ref=external_job_ref,
-        accept_idempotency_key=_require_text(
-            row.get("accept_idempotency_key"), field_name="accept_idempotency_key"
-        ),
+        accept_idempotency_key=_require_text(row.get("accept_idempotency_key"), field_name="accept_idempotency_key"),
         resolve_idempotency_key=_optional_text(
             row.get("resolve_idempotency_key"),
             field_name="resolve_idempotency_key",
@@ -987,30 +883,18 @@ def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
         ),
         deadline_at=_optional_text(row.get("deadline_at"), field_name="deadline_at"),
         expires_at=_optional_text(row.get("expires_at"), field_name="expires_at"),
-        status=deserialize_wait_record_status(
-            _require_text(row.get("status"), field_name="status")
-        ),
-        created_event_id=_require_text(
-            row.get("created_event_id"), field_name="created_event_id"
-        ),
-        created_event_sequence=_require_int(
-            row.get("created_event_sequence"), field_name="created_event_sequence"
-        ),
-        updated_event_id=_require_text(
-            row.get("updated_event_id"), field_name="updated_event_id"
-        ),
-        updated_event_sequence=_require_int(
-            row.get("updated_event_sequence"), field_name="updated_event_sequence"
-        ),
+        status=deserialize_wait_record_status(_require_text(row.get("status"), field_name="status")),
+        created_event_id=_require_text(row.get("created_event_id"), field_name="created_event_id"),
+        created_event_sequence=_require_int(row.get("created_event_sequence"), field_name="created_event_sequence"),
+        updated_event_id=_require_text(row.get("updated_event_id"), field_name="updated_event_id"),
+        updated_event_sequence=_require_int(row.get("updated_event_sequence"), field_name="updated_event_sequence"),
         created_at=_require_text(row.get("created_at"), field_name="created_at"),
         updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
         terminal_at=_optional_text(row.get("terminal_at"), field_name="terminal_at"),
     )
 
 
-def read_session_by_id(
-    transaction: HostTransaction, session_id: str
-) -> SessionRow | None:
+def read_session_by_id(transaction: HostTransaction, session_id: str) -> SessionRow | None:
     """按 Session id 读取 Session row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1043,9 +927,7 @@ def read_session_by_id(
     return session_row_from_host_row(row)
 
 
-def read_session_slot(
-    transaction: HostTransaction, scope: str, slot_key: str
-) -> SessionSlotRow | None:
+def read_session_slot(transaction: HostTransaction, scope: str, slot_key: str) -> SessionSlotRow | None:
     """按 ``(scope, slot_key)`` 读取 Session slot row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1078,9 +960,7 @@ def read_session_slot(
     return session_slot_row_from_host_row(row)
 
 
-def read_session_slot_by_session_id(
-    transaction: HostTransaction, session_id: str
-) -> SessionSlotRow | None:
+def read_session_slot_by_session_id(transaction: HostTransaction, session_id: str) -> SessionSlotRow | None:
     """读取当前绑定到指定 Session 的 slot row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1159,9 +1039,7 @@ def read_run_by_id(transaction: HostTransaction, run_id: str) -> RunRow | None:
     return run_row_from_host_row(row)
 
 
-def read_active_run_for_session(
-    transaction: HostTransaction, session_id: str
-) -> RunRow | None:
+def read_active_run_for_session(transaction: HostTransaction, session_id: str) -> RunRow | None:
     """读取 Session 当前 active Run。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1217,9 +1095,7 @@ def read_active_run_for_session(
     return run_row_from_host_row(row)
 
 
-def read_accepted_run_for_session(
-    transaction: HostTransaction, session_id: str
-) -> RunRow | None:
+def read_accepted_run_for_session(transaction: HostTransaction, session_id: str) -> RunRow | None:
     """读取 Session 下 pre-start accepted Run。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1266,9 +1142,7 @@ def read_accepted_run_for_session(
     return run_row_from_host_row(row)
 
 
-def read_earliest_queued_run(
-    transaction: HostTransaction, session_id: str
-) -> RunRow | None:
+def read_earliest_queued_run(transaction: HostTransaction, session_id: str) -> RunRow | None:
     """读取 Session 下最早 accepted 的 queued Run。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1316,9 +1190,7 @@ def read_earliest_queued_run(
     return run_row_from_host_row(row)
 
 
-def read_non_terminal_runs_for_session(
-    transaction: HostTransaction, session_id: str
-) -> tuple[RunRow, ...]:
+def read_non_terminal_runs_for_session(transaction: HostTransaction, session_id: str) -> tuple[RunRow, ...]:
     """读取指定 Session 下所有非终态 Run。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1456,9 +1328,7 @@ def count_runs_by_source_relation(
     return _require_int(row.get("related_count"), field_name="related_count")
 
 
-def read_attempt_by_id(
-    transaction: HostTransaction, attempt_id: str
-) -> AttemptRow | None:
+def read_attempt_by_id(transaction: HostTransaction, attempt_id: str) -> AttemptRow | None:
     """按 Attempt id 读取 Attempt row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1493,9 +1363,7 @@ def read_attempt_by_id(
     return attempt_row_from_host_row(row)
 
 
-def read_dispatch_record_by_attempt_id(
-    transaction: HostTransaction, attempt_id: str
-) -> DispatchRecordRow | None:
+def read_dispatch_record_by_attempt_id(transaction: HostTransaction, attempt_id: str) -> DispatchRecordRow | None:
     """按 Attempt id 读取 dispatch record row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1543,9 +1411,7 @@ def read_dispatch_record_by_attempt_id(
     return dispatch_record_row_from_host_row(row)
 
 
-def read_dispatch_record_by_id(
-    transaction: HostTransaction, dispatch_record_id: str
-) -> DispatchRecordRow | None:
+def read_dispatch_record_by_id(transaction: HostTransaction, dispatch_record_id: str) -> DispatchRecordRow | None:
     """按 dispatch record id 读取 dispatch record row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1555,9 +1421,7 @@ def read_dispatch_record_by_id(
     :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
     """
 
-    _require_non_empty_text(
-        dispatch_record_id, field_name="dispatch_record_id"
-    )
+    _require_non_empty_text(dispatch_record_id, field_name="dispatch_record_id")
     row = transaction.fetchone(
         f"""
         SELECT
@@ -1595,9 +1459,7 @@ def read_dispatch_record_by_id(
     return dispatch_record_row_from_host_row(row)
 
 
-def read_wait_record_by_id(
-    transaction: HostTransaction, wait_id: str
-) -> WaitRecordRow | None:
+def read_wait_record_by_id(transaction: HostTransaction, wait_id: str) -> WaitRecordRow | None:
     """按 wait id 读取 wait record row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1617,9 +1479,7 @@ def read_wait_record_by_id(
     return wait_record_row_from_host_row(row)
 
 
-def read_active_wait_records_for_run(
-    transaction: HostTransaction, run_id: str
-) -> tuple[WaitRecordRow, ...]:
+def read_active_wait_records_for_run(transaction: HostTransaction, run_id: str) -> tuple[WaitRecordRow, ...]:
     """读取 Run 下仍处于 waiting 的 wait records。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1631,8 +1491,7 @@ def read_active_wait_records_for_run(
 
     _require_non_empty_text(run_id, field_name="run_id")
     rows = transaction.fetchall(
-        _WAIT_RECORD_SELECT_SQL
-        + """
+        _WAIT_RECORD_SELECT_SQL + """
         WHERE run_id = ? AND status = ?
         ORDER BY created_event_sequence ASC, wait_id ASC
         """,
@@ -1657,8 +1516,7 @@ def read_wait_records_for_poll_observation(
     """
 
     rows = transaction.fetchall(
-        _WAIT_RECORD_SELECT_SQL
-        + """
+        _WAIT_RECORD_SELECT_SQL + """
         WHERE resume_policy = ?
           AND status IN (?, ?)
         ORDER BY created_event_sequence ASC, wait_id ASC
@@ -1672,9 +1530,7 @@ def read_wait_records_for_poll_observation(
     return tuple(wait_record_row_from_host_row(row) for row in rows)
 
 
-def insert_session(
-    transaction: HostTransaction, session: SessionRow
-) -> None:
+def insert_session(transaction: HostTransaction, session: SessionRow) -> None:
     """插入 Session row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1713,9 +1569,7 @@ def insert_session(
     )
 
 
-def insert_session_slot(
-    transaction: HostTransaction, slot: SessionSlotRow
-) -> None:
+def insert_session_slot(transaction: HostTransaction, slot: SessionSlotRow) -> None:
     """插入 Session slot row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -1750,9 +1604,7 @@ def insert_session_slot(
     )
 
 
-def upsert_session_slot(
-    transaction: HostTransaction, slot: SessionSlotRow
-) -> None:
+def upsert_session_slot(transaction: HostTransaction, slot: SessionSlotRow) -> None:
     """插入或重绑定 Session slot row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -2009,9 +1861,7 @@ def insert_attempt(transaction: HostTransaction, attempt: AttemptRow) -> None:
     )
 
 
-def insert_dispatch_record(
-    transaction: HostTransaction, dispatch_record: DispatchRecordRow
-) -> None:
+def insert_dispatch_record(transaction: HostTransaction, dispatch_record: DispatchRecordRow) -> None:
     """插入 Attempt dispatch record row。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -2336,11 +2186,7 @@ def cancel_active_wait_records_for_run(
     before_rows = read_active_wait_records_for_run(transaction, run_id)
     if not before_rows:
         existing = _read_wait_record_count_for_run(transaction, run_id)
-        status = (
-            StateMutationStatus.INVALID_STATE
-            if existing > 0
-            else StateMutationStatus.NOT_FOUND
-        )
+        status = StateMutationStatus.INVALID_STATE if existing > 0 else StateMutationStatus.NOT_FOUND
         return WaitRecordsMutationResult(status=status, rows=())
     result = transaction.execute(
         f"""
@@ -2370,9 +2216,7 @@ def cancel_active_wait_records_for_run(
         updated_event_sequence=updated_event_sequence,
     )
     if result.rowcount == len(before_rows):
-        return WaitRecordsMutationResult(
-            status=StateMutationStatus.UPDATED, rows=rows
-        )
+        return WaitRecordsMutationResult(status=StateMutationStatus.UPDATED, rows=rows)
     return WaitRecordsMutationResult(
         status=StateMutationStatus.CAS_LOST,
         rows=read_active_wait_records_for_run(transaction, run_id),
@@ -2932,9 +2776,7 @@ def resume_waiting_run_row(
         current_attempt_id=resumed_attempt_id,
         updated_at=updated_at,
     )
-    _require_non_empty_text(
-        suspended_attempt_id, field_name="suspended_attempt_id"
-    )
+    _require_non_empty_text(suspended_attempt_id, field_name="suspended_attempt_id")
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -3024,9 +2866,7 @@ def steer_active_run_row(
         current_attempt_id=next_attempt_id,
         updated_at=updated_at,
     )
-    _require_non_empty_text(
-        previous_attempt_id, field_name="previous_attempt_id"
-    )
+    _require_non_empty_text(previous_attempt_id, field_name="previous_attempt_id")
     _require_non_empty_text(input_event_id, field_name="input_event_id")
     _require_positive_sequence(input_event_sequence, "input_event_sequence")
     result = transaction.execute(
@@ -3965,9 +3805,7 @@ def mark_dispatch_waiting_for_lane_row(
     """
 
     _require_non_empty_text(attempt_id, field_name="attempt_id")
-    _require_non_empty_text(
-        owner_host_instance_id, field_name="owner_host_instance_id"
-    )
+    _require_non_empty_text(owner_host_instance_id, field_name="owner_host_instance_id")
     _require_non_empty_text(lane_name, field_name="lane_name")
     _require_non_empty_text(waiting_for_lane_at, field_name="waiting_for_lane_at")
     result = transaction.execute(
@@ -4037,9 +3875,7 @@ def mark_dispatching_after_lane_row(
     """
 
     _require_non_empty_text(attempt_id, field_name="attempt_id")
-    _require_non_empty_text(
-        owner_host_instance_id, field_name="owner_host_instance_id"
-    )
+    _require_non_empty_text(owner_host_instance_id, field_name="owner_host_instance_id")
     _require_non_empty_text(lane_name, field_name="lane_name")
     _require_non_empty_text(lane_claim_id, field_name="lane_claim_id")
     _require_non_empty_text(lane_owner_id, field_name="lane_owner_id")
@@ -4121,12 +3957,8 @@ def mark_dispatch_worker_accepted_row(
     """
 
     _require_non_empty_text(attempt_id, field_name="attempt_id")
-    _require_non_empty_text(
-        worker_accept_event_id, field_name="worker_accept_event_id"
-    )
-    _require_positive_sequence(
-        worker_accept_event_sequence, "worker_accept_event_sequence"
-    )
+    _require_non_empty_text(worker_accept_event_id, field_name="worker_accept_event_id")
+    _require_positive_sequence(worker_accept_event_sequence, "worker_accept_event_sequence")
     _require_non_empty_text(worker_accepted_at, field_name="worker_accepted_at")
     result = transaction.execute(
         f"""
@@ -4267,9 +4099,7 @@ def session_snapshot_from_rows(
         slot=_slot_ref_from_row(slot),
         active_run_id=_read_active_run_id(transaction, session.session_id),
         queued_run_ids=_read_queued_run_ids(transaction, session.session_id),
-        timeline_cursor=HostStreamCursor(
-            event_sequence=_session_timeline_cursor(session)
-        ),
+        timeline_cursor=HostStreamCursor(event_sequence=_session_timeline_cursor(session)),
     )
 
 
@@ -4292,9 +4122,7 @@ def run_snapshot_from_row(run: RunRow) -> RunSnapshot:
         session_id=run.session_id,
         status=status,
         current_attempt_id=run.current_attempt_id,
-        terminal_result_summary=_terminal_result_summary_from_status(
-            status
-        ),
+        terminal_result_summary=_terminal_result_summary_from_status(status),
         event_cursor=HostStreamCursor(event_sequence=_run_event_cursor(run)),
         source_run_id=run.source_run_id,
         source_run_relation=run.source_run_relation,
@@ -4338,7 +4166,7 @@ def _terminal_result_summary_from_status(
     :raises ValueError: status-only 终态摘要无法满足公共类型约束时抛出。
     """
 
-    if status not in _TERMINAL_RUN_STATUSES:
+    if status not in TERMINAL_RUN_STATUSES:
         return None
     return TerminalResultSummary(
         status=status,
@@ -4362,9 +4190,7 @@ def _serialize_str_enum(value: StrEnum, *, enum_name: str) -> str:
     return value.value
 
 
-def _deserialize_str_enum(
-    value: str, *, enum_type: type[_StatusT], enum_name: str
-) -> _StatusT:
+def _deserialize_str_enum(value: str, *, enum_type: type[_StatusT], enum_name: str) -> _StatusT:
     """反序列化 StrEnum。
 
     :param value: SQLite 或 payload 中的文本值。
@@ -4439,30 +4265,14 @@ def _validate_run_for_insert(run: RunRow) -> None:
     _require_non_empty_text(run.input_event_id, field_name="input_event_id")
     _require_positive_sequence(run.input_event_sequence, "input_event_sequence")
     _require_non_empty_text(run.accepted_event_id, field_name="accepted_event_id")
-    _require_positive_sequence(
-        run.accepted_event_sequence, "accepted_event_sequence"
-    )
-    _require_optional_non_empty_text(
-        run.queued_event_id, field_name="queued_event_id"
-    )
-    _require_optional_positive_sequence(
-        run.queued_event_sequence, "queued_event_sequence"
-    )
-    _require_optional_non_empty_text(
-        run.started_event_id, field_name="started_event_id"
-    )
-    _require_optional_positive_sequence(
-        run.started_event_sequence, "started_event_sequence"
-    )
-    _require_optional_non_empty_text(
-        run.terminal_event_id, field_name="terminal_event_id"
-    )
-    _require_optional_positive_sequence(
-        run.terminal_event_sequence, "terminal_event_sequence"
-    )
-    _require_optional_non_empty_text(
-        run.current_attempt_id, field_name="current_attempt_id"
-    )
+    _require_positive_sequence(run.accepted_event_sequence, "accepted_event_sequence")
+    _require_optional_non_empty_text(run.queued_event_id, field_name="queued_event_id")
+    _require_optional_positive_sequence(run.queued_event_sequence, "queued_event_sequence")
+    _require_optional_non_empty_text(run.started_event_id, field_name="started_event_id")
+    _require_optional_positive_sequence(run.started_event_sequence, "started_event_sequence")
+    _require_optional_non_empty_text(run.terminal_event_id, field_name="terminal_event_id")
+    _require_optional_positive_sequence(run.terminal_event_sequence, "terminal_event_sequence")
+    _require_optional_non_empty_text(run.current_attempt_id, field_name="current_attempt_id")
     _require_optional_non_empty_text(run.source_run_id, field_name="source_run_id")
     _require_non_empty_text(run.execution_target, field_name="execution_target")
     _require_non_empty_text(run.queue_policy, field_name="queue_policy")
@@ -4482,17 +4292,9 @@ def _validate_run_for_insert(run: RunRow) -> None:
         if run.current_attempt_id is not None:
             raise HostDurableError("accepted Run current_attempt_id must be unset")
     if _is_terminal_run_status(run.status):
-        if (
-            run.terminal_event_id is None
-            or run.terminal_event_sequence is None
-            or run.terminal_at is None
-        ):
+        if run.terminal_event_id is None or run.terminal_event_sequence is None or run.terminal_at is None:
             raise HostDurableError("terminal Run requires terminal refs")
-    elif (
-        run.terminal_event_id is not None
-        or run.terminal_event_sequence is not None
-        or run.terminal_at is not None
-    ):
+    elif run.terminal_event_id is not None or run.terminal_event_sequence is not None or run.terminal_at is not None:
         raise HostDurableError("non-terminal Run terminal refs must be unset")
     if (run.source_run_id is None) != (run.source_run_relation is None):
         raise HostDurableError("Run source relation fields must be paired")
@@ -4511,18 +4313,12 @@ def _validate_attempt_for_insert(attempt: AttemptRow) -> None:
     _require_non_empty_text(attempt.execution_id, field_name="execution_id")
     if attempt.status != AttemptStatus.STARTING:
         raise HostDurableError("insert_attempt only accepts STARTING Attempt")
-    _require_non_empty_text(
-        attempt.started_event_id, field_name="started_event_id"
-    )
-    _require_positive_sequence(
-        attempt.started_event_sequence, "started_event_sequence"
-    )
+    _require_non_empty_text(attempt.started_event_id, field_name="started_event_id")
+    _require_positive_sequence(attempt.started_event_sequence, "started_event_sequence")
     if attempt.terminal_event_id is not None:
         raise HostDurableError("STARTING Attempt terminal_event_id must be unset")
     if attempt.terminal_event_sequence is not None:
-        raise HostDurableError(
-            "STARTING Attempt terminal_event_sequence must be unset"
-        )
+        raise HostDurableError("STARTING Attempt terminal_event_sequence must be unset")
     _require_non_empty_text(attempt.created_at, field_name="created_at")
     _require_non_empty_text(attempt.updated_at, field_name="updated_at")
     if attempt.terminal_at is not None:
@@ -4539,9 +4335,7 @@ def _validate_dispatch_record_for_insert(
     :raises HostDurableError: 任一字段违反 Phase 3 dispatch row 约束时抛出。
     """
 
-    _require_non_empty_text(
-        dispatch_record.dispatch_record_id, field_name="dispatch_record_id"
-    )
+    _require_non_empty_text(dispatch_record.dispatch_record_id, field_name="dispatch_record_id")
     _require_non_empty_text(dispatch_record.run_id, field_name="run_id")
     _require_non_empty_text(dispatch_record.attempt_id, field_name="attempt_id")
     _require_non_empty_text(dispatch_record.execution_id, field_name="execution_id")
@@ -4549,40 +4343,20 @@ def _validate_dispatch_record_for_insert(
         raise HostDurableError("dispatch record status is invalid")
     if not isinstance(dispatch_record.worker_kind, WorkerKind):
         raise HostDurableError("worker kind is invalid")
-    _require_non_empty_text(
-        dispatch_record.execution_target, field_name="execution_target"
-    )
+    _require_non_empty_text(dispatch_record.execution_target, field_name="execution_target")
     _require_optional_non_empty_text(
         dispatch_record.owner_host_instance_id,
         field_name="owner_host_instance_id",
     )
-    _require_non_empty_text(
-        dispatch_record.created_event_id, field_name="created_event_id"
-    )
-    _require_positive_sequence(
-        dispatch_record.created_event_sequence, "created_event_sequence"
-    )
-    _require_optional_non_empty_text(
-        dispatch_record.waiting_for_lane_at, field_name="waiting_for_lane_at"
-    )
-    _require_optional_non_empty_text(
-        dispatch_record.lane_name, field_name="lane_name"
-    )
-    _require_optional_non_empty_text(
-        dispatch_record.lane_claim_id, field_name="lane_claim_id"
-    )
-    _require_optional_non_empty_text(
-        dispatch_record.lane_owner_id, field_name="lane_owner_id"
-    )
-    _require_optional_non_empty_text(
-        dispatch_record.lane_acquired_at, field_name="lane_acquired_at"
-    )
-    _require_optional_non_empty_text(
-        dispatch_record.dispatching_at, field_name="dispatching_at"
-    )
-    _require_optional_non_empty_text(
-        dispatch_record.worker_accepted_at, field_name="worker_accepted_at"
-    )
+    _require_non_empty_text(dispatch_record.created_event_id, field_name="created_event_id")
+    _require_positive_sequence(dispatch_record.created_event_sequence, "created_event_sequence")
+    _require_optional_non_empty_text(dispatch_record.waiting_for_lane_at, field_name="waiting_for_lane_at")
+    _require_optional_non_empty_text(dispatch_record.lane_name, field_name="lane_name")
+    _require_optional_non_empty_text(dispatch_record.lane_claim_id, field_name="lane_claim_id")
+    _require_optional_non_empty_text(dispatch_record.lane_owner_id, field_name="lane_owner_id")
+    _require_optional_non_empty_text(dispatch_record.lane_acquired_at, field_name="lane_acquired_at")
+    _require_optional_non_empty_text(dispatch_record.dispatching_at, field_name="dispatching_at")
+    _require_optional_non_empty_text(dispatch_record.worker_accepted_at, field_name="worker_accepted_at")
     _require_optional_non_empty_text(
         dispatch_record.worker_accept_event_id,
         field_name="worker_accept_event_id",
@@ -4591,17 +4365,11 @@ def _validate_dispatch_record_for_insert(
         dispatch_record.worker_accept_event_sequence,
         "worker_accept_event_sequence",
     )
-    _require_optional_non_empty_text(
-        dispatch_record.cancelled_event_id, field_name="cancelled_event_id"
-    )
-    _require_optional_positive_sequence(
-        dispatch_record.cancelled_event_sequence, "cancelled_event_sequence"
-    )
+    _require_optional_non_empty_text(dispatch_record.cancelled_event_id, field_name="cancelled_event_id")
+    _require_optional_positive_sequence(dispatch_record.cancelled_event_sequence, "cancelled_event_sequence")
     _require_non_empty_text(dispatch_record.created_at, field_name="created_at")
     _require_non_empty_text(dispatch_record.updated_at, field_name="updated_at")
-    _require_optional_non_empty_text(
-        dispatch_record.cancelled_at, field_name="cancelled_at"
-    )
+    _require_optional_non_empty_text(dispatch_record.cancelled_at, field_name="cancelled_at")
     _validate_dispatch_record_status_shape(dispatch_record)
 
 
@@ -4836,9 +4604,7 @@ def _validate_run_terminal_update(
 
     _require_non_empty_text(run_id, field_name="run_id")
     _require_non_empty_text(terminal_event_id, field_name="terminal_event_id")
-    _require_positive_sequence(
-        terminal_event_sequence, "terminal_event_sequence"
-    )
+    _require_positive_sequence(terminal_event_sequence, "terminal_event_sequence")
     _require_non_empty_text(terminal_at, field_name="terminal_at")
 
 
@@ -4861,9 +4627,7 @@ def _validate_attempt_terminal_update(
 
     _require_non_empty_text(attempt_id, field_name="attempt_id")
     _require_non_empty_text(terminal_event_id, field_name="terminal_event_id")
-    _require_positive_sequence(
-        terminal_event_sequence, "terminal_event_sequence"
-    )
+    _require_positive_sequence(terminal_event_sequence, "terminal_event_sequence")
     _require_non_empty_text(terminal_at, field_name="terminal_at")
 
 
@@ -4895,9 +4659,7 @@ def _run_mutation_result(
     return RunMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
-def _run_mutation_result_for_active(
-    transaction: HostTransaction, *, run_id: str, rowcount: int
-) -> RunMutationResult:
+def _run_mutation_result_for_active(transaction: HostTransaction, *, run_id: str, rowcount: int) -> RunMutationResult:
     """构造 active Run terminal mutation 结果。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -4941,20 +4703,12 @@ def _attempt_mutation_result(
 
     latest = read_attempt_by_id(transaction, attempt_id)
     if rowcount == 1:
-        return AttemptMutationResult(
-            status=StateMutationStatus.UPDATED, row=latest
-        )
+        return AttemptMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
-        return AttemptMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=None
-        )
+        return AttemptMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
     if latest.status == expected_status and cas_lost_when_expected:
-        return AttemptMutationResult(
-            status=StateMutationStatus.CAS_LOST, row=latest
-        )
-    return AttemptMutationResult(
-        status=StateMutationStatus.INVALID_STATE, row=latest
-    )
+        return AttemptMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return AttemptMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
 def _attempt_mutation_result_for_active(
@@ -4970,20 +4724,12 @@ def _attempt_mutation_result_for_active(
 
     latest = read_attempt_by_id(transaction, attempt_id)
     if rowcount == 1:
-        return AttemptMutationResult(
-            status=StateMutationStatus.UPDATED, row=latest
-        )
+        return AttemptMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
-        return AttemptMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=None
-        )
+        return AttemptMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
     if latest.status in (AttemptStatus.STARTING, AttemptStatus.RUNNING):
-        return AttemptMutationResult(
-            status=StateMutationStatus.CAS_LOST, row=latest
-        )
-    return AttemptMutationResult(
-        status=StateMutationStatus.INVALID_STATE, row=latest
-    )
+        return AttemptMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return AttemptMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
 def _dispatch_record_mutation_result_for_dispatch_start(
@@ -4999,23 +4745,15 @@ def _dispatch_record_mutation_result_for_dispatch_start(
 
     latest = read_dispatch_record_by_attempt_id(transaction, attempt_id)
     if rowcount == 1:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.UPDATED, row=latest
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=None
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
     if latest.status in (
         DispatchRecordStatus.PENDING,
         DispatchRecordStatus.WAITING_FOR_LANE,
     ):
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.CAS_LOST, row=latest
-        )
-    return DispatchRecordMutationResult(
-        status=StateMutationStatus.INVALID_STATE, row=latest
-    )
+        return DispatchRecordMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return DispatchRecordMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
 def _dispatch_record_mutation_result_for_dispatching(
@@ -5031,25 +4769,17 @@ def _dispatch_record_mutation_result_for_dispatching(
 
     latest = read_dispatch_record_by_attempt_id(transaction, attempt_id)
     if rowcount == 1:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.UPDATED, row=latest
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=None
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
     if (
         latest.status == DispatchRecordStatus.DISPATCHING
         and latest.worker_accept_event_id is None
         and latest.worker_accept_event_sequence is None
         and latest.worker_accepted_at is None
     ):
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.CAS_LOST, row=latest
-        )
-    return DispatchRecordMutationResult(
-        status=StateMutationStatus.INVALID_STATE, row=latest
-    )
+        return DispatchRecordMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return DispatchRecordMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
 def _dispatch_record_mutation_result_for_lane_dispatching(
@@ -5065,20 +4795,12 @@ def _dispatch_record_mutation_result_for_lane_dispatching(
 
     latest = read_dispatch_record_by_attempt_id(transaction, attempt_id)
     if rowcount == 1:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.UPDATED, row=latest
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=None
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
     if latest.status == DispatchRecordStatus.WAITING_FOR_LANE:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.CAS_LOST, row=latest
-        )
-    return DispatchRecordMutationResult(
-        status=StateMutationStatus.INVALID_STATE, row=latest
-    )
+        return DispatchRecordMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return DispatchRecordMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
 def _invalid_dispatching_after_lane_precondition(
@@ -5101,23 +4823,15 @@ def _invalid_dispatching_after_lane_precondition(
     :returns: 前置失败时返回 mutation 结果，否则返回 ``None``。
     """
 
-    dispatch_record = read_dispatch_record_by_attempt_id(
-        transaction, attempt_id
-    )
+    dispatch_record = read_dispatch_record_by_attempt_id(transaction, attempt_id)
     if dispatch_record is None:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=None
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
     attempt = read_attempt_by_id(transaction, attempt_id)
     if attempt is None:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=dispatch_record
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=dispatch_record)
     run = read_run_by_id(transaction, dispatch_record.run_id)
     if run is None:
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=dispatch_record
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=dispatch_record)
     if (
         dispatch_record.status != DispatchRecordStatus.WAITING_FOR_LANE
         or dispatch_record.owner_host_instance_id != owner_host_instance_id
@@ -5140,9 +4854,7 @@ def _invalid_dispatching_after_lane_precondition(
         or dispatch_record.cancelled_event_id is not None
         or dispatch_record.cancelled_event_sequence is not None
     ):
-        return DispatchRecordMutationResult(
-            status=StateMutationStatus.INVALID_STATE, row=dispatch_record
-        )
+        return DispatchRecordMutationResult(status=StateMutationStatus.INVALID_STATE, row=dispatch_record)
     return None
 
 
@@ -5185,9 +4897,7 @@ def _validate_wait_record_for_insert(row: WaitRecordRow) -> None:
     :raises HostDurableError: 任一字段违反 wait record 约束时抛出。
     """
 
-    _require_text_max_length(
-        row.wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH
-    )
+    _require_text_max_length(row.wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH)
     _require_non_empty_text(row.session_id, field_name="session_id")
     _require_non_empty_text(row.run_id, field_name="run_id")
     _require_non_empty_text(row.attempt_id, field_name="attempt_id")
@@ -5212,9 +4922,7 @@ def _validate_wait_record_for_insert(row: WaitRecordRow) -> None:
         field_name="resume_token",
         max_length=HOST_WAIT_RESUME_TOKEN_MAX_LENGTH,
     )
-    if row.snapshot_ref is not None and not isinstance(
-        row.snapshot_ref, WaitSnapshotRef
-    ):
+    if row.snapshot_ref is not None and not isinstance(row.snapshot_ref, WaitSnapshotRef):
         raise HostDurableError("wait snapshot_ref is invalid")
     _validate_wait_external_job_ref(row)
     _require_text_max_length(
@@ -5228,13 +4936,9 @@ def _validate_wait_record_for_insert(row: WaitRecordRow) -> None:
     if not isinstance(row.status, WaitRecordStatus):
         raise HostDurableError("wait status is invalid")
     _require_non_empty_text(row.created_event_id, field_name="created_event_id")
-    _require_positive_sequence(
-        row.created_event_sequence, "created_event_sequence"
-    )
+    _require_positive_sequence(row.created_event_sequence, "created_event_sequence")
     _require_non_empty_text(row.updated_event_id, field_name="updated_event_id")
-    _require_positive_sequence(
-        row.updated_event_sequence, "updated_event_sequence"
-    )
+    _require_positive_sequence(row.updated_event_sequence, "updated_event_sequence")
     _require_non_empty_text(row.created_at, field_name="created_at")
     _require_non_empty_text(row.updated_at, field_name="updated_at")
     _require_optional_non_empty_text(row.terminal_at, field_name="terminal_at")
@@ -5273,23 +4977,27 @@ def _validate_wait_resolution_refs(row: WaitRecordRow) -> None:
         field_name="resolve_idempotency_key",
         max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
     )
-    _require_optional_non_empty_text(
-        row.resolve_semantic_digest, field_name="resolve_semantic_digest"
-    )
-    if (row.resolve_idempotency_key is None) != (
-        row.resolve_semantic_digest is None
-    ):
+    _require_optional_non_empty_text(row.resolve_semantic_digest, field_name="resolve_semantic_digest")
+    if (row.resolve_idempotency_key is None) != (row.resolve_semantic_digest is None):
         raise HostDurableError("wait resolve fields must be paired")
-    if row.status in (
-        WaitRecordStatus.RESOLVED,
-        WaitRecordStatus.FAILED,
-        WaitRecordStatus.LOST,
-    ) and row.resolve_idempotency_key is None:
+    if (
+        row.status
+        in (
+            WaitRecordStatus.RESOLVED,
+            WaitRecordStatus.FAILED,
+            WaitRecordStatus.LOST,
+        )
+        and row.resolve_idempotency_key is None
+    ):
         raise HostDurableError("resolved, failed or lost wait requires resolve refs")
-    if row.status in (
-        WaitRecordStatus.WAITING,
-        WaitRecordStatus.CANCELLED,
-    ) and row.resolve_idempotency_key is not None:
+    if (
+        row.status
+        in (
+            WaitRecordStatus.WAITING,
+            WaitRecordStatus.CANCELLED,
+        )
+        and row.resolve_idempotency_key is not None
+    ):
         raise HostDurableError("waiting or cancelled wait must not carry resolve refs")
 
 
@@ -5356,9 +5064,7 @@ def _mark_wait_record_terminal_row(
             serialize_wait_record_status(WaitRecordStatus.WAITING),
         ),
     )
-    return _wait_record_mutation_result(
-        transaction, wait_id=wait_id, rowcount=result.rowcount
-    )
+    return _wait_record_mutation_result(transaction, wait_id=wait_id, rowcount=result.rowcount)
 
 
 def _validate_wait_terminal_update(
@@ -5384,17 +5090,13 @@ def _validate_wait_terminal_update(
     :raises HostDurableError: 任一字段无效时抛出。
     """
 
-    _require_text_max_length(
-        wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH
-    )
+    _require_text_max_length(wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH)
     _require_optional_text_max_length(
         resolve_idempotency_key,
         field_name="resolve_idempotency_key",
         max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
     )
-    _require_optional_non_empty_text(
-        resolve_semantic_digest, field_name="resolve_semantic_digest"
-    )
+    _require_optional_non_empty_text(resolve_semantic_digest, field_name="resolve_semantic_digest")
     if (resolve_idempotency_key is None) != (resolve_semantic_digest is None):
         raise HostDurableError("wait resolve fields must be paired")
     _require_non_empty_text(updated_event_id, field_name="updated_event_id")
@@ -5439,25 +5141,15 @@ def _wait_record_mutation_result(
 
     latest = read_wait_record_by_id(transaction, wait_id)
     if rowcount == 1:
-        return WaitRecordMutationResult(
-            status=StateMutationStatus.UPDATED, row=latest
-        )
+        return WaitRecordMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
-        return WaitRecordMutationResult(
-            status=StateMutationStatus.NOT_FOUND, row=None
-        )
+        return WaitRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
     if latest.status == WaitRecordStatus.WAITING:
-        return WaitRecordMutationResult(
-            status=StateMutationStatus.CAS_LOST, row=latest
-        )
-    return WaitRecordMutationResult(
-        status=StateMutationStatus.INVALID_STATE, row=latest
-    )
+        return WaitRecordMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return WaitRecordMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
-def _read_wait_record_count_for_run(
-    transaction: HostTransaction, run_id: str
-) -> int:
+def _read_wait_record_count_for_run(transaction: HostTransaction, run_id: str) -> int:
     """读取 Run 下 wait record 总数。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -5496,8 +5188,7 @@ def _read_terminal_wait_records_for_run(
     """
 
     rows = transaction.fetchall(
-        _WAIT_RECORD_SELECT_SQL
-        + """
+        _WAIT_RECORD_SELECT_SQL + """
         WHERE run_id = ?
           AND updated_event_id = ?
           AND updated_event_sequence = ?
@@ -5521,9 +5212,7 @@ def _require_positive_sequence(value: int, field_name: str) -> None:
         raise HostDurableError(f"{field_name} must be positive")
 
 
-def _require_optional_positive_sequence(
-    value: int | None, field_name: str
-) -> None:
+def _require_optional_positive_sequence(value: int | None, field_name: str) -> None:
     """校验 optional 事件序号。
 
     :param value: 事件序号或 ``None``。
@@ -5536,9 +5225,7 @@ def _require_optional_positive_sequence(
         _require_positive_sequence(value, field_name)
 
 
-def _require_text_max_length(
-    value: str, *, field_name: str, max_length: int
-) -> None:
+def _require_text_max_length(value: str, *, field_name: str, max_length: int) -> None:
     """校验必填文本非空且不超过长度上限。
 
     :param value: 待校验文本。
@@ -5553,9 +5240,7 @@ def _require_text_max_length(
         raise HostDurableError(f"{field_name} length must be <= {max_length}")
 
 
-def _require_optional_text_max_length(
-    value: str | None, *, field_name: str, max_length: int
-) -> None:
+def _require_optional_text_max_length(value: str | None, *, field_name: str, max_length: int) -> None:
     """校验 optional 文本存在时非空且不超过长度上限。
 
     :param value: 待校验文本或 ``None``。
@@ -5566,9 +5251,7 @@ def _require_optional_text_max_length(
     """
 
     if value is not None:
-        _require_text_max_length(
-            value, field_name=field_name, max_length=max_length
-        )
+        _require_text_max_length(value, field_name=field_name, max_length=max_length)
 
 
 def _is_terminal_run_status(status: RunStatus) -> bool:
@@ -5627,9 +5310,7 @@ def _run_event_cursor(run: RunRow) -> int:
     return max(sequence for sequence in event_sequences if sequence is not None)
 
 
-def _read_active_run_id(
-    transaction: HostTransaction, session_id: str
-) -> str | None:
+def _read_active_run_id(transaction: HostTransaction, session_id: str) -> str | None:
     """读取 Session 当前 active Run id。
 
     :param transaction: 调用方提供的 Host transaction。
@@ -5661,9 +5342,7 @@ def _read_active_run_id(
     return _require_text(row.get("run_id"), field_name="run_id")
 
 
-def _read_queued_run_ids(
-    transaction: HostTransaction, session_id: str
-) -> tuple[str, ...]:
+def _read_queued_run_ids(transaction: HostTransaction, session_id: str) -> tuple[str, ...]:
     """读取 Session queued Run id 列表。
 
     :param transaction: 调用方提供的 Host transaction。

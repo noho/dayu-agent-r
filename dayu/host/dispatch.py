@@ -205,9 +205,7 @@ _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
 _EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX = "event-context-compact-requested"
 _EVENT_ID_CONTEXT_COMPACTED_PREFIX = "event-context-compacted"
-_EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX = (
-    "event-context-compaction-attempt-rejected"
-)
+_EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX = "event-context-compaction-attempt-rejected"
 _LANE_OWNER_PREFIX = "host-dispatch"
 _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
@@ -218,19 +216,15 @@ _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
-_LOG_DRAIN_LOOP_IDLE = (
-    "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
-)
+_LOG_DRAIN_LOOP_IDLE = "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
 _LOG_DRAIN_LOOP_CLOSE_EXIT = "dispatch drain loop exiting after close host_handle_id=%s"
-_LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = (
-    "dispatch drain loop cancelled during close host_handle_id=%s"
-)
-_LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY = (
-    "dispatch drain loop cancelled externally host_handle_id=%s"
-)
+_LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = "dispatch drain loop cancelled during close host_handle_id=%s"
+_LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY = "dispatch drain loop cancelled externally host_handle_id=%s"
 _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION = (
-    "dispatch drain loop stopped unexpectedly; continuing host_handle_id=%s "
-    "error_type=%s"
+    "dispatch drain loop stopped unexpectedly; continuing host_handle_id=%s " "error_type=%s"
+)
+_LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED = (
+    "dispatch drain loop durable retry exhausted; closing scheduler " "host_handle_id=%s error_type=%s"
 )
 _LOGGER = logging.getLogger(__name__)
 
@@ -481,8 +475,7 @@ def _propagate_active_worker_cancel(
         entry.handle.on_cancel(message.reason)
     except Exception as exc:
         _LOGGER.warning(
-            "active worker cancel hook failed; continuing attempt_id=%s "
-            "execution_id=%s run_id=%s error_type=%s",
+            "active worker cancel hook failed; continuing attempt_id=%s " "execution_id=%s run_id=%s error_type=%s",
             message.attempt_id,
             message.execution_id,
             message.run_id,
@@ -625,9 +618,7 @@ class _DurableRunCancellationToken(CancellationToken):
                 _ReadCompactionCancelReasonOperation(
                     run_id=self._run_id,
                     expected_status=self._expected_status,
-                    expected_input_event_sequence=(
-                        self._expected_input_event_sequence
-                    ),
+                    expected_input_event_sequence=(self._expected_input_event_sequence),
                 )
             )
         except HostTransactionRetryExhaustedError:
@@ -686,21 +677,18 @@ class HostDispatchScheduler:
             if host_instance_identity is not None
             else _new_dispatch_host_instance_identity(host_handle_id)
         )
-        self._active_registry = (
-            active_registry if active_registry is not None else ActiveWorkerRegistry()
-        )
+        self._active_registry = active_registry if active_registry is not None else ActiveWorkerRegistry()
         self._projection_catchup_port = projection_catchup_port
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
         self._closed = False
+        self._close_cleanup_done = False
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._promotion_drain_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
-        self._duplicate_governance_registry = (
-            InMemoryRunScopedDuplicateGovernanceRegistry()
-        )
+        self._duplicate_governance_registry = InMemoryRunScopedDuplicateGovernanceRegistry()
 
     @classmethod
     async def open(
@@ -728,18 +716,12 @@ class HostDispatchScheduler:
                 LaneConfig(
                     name=local_execution.lane_name,
                     capacity=local_execution.lane_capacity,
-                    default_timeout_seconds=(
-                        local_execution.lane_default_timeout_seconds
-                    ),
+                    default_timeout_seconds=(local_execution.lane_default_timeout_seconds),
                     claim_ttl_seconds=local_execution.lane_claim_ttl_seconds,
-                    heartbeat_interval_seconds=(
-                        local_execution.lane_heartbeat_interval_seconds
-                    ),
+                    heartbeat_interval_seconds=(local_execution.lane_heartbeat_interval_seconds),
                 )
             ],
-            coordinator=SQLiteLaneCoordinatorConfig(
-                db_path=local_execution.lane_db_path
-            ),
+            coordinator=SQLiteLaneCoordinatorConfig(db_path=local_execution.lane_db_path),
             owner=LaneOwner(
                 owner_id=f"{_LANE_OWNER_PREFIX}-{host_handle_id}",
                 pid=os.getpid(),
@@ -751,8 +733,7 @@ class HostDispatchScheduler:
             identity=host_identity,
         )
         _LOGGER.info(
-            "dispatch.scheduler.opened host_handle_id=%s lane_name=%s "
-            "lane_capacity=%s",
+            "dispatch.scheduler.opened host_handle_id=%s lane_name=%s " "lane_capacity=%s",
             host_handle_id,
             local_execution.lane_name,
             local_execution.lane_capacity,
@@ -792,8 +773,7 @@ class HostDispatchScheduler:
         self._queue.put_nowait(record)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "dispatch.wake_dispatch run_id=%s attempt_id=%s execution_id=%s "
-            "dispatch_record_id=%s queue_size=%s",
+            "dispatch.wake_dispatch run_id=%s attempt_id=%s execution_id=%s " "dispatch_record_id=%s queue_size=%s",
             record.run_id,
             record.attempt_id,
             record.execution_id,
@@ -820,13 +800,8 @@ class HostDispatchScheduler:
             session_id,
             self._promotion_queue.qsize(),
         )
-        if (
-            self._promotion_drain_task is None
-            or self._promotion_drain_task.done()
-        ):
-            self._promotion_drain_task = asyncio.create_task(
-                self._promotion_drain_loop()
-            )
+        if self._promotion_drain_task is None or self._promotion_drain_task.done():
+            self._promotion_drain_task = asyncio.create_task(self._promotion_drain_loop())
 
     async def run_queue_promotion(self, session_id: str) -> None:
         """执行同 Session queued Run promotion。
@@ -849,8 +824,7 @@ class HostDispatchScheduler:
         if stage.compact_accepted is not None:
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
-                "dispatch.queue_promotion.compact_catchup session_id=%s "
-                "run_id=%s compacted_event_sequence=%s",
+                "dispatch.queue_promotion.compact_catchup session_id=%s " "run_id=%s compacted_event_sequence=%s",
                 session_id,
                 stage.compact_accepted.run_id,
                 stage.compact_accepted.compacted_event_sequence,
@@ -858,18 +832,13 @@ class HostDispatchScheduler:
             catch_up_conversation_memory_projection(
                 self._transaction_runner,
                 policy=self._local_execution.memory_projection_policy,
-                batch_size=(
-                    self._local_execution.memory_projection_catchup_batch_size
-                ),
+                batch_size=(self._local_execution.memory_projection_catchup_batch_size),
                 max_event_sequence=stage.compact_accepted.compacted_event_sequence,
             )
-            pending_dispatch = self._start_governed_after_compact(
-                stage.compact_accepted
-            )
+            pending_dispatch = self._start_governed_after_compact(stage.compact_accepted)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "dispatch.queue_promotion.done session_id=%s dispatch_ready=%s "
-            "compact_accepted=%s",
+            "dispatch.queue_promotion.done session_id=%s dispatch_ready=%s " "compact_accepted=%s",
             session_id,
             pending_dispatch is not None,
             stage.compact_accepted is not None,
@@ -877,9 +846,7 @@ class HostDispatchScheduler:
         if pending_dispatch is not None:
             self.wake_dispatch(pending_dispatch)
 
-    async def _run_pre_start_governance(
-        self, session_id: str
-    ) -> _GovernanceStageResult:
+    async def _run_pre_start_governance(self, session_id: str) -> _GovernanceStageResult:
         """执行一次 pre-start Context Governance。
 
         :param session_id: 目标 Session id。
@@ -893,32 +860,24 @@ class HostDispatchScheduler:
                     "dispatch.governance.no_startable_run session_id=%s",
                     session_id,
                 )
-                return _GovernanceStageResult(
-                    pending_dispatch=None, compact_accepted=None
-                )
+                return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
             policy = self._local_execution.context_budget_policy
             if policy is None:
                 _LOGGER.log(
                     VERBOSE_LOG_LEVEL,
-                    "dispatch.governance.allow_without_budget session_id=%s "
-                    "run_id=%s run_status=%s",
+                    "dispatch.governance.allow_without_budget session_id=%s " "run_id=%s run_status=%s",
                     run.session_id,
                     run.run_id,
                     run.status.value,
                 )
                 return _GovernanceStageResult(
-                    pending_dispatch=self._start_governed_in_transaction(
-                        transaction, run
-                    ),
+                    pending_dispatch=self._start_governed_in_transaction(transaction, run),
                     compact_accepted=None,
                 )
-            input_event = self._event_log_store.read_event_by_id(
-                transaction, run.input_event_id
-            )
+            input_event = self._event_log_store.read_event_by_id(transaction, run.input_event_id)
             if input_event is None:
                 _LOGGER.critical(
-                    "dispatch.governance.input_missing session_id=%s run_id=%s "
-                    "input_event_id=%s",
+                    "dispatch.governance.input_missing session_id=%s run_id=%s " "input_event_id=%s",
                     run.session_id,
                     run.run_id,
                     run.input_event_id,
@@ -933,9 +892,7 @@ class HostDispatchScheduler:
                     ),
                     compact_accepted=None,
                 )
-            display_text = _display_text_from_input_event(
-                transaction, input_event
-            )
+            display_text = _display_text_from_input_event(transaction, input_event)
             estimate = estimate_context_budget(
                 policy,
                 BudgetEstimateInput(
@@ -953,8 +910,7 @@ class HostDispatchScheduler:
             decision = decide_context_budget(estimate)
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
-                "dispatch.governance.decision session_id=%s run_id=%s "
-                "decision=%s policy_ref=%s",
+                "dispatch.governance.decision session_id=%s run_id=%s " "decision=%s policy_ref=%s",
                 run.session_id,
                 run.run_id,
                 decision.value,
@@ -973,9 +929,7 @@ class HostDispatchScheduler:
             )
             if decision is ContextBudgetDecision.ALLOW_DISPATCH:
                 return _GovernanceStageResult(
-                    pending_dispatch=self._start_governed_in_transaction(
-                        transaction, run
-                    ),
+                    pending_dispatch=self._start_governed_in_transaction(transaction, run),
                     compact_accepted=None,
                 )
             if decision is ContextBudgetDecision.BLOCK_HARD_THRESHOLD:
@@ -1009,13 +963,10 @@ class HostDispatchScheduler:
                     compact_accepted=None,
                 )
             try:
-                compact_count = self._committed_proactive_compact_count(
-                    transaction, run
-                )
+                compact_count = self._committed_proactive_compact_count(transaction, run)
             except Exception:
                 _LOGGER.error(
-                    "dispatch.governance.compact_count_unreadable "
-                    "session_id=%s run_id=%s",
+                    "dispatch.governance.compact_count_unreadable " "session_id=%s run_id=%s",
                     run.session_id,
                     run.run_id,
                     exc_info=True,
@@ -1075,9 +1026,7 @@ class HostDispatchScheduler:
                 decision=decision,
             )
             if compact_pending is None:
-                return _GovernanceStageResult(
-                    pending_dispatch=None, compact_accepted=None
-                )
+                return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
             return _GovernanceStageResult(
                 pending_dispatch=None,
                 compact_accepted=None,
@@ -1087,18 +1036,13 @@ class HostDispatchScheduler:
         stage = self._transaction_runner.run_write(_operation)
         if stage.compact_pending is None:
             return stage
-        compacted_sequence = await self._execute_proactive_compaction(
-            stage.compact_pending
-        )
+        compacted_sequence = await self._execute_proactive_compaction(stage.compact_pending)
         if compacted_sequence is None:
-            return _GovernanceStageResult(
-                pending_dispatch=None, compact_accepted=None
-            )
+            return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
         pending = stage.compact_pending
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "dispatch.governance.compact_accepted session_id=%s run_id=%s "
-            "compacted_event_sequence=%s",
+            "dispatch.governance.compact_accepted session_id=%s run_id=%s " "compacted_event_sequence=%s",
             pending.session_id,
             pending.run_id,
             compacted_sequence,
@@ -1113,9 +1057,7 @@ class HostDispatchScheduler:
             ),
         )
 
-    async def _execute_proactive_compaction(
-        self, pending: _GovernanceCompactPending
-    ) -> int | None:
+    async def _execute_proactive_compaction(self, pending: _GovernanceCompactPending) -> int | None:
         """在事务外执行 proactive compact，并在新事务内写入结果。
 
         :param pending: 已写 request fact 的 compact 摘要。
@@ -1157,9 +1099,7 @@ class HostDispatchScheduler:
                         estimate=pending.estimate,
                         decision=pending.decision,
                         failure_reason="stale_compaction_result",
-                        budget_after_attempted_compact=(
-                            result.budget_after_attempted_compact
-                        ),
+                        budget_after_attempted_compact=(result.budget_after_attempted_compact),
                     )
                 return None
             for rejected in result.rejected_attempts:
@@ -1169,20 +1109,14 @@ class HostDispatchScheduler:
                     operation_id=pending.operation_id,
                     rejected=rejected,
                 )
-            if (
-                result.accepted_candidate is None
-                or result.quality_result is None
-                or result.failure_reason is not None
-            ):
+            if result.accepted_candidate is None or result.quality_result is None or result.failure_reason is not None:
                 self._append_compaction_failed_event(
                     transaction,
                     run=run,
                     estimate=pending.estimate,
                     decision=pending.decision,
                     failure_reason=result.failure_reason or "compaction_failed",
-                    budget_after_attempted_compact=(
-                        result.budget_after_attempted_compact
-                    ),
+                    budget_after_attempted_compact=(result.budget_after_attempted_compact),
                 )
                 self._fail_unstarted_in_transaction(
                     transaction,
@@ -1204,9 +1138,7 @@ class HostDispatchScheduler:
 
         return self._transaction_runner.run_write(_operation)
 
-    def _start_governed_after_compact(
-        self, accepted: _GovernanceCompactAccepted
-    ) -> PendingDispatchRecord | None:
+    def _start_governed_after_compact(self, accepted: _GovernanceCompactAccepted) -> PendingDispatchRecord | None:
         """compact catch-up 后启动同一个未启动 Run。
 
         :param accepted: compact accepted 摘要。
@@ -1217,8 +1149,7 @@ class HostDispatchScheduler:
             run = read_run_by_id(transaction, accepted.run_id)
             if run is None or run.status != accepted.expected_status:
                 _LOGGER.debug(
-                    "dispatch.governance.start_after_compact_skipped "
-                    "session_id=%s run_id=%s expected_status=%s",
+                    "dispatch.governance.start_after_compact_skipped " "session_id=%s run_id=%s expected_status=%s",
                     accepted.session_id,
                     accepted.run_id,
                     accepted.expected_status.value,
@@ -1228,9 +1159,7 @@ class HostDispatchScheduler:
 
         return self._transaction_runner.run_write(_operation)
 
-    def _start_governed_in_transaction(
-        self, transaction: HostTransaction, run: RunRow
-    ) -> PendingDispatchRecord | None:
+    def _start_governed_in_transaction(self, transaction: HostTransaction, run: RunRow) -> PendingDispatchRecord | None:
         """在当前事务内启动 accepted/queued Run。
 
         :param transaction: 当前 Host transaction。
@@ -1253,20 +1182,15 @@ class HostDispatchScheduler:
                 actor=_EVENT_ACTOR,
                 source=_EVENT_SOURCE,
                 start_reason=(
-                    RunStartReason.INITIAL
-                    if run.status is RunStatus.ACCEPTED
-                    else RunStartReason.QUEUE_PROMOTION
+                    RunStartReason.INITIAL if run.status is RunStatus.ACCEPTED else RunStartReason.QUEUE_PROMOTION
                 ),
                 worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=(
-                    self._host_instance_identity.host_instance_id
-                ),
+                owner_host_instance_id=(self._host_instance_identity.host_instance_id),
             ),
         )
         if result.status != StateMutationStatus.UPDATED:
             _LOGGER.debug(
-                "dispatch.start_governed.cas_miss session_id=%s run_id=%s "
-                "expected_status=%s",
+                "dispatch.start_governed.cas_miss session_id=%s run_id=%s " "expected_status=%s",
                 run.session_id,
                 run.run_id,
                 run.status.value,
@@ -1328,9 +1252,7 @@ class HostDispatchScheduler:
             ),
         )
 
-    def _committed_proactive_compact_count(
-        self, transaction: HostTransaction, run: RunRow
-    ) -> int:
+    def _committed_proactive_compact_count(self, transaction: HostTransaction, run: RunRow) -> int:
         """读取 durable EventLog 中本 Run proactive compact 请求数。
 
         :param transaction: 当前 Host transaction。
@@ -1425,9 +1347,7 @@ class HostDispatchScheduler:
                 transaction,
                 self._event_log_store,
                 run=run,
-                policy_digest=digest_memory_projection_policy(
-                    self._local_execution.memory_projection_policy
-                ),
+                policy_digest=digest_memory_projection_policy(self._local_execution.memory_projection_policy),
             ),
         )
         segment_selection = select_compact_segment(
@@ -1503,9 +1423,7 @@ class HostDispatchScheduler:
         artifact = CompactArtifactStore(
             LocalArtifactStore(
                 artifact_root,
-                create_artifact_root=(
-                    self._local_execution.compact_artifact_create_parent_dirs
-                ),
+                create_artifact_root=(self._local_execution.compact_artifact_create_parent_dirs),
             )
         ).write_compact_artifact(
             transaction,
@@ -1515,9 +1433,11 @@ class HostDispatchScheduler:
                 quality_result=quality,
                 policy_digest=sha256_digest_json(
                     {
-                        "policy_ref": self._local_execution.context_budget_policy.policy_ref
-                        if self._local_execution.context_budget_policy is not None
-                        else "none"
+                        "policy_ref": (
+                            self._local_execution.context_budget_policy.policy_ref
+                            if self._local_execution.context_budget_policy is not None
+                            else "none"
+                        )
                     }
                 ),
             ),
@@ -1591,9 +1511,11 @@ class HostDispatchScheduler:
                     budget_snapshot_ref=estimate.estimator_digest,
                     input_snapshot_cursor=run.input_event_sequence,
                     estimator_digest=estimate.estimator_digest,
-                    policy_ref=self._local_execution.context_budget_policy.policy_ref
-                    if self._local_execution.context_budget_policy is not None
-                    else "none",
+                    policy_ref=(
+                        self._local_execution.context_budget_policy.policy_ref
+                        if self._local_execution.context_budget_policy is not None
+                        else "none"
+                    ),
                     provider_request_id=None,
                     provider_error_ref=None,
                     attempt_id=None,
@@ -1647,9 +1569,7 @@ class HostDispatchScheduler:
                     policy_decision=_COMPACT_FAILURE_POLICY_DECISION,
                     retryable=False,
                     diagnostic_refs=(estimate.estimator_digest,),
-                    budget_after_attempted_compact=(
-                        budget_after_attempted_compact
-                    ),
+                    budget_after_attempted_compact=(budget_after_attempted_compact),
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1676,9 +1596,7 @@ class HostDispatchScheduler:
         self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
-                event_id=_new_event_id(
-                    _EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX
-                ),
+                event_id=_new_event_id(_EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX),
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=run.session_id,
                 run_id=run.run_id,
@@ -1697,14 +1615,10 @@ class HostDispatchScheduler:
                     attempt_number=rejected.attempt_number,
                     failure_category=rejected.failure_category,
                     repairable=rejected.repairable,
-                    runner_attempt_summary_refs=(
-                        rejected.runner_attempt_summary_refs
-                    ),
+                    runner_attempt_summary_refs=(rejected.runner_attempt_summary_refs),
                     diagnostic_refs=rejected.diagnostic_refs,
                     next_policy_decision=rejected.next_policy_decision,
-                    budget_after_attempted_compact=(
-                        rejected.budget_after_attempted_compact
-                    ),
+                    budget_after_attempted_compact=(rejected.budget_after_attempted_compact),
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1747,13 +1661,12 @@ class HostDispatchScheduler:
         :returns: ``None``。
         """
 
-        if self._closed:
+        if self._closed and self._close_cleanup_done:
             return
         self._closed = True
         self._best_effort_mark_host_instance_stopping(_SCHEDULER_CLOSE_REASON)
         _LOGGER.info(
-            "dispatch.scheduler.close_start host_handle_id=%s active_tasks=%s "
-            "active_handles=%s",
+            "dispatch.scheduler.close_start host_handle_id=%s active_tasks=%s " "active_handles=%s",
             self._host_handle_id,
             len(self._active_tasks),
             len(self._active_handles),
@@ -1777,6 +1690,7 @@ class HostDispatchScheduler:
         await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
         self._duplicate_governance_registry.clear_all()
         self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
+        self._close_cleanup_done = True
         _LOGGER.info(
             "dispatch.scheduler.close_done host_handle_id=%s",
             self._host_handle_id,
@@ -1790,9 +1704,7 @@ class HostDispatchScheduler:
         """
 
         if self._heartbeat_task is None or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.create_task(
-                self._host_instance_heartbeat_loop()
-            )
+            self._heartbeat_task = asyncio.create_task(self._host_instance_heartbeat_loop())
 
     async def _host_instance_heartbeat_loop(self) -> None:
         """后台刷新当前 Host instance heartbeat。
@@ -1828,14 +1740,11 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
-                    self._best_effort_mark_host_instance_stopping(
-                        "heartbeat_fatal_exit"
-                    )
+                    self._best_effort_mark_host_instance_stopping("heartbeat_fatal_exit")
                     return
         except asyncio.CancelledError:
             _LOGGER.debug(
-                "dispatch.host_instance_heartbeat.cancelled host_handle_id=%s "
-                "host_instance_id=%s",
+                "dispatch.host_instance_heartbeat.cancelled host_handle_id=%s " "host_instance_id=%s",
                 self._host_handle_id,
                 self._host_instance_identity.host_instance_id,
             )
@@ -1918,20 +1827,24 @@ class HostDispatchScheduler:
                             _LOGGER.debug(
                                 _LOG_DRAIN_LOOP_IDLE,
                                 self._host_handle_id,
-                                (
-                                    self._local_execution
-                                    .dispatch_poll_interval_seconds
-                                ),
+                                (self._local_execution.dispatch_poll_interval_seconds),
                             )
                             idle_sleep_logged = True
-                        await asyncio.sleep(
-                            self._local_execution.dispatch_poll_interval_seconds
-                        )
+                        await asyncio.sleep(self._local_execution.dispatch_poll_interval_seconds)
                     else:
                         idle_sleep_logged = False
                     result = await self.drain_once()
                     if result.processed > 0:
                         idle_sleep_logged = False
+                except HostTransactionRetryExhaustedError as exc:
+                    _LOGGER.error(
+                        _LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED,
+                        self._host_handle_id,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
+                    self._closed = True
+                    self._best_effort_mark_host_instance_stopped("drain_loop_durable_retry_exhausted")
                 except Exception as exc:
                     _LOGGER.warning(
                         _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION,
@@ -1940,15 +1853,11 @@ class HostDispatchScheduler:
                         exc_info=True,
                     )
                     if not self._closed:
-                        await asyncio.sleep(
-                            self._local_execution.dispatch_poll_interval_seconds
-                        )
+                        await asyncio.sleep(self._local_execution.dispatch_poll_interval_seconds)
             _LOGGER.debug(_LOG_DRAIN_LOOP_CLOSE_EXIT, self._host_handle_id)
         except asyncio.CancelledError:
             _LOGGER.debug(
-                _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE
-                if self._closed
-                else _LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY,
+                _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE if self._closed else _LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY,
                 self._host_handle_id,
             )
             raise
@@ -1968,15 +1877,13 @@ class HostDispatchScheduler:
                 except RuntimeError as exc:
                     if self._closed:
                         _LOGGER.debug(
-                            "dispatch.queue_promotion.cancelled_for_close "
-                            "host_handle_id=%s session_id=%s",
+                            "dispatch.queue_promotion.cancelled_for_close " "host_handle_id=%s session_id=%s",
                             self._host_handle_id,
                             session_id,
                         )
                     else:
                         _LOGGER.warning(
-                            "dispatch.queue_promotion.runtime_error "
-                            "host_handle_id=%s session_id=%s error_type=%s",
+                            "dispatch.queue_promotion.runtime_error " "host_handle_id=%s session_id=%s error_type=%s",
                             self._host_handle_id,
                             session_id,
                             exc.__class__.__name__,
@@ -2024,9 +1931,7 @@ class HostDispatchScheduler:
                 self._local_execution.lane_name,
                 self._local_execution.lane_default_timeout_seconds,
             )
-            self._safe_closeout_worker_startup_timeout(
-                record, reason=_WORKER_STARTUP_TIMEOUT_REASON
-            )
+            self._safe_closeout_worker_startup_timeout(record, reason=_WORKER_STARTUP_TIMEOUT_REASON)
             return "timed_out"
         if isinstance(acquire, LaneAcquireCancelled):
             if self._closed:
@@ -2040,9 +1945,7 @@ class HostDispatchScheduler:
                 record.dispatch_record_id,
                 self._local_execution.lane_name,
             )
-            self._safe_closeout_worker_startup_timeout(
-                record, reason=_WORKER_STARTUP_TIMEOUT_REASON
-            )
+            self._safe_closeout_worker_startup_timeout(record, reason=_WORKER_STARTUP_TIMEOUT_REASON)
             return "timed_out"
         if not isinstance(acquire, LaneAcquired):
             return "skipped"
@@ -2083,9 +1986,7 @@ class HostDispatchScheduler:
                 await _safe_release_lane_token(token)
             return "timed_out"
 
-    def _rewake_dispatch_after_current_drain(
-        self, record: PendingDispatchRecord
-    ) -> None:
+    def _rewake_dispatch_after_current_drain(self, record: PendingDispatchRecord) -> None:
         """在当前 drain 轮次之后重新投递 dispatch wakeup。
 
         :param record: 需要重试的 pending dispatch 摘要。
@@ -2094,9 +1995,7 @@ class HostDispatchScheduler:
 
         asyncio.get_running_loop().call_soon(self._queue.put_nowait, record)
 
-    def _mark_waiting_for_lane(
-        self, record: PendingDispatchRecord
-    ) -> DispatchRecordRow | None:
+    def _mark_waiting_for_lane(self, record: PendingDispatchRecord) -> DispatchRecordRow | None:
         """把 pending dispatch 标记为 waiting_for_lane。
 
         :param record: pending dispatch 摘要。
@@ -2104,9 +2003,7 @@ class HostDispatchScheduler:
         """
 
         def _operation(transaction: HostTransaction) -> DispatchRecordRow | None:
-            latest = read_dispatch_record_by_id(
-                transaction, record.dispatch_record_id
-            )
+            latest = read_dispatch_record_by_id(transaction, record.dispatch_record_id)
             if latest is None:
                 return None
             if latest.status == DispatchRecordStatus.WAITING_FOR_LANE:
@@ -2114,9 +2011,7 @@ class HostDispatchScheduler:
             result = mark_dispatch_waiting_for_lane_row(
                 transaction,
                 attempt_id=record.attempt_id,
-                owner_host_instance_id=(
-                    self._host_instance_identity.host_instance_id
-                ),
+                owner_host_instance_id=(self._host_instance_identity.host_instance_id),
                 lane_name=self._local_execution.lane_name,
                 waiting_for_lane_at=format_utc_timestamp(datetime.now(UTC)),
             )
@@ -2127,8 +2022,7 @@ class HostDispatchScheduler:
         row = self._transaction_runner.run_write(_operation)
         if row is None:
             _LOGGER.debug(
-                "dispatch.waiting_for_lane.skipped run_id=%s attempt_id=%s "
-                "execution_id=%s dispatch_record_id=%s",
+                "dispatch.waiting_for_lane.skipped run_id=%s attempt_id=%s " "execution_id=%s dispatch_record_id=%s",
                 record.run_id,
                 record.attempt_id,
                 record.execution_id,
@@ -2160,13 +2054,8 @@ class HostDispatchScheduler:
         def _operation(transaction: HostTransaction) -> DispatchRecordRow | None:
             run = read_run_by_id(transaction, record.run_id)
             attempt = read_attempt_by_id(transaction, record.attempt_id)
-            dispatch_record = read_dispatch_record_by_id(
-                transaction, record.dispatch_record_id
-            )
-            session_exists = (
-                run is not None
-                and read_session_by_id(transaction, run.session_id) is not None
-            )
+            dispatch_record = read_dispatch_record_by_id(transaction, record.dispatch_record_id)
+            session_exists = run is not None and read_session_by_id(transaction, run.session_id) is not None
             if not _is_dispatchable_recheck(
                 run=run,
                 attempt=attempt,
@@ -2178,9 +2067,7 @@ class HostDispatchScheduler:
             result = mark_dispatching_after_lane_row(
                 transaction,
                 attempt_id=record.attempt_id,
-                owner_host_instance_id=(
-                    self._host_instance_identity.host_instance_id
-                ),
+                owner_host_instance_id=(self._host_instance_identity.host_instance_id),
                 lane_name=token.name,
                 lane_claim_id=token.claim_id,
                 lane_owner_id=token.owner.owner_id,
@@ -2220,9 +2107,7 @@ class HostDispatchScheduler:
         )
         return row
 
-    def _dispatch_record_still_pre_accept(
-        self, dispatch_record: DispatchRecordRow
-    ) -> bool:
+    def _dispatch_record_still_pre_accept(self, dispatch_record: DispatchRecordRow) -> bool:
         """确认 dispatching row 仍处于 worker accept 前。
 
         :param dispatch_record: dispatching row。
@@ -2230,9 +2115,7 @@ class HostDispatchScheduler:
         """
 
         def _operation(transaction: HostTransaction) -> bool:
-            latest = read_dispatch_record_by_id(
-                transaction, dispatch_record.dispatch_record_id
-            )
+            latest = read_dispatch_record_by_id(transaction, dispatch_record.dispatch_record_id)
             return (
                 latest is not None
                 and latest.status == DispatchRecordStatus.DISPATCHING
@@ -2269,9 +2152,7 @@ class HostDispatchScheduler:
                 record=record,
                 snapshot=snapshot,
                 policy_snapshot=effective_decision.policy_snapshot,
-                selected_business_tool_names=(
-                    effective_decision.selected_business_tool_names
-                ),
+                selected_business_tool_names=(effective_decision.selected_business_tool_names),
             )
             worker = self._local_execution.worker_factory.create_worker(snapshot)
             _LOGGER.log(
@@ -2291,10 +2172,7 @@ class HostDispatchScheduler:
                 timeout=self._local_execution.worker_startup_timeout_seconds,
             )
         except MemoryProjectionRepairRequired as exc:
-            if (
-                exc.repair_request.reason
-                is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
-            ):
+            if exc.repair_request.reason is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD:
                 try:
                     _LOGGER.warning(
                         "dispatch memory projection lag repair still required; "
@@ -2380,8 +2258,7 @@ class HostDispatchScheduler:
             return "skipped"
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "dispatch.worker_accept.committed run_id=%s attempt_id=%s "
-            "execution_id=%s dispatch_record_id=%s",
+            "dispatch.worker_accept.committed run_id=%s attempt_id=%s " "execution_id=%s dispatch_record_id=%s",
             record.run_id,
             record.attempt_id,
             record.execution_id,
@@ -2433,10 +2310,7 @@ class HostDispatchScheduler:
         try:
             return builder.build(snapshot)
         except MemoryProjectionRepairRequired as exc:
-            if (
-                exc.repair_request.reason
-                is not MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
-            ):
+            if exc.repair_request.reason is not MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD:
                 raise
             _LOGGER.warning(
                 "dispatch.memory_projection.lag_rebuild_retry run_id=%s "
@@ -2449,9 +2323,7 @@ class HostDispatchScheduler:
             rebuild_conversation_memory_projection(
                 self._transaction_runner,
                 policy=self._local_execution.memory_projection_policy,
-                batch_size=(
-                    self._local_execution.memory_projection_catchup_batch_size
-                ),
+                batch_size=(self._local_execution.memory_projection_catchup_batch_size),
             )
             retry_builder = self._run_input_builder_for_dispatch(
                 snapshot=snapshot,
@@ -2480,10 +2352,7 @@ class HostDispatchScheduler:
             self._local_execution.memory_projection_policy,
         )
         compact_provider = DurableCompactArtifactProvider(self._transaction_runner)
-        if (
-            tooling_options is None
-            or not policy_snapshot.agent_policy.allow_tool_calls
-        ):
+        if tooling_options is None or not policy_snapshot.agent_policy.allow_tool_calls:
             return create_no_tool_run_input_builder(
                 transaction_runner=self._transaction_runner,
                 policy_snapshot=policy_snapshot,
@@ -2495,21 +2364,15 @@ class HostDispatchScheduler:
                     else ToolExecutionMode.NO_TOOL_DISABLED
                 ),
             )
-        tool_runtime = DefaultToolRuntimeFactory(
-            EffectiveToolBundleBuilder()
-        ).create_tool_runtime(
+        tool_runtime = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
             ToolRuntimeBuildRequest(
                 effective_bundle_request=EffectiveToolBundleBuildRequest(
                     business_tool_bundle=tooling_options.business_tool_bundle,
                     source_refs=tooling_options.source_refs,
                     framework_tool_policy=tooling_options.framework_tool_policy,
-                    policy_snapshot_digest=_policy_snapshot_digest(
-                        policy_snapshot
-                    ),
+                    policy_snapshot_digest=_policy_snapshot_digest(policy_snapshot),
                     selected_business_tool_names=selected_business_tool_names,
-                    enable_truncation_manager=(
-                        self._local_execution.enable_truncation_manager
-                    ),
+                    enable_truncation_manager=(self._local_execution.enable_truncation_manager),
                 ),
                 execution_scope=ToolRuntimeExecutionScope(
                     session_id=snapshot.session_id,
@@ -2549,9 +2412,7 @@ class HostDispatchScheduler:
 
         return self._transaction_runner.run_read(_IsReplayRunOperation(run_id=run_id))
 
-    def _catch_up_memory_projection_before_worker(
-        self, record: PendingDispatchRecord
-    ) -> None:
+    def _catch_up_memory_projection_before_worker(self, record: PendingDispatchRecord) -> None:
         """在构造 Engine request 前追平 conversation memory projection。
 
         :param record: pending dispatch 摘要。
@@ -2562,18 +2423,13 @@ class HostDispatchScheduler:
         result = catch_up_conversation_memory_projection(
             self._transaction_runner,
             policy=self._local_execution.memory_projection_policy,
-            batch_size=(
-                self._local_execution.memory_projection_catchup_batch_size
-            ),
-            max_event_sequence=(
-                self._required_memory_event_sequence_for_dispatch(record)
-            ),
+            batch_size=(self._local_execution.memory_projection_catchup_batch_size),
+            max_event_sequence=(self._required_memory_event_sequence_for_dispatch(record)),
         )
         if result.failures == 0:
             return
         _LOGGER.warning(
-            "dispatch.memory_projection.catch_up_failed_rebuild "
-            "run_id=%s attempt_id=%s execution_id=%s failures=%s",
+            "dispatch.memory_projection.catch_up_failed_rebuild " "run_id=%s attempt_id=%s execution_id=%s failures=%s",
             record.run_id,
             record.attempt_id,
             record.execution_id,
@@ -2582,14 +2438,10 @@ class HostDispatchScheduler:
         rebuild_conversation_memory_projection(
             self._transaction_runner,
             policy=self._local_execution.memory_projection_policy,
-            batch_size=(
-                self._local_execution.memory_projection_catchup_batch_size
-            ),
+            batch_size=(self._local_execution.memory_projection_catchup_batch_size),
         )
 
-    def _required_memory_event_sequence_for_dispatch(
-        self, record: PendingDispatchRecord
-    ) -> int:
+    def _required_memory_event_sequence_for_dispatch(self, record: PendingDispatchRecord) -> int:
         """读取当前 dispatch 允许 memory projection 覆盖的最大 EventLog cursor。
 
         :param record: pending dispatch 摘要。
@@ -2608,9 +2460,7 @@ class HostDispatchScheduler:
 
         return self._transaction_runner.run_read(_operation)
 
-    def _effective_dispatch_decision(
-        self, record: PendingDispatchRecord
-    ) -> _EffectiveDispatchDecision:
+    def _effective_dispatch_decision(self, record: PendingDispatchRecord) -> _EffectiveDispatchDecision:
         """读取当前 Run 在 admission 冻结的 dispatch 决策。
 
         :param record: pending dispatch 摘要。
@@ -2621,14 +2471,10 @@ class HostDispatchScheduler:
             run = read_run_by_id(transaction, record.run_id)
             if run is None:
                 raise RuntimeError("dispatch Run is missing")
-            event = self._event_log_store.read_event_by_id(
-                transaction, run.input_event_id
-            )
+            event = self._event_log_store.read_event_by_id(transaction, run.input_event_id)
             if event is None:
                 raise RuntimeError("dispatch input event is missing")
-            payload = event_payload_object(
-                transaction, event, payload_label="USER_INPUT_ACCEPTED"
-            )
+            payload = event_payload_object(transaction, event, payload_label="USER_INPUT_ACCEPTED")
             return _effective_dispatch_decision_from_payload(
                 payload,
                 fallback_policy_snapshot=self._local_policy_snapshot(),
@@ -2715,9 +2561,7 @@ class HostDispatchScheduler:
         def _operation(transaction: HostTransaction) -> bool:
             run = read_run_by_id(transaction, record.run_id)
             attempt = read_attempt_by_id(transaction, record.attempt_id)
-            latest_dispatch = read_dispatch_record_by_attempt_id(
-                transaction, record.attempt_id
-            )
+            latest_dispatch = read_dispatch_record_by_attempt_id(transaction, record.attempt_id)
             if not _is_worker_acceptable(
                 run=run,
                 attempt=attempt,
@@ -2762,8 +2606,7 @@ class HostDispatchScheduler:
         accepted = self._transaction_runner.run_write(_operation)
         if not accepted:
             _LOGGER.debug(
-                "dispatch.worker_accept.cas_miss run_id=%s attempt_id=%s "
-                "execution_id=%s dispatch_record_id=%s",
+                "dispatch.worker_accept.cas_miss run_id=%s attempt_id=%s " "execution_id=%s dispatch_record_id=%s",
                 record.run_id,
                 record.attempt_id,
                 record.execution_id,
@@ -2771,9 +2614,7 @@ class HostDispatchScheduler:
             )
         return accepted
 
-    def _closeout_worker_startup_timeout(
-        self, record: PendingDispatchRecord, *, reason: str
-    ) -> None:
+    def _closeout_worker_startup_timeout(self, record: PendingDispatchRecord, *, reason: str) -> None:
         """worker accept timeout 后关闭 STARTING Attempt。
 
         :param record: pending dispatch 摘要。
@@ -2820,8 +2661,7 @@ class HostDispatchScheduler:
         self._transaction_runner.run_write(_operation)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "dispatch.worker_startup.closeout_committed run_id=%s "
-            "attempt_id=%s execution_id=%s reason=%s",
+            "dispatch.worker_startup.closeout_committed run_id=%s " "attempt_id=%s execution_id=%s reason=%s",
             record.run_id,
             record.attempt_id,
             record.execution_id,
@@ -2848,11 +2688,7 @@ class HostDispatchScheduler:
         try:
             self._closeout_worker_startup_timeout(record, reason=reason)
         except Exception as exc:
-            original_error_type = (
-                original_error.__class__.__name__
-                if original_error is not None
-                else "None"
-            )
+            original_error_type = original_error.__class__.__name__ if original_error is not None else "None"
             _LOGGER.warning(
                 "worker startup closeout failed; continuing run_id=%s "
                 "attempt_id=%s execution_id=%s error_type=%s "
@@ -2903,15 +2739,9 @@ class HostDispatchScheduler:
                 context_budget_policy=self._local_execution.context_budget_policy,
                 context_compactor=self._local_execution.context_compactor,
                 compact_artifact_root=self._local_execution.compact_artifact_root,
-                compact_artifact_create_parent_dirs=(
-                    self._local_execution.compact_artifact_create_parent_dirs
-                ),
-                memory_projection_policy=(
-                    self._local_execution.memory_projection_policy
-                ),
-                memory_projection_catchup_batch_size=(
-                    self._local_execution.memory_projection_catchup_batch_size
-                ),
+                compact_artifact_create_parent_dirs=(self._local_execution.compact_artifact_create_parent_dirs),
+                memory_projection_policy=(self._local_execution.memory_projection_policy),
+                memory_projection_catchup_batch_size=(self._local_execution.memory_projection_catchup_batch_size),
             )
             worker_event_index = 0
             terminal_seen = False
@@ -2932,10 +2762,7 @@ class HostDispatchScheduler:
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
-                        if (
-                            cancellation_token.is_cancelled()
-                            and not self._closed
-                        ):
+                        if cancellation_token.is_cancelled() and not self._closed:
                             result = ingestor.ingest(
                                 _cancelled_eof_candidate(
                                     envelope=envelope,
@@ -3154,9 +2981,7 @@ def _cancelled_eof_candidate(
     )
 
 
-def _read_startable_run(
-    transaction: HostTransaction, session_id: str
-) -> RunRow | None:
+def _read_startable_run(transaction: HostTransaction, session_id: str) -> RunRow | None:
     """读取当前可进入 pre-start governance 的 Run。
 
     :param transaction: 当前 Host transaction。
@@ -3175,9 +3000,7 @@ def _read_startable_run(
     return read_earliest_queued_run(transaction, session_id)
 
 
-def _display_text_from_input_event(
-    transaction: HostTransaction, event: EventLogRow
-) -> str:
+def _display_text_from_input_event(transaction: HostTransaction, event: EventLogRow) -> str:
     """从 ``USER_INPUT_ACCEPTED`` event 读取展示文本。
 
     :param transaction: 当前 Host transaction。
@@ -3186,9 +3009,7 @@ def _display_text_from_input_event(
     :raises RuntimeError: payload 缺失展示文本时抛出。
     """
 
-    payload = event_payload_object(
-        transaction, event, payload_label="USER_INPUT_ACCEPTED"
-    )
+    payload = event_payload_object(transaction, event, payload_label="USER_INPUT_ACCEPTED")
     value = payload.get("display_text")
     if not isinstance(value, str) or value.strip() == "":
         raise RuntimeError("USER_INPUT_ACCEPTED display_text is invalid")
@@ -3222,8 +3043,7 @@ def _is_worker_acceptable(
         and attempt.status == AttemptStatus.STARTING
         and attempt.execution_id == record.execution_id
         and dispatch_record.status == DispatchRecordStatus.DISPATCHING
-        and dispatch_record.dispatch_record_id
-        == original_dispatch_record.dispatch_record_id
+        and dispatch_record.dispatch_record_id == original_dispatch_record.dispatch_record_id
         and dispatch_record.worker_accept_event_id is None
         and dispatch_record.cancelled_event_id is None
     )
@@ -3345,9 +3165,7 @@ def _proactive_material_blocks(
     )
 
 
-def _current_input_material_block(
-    *, run: RunRow, display_text: str
-) -> RunInputMaterialBlock:
+def _current_input_material_block(*, run: RunRow, display_text: str) -> RunInputMaterialBlock:
     """构造 proactive current input anchor material block。
 
     :param run: 当前 Run。
@@ -3392,9 +3210,7 @@ def _proactive_represented_evidence_refs(
     if snapshot_row is not None:
         for fact in snapshot_row.snapshot.evidence_backed_facts:
             refs.extend(fact.evidence_refs)
-    compacted = _latest_session_compacted_event_before_input(
-        transaction, event_log_store, run=run
-    )
+    compacted = _latest_session_compacted_event_before_input(transaction, event_log_store, run=run)
     if compacted is not None:
         refs.extend(preserved_canonical_evidence_refs(_payload_object(compacted)))
     return tuple(dict.fromkeys(refs))
@@ -3465,12 +3281,8 @@ def _policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:
             "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
             "allow_tool_calls": policy_snapshot.agent_policy.allow_tool_calls,
             "max_iterations": policy_snapshot.agent_policy.max_iterations,
-            "continuation_max_attempts": (
-                policy_snapshot.agent_policy.continuation_max_attempts
-            ),
-            "tool_execution_timeout_seconds": (
-                policy_snapshot.agent_policy.tool_execution_timeout_seconds
-            ),
+            "continuation_max_attempts": (policy_snapshot.agent_policy.continuation_max_attempts),
+            "tool_execution_timeout_seconds": (policy_snapshot.agent_policy.tool_execution_timeout_seconds),
         }
     )
 
@@ -3501,9 +3313,7 @@ def _effective_dispatch_decision_from_payload(
         if execution_value is None
         else _policy_snapshot_from_effective_execution(execution_value)
     )
-    selected_tool_names = (
-        None if tool_value is None else _selected_tool_names_from_effective_tool_set(tool_value)
-    )
+    selected_tool_names = None if tool_value is None else _selected_tool_names_from_effective_tool_set(tool_value)
     return _EffectiveDispatchDecision(
         policy_snapshot=policy_snapshot,
         selected_business_tool_names=selected_tool_names,
@@ -3621,8 +3431,7 @@ async def _safe_release_lane_token(token: LaneClaimToken) -> None:
         await token.release()
     except Exception as exc:
         _LOGGER.warning(
-            "dispatch.lane_token.release_failed lane_name=%s claim_id=%s "
-            "error_type=%s",
+            "dispatch.lane_token.release_failed lane_name=%s claim_id=%s " "error_type=%s",
             token.name,
             token.claim_id,
             exc.__class__.__name__,

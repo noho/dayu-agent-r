@@ -76,7 +76,7 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 - 协作式取消等待 / race helper。
 - `lane`：cross-process named semaphore / capacity guard，只表达 runtime capacity claim，不表达 Host admission、lease、fencing、Attempt owner、EventLog ordering 或 recovery proof。
 - `filelock`：第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥，不替代 SQLite transaction、EventLog 顺序或 Host 状态机。
-- `tools_discovery`：按显式 import path 或 package entry point 解析 provider callable，聚合 provider 输出为业务 `ToolBundle`、provider report 与 source refs；没有业务工具时使用内部 no-tool sentinel，不构造空 `ToolBundle`；不扫描业务包，不持有 Host / Service 上下文。
+- `tools_discovery`：按显式 import path 或 package entry point 解析 provider callable，聚合 provider 输出为业务 `ToolBundle`、provider report 与 source refs；没有业务工具时返回类型真实的内部空 `ToolBundle`；不扫描业务包，不持有 Host / Service 上下文。
 - `config_loader`：读取包内默认配置和调用方显式传入的 workspace 覆盖目录，输出 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes` 与 `tool_discovery` 五类 typed config view；不构造 Host，不创建 provider client，不解释 scene manifest，不解析 secret。
 - `location`：根据项目根目录与包内配置根目录解析 `workspace/config` 覆盖目录、prompt asset root 与 scene manifest root；ConfigLoader 和 ScenePrepare 不内置 workspace fallback。
 - `scene_prepare`：读取调用方显式传入的 scene manifest root 与 prompt asset root，校验 scene-only manifest、加载直接引用的 prompt fragments，用 typed context slot values 渲染 system messages，并输出已拼接的 system prompt、工具选择、model hints、typed agent policy override、fragment refs、source refs 与 content digest；不读取 ConfigLoader，不做工具发现，不表达 workflow、conversation lifecycle 或 Host runtime 部署。

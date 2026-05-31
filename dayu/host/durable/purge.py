@@ -55,6 +55,7 @@ from dayu.host.durable.schema import (
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
 )
+from dayu.host.durable.state import NON_TERMINAL_RUN_STATUSES, TERMINAL_RUN_STATUSES
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
 PURGE_IDEMPOTENCY_SCOPE_KIND = "purge_session"
@@ -100,34 +101,12 @@ _COUNT_HOST_PROJECTION_CHECKPOINTS = "host_projection_checkpoints"
 _COUNT_HOST_PROJECTION_FAILURES = "host_projection_failures"
 
 _SESSION_STATUS_CLOSED = "closed"
-_RUN_STATUS_ACCEPTED = "accepted"
-_RUN_STATUS_QUEUED = "queued"
-_RUN_STATUS_RUNNING = "running"
-_RUN_STATUS_WAITING = "waiting"
-_RUN_STATUS_CANCELLING = "cancelling"
-_RUN_STATUS_RECOVERING = "recovering"
-_RUN_STATUS_SUCCEEDED = "succeeded"
-_RUN_STATUS_FAILED = "failed"
-_RUN_STATUS_CANCELLED = "cancelled"
-_RUN_STATUS_LOST = "lost"
 _WAIT_STATUS_WAITING = "waiting"
 _PAYLOAD_KIND_SQLITE = "sqlite_payload"
 _TOMBSTONE_ID_PREFIX = "purge-tombstone-"
 
-_NON_TERMINAL_RUN_STATUSES = (
-    _RUN_STATUS_ACCEPTED,
-    _RUN_STATUS_QUEUED,
-    _RUN_STATUS_RUNNING,
-    _RUN_STATUS_WAITING,
-    _RUN_STATUS_CANCELLING,
-    _RUN_STATUS_RECOVERING,
-)
-_TERMINAL_RUN_STATUSES = (
-    _RUN_STATUS_SUCCEEDED,
-    _RUN_STATUS_FAILED,
-    _RUN_STATUS_CANCELLED,
-    _RUN_STATUS_LOST,
-)
+_NON_TERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in NON_TERMINAL_RUN_STATUSES)
+_TERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in TERMINAL_RUN_STATUSES)
 _PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS = (
     "host.minimal-read-model",
     "host.memory.session.v1",
@@ -233,28 +212,18 @@ class PurgeDeleteCounts:
             _COUNT_HOST_SESSIONS: self.host_sessions,
             _COUNT_HOST_RUNS: self.host_runs,
             _COUNT_HOST_ATTEMPTS: self.host_attempts,
-            _COUNT_HOST_ATTEMPT_DISPATCH_RECORDS: (
-                self.host_attempt_dispatch_records
-            ),
+            _COUNT_HOST_ATTEMPT_DISPATCH_RECORDS: (self.host_attempt_dispatch_records),
             _COUNT_HOST_WAIT_RECORDS: self.host_wait_records,
             _COUNT_HOST_RUN_RESULTS: self.host_run_results,
-            _COUNT_HOST_SESSION_TIMELINE_ITEMS: (
-                self.host_session_timeline_items
-            ),
+            _COUNT_HOST_SESSION_TIMELINE_ITEMS: (self.host_session_timeline_items),
             _COUNT_HOST_MEMORY_SNAPSHOTS: self.host_memory_snapshots,
             _COUNT_HOST_MEMORY_ITEMS: self.host_memory_items,
             _COUNT_HOST_MEMORY_DIAGNOSTICS: self.host_memory_diagnostics,
             _COUNT_HOST_AUDIT_SINK_MARKERS: self.host_audit_sink_markers,
             _COUNT_HOST_TOOL_TRACE_HOT: self.host_tool_trace_hot,
-            _COUNT_HOST_OUTBOX_TERMINAL_ITEMS: (
-                self.host_outbox_terminal_items
-            ),
-            _COUNT_HOST_OUTBOX_DRAIN_IDEMPOTENCY: (
-                self.host_outbox_drain_idempotency
-            ),
-            _COUNT_HOST_PROJECTION_CHECKPOINTS: (
-                self.host_projection_checkpoints
-            ),
+            _COUNT_HOST_OUTBOX_TERMINAL_ITEMS: (self.host_outbox_terminal_items),
+            _COUNT_HOST_OUTBOX_DRAIN_IDEMPOTENCY: (self.host_outbox_drain_idempotency),
+            _COUNT_HOST_PROJECTION_CHECKPOINTS: (self.host_projection_checkpoints),
             _COUNT_HOST_PROJECTION_FAILURES: self.host_projection_failures,
         }
         return value
@@ -482,9 +451,7 @@ class PurgeReplayDecision:
     message: str
 
 
-def read_purge_tombstone_by_session_id(
-    transaction: HostTransaction, session_id: str
-) -> PurgeTombstoneRow | None:
+def read_purge_tombstone_by_session_id(transaction: HostTransaction, session_id: str) -> PurgeTombstoneRow | None:
     """按 Session id 读取 purge tombstone。
 
     :param transaction: 调用方提供的 Host durable transaction。
@@ -501,9 +468,7 @@ def read_purge_tombstone_by_session_id(
     return _optional_tombstone_from_row(row)
 
 
-def read_purge_tombstone_by_id(
-    transaction: HostTransaction, tombstone_id: str
-) -> PurgeTombstoneRow | None:
+def read_purge_tombstone_by_id(transaction: HostTransaction, tombstone_id: str) -> PurgeTombstoneRow | None:
     """按 tombstone id 读取 purge tombstone。
 
     :param transaction: 调用方提供的 Host durable transaction。
@@ -520,9 +485,7 @@ def read_purge_tombstone_by_id(
     return _optional_tombstone_from_row(row)
 
 
-def insert_purge_tombstone(
-    transaction: HostTransaction, tombstone: PurgeTombstoneRow
-) -> PurgeTombstoneRow:
+def insert_purge_tombstone(transaction: HostTransaction, tombstone: PurgeTombstoneRow) -> PurgeTombstoneRow:
     """插入 purge tombstone row。
 
     :param transaction: 调用方提供的 Host durable transaction。
@@ -604,9 +567,7 @@ def build_purge_semantic_digest(
 
     _require_non_empty_text(session_id, field_name="session_id")
     _require_non_empty_text(reason, field_name="reason")
-    _require_optional_sha256_digest(
-        operation_context_digest, field_name="operation_context_digest"
-    )
+    _require_optional_sha256_digest(operation_context_digest, field_name="operation_context_digest")
     value: dict[str, JsonValue] = {
         _JSON_OPERATION: _PURGE_OPERATION,
         _JSON_SESSION_ID: session_id,
@@ -648,9 +609,7 @@ def record_or_read_purge_idempotency(
 
     _require_non_empty_text(session_id, field_name="session_id")
     _require_non_empty_text(client_request_id, field_name="client_request_id")
-    _require_sha256_digest(
-        semantic_request_digest, field_name="semantic_request_digest"
-    )
+    _require_sha256_digest(semantic_request_digest, field_name="semantic_request_digest")
     scope = _purge_idempotency_scope(session_id, client_request_id)
     tombstone = read_purge_tombstone_by_session_id(transaction, session_id)
     if tombstone is not None:
@@ -699,9 +658,7 @@ def record_or_read_purge_idempotency(
     )
 
 
-def purge_session_durable(
-    transaction: HostTransaction, request: PurgeSessionDeleteRequest
-) -> PurgeSessionDeleteResult:
+def purge_session_durable(transaction: HostTransaction, request: PurgeSessionDeleteRequest) -> PurgeSessionDeleteResult:
     """在调用方 write transaction 内执行 Session purge 删除矩阵。
 
     本 helper 只使用 Session / Run / Attempt / EventLog governance truth 判定
@@ -771,11 +728,7 @@ def purge_session_durable(
     )
     cleanup_refs = PurgeCommitCleanupRefs(
         artifact_relative_paths=tuple(
-            sorted(
-                ref.artifact_relative_path
-                for ref in descriptor_refs
-                if ref.artifact_relative_path is not None
-            )
+            sorted(ref.artifact_relative_path for ref in descriptor_refs if ref.artifact_relative_path is not None)
         )
     )
     deleted_counts = _counts_with_payload_cleanup(
@@ -863,9 +816,7 @@ def _result_for_replay_decision(
     raise HostDurableError(decision.message)
 
 
-def _read_session_row(
-    transaction: HostTransaction, session_id: str
-) -> HostRow | None:
+def _read_session_row(transaction: HostTransaction, session_id: str) -> HostRow | None:
     """读取目标 Session row。
 
     :param transaction: Host transaction。
@@ -902,9 +853,7 @@ def _enforce_session_closed(session_row: HostRow) -> None:
         raise PurgeSessionInvalidStateError("purge requires closed Session")
 
 
-def _enforce_no_non_terminal_runs(
-    transaction: HostTransaction, session_id: str
-) -> None:
+def _enforce_no_non_terminal_runs(transaction: HostTransaction, session_id: str) -> None:
     """校验目标 Session 下所有 Run 均为终态。
 
     :param transaction: Host transaction。
@@ -925,11 +874,9 @@ def _enforce_no_non_terminal_runs(
     )
     for row in rows:
         status = _require_text(row.get("status"), field_name="run.status")
-        if status in _NON_TERMINAL_RUN_STATUSES:
-            raise PurgeSessionInvalidStateError(
-                "purge requires every Run to be terminal"
-            )
-        if status not in _TERMINAL_RUN_STATUSES:
+        if status in _NON_TERMINAL_RUN_STATUS_VALUES:
+            raise PurgeSessionInvalidStateError("purge requires every Run to be terminal")
+        if status not in _TERMINAL_RUN_STATUS_VALUES:
             raise HostDurableError("Run row status is invalid")
 
 
@@ -955,9 +902,7 @@ def _enforce_no_active_waits(transaction: HostTransaction, session_id: str) -> N
         raise PurgeSessionInvalidStateError("purge requires no active wait records")
 
 
-def _read_target_event_refs(
-    transaction: HostTransaction, session_id: str
-) -> tuple[_EventLogDeleteRef, ...]:
+def _read_target_event_refs(transaction: HostTransaction, session_id: str) -> tuple[_EventLogDeleteRef, ...]:
     """读取目标 Session 的 EventLog 删除引用。
 
     :param transaction: Host transaction。
@@ -988,9 +933,7 @@ def _read_target_event_refs(
     )
 
 
-def _read_target_run_ids(
-    transaction: HostTransaction, session_id: str
-) -> tuple[str, ...]:
+def _read_target_run_ids(transaction: HostTransaction, session_id: str) -> tuple[str, ...]:
     """读取目标 Session 的 Run ids。
 
     :param transaction: Host transaction。
@@ -1011,9 +954,7 @@ def _read_target_run_ids(
     )
 
 
-def _read_target_attempt_ids(
-    transaction: HostTransaction, run_ids: tuple[str, ...]
-) -> tuple[str, ...]:
+def _read_target_attempt_ids(transaction: HostTransaction, run_ids: tuple[str, ...]) -> tuple[str, ...]:
     """读取目标 Run ids 下的 Attempt ids。
 
     :param transaction: Host transaction。
@@ -1036,9 +977,7 @@ def _read_target_attempt_ids(
     )
 
 
-def _read_target_payload_refs(
-    transaction: HostTransaction, session_id: str
-) -> tuple[str, ...]:
+def _read_target_payload_refs(transaction: HostTransaction, session_id: str) -> tuple[str, ...]:
     """收集目标 Session 删除范围内出现过的 payload descriptor refs。
 
     :param transaction: Host transaction。
@@ -1598,9 +1537,7 @@ def _insert_tombstone_and_idempotency(
     return tombstone
 
 
-def _build_tombstone_id(
-    *, session_id: str, client_request_id: str, semantic_request_digest: str
-) -> str:
+def _build_tombstone_id(*, session_id: str, client_request_id: str, semantic_request_digest: str) -> str:
     """构造稳定 tombstone id。
 
     :param session_id: 目标 Session id。
@@ -1796,9 +1733,7 @@ def _count_old_idempotency_records(
     )
 
 
-def _delete_dispatch_records(
-    transaction: HostTransaction, run_ids: tuple[str, ...]
-) -> int:
+def _delete_dispatch_records(transaction: HostTransaction, run_ids: tuple[str, ...]) -> int:
     """删除目标 Run ids 对应 dispatch records。
 
     :param transaction: Host transaction。
@@ -1836,9 +1771,7 @@ def _delete_attempts(transaction: HostTransaction, run_ids: tuple[str, ...]) -> 
     ).rowcount
 
 
-def _delete_runs_child_before_parent(
-    transaction: HostTransaction, session_id: str
-) -> int:
+def _delete_runs_child_before_parent(transaction: HostTransaction, session_id: str) -> int:
     """按 source_run_id 子先父顺序删除目标 Session Runs。
 
     :param transaction: Host transaction。
@@ -1896,9 +1829,7 @@ def _delete_by_event_ids(
     ).rowcount
 
 
-def _delete_by_session(
-    transaction: HostTransaction, table_name: str, session_id: str
-) -> int:
+def _delete_by_session(transaction: HostTransaction, table_name: str, session_id: str) -> int:
     """按 session_id 删除 rows。
 
     :param transaction: Host transaction。
@@ -1979,9 +1910,7 @@ def _read_payload_descriptor_delete_ref(
     )
 
 
-def _payload_ref_is_still_referenced(
-    transaction: HostTransaction, payload_ref: str
-) -> bool:
+def _payload_ref_is_still_referenced(transaction: HostTransaction, payload_ref: str) -> bool:
     """判断 payload ref 是否仍被 durable rows 引用。
 
     :param transaction: Host transaction。
@@ -2004,9 +1933,7 @@ def _payload_ref_is_still_referenced(
     return False
 
 
-def _sqlite_payload_is_still_referenced(
-    transaction: HostTransaction, sqlite_payload_id: str
-) -> bool:
+def _sqlite_payload_is_still_referenced(transaction: HostTransaction, sqlite_payload_id: str) -> bool:
     """判断 SQLite payload row 是否仍被 descriptor 引用。
 
     :param transaction: Host transaction。
@@ -2068,21 +1995,13 @@ def _build_deleted_refs_digest(
 
     value: dict[str, JsonValue] = {
         _REFS_EVENT_IDS: _json_text_list(tuple(ref.event_id for ref in event_refs)),
-        _REFS_EVENT_SEQUENCES: _json_int_list(
-            tuple(ref.event_sequence for ref in event_refs)
-        ),
+        _REFS_EVENT_SEQUENCES: _json_int_list(tuple(ref.event_sequence for ref in event_refs)),
         _REFS_RUN_IDS: _json_text_list(run_ids),
         _REFS_ATTEMPT_IDS: _json_text_list(attempt_ids),
         _REFS_PAYLOAD_REFS: _json_text_list(payload_refs),
-        _REFS_DELETED_PAYLOAD_REFS: _json_text_list(
-            tuple(sorted(deleted_payload_refs))
-        ),
-        _REFS_DELETED_SQLITE_PAYLOAD_IDS: _json_text_list(
-            tuple(sorted(deleted_sqlite_payload_ids))
-        ),
-        _REFS_ARTIFACT_RELATIVE_PATHS: _json_text_list(
-            tuple(sorted(artifact_relative_paths))
-        ),
+        _REFS_DELETED_PAYLOAD_REFS: _json_text_list(tuple(sorted(deleted_payload_refs))),
+        _REFS_DELETED_SQLITE_PAYLOAD_IDS: _json_text_list(tuple(sorted(deleted_sqlite_payload_ids))),
+        _REFS_ARTIFACT_RELATIVE_PATHS: _json_text_list(tuple(sorted(artifact_relative_paths))),
     }
     return sha256_digest_json(value)
 
@@ -2165,14 +2084,10 @@ def _read_texts(
     """
 
     rows = transaction.fetchall(sql, parameters)
-    return tuple(
-        _require_text(row.get(column_name), field_name=column_name) for row in rows
-    )
+    return tuple(_require_text(row.get(column_name), field_name=column_name) for row in rows)
 
 
-def _count_by_session(
-    transaction: HostTransaction, table_name: str, session_id: str
-) -> int:
+def _count_by_session(transaction: HostTransaction, table_name: str, session_id: str) -> int:
     """按 session_id 统计 rows。
 
     :param transaction: Host transaction。
@@ -2192,9 +2107,7 @@ def _count_by_session(
     )
 
 
-def _count_attempts_by_session(
-    transaction: HostTransaction, session_id: str
-) -> int:
+def _count_attempts_by_session(transaction: HostTransaction, session_id: str) -> int:
     """统计目标 Session 的 Attempt rows。
 
     :param transaction: Host transaction。
@@ -2266,9 +2179,7 @@ def _assert_deleted(label: str, actual: int, expected: int) -> None:
         raise HostDurableError(f"{label} delete count mismatch")
 
 
-def _purge_idempotency_scope(
-    session_id: str, client_request_id: str
-) -> IdempotencyScope:
+def _purge_idempotency_scope(session_id: str, client_request_id: str) -> IdempotencyScope:
     """构造 purge 幂等作用域。
 
     :param session_id: 目标 Session id。
@@ -2590,9 +2501,7 @@ def _validate_tombstone(tombstone: PurgeTombstoneRow) -> None:
         tombstone.precondition_digest,
         field_name="precondition_digest",
     )
-    expected_deleted_counts_digest = build_deleted_counts_digest(
-        tombstone.deleted_counts
-    )
+    expected_deleted_counts_digest = build_deleted_counts_digest(tombstone.deleted_counts)
     if tombstone.deleted_counts_digest != expected_deleted_counts_digest:
         raise HostDurableError("deleted_counts_digest does not match counts")
     _require_sha256_digest(

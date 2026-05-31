@@ -23,7 +23,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 14
+HOST_SCHEMA_VERSION = 15
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -54,41 +54,23 @@ INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION = "host_runs_one_accepted_per_session"
 INDEX_HOST_RUNS_QUEUE_FIFO = "host_runs_queue_fifo"
 INDEX_HOST_RUNS_SESSION_STATUS = "host_runs_session_status"
-INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN = (
-    "host_wait_records_one_active_per_run"
-)
+INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN = "host_wait_records_one_active_per_run"
 INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL = "host_wait_records_active_poll"
 INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB = "host_wait_records_external_job"
-INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE = (
-    "host_run_results_session_terminal_sequence"
-)
-INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE = (
-    "host_session_timeline_items_session_sequence"
-)
-INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE = (
-    "host_session_timeline_items_run_sequence"
-)
-INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR = (
-    "host_memory_snapshots_session_cursor"
-)
+INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE = "host_run_results_session_terminal_sequence"
+INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE = "host_session_timeline_items_session_sequence"
+INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE = "host_session_timeline_items_run_sequence"
+INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR = "host_memory_snapshots_session_cursor"
 INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE = "host_memory_items_session_sequence"
-INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON = (
-    "host_memory_diagnostics_session_reason"
-)
+INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON = "host_memory_diagnostics_session_reason"
 INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE = "event_log_run_type_sequence"
 INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE = "host_tool_trace_hot_run_sequence"
 INDEX_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE = "host_tool_trace_hot_tool_sequence"
 INDEX_HOST_TOOL_TRACE_HOT_TOOL_CALL = "host_tool_trace_hot_tool_call"
-INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST = (
-    "host_tool_trace_hot_provider_request"
-)
+INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST = "host_tool_trace_hot_provider_request"
 INDEX_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF = "host_tool_trace_hot_diagnostic_ref"
-INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE = (
-    "host_outbox_terminal_items_session_sequence"
-)
-INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE = (
-    "host_outbox_terminal_items_state_sequence"
-)
+INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE = "host_outbox_terminal_items_session_sequence"
+INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE = "host_outbox_terminal_items_state_sequence"
 INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN = "host_outbox_terminal_items_run"
 INDEX_HOST_PURGE_TOMBSTONES_SESSION = "host_purge_tombstones_session"
 
@@ -401,6 +383,12 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
     (queued_event_id IS NOT NULL
       AND queued_event_sequence IS NOT NULL
       AND current_attempt_id IS NULL)
+  ),
+  CHECK (
+    status NOT IN ('running', 'waiting', 'cancelling', 'recovering')
+    OR
+    (started_event_id IS NOT NULL
+      AND started_event_sequence IS NOT NULL)
   ),
   CHECK (
     status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')
@@ -1128,9 +1116,7 @@ FOUNDATION_DDL: tuple[str, ...] = (
 )
 """按外键依赖顺序排列的 Phase 2 foundation DDL。"""
 
-FOUNDATION_INDEX_DDL: tuple[str, ...] = (
-    _EVENT_LOG_RUN_TYPE_SEQUENCE_INDEX_DDL,
-)
+FOUNDATION_INDEX_DDL: tuple[str, ...] = (_EVENT_LOG_RUN_TYPE_SEQUENCE_INDEX_DDL,)
 """Phase 2 foundation table index DDL。"""
 
 PHASE3_STATE_DDL: tuple[str, ...] = (
@@ -1214,9 +1200,7 @@ OUTBOX_PROJECTION_INDEX_DDL: tuple[str, ...] = (
 )
 """Phase 13 outbox projection index DDL。"""
 
-PURGE_GOVERNANCE_INDEX_DDL: tuple[str, ...] = (
-    _HOST_PURGE_TOMBSTONES_SESSION_INDEX_DDL,
-)
+PURGE_GOVERNANCE_INDEX_DDL: tuple[str, ...] = (_HOST_PURGE_TOMBSTONES_SESSION_INDEX_DDL,)
 """Phase 15 purge tombstone governance index DDL。"""
 
 HOST_DURABLE_DDL: tuple[str, ...] = (
@@ -1256,7 +1240,8 @@ def bootstrap_host_durable_store(connection: sqlite3.Connection) -> None:
     if current_version not in (0, HOST_SCHEMA_VERSION):
         raise HostSchemaMismatchError(
             "Host durable schema version mismatch: "
-            f"expected {HOST_SCHEMA_VERSION}, got {current_version}"
+            f"expected fresh schema {HOST_SCHEMA_VERSION}, got {current_version}; "
+            "recreate the durable database for this version"
         )
     for statement in HOST_DURABLE_DDL:
         connection.execute(statement)
@@ -1278,7 +1263,8 @@ def validate_host_schema_version(connection: sqlite3.Connection) -> None:
     if current_version != HOST_SCHEMA_VERSION:
         raise HostSchemaMismatchError(
             "Host durable schema version mismatch: "
-            f"expected {HOST_SCHEMA_VERSION}, got {current_version}"
+            f"expected fresh schema {HOST_SCHEMA_VERSION}, got {current_version}; "
+            "recreate the durable database for this version"
         )
 
 

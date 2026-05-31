@@ -21,45 +21,11 @@ from dayu.contracts import (
     ToolBundleSourceRef,
     ToolDefinition,
 )
-from dayu.contracts.tool_schema import ToolSchema, ToolTruncateSpec
 from dayu.runtime._digest import canonical_json_digest, normalize_json_value
 
 _IMPORT_PATH_SEPARATOR = ":"
 _ATTRIBUTE_PATH_SEPARATOR = "."
 _RESERVED_FRAMEWORK_TOOL_NAMES: frozenset[str] = frozenset({"fetch_more"})
-
-
-@dataclass(frozen=True, slots=True)
-class _NoToolBundle:
-    """工具发现 no-tool sentinel。
-
-    公共 ``ToolBundle`` 构造期拒绝空集合；工具发现内部用该 sentinel 表达
-    provider 均禁用或显式允许空输出的 no-tool 结果，避免向下游传递空
-    ``ToolBundle`` 实例。
-
-    :param definitions: 固定为空的工具定义元组。
-    """
-
-    definitions: tuple[ToolDefinition, ...] = ()
-
-    def to_tool_schemas(self) -> tuple[ToolSchema, ...]:
-        """返回空 schema 元组。
-
-        :returns: 空 ``ToolSchema`` 元组。
-        """
-
-        return ()
-
-    def truncate_specs(self) -> Mapping[str, ToolTruncateSpec]:
-        """返回空截断声明映射。
-
-        :returns: 空映射。
-        """
-
-        return {}
-
-
-_NO_TOOL_BUNDLE: Final[ToolBundle] = cast(ToolBundle, _NoToolBundle())
 
 
 class ToolsDiscoveryError(ValueError):
@@ -214,8 +180,7 @@ class ToolsDiscoveryProviderReport:
 class ToolsDiscoveryResult:
     """工具发现聚合结果。
 
-    :param tool_bundle: 聚合后的业务工具 bundle；没有发现工具时为 no-tool
-        sentinel，其 ``definitions`` 为空。
+    :param tool_bundle: 聚合后的业务工具 bundle；没有发现工具时为空 bundle。
     :param provider_reports: provider 级别报告，不包含 callable 或 adapter。
     :param source_refs: 按 provider 输出顺序拼接的来源引用。
     """
@@ -293,7 +258,7 @@ class ToolsDiscovery:
             source_refs.extend(normalized_source_refs)
         _validate_unique_tool_names(tuple(definitions))
         tool_bundle = (
-            _NO_TOOL_BUNDLE
+            ToolBundle(definitions=(), _allow_empty=True)
             if not definitions
             else ToolBundle(definitions=tuple(definitions))
         )
@@ -438,9 +403,7 @@ def _tool_definitions_digest(definitions: tuple[ToolDefinition, ...]) -> str:
     :raises ValueError: 声明中的浮点数不是合法 JSON number 时抛出。
     """
 
-    tools: list[JsonValue] = [
-        _tool_definition_json_value(definition) for definition in definitions
-    ]
+    tools: list[JsonValue] = [_tool_definition_json_value(definition) for definition in definitions]
     payload: dict[str, JsonValue] = {"tools": tools}
     return canonical_json_digest(payload)
 
@@ -485,11 +448,7 @@ def _tool_definition_json_value(definition: ToolDefinition) -> JsonValue:
         "schema": _tool_schema_json_value(definition),
         "truncate": _tool_truncate_json_value(definition),
         "tags": list(definition.tags),
-        "display": (
-            definition.display.name
-            if definition.display is not None
-            else None
-        ),
+        "display": (definition.display.name if definition.display is not None else None),
     }
     return value
 
@@ -534,18 +493,10 @@ def _tool_truncate_json_value(definition: ToolDefinition) -> JsonValue:
         return None
     value: dict[str, JsonValue] = {
         "enabled": truncate.enabled,
-        "strategy": (
-            truncate.strategy.value
-            if truncate.strategy is not None
-            else None
-        ),
+        "strategy": (truncate.strategy.value if truncate.strategy is not None else None),
         "limits": _int_mapping_json_value(truncate.limits),
         "target_field": truncate.target_field,
-        "field_path": (
-            list(truncate.field_path)
-            if truncate.field_path is not None
-            else None
-        ),
+        "field_path": (list(truncate.field_path) if truncate.field_path is not None else None),
         "ttl_seconds": truncate.ttl_seconds,
     }
     return value
@@ -619,10 +570,7 @@ def _validate_reserved_tool_names(definitions: tuple[ToolDefinition, ...]) -> No
 
     for definition in definitions:
         if definition.name in _RESERVED_FRAMEWORK_TOOL_NAMES:
-            raise ToolsDiscoveryError(
-                "business tool name is reserved for framework tool:"
-                f" {definition.name}"
-            )
+            raise ToolsDiscoveryError("business tool name is reserved for framework tool:" f" {definition.name}")
 
 
 def _require_provider_identity(provider_id: str) -> str:

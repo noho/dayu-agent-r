@@ -443,7 +443,7 @@ def test_empty_provider_without_allow_empty_fails() -> None:
 
 
 def test_empty_provider_with_allow_empty_succeeds() -> None:
-    """provider 显式允许空输出时以 ``None`` 表达无业务工具。"""
+    """provider 显式允许空输出时返回类型真实的空工具 bundle。"""
 
     def provider(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
         """空输出测试 provider。

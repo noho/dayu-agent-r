@@ -143,9 +143,7 @@ _AwaitedT = TypeVar("_AwaitedT")
 class _PurgeCapableHost(Protocol):
     """测试内收窄的 purge-capable public Host 协议。"""
 
-    async def purge_session(
-        self, session_id: str, request: PurgeSessionRequest
-    ) -> PurgeSessionResult:
+    async def purge_session(self, session_id: str, request: PurgeSessionRequest) -> PurgeSessionResult:
         """清理已关闭 Session 的本地可恢复事实。
 
         :param session_id: 目标 Session id。
@@ -166,9 +164,7 @@ def _options(tmp_path: Path) -> HostDurableStoreOptions:
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "host" / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(
-            artifact_root=tmp_path / "artifacts"
-        ),
+        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
         sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=0.25),
     )
 
@@ -419,9 +415,7 @@ def _tombstone(
     """
 
     counts = _counts()
-    effective_semantic_digest = (
-        _semantic_digest() if semantic_digest is None else semantic_digest
-    )
+    effective_semantic_digest = _semantic_digest() if semantic_digest is None else semantic_digest
     return PurgeTombstoneRow(
         tombstone_id="purge-tombstone-1",
         session_id=_SESSION_ID,
@@ -501,9 +495,7 @@ class _FailingAuditRecorder:
         raise OSError("audit append failed")
 
 
-def _purge_in_independent_process(
-    root_path_text: str, result_marker_text: str
-) -> None:
+def _purge_in_independent_process(root_path_text: str, result_marker_text: str) -> None:
     """独立进程 A：打开 public Host handle 并执行 purge。
 
     :param root_path_text: 测试根目录文本路径。
@@ -520,9 +512,7 @@ def _purge_in_independent_process(
     )
 
 
-async def _purge_in_independent_process_async(
-    *, root_path: Path, result_marker: Path
-) -> None:
+async def _purge_in_independent_process_async(*, root_path: Path, result_marker: Path) -> None:
     """独立进程 A 的异步 purge 主体。
 
     :param root_path: 测试根目录。
@@ -538,9 +528,7 @@ async def _purge_in_independent_process_async(
         allow_tool_calls=False,
     )
     async with open_host(options) as host:
-        result = await cast(_PurgeCapableHost, host).purge_session(
-            _SESSION_ID, _purge_api_request()
-        )
+        result = await cast(_PurgeCapableHost, host).purge_session(_SESSION_ID, _purge_api_request())
     result_marker.write_text(
         json.dumps(
             {
@@ -554,9 +542,7 @@ async def _purge_in_independent_process_async(
     )
 
 
-def _read_after_purge_in_independent_process(
-    root_path_text: str, result_marker_text: str
-) -> None:
+def _read_after_purge_in_independent_process(root_path_text: str, result_marker_text: str) -> None:
     """独立进程 B：打开 public Host handle 并验证 purge 后 fail closed。
 
     :param root_path_text: 测试根目录文本路径。
@@ -573,9 +559,7 @@ def _read_after_purge_in_independent_process(
     )
 
 
-async def _read_after_purge_in_independent_process_async(
-    *, root_path: Path, result_marker: Path
-) -> None:
+async def _read_after_purge_in_independent_process_async(*, root_path: Path, result_marker: Path) -> None:
     """独立进程 B 的异步读后验证主体。
 
     :param root_path: 测试根目录。
@@ -593,12 +577,8 @@ async def _read_after_purge_in_independent_process_async(
     )
     observed: dict[str, JsonValue] = {}
     async with open_host(options) as host:
-        observed["get_session"] = await _host_api_error_code(
-            host.get_session(_SESSION_ID)
-        )
-        observed["get_run"] = await _host_api_error_code(
-            host.get_run(_PARENT_RUN_ID)
-        )
+        observed["get_session"] = await _host_api_error_code(host.get_session(_SESSION_ID))
+        observed["get_run"] = await _host_api_error_code(host.get_run(_PARENT_RUN_ID))
         observed["retry_run"] = await _host_api_error_code(
             host.retry_run(
                 _PARENT_RUN_ID,
@@ -638,9 +618,7 @@ async def _host_api_error_code(awaitable: Awaitable[_AwaitedT]) -> str:
 class _InsertAndReadTombstoneOperation:
     """插入并读取 tombstone 的测试 transaction operation。"""
 
-    def __call__(
-        self, transaction: HostTransaction
-    ) -> tuple[PurgeTombstoneRow, PurgeTombstoneRow | None]:
+    def __call__(self, transaction: HostTransaction) -> tuple[PurgeTombstoneRow, PurgeTombstoneRow | None]:
         """执行插入并按 Session id 读取。
 
         :param transaction: Host durable transaction。
@@ -922,9 +900,7 @@ class _SeedOpenSessionOperation:
 class _PurgeMatrixOperation:
     """执行 purge_session_durable 的测试 operation。"""
 
-    def __init__(
-        self, audit_recorder: _RecordingAuditRecorder | _FailingAuditRecorder | None = None
-    ) -> None:
+    def __init__(self, audit_recorder: _RecordingAuditRecorder | _FailingAuditRecorder | None = None) -> None:
         """初始化 purge matrix operation。
 
         :param audit_recorder: 可选测试 audit recorder。
@@ -1148,9 +1124,7 @@ def _delete_request(
     :returns: purge delete request。
     """
 
-    effective_audit_recorder = (
-        _RecordingAuditRecorder() if audit_recorder is None else audit_recorder
-    )
+    effective_audit_recorder = _RecordingAuditRecorder() if audit_recorder is None else audit_recorder
     return PurgeSessionDeleteRequest(
         session_id=_SESSION_ID,
         client_request_id=_CLIENT_REQUEST_ID,
@@ -1166,9 +1140,7 @@ def _delete_request(
     )
 
 
-def _insert_sqlite_payload_descriptor(
-    transaction: HostTransaction, *, payload_ref: str, payload_id: str
-) -> None:
+def _insert_sqlite_payload_descriptor(transaction: HostTransaction, *, payload_ref: str, payload_id: str) -> None:
     """写入 SQLite payload row 与 descriptor。
 
     :param transaction: Host transaction。
@@ -1488,28 +1460,23 @@ def _insert_target_events(transaction: HostTransaction) -> _TargetEvents:
         ),
     )
 
+
 def test_insert_and_read_purge_tombstone_round_trip(tmp_path: Path) -> None:
     """tombstone 可在无 Session / EventLog row 时插入并按 id/session 读取。"""
 
     result: tuple[PurgeTombstoneRow, PurgeTombstoneRow | None] | None = None
     with open_host_durable_store(_options(tmp_path)) as store:
-        result = store.transaction_runner.run_write(
-            _InsertAndReadTombstoneOperation()
-        )
+        result = store.transaction_runner.run_write(_InsertAndReadTombstoneOperation())
 
     assert result is not None
     inserted, by_session = result
     assert by_session == inserted
     assert inserted.session_id == _SESSION_ID
     assert inserted.deleted_counts.event_log_rows == 3
-    assert inserted.deleted_counts_digest == build_deleted_counts_digest(
-        inserted.deleted_counts
-    )
+    assert inserted.deleted_counts_digest == build_deleted_counts_digest(inserted.deleted_counts)
 
 
-def _insert_closed_session(
-    transaction: HostTransaction, events: _TargetEvents
-) -> None:
+def _insert_closed_session(transaction: HostTransaction, events: _TargetEvents) -> None:
     """写入 closed Session row。
 
     :param transaction: Host transaction。
@@ -1569,9 +1536,7 @@ def _insert_slot(transaction: HostTransaction, bound_event: tuple[str, int]) -> 
     )
 
 
-def _insert_run_rows(
-    transaction: HostTransaction, run_status: str, events: _TargetEvents
-) -> None:
+def _insert_run_rows(transaction: HostTransaction, run_status: str, events: _TargetEvents) -> None:
     """写入 parent/child Run rows。
 
     :param transaction: Host transaction。
@@ -1638,6 +1603,12 @@ def _insert_run_row(
     )
     queued_event_id = accepted_event[0] if status == _RUN_STATUS_QUEUED else None
     queued_event_sequence = accepted_event[1] if status == _RUN_STATUS_QUEUED else None
+    started_event_id = (
+        accepted_event[0] if status not in (_RUN_STATUS_ACCEPTED, _RUN_STATUS_QUEUED) and not is_terminal else None
+    )
+    started_event_sequence = (
+        accepted_event[1] if status not in (_RUN_STATUS_ACCEPTED, _RUN_STATUS_QUEUED) and not is_terminal else None
+    )
     transaction.execute(
         f"""
         INSERT INTO {TABLE_HOST_RUNS} (
@@ -1676,8 +1647,8 @@ def _insert_run_row(
             accepted_event[1],
             queued_event_id,
             queued_event_sequence,
-            None,
-            None,
+            started_event_id,
+            started_event_sequence,
             terminal_event[0] if is_terminal else None,
             terminal_event[1] if is_terminal else None,
             current_attempt_id if status not in (_RUN_STATUS_ACCEPTED, _RUN_STATUS_QUEUED) else None,
@@ -1692,9 +1663,7 @@ def _insert_run_row(
     )
 
 
-def _insert_attempt_rows(
-    transaction: HostTransaction, run_status: str, events: _TargetEvents
-) -> None:
+def _insert_attempt_rows(transaction: HostTransaction, run_status: str, events: _TargetEvents) -> None:
     """写入 Attempt rows。
 
     :param transaction: Host transaction。
@@ -1778,6 +1747,7 @@ def _insert_attempt_row(
             None if terminal_event is None else _TIMESTAMP,
         ),
     )
+
 
 def test_tombstone_replay_records_purge_idempotency_with_null_event_refs(
     tmp_path: Path,
@@ -1885,9 +1855,7 @@ def test_tombstone_same_key_same_digest_with_conflicting_idempotency_is_inconsis
 
     decision: PurgeReplayDecision | None = None
     with open_host_durable_store(_options(tmp_path)) as store:
-        store.transaction_runner.run_write(
-            _SeedTombstoneWithConflictingIdempotencyOperation()
-        )
+        store.transaction_runner.run_write(_SeedTombstoneWithConflictingIdempotencyOperation())
         decision = store.transaction_runner.run_write(
             _RecordOrReadOperation(
                 client_request_id=_CLIENT_REQUEST_ID,
@@ -1916,14 +1884,10 @@ def test_insert_tombstone_rejects_mismatched_deleted_counts_digest(
     malformed = replace(_tombstone(), deleted_counts_digest=_DIGEST_A)
     with open_host_durable_store(_options(tmp_path)) as store:
         with pytest.raises(HostDurableError):
-            store.transaction_runner.run_write(
-                _InsertMalformedTombstoneOperation(malformed)
-    )
+            store.transaction_runner.run_write(_InsertMalformedTombstoneOperation(malformed))
 
 
-def _insert_dispatch_rows(
-    transaction: HostTransaction, events: _TargetEvents
-) -> None:
+def _insert_dispatch_rows(transaction: HostTransaction, events: _TargetEvents) -> None:
     """写入 dispatch records。
 
     :param transaction: Host transaction。
@@ -2027,9 +1991,7 @@ def _insert_dispatch_row(
     )
 
 
-def _insert_wait_row(
-    transaction: HostTransaction, *, active_wait: bool, events: _TargetEvents
-) -> None:
+def _insert_wait_row(transaction: HostTransaction, *, active_wait: bool, events: _TargetEvents) -> None:
     """写入 wait record。
 
     :param transaction: Host transaction。
@@ -2104,9 +2066,7 @@ def _insert_wait_row(
     )
 
 
-def _insert_read_model_rows(
-    transaction: HostTransaction, events: _TargetEvents
-) -> None:
+def _insert_read_model_rows(transaction: HostTransaction, events: _TargetEvents) -> None:
     """写入 minimal read model rows。
 
     :param transaction: Host transaction。
@@ -2234,9 +2194,7 @@ def _insert_timeline_item(
     )
 
 
-def _insert_memory_rows(
-    transaction: HostTransaction, events: _TargetEvents
-) -> None:
+def _insert_memory_rows(transaction: HostTransaction, events: _TargetEvents) -> None:
     """写入 memory snapshot/items/diagnostics rows。
 
     :param transaction: Host transaction。
@@ -2334,9 +2292,7 @@ def _insert_memory_rows(
     )
 
 
-def _insert_audit_marker(
-    transaction: HostTransaction, event_ref: tuple[str, int]
-) -> None:
+def _insert_audit_marker(transaction: HostTransaction, event_ref: tuple[str, int]) -> None:
     """写入 audit marker row。
 
     :param transaction: Host transaction。
@@ -2357,9 +2313,7 @@ def _insert_audit_marker(
     )
 
 
-def _insert_tool_trace_row(
-    transaction: HostTransaction, event_ref: tuple[str, int]
-) -> None:
+def _insert_tool_trace_row(transaction: HostTransaction, event_ref: tuple[str, int]) -> None:
     """写入 tool trace hot row。
 
     :param transaction: Host transaction。
@@ -2425,9 +2379,7 @@ def _insert_tool_trace_row(
     )
 
 
-def _insert_outbox_rows(
-    transaction: HostTransaction, terminal_event: tuple[str, int]
-) -> None:
+def _insert_outbox_rows(transaction: HostTransaction, terminal_event: tuple[str, int]) -> None:
     """写入 outbox terminal item 与 drain idempotency rows。
 
     :param transaction: Host transaction。
@@ -2497,9 +2449,7 @@ def _insert_outbox_rows(
     )
 
 
-def _insert_projection_rows(
-    transaction: HostTransaction, events: _TargetEvents
-) -> None:
+def _insert_projection_rows(transaction: HostTransaction, events: _TargetEvents) -> None:
     """写入 checkpoint/failure rows。
 
     :param transaction: Host transaction。
@@ -2553,9 +2503,7 @@ def _insert_projection_rows(
     )
 
 
-def _insert_old_idempotency_rows(
-    transaction: HostTransaction, events: _TargetEvents
-) -> None:
+def _insert_old_idempotency_rows(transaction: HostTransaction, events: _TargetEvents) -> None:
     """写入 purge 应删除的旧 command idempotency rows。
 
     :param transaction: Host transaction。
@@ -2685,9 +2633,7 @@ def test_insert_tombstone_rejects_invalid_audit_record_ref(
     malformed = replace(_tombstone(), audit_record_ref="")
     with open_host_durable_store(_options(tmp_path)) as store:
         with pytest.raises(HostDurableError):
-            store.transaction_runner.run_write(
-                _InsertMalformedTombstoneOperation(malformed)
-            )
+            store.transaction_runner.run_write(_InsertMalformedTombstoneOperation(malformed))
 
 
 def test_insert_tombstone_rejects_invalid_audit_record_digest(
@@ -2698,9 +2644,7 @@ def test_insert_tombstone_rejects_invalid_audit_record_digest(
     malformed = replace(_tombstone(), audit_record_digest="not-a-digest")
     with open_host_durable_store(_options(tmp_path)) as store:
         with pytest.raises(HostDurableError):
-            store.transaction_runner.run_write(
-                _InsertMalformedTombstoneOperation(malformed)
-            )
+            store.transaction_runner.run_write(_InsertMalformedTombstoneOperation(malformed))
 
 
 def test_purge_session_durable_deletes_matrix_and_preserves_replay(
@@ -2717,12 +2661,8 @@ def test_purge_session_durable_deletes_matrix_and_preserves_replay(
         store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
         result = store.transaction_runner.run_write(_PurgeMatrixOperation(audit_recorder))
         replay = store.transaction_runner.run_write(_PurgeMatrixOperation())
-        purge_idempotency = store.transaction_runner.run_read(
-            _ReadPurgeIdempotencyOperation()
-        )
-        out_of_scope_idempotency_exists = store.transaction_runner.run_read(
-            _ReadOutOfScopeIdempotencyOperation()
-        )
+        purge_idempotency = store.transaction_runner.run_read(_ReadPurgeIdempotencyOperation())
+        out_of_scope_idempotency_exists = store.transaction_runner.run_read(_ReadOutOfScopeIdempotencyOperation())
         assert (
             store.transaction_runner.run_read(
                 _ReadTableCountOperation(
@@ -2763,12 +2703,8 @@ def test_purge_session_durable_deletes_matrix_and_preserves_replay(
             )
             == 1
         )
-        assert store.transaction_runner.run_read(
-            _ReadTableCountOperation(TABLE_HOST_PROJECTION_CHECKPOINTS)
-        ) == 0
-        assert store.transaction_runner.run_read(
-            _ReadTableCountOperation(TABLE_HOST_PROJECTION_FAILURES)
-        ) == 0
+        assert store.transaction_runner.run_read(_ReadTableCountOperation(TABLE_HOST_PROJECTION_CHECKPOINTS)) == 0
+        assert store.transaction_runner.run_read(_ReadTableCountOperation(TABLE_HOST_PROJECTION_FAILURES)) == 0
 
     assert result is not None
     assert replay is not None
@@ -2799,16 +2735,12 @@ def test_purge_session_durable_deletes_matrix_and_preserves_replay(
     assert result.deleted_counts.payload_descriptors == 2
     assert result.deleted_counts.sqlite_payloads == 1
     assert result.cleanup_refs.artifact_relative_paths == (_ARTIFACT_RELATIVE_PATH,)
-    assert result.tombstone.deleted_counts_digest == build_deleted_counts_digest(
-        result.deleted_counts
-    )
+    assert result.tombstone.deleted_counts_digest == build_deleted_counts_digest(result.deleted_counts)
     assert result.tombstone.audit_record_ref == _AUDIT_RECORD_REF
     assert result.tombstone.audit_record_digest == _DIGEST_A
     assert len(audit_recorder.requests) == 1
     assert audit_recorder.requests[0].session_id == _SESSION_ID
-    assert audit_recorder.requests[0].deleted_counts_digest == (
-        result.tombstone.deleted_counts_digest
-    )
+    assert audit_recorder.requests[0].deleted_counts_digest == (result.tombstone.deleted_counts_digest)
     assert purge_idempotency[0] == result.tombstone.tombstone_id
     assert purge_idempotency[1] is None
     assert purge_idempotency[2] is None
@@ -2824,9 +2756,7 @@ def test_purge_session_durable_audit_failure_rolls_back_tombstone(
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
         with pytest.raises(OSError, match="audit append failed"):
-            store.transaction_runner.run_write(
-                _PurgeMatrixOperation(_FailingAuditRecorder())
-            )
+            store.transaction_runner.run_write(_PurgeMatrixOperation(_FailingAuditRecorder()))
         tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
         event_count = store.transaction_runner.run_read(
             _ReadTableCountOperation(
@@ -2980,29 +2910,21 @@ def test_purge_session_durable_rejects_open_session(tmp_path: Path) -> None:
         store.transaction_runner.run_write(_SeedOpenSessionOperation())
         with pytest.raises(PurgeSessionInvalidStateError):
             store.transaction_runner.run_write(_PurgeMatrixOperation())
-        tombstone = store.transaction_runner.run_read(
-            _ReadTombstoneBySessionOperation()
-        )
+        tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
 
     assert tombstone is None
 
 
 @pytest.mark.parametrize("run_status", _NON_TERMINAL_RUN_STATUSES)
-def test_purge_session_durable_rejects_non_terminal_runs(
-    tmp_path: Path, run_status: str
-) -> None:
+def test_purge_session_durable_rejects_non_terminal_runs(tmp_path: Path, run_status: str) -> None:
     """purge helper 拒绝 active/queued/running/waiting/cancelling/recovering Run。"""
 
     tombstone: PurgeTombstoneRow | None = None
     with open_host_durable_store(_options(tmp_path)) as store:
-        store.transaction_runner.run_write(
-            _SeedClosedSessionMatrixOperation(run_status=run_status)
-        )
+        store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation(run_status=run_status))
         with pytest.raises(PurgeSessionInvalidStateError):
             store.transaction_runner.run_write(_PurgeMatrixOperation())
-        tombstone = store.transaction_runner.run_read(
-            _ReadTombstoneBySessionOperation()
-        )
+        tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
 
     assert tombstone is None
 
@@ -3017,14 +2939,10 @@ def test_purge_session_durable_rejects_unsupported_projection_checkpoint_and_rol
     unsupported_checkpoint_count = 0
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
-        store.transaction_runner.run_write(
-            _InsertUnsupportedProjectionCheckpointOperation()
-        )
+        store.transaction_runner.run_write(_InsertUnsupportedProjectionCheckpointOperation())
         with pytest.raises(HostDurableError):
             store.transaction_runner.run_write(_PurgeMatrixOperation())
-        tombstone = store.transaction_runner.run_read(
-            _ReadTombstoneBySessionOperation()
-        )
+        tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
         target_event_count = store.transaction_runner.run_read(
             _ReadTableCountOperation(
                 TABLE_EVENT_LOG,
@@ -3055,14 +2973,10 @@ def test_purge_session_durable_rejects_unsupported_projection_failure_and_rolls_
     unsupported_failure_count = 0
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation())
-        store.transaction_runner.run_write(
-            _InsertUnsupportedProjectionFailureOperation()
-        )
+        store.transaction_runner.run_write(_InsertUnsupportedProjectionFailureOperation())
         with pytest.raises(HostDurableError):
             store.transaction_runner.run_write(_PurgeMatrixOperation())
-        tombstone = store.transaction_runner.run_read(
-            _ReadTombstoneBySessionOperation()
-        )
+        tombstone = store.transaction_runner.run_read(_ReadTombstoneBySessionOperation())
         target_event_count = store.transaction_runner.run_read(
             _ReadTableCountOperation(
                 TABLE_EVENT_LOG,
@@ -3087,9 +3001,7 @@ def test_purge_session_durable_rejects_active_wait(tmp_path: Path) -> None:
     """purge helper 即使 Run 已终态也拒绝 active wait record。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        store.transaction_runner.run_write(
-            _SeedClosedSessionMatrixOperation(active_wait=True)
-        )
+        store.transaction_runner.run_write(_SeedClosedSessionMatrixOperation(active_wait=True))
         with pytest.raises(PurgeSessionInvalidStateError):
             store.transaction_runner.run_write(_PurgeMatrixOperation())
 
