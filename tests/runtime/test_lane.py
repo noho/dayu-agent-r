@@ -42,6 +42,7 @@ _FAST_HEARTBEAT_SECONDS = 0.05
 _FAST_POLL_SECONDS = 0.01
 _SHORT_TIMEOUT_SECONDS = 0.04
 _SLOW_OPERATION_SECONDS = 5.0
+_MONOTONIC_FORWARD_JUMP_SECONDS = 3600.0
 _CANCEL_REASON = "user-stop"
 _THREAD_EVENT_TIMEOUT_SECONDS = 1.0
 _UNTRACKED_RELEASE_FAILED_LOG_FRAGMENT = "untracked claim release failed"
@@ -390,6 +391,76 @@ async def test_acquire_refresh_and_release(tmp_path: Path) -> None:
 
     await token.release()
     assert token.released is True
+    assert _claim_count(db_path) == 0
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_lane_ttl_uses_real_utc_not_monotonic_elapsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """monotonic 大幅前跳不能清理真实 UTC 尚未过期的 active claim。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+    held = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(held, LaneAcquired)
+    original_monotonic = lane_module.time.monotonic
+
+    def jumped_monotonic() -> float:
+        """模拟本进程 monotonic 时间大幅前跳。
+
+        :returns: 前跳后的 monotonic 时间。
+        """
+
+        return original_monotonic() + _MONOTONIC_FORWARD_JUMP_SECONDS
+
+    monkeypatch.setattr(lane_module.time, "monotonic", jumped_monotonic)
+
+    blocked = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+
+    assert isinstance(blocked, LaneAcquireTimedOut)
+    assert _claim_count(db_path) == 1
+    await held.token.release()
+    assert _claim_count(db_path) == 0
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_real_utc_not_monotonic_elapsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """refresh 不能因 monotonic 大幅前跳误判 claim lost。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+    acquired = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(acquired, LaneAcquired)
+    original_monotonic = lane_module.time.monotonic
+
+    def jumped_monotonic() -> float:
+        """模拟本进程 monotonic 时间大幅前跳。
+
+        :returns: 前跳后的 monotonic 时间。
+        """
+
+        return original_monotonic() + _MONOTONIC_FORWARD_JUMP_SECONDS
+
+    monkeypatch.setattr(lane_module.time, "monotonic", jumped_monotonic)
+
+    await acquired.token.refresh()
+
+    assert acquired.token.released is False
+    assert acquired.token.expires_at.tzinfo is UTC
+    await acquired.token.release()
     assert _claim_count(db_path) == 0
     await controller.close(reason="test-done")
 

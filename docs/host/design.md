@@ -197,11 +197,11 @@ Coordinator / store / lock 选择和注入方式：
 
 Acquire / release 生命周期：
 
-- `acquire()` 成功时，coordinator 在短事务内先清理同一 lane 中 `expires_at <= now` 的 stale claims，再在 active claim 数量小于 capacity 时插入一条新 claim，返回 `LaneAcquired(token=LaneClaimToken(...))`。
+- `acquire()` 成功时，coordinator 在每个 SQLite transaction 开始前通过 `datetime.now(UTC)` 读取一次真实 UTC `now`，并在同一短事务内复用同一个 bound value 清理同一 lane 中 `expires_at <= now` 的 stale claims、统计 `expires_at > now` 的 active claim，再在 active claim 数量小于 capacity 时插入一条新 claim，返回 `LaneAcquired(token=LaneClaimToken(...))`。
 - `claim_id` 必须是不可猜测的随机 id；`owner` 默认由 runtime 根据当前进程生成，也允许上层显式传入稳定 owner id。owner identity 只用于 runtime cleanup / diagnostics，不是 Host owner。
 - 只有持有 `LaneClaimToken` 才表示当前 owner 占用了一个 lane 容量。token id 只标识 runtime capacity claim，不得传入 Host EventLog 作为 canonical identity。
 - `LaneClaimToken.release()` 必须异步、幂等，并在短事务内按 `(lane_name, claim_id, owner_id)` 删除 claim；重复 release 不得影响其它 owner 的 claim。
-- token 持有期间必须定期 heartbeat / refresh，延长 `expires_at`。第一版可以由 `LaneController` 为本进程持有的 tokens 启动 heartbeat task，也可以由 token context helper 驱动；无论实现方式，heartbeat failure 必须让 token 进入不可继续使用的 released / lost 状态，并触发调用方可观测错误或取消。
+- token 持有期间必须定期 heartbeat / refresh，延长 `expires_at`。每次 refresh 在 SQLite transaction 开始前读取一次真实 UTC `now`，并在同一事务内复用同一个 bound value 更新 `heartbeat_at`、`expires_at` 与判断旧 `expires_at > now`。第一版可以由 `LaneController` 为本进程持有的 tokens 启动 heartbeat task，也可以由 token context helper 驱动；无论实现方式，heartbeat failure 必须让 token 进入不可继续使用的 released / lost 状态，并触发调用方可观测错误或取消。
 - 调用方必须用 `try/finally` 或 runtime 提供的 async context helper 持有 token，确保工作完成、失败、取消或 shutdown 时释放容量。
 - 第一版以 token 模型为必须实现的 public primitive；可额外提供 async context manager helper，但它只能包裹同一 token acquire / release 语义，不能引入第二套生命周期。
 
@@ -219,7 +219,7 @@ Stale owner / timeout handling：
 - 如果进程崩溃或 owner task 未能 release，claim 最多占用到 `expires_at`；后续 acquire 会在事务内清理 expired claims。
 - stale cleanup 只释放 runtime capacity，不能证明 Host Attempt orphan，不能驱动 Host recovery，不能写 EventLog。
 - heartbeat / TTL 不是 lease / fencing。即使某个 expired claim 被清理，也不授权旧 worker takeover，也不证明旧 side effect 已停止。
-- clock 使用 runtime injected / stdlib monotonic-to-wall strategy 必须保证同一 process 内 TTL 计算一致；跨进程 clock skew 只能影响 resource capacity availability，不能影响 Host truth。
+- lane TTL 的 `created_at`、`heartbeat_at`、`expires_at` 与 stale cleanup 判断使用每个 SQLite transaction 前读取的真实 UTC；monotonic 只用于本进程等待 timeout / deadline 等等待时长计算，不参与跨进程过期判断。跨进程 clock skew 只能影响 runtime capacity availability，不能影响 Host truth / EventLog / Attempt lifecycle。
 
 Fairness / ordering / non-goals：
 

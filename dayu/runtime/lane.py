@@ -303,14 +303,11 @@ LaneAcquireOutcome: TypeAlias = (
 
 @dataclass(frozen=True, slots=True)
 class _LaneClock:
-    """基于 monotonic anchor 的 UTC 时钟。
+    """lane 私有时钟 helper。
 
-    :param monotonic_anchor: 进程内 monotonic 起点。
-    :param utc_anchor: 与 monotonic 起点对应的 UTC 时间。
+    UTC 时间只用于跨进程可见的 TTL 判断，必须直接读取真实 UTC；
+    monotonic 时间只用于当前进程内等待 timeout / deadline 计算。
     """
-
-    monotonic_anchor: float
-    utc_anchor: datetime
 
     @classmethod
     def start(cls) -> _LaneClock:
@@ -319,19 +316,15 @@ class _LaneClock:
         :returns: 新的 :class:`_LaneClock`。
         """
 
-        return cls(
-            monotonic_anchor=time.monotonic(),
-            utc_anchor=datetime.now(UTC),
-        )
+        return cls()
 
-    def now(self) -> datetime:
-        """返回当前 UTC 时间。
+    def utc_now(self) -> datetime:
+        """返回真实 UTC 时间。
 
-        :returns: 基于 monotonic elapsed 推导出的 UTC 时间。
+        :returns: timezone-aware 的当前 UTC 时间。
         """
 
-        elapsed_seconds = time.monotonic() - self.monotonic_anchor
-        return self.utc_anchor + timedelta(seconds=elapsed_seconds)
+        return datetime.now(UTC)
 
     def monotonic(self) -> float:
         """返回当前 monotonic 时间。
@@ -592,7 +585,7 @@ class LaneController:
         """
 
         claim_id = secrets.token_hex(_CLAIM_ID_BYTES)
-        now = self._clock.now()
+        now = self._clock.utc_now()
         expires_at = now + timedelta(seconds=lane_config.claim_ttl_seconds)
         connection = _connect(self._coordinator)
         try:
@@ -693,7 +686,7 @@ class LaneController:
         """
 
         lane_config = self._get_config(token.name)
-        now = self._clock.now()
+        now = self._clock.utc_now()
         expires_at = now + timedelta(seconds=lane_config.claim_ttl_seconds)
         connection = _connect(self._coordinator)
         try:
