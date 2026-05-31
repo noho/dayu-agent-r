@@ -7,6 +7,7 @@ lease / fencing 或 recovery 判断，也不提供 async wrapper。
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
@@ -15,6 +16,7 @@ from typing import Final
 from filelock import FileLock, Timeout
 
 _THIRD_PARTY_DEFAULT_TIMEOUT_SECONDS: Final[float] = -1.0
+_LOGGER = logging.getLogger(__name__)
 
 
 class RuntimeFileLockError(Exception):
@@ -99,13 +101,18 @@ class RuntimeFileLockToken:
         try:
             self._third_party_lock.release()
         except Exception as exc:
+            self.released = True
             raise RuntimeFileLockError("释放 runtime file lock 失败") from exc
         self.released = True
 
         try:
             _ensure_lock_file_marker_exists(self.lock_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug(
+                "runtime.filelock.marker_restore_failed lock_path=%s error_type=%s",
+                self.lock_path,
+                exc.__class__.__name__,
+            )
 
 
 class RuntimeFileLock:

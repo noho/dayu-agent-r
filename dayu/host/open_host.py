@@ -601,6 +601,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         )
         durable_store = open_host_durable_store(_durable_options_from_command_options(command_options))
         scheduler: HostDispatchScheduler | None = None
+        close_projection_catchup_port: ProjectionCatchupPort | None = None
         try:
             active_registry = ActiveWorkerRegistry()
             memory_projection_catchup_port = _MemoryProjectionCatchupPort(
@@ -682,6 +683,10 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
                     )
+            _best_effort_catch_up_projection_on_open_failure(
+                close_projection_catchup_port,
+                host_handle_id=host_handle_id,
+            )
             try:
                 durable_store.close()
             except Exception as cleanup_exc:
@@ -721,6 +726,33 @@ def open_host(options: OpenHostOptions) -> AbstractAsyncContextManager[Host]:
     """
 
     return _OpenHostContextManager(options)
+
+
+def _best_effort_catch_up_projection_on_open_failure(
+    projection_catchup_port: ProjectionCatchupPort | None,
+    *,
+    host_handle_id: str,
+) -> None:
+    """启动失败清理路径中尽力追平 projection。
+
+    :param projection_catchup_port: 已构造的 projection catch-up 端口；若启动
+        尚未完成端口构造则为 ``None``。
+    :param host_handle_id: 当前 open_host handle id。
+    :returns: ``None``。
+    """
+
+    if projection_catchup_port is None:
+        return
+    try:
+        projection_catchup_port.catch_up_projection()
+    except Exception as cleanup_exc:
+        _LOGGER.warning(
+            "host.open.cleanup_projection_catchup_failed host_handle_id=%s "
+            "error_type=%s",
+            host_handle_id,
+            cleanup_exc.__class__.__name__,
+            exc_info=True,
+        )
 
 
 def _command_options_from_open_host_options(

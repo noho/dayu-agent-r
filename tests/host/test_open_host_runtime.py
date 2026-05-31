@@ -61,12 +61,14 @@ from dayu.host.durable.transaction import HostTransaction
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
+    _CompositeProjectionCatchupPort,
     _PublicHostHandle,
     _command_options_from_open_host_options,
     _local_execution_options_from_open_host_options,
 )
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.recovery import StartupRecoveryScanner
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
 
@@ -549,6 +551,59 @@ async def test_public_host_close_closes_command_handle_when_scheduler_close_rais
     assert scheduler.close_count == 1
     assert projection_catchup_port.catch_up_count == 1
     assert command_handle.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_open_host_startup_failure_flushes_projection_before_close(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_host ready 前失败时仍应 best-effort 追平 projection。"""
+
+    catch_up_calls = 0
+
+    def raise_recovery_scan(
+        self: StartupRecoveryScanner,
+    ) -> None:
+        """模拟 startup recovery scan 失败。
+
+        :param self: 被 monkeypatch 的 scanner。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        del self
+        raise RuntimeError("forced startup recovery failure")
+
+    def record_catch_up(
+        self: _CompositeProjectionCatchupPort,
+    ) -> None:
+        """记录启动失败清理路径的 projection catch-up。
+
+        :param self: 被 monkeypatch 的 composite catch-up port。
+        :returns: ``None``。
+        """
+
+        nonlocal catch_up_calls
+        del self
+        catch_up_calls += 1
+
+    monkeypatch.setattr(
+        StartupRecoveryScanner,
+        "scan",
+        raise_recovery_scan,
+    )
+    monkeypatch.setattr(
+        _CompositeProjectionCatchupPort,
+        "catch_up_projection",
+        record_catch_up,
+    )
+
+    with pytest.raises(RuntimeError, match="forced startup recovery failure"):
+        async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())):
+            raise AssertionError("open_host must fail before yielding")
+
+    assert catch_up_calls == 1
 
 
 @pytest.mark.asyncio

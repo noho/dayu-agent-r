@@ -70,6 +70,15 @@ class HostTransactionOperation(Protocol[T_co]):
         ...
 
 
+class _SQLiteErrorCodeCarrier(Protocol):
+    """Python 运行时 ``sqlite3.Error`` 扩展错误码承载协议。
+
+    :param sqlite_errorcode: SQLite 直接错误码。
+    """
+
+    sqlite_errorcode: int
+
+
 class HostReadTransactionOperation(Protocol[T_co]):
     """Host durable read transaction body 协议。
 
@@ -470,7 +479,7 @@ def _sqlite_error_code(error: sqlite3.Error) -> int | None:
     """
 
     try:
-        code = error.sqlite_errorcode  # type: ignore[attr-defined]
+        code = cast(_SQLiteErrorCodeCarrier, error).sqlite_errorcode
     except AttributeError:
         return None
     if isinstance(code, int):

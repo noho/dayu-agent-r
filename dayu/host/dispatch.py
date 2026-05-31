@@ -216,6 +216,7 @@ _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
+_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
 _LOG_DRAIN_LOOP_IDLE = "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
 _LOG_DRAIN_LOOP_CLOSE_EXIT = "dispatch drain loop exiting after close host_handle_id=%s"
 _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = "dispatch drain loop cancelled during close host_handle_id=%s"
@@ -1844,7 +1845,12 @@ class HostDispatchScheduler:
                         exc_info=True,
                     )
                     self._closed = True
-                    self._best_effort_mark_host_instance_stopped("drain_loop_durable_retry_exhausted")
+                    self._active_registry.cancel_all(
+                        _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON
+                    )
+                    self._best_effort_mark_host_instance_stopped(
+                        _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON
+                    )
                 except Exception as exc:
                     _LOGGER.warning(
                         _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION,

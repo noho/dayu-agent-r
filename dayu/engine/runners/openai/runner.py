@@ -130,6 +130,8 @@ def _is_sse_response(*, content_type: str, stream: bool) -> bool:
 
     if not stream:
         return False
+    if content_type.strip() == "":
+        return False
     if _SSE_CONTENT_TYPE_FRAGMENT in content_type:
         return True
     return _JSON_CONTENT_TYPE_FRAGMENT not in content_type
@@ -579,6 +581,12 @@ class AsyncOpenAIRunner:
             content_type = (
                 response.headers.get("Content-Type") or ""
             ).lower()
+            if options.stream and content_type.strip() == "":
+                _LOGGER.warning(
+                    "runner.http.missing_content_type stream=true "
+                    "provider_request_id=%s",
+                    provider_request_id,
+                )
             hook = detect_reasoning_protocol_hook(
                 self._spec.provider_request
             )

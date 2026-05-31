@@ -134,6 +134,7 @@ _ERROR_RUNNER_TOOL_CALLS_MISSING: str = "runner_tool_calls_missing"
 _ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH: str = (
     "runner_tool_calls_finish_reason_mismatch"
 )
+_ERROR_RUNNER_EMPTY_FINAL_CONTENT: str = "runner_empty_final_content"
 _ERROR_DUPLICATE_TOOL_CALL_ID: str = "duplicate_tool_call_id"
 _ERROR_TOOL_EXECUTOR_EXCEPTION: str = "tool_executor_exception"
 _ERROR_TOOL_EXECUTION_TIMEOUT: str = "tool_execution_timeout"
@@ -166,6 +167,7 @@ _MISSING_TERMINAL_MESSAGE: str = "agent event stream ended without terminal"
 _FORCE_ANSWER_EMPTY_MESSAGE: str = (
     "force-answer runner did not produce final content"
 )
+_RUNNER_EMPTY_FINAL_CONTENT_MESSAGE: str = "runner did not produce final content"
 _MAX_ITERATIONS_EXHAUSTED_MESSAGE: str = (
     "agent policy max_iterations exhausted"
 )
@@ -1399,6 +1401,7 @@ class _AsyncAgent:
         iteration_index: int,
         tool_calls_enabled: bool,
         degraded: bool,
+        reject_empty_final_content: bool = True,
     ) -> _IterationDecision:
         """根据 Runner 消费状态分类下一步动作。
 
@@ -1407,6 +1410,8 @@ class _AsyncAgent:
         :param iteration_index: 当前迭代序号。
         :param tool_calls_enabled: 本轮是否允许工具调用。
         :param degraded: 产出 final answer 时是否标记为降级。
+        :param reject_empty_final_content: 是否在本函数内拒绝空 final content；
+            force-answer 路径保留自己的错误码。
         :returns: final / tool calls / failed 三类决策之一。
         :raises Exception: 不主动抛出异常。
         """
@@ -1491,6 +1496,13 @@ class _AsyncAgent:
         content = state.completed_content
         if content is None:
             content = "".join(state.content_chunks)
+        if reject_empty_final_content and content == "":
+            return RunFailedData(
+                error_code=_ERROR_RUNNER_EMPTY_FINAL_CONTENT,
+                message=_RUNNER_EMPTY_FINAL_CONTENT_MESSAGE,
+                provider_request_id=state.provider_request_id,
+                recoverable=False,
+            )
         filtered = finish_reason is FinishReason.CONTENT_FILTER
         return _FinalDecision(
             content=content,
@@ -1981,6 +1993,7 @@ class _AsyncAgent:
             iteration_index=iteration_index,
             tool_calls_enabled=False,
             degraded=True,
+            reject_empty_final_content=False,
         )
         if isinstance(decision, _ToolCallsDecision):
             yield await self._make_failed_or_cancelled_terminal_with_close(

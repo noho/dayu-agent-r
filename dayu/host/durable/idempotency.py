@@ -7,6 +7,7 @@ path 语义，不从 ``result_ref`` 推断结果类型，也不负责创建 Even
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -154,32 +155,42 @@ def record_idempotent_result(
         )
 
     created_at = format_utc_timestamp(datetime.now(UTC))
-    transaction.execute(
-        f"""
-        INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
-          scope_kind,
-          scope_id,
-          idempotency_key,
-          semantic_input_digest,
-          result_kind,
-          result_ref,
-          created_event_id,
-          created_event_sequence,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            scope.scope_kind,
-            scope.scope_id,
-            scope.idempotency_key,
-            semantic_input_digest,
-            result.result_kind,
-            result.result_ref,
-            result.created_event_id,
-            result.created_event_sequence,
-            created_at,
-        ),
-    )
+    try:
+        transaction.execute(
+            f"""
+            INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
+              scope_kind,
+              scope_id,
+              idempotency_key,
+              semantic_input_digest,
+              result_kind,
+              result_ref,
+              created_event_id,
+              created_event_sequence,
+              created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scope.scope_kind,
+                scope.scope_id,
+                scope.idempotency_key,
+                semantic_input_digest,
+                result.result_kind,
+                result.result_ref,
+                result.created_event_id,
+                result.created_event_sequence,
+                created_at,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        existing_after_conflict = read_idempotency_record(transaction, scope)
+        if existing_after_conflict is None:
+            raise
+        if existing_after_conflict.semantic_input_digest == semantic_input_digest:
+            return existing_after_conflict
+        raise HostIdempotencyConflictError(
+            "Idempotency key already exists with different semantic digest"
+        ) from exc
     row = read_idempotency_record(transaction, scope)
     if row is None:
         raise HostDurableError("Idempotency insert did not return inserted row")

@@ -77,6 +77,7 @@ from dayu.host.dispatch import (
     DispatchDrainResult,
     HostDispatchScheduler,
     _DurableRunCancellationToken,
+    _HostCancellationToken,
     _safe_close_worker_handle,
     _safe_release_lane_token,
 )
@@ -1479,6 +1480,15 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
             ],
             coordinator=SQLiteLaneCoordinatorConfig(db_path=tmp_path / "lane-drain-loop-retry-exhausted.sqlite3"),
         )
+        registry = ActiveWorkerRegistry()
+        active_token = _HostCancellationToken()
+        registry.register(
+            run_id="run-active",
+            attempt_id="attempt-active",
+            execution_id="execution-active",
+            handle=_FakeHandle(),
+            cancellation_token=active_token,
+        )
         scheduler = _RetryExhaustedDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
@@ -1498,10 +1508,16 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
             ),
             lane_controller=lane_controller,
             host_handle_id="host-drain-loop-retry-exhausted",
+            active_registry=registry,
         )
         scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
         await asyncio.sleep(0.03)
         assert scheduler._drain_task.done() is True
+        assert active_token.is_cancelled() is True
+        assert (
+            active_token.cancel_reason()
+            == "drain_loop_durable_retry_exhausted"
+        )
         with pytest.raises(RuntimeError, match="closed"):
             scheduler.wake_dispatch(
                 PendingDispatchRecord(
