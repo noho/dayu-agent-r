@@ -97,6 +97,7 @@ plan 必须基于：
 - 最新 review / deepreview artifact。
 
 plan 不得从旧代码路径、旧类名、旧 review finding 或行数指标直接推导实现方案。
+plan 必须避免过度设计；只能解决由当前代码、测试、设计真源和最新 review artifact 直接支撑的维护性风险，不得把局部拆分扩大成通用框架、平台化能力或未来阶段能力。
 
 ## 仓库发布约定
 

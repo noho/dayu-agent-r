@@ -34,7 +34,7 @@ docs/host/design.md
   -> Host 架构真源
   -> 定义架构边界、状态机、公共接口、EventLog、恢复、并发、等待、上下文治理和关键治理路径
 
-docs/host/followup-implementation-control.md
+docs/host/host-core-followup-implementation-control.md
   -> follow-up 实施编排文档
   -> 只记录未单独建 Issue 的 work units、当前状态、进入 / 退出条件、交付物、验证要求、review 结论和 residual risk
 ```
@@ -48,7 +48,7 @@ docs/host/followup-implementation-control.md
 Host follow-up work unit 采用以下工作流：
 
 ```text
-read followup-implementation-control.md
+read host-core-followup-implementation-control.md
   -> select one work unit
   -> inspect current code and tests
   -> discuss scope, non-goals, risk, and design sufficiency with the user
@@ -72,6 +72,7 @@ work unit plan 必须基于：
 - 代码核对得到的直接证据。
 
 plan 不得从旧设计稿、旧代码路径、非真源讨论记录或 reviewer 个人偏好推导架构边界。
+plan 必须避免过度设计；只能解决由代码核对、设计真源和本文档验收信号直接支撑的当前 work unit 风险，不得把局部缺口扩大成通用框架、平台化能力或未来阶段能力。
 
 plan 文档应放在 `docs/host/` 下；plan review、plan fix、plan re-review、implementation review、fix、re-review 和总控裁决 artifact 放在 `docs/reviews/` 下。
 
@@ -115,18 +116,18 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | not-started |
-| active work unit | none selected |
+| gate | implementation |
+| implementation status | ready-for-implementation |
+| active work unit | WU-AUDIT-01 |
 | default next work unit | WU-AUDIT-01 |
-| next entry point | discussion：确认默认下一条或由用户指定其它 work unit；随后进入 plan / implementation / review |
-| design source | 由 phaseflow 调用参数提供；本文档只维护实施总控状态 |
-| plan artifacts | none |
+| next entry point | implementation：按 accepted plan 派发 Slice 1 |
+| design source | docs/host/design.md |
+| plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
 | implementation commits | none |
-| review artifacts | none |
+| review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
-| blocking open questions | none；如果用户不接受默认顺序，需要先指定 active work unit |
+| blocking open questions | none |
 
 状态约定：
 
