@@ -123,7 +123,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | implementation：按 accepted plan 派发 Slice 1 |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
-| implementation commits | none |
+| implementation commits | accepted plan: f0f5f72；implementation: none |
 | review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
