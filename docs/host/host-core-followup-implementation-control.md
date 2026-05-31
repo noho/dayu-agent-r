@@ -116,17 +116,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | review |
-| implementation status | current work unit aggregate deepreview pending：WU-RUNTIME-02 |
+| gate | ready-to-open-draft-PR |
+| implementation status | current work unit completed：WU-RUNTIME-02 |
 | active work unit | WU-RUNTIME-02 |
 | default next work unit | WU-STRESS-01 |
-| next entry point | WU-RUNTIME-02 implementation slices complete；下一步进入 aggregate deepreview |
+| next entry point | WU-RUNTIME-02 已到达 ready-to-open-draft-PR；用户已预授权进入 draft PR gate，可自动 push、创建 draft PR 并推进 PR review 到 draft-PR-pass |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md；docs/host/wu-runtime-02-lane-clock-cancellation-plan.md |
-| implementation commits | WU-RUNTIME-01 accepted plan: 929d01c；WU-RUNTIME-01 accepted slice1: 7b5b3aa；WU-RUNTIME-01 accepted slice2: 51648be；WU-RUNTIME-01 accepted deepreview: 6980c96；WU-RUNTIME-01 accepted PR review: 9bf87a4；WU-RUNTIME-02 accepted plan: fa34592；WU-RUNTIME-02 accepted slice1: 1be0259 |
+| implementation commits | WU-RUNTIME-01 accepted plan: 929d01c；WU-RUNTIME-01 accepted slice1: 7b5b3aa；WU-RUNTIME-01 accepted slice2: 51648be；WU-RUNTIME-01 accepted deepreview: 6980c96；WU-RUNTIME-01 accepted PR review: 9bf87a4；WU-RUNTIME-02 accepted plan: fa34592；WU-RUNTIME-02 accepted slice1: 1be0259；WU-RUNTIME-02 accepted slice2: 5675886 |
 | review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-fix-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice2-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-slice2-20260601.md；docs/reviews/wu-runtime-01-pr-review-mimo-20260601.md；docs/reviews/wu-runtime-01-pr-review-ds-20260601.md；docs/reviews/wu-runtime-01-pr-review-controller-adjudication-20260601.md；docs/reviews/wu-runtime-02-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-02-plan-review-ds-20260601.md；docs/reviews/wu-runtime-02-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-02-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-02-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-02-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-02-code-review-slice1-mimo-20260601.md；docs/reviews/wu-runtime-02-code-review-slice1-ds-20260601.md；docs/reviews/wu-runtime-02-code-controller-adjudication-slice1-20260601.md；docs/reviews/wu-runtime-02-implementation-slice2-codex-20260601.md；docs/reviews/wu-runtime-02-code-review-slice2-mimo-20260601.md；docs/reviews/wu-runtime-02-code-review-slice2-ds-20260601.md；docs/reviews/wu-runtime-02-fix-slice2-codex-20260601.md；docs/reviews/wu-runtime-02-code-rereview-slice2-mimo-20260601.md；docs/reviews/wu-runtime-02-code-rereview-slice2-ds-20260601.md；docs/reviews/wu-runtime-02-code-controller-adjudication-slice2-20260601.md |
-| aggregate review artifacts | docs/reviews/wu-runtime-01-aggregate-deepreview-mimo-20260601.md；docs/reviews/wu-runtime-01-aggregate-deepreview-ds-20260601.md；docs/reviews/wu-runtime-01-aggregate-controller-adjudication-20260601.md |
-| draft PR status | draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/100 |
+| aggregate review artifacts | docs/reviews/wu-runtime-01-aggregate-deepreview-mimo-20260601.md；docs/reviews/wu-runtime-01-aggregate-deepreview-ds-20260601.md；docs/reviews/wu-runtime-01-aggregate-controller-adjudication-20260601.md；docs/reviews/wu-runtime-02-aggregate-deepreview-mimo-20260601.md；docs/reviews/wu-runtime-02-aggregate-deepreview-ds-20260601.md；docs/reviews/wu-runtime-02-aggregate-controller-adjudication-20260601.md |
+| draft PR status | WU-RUNTIME-02 ready to open draft PR；WU-RUNTIME-01 previous draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/100 |
 | blocking open questions | none |
 
 状态约定：
@@ -169,7 +169,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
 | RR-HCF-01 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime abstraction risk | closed | 本文档 WU-RUNTIME-01 | 已完成；后续只在 PR review 发现回归时处理 | `RuntimeFileLock` 已收缩为普通文件互斥 wrapper：删除 public `RuntimeFileLockToken.released`，移除 `_active_token` acquire gate，第三方 `FileLock` 继续持有 acquire / release 生命周期真源；context manager 只保留 `_context_token` cleanup guard。Host audit / tool trace explicit lock_path regression 已覆盖，未引入 stale lock、async wrapper、durable lease 或 Host recovery。 |
-| RR-HCF-02 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime correctness risk | deferred-with-owner | 本文档 WU-RUNTIME-02 | 单独进入 discussion / plan；先确认跨进程时间真源 | `lane` 的核心作用是多进程并发 named semaphore，抽象成立，不应被 `FileLock` 替代；风险集中在 `_LaneClock` 使用进程内 monotonic anchor 推导 UTC 参与跨进程 TTL 判断，以及 `_await_task_after_outer_cancellation` 无限等待的复杂控制流。 |
+| RR-HCF-02 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime correctness risk | closed | 本文档 WU-RUNTIME-02 | 已完成；后续只在 PR review 发现回归时处理 | `lane` 的多进程 named semaphore 抽象保留；`_LaneClock` 已改为真实 UTC per SQLite transaction，monotonic 只用于本进程等待 timeout；`_await_task_after_outer_cancellation` 已改为 busy timeout + grace 的有界等待，timeout 后保留 `CancelledError`、注册 observer 消费 late result / exception，untracked late claim 依赖 TTL stale cleanup。lane 单进程 / 多进程测试、import boundary 与 pyright 均通过。 |
 
 ## 当前 Work Units
 
@@ -189,7 +189,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
 | WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
 | WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 已完成 |
-| WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 | 未开始 |
+| WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 | 已完成 |
 
 ## WU-AUDIT-01 Purge Audit Cross-medium Orphan Reconciliation
 
