@@ -1,8 +1,14 @@
-# Host 实施总控
+# Host Core Implementation Archive
+
+## 文档状态
+
+状态：已完成。
+
+本文档原名为 `docs/host/implementation-control.md`。对应的 Host core phase 实施链路已推进到 `draft-PR-pass`，本文档已完成 active 总控使命并进入归档状态。后续新的 follow-up、issue-backed、UI / Service / GUI 或 maintainability work units 不再以本文档作为 active 总控入口。
 
 ## 文档职责
 
-本文档是 Host 设计与实施的总控文档，负责记录实施工作流、phase 编排、phase 进入 / 退出条件、交付物和验证要求。
+本文档是 Host core phase 设计与实施的归档总控文档，负责保留原实施工作流、phase 编排、phase 进入 / 退出条件、交付物和验证要求。
 
 本文档不承载新的架构决策，不替代设计文档，不作为实现细节说明书。
 
@@ -30,8 +36,8 @@ docs/host/design.md
   -> Host 架构真源
   -> 定义架构边界、状态机、公共接口、EventLog、恢复、并发、远程执行和关键治理路径
 
-docs/host/implementation-control.md
-  -> 实施编排文档
+docs/host/host-core-implementation-archive.md
+  -> 已完成的 Host core phase 实施编排归档
   -> 只记录 phases、依赖、进入 / 退出条件、交付物和验证要求
 ```
 
@@ -49,7 +55,7 @@ Host 实施采用以下工作流：
 
 ```text
 draft design checkpoint
-  -> update implementation-control.md phases
+  -> update host-core-implementation-archive.md phases
   -> select one phase
   -> discuss and refine the corresponding docs/host/design.md section with the user
   -> update docs/host/design.md if the phase discussion changes architecture
@@ -223,13 +229,24 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 15 Retention / Purge / Production Hardening。
-当前状态：Phase 13 Audit / Tool Trace / Outbox Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、
-review artifacts、accepted commits 与 PR 69 记录见 `历史记录` 和 `docs/reviews/`。
-Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
-当前 gate：Phase 15 design discussion / plan gate。
-下一步：基于 `docs/host/design.md` 与本总控文档细化 Phase 15 scope，生成 implementation-ready plan。P15 不以
-Phase 14 completion 为进入前置；任何 remote-dependent smoke / hardening 项必须排除、改写为 local / multiprocess /
-recovery coverage，或继续归 Issue #73。
+当前状态：已完成。Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS；P15-S1
+Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction Helper、P15-S3 Public Command Wiring And
+Read-after-purge Semantics、P15-S4 Audit JSONL Retention And Tombstone Audit Record、P15-S5 Projection Cleanup, Rebuild
+Confidence, And Local Hardening 与 P15-S6 Docs, Import Boundaries, Full Validation 均已通过 code review / re-review /
+controller validation，进入 accepted slice commit。
+Accepted plan commit 为 `5fae495`；Accepted S1 commit 为 `f607655`；Accepted S2 commit 为 `dac3a85`；Accepted S3
+commit 为 `17c5c00`；Accepted S4 commit 为 `eb83a12`；Accepted S5 commit 为 `ce6de0d`；Accepted S6 commit 为
+`6209170`。
+Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.md`。P15-S3 artifacts 为
+`docs/reviews/phase15-s3-implementation-codex-20260529.md`、
+`docs/reviews/phase15-s3-code-review-mimo-20260529.md`、
+`docs/reviews/phase15-s3-code-review-ds-20260529.md` 与
+`docs/reviews/phase15-s3-code-review-controller-adjudication-20260529.md`。Phase 13 Audit / Tool Trace / Outbox
+Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits 与 PR 69 记录见
+`历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
+当前 gate：draft-PR-pass。
+下一步：本文档不再作为 active 总控入口；Phase 15 draft PR 74 已创建并通过 PR-level review，等待用户后续 merge / mark ready / reviewer assignment 决策。P15 不以 Phase 14 completion 为进入前置；任何 remote-dependent smoke /
+hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map
 
@@ -246,7 +263,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `docs/engine/design.md`
 - `docs/host/design.md` §25 Context Governance
 - `docs/host/design.md` §25.1 Compact Event 响应路径
-- `docs/host/implementation-control.md` 追踪区 `Engine Context Compaction Event 语义前置`
+- `docs/host/host-core-implementation-archive.md` 追踪区 `Engine Context Compaction Event 语义前置`
 
 前置条件：
 - 用户明确确认允许修改 Engine 代码。
@@ -1486,7 +1503,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -1568,7 +1585,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -1798,7 +1815,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -1916,7 +1933,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -2215,6 +2232,9 @@ Owner / destination：GitHub Issue #73；未来重新进入 Phase 14 design / pl
 
 Owner / destination：Phase 15 Retention / Purge / Production Hardening，或在 P15 前拆出独立 hardening PR。
 
+- audit JSONL orphan residual：P15-S4 已保证 public `purge_session` 成功返回前写入 purge tombstone audit line 并把 ref/digest
+  纳入 tombstone；仍保留跨介质残余风险：audit JSONL append 成功后 SQLite commit 失败可能留下 tombstone-less audit line。Owner
+  / destination：P15-S6 docs / audit tooling follow-up。
 - `purge_session` destructive cleanup、audit tombstone、payload / memory / projection / outbox / tool trace 清理、projection rebuild tooling 与 retention matrix。
 - startup / recovery / crash E2E 压测、watch 轮询性能、SQLite 多进程写入压力、schema bootstrap / DDL 原子性、after-commit 多错误聚合、projection catch-up 批处理与 heavy sink runner。
 - dispatch / recovery production hardening：dispatch owner 写入时机与 owner id 真源已由 PR 68 post-draft fullrepo B1 / B2 fix 修复；剩余项为 liveness proof 压测、promotion deferred result 语义、startup timeout closeout diagnostic 字段、recovery orphan proof 覆盖、`ActiveWorkerRegistry` asyncio path 同步原语、`cancel_all` 快照窗口与 scheduler close task-cancel defense-in-depth 验证，以及 worker startup / fatal stream 事件序列与 cancel / closeout diagnostic 矩阵。
@@ -2286,6 +2306,130 @@ Owner / destination：后续 Conversation Memory / Context Governance hardening 
 - public memory scenario smoke residuals：`utils/smoke_host_public_conversation_memory_scenarios.py` 只通过 public answer 间接验证 conversation memory 语义，不读取 durable DB / EventLog / memory 表 / compact payload；`--suite all --pressure-mode off` 已通过；`_PROVIDER_IMPORT_DISPLAY_PATH` 继承 `__main__` display path pattern，若未来改为解析 import path 的 discovery 模式，需与既有 `smoke_host_public_multiturn.py` 一并统一。
 
 ## 历史记录
+
+### 2026-05-29 Phase 15 design discussion completed
+
+用户要求按 `$phaseflow` 推进 Phase 15，并授权到达 `ready-to-open-draft-PR` 后自动进入 draft PR gate。Controller 从 clean
+`main` 创建工作分支 `feat/host-phase15-retention-purge-hardening`。Phase 15 design discussion 已完成，artifact 为
+`docs/reviews/phase15-design-discussion-controller-20260529.md`。结论：`docs/host/design.md` 已足以支撑进入 plan，
+无需先修改设计真源；P15 plan 必须在冻结 public API envelope 内实现 `purge_session` destructive cleanup、purge tombstone、
+audit JSONL retention、projection cleanup / rebuild confidence 与 local production hardening，remote-dependent smoke 继续归
+Issue #73。
+
+Planning specialist AgentCodex 已生成 handoff implementation-ready plan：
+`docs/host/phase15-retention-purge-production-hardening-plan.md`。Plan review artifacts 为
+`docs/reviews/phase15-plan-review-mimo-20260529.md` 与 `docs/reviews/phase15-plan-review-ds-20260529.md`。Controller
+adjudication artifact 为 `docs/reviews/phase15-plan-review-controller-adjudication-20260529.md`，裁决接受 8 个 plan
+clarity / FK / idempotency / audit / projection reset finding 并进入 plan fix。Plan fix artifact 为
+`docs/reviews/phase15-plan-fix-codex-20260529.md`。Plan re-review artifacts 为
+`docs/reviews/phase15-plan-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-plan-rereview-ds-20260529.md`，两份 re-review
+均确认 ADJ-001 到 ADJ-008 全部已修复、无新 blocker，plan 现为 code-generation-ready。Accepted plan commit 为
+`5fae495`。
+
+Slice P15-S1 Purge Tombstone Schema And Durable Primitives implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s1-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s1-code-review-mimo-20260529.md` 与 `docs/reviews/phase15-s1-code-review-ds-20260529.md`；MiMo 为
+PASS / 0 findings，DS finding 经 Controller adjudication artifact
+`docs/reviews/phase15-s1-code-review-controller-adjudication-20260529.md` 裁决接受 2 项。Fix artifact 为
+`docs/reviews/phase15-s1-fix-codex-20260529.md`。Re-review artifacts 为
+`docs/reviews/phase15-s1-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-s1-rereview-ds-20260529.md`，两份 re-review
+均确认 S1-ADJ-001 / S1-ADJ-002 已修复且无新 blocker。Controller 本地验证：
+`pytest tests/host/test_durable_schema.py tests/host/test_purge_session.py tests/host/test_weak_typing_guard.py -q` 为
+31 passed；`python -m pyright dayu/host/durable/schema.py dayu/host/durable/purge.py tests/host/test_durable_schema.py
+tests/host/test_purge_session.py` 为 0 errors。README 检查结论：S1 未接 public `purge_session`，现有
+`dayu/host/README.md` structured unsupported 描述仍正确；`tests/README.md` 无需机械更新。Accepted S1 commit 为
+`f607655`。
+
+Slice P15-S2 Delete Matrix Transaction Helper implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s2-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s2-code-review-mimo-20260529.md` 与 `docs/reviews/phase15-s2-code-review-ds-20260529.md`；Controller
+adjudication artifact 为 `docs/reviews/phase15-s2-code-review-controller-adjudication-20260529.md`，裁决接受 5 项
+projection reset / maintainability / regression-test finding，拒绝 2 项非阻塞 test expansion。Fix artifact 为
+`docs/reviews/phase15-s2-fix-codex-20260529.md`。Re-review artifacts 为
+`docs/reviews/phase15-s2-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-s2-rereview-ds-20260529.md`，两份 re-review
+均确认 S2-ADJ-001 到 S2-ADJ-005 已修复且无新 blocker。Controller 本地验证：
+`pytest tests/host/test_purge_session.py tests/host/test_payload_store.py tests/host/test_projection_read_model.py
+tests/host/test_memory_projection.py tests/host/test_tool_trace_projection.py tests/host/test_outbox_durable.py -q` 为
+112 passed；`python -m pyright dayu/host/durable/purge.py dayu/host/durable/payload.py dayu/host/durable/read_model.py
+dayu/host/durable/memory.py dayu/host/durable/tool_trace.py dayu/host/durable/outbox.py dayu/host/durable/audit.py tests/host`
+为 0 errors。README 检查结论：S2 仍只新增 internal durable transaction helper，public `purge_session` 尚未接线，
+README 暂不更新。Accepted S2 commit 为 `dac3a85`。
+
+Slice P15-S3 Public Command Wiring And Read-after-purge Semantics implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s3-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s3-code-review-mimo-20260529.md` 与
+`docs/reviews/phase15-s3-code-review-ds-20260529.md`；MiMo PASS / 0 findings，DS 为 PASS / 0 blocking findings。
+Controller adjudication artifact 为 `docs/reviews/phase15-s3-code-review-controller-adjudication-20260529.md`，裁决无需
+S3 fix pass；DS audit fail-before-success observation 接受为 S4 handoff risk。Controller 本地验证：
+`pytest tests/host/test_command_handle.py tests/host/test_public_session_api.py tests/host/test_public_run_api.py
+tests/host/test_open_host_runtime.py tests/host/test_purge_session.py -q` 为 69 passed；`python -m pyright
+dayu/host/command.py dayu/host/open_host.py dayu/host/read_api.py tests/host` 为 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。README 检查结论：S3 已让包根 `purge_session` 从 structured unsupported 变为可用，已同步
+`dayu/host/README.md` 与 `tests/README.md` 的当前事实。Accepted S3 commit 为 `17c5c00`。
+
+Slice P15-S4 Audit JSONL Retention And Tombstone Audit Record implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s4-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s4-code-review-mimo-20260529.md` 与
+`docs/reviews/phase15-s4-code-review-ds-20260529.md`；MiMo PASS / 0 blocking findings，DS finding 经 Controller
+adjudication artifact `docs/reviews/phase15-s4-code-review-controller-adjudication-20260529.md` 裁决接受 3 项
+schema/type/codec、audit path duplication 与 redundant mkdir finding，另将 audit JSONL orphan line 作为 residual 追踪。
+Fix artifact 为 `docs/reviews/phase15-s4-fix-codex-20260529.md`。Re-review artifacts 为
+`docs/reviews/phase15-s4-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-s4-rereview-ds-20260529.md`，两份 re-review
+均确认 S4-ADJ-001 到 S4-ADJ-003 已修复且无新 blocker。Controller re-review adjudication artifact 为
+`docs/reviews/phase15-s4-rereview-controller-adjudication-20260529.md`。Controller 本地验证：
+`pytest tests/host/test_audit_sink.py tests/host/test_purge_session.py tests/host/test_durable_schema.py
+tests/host/test_open_host_runtime.py -q` 为 63 passed；`python -m pyright dayu/host/audit.py
+dayu/host/durable/audit.py dayu/host/durable/purge.py dayu/host/durable/schema.py dayu/host/command.py
+dayu/host/open_host.py tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。README 检查结论：
+S4 只补齐 internal fail-before-success invariant、fresh schema storage contract 与 audit path helper 复用，未改变 public API
+shape、OpenHostOptions、命令用法或配置入口，`dayu/host/README.md` 与 `tests/README.md` 无需更新。Accepted S4 commit 为
+`eb83a12`。
+
+Slice P15-S5 Projection Cleanup, Rebuild Confidence, And Local Hardening implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s5-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s5-code-review-mimo-20260529.md` 与
+`docs/reviews/phase15-s5-code-review-ds-20260529.md`；两份 review 均确认行为 PASS / 无 blocker。Controller adjudication artifact
+为 `docs/reviews/phase15-s5-code-review-controller-adjudication-20260529.md`，裁决接受 1 项新增测试/helper docstring 完整性 finding。
+Fix artifact 为 `docs/reviews/phase15-s5-fix-codex-20260529.md`。Re-review artifacts 为
+`docs/reviews/phase15-s5-rereview-mimo-20260529.md` 与 `docs/reviews/phase15-s5-rereview-ds-20260529.md`，两份 re-review
+均确认 S5-ADJ-001 已修复且无新 blocker。Controller re-review adjudication artifact 为
+`docs/reviews/phase15-s5-rereview-controller-adjudication-20260529.md`。Controller 本地验证：
+`pytest tests/host/test_projection_checkpoint.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py
+tests/host/test_recovery_scan.py tests/host/test_recovery_multiprocess.py tests/host/test_admission_multiprocess.py
+tests/host/test_purge_session.py -q` 为 74 passed；`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。README 检查结论：S5 只新增 local hardening 与 tests，未改变 public API shape、
+OpenHostOptions、命令用法、配置入口或稳定文档职责，S6 docs 仍为下一 slice owner。Accepted S5 commit 为 `ce6de0d`。
+
+Slice P15-S6 Docs, Import Boundaries, Full Validation implementation 已完成。Implementation artifact 为
+`docs/reviews/phase15-s6-implementation-codex-20260529.md`。Code review artifacts 为
+`docs/reviews/phase15-s6-code-review-mimo-20260529.md` 与
+`docs/reviews/phase15-s6-code-review-ds-20260529.md`；两份 review 均为 PASS / 0 findings。Controller adjudication artifact 为
+`docs/reviews/phase15-s6-code-review-controller-adjudication-20260529.md`。Controller 本地验证：
+`pytest tests/host/test_purge_session.py tests/host/test_durable_schema.py tests/host/test_command_handle.py
+tests/host/test_public_session_api.py tests/host/test_public_run_api.py tests/host/test_audit_sink.py
+tests/host/test_projection_read_model.py tests/host/test_projection_checkpoint.py tests/host/test_projection_runner.py
+tests/host/test_memory_projection.py tests/host/test_tool_trace_projection.py tests/host/test_outbox_durable.py
+tests/host/test_open_host_runtime.py tests/host/test_import_boundary.py tests/host/test_package_exports.py
+tests/host/test_weak_typing_guard.py -q` 为 227 passed；`python -m pyright dayu/ tests/ utils/` 为 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。Accepted S6 commit 为 `6209170`。当前 gate 进入 Phase 15 aggregate deepreview。
+
+Phase 15 aggregate deepreview 已完成。Aggregate review artifacts 为
+`docs/reviews/phase15-aggregate-deepreview-mimo-20260529.md` 与
+`docs/reviews/phase15-aggregate-deepreview-ds-20260529.md`。Controller adjudication artifact 为
+`docs/reviews/phase15-aggregate-deepreview-controller-adjudication-20260529.md`，裁决接受 1 项 dead-code cleanup finding；其它
+observations 均为 non-blocking residual / intentional design。Aggregate fix artifact 为
+`docs/reviews/phase15-aggregate-fix-codex-20260529.md`。Aggregate re-review artifacts 为
+`docs/reviews/phase15-aggregate-rereview-mimo-20260529.md` 与
+`docs/reviews/phase15-aggregate-rereview-ds-20260529.md`，两份 re-review 均确认 AGG-ADJ-001 已修复且无新 blocker。
+Controller re-review adjudication artifact 为 `docs/reviews/phase15-aggregate-rereview-controller-adjudication-20260529.md`。
+Controller final validation：`pytest tests/host -q` 为 1011 passed / 1 skipped；`python -m pyright dayu/ tests/ utils/` 为 0
+errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 `ready-to-open-draft-PR`。Aggregate review commit
+为 `151995b`。
+
+Draft PR gate 已完成。当前分支已 push 到 `github/feat/host-phase15-retention-purge-hardening`，draft PR 为
+https://github.com/noho/dayu-agent-r/pull/74。`gh pr view 74` 显示 PR 为 OPEN / draft / mergeStateStatus CLEAN；`gh pr checks 74`
+显示当前 branch no checks reported。PR-level review artifacts 为 `docs/reviews/phase15-pr74-review-mimo-20260529.md` 与
+`docs/reviews/phase15-pr74-review-ds-20260529.md`，两份 review 均为 PASS / no blocker / ready。当前 gate：`draft-PR-pass`。
 
 ### 2026-05-29 PR 68 merged and Phase 13 started
 
@@ -4024,7 +4168,7 @@ Phase 1 implementation 收口验证：
 - `source .venv/bin/activate && pytest tests/host tests/runtime -q`：102 passed。
 - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
 
-Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/implementation-control.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。
+Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/host-core-implementation-archive.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。
 
 Phase 2 design refinement 状态：`docs/reviews/gateflow-phase-design-host-p2-codex-20260514.md` 提出的 5 个 blocking questions 已按 controller-accepted A 决策写回设计真源与本文档，fix artifact 为 `docs/reviews/gateflow-phase-design-fix-host-p2-codex-20260514.md`。AgentMiMo 与 AgentDS 的 design fix re-review artifacts 分别为 `docs/reviews/gateflow-phase-design-re-review-host-p2-mimo-20260514.md` 与 `docs/reviews/gateflow-phase-design-re-review-host-p2-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-phase-design-re-review-host-p2-controller-adjudication-20260514.md`。Phase 2 plan 已写入 `docs/host/phase2-durable-store-eventlog-plan.md`；plan review artifacts 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-ds-20260514.md`，controller adjudication artifact 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`，plan fix artifact 为 `docs/reviews/gateflow-plan-fix-host-p2-durable-store-eventlog-codex-20260514.md`。AgentMiMo 与 AgentDS 的 plan re-review artifacts 分别为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`。Phase 2 accepted plan commit 为 `83c6ad6`。Slice 1 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s1-durable-schema-transaction-20260514.md`，controller implementation decision artifact 为 `docs/reviews/gateflow-implementation-decision-host-p2-s1-sqlite-payload-table-name-20260514.md`。AgentMiMo 与 AgentDS 的 Slice 1 code review artifacts 分别为 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-controller-adjudication-20260514.md`。Slice 1 validation：durable schema / transaction tests 15 passed，Host export / import boundary / weak typing guard tests 7 passed，`python -m pyright dayu/host tests/host` 0 errors；accepted Slice 1 commit 为 `be5dbdc`。Slice 2 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s2-eventlog-idempotency-20260514.md`；code review artifacts 为 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-controller-adjudication-20260514.md`；fix artifact 为 `docs/reviews/gateflow-fix-host-p2-s2-eventlog-idempotency-20260514.md`；code re-review artifacts 为 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-mimo-20260514.md` 与 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-ds-20260514.md`；controller re-review adjudication artifact 为 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-controller-adjudication-20260514.md`。Slice 2 validation：EventLog / Idempotency tests 19 passed，多进程 EventLog smoke 1 passed，durable schema / transaction tests 15 passed，Host export / import boundary / weak typing guard tests 7 passed，`python -m pyright dayu/host tests/host` 0 errors。Phase 2 accepted Slice 2 commit 已创建；具体 hash 由当前 git commit 记录。Slice 3 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s3-payload-artifact-liveness-20260514.md`；code review artifacts 为 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-controller-adjudication-20260514.md`；fix artifact 为 `docs/reviews/gateflow-fix-host-p2-s3-payload-artifact-liveness-20260514.md`；code re-review artifacts 为 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-mimo-20260514.md` 与 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-ds-20260514.md`；controller re-review adjudication artifact 为 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-controller-adjudication-20260514.md`。Slice 3 validation：payload / artifact / liveness tests 27 passed，EventLog / idempotency / multiprocess tests 20 passed，Host tests 94 passed，`python -m pyright dayu/host tests/host` 0 errors。Phase 2 accepted Slice 3 commit 已创建；具体 hash 由当前 git commit 记录。Aggregate deepreview artifacts 为 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-ds-20260514.md`；controller aggregate adjudication artifact 为 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`；aggregate fix artifact 为 `docs/reviews/gateflow-aggregate-fix-host-p2-durable-store-eventlog-20260514.md`；aggregate re-review artifacts 为 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-ds-20260514.md`；controller aggregate re-review adjudication artifact 为 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`。Aggregate fix validation：Host tests 101 passed，runtime import/lane/filelock tests 29 passed，`python -m pyright dayu/host tests/host` 0 errors，`python -m pyright dayu/ tests/ utils/` 0 errors。Phase 2 accepted deepreview commit 已创建；具体 hash 由当前 git commit 记录。Phase 2 状态为 completed，后续工作入口为 Phase 3 design discussion / plan gate。
 

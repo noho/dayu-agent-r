@@ -1122,7 +1122,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
       "endpoint": "https://api.example.com/v1/chat/completions",
       "api_key_ref": "MY_API_KEY",
       "headers": {
-        "Authorization": "Bearer ${MY_API_KEY}",
+        "Authorization": "Bearer {{MY_API_KEY}}",
         "Content-Type": "application/json"
       },
       "supports_tool_calling": true,
@@ -1162,7 +1162,7 @@ ConfigLoader 不解析 `${MY_API_KEY}`，也不替换 secret；这些字符串�
 - 模型 id：`models` map key 就是配置名；record 内不重复写 id。你在 `--model-name`、execution profile 或 scene hint 里写的就是它。
 - `endpoint`：模型服务地址。
 - `model`：真正发给服务商的模型标识。
-- `api_key_ref`：API key 引用名。
+- `api_key_ref`：API key 引用名；本地 Ollama 等免鉴权模型可为 `null`，此时不会要求或注入 API key header。
 - `headers`：鉴权和请求头，按配置原样保留。
 - `default_timeout_seconds`：单次请求默认超时时间，单位秒。
 - `supports_stream`：是否支持流式输出。

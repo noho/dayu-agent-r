@@ -51,7 +51,7 @@ dayu/config/
 | `provider` | provider 标识 |
 | `model` | provider 模型名 |
 | `endpoint` | provider endpoint |
-| `api_key_ref` | API key 引用，按字符串原样保留 |
+| `api_key_ref` | API key 引用，按字符串原样保留；本地或免鉴权 provider 可为 `null` |
 | `headers` | 请求 headers，按配置原样保留 |
 | `supports_tool_calling` | 是否支持工具调用 |
 | `supports_stream` | 是否支持流式输出 |

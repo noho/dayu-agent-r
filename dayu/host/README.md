@@ -77,10 +77,19 @@ Host 内部职责按语义分层：
 - `replay_run(run_id, request)`：基于成功源 Run 创建 no-tool 结构修复 Run。
 - `resolve_wait(wait_id, request)`：接收外部 wait result，并由 Host 恢复或收口 Run。
 - `close_session(session_id, request)`：关闭 Session 的新输入入口，不取消既有 Run。
+- `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 的 Host 本地可恢复事实，返回 purge tombstone ref 与删除计数摘要。
 - `watch_session_events(session_id)`：订阅 Session-level Host-owned typed events。
 - `close()`：关闭当前 opener runtime，向 active worker 传播 lifecycle cancel，但不写用户 cancel / failed terminal facts。
 
-`purge_session`、`PurgeSessionRequest` 与 `PurgeSessionResult` 仍属于包根 deferred 契约；当前语义是 structured unsupported：返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，不写幂等记录，也不删除 Host durable facts。
+Service-facing purge 入口包含 `Host.purge_session(session_id, request)` 与包根函数式 command facade `purge_session(host, session_id, request)`。第一版 destructive cleanup 仅允许清理已 `CLOSED`、不存在 active / queued / waiting / cancelling / recovering Run、且所有 Run 已终态的 Session；前置条件不满足时返回 `INVALID_STATE`，不会部分删除。
+
+purge 成功后，Host 会删除目标 Session 的本地可恢复事实和派生视图数据，包括 Session / slot binding、Run、Attempt、目标 Session EventLog rows、payload descriptor / 本地 SQLite payload、memory snapshot、minimal read model、projection checkpoint / failure 中指向目标 EventLog 的可重建派生记录、outbox terminal projection、tool trace hot rows 和旧 command idempotency rows。共享 artifact 只在没有其它 durable ref 引用时清理。Host 同事务保留独立 purge tombstone 和 `purge_session` 幂等记录；tombstone 不位于被 purge 的 Session EventLog 中，也不参与 resume、retry、replay、memory、RunInputBuilder 或普通 read truth。
+
+重复同一请求在源事实删除后仍通过 tombstone 幂等重放；同 key 不同语义返回 `IDEMPOTENCY_CONFLICT`，不同请求清理同一已 purge Session 返回 `CONFLICT`。purge 后 `get_session`、`get_run`、`retry_run`、`replay_run` 与 live watch 不从 tombstone、projection、audit、outbox、tool trace 或 memory 重建事实，按现有缺失事实语义返回 `NOT_FOUND`。
+
+purge 不删除或重写已经写入的 append-only audit JSONL。成功 purge 会写入 purge tombstone audit record，并把 audit record ref / digest 写入 tombstone；既有 audit 行可以保留对已删除 EventLog rows 的 refs。audit / diagnostic 查询可以用 tombstone 解释源事实已被 purge，但普通 Service-facing 读取路径不能把 audit、projection 或 tombstone 当作 Session snapshot 来源。
+
+第一版 purge 的非目标是：不做 remote / wire protocol 变更，不新增 public error code，不把 purge 表达成 close、cancel、archive、memory forget 或 UI hide，不实现 retention scheduler、周期 GC、DB vacuum、audit JSONL rotation / compaction、外部 audit 投递或 tool trace cold JSONL retention policy。
 
 ## Opener 与 Options
 
@@ -184,7 +193,7 @@ submit_followup(queue)
 
 runtime lane 只表达资源容量，不表达 Host ownership、lease、fencing、EventLog ordering 或 recovery proof。worker accept 前后都要依赖 durable recheck 与 Host state transition；worker stream 的 finally 路径负责 active registry 注销、worker handle close 与 lane release。
 
-Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：`STOPPED` owner 可直接证明当前 active dispatch 已 orphan；`STOPPING` owner 必须继续满足 stale heartbeat 与 pid missing / identity mismatch 等进程证据，避免抢正在关闭的旧 Host；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，其中 `ACCEPTED` 与 `QUEUED` 会在 scan 事务提交后唤醒 queue promotion，让 pre-start governance 重新接管；`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt；可恢复的 `RUNNING` orphan 或既有 `RECOVERING` Run 会在 recovery dispatch count 未超限时创建新的 Attempt / execution / dispatch record 并唤醒 scheduler，超限或不可恢复时转为 `LOST`。
+Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：`STOPPED` owner 可直接证明当前 active dispatch 已 orphan；`STOPPING` owner 必须继续满足 stale heartbeat 与 pid missing / identity mismatch 等进程证据，避免抢正在关闭的旧 Host；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态；durable row 中非正 pid 直接按 pid missing positive orphan proof 处理。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，其中 `ACCEPTED` 与 `QUEUED` 会在 scan 事务提交后唤醒 queue promotion，让 pre-start governance 重新接管；缺少 wakeup port 但存在待 promotion session 时记录 ERROR 诊断；`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt；可恢复的 `RUNNING` orphan 或既有 `RECOVERING` Run 会在 recovery dispatch count 未超限时创建新的 Attempt / execution / dispatch record 并唤醒 scheduler，超限或不可恢复时转为 `LOST`。
 
 worker startup timeout、worker accept failure、worker stream crash 和未知 terminal 都由 Host closeout 为结构化终态或 diagnostic。worker stream 在 Host 已请求 active cancel 后 clean EOF 时，Host 以 cancel terminal 收口；非取消 clean EOF 仍按 lost closeout 处理。terminal closeout 后会触发同 Session queued Run promotion。
 
@@ -192,7 +201,7 @@ worker startup timeout、worker accept failure、worker stream crash 和未知 t
 
 EventLog 是 append-only ledger。`canonical_fact` 子集是恢复、memory、tool governance、terminal summary 和状态索引的事实来源；非 canonical 的展示事件、`diagnostic` 与 `projection_signal` 只能服务展示、诊断或投影追平。
 
-`event_sequence` 是 Host 全局单调游标，供 read model、watch、projection catch-up、memory snapshot cursor 和 outbox 类能力对齐。EventLog append 与必要状态索引更新必须在同一 transaction 内完成。
+`event_sequence` 是 Host 全局单调游标，供 read model、watch、projection catch-up、memory snapshot cursor 和 outbox 类能力对齐。EventLog append 与必要状态索引更新必须在同一 transaction 内完成。同一 `event_id` 重放时，事件体 digest 相同会幂等返回既有 row，digest 不同会抛出 event identity conflict；INSERT 阶段撞上并发同 id row 也按同一规则重新分类。
 
 `watch_session_events(session_id)` 是普通 Service-facing session-level live event entry，返回 Host-owned typed `HostEvent` async iterator。它不接收 cursor，不做离线补读；terminal event 不结束 iterator；consumer 取消订阅只关闭本次 watch，不取消 Run、不写 EventLog。
 
@@ -209,7 +218,7 @@ Outbox terminal read / drain 是离线 terminal notification 补读入口，不�
 
 ## ToolRuntime
 
-`HostToolingOptions` 是 Host construction 阶段接收业务工具的 typed boundary。业务工具发现、provider 绑定、包入口扫描和 Service composition 发生在 Host 外部；Host 只接收已经装配好的 `ToolBundle` 与来源引用，不导入具体财报工具模块。
+`HostToolingOptions` 是 Host construction 阶段接收业务工具的 typed boundary。业务工具发现、provider 绑定、包入口扫描和 Service composition 发生在 Host 外部；Host 只接收已经装配好的非空 `ToolBundle` 与来源引用，不导入具体财报工具模块。没有业务工具时不构造空 `ToolBundle`，而是不传 `HostToolingOptions`。
 
 ToolRuntime 的稳定语义：
 
@@ -262,7 +271,7 @@ Runner usage 进入 Host 后只写 `USAGE_REPORTED` projection signal，并附�
 - proactive：dispatch Attempt 前执行输入治理，必要时写入 compact request / compacted / failed canonical facts，再创建 Attempt。
 - reactive：Engine 报告 context compaction required 后，由 Host 校验 attempt / execution identity，按 policy 关闭当前 Attempt，执行 bounded compaction operation，并用新的 Attempt 继续。
 
-LLM compactor 只提出 structured candidate；Host 负责 prompt-local label 校验、canonical provenance 映射、质量校验、proactive 预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。compactor system prompt 与 AgentPolicy 来自 Service 按 execution profile compactor scene 的装配结果，user prompt template 来自 Service 按 compactor baseline prompt asset 的读取结果；Host 不读取 prompt config，只把 `CompactionRequest` 渲染为 typed data block 并替换 user template 中的 compaction request 占位符。compact 后预算按统一 Host token 估算常数计算，覆盖 structured summary 文本、pinned patch 文本、fact claim、minimum preserve 文本、当前输入、保留的 recent refs、canonical evidence refs、evidence-backed fact refs、已有 summary refs 与 post-compact 系统提示的保守估算，不用 hard threshold 反向截断估算值。reactive path 不把 compact 后估算值当作能否重新 dispatch 的真源；若真实 recovery dispatch 再次触发 Engine overflow，可在 `max_reactive_compactions_per_run` 范围内继续下一次 reactive compact，超过上限后 fail closed；reactive compact request 会把 overflow 当时的 frozen material list digest 和 frozen material refs 写入 durable payload，后续 compaction request 与 pass queue 均以该冻结列表为输入边界；同一 reactive operation 内的 material pass 共享 proposal attempt 预算，只有所有 pass 成功后才提交一个 merged `CONTEXT_COMPACTED`，任一 pass 最终失败只提交一个 `CONTEXT_COMPACTION_FAILED`。compactor 的 Engine runner 调用受独立 timeout 边界约束，并接收 Host lifecycle 的真实 cancellation token：proactive compaction 通过 durable Run 状态观察 request 是否失效，reactive compaction 复用 Engine envelope 的 run-local token；timeout 会尽量 signal 可写 cancellation token，并按稳定 proposal failure 诊断收口。非 final outcome 的错误摘要会先脱敏，`finish_reason=length` 的 final proposal 视为截断脏 proposal，不会被接受为 compact 成功。质量校验会拒绝缺失 accepted tool evidence coverage、非法 pinned state patch、越权 evidence-backed fact candidate，以及 source refs 不在 compact material provenance map 内的 minimum preserve item。compact 不改写历史 EventLog facts，不让 summary 替代 evidence-backed extraction，也不直接写 memory snapshot。memory 是否吸收 compacted summary、fact candidate 或 minimum preserve item 由 memory projection policy 消费已提交 facts 决定。
+LLM compactor 只提出 structured candidate；Host 负责 prompt-local label 校验、canonical provenance 映射、质量校验、proactive 预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。compactor system prompt 与 AgentPolicy 来自 Service 按 execution profile compactor scene 的装配结果，user prompt template 来自 Service 按 compactor baseline prompt asset 的读取结果；Host 不读取 prompt config，只把 `CompactionRequest` 渲染为 typed data block 并替换 user template 中的 compaction request 占位符。compact 后预算按统一 Host token 估算常数计算，覆盖 structured summary 文本、pinned patch 文本、fact claim、minimum preserve 文本、当前输入、保留的 recent refs、canonical evidence refs、evidence-backed fact refs、已有 summary refs、post-compact 系统提示、message framing 与工具 schema envelope 的保守估算，不用 hard threshold 反向截断估算值。reactive path 不把 compact 后估算值当作能否重新 dispatch 的真源；若真实 recovery dispatch 再次触发 Engine overflow，可在 `max_reactive_compactions_per_run` 范围内继续下一次 reactive compact，超过上限后 fail closed；reactive compact request 会把 overflow 当时的 frozen material list digest 和 frozen material refs 写入 durable payload，后续 compaction request 与 pass queue 均以该冻结列表为输入边界；同一 reactive operation 内的 material pass 共享 proposal attempt 预算，只有所有 pass 成功后才提交一个 merged `CONTEXT_COMPACTED`，任一 pass 最终失败只提交一个 `CONTEXT_COMPACTION_FAILED`；若各 pass 通过但 merged candidate 被质量闸门拒绝，会记录 merge-level rejected attempt 供诊断。compactor 的 Engine runner 调用受独立 timeout 边界约束，并接收 Host lifecycle 的真实 cancellation token：proactive compaction 通过 durable Run 状态观察 request 是否失效，reactive compaction 复用 Engine envelope 的 run-local token；timeout 会尽量 signal 可写 cancellation token，并按稳定 proposal failure 诊断收口。非 final outcome 的错误摘要会先脱敏，`finish_reason=length` 的 final proposal 视为截断脏 proposal，不会被接受为 compact 成功。质量校验会拒绝缺失 accepted tool evidence coverage、非法 pinned state patch、越权 evidence-backed fact candidate，以及 source refs 不在 compact material provenance map 内的 minimum preserve item。compact 不改写历史 EventLog facts，不让 summary 替代 evidence-backed extraction，也不直接写 memory snapshot。memory 是否吸收 compacted summary、fact candidate 或 minimum preserve item 由 memory projection policy 消费已提交 facts 决定。
 
 ## Payload 与 Terminal Continuity
 
@@ -279,7 +288,7 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 - 低层 command handle factory 与 command handle options。
 - 内部新 Run admission primitive 和 `start_run`。
 - run-level `stream_run_events`。
-- durable store、transaction runner、schema、state row codec、payload table helper。
+- durable store、transaction runner、schema、state row codec、payload table helper；schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；SQLite 连接启用 WAL 与 auto-checkpoint；store close 会拒绝活跃 transaction，避免 SQLite 隐式 rollback 未提交写入。
 - dispatch scheduler、ToolRuntime factory、projection runner、memory repair runner。
 - recovery scanner、orphan proof classifier、Host instance liveness helper 与 startup recovery diagnostic。
 - `HostLocalExecutionOptions`、low-level local execution composition helper 与 run input provider internals。

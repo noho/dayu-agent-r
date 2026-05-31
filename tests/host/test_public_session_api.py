@@ -17,13 +17,16 @@ from dayu.host import (
     HostCallContext,
     HostMetadataEntry,
     OperationContext,
+    PurgeSessionRequest,
     SessionStatus,
     close_session,
     create_session,
     ensure_session,
     get_session,
+    purge_session,
 )
 from dayu.host.api import HostCommandHandleOptions
+import dayu.host.command as command_module
 from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.state import (
@@ -31,6 +34,7 @@ from dayu.host.durable.state import (
     _public_session_status_from_durable,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.projection import ProjectionCatchupPort
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -66,6 +70,42 @@ def _open_handle(tmp_path: Path) -> HostCommandHandle:
     return create_host_command_handle(_options(tmp_path))
 
 
+def test_session_lifecycle_commands_trigger_projection_catchup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session lifecycle facade 写入 durable 后必须触发 projection catch-up。"""
+
+    calls = 0
+
+    def record_catchup(port: ProjectionCatchupPort | None) -> None:
+        """记录 catch-up 调用。
+
+        :param port: command handle admission service 持有的 catch-up port。
+        :returns: ``None``。
+        """
+
+        nonlocal calls
+        assert port is not None
+        calls += 1
+
+    monkeypatch.setattr(
+        command_module,
+        "catch_up_projection_best_effort",
+        record_catchup,
+    )
+    handle = _open_handle(tmp_path)
+    try:
+        ensured = ensure_session(handle, _ensure_request())
+        created = create_session(handle, _create_request("create-catchup"))
+        close_session(handle, created.session_id, _close_request("close-catchup"))
+    finally:
+        handle.close()
+
+    assert ensured.session_id
+    assert calls == 3
+
+
 def _durable_session_row(status: SessionStatus) -> SessionRow:
     """构造 Session status mapping 测试用 durable Session row。
 
@@ -89,9 +129,7 @@ def _durable_session_row(status: SessionStatus) -> SessionRow:
 class _UnknownSessionStatusReader:
     """get_session monkeypatch 用 Session reader。"""
 
-    def __call__(
-        self, transaction: HostTransaction, session_id: str
-    ) -> SessionRow | None:
+    def __call__(self, transaction: HostTransaction, session_id: str) -> SessionRow | None:
         """返回带未知 status 的 durable Session row。
 
         :param transaction: Host transaction。
@@ -113,9 +151,7 @@ def test_session_status_mapping_rejects_unknown_session_status() -> None:
     """Session status mapping 对未知 durable status fail closed。"""
 
     with pytest.raises(HostDurableError):
-        _public_session_status_from_durable(
-            cast(SessionStatus, "future_session_status")
-        )
+        _public_session_status_from_durable(cast(SessionStatus, "future_session_status"))
 
 
 def test_get_session_unknown_durable_status_returns_internal_error(
@@ -151,9 +187,7 @@ def _context(actor: str = "analyst", request_id: str = "trace-1") -> HostCallCon
         actor=actor,
         source="pytest",
         request_id=request_id,
-        authorization_claims=(
-            AuthorizationClaim(name="role", value="research"),
-        ),
+        authorization_claims=(AuthorizationClaim(name="role", value="research"),),
         operation_context=OperationContext(
             operation_name="public_session_api",
             operation_kind="unit_test",
@@ -183,9 +217,7 @@ def _ensure_request(slot_key: str = "slot-a") -> EnsureSessionRequest:
     :returns: ensure session 请求。
     """
 
-    return EnsureSessionRequest(
-        scope="workspace", slot_key=slot_key, metadata=_metadata("ensure")
-    )
+    return EnsureSessionRequest(scope="workspace", slot_key=slot_key, metadata=_metadata("ensure"))
 
 
 def _create_request(
@@ -219,8 +251,20 @@ def _close_request(client_request_id: str) -> CloseSessionRequest:
     :returns: close session 请求。
     """
 
-    return CloseSessionRequest(
-        context=_context(), client_request_id=client_request_id, reason="done"
+    return CloseSessionRequest(context=_context(), client_request_id=client_request_id, reason="done")
+
+
+def _purge_request(client_request_id: str) -> PurgeSessionRequest:
+    """构造 purge session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: purge session 请求。
+    """
+
+    return PurgeSessionRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="public_session_api_purge",
     )
 
 
@@ -307,6 +351,31 @@ def test_get_session_missing_returns_not_found(tmp_path: Path) -> None:
     try:
         with pytest.raises(HostApiError) as exc_info:
             get_session(command_handle, "session-missing")
+        assert exc_info.value.code == HostApiErrorCode.NOT_FOUND
+        assert exc_info.value.retryable is False
+    finally:
+        command_handle.close()
+
+
+def test_get_session_after_purge_returns_not_found(tmp_path: Path) -> None:
+    """get_session 在 purge 后不从 tombstone 重建 Session snapshot。"""
+
+    command_handle = _open_handle(tmp_path)
+    try:
+        created = create_session(command_handle, _create_request("create-1"))
+        close_session(command_handle, created.session_id, _close_request("close-1"))
+        result = purge_session(
+            command_handle,
+            created.session_id,
+            _purge_request("purge-1"),
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            get_session(command_handle, created.session_id)
+
+        assert result.purged is True
+        assert result.purge_tombstone_ref is not None
+        assert result.deleted_counts_digest is not None
         assert exc_info.value.code == HostApiErrorCode.NOT_FOUND
         assert exc_info.value.retryable is False
     finally:

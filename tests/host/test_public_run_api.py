@@ -15,6 +15,7 @@ from dayu.host import (
     AttemptStatus,
     CancelMode,
     CancelRunRequest,
+    CloseSessionRequest,
     FollowupBehavior,
     HostApiError,
     HostApiErrorCode,
@@ -26,6 +27,7 @@ from dayu.host import (
     RunStatus,
     SubmitFollowupRequest,
     cancel_run,
+    close_session,
     ensure_session,
     get_run,
     purge_session,
@@ -297,6 +299,63 @@ def _cancel_request(client_request_id: str) -> CancelRunRequest:
         client_request_id=client_request_id,
         reason="user_stop",
         mode=CancelMode.GRACEFUL,
+    )
+
+
+def _close_request(client_request_id: str) -> CloseSessionRequest:
+    """构造 close_session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: close session 请求。
+    """
+
+    return CloseSessionRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="public_run_api_close",
+    )
+
+
+def _purge_request(client_request_id: str) -> PurgeSessionRequest:
+    """构造 purge_session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: purge session 请求。
+    """
+
+    return PurgeSessionRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="public_run_api_purge",
+    )
+
+
+def _retry_request(client_request_id: str) -> RetryRunRequest:
+    """构造 retry_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: retry run 请求。
+    """
+
+    return RetryRunRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="public_run_api_retry",
+    )
+
+
+def _replay_request(client_request_id: str) -> ReplayRunRequest:
+    """构造 replay_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: replay run 请求。
+    """
+
+    return ReplayRunRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="public_run_api_replay",
+        repair_instruction="repair structure",
     )
 
 
@@ -702,10 +761,10 @@ def test_public_cancel_and_promotion_race_preserves_run_invariants(
     assert latest_queued_status == RunStatus.CANCELLED
 
 
-def test_retry_replay_reject_non_terminal_and_purge_remains_unsupported(
+def test_retry_replay_reject_non_terminal_and_purge_rejects_open_session(
     tmp_path: Path,
 ) -> None:
-    """retry/replay 对非目标源状态 fail closed；purge_session 仍 unsupported。"""
+    """retry/replay 对非目标源状态 fail closed；purge 拒绝未关闭 Session。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
@@ -737,21 +796,13 @@ def test_retry_replay_reject_non_terminal_and_purge_remains_unsupported(
                 ),
             )
         with pytest.raises(HostApiError) as purge_exc:
-            purge_session(
-                host,
-                session_id,
-                PurgeSessionRequest(
-                    context=_context(),
-                    client_request_id="purge-1",
-                    reason="purge_test",
-                ),
-            )
+            purge_session(host, session_id, _purge_request("purge-open"))
 
         for exc_info in (retry_exc, replay_exc):
             assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
             assert exc_info.value.retryable is False
             assert exc_info.value.detail is None
-        assert purge_exc.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
+        assert purge_exc.value.code == HostApiErrorCode.INVALID_STATE
         assert purge_exc.value.retryable is False
         assert purge_exc.value.detail is None
         for exc_info in (retry_exc, replay_exc, purge_exc):
@@ -759,5 +810,46 @@ def test_retry_replay_reject_non_terminal_and_purge_remains_unsupported(
             assert exc_info.value.detail is None
         assert _event_count(options.db_path) == before_events
         assert _idempotency_count(options.db_path) == before_idempotency
+    finally:
+        host.close()
+
+
+def test_purge_session_deletes_run_truth_and_retry_replay_fail_not_found(
+    tmp_path: Path,
+) -> None:
+    """purge 后 Run read/retry/replay 都按缺失事实 fail closed。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host)
+        run = start_run(host, _start_request(session_id, "start-purge"))
+        cancelled = cancel_run(host, run.run_id, _cancel_request("cancel-purge"))
+        close_session(host, session_id, _close_request("close-purge"))
+
+        first = purge_session(host, session_id, _purge_request("purge-1"))
+        replay = purge_session(host, session_id, _purge_request("purge-1"))
+
+        assert cancelled.status == RunStatus.CANCELLED
+        assert first.session_id == session_id
+        assert first.purged is True
+        assert first.purge_tombstone_ref is not None
+        assert first.deleted_counts_digest is not None
+        assert replay == first
+
+        with pytest.raises(HostApiError) as get_run_exc:
+            get_run(host, run.run_id)
+        with pytest.raises(HostApiError) as retry_exc:
+            retry_run(host, run.run_id, _retry_request("retry-after-purge"))
+        with pytest.raises(HostApiError) as replay_exc:
+            replay_run(host, run.run_id, _replay_request("replay-after-purge"))
+        with pytest.raises(HostApiError) as different_purge_exc:
+            purge_session(host, session_id, _purge_request("purge-2"))
+
+        for exc_info in (get_run_exc, retry_exc, replay_exc):
+            assert exc_info.value.code == HostApiErrorCode.NOT_FOUND
+            assert exc_info.value.retryable is False
+        assert different_purge_exc.value.code == HostApiErrorCode.CONFLICT
+        assert different_purge_exc.value.retryable is False
     finally:
         host.close()

@@ -31,10 +31,12 @@ from dayu.host.durable.schema import (
     OUTBOX_PROJECTION_TABLES,
     PHASE3_STATE_TABLES,
     PROJECTION_TABLES,
+    PURGE_GOVERNANCE_TABLES,
     TOOL_TRACE_PROJECTION_TABLES,
     INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON,
     INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE,
     INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR,
+    INDEX_HOST_PURGE_TOMBSTONES_SESSION,
     INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE,
     INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE,
     INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE,
@@ -48,7 +50,9 @@ from dayu.host.durable.schema import (
     TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
     TABLE_HOST_PROJECTION_CHECKPOINTS,
     TABLE_HOST_PROJECTION_FAILURES,
+    TABLE_HOST_PURGE_TOMBSTONES,
     TABLE_HOST_RUN_RESULTS,
+    TABLE_HOST_SESSIONS,
     TABLE_HOST_SESSION_TIMELINE_ITEMS,
     TABLE_HOST_TOOL_TRACE_HOT,
     TABLE_HOST_WAIT_RECORDS,
@@ -76,12 +80,8 @@ def _options(
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "host" / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(
-            artifact_root=tmp_path / "artifacts"
-        ),
-        sqlite_policy=HostSQLiteStoragePolicy(
-            busy_timeout_seconds=busy_timeout_seconds
-        ),
+        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=busy_timeout_seconds),
     )
 
 
@@ -92,9 +92,7 @@ def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
     :returns: 用户表名集合。
     """
 
-    rows = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()
+    rows = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     return frozenset(str(row[0]) for row in rows if str(row[0]) != "sqlite_sequence")
 
 
@@ -176,9 +174,7 @@ def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> No
     )
 
 
-def _insert_payload_descriptor_probe(
-    connection: sqlite3.Connection, payload_ref: str
-) -> None:
+def _insert_payload_descriptor_probe(connection: sqlite3.Connection, payload_ref: str) -> None:
     """插入 schema 约束测试用 payload descriptor row。
 
     :param connection: SQLite connection。
@@ -187,8 +183,7 @@ def _insert_payload_descriptor_probe(
     :raises sqlite3.Error: 插入失败时由 SQLite 抛出。
     """
 
-    connection.execute(
-        f"""
+    connection.execute(f"""
         INSERT INTO {TABLE_SQLITE_PAYLOADS} (
           payload_id,
           payload_format,
@@ -204,8 +199,7 @@ def _insert_payload_descriptor_probe(
           'sha256:0000000000000000000000000000000000000000000000000000000000000000',
           '2026-05-16T00:00:00.000000Z'
         )
-        """
-    )
+        """)
     connection.execute(
         f"""
         INSERT INTO {TABLE_PAYLOAD_DESCRIPTORS} (
@@ -233,7 +227,7 @@ def _insert_payload_descriptor_probe(
 def test_fresh_db_creates_foundation_phase8_and_memory_tables(
     tmp_path: Path,
 ) -> None:
-    """fresh DB bootstrap 创建 foundation、state、projection、memory 与 Phase 13 tables。"""
+    """fresh DB bootstrap 创建全部 Host durable tables。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -242,19 +236,12 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
             assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
             assert set(PHASE3_STATE_TABLES).issubset(_table_names(connection))
             assert set(PROJECTION_TABLES).issubset(_table_names(connection))
-            assert set(MEMORY_PROJECTION_TABLES).issubset(
-                _table_names(connection)
-            )
+            assert set(MEMORY_PROJECTION_TABLES).issubset(_table_names(connection))
             assert set(AUDIT_PROJECTION_TABLES).issubset(_table_names(connection))
-            assert set(TOOL_TRACE_PROJECTION_TABLES).issubset(
-                _table_names(connection)
-            )
-            assert set(OUTBOX_PROJECTION_TABLES).issubset(
-                _table_names(connection)
-            )
-            assert _pragma_int(connection, "PRAGMA user_version") == (
-                HOST_SCHEMA_VERSION
-            )
+            assert set(TOOL_TRACE_PROJECTION_TABLES).issubset(_table_names(connection))
+            assert set(OUTBOX_PROJECTION_TABLES).issubset(_table_names(connection))
+            assert set(PURGE_GOVERNANCE_TABLES).issubset(_table_names(connection))
+            assert _pragma_int(connection, "PRAGMA user_version") == (HOST_SCHEMA_VERSION)
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -291,10 +278,43 @@ def test_schema_mismatch_raises_structured_error(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_host_schema_version_is_phase13_outbox_version() -> None:
-    """当前 committed Host schema version 是 Slice 3 的 fresh schema 13。"""
+def test_host_schema_version_is_active_run_check_version() -> None:
+    """当前 committed Host schema version 是 active Run CHECK fresh schema 15。"""
 
-    assert HOST_SCHEMA_VERSION == 13
+    assert HOST_SCHEMA_VERSION == 15
+
+
+def test_purge_tombstone_table_has_no_session_or_event_log_fk(
+    tmp_path: Path,
+) -> None:
+    """purge tombstone table 不外键引用会被删除的 Session / EventLog facts。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert TABLE_HOST_PURGE_TOMBSTONES in _table_names(connection)
+            assert _primary_key_columns(
+                connection,
+                TABLE_HOST_PURGE_TOMBSTONES,
+            ) == ("tombstone_id",)
+            table_info = connection.execute(f"PRAGMA table_info({TABLE_HOST_PURGE_TOMBSTONES})").fetchall()
+            not_null_columns = {str(row[1]) for row in table_info if int(row[3]) == 1}
+            assert "audit_record_ref" in not_null_columns
+            assert "audit_record_digest" in not_null_columns
+
+            tombstone_fks = connection.execute(f"PRAGMA foreign_key_list({TABLE_HOST_PURGE_TOMBSTONES})").fetchall()
+            fk_targets = {str(row[2]) for row in tombstone_fks}
+            assert TABLE_EVENT_LOG not in fk_targets
+            assert TABLE_HOST_SESSIONS not in fk_targets
+
+            tombstone_indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_PURGE_TOMBSTONES})").fetchall()
+            tombstone_index_names = {str(row[1]) for row in tombstone_indexes}
+            assert INDEX_HOST_PURGE_TOMBSTONES_SESSION in tombstone_index_names
+            session_index = next(row for row in tombstone_indexes if str(row[1]) == INDEX_HOST_PURGE_TOMBSTONES_SESSION)
+            assert int(session_index[2]) == 1
+        finally:
+            connection.close()
 
 
 def test_wait_record_snapshot_columns_are_all_or_none(tmp_path: Path) -> None:
@@ -306,8 +326,7 @@ def test_wait_record_snapshot_columns_are_all_or_none(tmp_path: Path) -> None:
         try:
             connection.execute("PRAGMA foreign_keys=OFF")
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_WAIT_RECORDS} (
                       wait_id,
                       session_id,
@@ -367,8 +386,7 @@ def test_wait_record_snapshot_columns_are_all_or_none(tmp_path: Path) -> None:
                       '2026-05-19T00:00:00.000000Z',
                       NULL
                     )
-                    """
-                )
+                    """)
         finally:
             connection.close()
 
@@ -380,10 +398,7 @@ def test_wal_persists_on_second_independent_connection(tmp_path: Path) -> None:
     with open_host_durable_store(options) as store:
         second_connection = store.connect()
         try:
-            assert (
-                _pragma_text(second_connection, "PRAGMA journal_mode").lower()
-                == "wal"
-            )
+            assert _pragma_text(second_connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(second_connection, "PRAGMA foreign_keys") == 1
         finally:
             second_connection.close()
@@ -396,12 +411,8 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
     with open_host_durable_store(options) as store:
         connection = store.connect()
         try:
-            event_columns = connection.execute(
-                f"PRAGMA table_info({TABLE_EVENT_LOG})"
-            ).fetchall()
-            event_sequence = next(
-                row for row in event_columns if str(row[1]) == "event_sequence"
-            )
+            event_columns = connection.execute(f"PRAGMA table_info({TABLE_EVENT_LOG})").fetchall()
+            event_sequence = next(row for row in event_columns if str(row[1]) == "event_sequence")
             assert str(event_sequence[2]).upper() == "INTEGER"
             assert int(event_sequence[5]) == 1
 
@@ -412,14 +423,10 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
             assert create_sql_row is not None
             assert "AUTOINCREMENT" in str(create_sql_row[0]).upper()
 
-            event_indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_EVENT_LOG})"
-            ).fetchall()
+            event_indexes = connection.execute(f"PRAGMA index_list({TABLE_EVENT_LOG})").fetchall()
             assert any(int(row[2]) == 1 for row in event_indexes)
 
-            event_fks = connection.execute(
-                f"PRAGMA foreign_key_list({TABLE_EVENT_LOG})"
-            ).fetchall()
+            event_fks = connection.execute(f"PRAGMA foreign_key_list({TABLE_EVENT_LOG})").fetchall()
             assert any(str(row[2]) == TABLE_PAYLOAD_DESCRIPTORS for row in event_fks)
 
             assert _primary_key_columns(connection, TABLE_IDEMPOTENCY_RECORDS) == (
@@ -427,15 +434,9 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
                 "scope_id",
                 "idempotency_key",
             )
-            assert _primary_key_columns(connection, TABLE_PAYLOAD_DESCRIPTORS) == (
-                "payload_ref",
-            )
-            assert _primary_key_columns(connection, TABLE_SQLITE_PAYLOADS) == (
-                "payload_id",
-            )
-            assert _primary_key_columns(connection, TABLE_HOST_INSTANCES) == (
-                "host_instance_id",
-            )
+            assert _primary_key_columns(connection, TABLE_PAYLOAD_DESCRIPTORS) == ("payload_ref",)
+            assert _primary_key_columns(connection, TABLE_SQLITE_PAYLOADS) == ("payload_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_INSTANCES) == ("host_instance_id",)
         finally:
             connection.close()
 
@@ -451,8 +452,7 @@ def test_event_log_schema_rejects_unpaired_payload_reference(
         try:
             _insert_payload_descriptor_probe(connection, "payload-ref-1")
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_EVENT_LOG} (
                       event_id,
                       event_body_digest,
@@ -474,11 +474,9 @@ def test_event_log_schema_rejects_unpaired_payload_reference(
                       'payload-ref-1',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_EVENT_LOG} (
                       event_id,
                       event_body_digest,
@@ -500,8 +498,7 @@ def test_event_log_schema_rejects_unpaired_payload_reference(
                       'sha256:0000000000000000000000000000000000000000000000000000000000000000',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
         finally:
             connection.close()
 
@@ -517,8 +514,7 @@ def test_idempotency_schema_rejects_unpaired_event_reference(
         try:
             _insert_event_log_probe(connection, "event-1")
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
                       scope_kind,
                       scope_id,
@@ -538,11 +534,9 @@ def test_idempotency_schema_rejects_unpaired_event_reference(
                       'event-1',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
                       scope_kind,
                       scope_id,
@@ -562,11 +556,9 @@ def test_idempotency_schema_rejects_unpaired_event_reference(
                       1,
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
                       scope_kind,
                       scope_id,
@@ -588,8 +580,7 @@ def test_idempotency_schema_rejects_unpaired_event_reference(
                       0,
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
         finally:
             connection.close()
 
@@ -602,18 +593,14 @@ def test_wait_record_table_and_indexes_are_created(tmp_path: Path) -> None:
         connection = store.connect()
         try:
             assert TABLE_HOST_WAIT_RECORDS in _table_names(connection)
-            wait_indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_WAIT_RECORDS})"
-            ).fetchall()
+            wait_indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_WAIT_RECORDS})").fetchall()
             wait_index_names = {str(row[1]) for row in wait_indexes}
             assert INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN in wait_index_names
             assert INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL in wait_index_names
             assert INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB in wait_index_names
 
             active_index_row = next(
-                row
-                for row in wait_indexes
-                if str(row[1]) == INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN
+                row for row in wait_indexes if str(row[1]) == INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN
             )
             assert int(active_index_row[2]) == 1
             assert int(active_index_row[4]) == 1
@@ -634,27 +621,13 @@ def test_projection_checkpoint_and_failure_tables_are_created(
             assert TABLE_HOST_PROJECTION_FAILURES in _table_names(connection)
             assert TABLE_HOST_RUN_RESULTS in _table_names(connection)
             assert TABLE_HOST_SESSION_TIMELINE_ITEMS in _table_names(connection)
-            assert _primary_key_columns(
-                connection, TABLE_HOST_PROJECTION_CHECKPOINTS
-            ) == ("consumer_id",)
-            assert _primary_key_columns(
-                connection, TABLE_HOST_PROJECTION_FAILURES
-            ) == ("consumer_id",)
-            assert _primary_key_columns(connection, TABLE_HOST_RUN_RESULTS) == (
-                "run_id",
-            )
-            assert _primary_key_columns(
-                connection, TABLE_HOST_SESSION_TIMELINE_ITEMS
-            ) == ("timeline_item_id",)
-            run_result_indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_RUN_RESULTS})"
-            ).fetchall()
-            timeline_indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_SESSION_TIMELINE_ITEMS})"
-            ).fetchall()
-            assert INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE in {
-                str(row[1]) for row in run_result_indexes
-            }
+            assert _primary_key_columns(connection, TABLE_HOST_PROJECTION_CHECKPOINTS) == ("consumer_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_PROJECTION_FAILURES) == ("consumer_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_RUN_RESULTS) == ("run_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_SESSION_TIMELINE_ITEMS) == ("timeline_item_id",)
+            run_result_indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_RUN_RESULTS})").fetchall()
+            timeline_indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_SESSION_TIMELINE_ITEMS})").fetchall()
+            assert INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE in {str(row[1]) for row in run_result_indexes}
             assert {
                 INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE,
                 INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE,
@@ -675,34 +648,16 @@ def test_memory_projection_tables_and_indexes_are_created(
             assert TABLE_HOST_MEMORY_SNAPSHOTS in _table_names(connection)
             assert TABLE_HOST_MEMORY_ITEMS in _table_names(connection)
             assert TABLE_HOST_MEMORY_DIAGNOSTICS in _table_names(connection)
-            assert _primary_key_columns(connection, TABLE_HOST_MEMORY_SNAPSHOTS) == (
-                "snapshot_id",
-            )
-            assert _primary_key_columns(connection, TABLE_HOST_MEMORY_ITEMS) == (
-                "item_id",
-            )
-            assert _primary_key_columns(
-                connection, TABLE_HOST_MEMORY_DIAGNOSTICS
-            ) == ("diagnostic_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_MEMORY_SNAPSHOTS) == ("snapshot_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_MEMORY_ITEMS) == ("item_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_MEMORY_DIAGNOSTICS) == ("diagnostic_id",)
 
-            snapshot_indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_MEMORY_SNAPSHOTS})"
-            ).fetchall()
-            item_indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_MEMORY_ITEMS})"
-            ).fetchall()
-            diagnostic_indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_MEMORY_DIAGNOSTICS})"
-            ).fetchall()
-            assert INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR in {
-                str(row[1]) for row in snapshot_indexes
-            }
-            assert INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE in {
-                str(row[1]) for row in item_indexes
-            }
-            assert INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON in {
-                str(row[1]) for row in diagnostic_indexes
-            }
+            snapshot_indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_MEMORY_SNAPSHOTS})").fetchall()
+            item_indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_MEMORY_ITEMS})").fetchall()
+            diagnostic_indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_MEMORY_DIAGNOSTICS})").fetchall()
+            assert INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR in {str(row[1]) for row in snapshot_indexes}
+            assert INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE in {str(row[1]) for row in item_indexes}
+            assert INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON in {str(row[1]) for row in diagnostic_indexes}
         finally:
             connection.close()
 
@@ -715,9 +670,7 @@ def test_audit_sink_marker_table_is_created(tmp_path: Path) -> None:
         connection = store.connect()
         try:
             assert TABLE_HOST_AUDIT_SINK_MARKERS in _table_names(connection)
-            assert _primary_key_columns(
-                connection, TABLE_HOST_AUDIT_SINK_MARKERS
-            ) == ("event_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_AUDIT_SINK_MARKERS) == ("event_id",)
         finally:
             connection.close()
 
@@ -730,12 +683,8 @@ def test_tool_trace_hot_table_and_indexes_are_created(tmp_path: Path) -> None:
         connection = store.connect()
         try:
             assert TABLE_HOST_TOOL_TRACE_HOT in _table_names(connection)
-            assert _primary_key_columns(connection, TABLE_HOST_TOOL_TRACE_HOT) == (
-                "trace_id",
-            )
-            indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_TOOL_TRACE_HOT})"
-            ).fetchall()
+            assert _primary_key_columns(connection, TABLE_HOST_TOOL_TRACE_HOT) == ("trace_id",)
+            indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_TOOL_TRACE_HOT})").fetchall()
             index_names = {str(row[1]) for row in indexes}
             assert {
                 INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE,
@@ -765,9 +714,7 @@ def test_outbox_tables_and_indexes_are_created(tmp_path: Path) -> None:
                 connection,
                 TABLE_HOST_OUTBOX_DRAIN_IDEMPOTENCY,
             ) == ("session_id", "drain_request_id")
-            indexes = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_OUTBOX_TERMINAL_ITEMS})"
-            ).fetchall()
+            indexes = connection.execute(f"PRAGMA index_list({TABLE_HOST_OUTBOX_TERMINAL_ITEMS})").fetchall()
             index_names = {str(row[1]) for row in indexes}
             assert {
                 INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE,
@@ -789,19 +736,16 @@ def test_projection_schema_constraints_reject_invalid_rows(
         try:
             _insert_event_log_probe(connection, "event-1")
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
                       consumer_id,
                       checkpoint_event_sequence,
                       checkpoint_event_id,
                       updated_at
                     ) VALUES ('consumer', -1, NULL, '2026-05-16T00:00:00.000000Z')
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_PROJECTION_FAILURES} (
                       consumer_id,
                       failed_event_sequence,
@@ -821,11 +765,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
                       consumer_id,
                       checkpoint_event_sequence,
@@ -837,11 +779,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       'event-1',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
                       consumer_id,
                       checkpoint_event_sequence,
@@ -853,11 +793,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       NULL,
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
                       consumer_id,
                       checkpoint_event_sequence,
@@ -869,11 +807,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       'missing-event',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_RUN_RESULTS} (
                       run_id,
                       session_id,
@@ -895,11 +831,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_SESSION_TIMELINE_ITEMS} (
                       timeline_item_id,
                       session_id,
@@ -921,10 +855,8 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       NULL,
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
-            connection.execute(
-                f"""
+                    """)
+            connection.execute(f"""
                 INSERT INTO {TABLE_HOST_MEMORY_DIAGNOSTICS} (
                   diagnostic_id,
                   session_id,
@@ -938,11 +870,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                   '{{}}',
                   '2026-05-16T00:00:00.000000Z'
                 )
-                """
-            )
+                """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_AUDIT_SINK_MARKERS} (
                       event_id,
                       event_sequence,
@@ -954,11 +884,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       'sha256:1111111111111111111111111111111111111111111111111111111111111111',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_AUDIT_SINK_MARKERS} (
                       event_id,
                       event_sequence,
@@ -970,11 +898,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       'sha256:1111111111111111111111111111111111111111111111111111111111111111',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_TOOL_TRACE_HOT} (
                       trace_id,
                       event_id,
@@ -998,11 +924,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_TOOL_TRACE_HOT} (
                       trace_id,
                       event_id,
@@ -1024,11 +948,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_OUTBOX_TERMINAL_ITEMS} (
                       item_id,
                       idempotency_key,
@@ -1058,11 +980,9 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_OUTBOX_TERMINAL_ITEMS} (
                       item_id,
                       idempotency_key,
@@ -1090,8 +1010,7 @@ def test_projection_schema_constraints_reject_invalid_rows(
                       '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
         finally:
             connection.close()
 
@@ -1105,25 +1024,17 @@ def test_event_sequence_is_sqlite_foreign_key_parent_key(
     with open_host_durable_store(options) as store:
         connection = store.connect()
         try:
-            event_columns = connection.execute(
-                f"PRAGMA table_info({TABLE_EVENT_LOG})"
-            ).fetchall()
-            event_sequence = next(
-                row for row in event_columns if str(row[1]) == "event_sequence"
-            )
+            event_columns = connection.execute(f"PRAGMA table_info({TABLE_EVENT_LOG})").fetchall()
+            event_sequence = next(row for row in event_columns if str(row[1]) == "event_sequence")
             assert int(event_sequence[5]) == 1
-            connection.execute(
-                """
+            connection.execute("""
                 CREATE TABLE projection_fk_probe (
                   event_sequence INTEGER NOT NULL,
                   FOREIGN KEY(event_sequence) REFERENCES event_log(event_sequence)
                 )
-                """
-            )
+                """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    "INSERT INTO projection_fk_probe (event_sequence) VALUES (999)"
-                )
+                connection.execute("INSERT INTO projection_fk_probe (event_sequence) VALUES (999)")
         finally:
             connection.close()
 
@@ -1150,8 +1061,7 @@ def test_memory_schema_constraints_reject_invalid_rows(
         connection = store.connect()
         try:
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_MEMORY_SNAPSHOTS} (
                       snapshot_id,
                       session_id,
@@ -1175,10 +1085,8 @@ def test_memory_schema_constraints_reject_invalid_rows(
                       '2026-05-16T00:00:00.000000Z',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
-            connection.execute(
-                f"""
+                    """)
+            connection.execute(f"""
                 INSERT INTO {TABLE_HOST_MEMORY_SNAPSHOTS} (
                   snapshot_id,
                   session_id,
@@ -1202,11 +1110,9 @@ def test_memory_schema_constraints_reject_invalid_rows(
                   '2026-05-16T00:00:00.000000Z',
                   '2026-05-16T00:00:00.000000Z'
                 )
-                """
-            )
+                """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_MEMORY_ITEMS} (
                       item_id,
                       snapshot_id,
@@ -1230,11 +1136,9 @@ def test_memory_schema_constraints_reject_invalid_rows(
                       'tool-a',
                       '{{}}'
                     )
-                    """
-                )
+                    """)
             with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(
-                    f"""
+                connection.execute(f"""
                     INSERT INTO {TABLE_HOST_MEMORY_DIAGNOSTICS} (
                       diagnostic_id,
                       session_id,
@@ -1248,37 +1152,32 @@ def test_memory_schema_constraints_reject_invalid_rows(
                       '{{}}',
                       '2026-05-16T00:00:00.000000Z'
                     )
-                    """
-                )
+                    """)
         finally:
             connection.close()
 
 
-def test_schema_does_not_create_unowned_future_purge_tables(
+def test_schema_creates_only_owned_purge_tombstone_table(
     tmp_path: Path,
 ) -> None:
-    """Phase 13 bootstrap 不得预创建未归属的 future purge tables。"""
+    """Phase 15 bootstrap 只创建已归属的 purge tombstone table。"""
 
     forbidden_fragments = ("purge",)
     options = _options(tmp_path)
-    unexpected: set[str] = set()
+    purge_tables: set[str] = set()
     with open_host_durable_store(options) as store:
         connection = store.connect()
         try:
             table_names = _table_names(connection)
-            unexpected = {
-                table
-                for table in table_names
-                if any(fragment in table for fragment in forbidden_fragments)
+            purge_tables = {
+                table for table in table_names if any(fragment in table for fragment in forbidden_fragments)
             }
         finally:
             connection.close()
-    assert not unexpected
+    assert purge_tables == {TABLE_HOST_PURGE_TOMBSTONES}
 
 
-def _primary_key_columns(
-    connection: sqlite3.Connection, table_name: str
-) -> tuple[str, ...]:
+def _primary_key_columns(connection: sqlite3.Connection, table_name: str) -> tuple[str, ...]:
     """读取表的 primary key 列名顺序。
 
     :param connection: SQLite connection。

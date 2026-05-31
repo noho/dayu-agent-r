@@ -43,6 +43,25 @@ class _CountingThirdPartyLock:
         self.release_calls += 1
 
 
+class _FailingThirdPartyLock:
+    """测试用 release 失败第三方 lock 替身。"""
+
+    def __init__(self) -> None:
+        """初始化 release 调用计数。"""
+
+        self.release_calls = 0
+
+    def release(self) -> None:
+        """记录调用后抛出底层 release 错误。
+
+        :returns: 不会返回。
+        :raises OSError: 始终抛出测试错误。
+        """
+
+        self.release_calls += 1
+        raise OSError("release failed")
+
+
 class _FailingReleaseToken(RuntimeFileLockToken):
     """测试用 release 失败 token。"""
 
@@ -241,6 +260,26 @@ def test_release_marks_released_after_underlying_release_before_marker_failure(
 
     assert token.released is True
     assert third_party_lock.release_calls == 1
+    token.release()
+    assert third_party_lock.release_calls == 1
+
+
+def test_release_failure_marks_token_released_to_prevent_retry(
+    tmp_path: Path,
+) -> None:
+    """底层 release 失败后 token 也要进入 released 状态避免二次释放。"""
+
+    lock_path = _lock_path(tmp_path)
+    third_party_lock = _FailingThirdPartyLock()
+    token = RuntimeFileLockToken(
+        lock_path=lock_path,
+        third_party_lock=cast(FileLock, third_party_lock),
+    )
+
+    with pytest.raises(RuntimeFileLockError, match="释放 runtime file lock 失败"):
+        token.release()
+
+    assert token.released is True
     token.release()
     assert third_party_lock.release_calls == 1
 

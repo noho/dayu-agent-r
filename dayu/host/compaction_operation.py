@@ -45,9 +45,7 @@ _MAX_SAFE_EXCEPTION_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
 _BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
-_ASSIGNMENT_SECRET_PATTERN = re.compile(
-    r"(?i)((?:api[_-]?key|authorization|token|secret)\s*[:=]\s*)[^,\s}\]]+"
-)
+_ASSIGNMENT_SECRET_PATTERN = re.compile(r"(?i)((?:api[_-]?key|authorization|token|secret)\s*[:=]\s*)[^,\s}\]]+")
 _ERROR_CODE_PATTERN = re.compile(r"\berror_code=([A-Za-z0-9_-]+)")
 _LOGGER = logging.getLogger(__name__)
 _MERGED_CANDIDATE_PREFIX = "merged:"
@@ -151,11 +149,7 @@ async def run_compaction_operation(
                     budget_after_attempted_compact=last_budget,
                 )
             repairable = attempt_number < max_attempts
-            next_decision = (
-                _NEXT_DECISION_RETRY_REPAIR
-                if repairable
-                else _NEXT_DECISION_FAIL_COMPACTION
-            )
+            next_decision = _NEXT_DECISION_RETRY_REPAIR if repairable else _NEXT_DECISION_FAIL_COMPACTION
             try:
                 candidate = await compactor.compact(pass_request, cancellation_token)
             except Exception as exc:
@@ -213,8 +207,7 @@ async def run_compaction_operation(
                 attempt_number += 1
                 continue
             if _requires_budget_acceptance(pass_request) and (
-                candidate.budget_after_compact
-                >= pass_request.budget_before_compact.hard_threshold_tokens
+                candidate.budget_after_compact >= pass_request.budget_before_compact.hard_threshold_tokens
             ):
                 rejected_attempt = _attempt_rejected(
                     request=pass_request,
@@ -255,6 +248,17 @@ async def run_compaction_operation(
     merged_candidate = _merge_pass_candidates(request, tuple(accepted_candidates))
     merged_quality = check_compaction_candidate(request, merged_candidate)
     if not merged_quality.accepted:
+        rejected.append(
+            _attempt_rejected(
+                request=request,
+                attempt_number=attempt_number,
+                failure_category=_FAILURE_QUALITY_CHECK_REJECTED,
+                repairable=False,
+                next_policy_decision=_NEXT_DECISION_FAIL_COMPACTION,
+                budget_after_attempted_compact=merged_candidate.budget_after_compact,
+                diagnostic_suffix=_DIAGNOSTIC_SUFFIX_UNKNOWN,
+            )
+        )
         return CompactionOperationResult(
             accepted_candidate=None,
             quality_result=None,
@@ -263,8 +267,7 @@ async def run_compaction_operation(
             budget_after_attempted_compact=merged_candidate.budget_after_compact,
         )
     if _requires_budget_acceptance(request) and (
-        merged_candidate.budget_after_compact
-        >= request.budget_before_compact.hard_threshold_tokens
+        merged_candidate.budget_after_compact >= request.budget_before_compact.hard_threshold_tokens
     ):
         return CompactionOperationResult(
             accepted_candidate=None,
@@ -330,42 +333,24 @@ def _merge_pass_candidates(
     candidate_id = _MERGED_CANDIDATE_PREFIX + candidate_digest
     return CompactionCandidate(
         candidate_id=candidate_id,
-        episode_summary_candidate=_merge_episode_summary_candidate(
-            candidate_digest, candidates
-        ),
-        pinned_state_patch_candidate=_merge_pinned_state_patch_candidate(
-            candidate_digest, candidates
-        ),
+        episode_summary_candidate=_merge_episode_summary_candidate(candidate_digest, candidates),
+        pinned_state_patch_candidate=_merge_pinned_state_patch_candidate(candidate_digest, candidates),
         preservation_evidence=_dedupe_preservation_evidence(candidates),
         evidence_backed_fact_candidates=_dedupe_fact_candidates(candidates),
         minimum_preserve_item_candidates=_dedupe_minimum_preserve_items(candidates),
         retained_current_user_input_ref=request.current_input_ref,
         preserved_material_source_refs=request.material_source_refs,
         preserved_canonical_evidence_refs=_dedupe_strings(
-            tuple(
-                candidate.preserved_canonical_evidence_refs
-                for candidate in candidates
-            )
+            tuple(candidate.preserved_canonical_evidence_refs for candidate in candidates)
         ),
         preserved_evidence_backed_fact_refs=_dedupe_strings(
-            tuple(
-                candidate.preserved_evidence_backed_fact_refs
-                for candidate in candidates
-            )
+            tuple(candidate.preserved_evidence_backed_fact_refs for candidate in candidates)
         ),
-        dropped_ranges=_dedupe_ranges(
-            tuple(item for candidate in candidates for item in candidate.dropped_ranges)
-        ),
+        dropped_ranges=_dedupe_ranges(tuple(item for candidate in candidates for item in candidate.dropped_ranges)),
         summarized_ranges=_dedupe_ranges(
-            tuple(
-                item
-                for candidate in candidates
-                for item in candidate.summarized_ranges
-            )
+            tuple(item for candidate in candidates for item in candidate.summarized_ranges)
         ),
-        budget_after_compact=min(
-            candidate.budget_after_compact for candidate in candidates
-        ),
+        budget_after_compact=min(candidate.budget_after_compact for candidate in candidates),
     )
 
 
@@ -390,38 +375,20 @@ def _merge_episode_summary_candidate(
             tuple(summary.goal for summary in summaries),
             separator=_MERGED_TEXT_SEPARATOR,
         ),
-        completed_actions=_dedupe_strings(
-            tuple(summary.completed_actions for summary in summaries)
-        ),
-        confirmed_fact_refs=_dedupe_strings(
-            tuple(summary.confirmed_fact_refs for summary in summaries)
-        ),
-        confirmed_fact_summaries=_dedupe_strings(
-            tuple(summary.confirmed_fact_summaries for summary in summaries)
-        ),
-        user_constraints=_dedupe_strings(
-            tuple(summary.user_constraints for summary in summaries)
-        ),
-        open_questions=_dedupe_strings(
-            tuple(summary.open_questions for summary in summaries)
-        ),
+        completed_actions=_dedupe_strings(tuple(summary.completed_actions for summary in summaries)),
+        confirmed_fact_refs=_dedupe_strings(tuple(summary.confirmed_fact_refs for summary in summaries)),
+        confirmed_fact_summaries=_dedupe_strings(tuple(summary.confirmed_fact_summaries for summary in summaries)),
+        user_constraints=_dedupe_strings(tuple(summary.user_constraints for summary in summaries)),
+        open_questions=_dedupe_strings(tuple(summary.open_questions for summary in summaries)),
         next_step=_merge_optional_text(
             tuple(summary.next_step for summary in summaries),
             separator=_MERGED_TEXT_SEPARATOR,
         ),
-        tool_finding_refs=_dedupe_strings(
-            tuple(summary.tool_finding_refs for summary in summaries)
-        ),
-        source_event_refs=_dedupe_strings(
-            tuple(summary.source_event_refs for summary in summaries)
-        ),
-        evidence_refs=_dedupe_strings(
-            tuple(summary.evidence_refs for summary in summaries)
-        ),
+        tool_finding_refs=_dedupe_strings(tuple(summary.tool_finding_refs for summary in summaries)),
+        source_event_refs=_dedupe_strings(tuple(summary.source_event_refs for summary in summaries)),
+        evidence_refs=_dedupe_strings(tuple(summary.evidence_refs for summary in summaries)),
         proposed_evidence_backed_fact_refs=_dedupe_strings(
-            tuple(
-                summary.proposed_evidence_backed_fact_refs for summary in summaries
-            )
+            tuple(summary.proposed_evidence_backed_fact_refs for summary in summaries)
         ),
     )
 
@@ -439,24 +406,14 @@ def _merge_pinned_state_patch_candidate(
     patches = tuple(candidate.pinned_state_patch_candidate for candidate in candidates)
     return PinnedStatePatchCandidate(
         candidate_id=_MERGED_PINNED_PATCH_CANDIDATE_PREFIX + candidate_digest,
-        current_goal=_merge_text_field_patch(
-            tuple(patch.current_goal for patch in patches)
-        ),
-        confirmed_subjects=_merge_tuple_field_patch(
-            tuple(patch.confirmed_subjects for patch in patches)
-        ),
-        user_constraints=_merge_tuple_field_patch(
-            tuple(patch.user_constraints for patch in patches)
-        ),
-        open_questions=_merge_tuple_field_patch(
-            tuple(patch.open_questions for patch in patches)
-        ),
+        current_goal=_merge_text_field_patch(tuple(patch.current_goal for patch in patches)),
+        confirmed_subjects=_merge_tuple_field_patch(tuple(patch.confirmed_subjects for patch in patches)),
+        user_constraints=_merge_tuple_field_patch(tuple(patch.user_constraints for patch in patches)),
+        open_questions=_merge_tuple_field_patch(tuple(patch.open_questions for patch in patches)),
     )
 
 
-def _merge_text_field_patch(
-    patches: tuple[PinnedTextFieldPatch, ...]
-) -> PinnedTextFieldPatch:
+def _merge_text_field_patch(patches: tuple[PinnedTextFieldPatch, ...]) -> PinnedTextFieldPatch:
     """合并文本 pinned patch 字段。
 
     文本字段是 scalar value，无法无损拼接为一个 pinned state 值；因此按 pass
@@ -474,9 +431,7 @@ def _merge_text_field_patch(
     return selected
 
 
-def _merge_tuple_field_patch(
-    patches: tuple[PinnedStringTupleFieldPatch, ...]
-) -> PinnedStringTupleFieldPatch:
+def _merge_tuple_field_patch(patches: tuple[PinnedStringTupleFieldPatch, ...]) -> PinnedStringTupleFieldPatch:
     """合并字符串 tuple pinned patch 字段。
 
     :param patches: pass tuple 字段 patch。
@@ -531,9 +486,7 @@ def _merge_required_text(values: tuple[str, ...], *, separator: str) -> str:
     return separator.join(merged)
 
 
-def _merge_optional_text(
-    values: tuple[str | None, ...], *, separator: str
-) -> str | None:
+def _merge_optional_text(values: tuple[str | None, ...], *, separator: str) -> str | None:
     """合并可选文本字段。
 
     :param values: pass 可选文本值。
@@ -560,9 +513,7 @@ def _dedupe_strings(values: tuple[tuple[str, ...], ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(merged))
 
 
-def _dedupe_preservation_evidence(
-    candidates: tuple[CompactionCandidate, ...]
-) -> tuple[PreservationEvidence, ...]:
+def _dedupe_preservation_evidence(candidates: tuple[CompactionCandidate, ...]) -> tuple[PreservationEvidence, ...]:
     """按 evidence id 去重 preservation evidence。
 
     :param candidates: pass candidates。
@@ -580,9 +531,7 @@ def _dedupe_preservation_evidence(
     return tuple(values)
 
 
-def _dedupe_fact_candidates(
-    candidates: tuple[CompactionCandidate, ...]
-) -> tuple[EvidenceBackedFactCandidate, ...]:
+def _dedupe_fact_candidates(candidates: tuple[CompactionCandidate, ...]) -> tuple[EvidenceBackedFactCandidate, ...]:
     """按 candidate id 去重 fact candidates。
 
     :param candidates: pass candidates。
@@ -601,7 +550,7 @@ def _dedupe_fact_candidates(
 
 
 def _dedupe_minimum_preserve_items(
-    candidates: tuple[CompactionCandidate, ...]
+    candidates: tuple[CompactionCandidate, ...],
 ) -> tuple[MinimumPreserveItemCandidate, ...]:
     """按 item id 去重 minimum preserve items。
 
@@ -678,12 +627,8 @@ def _attempt_rejected(
         attempt_number=attempt_number,
         failure_category=failure_category,
         repairable=repairable,
-        runner_attempt_summary_refs=(
-            f"runner-attempt:{request.run_id}:{attempt_number}",
-        ),
-        diagnostic_refs=(
-            f"diagnostic:{failure_category}:{operation_ref}:{diagnostic_suffix}",
-        ),
+        runner_attempt_summary_refs=(f"runner-attempt:{request.run_id}:{attempt_number}",),
+        diagnostic_refs=(f"diagnostic:{failure_category}:{operation_ref}:{diagnostic_suffix}",),
         next_policy_decision=next_policy_decision,
         budget_after_attempted_compact=budget_after_attempted_compact,
     )
@@ -798,12 +743,8 @@ def _safe_exception_message(exc: Exception | None) -> str:
     message = str(exc)
     if message.strip() == "":
         return exc.__class__.__name__
-    redacted = _BEARER_SECRET_PATTERN.sub(
-        f"Bearer {_REDACTED_SECRET}", message
-    )
-    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(
-        rf"\1{_REDACTED_SECRET}", redacted
-    )
+    redacted = _BEARER_SECRET_PATTERN.sub(f"Bearer {_REDACTED_SECRET}", message)
+    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(rf"\1{_REDACTED_SECRET}", redacted)
     if len(redacted) <= _MAX_SAFE_EXCEPTION_MESSAGE_CHARS:
         return redacted
     body_length = _MAX_SAFE_EXCEPTION_MESSAGE_CHARS - len(_TRUNCATED_SUFFIX)

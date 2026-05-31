@@ -30,10 +30,7 @@ async def test_missing_index_falls_back_to_id() -> None:
         b"data: [DONE]\n\n",
     ]
     events = await parse_sse(chunks)
-    completed = [
-        e for e in events
-        if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
-    ]
+    completed = [e for e in events if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED]
     assert len(completed) == 1
     data = completed[0].data
     assert isinstance(data, RunnerToolCallsCompletedData)
@@ -64,18 +61,44 @@ async def test_synthetic_index_does_not_collide_with_later_native_index() -> Non
     ]
 
     events = await parse_sse(chunks)
-    completed = [
-        e for e in events
-        if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
-    ]
+    completed = [e for e in events if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED]
 
     assert len(completed) == 1
     data = completed[0].data
     assert isinstance(data, RunnerToolCallsCompletedData)
-    assert {
-        (tool_call.tool_call_id, tool_call.name)
-        for tool_call in data.tool_calls
-    } == {
+    assert {(tool_call.tool_call_id, tool_call.name) for tool_call in data.tool_calls} == {
         ("call-synthetic", "missing"),
         ("call-native", "native"),
     }
+
+
+@pytest.mark.asyncio
+async def test_later_native_index_remaps_existing_id_partial() -> None:
+    """同一 tool call id 后续补充原生 index 时，旧 partial 必须合并过去。"""
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"id":"call-remap","type":"function",'
+            b'"function":{"name":"lookup","arguments":"{\\"k\\""}}]}}]}\n\n'
+        ),
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":0,"id":"call-remap",'
+            b'"function":{"arguments":":1}"}}]}}]}\n\n'
+        ),
+        b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    events = await parse_sse(chunks)
+    completed = [e for e in events if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED]
+
+    assert len(completed) == 1
+    data = completed[0].data
+    assert isinstance(data, RunnerToolCallsCompletedData)
+    assert len(data.tool_calls) == 1
+    tool_call = data.tool_calls[0]
+    assert tool_call.tool_call_id == "call-remap"
+    assert tool_call.name == "lookup"
+    assert tool_call.arguments == {"k": 1}

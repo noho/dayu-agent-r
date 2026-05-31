@@ -61,6 +61,8 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 _ERROR_FIELD: str = "error"
 _ERROR_MESSAGE_FIELD: str = "message"
 _PROVIDER_ERROR_CODE: str = "non_stream_provider_error"
+_TOOL_CALL_NOT_OBJECT_CODE: str = "non_stream_tool_call_not_object"
+_TOOL_CALLS_EMPTY_AFTER_FILTER_CODE: str = "non_stream_tool_calls_empty_after_filter"
 
 _NonStreamRunnerEventData: TypeAlias = (
     RunnerContentCompletedData
@@ -430,10 +432,21 @@ def _build_tool_calls(
 
     aggregator = ToolCallAggregator(provider_request_id=provider_request_id)
     fatal_errors: list[RunnerProtocolErrorData] = []
+    warnings: list[RunnerProtocolErrorData] = []
     index = 0
-    for raw in raw_tool_calls:
+    valid_raw_count = 0
+    for position, raw in enumerate(raw_tool_calls):
         if not isinstance(raw, dict):
+            warnings.append(
+                RunnerProtocolErrorData(
+                    error_code=_TOOL_CALL_NOT_OBJECT_CODE,
+                    message=f"non-stream tool_calls[{position}] is not a JSON object",
+                    provider_request_id=provider_request_id,
+                    raw_payload=None,
+                )
+            )
             continue
+        valid_raw_count += 1
         delta, pre_error = _coerce_final_tool_call(
             raw, index=index, provider_request_id=provider_request_id
         )
@@ -446,10 +459,19 @@ def _build_tool_calls(
     combined_fatals: tuple[RunnerProtocolErrorData, ...] = (
         tuple(fatal_errors) + result.fatal_errors
     )
+    if valid_raw_count == 0:
+        combined_fatals = combined_fatals + (
+            RunnerProtocolErrorData(
+                error_code=_TOOL_CALLS_EMPTY_AFTER_FILTER_CODE,
+                message="non-stream tool_calls contained no JSON object entries",
+                provider_request_id=provider_request_id,
+                raw_payload=None,
+            ),
+        )
     return _NonStreamToolCallsResult(
         tool_calls=result.tool_calls,
         fatal_errors=combined_fatals,
-        warnings=result.warnings,
+        warnings=tuple(warnings) + result.warnings,
     )
 
 

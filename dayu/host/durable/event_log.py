@@ -10,6 +10,7 @@ EngineEvent ingest、projection、audit、stream fanout、payload descriptor 写
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -343,52 +344,62 @@ def append_event(
         )
 
     appended_at = format_utc_timestamp(datetime.now(UTC))
-    transaction.execute(
-        f"""
-        INSERT INTO {TABLE_EVENT_LOG} (
-          event_id,
-          event_body_digest,
-          event_class,
-          session_id,
-          run_id,
-          attempt_id,
-          execution_id,
-          event_type,
-          occurred_at,
-          actor,
-          source,
-          client_request_id,
-          idempotency_key,
-          policy_decision_json,
-          reason_json,
-          payload_json,
-          payload_ref,
-          payload_digest,
-          appended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            request.event_id,
-            encoded.event_body_digest,
-            request.event_class.value,
-            request.session_id,
-            request.run_id,
-            request.attempt_id,
-            request.execution_id,
-            request.event_type,
-            encoded.occurred_at,
-            request.actor,
-            request.source,
-            request.client_request_id,
-            request.idempotency_key,
-            encoded.policy_decision_json,
-            encoded.reason_json,
-            encoded.payload_json,
-            request.payload_ref,
-            request.payload_digest,
-            appended_at,
-        ),
-    )
+    try:
+        transaction.execute(
+            f"""
+            INSERT INTO {TABLE_EVENT_LOG} (
+              event_id,
+              event_body_digest,
+              event_class,
+              session_id,
+              run_id,
+              attempt_id,
+              execution_id,
+              event_type,
+              occurred_at,
+              actor,
+              source,
+              client_request_id,
+              idempotency_key,
+              policy_decision_json,
+              reason_json,
+              payload_json,
+              payload_ref,
+              payload_digest,
+              appended_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request.event_id,
+                encoded.event_body_digest,
+                request.event_class.value,
+                request.session_id,
+                request.run_id,
+                request.attempt_id,
+                request.execution_id,
+                request.event_type,
+                encoded.occurred_at,
+                request.actor,
+                request.source,
+                request.client_request_id,
+                request.idempotency_key,
+                encoded.policy_decision_json,
+                encoded.reason_json,
+                encoded.payload_json,
+                request.payload_ref,
+                request.payload_digest,
+                appended_at,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        existing = read_event_by_id(transaction, request.event_id)
+        if existing is None:
+            raise
+        if existing.event_body_digest == encoded.event_body_digest:
+            return EventLogAppendResult(row=existing, inserted=False)
+        raise HostEventIdentityConflictError(
+            "EventLog event_id already exists with different event body"
+        ) from exc
     row = read_event_by_id(transaction, request.event_id)
     if row is None:
         raise HostDurableError("EventLog append did not return inserted row")

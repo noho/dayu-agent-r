@@ -18,7 +18,7 @@ Host / ToolRuntime 的职责，公共契约层不提供默认执行器或 callab
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import Protocol, runtime_checkable
 
 from dayu.contracts.tool_call import (
@@ -100,13 +100,14 @@ class ToolDefinition:
         """校验工具声明的 LLM schema 名称同源。
 
         :returns: 无返回值。
-        :raises ValueError: ``name`` 与 ``schema.function.name`` 不一致时抛出。
+        :raises ValueError: ``name`` 为空，或 ``name`` 与
+            ``schema.function.name`` 不一致时抛出。
         """
 
+        if self.name.strip() == "":
+            raise ValueError("ToolDefinition name must be non-empty")
         if self.name != self.schema.function.name:
-            raise ValueError(
-                "ToolDefinition name must match schema.function.name"
-            )
+            raise ValueError("ToolDefinition name must match schema.function.name")
 
     def to_tool_schema(self) -> ToolSchema:
         """投影为 Engine / Runner 可见的工具 schema。
@@ -123,17 +124,22 @@ class ToolBundle:
     """一组工具声明。
 
     :param definitions: 工具定义元组。
+    :param _allow_empty: 仅供框架 no-tool 真源构造空 bundle。
     """
 
     definitions: tuple[ToolDefinition, ...]
+    _allow_empty: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _allow_empty: bool) -> None:
         """校验 bundle 内工具名唯一。
 
+        :param _allow_empty: 是否允许空工具集合。
         :returns: 无返回值。
-        :raises ValueError: 出现重复工具名时抛出。
+        :raises ValueError: 工具集合为空或出现重复工具名时抛出。
         """
 
+        if not self.definitions and not _allow_empty:
+            raise ValueError("ToolBundle.definitions must be non-empty")
         names: set[str] = set()
         for definition in self.definitions:
             if definition.name in names:
@@ -157,9 +163,7 @@ class ToolBundle:
         """
 
         return {
-            definition.name: definition.truncate
-            for definition in self.definitions
-            if definition.truncate is not None
+            definition.name: definition.truncate for definition in self.definitions if definition.truncate is not None
         }
 
 
@@ -245,11 +249,7 @@ def tool(
         description=description,
         parameters=parameters,
         truncate=truncate,
-        display=(
-            ToolDisplayInfo(name=display_name)
-            if display_name is not None
-            else None
-        ),
+        display=(ToolDisplayInfo(name=display_name) if display_name is not None else None),
         tags=tuple(tags),
     )
 

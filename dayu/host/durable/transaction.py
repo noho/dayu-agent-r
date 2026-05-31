@@ -30,6 +30,7 @@ _SQLITE_CONSTRAINT_FOREIGNKEY = sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
 _SQLITE_CONSTRAINT_CHECK = sqlite3.SQLITE_CONSTRAINT_CHECK
 _SQLITE_EXTENDED_RESULT_CODE_MASK = 0xFF
 _SQLITE_MILLISECONDS_PER_SECOND = 1000
+_SQLITE_WAL_AUTOCHECKPOINT_PAGES = 256
 _LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -67,6 +68,15 @@ class HostTransactionOperation(Protocol[T_co]):
         """
 
         ...
+
+
+class _SQLiteErrorCodeCarrier(Protocol):
+    """Python 运行时 ``sqlite3.Error`` 扩展错误码承载协议。
+
+    :param sqlite_errorcode: SQLite 直接错误码。
+    """
+
+    sqlite_errorcode: int
 
 
 class HostReadTransactionOperation(Protocol[T_co]):
@@ -157,9 +167,7 @@ class HostTransaction:
 
         return self._payload_inline_threshold_bytes
 
-    def execute(
-        self, sql: str, parameters: SQLParameters = ()
-    ) -> HostExecuteResult:
+    def execute(self, sql: str, parameters: SQLParameters = ()) -> HostExecuteResult:
         """执行一条 SQL statement 并返回写入摘要。
 
         :param sql: SQL statement。
@@ -174,9 +182,7 @@ class HostTransaction:
             lastrowid=cursor.lastrowid,
         )
 
-    def fetchone(
-        self, sql: str, parameters: SQLParameters = ()
-    ) -> HostRow | None:
+    def fetchone(self, sql: str, parameters: SQLParameters = ()) -> HostRow | None:
         """执行查询并读取一行。
 
         :param sql: SQL query。
@@ -191,9 +197,7 @@ class HostTransaction:
             return None
         return _build_host_row(cursor, row)
 
-    def fetchall(
-        self, sql: str, parameters: SQLParameters = ()
-    ) -> tuple[HostRow, ...]:
+    def fetchall(self, sql: str, parameters: SQLParameters = ()) -> tuple[HostRow, ...]:
         """执行查询并读取所有行。
 
         :param sql: SQL query。
@@ -233,6 +237,17 @@ class HostTransactionRunner:
         self._connection = connection
         self._sqlite_policy = sqlite_policy
         self._payload_inline_threshold_bytes = payload_inline_threshold_bytes
+        self._active_transaction_count = 0
+
+    @property
+    def has_active_transaction(self) -> bool:
+        """返回当前 runner 是否持有未收口 transaction。
+
+        :returns: 存在已 ``BEGIN`` 且尚未 commit / rollback 的 transaction
+            时返回 ``True``，否则返回 ``False``。
+        """
+
+        return self._active_transaction_count > 0
 
     def run_write(
         self,
@@ -260,15 +275,17 @@ class HostTransactionRunner:
             attempt += 1
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                result = operation(
-                    HostTransaction(
-                        self._connection,
-                        payload_inline_threshold_bytes=(
-                            self._payload_inline_threshold_bytes
-                        ),
+                self._active_transaction_count += 1
+                try:
+                    result = operation(
+                        HostTransaction(
+                            self._connection,
+                            payload_inline_threshold_bytes=(self._payload_inline_threshold_bytes),
+                        )
                     )
-                )
-                self._connection.execute("COMMIT")
+                    self._connection.execute("COMMIT")
+                finally:
+                    self._active_transaction_count -= 1
             except sqlite3.Error as exc:
                 _rollback(self._connection)
                 durable_error = _classify_sqlite_error(exc)
@@ -280,8 +297,7 @@ class HostTransactionRunner:
                         ) from exc
                     time.sleep(delay_seconds)
                     delay_seconds = min(
-                        delay_seconds
-                        * self._sqlite_policy.write_retry_backoff_multiplier,
+                        delay_seconds * self._sqlite_policy.write_retry_backoff_multiplier,
                         self._sqlite_policy.write_retry_max_delay_seconds,
                     )
                     continue
@@ -312,15 +328,17 @@ class HostTransactionRunner:
             attempt += 1
             try:
                 self._connection.execute("BEGIN")
-                result = operation(
-                    HostTransaction(
-                        self._connection,
-                        payload_inline_threshold_bytes=(
-                            self._payload_inline_threshold_bytes
-                        ),
+                self._active_transaction_count += 1
+                try:
+                    result = operation(
+                        HostTransaction(
+                            self._connection,
+                            payload_inline_threshold_bytes=(self._payload_inline_threshold_bytes),
+                        )
                     )
-                )
-                self._connection.execute("COMMIT")
+                    self._connection.execute("COMMIT")
+                finally:
+                    self._active_transaction_count -= 1
             except sqlite3.Error as exc:
                 _rollback(self._connection)
                 if _is_busy_or_locked(exc):
@@ -331,8 +349,7 @@ class HostTransactionRunner:
                         ) from exc
                     time.sleep(delay_seconds)
                     delay_seconds = min(
-                        delay_seconds
-                        * self._sqlite_policy.write_retry_backoff_multiplier,
+                        delay_seconds * self._sqlite_policy.write_retry_backoff_multiplier,
                         self._sqlite_policy.write_retry_max_delay_seconds,
                     )
                     continue
@@ -346,9 +363,7 @@ class HostTransactionRunner:
             return result
 
 
-def configure_connection_pragmas(
-    connection: sqlite3.Connection, sqlite_policy: HostSQLiteStoragePolicy
-) -> None:
+def configure_connection_pragmas(connection: sqlite3.Connection, sqlite_policy: HostSQLiteStoragePolicy) -> None:
     """配置 Host durable SQLite connection 的基础 PRAGMA。
 
     :param connection: SQLite connection。
@@ -357,12 +372,11 @@ def configure_connection_pragmas(
     :raises sqlite3.Error: PRAGMA 设置失败时抛出。
     """
 
-    busy_timeout_ms = int(
-        sqlite_policy.busy_timeout_seconds * _SQLITE_MILLISECONDS_PER_SECOND
-    )
+    busy_timeout_ms = int(sqlite_policy.busy_timeout_seconds * _SQLITE_MILLISECONDS_PER_SECOND)
     connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(f"PRAGMA wal_autocheckpoint={_SQLITE_WAL_AUTOCHECKPOINT_PAGES}")
 
 
 def _build_host_row(cursor: sqlite3.Cursor, row: sqlite3.Row) -> HostRow:
@@ -398,8 +412,7 @@ def _run_after_commit(callbacks: tuple[AfterCommitCallback, ...]) -> None:
                 first_error_index = index
                 continue
             _LOGGER.exception(
-                "Host durable after-commit callback secondary failure "
-                "callback_index=%s first_callback_index=%s",
+                "Host durable after-commit callback secondary failure " "callback_index=%s first_callback_index=%s",
                 index,
                 first_error_index,
             )
@@ -458,14 +471,17 @@ def _sqlite_error_code(error: sqlite3.Error) -> int | None:
     """读取 Python 运行时 SQLite extended error code。
 
     ``sqlite3.Error.sqlite_errorcode`` 是 Python 3.11 暴露的 SQLite 直接错误码；
-    这里用 ``getattr`` 是为了兼容类型 stub 对该运行时属性声明不足的情况，
-    而不是用字符串消息猜测 busy / locked 或约束错误。
+    类型 stub 可能未声明该运行时属性，因此只在缺失时按 ``None`` 收口，
+    不用字符串消息猜测 busy / locked 或约束错误。
 
     :param error: SQLite error。
     :returns: SQLite error code；缺失或不是整数时返回 ``None``。
     """
 
-    code = getattr(error, "sqlite_errorcode", None)
+    try:
+        code = cast(_SQLiteErrorCodeCarrier, error).sqlite_errorcode
+    except AttributeError:
+        return None
     if isinstance(code, int):
         return code
     return None

@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_declaration import ToolBundle
+from dayu.contracts.tool_schema import ToolSchema
 from dayu.host.api import (
     AttemptStatus,
     AuthorizationClaim,
@@ -135,6 +136,7 @@ from dayu.host.projection import (
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.tool_runtime_schema_projection import (
     business_bundle_digest as _business_bundle_digest,
+    tool_definitions_digest as _tool_definitions_digest,
     tool_schemas_digest as _tool_schemas_digest,
 )
 from dayu.host.tooling import HostToolingOptions
@@ -3518,13 +3520,13 @@ def _effective_tool_set_json(
     :raises ValueError: 工具 bundle schema 字段非法时由底层转换抛出。
     """
 
-    business_bundle = (
-        ToolBundle(definitions=())
+    business_definitions = (
+        ()
         if tooling_options is None
-        else tooling_options.business_tool_bundle
+        else tooling_options.business_tool_bundle.definitions
     )
     known_names = frozenset(
-        definition.name for definition in business_bundle.definitions
+        definition.name for definition in business_definitions
     )
     if requested_tool_names is None:
         effective_names = known_names
@@ -3546,14 +3548,12 @@ def _effective_tool_set_json(
             if not requested_tool_names
             else _TOOL_SELECTION_SUBSET
         )
-    selected_bundle = ToolBundle(
-        definitions=tuple(
-            definition
-            for definition in business_bundle.definitions
-            if definition.name in effective_names
-        )
+    selected_schemas = tuple(
+        definition.to_tool_schema()
+        for definition in business_definitions
+        if definition.name in effective_names
     )
-    schema_digest = _tool_schemas_digest(selected_bundle.to_tool_schemas())
+    schema_digest = _tool_schemas_digest(selected_schemas)
     source_refs_json: list[JsonValue] = []
     if tooling_options is not None:
         source_refs_json = [
@@ -3574,7 +3574,7 @@ def _effective_tool_set_json(
             else _sorted_text_json_array(requested_tool_names)
         ),
         "effective_business_tool_names": _sorted_text_json_array(effective_names),
-        "business_bundle_digest": _business_bundle_digest(business_bundle),
+        "business_bundle_digest": _tool_definitions_digest(business_definitions),
         "effective_schema_digest": schema_digest,
         "source_refs": source_refs_json,
     }
@@ -3587,16 +3587,16 @@ def _no_tool_effective_tool_set_json() -> JsonValue:
     :returns: 表示禁用业务工具的 tool set JSON。
     """
 
-    empty_bundle = ToolBundle(definitions=())
-    empty_schemas = empty_bundle.to_tool_schemas()
+    empty_schemas: tuple[ToolSchema, ...] = ()
+    empty_schema_digest = _tool_schemas_digest(empty_schemas)
     return {
         "tool_snapshot_ref": _TOOL_SNAPSHOT_REF_PREFIX
-        + _tool_schemas_digest(empty_schemas),
+        + empty_schema_digest,
         "selector": _TOOL_SELECTION_NONE,
         "requested_business_tool_names": [],
         "effective_business_tool_names": [],
-        "business_bundle_digest": _business_bundle_digest(empty_bundle),
-        "effective_schema_digest": _tool_schemas_digest(empty_schemas),
+        "business_bundle_digest": _tool_definitions_digest(()),
+        "effective_schema_digest": empty_schema_digest,
         "source_refs": [],
     }
 

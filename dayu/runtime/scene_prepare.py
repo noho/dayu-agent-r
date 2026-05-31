@@ -47,9 +47,7 @@ _ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
         "context_slots",
     }
 )
-_ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset(
-    {"default_model_id", "runner_option_hint_id"}
-)
+_ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset({"default_model_id", "runner_option_hint_id"})
 _ALLOWED_AGENT_POLICY_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "max_iterations",
@@ -65,18 +63,10 @@ _ALLOWED_AGENT_POLICY_FIELDS: Final[frozenset[str]] = frozenset(
 _ALLOWED_TOOL_SELECTION_FIELDS: Final[frozenset[str]] = frozenset(
     {"mode", "tool_names", "tool_tags_any", "allow_empty"}
 )
-_ALLOWED_DEFAULTS_FIELDS: Final[frozenset[str]] = frozenset(
-    {"missing_required_fragment"}
-)
-_ALLOWED_FRAGMENT_FIELDS: Final[frozenset[str]] = frozenset(
-    {"id", "path", "order", "required"}
-)
-_ALLOWED_CONTEXT_SLOT_FIELDS: Final[frozenset[str]] = frozenset(
-    {"name", "value_type", "required"}
-)
-_AGENT_FALLBACK_MODES: Final[frozenset[str]] = frozenset(
-    {"force_answer", "raise_error"}
-)
+_ALLOWED_DEFAULTS_FIELDS: Final[frozenset[str]] = frozenset({"missing_required_fragment"})
+_ALLOWED_FRAGMENT_FIELDS: Final[frozenset[str]] = frozenset({"id", "path", "order", "required"})
+_ALLOWED_CONTEXT_SLOT_FIELDS: Final[frozenset[str]] = frozenset({"name", "value_type", "required"})
+_AGENT_FALLBACK_MODES: Final[frozenset[str]] = frozenset({"force_answer", "raise_error"})
 
 JsonObject: TypeAlias = Mapping[str, JsonValue]
 """scene manifest JSON object 的只读映射类型。"""
@@ -191,11 +181,7 @@ class SceneToolCatalog:
         :returns: 命中任一标签的工具名集合。
         """
 
-        return frozenset(
-            tool.name
-            for tool in self.tools
-            if not tool.tags.isdisjoint(tags)
-        )
+        return frozenset(tool.name for tool in self.tools if not tool.tags.isdisjoint(tags))
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,9 +518,7 @@ def prepare_scene(request: ScenePrepareRequest) -> PreparedSceneInputs:
     return ScenePrepare().prepare(request)
 
 
-def _resolve_scene(
-    *, scene_id: str, manifest_root: Path, stack: tuple[str, ...]
-) -> _ResolvedScene:
+def _resolve_scene(*, scene_id: str, manifest_root: Path, stack: tuple[str, ...]) -> _ResolvedScene:
     """解析 scene manifest 继承链。
 
     :param scene_id: 当前解析的 scene id。
@@ -561,9 +545,7 @@ def _resolve_scene(
     return _resolved_from_manifest(parent=parent, manifest=manifest)
 
 
-def _resolved_from_manifest(
-    *, parent: _ResolvedScene | None, manifest: _SceneManifest
-) -> _ResolvedScene:
+def _resolved_from_manifest(*, parent: _ResolvedScene | None, manifest: _SceneManifest) -> _ResolvedScene:
     """把单个 manifest 合并到可选父 scene。
 
     :param parent: 已解析父 scene；无父时为 ``None``。
@@ -596,9 +578,7 @@ def _resolved_from_manifest(
         parent_manifests = parent.manifests
     fragments = (*parent_fragments, *manifest.fragments)
     _validate_fragment_uniqueness(fragments, scene_id=manifest.scene_id)
-    context_slots = _dedupe_context_slots(
-        (*parent_context_slots, *manifest.context_slots)
-    )
+    context_slots = _dedupe_context_slots((*parent_context_slots, *manifest.context_slots))
     return _ResolvedScene(
         manifests=(*parent_manifests, manifest),
         scene_id=manifest.scene_id,
@@ -679,15 +659,11 @@ def _load_manifest(*, scene_id: str, manifest_root: Path) -> _SceneManifest:
         relative_manifest_path=f"{scene_id}{_SCENE_FILE_SUFFIX}",
     )
     if manifest.scene_id != scene_id:
-        raise ScenePrepareError(
-            f"scene manifest file {scene_id} declares different scene: {manifest.scene_id}"
-        )
+        raise ScenePrepareError(f"scene manifest file {scene_id} declares different scene: {manifest.scene_id}")
     return manifest
 
 
-def _parse_manifest(
-    *, raw: JsonObject, manifest_path: Path, relative_manifest_path: str
-) -> _SceneManifest:
+def _parse_manifest(*, raw: JsonObject, manifest_path: Path, relative_manifest_path: str) -> _SceneManifest:
     """解析单个 manifest JSON object。
 
     :param raw: manifest JSON object。
@@ -713,11 +689,22 @@ def _parse_manifest(
         capability_tags=_parse_text_tuple(raw, field_name="capability_tags", context=relative_manifest_path),
         extends=extends,
         model_hints=_parse_model_hints(_optional_field(raw, "model"), context=relative_manifest_path),
-        agent_policy_override=_parse_agent_policy_override(_optional_field(raw, "agent_policy"), context=relative_manifest_path),
+        agent_policy_override=_parse_agent_policy_override(
+            _optional_field(raw, "agent_policy"), context=relative_manifest_path
+        ),
         tool_selection=_parse_tool_selection(_optional_field(raw, "tool_selection"), context=relative_manifest_path),
-        defaults=_parse_defaults(_require_mapping_field(raw, field_name="defaults", context=relative_manifest_path), context=relative_manifest_path),
-        fragments=_parse_fragments(_require_sequence_field(raw, field_name="fragments", context=relative_manifest_path), context=relative_manifest_path),
-        context_slots=_parse_context_slots(_require_sequence_field(raw, field_name="context_slots", context=relative_manifest_path), context=relative_manifest_path),
+        defaults=_parse_defaults(
+            _require_mapping_field(raw, field_name="defaults", context=relative_manifest_path),
+            context=relative_manifest_path,
+        ),
+        fragments=_parse_fragments(
+            _require_sequence_field(raw, field_name="fragments", context=relative_manifest_path),
+            context=relative_manifest_path,
+        ),
+        context_slots=_parse_context_slots(
+            _require_sequence_field(raw, field_name="context_slots", context=relative_manifest_path),
+            context=relative_manifest_path,
+        ),
         raw=raw,
         manifest_path=manifest_path,
         relative_manifest_path=relative_manifest_path,
@@ -774,9 +761,7 @@ def _parse_model_hints(value: JsonValue | None, *, context: str) -> SceneModelHi
     )
 
 
-def _parse_agent_policy_override(
-    value: JsonValue | None, *, context: str
-) -> SceneAgentPolicyOverride | None:
+def _parse_agent_policy_override(value: JsonValue | None, *, context: str) -> SceneAgentPolicyOverride | None:
     """解析 ``agent_policy`` typed override。
 
     :param value: ``agent_policy`` 字段值。
@@ -836,9 +821,7 @@ def _parse_agent_policy_override(
     )
 
 
-def _parse_tool_selection(
-    value: JsonValue | None, *, context: str
-) -> SceneToolSelection | None:
+def _parse_tool_selection(value: JsonValue | None, *, context: str) -> SceneToolSelection | None:
     """解析 ``tool_selection`` 配置。
 
     :param value: ``tool_selection`` 字段值。
@@ -905,15 +888,11 @@ def _parse_defaults(record: JsonObject, *, context: str) -> _SceneDefaults:
         context=f"{context}.defaults",
     )
     if policy != _MISSING_FRAGMENT_POLICY_FAIL_CLOSED:
-        raise ScenePrepareError(
-            f"{context}.defaults.missing_required_fragment must be fail_closed"
-        )
+        raise ScenePrepareError(f"{context}.defaults.missing_required_fragment must be fail_closed")
     return _SceneDefaults(missing_required_fragment=policy)
 
 
-def _parse_fragments(
-    values: Sequence[JsonValue], *, context: str
-) -> tuple[_ManifestFragment, ...]:
+def _parse_fragments(values: Sequence[JsonValue], *, context: str) -> tuple[_ManifestFragment, ...]:
     """解析 ``fragments`` 配置。
 
     :param values: fragment JSON 值序列。
@@ -954,9 +933,7 @@ def _parse_fragments(
     return tuple(fragments)
 
 
-def _parse_context_slots(
-    values: Sequence[JsonValue], *, context: str
-) -> tuple[_ContextSlot, ...]:
+def _parse_context_slots(values: Sequence[JsonValue], *, context: str) -> tuple[_ContextSlot, ...]:
     """解析 ``context_slots`` 配置。
 
     :param values: context slot JSON 值序列。
@@ -1022,12 +999,8 @@ def _load_fragment_contents(
         if not path.exists():
             if fragment.required:
                 if defaults.missing_required_fragment == _MISSING_FRAGMENT_POLICY_FAIL_CLOSED:
-                    raise ScenePrepareError(
-                        f"required fragment missing: {fragment.fragment_id}"
-                    )
-                raise ScenePrepareError(
-                    f"required fragment missing without fail-closed policy: {fragment.fragment_id}"
-                )
+                    raise ScenePrepareError(f"required fragment missing: {fragment.fragment_id}")
+                raise ScenePrepareError(f"required fragment missing without fail-closed policy: {fragment.fragment_id}")
             continue
         loaded.append((fragment, path.read_text(encoding="utf-8")))
     return tuple(loaded)
@@ -1062,11 +1035,7 @@ def _render_fragment_content(
         context_slot_values=context_slot_values,
         fragment_id=fragment_id,
     )
-    if (
-        _UNRESOLVED_PLACEHOLDER_PATTERN.search(rendered) is not None
-        or "{{" in rendered
-        or "}}" in rendered
-    ):
+    if _UNRESOLVED_PLACEHOLDER_PATTERN.search(rendered) is not None:
         raise ScenePrepareError(f"unresolved placeholder remains in fragment {fragment_id}")
     return rendered
 
@@ -1091,16 +1060,12 @@ def _replace_placeholders(
     rendered_parts: list[str] = []
     cursor = 0
     for match in _PLACEHOLDER_PATTERN.finditer(content):
-        rendered_parts.append(content[cursor:match.start()])
+        rendered_parts.append(content[cursor : match.start()])
         slot_name = match.group(1)
         if slot_name not in slot_names:
-            raise ScenePrepareError(
-                f"unknown placeholder in fragment {fragment_id}: {slot_name}"
-            )
+            raise ScenePrepareError(f"unknown placeholder in fragment {fragment_id}: {slot_name}")
         if slot_name not in context_slot_values:
-            raise ScenePrepareError(
-                f"context slot value missing for placeholder {slot_name}"
-            )
+            raise ScenePrepareError(f"context slot value missing for placeholder {slot_name}")
         value = context_slot_values[slot_name]
         if not isinstance(value, str):
             raise ScenePrepareError(f"context slot value must be string: {slot_name}")
@@ -1110,9 +1075,7 @@ def _replace_placeholders(
     return "".join(rendered_parts)
 
 
-def _select_tools(
-    *, selection: SceneToolSelection, catalog: SceneToolCatalog
-) -> SceneToolSelectionResult:
+def _select_tools(*, selection: SceneToolSelection, catalog: SceneToolCatalog) -> SceneToolSelectionResult:
     """根据 manifest tool_selection 和可用工具目录计算工具白名单。
 
     :param selection: manifest 工具选择配置。
@@ -1131,15 +1094,10 @@ def _select_tools(
     available_names = catalog.names()
     unknown_names = selection.tool_names - available_names
     if unknown_names:
-        raise ScenePrepareError(
-            "unknown tool_names: " + ", ".join(sorted(unknown_names))
-        )
+        raise ScenePrepareError("unknown tool_names: " + ", ".join(sorted(unknown_names)))
     selected_by_tag = catalog.names_for_any_tag(selection.tool_tags_any)
     if selection.tool_tags_any and not selected_by_tag and not selection.allow_empty:
-        raise ScenePrepareError(
-            "tool_tags_any matched no tools: "
-            + ", ".join(sorted(selection.tool_tags_any))
-        )
+        raise ScenePrepareError("tool_tags_any matched no tools: " + ", ".join(sorted(selection.tool_tags_any)))
     selected = frozenset((*selection.tool_names, *selected_by_tag))
     if not selected and not selection.allow_empty:
         raise ScenePrepareError("tool_selection select produced empty tool set")
@@ -1225,9 +1183,7 @@ def _prepared_scene_digest(
         "context_slot_values": _sorted_text_mapping_json(request.context_slot_values),
         "available_tools": _tool_catalog_json(request.available_tools),
         "selected_tool_names": (
-            None
-            if tool_selection.tool_names is None
-            else _text_sequence_json(tuple(sorted(tool_selection.tool_names)))
+            None if tool_selection.tool_names is None else _text_sequence_json(tuple(sorted(tool_selection.tool_names)))
         ),
     }
     return canonical_json_digest(payload)
@@ -1265,9 +1221,7 @@ def _tool_catalog_json(catalog: SceneToolCatalog) -> JsonValue:
     return tools
 
 
-def _require_exact_fields(
-    record: JsonObject, *, allowed: frozenset[str], context: str
-) -> None:
+def _require_exact_fields(record: JsonObject, *, allowed: frozenset[str], context: str) -> None:
     """校验 JSON object 只包含允许字段。
 
     :param record: JSON object。
@@ -1279,15 +1233,10 @@ def _require_exact_fields(
 
     unknown = frozenset(record) - allowed
     if unknown:
-        raise ScenePrepareError(
-            f"{context} contains unsupported fields: "
-            + ", ".join(sorted(unknown))
-        )
+        raise ScenePrepareError(f"{context} contains unsupported fields: " + ", ".join(sorted(unknown)))
 
 
-def _parse_optional_fallback_mode(
-    record: JsonObject, *, context: str
-) -> SceneAgentFallbackMode | None:
+def _parse_optional_fallback_mode(record: JsonObject, *, context: str) -> SceneAgentFallbackMode | None:
     """解析可选 fallback mode。
 
     :param record: agent policy override JSON object。
@@ -1384,9 +1333,7 @@ def _validate_context_slot_values(values: Mapping[str, str]) -> None:
             raise ScenePrepareError(f"context slot value must be string: {key}")
 
 
-def _validate_fragment_uniqueness(
-    fragments: tuple[_ManifestFragment, ...], *, scene_id: str
-) -> None:
+def _validate_fragment_uniqueness(fragments: tuple[_ManifestFragment, ...], *, scene_id: str) -> None:
     """校验 fragment id 与 order 唯一。
 
     :param fragments: fragment 列表。
@@ -1454,9 +1401,7 @@ def _optional_field(record: JsonObject, field_name: str) -> JsonValue | None:
     return record[field_name]
 
 
-def _require_mapping_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> JsonObject:
+def _require_mapping_field(record: JsonObject, *, field_name: str, context: str) -> JsonObject:
     """读取必需 JSON object 字段。
 
     :param record: JSON object。
@@ -1471,9 +1416,7 @@ def _require_mapping_field(
     return _require_json_object(record[field_name], context=f"{context}.{field_name}")
 
 
-def _require_sequence_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> Sequence[JsonValue]:
+def _require_sequence_field(record: JsonObject, *, field_name: str, context: str) -> Sequence[JsonValue]:
     """读取必需 JSON array 字段。
 
     :param record: JSON object。
@@ -1497,11 +1440,14 @@ def _require_json_object(value: JsonValue, *, context: str) -> JsonObject:
     :param value: JSON 值。
     :param context: 错误消息上下文。
     :returns: JSON object。
-    :raises ScenePrepareError: 值不是 object 时抛出。
+    :raises ScenePrepareError: 值不是 object 或 key 不是字符串时抛出。
     """
 
     if not isinstance(value, Mapping):
         raise ScenePrepareError(f"{context} must be object")
+    for key in value:
+        if not isinstance(key, str):
+            raise ScenePrepareError(f"{context} keys must be string")
     return value
 
 
@@ -1523,9 +1469,7 @@ def _require_str_field(record: JsonObject, *, field_name: str, context: str) -> 
     return _require_non_empty_text(value, field_name=f"{context}.{field_name}")
 
 
-def _optional_str_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> str | None:
+def _optional_str_field(record: JsonObject, *, field_name: str, context: str) -> str | None:
     """读取可选字符串字段。
 
     :param record: JSON object。
@@ -1561,9 +1505,7 @@ def _require_int_field(record: JsonObject, *, field_name: str, context: str) -> 
     return value
 
 
-def _optional_bool_field(
-    record: JsonObject, *, field_name: str, context: str, default: bool
-) -> bool:
+def _optional_bool_field(record: JsonObject, *, field_name: str, context: str, default: bool) -> bool:
     """读取可选 bool 字段。
 
     :param record: JSON object。
@@ -1582,9 +1524,7 @@ def _optional_bool_field(
     return value
 
 
-def _optional_bool_field_or_none(
-    record: JsonObject, *, field_name: str, context: str
-) -> bool | None:
+def _optional_bool_field_or_none(record: JsonObject, *, field_name: str, context: str) -> bool | None:
     """读取可选 bool 字段，缺省时返回 ``None``。
 
     :param record: JSON object。
@@ -1602,9 +1542,7 @@ def _optional_bool_field_or_none(
     return value
 
 
-def _optional_positive_int_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> int | None:
+def _optional_positive_int_field(record: JsonObject, *, field_name: str, context: str) -> int | None:
     """读取可选正整数字段。
 
     :param record: JSON object。
@@ -1622,9 +1560,7 @@ def _optional_positive_int_field(
     return value
 
 
-def _optional_non_negative_int_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> int | None:
+def _optional_non_negative_int_field(record: JsonObject, *, field_name: str, context: str) -> int | None:
     """读取可选非负整数字段。
 
     :param record: JSON object。
@@ -1642,9 +1578,7 @@ def _optional_non_negative_int_field(
     return value
 
 
-def _optional_int_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> int | None:
+def _optional_int_field(record: JsonObject, *, field_name: str, context: str) -> int | None:
     """读取可选整数字段。
 
     :param record: JSON object。
@@ -1662,9 +1596,7 @@ def _optional_int_field(
     return value
 
 
-def _optional_positive_float_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> float | None:
+def _optional_positive_float_field(record: JsonObject, *, field_name: str, context: str) -> float | None:
     """读取可选有限正数字段。
 
     :param record: JSON object。
@@ -1685,9 +1617,7 @@ def _optional_positive_float_field(
     return numeric_value
 
 
-def _parse_text_tuple(
-    record: JsonObject, *, field_name: str, context: str
-) -> tuple[str, ...]:
+def _parse_text_tuple(record: JsonObject, *, field_name: str, context: str) -> tuple[str, ...]:
     """解析必需字符串数组字段。
 
     :param record: JSON object。
@@ -1701,9 +1631,7 @@ def _parse_text_tuple(
     return _text_tuple_from_values(values, context=f"{context}.{field_name}")
 
 
-def _parse_optional_text_tuple(
-    record: JsonObject, *, field_name: str, context: str
-) -> tuple[str, ...]:
+def _parse_optional_text_tuple(record: JsonObject, *, field_name: str, context: str) -> tuple[str, ...]:
     """解析可选字符串数组字段。
 
     :param record: JSON object。
@@ -1721,9 +1649,7 @@ def _parse_optional_text_tuple(
     return _text_tuple_from_values(value, context=f"{context}.{field_name}")
 
 
-def _text_tuple_from_values(
-    values: Sequence[JsonValue], *, context: str
-) -> tuple[str, ...]:
+def _text_tuple_from_values(values: Sequence[JsonValue], *, context: str) -> tuple[str, ...]:
     """把 JSON array 解析为字符串元组。
 
     :param values: JSON 值序列。
@@ -1787,6 +1713,7 @@ def _require_non_empty_text(value: str, *, field_name: str) -> str:
 
 __all__ = [
     "PreparedSceneInputs",
+    "SceneFragmentRef",
     "SceneAgentFallbackMode",
     "SceneAgentPolicyOverride",
     "SceneModelHints",

@@ -519,7 +519,7 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
 async def test_finish_reason_mismatch_logs_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """content completed 与 done 的 finish_reason 不一致时必须记录 warning。"""
+    """finish_reason 不一致时必须记录 warning 且保留更早完成原因。"""
 
     runner = _ScriptedRunner(
         events=(
@@ -554,7 +554,7 @@ async def test_finish_reason_mismatch_logs_warning(
     ]
     assert len(iteration_completed) == 1
     assert isinstance(iteration_completed[0].data, IterationCompletedData)
-    assert iteration_completed[0].data.finish_reason is FinishReason.LENGTH
+    assert iteration_completed[0].data.finish_reason is FinishReason.STOP
 
 
 @pytest.mark.asyncio

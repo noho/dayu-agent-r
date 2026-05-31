@@ -191,9 +191,7 @@ class RunInputMaterialBlock:
             self.canonical_source_refs,
             "RunInputMaterialBlock.canonical_source_refs",
         )
-        _require_non_empty_text(
-            self.content_digest, "RunInputMaterialBlock.content_digest"
-        )
+        _require_non_empty_text(self.content_digest, "RunInputMaterialBlock.content_digest")
         if self.event_sequence is not None and self.event_sequence < 0:
             raise ValueError("RunInputMaterialBlock.event_sequence must be non-negative")
         if self.event_sub_index < 0:
@@ -212,9 +210,7 @@ class RunInputMaterialBlock:
             "RunInputMaterialBlock.tool_call_event_ref",
         )
         _require_string_tuple(self.payload_refs, "RunInputMaterialBlock.payload_refs")
-        _require_string_tuple(
-            self.artifact_refs, "RunInputMaterialBlock.artifact_refs"
-        )
+        _require_string_tuple(self.artifact_refs, "RunInputMaterialBlock.artifact_refs")
         _require_opaque_evidence_ref_tuple(
             self.source_locator_refs,
             "RunInputMaterialBlock.source_locator_refs",
@@ -368,9 +364,7 @@ class _EvidenceChunk:
     content_digest: str
 
 
-def material_label(
-    section: CompactMaterialSection, ordinal: int
-) -> PromptLocalMaterialLabel:
+def material_label(section: CompactMaterialSection, ordinal: int) -> PromptLocalMaterialLabel:
     """构造普通 prompt-local material label。
 
     :param section: material section。
@@ -387,9 +381,7 @@ def material_label(
     return f"{_SECTION_PREFIXES[section]}{ordinal}"
 
 
-def evidence_chunk_label(
-    evidence_ordinal: int, chunk_ordinal: int
-) -> PromptLocalMaterialLabel:
+def evidence_chunk_label(evidence_ordinal: int, chunk_ordinal: int) -> PromptLocalMaterialLabel:
     """构造 evidence chunk prompt-local label。
 
     :param evidence_ordinal: evidence block ordinal。
@@ -402,10 +394,7 @@ def evidence_chunk_label(
         raise ValueError("evidence_ordinal must be positive")
     if chunk_ordinal < _FIRST_ORDINAL:
         raise ValueError("chunk_ordinal must be positive")
-    return (
-        f"{_EVIDENCE_PREFIX}{evidence_ordinal}"
-        f"{_LABEL_CHUNK_SEPARATOR}{chunk_ordinal}"
-    )
+    return f"{_EVIDENCE_PREFIX}{evidence_ordinal}" f"{_LABEL_CHUNK_SEPARATOR}{chunk_ordinal}"
 
 
 def current_input_anchor_label() -> PromptLocalMaterialLabel:
@@ -420,9 +409,7 @@ def current_input_anchor_label() -> PromptLocalMaterialLabel:
     )
 
 
-def validate_material_label(
-    label: PromptLocalMaterialLabel, section: CompactMaterialSection
-) -> None:
+def validate_material_label(label: PromptLocalMaterialLabel, section: CompactMaterialSection) -> None:
     """校验 prompt-local label 与 section 是否匹配。
 
     :param label: 待校验 label。
@@ -574,15 +561,11 @@ def select_compact_segment(
         recent_raw_turns_floor=recent_raw_turns_floor,
         max_selected_size_units=max_selected_size_units,
     )
-    protected_recent_ids = _protected_recent_raw_block_ids(
-        material_blocks, recent_raw_turns_floor
-    )
+    protected_recent_ids = _protected_recent_raw_block_ids(material_blocks, recent_raw_turns_floor)
     selected: list[str] = []
     excluded_reasons: dict[str, str] = {}
     selected_units = 0
-    for block in _sorted_material_blocks(
-        material_blocks, memory_snapshot_cursor=memory_snapshot_cursor
-    ):
+    for block in _sorted_material_blocks(material_blocks, memory_snapshot_cursor=memory_snapshot_cursor):
         reason = _block_exclusion_reason(block, protected_recent_ids)
         if reason is not None:
             excluded_reasons[block.block_id] = reason
@@ -845,7 +828,7 @@ def build_initial_material_pack(
     provenance_entries = [
         _current_anchor_provenance(current_anchor),
         *_history_provenance(history_blocks),
-        *_evidence_provenance(evidence_blocks, evidence_materials),
+        *_evidence_provenance(evidence_materials),
     ]
     provenance_map = {entry.label: entry for entry in provenance_entries}
     return CompactMaterialPack(
@@ -894,9 +877,7 @@ def initial_segment_selection(
     )
 
 
-def _history_blocks(
-    materials: tuple[InitialHistoryMaterial, ...]
-) -> tuple[CompactMaterialBlock, ...]:
+def _history_blocks(materials: tuple[InitialHistoryMaterial, ...]) -> tuple[CompactMaterialBlock, ...]:
     """把初始 history material 转为 typed blocks。
 
     :param materials: 初始 history material。
@@ -923,9 +904,7 @@ def _history_blocks(
     return tuple(blocks)
 
 
-def _evidence_blocks(
-    materials: tuple[InitialEvidenceMaterial, ...]
-) -> tuple[CompactEvidenceBlock, ...]:
+def _evidence_blocks(materials: tuple[InitialEvidenceMaterial, ...]) -> tuple[CompactEvidenceBlock, ...]:
     """把初始 evidence material 转为 typed blocks。
 
     :param materials: 初始 evidence material。
@@ -975,9 +954,7 @@ def _current_anchor_provenance(
     )
 
 
-def _history_provenance(
-    blocks: tuple[CompactMaterialBlock, ...]
-) -> tuple[PromptLocalProvenanceEntry, ...]:
+def _history_provenance(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[PromptLocalProvenanceEntry, ...]:
     """构造 history block provenance entries。
 
     :param blocks: history blocks。
@@ -1006,18 +983,15 @@ def _history_provenance(
 
 
 def _evidence_provenance(
-    blocks: tuple[CompactEvidenceBlock, ...],
     materials: tuple[InitialEvidenceMaterial, ...],
 ) -> tuple[PromptLocalProvenanceEntry, ...]:
     """构造 evidence block provenance entries。
 
-    :param blocks: evidence blocks。
     :param materials: 初始 evidence material。
     :returns: provenance entries。
     """
 
     entries: list[PromptLocalProvenanceEntry] = []
-    del blocks
     for index, material in enumerate(materials, start=_FIRST_ORDINAL):
         for chunk in _evidence_chunks(index, material.raw_result_text):
             entries.append(
@@ -1145,9 +1119,7 @@ def _sorted_material_blocks(
     )
 
 
-def _block_event_sequence(
-    block: RunInputMaterialBlock, memory_snapshot_cursor: int | None
-) -> int:
+def _block_event_sequence(block: RunInputMaterialBlock, memory_snapshot_cursor: int | None) -> int:
     """返回排序使用的 event sequence。
 
     :param block: material block。
@@ -1172,19 +1144,13 @@ def _protected_recent_raw_block_ids(
     :returns: protected block id 集合。
     """
 
-    explicit = [
-        block.block_id
-        for block in blocks
-        if block.protected_recent_raw_turn and _is_raw_turn_block(block)
-    ]
+    explicit = [block.block_id for block in blocks if block.protected_recent_raw_turn and _is_raw_turn_block(block)]
     if recent_raw_turns_floor == 0:
         return frozenset(explicit)
     raw_blocks = sorted(
         (block for block in blocks if _is_raw_turn_block(block)),
         key=lambda block: (
-            _NO_EVENT_SEQUENCE
-            if block.event_sequence is None
-            else block.event_sequence,
+            _NO_EVENT_SEQUENCE if block.event_sequence is None else block.event_sequence,
             block.event_sub_index,
             block.block_id,
         ),
@@ -1208,9 +1174,7 @@ def _is_raw_turn_block(block: RunInputMaterialBlock) -> bool:
     )
 
 
-def _block_exclusion_reason(
-    block: RunInputMaterialBlock, protected_recent_ids: frozenset[str]
-) -> str | None:
+def _block_exclusion_reason(block: RunInputMaterialBlock, protected_recent_ids: frozenset[str]) -> str | None:
     """返回 block 的 deterministic exclusion reason。
 
     :param block: material block。
@@ -1288,9 +1252,7 @@ def _effective_snapshot(
     return memory_snapshot
 
 
-def _current_input_anchor(
-    current_input_ref: str, current_input_text: str
-) -> CurrentInputAnchor:
+def _current_input_anchor(current_input_ref: str, current_input_text: str) -> CurrentInputAnchor:
     """构造 current input anchor。
 
     :param current_input_ref: current input canonical ref。
@@ -1303,13 +1265,8 @@ def _current_input_anchor(
         anchor_text = normalized
         truncated = False
     else:
-        prefix_len = (
-            CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS
-            - len(_CURRENT_INPUT_TRUNCATED_MARKER)
-        )
-        anchor_text = (
-            normalized[:prefix_len].rstrip() + _CURRENT_INPUT_TRUNCATED_MARKER
-        )
+        prefix_len = CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS - len(_CURRENT_INPUT_TRUNCATED_MARKER)
+        anchor_text = normalized[:prefix_len].rstrip() + _CURRENT_INPUT_TRUNCATED_MARKER
         truncated = True
     return CurrentInputAnchor(
         anchor_label=current_input_anchor_label(),
@@ -1347,9 +1304,7 @@ def _selected_material_blocks(
     return tuple(selected)
 
 
-def _is_current_input_history_duplicate(
-    block: RunInputMaterialBlock, current_anchor: CurrentInputAnchor
-) -> bool:
+def _is_current_input_history_duplicate(block: RunInputMaterialBlock, current_anchor: CurrentInputAnchor) -> bool:
     """判断 history block 是否重复当前输入 anchor。
 
     :param block: material block。
@@ -1476,9 +1431,7 @@ def _snapshot_assumptions_text(snapshot: ConversationMemorySnapshot) -> str | No
     return "\n".join(lines)
 
 
-def _pack_stable_blocks(
-    blocks: tuple[RunInputMaterialBlock, ...]
-) -> tuple[CompactMaterialBlock, ...]:
+def _pack_stable_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[CompactMaterialBlock, ...]:
     """把 stable material view 转为 prompt-local blocks。
 
     :param blocks: stable material blocks。
@@ -1491,9 +1444,7 @@ def _pack_stable_blocks(
     return tuple(result)
 
 
-def _pack_history_blocks(
-    blocks: tuple[RunInputMaterialBlock, ...]
-) -> tuple[CompactMaterialBlock, ...]:
+def _pack_history_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[CompactMaterialBlock, ...]:
     """把 selected history material 转为 prompt-local blocks。
 
     :param blocks: selected material blocks。
@@ -1501,17 +1452,13 @@ def _pack_history_blocks(
     """
 
     result: list[CompactMaterialBlock] = []
-    history_blocks = tuple(
-        block for block in blocks if block.section is CompactMaterialSection.HISTORY_INPUT
-    )
+    history_blocks = tuple(block for block in blocks if block.section is CompactMaterialSection.HISTORY_INPUT)
     for index, block in enumerate(history_blocks, start=_FIRST_ORDINAL):
         result.append(_compact_material_block(block, index))
     return tuple(result)
 
 
-def _compact_material_block(
-    block: RunInputMaterialBlock, ordinal: int
-) -> CompactMaterialBlock:
+def _compact_material_block(block: RunInputMaterialBlock, ordinal: int) -> CompactMaterialBlock:
     """构造普通 prompt-local material block。
 
     :param block: ordinary material block。
@@ -1531,9 +1478,7 @@ def _compact_material_block(
     )
 
 
-def _pack_evidence_blocks(
-    blocks: tuple[RunInputMaterialBlock, ...]
-) -> tuple[CompactEvidenceBlock, ...]:
+def _pack_evidence_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[CompactEvidenceBlock, ...]:
     """把 selected evidence material 转为 prompt-local evidence blocks。
 
     :param blocks: selected material blocks。
@@ -1541,9 +1486,7 @@ def _pack_evidence_blocks(
     """
 
     result: list[CompactEvidenceBlock] = []
-    evidence_blocks = tuple(
-        block for block in blocks if block.section is CompactMaterialSection.EVIDENCE_INPUT
-    )
+    evidence_blocks = tuple(block for block in blocks if block.section is CompactMaterialSection.EVIDENCE_INPUT)
     for index, block in enumerate(evidence_blocks, start=_FIRST_ORDINAL):
         for chunk in _evidence_chunks(index, block.text):
             result.append(
@@ -1570,9 +1513,7 @@ def _pack_evidence_blocks(
     return tuple(result)
 
 
-def _provenance_from_blocks(
-    blocks: tuple[CompactMaterialBlock, ...]
-) -> tuple[PromptLocalProvenanceEntry, ...]:
+def _provenance_from_blocks(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[PromptLocalProvenanceEntry, ...]:
     """构造普通 material provenance entries。
 
     :param blocks: compact material blocks。
@@ -1609,11 +1550,7 @@ def _provenance_from_evidence_blocks(
     :returns: provenance entries。
     """
 
-    source_blocks = tuple(
-        block
-        for block in selected_blocks
-        if block.section is CompactMaterialSection.EVIDENCE_INPUT
-    )
+    source_blocks = tuple(block for block in selected_blocks if block.section is CompactMaterialSection.EVIDENCE_INPUT)
     entries: list[PromptLocalProvenanceEntry] = []
     del evidence_blocks
     for index, source in enumerate(source_blocks, start=_FIRST_ORDINAL):
@@ -1698,9 +1635,7 @@ def _evidence_chunks(evidence_ordinal: int, text: str) -> tuple[_EvidenceChunk, 
     return tuple(chunks)
 
 
-def _raise_on_duplicate_section_owner(
-    entries: tuple[PromptLocalProvenanceEntry, ...]
-) -> None:
+def _raise_on_duplicate_section_owner(entries: tuple[PromptLocalProvenanceEntry, ...]) -> None:
     """对 builder 输出执行 duplicate section owner guard。
 
     :param entries: provenance entries。
@@ -1716,9 +1651,7 @@ def _raise_on_duplicate_section_owner(
             seen[key] = entry.section
             continue
         if existing is not entry.section:
-            raise DuplicateMaterialSectionOwnerError(
-                "material pack canonical content appears in two sections"
-            )
+            raise DuplicateMaterialSectionOwnerError("material pack canonical content appears in two sections")
 
 
 def _validate_snapshot_session(
@@ -1777,9 +1710,7 @@ def _raise_snapshot_repair_required(
     )
 
 
-def _require_material_block_tuple(
-    value: tuple[RunInputMaterialBlock, ...], field_name: str
-) -> None:
+def _require_material_block_tuple(value: tuple[RunInputMaterialBlock, ...], field_name: str) -> None:
     """校验 RunInputMaterialBlock tuple。
 
     :param value: 待校验 tuple。
@@ -1811,9 +1742,7 @@ def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
         _require_non_empty_text(item, field_name)
 
 
-def _require_opaque_evidence_ref_tuple(
-    value: tuple[OpaqueEvidenceRef, ...], field_name: str
-) -> None:
+def _require_opaque_evidence_ref_tuple(value: tuple[OpaqueEvidenceRef, ...], field_name: str) -> None:
     """校验 OpaqueEvidenceRef tuple。
 
     :param value: 待校验 tuple。

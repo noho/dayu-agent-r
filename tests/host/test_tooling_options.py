@@ -192,7 +192,7 @@ def test_host_tooling_options_requires_source_refs() -> None:
 
     with pytest.raises(ValueError, match="source_refs"):
         HostToolingOptions(
-            business_tool_bundle=ToolBundle(definitions=()),
+            business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
             source_refs=(),
         )
 

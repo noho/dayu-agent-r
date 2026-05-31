@@ -92,10 +92,16 @@ class HostDurableStore:
         """关闭 store 持有的 SQLite connection。
 
         :returns: ``None``。
+        :raises HostDurableError: 存在活跃 transaction 时抛出，避免 SQLite
+            close 隐式 rollback 未提交写入。
         """
 
         if self._closed:
             return
+        if self._transaction_runner.has_active_transaction:
+            raise HostDurableError(
+                "Host durable store cannot close with active transaction"
+            )
         self._connection.close()
         self._closed = True
 

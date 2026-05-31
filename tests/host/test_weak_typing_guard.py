@@ -41,6 +41,7 @@ def _iter_files() -> list[Path]:
 _BARE_BUILTIN_GENERICS: frozenset[str] = frozenset(
     {"dict", "list", "tuple", "set", "frozenset"}
 )
+EXPLICIT_WEAK_TYPING_SCAN_FILES: frozenset[str] = frozenset({"durable/purge.py"})
 
 
 def _annotation_violations(node: ast.expr | None, *, location: str) -> list[str]:
@@ -191,3 +192,13 @@ def test_host_disallows_weak_typing() -> None:
             elif isinstance(node, ast.ClassDef):
                 violations.extend(_check_class_field_annotations(node, file=rel))
     assert not violations, "weak typing violations:\n" + "\n".join(violations)
+
+
+def test_explicit_host_modules_are_covered_by_weak_typing_scan() -> None:
+    """新增高风险 Host 模块必须被弱类型全包扫描覆盖。"""
+
+    root = _host_root()
+    scanned_files = frozenset(
+        file_path.relative_to(root).as_posix() for file_path in _iter_files()
+    )
+    assert EXPLICIT_WEAK_TYPING_SCAN_FILES <= scanned_files

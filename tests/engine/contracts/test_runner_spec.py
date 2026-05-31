@@ -212,6 +212,25 @@ def test_runner_spec_supports_stream_usage_false_construction() -> None:
     assert spec.supports_stream_usage is False
 
 
+def test_runner_spec_allows_none_api_key_ref_for_local_provider() -> None:
+    """本地或免鉴权 provider 可用 ``None`` 表达不需要 API key。"""
+
+    spec = RunnerSpec(
+        provider="ollama",
+        model="llama-local",
+        endpoint="http://localhost:11434/v1/chat/completions",
+        api_key_ref=None,
+        headers={"Content-Type": "application/json"},
+        supports_tool_calling=True,
+        supports_streaming=True,
+        supports_stream_usage=True,
+        default_timeout_seconds=30.0,
+        max_retries=0,
+        provider_request=None,
+    )
+    assert spec.api_key_ref is None
+
+
 def test_runner_spec_default_timeout_seconds_must_be_positive() -> None:
     """``default_timeout_seconds`` 非正数必须报错。"""
 

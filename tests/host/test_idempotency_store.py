@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -32,6 +34,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.transaction import HostExecuteResult, HostRow, SQLParameters
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -115,6 +118,83 @@ def _event_request(event_id: str) -> EventLogAppendRequest:
     )
 
 
+def _idempotency_host_row(semantic_input_digest: str) -> HostRow:
+    """构造幂等记录查询 row。
+
+    :param semantic_input_digest: row 中保存的 semantic digest。
+    :returns: HostRow。
+    """
+
+    return HostRow(
+        columns=(
+            "scope_kind",
+            "scope_id",
+            "idempotency_key",
+            "semantic_input_digest",
+            "result_kind",
+            "result_ref",
+            "created_event_id",
+            "created_event_sequence",
+            "created_at",
+        ),
+        values=(
+            "session_command",
+            "session-1",
+            "key-1",
+            semantic_input_digest,
+            "event",
+            "event-existing",
+            None,
+            None,
+            "2026-05-14T01:02:03.123456Z",
+        ),
+    )
+
+
+class _IntegrityInterleavingTransaction:
+    """模拟 INSERT 前后发生并发唯一约束冲突的 transaction。"""
+
+    def __init__(self, existing_digest: str) -> None:
+        """保存冲突后可回读的既有 digest。
+
+        :param existing_digest: 冲突后回读 row 的 semantic digest。
+        :returns: ``None``。
+        """
+
+        self._existing_digest = existing_digest
+        self.fetchone_calls = 0
+
+    def fetchone(
+        self, sql: str, parameters: SQLParameters = ()
+    ) -> HostRow | None:
+        """首次读返回空，冲突后重读返回既有 row。
+
+        :param sql: SQL 文本，本 fake 不解析。
+        :param parameters: SQL 参数，本 fake 不解析。
+        :returns: 首次为 ``None``，之后为既有幂等 row。
+        """
+
+        del sql, parameters
+        self.fetchone_calls += 1
+        if self.fetchone_calls == 1:
+            return None
+        return _idempotency_host_row(self._existing_digest)
+
+    def execute(
+        self, sql: str, parameters: SQLParameters = ()
+    ) -> HostExecuteResult:
+        """模拟 INSERT 命中唯一约束。
+
+        :param sql: SQL 文本，本 fake 不解析。
+        :param parameters: SQL 参数，本 fake 不解析。
+        :returns: 不会返回。
+        :raises sqlite3.IntegrityError: 始终抛出唯一约束冲突。
+        """
+
+        del sql, parameters
+        raise sqlite3.IntegrityError("UNIQUE constraint failed")
+
+
 def test_first_idempotency_insert_stores_digest_and_result(
     tmp_path: Path,
 ) -> None:
@@ -183,6 +263,42 @@ def test_repeat_same_scope_key_and_digest_returns_existing_record(
             "event-1",
             "event-1",
         )
+
+
+def test_integrity_error_with_same_digest_returns_concurrent_record() -> None:
+    """INSERT 并发唯一冲突后，相同 digest 必须回读并返回既有记录。"""
+
+    digest = sha256_digest_json({"command": "start"})
+    transaction = _IntegrityInterleavingTransaction(existing_digest=digest)
+
+    record = record_idempotent_result(
+        cast(HostTransaction, transaction),
+        _scope(),
+        digest,
+        _result_ref(),
+    )
+
+    assert record.result_ref == "event-existing"
+    assert record.semantic_input_digest == digest
+    assert transaction.fetchone_calls == 2
+
+
+def test_integrity_error_with_different_digest_raises_conflict() -> None:
+    """INSERT 并发唯一冲突后，不同 digest 必须转为幂等冲突。"""
+
+    first_digest = sha256_digest_json({"command": "start"})
+    second_digest = sha256_digest_json({"command": "cancel"})
+    transaction = _IntegrityInterleavingTransaction(existing_digest=first_digest)
+
+    with pytest.raises(HostIdempotencyConflictError):
+        record_idempotent_result(
+            cast(HostTransaction, transaction),
+            _scope(),
+            second_digest,
+            _result_ref(),
+        )
+
+    assert transaction.fetchone_calls == 2
 
 
 def test_idempotency_store_wrapper_methods_delegate_to_functions(

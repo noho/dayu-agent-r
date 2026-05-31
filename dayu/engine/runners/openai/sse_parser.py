@@ -115,9 +115,7 @@ def _event_type_for(data: RunnerEventData) -> RunnerEventType:
         # RunnerHTTPErrorData 由 runner.py 层产生，不会进本路径。
         case _:
             # 不应发生：上方已穷尽 SSE parser 可产出的类型。
-            raise AssertionError(
-                f"unexpected event data type for SSE parser: {type(data)!r}"
-            )
+            raise AssertionError(f"unexpected event data type for SSE parser: {type(data)!r}")
 
 
 def _provider_error_message(error_payload: JsonValue) -> str:
@@ -152,24 +150,17 @@ class SSEParser:
     ) -> None:
         self._extractor = StreamingXMLTagExtractor(tag_name=hook.tag_name)
         self._provider_request_id: str | None = provider_request_id
-        self._aggregator = ToolCallAggregator(
-            provider_request_id=provider_request_id
-        )
+        self._aggregator = ToolCallAggregator(provider_request_id=provider_request_id)
         self._content_buffer: list[str] = []
         self._reasoning_buffer: list[str] = []
         self._finish_reason: FinishReason | None = None
-        self._byte_buffer: bytearray = bytearray()
         self._line_carry: str = ""
         self._data_lines: list[str] = []
         self._terminated: bool = False
         self._tool_calls_seen: bool = False
-        self._utf8_decoder: codecs.IncrementalDecoder = (
-            codecs.getincrementaldecoder("utf-8-sig")(errors="strict")
-        )
+        self._utf8_decoder: codecs.IncrementalDecoder = codecs.getincrementaldecoder("utf-8-sig")(errors="strict")
 
-    async def parse(
-        self, byte_stream: AsyncIterable[bytes]
-    ) -> AsyncIterator[RunnerEvent]:
+    async def parse(self, byte_stream: AsyncIterable[bytes]) -> AsyncIterator[RunnerEvent]:
         """解析 ``byte_stream``，产出 :class:`RunnerEvent` 序列。
 
         :param byte_stream: SSE 字节流（每次 yield 一个 chunk）。
@@ -182,9 +173,7 @@ class SSEParser:
             try:
                 text = self._utf8_decoder.decode(chunk, final=False)
             except UnicodeDecodeError:
-                async for event in self._handle_invalid_utf8(
-                    chunk, final_decode=False
-                ):
+                async for event in self._handle_invalid_utf8(chunk, final_decode=False):
                     yield event
                 return
             self._line_carry += text
@@ -203,9 +192,7 @@ class SSEParser:
         try:
             tail = self._utf8_decoder.decode(b"", final=True)
         except UnicodeDecodeError:
-            async for event in self._handle_invalid_utf8(
-                b"", final_decode=True
-            ):
+            async for event in self._handle_invalid_utf8(b"", final_decode=True):
                 yield event
             return
         if tail:
@@ -224,9 +211,7 @@ class SSEParser:
         async for event in self._finalize_success():
             yield event
 
-    async def _handle_invalid_utf8(
-        self, chunk: bytes, *, final_decode: bool
-    ) -> AsyncIterator[RunnerEvent]:
+    async def _handle_invalid_utf8(self, chunk: bytes, *, final_decode: bool) -> AsyncIterator[RunnerEvent]:
         """非法 UTF-8 chunk → 协议错误 + Done(ERROR) 收口。
 
         :param chunk: 触发解码失败的当前字节片段；final flush 失败时为空。
@@ -334,9 +319,7 @@ class SSEParser:
         async for event in self._handle_chunk_object(parsed):
             yield event
 
-    async def _handle_chunk_object(
-        self, parsed: dict[str, JsonValue]
-    ) -> AsyncIterator[RunnerEvent]:
+    async def _handle_chunk_object(self, parsed: dict[str, JsonValue]) -> AsyncIterator[RunnerEvent]:
         """处理单个解析后的 SSE chunk JSON 对象。
 
         :param parsed: 已解析的 SSE JSON object。
@@ -345,9 +328,7 @@ class SSEParser:
         """
 
         if _ERROR_FIELD in parsed:
-            _LOGGER.warning(
-                "sse.protocol_error code=%s", _PROVIDER_ERROR_CODE
-            )
+            _LOGGER.warning("sse.protocol_error code=%s", _PROVIDER_ERROR_CODE)
             self._terminated = True
             yield _make_event(
                 RunnerProtocolErrorData(
@@ -381,10 +362,7 @@ class SSEParser:
             yield _make_event(
                 RunnerProtocolErrorData(
                     error_code=_MISSING_CHOICES_CODE,
-                    message=(
-                        "SSE data line must contain non-empty choices or "
-                        "valid usage"
-                    ),
+                    message=("SSE data line must contain non-empty choices or " "valid usage"),
                     provider_request_id=self._provider_request_id,
                     raw_payload=dict(parsed),
                     partial_tool_calls=self._aggregator.partial_summaries(),
@@ -402,8 +380,7 @@ class SSEParser:
             for index, choice in enumerate(choices):
                 if not isinstance(choice, dict):
                     _LOGGER.warning(
-                        "sse.protocol_diagnostic "
-                        "code=sse_choice_not_object index=%d type=%s",
+                        "sse.protocol_diagnostic " "code=sse_choice_not_object index=%d type=%s",
                         index,
                         type(choice).__name__,
                     )
@@ -413,8 +390,7 @@ class SSEParser:
                     yield event
             if not handled_choice:
                 _LOGGER.warning(
-                    "sse.protocol_error code=%s choices_type=list "
-                    "valid_choice_count=0",
+                    "sse.protocol_error code=%s choices_type=list " "valid_choice_count=0",
                     _MISSING_CHOICES_CODE,
                 )
                 self._terminated = True
@@ -438,9 +414,7 @@ class SSEParser:
             async for event in self._handle_usage(usage):
                 yield event
 
-    async def _handle_choice(
-        self, choice: dict[str, JsonValue]
-    ) -> AsyncIterator[RunnerEvent]:
+    async def _handle_choice(self, choice: dict[str, JsonValue]) -> AsyncIterator[RunnerEvent]:
         """处理单个 choice 对象。"""
 
         delta = choice.get("delta")
@@ -450,24 +424,14 @@ class SSEParser:
                 extraction = self._extractor.feed(content)
                 if extraction.outside_text:
                     self._content_buffer.append(extraction.outside_text)
-                    yield _make_event(
-                        RunnerContentDeltaData(
-                            delta=extraction.outside_text
-                        )
-                    )
+                    yield _make_event(RunnerContentDeltaData(delta=extraction.outside_text))
                 if extraction.inside_text:
                     self._reasoning_buffer.append(extraction.inside_text)
-                    yield _make_event(
-                        RunnerReasoningDeltaData(
-                            delta=extraction.inside_text
-                        )
-                    )
+                    yield _make_event(RunnerReasoningDeltaData(delta=extraction.inside_text))
             reasoning = delta.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning:
                 self._reasoning_buffer.append(reasoning)
-                yield _make_event(
-                    RunnerReasoningDeltaData(delta=reasoning)
-                )
+                yield _make_event(RunnerReasoningDeltaData(delta=reasoning))
             tool_calls_delta = delta.get("tool_calls")
             if isinstance(tool_calls_delta, list):
                 self._tool_calls_seen = True
@@ -476,13 +440,9 @@ class SSEParser:
                     if not isinstance(raw, dict):
                         continue
                     typed_delta = self._coerce_tool_call_delta(raw)
-                    resolved_index = self._aggregator.feed(
-                        typed_delta, position=position
-                    )
+                    resolved_index = self._aggregator.feed(typed_delta, position=position)
                     position += 1
-                    event_data = self._tool_call_delta_event(
-                        typed_delta, resolved_index=resolved_index
-                    )
+                    event_data = self._tool_call_delta_event(typed_delta, resolved_index=resolved_index)
                     if event_data is not None:
                         yield _make_event(event_data)
         finish_reason = choice.get("finish_reason")
@@ -492,14 +452,11 @@ class SSEParser:
                 self._finish_reason = mapped
             else:
                 _LOGGER.warning(
-                    "sse.protocol_diagnostic code=unknown_finish_reason "
-                    "finish_reason=%s",
+                    "sse.protocol_diagnostic code=unknown_finish_reason " "finish_reason=%s",
                     finish_reason,
                 )
 
-    def _coerce_tool_call_delta(
-        self, raw: dict[str, JsonValue]
-    ) -> _OpenAIToolCallDelta:
+    def _coerce_tool_call_delta(self, raw: dict[str, JsonValue]) -> _OpenAIToolCallDelta:
         """把原始 dict 转成强类型 :class:`_OpenAIToolCallDelta`。
 
         非 schema 字段一律忽略；类型不匹配的字段不写入。
@@ -559,8 +516,7 @@ class SSEParser:
                 tool_call_index = raw_index
             else:
                 _LOGGER.warning(
-                    "sse.protocol_diagnostic code=tool_call_delta_unowned "
-                    "provider_request_id=%s",
+                    "sse.protocol_diagnostic code=tool_call_delta_unowned " "provider_request_id=%s",
                     self._provider_request_id,
                 )
                 return None
@@ -583,9 +539,7 @@ class SSEParser:
             arguments_delta=arguments_delta,
         )
 
-    async def _handle_usage(
-        self, usage: dict[str, JsonValue]
-    ) -> AsyncIterator[RunnerEvent]:
+    async def _handle_usage(self, usage: dict[str, JsonValue]) -> AsyncIterator[RunnerEvent]:
         """处理 ``usage`` 字段。
 
         :param usage: provider 返回的 usage object。
@@ -624,14 +578,10 @@ class SSEParser:
         flush = self._extractor.flush()
         if flush.outside_text:
             self._content_buffer.append(flush.outside_text)
-            yield _make_event(
-                RunnerContentDeltaData(delta=flush.outside_text)
-            )
+            yield _make_event(RunnerContentDeltaData(delta=flush.outside_text))
         if flush.inside_text:
             self._reasoning_buffer.append(flush.inside_text)
-            yield _make_event(
-                RunnerReasoningDeltaData(delta=flush.inside_text)
-            )
+            yield _make_event(RunnerReasoningDeltaData(delta=flush.inside_text))
         if self._tool_calls_seen:
             result = self._aggregator.finalize()
             for warning in result.warnings:
@@ -664,11 +614,7 @@ class SSEParser:
                     finish_reason=self._finish_reason or FinishReason.STOP,
                 )
             )
-        finish = (
-            FinishReason.TOOL_CALLS
-            if self._tool_calls_seen
-            else self._finish_reason or FinishReason.STOP
-        )
+        finish = FinishReason.TOOL_CALLS if self._tool_calls_seen else self._finish_reason or FinishReason.STOP
         self._terminated = True
         yield _make_event(
             RunnerDoneData(

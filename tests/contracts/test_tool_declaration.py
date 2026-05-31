@@ -150,6 +150,55 @@ def test_tool_definition_rejects_name_schema_mismatch() -> None:
         raise AssertionError("mismatched tool definition was accepted")
 
 
+def test_tool_definition_rejects_empty_name() -> None:
+    """手动构造声明时，工具名不能为空。"""
+
+    schema = ToolSchema(
+        type="function",
+        function=ToolFunctionSchema(
+            name="",
+            description="schema tool",
+            parameters=_parameters(),
+        ),
+    )
+
+    try:
+        ToolDefinition(
+            name="",
+            schema=schema,
+            callable=_echo_tool,
+            truncate=_truncate_spec(),
+            display=None,
+            tags=(),
+        )
+    except ValueError as exc:
+        assert str(exc) == "ToolDefinition name must be non-empty"
+    else:
+        raise AssertionError("empty tool definition name was accepted")
+
+
+def test_tool_bundle_rejects_public_empty_definitions() -> None:
+    """调用方默认不得直接构造空 ``ToolBundle``。"""
+
+    try:
+        ToolBundle(definitions=())
+    except ValueError as exc:
+        assert str(exc) == "ToolBundle.definitions must be non-empty"
+    else:
+        raise AssertionError("empty tool bundle was accepted")
+
+
+def test_tool_bundle_internal_empty_constructor_keeps_real_type() -> None:
+    """框架 no-tool 路径可构造类型真实的空 ``ToolBundle``。"""
+
+    bundle = ToolBundle(definitions=(), _allow_empty=True)
+
+    assert isinstance(bundle, ToolBundle)
+    assert bundle.definitions == ()
+    assert bundle.to_tool_schemas() == ()
+    assert bundle.truncate_specs() == {}
+
+
 def test_tool_bundle_rejects_duplicate_tool_name() -> None:
     """bundle 拒绝重复工具名，避免截断声明静默覆盖。"""
 

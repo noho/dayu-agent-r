@@ -230,7 +230,8 @@ class RunnerSpec:
         约定）。
     :param model: 模型名。
     :param endpoint: provider 端点 URL。
-    :param api_key_ref: API key 引用名（不直接落 key 明文）。
+    :param api_key_ref: API key 引用名（不直接落 key 明文）；``None`` 表示
+        本地或免鉴权 provider 不需要 API key header。
     :param headers: 附加头映射。
     :param supports_tool_calling: 该 Runner 是否支持工具调用。
     :param supports_streaming: 该 Runner 是否支持流式输出。
@@ -253,7 +254,7 @@ class RunnerSpec:
     provider: str
     model: str
     endpoint: str
-    api_key_ref: str
+    api_key_ref: str | None
     headers: Mapping[str, str]
     supports_tool_calling: bool
     supports_streaming: bool

@@ -21,6 +21,7 @@ from dayu.host.audit import (
     DEFAULT_LOG_AUDIT_CATCHUP_BATCH_SIZE,
     LogAuditSinkOptions,
     catch_up_log_audit_sink_projection,
+    default_log_audit_sink_options,
 )
 from dayu.host.admission import create_host_admission_service
 from dayu.host.api import (
@@ -38,6 +39,8 @@ from dayu.host.api import (
     HostLocalExecutionOptions,
     OutboxTerminalItemsBatch,
     OpenHostOptions,
+    PurgeSessionRequest,
+    PurgeSessionResult,
     ReadOutboxTerminalItemsRequest,
     ReplayRunRequest,
     ResolveWaitRequest,
@@ -53,6 +56,7 @@ from dayu.host.command import (
     close_session as _close_session,
     create_session as _create_session,
     ensure_session as _ensure_session,
+    purge_session as _purge_session,
     resolve_wait as _resolve_wait,
     retry_run as _retry_run,
     replay_run as _replay_run,
@@ -106,15 +110,6 @@ _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS = 1024
 
 _SESSION_WATCH_POLL_INTERVAL_SECONDS = 0.02
 """session live watch 未读取到新事件时的轻量轮询间隔。"""
-
-_AUDIT_ARTIFACT_DIRECTORY_NAME = "audit"
-"""artifact_root 下 audit artifact 目录名。"""
-
-_AUDIT_JSONL_FILE_NAME = "host-audit.jsonl"
-"""默认 audit JSONL 文件名。"""
-
-_AUDIT_LOCK_FILE_SUFFIX = ".lock"
-"""默认 audit JSONL lock 文件名后缀。"""
 
 _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME = "tool-trace"
 """artifact_root 下 Tool Trace artifact 目录名。"""
@@ -298,9 +293,7 @@ class _PublicHostHandle:
         self._projection_catchup_port = projection_catchup_port
         self._closed: bool = False
 
-    async def ensure_session(
-        self, request: EnsureSessionRequest
-    ) -> SessionSnapshot:
+    async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
 
         :param request: ensure session 请求。
@@ -311,9 +304,7 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _ensure_session(self._command_handle, request)
 
-    async def create_session(
-        self, request: CreateSessionRequest
-    ) -> SessionSnapshot:
+    async def create_session(self, request: CreateSessionRequest) -> SessionSnapshot:
         """显式创建 Session。
 
         :param request: create session 请求。
@@ -386,9 +377,7 @@ class _PublicHostHandle:
             request,
         )
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """提交普通 queue / steer follow-up。
 
         :param session_id: 目标 Session id。
@@ -400,9 +389,7 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _submit_followup(self._command_handle, session_id, request)
 
-    async def retry_run(
-        self, run_id: str, request: RetryRunRequest
-    ) -> RunSnapshot:
+    async def retry_run(self, run_id: str, request: RetryRunRequest) -> RunSnapshot:
         """重试源 Run。
 
         :param run_id: 源 Run id。
@@ -414,9 +401,7 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _retry_run(self._command_handle, run_id, request)
 
-    async def replay_run(
-        self, run_id: str, request: ReplayRunRequest
-    ) -> RunSnapshot:
+    async def replay_run(self, run_id: str, request: ReplayRunRequest) -> RunSnapshot:
         """基于源 Run 创建结构化 replay Run。
 
         :param run_id: 源 Run id。
@@ -428,9 +413,7 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _replay_run(self._command_handle, run_id, request)
 
-    async def resolve_wait(
-        self, wait_id: str, request: ResolveWaitRequest
-    ) -> RunSnapshot:
+    async def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
         """接收已取得的 wait result 并恢复治理路径。
 
         :param wait_id: 待 resolve 的 wait id。
@@ -442,9 +425,7 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _resolve_wait(self._command_handle, wait_id, request)
 
-    async def cancel_run(
-        self, run_id: str, request: CancelRunRequest
-    ) -> RunSnapshot:
+    async def cancel_run(self, run_id: str, request: CancelRunRequest) -> RunSnapshot:
         """取消单个 Run。
 
         :param run_id: 目标 Run id。
@@ -456,9 +437,7 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _cancel_run(self._command_handle, run_id, request)
 
-    async def cancel_session_runs(
-        self, session_id: str, request: CancelSessionRunsRequest
-    ) -> SessionSnapshot:
+    async def cancel_session_runs(self, session_id: str, request: CancelSessionRunsRequest) -> SessionSnapshot:
         """取消 Session 下全部未终态 Run。
 
         :param session_id: 目标 Session id。
@@ -470,9 +449,7 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _cancel_session_runs(self._command_handle, session_id, request)
 
-    async def close_session(
-        self, session_id: str, request: CloseSessionRequest
-    ) -> SessionSnapshot:
+    async def close_session(self, session_id: str, request: CloseSessionRequest) -> SessionSnapshot:
         """关闭 Session 的新输入入口。
 
         :param session_id: 目标 Session id。
@@ -483,6 +460,18 @@ class _PublicHostHandle:
 
         self._raise_if_closed()
         return _close_session(self._command_handle, session_id, request)
+
+    async def purge_session(self, session_id: str, request: PurgeSessionRequest) -> PurgeSessionResult:
+        """清理已关闭 Session 的 Host 本地可恢复事实。
+
+        :param session_id: 目标 Session id。
+        :param request: purge session 请求。
+        :returns: purge tombstone 与删除计数摘要。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        """
+
+        self._raise_if_closed()
+        return _purge_session(self._command_handle, session_id, request)
 
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
@@ -500,17 +489,14 @@ class _PublicHostHandle:
         )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "host.public_handle.watch_attached host_handle_id=%s "
-            "session_id=%s cursor=%s",
+            "host.public_handle.watch_attached host_handle_id=%s " "session_id=%s cursor=%s",
             self._host_handle_id,
             session_id,
             cursor,
         )
         return self._watch_session_events_after(session_id, cursor)
 
-    async def _watch_session_events_after(
-        self, session_id: str, cursor: int
-    ) -> AsyncIterator[HostEvent]:
+    async def _watch_session_events_after(self, session_id: str, cursor: int) -> AsyncIterator[HostEvent]:
         """从指定 cursor 后持续产出 Session live HostEvent。
 
         :param session_id: 目标 Session id。
@@ -608,17 +594,14 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             self._options,
             host_handle_id=host_handle_id,
         )
-        local_execution = _local_execution_options_from_open_host_options(
-            self._options
-        )
+        local_execution = _local_execution_options_from_open_host_options(self._options)
         _LOGGER.info(
             "host.open.start host_handle_id=%s",
             host_handle_id,
         )
-        durable_store = open_host_durable_store(
-            _durable_options_from_command_options(command_options)
-        )
+        durable_store = open_host_durable_store(_durable_options_from_command_options(command_options))
         scheduler: HostDispatchScheduler | None = None
+        close_projection_catchup_port: ProjectionCatchupPort | None = None
         try:
             active_registry = ActiveWorkerRegistry()
             memory_projection_catchup_port = _MemoryProjectionCatchupPort(
@@ -627,15 +610,14 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             )
             audit_projection_catchup_port = _LogAuditProjectionCatchupPort(
                 durable_store=durable_store,
-                options=_log_audit_sink_options_from_open_host_options(
-                    self._options
+                options=default_log_audit_sink_options(
+                    self._options.artifact_root,
+                    create_parent_dirs=self._options.create_parent_dirs,
                 ),
             )
             tool_trace_projection_catchup_port = _ToolTraceProjectionCatchupPort(
                 durable_store=durable_store,
-                options=_tool_trace_sink_options_from_open_host_options(
-                    self._options
-                ),
+                options=_tool_trace_sink_options_from_open_host_options(self._options),
             )
             outbox_projection_catchup_port = _OutboxTerminalProjectionCatchupPort(
                 durable_store=durable_store,
@@ -696,18 +678,20 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                     await scheduler.close()
                 except Exception as cleanup_exc:
                     _LOGGER.error(
-                        "host.open.cleanup_scheduler_failed host_handle_id=%s "
-                        "error_type=%s",
+                        "host.open.cleanup_scheduler_failed host_handle_id=%s " "error_type=%s",
                         host_handle_id,
                         cleanup_exc.__class__.__name__,
                         exc_info=True,
                     )
+            _best_effort_catch_up_projection_on_open_failure(
+                close_projection_catchup_port,
+                host_handle_id=host_handle_id,
+            )
             try:
                 durable_store.close()
             except Exception as cleanup_exc:
                 _LOGGER.error(
-                    "host.open.cleanup_durable_store_failed host_handle_id=%s "
-                    "error_type=%s",
+                    "host.open.cleanup_durable_store_failed host_handle_id=%s " "error_type=%s",
                     host_handle_id,
                     cleanup_exc.__class__.__name__,
                     exc_info=True,
@@ -728,7 +712,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         :returns: ``None`` 表示不吞掉异常。
         """
 
-        del exc_type, exc_value, traceback
         if self._host is not None:
             await self._host.close()
         return None
@@ -745,6 +728,33 @@ def open_host(options: OpenHostOptions) -> AbstractAsyncContextManager[Host]:
     return _OpenHostContextManager(options)
 
 
+def _best_effort_catch_up_projection_on_open_failure(
+    projection_catchup_port: ProjectionCatchupPort | None,
+    *,
+    host_handle_id: str,
+) -> None:
+    """启动失败清理路径中尽力追平 projection。
+
+    :param projection_catchup_port: 已构造的 projection catch-up 端口；若启动
+        尚未完成端口构造则为 ``None``。
+    :param host_handle_id: 当前 open_host handle id。
+    :returns: ``None``。
+    """
+
+    if projection_catchup_port is None:
+        return
+    try:
+        projection_catchup_port.catch_up_projection()
+    except Exception as cleanup_exc:
+        _LOGGER.warning(
+            "host.open.cleanup_projection_catchup_failed host_handle_id=%s "
+            "error_type=%s",
+            host_handle_id,
+            cleanup_exc.__class__.__name__,
+            exc_info=True,
+        )
+
+
 def _command_options_from_open_host_options(
     options: OpenHostOptions,
     *,
@@ -758,9 +768,7 @@ def _command_options_from_open_host_options(
     """
 
     local_execution = _local_execution_options_from_open_host_options(options)
-    context_budget_fields = _command_context_budget_fields_from_open_host_options(
-        options
-    )
+    context_budget_fields = _command_context_budget_fields_from_open_host_options(options)
     return HostCommandHandleOptions(
         host_handle_id=host_handle_id,
         db_path=options.db_path,
@@ -768,15 +776,9 @@ def _command_options_from_open_host_options(
         create_parent_dirs=options.create_parent_dirs,
         sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
         sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
-        sqlite_write_retry_initial_delay_seconds=(
-            options.sqlite_write_retry_initial_delay_seconds
-        ),
-        sqlite_write_retry_backoff_multiplier=(
-            options.sqlite_write_retry_backoff_multiplier
-        ),
-        sqlite_write_retry_max_delay_seconds=(
-            options.sqlite_write_retry_max_delay_seconds
-        ),
+        sqlite_write_retry_initial_delay_seconds=(options.sqlite_write_retry_initial_delay_seconds),
+        sqlite_write_retry_backoff_multiplier=(options.sqlite_write_retry_backoff_multiplier),
+        sqlite_write_retry_max_delay_seconds=(options.sqlite_write_retry_max_delay_seconds),
         payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
         context_window_size=context_budget_fields.context_window_size,
         reserved_output_tokens=context_budget_fields.reserved_output_tokens,
@@ -805,15 +807,11 @@ def _command_context_budget_fields_from_open_host_options(
     if context_policy is None:
         return _CommandContextBudgetFields(
             context_window_size=_INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE,
-            reserved_output_tokens=(
-                _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS
-            ),
+            reserved_output_tokens=(_INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS),
         )
     return _CommandContextBudgetFields(
         context_window_size=context_policy.context_window_size,
-        reserved_output_tokens=_internal_reserved_output_tokens_for_policy(
-            context_policy.context_window_size
-        ),
+        reserved_output_tokens=_internal_reserved_output_tokens_for_policy(context_policy.context_window_size),
     )
 
 
@@ -851,9 +849,7 @@ def _local_execution_options_from_open_host_options(
             runner_options=compactor_runner_baseline.compactor_runner_options,
             agent_policy=compactor_runner_baseline.compactor_agent_policy,
             system_prompt=compactor_runner_baseline.compactor_system_prompt,
-            user_prompt_template=(
-                compactor_runner_baseline.compactor_user_prompt_template
-            ),
+            user_prompt_template=(compactor_runner_baseline.compactor_user_prompt_template),
         )
         if compactor_runner_baseline is not None
         else None
@@ -874,20 +870,14 @@ def _local_execution_options_from_open_host_options(
         context_budget_policy=options.context_budget_policy,
         context_compactor=context_compactor,
         compactor_runner_spec=(
-            compactor_runner_baseline.compactor_runner_spec
-            if compactor_runner_baseline is not None
-            else None
+            compactor_runner_baseline.compactor_runner_spec if compactor_runner_baseline is not None else None
         ),
         compactor_runner_options=(
-            compactor_runner_baseline.compactor_runner_options
-            if compactor_runner_baseline is not None
-            else None
+            compactor_runner_baseline.compactor_runner_options if compactor_runner_baseline is not None else None
         ),
         compactor_policy_ref=None,
         compact_artifact_root=(
-            compactor_runner_baseline.compact_artifact_root
-            if compactor_runner_baseline is not None
-            else None
+            compactor_runner_baseline.compact_artifact_root if compactor_runner_baseline is not None else None
         ),
         compact_artifact_create_parent_dirs=(
             compactor_runner_baseline.compact_artifact_create_parent_dirs
@@ -895,54 +885,9 @@ def _local_execution_options_from_open_host_options(
             else options.create_parent_dirs
         ),
         memory_projection_policy=options.memory_projection_policy,
-        memory_projection_catchup_batch_size=(
-            options.memory_projection_catchup_batch_size
-        ),
+        memory_projection_catchup_batch_size=(options.memory_projection_catchup_batch_size),
         tooling_options=options.tooling_options,
         enable_truncation_manager=options.enable_truncation_manager,
-    )
-
-
-def _log_audit_sink_options_from_open_host_options(
-    options: OpenHostOptions,
-) -> LogAuditSinkOptions:
-    """从 public opener options 派生内部 audit sink options。
-
-    :param options: public opener options。
-    :returns: LogAuditSink options；不新增 public ``OpenHostOptions`` 字段。
-    :raises TypeError: 派生出的路径配置类型非法时抛出。
-    :raises ValueError: 派生出的路径为空时抛出。
-    """
-
-    audit_jsonl_path = _default_audit_jsonl_path(options.artifact_root)
-    return LogAuditSinkOptions(
-        audit_jsonl_path=audit_jsonl_path,
-        create_parent_dirs=options.create_parent_dirs,
-        lock_path=_default_audit_lock_path(audit_jsonl_path),
-    )
-
-
-def _default_audit_jsonl_path(artifact_root: Path) -> Path:
-    """从 artifact_root 派生默认 audit JSONL 路径。
-
-    :param artifact_root: Host artifact root。
-    :returns: 默认 audit JSONL 路径。
-    :raises: 无。
-    """
-
-    return artifact_root / _AUDIT_ARTIFACT_DIRECTORY_NAME / _AUDIT_JSONL_FILE_NAME
-
-
-def _default_audit_lock_path(audit_jsonl_path: Path) -> Path:
-    """从 audit JSONL 路径派生相邻 lock 文件路径。
-
-    :param audit_jsonl_path: audit JSONL 路径。
-    :returns: 相邻 lock 文件路径。
-    :raises: 无。
-    """
-
-    return audit_jsonl_path.with_name(
-        audit_jsonl_path.name + _AUDIT_LOCK_FILE_SUFFIX
     )
 
 
@@ -973,11 +918,7 @@ def _default_tool_trace_cold_jsonl_path(artifact_root: Path) -> Path:
     :raises: 无。
     """
 
-    return (
-        artifact_root
-        / _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME
-        / _TOOL_TRACE_COLD_JSONL_FILE_NAME
-    )
+    return artifact_root / _TOOL_TRACE_ARTIFACT_DIRECTORY_NAME / _TOOL_TRACE_COLD_JSONL_FILE_NAME
 
 
 def _default_tool_trace_lock_path(cold_jsonl_path: Path) -> Path:
@@ -988,9 +929,7 @@ def _default_tool_trace_lock_path(cold_jsonl_path: Path) -> Path:
     :raises: 无。
     """
 
-    return cold_jsonl_path.with_name(
-        cold_jsonl_path.name + _TOOL_TRACE_LOCK_FILE_SUFFIX
-    )
+    return cold_jsonl_path.with_name(cold_jsonl_path.name + _TOOL_TRACE_LOCK_FILE_SUFFIX)
 
 
 def _new_open_host_handle_id() -> str:

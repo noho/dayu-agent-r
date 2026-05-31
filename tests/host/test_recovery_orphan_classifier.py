@@ -248,6 +248,19 @@ def test_stale_owner_with_missing_pid_is_positive_orphan_proof() -> None:
     assert result.reason == "owner_pid_missing"
 
 
+def test_invalid_owner_pid_is_positive_orphan_proof_without_probe() -> None:
+    """owner_liveness pid 非正时直接证明 orphan，避免无限 inconclusive。"""
+
+    result = classify_orphan_candidate(
+        _candidate(_row(heartbeat_age_seconds=60, pid=0)),
+        None,
+        _policy(),
+    )
+    assert isinstance(result, PositiveOrphanProof)
+    assert result.pid == 0
+    assert result.reason == "owner_pid_missing"
+
+
 def test_live_pid_without_identity_capability_is_inconclusive() -> None:
     """pid 存在但缺启动指纹能力时不能误判 orphan。
 

@@ -52,6 +52,12 @@ _TERMINAL_RUN_STATUSES = (
     RunStatus.CANCELLED,
     RunStatus.LOST,
 )
+_STARTED_RUN_STATUSES = (
+    RunStatus.RUNNING,
+    RunStatus.WAITING,
+    RunStatus.CANCELLING,
+    RunStatus.RECOVERING,
+)
 
 
 def _options(
@@ -69,9 +75,7 @@ def _options(
     return HostDurableStoreOptions(
         db_path=tmp_path / "host" / "durable.sqlite3",
         payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
-        sqlite_policy=HostSQLiteStoragePolicy(
-            busy_timeout_seconds=busy_timeout_seconds
-        ),
+        sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=busy_timeout_seconds),
     )
 
 
@@ -82,21 +86,13 @@ def test_active_run_partial_unique_index_shape(tmp_path: Path) -> None:
     with open_host_durable_store(options) as store:
         connection = store.connect()
         try:
-            index_rows = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_RUNS})"
-            ).fetchall()
-            matching = [
-                row
-                for row in index_rows
-                if str(row[1]) == INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION
-            ]
+            index_rows = connection.execute(f"PRAGMA index_list({TABLE_HOST_RUNS})").fetchall()
+            matching = [row for row in index_rows if str(row[1]) == INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION]
             assert len(matching) == 1
             assert int(matching[0][2]) == 1
             assert int(matching[0][4]) == 1
 
-            column_rows = connection.execute(
-                f"PRAGMA index_info({INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION})"
-            ).fetchall()
+            column_rows = connection.execute(f"PRAGMA index_info({INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION})").fetchall()
             assert tuple(str(row[2]) for row in column_rows) == ("session_id",)
 
             create_sql_row = connection.execute(
@@ -134,19 +130,13 @@ def test_queue_fifo_index_shape(tmp_path: Path) -> None:
     with open_host_durable_store(options) as store:
         connection = store.connect()
         try:
-            index_rows = connection.execute(
-                f"PRAGMA index_list({TABLE_HOST_RUNS})"
-            ).fetchall()
-            matching = [
-                row for row in index_rows if str(row[1]) == INDEX_HOST_RUNS_QUEUE_FIFO
-            ]
+            index_rows = connection.execute(f"PRAGMA index_list({TABLE_HOST_RUNS})").fetchall()
+            matching = [row for row in index_rows if str(row[1]) == INDEX_HOST_RUNS_QUEUE_FIFO]
             assert len(matching) == 1
             assert int(matching[0][2]) == 0
             assert int(matching[0][4]) == 1
 
-            column_rows = connection.execute(
-                f"PRAGMA index_info({INDEX_HOST_RUNS_QUEUE_FIFO})"
-            ).fetchall()
+            column_rows = connection.execute(f"PRAGMA index_info({INDEX_HOST_RUNS_QUEUE_FIFO})").fetchall()
             assert tuple(str(row[2]) for row in column_rows) == (
                 "session_id",
                 "accepted_event_sequence",
@@ -234,10 +224,36 @@ def test_active_runs_for_different_sessions_succeed(tmp_path: Path) -> None:
         assert store.transaction_runner.run_write(operation) == 2
 
 
+@pytest.mark.parametrize("status", _STARTED_RUN_STATUSES)
+def test_started_run_status_requires_started_event_columns(tmp_path: Path, status: RunStatus) -> None:
+    """active / recovering Run 缺 started event 时必须被 schema CHECK 拒绝。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入缺 started event 的非法 Run row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-1",
+                session_id="session-1",
+                status=status,
+                client_request_id="request-1",
+                include_started_event=False,
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
 @pytest.mark.parametrize("terminal_status", _TERMINAL_RUN_STATUSES)
-def test_same_session_active_and_terminal_runs_succeed(
-    tmp_path: Path, terminal_status: RunStatus
-) -> None:
+def test_same_session_active_and_terminal_runs_succeed(tmp_path: Path, terminal_status: RunStatus) -> None:
     """同一 Session 可同时保存一个 active Run 与一个 terminal Run。"""
 
     options = _options(tmp_path)
@@ -266,8 +282,7 @@ def test_same_session_active_and_terminal_runs_succeed(
                 client_request_id=f"request-terminal-{terminal_status.value}",
             )
             row = transaction.fetchone(
-                f"SELECT COUNT(*) AS count FROM {TABLE_HOST_RUNS} "
-                "WHERE session_id = ?",
+                f"SELECT COUNT(*) AS count FROM {TABLE_HOST_RUNS} " "WHERE session_id = ?",
                 ("session-1",),
             )
             assert row is not None
@@ -389,17 +404,13 @@ def test_dispatch_record_status_check_allows_phase5_statuses(
                 attempt_id="attempt-dispatching",
                 execution_id="execution-dispatching",
             )
-            row = transaction.fetchone(
-                f"SELECT COUNT(*) AS count FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}"
-            )
+            row = transaction.fetchone(f"SELECT COUNT(*) AS count FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}")
             assert row is not None
-            rows = transaction.fetchall(
-                f"""
+            rows = transaction.fetchall(f"""
                 SELECT status
                 FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
                 ORDER BY status ASC
-                """
-            )
+                """)
             return (
                 _required_row_int(row, column="count"),
                 tuple(_required_row_text(status_row, column="status") for status_row in rows),
@@ -896,9 +907,7 @@ def _insert_session_tx(transaction: HostTransaction, *, session_id: str) -> None
     """
 
     event_id = f"event-session-created-{session_id}"
-    created_sequence = _insert_event_tx(
-        transaction, event_id=event_id, session_id=session_id
-    )
+    created_sequence = _insert_event_tx(transaction, event_id=event_id, session_id=session_id)
     transaction.execute(
         f"""
         INSERT INTO {TABLE_HOST_SESSIONS} (
@@ -934,6 +943,7 @@ def _insert_run_tx(
     session_id: str,
     status: RunStatus,
     client_request_id: str,
+    include_started_event: bool = True,
 ) -> None:
     """插入测试用 Run row。
 
@@ -942,6 +952,7 @@ def _insert_run_tx(
     :param session_id: Session id。
     :param status: Run 状态。
     :param client_request_id: client request id。
+    :param include_started_event: active / recovering 状态是否写入 started event。
     :returns: ``None``。
     """
 
@@ -961,6 +972,8 @@ def _insert_run_tx(
     )
     queued_event_id: str | None = None
     queued_sequence: int | None = None
+    started_event_id: str | None = None
+    started_sequence: int | None = None
     terminal_event_id: str | None = None
     terminal_sequence: int | None = None
     terminal_at: str | None = None
@@ -969,6 +982,14 @@ def _insert_run_tx(
         queued_sequence = _insert_event_tx(
             transaction,
             event_id=queued_event_id,
+            session_id=session_id,
+            run_id=run_id,
+        )
+    if include_started_event and status in _STARTED_RUN_STATUSES:
+        started_event_id = f"event-started-{run_id}"
+        started_sequence = _insert_event_tx(
+            transaction,
+            event_id=started_event_id,
             session_id=session_id,
             run_id=run_id,
         )
@@ -1019,8 +1040,8 @@ def _insert_run_tx(
             accepted_sequence,
             queued_event_id,
             queued_sequence,
-            None,
-            None,
+            started_event_id,
+            started_sequence,
             terminal_event_id,
             terminal_sequence,
             None,
@@ -1470,9 +1491,7 @@ def _insert_dispatch_record_with_diagnostics_tx(
     )
 
 
-def _ensure_host_instance_tx(
-    transaction: HostTransaction, *, host_instance_id: str
-) -> None:
+def _ensure_host_instance_tx(transaction: HostTransaction, *, host_instance_id: str) -> None:
     """写入测试用 Host instance row。
 
     :param transaction: Host transaction。

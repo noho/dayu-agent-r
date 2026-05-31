@@ -134,7 +134,6 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-# 具体 pytest 设置见 pytest.ini（保留为单一事实源）。
 minversion = "7.4"
 
 [tool.ruff]

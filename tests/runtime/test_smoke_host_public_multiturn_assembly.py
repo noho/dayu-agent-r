@@ -7,7 +7,13 @@ import pathlib
 
 import pytest
 
-from dayu.contracts import ToolBundle
+from dayu.contracts import (
+    BatchToolExecutionContext,
+    ToolBundle,
+    ToolCallRequest,
+    ToolDefinition,
+    ToolExecutionOutcome,
+)
 from dayu.runtime.log import LogLevel
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
@@ -31,6 +37,23 @@ _SCENE_ID = "smoke_host_public_multiturn"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+
+
+async def _not_smoke_tool(
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+) -> ToolExecutionOutcome:
+    """测试用非 smoke callable。
+
+    :param call: 工具调用请求。
+    :param context: 执行上下文。
+    :returns: 不返回；本测试只验证声明识别，不会调用该工具。
+    :raises AssertionError: 被意外调用时抛出。
+    """
+
+    del call
+    del context
+    raise AssertionError("non-smoke tool should not be called")
 
 
 def test_runtime_assembly_adds_builtin_smoke_tool_without_workspace_overlay(
@@ -198,9 +221,21 @@ def test_find_smoke_tool_only_inspects_passed_tool_bundle() -> None:
         )
     )
     discovered_bundle = ToolBundle(definitions=provider_output.definitions)
+    non_smoke_bundle = ToolBundle(
+        definitions=(
+            ToolDefinition(
+                name=provider_output.definitions[0].name,
+                schema=provider_output.definitions[0].schema,
+                callable=_not_smoke_tool,
+                truncate=None,
+                display=None,
+                tags=(),
+            ),
+        )
+    )
 
     assert _find_smoke_tool(discovered_bundle) is not None
-    assert _find_smoke_tool(ToolBundle(definitions=())) is None
+    assert _find_smoke_tool(non_smoke_bundle) is None
 
 
 def test_smoke_failure_summary_redacts_sensitive_message() -> None:

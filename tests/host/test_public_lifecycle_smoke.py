@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
+from typing import Protocol, cast
 
 import pytest
 
@@ -28,6 +29,7 @@ from dayu.host import (
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
+    PurgeSessionRequest,
     RunStatus,
     SessionStatus,
     SubmitFollowupRequest,
@@ -35,6 +37,22 @@ from dayu.host import (
 )
 from dayu.host.api import AuthorizationClaim
 from dayu.host.memory import default_memory_projection_policy
+
+
+class _PurgeCapableHost(Protocol):
+    """测试 open_host concrete handle 的 purge lifecycle gate。"""
+
+    async def purge_session(
+        self, session_id: str, request: PurgeSessionRequest
+    ) -> object:
+        """清理已关闭 Session。
+
+        :param session_id: 目标 Session id。
+        :param request: purge 请求。
+        :returns: purge result；本测试只验证 closed gate。
+        """
+
+        ...
 
 
 class _BlockingHandle:
@@ -197,6 +215,11 @@ async def test_close_session_host_close_and_cancel_are_distinct(
             await host.submit_followup(
                 session.session_id,
                 _followup_request(session.session_id, "after-host-close"),
+            )
+        with pytest.raises(HostClosedError):
+            await cast(_PurgeCapableHost, host).purge_session(
+                session.session_id,
+                _purge_request("purge-after-host-close"),
             )
 
 
@@ -389,6 +412,20 @@ def _close_request(client_request_id: str) -> CloseSessionRequest:
         context=_context(client_request_id),
         client_request_id=client_request_id,
         reason="done",
+    )
+
+
+def _purge_request(client_request_id: str) -> PurgeSessionRequest:
+    """构造 purge session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: PurgeSessionRequest。
+    """
+
+    return PurgeSessionRequest(
+        context=_context(client_request_id),
+        client_request_id=client_request_id,
+        reason="public_lifecycle_purge",
     )
 
 

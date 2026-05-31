@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import NoReturn
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.audit import (
+    LogAuditSinkOptions,
+    append_purge_tombstone_audit_record,
+    default_log_audit_sink_options,
+)
 from dayu.host.admission import (
     HostAdmissionService,
     PendingDispatchRecord,
@@ -54,7 +60,7 @@ from dayu.host._execution_config_projection import (
     optional_runner_options_json as _optional_runner_options_json,
     optional_runner_spec_json as _optional_runner_spec_json,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import (
     HostDurableStore,
     open_host_durable_store,
@@ -72,6 +78,17 @@ from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
+)
+from dayu.host.durable.purge import (
+    PurgeSessionAlreadyPurgedError,
+    PurgeSessionDeleteRequest,
+    PurgeSessionDeleteResult,
+    PurgeSessionInvalidStateError,
+    PurgeSessionNotFoundError,
+    PurgeTombstoneAuditRecordRequest,
+    PurgeTombstoneAuditRecordResult,
+    build_purge_semantic_digest,
+    purge_session_durable,
 )
 from dayu.host.durable.session_lifecycle import (
     close_session as _close_session_in_durable,
@@ -99,7 +116,9 @@ from dayu.host.dispatch import (
     ActiveCancelMessage,
     ActiveWorkerRegistry,
 )
+from dayu.host.projection import catch_up_projection_best_effort
 from dayu.host.waiting import DefaultHostResolveWaitService
+from dayu.runtime.filelock import RuntimeFileLockError
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_HANDLE_ID_PREFIX = "host-command"
@@ -191,6 +210,23 @@ class HostCommandHandle:
         except HostDurableError as exc:
             raise _host_api_error_from_durable_error(exc) from exc
 
+    def _audit_sink_options(self) -> LogAuditSinkOptions:
+        """从当前 handle 持有的 durable store 派生 audit sink options。
+
+        :returns: append-only audit JSONL sink options。
+        :raises HostApiError: handle 已关闭或 durable store 配置不可读取时抛出。
+        """
+
+        self._raise_if_closed()
+        try:
+            options = self._durable_store.options
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
+        return default_log_audit_sink_options(
+            options.payload_policy.artifact_root,
+            create_parent_dirs=options.payload_policy.create_artifact_root,
+        )
+
     def _run_read(self, operation: HostReadTransactionOperation[T]) -> T:
         """在 handle 私有 store 上执行 read transaction。
 
@@ -257,18 +293,12 @@ def create_host_command_handle(
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
     try:
-        admission_service = create_host_admission_service(
-            durable_store.transaction_runner
-        )
+        admission_service = create_host_admission_service(durable_store.transaction_runner)
         return HostCommandHandle(
             host_handle_id=_host_handle_id_from_options(options),
             durable_store=durable_store,
             admission_service=admission_service,
-            active_registry=(
-                active_registry
-                if active_registry is not None
-                else ActiveWorkerRegistry()
-            ),
+            active_registry=(active_registry if active_registry is not None else ActiveWorkerRegistry()),
         )
     except HostDurableError as exc:
         durable_store.close()
@@ -307,9 +337,7 @@ def compose_host_local_execution_options(
     )
 
 
-def ensure_session(
-    host: HostCommandHandle, request: EnsureSessionRequest
-) -> SessionSnapshot:
+def ensure_session(host: HostCommandHandle, request: EnsureSessionRequest) -> SessionSnapshot:
     """确保 slot 绑定到一个 Session，并返回 Session snapshot。
 
     :param host: Host command handle。
@@ -322,12 +350,11 @@ def ensure_session(
         result = _ensure_session_in_durable(host._transaction_runner(), request)
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
+    catch_up_projection_best_effort(host._admission_service.projection_catchup_port)
     return result.snapshot
 
 
-def create_session(
-    host: HostCommandHandle, request: CreateSessionRequest
-) -> SessionSnapshot:
+def create_session(host: HostCommandHandle, request: CreateSessionRequest) -> SessionSnapshot:
     """显式创建 Session，并返回 Session snapshot。
 
     Phase 4 public facade 的幂等语义不把 ``metadata`` 作为 semantic
@@ -350,6 +377,7 @@ def create_session(
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
+    catch_up_projection_best_effort(host._admission_service.projection_catchup_port)
     return result.snapshot
 
 
@@ -367,9 +395,7 @@ def close_session(
     :raises HostApiError: handle 已关闭、Session 缺失、状态非法或幂等冲突时抛出。
     """
 
-    caller_digest = _close_session_public_semantic_digest(
-        session_id=session_id, request=request
-    )
+    caller_digest = _close_session_public_semantic_digest(session_id=session_id, request=request)
     try:
         result = _close_session_in_durable(
             host._transaction_runner(),
@@ -379,6 +405,7 @@ def close_session(
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
+    catch_up_projection_best_effort(host._admission_service.projection_catchup_port)
     return result.snapshot
 
 
@@ -406,10 +433,7 @@ def start_run(host: HostCommandHandle, request: StartRunRequest) -> RunSnapshot:
         raise _host_api_error_from_durable_error(exc) from exc
     _LOGGER.log(
         VERBOSE_LOG_LEVEL,
-        (
-            "host.command.committed operation=start_run session_id=%s "
-            "run_id=%s run_status=%s input_event_id=%s"
-        ),
+        ("host.command.committed operation=start_run session_id=%s " "run_id=%s run_status=%s input_event_id=%s"),
         result.run.session_id,
         result.run.run_id,
         result.run.status.value,
@@ -450,22 +474,15 @@ def submit_followup(
         result = host._admission_service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=request,
-                resolved_execution_target=(
-                    _PUBLIC_FOLLOWUP_DEFAULT_EXECUTION_TARGET
-                ),
+                resolved_execution_target=(_PUBLIC_FOLLOWUP_DEFAULT_EXECUTION_TARGET),
             ),
-            caller_semantic_digest=_submit_followup_public_semantic_digest(
-                request
-            ),
+            caller_semantic_digest=_submit_followup_public_semantic_digest(request),
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
     _LOGGER.log(
         VERBOSE_LOG_LEVEL,
-        (
-            "host.command.committed operation=submit_followup session_id=%s "
-            "run_id=%s run_status=%s input_event_id=%s"
-        ),
+        ("host.command.committed operation=submit_followup session_id=%s " "run_id=%s run_status=%s input_event_id=%s"),
         result.run.session_id,
         result.run.run_id,
         result.run.status.value,
@@ -477,16 +494,12 @@ def submit_followup(
         accepted_run_id=result.run.run_id,
         accepted_run_status=result.run.status,
         command_watermark=run_snapshot_from_row(result.run).event_cursor,
-        queued_run_id=(
-            result.run.run_id if result.run.status == RunStatus.QUEUED else None
-        ),
+        queued_run_id=(result.run.run_id if result.run.status == RunStatus.QUEUED else None),
         target_run_id=None,
     )
 
 
-def _submit_followup_steer(
-    host: HostCommandHandle, request: SubmitFollowupRequest
-) -> FollowupSnapshot:
+def _submit_followup_steer(host: HostCommandHandle, request: SubmitFollowupRequest) -> FollowupSnapshot:
     """提交 steer follow-up 并返回 public snapshot。
 
     :param host: Host command handle。
@@ -498,9 +511,7 @@ def _submit_followup_steer(
     try:
         result = host._admission_service.submit_followup_steer(
             request,
-            caller_semantic_digest=_submit_followup_public_semantic_digest(
-                request
-            ),
+            caller_semantic_digest=_submit_followup_public_semantic_digest(request),
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
@@ -527,9 +538,7 @@ def _submit_followup_steer(
     )
 
 
-def cancel_run(
-    host: HostCommandHandle, run_id: str, request: CancelRunRequest
-) -> RunSnapshot:
+def cancel_run(host: HostCommandHandle, run_id: str, request: CancelRunRequest) -> RunSnapshot:
     """取消单个 Run，并返回最新 Run snapshot。
 
     当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching、
@@ -555,9 +564,7 @@ def cancel_run(
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
     except HostApiError as exc:
-        if exc.code == HostApiErrorCode.INVALID_STATE and _is_deferred_cancel_state(
-            host, run_id
-        ):
+        if exc.code == HostApiErrorCode.INVALID_STATE and _is_deferred_cancel_state(host, run_id):
             raise HostApiError(
                 code=HostApiErrorCode.UNSUPPORTED_OPERATION,
                 message="Run cancel requires a later cancel owner phase",
@@ -567,15 +574,17 @@ def cancel_run(
     _propagate_active_cancel_targets(
         host,
         (
-            ActiveCancelMessage(
-                run_id=result.active_cancel_target.run_id,
-                attempt_id=result.active_cancel_target.attempt_id,
-                execution_id=result.active_cancel_target.execution_id,
-                reason=result.active_cancel_target.reason,
-            ),
-        )
-        if result.active_cancel_target is not None
-        else ()
+            (
+                ActiveCancelMessage(
+                    run_id=result.active_cancel_target.run_id,
+                    attempt_id=result.active_cancel_target.attempt_id,
+                    execution_id=result.active_cancel_target.execution_id,
+                    reason=result.active_cancel_target.reason,
+                ),
+            )
+            if result.active_cancel_target is not None
+            else ()
+        ),
     )
     return run_snapshot_from_row(result.run)
 
@@ -619,14 +628,12 @@ def cancel_session_runs(
                 reason=target.reason,
             )
             for target in result.active_cancel_targets
-        )
+        ),
     )
     return result.snapshot
 
 
-def retry_run(
-    host: HostCommandHandle, run_id: str, request: RetryRunRequest
-) -> RunSnapshot:
+def retry_run(host: HostCommandHandle, run_id: str, request: RetryRunRequest) -> RunSnapshot:
     """重试普通本地 FAILED 源 Run，并返回关联新 Run snapshot。
 
     :param host: Host command handle。
@@ -652,9 +659,7 @@ def retry_run(
     return run_snapshot_from_row(result.run)
 
 
-def replay_run(
-    host: HostCommandHandle, run_id: str, request: ReplayRunRequest
-) -> RunSnapshot:
+def replay_run(host: HostCommandHandle, run_id: str, request: ReplayRunRequest) -> RunSnapshot:
     """对 SUCCEEDED 源 Run 创建 no-tool 结构修复 replay Run。
 
     :param host: Host command handle。
@@ -679,9 +684,7 @@ def replay_run(
     return run_snapshot_from_row(result.run)
 
 
-def resolve_wait(
-    host: HostCommandHandle, wait_id: str, request: ResolveWaitRequest
-) -> RunSnapshot:
+def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
     """接收 wait result 并返回最新 Run snapshot。
 
     :param host: Host command handle。
@@ -703,17 +706,13 @@ def resolve_wait(
             transaction_runner=transaction_runner,
             event_log_store=host._admission_service.event_log_store,
             idempotency_store=host._admission_service.idempotency_store,
-            projection_catchup_port=(
-                host._admission_service.projection_catchup_port
-            ),
+            projection_catchup_port=(host._admission_service.projection_catchup_port),
         )
         result = service.resolve_wait(wait_id, request)
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
     if result.dispatch_record is not None and not result.idempotent_replay:
-        host._admission_service.wakeup_port.wake_dispatch(
-            _pending_dispatch_from_row(result.dispatch_record)
-        )
+        host._admission_service.wakeup_port.wake_dispatch(_pending_dispatch_from_row(result.dispatch_record))
     _LOGGER.log(
         VERBOSE_LOG_LEVEL,
         (
@@ -724,9 +723,7 @@ def resolve_wait(
         result.run.run_id,
         result.run.status.value,
         wait_id,
-        None
-        if result.dispatch_record is None
-        else result.dispatch_record.dispatch_record_id,
+        None if result.dispatch_record is None else result.dispatch_record.dispatch_record_id,
     )
     return run_snapshot_from_row(result.run)
 
@@ -736,19 +733,124 @@ def purge_session(
     session_id: str,
     request: PurgeSessionRequest,
 ) -> PurgeSessionResult:
-    """稳定拒绝 Phase 4 尚未实现的 Session purge。
+    """清理已关闭 Session 的 Host 本地可恢复事实。
 
-    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
-
-    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param host: Host command handle。
     :param session_id: 目标 Session id。
     :param request: purge session 请求。
-    :returns: 当前阶段不会返回。
-    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    :returns: purge tombstone 与删除计数摘要组成的 public result。
+    :raises HostApiError: handle 已关闭、Session 缺失、前置条件非法、幂等冲突、
+        已由不同请求 purge 或 durable 写入失败时抛出。
     """
 
     host._raise_if_closed()
-    _raise_unsupported_operation("purge_session")
+    try:
+        operation = _PurgeSessionOperation(
+            session_id=session_id,
+            request=request,
+            audit_sink_options=host._audit_sink_options(),
+        )
+        result = host._transaction_runner().run_write(operation)
+    except PurgeSessionInvalidStateError as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="purge_session requires a closed Session with terminal Runs",
+            retryable=False,
+        ) from exc
+    except PurgeSessionAlreadyPurgedError as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.CONFLICT,
+            message="Session has already been purged",
+            retryable=False,
+        ) from exc
+    except PurgeSessionNotFoundError as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Session not found",
+            retryable=False,
+        ) from exc
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
+    except (OSError, RuntimeFileLockError) as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Host purge audit append failed",
+            retryable=True,
+        ) from exc
+    return PurgeSessionResult(
+        session_id=result.tombstone.session_id,
+        purged=True,
+        purge_tombstone_ref=result.tombstone.tombstone_id,
+        deleted_counts_digest=result.tombstone.deleted_counts_digest,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PurgeSessionOperation:
+    """purge_session write transaction body。"""
+
+    session_id: str
+    request: PurgeSessionRequest
+    audit_sink_options: LogAuditSinkOptions
+
+    def __call__(self, transaction: HostTransaction) -> PurgeSessionDeleteResult:
+        """执行 purge durable helper。
+
+        :param transaction: 当前 Host write transaction。
+        :returns: durable purge delete result。
+        :raises HostDurableError: purge 前置条件、幂等或 durable 写入失败时抛出。
+        """
+
+        operation_context_refs = _operation_context_json_value(self.request.context.operation_context)
+        request_context = _call_context_json_value(self.request.context)
+        operation_context_digest = sha256_digest_json(operation_context_refs)
+        semantic_digest = build_purge_semantic_digest(
+            session_id=self.session_id,
+            reason=self.request.reason,
+            operation_context_digest=operation_context_digest,
+            operation_context_refs=operation_context_refs,
+            request_context=request_context,
+        )
+        return purge_session_durable(
+            transaction,
+            PurgeSessionDeleteRequest(
+                session_id=self.session_id,
+                client_request_id=self.request.client_request_id,
+                semantic_request_digest=semantic_digest,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                operation_context_digest=operation_context_digest,
+                operation_context_refs=operation_context_refs,
+                reason=self.request.reason,
+                purged_at=format_utc_timestamp(datetime.now(UTC)),
+                audit_recorder=_PurgeAuditJsonlRecorder(self.audit_sink_options),
+                request_context=request_context,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PurgeAuditJsonlRecorder:
+    """public purge command 使用的 JSONL audit recorder。
+
+    :param options: audit JSONL sink options。
+    """
+
+    options: LogAuditSinkOptions
+
+    def record_purge_tombstone_audit(
+        self, request: PurgeTombstoneAuditRecordRequest
+    ) -> PurgeTombstoneAuditRecordResult:
+        """追加 purge tombstone audit JSONL line。
+
+        :param request: purge tombstone audit 写入请求。
+        :returns: audit record ref 与 line digest。
+        :raises HostDurableError: audit source key digest 冲突时抛出。
+        :raises OSError: audit JSONL 文件写入失败时抛出。
+        :raises RuntimeFileLockError: audit JSONL 文件锁失败时抛出。
+        """
+
+        return append_purge_tombstone_audit_record(self.options, request)
 
 
 def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:
@@ -776,9 +878,7 @@ def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:
             message="Host command durable identity conflict",
             retryable=False,
         )
-    if isinstance(
-        error, HostTransactionBusyError | HostTransactionRetryExhaustedError
-    ):
+    if isinstance(error, HostTransactionBusyError | HostTransactionRetryExhaustedError):
         return HostApiError(
             code=HostApiErrorCode.INTERNAL_ERROR,
             message="Host durable transaction is busy",
@@ -810,24 +910,16 @@ def _durable_options_from_public_options(
         db_path=options.db_path,
         payload_policy=PayloadStoragePolicy(
             artifact_root=options.artifact_root,
-            payload_inline_threshold_bytes=(
-                options.payload_inline_threshold_bytes
-            ),
+            payload_inline_threshold_bytes=(options.payload_inline_threshold_bytes),
             create_artifact_root=options.create_parent_dirs,
         ),
         create_parent_dirs=options.create_parent_dirs,
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
             write_busy_retry_count=options.sqlite_write_busy_retry_count,
-            write_retry_initial_delay_seconds=(
-                options.sqlite_write_retry_initial_delay_seconds
-            ),
-            write_retry_backoff_multiplier=(
-                options.sqlite_write_retry_backoff_multiplier
-            ),
-            write_retry_max_delay_seconds=(
-                options.sqlite_write_retry_max_delay_seconds
-            ),
+            write_retry_initial_delay_seconds=(options.sqlite_write_retry_initial_delay_seconds),
+            write_retry_backoff_multiplier=(options.sqlite_write_retry_backoff_multiplier),
+            write_retry_max_delay_seconds=(options.sqlite_write_retry_max_delay_seconds),
         ),
     )
 
@@ -896,12 +988,8 @@ def _submit_followup_public_semantic_digest(
             "prompt_digest": _submit_followup_prompt_digest(request),
             "tool_names": _tool_names_digest_value(request.tool_names),
             "runner_spec_digest": _optional_runner_spec_json(request.runner_spec),
-            "runner_options_digest": _optional_runner_options_json(
-                request.runner_options
-            ),
-            "agent_policy_digest": _optional_agent_policy_json(
-                request.agent_policy
-            ),
+            "runner_options_digest": _optional_runner_options_json(request.runner_options),
+            "agent_policy_digest": _optional_agent_policy_json(request.agent_policy),
             "behavior": request.behavior.value,
             "target_run_id": request.target_run_id,
             "call_context_digest": _call_context_digest(request.context),
@@ -909,9 +997,7 @@ def _submit_followup_public_semantic_digest(
     )
 
 
-def _cancel_run_public_semantic_digest(
-    *, run_id: str, request: CancelRunRequest
-) -> str:
+def _cancel_run_public_semantic_digest(*, run_id: str, request: CancelRunRequest) -> str:
     """计算 public cancel_run facade semantic digest。
 
     :param run_id: 目标 Run id。
@@ -930,9 +1016,7 @@ def _cancel_run_public_semantic_digest(
     )
 
 
-def _cancel_session_runs_public_semantic_digest(
-    *, session_id: str, request: CancelSessionRunsRequest
-) -> str:
+def _cancel_session_runs_public_semantic_digest(*, session_id: str, request: CancelSessionRunsRequest) -> str:
     """计算 public cancel_session_runs facade semantic digest。
 
     :param session_id: 目标 Session id。
@@ -951,9 +1035,7 @@ def _cancel_session_runs_public_semantic_digest(
     )
 
 
-def _retry_run_public_semantic_digest(
-    *, run_id: str, request: RetryRunRequest
-) -> str:
+def _retry_run_public_semantic_digest(*, run_id: str, request: RetryRunRequest) -> str:
     """计算 public retry_run facade semantic digest。
 
     :param run_id: 源 Run id。
@@ -971,9 +1053,7 @@ def _retry_run_public_semantic_digest(
     )
 
 
-def _replay_run_public_semantic_digest(
-    *, run_id: str, request: ReplayRunRequest
-) -> str:
+def _replay_run_public_semantic_digest(*, run_id: str, request: ReplayRunRequest) -> str:
     """计算 public replay_run facade semantic digest。
 
     :param run_id: 源 Run id。
@@ -1061,9 +1141,7 @@ def _create_session_public_semantic_digest(
     )
 
 
-def _close_session_public_semantic_digest(
-    *, session_id: str, request: CloseSessionRequest
-) -> str:
+def _close_session_public_semantic_digest(*, session_id: str, request: CloseSessionRequest) -> str:
     """计算 public close_session facade semantic digest。
 
     digest 只包含显式 close_session 语义字段与 HostCallContext digest，不包含
@@ -1115,7 +1193,7 @@ def _call_context_digest(context: HostCallContext) -> str:
     return sha256_digest_json(_call_context_json_value(context))
 
 
-def _call_context_json_value(context: HostCallContext) -> JsonValue:
+def _call_context_json_value(context: HostCallContext) -> dict[str, JsonValue]:
     """把 HostCallContext 转为 canonical JSON 值。
 
     :param context: Host call context。
@@ -1125,18 +1203,12 @@ def _call_context_json_value(context: HostCallContext) -> JsonValue:
     return {
         "actor": context.actor,
         "source": context.source,
-        "authorization_claims": _authorization_claims_json_value(
-            context.authorization_claims
-        ),
-        "operation_context": _operation_context_json_value(
-            context.operation_context
-        ),
+        "authorization_claims": _authorization_claims_json_value(context.authorization_claims),
+        "operation_context": _operation_context_json_value(context.operation_context),
     }
 
 
-def _authorization_claims_json_value(
-    claims: tuple[AuthorizationClaim, ...]
-) -> JsonValue:
+def _authorization_claims_json_value(claims: tuple[AuthorizationClaim, ...]) -> JsonValue:
     """把 authorization claims 转为 canonical JSON 值。
 
     :param claims: 授权声明元组。
@@ -1149,7 +1221,9 @@ def _authorization_claims_json_value(
     return values
 
 
-def _operation_context_json_value(context: OperationContext) -> JsonValue:
+def _operation_context_json_value(
+    context: OperationContext,
+) -> dict[str, JsonValue]:
     """把 OperationContext 转为 canonical JSON 值。
 
     :param context: 操作上下文。
@@ -1215,14 +1289,11 @@ class _IsDeferredCancelStateOperation:
         if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
             return False
         return not (
-            _is_predispatch_starting_run(transaction, run)
-            or _is_active_worker_cancelable_run(transaction, run)
+            _is_predispatch_starting_run(transaction, run) or _is_active_worker_cancelable_run(transaction, run)
         )
 
 
-def _is_predispatch_starting_run(
-    transaction: HostTransaction, run: RunRow
-) -> bool:
+def _is_predispatch_starting_run(transaction: HostTransaction, run: RunRow) -> bool:
     """判断 Run 是否仍是可直接取消的 pre-dispatch STARTING。
 
     :param transaction: 当前 Host transaction。
@@ -1239,9 +1310,7 @@ def _is_predispatch_starting_run(
     )
 
 
-def _is_active_worker_cancelable_run(
-    transaction: HostTransaction, run: RunRow
-) -> bool:
+def _is_active_worker_cancelable_run(transaction: HostTransaction, run: RunRow) -> bool:
     """判断 Run 是否处于 Phase 5 active worker cancel 子集。
 
     :param transaction: 当前 Host transaction。
@@ -1307,9 +1376,7 @@ def _read_attempt_and_dispatch_for_run(
     if run.current_attempt_id is None:
         return None, None
     attempt = read_attempt_by_id(transaction, run.current_attempt_id)
-    dispatch_record = read_dispatch_record_by_attempt_id(
-        transaction, run.current_attempt_id
-    )
+    dispatch_record = read_dispatch_record_by_attempt_id(transaction, run.current_attempt_id)
     return attempt, dispatch_record
 
 

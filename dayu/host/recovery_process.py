@@ -230,6 +230,15 @@ def classify_orphan_candidate(
             probe_error_code=None,
         )
     row = candidate.owner_liveness
+    if row.pid <= 0:
+        return PositiveOrphanProof(
+            owner_host_instance_id=candidate.owner_host_instance_id,
+            pid=row.pid,
+            reason=_ORPHAN_REASON_PID_MISSING,
+            heartbeat_at=row.heartbeat_at,
+            observed_start_token=None,
+            observed_boot_id=None,
+        )
     if row.status is HostInstanceStatus.STOPPED:
         return PositiveOrphanProof(
             owner_host_instance_id=candidate.owner_host_instance_id,

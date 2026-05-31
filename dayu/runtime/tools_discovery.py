@@ -13,7 +13,7 @@ import importlib.metadata as importlib_metadata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Protocol, TypeAlias, cast
+from typing import Final, Protocol, TypeAlias, cast
 
 from dayu.contracts import (
     JsonValue,
@@ -180,7 +180,7 @@ class ToolsDiscoveryProviderReport:
 class ToolsDiscoveryResult:
     """工具发现聚合结果。
 
-    :param tool_bundle: 聚合后的业务工具 bundle。
+    :param tool_bundle: 聚合后的业务工具 bundle；没有发现工具时为空 bundle。
     :param provider_reports: provider 级别报告，不包含 callable 或 adapter。
     :param source_refs: 按 provider 输出顺序拼接的来源引用。
     """
@@ -257,8 +257,13 @@ class ToolsDiscovery:
             definitions.extend(output.definitions)
             source_refs.extend(normalized_source_refs)
         _validate_unique_tool_names(tuple(definitions))
+        tool_bundle = (
+            ToolBundle(definitions=(), _allow_empty=True)
+            if not definitions
+            else ToolBundle(definitions=tuple(definitions))
+        )
         return ToolsDiscoveryResult(
-            tool_bundle=ToolBundle(definitions=tuple(definitions)),
+            tool_bundle=tool_bundle,
             provider_reports=tuple(reports),
             source_refs=tuple(source_refs),
         )
@@ -398,9 +403,7 @@ def _tool_definitions_digest(definitions: tuple[ToolDefinition, ...]) -> str:
     :raises ValueError: 声明中的浮点数不是合法 JSON number 时抛出。
     """
 
-    tools: list[JsonValue] = [
-        _tool_definition_json_value(definition) for definition in definitions
-    ]
+    tools: list[JsonValue] = [_tool_definition_json_value(definition) for definition in definitions]
     payload: dict[str, JsonValue] = {"tools": tools}
     return canonical_json_digest(payload)
 
@@ -445,11 +448,7 @@ def _tool_definition_json_value(definition: ToolDefinition) -> JsonValue:
         "schema": _tool_schema_json_value(definition),
         "truncate": _tool_truncate_json_value(definition),
         "tags": list(definition.tags),
-        "display": (
-            definition.display.name
-            if definition.display is not None
-            else None
-        ),
+        "display": (definition.display.name if definition.display is not None else None),
     }
     return value
 
@@ -494,18 +493,10 @@ def _tool_truncate_json_value(definition: ToolDefinition) -> JsonValue:
         return None
     value: dict[str, JsonValue] = {
         "enabled": truncate.enabled,
-        "strategy": (
-            truncate.strategy.value
-            if truncate.strategy is not None
-            else None
-        ),
+        "strategy": (truncate.strategy.value if truncate.strategy is not None else None),
         "limits": _int_mapping_json_value(truncate.limits),
         "target_field": truncate.target_field,
-        "field_path": (
-            list(truncate.field_path)
-            if truncate.field_path is not None
-            else None
-        ),
+        "field_path": (list(truncate.field_path) if truncate.field_path is not None else None),
         "ttl_seconds": truncate.ttl_seconds,
     }
     return value
@@ -579,10 +570,7 @@ def _validate_reserved_tool_names(definitions: tuple[ToolDefinition, ...]) -> No
 
     for definition in definitions:
         if definition.name in _RESERVED_FRAMEWORK_TOOL_NAMES:
-            raise ToolsDiscoveryError(
-                "business tool name is reserved for framework tool:"
-                f" {definition.name}"
-            )
+            raise ToolsDiscoveryError("business tool name is reserved for framework tool:" f" {definition.name}")
 
 
 def _require_provider_identity(provider_id: str) -> str:

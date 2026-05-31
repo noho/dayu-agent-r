@@ -7,7 +7,7 @@ import pathlib
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
 
@@ -22,10 +22,13 @@ from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
+    CloseSessionRequest,
     CompactorRunnerBaseline,
     EnsureSessionRequest,
     FollowupBehavior,
     Host,
+    HostApiError,
+    HostApiErrorCode,
     HostCallContext,
     HostEvent,
     HostEventKind,
@@ -36,6 +39,8 @@ from dayu.host import (
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
+    PurgeSessionRequest,
+    PurgeSessionResult,
     RunSnapshot,
     RunStatus,
     SubmitFollowupRequest,
@@ -56,14 +61,32 @@ from dayu.host.durable.transaction import HostTransaction
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
+    _CompositeProjectionCatchupPort,
     _PublicHostHandle,
     _command_options_from_open_host_options,
     _local_execution_options_from_open_host_options,
 )
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.recovery import StartupRecoveryScanner
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
+
+
+class _PurgeCapableHost(Protocol):
+    """测试 open_host concrete handle 的 purge 接线能力。"""
+
+    async def purge_session(
+        self, session_id: str, request: PurgeSessionRequest
+    ) -> PurgeSessionResult:
+        """清理已关闭 Session。
+
+        :param session_id: 目标 Session id。
+        :param request: purge 请求。
+        :returns: concrete public purge result。
+        """
+
+        ...
 
 
 class _FinalAnswerHandle:
@@ -530,6 +553,92 @@ async def test_public_host_close_closes_command_handle_when_scheduler_close_rais
     assert command_handle.close_count == 1
 
 
+@pytest.mark.asyncio
+async def test_open_host_startup_failure_flushes_projection_before_close(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_host ready 前失败时仍应 best-effort 追平 projection。"""
+
+    catch_up_calls = 0
+
+    def raise_recovery_scan(
+        self: StartupRecoveryScanner,
+    ) -> None:
+        """模拟 startup recovery scan 失败。
+
+        :param self: 被 monkeypatch 的 scanner。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        del self
+        raise RuntimeError("forced startup recovery failure")
+
+    def record_catch_up(
+        self: _CompositeProjectionCatchupPort,
+    ) -> None:
+        """记录启动失败清理路径的 projection catch-up。
+
+        :param self: 被 monkeypatch 的 composite catch-up port。
+        :returns: ``None``。
+        """
+
+        nonlocal catch_up_calls
+        del self
+        catch_up_calls += 1
+
+    monkeypatch.setattr(
+        StartupRecoveryScanner,
+        "scan",
+        raise_recovery_scan,
+    )
+    monkeypatch.setattr(
+        _CompositeProjectionCatchupPort,
+        "catch_up_projection",
+        record_catch_up,
+    )
+
+    with pytest.raises(RuntimeError, match="forced startup recovery failure"):
+        async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())):
+            raise AssertionError("open_host must fail before yielding")
+
+    assert catch_up_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_open_host_purge_session_and_watch_after_purge_fail_closed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """open_host purge 接到 command facade，purge 后 watch 不重建 Session。"""
+
+    options = _options(tmp_path, _FinalAnswerWorkerFactory())
+
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        await host.close_session(
+            session.session_id,
+            _close_request("close-before-purge"),
+        )
+        purge_host = cast(_PurgeCapableHost, host)
+        result = await purge_host.purge_session(
+            session.session_id,
+            _purge_request("purge-open-host"),
+        )
+
+        assert result.session_id == session.session_id
+        assert result.purged is True
+        assert result.purge_tombstone_ref is not None
+        assert result.deleted_counts_digest is not None
+        with pytest.raises(HostApiError) as get_session_exc:
+            await host.get_session(session.session_id)
+        with pytest.raises(HostApiError) as watch_exc:
+            host.watch_session_events(session.session_id)
+
+        assert get_session_exc.value.code == HostApiErrorCode.NOT_FOUND
+        assert watch_exc.value.code == HostApiErrorCode.NOT_FOUND
+
+
 def test_compactor_runner_baseline_none_maps_to_fail_closed_no_capability(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -823,6 +932,34 @@ def _ensure_request() -> EnsureSessionRequest:
         scope="workspace",
         slot_key="open-host-runtime",
         metadata=(),
+    )
+
+
+def _close_request(client_request_id: str) -> CloseSessionRequest:
+    """构造 close session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: CloseSessionRequest。
+    """
+
+    return CloseSessionRequest(
+        context=_context(client_request_id),
+        client_request_id=client_request_id,
+        reason="open_host_runtime_close",
+    )
+
+
+def _purge_request(client_request_id: str) -> PurgeSessionRequest:
+    """构造 purge session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: PurgeSessionRequest。
+    """
+
+    return PurgeSessionRequest(
+        context=_context(client_request_id),
+        client_request_id=client_request_id,
+        reason="open_host_runtime_purge",
     )
 
 

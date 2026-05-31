@@ -352,6 +352,46 @@ async def test_stream_true_json_content_type_uses_non_stream_parser() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_true_missing_content_type_uses_non_stream_parser(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """stream=True 但缺 Content-Type 时保守按非流式 JSON 解析并记录诊断。"""
+
+    caplog.set_level(
+        "WARNING", logger="dayu.engine.runners.openai.runner"
+    )
+    runner = AsyncOpenAIRunner(
+        spec=make_spec(supports_streaming=True),
+        cancellation_token=FakeCancellationToken(),
+    )
+    session = FakeSession()
+    session.enqueue_response(
+        FakeResponseSpec(
+            status=200,
+            headers={"x-request-id": "req_missing_content_type"},
+            body_chunks=[
+                b'{"choices":[{"message":{"role":"assistant",'
+                b'"content":"json"},"finish_reason":"stop"}]}'
+            ],
+        )
+    )
+    _install_session(runner, session)
+
+    events = await _collect(runner)
+
+    assert [event.type for event in events] == [
+        RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    assert isinstance(events[0].data, RunnerContentCompletedData)
+    assert events[0].data.content == "json"
+    assert isinstance(events[1].data, RunnerDoneData)
+    assert events[1].data.provider_request_id == "req_missing_content_type"
+    assert "runner.http.missing_content_type" in caplog.text
+    await runner.close()
+
+
+@pytest.mark.asyncio
 async def test_non_stream_success_provider_request_id_reaches_agent_iteration_completed() -> None:
     """非流式正常成功响应的 request id 会传到 Agent iteration_completed。"""
 

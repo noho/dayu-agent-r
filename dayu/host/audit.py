@@ -27,6 +27,10 @@ from dayu.host.durable.codec import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, read_event_by_id
+from dayu.host.durable.purge import (
+    PurgeTombstoneAuditRecordRequest,
+    PurgeTombstoneAuditRecordResult,
+)
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.projection import (
     ProjectionApplyResult,
@@ -68,6 +72,20 @@ _AUDIT_FIELD_REASON = "reason"
 _AUDIT_FIELD_PAYLOAD_REF = "payload_ref"
 _AUDIT_FIELD_PAYLOAD_DIGEST = "payload_digest"
 _AUDIT_FIELD_LINE_DIGEST = "line_digest"
+_AUDIT_FIELD_LINE_KIND = "line_kind"
+_AUDIT_FIELD_PURGE_TOMBSTONE_REF = "purge_tombstone_ref"
+_AUDIT_FIELD_AUDIT_RECORD_REF = "audit_record_ref"
+_AUDIT_FIELD_DELETED_COUNTS_DIGEST = "deleted_counts_digest"
+_AUDIT_FIELD_PRECONDITION_DIGEST = "precondition_digest"
+_AUDIT_FIELD_DELETED_REFS_DIGEST = "deleted_refs_digest"
+_AUDIT_FIELD_REQUEST_CONTEXT = "request_context"
+_AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED = "source_eventlog_facts_purged"
+_AUDIT_FIELD_DELETED_COUNTS = "deleted_counts"
+_AUDIT_LINE_KIND_PURGE_TOMBSTONE = "purge_tombstone"
+_AUDIT_RECORD_REF_PREFIX = "audit-jsonl:purge-tombstone:"
+_AUDIT_ARTIFACT_DIRECTORY_NAME = "audit"
+_AUDIT_JSONL_FILE_NAME = "host-audit.jsonl"
+_AUDIT_LOCK_FILE_SUFFIX = ".lock"
 _PAYLOAD_FIELD_OPERATION_CONTEXT = "operation_context"
 _PAYLOAD_FIELD_AUTHORIZATION_CLAIMS = "authorization_claims"
 _PAYLOAD_FIELD_POLICY_DECISION_REF = "policy_decision_ref"
@@ -159,6 +177,30 @@ class LogAuditSinkCatchupResult:
     events_applied: int
     duplicates: int
     failures: int
+
+
+def default_log_audit_sink_options(
+    artifact_root: Path, *, create_parent_dirs: bool
+) -> LogAuditSinkOptions:
+    """从 artifact root 派生默认 audit JSONL sink options。
+
+    :param artifact_root: Host artifact 根目录。
+    :param create_parent_dirs: 写入 audit JSONL 前是否创建 parent directory。
+    :returns: 默认 LogAuditSink options。
+    :raises TypeError: 路径字段类型非法时抛出。
+    :raises ValueError: 路径为空时抛出。
+    """
+
+    audit_jsonl_path = (
+        artifact_root / _AUDIT_ARTIFACT_DIRECTORY_NAME / _AUDIT_JSONL_FILE_NAME
+    )
+    return LogAuditSinkOptions(
+        audit_jsonl_path=audit_jsonl_path,
+        create_parent_dirs=create_parent_dirs,
+        lock_path=audit_jsonl_path.with_name(
+            audit_jsonl_path.name + _AUDIT_LOCK_FILE_SUFFIX
+        ),
+    )
 
 
 class LogAuditSink:
@@ -258,30 +300,16 @@ class LogAuditSink:
         :raises RuntimeFileLockError: lock 获取或释放失败时由底层抛出。
         """
 
-        if self._options.create_parent_dirs:
-            self._options.audit_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-        source_keys = (
-            (_AUDIT_FIELD_EVENT_ID, _required_line_text(line, _AUDIT_FIELD_EVENT_ID)),
+        _append_audit_json_line(
+            self._options,
+            line,
+            source_keys=(
+                (
+                    _AUDIT_FIELD_EVENT_ID,
+                    _required_line_text(line, _AUDIT_FIELD_EVENT_ID),
+                ),
+            ),
         )
-        if self._options.lock_path is None:
-            _append_text_if_absent(
-                self._options.audit_jsonl_path,
-                line.to_jsonl_text(),
-                line_digest=line.line_digest,
-                source_keys=source_keys,
-            )
-            return
-        with file_lock(
-            self._options.lock_path,
-            timeout_seconds=_LOCK_TIMEOUT_SECONDS,
-            create_parent_dirs=self._options.create_parent_dirs,
-        ):
-            _append_text_if_absent(
-                self._options.audit_jsonl_path,
-                line.to_jsonl_text(),
-                line_digest=line.line_digest,
-                source_keys=source_keys,
-            )
 
 
 def build_audit_json_line(
@@ -341,6 +369,93 @@ def build_audit_json_line(
     fields: dict[str, JsonValue] = dict(fields_without_digest)
     fields[_AUDIT_FIELD_LINE_DIGEST] = line_digest
     return AuditJsonLine(fields=fields, line_digest=line_digest)
+
+
+def build_purge_tombstone_audit_json_line(
+    request: PurgeTombstoneAuditRecordRequest,
+) -> AuditJsonLine:
+    """构造 purge tombstone audit JSONL line。
+
+    该 line 以 purge tombstone 为 source，不读取已删除或即将删除的 EventLog
+    row；字段只使用同一 purge 请求与删除矩阵的稳定值，保证 rollback 后
+    retry 不会因时间戳变化产生 source key 冲突。
+
+    :param request: purge tombstone audit 写入请求。
+    :returns: 包含 ``line_digest`` 的 audit JSONL line。
+    :raises HostDurableError: 请求字段无效时抛出。
+    """
+
+    audit_record_ref = _purge_tombstone_audit_record_ref(request.tombstone_id)
+    fields_without_digest: dict[str, JsonValue] = {
+        _AUDIT_FIELD_SCHEMA_VERSION: _AUDIT_LINE_SCHEMA_VERSION,
+        _AUDIT_FIELD_LINE_KIND: _AUDIT_LINE_KIND_PURGE_TOMBSTONE,
+        _AUDIT_FIELD_AUDIT_RECORD_REF: audit_record_ref,
+        _AUDIT_FIELD_PURGE_TOMBSTONE_REF: request.tombstone_id,
+        _AUDIT_FIELD_SESSION_ID: request.session_id,
+        _AUDIT_FIELD_ACTOR: request.actor,
+        _AUDIT_FIELD_SOURCE: request.source,
+        _AUDIT_FIELD_CLIENT_REQUEST_ID: request.client_request_id,
+        _AUDIT_FIELD_OPERATION_CONTEXT_REFS: request.operation_context_refs,
+        _AUDIT_FIELD_OPERATION_CONTEXT_DIGEST: request.operation_context_digest,
+        _AUDIT_FIELD_REASON: request.reason,
+        _AUDIT_FIELD_PRECONDITION_DIGEST: request.precondition_digest,
+        _AUDIT_FIELD_DELETED_COUNTS: request.deleted_counts.json_value(),
+        _AUDIT_FIELD_DELETED_COUNTS_DIGEST: request.deleted_counts_digest,
+        _AUDIT_FIELD_DELETED_REFS_DIGEST: request.deleted_refs_digest,
+        _AUDIT_FIELD_REQUEST_CONTEXT: request.request_context,
+        _AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED: True,
+    }
+    line_digest = sha256_digest_json(fields_without_digest)
+    fields: dict[str, JsonValue] = dict(fields_without_digest)
+    fields[_AUDIT_FIELD_LINE_DIGEST] = line_digest
+    return AuditJsonLine(fields=fields, line_digest=line_digest)
+
+
+def append_purge_tombstone_audit_record(
+    options: LogAuditSinkOptions,
+    request: PurgeTombstoneAuditRecordRequest,
+) -> PurgeTombstoneAuditRecordResult:
+    """append-only 写入 purge tombstone audit JSONL line。
+
+    :param options: audit JSONL sink options。
+    :param request: purge tombstone audit 写入请求。
+    :returns: audit record ref 与 line digest。
+    :raises HostDurableError: 既有同 tombstone source key 行 digest 冲突时抛出。
+    :raises OSError: JSONL 文件创建或追加失败时抛出。
+    :raises RuntimeFileLockError: 文件锁获取或释放失败时由底层抛出。
+    """
+
+    line = build_purge_tombstone_audit_json_line(request)
+    _append_audit_json_line(
+        options,
+        line,
+        source_keys=(
+            (
+                _AUDIT_FIELD_PURGE_TOMBSTONE_REF,
+                _required_line_text(line, _AUDIT_FIELD_PURGE_TOMBSTONE_REF),
+            ),
+        ),
+    )
+    return PurgeTombstoneAuditRecordResult(
+        audit_record_ref=_required_line_text(line, _AUDIT_FIELD_AUDIT_RECORD_REF),
+        audit_record_digest=line.line_digest,
+    )
+
+
+def audit_json_line_marks_purged_source_eventlog_facts(
+    line: Mapping[str, JsonValue],
+) -> bool:
+    """判断 audit JSONL object 是否为 purge tombstone audit line。
+
+    :param line: 已解析的 audit JSONL object。
+    :returns: 该行明确表示源 EventLog facts 已 purge 时返回 ``True``。
+    :raises: 无。
+    """
+
+    return (
+        line.get(_AUDIT_FIELD_LINE_KIND) == _AUDIT_LINE_KIND_PURGE_TOMBSTONE
+        and line.get(_AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED) is True
+    )
 
 
 def catch_up_log_audit_sink_projection(
@@ -419,6 +534,59 @@ def _append_text_if_absent(
     if _jsonl_contains_line(path, line_digest=line_digest, source_keys=source_keys):
         return
     _append_text(path, text)
+
+
+def _append_audit_json_line(
+    options: LogAuditSinkOptions,
+    line: AuditJsonLine,
+    *,
+    source_keys: tuple[tuple[str, str], ...],
+) -> None:
+    """按 audit sink options 幂等追加 JSONL line。
+
+    :param options: audit sink options。
+    :param line: 待追加的 audit JSONL line。
+    :param source_keys: 当前 line 的稳定 source key 集合。
+    :returns: ``None``。
+    :raises HostDurableError: source key 冲突时抛出。
+    :raises OSError: 创建目录或写文件失败时抛出。
+    :raises RuntimeFileLockError: lock 获取或释放失败时由底层抛出。
+    """
+
+    if options.create_parent_dirs:
+        options.audit_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    if options.lock_path is None:
+        _append_text_if_absent(
+            options.audit_jsonl_path,
+            line.to_jsonl_text(),
+            line_digest=line.line_digest,
+            source_keys=source_keys,
+        )
+        return
+    with file_lock(
+        options.lock_path,
+        timeout_seconds=_LOCK_TIMEOUT_SECONDS,
+        create_parent_dirs=options.create_parent_dirs,
+    ):
+        _append_text_if_absent(
+            options.audit_jsonl_path,
+            line.to_jsonl_text(),
+            line_digest=line.line_digest,
+            source_keys=source_keys,
+        )
+
+
+def _purge_tombstone_audit_record_ref(tombstone_id: str) -> str:
+    """构造 purge tombstone audit record ref。
+
+    :param tombstone_id: purge tombstone id。
+    :returns: audit JSONL record ref。
+    :raises HostDurableError: tombstone id 为空时抛出。
+    """
+
+    if tombstone_id.strip() == "":
+        raise HostDurableError("purge tombstone audit ref requires tombstone_id")
+    return _AUDIT_RECORD_REF_PREFIX + tombstone_id
 
 
 def _append_text(path: Path, text: str) -> None:
@@ -677,6 +845,10 @@ __all__ = [
     "LogAuditSink",
     "LogAuditSinkCatchupResult",
     "LogAuditSinkOptions",
+    "append_purge_tombstone_audit_record",
+    "audit_json_line_marks_purged_source_eventlog_facts",
     "build_audit_json_line",
+    "build_purge_tombstone_audit_json_line",
     "catch_up_log_audit_sink_projection",
+    "default_log_audit_sink_options",
 ]

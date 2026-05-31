@@ -124,7 +124,7 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 - `is_supports_tool_calling()`：返回 Runner 是否支持工具调用。
 - `close()`：关闭 Runner 并释放底层连接。
 
-`RunnerSpec` 描述 Runner 规约，字段包括 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、默认 timeout、最大重试次数、provider 请求扩展和 SSE idle 配置。默认 timeout 必须为正数，最大重试次数必须为非负整数。
+`RunnerSpec` 描述 Runner 规约，字段包括 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、默认 timeout、最大重试次数、provider 请求扩展和 SSE idle 配置。`api_key_ref=None` 表示本地或免鉴权 provider 不需要 API key header。默认 timeout 必须为正数，最大重试次数必须为非负整数。
 
 `RunnerCallOptions` 描述单次调用参数，字段包括 `temperature`、`max_tokens`、`top_p`、`stream`。
 
@@ -169,7 +169,7 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 
 - `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、非空 `messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`。
 - `AgentPolicy`：Agent loop 策略。形状包含 iteration 预算、续写预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。
-- `RunnerSpec`：Runner 规约。形状包含 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、stream usage 能力、默认 timeout、重试次数、provider 请求扩展、SSE idle timeout 与 heartbeat。
+- `RunnerSpec`：Runner 规约。形状包含 provider、model、endpoint、可为空的 api key 引用、headers、tool calling / streaming 能力、stream usage 能力、默认 timeout、重试次数、provider 请求扩展、SSE idle timeout 与 heartbeat。
 - `RunnerCallOptions`：单次 Runner 调用参数。形状包含 `temperature`、`max_tokens`、`top_p`、`stream`。
 - `ProviderRequestExtension`：provider 私有请求扩展的封闭联合。当前成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。
 - `AsyncRunner`：Engine 调用 LLM provider 的协议。形状包含 `call(messages, options, tools)`、`is_supports_tool_calling()`、`close()`。

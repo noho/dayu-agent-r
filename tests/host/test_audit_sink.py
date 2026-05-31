@@ -13,6 +13,9 @@ from dayu.host.audit import (
     LOG_AUDIT_SINK_CONSUMER_ID,
     LogAuditSink,
     LogAuditSinkOptions,
+    append_purge_tombstone_audit_record,
+    audit_json_line_marks_purged_source_eventlog_facts,
+    default_log_audit_sink_options,
 )
 from dayu.host.durable.audit import read_audit_sink_marker
 from dayu.host.durable.codec import sha256_digest_json
@@ -28,6 +31,11 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.purge import (
+    PurgeDeleteCounts,
+    PurgeTombstoneAuditRecordRequest,
+    build_deleted_counts_digest,
+)
 from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
@@ -39,12 +47,44 @@ from dayu.host.durable.schema import (
     TABLE_HOST_RUNS,
 )
 from dayu.host.durable.transaction import HostTransactionRunner
-from dayu.host.open_host import _default_audit_jsonl_path
 from dayu.host.projection import ProjectionRunner
 
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_PREVIEW_DELTA = "PREVIEW_DELTA"
 _FIXED_NOW = datetime(2026, 5, 29, 1, 2, 3, tzinfo=UTC)
+_DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def _purge_counts() -> PurgeDeleteCounts:
+    """构造 purge audit line 测试删除计数。
+
+    :returns: purge 删除矩阵计数。
+    """
+
+    return PurgeDeleteCounts(
+        event_log_rows=2,
+        idempotency_records=1,
+        payload_descriptors=0,
+        sqlite_payloads=0,
+        host_session_slots=1,
+        host_sessions=1,
+        host_runs=1,
+        host_attempts=1,
+        host_attempt_dispatch_records=1,
+        host_wait_records=0,
+        host_run_results=1,
+        host_session_timeline_items=1,
+        host_memory_snapshots=0,
+        host_memory_items=0,
+        host_memory_diagnostics=0,
+        host_audit_sink_markers=1,
+        host_tool_trace_hot=0,
+        host_outbox_terminal_items=0,
+        host_outbox_drain_idempotency=0,
+        host_projection_checkpoints=1,
+        host_projection_failures=0,
+    )
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -470,9 +510,80 @@ def test_audit_sink_does_not_modify_governance_or_event_log(
         assert attempt_count_after == attempt_count_before == 0
 
 
+def test_purge_tombstone_audit_line_is_append_only_and_recognizable(
+    tmp_path: Path,
+) -> None:
+    """purge tombstone audit line 可追加到既有 JSONL 后并被识别。"""
+
+    audit_path = tmp_path / "audit" / "host-audit.jsonl"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(
+        '{"event_id":"event-1","line_digest":"sha256:'
+        'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}\n',
+        encoding="utf-8",
+    )
+    counts = _purge_counts()
+    result = append_purge_tombstone_audit_record(
+        LogAuditSinkOptions(audit_jsonl_path=audit_path, lock_path=None),
+        PurgeTombstoneAuditRecordRequest(
+            tombstone_id="purge-tombstone-1",
+            session_id="session-purged-1",
+            client_request_id="purge-request-1",
+            actor="user-1",
+            source="host-api",
+            operation_context_digest=_DIGEST_A,
+            operation_context_refs={"business_object_id": "session-purged-1"},
+            reason="retention-request",
+            precondition_digest=_DIGEST_B,
+            deleted_counts=counts,
+            deleted_counts_digest=build_deleted_counts_digest(counts),
+            deleted_refs_digest=_DIGEST_A,
+            request_context={"request_id": "request-1"},
+        ),
+    )
+    append_purge_tombstone_audit_record(
+        LogAuditSinkOptions(audit_jsonl_path=audit_path, lock_path=None),
+        PurgeTombstoneAuditRecordRequest(
+            tombstone_id="purge-tombstone-1",
+            session_id="session-purged-1",
+            client_request_id="purge-request-1",
+            actor="user-1",
+            source="host-api",
+            operation_context_digest=_DIGEST_A,
+            operation_context_refs={"business_object_id": "session-purged-1"},
+            reason="retention-request",
+            precondition_digest=_DIGEST_B,
+            deleted_counts=counts,
+            deleted_counts_digest=build_deleted_counts_digest(counts),
+            deleted_refs_digest=_DIGEST_A,
+            request_context={"request_id": "request-1"},
+        ),
+    )
+
+    lines = _json_lines(audit_path)
+    purge_line = lines[1]
+    assert len(lines) == 2
+    assert lines[0]["event_id"] == "event-1"
+    assert audit_json_line_marks_purged_source_eventlog_facts(purge_line)
+    assert purge_line["session_id"] == "session-purged-1"
+    assert purge_line["purge_tombstone_ref"] == "purge-tombstone-1"
+    assert purge_line["deleted_counts_digest"] == build_deleted_counts_digest(counts)
+    assert purge_line["source_eventlog_facts_purged"] is True
+    assert result.audit_record_ref == purge_line["audit_record_ref"]
+    assert result.audit_record_digest == purge_line["line_digest"]
+
+
 def test_default_audit_path_is_derived_from_artifact_root(tmp_path: Path) -> None:
     """open_host 默认 audit JSONL 路径从 artifact_root 派生。"""
 
-    assert _default_audit_jsonl_path(tmp_path / "artifacts") == (
+    options = default_log_audit_sink_options(
+        tmp_path / "artifacts",
+        create_parent_dirs=True,
+    )
+
+    assert options.audit_jsonl_path == (
         tmp_path / "artifacts" / "audit" / "host-audit.jsonl"
+    )
+    assert options.lock_path == (
+        tmp_path / "artifacts" / "audit" / "host-audit.jsonl.lock"
     )

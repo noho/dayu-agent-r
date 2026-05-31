@@ -12,6 +12,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerDoneData,
     RunnerEventType,
+    RunnerProtocolErrorData,
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
@@ -368,3 +369,48 @@ def test_non_stream_tool_call_index_ignores_non_dict_elements() -> None:
     data = completed[0].data
     assert isinstance(data, RunnerToolCallsCompletedData)
     assert data.tool_calls[0].index_in_iteration == 0
+
+
+def test_non_stream_all_non_dict_tool_calls_emit_protocol_error() -> None:
+    """非流式 tool_calls 全部非法时必须暴露明确协议错误。"""
+
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [None, "bad"],
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload,
+            hook=make_no_thought_hook(),
+            provider_request_id="req_bad_tool_calls",
+        )
+    )
+
+    protocol_errors: list[RunnerProtocolErrorData] = []
+    for event in events:
+        if event.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR:
+            data = event.data
+            assert isinstance(data, RunnerProtocolErrorData)
+            protocol_errors.append(data)
+    assert len(protocol_errors) == 3
+    for error in protocol_errors:
+        assert error.provider_request_id == "req_bad_tool_calls"
+    assert [error.error_code for error in protocol_errors] == [
+        "non_stream_tool_call_not_object",
+        "non_stream_tool_call_not_object",
+        "non_stream_tool_calls_empty_after_filter",
+    ]
+    assert events[-1].type is RunnerEventType.RUNNER_DONE
+    done = events[-1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR

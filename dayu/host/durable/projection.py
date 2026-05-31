@@ -24,6 +24,8 @@ from dayu.host.durable.schema import (
 from dayu.host.durable.transaction import HostRow, HostTransaction
 
 _INITIAL_CHECKPOINT_SEQUENCE = 0
+_CHECKPOINT_EVENT_ID_COLUMN = "checkpoint_event_id"
+_FAILED_EVENT_ID_COLUMN = "failed_event_id"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +70,18 @@ class ProjectionFailureRow:
     first_failed_at: str
     last_failed_at: str
     retry_after: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionResetResult:
+    """projection reset 删除结果。
+
+    :param deleted_checkpoints: 删除的 checkpoint row 数量。
+    :param deleted_failures: 删除的 failure row 数量。
+    """
+
+    deleted_checkpoints: int
+    deleted_failures: int
 
 
 def read_projection_checkpoint(
@@ -343,6 +357,63 @@ def clear_projection_failure(
     )
 
 
+def reset_projection_refs_for_deleted_events(
+    transaction: HostTransaction,
+    *,
+    event_ids: tuple[str, ...],
+    rebuildable_consumer_ids: tuple[str, ...],
+) -> ProjectionResetResult:
+    """删除引用被清理 EventLog rows 的可重建 projection cursor/failure。
+
+    调用方必须已经用 Session / Run / Attempt / EventLog 真源完成 purge 前置判定。
+    本 helper 只精确处理传入 EventLog ids 上的 projection-local rows，并拒绝
+    不在白名单内的 consumer，避免把 projection cursor 当成治理事实。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param event_ids: 已确认将被删除的 EventLog ids。
+    :param rebuildable_consumer_ids: 允许从剩余 EventLog 重建的 projection consumer ids。
+    :returns: 删除的 checkpoint/failure row 计数。
+    :raises HostDurableError: 输入无效或存在不可 reset consumer 引用目标 EventLog 时抛出。
+    """
+
+    _validate_reset_event_ids(event_ids)
+    _validate_rebuildable_consumer_ids(rebuildable_consumer_ids)
+    if len(event_ids) == 0:
+        return ProjectionResetResult(deleted_checkpoints=0, deleted_failures=0)
+    _raise_for_unsupported_projection_reset_refs(
+        transaction,
+        table_name=TABLE_HOST_PROJECTION_CHECKPOINTS,
+        event_id_column_name=_CHECKPOINT_EVENT_ID_COLUMN,
+        event_ids=event_ids,
+        rebuildable_consumer_ids=rebuildable_consumer_ids,
+    )
+    _raise_for_unsupported_projection_reset_refs(
+        transaction,
+        table_name=TABLE_HOST_PROJECTION_FAILURES,
+        event_id_column_name=_FAILED_EVENT_ID_COLUMN,
+        event_ids=event_ids,
+        rebuildable_consumer_ids=rebuildable_consumer_ids,
+    )
+    deleted_checkpoints = _delete_allowed_projection_reset_refs(
+        transaction,
+        table_name=TABLE_HOST_PROJECTION_CHECKPOINTS,
+        event_id_column_name=_CHECKPOINT_EVENT_ID_COLUMN,
+        event_ids=event_ids,
+        rebuildable_consumer_ids=rebuildable_consumer_ids,
+    )
+    deleted_failures = _delete_allowed_projection_reset_refs(
+        transaction,
+        table_name=TABLE_HOST_PROJECTION_FAILURES,
+        event_id_column_name=_FAILED_EVENT_ID_COLUMN,
+        event_ids=event_ids,
+        rebuildable_consumer_ids=rebuildable_consumer_ids,
+    )
+    return ProjectionResetResult(
+        deleted_checkpoints=deleted_checkpoints,
+        deleted_failures=deleted_failures,
+    )
+
+
 def _validate_failure_input(
     consumer_id: str,
     *,
@@ -374,6 +445,127 @@ def _validate_failure_input(
     _require_optional_non_empty_text(retry_after, field_name="retry_after")
     if failed_event_sequence <= _INITIAL_CHECKPOINT_SEQUENCE:
         raise HostDurableError("projection failed_event_sequence must be positive")
+
+
+def _validate_reset_event_ids(event_ids: tuple[str, ...]) -> None:
+    """校验 projection reset 目标 EventLog ids。
+
+    :param event_ids: 待 reset 的 EventLog ids。
+    :returns: ``None``。
+    :raises HostDurableError: 任一 event id 非法或重复时抛出。
+    """
+
+    seen: set[str] = set()
+    for event_id in event_ids:
+        _require_non_empty_text(event_id, field_name="event_id")
+        if event_id in seen:
+            raise HostDurableError("projection reset event_id is duplicated")
+        seen.add(event_id)
+
+
+def _validate_rebuildable_consumer_ids(
+    rebuildable_consumer_ids: tuple[str, ...],
+) -> None:
+    """校验允许 reset 的 projection consumer ids。
+
+    :param rebuildable_consumer_ids: 允许 reset 的 consumer ids。
+    :returns: ``None``。
+    :raises HostDurableError: consumer id 集合为空、非法或重复时抛出。
+    """
+
+    if len(rebuildable_consumer_ids) == 0:
+        raise HostDurableError("projection reset consumer allow-list cannot be empty")
+    seen: set[str] = set()
+    for consumer_id in rebuildable_consumer_ids:
+        _require_non_empty_text(consumer_id, field_name="consumer_id")
+        if consumer_id in seen:
+            raise HostDurableError("projection reset consumer_id is duplicated")
+        seen.add(consumer_id)
+
+
+def _raise_for_unsupported_projection_reset_refs(
+    transaction: HostTransaction,
+    *,
+    table_name: str,
+    event_id_column_name: str,
+    event_ids: tuple[str, ...],
+    rebuildable_consumer_ids: tuple[str, ...],
+) -> None:
+    """检查目标 EventLog 上是否存在不可 reset 的 projection consumer row。
+
+    :param transaction: Host transaction。
+    :param table_name: projection checkpoint/failure 表名。
+    :param event_id_column_name: 指向 EventLog id 的列名。
+    :param event_ids: 目标 EventLog ids。
+    :param rebuildable_consumer_ids: 允许 reset 的 consumer ids。
+    :returns: ``None``。
+    :raises HostDurableError: 非白名单 consumer 引用目标 EventLog 时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT consumer_id
+        FROM {table_name}
+        WHERE {_in_clause(event_id_column_name, event_ids)}
+          AND consumer_id NOT IN ({_placeholders(rebuildable_consumer_ids)})
+        LIMIT 1
+        """,
+        event_ids + rebuildable_consumer_ids,
+    )
+    if row is not None:
+        consumer_id = _require_text(row.get("consumer_id"), field_name="consumer_id")
+        raise HostDurableError(
+            f"projection consumer cannot be reset during purge: {consumer_id}"
+        )
+
+
+def _delete_allowed_projection_reset_refs(
+    transaction: HostTransaction,
+    *,
+    table_name: str,
+    event_id_column_name: str,
+    event_ids: tuple[str, ...],
+    rebuildable_consumer_ids: tuple[str, ...],
+) -> int:
+    """删除白名单 consumer 且引用目标 EventLog 的 projection reset rows。
+
+    :param transaction: Host transaction。
+    :param table_name: projection checkpoint/failure 表名。
+    :param event_id_column_name: 指向 EventLog id 的列名。
+    :param event_ids: 目标 EventLog ids。
+    :param rebuildable_consumer_ids: 允许 reset 的 consumer ids。
+    :returns: 删除 row 数量。
+    """
+
+    return transaction.execute(
+        f"""
+        DELETE FROM {table_name}
+        WHERE {_in_clause(event_id_column_name, event_ids)}
+          AND consumer_id IN ({_placeholders(rebuildable_consumer_ids)})
+        """,
+        event_ids + rebuildable_consumer_ids,
+    ).rowcount
+
+
+def _in_clause(column_name: str, values: tuple[str, ...]) -> str:
+    """构造固定列名的 SQL IN 子句。
+
+    :param column_name: SQL 列名，由本模块固定常量传入。
+    :param values: 参数值。
+    :returns: SQL IN 子句。
+    """
+
+    return f"{column_name} IN ({_placeholders(values)})"
+
+
+def _placeholders(values: tuple[str, ...]) -> str:
+    """按值数量生成 SQL placeholders。
+
+    :param values: 参数值。
+    :returns: 逗号分隔的 placeholders。
+    """
+
+    return ", ".join("?" for _value in values)
 
 
 def _checkpoint_row_from_host_row(row: HostRow) -> ProjectionCheckpointRow:

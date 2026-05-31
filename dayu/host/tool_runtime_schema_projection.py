@@ -66,11 +66,21 @@ def business_bundle_digest(bundle: ToolBundle) -> str:
     :returns: ``sha256:`` 前缀摘要。
     """
 
+    return tool_definitions_digest(bundle.definitions)
+
+
+def tool_definitions_digest(definitions: tuple[ToolDefinition, ...]) -> str:
+    """计算业务工具定义元组的稳定诊断摘要。
+
+    :param definitions: 业务工具定义元组；空元组表示 no-tool 模式。
+    :returns: ``sha256:`` 前缀摘要。
+    """
+
     return sha256_digest_json(
         {
             "definitions": [
                 tool_definition_digest_json(definition)
-                for definition in bundle.definitions
+                for definition in definitions
             ]
         }
     )

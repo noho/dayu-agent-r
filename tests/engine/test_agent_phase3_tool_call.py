@@ -1857,6 +1857,22 @@ async def test_force_answer_empty_and_tool_call_are_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_normal_final_empty_content_is_fail_closed() -> None:
+    """普通最终回答路径也必须拒绝空 content。"""
+
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(),
+            runner=_ScriptedRunner(scripts=(_final_script(""),)),
+        )
+    )
+
+    failed = _failed_data(events)
+    assert failed.error_code == "runner_empty_final_content"
+    assert failed.message == "runner did not produce final content"
+
+
+@pytest.mark.asyncio
 async def test_content_filter_is_degraded_final() -> None:
     """content_filter final answer 必须 filtered=True 且 degraded=True。"""
 

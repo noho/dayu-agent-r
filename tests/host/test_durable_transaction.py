@@ -631,3 +631,36 @@ def test_runner_can_be_constructed_with_independent_connection(
             assert _count_rows(connection, "notes") == 1
         finally:
             connection.close()
+
+
+def test_store_close_rejects_active_transaction(tmp_path: Path) -> None:
+    """store close 遇到活跃 transaction 必须拒绝，避免 SQLite 静默 rollback。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        setup_connection = store.connect()
+        try:
+            _create_notes_table(setup_connection)
+        finally:
+            setup_connection.close()
+
+        def operation(transaction: HostTransaction) -> None:
+            """在 transaction 内尝试关闭 store。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            with pytest.raises(HostDurableError, match="active transaction"):
+                store.close()
+            transaction.execute(
+                "INSERT INTO notes (id, body) VALUES (?, ?)",
+                ("n-active", "committed"),
+            )
+
+        store.transaction_runner.run_write(operation)
+        check_connection = store.connect()
+        try:
+            assert _count_rows(check_connection, "notes") == 1
+        finally:
+            check_connection.close()

@@ -228,6 +228,7 @@ def test_fake_provider_callable_aggregation_success() -> None:
 
     result = ToolsDiscovery().discover_from_bindings((ToolsDiscoveryProviderBinding(spec=spec, provider=provider),))
 
+    assert result.tool_bundle is not None
     assert tuple(definition.name for definition in result.tool_bundle.definitions) == ("lookup_filing", "quote_metric")
     assert result.provider_reports[0].provider_id == "alpha-provider"
     assert result.provider_reports[0].tool_names == (
@@ -246,6 +247,7 @@ def test_import_path_resolution_to_callable() -> None:
     result = discover_tools((_spec("imported"),))
 
     assert result.provider_reports[0].provider_id == "imported-provider"
+    assert result.tool_bundle is not None
     assert result.tool_bundle.definitions[0].name == "imported_tool"
 
 
@@ -299,6 +301,7 @@ def test_package_entry_point_resolution_to_callable(
     result = ToolsDiscovery().discover_from_bindings((ToolsDiscoveryProviderBinding(spec=spec, provider=provider),))
 
     assert result.provider_reports[0].provider_id == "entry-provider"
+    assert result.tool_bundle is not None
     assert result.tool_bundle.definitions[0].name == "entry_tool"
 
 
@@ -440,7 +443,7 @@ def test_empty_provider_without_allow_empty_fails() -> None:
 
 
 def test_empty_provider_with_allow_empty_succeeds() -> None:
-    """provider 显式允许空输出时可以产出空 ``ToolBundle``。"""
+    """provider 显式允许空输出时返回类型真实的空工具 bundle。"""
 
     def provider(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
         """空输出测试 provider。
