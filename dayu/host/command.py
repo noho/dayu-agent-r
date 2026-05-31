@@ -9,6 +9,7 @@ supervisor，不实现 Engine dispatch、EventLog stream 或 purge。
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import NoReturn
@@ -17,7 +18,12 @@ from uuid import uuid4
 from dayu.contracts.json_value import JsonValue
 from dayu.host.audit import (
     LogAuditSinkOptions,
-    append_purge_tombstone_audit_record,
+    PurgeCompletedAuditRecordRequest,
+    PurgeFailedAuditRecordRequest,
+    PurgeStartedAuditRecordRequest,
+    append_purge_completed_audit_record,
+    append_purge_failed_audit_record,
+    append_purge_started_audit_record,
     default_log_audit_sink_options,
 )
 from dayu.host.admission import (
@@ -85,8 +91,7 @@ from dayu.host.durable.purge import (
     PurgeSessionDeleteResult,
     PurgeSessionInvalidStateError,
     PurgeSessionNotFoundError,
-    PurgeTombstoneAuditRecordRequest,
-    PurgeTombstoneAuditRecordResult,
+    build_purge_tombstone_id,
     build_purge_semantic_digest,
     purge_session_durable,
 )
@@ -132,6 +137,11 @@ _OPERATION_CANCEL_SESSION_RUNS = "cancel_session_runs"
 _OPERATION_RETRY_RUN = "retry_run"
 _OPERATION_REPLAY_RUN = "replay_run"
 _PUBLIC_FOLLOWUP_DEFAULT_EXECUTION_TARGET = "host-public-followup-default"
+_PURGE_FAILURE_STAGE_PRECONDITION_CHECK = "precondition_check"
+_PURGE_FAILURE_STAGE_ALREADY_PURGED = "already_purged"
+_PURGE_FAILURE_STAGE_NOT_FOUND = "not_found"
+_PURGE_FAILURE_STAGE_IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+_PURGE_FAILURE_STAGE_SQLITE_TRANSACTION = "sqlite_purge_transaction"
 
 
 class HostCommandHandle:
@@ -728,6 +738,34 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
     return run_snapshot_from_row(result.run)
 
 
+@dataclass(frozen=True, slots=True)
+class _PurgeAuditInputs:
+    """purge command path 的 deterministic audit 输入。
+
+    :param tombstone_id: deterministic purge tombstone id。
+    :param session_id: 目标 Session id。
+    :param client_request_id: purge 请求幂等 key。
+    :param semantic_request_digest: purge semantic digest。
+    :param actor: 发起方标识。
+    :param source: 来源标识。
+    :param operation_context_digest: 操作上下文 digest。
+    :param operation_context_refs: 操作上下文 refs JSON object。
+    :param reason: purge 原因。
+    :param request_context: 请求上下文 refs JSON object。
+    """
+
+    tombstone_id: str
+    session_id: str
+    client_request_id: str
+    semantic_request_digest: str
+    actor: str | None
+    source: str | None
+    operation_context_digest: str
+    operation_context_refs: Mapping[str, JsonValue]
+    reason: str
+    request_context: Mapping[str, JsonValue]
+
+
 def purge_session(
     host: HostCommandHandle,
     session_id: str,
@@ -739,36 +777,33 @@ def purge_session(
     :param session_id: 目标 Session id。
     :param request: purge session 请求。
     :returns: purge tombstone 与删除计数摘要组成的 public result。
+    purge command path 直接写 JSONL 是 purge 专用例外：目标 EventLog facts
+    会在 destructive transaction 内被删除，不能依赖普通 EventLog audit
+    projection 事后生成 purge 流水。该例外不得扩散为通用 command audit 模式。
+
     :raises HostApiError: handle 已关闭、Session 缺失、前置条件非法、幂等冲突、
-        已由不同请求 purge 或 durable 写入失败时抛出。
+        已由不同请求 purge、durable 写入失败或 purge audit append 失败时抛出。
     """
 
     host._raise_if_closed()
+    audit_sink_options = host._audit_sink_options()
+    audit_inputs = _build_purge_audit_inputs(session_id=session_id, request=request)
     try:
-        operation = _PurgeSessionOperation(
-            session_id=session_id,
-            request=request,
-            audit_sink_options=host._audit_sink_options(),
+        started_audit = append_purge_started_audit_record(
+            audit_sink_options,
+            PurgeStartedAuditRecordRequest(
+                tombstone_id=audit_inputs.tombstone_id,
+                session_id=audit_inputs.session_id,
+                client_request_id=audit_inputs.client_request_id,
+                semantic_request_digest=audit_inputs.semantic_request_digest,
+                actor=audit_inputs.actor,
+                source=audit_inputs.source,
+                operation_context_digest=audit_inputs.operation_context_digest,
+                operation_context_refs=audit_inputs.operation_context_refs,
+                reason=audit_inputs.reason,
+                request_context=audit_inputs.request_context,
+            ),
         )
-        result = host._transaction_runner().run_write(operation)
-    except PurgeSessionInvalidStateError as exc:
-        raise HostApiError(
-            code=HostApiErrorCode.INVALID_STATE,
-            message="purge_session requires a closed Session with terminal Runs",
-            retryable=False,
-        ) from exc
-    except PurgeSessionAlreadyPurgedError as exc:
-        raise HostApiError(
-            code=HostApiErrorCode.CONFLICT,
-            message="Session has already been purged",
-            retryable=False,
-        ) from exc
-    except PurgeSessionNotFoundError as exc:
-        raise HostApiError(
-            code=HostApiErrorCode.NOT_FOUND,
-            message="Session not found",
-            retryable=False,
-        ) from exc
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
     except (OSError, RuntimeFileLockError) as exc:
@@ -777,6 +812,83 @@ def purge_session(
             message="Host purge audit append failed",
             retryable=True,
         ) from exc
+
+    try:
+        operation = _PurgeSessionOperation(
+            audit_inputs=audit_inputs,
+            started_audit_record_ref=started_audit.audit_record_ref,
+            started_audit_record_digest=started_audit.audit_record_digest,
+        )
+        result = host._transaction_runner().run_write(operation)
+    except PurgeSessionInvalidStateError as exc:
+        _append_purge_failed_best_effort(
+            audit_sink_options,
+            audit_inputs,
+            failure_stage=_PURGE_FAILURE_STAGE_PRECONDITION_CHECK,
+            error=exc,
+        )
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="purge_session requires a closed Session with terminal Runs",
+            retryable=False,
+        ) from exc
+    except PurgeSessionAlreadyPurgedError as exc:
+        _append_purge_failed_best_effort(
+            audit_sink_options,
+            audit_inputs,
+            failure_stage=_PURGE_FAILURE_STAGE_ALREADY_PURGED,
+            error=exc,
+        )
+        raise HostApiError(
+            code=HostApiErrorCode.CONFLICT,
+            message="Session has already been purged",
+            retryable=False,
+        ) from exc
+    except PurgeSessionNotFoundError as exc:
+        _append_purge_failed_best_effort(
+            audit_sink_options,
+            audit_inputs,
+            failure_stage=_PURGE_FAILURE_STAGE_NOT_FOUND,
+            error=exc,
+        )
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Session not found",
+            retryable=False,
+        ) from exc
+    except HostIdempotencyConflictError as exc:
+        _append_purge_failed_best_effort(
+            audit_sink_options,
+            audit_inputs,
+            failure_stage=_PURGE_FAILURE_STAGE_IDEMPOTENCY_CONFLICT,
+            error=exc,
+        )
+        raise _host_api_error_from_durable_error(exc) from exc
+    except HostDurableError as exc:
+        _append_purge_failed_best_effort(
+            audit_sink_options,
+            audit_inputs,
+            failure_stage=_PURGE_FAILURE_STAGE_SQLITE_TRANSACTION,
+            error=exc,
+        )
+        raise _host_api_error_from_durable_error(exc) from exc
+
+    try:
+        append_purge_completed_audit_record(
+            audit_sink_options,
+            PurgeCompletedAuditRecordRequest(
+                tombstone=result.tombstone,
+                semantic_request_digest=audit_inputs.semantic_request_digest,
+            ),
+        )
+    except (OSError, RuntimeFileLockError) as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Host purge completed audit append failed",
+            retryable=True,
+        ) from exc
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     return PurgeSessionResult(
         session_id=result.tombstone.session_id,
         purged=True,
@@ -789,9 +901,9 @@ def purge_session(
 class _PurgeSessionOperation:
     """purge_session write transaction body。"""
 
-    session_id: str
-    request: PurgeSessionRequest
-    audit_sink_options: LogAuditSinkOptions
+    audit_inputs: _PurgeAuditInputs
+    started_audit_record_ref: str
+    started_audit_record_digest: str
 
     def __call__(self, transaction: HostTransaction) -> PurgeSessionDeleteResult:
         """执行 purge durable helper。
@@ -801,56 +913,109 @@ class _PurgeSessionOperation:
         :raises HostDurableError: purge 前置条件、幂等或 durable 写入失败时抛出。
         """
 
-        operation_context_refs = _operation_context_json_value(self.request.context.operation_context)
-        request_context = _call_context_json_value(self.request.context)
-        operation_context_digest = sha256_digest_json(operation_context_refs)
-        semantic_digest = build_purge_semantic_digest(
-            session_id=self.session_id,
-            reason=self.request.reason,
-            operation_context_digest=operation_context_digest,
-            operation_context_refs=operation_context_refs,
-            request_context=request_context,
-        )
         return purge_session_durable(
             transaction,
             PurgeSessionDeleteRequest(
-                session_id=self.session_id,
-                client_request_id=self.request.client_request_id,
-                semantic_request_digest=semantic_digest,
-                actor=self.request.context.actor,
-                source=self.request.context.source,
-                operation_context_digest=operation_context_digest,
-                operation_context_refs=operation_context_refs,
-                reason=self.request.reason,
+                session_id=self.audit_inputs.session_id,
+                client_request_id=self.audit_inputs.client_request_id,
+                semantic_request_digest=self.audit_inputs.semantic_request_digest,
+                actor=self.audit_inputs.actor,
+                source=self.audit_inputs.source,
+                operation_context_digest=self.audit_inputs.operation_context_digest,
+                operation_context_refs=self.audit_inputs.operation_context_refs,
+                reason=self.audit_inputs.reason,
                 purged_at=format_utc_timestamp(datetime.now(UTC)),
-                audit_recorder=_PurgeAuditJsonlRecorder(self.audit_sink_options),
-                request_context=request_context,
+                started_audit_record_ref=self.started_audit_record_ref,
+                started_audit_record_digest=self.started_audit_record_digest,
+                request_context=self.audit_inputs.request_context,
             ),
         )
 
 
-@dataclass(frozen=True, slots=True)
-class _PurgeAuditJsonlRecorder:
-    """public purge command 使用的 JSONL audit recorder。
+def _build_purge_audit_inputs(
+    *, session_id: str, request: PurgeSessionRequest
+) -> _PurgeAuditInputs:
+    """构造 purge command path 的 deterministic audit 输入。
 
-    :param options: audit JSONL sink options。
+    :param session_id: 目标 Session id。
+    :param request: purge session 请求。
+    :returns: purge audit 输入。
+    :raises HostDurableError: semantic digest 或 tombstone id 输入非法时抛出。
     """
 
-    options: LogAuditSinkOptions
+    operation_context_refs = _operation_context_json_value(
+        request.context.operation_context
+    )
+    request_context = _call_context_json_value(request.context)
+    operation_context_digest = sha256_digest_json(operation_context_refs)
+    semantic_digest = build_purge_semantic_digest(
+        session_id=session_id,
+        reason=request.reason,
+        operation_context_digest=operation_context_digest,
+        operation_context_refs=operation_context_refs,
+        request_context=request_context,
+    )
+    tombstone_id = build_purge_tombstone_id(
+        session_id,
+        request.client_request_id,
+        semantic_digest,
+    )
+    return _PurgeAuditInputs(
+        tombstone_id=tombstone_id,
+        session_id=session_id,
+        client_request_id=request.client_request_id,
+        semantic_request_digest=semantic_digest,
+        actor=request.context.actor,
+        source=request.context.source,
+        operation_context_digest=operation_context_digest,
+        operation_context_refs=operation_context_refs,
+        reason=request.reason,
+        request_context=request_context,
+    )
 
-    def record_purge_tombstone_audit(
-        self, request: PurgeTombstoneAuditRecordRequest
-    ) -> PurgeTombstoneAuditRecordResult:
-        """追加 purge tombstone audit JSONL line。
 
-        :param request: purge tombstone audit 写入请求。
-        :returns: audit record ref 与 line digest。
-        :raises HostDurableError: audit source key digest 冲突时抛出。
-        :raises OSError: audit JSONL 文件写入失败时抛出。
-        :raises RuntimeFileLockError: audit JSONL 文件锁失败时抛出。
-        """
+def _append_purge_failed_best_effort(
+    options: LogAuditSinkOptions,
+    audit_inputs: _PurgeAuditInputs,
+    *,
+    failure_stage: str,
+    error: Exception,
+) -> None:
+    """best-effort 追加 purge_failed audit line。
 
-        return append_purge_tombstone_audit_record(self.options, request)
+    :param options: audit JSONL sink options。
+    :param audit_inputs: deterministic purge audit 输入。
+    :param failure_stage: 稳定失败阶段。
+    :param error: 原始 transaction 错误。
+    :returns: ``None``。
+    :raises: 无；failed audit append 失败只记录 warning。
+    """
+
+    try:
+        append_purge_failed_audit_record(
+            options,
+            PurgeFailedAuditRecordRequest(
+                tombstone_id=audit_inputs.tombstone_id,
+                session_id=audit_inputs.session_id,
+                client_request_id=audit_inputs.client_request_id,
+                semantic_request_digest=audit_inputs.semantic_request_digest,
+                actor=audit_inputs.actor,
+                source=audit_inputs.source,
+                operation_context_digest=audit_inputs.operation_context_digest,
+                operation_context_refs=audit_inputs.operation_context_refs,
+                reason=audit_inputs.reason,
+                request_context=audit_inputs.request_context,
+                failure_stage=failure_stage,
+                failure_message=str(error),
+            ),
+        )
+    except Exception as audit_error:
+        _LOGGER.warning(
+            "purge_failed audit append failed for session_id=%s tombstone_id=%s: %s",
+            audit_inputs.session_id,
+            audit_inputs.tombstone_id,
+            audit_error,
+        )
 
 
 def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:

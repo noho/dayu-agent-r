@@ -117,14 +117,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | ready-for-implementation |
+| implementation status | implementation-reviewed |
 | active work unit | WU-AUDIT-01 |
 | default next work unit | WU-AUDIT-01 |
-| next entry point | implementation：按 accepted plan 派发 Slice 1 |
+| next entry point | accepted slice checkpoint：记录当前 implementation commit 后进入 aggregate deepreview |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
 | implementation commits | accepted plan: f0f5f72；implementation: none |
-| review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md |
+| review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-code-review-mimo-20260531.md；docs/reviews/wu-audit-01-code-review-ds-20260531.md；docs/reviews/wu-audit-01-code-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-code-rereview-ds-20260531.md；docs/reviews/wu-audit-01-code-controller-adjudication-20260531.md |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
 | blocking open questions | none |
@@ -168,7 +168,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| none | - | - | closed | - | - | 当前没有未分配 residual risk 或遗留问题。 |
+| RR-AUDIT-01 | WU-AUDIT-01 implementation | slice boundary | closed | WU-AUDIT-01 integrated implementation | code review 验证 integrated diff | 原 Slice 1 单独移除 durable audit recorder 会导致 `command.py` 旧调用触发 pyright / purge tests 失败；controller 已裁决合并最小 audit 闭环实现，不保留半成品切片。 |
+| RR-AUDIT-02 | WU-AUDIT-01 implementation | docs sync | closed | WU-AUDIT-01 current gate | none | `dayu/host/README.md` 已同步 purge_started / purge_completed / purge_failed 语义，`tests/README.md` 已同步测试覆盖描述；code re-review confirmed no old terminology remains in README scope. |
 
 ## 当前 Work Units
 
