@@ -13,7 +13,12 @@ from dayu.host.audit import (
     LOG_AUDIT_SINK_CONSUMER_ID,
     LogAuditSink,
     LogAuditSinkOptions,
-    append_purge_tombstone_audit_record,
+    PurgeCompletedAuditRecordRequest,
+    PurgeFailedAuditRecordRequest,
+    PurgeStartedAuditRecordRequest,
+    append_purge_completed_audit_record,
+    append_purge_failed_audit_record,
+    append_purge_started_audit_record,
     audit_json_line_marks_purged_source_eventlog_facts,
     default_log_audit_sink_options,
 )
@@ -33,8 +38,10 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.purge import (
     PurgeDeleteCounts,
-    PurgeTombstoneAuditRecordRequest,
+    PurgeTombstoneRow,
     build_deleted_counts_digest,
+    build_purge_semantic_digest,
+    build_purge_tombstone_digest,
 )
 from dayu.host.durable.projection import (
     read_projection_checkpoint,
@@ -54,6 +61,11 @@ _EVENT_TYPE_PREVIEW_DELTA = "PREVIEW_DELTA"
 _FIXED_NOW = datetime(2026, 5, 29, 1, 2, 3, tzinfo=UTC)
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_DIGEST_C = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+_PURGE_TOMBSTONE_ID = "purge-tombstone-1"
+_PURGE_SESSION_ID = "session-purged-1"
+_PURGE_CLIENT_REQUEST_ID = "purge-request-1"
+_PURGE_REASON = "retention-request"
 
 
 def _purge_counts() -> PurgeDeleteCounts:
@@ -84,6 +96,72 @@ def _purge_counts() -> PurgeDeleteCounts:
         host_outbox_drain_idempotency=0,
         host_projection_checkpoints=1,
         host_projection_failures=0,
+    )
+
+
+def _purge_operation_context_refs() -> dict[str, JsonValue]:
+    """构造 purge audit 测试 operation context refs。
+
+    :returns: operation context refs JSON object。
+    """
+
+    return {"business_object_id": _PURGE_SESSION_ID}
+
+
+def _purge_request_context() -> dict[str, JsonValue]:
+    """构造 purge audit 测试 request context。
+
+    :returns: request context JSON object。
+    """
+
+    return {"request_id": "request-1"}
+
+
+def _purge_semantic_digest() -> str:
+    """构造 purge audit 测试 semantic digest。
+
+    :returns: ``sha256:`` semantic digest。
+    """
+
+    return build_purge_semantic_digest(
+        session_id=_PURGE_SESSION_ID,
+        reason=_PURGE_REASON,
+        operation_context_digest=_DIGEST_A,
+        operation_context_refs=_purge_operation_context_refs(),
+        request_context=_purge_request_context(),
+    )
+
+
+def _purge_tombstone(started_line: Mapping[str, JsonValue]) -> PurgeTombstoneRow:
+    """构造 purge_completed 测试 tombstone。
+
+    :param started_line: 已构造的 purge_started audit line。
+    :returns: purge tombstone row。
+    """
+
+    counts = _purge_counts()
+    audit_record_ref = started_line.get("audit_record_ref")
+    audit_record_digest = started_line.get("line_digest")
+    assert isinstance(audit_record_ref, str)
+    assert isinstance(audit_record_digest, str)
+    return PurgeTombstoneRow(
+        tombstone_id=_PURGE_TOMBSTONE_ID,
+        session_id=_PURGE_SESSION_ID,
+        client_request_id=_PURGE_CLIENT_REQUEST_ID,
+        semantic_request_digest=_purge_semantic_digest(),
+        actor="user-1",
+        source="host-api",
+        operation_context_digest=_DIGEST_A,
+        operation_context_refs=_purge_operation_context_refs(),
+        reason=_PURGE_REASON,
+        purged_at="2026-05-29T00:00:00.000000Z",
+        precondition_digest=_DIGEST_B,
+        deleted_counts=counts,
+        deleted_counts_digest=build_deleted_counts_digest(counts),
+        deleted_refs_digest=_DIGEST_C,
+        audit_record_ref=audit_record_ref,
+        audit_record_digest=audit_record_digest,
+        request_context=_purge_request_context(),
     )
 
 
@@ -510,10 +588,10 @@ def test_audit_sink_does_not_modify_governance_or_event_log(
         assert attempt_count_after == attempt_count_before == 0
 
 
-def test_purge_tombstone_audit_line_is_append_only_and_recognizable(
+def test_purge_audit_lines_are_append_only_and_only_completed_marks_purged(
     tmp_path: Path,
 ) -> None:
-    """purge tombstone audit line 可追加到既有 JSONL 后并被识别。"""
+    """purge started/failed/completed audit line 幂等追加且只有 completed 被识别。"""
 
     audit_path = tmp_path / "audit" / "host-audit.jsonl"
     audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -522,55 +600,95 @@ def test_purge_tombstone_audit_line_is_append_only_and_recognizable(
         'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}\n',
         encoding="utf-8",
     )
-    counts = _purge_counts()
-    result = append_purge_tombstone_audit_record(
-        LogAuditSinkOptions(audit_jsonl_path=audit_path, lock_path=None),
-        PurgeTombstoneAuditRecordRequest(
-            tombstone_id="purge-tombstone-1",
-            session_id="session-purged-1",
-            client_request_id="purge-request-1",
+    options = LogAuditSinkOptions(audit_jsonl_path=audit_path, lock_path=None)
+    started_result = append_purge_started_audit_record(
+        options,
+        PurgeStartedAuditRecordRequest(
+            tombstone_id=_PURGE_TOMBSTONE_ID,
+            session_id=_PURGE_SESSION_ID,
+            client_request_id=_PURGE_CLIENT_REQUEST_ID,
+            semantic_request_digest=_purge_semantic_digest(),
             actor="user-1",
             source="host-api",
             operation_context_digest=_DIGEST_A,
-            operation_context_refs={"business_object_id": "session-purged-1"},
-            reason="retention-request",
-            precondition_digest=_DIGEST_B,
-            deleted_counts=counts,
-            deleted_counts_digest=build_deleted_counts_digest(counts),
-            deleted_refs_digest=_DIGEST_A,
-            request_context={"request_id": "request-1"},
+            operation_context_refs=_purge_operation_context_refs(),
+            reason=_PURGE_REASON,
+            request_context=_purge_request_context(),
         ),
     )
-    append_purge_tombstone_audit_record(
-        LogAuditSinkOptions(audit_jsonl_path=audit_path, lock_path=None),
-        PurgeTombstoneAuditRecordRequest(
-            tombstone_id="purge-tombstone-1",
-            session_id="session-purged-1",
-            client_request_id="purge-request-1",
+    append_purge_started_audit_record(
+        options,
+        PurgeStartedAuditRecordRequest(
+            tombstone_id=_PURGE_TOMBSTONE_ID,
+            session_id=_PURGE_SESSION_ID,
+            client_request_id=_PURGE_CLIENT_REQUEST_ID,
+            semantic_request_digest=_purge_semantic_digest(),
             actor="user-1",
             source="host-api",
             operation_context_digest=_DIGEST_A,
-            operation_context_refs={"business_object_id": "session-purged-1"},
-            reason="retention-request",
-            precondition_digest=_DIGEST_B,
-            deleted_counts=counts,
-            deleted_counts_digest=build_deleted_counts_digest(counts),
-            deleted_refs_digest=_DIGEST_A,
-            request_context={"request_id": "request-1"},
+            operation_context_refs=_purge_operation_context_refs(),
+            reason=_PURGE_REASON,
+            request_context=_purge_request_context(),
+        ),
+    )
+    failed_result = append_purge_failed_audit_record(
+        options,
+        PurgeFailedAuditRecordRequest(
+            tombstone_id=_PURGE_TOMBSTONE_ID,
+            session_id=_PURGE_SESSION_ID,
+            client_request_id=_PURGE_CLIENT_REQUEST_ID,
+            semantic_request_digest=_purge_semantic_digest(),
+            actor="user-1",
+            source="host-api",
+            operation_context_digest=_DIGEST_A,
+            operation_context_refs=_purge_operation_context_refs(),
+            reason=_PURGE_REASON,
+            request_context=_purge_request_context(),
+            failure_stage="sqlite_purge_transaction",
+            failure_message="test failure",
+        ),
+    )
+    lines_after_failed = _json_lines(audit_path)
+    tombstone = _purge_tombstone(lines_after_failed[1])
+    completed_result = append_purge_completed_audit_record(
+        LogAuditSinkOptions(audit_jsonl_path=audit_path, lock_path=None),
+        PurgeCompletedAuditRecordRequest(
+            tombstone=tombstone,
+            semantic_request_digest=_purge_semantic_digest(),
+        ),
+    )
+    append_purge_completed_audit_record(
+        options,
+        PurgeCompletedAuditRecordRequest(
+            tombstone=tombstone,
+            semantic_request_digest=_purge_semantic_digest(),
         ),
     )
 
     lines = _json_lines(audit_path)
-    purge_line = lines[1]
-    assert len(lines) == 2
+    started_line = lines[1]
+    failed_line = lines[2]
+    completed_line = lines[3]
+    assert len(lines) == 4
     assert lines[0]["event_id"] == "event-1"
-    assert audit_json_line_marks_purged_source_eventlog_facts(purge_line)
-    assert purge_line["session_id"] == "session-purged-1"
-    assert purge_line["purge_tombstone_ref"] == "purge-tombstone-1"
-    assert purge_line["deleted_counts_digest"] == build_deleted_counts_digest(counts)
-    assert purge_line["source_eventlog_facts_purged"] is True
-    assert result.audit_record_ref == purge_line["audit_record_ref"]
-    assert result.audit_record_digest == purge_line["line_digest"]
+    assert started_line["line_kind"] == "purge_started"
+    assert started_line["source_eventlog_facts_purged"] is False
+    assert started_line["purge_tombstone_ref"] is None
+    assert failed_line["line_kind"] == "purge_failed"
+    assert failed_line["source_eventlog_facts_purged"] is False
+    assert completed_line["line_kind"] == "purge_completed"
+    assert completed_line["purge_tombstone_ref"] == _PURGE_TOMBSTONE_ID
+    assert completed_line["purge_tombstone_digest"] == build_purge_tombstone_digest(tombstone)
+    assert completed_line["deleted_counts_digest"] == build_deleted_counts_digest(_purge_counts())
+    assert completed_line["source_eventlog_facts_purged"] is True
+    assert audit_json_line_marks_purged_source_eventlog_facts(started_line) is False
+    assert audit_json_line_marks_purged_source_eventlog_facts(failed_line) is False
+    assert audit_json_line_marks_purged_source_eventlog_facts(completed_line) is True
+    assert started_result.audit_record_ref == started_line["audit_record_ref"]
+    assert started_result.audit_record_digest == started_line["line_digest"]
+    assert failed_result.audit_record_ref == failed_line["audit_record_ref"]
+    assert completed_result.audit_record_ref == completed_line["audit_record_ref"]
+    assert completed_result.audit_record_digest == completed_line["line_digest"]
 
 
 def test_default_audit_path_is_derived_from_artifact_root(tmp_path: Path) -> None:

@@ -97,6 +97,7 @@ plan 必须基于：
 - 最新 review / deepreview artifact。
 
 plan 不得从旧代码路径、旧类名、旧 review finding 或行数指标直接推导实现方案。
+plan 必须避免过度设计；只能解决由当前代码、测试、设计真源和最新 review artifact 直接支撑的维护性风险，不得把局部拆分扩大成通用框架、平台化能力或未来阶段能力。
 
 ## 仓库发布约定
 
@@ -168,6 +169,7 @@ git push -u github <branch>
 |---|---|---|---|---|---|---|
 | RR-MAINT-01 | repo review 20260531 | module scale risk | deferred-with-owner | 本文档 WU-MAINT-06 | WU-MAINT-06 重新评估 | `dayu/host/durable/run_transition.py`、`dayu/host/tool_runtime.py`、`dayu/host/durable/state.py`、`dayu/host/admission.py` 行数极高，先不在 issue backlog 前处理。 |
 | RR-MAINT-02 | GitHub Issue #33 | God Object risk | deferred-with-owner | 本文档 WU-MAINT-03 / WU-MAINT-04 | issue backlog 完成后刷新代码事实 | `LocalRunHarness` 已不存在，但当前 Host dispatch / ingest orchestration 大对象仍需后续治理。 |
+| RR-MAINT-03 | `docs/reviews/repo-review-20260531-223418.md` | God Object risk | deferred-with-owner | 本文档 WU-MAINT-07 | WU-MAINT-00 刷新后确认拆分边界 | `_AsyncAgent` 约 1900 行且承担 Runner 迭代、工具批量执行、fallback、取消观察、延续逻辑、事件分发和终态决策；不并入当前 audit 修复批次，进入 Engine maintainability work unit。 |
 
 ## 当前 Work Units
 
@@ -180,6 +182,7 @@ git push -u github <branch>
 | WU-MAINT-04 | EngineEvent ingestor orchestration decomposition | 拆 `EngineEventIngestor` 中 terminal closeout、reactive compaction、wait confirmation、diagnostic payload 等职责 |
 | WU-MAINT-05 | Focused long-function cleanup batch | 拆 `run_compaction_operation()`、`project_conversation_memory_event()`、`merge_agent_policy_config()`、`_build_purge_precondition_digest()`、`_create_steer_attempt_result()` |
 | WU-MAINT-06 | God module scale assessment | 评估并规划超大模块拆分时机，不直接机械拆文件 |
+| WU-MAINT-07 | Engine `_AsyncAgent` responsibility decomposition | 拆分 `_AsyncAgent` 的 Runner 迭代、工具执行、fallback、终态决策和取消观察职责 |
 
 ## WU-MAINT-00 Refresh Maintainability Inventory
 
@@ -342,3 +345,27 @@ git push -u github <branch>
 - 有明确的模块 ownership 评估结果。
 - 需要拆分的模块有独立后续 work unit 或 issue owner。
 - 不需要拆分的模块有保留理由和后续观察指标。
+
+## WU-MAINT-07 Engine `_AsyncAgent` Responsibility Decomposition
+
+### 状态
+
+`blocked-by-issue-backlog`。需等待 WU-MAINT-00 刷新后确认当前 `_AsyncAgent` 的真实职责边界和测试保护面。
+
+### 目标
+
+- 拆分 `_AsyncAgent` 中 Runner 迭代、工具批量执行、fallback 模式、终态决策、取消观察和事件分发等职责。
+- 保持 Agent / Runner / ToolExecutor public contract、EngineEvent 语义和 Host / Engine 边界不变。
+- 先补或确认 characterization tests，再按职责 owner 小步拆分。
+
+### 非目标
+
+- 不借维护性拆分改变 provider protocol、tool-calling contract 或 Host durable state。
+- 不引入通用框架、平台化调度器或只做透传的胶水 collaborator。
+- 不与 HTTP 实时观测、duplicate governance、context compaction 等 correctness / feature work 混在同一 work unit。
+
+### 验收信号
+
+- `_AsyncAgent` 不再同时承担工具执行、fallback、终态决策和 Runner 事件消费的主要实现细节。
+- 新 owner 的职责能从名称、构造参数和测试边界直接读出。
+- Engine agent / runner / cancellation / tool execution 相关测试通过，pyright 不新增或扩散类型错误。

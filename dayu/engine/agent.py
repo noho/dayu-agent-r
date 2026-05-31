@@ -1836,6 +1836,12 @@ class _AsyncAgent:
         except asyncio.CancelledError:
             if self._request.cancellation_token.is_cancelled():
                 raise
+            _LOGGER.warning(
+                "engine.agent.tool_executor.cancelled_without_run_cancellation "
+                "run_id=%s call_count=%d",
+                self._request.run_id,
+                len(request.calls),
+            )
             records = tuple(
                 _failed_record_from_cancelled(call=call)
                 for call in request.calls

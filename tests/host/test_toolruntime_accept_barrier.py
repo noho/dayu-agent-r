@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -14,12 +15,14 @@ from dayu.host.api import EnsureSessionRequest, HostPayloadRef
 from dayu.host._event_payload import payload_object
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.artifact import LocalArtifactRef
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.payload import write_payload_descriptor_for_artifact
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
@@ -266,6 +269,42 @@ def test_accept_rejects_missing_payload_descriptor_before_writing_events(
             payload_ref=HostPayloadRef(
                 payload_ref="payload:missing-descriptor",
                 payload_digest=payload_digest,
+            ),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+
+        assert isinstance(result, ToolFactRejectedAck)
+        assert result.reason_code is ToolAcceptRejectReason.PAYLOAD_REFERENCE_INVALID
+        assert _tool_events(store.transaction_runner) == ()
+
+
+def test_accept_rejects_payload_descriptor_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    """accept barrier 拒绝 descriptor 存在但 digest 不匹配的 payload_ref。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        payload_ref = "payload:digest-mismatch"
+        stored_digest = sha256_digest_json({"payload": "stored"})
+        candidate_digest = sha256_digest_json({"payload": "candidate"})
+        store.transaction_runner.run_write(
+            partial(
+                _write_artifact_payload_descriptor,
+                payload_ref=payload_ref,
+                payload_digest=stored_digest,
+            )
+        )
+        candidate = replace(
+            _completed_candidate(seeded, tool_call_id="tool-call-payload-mismatch"),
+            payload_digest=candidate_digest,
+            payload_ref=HostPayloadRef(
+                payload_ref=payload_ref,
+                payload_digest=candidate_digest,
             ),
         )
         accept_port = DefaultHostToolFactAcceptPort(
@@ -718,6 +757,30 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
 
     transaction_runner.run_write(_operation)
     return seeded
+
+
+def _write_artifact_payload_descriptor(
+    transaction: HostTransaction, *, payload_ref: str, payload_digest: str
+) -> None:
+    """写入测试用 artifact payload descriptor。
+
+    :param transaction: Host transaction。
+    :param payload_ref: payload descriptor ref。
+    :param payload_digest: descriptor 记录的 payload digest。
+    :returns: ``None``。
+    """
+
+    write_payload_descriptor_for_artifact(
+        transaction,
+        payload_ref,
+        LocalArtifactRef(
+            artifact_relative_path="tool/digest-mismatch.json",
+            artifact_digest=payload_digest,
+            artifact_size_bytes=128,
+        ),
+        "application/json",
+        {},
+    )
 
 
 def _completed_candidate(

@@ -34,7 +34,7 @@ docs/host/design.md
   -> Host 架构真源
   -> 定义架构边界、状态机、公共接口、EventLog、恢复、并发、等待、上下文治理和关键治理路径
 
-docs/host/followup-implementation-control.md
+docs/host/host-core-followup-implementation-control.md
   -> follow-up 实施编排文档
   -> 只记录未单独建 Issue 的 work units、当前状态、进入 / 退出条件、交付物、验证要求、review 结论和 residual risk
 ```
@@ -48,7 +48,7 @@ docs/host/followup-implementation-control.md
 Host follow-up work unit 采用以下工作流：
 
 ```text
-read followup-implementation-control.md
+read host-core-followup-implementation-control.md
   -> select one work unit
   -> inspect current code and tests
   -> discuss scope, non-goals, risk, and design sufficiency with the user
@@ -72,6 +72,7 @@ work unit plan 必须基于：
 - 代码核对得到的直接证据。
 
 plan 不得从旧设计稿、旧代码路径、非真源讨论记录或 reviewer 个人偏好推导架构边界。
+plan 必须避免过度设计；只能解决由代码核对、设计真源和本文档验收信号直接支撑的当前 work unit 风险，不得把局部缺口扩大成通用框架、平台化能力或未来阶段能力。
 
 plan 文档应放在 `docs/host/` 下；plan review、plan fix、plan re-review、implementation review、fix、re-review 和总控裁决 artifact 放在 `docs/reviews/` 下。
 
@@ -115,18 +116,18 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | not-started |
+| gate | draft-PR-pass |
+| implementation status | current work unit completed：WU-AUDIT-01 |
 | active work unit | none selected |
-| default next work unit | WU-AUDIT-01 |
-| next entry point | discussion：确认默认下一条或由用户指定其它 work unit；随后进入 plan / implementation / review |
-| design source | 由 phaseflow 调用参数提供；本文档只维护实施总控状态 |
-| plan artifacts | none |
-| implementation commits | none |
-| review artifacts | none |
-| aggregate review artifacts | none |
-| draft PR status | not-started |
-| blocking open questions | none；如果用户不接受默认顺序，需要先指定 active work unit |
+| default next work unit | WU-STRESS-01 |
+| next entry point | PR merge 后进入 discussion：确认 WU-STRESS-01 或由用户指定其它 work unit；随后进入代码核对 / plan / implementation / review |
+| design source | docs/host/design.md |
+| plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
+| implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74；accepted deepreview: 4487262；accepted PR review: b8c7866；accepted full-repo review fix pass1: 791f9c6 |
+| review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-code-review-mimo-20260531.md；docs/reviews/wu-audit-01-code-review-ds-20260531.md；docs/reviews/wu-audit-01-code-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-code-rereview-ds-20260531.md；docs/reviews/wu-audit-01-code-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-pr-review-mimo-20260531.md；docs/reviews/wu-audit-01-pr-review-ds-20260531.md；docs/reviews/wu-audit-01-pr-review-controller-adjudication-20260531.md；docs/reviews/repo-review-fix-pass1-codex-20260531.md；docs/reviews/repo-review-fix-pass1-rereview-mimo-20260531.md；docs/reviews/repo-review-fix-pass1-rereview-ds-20260531.md；docs/reviews/repo-review-fix-pass1-controller-adjudication-20260531.md |
+| aggregate review artifacts | docs/reviews/wu-audit-01-aggregate-deepreview-mimo-20260531.md；docs/reviews/wu-audit-01-aggregate-deepreview-ds-20260531.md；docs/reviews/wu-audit-01-aggregate-controller-adjudication-20260531.md；docs/reviews/repo-review-20260531-222837.md；docs/reviews/repo-review-20260531-223418.md |
+| draft PR status | draft PR opened and PR review passed; full-repo review fix pass1 accepted: https://github.com/noho/dayu-agent-r/pull/99 |
+| blocking open questions | none |
 
 状态约定：
 
@@ -167,25 +168,28 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| none | - | - | closed | - | - | 当前没有未分配 residual risk 或遗留问题。 |
+| RR-HCF-01 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime abstraction risk | deferred-with-owner | 本文档 WU-RUNTIME-01 | 单独进入 discussion / plan；不得做一行状态补丁 | `RuntimeFileLock` 生产调用面只需要 JSONL / trace 文件互斥、parent directory 准备和 runtime 统一异常边界；当前 wrapper 复制 `FileLock` 的 token / released 生命周期状态，已多次被 review 发现边界 bug。后续应收缩封装或替换为直接委托第三方 `FileLock`，不保留无必要状态机。 |
+| RR-HCF-02 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime correctness risk | deferred-with-owner | 本文档 WU-RUNTIME-02 | 单独进入 discussion / plan；先确认跨进程时间真源 | `lane` 的核心作用是多进程并发 named semaphore，抽象成立，不应被 `FileLock` 替代；风险集中在 `_LaneClock` 使用进程内 monotonic anchor 推导 UTC 参与跨进程 TTL 判断，以及 `_await_task_after_outer_cancellation` 无限等待的复杂控制流。 |
 
 ## 当前 Work Units
 
-| Work Unit | 主题 | 当前定位 |
-|---|---|---|
-| WU-AUDIT-01 | Purge audit orphan reconciliation | purge audit JSONL 与 SQLite tombstone 一致性 |
-| WU-STRESS-01 | Host production stress suite | crash / recovery / watch / scheduler 组合压力 |
-| WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 |
-| WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 |
-| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 |
-| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 |
-| WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E |
-| WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 |
-| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope |
-| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 |
-| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit |
-| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 |
-| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 |
+| Work Unit | 主题 | 当前定位 | 完成状态 |
+|---|---|---|---|
+| WU-AUDIT-01 | Purge audit orphan reconciliation | purge audit JSONL 与 SQLite tombstone 一致性 | 已完成 |
+| WU-STRESS-01 | Host production stress suite | crash / recovery / watch / scheduler 组合压力 | 未开始 |
+| WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 | 未开始 |
+| WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 | 未开始 |
+| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | 未开始 |
+| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 未开始 |
+| WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 未开始 |
+| WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 未开始 |
+| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 未开始 |
+| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
+| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
+| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
+| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
+| WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 未开始 |
+| WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 | 未开始 |
 
 ## WU-AUDIT-01 Purge Audit Cross-medium Orphan Reconciliation
 
@@ -534,3 +538,51 @@ Runtime 已承担层中立基础能力，Host / Engine import boundary guard 已
 - 合并后的 helper 有直接测试。
 - runtime 不 import Host / Engine / Service / UI / Fins。
 - 被保留在业务层的 helper 必须有明确 owner 理由，不把“看起来重复”当作重构理由。
+
+## WU-RUNTIME-01 Runtime File Lock Wrapper Contraction
+
+### 背景
+
+`RuntimeFileLock` 的生产用途是 audit / tool trace JSONL 写入互斥。当前 wrapper 同时维护 `_active_token` 与 `RuntimeFileLockToken.released`，复制了第三方 `FileLock` 的生命周期状态，并在多轮 review 中持续暴露 release 边界 bug。
+
+### 目标
+
+- 核对生产调用面是否只需要 `file_lock(...)`、parent directory 准备、timeout 校验和统一 runtime 异常。
+- 收缩 `dayu.runtime.filelock`，让第三方 `FileLock` 继续持有实际 acquire / release 生命周期真源。
+- 删除或隐藏无生产调用方依赖的 token released 状态；若保留 token，必须证明它不是第二套 lifecycle truth。
+
+### 非目标
+
+- 不让 Host / Service / Engine 直接 import 第三方 `filelock`。
+- 不引入 stale takeover、break lock、async wrapper 或 durable lease 语义。
+- 不为旧 token 状态提供兼容 wrapper。
+
+### 验收信号
+
+- release 失败不会被标记成成功 released。
+- audit / tool trace 文件互斥路径测试通过。
+- runtime import boundary 仍证明第三方 `filelock` 只由 runtime filelock 边界持有。
+
+## WU-RUNTIME-02 Runtime Lane Clock and Cancellation Simplification
+
+### 背景
+
+`lane` 的作用是多进程并发 named semaphore，核心抽象成立，不能用 `FileLock` 替代。当前风险集中在实现细节：跨进程 TTL 判断使用每个进程的 `_LaneClock` monotonic anchor 推导 UTC，可能与真实 UTC / 其它进程时钟漂移；outer cancellation 后等待 shielded task 的 helper 也存在无限等待复杂度。
+
+### 目标
+
+- 保留 SQLite-backed 多进程 named semaphore / capacity claim 抽象。
+- 将 stale cleanup、claim expiry、heartbeat refresh 等跨进程可见 TTL 判断统一到明确时间真源；优先评估真实 UTC 或 SQLite 时间真源。
+- 简化 `_await_task_after_outer_cancellation`，让极端取消路径有明确上限、失败语义或证明其必须无限等待。
+
+### 非目标
+
+- 不把 lane 退化成单进程 semaphore。
+- 不用 `FileLock` 替代 capacity > 1 的 named semaphore。
+- 不让 lane 表达 Host durable truth、Attempt owner、EventLog ordering、lease / fencing 或 recovery proof。
+
+### 验收信号
+
+- 多进程 capacity invariant、non-blocking timeout、release 后 acquire、crashed holder TTL cleanup 测试继续通过。
+- 新增或更新测试覆盖跨进程 TTL 时间真源选择。
+- 取消路径不会在底层 thread / SQLite 极端阻塞时无限消耗事件循环而无诊断。

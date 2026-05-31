@@ -21,6 +21,11 @@ from typing import Final, TypeAlias, TypeVar, cast
 
 from dayu.contracts import JsonValue, ToolBundle
 from dayu.runtime._digest import canonical_json_digest
+from dayu.runtime._agent_policy_constants import (
+    AGENT_FALLBACK_MODE_FORCE_ANSWER,
+    AGENT_FALLBACK_MODE_RAISE_ERROR,
+    AGENT_FALLBACK_MODES,
+)
 
 _SCHEMA_VERSION: Final[int] = 1
 _SCENE_FILE_SUFFIX: Final[str] = ".json"
@@ -66,7 +71,6 @@ _ALLOWED_TOOL_SELECTION_FIELDS: Final[frozenset[str]] = frozenset(
 _ALLOWED_DEFAULTS_FIELDS: Final[frozenset[str]] = frozenset({"missing_required_fragment"})
 _ALLOWED_FRAGMENT_FIELDS: Final[frozenset[str]] = frozenset({"id", "path", "order", "required"})
 _ALLOWED_CONTEXT_SLOT_FIELDS: Final[frozenset[str]] = frozenset({"name", "value_type", "required"})
-_AGENT_FALLBACK_MODES: Final[frozenset[str]] = frozenset({"force_answer", "raise_error"})
 
 JsonObject: TypeAlias = Mapping[str, JsonValue]
 """scene manifest JSON object 的只读映射类型。"""
@@ -98,8 +102,8 @@ class SceneToolSelectionMode(StrEnum):
 class SceneAgentFallbackMode(StrEnum):
     """scene agent policy override 支持的 fallback 模式。"""
 
-    FORCE_ANSWER = "force_answer"
-    RAISE_ERROR = "raise_error"
+    FORCE_ANSWER = AGENT_FALLBACK_MODE_FORCE_ANSWER
+    RAISE_ERROR = AGENT_FALLBACK_MODE_RAISE_ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -1248,7 +1252,7 @@ def _parse_optional_fallback_mode(record: JsonObject, *, context: str) -> SceneA
     mode = _optional_str_field(record, field_name="fallback_mode", context=context)
     if mode is None:
         return None
-    if mode not in _AGENT_FALLBACK_MODES:
+    if mode not in AGENT_FALLBACK_MODES:
         raise ScenePrepareError(f"{context}.fallback_mode is unsupported: {mode}")
     return SceneAgentFallbackMode(mode)
 

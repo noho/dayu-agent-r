@@ -3372,7 +3372,10 @@ def _candidate_payload_descriptor_exists(
         transaction,
         candidate.payload_ref.payload_ref,
     )
-    return descriptor is not None
+    return (
+        descriptor is not None
+        and descriptor.payload_digest == candidate.payload_ref.payload_digest
+    )
 
 
 def _tool_accept_event_plan(candidate: ToolFactAcceptCandidate) -> _ToolAcceptEventPlan:

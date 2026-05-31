@@ -397,6 +397,85 @@ def _mark_run_status(db_path: Path, run_id: str, status: RunStatus) -> None:
     """
 
     with sqlite3.connect(db_path) as connection:
+        if status in {
+            RunStatus.RUNNING,
+            RunStatus.WAITING,
+            RunStatus.CANCELLING,
+            RunStatus.RECOVERING,
+        }:
+            event_id = f"event-direct-started-{run_id}-{status.value}"
+            connection.execute(
+                f"""
+                INSERT INTO {TABLE_EVENT_LOG} (
+                  event_id,
+                  event_body_digest,
+                  event_class,
+                  session_id,
+                  run_id,
+                  attempt_id,
+                  execution_id,
+                  event_type,
+                  occurred_at,
+                  actor,
+                  source,
+                  client_request_id,
+                  idempotency_key,
+                  policy_decision_json,
+                  reason_json,
+                  payload_json,
+                  payload_ref,
+                  payload_digest,
+                  appended_at
+                )
+                SELECT
+                  ?,
+                  ?,
+                  'canonical_fact',
+                  session_id,
+                  run_id,
+                  NULL,
+                  NULL,
+                  'RUN_STARTED',
+                  ?,
+                  'pytest',
+                  'pytest',
+                  ?,
+                  ?,
+                  NULL,
+                  NULL,
+                  '{{}}',
+                  NULL,
+                  NULL,
+                  ?
+                FROM host_runs
+                WHERE run_id = ?
+                """,
+                (
+                    event_id,
+                    "f" * 64,
+                    _NOW.isoformat().replace("+00:00", "Z"),
+                    f"client-direct-started-{run_id}-{status.value}",
+                    f"idem-direct-started-{run_id}-{status.value}",
+                    _NOW.isoformat().replace("+00:00", "Z"),
+                    run_id,
+                ),
+            )
+            row = connection.execute(
+                f"SELECT event_sequence FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            assert row is not None
+            connection.execute(
+                """
+                UPDATE host_runs
+                SET status = ?,
+                    started_event_id = COALESCE(started_event_id, ?),
+                    started_event_sequence = COALESCE(started_event_sequence, ?)
+                WHERE run_id = ?
+                """,
+                (status.value, event_id, int(row[0]), run_id),
+            )
+            return
         connection.execute(
             "UPDATE host_runs SET status = ? WHERE run_id = ?",
             (status.value, run_id),

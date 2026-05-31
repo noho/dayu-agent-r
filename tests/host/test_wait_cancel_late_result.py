@@ -23,6 +23,7 @@ from dayu.host import (
 from dayu.host.command import create_host_command_handle
 from dayu.host.admission import create_host_admission_service
 from dayu.host.durable.event_log import EventLogRow
+from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.state import WaitRecordStatus
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.projection import ProjectionCatchupPort
@@ -81,6 +82,36 @@ def test_cancel_run_cancels_waiting_run_without_resume_attempt(
         assert wait_record.status is WaitRecordStatus.CANCELLED
         assert "RESUME_REQUESTED" not in event_types
         assert "ATTEMPT_STARTED" not in event_types[-2:]
+    finally:
+        host.close()
+
+
+def test_cancel_run_allows_resolved_wait_record_while_run_still_waiting(
+    tmp_path: Path,
+) -> None:
+    """wait record 已 resolved 但 Run 仍 WAITING 时，cancel_run 仍可取消 Run。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _mark_wait_record_resolved_without_resume(
+            host._transaction_runner(), seeded.wait_id
+        )
+
+        snapshot = cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("cancel-waiting-resolved-record"),
+                client_request_id="cancel-waiting-resolved-record",
+                reason="user_cancel_after_resolve",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert snapshot.status is RunStatus.CANCELLED
+        assert wait_record.status is WaitRecordStatus.RESOLVED
     finally:
         host.close()
 
@@ -235,6 +266,52 @@ def _events_by_type(
     """
 
     return tuple(event for event in events if event.event_type == event_type)
+
+
+def _mark_wait_record_resolved_without_resume(
+    transaction_runner: HostTransactionRunner, wait_id: str
+) -> None:
+    """只把 wait record 标记为 RESOLVED，不推进 Run resume。
+
+    :param transaction_runner: Host transaction runner。
+    :param wait_id: wait record id。
+    :returns: ``None``。
+    """
+
+    wait_record = _read_wait(transaction_runner, wait_id)
+
+    def operation(transaction: HostTransaction) -> None:
+        """执行测试专用 wait record 状态更新。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"""
+            UPDATE {TABLE_HOST_WAIT_RECORDS}
+            SET status = ?,
+                resolve_idempotency_key = ?,
+                resolve_semantic_digest = ?,
+                updated_event_id = ?,
+                updated_event_sequence = ?,
+                updated_at = ?,
+                terminal_at = ?
+            WHERE wait_id = ?
+            """,
+            (
+                WaitRecordStatus.RESOLVED.value,
+                "resolve-without-resume",
+                "sha256:" + "3" * 64,
+                wait_record.created_event_id,
+                wait_record.created_event_sequence,
+                wait_record.updated_at,
+                wait_record.updated_at,
+                wait_id,
+            ),
+        )
+
+    transaction_runner.run_write(operation)
 
 
 def _attempt_count(transaction_runner: HostTransactionRunner) -> int:

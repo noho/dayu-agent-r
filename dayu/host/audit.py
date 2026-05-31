@@ -28,8 +28,9 @@ from dayu.host.durable.codec import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, read_event_by_id
 from dayu.host.durable.purge import (
-    PurgeTombstoneAuditRecordRequest,
-    PurgeTombstoneAuditRecordResult,
+    PurgeTombstoneRow,
+    build_purge_attempt_ref,
+    build_purge_tombstone_digest,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.projection import (
@@ -73,16 +74,26 @@ _AUDIT_FIELD_PAYLOAD_REF = "payload_ref"
 _AUDIT_FIELD_PAYLOAD_DIGEST = "payload_digest"
 _AUDIT_FIELD_LINE_DIGEST = "line_digest"
 _AUDIT_FIELD_LINE_KIND = "line_kind"
+_AUDIT_FIELD_PURGE_ATTEMPT_REF = "purge_attempt_ref"
+_AUDIT_FIELD_PLANNED_PURGE_TOMBSTONE_REF = "planned_purge_tombstone_ref"
 _AUDIT_FIELD_PURGE_TOMBSTONE_REF = "purge_tombstone_ref"
+_AUDIT_FIELD_PURGE_TOMBSTONE_DIGEST = "purge_tombstone_digest"
 _AUDIT_FIELD_AUDIT_RECORD_REF = "audit_record_ref"
+_AUDIT_FIELD_STARTED_AUDIT_RECORD_REF = "started_audit_record_ref"
+_AUDIT_FIELD_STARTED_AUDIT_RECORD_DIGEST = "started_audit_record_digest"
+_AUDIT_FIELD_SEMANTIC_REQUEST_DIGEST = "semantic_request_digest"
 _AUDIT_FIELD_DELETED_COUNTS_DIGEST = "deleted_counts_digest"
 _AUDIT_FIELD_PRECONDITION_DIGEST = "precondition_digest"
 _AUDIT_FIELD_DELETED_REFS_DIGEST = "deleted_refs_digest"
 _AUDIT_FIELD_REQUEST_CONTEXT = "request_context"
 _AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED = "source_eventlog_facts_purged"
 _AUDIT_FIELD_DELETED_COUNTS = "deleted_counts"
-_AUDIT_LINE_KIND_PURGE_TOMBSTONE = "purge_tombstone"
-_AUDIT_RECORD_REF_PREFIX = "audit-jsonl:purge-tombstone:"
+_AUDIT_FIELD_FAILURE_STAGE = "failure_stage"
+_AUDIT_FIELD_FAILURE_MESSAGE = "failure_message"
+_AUDIT_LINE_KIND_PURGE_STARTED = "purge_started"
+_AUDIT_LINE_KIND_PURGE_COMPLETED = "purge_completed"
+_AUDIT_LINE_KIND_PURGE_FAILED = "purge_failed"
+_AUDIT_RECORD_REF_PREFIX = "audit-jsonl:"
 _AUDIT_ARTIFACT_DIRECTORY_NAME = "audit"
 _AUDIT_JSONL_FILE_NAME = "host-audit.jsonl"
 _AUDIT_LOCK_FILE_SUFFIX = ".lock"
@@ -103,6 +114,7 @@ _OPERATION_CONTEXT_REF_FIELDS: tuple[str, ...] = (
 _PRINCIPAL_CLAIM_NAMES: frozenset[str] = frozenset(("principal", "subject", "user"))
 _JSONL_LINE_SEPARATOR = "\n"
 _LOCK_TIMEOUT_SECONDS = 5.0
+_PURGE_FAILURE_MESSAGE_MAX_CHARS = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +167,90 @@ class AuditJsonLine:
         """
 
         return canonical_json_dumps(self.fields) + _JSONL_LINE_SEPARATOR
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeStartedAuditRecordRequest:
+    """purge_started audit record 构造请求。
+
+    :param tombstone_id: 本次 purge 的 deterministic tombstone id。
+    :param session_id: 被 purge 的 Session id。
+    :param client_request_id: purge 请求幂等 key。
+    :param semantic_request_digest: purge 请求 semantic digest。
+    :param actor: 发起方标识。
+    :param source: 来源标识。
+    :param operation_context_digest: 操作上下文 digest。
+    :param operation_context_refs: 操作上下文 refs JSON object。
+    :param reason: purge 原因。
+    :param request_context: 请求上下文 refs JSON object。
+    """
+
+    tombstone_id: str
+    session_id: str
+    client_request_id: str
+    semantic_request_digest: str
+    actor: str | None
+    source: str | None
+    operation_context_digest: str | None
+    operation_context_refs: Mapping[str, JsonValue]
+    reason: str
+    request_context: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeCompletedAuditRecordRequest:
+    """purge_completed audit record 构造请求。
+
+    :param tombstone: 已提交的 purge tombstone row。
+    :param semantic_request_digest: purge 请求 semantic digest。
+    """
+
+    tombstone: PurgeTombstoneRow
+    semantic_request_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeFailedAuditRecordRequest:
+    """purge_failed audit record 构造请求。
+
+    :param tombstone_id: 本次 purge 的 deterministic tombstone id。
+    :param session_id: 被 purge 的 Session id。
+    :param client_request_id: purge 请求幂等 key。
+    :param semantic_request_digest: purge 请求 semantic digest。
+    :param actor: 发起方标识。
+    :param source: 来源标识。
+    :param operation_context_digest: 操作上下文 digest。
+    :param operation_context_refs: 操作上下文 refs JSON object。
+    :param reason: purge 原因。
+    :param request_context: 请求上下文 refs JSON object。
+    :param failure_stage: 失败阶段稳定字符串。
+    :param failure_message: 有界诊断文本。
+    """
+
+    tombstone_id: str
+    session_id: str
+    client_request_id: str
+    semantic_request_digest: str
+    actor: str | None
+    source: str | None
+    operation_context_digest: str | None
+    operation_context_refs: Mapping[str, JsonValue]
+    reason: str
+    request_context: Mapping[str, JsonValue]
+    failure_stage: str
+    failure_message: str
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeAuditRecordResult:
+    """purge audit record 写入结果。
+
+    :param audit_record_ref: append-only audit JSONL 中的稳定 record ref。
+    :param audit_record_digest: 已追加 audit JSONL line digest。
+    """
+
+    audit_record_ref: str
+    audit_record_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,81 +467,190 @@ def build_audit_json_line(
     return AuditJsonLine(fields=fields, line_digest=line_digest)
 
 
-def build_purge_tombstone_audit_json_line(
-    request: PurgeTombstoneAuditRecordRequest,
+def build_purge_started_audit_json_line(
+    request: PurgeStartedAuditRecordRequest,
 ) -> AuditJsonLine:
-    """构造 purge tombstone audit JSONL line。
+    """构造 purge_started audit JSONL line。
 
-    该 line 以 purge tombstone 为 source，不读取已删除或即将删除的 EventLog
-    row；字段只使用同一 purge 请求与删除矩阵的稳定值，保证 rollback 后
-    retry 不会因时间戳变化产生 source key 冲突。
+    ``schema_version``、``line_kind``、``audit_record_ref``、
+    ``purge_attempt_ref`` 与 ``line_digest`` 均由 builder 派生；调用方只提供
+    purge 业务输入。该 line 不包含 transaction 内才知道的删除矩阵信息。
 
-    :param request: purge tombstone audit 写入请求。
+    :param request: purge_started audit record 请求。
     :returns: 包含 ``line_digest`` 的 audit JSONL line。
     :raises HostDurableError: 请求字段无效时抛出。
     """
 
-    audit_record_ref = _purge_tombstone_audit_record_ref(request.tombstone_id)
-    fields_without_digest: dict[str, JsonValue] = {
-        _AUDIT_FIELD_SCHEMA_VERSION: _AUDIT_LINE_SCHEMA_VERSION,
-        _AUDIT_FIELD_LINE_KIND: _AUDIT_LINE_KIND_PURGE_TOMBSTONE,
-        _AUDIT_FIELD_AUDIT_RECORD_REF: audit_record_ref,
-        _AUDIT_FIELD_PURGE_TOMBSTONE_REF: request.tombstone_id,
-        _AUDIT_FIELD_SESSION_ID: request.session_id,
-        _AUDIT_FIELD_ACTOR: request.actor,
-        _AUDIT_FIELD_SOURCE: request.source,
-        _AUDIT_FIELD_CLIENT_REQUEST_ID: request.client_request_id,
-        _AUDIT_FIELD_OPERATION_CONTEXT_REFS: request.operation_context_refs,
-        _AUDIT_FIELD_OPERATION_CONTEXT_DIGEST: request.operation_context_digest,
-        _AUDIT_FIELD_REASON: request.reason,
-        _AUDIT_FIELD_PRECONDITION_DIGEST: request.precondition_digest,
-        _AUDIT_FIELD_DELETED_COUNTS: request.deleted_counts.json_value(),
-        _AUDIT_FIELD_DELETED_COUNTS_DIGEST: request.deleted_counts_digest,
-        _AUDIT_FIELD_DELETED_REFS_DIGEST: request.deleted_refs_digest,
-        _AUDIT_FIELD_REQUEST_CONTEXT: request.request_context,
-        _AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED: True,
-    }
-    line_digest = sha256_digest_json(fields_without_digest)
-    fields: dict[str, JsonValue] = dict(fields_without_digest)
-    fields[_AUDIT_FIELD_LINE_DIGEST] = line_digest
-    return AuditJsonLine(fields=fields, line_digest=line_digest)
+    _validate_purge_started_request(request)
+    fields_without_digest: dict[str, JsonValue] = _base_purge_audit_fields(
+        line_kind=_AUDIT_LINE_KIND_PURGE_STARTED,
+        tombstone_id=request.tombstone_id,
+        session_id=request.session_id,
+        client_request_id=request.client_request_id,
+        semantic_request_digest=request.semantic_request_digest,
+        actor=request.actor,
+        source=request.source,
+        operation_context_digest=request.operation_context_digest,
+        operation_context_refs=request.operation_context_refs,
+        reason=request.reason,
+        request_context=request.request_context,
+    )
+    fields_without_digest.update(
+        {
+            _AUDIT_FIELD_PLANNED_PURGE_TOMBSTONE_REF: request.tombstone_id,
+            _AUDIT_FIELD_PURGE_TOMBSTONE_REF: None,
+            _AUDIT_FIELD_PURGE_TOMBSTONE_DIGEST: None,
+            _AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED: False,
+        }
+    )
+    return _line_with_digest(fields_without_digest)
 
 
-def append_purge_tombstone_audit_record(
+def append_purge_started_audit_record(
     options: LogAuditSinkOptions,
-    request: PurgeTombstoneAuditRecordRequest,
-) -> PurgeTombstoneAuditRecordResult:
-    """append-only 写入 purge tombstone audit JSONL line。
+    request: PurgeStartedAuditRecordRequest,
+) -> PurgeAuditRecordResult:
+    """append-only 写入 purge_started audit JSONL line。
 
     :param options: audit JSONL sink options。
-    :param request: purge tombstone audit 写入请求。
+    :param request: purge_started audit record 请求。
     :returns: audit record ref 与 line digest。
-    :raises HostDurableError: 既有同 tombstone source key 行 digest 冲突时抛出。
+    :raises HostDurableError: 同 ``(line_kind, purge_attempt_ref)`` digest 冲突时抛出。
     :raises OSError: JSONL 文件创建或追加失败时抛出。
     :raises RuntimeFileLockError: 文件锁获取或释放失败时由底层抛出。
     """
 
-    line = build_purge_tombstone_audit_json_line(request)
-    _append_audit_json_line(
-        options,
-        line,
-        source_keys=(
-            (
-                _AUDIT_FIELD_PURGE_TOMBSTONE_REF,
-                _required_line_text(line, _AUDIT_FIELD_PURGE_TOMBSTONE_REF),
+    line = build_purge_started_audit_json_line(request)
+    _append_purge_audit_json_line(options, line)
+    return _purge_audit_record_result(line)
+
+
+def build_purge_completed_audit_json_line(
+    request: PurgeCompletedAuditRecordRequest,
+) -> AuditJsonLine:
+    """构造 purge_completed audit JSONL line。
+
+    ``purge_tombstone_digest`` 来自 committed tombstone row 的稳定 digest，
+    覆盖 tombstone 全部已持久字段，包括 started audit ref/digest；builder
+    不接收 completed audit ref/digest，避免循环依赖。
+
+    :param request: purge_completed audit record 请求。
+    :returns: 包含 ``line_digest`` 的 audit JSONL line。
+    :raises HostDurableError: 请求字段无效时抛出。
+    """
+
+    _validate_purge_completed_request(request)
+    tombstone = request.tombstone
+    fields_without_digest: dict[str, JsonValue] = _base_purge_audit_fields(
+        line_kind=_AUDIT_LINE_KIND_PURGE_COMPLETED,
+        tombstone_id=tombstone.tombstone_id,
+        session_id=tombstone.session_id,
+        client_request_id=tombstone.client_request_id,
+        semantic_request_digest=request.semantic_request_digest,
+        actor=tombstone.actor,
+        source=tombstone.source,
+        operation_context_digest=tombstone.operation_context_digest,
+        operation_context_refs=tombstone.operation_context_refs,
+        reason=tombstone.reason,
+        request_context=tombstone.request_context,
+    )
+    fields_without_digest.update(
+        {
+            _AUDIT_FIELD_PURGE_TOMBSTONE_REF: tombstone.tombstone_id,
+            _AUDIT_FIELD_PURGE_TOMBSTONE_DIGEST: build_purge_tombstone_digest(tombstone),
+            _AUDIT_FIELD_STARTED_AUDIT_RECORD_REF: tombstone.audit_record_ref,
+            _AUDIT_FIELD_STARTED_AUDIT_RECORD_DIGEST: tombstone.audit_record_digest,
+            _AUDIT_FIELD_DELETED_COUNTS_DIGEST: tombstone.deleted_counts_digest,
+            _AUDIT_FIELD_PRECONDITION_DIGEST: tombstone.precondition_digest,
+            _AUDIT_FIELD_DELETED_REFS_DIGEST: tombstone.deleted_refs_digest,
+            _AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED: True,
+        }
+    )
+    return _line_with_digest(fields_without_digest)
+
+
+def append_purge_completed_audit_record(
+    options: LogAuditSinkOptions,
+    request: PurgeCompletedAuditRecordRequest,
+) -> PurgeAuditRecordResult:
+    """append-only 写入 purge_completed audit JSONL line。
+
+    :param options: audit JSONL sink options。
+    :param request: purge_completed audit record 请求。
+    :returns: audit record ref 与 line digest。
+    :raises HostDurableError: 同 ``(line_kind, purge_attempt_ref)`` digest 冲突时抛出。
+    :raises OSError: JSONL 文件创建或追加失败时抛出。
+    :raises RuntimeFileLockError: 文件锁获取或释放失败时由底层抛出。
+    """
+
+    line = build_purge_completed_audit_json_line(request)
+    _append_purge_audit_json_line(options, line)
+    return _purge_audit_record_result(line)
+
+
+def build_purge_failed_audit_json_line(
+    request: PurgeFailedAuditRecordRequest,
+) -> AuditJsonLine:
+    """构造 purge_failed audit JSONL line。
+
+    ``purge_failed`` 只记录 best-effort 诊断，不表示 EventLog facts 已被
+    purge，也不参与 durable truth、recovery 或 reconciliation 查询。
+
+    :param request: purge_failed audit record 请求。
+    :returns: 包含 ``line_digest`` 的 audit JSONL line。
+    :raises HostDurableError: 请求字段无效时抛出。
+    """
+
+    _validate_purge_failed_request(request)
+    fields_without_digest: dict[str, JsonValue] = _base_purge_audit_fields(
+        line_kind=_AUDIT_LINE_KIND_PURGE_FAILED,
+        tombstone_id=request.tombstone_id,
+        session_id=request.session_id,
+        client_request_id=request.client_request_id,
+        semantic_request_digest=request.semantic_request_digest,
+        actor=request.actor,
+        source=request.source,
+        operation_context_digest=request.operation_context_digest,
+        operation_context_refs=request.operation_context_refs,
+        reason=request.reason,
+        request_context=request.request_context,
+    )
+    fields_without_digest.update(
+        {
+            _AUDIT_FIELD_PLANNED_PURGE_TOMBSTONE_REF: request.tombstone_id,
+            _AUDIT_FIELD_FAILURE_STAGE: request.failure_stage,
+            _AUDIT_FIELD_FAILURE_MESSAGE: _bounded_failure_message(
+                request.failure_message
             ),
-        ),
+            _AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED: False,
+        }
     )
-    return PurgeTombstoneAuditRecordResult(
-        audit_record_ref=_required_line_text(line, _AUDIT_FIELD_AUDIT_RECORD_REF),
-        audit_record_digest=line.line_digest,
-    )
+    return _line_with_digest(fields_without_digest)
+
+
+def append_purge_failed_audit_record(
+    options: LogAuditSinkOptions,
+    request: PurgeFailedAuditRecordRequest,
+) -> PurgeAuditRecordResult:
+    """append-only 写入 purge_failed audit JSONL line。
+
+    :param options: audit JSONL sink options。
+    :param request: purge_failed audit record 请求。
+    :returns: audit record ref 与 line digest。
+    :raises HostDurableError: 同 ``(line_kind, purge_attempt_ref)`` digest 冲突时抛出。
+    :raises OSError: JSONL 文件创建或追加失败时抛出。
+    :raises RuntimeFileLockError: 文件锁获取或释放失败时由底层抛出。
+    """
+
+    line = build_purge_failed_audit_json_line(request)
+    _append_purge_audit_json_line(options, line)
+    return _purge_audit_record_result(line)
 
 
 def audit_json_line_marks_purged_source_eventlog_facts(
     line: Mapping[str, JsonValue],
 ) -> bool:
-    """判断 audit JSONL object 是否为 purge tombstone audit line。
+    """判断 audit JSONL object 是否为 completed purge audit line。
 
     :param line: 已解析的 audit JSONL object。
     :returns: 该行明确表示源 EventLog facts 已 purge 时返回 ``True``。
@@ -453,9 +658,301 @@ def audit_json_line_marks_purged_source_eventlog_facts(
     """
 
     return (
-        line.get(_AUDIT_FIELD_LINE_KIND) == _AUDIT_LINE_KIND_PURGE_TOMBSTONE
+        line.get(_AUDIT_FIELD_LINE_KIND) == _AUDIT_LINE_KIND_PURGE_COMPLETED
         and line.get(_AUDIT_FIELD_SOURCE_EVENTLOG_FACTS_PURGED) is True
     )
+
+
+def _base_purge_audit_fields(
+    *,
+    line_kind: str,
+    tombstone_id: str,
+    session_id: str,
+    client_request_id: str,
+    semantic_request_digest: str,
+    actor: str | None,
+    source: str | None,
+    operation_context_digest: str | None,
+    operation_context_refs: Mapping[str, JsonValue],
+    reason: str,
+    request_context: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """构造 purge audit line 公共字段。
+
+    :param line_kind: purge audit line kind。
+    :param tombstone_id: deterministic tombstone id。
+    :param session_id: 被 purge 的 Session id。
+    :param client_request_id: purge 请求幂等 key。
+    :param semantic_request_digest: purge 请求 semantic digest。
+    :param actor: 发起方标识。
+    :param source: 来源标识。
+    :param operation_context_digest: 操作上下文 digest。
+    :param operation_context_refs: 操作上下文 refs JSON object。
+    :param reason: purge 原因。
+    :param request_context: 请求上下文 refs JSON object。
+    :returns: 不含 ``line_digest`` 的 JSON object。
+    :raises HostDurableError: line kind 或 tombstone id 无效时抛出。
+    """
+
+    attempt_ref = build_purge_attempt_ref(tombstone_id)
+    return {
+        _AUDIT_FIELD_SCHEMA_VERSION: _AUDIT_LINE_SCHEMA_VERSION,
+        _AUDIT_FIELD_LINE_KIND: line_kind,
+        _AUDIT_FIELD_AUDIT_RECORD_REF: _purge_audit_record_ref(
+            line_kind=line_kind,
+            attempt_ref=attempt_ref,
+        ),
+        _AUDIT_FIELD_PURGE_ATTEMPT_REF: attempt_ref,
+        _AUDIT_FIELD_SESSION_ID: session_id,
+        _AUDIT_FIELD_CLIENT_REQUEST_ID: client_request_id,
+        _AUDIT_FIELD_ACTOR: actor,
+        _AUDIT_FIELD_SOURCE: source,
+        _AUDIT_FIELD_OPERATION_CONTEXT_REFS: operation_context_refs,
+        _AUDIT_FIELD_OPERATION_CONTEXT_DIGEST: operation_context_digest,
+        _AUDIT_FIELD_REASON: reason,
+        _AUDIT_FIELD_REQUEST_CONTEXT: request_context,
+        _AUDIT_FIELD_SEMANTIC_REQUEST_DIGEST: semantic_request_digest,
+    }
+
+
+def _line_with_digest(fields_without_digest: Mapping[str, JsonValue]) -> AuditJsonLine:
+    """为 audit fields 补充 line digest。
+
+    :param fields_without_digest: 不含 ``line_digest`` 的 JSON object。
+    :returns: 包含 ``line_digest`` 的 audit JSONL line。
+    :raises TypeError: 字段包含非 JSON 值时抛出。
+    :raises ValueError: 字段包含非有限浮点数时抛出。
+    """
+
+    line_digest = sha256_digest_json(fields_without_digest)
+    fields: dict[str, JsonValue] = dict(fields_without_digest)
+    fields[_AUDIT_FIELD_LINE_DIGEST] = line_digest
+    return AuditJsonLine(fields=fields, line_digest=line_digest)
+
+
+def _append_purge_audit_json_line(
+    options: LogAuditSinkOptions,
+    line: AuditJsonLine,
+) -> None:
+    """按 purge audit source key 幂等追加 JSONL line。
+
+    :param options: audit JSONL sink options。
+    :param line: 待追加的 purge audit line。
+    :returns: ``None``。
+    :raises HostDurableError: 同 ``(line_kind, purge_attempt_ref)`` digest 冲突时抛出。
+    :raises OSError: 创建目录或写文件失败时抛出。
+    :raises RuntimeFileLockError: lock 获取或释放失败时由底层抛出。
+    """
+
+    _append_audit_json_line(
+        options,
+        line,
+        source_keys=(
+            (_AUDIT_FIELD_LINE_KIND, _required_line_text(line, _AUDIT_FIELD_LINE_KIND)),
+            (
+                _AUDIT_FIELD_PURGE_ATTEMPT_REF,
+                _required_line_text(line, _AUDIT_FIELD_PURGE_ATTEMPT_REF),
+            ),
+        ),
+    )
+
+
+def _purge_audit_record_result(line: AuditJsonLine) -> PurgeAuditRecordResult:
+    """从 audit line 构造 purge audit append result。
+
+    :param line: 已构造的 purge audit line。
+    :returns: purge audit record result。
+    :raises HostDurableError: audit record ref 字段缺失时抛出。
+    """
+
+    return PurgeAuditRecordResult(
+        audit_record_ref=_required_line_text(line, _AUDIT_FIELD_AUDIT_RECORD_REF),
+        audit_record_digest=line.line_digest,
+    )
+
+
+def _purge_audit_record_ref(*, line_kind: str, attempt_ref: str) -> str:
+    """构造 purge audit record ref。
+
+    :param line_kind: purge audit line kind。
+    :param attempt_ref: purge attempt ref。
+    :returns: audit JSONL record ref。
+    :raises HostDurableError: line kind 或 attempt ref 为空时抛出。
+    """
+
+    _require_non_empty_text(line_kind, field_name="line_kind")
+    _require_non_empty_text(attempt_ref, field_name="purge_attempt_ref")
+    return f"{_AUDIT_RECORD_REF_PREFIX}{line_kind}:{attempt_ref}"
+
+
+def _validate_purge_started_request(request: PurgeStartedAuditRecordRequest) -> None:
+    """校验 purge_started 请求。
+
+    :param request: purge_started audit record 请求。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段不符合 audit contract 时抛出。
+    """
+
+    _validate_purge_common_request(
+        tombstone_id=request.tombstone_id,
+        session_id=request.session_id,
+        client_request_id=request.client_request_id,
+        semantic_request_digest=request.semantic_request_digest,
+        actor=request.actor,
+        source=request.source,
+        operation_context_digest=request.operation_context_digest,
+        reason=request.reason,
+    )
+
+
+def _validate_purge_completed_request(
+    request: PurgeCompletedAuditRecordRequest,
+) -> None:
+    """校验 purge_completed 请求。
+
+    :param request: purge_completed audit record 请求。
+    :returns: ``None``。
+    :raises HostDurableError: semantic digest 无效或 tombstone 无效时抛出。
+    """
+
+    _require_sha256_digest(
+        request.semantic_request_digest,
+        field_name="semantic_request_digest",
+    )
+    build_purge_tombstone_digest(request.tombstone)
+
+
+def _validate_purge_failed_request(request: PurgeFailedAuditRecordRequest) -> None:
+    """校验 purge_failed 请求。
+
+    :param request: purge_failed audit record 请求。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段不符合 audit contract 时抛出。
+    """
+
+    _validate_purge_common_request(
+        tombstone_id=request.tombstone_id,
+        session_id=request.session_id,
+        client_request_id=request.client_request_id,
+        semantic_request_digest=request.semantic_request_digest,
+        actor=request.actor,
+        source=request.source,
+        operation_context_digest=request.operation_context_digest,
+        reason=request.reason,
+    )
+    _require_non_empty_text(request.failure_stage, field_name="failure_stage")
+    _require_non_empty_text(request.failure_message, field_name="failure_message")
+
+
+def _validate_purge_common_request(
+    *,
+    tombstone_id: str,
+    session_id: str,
+    client_request_id: str,
+    semantic_request_digest: str,
+    actor: str | None,
+    source: str | None,
+    operation_context_digest: str | None,
+    reason: str,
+) -> None:
+    """校验 purge audit 公共请求字段。
+
+    :param tombstone_id: purge tombstone id。
+    :param session_id: 被 purge 的 Session id。
+    :param client_request_id: purge 请求幂等 key。
+    :param semantic_request_digest: purge 请求 semantic digest。
+    :param actor: 发起方标识。
+    :param source: 来源标识。
+    :param operation_context_digest: 操作上下文 digest。
+    :param reason: purge 原因。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段不符合 audit contract 时抛出。
+    """
+
+    _require_non_empty_text(tombstone_id, field_name="tombstone_id")
+    _require_non_empty_text(session_id, field_name="session_id")
+    _require_non_empty_text(client_request_id, field_name="client_request_id")
+    _require_sha256_digest(
+        semantic_request_digest,
+        field_name="semantic_request_digest",
+    )
+    _require_optional_non_empty_text(actor, field_name="actor")
+    _require_optional_non_empty_text(source, field_name="source")
+    _require_optional_sha256_digest(
+        operation_context_digest,
+        field_name="operation_context_digest",
+    )
+    _require_non_empty_text(reason, field_name="reason")
+
+
+def _bounded_failure_message(value: str) -> str:
+    """返回有界 failure message。
+
+    :param value: 原始 failure message。
+    :returns: 最多 ``_PURGE_FAILURE_MESSAGE_MAX_CHARS`` 个字符的诊断文本。
+    :raises HostDurableError: 文本为空时抛出。
+    """
+
+    _require_non_empty_text(value, field_name="failure_message")
+    return value[:_PURGE_FAILURE_MESSAGE_MAX_CHARS]
+
+
+def _require_non_empty_text(value: str, *, field_name: str) -> None:
+    """校验必填非空文本。
+
+    :param value: 待校验文本。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises HostDurableError: 值为空时抛出。
+    """
+
+    if value.strip() == "":
+        raise HostDurableError(f"{field_name} must be non-empty text")
+
+
+def _require_optional_non_empty_text(value: str | None, *, field_name: str) -> None:
+    """校验可选非空文本。
+
+    :param value: 待校验文本或 ``None``。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises HostDurableError: 值存在但为空时抛出。
+    """
+
+    if value is not None:
+        _require_non_empty_text(value, field_name=field_name)
+
+
+def _require_sha256_digest(value: str, *, field_name: str) -> None:
+    """校验 sha256 digest 文本。
+
+    :param value: 待校验 digest。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises HostDurableError: 值不是 ``sha256:`` digest 时抛出。
+    """
+
+    prefix = "sha256:"
+    hex_part = value.removeprefix(prefix)
+    if (
+        not value.startswith(prefix)
+        or len(hex_part) != 64
+        or any(character not in "0123456789abcdef" for character in hex_part)
+    ):
+        raise HostDurableError(f"{field_name} must be sha256 digest")
+
+
+def _require_optional_sha256_digest(value: str | None, *, field_name: str) -> None:
+    """校验可选 sha256 digest 文本。
+
+    :param value: 待校验 digest 或 ``None``。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises HostDurableError: 值存在但不是 ``sha256:`` digest 时抛出。
+    """
+
+    if value is not None:
+        _require_sha256_digest(value, field_name=field_name)
 
 
 def catch_up_log_audit_sink_projection(
@@ -576,19 +1073,6 @@ def _append_audit_json_line(
         )
 
 
-def _purge_tombstone_audit_record_ref(tombstone_id: str) -> str:
-    """构造 purge tombstone audit record ref。
-
-    :param tombstone_id: purge tombstone id。
-    :returns: audit JSONL record ref。
-    :raises HostDurableError: tombstone id 为空时抛出。
-    """
-
-    if tombstone_id.strip() == "":
-        raise HostDurableError("purge tombstone audit ref requires tombstone_id")
-    return _AUDIT_RECORD_REF_PREFIX + tombstone_id
-
-
 def _append_text(path: Path, text: str) -> None:
     """向文件追加 UTF-8 文本。
 
@@ -609,13 +1093,13 @@ def _jsonl_contains_line(
     line_digest: str,
     source_keys: tuple[tuple[str, str], ...],
 ) -> bool:
-    """检查 JSONL 中是否已有同一 line digest。
+    """检查 JSONL 中是否已有同一 line digest 或同一组合 source key。
 
     :param path: JSONL 文件路径。
     :param line_digest: 当前行 digest。
     :param source_keys: 当前行的稳定 source key 集合。
     :returns: 已存在同一 line digest 时返回 ``True``。
-    :raises HostDurableError: 已存在相同 source key 但 digest 不同时抛出。
+    :raises HostDurableError: 已存在相同组合 source key 但 digest 不同时抛出。
     :raises OSError: 读取文件失败时抛出。
     """
 
@@ -629,11 +1113,13 @@ def _jsonl_contains_line(
             existing_digest = existing.get(_AUDIT_FIELD_LINE_DIGEST)
             if existing_digest == line_digest:
                 return True
-            for field_name, field_value in source_keys:
-                if existing.get(field_name) == field_value:
-                    raise HostDurableError(
-                        "audit JSONL source key conflicts with line digest"
-                    )
+            if all(
+                existing.get(field_name) == field_value
+                for field_name, field_value in source_keys
+            ):
+                raise HostDurableError(
+                    "audit JSONL source key conflicts with line digest"
+                )
     return False
 
 
@@ -845,10 +1331,18 @@ __all__ = [
     "LogAuditSink",
     "LogAuditSinkCatchupResult",
     "LogAuditSinkOptions",
-    "append_purge_tombstone_audit_record",
+    "PurgeAuditRecordResult",
+    "PurgeCompletedAuditRecordRequest",
+    "PurgeFailedAuditRecordRequest",
+    "PurgeStartedAuditRecordRequest",
+    "append_purge_completed_audit_record",
+    "append_purge_failed_audit_record",
+    "append_purge_started_audit_record",
     "audit_json_line_marks_purged_source_eventlog_facts",
     "build_audit_json_line",
-    "build_purge_tombstone_audit_json_line",
+    "build_purge_completed_audit_json_line",
+    "build_purge_failed_audit_json_line",
+    "build_purge_started_audit_json_line",
     "catch_up_log_audit_sink_projection",
     "default_log_audit_sink_options",
 ]

@@ -2386,7 +2386,7 @@ class PurgeSessionResult:
     字段语义：
 
     - ``session_id``：被清理的 Session id。
-    - ``purged``：是否完成清理。
+    - ``purged``：是否完成清理；``True`` 以 committed durable tombstone 为准。
     - ``purge_tombstone_ref``：清理 tombstone 引用；未清理时为 ``None``。
     - ``deleted_counts_digest``：删除计数摘要；未清理时为 ``None``。
     """

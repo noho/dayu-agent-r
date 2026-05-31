@@ -87,7 +87,7 @@ purge 成功后，Host 会删除目标 Session 的本地可恢复事实和派生
 
 重复同一请求在源事实删除后仍通过 tombstone 幂等重放；同 key 不同语义返回 `IDEMPOTENCY_CONFLICT`，不同请求清理同一已 purge Session 返回 `CONFLICT`。purge 后 `get_session`、`get_run`、`retry_run`、`replay_run` 与 live watch 不从 tombstone、projection、audit、outbox、tool trace 或 memory 重建事实，按现有缺失事实语义返回 `NOT_FOUND`。
 
-purge 不删除或重写已经写入的 append-only audit JSONL。成功 purge 会写入 purge tombstone audit record，并把 audit record ref / digest 写入 tombstone；既有 audit 行可以保留对已删除 EventLog rows 的 refs。audit / diagnostic 查询可以用 tombstone 解释源事实已被 purge，但普通 Service-facing 读取路径不能把 audit、projection 或 tombstone 当作 Session snapshot 来源。
+purge 不删除或重写已经写入的 append-only audit JSONL。purge audit JSONL 只记录 destructive 操作流水：`purge_started` 表示 purge attempt 已发起，不表示完成；`purge_completed` 只在 SQLite tombstone commit 成功后写入，并引用 tombstone id / digest；`purge_failed` 是失败路径的 best-effort 诊断。tombstone 中的 audit record ref / digest 指向 `purge_started` 行；purge 完成真源仍是 SQLite tombstone。既有 audit 行可以保留对已删除 EventLog rows 的 refs。普通 Service-facing 读取路径不能把 audit、projection 或 tombstone 当作 Session snapshot 来源。
 
 第一版 purge 的非目标是：不做 remote / wire protocol 变更，不新增 public error code，不把 purge 表达成 close、cancel、archive、memory forget 或 UI hide，不实现 retention scheduler、周期 GC、DB vacuum、audit JSONL rotation / compaction、外部 audit 投递或 tool trace cold JSONL retention policy。
 

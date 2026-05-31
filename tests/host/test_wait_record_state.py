@@ -102,6 +102,12 @@ def _seed_run(transaction: HostTransaction, *, run_id: str = "run-1") -> None:
         session_id="session-1",
         run_id=run_id,
     )
+    started_sequence = _insert_event(
+        transaction,
+        event_id=f"event-started-{run_id}",
+        session_id="session-1",
+        run_id=run_id,
+    )
     insert_run(
         transaction,
         RunRow(
@@ -115,8 +121,8 @@ def _seed_run(transaction: HostTransaction, *, run_id: str = "run-1") -> None:
             accepted_event_sequence=accepted_sequence,
             queued_event_id=None,
             queued_event_sequence=None,
-            started_event_id=None,
-            started_event_sequence=None,
+            started_event_id=f"event-started-{run_id}",
+            started_event_sequence=started_sequence,
             terminal_event_id=None,
             terminal_event_sequence=None,
             current_attempt_id=None,

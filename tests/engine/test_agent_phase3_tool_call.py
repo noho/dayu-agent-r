@@ -1604,7 +1604,9 @@ async def test_awaiting_cancellation_before_and_after_outcome_boundary() -> None
 
 
 @pytest.mark.asyncio
-async def test_duplicate_and_executor_exception_paths() -> None:
+async def test_duplicate_and_executor_exception_paths(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """duplicate、executor exception 均有明确收口。"""
 
     duplicate_executor = _RecordingToolExecutor(
@@ -1645,18 +1647,20 @@ async def test_duplicate_and_executor_exception_paths() -> None:
     cancelled_runner = _ScriptedRunner(
         scripts=(_tool_script(_tool_call("tc_1")), _final_script("recovered"))
     )
-    cancelled_events = await _collect(
-        _AsyncAgent(
-            request=_request(executor=cancelled_executor),
-            runner=cancelled_runner,
+    with caplog.at_level("WARNING", logger="dayu.engine.agent"):
+        cancelled_events = await _collect(
+            _AsyncAgent(
+                request=_request(executor=cancelled_executor),
+                runner=cancelled_runner,
+            )
         )
-    )
     assert _terminal(cancelled_events).type is EngineEventType.FINAL_ANSWER
     cancelled_tool_message = cancelled_runner.messages_seen[1][-1]
     assert isinstance(cancelled_tool_message, ToolMessage)
     assert json.loads(cancelled_tool_message.content)["error"] == (
         _TOOL_EXECUTOR_EXCEPTION_ERROR
     )
+    assert "tool_executor.cancelled_without_run_cancellation" in caplog.text
 
 
 @pytest.mark.asyncio

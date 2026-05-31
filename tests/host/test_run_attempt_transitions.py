@@ -37,6 +37,7 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.liveness import HostInstanceStatus
+from dayu.host.durable.schema import TABLE_HOST_RUNS
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CancelActiveAttemptInput,
@@ -64,6 +65,8 @@ from dayu.host.durable.state import (
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
+    cancel_queued_run_row,
+    cancel_running_run_row,
     cancel_starting_dispatch_record_row,
     mark_attempt_running_row,
     mark_dispatch_worker_accepted_row,
@@ -1485,6 +1488,139 @@ def test_cancel_queued_terminal_run_returns_invalid_state(
         assert store.transaction_runner.run_write(cancel_terminal) == (
             StateMutationStatus.INVALID_STATE.value,
             RunStatus.SUCCEEDED.value,
+        )
+
+
+def test_cancel_queued_run_row_requires_empty_terminal_refs(
+    tmp_path: Path,
+) -> None:
+    """queued Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+            """构造带 terminal refs 的 queued 行并尝试 cancel。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与保留的 terminal event id。
+            """
+
+            input_event = _append_user_input(
+                transaction,
+                session_id=session_id,
+                run_id="run-queued-guard",
+                event_id="event-input-queued-guard",
+            )
+            create_queued_run_in_transaction(
+                transaction,
+                EventLogStore(),
+                _create_queued_input(
+                    session_id=session_id,
+                    run_id="run-queued-guard",
+                    input_event_sequence=input_event.event_sequence,
+                    request_index="queued-guard",
+                ),
+            )
+            terminal_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-terminal-queued-guard",
+                    session_id=session_id,
+                    run_id="run-queued-guard",
+                    event_type="RUN_FAILED",
+                    payload={"reason": "terminal-guard"},
+                ),
+            ).row
+            transaction.execute("PRAGMA ignore_check_constraints = ON")
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_RUNS}
+                SET terminal_event_id = ?,
+                    terminal_event_sequence = ?,
+                    terminal_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    terminal_event.event_id,
+                    terminal_event.event_sequence,
+                    "2026-05-14T01:02:09Z",
+                    "run-queued-guard",
+                ),
+            )
+            transaction.execute("PRAGMA ignore_check_constraints = OFF")
+            result = cancel_queued_run_row(
+                transaction,
+                run_id="run-queued-guard",
+                terminal_event_id="event-cancel-queued-guard",
+                terminal_event_sequence=terminal_event.event_sequence + 1,
+                terminal_at="2026-05-14T01:02:10Z",
+            )
+            assert result.row is not None
+            return result.status.value, result.row.terminal_event_id
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.INVALID_STATE.value,
+            "event-terminal-queued-guard",
+        )
+
+
+def test_cancel_running_run_row_requires_empty_terminal_refs(
+    tmp_path: Path,
+) -> None:
+    """running Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+            """构造带 terminal refs 的 running 行并尝试 cancel。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与保留的 terminal event id。
+            """
+
+            terminal_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-terminal-running-guard",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "terminal-guard"},
+                ),
+            ).row
+            transaction.execute("PRAGMA ignore_check_constraints = ON")
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_RUNS}
+                SET terminal_event_id = ?,
+                    terminal_event_sequence = ?,
+                    terminal_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    terminal_event.event_id,
+                    terminal_event.event_sequence,
+                    "2026-05-14T01:02:09Z",
+                    seeded.run_id,
+                ),
+            )
+            transaction.execute("PRAGMA ignore_check_constraints = OFF")
+            result = cancel_running_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id=seeded.attempt_id,
+                terminal_event_id="event-cancel-running-guard",
+                terminal_event_sequence=terminal_event.event_sequence + 1,
+                terminal_at="2026-05-14T01:02:10Z",
+            )
+            assert result.row is not None
+            return result.status.value, result.row.terminal_event_id
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            "event-terminal-running-guard",
         )
 
 
