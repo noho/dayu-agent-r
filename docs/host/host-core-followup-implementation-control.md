@@ -120,11 +120,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | implementation status | current work unit implementation：WU-RUNTIME-01 |
 | active work unit | WU-RUNTIME-01 |
 | default next work unit | WU-STRESS-01 |
-| next entry point | WU-RUNTIME-01 Slice 2 implementation handoff：补 Host audit / tool trace lock-path regression tests，不修改 Host production source |
+| next entry point | WU-RUNTIME-01 aggregate deepreview：对当前 branch 相对 main 的完整 diff 做至少两份独立 review |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md |
-| implementation commits | accepted plan: 929d01c；accepted slice1: 7b5b3aa |
-| review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-fix-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-20260601.md |
+| implementation commits | accepted plan: 929d01c；accepted slice1: 7b5b3aa；accepted slice2: pending local commit |
+| review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-fix-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice2-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-slice2-20260601.md |
 | aggregate review artifacts | pending |
 | draft PR status | not opened |
 | blocking open questions | none |
