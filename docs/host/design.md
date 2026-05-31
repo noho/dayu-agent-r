@@ -2,8 +2,6 @@
 
 本文档是 Host 唯一设计真源。稳定架构边界、公共接口、状态机、EventLog 语义、恢复语义、执行路径、工具治理、memory / context governance 与后续 public contract 决策只以本文档为准。
 
-`docs/host/implementation-control.md` 只记录 phase 编排、gate 状态、交付物、验证要求和风险追踪；`docs/host/post-p10.md` 只记录 P10.5 的目标、任务、coverage 和讨论待决项。两者不得替代本文档承载稳定设计语义。
-
 ## 1. 设计目标
 
 Host 的设计目标是支撑生产级买方财报分析 Agent。系统范式是“宿主强约束下的 LLM in the loop”：

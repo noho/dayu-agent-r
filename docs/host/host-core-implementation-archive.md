@@ -1,14 +1,14 @@
-# Host 实施总控
+# Host Core Implementation Archive
 
 ## 文档状态
 
 状态：已完成。
 
-本文档对应的 Host 原 phase 实施链路已推进到 `draft-PR-pass`。后续新的 follow-up、issue-backed 或 product entrypoint work units 不再以本文档作为 active 总控入口。
+本文档原名为 `docs/host/implementation-control.md`。对应的 Host core phase 实施链路已推进到 `draft-PR-pass`，本文档已完成 active 总控使命并进入归档状态。后续新的 follow-up、issue-backed、UI / Service / GUI 或 maintainability work units 不再以本文档作为 active 总控入口。
 
 ## 文档职责
 
-本文档是 Host 设计与实施的总控文档，负责记录实施工作流、phase 编排、phase 进入 / 退出条件、交付物和验证要求。
+本文档是 Host core phase 设计与实施的归档总控文档，负责保留原实施工作流、phase 编排、phase 进入 / 退出条件、交付物和验证要求。
 
 本文档不承载新的架构决策，不替代设计文档，不作为实现细节说明书。
 
@@ -36,8 +36,8 @@ docs/host/design.md
   -> Host 架构真源
   -> 定义架构边界、状态机、公共接口、EventLog、恢复、并发、远程执行和关键治理路径
 
-docs/host/implementation-control.md
-  -> 实施编排文档
+docs/host/host-core-implementation-archive.md
+  -> 已完成的 Host core phase 实施编排归档
   -> 只记录 phases、依赖、进入 / 退出条件、交付物和验证要求
 ```
 
@@ -55,7 +55,7 @@ Host 实施采用以下工作流：
 
 ```text
 draft design checkpoint
-  -> update implementation-control.md phases
+  -> update host-core-implementation-archive.md phases
   -> select one phase
   -> discuss and refine the corresponding docs/host/design.md section with the user
   -> update docs/host/design.md if the phase discussion changes architecture
@@ -263,7 +263,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `docs/engine/design.md`
 - `docs/host/design.md` §25 Context Governance
 - `docs/host/design.md` §25.1 Compact Event 响应路径
-- `docs/host/implementation-control.md` 追踪区 `Engine Context Compaction Event 语义前置`
+- `docs/host/host-core-implementation-archive.md` 追踪区 `Engine Context Compaction Event 语义前置`
 
 前置条件：
 - 用户明确确认允许修改 Engine 代码。
@@ -1503,7 +1503,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -1585,7 +1585,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -1815,7 +1815,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -1933,7 +1933,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 交付物：
 - updated `docs/host/design.md`
-- updated `docs/host/implementation-control.md`
+- updated `docs/host/host-core-implementation-archive.md`
 - handoff implementation-ready plan
 - plan review / fix / re-review artifacts
 - implementation slices
@@ -4168,7 +4168,7 @@ Phase 1 implementation 收口验证：
 - `source .venv/bin/activate && pytest tests/host tests/runtime -q`：102 passed。
 - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
 
-Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/implementation-control.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。
+Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/host-core-implementation-archive.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。
 
 Phase 2 design refinement 状态：`docs/reviews/gateflow-phase-design-host-p2-codex-20260514.md` 提出的 5 个 blocking questions 已按 controller-accepted A 决策写回设计真源与本文档，fix artifact 为 `docs/reviews/gateflow-phase-design-fix-host-p2-codex-20260514.md`。AgentMiMo 与 AgentDS 的 design fix re-review artifacts 分别为 `docs/reviews/gateflow-phase-design-re-review-host-p2-mimo-20260514.md` 与 `docs/reviews/gateflow-phase-design-re-review-host-p2-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-phase-design-re-review-host-p2-controller-adjudication-20260514.md`。Phase 2 plan 已写入 `docs/host/phase2-durable-store-eventlog-plan.md`；plan review artifacts 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-ds-20260514.md`，controller adjudication artifact 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`，plan fix artifact 为 `docs/reviews/gateflow-plan-fix-host-p2-durable-store-eventlog-codex-20260514.md`。AgentMiMo 与 AgentDS 的 plan re-review artifacts 分别为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`。Phase 2 accepted plan commit 为 `83c6ad6`。Slice 1 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s1-durable-schema-transaction-20260514.md`，controller implementation decision artifact 为 `docs/reviews/gateflow-implementation-decision-host-p2-s1-sqlite-payload-table-name-20260514.md`。AgentMiMo 与 AgentDS 的 Slice 1 code review artifacts 分别为 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-controller-adjudication-20260514.md`。Slice 1 validation：durable schema / transaction tests 15 passed，Host export / import boundary / weak typing guard tests 7 passed，`python -m pyright dayu/host tests/host` 0 errors；accepted Slice 1 commit 为 `be5dbdc`。Slice 2 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s2-eventlog-idempotency-20260514.md`；code review artifacts 为 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-controller-adjudication-20260514.md`；fix artifact 为 `docs/reviews/gateflow-fix-host-p2-s2-eventlog-idempotency-20260514.md`；code re-review artifacts 为 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-mimo-20260514.md` 与 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-ds-20260514.md`；controller re-review adjudication artifact 为 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-controller-adjudication-20260514.md`。Slice 2 validation：EventLog / Idempotency tests 19 passed，多进程 EventLog smoke 1 passed，durable schema / transaction tests 15 passed，Host export / import boundary / weak typing guard tests 7 passed，`python -m pyright dayu/host tests/host` 0 errors。Phase 2 accepted Slice 2 commit 已创建；具体 hash 由当前 git commit 记录。Slice 3 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s3-payload-artifact-liveness-20260514.md`；code review artifacts 为 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-controller-adjudication-20260514.md`；fix artifact 为 `docs/reviews/gateflow-fix-host-p2-s3-payload-artifact-liveness-20260514.md`；code re-review artifacts 为 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-mimo-20260514.md` 与 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-ds-20260514.md`；controller re-review adjudication artifact 为 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-controller-adjudication-20260514.md`。Slice 3 validation：payload / artifact / liveness tests 27 passed，EventLog / idempotency / multiprocess tests 20 passed，Host tests 94 passed，`python -m pyright dayu/host tests/host` 0 errors。Phase 2 accepted Slice 3 commit 已创建；具体 hash 由当前 git commit 记录。Aggregate deepreview artifacts 为 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-ds-20260514.md`；controller aggregate adjudication artifact 为 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`；aggregate fix artifact 为 `docs/reviews/gateflow-aggregate-fix-host-p2-durable-store-eventlog-20260514.md`；aggregate re-review artifacts 为 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-ds-20260514.md`；controller aggregate re-review adjudication artifact 为 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`。Aggregate fix validation：Host tests 101 passed，runtime import/lane/filelock tests 29 passed，`python -m pyright dayu/host tests/host` 0 errors，`python -m pyright dayu/ tests/ utils/` 0 errors。Phase 2 accepted deepreview commit 已创建；具体 hash 由当前 git commit 记录。Phase 2 状态为 completed，后续工作入口为 Phase 3 design discussion / plan gate。
 
