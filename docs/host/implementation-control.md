@@ -1,5 +1,11 @@
 # Host 实施总控
 
+## 文档状态
+
+状态：已完成。
+
+本文档对应的 Host 原 phase 实施链路已推进到 `draft-PR-pass`。后续新的 follow-up、issue-backed 或 product entrypoint work units 不再以本文档作为 active 总控入口。
+
 ## 文档职责
 
 本文档是 Host 设计与实施的总控文档，负责记录实施工作流、phase 编排、phase 进入 / 退出条件、交付物和验证要求。
@@ -223,7 +229,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 15 Retention / Purge / Production Hardening。
-当前状态：Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS；P15-S1
+当前状态：已完成。Phase 15 handoff implementation-ready plan 已生成，plan review / fix / re-review 已完成且 re-review 为 PASS；P15-S1
 Purge Tombstone Schema And Durable Primitives、P15-S2 Delete Matrix Transaction Helper、P15-S3 Public Command Wiring And
 Read-after-purge Semantics、P15-S4 Audit JSONL Retention And Tombstone Audit Record、P15-S5 Projection Cleanup, Rebuild
 Confidence, And Local Hardening 与 P15-S6 Docs, Import Boundaries, Full Validation 均已通过 code review / re-review /
@@ -239,7 +245,7 @@ Plan artifact 为 `docs/host/phase15-retention-purge-production-hardening-plan.m
 Projections 已完成，最终 full-repo review re-review 为 PASS；过程证据、review artifacts、accepted commits 与 PR 69 记录见
 `历史记录` 和 `docs/reviews/`。Phase 14 RemoteProxy / RemoteStub 暂不实现，已 deferred 到 GitHub Issue #73。
 当前 gate：draft-PR-pass。
-下一步：Phase 15 draft PR 74 已创建并通过 PR-level review；等待用户后续 merge / mark ready / reviewer assignment 决策。P15 不以 Phase 14 completion 为进入前置；任何 remote-dependent smoke /
+下一步：本文档不再作为 active 总控入口；Phase 15 draft PR 74 已创建并通过 PR-level review，等待用户后续 merge / mark ready / reviewer assignment 决策。P15 不以 Phase 14 completion 为进入前置；任何 remote-dependent smoke /
 hardening 项必须排除、改写为 local / multiprocess / recovery coverage，或继续归 Issue #73。
 
 ## Phase Map

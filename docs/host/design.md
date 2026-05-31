@@ -86,7 +86,7 @@ Config catalog 的 record id 由顶层 map key 提供，record 内不重复 `run
 
 `models.json` 是模型目录，只表达 provider / model 能力与请求基础参数：runner kind、provider、model、endpoint、`api_key_ref`、headers、tool calling / streaming / stream usage capability、default timeout、max retries、SSE idle timeout / heartbeat、provider request extension、context window tokens 与 provider/model-specific `runtime_hints.runner_option_hints`。`runner_option_hint_id` 是 semantic call style selector，例如 `interactive`、`overview`、`audit`、`decision`、`write`、`infer` 与 `conversation_compaction`；具体 `temperature`、`top_p`、`stream` 等 RunnerCallOptions 值由 effective model 的 hint 表解释，不放入全局 execution profile。默认 config 不使用 `max_tokens` 限制模型输出；若未来需要输出 token cap，必须作为显式 per-run / provider adapter override 或 provider-specific public contract 重新设计，不能回到默认 model hint。
 
-`execution_profiles.json` 表达 execution baseline 与治理策略选择。顶层 selector 使用 `default_execution_profile_id`，catalog 使用 `execution_profiles`；默认 profile id 可以按场景与窗口分档，例如 `standard-256k`、`standard-1m`、`wechat-256k` 与 `wechat-1m`。单个 execution profile 至少包含 `run_baseline`、`compactor_baseline`、`context_budget_policy`、`memory_projection_policy`、`tool_truncation_policy` 与内嵌 `agent_policy`。`run_baseline` 保存默认 `model_id` 与 `runner_option_hint_id`；`compactor_baseline` 保存 compactor 专用 `model_id`、`scene_id`、`runner_option_hint_id`、`user_prompt_template_path` 与 artifact root，默认 compactor scene、runner hint 与 user prompt template 分别为 `conversation_compaction`、`conversation_compaction` 与 `scenes/conversation_compaction_user.md`。compactor 的 system prompt、AgentPolicy 与 user prompt template 不写在 Host 或 Service 代码中；Service / composition root 必须按 `compactor_baseline.scene_id` 装配 compactor scene asset，从 scene 读取 compactor system prompt 与完整 `agent_policy`，并按 `compactor_baseline.user_prompt_template_path` 读取 user prompt template，然后作为 typed `CompactorRunnerBaseline` 字段传入 Host。普通 `agent_policy` 一比一对齐 Engine / Host public `AgentPolicy` typed shape，使用 `max_iterations`、`continuation_max_attempts`、`allow_tool_calls`、`tool_execution_timeout_seconds`、`fallback_mode`、`fallback_prompt`、`continuation_prompt` 与 `max_consecutive_failed_tool_batches` 等稳定字段；`fallback_mode` 只允许 `force_answer` / `raise_error`，默认 `force_answer`，默认 `fallback_prompt` 为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”。`execution_profiles.json` 不保留顶层 `agent_policy_profiles` catalog、`agent_policy_profile_id`、`runner_options_profiles`、`runner_hints` 或 `agent_hints`。
+`execution_profiles.json` 表达 execution baseline 与治理策略选择。顶层 selector 使用 `default_execution_profile_id`，catalog 使用 `execution_profiles`；默认 profile id 可以按场景与窗口分档，例如 `standard-256k`、`standard-1m`、`wechat-256k` 与 `wechat-1m`。单个 execution profile 至少包含 `run_baseline`、`compactor_baseline`、`context_budget_policy`、`memory_projection_policy`、`tool_truncation_policy` 与内嵌 `agent_policy`。`run_baseline` 保存默认 `model_id` 与 `runner_option_hint_id`；`compactor_baseline` 保存 compactor 专用 `model_id`、`scene_id`、`runner_option_hint_id`、`user_prompt_template_path` 与 artifact root，默认 compactor scene、runner hint 与 user prompt template 分别为 `conversation_compaction`、`conversation_compaction` 与 `scenes/conversation_compaction_user.md`。默认 compactor model 由 execution profile 的 `compactor_baseline.model_id` 表达；packaged 默认应选择低延迟 flash-tier 模型，因为 compact 是低温度、无工具、结构化 JSON proposal 任务，优先需要快、稳定、可重试。高规格 compact 模型只能由 profile 显式选择，不由 scene 或 Host 代码隐式切换。`conversation_compaction` scene manifest 中若保留 `model.default_model_id`，其 packaged default 必须与默认 execution profile 的 compactor model 对齐，或被明确标记为非治理 fallback；不得与 profile 默认给出互相矛盾的 compactor model truth。compactor 的 system prompt、AgentPolicy 与 user prompt template 不写在 Host 或 Service 代码中；Service / composition root 必须按 `compactor_baseline.scene_id` 装配 compactor scene asset，从 scene 读取 compactor system prompt 与完整 `agent_policy`，并按 `compactor_baseline.user_prompt_template_path` 读取 user prompt template，然后作为 typed `CompactorRunnerBaseline` 字段传入 Host。普通 `agent_policy` 一比一对齐 Engine / Host public `AgentPolicy` typed shape，使用 `max_iterations`、`continuation_max_attempts`、`allow_tool_calls`、`tool_execution_timeout_seconds`、`fallback_mode`、`fallback_prompt`、`continuation_prompt` 与 `max_consecutive_failed_tool_batches` 等稳定字段；`fallback_mode` 只允许 `force_answer` / `raise_error`，默认 `force_answer`，默认 `fallback_prompt` 为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”。`execution_profiles.json` 不保留顶层 `agent_policy_profiles` catalog、`agent_policy_profile_id`、`runner_options_profiles`、`runner_hints` 或 `agent_hints`。
 
 execution profile 选择是 Service / composition root 的显式业务决策，不由 helper 根据 `models.context_window_tokens` 隐式切换。Service 可以根据业务场景、响应速度和 effective model 选择合适 profile；assembly helper 只做兼容性校验和诊断，例如 1M profile 搭配 256K 模型时 fail fast 或输出明确 diagnostic，256K profile 搭配 1M 模型时可允许但提示策略较保守。若需要机器可读约束，profile 可增加 `context_window_class` 或 `min_context_window_tokens` 一类字段；这些字段只用于校验，不用于自动选择。
 
@@ -384,7 +384,7 @@ CLOSED
 
 `purge_session` 是第一版对 EventLog append-only retention 的唯一 destructive exception。它只能在严格前置条件成立后删除该 Session 的可恢复事实，并必须保留最小 purge tombstone / audit record。tombstone 至少包含 `session_id`、purge `client_request_id`、semantic request digest、actor / source / request refs、reason、purge timestamp、precondition digest、deleted counts / digest 和 tombstone id。purge tombstone 不是可恢复 Session fact，不参与 resume、retry、replay、memory 或 RunInputBuilder；它不能位于被 purge 的 Session EventLog 中，必须存入 Host durable store 中可按 `session_id` 查询的 tombstone table 或等价持久区域。
 
-`purge_session` 不删除已经写入的 append-only audit JSONL 记录。purge 必须写入 purge tombstone audit record；既有 audit JSONL 行可以保留对已删除 EventLog rows 的 refs，audit 查询 / analyze 工具必须能识别 purge tombstone，并报告源 EventLog facts 已被 purge。
+`purge_session` 不删除已经写入的 append-only audit JSONL 记录。purge audit JSONL 记录的是 destructive 操作流水，而不是 purge 完成真源。purge 应至少能表达 `purge_started` 与 `purge_completed` 两类 audit line：`purge_started` 只表示上层发起并通过前置检查、Host 准备执行 destructive purge；`purge_completed` 只能在 SQLite purge tombstone 已提交后写入，并必须引用 tombstone id / digest。若 purge 执行失败，可以写入 `purge_failed` audit line 记录失败阶段和原因。既有 audit JSONL 行可以保留对已删除 EventLog rows 的 refs，audit 查询 / analyze 工具必须以 SQLite tombstone 判断 purge 是否完成：只有 `purge_started` 但没有可验证 tombstone / completed 记录时，只能报告 purge attempt / incomplete，不得报告 purge 已完成。
 
 purge 后该 Session 不再支持 `get_session`、`get_run`、`retry_run`、`replay_run` 或 final answer 恢复；Host 内部 EventLog 补读也不得再恢复该 Session 的可恢复事实。读取接口应返回 `not_found` / `gone` 或 tombstone snapshot；具体错误形状属于 Public API phase。
 
@@ -738,6 +738,8 @@ SQLite schema convention：
 - 第一版 Host durable store 使用单个 SQLite 数据库文件作为 Host 本地治理真源。`dayu.runtime.lane` 的 runtime lane DB 仍是独立 runtime coordinator，不得复用 Host durable store。
 - 第一版按全新 schema 起库处理。bootstrap 只负责 fresh DB schema creation 与幂等校验，不提供旧库兼容读取、兼容迁移或旧 schema fallback。
 - bootstrap 必须设置并校验 `PRAGMA user_version`，用于标识当前 Host durable schema version。schema version 不匹配时必须结构化失败，不得静默按旧 schema 运行。
+- fresh bootstrap 的全量 DDL 与 `PRAGMA user_version` 写入必须有明确事务边界并同成同败。DDL 中途失败不得留下带 current `user_version` 的半初始化 durable store；下一次 open 要么从 fresh 状态完整成功，要么以结构化 schema / corruption 错误失败。
+- current-version DB 的 opener validation 不得只相信 `PRAGMA user_version`，也不得把缺表 / 缺索引的 current-version DB 通过 `CREATE ... IF NOT EXISTS` 静默修好并继续运行。若 required table / index / schema invariant 缺失，普通 opener 必须结构化失败；显式 offline repair / rebuild 工具必须另行设计，不能混进正常 open path。
 - durable ids 使用 TEXT 存储稳定业务标识，例如 `session_id`、`run_id`、`attempt_id`、`execution_id`、`event_id`、`host_instance_id`。`event_sequence` 是 EventLog 的全局 INTEGER cursor，不替代这些业务 id。
 - durable timestamp 使用 UTC ISO-8601 TEXT 存储，必须规范化为 UTC、固定微秒精度并使用 `Z` 后缀。schema、reader 和 tests 不得混用本地时区、naive datetime、Unix timestamp integer 或多种 timestamp 表达。
 - JSON payload、policy decision、reason、actor、source、diagnostic refs 等结构化字段以确定性 canonical JSON TEXT 存储；digest 计算必须基于同一 canonicalization，不能依赖 Python dict 插入顺序或数据库返回顺序。
@@ -748,7 +750,9 @@ SQLite transaction runner：
 
 - Host mutating command 使用短 write transaction。write transaction 必须显式进入 `BEGIN IMMEDIATE`，避免在写入中途才升级锁导致不确定失败。
 - Host durable connection 必须启用 WAL、`foreign_keys=ON` 和明确 busy timeout；这些属于 Host storage policy，不复用 runtime lane 的 SQLite 配置。
+- WAL auto-checkpoint 可以作为 baseline，但 production hardening 必须定义 Host-owned checkpoint maintenance policy：触发点、运行时机、失败诊断、WAL size / checkpoint result 观测和测试入口必须明确。checkpoint 不得在 Host hot write transaction 内阻塞执行，也不得成为 EventLog append、state transition、recovery 或 projection correctness 的前置条件；checkpoint failure 只能进入 diagnostic / maintenance 路径。
 - retry policy 只包裹短事务级 SQLite busy / locked 类失败，并必须有有限重试次数和退避。唯一约束冲突、外键错误、schema mismatch、payload digest mismatch、idempotency conflict、CAS precondition failed 不得按 busy retry 处理。
+- Read transaction 使用 SQLite snapshot 语义：单个 read transaction 内允许看到 transaction 开始时的稳定旧快照。需要 fresh durable truth 的 public read、scheduler、recovery 和 governance decision 必须开启新的短 read / write transaction；不得复用长 read transaction、read model、projection lag、memory snapshot 或 watch cache 作为治理真源。
 - transaction runner 必须保证 commit 成功前不会触发 after-commit wakeup。after-commit callbacks 只在 SQLite commit 成功后执行；rollback、异常或 retry 中间失败不得唤醒 projection / sink / dispatcher。
 - 长耗时工作、Engine dispatch、artifact 大文件写入、projection、audit、tool trace、memory projection 不得在 Host SQLite write transaction 内执行。事务内只做状态校验、EventLog append、foundation row 写入、必要 state index 更新和可证明短小的 payload row 写入。
 
@@ -1688,7 +1692,7 @@ Audit 重点记录治理动作和责任链：
 
 `LogAuditSink` 不写大 payload，不复制 tool trace 冷数据。工具执行细节、证据锚点、截断、等待、provider request id 等深诊断信息属于 tool trace；audit 只记录可关联 ref / digest。audit 与 tool trace 必须都能通过 operation context 回答“这是什么业务的什么操作产生的记录”。
 
-`purge_session` 不删除已经写入的 append-only audit JSONL 记录。purge 必须产生 purge tombstone audit record；既有 audit 行可以保留对已 purge EventLog rows 的 refs。audit 查询 / analyze 工具必须能识别 purge tombstone，并提示对应 Session 的源 EventLog facts 已被 purge。
+`purge_session` 不删除已经写入的 append-only audit JSONL 记录。purge audit JSONL 记录 destructive 操作流水，至少应区分 `purge_started` 与 `purge_completed`：`purge_started` 表示 purge attempt 已发起，不能解释为完成；`purge_completed` 必须在 SQLite tombstone commit 成功后写入，并引用 tombstone id / digest。若 purge 失败，可以写入 `purge_failed` 记录失败阶段和原因。audit 查询 / analyze 工具必须能识别 purge audit lines，并以 SQLite tombstone 作为 purge 完成真源；只有 started 而没有 completed / tombstone 时，应提示该 Session 只有 purge attempt 或 incomplete purge，不得提示源 EventLog facts 已成功 purge。
 
 audit projection 可以为了查询重组，但不能反向成为恢复、resume 或 memory 真源。
 
@@ -2072,24 +2076,24 @@ ToolRuntime 负责：
 
 Engine 只负责同一次模型响应内的结构性工具调用协议，不理解工具语义、业务幂等性、用户意图或历史结果质量。语义级重复工具调用治理属于 Host / ToolRuntime。
 
-治理目标不是禁止所有重复工具调用，也不是治理同一轮 / 同一 iteration 内正常出现的结构性工具调用。第一版只治理同一个 Run 内模型复读导致的重复工具调用，目标是减少无意义 token 和工具执行浪费。
+治理目标不是禁止所有重复工具调用，也不是跨 Attempt 复用历史工具结果。第一版只治理同一个 Attempt 内模型复读导致的重复工具调用，目标是减少一次 LLM 调用内的无意义 token、工具执行浪费和工具循环风险。跨 Attempt 的重复工具调用默认视为新的工具请求；是否复用旧结果、刷新结果或要求工具级幂等，不由 duplicate governance 决定。
 
 重复判定信号：
 
 - tool identity：工具名、工具版本、schema version。
 - normalized arguments：去除无关顺序和默认值后的参数 digest。
-- optional tool-provided semantic key：工具声明的 run-local 语义重复 key。
-- accepted result digest / evidence anchor：当前 Run 内已接受结果是否等价或覆盖当前请求。
+- optional tool-provided semantic key：工具声明的 attempt-local 语义重复 key。
+- accepted result digest / evidence anchor：当前 Attempt 内已接受结果是否等价或覆盖当前请求。
 
-ToolRuntime 维护 run-local in-memory duplicate index，不需要 session-scope durable ledger。这里的 run-local 是同一个 Run 的治理语义，不是单个 Attempt 或单个 ToolRuntime 实例的生命周期语义。同进程且未丢失 Host 运行期状态时，同一个 Run 因 `WAITING -> resolve_wait -> resume`、steer 或 recovery 创建的新 Attempt 必须继续复用该 Run 的 duplicate index，不能因为重新创建 ToolRuntime 而忘记已 accepted 的工具事实。
+ToolRuntime 维护 attempt-local in-memory duplicate index，不需要 session-scope 或 run-scope durable duplicate ledger。duplicate key 的 scope 必须绑定当前 Attempt，至少包含 `attempt_id`，并结合 tool identity、normalized arguments digest 与可选 semantic key。`WAITING -> resolve_wait -> resume`、steer、recovery 或 compact recovery 创建的新 Attempt 不继承旧 Attempt 的 duplicate index；模型在新 Attempt 中再次发起同 tool + 同 args 调用时，ToolRuntime 默认按新的工具请求治理。
 
-Host 崩溃或重启后的恢复不要求继承该内存索引；P6 第一版不引入 durable duplicate ledger。崩溃恢复或内存索引丢失后，重复风险由 RunInputBuilder 把已接受工具事实放回 messages 来降低；如果后续需要从 EventLog 重建 duplicate index，必须作为独立设计进入对应 phase。
+Host 崩溃、重启、Attempt 终止或新 Attempt 创建后不要求继承该内存索引；P6 第一版不引入 durable duplicate ledger，也不从 EventLog 重建 duplicate index。RunInputBuilder 是否把旧工具结果作为上下文、历史观测或证据 ref 注入 prompt，属于 memory / prompt assembly / tool result presentation policy，不属于 duplicate governance，也不得被用作跨 Attempt 语义去重的 correctness 前提。
 
 policy action 必须分级：
 
 - `allow`：重复调用有新 scope、新参数、新证据需求或用户明确要求。
-- `reuse`：直接复用已接受工具事实 / evidence anchor，不重新执行工具。
-- `hint`：append `GUIDANCE_INSERTED`，提醒模型已有事实或建议改查其它证据。
+- `reuse`：在同一 Attempt 内直接复用已接受工具事实 / evidence anchor，不重新执行工具。
+- `hint`：append `GUIDANCE_INSERTED`，提醒模型本 Attempt 已有事实或建议改查其它证据。
 - `require_justification`：允许继续，但要求下一轮 messages 中保留模型为什么需要重复调用的上下文。
 - `hard_stop`：判定为工具循环或违反幂等 policy，关闭当前 Attempt 为 failed / governed stop，并由 Host policy 决定 retry、replay 或失败。
 
@@ -2098,13 +2102,13 @@ EventLog 规则：
 - 工具调用意图进入 `TOOL_CALL_REQUESTED`。
 - policy 决策进入 `TOOL_CALL_GOVERNED`，至少包含 duplicate key、决策、scope、reason、相关 prior event refs。
 - 真正执行并被接受的结果进入 `TOOL_RESULT_ACCEPTED`。P1-P7 的 accepted waiting terminal result 同样使用 `TOOL_RESULT_ACCEPTED` 作为唯一 accepted tool result canonical event，通过 payload 的 wait-specific fields 区分等待完成来源、wait id、resolution kind 与 wait record 状态，避免追加第二份 canonical tool fact。
-- `reuse` 不伪造新的工具事实；它引用 prior accepted result，并在 messages 中表达为 Host 复用的已接受事实。
+- `reuse` 不伪造新的工具事实；它只能引用当前 Attempt 内 prior accepted result，并在 messages 中表达为 Host 复用的已接受事实。
 - audit / tool trace 必须能解释为什么某次重复调用被允许、复用、提示或阻断。
 
 边界：
 
-- 第一版只实现 run-local deterministic duplicate key；跨 Run、跨 Session、跨多年历史中的相似证据召回属于 Conversation Memory / retrieval，不属于重复工具调用治理。
-- 对财报读取类 read-only 工具，默认优先 `reuse` / `hint`，除非参数或 evidence scope 明确变化。
+- 第一版只实现 attempt-local deterministic duplicate key；跨 Attempt、跨 Run、跨 Session、跨多年历史中的相似证据召回属于 Conversation Memory / retrieval、tool result presentation 或工具自身 policy，不属于重复工具调用治理。
+- 对财报读取类 read-only 工具，同一 Attempt 内重复调用默认优先 `reuse` / `hint`，除非参数或 evidence scope 明确变化；跨 Attempt 不默认复用。
 - 对外部写入或付费工具，必须依赖工具 schema / policy 提供 idempotency key；Host 的 duplicate governance 不能替代工具级幂等。
 - 该治理不能进入 Engine，也不能让 RemoteStub 拥有 Host 状态。
 
@@ -2254,7 +2258,7 @@ CAS 或 busy timeout 做短等待和重试。
 
 resume policy 覆盖 internal / manual、poll、callback 三类入口。所有入口都必须走同一个 `resolve_wait` pipeline，不能各自更新 Run / Attempt / EventLog。
 
-`WAITING -> resolve_wait -> resume` 会创建一次新的模型请求。模型本身是无状态调用方，Host 不能把“模型没有天然记住上一个 Attempt 已经发过某个 tool call”作为协议前提，也不能要求模型在新请求里自动避免重复 tool call。resume 的 RunInputBuilder 必须从 EventLog canonical facts 重建足够的 messages，把已 accepted 的等待结果、工具事实、governance guidance 与必要上下文放回模型输入；若模型仍发出同一个语义工具调用，Run-local duplicate governance 负责复用、提示、要求说明或阻断。
+`WAITING -> resolve_wait -> resume` 会创建一次新的模型请求。模型本身是无状态调用方，Host 不能把“模型没有天然记住上一个 Attempt 已经发过某个 tool call”作为协议前提，也不能要求模型在新请求里自动避免重复 tool call。resume 的 RunInputBuilder 必须从 EventLog canonical facts 重建足够的 messages，把已 accepted 的等待结果、必要上下文和按 policy 允许注入的工具事实 / refs 放回模型输入；若模型仍发出与上一 Attempt 等价的工具调用，第一版 duplicate governance 不做跨 Attempt 复用或阻断，ToolRuntime 按新的 Attempt 内工具请求处理。工具结果是否可复用、是否需要刷新、是否需要工具级幂等，由工具 policy、freshness / side-effect 语义或后续 retrieval / prompt assembly 设计决定。
 
 约束：
 
@@ -2317,7 +2321,7 @@ wait condition satisfied
   -> Host dispatches through LocalProxy / RemoteProxy
 ```
 
-Resume 是同一 Run 内的新 Attempt，不是恢复旧 Attempt，也不是让旧模型进程继续执行。由于模型请求无状态，Host 必须在 rebuild messages 阶段显式提供已 accepted 的工具事实、等待结果和必要 guidance。模型在 resume 后重复发起与上一 Attempt 等价的 tool call 时，这属于 Host duplicate governance 的输入，不是模型协议违规；同 Run 的 duplicate index 必须在正常同进程生命周期内跨 Attempt 生效。
+Resume 是同一 Run 内的新 Attempt，不是恢复旧 Attempt，也不是让旧模型进程继续执行。由于模型请求无状态，Host 必须在 rebuild messages 阶段显式提供等待结果、必要上下文，以及按 prompt / memory / tool-result policy 允许注入的已 accepted 工具事实或 refs。模型在 resume 后重复发起与上一 Attempt 等价的 tool call 时，这不是模型协议违规；第一版 duplicate governance 只在当前 Attempt 内生效，不跨 Attempt 复用旧 duplicate index。
 
 Retry：
 
@@ -2684,7 +2688,7 @@ Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace�
 - 每个 Run 的 proactive trigger 第一版最多启动一个 compaction operation；reactive trigger 每次 Engine overflow 最多启动一个 operation，但同一 Run 可在 `max_reactive_compactions_per_run` 上限内多次 reactive compact，默认上限为 2。一个 operation 内可以包含 Host-owned bounded semantic repair attempts，但不得启动无界 compact loop。
 - `max_compaction_attempts_per_operation` 由 Host context budget policy 显式给出，含第一次 proposal attempt、reactive material
   block pass proposal 与后续 semantic repair attempts，必须为正整数。它控制一次 Host compaction operation 内所有外部 LLM proposal
-  调用总数；不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
+  调用总数；默认 packaged policy 为 5 次。代码 fallback 默认值与 execution profile 默认值必须保持一致，避免同一 Host 在不同装配路径下出现不同 compact retry 语义。该字段不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
 - 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
 
 Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 memory snapshot、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 compacted summary 替代 `evidence_backed_fact` 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。`WorkingAssumptionView` 的主动填充可以由 proactive compaction 或后续 retrieval owner 通过 canonical facts / projection policy 接入；P10 不得绕过 P9 memory projection 边界直接写入。
@@ -2713,6 +2717,16 @@ Compactor 与 retry / repair 的 owner 边界固定为：
 - Host Context Governance 拥有 semantic repair / retry：非 final answer、空 summary、解析失败、candidate shape 非法、缺 preservation evidence、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
 - stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。proactive compaction 在 worker 启动前没有 active worker token，必须使用 durable Run 状态观察 token；reactive compaction 必须复用 Engine envelope 中的 run-local cancellation token。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
+
+LLM compaction repair 耗尽或 compactor 不可用时，Host 可以进入 deterministic recent-window fallback。该 fallback 不是
+compact 成功，不提交 `CONTEXT_COMPACTED`，不生成 episode summary、minimum preserve、pinned state patch 或
+`evidence_backed_fact`，也不写 memory projection。它只为本次 dispatch 构造类似首次 compact 前的 bounded RunInputBuilder
+输入视图：当前用户输入、最新 N 轮 raw turns、至少 M 轮 recent raw floor、已有 stable facts、answer anchors、open task
+state，以及必要 evidence / artifact / tool result refs。fallback 必须写 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic，
+并标明本次 dispatch 使用了 recent-window fallback；记录内容至少包含 compact failure reason、fallback policy
+decision、fallback input window / digest、重新估算后的 budget result 和 diagnostic refs。fallback 后必须重新估算预算；
+若该 bounded input view 仍超过 hard threshold，Host 不得 dispatch，必须按 failure policy 收口。fallback 读取已有
+facts / refs，但不得把 refs 或 raw turns 提升为新的 stable facts。
 
 Compaction operation 的 durable 语义固定为：
 
@@ -2823,6 +2837,7 @@ proactive trigger before dispatch
   -> append CONTEXT_COMPACTION_REQUESTED(trigger_source=proactive)
   -> Host ContextGovernance runs bounded compaction operation outside write transaction
   -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
+  -> if compact failed and policy allows fallback: build deterministic recent-window input view and re-estimate
   -> RunInputBuilder rebuilds complete AgentRunRequest.messages
   -> append RUN_STARTED / ATTEMPT_STARTED
   -> dispatch Engine
@@ -2834,6 +2849,7 @@ reactive trigger from EngineEvent.context_compaction_requested
   -> Run -> RECOVERING when policy allows recovery
   -> Host ContextGovernance runs bounded compaction operation outside write transaction
   -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
+  -> if compact failed and policy allows fallback: build deterministic recent-window input view and re-estimate
   -> append RUN_STARTED(start_reason=recovery)
   -> create new Attempt with new execution_id
   -> append ATTEMPT_STARTED
@@ -2847,20 +2863,21 @@ reactive path 约束：
 - Host 必须先按 `attempt_id + execution_id` 校验 `context_compaction_requested` 是否来自当前 active Attempt。
 - Engine 后续的 recoverable `run_failed(context_compaction_required)` 只能关闭当前 Attempt；它不能让 Engine 自己重试，也不能让旧 Attempt resume。
 - Host 若接受恢复，应把 Run 标为 `RECOVERING`，执行 compact 后创建新 Attempt；若 compact policy 放弃恢复，Run 才进入 `FAILED`。
-- proactive compact failure 在 dispatch 前收口，Run 进入 `FAILED`，不得创建 Attempt，也不得进入 `RECOVERING`。
-- reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
+- proactive compact failure 在 dispatch 前优先尝试 deterministic recent-window fallback；fallback 预算通过时允许创建 Attempt，但不得写 `CONTEXT_COMPACTED` 或 memory projection。fallback 仍超预算或 policy 不允许 fallback 时，Run 按 failure policy 收口，后续引入 `REJECTED` 后应归入 governance rejection，不得进入 `RECOVERING`。
+- reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Host 可按 policy 尝试 deterministic recent-window fallback，并创建新的 recovery Attempt。fallback 仍超预算或 policy 不允许 fallback 时，Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
 - `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 operation id、trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor、retry / repair budget snapshot 和 reason。
 - `CONTEXT_COMPACTION_ATTEMPT_REJECTED` payload 至少记录 operation id、attempt number、failure category、whether repairable、runner attempt summary refs、quality / parse / budget diagnostic refs 和 next policy decision。
 - `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、episode summary candidate、pinned state patch candidate、evidence-backed fact candidates、minimum preserve item candidates、preserved fact refs、dropped / summarized ranges、accepted evidence refs / prompt-local label mapping refs、quality check result、budget after compact。
-- `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs。
+- `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs；若 policy decision 采用 deterministic recent-window fallback，还必须记录 fallback input window / digest、fallback budget result，以及 fallback 后是 dispatch 还是 fail closed。
 
 compact 不变量：
 
 - compact 不能改写历史 EventLog facts，也不能让 summary 替代 evidence anchor。
 - compacted snapshot / summary 是 read model 或 input artifact；是否进入 memory projection 必须由 memory policy 决定。
 - RunInputBuilder 必须从 `USER_INPUT_ACCEPTED`、canonical facts、memory snapshot 和 compacted artifacts 重建完整 messages；不能复用失败 Attempt 的 provider request payload。
+- deterministic recent-window fallback 只能影响本次 RunInputBuilder 输入选择，不得改写 EventLog 历史事实，不得提交 `CONTEXT_COMPACTED`，不得 materialize memory snapshot；但它必须有 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic 痕迹，不能静默发生。
 - 新 Attempt 必须有新的 `attempt_id` / `execution_id`；旧 Attempt 不 takeover、不 resume。
-- compact 必须有 policy 上限。proactive operation 内 bounded repair attempts 后仍超过 budget threshold 时，Host 必须 append `CONTEXT_COMPACTION_FAILED` 并让 Run 进入 `FAILED`。reactive path 中 compact 后若真实 recovery dispatch 再次触发 Engine overflow，可在 `max_reactive_compactions_per_run` 范围内追加下一次 reactive compact；超过上限后 append `CONTEXT_COMPACTION_FAILED` 并让 Run 进入 `FAILED`。不得进入 `LOST`，不得无限 compact retry。
+- compact 必须有 policy 上限。proactive operation 内 bounded repair attempts 耗尽后，Host 必须 append `CONTEXT_COMPACTION_FAILED`；若 deterministic recent-window fallback 预算通过，可继续 dispatch，否则按 failure policy 收口。reactive path 中 compact 后若真实 recovery dispatch 再次触发 Engine overflow，可在 `max_reactive_compactions_per_run` 范围内追加下一次 reactive compact；超过上限后 append `CONTEXT_COMPACTION_FAILED`，可按 policy 尝试 deterministic recent-window fallback，仍失败则让 Run 进入 `FAILED`。不得进入 `LOST`，不得无限 compact retry。
 - tool trace / audit 必须能解释哪些内容被保留、压缩、丢弃，以及为什么这样做。
 
 参数默认值由 memory / context policy provider 定义。设计固定治理范围，policy 固定优先级和默认值。
