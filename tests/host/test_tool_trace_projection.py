@@ -166,12 +166,14 @@ def _run_trace_once(
     cold_jsonl_path: Path,
     *,
     limit: int = 10,
+    lock_path: Path | None = None,
 ) -> None:
     """运行一次 Tool Trace projection。
 
     :param transaction_runner: Host durable transaction runner。
     :param cold_jsonl_path: cold JSONL 路径。
     :param limit: ProjectionRunner 单次扫描上限。
+    :param lock_path: 显式 runtime file lock 路径；``None`` 时使用默认派生路径。
     :returns: ``None``。
     """
 
@@ -182,7 +184,7 @@ def _run_trace_once(
                 ToolTraceSinkOptions(
                     cold_jsonl_path=cold_jsonl_path,
                     create_parent_dirs=True,
-                    lock_path=None,
+                    lock_path=lock_path,
                 )
             ),
         ),
@@ -255,6 +257,7 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
     """TOOL_CALL_REQUESTED / GOVERNED / RESULT_ACCEPTED 投影关键字段。"""
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
+    lock_path = tmp_path / "locks" / "tool-trace-cold.jsonl.lock"
     with open_host_durable_store(_options(tmp_path)) as store:
         requested = _append_tool_event(
             store.transaction_runner,
@@ -314,7 +317,7 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             payload_ref="artifact://event-log-payload",
         )
 
-        _run_trace_once(store.transaction_runner, cold_path)
+        _run_trace_once(store.transaction_runner, cold_path, lock_path=lock_path)
         requested_row = store.transaction_runner.run_read(
             lambda transaction: read_tool_trace_hot_row(
                 transaction, requested.event_id
@@ -328,6 +331,11 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         result_row = store.transaction_runner.run_read(
             lambda transaction: read_tool_trace_hot_row(transaction, result.event_id)
         )
+        checkpoint = store.transaction_runner.run_read(
+            lambda transaction: read_projection_checkpoint(
+                transaction, TOOL_TRACE_CONSUMER_ID.value
+            )
+        )
 
         assert requested_row is not None
         assert requested_row.tool_call_id == "tool-call-1"
@@ -340,6 +348,9 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         assert result_row is not None
         assert result_row.result_digest == "sha256:outcome"
         assert result_row.diagnostic_ref == "diag-result"
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == result.event_sequence
+        assert lock_path.exists()
         cold_lines = _json_lines(cold_path)
         assert [line["event_id"] for line in cold_lines] == [
             "event-requested",

@@ -25,6 +25,7 @@
 
 - Dayu 的架构定位是：宿主强约束下的 `LLM in the loop`。
 - Host 对 Agent / Runner 的生命周期、取消、治理是强约束真源。
+- 不做过度设计，以最小化满足需求为标准。
 - 严格遵守分层架构：`UI -> Service -> Host -> Engine`。
 - `dayu.runtime` 是公共运行时基础设施包，不属于 `UI / Service / Host / Engine` 任一业务层，只能承载层中立、运行期通用、可被多层复用的基础能力。
 - `dayu.runtime` 不得 import `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`；只能依赖标准库与更底层的公共契约。

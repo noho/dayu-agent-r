@@ -71,7 +71,7 @@ class RuntimeFileLockToken:
     """
 
     lock_path: Path
-    released: bool
+    _release_completed: bool
     _third_party_lock: FileLock = field(repr=False, compare=False)
 
     def __init__(self, *, lock_path: Path, third_party_lock: FileLock) -> None:
@@ -85,25 +85,24 @@ class RuntimeFileLockToken:
 
         _require_valid_lock_path(lock_path)
         self.lock_path = lock_path
-        self.released = False
+        self._release_completed = False
         self._third_party_lock = third_party_lock
 
     def release(self) -> None:
-        """释放文件锁；重复调用保持幂等。
+        """释放文件锁；成功释放后的重复调用保持幂等。
 
         :returns: ``None``。
         :raises RuntimeFileLockError: 第三方 release 失败时抛出。
         """
 
-        if self.released:
+        if self._release_completed:
             return
 
         try:
             self._third_party_lock.release()
         except Exception as exc:
-            self.released = True
             raise RuntimeFileLockError("释放 runtime file lock 失败") from exc
-        self.released = True
+        self._release_completed = True
 
         try:
             _ensure_lock_file_marker_exists(self.lock_path)
@@ -118,19 +117,18 @@ class RuntimeFileLockToken:
 class RuntimeFileLock:
     """同步 runtime 文件锁。
 
-    同一个 :class:`RuntimeFileLock` 实例只承诺单线程 / 单控制流使用；
-    多线程需要各自创建独立实例并依赖底层文件锁协调，不得共享实例上的
-    active token 跟踪状态。
+    同一个 :class:`RuntimeFileLock` 实例不承诺 reentrant 语义；调用方应让
+    第三方 ``FileLock`` 持有 acquire / release 生命周期真源。
 
     :param options: 文件锁配置。
     :raises RuntimeFileLockError: 配置非法时抛出。
     """
 
-    __slots__ = ("_active_token", "_third_party_lock", "options")
+    __slots__ = ("_context_token", "_third_party_lock", "options")
 
     options: RuntimeFileLockOptions
     _third_party_lock: FileLock
-    _active_token: RuntimeFileLockToken | None
+    _context_token: RuntimeFileLockToken | None
 
     def __init__(self, options: RuntimeFileLockOptions) -> None:
         """初始化同步 runtime 文件锁。
@@ -141,7 +139,7 @@ class RuntimeFileLock:
         """
 
         self.options = options
-        self._active_token = None
+        self._context_token = None
         try:
             self._third_party_lock = FileLock(str(options.lock_path))
         except Exception as exc:
@@ -159,12 +157,9 @@ class RuntimeFileLock:
         :returns: 已获取锁的 token。
         :raises RuntimeFileLockTimeoutError: non-blocking 或限时 acquire 超时时
             抛出。
-        :raises RuntimeFileLockError: parent directory、路径、同实例重叠 acquire
-            或 acquire 失败时抛出。
+        :raises RuntimeFileLockError: parent directory、路径或 acquire 失败时抛出。
         """
 
-        if self._active_token is not None and not self._active_token.released:
-            raise RuntimeFileLockError("runtime file lock token is already active")
         effective_timeout = _effective_timeout_seconds(
             timeout_seconds=timeout_seconds,
             default_timeout_seconds=self.options.timeout_seconds,
@@ -182,17 +177,20 @@ class RuntimeFileLock:
             lock_path=self.options.lock_path,
             third_party_lock=self._third_party_lock,
         )
-        self._active_token = token
         return token
 
     def __enter__(self) -> RuntimeFileLockToken:
         """进入同步 context manager 并获取文件锁。
 
         :returns: 已获取锁的 token。
-        :raises RuntimeFileLockError: 获取锁失败或同实例 token 未释放时抛出。
+        :raises RuntimeFileLockError: context manager 嵌套使用或获取锁失败时抛出。
         """
 
-        return self.acquire()
+        if self._context_token is not None:
+            raise RuntimeFileLockError("runtime file lock context manager 不支持嵌套")
+        token = self.acquire()
+        self._context_token = token
+        return token
 
     def __exit__(
         self,
@@ -209,12 +207,12 @@ class RuntimeFileLock:
         :raises RuntimeFileLockError: 释放锁失败时抛出。
         """
 
-        token = self._active_token
-        if token is not None:
-            try:
+        token = self._context_token
+        try:
+            if token is not None:
                 token.release()
-            finally:
-                self._active_token = None
+        finally:
+            self._context_token = None
 
 
 def file_lock(

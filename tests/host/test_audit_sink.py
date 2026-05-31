@@ -231,12 +231,16 @@ def _append_event(
 
 
 def _run_audit_once(
-    transaction_runner: HostTransactionRunner, audit_jsonl_path: Path
+    transaction_runner: HostTransactionRunner,
+    audit_jsonl_path: Path,
+    *,
+    lock_path: Path | None = None,
 ) -> None:
     """运行一次 LogAuditSink projection。
 
     :param transaction_runner: Host durable transaction runner。
     :param audit_jsonl_path: audit JSONL 路径。
+    :param lock_path: 显式 runtime file lock 路径；``None`` 时使用默认派生路径。
     :returns: ``None``。
     """
 
@@ -247,7 +251,7 @@ def _run_audit_once(
                 LogAuditSinkOptions(
                     audit_jsonl_path=audit_jsonl_path,
                     create_parent_dirs=True,
-                    lock_path=None,
+                    lock_path=lock_path,
                 )
             ),
         ),
@@ -313,6 +317,7 @@ def test_jsonl_line_contains_required_audit_fields(tmp_path: Path) -> None:
     """audit JSONL 行包含计划要求的最小字段与 line digest。"""
 
     audit_path = tmp_path / "audit" / "host-audit.jsonl"
+    lock_path = tmp_path / "locks" / "host-audit.jsonl.lock"
     payload: JsonValue = {
         "operation_context": {
             "operation_name": "submit_followup",
@@ -334,18 +339,26 @@ def test_jsonl_line_contains_required_audit_fields(tmp_path: Path) -> None:
         event = _append_event(
             store.transaction_runner, event_id="event-1", payload=payload
         )
-        _append_event(
+        preview_event = _append_event(
             store.transaction_runner,
             event_id="event-preview",
             event_class=EventClass.PREVIEW,
             event_type=_EVENT_TYPE_PREVIEW_DELTA,
             payload={"delta": "ignored"},
         )
-        _run_audit_once(store.transaction_runner, audit_path)
+        _run_audit_once(store.transaction_runner, audit_path, lock_path=lock_path)
         marker = store.transaction_runner.run_read(
             lambda transaction: read_audit_sink_marker(transaction, event.event_id)
         )
+        checkpoint = store.transaction_runner.run_read(
+            lambda transaction: read_projection_checkpoint(
+                transaction, LOG_AUDIT_SINK_CONSUMER_ID.value
+            )
+        )
         assert marker is not None
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == preview_event.event_sequence
+        assert lock_path.exists()
         marker_line_digest = marker.line_digest
 
     lines = _json_lines(audit_path)

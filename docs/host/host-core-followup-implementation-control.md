@@ -117,16 +117,16 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | current work unit completed：WU-AUDIT-01 |
-| active work unit | none selected |
+| implementation status | current work unit completed：WU-RUNTIME-01 |
+| active work unit | WU-RUNTIME-01 |
 | default next work unit | WU-STRESS-01 |
-| next entry point | PR merge 后进入 discussion：确认 WU-STRESS-01 或由用户指定其它 work unit；随后进入代码核对 / plan / implementation / review |
+| next entry point | WU-RUNTIME-01 已到达 draft-PR-pass；后续 merge、mark ready for review、request reviewers、delete branch 或对外 comment 需要额外授权 |
 | design source | docs/host/design.md |
-| plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
-| implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74；accepted deepreview: 4487262；accepted PR review: b8c7866；accepted full-repo review fix pass1: 791f9c6 |
-| review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-code-review-mimo-20260531.md；docs/reviews/wu-audit-01-code-review-ds-20260531.md；docs/reviews/wu-audit-01-code-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-code-rereview-ds-20260531.md；docs/reviews/wu-audit-01-code-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-pr-review-mimo-20260531.md；docs/reviews/wu-audit-01-pr-review-ds-20260531.md；docs/reviews/wu-audit-01-pr-review-controller-adjudication-20260531.md；docs/reviews/repo-review-fix-pass1-codex-20260531.md；docs/reviews/repo-review-fix-pass1-rereview-mimo-20260531.md；docs/reviews/repo-review-fix-pass1-rereview-ds-20260531.md；docs/reviews/repo-review-fix-pass1-controller-adjudication-20260531.md |
-| aggregate review artifacts | docs/reviews/wu-audit-01-aggregate-deepreview-mimo-20260531.md；docs/reviews/wu-audit-01-aggregate-deepreview-ds-20260531.md；docs/reviews/wu-audit-01-aggregate-controller-adjudication-20260531.md；docs/reviews/repo-review-20260531-222837.md；docs/reviews/repo-review-20260531-223418.md |
-| draft PR status | draft PR opened and PR review passed; full-repo review fix pass1 accepted: https://github.com/noho/dayu-agent-r/pull/99 |
+| plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md |
+| implementation commits | accepted plan: 929d01c；accepted slice1: 7b5b3aa；accepted slice2: 51648be；accepted deepreview: 6980c96；accepted PR review: 9bf87a4 |
+| review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-fix-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice2-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-slice2-20260601.md；docs/reviews/wu-runtime-01-pr-review-mimo-20260601.md；docs/reviews/wu-runtime-01-pr-review-ds-20260601.md；docs/reviews/wu-runtime-01-pr-review-controller-adjudication-20260601.md |
+| aggregate review artifacts | docs/reviews/wu-runtime-01-aggregate-deepreview-mimo-20260601.md；docs/reviews/wu-runtime-01-aggregate-deepreview-ds-20260601.md；docs/reviews/wu-runtime-01-aggregate-controller-adjudication-20260601.md |
+| draft PR status | draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/100 |
 | blocking open questions | none |
 
 状态约定：
@@ -168,7 +168,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| RR-HCF-01 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime abstraction risk | deferred-with-owner | 本文档 WU-RUNTIME-01 | 单独进入 discussion / plan；不得做一行状态补丁 | `RuntimeFileLock` 生产调用面只需要 JSONL / trace 文件互斥、parent directory 准备和 runtime 统一异常边界；当前 wrapper 复制 `FileLock` 的 token / released 生命周期状态，已多次被 review 发现边界 bug。后续应收缩封装或替换为直接委托第三方 `FileLock`，不保留无必要状态机。 |
+| RR-HCF-01 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime abstraction risk | closed | 本文档 WU-RUNTIME-01 | 已完成；后续只在 PR review 发现回归时处理 | `RuntimeFileLock` 已收缩为普通文件互斥 wrapper：删除 public `RuntimeFileLockToken.released`，移除 `_active_token` acquire gate，第三方 `FileLock` 继续持有 acquire / release 生命周期真源；context manager 只保留 `_context_token` cleanup guard。Host audit / tool trace explicit lock_path regression 已覆盖，未引入 stale lock、async wrapper、durable lease 或 Host recovery。 |
 | RR-HCF-02 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime correctness risk | deferred-with-owner | 本文档 WU-RUNTIME-02 | 单独进入 discussion / plan；先确认跨进程时间真源 | `lane` 的核心作用是多进程并发 named semaphore，抽象成立，不应被 `FileLock` 替代；风险集中在 `_LaneClock` 使用进程内 monotonic anchor 推导 UTC 参与跨进程 TTL 判断，以及 `_await_task_after_outer_cancellation` 无限等待的复杂控制流。 |
 
 ## 当前 Work Units
@@ -188,7 +188,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
 | WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
-| WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 未开始 |
+| WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 已完成 |
 | WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 | 未开始 |
 
 ## WU-AUDIT-01 Purge Audit Cross-medium Orphan Reconciliation

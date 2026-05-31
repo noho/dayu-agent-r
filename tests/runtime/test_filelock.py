@@ -7,6 +7,7 @@ break lock / async wrapper 的公共边界。
 
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
 from typing import cast
 
@@ -62,19 +63,6 @@ class _FailingThirdPartyLock:
         raise OSError("release failed")
 
 
-class _FailingReleaseToken(RuntimeFileLockToken):
-    """测试用 release 失败 token。"""
-
-    def release(self) -> None:
-        """模拟底层 release 失败。
-
-        :returns: 不返回；始终抛出 ``RuntimeFileLockError``。
-        :raises RuntimeFileLockError: 始终抛出，用于验证 active token 保留。
-        """
-
-        raise RuntimeFileLockError("release failed")
-
-
 def _raise_marker_restore_error(_lock_path: Path) -> None:
     """模拟 marker 恢复失败。
 
@@ -120,21 +108,26 @@ def test_missing_parent_without_creation_raises_runtime_error(tmp_path: Path) ->
 
 
 def test_context_manager_releases_on_normal_path(tmp_path: Path) -> None:
-    """context manager 正常退出必须 release token。"""
+    """context manager 正常退出后独立 lock 必须可再次获取。"""
 
-    lock = file_lock(_lock_path(tmp_path))
+    lock_path = _lock_path(tmp_path)
+    lock = file_lock(lock_path)
 
     with lock as token:
         assert isinstance(token, RuntimeFileLockToken)
-        assert not token.released
 
-    assert token.released
+    second_token = file_lock(lock_path).acquire(timeout_seconds=0)
+    try:
+        assert isinstance(second_token, RuntimeFileLockToken)
+    finally:
+        second_token.release()
 
 
 def test_context_manager_releases_on_exception_path(tmp_path: Path) -> None:
-    """context manager 异常退出也必须 release token。"""
+    """context manager 异常退出后独立 lock 必须可再次获取。"""
 
-    lock = file_lock(_lock_path(tmp_path))
+    lock_path = _lock_path(tmp_path)
+    lock = file_lock(lock_path)
     token: RuntimeFileLockToken | None = None
 
     with pytest.raises(ValueError, match="boom"):
@@ -143,74 +136,55 @@ def test_context_manager_releases_on_exception_path(tmp_path: Path) -> None:
             raise ValueError("boom")
 
     assert token is not None
-    assert token.released
+    second_token = file_lock(lock_path).acquire(timeout_seconds=0)
+    try:
+        assert isinstance(second_token, RuntimeFileLockToken)
+    finally:
+        second_token.release()
 
 
-def test_context_manager_release_failure_clears_active_token_and_allows_reacquire(
+def test_nested_context_manager_on_same_instance_fails_fast_without_leak(
     tmp_path: Path,
 ) -> None:
-    """context manager release 失败时也必须清理 active token。"""
+    """同一实例嵌套 context 必须拒绝且不得泄漏外层 token。"""
 
     lock_path = _lock_path(tmp_path)
-    third_party_lock = _CountingThirdPartyLock()
     lock = file_lock(lock_path)
-    failing_token = _FailingReleaseToken(
-        lock_path=lock_path,
-        third_party_lock=cast(FileLock, third_party_lock),
-    )
-    lock._active_token = failing_token
 
-    with pytest.raises(RuntimeFileLockError, match="release failed"):
-        lock.__exit__(None, None, None)
-
-    assert lock._active_token is None
-    token = lock.acquire(timeout_seconds=0)
-    try:
-        assert token is not failing_token
-    finally:
-        token.release()
-
-
-def test_nested_context_manager_on_same_instance_fails_fast(tmp_path: Path) -> None:
-    """同一 lock 实例嵌套 context 必须拒绝，避免覆盖 active token。"""
-
-    lock = file_lock(_lock_path(tmp_path))
-
-    with lock as outer_token:
-        with pytest.raises(RuntimeFileLockError, match="already active"):
+    with lock:
+        with pytest.raises(RuntimeFileLockError, match="不支持嵌套"):
             with lock:
                 raise AssertionError("nested context must not enter")
 
-    assert outer_token.released
-
-
-def test_manual_acquire_inside_context_fails_fast(tmp_path: Path) -> None:
-    """context 持有 token 时同实例手动 acquire 必须拒绝。"""
-
-    lock = file_lock(_lock_path(tmp_path))
-
-    with lock as token:
-        with pytest.raises(RuntimeFileLockError, match="already active"):
-            lock.acquire(timeout_seconds=0)
-
-    assert token.released
-
-
-def test_context_enter_after_manual_acquire_fails_fast(tmp_path: Path) -> None:
-    """手动 acquire 未释放时，同实例 context enter 必须拒绝。"""
-
-    lock = file_lock(_lock_path(tmp_path))
-    token = lock.acquire(timeout_seconds=0)
+    second_token = file_lock(lock_path).acquire(timeout_seconds=0)
     try:
-        with pytest.raises(RuntimeFileLockError, match="already active"):
-            with lock:
-                raise AssertionError("context must not enter")
+        assert isinstance(second_token, RuntimeFileLockToken)
     finally:
-        token.release()
+        second_token.release()
+
+
+def test_context_manager_release_failure_clears_context_token(
+    tmp_path: Path,
+) -> None:
+    """context manager release 失败时也必须清理 context cleanup 引用。"""
+
+    lock_path = _lock_path(tmp_path)
+    third_party_lock = _FailingThirdPartyLock()
+    lock = file_lock(lock_path)
+    lock._context_token = RuntimeFileLockToken(
+        lock_path=lock_path,
+        third_party_lock=cast(FileLock, third_party_lock),
+    )
+
+    with pytest.raises(RuntimeFileLockError, match="释放 runtime file lock 失败"):
+        lock.__exit__(None, None, None)
+
+    assert lock._context_token is None
+    assert third_party_lock.release_calls == 1
 
 
 def test_manual_release_allows_same_instance_reacquire(tmp_path: Path) -> None:
-    """手动 token release 后，同一 lock 实例必须允许再次 acquire。"""
+    """手动 token release 后，同一 lock 实例可按底层语义再次 acquire。"""
 
     lock = file_lock(_lock_path(tmp_path))
     first_token = lock.acquire(timeout_seconds=0)
@@ -219,7 +193,6 @@ def test_manual_release_allows_same_instance_reacquire(tmp_path: Path) -> None:
     second_token = lock.acquire(timeout_seconds=0)
     try:
         assert second_token is not first_token
-        assert not second_token.released
     finally:
         second_token.release()
 
@@ -233,15 +206,14 @@ def test_release_is_idempotent(tmp_path: Path) -> None:
     token.release()
     token.release()
 
-    assert token.released
     assert lock_path.exists()
 
 
-def test_release_marks_released_after_underlying_release_before_marker_failure(
+def test_release_success_before_marker_failure_remains_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """底层 release 成功后 marker 恢复失败不得向调用方抛错。"""
+    """底层 release 成功后 marker 恢复失败不得破坏 release 幂等。"""
 
     lock_path = _lock_path(tmp_path)
     third_party_lock = _CountingThirdPartyLock()
@@ -258,16 +230,15 @@ def test_release_marks_released_after_underlying_release_before_marker_failure(
 
     token.release()
 
-    assert token.released is True
     assert third_party_lock.release_calls == 1
     token.release()
     assert third_party_lock.release_calls == 1
 
 
-def test_release_failure_marks_token_released_to_prevent_retry(
+def test_release_failure_does_not_complete_and_allows_retry(
     tmp_path: Path,
 ) -> None:
-    """底层 release 失败后 token 也要进入 released 状态避免二次释放。"""
+    """底层 release 失败不得进入成功态，再次 release 必须重试底层 release。"""
 
     lock_path = _lock_path(tmp_path)
     third_party_lock = _FailingThirdPartyLock()
@@ -279,9 +250,10 @@ def test_release_failure_marks_token_released_to_prevent_retry(
     with pytest.raises(RuntimeFileLockError, match="释放 runtime file lock 失败"):
         token.release()
 
-    assert token.released is True
-    token.release()
-    assert third_party_lock.release_calls == 1
+    with pytest.raises(RuntimeFileLockError, match="释放 runtime file lock 失败"):
+        token.release()
+
+    assert third_party_lock.release_calls == 2
 
 
 def test_non_blocking_timeout_is_wrapped(tmp_path: Path) -> None:
@@ -302,8 +274,20 @@ def test_public_api_shape_and_non_goals_are_explicit(tmp_path: Path) -> None:
 
     options = RuntimeFileLockOptions(lock_path=_lock_path(tmp_path))
     lock = RuntimeFileLock(options)
+    token_field_names = {field.name for field in fields(RuntimeFileLockToken)}
+    public_token_field_names = {
+        field.name
+        for field in fields(RuntimeFileLockToken)
+        if not field.name.startswith("_")
+    }
 
     assert lock.options == options
+    assert public_token_field_names == {"lock_path"}
+    assert "released" not in token_field_names
+    assert "_context_token" not in token_field_names
+    assert "_active_token" not in RuntimeFileLock.__slots__
+    assert "_context_token" in RuntimeFileLock.__slots__
+    assert "_context_token" not in filelock_module.__all__
     assert "force_release" not in vars(RuntimeFileLock)
     assert "break_lock" not in vars(RuntimeFileLock)
     assert "__aenter__" not in vars(RuntimeFileLock)
