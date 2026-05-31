@@ -173,23 +173,23 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 ## 当前 Work Units
 
-| Work Unit | 主题 | 当前定位 |
-|---|---|---|
-| WU-AUDIT-01 | Purge audit orphan reconciliation | purge audit JSONL 与 SQLite tombstone 一致性 |
-| WU-STRESS-01 | Host production stress suite | crash / recovery / watch / scheduler 组合压力 |
-| WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 |
-| WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 |
-| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 |
-| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 |
-| WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E |
-| WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 |
-| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope |
-| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 |
-| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit |
-| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 |
-| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 |
-| WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 |
-| WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 |
+| Work Unit | 主题 | 当前定位 | 完成状态 |
+|---|---|---|---|
+| WU-AUDIT-01 | Purge audit orphan reconciliation | purge audit JSONL 与 SQLite tombstone 一致性 | 已完成 |
+| WU-STRESS-01 | Host production stress suite | crash / recovery / watch / scheduler 组合压力 | 未开始 |
+| WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 | 未开始 |
+| WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 | 未开始 |
+| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | 未开始 |
+| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 未开始 |
+| WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 未开始 |
+| WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 未开始 |
+| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 未开始 |
+| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
+| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
+| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
+| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
+| WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 未开始 |
+| WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 | 未开始 |
 
 ## WU-AUDIT-01 Purge Audit Cross-medium Orphan Reconciliation
 
