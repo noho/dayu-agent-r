@@ -116,17 +116,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | review |
-| implementation status | accepted-slice-committed |
+| gate | ready-to-open-draft-PR |
+| implementation status | completed |
 | active work unit | WU-AUDIT-01 |
 | default next work unit | WU-AUDIT-01 |
-| next entry point | accepted deepreview checkpoint：记录 aggregate review 裁决后进入 ready-to-open-draft-PR |
+| next entry point | draft PR gate：push 当前分支并创建 draft PR；PR review / fix / re-review 后推进到 draft-PR-pass |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-audit-01-purge-audit-reconciliation-plan.md |
-| implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74 |
+| implementation commits | accepted plan: f0f5f72；accepted implementation: fc8dd74；accepted deepreview: 4487262 |
 | review artifacts | docs/reviews/wu-audit-01-plan-review-mimo-20260531.md；docs/reviews/wu-audit-01-plan-review-ds-20260531.md；docs/reviews/wu-audit-01-plan-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-plan-rereview-ds-20260531.md；docs/reviews/wu-audit-01-plan-controller-adjudication-20260531.md；docs/reviews/wu-audit-01-code-review-mimo-20260531.md；docs/reviews/wu-audit-01-code-review-ds-20260531.md；docs/reviews/wu-audit-01-code-rereview-mimo-20260531.md；docs/reviews/wu-audit-01-code-rereview-ds-20260531.md；docs/reviews/wu-audit-01-code-controller-adjudication-20260531.md |
 | aggregate review artifacts | docs/reviews/wu-audit-01-aggregate-deepreview-mimo-20260531.md；docs/reviews/wu-audit-01-aggregate-deepreview-ds-20260531.md；docs/reviews/wu-audit-01-aggregate-controller-adjudication-20260531.md |
-| draft PR status | not-started |
+| draft PR status | ready-to-open |
 | blocking open questions | none |
 
 状态约定：
