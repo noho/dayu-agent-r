@@ -116,17 +116,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | ready-to-open-draft-PR |
+| gate | draft-PR-pass |
 | implementation status | current work unit completed：WU-RUNTIME-01 |
 | active work unit | WU-RUNTIME-01 |
 | default next work unit | WU-STRESS-01 |
-| next entry point | draft PR gate：用户已授权到达 ready-to-open-draft-PR 后自动 push、创建 draft PR 并推进 PR review / fix / re-review 直到 draft-PR-pass |
+| next entry point | WU-RUNTIME-01 已到达 draft-PR-pass；后续 merge、mark ready for review、request reviewers、delete branch 或对外 comment 需要额外授权 |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md |
-| implementation commits | accepted plan: 929d01c；accepted slice1: 7b5b3aa；accepted slice2: 51648be；accepted deepreview: 6980c96 |
-| review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-fix-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice2-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-slice2-20260601.md |
+| implementation commits | accepted plan: 929d01c；accepted slice1: 7b5b3aa；accepted slice2: 51648be；accepted deepreview: 6980c96；accepted PR review: pending local commit |
+| review artifacts | docs/reviews/wu-runtime-01-plan-review-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-review-ds-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-plan-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-plan-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-fix-slice1-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-20260601.md；docs/reviews/wu-runtime-01-implementation-slice2-codex-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-review-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-mimo-20260601.md；docs/reviews/wu-runtime-01-code-rereview-slice2-ds-20260601.md；docs/reviews/wu-runtime-01-code-controller-adjudication-slice2-20260601.md；docs/reviews/wu-runtime-01-pr-review-mimo-20260601.md；docs/reviews/wu-runtime-01-pr-review-ds-20260601.md；docs/reviews/wu-runtime-01-pr-review-controller-adjudication-20260601.md |
 | aggregate review artifacts | docs/reviews/wu-runtime-01-aggregate-deepreview-mimo-20260601.md；docs/reviews/wu-runtime-01-aggregate-deepreview-ds-20260601.md；docs/reviews/wu-runtime-01-aggregate-controller-adjudication-20260601.md |
-| draft PR status | ready; user pre-authorized draft PR gate for WU-RUNTIME-01 |
+| draft PR status | draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/100 |
 | blocking open questions | none |
 
 状态约定：
