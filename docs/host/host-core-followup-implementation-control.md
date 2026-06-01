@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-TOOL-01 Slice 1 accepted checkpoint complete；ready for implementation Slice 2 |
+| implementation status | WU-TOOL-01 Slice 2 code review passed；accepted slice checkpoint pending |
 | active work unit | WU-TOOL-01 |
 | default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-01 implementation Slice 2 handoff；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-01 accepted Slice 2 commit, then implementation Slice 3 handoff；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -453,6 +453,8 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 裁决：CR1 至 CR6 全部 closed；Slice 1 code re-review pass；本地验证通过 `tests/host/test_toolruntime_duplicate_governance.py` 26 passed、`tests/host/test_dispatch_scheduler.py` 57 passed、`pyright` 0 errors。
 - Slice 1 deferred items：`tool_trace.py` duplicate scope 由 Slice 3 处理；README sync 由 Slice 4 处理；旧 registry 测试名清理由 Slice 2 dispatch behavior 改写处理；awaiting fanout 更宽并发治理记录为 `RR-TOOL-01`。
 - Accepted Slice 1 commit: `bd782be` (`gateflow: accept WU-TOOL-01 slice1`)。
+- 2026-06-01：Slice 2 implementation artifact: `docs/reviews/wu-tool-01-implementation-slice2-codex-20260601.md`；code review artifacts: `docs/reviews/wu-tool-01-code-review-slice2-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-review-slice2-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-code-review-slice2-controller-adjudication-20260601.md`。
+- 裁决：Slice 2 code review 0 blocking；test-only `cast` 与 `_tooling_options()` helper 默认 policy 构造均为可接受测试实现，不需要 fix loop；本地验证通过 `tests/host/test_tooling_options.py` + `tests/host/test_dispatch_scheduler.py` 70 passed、`pyright` 0 errors。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 
