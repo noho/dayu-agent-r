@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-STRESS-01 complete；draft PR opened, PR review finding fixed, focused re-review passed, branch pushed |
-| active work unit | WU-STRESS-01 |
-| default next work unit | WU-STRESS-01 |
-| next entry point | WU-STRESS-01 complete；await user merge / follow-up decision |
+| gate | discussion-ready |
+| implementation status | WU-STRESS-01 complete and ready for user merge；next scope is combined WU-DUR-01 + WU-DUR-02 |
+| active work unit | WU-DUR-01 + WU-DUR-02 |
+| default next work unit | WU-DUR-01 + WU-DUR-02 |
+| next entry point | WU-DUR-01 + WU-DUR-02 combined discussion / code inspection gate：verify current durable bootstrap and concurrency evidence before one joint plan |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md；docs/host/wu-runtime-02-lane-clock-cancellation-plan.md；docs/host/wu-stress-01-host-production-stress-suite-plan.md |
 | plan review artifacts | WU-STRESS-01 discussion/code inspection: docs/reviews/wu-stress-01-discussion-code-inspection-20260601.md；plan review: docs/reviews/wu-stress-01-plan-review-mimo-20260601.md, docs/reviews/wu-stress-01-plan-review-ds-20260601.md；controller adjudication: docs/reviews/wu-stress-01-plan-controller-adjudication-20260601.md；plan re-review: docs/reviews/wu-stress-01-plan-rereview-mimo-20260601.md, docs/reviews/wu-stress-01-plan-rereview-ds-20260601.md |
@@ -173,8 +173,6 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|---|---|---|---|---|
 | RR-STRESS-01 | WU-STRESS-01 aggregate deepreview | 测试边界 | deferred-with-owner | WU-STRESS residual risk / future hardening if needed | 当前 work unit 不扩展为 fuzz / soak；若未来需要更高规格覆盖，单独开 hardening work unit | 当前 stress suite 是可重复、确定性、有限预算 production hardening suite，验收信号未要求不可控 fuzz 或长时 soak。 |
 | RR-STRESS-02 | WU-STRESS-01 aggregate deepreview | 测试工具限制 | deferred-with-owner | pytest-timeout limitation accepted by WU-STRESS-01 | 保留 pytest-timeout 作为外层兜底；若 event loop 全局卡死，允许 timeout 先于内部 summary 终止 | 内部摘要覆盖可恢复失败；全局卡死时测试框架强杀是预期兜底，不改变 Host 语义。 |
-| RR-STRESS-03 | WU-STRESS-01 aggregate deepreview | 公共契约 | closed | WU-STRESS-01 controller adjudication | 无后续动作 | `RUN_LOST` 不是当前 live `HostEventKind`；当前测试按公共契约使用 `RunStatus` 与 EventLog 数量证明 lost / recovery 语义。 |
-| RR-STRESS-04 | WU-STRESS-01 aggregate deepreview | 诊断语义 | closed | WU-STRESS-01 controller adjudication | 无后续动作 | watch lag 指标是 stress test diagnostic，不是生产 SLO 或 replay truth；测试已覆盖 cursor 不倒退和 terminal 不漏。 |
 
 ## 当前 Work Units
 
@@ -182,8 +180,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|---|---|
 | WU-AUDIT-01 | Purge audit orphan reconciliation | purge audit JSONL 与 SQLite tombstone 一致性 | 已完成 |
 | WU-STRESS-01 | Host production stress suite | crash / recovery / watch / scheduler 组合压力 | 已完成：draft-PR-pass |
-| WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 | 未开始 |
-| WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 | 未开始 |
+| WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 | 下一轮联合实施：与 WU-DUR-02 一起进入 discussion / code inspection |
+| WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 | 下一轮联合实施：与 WU-DUR-01 一起进入 discussion / code inspection |
 | WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | 未开始 |
 | WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 未开始 |
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 未开始 |
