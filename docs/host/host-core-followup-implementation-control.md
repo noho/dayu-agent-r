@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-DUR-01 + WU-DUR-02 draft PR opened and PR review passed |
-| active work unit | WU-DUR-01 + WU-DUR-02 |
-| default next work unit | WU-DUR-01 + WU-DUR-02 |
-| next entry point | WU-DUR-01 + WU-DUR-02 complete；merge / ready-for-review / reviewer request require separate authorization |
+| gate | discussion-ready |
+| implementation status | WU-DUR-01 + WU-DUR-02 已完成：draft-PR-pass；下一轮 work unit 为 WU-LIFE-01 + WU-LIFE-02 |
+| active work unit | WU-LIFE-01 + WU-LIFE-02 |
+| default next work unit | WU-LIFE-01 + WU-LIFE-02 |
+| next entry point | WU-LIFE-01 + WU-LIFE-02 discussion / code inspection gate；WU-DUR-01 + WU-DUR-02 merge / ready-for-review / reviewer request require separate authorization |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md；docs/host/wu-runtime-02-lane-clock-cancellation-plan.md；docs/host/wu-stress-01-host-production-stress-suite-plan.md；docs/host/wu-dur-01-02-durable-bootstrap-concurrency-plan.md |
 | plan review artifacts | WU-STRESS-01 discussion/code inspection: docs/reviews/wu-stress-01-discussion-code-inspection-20260601.md；plan review: docs/reviews/wu-stress-01-plan-review-mimo-20260601.md, docs/reviews/wu-stress-01-plan-review-ds-20260601.md；controller adjudication: docs/reviews/wu-stress-01-plan-controller-adjudication-20260601.md；plan re-review: docs/reviews/wu-stress-01-plan-rereview-mimo-20260601.md, docs/reviews/wu-stress-01-plan-rereview-ds-20260601.md；WU-DUR-01 + WU-DUR-02 discussion/code inspection: docs/reviews/wu-dur-01-02-discussion-code-inspection-20260601.md；plan review: docs/reviews/wu-dur-01-02-plan-review-mimo-20260601.md, docs/reviews/wu-dur-01-02-plan-review-ds-20260601.md；controller adjudication: docs/reviews/wu-dur-01-02-plan-controller-adjudication-20260601.md；plan fix: docs/reviews/wu-dur-01-02-plan-fix-codex-20260601.md；plan re-review: docs/reviews/wu-dur-01-02-plan-rereview-mimo-20260601.md, docs/reviews/wu-dur-01-02-plan-rereview-ds-20260601.md |
@@ -187,8 +187,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-STRESS-01 | Host production stress suite | crash / recovery / watch / scheduler 组合压力 | 已完成：draft-PR-pass |
 | WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 | 已完成：draft-PR-pass |
 | WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 | 已完成：draft-PR-pass |
-| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | 未开始 |
-| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 未开始 |
+| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | 下一轮联合实施：与 WU-LIFE-02 一起进入 discussion / code inspection |
+| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 下一轮联合实施：与 WU-LIFE-01 一起进入 discussion / code inspection |
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 未开始 |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 未开始 |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 未开始 |
