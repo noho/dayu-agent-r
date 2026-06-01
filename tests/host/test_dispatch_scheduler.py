@@ -72,7 +72,6 @@ from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
 )
-from dayu.host.tool_runtime import DuplicateGovernancePolicy
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.dispatch import (
     ActiveCancelMessage,
@@ -2105,7 +2104,6 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             assert request.agent_policy.allow_tool_calls is True
             assert "tool-enabled previous memory prompt" in contents
             assert [schema.function.name for schema in request.tool_schemas] == ["fake_dispatch_tool"]
-            assert scheduler._duplicate_governance_registry.active_run_count() == 1
 
             tool_outcome = await request.tool_executor.execute(
                 _tool_execution_request(
@@ -2128,7 +2126,6 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             assert projection.calls == 1
         finally:
             await scheduler.close()
-            assert scheduler._duplicate_governance_registry.active_run_count() == 0
 
 
 @pytest.mark.asyncio
@@ -2887,11 +2884,6 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
         scheduler.wake_dispatch(_pending_dispatch(seeded))
         assert (await scheduler.drain_once()).dispatched == 1
         await handle.events_started.wait()
-        scheduler._duplicate_governance_registry.duplicate_governance_for_run(
-            run_id=seeded.run_id,
-            policy=DuplicateGovernancePolicy(),
-        )
-        assert scheduler._duplicate_governance_registry.active_run_count() == 1
         blocked_close = _CloseOnceBlockedLaneClose(scheduler._lane_controller.close)
         monkeypatch.setattr(scheduler._lane_controller, "close", blocked_close)
 
@@ -2923,7 +2915,6 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
             )
             is False
         )
-        assert scheduler._duplicate_governance_registry.active_run_count() == 0
         _assert_no_scheduler_close_terminal_events(store.transaction_runner)
         with pytest.raises(RuntimeLaneClosedError):
             await scheduler._lane_controller.acquire(_LANE_NAME, timeout_seconds=0)
@@ -4063,7 +4054,6 @@ async def test_reactive_recovery_does_not_clear_duplicate_registry(
 
             assert factory.accepted_snapshots[0].attempt_id == seeded.attempt_id
             assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
-            assert scheduler._duplicate_governance_registry.active_run_count() == 1
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
         finally:
             await scheduler.close()

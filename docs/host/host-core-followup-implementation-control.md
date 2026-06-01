@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-TOOL-01 accepted plan checkpoint complete；ready for implementation Slice 1 |
+| implementation status | WU-TOOL-01 Slice 1 code re-review passed；accepted slice checkpoint pending |
 | active work unit | WU-TOOL-01 |
 | default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-01 implementation Slice 1 handoff；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-01 accepted Slice 1 commit, then implementation Slice 2 handoff；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -171,6 +171,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-LIFE-01 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | worker-started-but-not-accepted deterministic close window / close cancellation boundary | deferred-with-owner | future scheduler lifecycle hardening if needed | 若后续 close() refactor 改变 cleanup 顺序、增加非幂等步骤，或需要覆盖 worker-started-but-not-accepted precise window，再补 deterministic instrumentation/test | 当前 Slice B 已覆盖 lane-wait pre-worker 与 active-worker close 两侧稳定窗口，并证明 close cancellation retry 可在 lane close 边界补完 cleanup；精确 worker-started-but-not-accepted 窗口未稳定构造，按 plan deferred。 |
 | RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
 | RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
+| RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
+| RR-TOOL-02 | WU-TOOL-01 Slice 1 code re-review | tool trace duplicate scope 透传 | open | WU-TOOL-01 Slice 3 | 在 Slice 3 为 `TOOL_CALL_GOVERNED` 和 tool trace summary 增加 machine-readable attempt duplicate scope | Approved plan 已把该项列为 Slice 3；Slice 1 只完成 typed policy 与 attempt-local state。 |
 
 ## 当前 Work Units
 
@@ -184,7 +186,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 已完成：draft-PR-pass |
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 已完成：draft-PR-pass |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
-| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | discussion-ready |
+| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | implementation |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
@@ -445,6 +447,11 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-01：plan fix artifact: `docs/reviews/wu-tool-01-plan-fix-codex-20260601.md`；plan re-review artifacts: `docs/reviews/wu-tool-01-plan-rereview-mimo-20260601.md`, `docs/reviews/wu-tool-01-plan-rereview-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-plan-rereview-controller-adjudication-20260601.md`。
 - 裁决：ADJ-001 至 ADJ-007 全部 closed；plan code-generation-ready；进入 accepted plan checkpoint。
 - Accepted plan commit: `c9a0c71` (`gateflow: accept plan for WU-TOOL-01`)。
+- 2026-06-01：Slice 1 implementation artifact: `docs/reviews/wu-tool-01-implementation-slice1-codex-20260601.md`；code review artifacts: `docs/reviews/wu-tool-01-code-review-slice1-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-review-slice1-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-code-review-slice1-controller-adjudication-20260601.md`。
+- 裁决：接受 CR1 至 CR6；要求删除 `tool_runtime.py` duplicate governance re-export、删除 run-scoped registry lifecycle、迁移 `DuplicateGovernancePort`、补 owner cancellation / timeout durable-missing 测试，并移除 hardcoded duplicate message fallback。
+- 2026-06-01：Slice 1 fix artifact: `docs/reviews/wu-tool-01-fix-slice1-codex-20260601.md`；code re-review artifacts: `docs/reviews/wu-tool-01-code-rereview-slice1-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-rereview-slice1-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-code-rereview-slice1-controller-adjudication-20260601.md`。
+- 裁决：CR1 至 CR6 全部 closed；Slice 1 code re-review pass；本地验证通过 `tests/host/test_toolruntime_duplicate_governance.py` 26 passed、`tests/host/test_dispatch_scheduler.py` 57 passed、`pyright` 0 errors。
+- Slice 1 deferred items：`tool_trace.py` duplicate scope 由 Slice 3 处理；README sync 由 Slice 4 处理；旧 registry 测试名清理由 Slice 2 dispatch behavior 改写处理；awaiting fanout 更宽并发治理记录为 `RR-TOOL-01`。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 

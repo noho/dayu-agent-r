@@ -187,7 +187,6 @@ from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
     EffectiveToolBundleBuilder,
-    InMemoryRunScopedDuplicateGovernanceRegistry,
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
 )
@@ -732,7 +731,6 @@ class HostDispatchScheduler:
         self._promotion_drain_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
-        self._duplicate_governance_registry = InMemoryRunScopedDuplicateGovernanceRegistry()
 
     @classmethod
     async def open(
@@ -1982,7 +1980,6 @@ class HostDispatchScheduler:
             active_task.cancel()
             await _suppress_task_cancel(active_task)
         await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
-        self._duplicate_governance_registry.clear_all()
         self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
         self._close_cleanup_done = True
         _LOGGER.info(
@@ -2692,7 +2689,6 @@ class HostDispatchScheduler:
                     event_log_store=self._event_log_store,
                 ),
                 wait_adapter_registry=tooling_options.wait_adapter_registry,
-                duplicate_governance_registry=self._duplicate_governance_registry,
             )
         )
         return create_tool_enabled_run_input_builder(
@@ -2969,7 +2965,6 @@ class HostDispatchScheduler:
             record.execution_id,
             reason,
         )
-        self._duplicate_governance_registry.clear_run(record.run_id)
 
     def _safe_closeout_worker_startup_timeout(
         self,
@@ -3166,8 +3161,6 @@ class HostDispatchScheduler:
                         run_terminal_closed = _ingest_closed_run(result)
                         break
         finally:
-            if run_terminal_closed:
-                self._duplicate_governance_registry.clear_run(record.run_id)
             self._active_handles.discard(handle)
             self._active_registry.unregister(
                 attempt_id=record.attempt_id,
