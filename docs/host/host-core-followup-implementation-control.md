@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | WU-CTX-02 + WU-CTX-03 已完成：draft-PR-pass；下一项进入 WU-TOOL-01 |
+| gate | implementation |
+| implementation status | WU-TOOL-01 plan re-review passed；accepted plan checkpoint pending |
 | active work unit | WU-TOOL-01 |
 | default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-01 discussion / code inspection；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-01 implementation Slice 1 handoff after accepted plan commit；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -418,6 +418,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 明确 cross-Attempt ToolRuntime state 不继承 duplicate index；resume、steer、recovery 或 compact recovery 创建的新 Attempt 中，重复工具调用按新的工具请求处理。
 - 清理或改写当前 run-local duplicate index 代码路径，避免 worker-local cache 成为跨 Attempt correctness 前提。
 - 修改 production diagnostic / trace，使 `TOOL_CALL_GOVERNED` 或等价 diagnostic 能表达 duplicate scope 是当前 Attempt，并记录当前 Attempt 内 prior event refs。
+- duplicate governance 的治理动作、提示文案和 justification 参数名必须通过 typed policy 配置或 Attempt snapshot 传入；禁止把提示或 policy 继续硬编码在执行路径里。
 
 ### 非目标
 
@@ -432,7 +433,17 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 跨 Attempt duplicate 有明确测试，证明不会命中旧 Attempt 的 duplicate index；新的 Attempt 按新工具请求执行或由工具自身 policy 处理。
 - worker restart / Host restart 后不要求继承 duplicate index，测试或文档明确该行为不是 correctness 前提。
 - diagnostic 能区分 attempt-scoped dedup 命中、重复拒绝、执行失败和 durable 缺失。
+- 测试覆盖可配置 duplicate policy、可配置提示文案与 justification 参数名；不同配置不得改变 attempt-local scope 边界。
 - 现有依赖 run-scope duplicate 命中的测试被删除或改写；不得通过兼容分支同时保留 run-scope 与 attempt-scope 两套行为。
+
+### Discussion / Code Inspection 记录
+
+- 2026-06-01：controller 完成 WU-TOOL-01 discussion / code inspection，artifact: `docs/reviews/wu-tool-01-discussion-code-inspection-20260601.md`。
+- 裁决：当前代码仍存在 run-scoped registry、run-local duplicate key 和硬编码 duplicate message；WU-TOOL-01 风险真实存在，且需要在 attempt-scope 改造中同步补齐 typed policy / prompt 配置边界。
+- 2026-06-01：planning artifact 已生成，artifact: `docs/host/wu-tool-01-attempt-scoped-duplicate-governance-plan.md`；plan review artifacts: `docs/reviews/wu-tool-01-plan-review-mimo-20260601.md`, `docs/reviews/wu-tool-01-plan-review-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-plan-review-controller-adjudication-20260601.md`。
+- 裁决：接受 in-flight 并发契约、测试构造、typed policy module、默认 messages、allow 并发测试和术语收口相关 findings；进入 plan fix。
+- 2026-06-01：plan fix artifact: `docs/reviews/wu-tool-01-plan-fix-codex-20260601.md`；plan re-review artifacts: `docs/reviews/wu-tool-01-plan-rereview-mimo-20260601.md`, `docs/reviews/wu-tool-01-plan-rereview-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-plan-rereview-controller-adjudication-20260601.md`。
+- 裁决：ADJ-001 至 ADJ-007 全部 closed；plan code-generation-ready；进入 accepted plan checkpoint。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 
