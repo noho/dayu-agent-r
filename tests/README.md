@@ -26,6 +26,12 @@ pytest tests/contracts tests/host tests/runtime tests/service tests/engine -q
 python -m pyright dayu/ tests/ utils/
 ```
 
+默认 pytest 配置会排除 `stress` marker，因此常规命令不会运行 Host production stress suite。显式运行 stress suite 时需要覆盖默认 `addopts`：
+
+```bash
+pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
+```
+
 也可以按目录或文件收窄测试范围：
 
 ```bash
@@ -50,6 +56,7 @@ pytest tests/host/test_resolve_wait_command.py tests/host/test_run_attempt_trans
 pytest tests/host/test_wait_cancel_late_result.py tests/host/test_wait_adapter_polling.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_cancel_session_runs.py tests/host/test_public_run_api.py -q
 pytest tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py -q
 pytest tests/host/test_watch_session_events.py tests/host/test_public_host_event.py -q
+pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 pytest tests/host/test_context_budget.py tests/host/test_compaction_contract.py tests/host/test_compact_artifact_store.py -q
 pytest tests/host/test_compact_material.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q
 pytest tests/host/test_context_compact_events.py -q
@@ -123,6 +130,12 @@ Host 公共 API 类型、Session / Run public command facade、construction tool
 - Phase 5 / 10 本地执行集成：`test_phase5_local_execution_integration.py` 使用 public `start_run`、真实 `HostDispatchScheduler`、runtime lane 与 fake local worker 覆盖 no-tool Engine 闭环。fake worker 必须只通过 `LocalEngineWorkerFactory` / `LocalWorkerHandle` 边界产出 Engine public `EngineEvent`、响应 `on_cancel(reason)` hook 或模拟 clean EOF / stream crash；测试断言 Host durable Run / Attempt 终态、active cancel 传播、terminal / cancel 后 queue promotion 继续唤醒 pre-start governance / dispatch，不绕过 scheduler 直接改生产状态。
 - import boundary：允许 Host 在 LocalProxy 与 Host-owned LLM compaction 边界沿依赖方向调用 Engine public entry / contracts，阻止 Host 导入 Config、Fins、Service 或 UI，阻止 Host 使用动态模块扫描能力扫描业务工具模块，确认 business `ToolBundle` 不进入 per-run request dataclass 字段，并确认 `fetch_more` 只留在 ToolRuntime / tooling owner；显式覆盖 `dayu.host.durable.purge` 不依赖上层、runtime、public command owner 或 audit / dispatch owner。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入 Host 公共类型源码，并显式确认 `dayu.host.durable.purge` 被纳入扫描。
+- production stress：`test_host_production_stress.py` 使用 `stress` marker，默认 pytest 排除，需通过
+  `pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q` 显式运行。stress summary
+  JSON 固定包含 `scenario_name`、`session_count`、`run_count`、`crash_count`、`recovery_count`、
+  `watch_lag_max`、`watch_lag_samples`、`scheduler_drained`、`liveness_stale_detected`、
+  `terminal_duplicate_count`、`terminal_dedupe_ok` 与 `failure_boundary`；`failure_boundary` 只允许使用
+  stress helper 定义的封闭失败边界或 `None`。
 
 ### `tests/engine/`
 
