@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | review |
-| implementation status | WU-TOOL-01 aggregate review passed；local closeout pending |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-TOOL-01 local gate passed；ready to open draft PR |
 | active work unit | WU-TOOL-01 |
 | default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-01 local gate closeout；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-01 draft PR gate；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -186,7 +186,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 已完成：draft-PR-pass |
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 已完成：draft-PR-pass |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
-| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | implementation |
+| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | ready-to-open-draft-PR |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
@@ -466,6 +466,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - Accepted Slice 4 commit: `660561a` (`gateflow: accept WU-TOOL-01 slice4`)。
 - 2026-06-01：aggregate review artifacts: `docs/reviews/wu-tool-01-aggregate-review-mimo-20260601.md`, `docs/reviews/wu-tool-01-aggregate-review-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-aggregate-review-controller-adjudication-20260601.md`。
 - 裁决：aggregate review 0 blocking；WU-TOOL-01 attempt-scoped duplicate governance、typed policy/configurable message/justification、production dispatch wiring、diagnostic/trace scope、restart non-durable behavior、README/test sync 全部通过 aggregate review；`RR-TOOL-02` closed，`RR-TOOL-01` 保持 deferred-with-owner。
+- Local gate closeout commit: `1aff6e4` (`gateflow: record WU-TOOL-01 aggregate review`)；worktree clean；进入 `ready-to-open-draft-PR`。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 
