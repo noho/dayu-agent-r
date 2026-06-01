@@ -135,6 +135,10 @@ exclude = [
 
 [tool.pytest.ini_options]
 minversion = "7.4"
+addopts = "-m 'not stress'"
+markers = [
+    "stress: production hardening stress tests; excluded from default pytest runs",
+]
 
 [tool.ruff]
 line-length = 120
