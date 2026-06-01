@@ -1307,7 +1307,9 @@ def validate_host_durable_schema(connection: sqlite3.Connection) -> None:
 def _bootstrap_fresh_schema(connection: sqlite3.Connection) -> None:
     """在一个显式 SQLite 事务中创建 fresh Host durable schema。
 
-    :param connection: 已完成 PRAGMA setup 的 SQLite connection。
+    :param connection: 已完成 PRAGMA setup 且处于 autocommit 模式
+        （``isolation_level=None``）的 SQLite connection；本函数会自行开启
+        ``BEGIN IMMEDIATE`` 显式事务。
     :returns: ``None``。
     :raises sqlite3.Error: BEGIN、DDL、user_version 设置、COMMIT 或 ROLLBACK
         执行失败时抛出原始 SQLite 异常；ROLLBACK 失败只做 best-effort 清理。

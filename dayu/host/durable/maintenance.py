@@ -111,7 +111,8 @@ def _read_wal_size_bytes(db_path: Path) -> int:
     """读取 SQLite WAL 文件大小。
 
     :param db_path: Host durable SQLite DB 文件路径。
-    :returns: ``db_path`` 对应 ``-wal`` 文件大小；文件不存在时返回 ``0``。
+    :returns: ``db_path`` 对应 ``-wal`` 文件大小；WAL 文件不存在或已被
+        SQLite 清理时返回 ``0``。
     :raises HostDurableError: WAL 文件存在但无法读取 metadata 时抛出。
     """
 
