@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | WU-DUR-01 + WU-DUR-02 已完成：draft-PR-pass；WU-LIFE-01 + WU-LIFE-02 已完成：draft-PR-pass；WU-CTX-02 + WU-CTX-03 为下一组 work unit，待进入 discussion / code inspection |
+| gate | implementation |
+| implementation status | WU-DUR-01 + WU-DUR-02 已完成：draft-PR-pass；WU-LIFE-01 + WU-LIFE-02 已完成：draft-PR-pass；WU-CTX-02 + WU-CTX-03 plan gate 已通过，待 accepted plan commit 后进入 Slice A implementation |
 | active work unit | WU-CTX-02 + WU-CTX-03 |
 | default next work unit | WU-CTX-02 + WU-CTX-03 |
-| next entry point | WU-CTX-02 + WU-CTX-03 discussion / code inspection；WU-LIFE-01 + WU-LIFE-02 merge / ready-for-review / reviewer request require separate authorization；WU-DUR-01 + WU-DUR-02 merge / ready-for-review / reviewer request require separate authorization |
+| next entry point | WU-CTX-02 + WU-CTX-03 Slice A implementation；WU-LIFE-01 + WU-LIFE-02 merge / ready-for-review / reviewer request require separate authorization；WU-DUR-01 + WU-DUR-02 merge / ready-for-review / reviewer request require separate authorization |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md；docs/host/wu-runtime-02-lane-clock-cancellation-plan.md；docs/host/wu-stress-01-host-production-stress-suite-plan.md；docs/host/wu-dur-01-02-durable-bootstrap-concurrency-plan.md；docs/host/wu-life-01-02-recovery-scheduler-lifecycle-plan.md |
 | plan review artifacts | WU-STRESS-01 discussion/code inspection: docs/reviews/wu-stress-01-discussion-code-inspection-20260601.md；plan review: docs/reviews/wu-stress-01-plan-review-mimo-20260601.md, docs/reviews/wu-stress-01-plan-review-ds-20260601.md；controller adjudication: docs/reviews/wu-stress-01-plan-controller-adjudication-20260601.md；plan re-review: docs/reviews/wu-stress-01-plan-rereview-mimo-20260601.md, docs/reviews/wu-stress-01-plan-rereview-ds-20260601.md；WU-DUR-01 + WU-DUR-02 discussion/code inspection: docs/reviews/wu-dur-01-02-discussion-code-inspection-20260601.md；plan review: docs/reviews/wu-dur-01-02-plan-review-mimo-20260601.md, docs/reviews/wu-dur-01-02-plan-review-ds-20260601.md；controller adjudication: docs/reviews/wu-dur-01-02-plan-controller-adjudication-20260601.md；plan fix: docs/reviews/wu-dur-01-02-plan-fix-codex-20260601.md；plan re-review: docs/reviews/wu-dur-01-02-plan-rereview-mimo-20260601.md, docs/reviews/wu-dur-01-02-plan-rereview-ds-20260601.md；WU-LIFE-01 + WU-LIFE-02 discussion/code inspection: docs/reviews/wu-life-01-02-discussion-code-inspection-20260601.md；controller adjudication: docs/reviews/wu-life-01-02-discussion-controller-adjudication-20260601.md；plan review: docs/reviews/wu-life-01-02-plan-review-mimo-20260601.md, docs/reviews/wu-life-01-02-plan-review-ds-20260601.md；plan controller adjudication: docs/reviews/wu-life-01-02-plan-controller-adjudication-20260601.md |
@@ -131,6 +131,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | PR review artifacts | WU-STRESS-01 PR review: docs/reviews/wu-stress-01-pr-review-mimo-20260601.md, docs/reviews/wu-stress-01-pr-review-ds-20260601.md；PR fix: docs/reviews/wu-stress-01-fix-pr-codex-20260601.md；PR focused re-review: docs/reviews/wu-stress-01-pr-rereview-mimo-20260601.md, docs/reviews/wu-stress-01-pr-rereview-ds-20260601.md；controller adjudication: docs/reviews/wu-stress-01-pr-review-controller-adjudication-20260601.md；WU-DUR-01 + WU-DUR-02 PR review: docs/reviews/wu-dur-01-02-pr-review-mimo-20260601.md, docs/reviews/wu-dur-01-02-pr-review-ds-20260601.md；controller adjudication: docs/reviews/wu-dur-01-02-pr-review-controller-adjudication-20260601.md；WU-LIFE-01 + WU-LIFE-02 PR review: docs/reviews/wu-life-01-02-pr-review-mimo-20260601.md, docs/reviews/wu-life-01-02-pr-review-ds-20260601.md；controller adjudication: docs/reviews/wu-life-01-02-pr-review-controller-adjudication-20260601.md |
 | draft PR status | WU-LIFE-01 + WU-LIFE-02 draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/104；WU-DUR-01 + WU-DUR-02 draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/103；WU-STRESS-01 draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/102；WU-RUNTIME-02 draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/101；WU-RUNTIME-01 previous draft PR opened and PR review passed: https://github.com/noho/dayu-agent-r/pull/100 |
 | blocking open questions | none |
+
+### WU-CTX-02 + WU-CTX-03 当前 Gate Artifacts
+
+| Gate / Slice | 状态 | Artifacts | Validation |
+|---|---|---|---|
+| discussion / code inspection | passed | docs/reviews/wu-ctx-02-03-discussion-code-inspection-20260601.md；docs/reviews/wu-ctx-02-03-discussion-controller-adjudication-20260601.md | n/a |
+| plan | accepted | docs/host/wu-ctx-02-03-compact-failure-overflow-plan.md；docs/reviews/wu-ctx-02-03-plan-review-mimo-20260601.md；docs/reviews/wu-ctx-02-03-plan-review-ds-20260601.md；docs/reviews/wu-ctx-02-03-plan-controller-adjudication-20260601.md；docs/reviews/wu-ctx-02-03-plan-fix-codex-20260601.md；docs/reviews/wu-ctx-02-03-plan-rereview-mimo-20260601.md；docs/reviews/wu-ctx-02-03-plan-rereview-ds-20260601.md | MiMo/DS re-review passed；DS-1/DS-3/DS-4 fixed；DS-2 rejected and not introduced |
 
 ### WU-LIFE-01 + WU-LIFE-02 当前 Gate Artifacts
 
@@ -189,6 +196,9 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-DUR-05 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | index definition / DDL text invariant validation | deferred-with-owner | WU-LAYER-01 schema invariant hardening | 后续如需抵御同名但定义错误的 index，再扩展 schema invariant validation | WU-DUR 当前只要求 required table/index existence fail-closed；full DDL text/index definition validation 已由 plan 明确 defer。 |
 | RR-LIFE-01 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | worker-started-but-not-accepted deterministic close window / close cancellation boundary | deferred-with-owner | future scheduler lifecycle hardening if needed | 若后续 close() refactor 改变 cleanup 顺序、增加非幂等步骤，或需要覆盖 worker-started-but-not-accepted precise window，再补 deterministic instrumentation/test | 当前 Slice B 已覆盖 lane-wait pre-worker 与 active-worker close 两侧稳定窗口，并证明 close cancellation retry 可在 lane close 边界补完 cleanup；精确 worker-started-but-not-accepted 窗口未稳定构造，按 plan deferred。 |
 | RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
+| RR-CTX-PLAN-01 | WU-CTX-02 + WU-CTX-03 discussion/code inspection | fallback policy public contract 边界 | closed | WU-CTX-02 + WU-CTX-03 accepted plan | Plan 明确第一版 fallback N 由 deterministic budget-driven selection 得出，不新增 public policy field；若 implementation 发现必须新增 public field，按 stop condition 回 controller | docs/host/wu-ctx-02-03-compact-failure-overflow-plan.md 已覆盖，focused re-review passed。 |
+| RR-CTX-PLAN-02 | WU-CTX-02 + WU-CTX-03 discussion/code inspection | post-compact estimator failure 独立路径 | open | WU-CTX-02 Slice C/D implementation owner | Slice C 前置核对 conservative estimator 对 fallback-selected `message_fragments` 子集的兼容性；测试覆盖 normal、empty stable input、over-budget | Plan 已给 owner 和验证入口，implementation gate 关闭。 |
+| RR-CTX-PLAN-03 | WU-CTX-02 + WU-CTX-03 discussion/code inspection | 连续 overflow E2E 稳定性 | open | WU-CTX-03 Slice E implementation owner | 使用确定性 fake worker / scheduler helper，不得依赖不可控 sleep 或 race；E2E 断言 Attempt 数、compact events 与 terminal 状态 | Plan 已给 owner 和 stop condition，implementation gate 关闭。 |
 
 ## 当前 Work Units
 
@@ -200,8 +210,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 | 已完成：draft-PR-pass |
 | WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | 已完成：draft-PR-pass |
 | WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 已完成：draft-PR-pass |
-| WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | discussion-ready |
-| WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | discussion-ready |
+| WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | implementation |
+| WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | implementation |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 未开始 |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
