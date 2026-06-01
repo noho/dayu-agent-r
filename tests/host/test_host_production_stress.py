@@ -40,6 +40,7 @@ from tests.host.recovery_support import (
     write_result_marker,
 )
 from tests.host.stress_support import (
+    HostStressScenario,
     HostStressSummary,
     InspectableStressWorkerFactory,
     StressFailureBoundary,
@@ -106,6 +107,25 @@ _SLICE4_WAIT_TIMEOUT_SECONDS = 20.0
 _SLICE4_CRASH_COUNT = 1
 _SLICE4_EXPECTED_RECOVERY_COUNT = 1
 _SLICE4_EXPECTED_LOST_COUNT = 1
+_SLICE5_SCENARIO_NAME = "mixed-host-deterministic-fault-injection"
+_SLICE5_SCENARIO = HostStressScenario(
+    session_count=3,
+    runs_per_session=5,
+    crash_cycles=1,
+    watch_delay=0.02,
+    lane_capacity=1,
+)
+_SLICE5_RUN_COUNT = _SLICE5_SCENARIO.session_count * _SLICE5_SCENARIO.runs_per_session
+_SLICE5_LANE_TIMEOUT_SECONDS = 1.0
+_SLICE5_WAIT_TIMEOUT_SECONDS = 25.0
+_SLICE5_CONSUME_TIMEOUT_SECONDS = 40.0
+# session0 有 5 个 Run，但 crash/recovery 的 RUN_LOST 只进入 durable/public
+# snapshot，不作为 HostEvent 发给 watcher；session1 无 lost，session2 的
+# stream exception 同理不发 HostEvent，因此 primary 期望为 (4, 5, 4)。
+_SLICE5_PRIMARY_TERMINAL_COUNTS: tuple[int, ...] = (4, 5, 4)
+_SLICE5_SECONDARY_FIRST_TERMINAL_COUNT = 1
+_SLICE5_SECONDARY_RECONNECT_TERMINAL_COUNT = 1
+_SLICE5_EXPECTED_LOST_COUNT = 1
 _SUMMARY_JSON_FIELDS: tuple[str, ...] = (
     "crash_count",
     "failure_boundary",
@@ -753,6 +773,213 @@ class Slice4SchedulerLivenessDiagnostics:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class Slice5MixedHostDiagnostics:
+    """Slice 5 mixed Host stress 诊断。
+
+    :param public_snapshots: 全部 Run 的 public terminal snapshot。
+    :param primary_events: primary watchers 全程观测到的 public terminal 事件。
+    :param secondary_first_events: secondary watcher 首次连接观测到的 terminal。
+    :param secondary_reconnect_events: secondary watcher 重连后观测到的 terminal。
+    :param expected_reconnect_run_id: secondary reconnect 后应观测到的 Run id。
+    :param durable_observations: 可表达 public terminal 的 durable observation。
+    :param all_terminal_event_count: 包含 ``RUN_LOST`` 的 terminal EventLog 数。
+    :param watch_lag_samples_by_session: primary watcher 的 per-session lag 样本。
+    :param final_watch_lags_by_session: primary watcher drain 后的最终 lag。
+    :param recovery_count: ``RUN_RECOVERING`` 事件数量。
+    :param attempt_lost_count: ``ATTEMPT_LOST`` 事件数量。
+    :param run_lost_count: ``RUN_LOST`` 事件数量。
+    :param accepted_handle_count: worker accepted handle 数量。
+    :param total_close_count: worker handle close 数量。
+    :param total_cancel_count: worker handle cancel 通知数量。
+    :param lane_released: Host close 后 lane 是否可立即 acquire。
+    :param stale_instance_count: stale Host instance 诊断数量。
+    :param clean_close_recovery_delta: clean close 后 reopen 的 recovery 增量。
+    :param clean_close_attempt_lost_delta: clean close 后 reopen 的 lost 增量。
+    :returns: 不适用；dataclass 初始化返回实例。
+    :raises Exception: 本类型不主动抛出异常。
+    """
+
+    public_snapshots: tuple[RunSnapshot, ...]
+    primary_events: tuple[HostEvent, ...]
+    secondary_first_events: tuple[HostEvent, ...]
+    secondary_reconnect_events: tuple[HostEvent, ...]
+    expected_reconnect_run_id: str
+    durable_observations: tuple[StressTerminalObservation, ...]
+    all_terminal_event_count: int
+    watch_lag_samples_by_session: tuple[tuple[int, ...], ...]
+    final_watch_lags_by_session: tuple[int, ...]
+    recovery_count: int
+    attempt_lost_count: int
+    run_lost_count: int
+    accepted_handle_count: int
+    total_close_count: int
+    total_cancel_count: int
+    lane_released: bool
+    stale_instance_count: int
+    clean_close_recovery_delta: int
+    clean_close_attempt_lost_delta: int
+
+    @property
+    def terminal_duplicate_count(self) -> int:
+        """返回 public terminal durable observation duplicate 数量。
+
+        :returns: duplicate 数量。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return terminal_duplicate_count(self.durable_observations)
+
+    @property
+    def terminal_dedupe_ok(self) -> bool:
+        """返回 mixed terminal 去重证明是否通过。
+
+        :returns: public terminal observation 无重复且包含 ``RUN_LOST`` 的
+            terminal EventLog 总数等于全部 public terminal snapshot 时返回
+            ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            self.terminal_duplicate_count == 0
+            and terminal_dedupe_ok(self.durable_observations)
+            and self.all_terminal_event_count == len(self.public_snapshots)
+        )
+
+    @property
+    def scheduler_drained(self) -> bool:
+        """返回 mixed scheduler 是否完成 drain。
+
+        :returns: 全部 Run 进入 public 终态、handle 均 close 且 clean reopen
+            没有额外 recovery/lost 增量时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            len(self.public_snapshots) == _SLICE5_RUN_COUNT
+            and self.all_terminal_event_count == _SLICE5_RUN_COUNT
+            and all(_is_terminal_status(snapshot.status) for snapshot in self.public_snapshots)
+            and self.total_close_count == self.accepted_handle_count
+            and self.clean_close_recovery_delta == 0
+            and self.clean_close_attempt_lost_delta == 0
+        )
+
+    @property
+    def liveness_stale_detected(self) -> bool:
+        """返回 intentional owner crash/recovery 是否被观测。
+
+        :returns: recovery 数等于 crash 数、lost attempt 至少覆盖 crash 数，
+            且存在 stale host instance diagnostic 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            self.recovery_count == _SLICE5_SCENARIO.crash_cycles
+            and self.attempt_lost_count >= _SLICE5_SCENARIO.crash_cycles
+            and self.stale_instance_count >= 1
+        )
+
+    @property
+    def watch_lag_drained(self) -> bool:
+        """返回 primary watcher lag 是否最终 drain。
+
+        :returns: 每个 primary watcher 都有样本，且最终 lag 全部为 0 时返回
+            ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            len(self.watch_lag_samples_by_session) == _SLICE5_SCENARIO.session_count
+            and all(len(samples) > 0 for samples in self.watch_lag_samples_by_session)
+            and len(self.final_watch_lags_by_session) == _SLICE5_SCENARIO.session_count
+            and all(lag == 0 for lag in self.final_watch_lags_by_session)
+        )
+
+    @property
+    def reconnect_ok(self) -> bool:
+        """返回 secondary watcher 重连后是否观测到后续 terminal。
+
+        :returns: 首次连接和重连后均达到期望 terminal 数，且重连事件包含
+            指定 Run id 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            len(self.secondary_first_events) >= _SLICE5_SECONDARY_FIRST_TERMINAL_COUNT
+            and len(self.secondary_reconnect_events) >= _SLICE5_SECONDARY_RECONNECT_TERMINAL_COUNT
+            and self.expected_reconnect_run_id in _run_ids_from_events(self.secondary_reconnect_events)
+        )
+
+    @property
+    def mixed_statuses_ok(self) -> bool:
+        """返回 mixed fault script 是否覆盖全部目标终态。
+
+        :returns: public snapshots 同时包含 succeeded、failed、cancelled 和
+            lost 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        statuses = _snapshot_statuses(self.public_snapshots)
+        return (
+            RunStatus.SUCCEEDED in statuses
+            and RunStatus.FAILED in statuses
+            and RunStatus.CANCELLED in statuses
+            and RunStatus.LOST in statuses
+        )
+
+    @property
+    def cleanup_ok(self) -> bool:
+        """返回 active cancel 与 lane cleanup 诊断是否通过。
+
+        :returns: 至少一次 cancel 传播到 worker，全部 handle close，且 Host
+            close 后 lane 可立即 acquire 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            self.accepted_handle_count > 0
+            and self.total_close_count == self.accepted_handle_count
+            and self.total_cancel_count >= 1
+            and self.lane_released
+        )
+
+    @property
+    def stream_exception_ok(self) -> bool:
+        """返回 stream exception closeout 是否符合预期。
+
+        :returns: ``RUN_LOST`` 数量等于 Slice 5 期望时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.run_lost_count == _SLICE5_EXPECTED_LOST_COUNT
+
+    @property
+    def failure_boundary(self) -> StressFailureBoundary | None:
+        """返回 mixed stress 失败边界。
+
+        :returns: 成功时返回 ``None``，否则返回封闭失败边界。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if not self.scheduler_drained:
+            return "scheduler"
+        if not self.liveness_stale_detected:
+            return "liveness"
+        if not self.reconnect_ok:
+            return "watch_reconnect"
+        if not self.watch_lag_drained:
+            return "watch"
+        if not self.cleanup_ok:
+            return "active_cleanup"
+        if not self.stream_exception_ok:
+            return "scheduler"
+        if not self.terminal_dedupe_ok:
+            return "durable"
+        if not self.mixed_statuses_ok:
+            return "unknown"
+        return None
+
+
 @pytest.mark.timeout(5)
 def test_stress_marker_summary_contract(
     record_property: Callable[[str, str], None],
@@ -803,6 +1030,389 @@ def test_stress_marker_summary_contract(
     for field_name in _SUMMARY_JSON_FIELDS:
         assert f'"{field_name}"' in summary_json
     assert f'"scenario_name": "{_SCENARIO_NAME}"' in summary_json
+    assert_summary_ok(summary)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_mixed_host_stress_deterministic_fault_injection(
+    tmp_path: pathlib.Path,
+    record_property: Callable[[str, str], None],
+) -> None:
+    """验证 deterministic fault injection 下的最终 mixed Host stress。
+
+    :param tmp_path: pytest 临时目录。
+    :param record_property: pytest 属性记录 fixture。
+    :returns: ``None``。
+    :raises AssertionError: mixed summary 任一验收字段不满足时抛出，message
+        包含 summary JSON。
+    """
+
+    scenario = _SLICE5_SCENARIO
+    run_ids: list[str] = []
+    public_snapshots: tuple[RunSnapshot, ...] = ()
+    primary_event_groups: tuple[tuple[HostEvent, ...], ...] = ()
+    secondary_first_events: tuple[HostEvent, ...] = ()
+    secondary_reconnect_events: tuple[HostEvent, ...] = ()
+    reconnect_run_id = ""
+    watch_lag_samples_by_session: list[list[int]] = [[] for _index in range(scenario.session_count)]
+    last_primary_terminal_counts: list[int] = [0 for _index in range(scenario.session_count)]
+    final_watch_lags_by_session: tuple[int, ...] = ()
+    recovery_count_before_clean_reopen = 0
+    attempt_lost_before_clean_reopen = 0
+    factory = InspectableStressWorkerFactory()
+    lane_released = False
+
+    try:
+        crashed = start_and_crash_owner_for_stress(
+            tmp_path,
+            slot_key="wu-stress-s5-session-0",
+            client_request_id="wu-stress-s5-owner-crash",
+            user_prompt="slice5 intentional owner crash",
+        )
+        run_ids.append(crashed.run_id)
+        options = build_stress_open_host_options(
+            tmp_path,
+            factory,
+            lane_capacity=scenario.lane_capacity,
+            lane_timeout_seconds=_SLICE5_LANE_TIMEOUT_SECONDS,
+        )
+
+        async with open_host(options) as host:
+            await wait_all_runs_terminal(
+                host,
+                (crashed.run_id,),
+                _SLICE5_WAIT_TIMEOUT_SECONDS,
+            )
+            sessions = (
+                await host.ensure_session(ensure_request("wu-stress-s5-session-0")),
+                await host.ensure_session(ensure_request("wu-stress-s5-session-1")),
+                await host.ensure_session(ensure_request("wu-stress-s5-session-2")),
+            )
+            session_ids = tuple(session.session_id for session in sessions)
+            last_primary_terminal_counts = [
+                len(read_session_terminal_sequences(tmp_path, session_id)) for session_id in session_ids
+            ]
+            primary_watchers = tuple(host.watch_session_events(session_id) for session_id in session_ids)
+            primary_watchers_closed = [False for _index in range(scenario.session_count)]
+            primary_observed_events = tuple(asyncio.Queue[HostEvent]() for _index in range(scenario.session_count))
+            primary_tasks = tuple(
+                asyncio.create_task(
+                    consume_terminals(
+                        watcher,
+                        expected_count=_SLICE5_PRIMARY_TERMINAL_COUNTS[index],
+                        delay_seconds=scenario.watch_delay,
+                        timeout_seconds=_SLICE5_CONSUME_TIMEOUT_SECONDS,
+                        observed_events=primary_observed_events[index],
+                    )
+                )
+                for index, watcher in enumerate(primary_watchers)
+            )
+            secondary_watcher = host.watch_session_events(sessions[0].session_id)
+            secondary_watcher_closed = False
+            secondary_first_task = asyncio.create_task(
+                consume_terminals(
+                    secondary_watcher,
+                    expected_count=_SLICE5_SECONDARY_FIRST_TERMINAL_COUNT,
+                    delay_seconds=0,
+                    timeout_seconds=_SLICE5_CONSUME_TIMEOUT_SECONDS,
+                )
+            )
+
+            try:
+                session0_initial_run_id = await _submit_followup_waiting_for_accept(
+                    host,
+                    factory,
+                    sessions[0].session_id,
+                    "wu-stress-s5-s0-initial-final",
+                )
+                run_ids.append(session0_initial_run_id)
+                secondary_first_events = await secondary_first_task
+                await close_host_event_iterator(secondary_watcher)
+                secondary_watcher_closed = True
+                last_primary_terminal_counts = _record_all_watch_lag_samples(
+                    tmp_path,
+                    session_ids,
+                    primary_observed_events,
+                    last_primary_terminal_counts,
+                    watch_lag_samples_by_session,
+                )
+
+                session0_active_run_id = await _submit_scripted_followup(
+                    host,
+                    factory,
+                    sessions[0].session_id,
+                    "wu-stress-s5-s0-active-final",
+                    StressWorkerBehavior.BLOCKING_FINAL,
+                )
+                run_ids.append(session0_active_run_id)
+                await _wait_run_status(host, session0_active_run_id, RunStatus.RUNNING)
+                session0_queued_cancel_run_id = await _submit_followup(
+                    host,
+                    sessions[0].session_id,
+                    "wu-stress-s5-s0-queued-cancel",
+                )
+                run_ids.append(session0_queued_cancel_run_id)
+                await _cancel_run(host, session0_queued_cancel_run_id)
+                factory.release_run(session0_active_run_id)
+                await wait_all_runs_terminal(
+                    host,
+                    (session0_active_run_id, session0_queued_cancel_run_id),
+                    _SLICE5_WAIT_TIMEOUT_SECONDS,
+                )
+                last_primary_terminal_counts = _record_all_watch_lag_samples(
+                    tmp_path,
+                    session_ids,
+                    primary_observed_events,
+                    last_primary_terminal_counts,
+                    watch_lag_samples_by_session,
+                )
+
+                secondary_reconnect_watcher = host.watch_session_events(sessions[0].session_id)
+                secondary_reconnect_task = asyncio.create_task(
+                    consume_terminals(
+                        secondary_reconnect_watcher,
+                        expected_count=_SLICE5_SECONDARY_RECONNECT_TERMINAL_COUNT,
+                        delay_seconds=0,
+                        timeout_seconds=_SLICE5_CONSUME_TIMEOUT_SECONDS,
+                    )
+                )
+                reconnect_run_id = await _submit_followup_waiting_for_accept(
+                    host,
+                    factory,
+                    sessions[0].session_id,
+                    "wu-stress-s5-s0-reconnect-final",
+                )
+                run_ids.append(reconnect_run_id)
+                secondary_reconnect_events = await secondary_reconnect_task
+                await close_host_event_iterator(secondary_reconnect_watcher)
+
+                session1_active_cancel_run_id = await _submit_scripted_followup(
+                    host,
+                    factory,
+                    sessions[1].session_id,
+                    "wu-stress-s5-s1-active-cancel",
+                    StressWorkerBehavior.BLOCKING_FINAL,
+                )
+                run_ids.append(session1_active_cancel_run_id)
+                await _wait_run_status(host, session1_active_cancel_run_id, RunStatus.RUNNING)
+                await _cancel_run(host, session1_active_cancel_run_id)
+                factory.release_run(session1_active_cancel_run_id)
+                await wait_all_runs_terminal(
+                    host,
+                    (session1_active_cancel_run_id,),
+                    _SLICE5_WAIT_TIMEOUT_SECONDS,
+                )
+                session1_failed_run_id = await _submit_scripted_followup(
+                    host,
+                    factory,
+                    sessions[1].session_id,
+                    "wu-stress-s5-s1-failed",
+                    StressWorkerBehavior.FAILED,
+                )
+                run_ids.append(session1_failed_run_id)
+                session1_final_run_id = await _submit_followup_waiting_for_accept(
+                    host,
+                    factory,
+                    sessions[1].session_id,
+                    "wu-stress-s5-s1-final",
+                )
+                run_ids.append(session1_final_run_id)
+                session1_second_failed_run_id = await _submit_scripted_followup(
+                    host,
+                    factory,
+                    sessions[1].session_id,
+                    "wu-stress-s5-s1-second-failed",
+                    StressWorkerBehavior.FAILED,
+                )
+                run_ids.append(session1_second_failed_run_id)
+                session1_tail_final_run_id = await _submit_followup_waiting_for_accept(
+                    host,
+                    factory,
+                    sessions[1].session_id,
+                    "wu-stress-s5-s1-tail-final",
+                )
+                run_ids.append(session1_tail_final_run_id)
+                last_primary_terminal_counts = _record_all_watch_lag_samples(
+                    tmp_path,
+                    session_ids,
+                    primary_observed_events,
+                    last_primary_terminal_counts,
+                    watch_lag_samples_by_session,
+                )
+
+                session2_stream_lost_run_id = await _submit_scripted_followup(
+                    host,
+                    factory,
+                    sessions[2].session_id,
+                    "wu-stress-s5-s2-stream-exception",
+                    StressWorkerBehavior.STREAM_EXCEPTION,
+                )
+                run_ids.append(session2_stream_lost_run_id)
+                await wait_all_runs_terminal(
+                    host,
+                    (session2_stream_lost_run_id,),
+                    _SLICE5_WAIT_TIMEOUT_SECONDS,
+                )
+                session2_active_run_id = await _submit_scripted_followup(
+                    host,
+                    factory,
+                    sessions[2].session_id,
+                    "wu-stress-s5-s2-active-final",
+                    StressWorkerBehavior.BLOCKING_FINAL,
+                )
+                run_ids.append(session2_active_run_id)
+                await _wait_run_status(host, session2_active_run_id, RunStatus.RUNNING)
+                session2_queued_cancel_run_id = await _submit_followup(
+                    host,
+                    sessions[2].session_id,
+                    "wu-stress-s5-s2-queued-cancel",
+                )
+                run_ids.append(session2_queued_cancel_run_id)
+                await _cancel_run(host, session2_queued_cancel_run_id)
+                factory.release_run(session2_active_run_id)
+                await wait_all_runs_terminal(
+                    host,
+                    (session2_active_run_id, session2_queued_cancel_run_id),
+                    _SLICE5_WAIT_TIMEOUT_SECONDS,
+                )
+                session2_failed_run_id = await _submit_scripted_followup(
+                    host,
+                    factory,
+                    sessions[2].session_id,
+                    "wu-stress-s5-s2-failed",
+                    StressWorkerBehavior.FAILED,
+                )
+                run_ids.append(session2_failed_run_id)
+                session2_final_run_id = await _submit_followup_waiting_for_accept(
+                    host,
+                    factory,
+                    sessions[2].session_id,
+                    "wu-stress-s5-s2-final",
+                )
+                run_ids.append(session2_final_run_id)
+                last_primary_terminal_counts = _record_all_watch_lag_samples(
+                    tmp_path,
+                    session_ids,
+                    primary_observed_events,
+                    last_primary_terminal_counts,
+                    watch_lag_samples_by_session,
+                )
+
+                public_snapshots = await wait_all_runs_terminal(
+                    host,
+                    tuple(run_ids),
+                    _SLICE5_WAIT_TIMEOUT_SECONDS,
+                )
+                primary_event_groups = tuple(await asyncio.gather(*primary_tasks))
+                for index, watcher in enumerate(primary_watchers):
+                    await close_host_event_iterator(watcher)
+                    primary_watchers_closed[index] = True
+
+                final_watch_lags_by_session = _compute_final_watch_lags_by_session(
+                    tmp_path,
+                    session_ids,
+                    primary_observed_events,
+                    last_primary_terminal_counts,
+                )
+                recovery_count_before_clean_reopen = count_event_type(tmp_path, _EVENT_TYPE_RUN_RECOVERING)
+                attempt_lost_before_clean_reopen = count_event_type(tmp_path, _EVENT_TYPE_ATTEMPT_LOST)
+            finally:
+                if not secondary_first_task.done():
+                    secondary_first_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await secondary_first_task
+                if not secondary_watcher_closed:
+                    with suppress(Exception):
+                        await close_host_event_iterator(secondary_watcher)
+                for task in primary_tasks:
+                    if not task.done():
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+                for index, watcher in enumerate(primary_watchers):
+                    if not primary_watchers_closed[index]:
+                        with suppress(Exception):
+                            await close_host_event_iterator(watcher)
+
+        lane_released = await verify_lane_released(options.lane_db_path, options.lane_name)
+        reopen_factory = InspectableStressWorkerFactory()
+        async with open_host(
+            build_stress_open_host_options(
+                tmp_path,
+                reopen_factory,
+                lane_capacity=scenario.lane_capacity,
+                lane_timeout_seconds=_SLICE5_LANE_TIMEOUT_SECONDS,
+            )
+        ) as reopened:
+            public_snapshots = await wait_all_runs_terminal(
+                reopened,
+                tuple(run_ids),
+                _SLICE5_WAIT_TIMEOUT_SECONDS,
+            )
+    except TimeoutError as error:
+        summary = _slice5_timeout_summary(len(run_ids))
+        summary_json = summary_to_json(summary)
+        record_property(_SUMMARY_JSON_PROPERTY, summary_json)
+        raise AssertionError(summary_json) from error
+
+    recovery_count = count_event_type(tmp_path, _EVENT_TYPE_RUN_RECOVERING)
+    attempt_lost_count = count_event_type(tmp_path, _EVENT_TYPE_ATTEMPT_LOST)
+    durable_observations = terminal_events_for_runs(tmp_path, tuple(run_ids))
+    host_instances = read_host_instances(tmp_path)
+    diagnostics = Slice5MixedHostDiagnostics(
+        public_snapshots=public_snapshots,
+        primary_events=_flatten_events(primary_event_groups),
+        secondary_first_events=secondary_first_events,
+        secondary_reconnect_events=secondary_reconnect_events,
+        expected_reconnect_run_id=reconnect_run_id,
+        durable_observations=durable_observations,
+        all_terminal_event_count=terminal_event_count_for_runs(tmp_path, tuple(run_ids)),
+        watch_lag_samples_by_session=tuple(tuple(samples) for samples in watch_lag_samples_by_session),
+        final_watch_lags_by_session=final_watch_lags_by_session,
+        recovery_count=recovery_count,
+        attempt_lost_count=attempt_lost_count,
+        run_lost_count=run_lost_event_count(tmp_path),
+        accepted_handle_count=factory.accepted_handle_count,
+        total_close_count=factory.total_close_count,
+        total_cancel_count=factory.total_cancel_count,
+        lane_released=lane_released,
+        stale_instance_count=sum(1 for item in host_instances if item.heartbeat_stale),
+        clean_close_recovery_delta=recovery_count - recovery_count_before_clean_reopen,
+        clean_close_attempt_lost_delta=attempt_lost_count - attempt_lost_before_clean_reopen,
+    )
+    summary_watch_lag_samples = _flatten_int_groups(diagnostics.watch_lag_samples_by_session)
+    summary = HostStressSummary(
+        scenario_name=_SLICE5_SCENARIO_NAME,
+        session_count=scenario.session_count,
+        run_count=len(run_ids),
+        crash_count=scenario.crash_cycles,
+        recovery_count=recovery_count,
+        watch_lag_max=max(summary_watch_lag_samples),
+        watch_lag_samples=summary_watch_lag_samples,
+        scheduler_drained=diagnostics.scheduler_drained,
+        liveness_stale_detected=diagnostics.liveness_stale_detected,
+        terminal_duplicate_count=diagnostics.terminal_duplicate_count,
+        terminal_dedupe_ok=diagnostics.terminal_dedupe_ok,
+        failure_boundary=diagnostics.failure_boundary,
+    )
+    summary_json = summary_to_json(summary)
+    record_property(_SUMMARY_JSON_PROPERTY, summary_json)
+    (tmp_path / "host-stress-summary.json").write_text(summary_json, encoding="utf-8")
+
+    assert summary.session_count == scenario.session_count, summary_json
+    assert summary.run_count == _SLICE5_RUN_COUNT, summary_json
+    assert summary.crash_count >= 1, summary_json
+    assert summary.recovery_count == summary.crash_count, summary_json
+    assert summary.watch_lag_max >= 0, summary_json
+    assert diagnostics.watch_lag_drained, summary_json
+    assert summary.scheduler_drained, summary_json
+    assert summary.liveness_stale_detected, summary_json
+    assert summary.terminal_duplicate_count == 0, summary_json
+    assert summary.terminal_dedupe_ok, summary_json
+    assert diagnostics.mixed_statuses_ok, summary_json
+    assert diagnostics.reconnect_ok, summary_json
+    assert diagnostics.failure_boundary is None, summary_json
     assert_summary_ok(summary)
 
 
@@ -1474,6 +2084,34 @@ async def _submit_scripted_followup(
     run_id = await _submit_followup(host, session_id, client_request_id)
     await _wait_accepted_count(factory, previous_accept_count + 1)
     return run_id
+
+
+def _slice5_timeout_summary(run_count: int) -> HostStressSummary:
+    """构造 Slice 5 timeout 失败摘要。
+
+    该 helper 只在 mixed stress 的内部 deadline 触发时使用，确保
+    AssertionError 仍携带结构化 summary JSON。它不读取 durable store，避免
+    在失败清理窗口里引入新的 SQLite 争用或二次异常。
+
+    :param run_count: timeout 发生时已提交或记录的 Run 数量。
+    :returns: 带 ``failure_boundary="unknown"`` 的 HostStressSummary。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostStressSummary(
+        scenario_name=_SLICE5_SCENARIO_NAME,
+        session_count=_SLICE5_SCENARIO.session_count,
+        run_count=run_count,
+        crash_count=_SLICE5_SCENARIO.crash_cycles,
+        recovery_count=0,
+        watch_lag_max=0,
+        watch_lag_samples=(0,),
+        scheduler_drained=False,
+        liveness_stale_detected=False,
+        terminal_duplicate_count=0,
+        terminal_dedupe_ok=True,
+        failure_boundary="unknown",
+    )
 
 
 async def _submit_followup_waiting_for_accept(

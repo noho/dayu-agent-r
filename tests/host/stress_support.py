@@ -152,6 +152,30 @@ class HostStressSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class HostStressScenario:
+    """Host mixed stress 场景参数。
+
+    本 dataclass 只服务 WU-STRESS-01 测试层 deterministic scenario，避免
+    mixed stress 的规模、watch 速度和 lane 容量散落在测试主体中。它不进入
+    生产代码，不作为 Host public contract，也不表达 durable truth。
+
+    :param session_count: 场景涉及的 Session 数量。
+    :param runs_per_session: 每个 Session 期望覆盖的 Run 数量。
+    :param crash_cycles: 场景内主动制造的 owner crash 次数。
+    :param watch_delay: primary watcher 每条 terminal 后的消费延迟秒数。
+    :param lane_capacity: Host dispatch runtime lane 容量。
+    :returns: 不适用；dataclass 初始化返回 ``HostStressScenario`` 实例。
+    :raises Exception: 本类型不主动抛出异常。
+    """
+
+    session_count: int
+    runs_per_session: int
+    crash_cycles: int
+    watch_delay: float
+    lane_capacity: int
+
+
+@dataclass(frozen=True, slots=True)
 class StressTerminalObservation:
     """stress helper 记录的 terminal 观测。
 
