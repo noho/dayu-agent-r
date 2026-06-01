@@ -28,12 +28,21 @@ _DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 10.0
 _DEFAULT_BUSY_TIMEOUT_SECONDS: Final[float] = 5.0
 _DEFAULT_POLL_INTERVAL_SECONDS: Final[float] = 0.05
 _OUTER_CANCELLATION_SETTLE_SLEEP_SECONDS: Final[float] = 0.01
+_OUTER_CANCELLATION_CLEANUP_GRACE_SECONDS: Final[float] = 0.25
 _SQLITE_MILLISECONDS_PER_SECOND: Final[int] = 1000
 _CLAIM_ID_BYTES: Final[int] = 16
 _OWNER_ID_BYTES: Final[int] = 8
 _CLAIMS_TABLE: Final[str] = "runtime_lane_claims"
+_OUTER_CANCELLATION_CLEANUP_TIMEOUT_MESSAGE: Final[str] = (
+    "runtime lane outer cancellation cleanup timed out"
+)
+_CLEANUP_OPERATION_TRACKED_RELEASE: Final[str] = "tracked_release"
+_CLEANUP_OPERATION_UNTRACKED_RELEASE: Final[str] = "untracked_release"
 _LOG_TRACKED_RELEASE_FAILED_AFTER_CANCEL: Final[str] = (
     "runtime lane tracked claim release failed after outer cancellation"
+)
+_LOG_TRACKED_RELEASE_CLEANUP_TIMEOUT_AFTER_CANCEL: Final[str] = (
+    "runtime lane tracked claim release cleanup timed out after outer cancellation"
 )
 _LOG_UNTRACKED_RELEASE_FAILED: Final[str] = (
     "runtime lane untracked claim release failed; claim will rely on TTL cleanup"
@@ -42,8 +51,32 @@ _LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL: Final[str] = (
     "runtime lane untracked claim release failed after outer cancellation; "
     "claim will rely on TTL cleanup"
 )
+_LOG_UNTRACKED_RELEASE_CLEANUP_TIMEOUT_AFTER_CANCEL: Final[str] = (
+    "runtime lane untracked claim release cleanup timed out after outer cancellation; "
+    "claim will rely on TTL cleanup"
+)
 _LOG_REFRESH_FAILED_AFTER_CANCEL: Final[str] = (
     "runtime lane refresh failed after outer cancellation"
+)
+_LOG_REFRESH_CLEANUP_TIMEOUT_AFTER_CANCEL: Final[str] = (
+    "runtime lane refresh cleanup timed out after outer cancellation"
+)
+_LOG_CLAIM_CLEANUP_TIMEOUT_AFTER_CANCEL: Final[str] = (
+    "runtime lane claim cleanup timed out after outer cancellation; "
+    "late acquired claim will rely on TTL cleanup"
+)
+_LOG_ABANDONED_CLAIM_ACQUIRED_TTL_FALLBACK: Final[str] = (
+    "runtime lane abandoned claim task acquired claim after cleanup timeout; "
+    "claim will rely on TTL cleanup"
+)
+_LOG_ABANDONED_CLAIM_FAILED_AFTER_CANCEL: Final[str] = (
+    "runtime lane abandoned claim task failed after cleanup timeout"
+)
+_LOG_ABANDONED_RELEASE_FAILED_AFTER_CANCEL: Final[str] = (
+    "runtime lane abandoned release task failed after cleanup timeout"
+)
+_LOG_ABANDONED_REFRESH_FAILED_AFTER_CANCEL: Final[str] = (
+    "runtime lane abandoned refresh task failed after cleanup timeout"
 )
 _CLOSE_REASON_HEARTBEAT_ERROR: Final[str] = "lane heartbeat error"
 _LOGGER = logging.getLogger(__name__)
@@ -75,6 +108,14 @@ class RuntimeLaneClaimLostError(RuntimeLaneError):
 
     当 heartbeat / refresh 无法按 ``lane_name + claim_id + owner_id`` 找到
     仍未过期的 claim 时抛出。
+    """
+
+
+class _OuterCancellationCleanupTimeoutError(RuntimeLaneError):
+    """外层取消后的私有 cleanup 等待超时错误。
+
+    该错误只在调用方已经收到 ``asyncio.CancelledError`` 后用于内部诊断，
+    不进入 public API，也不改变对外取消语义。
     """
 
 
@@ -303,14 +344,11 @@ LaneAcquireOutcome: TypeAlias = (
 
 @dataclass(frozen=True, slots=True)
 class _LaneClock:
-    """基于 monotonic anchor 的 UTC 时钟。
+    """lane 私有时钟 helper。
 
-    :param monotonic_anchor: 进程内 monotonic 起点。
-    :param utc_anchor: 与 monotonic 起点对应的 UTC 时间。
+    UTC 时间只用于跨进程可见的 TTL 判断，必须直接读取真实 UTC；
+    monotonic 时间只用于当前进程内等待 timeout / deadline 计算。
     """
-
-    monotonic_anchor: float
-    utc_anchor: datetime
 
     @classmethod
     def start(cls) -> _LaneClock:
@@ -319,19 +357,15 @@ class _LaneClock:
         :returns: 新的 :class:`_LaneClock`。
         """
 
-        return cls(
-            monotonic_anchor=time.monotonic(),
-            utc_anchor=datetime.now(UTC),
-        )
+        return cls()
 
-    def now(self) -> datetime:
-        """返回当前 UTC 时间。
+    def utc_now(self) -> datetime:
+        """返回真实 UTC 时间。
 
-        :returns: 基于 monotonic elapsed 推导出的 UTC 时间。
+        :returns: timezone-aware 的当前 UTC 时间。
         """
 
-        elapsed_seconds = time.monotonic() - self.monotonic_anchor
-        return self.utc_anchor + timedelta(seconds=elapsed_seconds)
+        return datetime.now(UTC)
 
     def monotonic(self) -> float:
         """返回当前 monotonic 时间。
@@ -568,8 +602,28 @@ class LaneController:
         try:
             return await asyncio.shield(claim_task)
         except asyncio.CancelledError as cancelled:
+            cleanup_timeout_seconds = _outer_cancellation_cleanup_timeout_seconds(
+                self._coordinator
+            )
             try:
-                claim = await _await_task_after_outer_cancellation(claim_task)
+                claim = await _await_task_after_outer_cancellation(
+                    claim_task,
+                    timeout_seconds=cleanup_timeout_seconds,
+                )
+            except _OuterCancellationCleanupTimeoutError as exc:
+                _observe_abandoned_claim_task(
+                    claim_task,
+                    lane_name=lane_config.name,
+                )
+                _LOGGER.warning(
+                    _LOG_CLAIM_CLEANUP_TIMEOUT_AFTER_CANCEL,
+                    extra={
+                        "lane_name": lane_config.name,
+                        "timeout_seconds": cleanup_timeout_seconds,
+                    },
+                    exc_info=True,
+                )
+                raise cancelled from exc
             except RuntimeLaneError as exc:
                 raise cancelled from exc
             if claim.acquired and claim.claim_id is not None:
@@ -592,7 +646,7 @@ class LaneController:
         """
 
         claim_id = secrets.token_hex(_CLAIM_ID_BYTES)
-        now = self._clock.now()
+        now = self._clock.utc_now()
         expires_at = now + timedelta(seconds=lane_config.claim_ttl_seconds)
         connection = _connect(self._coordinator)
         try:
@@ -662,10 +716,28 @@ class LaneController:
         try:
             expires_at = await asyncio.shield(refresh_task)
         except asyncio.CancelledError as cancelled:
+            cleanup_timeout_seconds = _outer_cancellation_cleanup_timeout_seconds(
+                self._coordinator
+            )
             try:
-                expires_at = await _await_task_after_outer_cancellation(refresh_task)
+                expires_at = await _await_task_after_outer_cancellation(
+                    refresh_task,
+                    timeout_seconds=cleanup_timeout_seconds,
+                )
             except RuntimeLaneClaimLostError as exc:
                 self._mark_token_lost(token)
+                raise cancelled from exc
+            except _OuterCancellationCleanupTimeoutError as exc:
+                _observe_abandoned_refresh_task(refresh_task, token=token)
+                _LOGGER.warning(
+                    _LOG_REFRESH_CLEANUP_TIMEOUT_AFTER_CANCEL,
+                    extra={
+                        "lane_name": token.name,
+                        "claim_id": token.claim_id,
+                        "timeout_seconds": cleanup_timeout_seconds,
+                    },
+                    exc_info=True,
+                )
                 raise cancelled from exc
             except RuntimeLaneError as exc:
                 _LOGGER.exception(
@@ -693,7 +765,7 @@ class LaneController:
         """
 
         lane_config = self._get_config(token.name)
-        now = self._clock.now()
+        now = self._clock.utc_now()
         expires_at = now + timedelta(seconds=lane_config.claim_ttl_seconds)
         connection = _connect(self._coordinator)
         try:
@@ -741,9 +813,32 @@ class LaneController:
         try:
             await asyncio.shield(release_task)
         except asyncio.CancelledError as cancelled:
+            cleanup_timeout_seconds = _outer_cancellation_cleanup_timeout_seconds(
+                self._coordinator
+            )
             try:
-                await _await_task_after_outer_cancellation(release_task)
-            except RuntimeLaneError:
+                await _await_task_after_outer_cancellation(
+                    release_task,
+                    timeout_seconds=cleanup_timeout_seconds,
+                )
+            except _OuterCancellationCleanupTimeoutError as exc:
+                _observe_abandoned_release_task(
+                    release_task,
+                    lane_name=token.name,
+                    claim_id=token.claim_id,
+                    operation=_CLEANUP_OPERATION_TRACKED_RELEASE,
+                )
+                _LOGGER.warning(
+                    _LOG_TRACKED_RELEASE_CLEANUP_TIMEOUT_AFTER_CANCEL,
+                    extra={
+                        "lane_name": token.name,
+                        "claim_id": token.claim_id,
+                        "timeout_seconds": cleanup_timeout_seconds,
+                    },
+                    exc_info=True,
+                )
+                raise cancelled from exc
+            except RuntimeLaneError as exc:
                 _LOGGER.exception(
                     _LOG_TRACKED_RELEASE_FAILED_AFTER_CANCEL,
                     extra={
@@ -751,7 +846,7 @@ class LaneController:
                         "claim_id": token.claim_id,
                     },
                 )
-                raise cancelled
+                raise cancelled from exc
             self._mark_token_released(token)
             raise
         self._mark_token_released(token)
@@ -801,14 +896,37 @@ class LaneController:
             )
             raise
         except asyncio.CancelledError as cancelled:
+            cleanup_timeout_seconds = _outer_cancellation_cleanup_timeout_seconds(
+                self._coordinator
+            )
             try:
-                await _await_task_after_outer_cancellation(release_task)
-            except RuntimeLaneError:
+                await _await_task_after_outer_cancellation(
+                    release_task,
+                    timeout_seconds=cleanup_timeout_seconds,
+                )
+            except _OuterCancellationCleanupTimeoutError as exc:
+                _observe_abandoned_release_task(
+                    release_task,
+                    lane_name=lane_name,
+                    claim_id=claim_id,
+                    operation=_CLEANUP_OPERATION_UNTRACKED_RELEASE,
+                )
+                _LOGGER.warning(
+                    _LOG_UNTRACKED_RELEASE_CLEANUP_TIMEOUT_AFTER_CANCEL,
+                    extra={
+                        "lane_name": lane_name,
+                        "claim_id": claim_id,
+                        "timeout_seconds": cleanup_timeout_seconds,
+                    },
+                    exc_info=True,
+                )
+                raise cancelled from exc
+            except RuntimeLaneError as exc:
                 _LOGGER.exception(
                     _LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL,
                     extra={"lane_name": lane_name, "claim_id": claim_id},
                 )
-                raise cancelled
+                raise cancelled from exc
             raise
 
     def _release_claim_sync(self, lane_name: str, claim_id: str) -> None:
@@ -1001,27 +1119,234 @@ class _suppress_cancelled_error:
 
 async def _await_task_after_outer_cancellation(
     task: asyncio.Task[_TaskResult],
+    *,
+    timeout_seconds: float,
 ) -> _TaskResult:
-    """外层取消已发生后等待 shielded task 完成。
+    """外层取消已发生后有界等待 shielded task 完成。
 
     该 helper 用于 DB claim / release 已交给线程执行后的 cleanup 路径。
-    外层 task 可能被重复 cancel；这里持续等待底层 task 完成，把最终结果
-    交还给调用方，由调用方继续重新抛出最初的 ``CancelledError``。
+    外层 task 可能被重复 cancel；这里在 monotonic deadline 内持续等待底层
+    task 完成，把最终结果交还给调用方，由调用方继续重新抛出最初的
+    ``CancelledError``。超过等待上限时不取消底层 task。
 
     :param task: 已创建且必须完成收尾的 asyncio task。
+    :param timeout_seconds: cleanup 最长等待秒数。
     :returns: task 的结果。
+    :raises _OuterCancellationCleanupTimeoutError: 超过 cleanup deadline 时抛出。
     :raises RuntimeLaneError: task 以 runtime lane 错误失败时透传。
     :raises asyncio.CancelledError: task 自身被取消时透传。
     """
 
+    deadline = time.monotonic() + timeout_seconds
     while True:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise _OuterCancellationCleanupTimeoutError(
+                _OUTER_CANCELLATION_CLEANUP_TIMEOUT_MESSAGE
+            )
         try:
-            return await asyncio.shield(task)
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=remaining_seconds,
+            )
+        except TimeoutError as exc:
+            raise _OuterCancellationCleanupTimeoutError(
+                _OUTER_CANCELLATION_CLEANUP_TIMEOUT_MESSAGE
+            ) from exc
         except asyncio.CancelledError:
             if task.done():
                 return task.result()
-            await asyncio.sleep(_OUTER_CANCELLATION_SETTLE_SLEEP_SECONDS)
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise _OuterCancellationCleanupTimeoutError(
+                    _OUTER_CANCELLATION_CLEANUP_TIMEOUT_MESSAGE
+                )
+            sleep_seconds = min(
+                _OUTER_CANCELLATION_SETTLE_SLEEP_SECONDS,
+                remaining_seconds,
+            )
+            try:
+                await asyncio.sleep(sleep_seconds)
+            except asyncio.CancelledError:
+                if task.done():
+                    return task.result()
             continue
+
+
+def _outer_cancellation_cleanup_timeout_seconds(
+    coordinator: SQLiteLaneCoordinatorConfig,
+) -> float:
+    """计算外层取消后 cleanup 等待上限。
+
+    cleanup 等待覆盖 SQLite busy timeout，再额外给一小段事件循环调度余量；
+    超过该上限后调用方保留外层取消语义，并把底层 task 交给私有 observer
+    消费 late result / exception。
+
+    :param coordinator: SQLite coordinator 配置。
+    :returns: cleanup 最长等待秒数。
+    """
+
+    return (
+        coordinator.busy_timeout_seconds
+        + _OUTER_CANCELLATION_CLEANUP_GRACE_SECONDS
+    )
+
+
+def _observe_abandoned_claim_task(
+    task: asyncio.Task[_ClaimAttempt],
+    *,
+    lane_name: str,
+) -> None:
+    """注册被放弃等待的 claim task observer。
+
+    :param task: 已超过 cleanup 等待上限但仍在运行的 claim task。
+    :param lane_name: lane 名称，用于诊断日志。
+    :returns: ``None``。
+    """
+
+    task.add_done_callback(
+        lambda completed_task: _consume_abandoned_claim_task(
+            completed_task,
+            lane_name=lane_name,
+        )
+    )
+
+
+def _consume_abandoned_claim_task(
+    task: asyncio.Future[_ClaimAttempt],
+    *,
+    lane_name: str,
+) -> None:
+    """消费被放弃等待的 claim task 结果或异常。
+
+    :param task: 已完成的 claim future。
+    :param lane_name: lane 名称，用于诊断日志。
+    :returns: ``None``。
+    """
+
+    if task.cancelled():
+        return
+    try:
+        claim = task.result()
+    except Exception:
+        _LOGGER.exception(
+            _LOG_ABANDONED_CLAIM_FAILED_AFTER_CANCEL,
+            extra={"lane_name": lane_name},
+        )
+        return
+    if claim.acquired and claim.claim_id is not None:
+        _LOGGER.warning(
+            _LOG_ABANDONED_CLAIM_ACQUIRED_TTL_FALLBACK,
+            extra={"lane_name": lane_name, "claim_id": claim.claim_id},
+        )
+
+
+def _observe_abandoned_release_task(
+    task: asyncio.Task[None],
+    *,
+    lane_name: str,
+    claim_id: str,
+    operation: str,
+) -> None:
+    """注册被放弃等待的 release task observer。
+
+    :param task: 已超过 cleanup 等待上限但仍在运行的 release task。
+    :param lane_name: lane 名称，用于诊断日志。
+    :param claim_id: claim id，用于诊断日志。
+    :param operation: release 操作类型。
+    :returns: ``None``。
+    """
+
+    task.add_done_callback(
+        lambda completed_task: _consume_abandoned_release_task(
+            completed_task,
+            lane_name=lane_name,
+            claim_id=claim_id,
+            operation=operation,
+        )
+    )
+
+
+def _consume_abandoned_release_task(
+    task: asyncio.Future[None],
+    *,
+    lane_name: str,
+    claim_id: str,
+    operation: str,
+) -> None:
+    """消费被放弃等待的 release task 结果或异常。
+
+    :param task: 已完成的 release future。
+    :param lane_name: lane 名称，用于诊断日志。
+    :param claim_id: claim id，用于诊断日志。
+    :param operation: release 操作类型。
+    :returns: ``None``。
+    """
+
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:
+        _LOGGER.exception(
+            _LOG_ABANDONED_RELEASE_FAILED_AFTER_CANCEL,
+            extra={
+                "lane_name": lane_name,
+                "claim_id": claim_id,
+                "operation": operation,
+            },
+        )
+
+
+def _observe_abandoned_refresh_task(
+    task: asyncio.Task[datetime],
+    *,
+    token: LaneClaimToken,
+) -> None:
+    """注册被放弃等待的 refresh task observer。
+
+    :param task: 已超过 cleanup 等待上限但仍在运行的 refresh task。
+    :param token: refresh 对应的 claim token，用于诊断日志。
+    :returns: ``None``。
+    """
+
+    task.add_done_callback(
+        lambda completed_task: _consume_abandoned_refresh_task(
+            completed_task,
+            lane_name=token.name,
+            claim_id=token.claim_id,
+        )
+    )
+
+
+def _consume_abandoned_refresh_task(
+    task: asyncio.Future[datetime],
+    *,
+    lane_name: str,
+    claim_id: str,
+) -> None:
+    """消费被放弃等待的 refresh task 结果或异常。
+
+    :param task: 已完成的 refresh future。
+    :param lane_name: lane 名称，用于诊断日志。
+    :param claim_id: claim id，用于诊断日志。
+    :returns: ``None``。
+    """
+
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        _LOGGER.warning(
+            _LOG_ABANDONED_REFRESH_FAILED_AFTER_CANCEL,
+            extra={
+                "lane_name": lane_name,
+                "claim_id": claim_id,
+                "error_type": exc.__class__.__name__,
+            },
+            exc_info=True,
+        )
 
 
 def _require_non_blank(value: str, *, field_name: str) -> None:
