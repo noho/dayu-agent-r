@@ -43,6 +43,10 @@ from dayu.host._event_payload import (
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.context_fallback import (
+    ActiveRecentWindowFallback,
+    EventLogContextFallbackProvider,
+)
 from dayu.host.compact_payload import (
     optional_text_list_field,
     preserved_canonical_evidence_refs,
@@ -424,6 +428,48 @@ class AcceptedToolEvidenceMaterialProvider(Protocol):
         :raises HostDurableError: evidence payload 损坏时抛出。
         """
         ...
+
+
+class ContextFallbackProvider(Protocol):
+    """RunInputBuilder 内部 fallback view provider 协议。"""
+
+    def load_context_fallback(
+        self,
+        *,
+        run_id: str,
+        run_started_event_sequence: int,
+        current_input_ref: str,
+    ) -> ActiveRecentWindowFallback | None:
+        """读取当前 dispatch 绑定的 fallback view。
+
+        :param run_id: 当前 Run id。
+        :param run_started_event_sequence: 当前 ``RUN_STARTED`` event sequence。
+        :param current_input_ref: 当前用户输入 event id。
+        :returns: active fallback view；不存在时返回 ``None``。
+        """
+        ...
+
+
+class NoopContextFallbackProvider:
+    """默认 no-op fallback provider。"""
+
+    def load_context_fallback(
+        self,
+        *,
+        run_id: str,
+        run_started_event_sequence: int,
+        current_input_ref: str,
+    ) -> ActiveRecentWindowFallback | None:
+        """返回空 fallback view。
+
+        :param run_id: 当前 Run id。
+        :param run_started_event_sequence: 当前 ``RUN_STARTED`` event sequence。
+        :param current_input_ref: 当前用户输入 event id。
+        :returns: 始终返回 ``None``。
+        """
+
+        del run_id, run_started_event_sequence, current_input_ref
+        return None
 
 
 class ToolSchemaSnapshotProvider(Protocol):
@@ -1508,6 +1554,7 @@ class RunInputBuilder:
         accepted_tool_evidence_material_provider: (
             AcceptedToolEvidenceMaterialProvider
         ),
+        context_fallback_provider: ContextFallbackProvider,
         tool_schema_snapshot_provider: ToolSchemaSnapshotProvider,
         tool_executor_provider: ToolExecutorProvider,
         scene_parameter_provider: SceneParameterProvider,
@@ -1522,6 +1569,7 @@ class RunInputBuilder:
         :param compact_artifact_provider: Compact artifact provider。
         :param accepted_tool_evidence_material_provider: accepted tool
             evidence material provider。
+        :param context_fallback_provider: context fallback view provider。
         :param tool_schema_snapshot_provider: Tool schema snapshot provider。
         :param tool_executor_provider: ToolExecutor provider。
         :param scene_parameter_provider: Scene parameter provider。
@@ -1537,6 +1585,7 @@ class RunInputBuilder:
         self._accepted_tool_evidence_material_provider = (
             accepted_tool_evidence_material_provider
         )
+        self._context_fallback_provider = context_fallback_provider
         self._tool_schema_snapshot_provider = tool_schema_snapshot_provider
         self._tool_executor_provider = tool_executor_provider
         self._scene_parameter_provider = scene_parameter_provider
@@ -1566,6 +1615,39 @@ class RunInputBuilder:
         compact = self._compact_artifact_provider.load_compact_artifact(
             attempt_snapshot, current_facts
         )
+        fallback = self._context_fallback_provider.load_context_fallback(
+            run_id=current_facts.run.run_id,
+            run_started_event_sequence=(
+                current_facts.run_started_event.event_sequence
+            ),
+            current_input_ref=current_facts.user_input_event.event_id,
+        )
+        if fallback is None:
+            bounded_context_messages = (
+                *memory.messages,
+                *compact.messages,
+                *continuity.messages,
+            )
+        else:
+            evidence = (
+                self._accepted_tool_evidence_material_provider
+                .load_accepted_tool_evidence_materials(
+                    attempt_snapshot,
+                    current_facts,
+                    memory,
+                    compact,
+                )
+            )
+            bounded_context_messages = _fallback_context_messages(
+                fallback=fallback,
+                material_blocks=build_run_input_material_blocks(
+                    current_facts=current_facts,
+                    memory=memory,
+                    compact=compact,
+                    continuity=continuity,
+                    accepted_tool_evidence=evidence,
+                ),
+            )
         tool_snapshot = self._tool_schema_snapshot_provider.load_tool_schema_snapshot(
             attempt_snapshot, current_facts
         )
@@ -1586,9 +1668,7 @@ class RunInputBuilder:
                 policy_snapshot,
                 self._tool_execution_mode,
             ),
-            *memory.messages,
-            *compact.messages,
-            *continuity.messages,
+            *bounded_context_messages,
             UserMessage(
                 role=AgentMessageRole.USER,
                 content=current_facts.user_prompt,
@@ -1654,6 +1734,7 @@ def create_no_tool_run_input_builder(
     policy_snapshot: PolicySnapshot,
     memory_snapshot_provider: MemorySnapshotProvider | None = None,
     compact_artifact_provider: CompactArtifactProvider | None = None,
+    context_fallback_provider: ContextFallbackProvider | None = None,
     tool_execution_mode: ToolExecutionMode = ToolExecutionMode.NO_TOOL_DISABLED,
 ) -> RunInputBuilder:
     """创建 Phase 5 默认 no-tool RunInputBuilder。
@@ -1662,6 +1743,7 @@ def create_no_tool_run_input_builder(
     :param policy_snapshot: 显式 policy snapshot。
     :param memory_snapshot_provider: 可选 memory snapshot provider；默认 no-op。
     :param compact_artifact_provider: 可选 compact artifact provider；默认 no-op。
+    :param context_fallback_provider: 可选 context fallback provider；默认 no-op。
     :param tool_execution_mode: no-tool 工具执行模式，只能是 replay 或 disabled。
     :returns: RunInputBuilder。
     :raises ValueError: 传入 ``TOOL_ENABLED`` 时抛出。
@@ -1687,6 +1769,11 @@ def create_no_tool_run_input_builder(
         accepted_tool_evidence_material_provider=(
             DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)
         ),
+        context_fallback_provider=(
+            NoopContextFallbackProvider()
+            if context_fallback_provider is None
+            else context_fallback_provider
+        ),
         tool_schema_snapshot_provider=NoopToolSchemaSnapshotProvider(),
         tool_executor_provider=NoToolExecutorProvider(),
         scene_parameter_provider=DefaultSceneParameterProvider(),
@@ -1702,6 +1789,7 @@ def create_tool_enabled_run_input_builder(
     tool_runtime_handle: ToolRuntimeHandle,
     memory_snapshot_provider: MemorySnapshotProvider | None = None,
     compact_artifact_provider: CompactArtifactProvider | None = None,
+    context_fallback_provider: ContextFallbackProvider | None = None,
 ) -> RunInputBuilder:
     """创建 tool-enabled RunInputBuilder。
 
@@ -1710,6 +1798,7 @@ def create_tool_enabled_run_input_builder(
     :param tool_runtime_handle: ToolRuntime handle。
     :param memory_snapshot_provider: 可选 memory snapshot provider；默认 no-op。
     :param compact_artifact_provider: 可选 compact artifact provider；默认 no-op。
+    :param context_fallback_provider: 可选 context fallback provider；默认 no-op。
     :returns: RunInputBuilder。
     """
 
@@ -1731,6 +1820,11 @@ def create_tool_enabled_run_input_builder(
         ),
         accepted_tool_evidence_material_provider=(
             DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)
+        ),
+        context_fallback_provider=(
+            NoopContextFallbackProvider()
+            if context_fallback_provider is None
+            else context_fallback_provider
         ),
         tool_schema_snapshot_provider=ToolRuntimeSchemaSnapshotProvider(
             handle_provider
@@ -2293,6 +2387,62 @@ def build_run_input_material_blocks(
         )
     )
     return tuple(blocks)
+
+
+def _fallback_context_messages(
+    *,
+    fallback: ActiveRecentWindowFallback,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+) -> tuple[AgentMessage, ...]:
+    """按 fallback selected block ids 渲染 bounded context messages。
+
+    :param fallback: active fallback view。
+    :param material_blocks: ordinary material blocks。
+    :returns: fallback bounded context messages，不包含当前 input anchor。
+    :raises HostDurableError: fallback view 与 ordinary material 不一致时抛出。
+    """
+
+    selected_ids = frozenset(fallback.selected_block_ids)
+    if len(selected_ids) != len(fallback.selected_block_ids):
+        raise HostDurableError("fallback selected block ids must be unique")
+    selected_blocks = tuple(
+        block for block in material_blocks if block.block_id in selected_ids
+    )
+    if len(selected_blocks) != len(selected_ids):
+        raise HostDurableError("fallback selected block id is missing from material view")
+    current_blocks = tuple(
+        block
+        for block in selected_blocks
+        if block.section is CompactMaterialSection.CURRENT_INPUT_ANCHOR
+        and fallback.current_input_ref in block.canonical_source_refs
+    )
+    if len(current_blocks) != 1:
+        raise HostDurableError("fallback view requires exactly one current input anchor")
+    messages: list[AgentMessage] = []
+    for block in selected_blocks:
+        if block.block_id == current_blocks[0].block_id:
+            continue
+        messages.append(_fallback_message_from_material_block(block))
+    return tuple(messages)
+
+
+def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
+    """把 fallback material block 渲染为 Engine message。
+
+    :param block: selected fallback material block。
+    :returns: Agent message。
+    """
+
+    if block.kind is CompactMaterialBlockKind.RAW_USER_TURN:
+        return UserMessage(role=AgentMessageRole.USER, content=block.text)
+    if block.kind is CompactMaterialBlockKind.RAW_ASSISTANT_TURN:
+        return AssistantMessage(
+            role=AgentMessageRole.ASSISTANT,
+            content=block.text,
+            reasoning_content=None,
+            tool_calls=(),
+        )
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
 
 
 def _run_input_message_content(message: AgentMessage) -> str:
@@ -3051,6 +3201,7 @@ __all__ = [
     "CompactArtifactProvider",
     "CompactArtifactView",
     "AcceptedToolEvidenceMaterialProvider",
+    "ContextFallbackProvider",
     "CurrentRunFactProvider",
     "CurrentRunFacts",
     "DefaultSceneParameterProvider",
@@ -3059,12 +3210,14 @@ __all__ = [
     "DurableCurrentRunFactProvider",
     "DurableMemorySnapshotProvider",
     "DurableSessionContinuityProvider",
+    "EventLogContextFallbackProvider",
     "MemoryProjectionRepairRequired",
     "MemorySnapshotProvider",
     "MemorySnapshotView",
     "NoToolExecutor",
     "NoToolExecutorProvider",
     "NoopCompactArtifactProvider",
+    "NoopContextFallbackProvider",
     "NoopAcceptedToolEvidenceMaterialProvider",
     "NoopMemorySnapshotProvider",
     "NoopToolSchemaSnapshotProvider",

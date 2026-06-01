@@ -114,6 +114,19 @@ def _load_manifest(path: Path) -> Mapping[str, JsonValue]:
     return value
 
 
+def _load_package_execution_profiles() -> Mapping[str, JsonValue]:
+    """读取包内 execution profiles 配置。
+
+    :returns: execution profiles JSON object。
+    :raises AssertionError: 配置顶层不是 JSON object 时抛出。
+    """
+
+    path = _repo_root() / "dayu" / "config" / "execution_profiles.json"
+    value = cast(JsonValue, json.loads(path.read_text(encoding="utf-8")))
+    assert isinstance(value, Mapping)
+    return value
+
+
 def _required_context_slot_values(
     manifest: Mapping[str, JsonValue],
 ) -> dict[str, str]:
@@ -238,6 +251,31 @@ def test_migrated_scene_manifest_schema_excludes_legacy_fields() -> None:
             assert "default_name" not in model
             assert "temperature_profile" not in model
             assert "default_model_id" in model
+
+
+def test_conversation_compaction_default_model_matches_default_profile_compactor() -> None:
+    """conversation_compaction 默认模型必须对齐默认 execution profile compactor。
+
+    :returns: ``None``。
+    :raises AssertionError: scene manifest 与默认 profile compactor 模型不一致时抛出。
+    """
+
+    manifest = _load_manifest(_manifest_root() / "conversation_compaction.json")
+    profiles = _load_package_execution_profiles()
+    default_profile_id = profiles["default_execution_profile_id"]
+    assert isinstance(default_profile_id, str)
+    execution_profiles = profiles["execution_profiles"]
+    assert isinstance(execution_profiles, Mapping)
+    default_profile = execution_profiles[default_profile_id]
+    assert isinstance(default_profile, Mapping)
+    compactor_baseline = default_profile["compactor_baseline"]
+    assert isinstance(compactor_baseline, Mapping)
+    expected_model_id = compactor_baseline["model_id"]
+    assert isinstance(expected_model_id, str)
+    model = manifest["model"]
+    assert isinstance(model, Mapping)
+
+    assert model["default_model_id"] == expected_model_id
 
 
 def test_prompt_mt_scene_asset_is_removed_and_smoke_scene_is_ordinary_asset() -> None:

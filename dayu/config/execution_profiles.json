@@ -20,7 +20,7 @@
         "hard_threshold_context_ratio": 0.82,
         "max_proactive_compactions_per_run": 2,
         "max_reactive_compactions_per_run": 2,
-        "max_compaction_attempts_per_operation": 3,
+        "max_compaction_attempts_per_operation": 5,
         "policy_ref": "standard-256k"
       },
       "memory_projection_policy": {
@@ -88,7 +88,7 @@
         "hard_threshold_context_ratio": 0.82,
         "max_proactive_compactions_per_run": 2,
         "max_reactive_compactions_per_run": 2,
-        "max_compaction_attempts_per_operation": 3,
+        "max_compaction_attempts_per_operation": 5,
         "policy_ref": "standard-1m"
       },
       "memory_projection_policy": {
@@ -156,7 +156,7 @@
         "hard_threshold_context_ratio": 0.82,
         "max_proactive_compactions_per_run": 2,
         "max_reactive_compactions_per_run": 2,
-        "max_compaction_attempts_per_operation": 3,
+        "max_compaction_attempts_per_operation": 5,
         "policy_ref": "wechat-256k"
       },
       "memory_projection_policy": {
@@ -224,7 +224,7 @@
         "hard_threshold_context_ratio": 0.82,
         "max_proactive_compactions_per_run": 2,
         "max_reactive_compactions_per_run": 2,
-        "max_compaction_attempts_per_operation": 3,
+        "max_compaction_attempts_per_operation": 5,
         "policy_ref": "wechat-1m"
       },
       "memory_projection_policy": {

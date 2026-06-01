@@ -64,8 +64,10 @@ from dayu.host.context_events import (
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     ContextCompactionTriggerSource,
+    DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
     context_budget_policy_from_threshold_tokens,
 )
+from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
@@ -156,10 +158,12 @@ _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
 _LANE_NAME = "llm"
 _SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 120
+_HARD_THRESHOLD_PROMPT_CHAR_COUNT = 240
 _SOFT_CONTEXT_WINDOW_SIZE = 110
 _SOFT_RESERVED_OUTPUT_TOKENS = 10
 _SOFT_HARD_THRESHOLD_TOKENS = 80
 _SOFT_SAFETY_MARGIN_RATIO = 0.5
+_REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS = 2.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _SCHEDULER_CLOSE_TERMINAL_EVENT_TYPES = (
     "CANCEL_REQUESTED",
@@ -1110,6 +1114,189 @@ class _ReactiveRecoveryWorkerFactory:
         del snapshot
         self.created += 1
         return _ReactiveRecoveryWorker(self)
+
+
+class _RepeatedReactiveOverflowHandle(_FakeHandle):
+    """每次 dispatch 后立即产出 reactive overflow 的 fake handle。"""
+
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        overflow_index: int,
+        factory: "_RepeatedReactiveOverflowWorkerFactory",
+    ) -> None:
+        """初始化 repeated-overflow handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param overflow_index: 当前 factory accept 序号，从 1 开始。
+        :param factory: 所属 factory，用于记录 close 同步点。
+        :returns: ``None``。
+        """
+
+        super().__init__(local_worker_id=f"worker-overflow-{overflow_index}")
+        self._snapshot = snapshot
+        self._overflow_index = overflow_index
+        self._factory = factory
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """立即产出单个 reactive overflow EngineEvent。
+
+        :returns: 只包含一个 ``CONTEXT_COMPACTION_REQUESTED`` 的异步迭代器。
+        """
+
+        yield EngineEvent(
+            occurred_at=_NOW,
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+            data=ContextCompactionRequestedData(
+                iteration_id=f"iter-reactive-{self._overflow_index}",
+                budget_state=None,
+                reason="provider_overflow",
+                provider_request_id=f"req-reactive-{self._overflow_index}",
+            ),
+            metadata=None,
+        )
+
+    async def close(self) -> None:
+        """记录 handle close，作为该次 overflow 已被 scheduler 收口的同步点。
+
+        :returns: ``None``。
+        """
+
+        await super().close()
+        await self._factory.record_closed()
+
+
+class _RepeatedReactiveOverflowWorker:
+    """每次 accept 都返回 repeated-overflow handle 的 fake worker。"""
+
+    def __init__(self, factory: "_RepeatedReactiveOverflowWorkerFactory") -> None:
+        """初始化 fake worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest) -> LocalWorkerHandle:
+        """记录 dispatch accept，并返回立即 overflow 的 handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 Engine request。
+        :returns: repeated-overflow handle。
+        """
+
+        accepted_index = await self._factory.record_accept(snapshot, request)
+        return _RepeatedReactiveOverflowHandle(snapshot, accepted_index, self._factory)
+
+
+class _RepeatedReactiveOverflowWorkerFactory:
+    """连续 reactive overflow dispatch-loop 的确定性 fake factory。"""
+
+    def __init__(self) -> None:
+        """初始化 fake factory。
+
+        :returns: ``None``。
+        """
+
+        self.created = 0
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+        self.closed_count = 0
+        self._accepted_condition = asyncio.Condition()
+        self._closed_condition = asyncio.Condition()
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 repeated-overflow worker。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :returns: repeated-overflow worker。
+        """
+
+        del snapshot
+        self.created += 1
+        return _RepeatedReactiveOverflowWorker(self)
+
+    async def record_accept(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> int:
+        """记录一次 worker accept 并唤醒测试同步点。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 Engine request。
+        :returns: 本次 accept 序号，从 1 开始。
+        """
+
+        async with self._accepted_condition:
+            self.accepted_snapshots.append(snapshot)
+            self.accepted_requests.append(request)
+            accepted_index = len(self.accepted_snapshots)
+            self._accepted_condition.notify_all()
+            return accepted_index
+
+    async def record_closed(self) -> None:
+        """记录一次 handle close 并唤醒测试同步点。
+
+        :returns: ``None``。
+        """
+
+        async with self._closed_condition:
+            self.closed_count += 1
+            self._closed_condition.notify_all()
+
+    async def wait_for_accepted_count(self, expected_count: int) -> None:
+        """等待 factory 观察到指定 accept 次数。
+
+        :param expected_count: 期望 accept 次数。
+        :returns: ``None``。
+        :raises TimeoutError: 超时仍未达到期望次数时抛出。
+        """
+
+        await asyncio.wait_for(
+            self._wait_for_accepted_count(expected_count),
+            timeout=_REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS,
+        )
+
+    async def wait_for_closed_count(self, expected_count: int) -> None:
+        """等待 factory 观察到指定 handle close 次数。
+
+        :param expected_count: 期望 close 次数。
+        :returns: ``None``。
+        :raises TimeoutError: 超时仍未达到期望次数时抛出。
+        """
+
+        await asyncio.wait_for(
+            self._wait_for_closed_count(expected_count),
+            timeout=_REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS,
+        )
+
+    async def _wait_for_accepted_count(self, expected_count: int) -> None:
+        """在 condition 上等待 accept 次数达标。
+
+        :param expected_count: 期望 accept 次数。
+        :returns: ``None``。
+        """
+
+        async with self._accepted_condition:
+            await self._accepted_condition.wait_for(
+                lambda: len(self.accepted_snapshots) >= expected_count
+            )
+
+    async def _wait_for_closed_count(self, expected_count: int) -> None:
+        """在 condition 上等待 handle close 次数达标。
+
+        :param expected_count: 期望 close 次数。
+        :returns: ``None``。
+        """
+
+        async with self._closed_condition:
+            await self._closed_condition.wait_for(
+                lambda: self.closed_count >= expected_count
+            )
 
 
 class _FinalAnswerWorker:
@@ -3280,7 +3467,19 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
                 seeded.run_id,
                 CONTEXT_COMPACTION_FAILED,
             )
-            assert _event_payload(failed)["failure_reason"] == "stale_compaction_result"
+            requested = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_REQUESTED,
+            )
+            payload = _event_payload(failed)
+            assert payload["failure_reason"] == "stale_compaction_result"
+            assert_failed_payload_no_fallback(
+                payload,
+                expected_operation_id=requested.event_id,
+                expected_attempt_count=1,
+                expected_retry_repair_budget_exhausted=False,
+            )
         finally:
             await scheduler.close()
 
@@ -3338,8 +3537,9 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
 async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
     tmp_path: Path,
 ) -> None:
-    """semantic proposal failure 写入 attempt rejected canonical facts。"""
+    """semantic proposal failure 写 rejected facts 后通过 fallback dispatch。"""
 
+    factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run(
             store,
@@ -3349,7 +3549,7 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
         scheduler = await _open_scheduler(
             tmp_path,
             store,
-            _FakeWorkerFactory(),
+            factory,
             context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=2,
             ),
@@ -3358,6 +3558,7 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
+            assert (await scheduler.drain_once()).dispatched == 1
 
             assert (
                 _event_count(
@@ -3377,7 +3578,19 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                 seeded.run_id,
                 CONTEXT_COMPACTION_ATTEMPT_REJECTED,
             )
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
             assert _event_payload(rejected)["operation_id"] == requested.event_id
+            payload = _event_payload(failed)
+            assert payload["operation_id"] == requested.event_id
+            assert payload["attempt_count"] == 2
+            assert payload["retry_repair_budget_exhausted"] is True
+            assert payload["fallback_action"] == "dispatch"
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert len(factory.accepted_requests) == 1
         finally:
             await scheduler.close()
 
@@ -3386,13 +3599,66 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
 async def test_pre_start_governance_compact_failure_is_attempt_free(
     tmp_path: Path,
 ) -> None:
-    """proactive compact 缺少 compactor/artifact store 时 fail closed 且零 Attempt。"""
+    """proactive compact 缺 compactor 后 fallback 预算通过会创建 Attempt。"""
 
+    factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run(
             store,
             run_id="run-compact-failure",
             display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            assert (await scheduler.drain_once()).dispatched == 1
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
+            event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
+            assert event_types.index(CONTEXT_COMPACTION_FAILED) < event_types.index("RUN_STARTED")
+            assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert len(factory.accepted_requests) == 1
+            requested = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_REQUESTED,
+            )
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            payload = _event_payload(failed)
+            assert payload["operation_id"] == requested.event_id
+            assert payload["fallback_action"] == "dispatch"
+            assert isinstance(payload["fallback_input_window"], Mapping)
+            assert payload["fallback_input_window"]["current_input_ref"] == (
+                f"event-input-{seeded.run_id}"
+            )
+            assert isinstance(payload["fallback_budget_result"], Mapping)
+            assert payload["fallback_budget_result"]["status"] == "within_hard_budget"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_fallback_budget_fail_closes_run(
+    tmp_path: Path,
+) -> None:
+    """fallback selected view 超过 hard budget 时 fail closed 且不创建 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-fallback-over-budget",
+            display_text=_hard_threshold_prompt(),
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -3404,14 +3670,17 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             await scheduler.run_queue_promotion(seeded.session_id)
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
-            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.FAILED)
-            assert _event_types_for_run(store.transaction_runner, seeded.run_id) == (
-                "USER_INPUT_ACCEPTED",
-                "RUN_ACCEPTED",
-                CONTEXT_COMPACTION_REQUESTED,
+            assert _run_status(store.transaction_runner, seeded.run_id) == RunStatus.FAILED
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
                 CONTEXT_COMPACTION_FAILED,
-                "RUN_FAILED",
             )
+            payload = _event_payload(failed)
+            assert payload["fallback_action"] == "fail_closed"
+            assert isinstance(payload["fallback_budget_result"], Mapping)
+            assert payload["fallback_budget_result"]["status"] == "over_hard_budget"
         finally:
             await scheduler.close()
 
@@ -3450,7 +3719,14 @@ async def test_pre_start_governance_proactive_count_limit_blocks_second_compact(
                 _event_types_for_run(store.transaction_runner, seeded.run_id).count(CONTEXT_COMPACTION_REQUESTED) == 1
             )
             failed = _read_event_by_type(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-            assert json.loads(_require_text(failed.payload_json))["failure_reason"] == "proactive_compact_limit_reached"
+            payload = _event_payload(failed)
+            assert payload["failure_reason"] == "proactive_compact_limit_reached"
+            assert_failed_payload_no_fallback(
+                payload,
+                expected_operation_id=None,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
+            )
         finally:
             await scheduler.close()
 
@@ -3486,8 +3762,13 @@ async def test_pre_start_governance_corrupted_compact_count_fails_closed(
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.FAILED)
             failed = _read_event_by_type(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-            assert (
-                json.loads(_require_text(failed.payload_json))["failure_reason"] == "proactive_compact_count_unreadable"
+            payload = _event_payload(failed)
+            assert payload["failure_reason"] == "proactive_compact_count_unreadable"
+            assert_failed_payload_no_fallback(
+                payload,
+                expected_operation_id=None,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
             )
         finally:
             await scheduler.close()
@@ -3616,6 +3897,141 @@ async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
             assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 1
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 2
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
+    tmp_path: Path,
+) -> None:
+    """reactive compact failure fallback 创建新 Attempt 且不依赖 compact artifact。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _ReactiveRecoveryWorkerFactory()
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_run_status(
+                store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
+            )
+            await _wait_for_active_tasks_to_finish(scheduler)
+
+            assert len(factory.accepted_snapshots) == 2
+            assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
+            assert factory.accepted_snapshots[1].execution_id != seeded.execution_id
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 2
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            payload = _event_payload(failed)
+            assert payload["fallback_action"] == "dispatch"
+            assert payload["fallback_policy_decision"] == (
+                "deterministic_recent_window"
+            )
+            second_contents = tuple(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[1].messages
+                )
+                if content is not None
+            )
+            assert "Accepted compact artifact is available for this run." not in (
+                "\n".join(second_contents)
+            )
+            assert second_contents[-1] == "dispatch prompt"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
+    tmp_path: Path,
+) -> None:
+    """连续 reactive overflow 达到上限后 fail closed，不无限创建 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _RepeatedReactiveOverflowWorkerFactory()
+        policy = _soft_compact_policy(max_reactive_compactions_per_run=2)
+        expected_attempt_count = 1 + policy.max_reactive_compactions_per_run
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=policy,
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+
+            await factory.wait_for_accepted_count(expected_attempt_count)
+            await factory.wait_for_closed_count(expected_attempt_count)
+
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            failed_payload = _event_payload(failed)
+            run_failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                "RUN_FAILED",
+            )
+            run_failed_payload = _event_payload(run_failed)
+            actual_attempt_count = _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+
+            assert run.status == RunStatus.FAILED
+            assert factory.created == expected_attempt_count
+            assert len(factory.accepted_snapshots) == expected_attempt_count
+            assert actual_attempt_count == expected_attempt_count
+            assert actual_attempt_count <= expected_attempt_count
+            assert event_types.count(CONTEXT_COMPACTION_REQUESTED) == (
+                policy.max_reactive_compactions_per_run
+            )
+            assert event_types.count(CONTEXT_COMPACTED) == (
+                policy.max_reactive_compactions_per_run
+            )
+            assert event_types.count(CONTEXT_COMPACTION_FAILED) == 1
+            assert event_types.count("RUN_LOST") == 0
+            assert event_types.count("RUN_FAILED") == 1
+            assert failed_payload["failure_reason"] == (
+                "reactive_compact_limit_reached"
+            )
+            assert_failed_payload_no_fallback(
+                failed_payload,
+                expected_operation_id=None,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
+            )
+            assert run_failed_payload["error_code"] == (
+                "reactive_compact_limit_reached"
+            )
+            assert run_failed_payload["context_compaction_failed_event_id"] == (
+                failed.event_id
+            )
         finally:
             await scheduler.close()
 
@@ -4021,9 +4437,15 @@ def _seed_accepted_run(
     return _AcceptedSeededRun(session_id=session_id, run_id=run_id)
 
 
-def _soft_compact_policy(*, max_compaction_attempts_per_operation: int = 1) -> ContextBudgetPolicy:
+def _soft_compact_policy(
+    *,
+    max_compaction_attempts_per_operation: int = 1,
+    max_reactive_compactions_per_run: int = DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
+) -> ContextBudgetPolicy:
     """构造会对测试 prompt 触发 soft compact 的预算策略。
 
+    :param max_compaction_attempts_per_operation: 单个 compaction operation 的 proposal attempt 上限。
+    :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
     :returns: context budget policy。
     """
 
@@ -4033,6 +4455,7 @@ def _soft_compact_policy(*, max_compaction_attempts_per_operation: int = 1) -> C
             (_SOFT_CONTEXT_WINDOW_SIZE - _SOFT_RESERVED_OUTPUT_TOKENS) * (1 - _SOFT_SAFETY_MARGIN_RATIO)
         ),
         hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
+        max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         max_compaction_attempts_per_operation=(max_compaction_attempts_per_operation),
         policy_ref="test-soft-compact-policy",
     )
@@ -4045,6 +4468,15 @@ def _soft_threshold_prompt() -> str:
     """
 
     return "x" * _SOFT_THRESHOLD_PROMPT_CHAR_COUNT
+
+
+def _hard_threshold_prompt() -> str:
+    """返回触发 hard threshold 的测试 prompt。
+
+    :returns: 测试 prompt。
+    """
+
+    return "x" * _HARD_THRESHOLD_PROMPT_CHAR_COUNT
 
 
 def _append_proactive_compaction_requested(
