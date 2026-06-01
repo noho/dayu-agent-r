@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | current work unit completed：WU-RUNTIME-02 |
-| active work unit | WU-RUNTIME-02 |
+| implementation status | current work unit completed：WU-RUNTIME-02；next work unit：WU-STRESS-01 |
+| active work unit | none；next work unit WU-STRESS-01 not-started |
 | default next work unit | WU-STRESS-01 |
-| next entry point | WU-RUNTIME-02 已到达 draft-PR-pass；后续 merge、mark ready for review、request reviewers、delete branch 或对外 comment 需要额外授权 |
+| next entry point | WU-RUNTIME-02 已到达 draft-PR-pass；PR merge 后从 WU-STRESS-01 的 discussion / code inspection 入口继续 |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md；docs/host/wu-runtime-02-lane-clock-cancellation-plan.md |
 | implementation commits | WU-RUNTIME-01 accepted plan: 929d01c；WU-RUNTIME-01 accepted slice1: 7b5b3aa；WU-RUNTIME-01 accepted slice2: 51648be；WU-RUNTIME-01 accepted deepreview: 6980c96；WU-RUNTIME-01 accepted PR review: 9bf87a4；WU-RUNTIME-02 accepted plan: fa34592；WU-RUNTIME-02 accepted slice1: 1be0259；WU-RUNTIME-02 accepted slice2: 5675886；WU-RUNTIME-02 accepted deepreview: ce36bff；WU-RUNTIME-02 accepted PR review: 442e05b |
@@ -168,8 +168,6 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| RR-HCF-01 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime abstraction risk | closed | 本文档 WU-RUNTIME-01 | 已完成；后续只在 PR review 发现回归时处理 | `RuntimeFileLock` 已收缩为普通文件互斥 wrapper：删除 public `RuntimeFileLockToken.released`，移除 `_active_token` acquire gate，第三方 `FileLock` 继续持有 acquire / release 生命周期真源；context manager 只保留 `_context_token` cleanup guard。Host audit / tool trace explicit lock_path regression 已覆盖，未引入 stale lock、async wrapper、durable lease 或 Host recovery。 |
-| RR-HCF-02 | `docs/reviews/repo-review-20260531-223418.md` / controller adjudication | runtime correctness risk | closed | 本文档 WU-RUNTIME-02 | 已完成；后续只在 PR review 发现回归时处理 | `lane` 的多进程 named semaphore 抽象保留；`_LaneClock` 已改为真实 UTC per SQLite transaction，monotonic 只用于本进程等待 timeout；`_await_task_after_outer_cancellation` 已改为 busy timeout + grace 的有界等待，timeout 后保留 `CancelledError`、注册 observer 消费 late result / exception，untracked late claim 依赖 TTL stale cleanup。lane 单进程 / 多进程测试、import boundary 与 pyright 均通过。 |
 
 ## 当前 Work Units
 
