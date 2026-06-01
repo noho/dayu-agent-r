@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import sqlite3
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from multiprocessing import Process
 from typing import Literal, TypeAlias
 
 from dayu.engine.contracts.agent_run import AgentRunRequest
@@ -37,6 +39,17 @@ from dayu.host import (
 from tests.host.public_smoke_support import (
     deterministic_runner_spec,
     open_host_options,
+)
+from tests.host.recovery_support import (
+    AcceptedAttemptMarker,
+    attempt_count_for_run as recovery_attempt_count_for_run,
+    event_type_count as recovery_event_type_count,
+    force_owner_pid_missing_and_heartbeat_stale,
+    run_blocking_owner_process,
+    run_open_probe_process,
+    terminate_process,
+    wait_for_accepted_marker,
+    wait_for_runtime_lane_claim_ttl_to_expire,
 )
 
 StressFailureBoundary: TypeAlias = Literal[
@@ -70,6 +83,16 @@ _FAILED_MESSAGE = "deterministic stress worker failed"
 _STREAM_EXCEPTION_MESSAGE = "deterministic stress worker stream exception"
 _WORKER_ID = "wu-stress-01-worker"
 _NOW = datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC)
+_HOST_DB_FILENAME = "host.sqlite3"
+_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
+_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
+_TERMINAL_EVENT_TYPES = (
+    _EVENT_TYPE_RUN_SUCCEEDED,
+    _EVENT_TYPE_RUN_FAILED,
+    _EVENT_TYPE_RUN_CANCELLED,
+)
+_PROCESS_START_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,3 +635,257 @@ def build_stress_open_host_options(
         worker_startup_timeout_seconds=_WORKER_STARTUP_TIMEOUT_SECONDS,
         dispatch_poll_interval_seconds=_DISPATCH_POLL_INTERVAL_SECONDS,
     )
+
+
+def run_blocking_stress_owner_process(
+    root_path_text: str,
+    accepted_marker_text: str,
+    release_marker_text: str,
+    result_marker_text: str,
+    slot_key: str,
+    client_request_id: str,
+    user_prompt: str,
+) -> None:
+    """运行 stress crash 场景的阻塞 owner 子进程。
+
+    本函数是 ``tests.host.recovery_support.run_blocking_owner_process`` 的
+    薄封装，只为 WU-STRESS-01 暴露 multiprocessing 顶层 target；进程内
+    仍通过既有 recovery helper 打开 Host、提交 Run、写 accepted marker，
+    不复制多进程 owner 实现，也不进入生产代码。
+
+    :param root_path_text: 测试根目录文本路径。
+    :param accepted_marker_text: accepted marker 文本路径。
+    :param release_marker_text: release marker 文本路径。
+    :param result_marker_text: result marker 文本路径。
+    :param slot_key: ensure_session slot key。
+    :param client_request_id: follow-up 幂等 id。
+    :param user_prompt: 用户输入。
+    :returns: ``None``。
+    :raises Exception: 底层 recovery helper 的异常会在子进程内透传。
+    """
+
+    run_blocking_owner_process(
+        root_path_text,
+        accepted_marker_text,
+        release_marker_text,
+        result_marker_text,
+        slot_key,
+        client_request_id,
+        user_prompt,
+    )
+
+
+def run_open_probe_for_stress(root_path_text: str, result_marker_text: str) -> None:
+    """运行 stress live owner probe 子进程。
+
+    本函数是 ``tests.host.recovery_support.run_open_probe_process`` 的薄封装，
+    只服务 WU-STRESS-01 live owner 防误恢复探针；它不表达 Host durable
+    truth，也不修改生产 recovery 策略。
+
+    :param root_path_text: 测试根目录文本路径。
+    :param result_marker_text: probe result marker 文本路径。
+    :returns: ``None``。
+    :raises Exception: 底层 recovery helper 的异常会在子进程内透传。
+    """
+
+    run_open_probe_process(root_path_text, result_marker_text)
+
+
+def start_and_crash_owner_for_stress(
+    root_path: pathlib.Path,
+    *,
+    slot_key: str,
+    client_request_id: str,
+    user_prompt: str,
+    timeout_seconds: float = _PROCESS_START_TIMEOUT_SECONDS,
+) -> AcceptedAttemptMarker:
+    """启动阻塞 owner，等待 accepted 后 crash 并制造 stale owner 证据。
+
+    本 helper 复用 recovery multiprocess helper 的 process target、accepted
+    marker、进程终止、lane TTL 等待和 stale owner fault injection；新增职责
+    仅是把这些步骤组合为 WU-STRESS-01 可复用的 crash/reopen stress 步骤。
+    它只服务测试层 deterministic fault injection，不进入生产代码，不作为
+    Host recovery truth。
+
+    :param root_path: pytest 临时根目录。
+    :param slot_key: ensure_session slot key。
+    :param client_request_id: follow-up 幂等 id。
+    :param user_prompt: 用户输入。
+    :param timeout_seconds: 等待 accepted marker 的超时秒数。
+    :returns: 被 crash 中断的 accepted attempt marker。
+    :raises TimeoutError: 超时未等到 accepted marker 时抛出。
+    :raises AssertionError: 子进程无法终止、owner row 不存在或 crash 前
+        attempt 数不为 1 时抛出。
+    """
+
+    accepted_marker = root_path / f"{client_request_id}-accepted"
+    release_marker = root_path / f"{client_request_id}-release"
+    result_marker = root_path / f"{client_request_id}-result"
+    owner_process = Process(
+        target=run_blocking_stress_owner_process,
+        args=(
+            str(root_path),
+            str(accepted_marker),
+            str(release_marker),
+            str(result_marker),
+            slot_key,
+            client_request_id,
+            user_prompt,
+        ),
+    )
+    owner_process.start()
+    try:
+        accepted = wait_for_accepted_marker(accepted_marker, timeout_seconds)
+        terminate_process(owner_process)
+        wait_for_runtime_lane_claim_ttl_to_expire()
+        force_owner_pid_missing_and_heartbeat_stale(root_path, accepted.run_id)
+        observed_attempt_count = recovery_attempt_count_for_run(
+            root_path, accepted.run_id
+        )
+        if observed_attempt_count != 1:
+            raise AssertionError("crashed owner run must have exactly one attempt")
+        return accepted
+    except BaseException as original_error:
+        if owner_process.is_alive():
+            try:
+                terminate_process(owner_process)
+            except BaseException as cleanup_error:
+                raise cleanup_error from original_error
+        raise
+
+
+def count_event_type(root_path: pathlib.Path, event_type: str) -> int:
+    """统计 EventLog 中指定 event type 的数量。
+
+    本函数复用 ``tests.host.recovery_support.event_type_count``，只为 stress
+    summary 提供命名一致的诊断入口；读取结果只用于测试断言和失败定位，
+    不替代 EventLog canonical fact。
+
+    :param root_path: pytest 临时根目录。
+    :param event_type: EventLog event type。
+    :returns: 指定类型事件数量。
+    :raises ValueError: ``event_type`` 为空时抛出。
+    :raises TypeError: 底层读取到非整数 count 时透传。
+    """
+
+    if event_type.strip() == "":
+        raise ValueError("event_type must be non-empty")
+    return recovery_event_type_count(root_path, event_type)
+
+
+def attempt_count_for_run(root_path: pathlib.Path, run_id: str) -> int:
+    """统计指定 Run 的 Attempt 数量。
+
+    本函数复用 ``tests.host.recovery_support.attempt_count_for_run``，只服务
+    WU-STRESS-01 诊断；它读取 durable row count 作为测试核对，不绕过 Host
+    状态机制造成功路径。
+
+    :param root_path: pytest 临时根目录。
+    :param run_id: Run id。
+    :returns: 该 Run 的 Attempt 数量。
+    :raises ValueError: ``run_id`` 为空时抛出。
+    :raises TypeError: 底层读取到非整数 count 时透传。
+    """
+
+    if run_id.strip() == "":
+        raise ValueError("run_id must be non-empty")
+    return recovery_attempt_count_for_run(root_path, run_id)
+
+
+def terminal_events_for_runs(
+    root_path: pathlib.Path,
+    run_ids: Sequence[str],
+) -> tuple[StressTerminalObservation, ...]:
+    """读取指定 Run 的 durable terminal event 诊断。
+
+    每次调用都会打开新的短连接并执行一次短读，得到 point-in-time
+    diagnostic。该读取只用于 terminal 去重诊断和 stress assertion message，
+    不表达 watcher replay truth，不替代 EventLog / Run / Attempt canonical
+    facts，也不复用长事务快照。
+
+    :param root_path: pytest 临时根目录。
+    :param run_ids: 需要读取 terminal event 的 Run id 序列。
+    :returns: 按 ``event_sequence`` 排序的 terminal 观测元组。
+    :raises ValueError: 任一 Run id 为空时抛出。
+    :raises TypeError: durable row 字段类型不符合预期时抛出。
+    """
+
+    if len(run_ids) == 0:
+        return ()
+    for run_id in run_ids:
+        if run_id.strip() == "":
+            raise ValueError("run_id must be non-empty")
+
+    placeholders = ",".join("?" for _ in run_ids)
+    terminal_type_placeholders = ",".join("?" for _ in _TERMINAL_EVENT_TYPES)
+    parameters = tuple(run_ids) + _TERMINAL_EVENT_TYPES
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT event_id, event_sequence, run_id, event_type
+            FROM event_log
+            WHERE run_id IN ({placeholders})
+              AND event_type IN ({terminal_type_placeholders})
+            ORDER BY event_sequence ASC
+            """,
+            parameters,
+        ).fetchall()
+
+    observations: list[StressTerminalObservation] = []
+    for row in rows:
+        event_id = row[0]
+        event_sequence = row[1]
+        run_id = row[2]
+        event_type = row[3]
+        if not isinstance(event_id, str):
+            raise TypeError("terminal event_id must be str")
+        if not isinstance(event_sequence, int):
+            raise TypeError("terminal event_sequence must be int")
+        if not isinstance(run_id, str):
+            raise TypeError("terminal run_id must be str")
+        if not isinstance(event_type, str):
+            raise TypeError("terminal event_type must be str")
+        observations.append(
+            StressTerminalObservation(
+                run_id=run_id,
+                event_id=event_id,
+                event_sequence=event_sequence,
+                terminal_kind=_terminal_kind_for_event_type(event_type),
+                terminal_status=_terminal_status_for_event_type(event_type),
+            )
+        )
+    return tuple(observations)
+
+
+def _terminal_kind_for_event_type(event_type: str) -> HostEventKind:
+    """把 durable terminal event type 映射为 public HostEvent kind。
+
+    :param event_type: durable terminal event type。
+    :returns: 对应的 ``HostEventKind``。
+    :raises ValueError: ``event_type`` 不是 terminal event type 时抛出。
+    """
+
+    if event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+        return HostEventKind.SUCCEEDED
+    if event_type == _EVENT_TYPE_RUN_FAILED:
+        return HostEventKind.FAILED
+    if event_type == _EVENT_TYPE_RUN_CANCELLED:
+        return HostEventKind.CANCELLED
+    raise ValueError(f"unsupported terminal event type: {event_type}")
+
+
+def _terminal_status_for_event_type(event_type: str) -> HostTerminalStatus:
+    """把 durable terminal event type 映射为 public terminal status。
+
+    :param event_type: durable terminal event type。
+    :returns: 对应的 ``HostTerminalStatus``。
+    :raises ValueError: ``event_type`` 不是 terminal event type 时抛出。
+    """
+
+    if event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+        return HostTerminalStatus.SUCCEEDED
+    if event_type == _EVENT_TYPE_RUN_FAILED:
+        return HostTerminalStatus.FAILED
+    if event_type == _EVENT_TYPE_RUN_CANCELLED:
+        return HostTerminalStatus.CANCELLED
+    raise ValueError(f"unsupported terminal event type: {event_type}")
