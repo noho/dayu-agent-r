@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-TOOL-01 plan re-review passed；accepted plan checkpoint pending |
+| implementation status | WU-TOOL-01 accepted plan checkpoint complete；ready for implementation Slice 1 |
 | active work unit | WU-TOOL-01 |
 | default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-01 implementation Slice 1 handoff after accepted plan commit；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-01 implementation Slice 1 handoff；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -444,6 +444,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 裁决：接受 in-flight 并发契约、测试构造、typed policy module、默认 messages、allow 并发测试和术语收口相关 findings；进入 plan fix。
 - 2026-06-01：plan fix artifact: `docs/reviews/wu-tool-01-plan-fix-codex-20260601.md`；plan re-review artifacts: `docs/reviews/wu-tool-01-plan-rereview-mimo-20260601.md`, `docs/reviews/wu-tool-01-plan-rereview-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-plan-rereview-controller-adjudication-20260601.md`。
 - 裁决：ADJ-001 至 ADJ-007 全部 closed；plan code-generation-ready；进入 accepted plan checkpoint。
+- Accepted plan commit: `c9a0c71` (`gateflow: accept plan for WU-TOOL-01`)。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 
