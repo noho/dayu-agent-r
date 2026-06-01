@@ -20,6 +20,7 @@ def test_default_context_budget_policy_sets_compaction_attempt_budget() -> None:
 
     policy = default_context_budget_policy(context_window_size=1000)
 
+    assert DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION == 5
     assert (
         policy.max_compaction_attempts_per_operation
         == DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION

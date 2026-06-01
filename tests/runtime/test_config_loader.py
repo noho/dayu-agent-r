@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import fields
 from pathlib import Path
+from typing import Final
 
 import pytest
 
@@ -21,6 +22,8 @@ from dayu.runtime.config_loader import (
     legacy_config_file_names,
     load_runtime_config,
 )
+
+_EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION: Final[int] = 5
 
 
 def _write_json(path: Path, value: JsonValue) -> None:
@@ -297,6 +300,10 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert standard_256k.context_window_class == "256k"
     assert standard_256k.min_context_window_tokens == 262144
     assert standard_256k.compactor_baseline.scene_id == "conversation_compaction"
+    assert (
+        standard_256k.context_budget_policy.max_compaction_attempts_per_operation
+        == _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION
+    )
     assert standard_256k.compactor_baseline.user_prompt_template_path == (
         "scenes/conversation_compaction_user.md"
     )
@@ -314,6 +321,10 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     for profile in config.execution_profiles.execution_profiles.values():
         assert profile.agent_policy.continuation_prompt
         assert profile.agent_policy.max_consecutive_failed_tool_batches == 2
+        assert (
+            profile.context_budget_policy.max_compaction_attempts_per_operation
+            == _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION
+        )
     assert config.host_runtime.default_host_runtime_id == "local"
     host_runtime = config.host_runtime.runtimes["local"]
     assert host_runtime.sqlite.write_busy_retry_count == 8

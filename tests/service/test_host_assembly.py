@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Final
 
 import pytest
 
@@ -70,6 +71,7 @@ _CUSTOM_COMPACTOR_SCENE_ID = "custom_compactor_scene"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+_EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION: Final[int] = 5
 
 
 def _scene_tool_catalog(discovered_tools: ServiceDiscoveredTools) -> SceneToolCatalog:
@@ -160,6 +162,12 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
     assert result.options.memory_projection_policy.max_evidence_backed_facts == 256
+    context_budget_policy = result.options.context_budget_policy
+    assert context_budget_policy is not None
+    assert (
+        context_budget_policy.max_compaction_attempts_per_operation
+        == _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION
+    )
     assert result.options.ordinary_run_baseline.runner_spec.headers["Authorization"] == f"Bearer {_API_KEY}"
     assert result.options.ordinary_run_baseline.runner_options.max_tokens is None
     compactor_baseline = result.options.compactor_runner_baseline
@@ -863,7 +871,7 @@ def _write_execution_profile_overlay(
                         "hard_threshold_context_ratio": 0.82,
                         "max_proactive_compactions_per_run": 2,
                         "max_reactive_compactions_per_run": 2,
-                        "max_compaction_attempts_per_operation": 3,
+                        "max_compaction_attempts_per_operation": 7,
                         "policy_ref": profile_id,
                     },
                     "memory_projection_policy": {
