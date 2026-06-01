@@ -91,6 +91,17 @@ from dayu.host.context_budget import (
     decide_context_budget,
     estimate_context_budget,
 )
+from dayu.host.context_fallback import (
+    FALLBACK_ACTION_DISPATCH,
+    FALLBACK_ACTION_FAIL_CLOSED,
+    FALLBACK_POLICY_DECISION_RECENT_WINDOW,
+    FALLBACK_POLICY_DECISION_SELECTION_FAILED,
+    build_recent_window_fallback_selection,
+    build_selection_failure_budget_payload,
+    build_selection_failure_window_payload,
+    estimate_recent_window_fallback_budget,
+    fallback_window_digest,
+)
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
@@ -216,6 +227,7 @@ _REASON_CONTEXT_COMPACTION_REQUIRED = "context_compaction_required"
 _REASON_CONTEXT_COMPACTION_RECOVERY_FAILED = "context_compaction_recovery_failed"
 _RECOVERY_FAILURE_POLICY_DECISION = "reactive_compact_failed"
 _REACTIVE_PRECONDITION_OPERATION_PREFIX = "reactive_precondition"
+_FALLBACK_ACTION_NOT_APPLICABLE = "not_applicable"
 _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
@@ -353,14 +365,24 @@ class _AcceptedWaitingRefs:
 
 @dataclass(frozen=True, slots=True)
 class _ReactiveRecoveryAccepted:
-    """reactive compact accepted 后的待启动摘要。"""
+    """reactive recovery 允许创建新 Attempt 的待启动摘要。
+
+    :param result: 已提交 recovery 前置 facts 的 ingest 结果。
+    :param run_id: 目标 Run id。
+    :param session_id: Session id。
+    :param source_attempt_id: 已关闭的旧 Attempt id。
+    :param compacted_event_id: accepted compact event id；fallback recovery 为
+        ``None``。
+    :param compacted_event_sequence: accepted compact event sequence；fallback
+        recovery 为 ``None``。
+    """
 
     result: EngineIngestResult
     run_id: str
     session_id: str
     source_attempt_id: str
-    compacted_event_id: str
-    compacted_event_sequence: int
+    compacted_event_id: str | None
+    compacted_event_sequence: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +399,8 @@ class _ReactiveCompactPending:
     :param operation_id: request fact event id。
     :param estimate: reactive compact 前估算。
     :param decision: reactive compact 前预算决策。
+    :param policy: reactive context budget policy。
+    :param recent_raw_turns_floor: fallback recent raw turn floor。
     """
 
     result_prefix: EngineIngestResult
@@ -389,6 +413,8 @@ class _ReactiveCompactPending:
     operation_id: str
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
+    policy: ContextBudgetPolicy
+    recent_raw_turns_floor: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,8 +426,26 @@ class _ReactiveRecoveryStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReactiveFallbackDecision:
+    """reactive compact failed 后的 deterministic fallback 决策。
+
+    :param action: fallback 动作。
+    :param policy_decision: fallback policy decision。
+    :param input_window: fallback input window 诊断。
+    :param input_digest: fallback input window digest。
+    :param budget_result: fallback budget 诊断。
+    """
+
+    action: str
+    policy_decision: str
+    input_window: Mapping[str, JsonValue]
+    input_digest: str
+    budget_result: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
 class _StartReactiveRecoveryOperation:
-    """reactive recovery compact accepted 后的 start transaction。"""
+    """reactive recovery accepted 后的 start transaction。"""
 
     event_log_store: EventLogStore
     accepted: _ReactiveRecoveryAccepted
@@ -545,7 +589,7 @@ class EngineEventIngestor:
         if isinstance(result, _ReactiveCompactPending):
             raise RuntimeError("reactive context compaction requires ingest_async")
         if isinstance(result, _ReactiveRecoveryAccepted):
-            result = self._complete_reactive_recovery_after_compact(result)
+            result = self._complete_reactive_recovery(result)
         return self._finish_ingest(
             result,
             candidate=candidate,
@@ -567,7 +611,7 @@ class EngineEventIngestor:
         if isinstance(result, _ReactiveCompactPending):
             result = await self._execute_reactive_compaction(result)
         if isinstance(result, _ReactiveRecoveryAccepted):
-            result = self._complete_reactive_recovery_after_compact(result)
+            result = self._complete_reactive_recovery(result)
         return self._finish_ingest(
             result,
             candidate=candidate,
@@ -1218,6 +1262,10 @@ class EngineEventIngestor:
             operation_id=requested.event_id,
             estimate=estimate,
             decision=decision,
+            policy=policy,
+            recent_raw_turns_floor=(
+                self._memory_projection_policy.recent_raw_turns_floor
+            ),
         )
 
     def _fail_reactive_recovery_without_request(
@@ -1542,6 +1590,12 @@ class EngineEventIngestor:
                 or operation_result.quality_result is None
                 or operation_result.failure_reason is not None
             ):
+                fallback = _reactive_fallback_decision(
+                    pending=pending,
+                    failure_reason=(
+                        operation_result.failure_reason or "compaction_failed"
+                    ),
+                )
                 failed = self._append_reactive_compaction_failed_event(
                     transaction,
                     context=latest,
@@ -1557,7 +1611,32 @@ class EngineEventIngestor:
                     budget_after_attempted_compact=(
                         operation_result.budget_after_attempted_compact
                     ),
+                    fallback_policy_decision=fallback.policy_decision,
+                    fallback_input_window=fallback.input_window,
+                    fallback_input_digest=fallback.input_digest,
+                    fallback_budget_result=fallback.budget_result,
+                    fallback_action=fallback.action,
                 )
+                if fallback.action == FALLBACK_ACTION_DISPATCH:
+                    return _ReactiveRecoveryAccepted(
+                        result=EngineIngestResult(
+                            status=EngineIngestStatus.ACCEPTED,
+                            events=(
+                                *pending.result_prefix.events,
+                                *tuple(attempt_rows),
+                                failed,
+                            ),
+                            terminal_closeout=False,
+                            promotion_triggered=False,
+                            reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                            stop_worker_stream=True,
+                        ),
+                        run_id=latest.run.run_id,
+                        session_id=latest.run.session_id,
+                        source_attempt_id=latest.attempt.attempt_id,
+                        compacted_event_id=None,
+                        compacted_event_sequence=None,
+                    )
                 fail_result = self._fail_recovering_run(
                     transaction,
                     context=latest,
@@ -1694,6 +1773,11 @@ class EngineEventIngestor:
         attempt_count: int,
         retry_repair_budget_exhausted: bool,
         budget_after_attempted_compact: int | None,
+        fallback_policy_decision: str | None = None,
+        fallback_input_window: Mapping[str, JsonValue] | None = None,
+        fallback_input_digest: str | None = None,
+        fallback_budget_result: Mapping[str, JsonValue] | None = None,
+        fallback_action: str = _FALLBACK_ACTION_NOT_APPLICABLE,
     ) -> EventLogRow:
         """追加 reactive ``CONTEXT_COMPACTION_FAILED`` fact。
 
@@ -1705,6 +1789,11 @@ class EngineEventIngestor:
         :param attempt_count: operation 内已拒绝 proposal attempt 数。
         :param retry_repair_budget_exhausted: semantic retry / repair 预算是否耗尽。
         :param budget_after_attempted_compact: compact 后估算；未知时为 ``None``。
+        :param fallback_policy_decision: fallback policy decision。
+        :param fallback_input_window: fallback input window 诊断。
+        :param fallback_input_digest: fallback input window digest。
+        :param fallback_budget_result: fallback budget 诊断。
+        :param fallback_action: fallback 动作。
         :returns: EventLog row。
         """
 
@@ -1746,6 +1835,11 @@ class EngineEventIngestor:
                     ),
                     diagnostic_refs=diagnostic_refs,
                     budget_after_attempted_compact=budget_after_attempted_compact,
+                    fallback_policy_decision=fallback_policy_decision,
+                    fallback_input_window=fallback_input_window,
+                    fallback_input_digest=fallback_input_digest,
+                    fallback_budget_result=fallback_budget_result,
+                    fallback_action=fallback_action,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1872,21 +1966,25 @@ class EngineEventIngestor:
             reason=_REASON_CONTEXT_COMPACTION_RECOVERY_FAILED,
         )
 
-    def _complete_reactive_recovery_after_compact(
+    def _complete_reactive_recovery(
         self, accepted: _ReactiveRecoveryAccepted
     ) -> EngineIngestResult:
-        """compact accepted 后 catch up memory projection 并启动新 Attempt。
+        """reactive recovery accepted 后启动新 Attempt。
 
-        :param accepted: compact accepted 摘要。
+        compact accepted recovery 先追平 memory projection；fallback recovery
+        不写 compact fact，也不物化 memory projection，直接创建新 Attempt。
+
+        :param accepted: recovery accepted 摘要。
         :returns: 最终 ingest 结果。
         """
 
-        catch_up_conversation_memory_projection(
-            self._transaction_runner,
-            policy=self._memory_projection_policy,
-            batch_size=self._memory_projection_catchup_batch_size,
-            max_event_sequence=accepted.compacted_event_sequence,
-        )
+        if accepted.compacted_event_sequence is not None:
+            catch_up_conversation_memory_projection(
+                self._transaction_runner,
+                policy=self._memory_projection_policy,
+                batch_size=self._memory_projection_catchup_batch_size,
+                max_event_sequence=accepted.compacted_event_sequence,
+            )
         started = self._transaction_runner.run_write(
             _StartReactiveRecoveryOperation(
                 event_log_store=self._event_log_store,
@@ -3131,6 +3229,88 @@ def _reactive_compaction_pass_queue(
             )
         )
     return tuple(pass_requests)
+
+
+def _reactive_fallback_decision(
+    *, pending: _ReactiveCompactPending, failure_reason: str
+) -> _ReactiveFallbackDecision:
+    """为 reactive compact final failure 构造 recent-window fallback 决策。
+
+    本函数只使用 overflow 时冻结的 ordinary material blocks 与同一个
+    context budget policy；不读取 compact artifact，不写 memory，也不伪造
+    ``CONTEXT_COMPACTED``。selection 或 budget 估算异常时 fail closed。
+
+    :param pending: reactive compact pending 摘要。
+    :param failure_reason: compact final failure reason。
+    :returns: fallback 决策与 failed payload 诊断字段。
+    """
+
+    try:
+        selection = build_recent_window_fallback_selection(
+            policy=pending.policy,
+            session_id=pending.context.run.session_id,
+            run_id=pending.context.run.run_id,
+            material_blocks=pending.frozen_material_blocks,
+            current_input_ref=pending.context.run.input_event_id,
+            input_cursor=pending.expected_input_event_sequence,
+            recent_raw_turns_floor=pending.recent_raw_turns_floor,
+            trigger_source=ContextCompactionTriggerSource.REACTIVE,
+        )
+        budget = estimate_recent_window_fallback_budget(
+            policy=pending.policy,
+            session_id=pending.context.run.session_id,
+            run_id=pending.context.run.run_id,
+            selection_blocks=selection.selected_blocks,
+            current_input_ref=pending.context.run.input_event_id,
+        )
+    except Exception as error:
+        window = build_selection_failure_window_payload(
+            current_input_ref=pending.context.run.input_event_id,
+            trigger_source=ContextCompactionTriggerSource.REACTIVE,
+            policy_ref=pending.policy.policy_ref,
+            input_cursor=pending.expected_input_event_sequence,
+            failure_reason=_fallback_selection_failure_reason(
+                error,
+                compact_failure_reason=failure_reason,
+            ),
+        )
+        return _ReactiveFallbackDecision(
+            action=FALLBACK_ACTION_FAIL_CLOSED,
+            policy_decision=FALLBACK_POLICY_DECISION_SELECTION_FAILED,
+            input_window=window,
+            input_digest=fallback_window_digest(window),
+            budget_result=build_selection_failure_budget_payload(
+                policy_ref=pending.policy.policy_ref
+            ),
+        )
+    action = (
+        FALLBACK_ACTION_DISPATCH
+        if budget.hard_budget_passed
+        else FALLBACK_ACTION_FAIL_CLOSED
+    )
+    return _ReactiveFallbackDecision(
+        action=action,
+        policy_decision=FALLBACK_POLICY_DECISION_RECENT_WINDOW,
+        input_window=selection.to_window_payload(),
+        input_digest=selection.digest,
+        budget_result=budget.to_payload(),
+    )
+
+
+def _fallback_selection_failure_reason(
+    error: Exception, *, compact_failure_reason: str
+) -> str:
+    """构造 fallback selection / estimate failure 诊断原因。
+
+    :param error: 捕获到的 fallback 异常。
+    :param compact_failure_reason: 触发 fallback 的 compact failure reason。
+    :returns: 结构化 reason 文本。
+    """
+
+    return (
+        "reactive_fallback_selection_failed:"
+        f"{compact_failure_reason}:{type(error).__name__}"
+    )
 
 
 def _single_block_segment_selection(

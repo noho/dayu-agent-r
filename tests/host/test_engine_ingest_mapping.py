@@ -617,11 +617,66 @@ def test_context_compaction_requested_stale_identity_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None:
-    """reactive compact failure 在旧 Attempt 关闭后 FAILED 收口，不进入 LOST。"""
+async def test_reactive_compactor_missing_fallback_dispatches_recovery_attempt(
+    tmp_path: Path,
+) -> None:
+    """reactive compact final failure 预算通过时 fallback 创建 recovery Attempt。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+        ).ingest_async(
+            _context_compaction_candidate(seeded, worker_event_index=42)
+        )
+
+        assert tuple(event.event_type for event in result.events) == (
+            CONTEXT_COMPACTION_REQUESTED,
+            "ATTEMPT_FAILED",
+            "RUN_RECOVERING",
+            CONTEXT_COMPACTION_FAILED,
+            "RUN_STARTED",
+            "ATTEMPT_STARTED",
+        )
+        assert result.terminal_closeout is False
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.FAILED
+        assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
+        assert _current_attempt_id(store.transaction_runner, seeded.run_id) != (
+            seeded.attempt_id
+        )
+        failed_payload = _payload(result.events[3])
+        assert failed_payload["operation_id"] == result.events[0].event_id
+        assert failed_payload["fallback_action"] == "dispatch"
+        assert failed_payload["fallback_policy_decision"] == (
+            "deterministic_recent_window"
+        )
+        assert isinstance(failed_payload["fallback_input_window"], Mapping)
+        assert failed_payload["fallback_input_window"]["current_input_ref"] == (
+            "event-input-ingest"
+        )
+        assert isinstance(failed_payload["fallback_budget_result"], Mapping)
+        assert failed_payload["fallback_budget_result"]["status"] == (
+            "within_hard_budget"
+        )
+
+
+@pytest.mark.asyncio
+async def test_reactive_fallback_over_budget_fails_closed_without_lost(
+    tmp_path: Path,
+) -> None:
+    """reactive fallback view 仍超 hard budget 时 FAILED 收口且不 LOST。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            display_text="overflow " * 80,
+        )
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
@@ -640,14 +695,16 @@ async def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -
         assert run_status == RunStatus.FAILED
         assert attempt_status == AttemptStatus.FAILED
         assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
         failed_payload = _payload(result.events[3])
-        assert_failed_payload_no_fallback(
-            failed_payload,
-            expected_operation_id=result.events[0].event_id,
-            expected_attempt_count=0,
-            expected_retry_repair_budget_exhausted=False,
+        assert failed_payload["operation_id"] == result.events[0].event_id
+        assert failed_payload["fallback_action"] == "fail_closed"
+        assert failed_payload["fallback_policy_decision"] == (
+            "deterministic_recent_window"
         )
+        assert isinstance(failed_payload["fallback_budget_result"], Mapping)
+        assert failed_payload["fallback_budget_result"]["status"] == "over_hard_budget"
 
 
 @pytest.mark.asyncio
@@ -1901,10 +1958,13 @@ def _options(tmp_path: Path) -> HostDurableStoreOptions:
     )
 
 
-def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
+def _seed_active_run(
+    transaction_runner: HostTransactionRunner, *, display_text: str = "hello"
+) -> _SeededRun:
     """创建已 worker accepted 的 active Run。
 
     :param transaction_runner: Host transaction runner。
+    :param display_text: 当前用户输入展示文本。
     :returns: seeded run。
     """
 
@@ -1949,7 +2009,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                     idempotency_key="idem-ingest-input",
                     policy_decision=None,
                     reason=None,
-                    payload_json={"display_text": "hello"},
+                    payload_json={"display_text": display_text},
                     payload_ref=None,
                     payload_digest=None,
                 ),
@@ -2769,4 +2829,3 @@ def _payload(row: EventLogRow) -> Mapping[str, JsonValue]:
     value = cast(JsonValue, json.loads(row.payload_json))
     assert isinstance(value, Mapping)
     return cast(Mapping[str, JsonValue], value)
-

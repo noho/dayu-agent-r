@@ -3717,6 +3717,63 @@ async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
 
 
 @pytest.mark.asyncio
+async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
+    tmp_path: Path,
+) -> None:
+    """reactive compact failure fallback 创建新 Attempt 且不依赖 compact artifact。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _ReactiveRecoveryWorkerFactory()
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_run_status(
+                store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
+            )
+            await _wait_for_active_tasks_to_finish(scheduler)
+
+            assert len(factory.accepted_snapshots) == 2
+            assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
+            assert factory.accepted_snapshots[1].execution_id != seeded.execution_id
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 2
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            payload = _event_payload(failed)
+            assert payload["fallback_action"] == "dispatch"
+            assert payload["fallback_policy_decision"] == (
+                "deterministic_recent_window"
+            )
+            second_contents = tuple(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[1].messages
+                )
+                if content is not None
+            )
+            assert "Accepted compact artifact is available for this run." not in (
+                "\n".join(second_contents)
+            )
+            assert second_contents[-1] == "dispatch prompt"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_reactive_recovery_does_not_clear_duplicate_registry(
     tmp_path: Path,
 ) -> None:
