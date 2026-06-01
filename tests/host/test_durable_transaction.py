@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     format_utc_timestamp,
@@ -25,11 +26,17 @@ from dayu.host.durable.errors import (
     HostTransactionRetryExhaustedError,
     HostUniqueConstraintError,
 )
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogStore,
+)
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import (
     HostTransaction,
     HostTransactionRunner,
@@ -38,6 +45,10 @@ from dayu.host.durable.transaction import (
 
 _SQLITE_BUSY_EXTENDED_TEST_CODE = sqlite3.SQLITE_BUSY | (1 << 8)
 _SQLITE_LOCKED_EXTENDED_TEST_CODE = sqlite3.SQLITE_LOCKED | (2 << 8)
+_TEST_EVENT_TYPE = "TEST_EVENT"
+_TEST_ACTOR = "durable-test"
+_TEST_SOURCE = "durable-test"
+_COUNT_COLUMN = "event_count"
 
 
 def _options(
@@ -92,6 +103,67 @@ def _count_rows(connection: sqlite3.Connection, table_name: str) -> int:
     row = connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _event_request(event_id: str) -> EventLogAppendRequest:
+    """构造测试用 EventLog append 请求。
+
+    :param event_id: 全局事件标识。
+    :returns: EventLog append 请求。
+    :raises ValueError: datetime 构造失败时由标准库抛出。
+    """
+
+    payload: JsonValue = {"event_id": event_id}
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-read-stale",
+        run_id="run-read-stale",
+        attempt_id=None,
+        execution_id=None,
+        event_type=_TEST_EVENT_TYPE,
+        occurred_at=datetime(2026, 6, 1, tzinfo=UTC),
+        actor=_TEST_ACTOR,
+        source=_TEST_SOURCE,
+        client_request_id=event_id,
+        idempotency_key=None,
+        policy_decision=None,
+        reason=None,
+        payload_json=payload,
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _append_event(transaction: HostTransaction, event_id: str) -> None:
+    """在当前 transaction 内追加测试 EventLog row。
+
+    :param transaction: Host durable transaction。
+    :param event_id: 全局事件标识。
+    :returns: ``None``。
+    :raises HostDurableError: EventLog append 失败时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    EventLogStore().append_event(transaction, _event_request(event_id))
+
+
+def _count_event_log_rows(transaction: HostTransaction) -> int:
+    """统计当前 transaction 可见的 EventLog row 数量。
+
+    :param transaction: Host durable transaction。
+    :returns: 当前可见 EventLog row 数量。
+    :raises AssertionError: SQLite 未返回 count row 时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    row = transaction.fetchone(
+        f"SELECT COUNT(*) AS {_COUNT_COLUMN} FROM {TABLE_EVENT_LOG}"
+    )
+    assert row is not None
+    count_value = row.get(_COUNT_COLUMN)
+    assert isinstance(count_value, int)
+    return count_value
 
 
 def test_successful_transaction_commits_then_runs_after_commit(
@@ -375,6 +447,67 @@ def test_read_busy_locked_retries_are_finite(tmp_path: Path) -> None:
 
         assert store.transaction_runner.run_read(operation) == "read-ok"
         assert attempts == [1, 2, 3]
+
+
+def test_read_transaction_keeps_stale_snapshot_until_commit(
+    tmp_path: Path,
+) -> None:
+    """同一 read transaction 内保持旧快照，新短读才能看到 fresh truth。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def append_initial_event(transaction: HostTransaction) -> None:
+            """写入 read snapshot 测试的初始 EventLog row。
+
+            :param transaction: Host durable transaction。
+            :returns: ``None``。
+            """
+
+            _append_event(transaction, "event-read-stale-initial")
+
+        store.transaction_runner.run_write(append_initial_event)
+        connection_b = store.connect()
+        try:
+            runner_b = HostTransactionRunner(
+                connection_b,
+                options.sqlite_policy,
+                payload_inline_threshold_bytes=(
+                    options.payload_policy.payload_inline_threshold_bytes
+                ),
+            )
+
+            def append_from_connection_b(transaction: HostTransaction) -> None:
+                """通过独立 connection B 写入已提交 EventLog row。
+
+                :param transaction: Host durable transaction。
+                :returns: ``None``。
+                """
+
+                _append_event(transaction, "event-read-stale-from-b")
+
+            def read_while_connection_b_commits(
+                transaction: HostTransaction,
+            ) -> tuple[int, int]:
+                """在 connection A 的同一 read transaction 中观察快照稳定性。
+
+                :param transaction: Host durable transaction。
+                :returns: connection B commit 前后的两次可见 EventLog 数量。
+                """
+
+                first_count = _count_event_log_rows(transaction)
+                runner_b.run_write(append_from_connection_b)
+                second_count = _count_event_log_rows(transaction)
+                return first_count, second_count
+
+            stale_counts = store.transaction_runner.run_read(
+                read_while_connection_b_commits
+            )
+            fresh_count = store.transaction_runner.run_read(_count_event_log_rows)
+            assert stale_counts == (1, 1)
+            assert fresh_count == 2
+        finally:
+            connection_b.close()
 
 
 @pytest.mark.parametrize(
