@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+import dayu.host.durable.schema as durable_schema
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostSchemaMismatchError
 from dayu.host.durable.options import (
@@ -16,6 +18,8 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.schema import (
     AUDIT_PROJECTION_TABLES,
+    HOST_DURABLE_DDL,
+    HOST_DURABLE_INDEXES,
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
     INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
@@ -64,6 +68,33 @@ from dayu.host.durable.schema import (
     TABLE_SQLITE_PAYLOADS,
     bootstrap_host_durable_store,
 )
+
+_CREATE_INDEX_NAME_PATTERN = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_]+)",
+    re.IGNORECASE,
+)
+"""从 Host durable DDL 中抽取 index 名称的测试正则。"""
+
+_CREATE_TABLE_NAME_PATTERN = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_]+)",
+    re.IGNORECASE,
+)
+"""从 Host durable DDL 中抽取 table 名称的测试正则。"""
+
+
+def _ddl_table_names(statements: tuple[str, ...]) -> frozenset[str]:
+    """从 DDL 语句中抽取 ``CREATE TABLE`` 表名集合。
+
+    :param statements: DDL 语句序列。
+    :returns: DDL 中声明的 table 名称集合。
+    :raises AssertionError: 本 helper 不主动抛出；调用方负责断言集合语义。
+    """
+
+    return frozenset(
+        match.group(1)
+        for statement in statements
+        for match in _CREATE_TABLE_NAME_PATTERN.finditer(statement)
+    )
 
 
 def _options(
@@ -137,6 +168,40 @@ def _index_exists(connection: sqlite3.Connection, index_name: str) -> bool:
         (index_name,),
     ).fetchone()
     return row is not None
+
+
+def _drop_table(db_path: Path, table_name: str) -> None:
+    """从测试 DB 中删除指定 table。
+
+    :param db_path: SQLite DB 文件路径。
+    :param table_name: 目标 table 名称。
+    :returns: ``None``。
+    :raises sqlite3.Error: 打开 DB 或执行 DDL 失败时由 SQLite 抛出。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(f"DROP TABLE {table_name}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _drop_index(db_path: Path, index_name: str) -> None:
+    """从测试 DB 中删除指定 index。
+
+    :param db_path: SQLite DB 文件路径。
+    :param index_name: 目标 index 名称。
+    :returns: ``None``。
+    :raises sqlite3.Error: 打开 DB 或执行 DDL 失败时由 SQLite 抛出。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(f"DROP INDEX {index_name}")
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> None:
@@ -276,6 +341,173 @@ def test_schema_mismatch_raises_structured_error(tmp_path: Path) -> None:
             bootstrap_host_durable_store(connection)
     finally:
         connection.close()
+
+
+def test_fresh_bootstrap_rolls_back_when_ddl_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fresh DDL 中途失败时不留下 partial user tables 或 current version。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: rollback 后残留用户表或 current version 时抛出。
+    """
+
+    db_path = tmp_path / "durable.sqlite3"
+    broken_ddl = (
+        HOST_DURABLE_DDL[0],
+        "CREATE TABLE broken_schema_probe (",
+        HOST_DURABLE_DDL[1],
+    )
+    monkeypatch.setattr(durable_schema, "HOST_DURABLE_DDL", broken_ddl)
+
+    connection = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        with pytest.raises(sqlite3.Error):
+            bootstrap_host_durable_store(connection)
+        assert _table_names(connection) == frozenset()
+        assert _pragma_int(connection, "PRAGMA user_version") == 0
+    finally:
+        connection.close()
+
+
+def test_current_schema_missing_table_opener_raises_without_repair(
+    tmp_path: Path,
+) -> None:
+    """current user_version 缺 required table 时 opener fail closed 且不建表。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: opener 未抛错或静默创建缺失表时抛出。
+    """
+
+    options = _options(tmp_path)
+    options.db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(options.db_path)
+    try:
+        connection.execute(f"PRAGMA user_version={HOST_SCHEMA_VERSION}")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        HostSchemaMismatchError,
+        match=f"missing required table: {TABLE_EVENT_LOG}",
+    ):
+        open_host_durable_store(options)
+
+    verify_connection = sqlite3.connect(options.db_path)
+    try:
+        assert TABLE_EVENT_LOG not in _table_names(verify_connection)
+    finally:
+        verify_connection.close()
+
+
+def test_current_schema_missing_index_opener_raises_without_repair(
+    tmp_path: Path,
+) -> None:
+    """current user_version 缺 required index 时 opener fail closed 且不重建索引。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: opener 未抛错或静默重建缺失索引时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options):
+        pass
+    _drop_index(options.db_path, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
+
+    with pytest.raises(
+        HostSchemaMismatchError,
+        match=f"missing required index: {INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE}",
+    ):
+        open_host_durable_store(options)
+
+    verify_connection = sqlite3.connect(options.db_path)
+    try:
+        assert not _index_exists(verify_connection, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
+    finally:
+        verify_connection.close()
+
+
+def test_secondary_connection_missing_table_raises_without_repair(
+    tmp_path: Path,
+) -> None:
+    """store.connect secondary path 缺 required table 时只校验不 bootstrap。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: secondary path 未抛错或静默重建缺失表时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _drop_table(options.db_path, TABLE_HOST_MEMORY_DIAGNOSTICS)
+        with pytest.raises(
+            HostSchemaMismatchError,
+            match=f"missing required table: {TABLE_HOST_MEMORY_DIAGNOSTICS}",
+        ):
+            store.connect()
+
+    verify_connection = sqlite3.connect(options.db_path)
+    try:
+        assert TABLE_HOST_MEMORY_DIAGNOSTICS not in _table_names(verify_connection)
+    finally:
+        verify_connection.close()
+
+
+def test_secondary_connection_missing_index_raises_without_repair(
+    tmp_path: Path,
+) -> None:
+    """store.connect secondary path 缺 required index 时只校验不 bootstrap。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: secondary path 未抛错或静默重建缺失索引时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _drop_index(options.db_path, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
+        with pytest.raises(
+            HostSchemaMismatchError,
+            match=f"missing required index: {INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE}",
+        ):
+            store.connect()
+
+    verify_connection = sqlite3.connect(options.db_path)
+    try:
+        assert not _index_exists(verify_connection, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
+    finally:
+        verify_connection.close()
+
+
+def test_host_durable_indexes_match_create_index_ddl() -> None:
+    """HOST_DURABLE_INDEXES 与 HOST_DURABLE_DDL 中的 index DDL 保持同源。
+
+    :returns: ``None``。
+    :raises AssertionError: required index 常量集合与 DDL 中 index 名称不一致时抛出。
+    """
+
+    ddl_index_names = {
+        match.group(1)
+        for statement in HOST_DURABLE_DDL
+        for match in _CREATE_INDEX_NAME_PATTERN.finditer(statement)
+    }
+    assert ddl_index_names == set(HOST_DURABLE_INDEXES)
+
+
+def test_host_durable_tables_match_create_table_ddl() -> None:
+    """HOST_DURABLE_TABLES 与 HOST_DURABLE_DDL 中的 table DDL 保持同源。
+
+    :returns: ``None``。
+    :raises AssertionError: required table 常量集合与 DDL 中 table 名称不一致时抛出。
+    """
+
+    assert _ddl_table_names(HOST_DURABLE_DDL) == set(HOST_DURABLE_TABLES)
 
 
 def test_host_schema_version_is_active_run_check_version() -> None:

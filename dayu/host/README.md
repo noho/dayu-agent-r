@@ -288,7 +288,13 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 - 低层 command handle factory 与 command handle options。
 - 内部新 Run admission primitive 和 `start_run`。
 - run-level `stream_run_events`。
-- durable store、transaction runner、schema、state row codec、payload table helper；schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；SQLite 连接启用 WAL 与 auto-checkpoint；store close 会拒绝活跃 transaction，避免 SQLite 隐式 rollback 未提交写入。
+- durable foundation：
+  - durable store、transaction runner、schema、state row codec、payload table helper。
+  - schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；主连接与 secondary durable connections 都会执行完整当前 schema validation。
+  - SQLite 连接启用 WAL 与 auto-checkpoint。
+  - transaction runner 的 read transaction 使用 SQLite snapshot 语义，新的短读事务读取最新 committed truth。
+  - 内部 WAL checkpoint primitive 只服务显式 diagnostic / test entry，不属于 public maintenance API，也不作为 EventLog 或状态正确性的前置条件。
+  - store close 会拒绝活跃 transaction，避免 SQLite 隐式 rollback 未提交写入。
 - dispatch scheduler、ToolRuntime factory、projection runner、memory repair runner。
 - recovery scanner、orphan proof classifier、Host instance liveness helper 与 startup recovery diagnostic。
 - `HostLocalExecutionOptions`、low-level local execution composition helper 与 run input provider internals。
