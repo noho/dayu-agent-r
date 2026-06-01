@@ -94,9 +94,20 @@ from dayu.host.compaction import (
     EvidenceBackedFactKind,
     MinimumPreserveReason,
 )
+from dayu.host.compact_material import RunInputMaterialBlock, run_input_material_block
+from dayu.host.context_fallback import (
+    ActiveRecentWindowFallback,
+    build_recent_window_fallback_selection,
+    estimate_recent_window_fallback_budget,
+)
+from dayu.host.context_policy import (
+    ContextCompactionTriggerSource,
+    context_budget_policy_from_threshold_tokens,
+)
 from dayu.host.compact_payload import preserved_fact_refs_summary
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
+    CurrentRunFacts,
     DurableCurrentRunFactProvider,
     DurableMemorySnapshotProvider,
     MemoryProjectionRepairRequired,
@@ -104,6 +115,7 @@ from dayu.host.run_input import (
     NoToolExecutor,
     PolicySnapshot,
     ToolExecutionMode,
+    MemorySnapshotView,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -189,6 +201,53 @@ class _OpenCancellationToken:
         """
 
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticContextFallbackProvider:
+    """测试用静态 fallback provider。"""
+
+    fallback: ActiveRecentWindowFallback | None
+
+    def load_context_fallback(
+        self,
+        *,
+        run_id: str,
+        run_started_event_sequence: int,
+        current_input_ref: str,
+    ) -> ActiveRecentWindowFallback | None:
+        """返回预置 fallback view。
+
+        :param run_id: 当前 Run id。
+        :param run_started_event_sequence: 当前 ``RUN_STARTED`` event sequence。
+        :param current_input_ref: 当前输入 ref。
+        :returns: 预置 fallback view。
+        """
+
+        del run_id, run_started_event_sequence, current_input_ref
+        return self.fallback
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticMemorySnapshotProvider:
+    """测试用静态 memory snapshot provider。"""
+
+    view: MemorySnapshotView
+
+    def load_memory_snapshot(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+    ) -> MemorySnapshotView:
+        """返回预置 memory view。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: 预置 memory view。
+        """
+
+        del snapshot, current_facts
+        return self.view
 
 
 def test_current_user_message_comes_from_durable_user_input(
@@ -673,6 +732,209 @@ def test_run_input_builder_exposes_shared_material_block_source(
         assert blocks[0].kind is CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR
         assert blocks[0].text == "current prompt"
         assert blocks[0].canonical_source_refs == ("event-current-input",)
+
+
+def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None:
+    """fallback selection 稳定保留 floor，且不会追加超过 hard budget 的下一块。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=120,
+        soft_threshold_tokens=70,
+        hard_threshold_tokens=90,
+        policy_ref="test-fallback-policy",
+    )
+    blocks = (
+        _material_block(
+            "stable:goals",
+            CompactMaterialSection.STABLE_INPUT,
+            CompactMaterialBlockKind.PINNED_STATE,
+            "stable goal",
+            event_sequence=None,
+        ),
+        _material_block(
+            "history:old",
+            CompactMaterialSection.HISTORY_INPUT,
+            CompactMaterialBlockKind.RAW_USER_TURN,
+            "older raw turn",
+            event_sequence=1,
+        ),
+        _material_block(
+            "history:blocked",
+            CompactMaterialSection.HISTORY_INPUT,
+            CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            "x" * 180,
+            event_sequence=3,
+        ),
+        _material_block(
+            "history:recent",
+            CompactMaterialSection.HISTORY_INPUT,
+            CompactMaterialBlockKind.RAW_USER_TURN,
+            "recent raw turn",
+            event_sequence=4,
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current prompt",
+            event_sequence=5,
+            source_ref="event-current",
+        ),
+    )
+
+    first = build_recent_window_fallback_selection(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=5,
+        recent_raw_turns_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+    second = build_recent_window_fallback_selection(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=5,
+        recent_raw_turns_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+    budget = estimate_recent_window_fallback_budget(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        selection_blocks=first.selected_blocks,
+        current_input_ref="event-current",
+    )
+
+    assert first.selected_block_ids == second.selected_block_ids
+    assert first.digest == second.digest
+    assert "history:recent" in first.selected_block_ids
+    assert "history:old" not in first.selected_block_ids
+    assert first.blocked_next_block_id == "history:blocked"
+    assert first.to_window_payload()["selected_raw_turn_count"] == 1
+    assert budget.hard_budget_passed is True
+
+
+def test_recent_window_fallback_estimate_covers_normal_empty_stable_and_over_budget() -> None:
+    """fallback estimate 覆盖 normal、无 stable input 与 over-budget。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=90,
+        soft_threshold_tokens=50,
+        hard_threshold_tokens=70,
+        policy_ref="test-fallback-estimate-policy",
+    )
+    current = _material_block(
+        "current:event-current",
+        CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        "current prompt",
+        event_sequence=2,
+        source_ref="event-current",
+    )
+    normal = estimate_recent_window_fallback_budget(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        selection_blocks=(
+            _material_block(
+                "stable:goals",
+                CompactMaterialSection.STABLE_INPUT,
+                CompactMaterialBlockKind.PINNED_STATE,
+                "stable goal",
+                event_sequence=None,
+            ),
+            current,
+        ),
+        current_input_ref="event-current",
+    )
+    empty_stable = estimate_recent_window_fallback_budget(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        selection_blocks=(current,),
+        current_input_ref="event-current",
+    )
+    over_budget = estimate_recent_window_fallback_budget(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        selection_blocks=(
+            _material_block(
+                "current:event-current",
+                CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                "x" * 210,
+                event_sequence=2,
+                source_ref="event-current",
+            ),
+        ),
+        current_input_ref="event-current",
+    )
+
+    assert normal.hard_budget_passed is True
+    assert empty_stable.hard_budget_passed is True
+    assert over_budget.hard_budget_passed is False
+    assert over_budget.to_payload()["status"] == "over_hard_budget"
+
+
+def test_fallback_provider_renders_only_selected_window_and_current_input(
+    tmp_path: Path,
+) -> None:
+    """RunInputBuilder fallback view 只渲染 selected recent window 与当前输入。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        fallback = ActiveRecentWindowFallback(
+            selected_block_ids=("memory:2", "current:event-current-input"),
+            current_input_ref="event-current-input",
+            fallback_input_digest=_DIGEST_A,
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+            memory_snapshot_provider=_StaticMemorySnapshotProvider(
+                MemorySnapshotView(
+                    messages=(
+                        UserMessage(
+                            role=AgentMessageRole.USER,
+                            content="dropped older raw turn",
+                        ),
+                        AssistantMessage(
+                            role=AgentMessageRole.ASSISTANT,
+                            content="dropped older assistant turn",
+                            reasoning_content=None,
+                            tool_calls=(),
+                        ),
+                        UserMessage(
+                            role=AgentMessageRole.USER,
+                            content="selected recent raw turn",
+                        ),
+                    ),
+                    memory_snapshot_cursor=None,
+                    policy_digest=None,
+                    diagnostics=(),
+                )
+            ),
+            context_fallback_provider=_StaticContextFallbackProvider(fallback),
+        )
+
+        request = builder.build(_attempt_snapshot(seeded))
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert "selected recent raw turn" in contents
+        assert "current prompt" in contents
+        assert "dropped older raw turn" not in contents
+        assert "dropped older assistant turn" not in contents
 
 
 def test_covered_memory_snapshot_filters_current_user_input(
@@ -1425,6 +1687,36 @@ def _build_request_with_memory(
         memory_snapshot_provider=provider,
     )
     return builder.build(_attempt_snapshot(seeded))
+
+
+def _material_block(
+    block_id: str,
+    section: CompactMaterialSection,
+    kind: CompactMaterialBlockKind,
+    text: str,
+    *,
+    event_sequence: int | None,
+    source_ref: str | None = None,
+) -> RunInputMaterialBlock:
+    """构造测试用 material block。
+
+    :param block_id: block id。
+    :param section: material section。
+    :param kind: material kind。
+    :param text: block 文本。
+    :param event_sequence: event sequence。
+    :param source_ref: canonical source ref；不传时使用 block id。
+    :returns: RunInputMaterialBlock。
+    """
+
+    return run_input_material_block(
+        block_id=block_id,
+        section=section,
+        kind=kind,
+        text=text,
+        canonical_source_refs=(block_id if source_ref is None else source_ref,),
+        event_sequence=event_sequence,
+    )
 
 
 def _required_memory_cursor(

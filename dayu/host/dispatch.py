@@ -46,7 +46,7 @@ from dayu.host.durable.event_log import (
     EventPayloadTextEqualsFilter,
     EventLogStore,
 )
-from dayu.host.durable.errors import HostTransactionRetryExhaustedError
+from dayu.host.durable.errors import HostDurableError, HostTransactionRetryExhaustedError
 from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
@@ -157,6 +157,19 @@ from dayu.host.context_budget import (
     decide_context_budget,
     estimate_context_budget,
 )
+from dayu.host.context_fallback import (
+    FALLBACK_ACTION_DISPATCH,
+    FALLBACK_ACTION_FAIL_CLOSED,
+    FALLBACK_POLICY_DECISION_RECENT_WINDOW,
+    FALLBACK_POLICY_DECISION_SELECTION_FAILED,
+    EventLogContextFallbackProvider,
+    RecentWindowFallbackSelection,
+    build_recent_window_fallback_selection,
+    build_selection_failure_budget_payload,
+    build_selection_failure_window_payload,
+    estimate_recent_window_fallback_budget,
+    fallback_window_digest,
+)
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
@@ -167,7 +180,7 @@ from dayu.host.context_events import (
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
 )
-from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.context_policy import ContextBudgetPolicy, ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
@@ -215,6 +228,7 @@ _COMPACTION_CANCEL_REASON_INPUT_CHANGED = "run_input_event_sequence_changed"
 _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
 _COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
+_FALLBACK_ACTION_NOT_APPLICABLE = "not_applicable"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
@@ -331,6 +345,18 @@ class _GovernanceStageResult:
     pending_dispatch: PendingDispatchRecord | None
     compact_accepted: _GovernanceCompactAccepted | None
     compact_pending: _GovernanceCompactPending | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProactiveCompactionExecutionResult:
+    """proactive compaction 事务外执行后的 Host 后续动作。
+
+    :param compacted_event_sequence: accepted compact event sequence。
+    :param pending_dispatch: fallback dispatch 已启动时的 pending dispatch。
+    """
+
+    compacted_event_sequence: int | None
+    pending_dispatch: PendingDispatchRecord | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -963,7 +989,7 @@ class HostDispatchScheduler:
                     estimate.hard_threshold_tokens,
                     policy.policy_ref,
                 )
-                self._append_compaction_failed_event(
+                fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
                     transaction,
                     run=run,
                     estimate=estimate,
@@ -976,16 +1002,19 @@ class HostDispatchScheduler:
                     attempt_count=0,
                     retry_repair_budget_exhausted=False,
                 )
-                return _GovernanceStageResult(
-                    pending_dispatch=self._fail_unstarted_in_transaction(
-                        transaction,
-                        run,
-                        reason=_GOVERNANCE_FAILURE_REASON,
-                        error_code="context_hard_threshold_before_dispatch",
-                        message="Context estimate exceeds hard threshold before dispatch",
-                    ),
-                    compact_accepted=None,
+                if fallback_dispatch is not None:
+                    return _GovernanceStageResult(
+                        pending_dispatch=fallback_dispatch,
+                        compact_accepted=None,
+                    )
+                self._fail_unstarted_in_transaction(
+                    transaction,
+                    run,
+                    reason=_GOVERNANCE_FAILURE_REASON,
+                    error_code="context_hard_threshold_before_dispatch",
+                    message="Context estimate exceeds hard threshold before dispatch",
                 )
+                return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
             try:
                 compact_count = self._committed_proactive_compact_count(transaction, run)
             except Exception:
@@ -1054,26 +1083,25 @@ class HostDispatchScheduler:
                     ),
                     compact_accepted=None,
                 )
-            compact_pending = self._prepare_compact_before_dispatch(
+            prepared = self._prepare_compact_before_dispatch(
                 transaction,
                 run=run,
                 display_text=display_text,
                 estimate=estimate,
                 decision=decision,
             )
-            if compact_pending is None:
-                return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
-            return _GovernanceStageResult(
-                pending_dispatch=None,
-                compact_accepted=None,
-                compact_pending=compact_pending,
-            )
+            return prepared
 
         stage = self._transaction_runner.run_write(_operation)
         if stage.compact_pending is None:
             return stage
-        compacted_sequence = await self._execute_proactive_compaction(stage.compact_pending)
-        if compacted_sequence is None:
+        compacted = await self._execute_proactive_compaction(stage.compact_pending)
+        if compacted.pending_dispatch is not None:
+            return _GovernanceStageResult(
+                pending_dispatch=compacted.pending_dispatch,
+                compact_accepted=None,
+            )
+        if compacted.compacted_event_sequence is None:
             return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
         pending = stage.compact_pending
         _LOGGER.log(
@@ -1081,7 +1109,7 @@ class HostDispatchScheduler:
             "dispatch.governance.compact_accepted session_id=%s run_id=%s " "compacted_event_sequence=%s",
             pending.session_id,
             pending.run_id,
-            compacted_sequence,
+            compacted.compacted_event_sequence,
         )
         return _GovernanceStageResult(
             pending_dispatch=None,
@@ -1089,21 +1117,25 @@ class HostDispatchScheduler:
                 run_id=pending.run_id,
                 session_id=pending.session_id,
                 expected_status=pending.expected_status,
-                compacted_event_sequence=compacted_sequence,
+                compacted_event_sequence=compacted.compacted_event_sequence,
             ),
         )
 
-    async def _execute_proactive_compaction(self, pending: _GovernanceCompactPending) -> int | None:
+    async def _execute_proactive_compaction(
+        self, pending: _GovernanceCompactPending
+    ) -> _ProactiveCompactionExecutionResult:
         """在事务外执行 proactive compact，并在新事务内写入结果。
 
         :param pending: 已写 request fact 的 compact 摘要。
-        :returns: accepted ``CONTEXT_COMPACTED`` sequence；失败或 stale 时为
-            ``None``。
+        :returns: accepted compact sequence 或 fallback pending dispatch。
         """
 
         compactor = self._local_execution.context_compactor
         if compactor is None:
-            return None
+            return _ProactiveCompactionExecutionResult(
+                compacted_event_sequence=None,
+                pending_dispatch=None,
+            )
         attempts = (
             self._local_execution.context_budget_policy.max_compaction_attempts_per_operation
             if self._local_execution.context_budget_policy is not None
@@ -1121,7 +1153,7 @@ class HostDispatchScheduler:
             ),
         )
 
-        def _operation(transaction: HostTransaction) -> int | None:
+        def _operation(transaction: HostTransaction) -> _ProactiveCompactionExecutionResult:
             run = read_run_by_id(transaction, pending.run_id)
             if (
                 run is None
@@ -1140,7 +1172,10 @@ class HostDispatchScheduler:
                         retry_repair_budget_exhausted=False,
                         budget_after_attempted_compact=(result.budget_after_attempted_compact),
                     )
-                return None
+                return _ProactiveCompactionExecutionResult(
+                    compacted_event_sequence=None,
+                    pending_dispatch=None,
+                )
             for rejected in result.rejected_attempts:
                 self._append_compaction_attempt_rejected_event(
                     transaction,
@@ -1149,7 +1184,7 @@ class HostDispatchScheduler:
                     rejected=rejected,
                 )
             if result.accepted_candidate is None or result.quality_result is None or result.failure_reason is not None:
-                self._append_compaction_failed_event(
+                fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
                     transaction,
                     run=run,
                     estimate=pending.estimate,
@@ -1162,6 +1197,11 @@ class HostDispatchScheduler:
                     ),
                     budget_after_attempted_compact=(result.budget_after_attempted_compact),
                 )
+                if fallback_dispatch is not None:
+                    return _ProactiveCompactionExecutionResult(
+                        compacted_event_sequence=None,
+                        pending_dispatch=fallback_dispatch,
+                    )
                 self._fail_unstarted_in_transaction(
                     transaction,
                     run,
@@ -1169,8 +1209,11 @@ class HostDispatchScheduler:
                     error_code="context_compaction_failed",
                     message="Context compaction failed before dispatch",
                 )
-                return None
-            return self._append_compacted_event(
+                return _ProactiveCompactionExecutionResult(
+                    compacted_event_sequence=None,
+                    pending_dispatch=None,
+                )
+            compacted_sequence = self._append_compacted_event(
                 transaction,
                 run=run,
                 estimate=pending.estimate,
@@ -1178,6 +1221,10 @@ class HostDispatchScheduler:
                 request=pending.request,
                 candidate=result.accepted_candidate,
                 quality=result.quality_result,
+            )
+            return _ProactiveCompactionExecutionResult(
+                compacted_event_sequence=compacted_sequence,
+                pending_dispatch=None,
             )
 
         return self._transaction_runner.run_write(_operation)
@@ -1326,7 +1373,7 @@ class HostDispatchScheduler:
         display_text: str,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
-    ) -> _GovernanceCompactPending | None:
+    ) -> _GovernanceStageResult:
         """在当前事务内写入 proactive compact request 并冻结请求。
 
         :param transaction: 当前 Host transaction。
@@ -1334,7 +1381,7 @@ class HostDispatchScheduler:
         :param display_text: 当前输入展示文本。
         :param estimate: compact 前预算估算。
         :param decision: 触发 compact 的预算决策。
-        :returns: 待事务外执行的 compact；失败路径返回 ``None``。
+        :returns: 待事务外执行的 compact 或 fallback dispatch / fail closed 结果。
         """
 
         compactor = self._local_execution.context_compactor
@@ -1367,7 +1414,7 @@ class HostDispatchScheduler:
                 compactor is not None,
                 artifact_root is not None,
             )
-            self._append_compaction_failed_event(
+            fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
                 transaction,
                 run=run,
                 estimate=estimate,
@@ -1377,6 +1424,11 @@ class HostDispatchScheduler:
                 attempt_count=0,
                 retry_repair_budget_exhausted=False,
             )
+            if fallback_dispatch is not None:
+                return _GovernanceStageResult(
+                    pending_dispatch=fallback_dispatch,
+                    compact_accepted=None,
+                )
             self._fail_unstarted_in_transaction(
                 transaction,
                 run,
@@ -1384,7 +1436,7 @@ class HostDispatchScheduler:
                 error_code="context_compactor_missing",
                 message="Context compactor or artifact store is not configured",
             )
-            return None
+            return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
         material_blocks = _proactive_material_blocks(
             transaction,
             self._event_log_store,
@@ -1430,15 +1482,19 @@ class HostDispatchScheduler:
             existing_episode_summary_refs=(),
             budget_before_compact=estimate,
         )
-        return _GovernanceCompactPending(
-            run_id=run.run_id,
-            session_id=run.session_id,
-            expected_status=run.status,
-            expected_input_event_sequence=run.input_event_sequence,
-            request=request,
-            operation_id=requested.event_id,
-            estimate=estimate,
-            decision=decision,
+        return _GovernanceStageResult(
+            pending_dispatch=None,
+            compact_accepted=None,
+            compact_pending=_GovernanceCompactPending(
+                run_id=run.run_id,
+                session_id=run.session_id,
+                expected_status=run.status,
+                expected_input_event_sequence=run.input_event_sequence,
+                request=request,
+                operation_id=requested.event_id,
+                estimate=estimate,
+                decision=decision,
+            ),
         )
 
     def _append_compacted_event(
@@ -1573,6 +1629,171 @@ class HostDispatchScheduler:
             ),
         ).row
 
+    def _append_compaction_failed_with_proactive_fallback(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        estimate: BudgetEstimate,
+        decision: ContextBudgetDecision,
+        operation_id: str,
+        failure_reason: str,
+        attempt_count: int,
+        retry_repair_budget_exhausted: bool,
+        budget_after_attempted_compact: int | None = None,
+    ) -> PendingDispatchRecord | None:
+        """写入 proactive failed event，并按 recent-window fallback 决定是否启动。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 目标 Run。
+        :param estimate: compact 前预算估算。
+        :param decision: 触发 compact 的预算决策。
+        :param operation_id: compact operation id。
+        :param failure_reason: compact failure reason。
+        :param attempt_count: operation 内已拒绝 proposal attempt 数。
+        :param retry_repair_budget_exhausted: retry / repair 预算是否耗尽。
+        :param budget_after_attempted_compact: compact 尝试后预算；未知为 ``None``。
+        :returns: fallback 预算通过时返回 pending dispatch；否则返回 ``None``。
+        """
+
+        policy = self._local_execution.context_budget_policy
+        if policy is None:
+            self._append_compaction_failed_event(
+                transaction,
+                run=run,
+                estimate=estimate,
+                decision=decision,
+                operation_id=operation_id,
+                failure_reason=failure_reason,
+                attempt_count=attempt_count,
+                retry_repair_budget_exhausted=retry_repair_budget_exhausted,
+                budget_after_attempted_compact=budget_after_attempted_compact,
+            )
+            return None
+        try:
+            selection = self._build_proactive_fallback_selection(
+                transaction,
+                run=run,
+                policy=policy,
+            )
+            budget = estimate_recent_window_fallback_budget(
+                policy=policy,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                selection_blocks=selection.selected_blocks,
+                current_input_ref=run.input_event_id,
+            )
+        except Exception as exc:
+            _LOGGER.error(
+                "dispatch.compact.fallback_selection_failed session_id=%s "
+                "run_id=%s failure_reason=%s",
+                run.session_id,
+                run.run_id,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            window = build_selection_failure_window_payload(
+                current_input_ref=run.input_event_id,
+                trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+                policy_ref=policy.policy_ref,
+                input_cursor=run.input_event_sequence,
+                failure_reason=type(exc).__name__,
+            )
+            self._append_compaction_failed_event(
+                transaction,
+                run=run,
+                estimate=estimate,
+                decision=decision,
+                operation_id=operation_id,
+                failure_reason=failure_reason,
+                attempt_count=attempt_count,
+                retry_repair_budget_exhausted=retry_repair_budget_exhausted,
+                budget_after_attempted_compact=budget_after_attempted_compact,
+                fallback_policy_decision=FALLBACK_POLICY_DECISION_SELECTION_FAILED,
+                fallback_input_window=window,
+                fallback_input_digest=fallback_window_digest(window),
+                fallback_budget_result=build_selection_failure_budget_payload(
+                    policy_ref=policy.policy_ref,
+                ),
+                fallback_action=FALLBACK_ACTION_FAIL_CLOSED,
+            )
+            return None
+        fallback_action = (
+            FALLBACK_ACTION_DISPATCH
+            if budget.hard_budget_passed
+            else FALLBACK_ACTION_FAIL_CLOSED
+        )
+        self._append_compaction_failed_event(
+            transaction,
+            run=run,
+            estimate=estimate,
+            decision=decision,
+            operation_id=operation_id,
+            failure_reason=failure_reason,
+            attempt_count=attempt_count,
+            retry_repair_budget_exhausted=retry_repair_budget_exhausted,
+            budget_after_attempted_compact=budget_after_attempted_compact,
+            fallback_policy_decision=FALLBACK_POLICY_DECISION_RECENT_WINDOW,
+            fallback_input_window=selection.to_window_payload(),
+            fallback_input_digest=selection.digest,
+            fallback_budget_result=budget.to_payload(),
+            fallback_action=fallback_action,
+        )
+        if fallback_action != FALLBACK_ACTION_DISPATCH:
+            return None
+        return self._start_governed_in_transaction(transaction, run)
+
+    def _build_proactive_fallback_selection(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        policy: ContextBudgetPolicy,
+    ) -> RecentWindowFallbackSelection:
+        """构造 proactive fallback selection。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 目标 Run。
+        :param policy: context budget policy。
+        :returns: recent-window fallback selection。
+        :raises HostDurableError: input event 缺失或 payload 损坏时抛出。
+        :raises ValueError: material view 无法选择 current anchor 时抛出。
+        """
+
+        input_event = self._event_log_store.read_event_by_id(
+            transaction,
+            run.input_event_id,
+        )
+        if input_event is None:
+            raise HostDurableError("fallback current input event is missing")
+        display_text = _display_text_from_input_event(transaction, input_event)
+        material_blocks = _proactive_material_blocks(
+            transaction,
+            self._event_log_store,
+            run=run,
+            display_text=display_text,
+            represented_evidence_refs=_proactive_represented_evidence_refs(
+                transaction,
+                self._event_log_store,
+                run=run,
+                policy_digest=digest_memory_projection_policy(
+                    self._local_execution.memory_projection_policy
+                ),
+            ),
+        )
+        return build_recent_window_fallback_selection(
+            policy=policy,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            material_blocks=material_blocks,
+            current_input_ref=run.input_event_id,
+            input_cursor=run.input_event_sequence,
+            recent_raw_turns_floor=(
+                self._local_execution.memory_projection_policy.recent_raw_turns_floor
+            ),
+            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        )
+
     def _append_compaction_failed_event(
         self,
         transaction: HostTransaction,
@@ -1585,6 +1806,11 @@ class HostDispatchScheduler:
         attempt_count: int,
         retry_repair_budget_exhausted: bool,
         budget_after_attempted_compact: int | None = None,
+        fallback_policy_decision: str | None = None,
+        fallback_input_window: Mapping[str, JsonValue] | None = None,
+        fallback_input_digest: str | None = None,
+        fallback_budget_result: Mapping[str, JsonValue] | None = None,
+        fallback_action: str = _FALLBACK_ACTION_NOT_APPLICABLE,
     ) -> None:
         """追加 ``CONTEXT_COMPACTION_FAILED``。
 
@@ -1597,6 +1823,11 @@ class HostDispatchScheduler:
         :param attempt_count: operation 内已拒绝 proposal attempt 数。
         :param retry_repair_budget_exhausted: semantic retry / repair 预算是否耗尽。
         :param budget_after_attempted_compact: compact 后预算；未执行时为 ``None``。
+        :param fallback_policy_decision: fallback policy decision。
+        :param fallback_input_window: fallback input window 诊断。
+        :param fallback_input_digest: fallback input digest。
+        :param fallback_budget_result: fallback budget 诊断。
+        :param fallback_action: fallback 动作。
         :returns: ``None``。
         """
 
@@ -1628,6 +1859,11 @@ class HostDispatchScheduler:
                     ),
                     diagnostic_refs=(estimate.estimator_digest,),
                     budget_after_attempted_compact=(budget_after_attempted_compact),
+                    fallback_policy_decision=fallback_policy_decision,
+                    fallback_input_window=fallback_input_window,
+                    fallback_input_digest=fallback_input_digest,
+                    fallback_budget_result=fallback_budget_result,
+                    fallback_action=fallback_action,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -2415,12 +2651,14 @@ class HostDispatchScheduler:
             self._local_execution.memory_projection_policy,
         )
         compact_provider = DurableCompactArtifactProvider(self._transaction_runner)
+        fallback_provider = EventLogContextFallbackProvider(self._transaction_runner)
         if tooling_options is None or not policy_snapshot.agent_policy.allow_tool_calls:
             return create_no_tool_run_input_builder(
                 transaction_runner=self._transaction_runner,
                 policy_snapshot=policy_snapshot,
                 memory_snapshot_provider=memory_provider,
                 compact_artifact_provider=compact_provider,
+                context_fallback_provider=fallback_provider,
                 tool_execution_mode=(
                     ToolExecutionMode.NO_TOOL_REPLAY
                     if self._is_replay_run(snapshot.run_id)
@@ -2463,6 +2701,7 @@ class HostDispatchScheduler:
             tool_runtime_handle=tool_runtime,
             memory_snapshot_provider=memory_provider,
             compact_artifact_provider=compact_provider,
+            context_fallback_provider=fallback_provider,
         )
 
     def _is_replay_run(self, run_id: str) -> bool:

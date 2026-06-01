@@ -157,6 +157,7 @@ _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
 _LANE_NAME = "llm"
 _SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 120
+_HARD_THRESHOLD_PROMPT_CHAR_COUNT = 240
 _SOFT_CONTEXT_WINDOW_SIZE = 110
 _SOFT_RESERVED_OUTPUT_TOKENS = 10
 _SOFT_HARD_THRESHOLD_TOKENS = 80
@@ -3351,8 +3352,9 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
 async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
     tmp_path: Path,
 ) -> None:
-    """semantic proposal failure 写入 attempt rejected canonical facts。"""
+    """semantic proposal failure 写 rejected facts 后通过 fallback dispatch。"""
 
+    factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run(
             store,
@@ -3362,7 +3364,7 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
         scheduler = await _open_scheduler(
             tmp_path,
             store,
-            _FakeWorkerFactory(),
+            factory,
             context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=2,
             ),
@@ -3371,6 +3373,7 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
+            assert (await scheduler.drain_once()).dispatched == 1
 
             assert (
                 _event_count(
@@ -3396,12 +3399,13 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                 CONTEXT_COMPACTION_FAILED,
             )
             assert _event_payload(rejected)["operation_id"] == requested.event_id
-            assert_failed_payload_no_fallback(
-                _event_payload(failed),
-                expected_operation_id=requested.event_id,
-                expected_attempt_count=2,
-                expected_retry_repair_budget_exhausted=True,
-            )
+            payload = _event_payload(failed)
+            assert payload["operation_id"] == requested.event_id
+            assert payload["attempt_count"] == 2
+            assert payload["retry_repair_budget_exhausted"] is True
+            assert payload["fallback_action"] == "dispatch"
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert len(factory.accepted_requests) == 1
         finally:
             await scheduler.close()
 
@@ -3410,13 +3414,66 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
 async def test_pre_start_governance_compact_failure_is_attempt_free(
     tmp_path: Path,
 ) -> None:
-    """proactive compact 缺少 compactor/artifact store 时 fail closed 且零 Attempt。"""
+    """proactive compact 缺 compactor 后 fallback 预算通过会创建 Attempt。"""
 
+    factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run(
             store,
             run_id="run-compact-failure",
             display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            assert (await scheduler.drain_once()).dispatched == 1
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
+            event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
+            assert event_types.index(CONTEXT_COMPACTION_FAILED) < event_types.index("RUN_STARTED")
+            assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert len(factory.accepted_requests) == 1
+            requested = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_REQUESTED,
+            )
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            payload = _event_payload(failed)
+            assert payload["operation_id"] == requested.event_id
+            assert payload["fallback_action"] == "dispatch"
+            assert isinstance(payload["fallback_input_window"], Mapping)
+            assert payload["fallback_input_window"]["current_input_ref"] == (
+                f"event-input-{seeded.run_id}"
+            )
+            assert isinstance(payload["fallback_budget_result"], Mapping)
+            assert payload["fallback_budget_result"]["status"] == "within_hard_budget"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_fallback_budget_fail_closes_run(
+    tmp_path: Path,
+) -> None:
+    """fallback selected view 超过 hard budget 时 fail closed 且不创建 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-fallback-over-budget",
+            display_text=_hard_threshold_prompt(),
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -3428,30 +3485,17 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             await scheduler.run_queue_promotion(seeded.session_id)
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
-            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.FAILED)
-            assert _event_types_for_run(store.transaction_runner, seeded.run_id) == (
-                "USER_INPUT_ACCEPTED",
-                "RUN_ACCEPTED",
-                CONTEXT_COMPACTION_REQUESTED,
-                CONTEXT_COMPACTION_FAILED,
-                "RUN_FAILED",
-            )
-            requested = _latest_event_for_run(
-                store.transaction_runner,
-                seeded.run_id,
-                CONTEXT_COMPACTION_REQUESTED,
-            )
+            assert _run_status(store.transaction_runner, seeded.run_id) == RunStatus.FAILED
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
             failed = _latest_event_for_run(
                 store.transaction_runner,
                 seeded.run_id,
                 CONTEXT_COMPACTION_FAILED,
             )
-            assert_failed_payload_no_fallback(
-                _event_payload(failed),
-                expected_operation_id=requested.event_id,
-                expected_attempt_count=0,
-                expected_retry_repair_budget_exhausted=False,
-            )
+            payload = _event_payload(failed)
+            assert payload["fallback_action"] == "fail_closed"
+            assert isinstance(payload["fallback_budget_result"], Mapping)
+            assert payload["fallback_budget_result"]["status"] == "over_hard_budget"
         finally:
             await scheduler.close()
 
@@ -4097,6 +4141,15 @@ def _soft_threshold_prompt() -> str:
     """
 
     return "x" * _SOFT_THRESHOLD_PROMPT_CHAR_COUNT
+
+
+def _hard_threshold_prompt() -> str:
+    """返回触发 hard threshold 的测试 prompt。
+
+    :returns: 测试 prompt。
+    """
+
+    return "x" * _HARD_THRESHOLD_PROMPT_CHAR_COUNT
 
 
 def _append_proactive_compaction_requested(
