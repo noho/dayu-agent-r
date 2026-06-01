@@ -102,6 +102,7 @@ _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
+_EVENT_REASON_JSON_PATH = "$.reason"
 _TERMINAL_EVENT_TYPES = (
     _EVENT_TYPE_RUN_SUCCEEDED,
     _EVENT_TYPE_RUN_FAILED,
@@ -281,7 +282,8 @@ class DeterministicStressWorkerHandle:
     async def events(self) -> AsyncIterator[EngineEvent]:
         """按脚本行为产出 Engine event stream。
 
-        :returns: EngineEvent 异步迭代器。
+        :returns: EngineEvent 异步迭代器；``CLEAN_EOF`` 行为不产出事件，
+            由 Host scheduler 显式 closeout。
         :raises RuntimeError: 行为为 ``STREAM_EXCEPTION`` 时抛出。
         """
 
@@ -297,6 +299,8 @@ class DeterministicStressWorkerHandle:
             return
         if self._behavior is StressWorkerBehavior.STREAM_EXCEPTION:
             raise RuntimeError(_STREAM_EXCEPTION_MESSAGE)
+        if self._behavior is StressWorkerBehavior.CLEAN_EOF:
+            return
         return
 
     async def close(self) -> None:
@@ -1358,6 +1362,46 @@ def run_lost_event_count(root_path: pathlib.Path) -> int:
     """
 
     return recovery_event_type_count(root_path, _EVENT_TYPE_RUN_LOST)
+
+
+def run_failed_reason_for_run(root_path: pathlib.Path, run_id: str) -> str | None:
+    """读取指定 Run 的 ``RUN_FAILED`` reason。
+
+    本 helper 只服务 stress 测试对 scheduler failed closeout 的直接证明；
+    它读取 EventLog canonical fact 的 ``reason_json.reason``，不替代 public
+    Host API，也不暴露 scheduler private state。
+
+    :param root_path: pytest 临时根目录。
+    :param run_id: 目标 Run id。
+    :returns: 最近一条 ``RUN_FAILED`` 的 reason；不存在 reason 时返回
+        ``None``。
+    :raises ValueError: ``run_id`` 为空时抛出。
+    :raises TypeError: durable reason 不是文本时抛出。
+    """
+
+    if run_id.strip() == "":
+        raise ValueError("run_id must be non-empty")
+
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
+        row = connection.execute(
+            """
+            SELECT json_extract(reason_json, ?)
+            FROM event_log
+            WHERE run_id = ?
+              AND event_type = ?
+            ORDER BY event_sequence DESC
+            LIMIT 1
+            """,
+            (_EVENT_REASON_JSON_PATH, run_id, _EVENT_TYPE_RUN_FAILED),
+        ).fetchone()
+    if row is None:
+        return None
+    value = row[0]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("RUN_FAILED reason must be text")
+    return value
 
 
 def _terminal_kind_for_event_type(event_type: str) -> HostEventKind:

@@ -57,6 +57,7 @@ from tests.host.stress_support import (
     read_event_log_count,
     read_host_instances,
     read_session_terminal_sequences,
+    run_failed_reason_for_run,
     run_blocking_stress_owner_process,
     run_open_probe_for_stress,
     start_and_crash_owner_for_stress,
@@ -107,6 +108,7 @@ _SLICE4_WAIT_TIMEOUT_SECONDS = 20.0
 _SLICE4_CRASH_COUNT = 1
 _SLICE4_EXPECTED_RECOVERY_COUNT = 1
 _SLICE4_EXPECTED_LOST_COUNT = 1
+_CLEAN_EOF_FAILED_REASON = "stream_ended_without_terminal"
 _SLICE5_SCENARIO_NAME = "mixed-host-deterministic-fault-injection"
 _SLICE5_SCENARIO = HostStressScenario(
     session_count=3,
@@ -646,6 +648,8 @@ class Slice4SchedulerLivenessDiagnostics:
     :param stale_instance_count: stale Host instance 诊断数量。
     :param clean_close_recovery_delta: clean close 后 reopen 的 recovery 事件增量。
     :param clean_close_attempt_lost_delta: clean close 后 reopen 的 lost 事件增量。
+    :param clean_eof_run_id: clean EOF closeout 目标 Run id。
+    :param clean_eof_failed_reason: clean EOF Run 对应的 ``RUN_FAILED`` reason。
     :returns: 不适用；dataclass 初始化返回实例。
     :raises Exception: 本类型不主动抛出异常。
     """
@@ -663,6 +667,8 @@ class Slice4SchedulerLivenessDiagnostics:
     stale_instance_count: int
     clean_close_recovery_delta: int
     clean_close_attempt_lost_delta: int
+    clean_eof_run_id: str
+    clean_eof_failed_reason: str | None
 
     @property
     def terminal_duplicate_count(self) -> int:
@@ -751,6 +757,24 @@ class Slice4SchedulerLivenessDiagnostics:
         return self.run_lost_count == _SLICE4_EXPECTED_LOST_COUNT
 
     @property
+    def clean_eof_failed_closeout_ok(self) -> bool:
+        """返回 clean EOF scheduler failed closeout 是否符合预期。
+
+        :returns: clean EOF Run 的 public snapshot 为 ``FAILED``，且 durable
+            ``RUN_FAILED`` reason 为 stream EOF without terminal 时返回
+            ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            any(
+                snapshot.run_id == self.clean_eof_run_id and snapshot.status is RunStatus.FAILED
+                for snapshot in self.public_snapshots
+            )
+            and self.clean_eof_failed_reason == _CLEAN_EOF_FAILED_REASON
+        )
+
+    @property
     def failure_boundary(self) -> StressFailureBoundary | None:
         """返回 Slice 4 失败边界。
 
@@ -768,6 +792,8 @@ class Slice4SchedulerLivenessDiagnostics:
             return "scheduler_close"
         if not self.stream_exception_closeout_ok:
             return "scheduler"
+        if not self.clean_eof_failed_closeout_ok:
+            return "scheduler_close"
         if not self.terminal_dedupe_ok:
             return "durable"
         return None
@@ -1446,6 +1472,7 @@ async def test_scheduler_liveness_long_run_mixed_flow_stress(
     )
     run_ids: list[str] = [crashed.run_id]
     public_snapshots: tuple[RunSnapshot, ...] = ()
+    clean_eof_run_id = ""
     recovery_count_before_clean_reopen = 0
     attempt_lost_before_clean_reopen = 0
 
@@ -1522,6 +1549,14 @@ async def test_scheduler_liveness_long_run_mixed_flow_stress(
             StressWorkerBehavior.FAILED,
         )
         run_ids.append(failed_run_id)
+        clean_eof_run_id = await _submit_scripted_followup(
+            host,
+            factory,
+            sessions[3].session_id,
+            "wu-stress-s4-clean-eof",
+            StressWorkerBehavior.CLEAN_EOF,
+        )
+        run_ids.append(clean_eof_run_id)
         public_snapshots = await wait_all_runs_terminal(
             host,
             tuple(run_ids),
@@ -1564,6 +1599,8 @@ async def test_scheduler_liveness_long_run_mixed_flow_stress(
         stale_instance_count=sum(1 for item in host_instances if item.heartbeat_stale),
         clean_close_recovery_delta=recovery_count - recovery_count_before_clean_reopen,
         clean_close_attempt_lost_delta=attempt_lost_count - attempt_lost_before_clean_reopen,
+        clean_eof_run_id=clean_eof_run_id,
+        clean_eof_failed_reason=run_failed_reason_for_run(tmp_path, clean_eof_run_id),
     )
     watch_lag_max, watch_lag_samples = _slice2_watch_lag_placeholder()
     summary = HostStressSummary(
@@ -1587,6 +1624,7 @@ async def test_scheduler_liveness_long_run_mixed_flow_stress(
     assert RunStatus.FAILED in _snapshot_statuses(public_snapshots), summary_json
     assert RunStatus.CANCELLED in _snapshot_statuses(public_snapshots), summary_json
     assert RunStatus.LOST in _snapshot_statuses(public_snapshots), summary_json
+    assert diagnostics.clean_eof_failed_closeout_ok, summary_json
     assert diagnostics.failure_boundary is None, summary_json
     assert_summary_ok(summary)
 
