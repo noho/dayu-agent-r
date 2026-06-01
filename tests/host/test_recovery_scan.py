@@ -15,6 +15,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
+    AttemptStatus,
     EnsureSessionRequest,
     HostMetadataEntry,
     RunStatus,
@@ -38,6 +39,7 @@ from dayu.host.durable.run_transition import (
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
+    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
     TABLE_HOST_SESSIONS,
     TABLE_HOST_SESSION_SLOTS,
 )
@@ -48,6 +50,8 @@ from dayu.host.durable.state import (
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
+    read_attempt_by_id,
+    read_dispatch_record_by_attempt_id,
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
@@ -65,6 +69,283 @@ _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST = "cancel_in_flight_attempt_lost"
 _EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
+_REASON_OWNER_HEARTBEAT_RECENT = "owner_heartbeat_recent"
+_REASON_PROCESS_PROBE_ERROR = "process_probe_error"
+_REASON_PID_LIVE_WITHOUT_IDENTITY = "owner_pid_live_without_identity_proof"
+_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE = "waiting_adapter_observation_unavailable"
+_REASON_MISSING_CURRENT_ATTEMPT_OR_DISPATCH = "missing_current_attempt_or_dispatch"
+_COVERAGE_EXISTING = "existing"
+_COVERAGE_NEW = "new"
+_COVERAGE_NON_GOAL = "non-goal"
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryLifecycleMatrixRow:
+    """WU-LIFE recovery lifecycle proof matrix 行。
+
+    :param scenario_id: 场景稳定 id。
+    :param run_status: 场景入口 Run status 或非 Run 型治理描述。
+    :param owner_proof_or_dispatch_condition: owner proof、dispatch 或治理条件。
+    :param expected_decision: 期望 scanner / dispatcher 决策。
+    :param expected_durable_mutation: 期望 durable mutation。
+    :param expected_reason: 期望结构化 reason。
+    :param coverage_classification: 覆盖分类：existing、new 或 non-goal。
+    """
+
+    scenario_id: str
+    run_status: str
+    owner_proof_or_dispatch_condition: str
+    expected_decision: str
+    expected_durable_mutation: str
+    expected_reason: str
+    coverage_classification: str
+
+
+_RECOVERY_LIFECYCLE_PROOF_MATRIX: tuple[_RecoveryLifecycleMatrixRow, ...] = (
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="accepted-startup-wake",
+        run_status=RunStatus.ACCEPTED.value,
+        owner_proof_or_dispatch_condition="unstarted run requires queue promotion wake",
+        expected_decision=StartupRecoveryDecision.ACCEPTED_WAKE.value,
+        expected_durable_mutation="none",
+        expected_reason="accepted",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="queued-startup-promotion-check",
+        run_status=RunStatus.QUEUED.value,
+        owner_proof_or_dispatch_condition="queued run requires queue promotion check",
+        expected_decision=StartupRecoveryDecision.QUEUE_PROMOTION_CHECK.value,
+        expected_durable_mutation="none",
+        expected_reason="queued",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="waiting-diagnostic-only-low-level",
+        run_status=RunStatus.WAITING.value,
+        owner_proof_or_dispatch_condition="wait adapter observation unavailable at startup",
+        expected_decision=StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY.value,
+        expected_durable_mutation="none",
+        expected_reason=_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="waiting-durable-read-diagnostic-only",
+        run_status=RunStatus.WAITING.value,
+        owner_proof_or_dispatch_condition="durable read preserves WAITING semantics after startup scan",
+        expected_decision=StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY.value,
+        expected_durable_mutation="none",
+        expected_reason=_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,
+        coverage_classification=_COVERAGE_NEW,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="running-positive-orphan-projection-lag",
+        run_status=RunStatus.RUNNING.value,
+        owner_proof_or_dispatch_condition="stale owner pid missing with projection lag marker",
+        expected_decision=StartupRecoveryDecision.RUN_RECOVERING.value,
+        expected_durable_mutation="ATTEMPT_LOST,RUN_RECOVERING",
+        expected_reason="startup_orphan_attempt_lost",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="running-owner-heartbeat-recent",
+        run_status=RunStatus.RUNNING.value,
+        owner_proof_or_dispatch_condition="owner heartbeat is inside stale threshold",
+        expected_decision=StartupRecoveryDecision.OWNER_STILL_LIVE.value,
+        expected_durable_mutation="none",
+        expected_reason=_REASON_OWNER_HEARTBEAT_RECENT,
+        coverage_classification=_COVERAGE_NEW,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="running-process-probe-error",
+        run_status=RunStatus.RUNNING.value,
+        owner_proof_or_dispatch_condition="process probe returns an error for stale owner",
+        expected_decision=StartupRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
+        expected_durable_mutation="none",
+        expected_reason=_REASON_PROCESS_PROBE_ERROR,
+        coverage_classification=_COVERAGE_NEW,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="running-stale-heartbeat-only",
+        run_status=RunStatus.RUNNING.value,
+        owner_proof_or_dispatch_condition="stale heartbeat without process identity proof",
+        expected_decision=StartupRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
+        expected_durable_mutation="none",
+        expected_reason=_REASON_PID_LIVE_WITHOUT_IDENTITY,
+        coverage_classification=_COVERAGE_NEW,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="running-missing-current-attempt-or-dispatch",
+        run_status=RunStatus.RUNNING.value,
+        owner_proof_or_dispatch_condition="current Attempt or dispatch record is absent",
+        expected_decision=StartupRecoveryDecision.ORPHAN_INCONCLUSIVE.value,
+        expected_durable_mutation="none",
+        expected_reason=_REASON_MISSING_CURRENT_ATTEMPT_OR_DISPATCH,
+        coverage_classification=_COVERAGE_NEW,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="cancelling-positive-orphan",
+        run_status=RunStatus.CANCELLING.value,
+        owner_proof_or_dispatch_condition="stale owner pid missing during cancellation",
+        expected_decision=StartupRecoveryDecision.RUN_LOST.value,
+        expected_durable_mutation="ATTEMPT_LOST,RUN_LOST",
+        expected_reason=_REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST,
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="recovering-under-dispatch-limit",
+        run_status=RunStatus.RECOVERING.value,
+        owner_proof_or_dispatch_condition="canonical recovery dispatch count under limit",
+        expected_decision=StartupRecoveryDecision.RECOVERY_DISPATCHED.value,
+        expected_durable_mutation="RUN_STARTED,ATTEMPT_STARTED,dispatch record",
+        expected_reason=RunStartReason.RECOVERY.value,
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="recovering-over-dispatch-limit-projection-lag",
+        run_status=RunStatus.RECOVERING.value,
+        owner_proof_or_dispatch_condition="canonical EventLog recovery count reaches limit",
+        expected_decision=StartupRecoveryDecision.RUN_LOST.value,
+        expected_durable_mutation="RUN_LOST",
+        expected_reason="startup_recovery_dispatch_limit_exceeded",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="old-execution-late-terminal-after-recovery",
+        run_status=RunStatus.RECOVERING.value,
+        owner_proof_or_dispatch_condition="late terminal event targets old execution",
+        expected_decision="late execution rejected",
+        expected_durable_mutation="none",
+        expected_reason="execution_attempt_mismatch",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="live-owner-multiprocess",
+        run_status=RunStatus.RUNNING.value,
+        owner_proof_or_dispatch_condition="separate process owner is live",
+        expected_decision=StartupRecoveryDecision.OWNER_STILL_LIVE.value,
+        expected_durable_mutation="none",
+        expected_reason="multiprocess live owner proof",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="owner-crash-public-stream-recovery",
+        run_status=RunStatus.RUNNING.value,
+        owner_proof_or_dispatch_condition="owner process exits before reopen",
+        expected_decision=StartupRecoveryDecision.RECOVERY_DISPATCHED.value,
+        expected_durable_mutation="ATTEMPT_LOST,RUN_RECOVERING,RUN_STARTED",
+        expected_reason="public stream observes recovered final answer",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="startup-dispatch-failure-reason-mapping",
+        run_status="startup/dispatch governance",
+        owner_proof_or_dispatch_condition="timeout, dispatch failure, stream failure",
+        expected_decision="reason mapping preserved",
+        expected_durable_mutation="covered by scheduler tests",
+        expected_reason="existing scheduler diagnostics",
+        coverage_classification=_COVERAGE_EXISTING,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="stress-repeated-crash-recovery-terminal-dedupe",
+        run_status="stress",
+        owner_proof_or_dispatch_condition="repeated crash and recovery loop",
+        expected_decision="stress evidence only",
+        expected_durable_mutation="not in default validation",
+        expected_reason="stress coverage outside work unit",
+        coverage_classification=_COVERAGE_NON_GOAL,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="rr-dur-01-projection-checkpoint-cas-race",
+        run_status="durable governance",
+        owner_proof_or_dispatch_condition="true multiprocess projection checkpoint CAS race",
+        expected_decision="out of scope",
+        expected_durable_mutation="none",
+        expected_reason="recovery scanner does not depend on projection checkpoint",
+        coverage_classification=_COVERAGE_NON_GOAL,
+    ),
+    _RecoveryLifecycleMatrixRow(
+        scenario_id="rr-dur-04-short-transaction-durable-truth",
+        run_status="durable governance",
+        owner_proof_or_dispatch_condition=(
+            "scanner writes decisions inside run_write using durable Run/Attempt/" "EventLog/dispatch/liveness truth"
+        ),
+        expected_decision="short transaction durable truth",
+        expected_durable_mutation="no production rewrite",
+        expected_reason="projection lag covered by existing scanner tests",
+        coverage_classification=_COVERAGE_NEW,
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PidLiveNoIdentityProbe:
+    """测试用 pid live without identity probe。"""
+
+    def collect(self, pid: int) -> ProcessEvidence:
+        """返回 pid 存活但缺少身份指纹的证据。
+
+        :param pid: 目标 pid。
+        :returns: pid 存活证据。
+        """
+
+        return ProcessEvidence(
+            pid=pid,
+            exists=True,
+            observed_start_token=None,
+            observed_boot_id=None,
+            probe_error_code=None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PidProbeErrorProbe:
+    """测试用 process probe error probe。"""
+
+    def collect(self, pid: int) -> ProcessEvidence:
+        """返回进程探测错误证据。
+
+        :param pid: 目标 pid。
+        :returns: 带错误码的进程证据。
+        """
+
+        return ProcessEvidence(
+            pid=pid,
+            exists=True,
+            observed_start_token=None,
+            observed_boot_id=None,
+            probe_error_code="permission_denied",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveRunObservation:
+    """scanner 前后 active Run durable 观测。
+
+    :param run_status: Run 状态。
+    :param run_updated_at: Run updated_at。
+    :param current_attempt_id: Run current_attempt_id。
+    :param attempt_status: Attempt 状态。
+    :param attempt_updated_at: Attempt updated_at。
+    :param attempt_terminal_event_id: Attempt terminal event id。
+    :param dispatch_status: dispatch record 状态。
+    :param dispatch_updated_at: dispatch record updated_at。
+    :param dispatch_cancelled_event_id: dispatch cancelled event id。
+    :param dispatch_owner_host_instance_id: dispatch owner host instance id。
+    :param event_types: canonical EventLog event type 序列。
+    """
+
+    run_status: str
+    run_updated_at: str
+    current_attempt_id: str
+    attempt_status: AttemptStatus
+    attempt_updated_at: str
+    attempt_terminal_event_id: str | None
+    dispatch_status: DispatchRecordStatus
+    dispatch_updated_at: str
+    dispatch_cancelled_event_id: str | None
+    dispatch_owner_host_instance_id: str | None
+    event_types: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +452,103 @@ def test_scan_running_positive_orphan_moves_to_recovering_without_projection(
         assert store.transaction_runner.run_write(verify) == RunStatus.RECOVERING.value
 
 
+def test_recovery_lifecycle_proof_matrix_covers_slice_a_rows() -> None:
+    """证明 WU-LIFE Slice A recovery lifecycle matrix 覆盖必需场景。
+
+    :returns: ``None``。
+    :raises AssertionError: matrix 缺少必需行或覆盖分类非法时由 pytest 抛出。
+    """
+
+    scenario_ids = tuple(row.scenario_id for row in _RECOVERY_LIFECYCLE_PROOF_MATRIX)
+    rows_by_id = {row.scenario_id: row for row in _RECOVERY_LIFECYCLE_PROOF_MATRIX}
+    assert len(scenario_ids) == len(set(scenario_ids))
+    assert {
+        "waiting-diagnostic-only-low-level",
+        "waiting-durable-read-diagnostic-only",
+        "running-owner-heartbeat-recent",
+        "running-process-probe-error",
+        "running-stale-heartbeat-only",
+        "running-missing-current-attempt-or-dispatch",
+        "rr-dur-04-short-transaction-durable-truth",
+    }.issubset(set(scenario_ids))
+    assert all(
+        row.coverage_classification in (_COVERAGE_EXISTING, _COVERAGE_NEW, _COVERAGE_NON_GOAL)
+        for row in _RECOVERY_LIFECYCLE_PROOF_MATRIX
+    )
+    assert rows_by_id["waiting-diagnostic-only-low-level"].coverage_classification == _COVERAGE_EXISTING
+    assert rows_by_id["waiting-durable-read-diagnostic-only"].coverage_classification == _COVERAGE_NEW
+    assert rows_by_id["running-missing-current-attempt-or-dispatch"].coverage_classification == _COVERAGE_NEW
+
+
+def test_scan_running_owner_heartbeat_recent_does_not_mutate_durable_rows(
+    tmp_path: Path,
+) -> None:
+    """RUNNING owner heartbeat recent 时 scanner 不写 recovery 或 terminal facts。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: scanner 误写 durable rows 或 reason 错误时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _mark_owner_heartbeat(
+            store.transaction_runner,
+            heartbeat_at="2026-05-19T03:04:00.000000Z",
+        )
+        before = _active_run_observation(store.transaction_runner, "run-1")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+        ).scan(_policy())
+
+        after = _active_run_observation(store.transaction_runner, "run-1")
+        assert tuple(action.decision for action in result.actions) == (StartupRecoveryDecision.OWNER_STILL_LIVE,)
+        assert tuple(action.reason for action in result.actions) == (_REASON_OWNER_HEARTBEAT_RECENT,)
+        assert after == before
+        _assert_no_recovery_or_terminal_facts(store.transaction_runner)
+
+
+@pytest.mark.parametrize(
+    ("process_probe", "expected_reason"),
+    (
+        (_PidProbeErrorProbe(), _REASON_PROCESS_PROBE_ERROR),
+        (_PidLiveNoIdentityProbe(), _REASON_PID_LIVE_WITHOUT_IDENTITY),
+    ),
+)
+def test_scan_running_inconclusive_owner_proof_does_not_mutate_durable_rows(
+    tmp_path: Path,
+    process_probe: _PidProbeErrorProbe | _PidLiveNoIdentityProbe,
+    expected_reason: str,
+) -> None:
+    """RUNNING inconclusive proof 不得写 terminal 或 recovery facts。
+
+    :param tmp_path: pytest 临时目录。
+    :param process_probe: 测试用进程证据 probe。
+    :param expected_reason: 期望 scanner action reason。
+    :returns: ``None``。
+    :raises AssertionError: scanner 误写 durable rows 或 reason 错误时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        before = _active_run_observation(store.transaction_runner, "run-1")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=process_probe,
+        ).scan(_policy())
+
+        after = _active_run_observation(store.transaction_runner, "run-1")
+        assert tuple(action.decision for action in result.actions) == (StartupRecoveryDecision.ORPHAN_INCONCLUSIVE,)
+        assert tuple(action.reason for action in result.actions) == (expected_reason,)
+        assert after == before
+        _assert_no_recovery_or_terminal_facts(store.transaction_runner)
+
+
 def test_scan_waiting_uses_diagnostic_only_fallback(tmp_path: Path) -> None:
     """WAITING startup scan 不创建 Attempt、不推进状态。"""
 
@@ -187,8 +565,69 @@ def test_scan_waiting_uses_diagnostic_only_fallback(tmp_path: Path) -> None:
         assert tuple(action.decision for action in result.actions) == (
             StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,
         )
+        assert tuple(action.reason for action in result.actions) == (_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,)
         assert _count_rows(store.transaction_runner, "host_attempts") == 1
         assert _run_status(store.transaction_runner, "run-1") == RunStatus.WAITING.value
+        _assert_no_recovery_or_terminal_facts(store.transaction_runner)
+
+
+def test_scan_waiting_durable_read_state_remains_diagnostic_only(
+    tmp_path: Path,
+) -> None:
+    """WAITING startup scan 后 durable read 仍保持等待诊断语义。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: scanner 创建 recovery Attempt 或写 terminal fact 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _mark_run_status(store.transaction_runner, "run-1", RunStatus.WAITING)
+        attempt_count_before = _count_rows(store.transaction_runner, "host_attempts")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (StartupRecoveryDecision.WAITING_DIAGNOSTIC_ONLY,)
+        assert tuple(action.reason for action in result.actions) == (_REASON_WAITING_ADAPTER_OBSERVATION_UNAVAILABLE,)
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.WAITING.value
+        assert _count_rows(store.transaction_runner, "host_attempts") == attempt_count_before
+        _assert_no_recovery_or_terminal_facts(store.transaction_runner)
+
+
+def test_scan_running_missing_dispatch_record_is_inconclusive_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """RUNNING 缺失当前 dispatch row 时 scanner 只给出 inconclusive 诊断。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: scanner 写入 recovery/terminal fact 或 reason 错误时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _delete_dispatch_record_for_attempt(store.transaction_runner, "attempt-run-1")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.ORPHAN_INCONCLUSIVE,
+        )
+        assert tuple(action.reason for action in result.actions) == (
+            _REASON_MISSING_CURRENT_ATTEMPT_OR_DISPATCH,
+        )
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.RUNNING.value
+        assert _count_rows(store.transaction_runner, TABLE_HOST_ATTEMPT_DISPATCH_RECORDS) == 0
+        _assert_no_recovery_or_terminal_facts(store.transaction_runner)
 
 
 def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
@@ -397,6 +836,34 @@ def _delete_session_rows_without_foreign_keys(db_path: Path) -> None:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute(f"DELETE FROM {TABLE_HOST_SESSION_SLOTS}")
         connection.execute(f"DELETE FROM {TABLE_HOST_SESSIONS}")
+
+
+def _delete_dispatch_record_for_attempt(
+    transaction_runner: HostTransactionRunner, attempt_id: str
+) -> None:
+    """删除测试 dispatch row 以构造 current Attempt 缺失 dispatch 的 scanner 场景。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_id: 目标 Attempt id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """删除 dispatch row。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"""
+            DELETE FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
+            WHERE attempt_id = ?
+            """,
+            (attempt_id,),
+        )
+
+    transaction_runner.run_write(operation)
 
 
 def _seed_running_dispatching_run(
@@ -719,6 +1186,36 @@ def _insert_stale_host_instance(transaction: HostTransaction) -> None:
     )
 
 
+def _mark_owner_heartbeat(transaction_runner: HostTransactionRunner, *, heartbeat_at: str) -> None:
+    """更新测试 owner liveness heartbeat。
+
+    :param transaction_runner: Host transaction runner。
+    :param heartbeat_at: 目标 heartbeat timestamp。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """更新 owner heartbeat。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            """
+            UPDATE host_instances
+            SET heartbeat_at = ?
+            WHERE host_instance_id = ?
+            """,
+            (
+                heartbeat_at,
+                "host-instance-old",
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
 def _insert_projection_lag_marker(transaction_runner: HostTransactionRunner) -> None:
     """写入 projection checkpoint lag 标记。
 
@@ -753,6 +1250,65 @@ def _insert_projection_lag_marker(transaction_runner: HostTransactionRunner) -> 
         )
 
     transaction_runner.run_write(operation)
+
+
+def _active_run_observation(transaction_runner: HostTransactionRunner, run_id: str) -> _ActiveRunObservation:
+    """读取 active Run scanner 前后必须保持不变的 durable 观测。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: Run id。
+    :returns: active Run durable 观测。
+    :raises AssertionError: 测试数据缺少 Run、Attempt 或 dispatch row 时抛出。
+    """
+
+    def operation(transaction: HostTransaction) -> _ActiveRunObservation:
+        """在 transaction 中读取 durable 观测。
+
+        :param transaction: Host transaction。
+        :returns: active Run durable 观测。
+        :raises AssertionError: 测试数据缺少 Run、Attempt 或 dispatch row 时抛出。
+        """
+
+        run = read_run_by_id(transaction, run_id)
+        assert run is not None
+        assert run.current_attempt_id is not None
+        attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+        assert attempt is not None
+        dispatch_record = read_dispatch_record_by_attempt_id(
+            transaction,
+            run.current_attempt_id,
+        )
+        assert dispatch_record is not None
+        return _ActiveRunObservation(
+            run_status=run.status.value,
+            run_updated_at=run.updated_at,
+            current_attempt_id=run.current_attempt_id,
+            attempt_status=attempt.status,
+            attempt_updated_at=attempt.updated_at,
+            attempt_terminal_event_id=attempt.terminal_event_id,
+            dispatch_status=dispatch_record.status,
+            dispatch_updated_at=dispatch_record.updated_at,
+            dispatch_cancelled_event_id=dispatch_record.cancelled_event_id,
+            dispatch_owner_host_instance_id=dispatch_record.owner_host_instance_id,
+            event_types=_event_types(transaction),
+        )
+
+    return transaction_runner.run_read(operation)
+
+
+def _assert_no_recovery_or_terminal_facts(
+    transaction_runner: HostTransactionRunner,
+) -> None:
+    """断言 scanner 未写 recovery 或 terminal EventLog facts。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: ``None``。
+    :raises AssertionError: 任一 forbidden fact 被写入时抛出。
+    """
+
+    assert _event_type_count(transaction_runner, _EVENT_TYPE_ATTEMPT_LOST) == 0
+    assert _event_type_count(transaction_runner, _EVENT_TYPE_RUN_RECOVERING) == 0
+    assert _event_type_count(transaction_runner, _EVENT_TYPE_RUN_LOST) == 0
 
 
 def _mark_run_status(
