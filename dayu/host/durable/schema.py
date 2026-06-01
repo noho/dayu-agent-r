@@ -1,4 +1,4 @@
-"""Host durable SQLite schema bootstrap 与版本校验。
+"""Host durable SQLite schema bootstrap 与结构校验。
 
 本模块是 Host durable schema convention 的唯一 DDL 真源。它创建 Phase 2
 foundation tables、Phase 3 Session / Run / Attempt durable state tables，
@@ -134,6 +134,33 @@ HOST_DURABLE_TABLES: tuple[str, ...] = (
     + PURGE_GOVERNANCE_TABLES
 )
 """当前 fresh bootstrap 应创建的 Host durable table 名称集合。"""
+
+HOST_DURABLE_INDEXES: tuple[str, ...] = (
+    INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
+    INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION,
+    INDEX_HOST_RUNS_QUEUE_FIFO,
+    INDEX_HOST_RUNS_SESSION_STATUS,
+    INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN,
+    INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL,
+    INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB,
+    INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE,
+    INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE,
+    INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE,
+    INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR,
+    INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE,
+    INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON,
+    INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
+    INDEX_HOST_TOOL_TRACE_HOT_RUN_SEQUENCE,
+    INDEX_HOST_TOOL_TRACE_HOT_TOOL_SEQUENCE,
+    INDEX_HOST_TOOL_TRACE_HOT_TOOL_CALL,
+    INDEX_HOST_TOOL_TRACE_HOT_PROVIDER_REQUEST,
+    INDEX_HOST_TOOL_TRACE_HOT_DIAGNOSTIC_REF,
+    INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE,
+    INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE,
+    INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN,
+    INDEX_HOST_PURGE_TOMBSTONES_SESSION,
+)
+"""当前 Host durable schema 必须存在的 index 名称集合。"""
 
 _SQLITE_PAYLOADS_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_SQLITE_PAYLOADS} (
@@ -1224,39 +1251,46 @@ HOST_DURABLE_DDL: tuple[str, ...] = (
 
 
 def bootstrap_host_durable_store(connection: sqlite3.Connection) -> None:
-    """初始化 fresh Host durable SQLite schema 并校验版本。
+    """初始化 fresh Host durable SQLite schema 或校验当前 schema。
 
-    ``user_version`` 为 ``0`` 的 DB 被视为 fresh DB；函数会创建 foundation
-    与 Phase 3 state tables 并设置当前 ``PRAGMA user_version``。``user_version`` 为当前版本
-    时函数幂等执行 DDL。其它版本一律结构化失败，不做兼容读取或迁移。
+    ``user_version`` 为 ``0`` 的 DB 被视为 fresh DB；函数会在显式事务中创建
+    全量 Host durable schema 并设置当前 ``PRAGMA user_version``。``user_version``
+    为当前版本时只执行结构校验，不执行 DDL，不修复缺失对象。其它版本一律
+    结构化失败，不做兼容读取或迁移。
 
     :param connection: 已完成 PRAGMA setup 的 SQLite connection。
     :returns: ``None``。
-    :raises HostSchemaMismatchError: DB schema version 不匹配时抛出。
+    :raises HostSchemaMismatchError: DB schema version 不匹配或当前 schema
+        缺少 required table / index 时抛出。
     :raises sqlite3.Error: SQLite DDL 或 PRAGMA 执行失败时抛出。
     """
 
     current_version = _read_user_version(connection)
-    if current_version not in (0, HOST_SCHEMA_VERSION):
-        raise HostSchemaMismatchError(
-            "Host durable schema version mismatch: "
-            f"expected fresh schema {HOST_SCHEMA_VERSION}, got {current_version}; "
-            "recreate the durable database for this version"
-        )
-    for statement in HOST_DURABLE_DDL:
-        connection.execute(statement)
-    connection.execute(f"PRAGMA user_version={HOST_SCHEMA_VERSION}")
-    connection.commit()
-    validate_host_schema_version(connection)
+    if current_version == 0:
+        _bootstrap_fresh_schema(connection)
+        validate_host_durable_schema(connection)
+        return
+    if current_version == HOST_SCHEMA_VERSION:
+        validate_host_durable_schema(connection)
+        return
+    raise HostSchemaMismatchError(
+        "Host durable schema version mismatch: "
+        f"expected fresh schema {HOST_SCHEMA_VERSION}, got {current_version}; "
+        "recreate the durable database for this version"
+    )
 
 
-def validate_host_schema_version(connection: sqlite3.Connection) -> None:
-    """校验 Host durable SQLite ``user_version``。
+def validate_host_durable_schema(connection: sqlite3.Connection) -> None:
+    """校验 Host durable SQLite 当前 schema 结构。
+
+    校验范围包括 ``PRAGMA user_version``、required tables 和 required indexes。
+    本函数不执行 DDL，不尝试迁移或修复缺失对象。
 
     :param connection: SQLite connection。
     :returns: ``None``。
-    :raises HostSchemaMismatchError: ``user_version`` 不是当前版本时抛出。
-    :raises sqlite3.Error: PRAGMA 查询失败时抛出。
+    :raises HostSchemaMismatchError: ``user_version`` 不是当前版本，或缺少
+        required table / index 时抛出。
+    :raises sqlite3.Error: PRAGMA 或 sqlite_master 查询失败时抛出。
     """
 
     current_version = _read_user_version(connection)
@@ -1266,6 +1300,73 @@ def validate_host_schema_version(connection: sqlite3.Connection) -> None:
             f"expected fresh schema {HOST_SCHEMA_VERSION}, got {current_version}; "
             "recreate the durable database for this version"
         )
+    _validate_required_tables(connection)
+    _validate_required_indexes(connection)
+
+
+def _bootstrap_fresh_schema(connection: sqlite3.Connection) -> None:
+    """在一个显式 SQLite 事务中创建 fresh Host durable schema。
+
+    :param connection: 已完成 PRAGMA setup 的 SQLite connection。
+    :returns: ``None``。
+    :raises sqlite3.Error: BEGIN、DDL、user_version 设置、COMMIT 或 ROLLBACK
+        执行失败时抛出原始 SQLite 异常；ROLLBACK 失败只做 best-effort 清理。
+    """
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in HOST_DURABLE_DDL:
+            connection.execute(statement)
+        connection.execute(f"PRAGMA user_version={HOST_SCHEMA_VERSION}")
+        connection.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _validate_required_tables(connection: sqlite3.Connection) -> None:
+    """校验当前 DB 包含所有 Host durable required tables。
+
+    :param connection: SQLite connection。
+    :returns: ``None``。
+    :raises HostSchemaMismatchError: 缺少 required table 时抛出。
+    :raises sqlite3.Error: sqlite_master 查询失败时抛出。
+    """
+
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    existing_tables = frozenset(str(row[0]) for row in rows)
+    for table_name in HOST_DURABLE_TABLES:
+        if table_name not in existing_tables:
+            raise HostSchemaMismatchError(
+                "Host durable schema missing required table: "
+                f"{table_name}"
+            )
+
+
+def _validate_required_indexes(connection: sqlite3.Connection) -> None:
+    """校验当前 DB 包含所有 Host durable required indexes。
+
+    :param connection: SQLite connection。
+    :returns: ``None``。
+    :raises HostSchemaMismatchError: 缺少 required index 时抛出。
+    :raises sqlite3.Error: sqlite_master 查询失败时抛出。
+    """
+
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'"
+    ).fetchall()
+    existing_indexes = frozenset(str(row[0]) for row in rows)
+    for index_name in HOST_DURABLE_INDEXES:
+        if index_name not in existing_indexes:
+            raise HostSchemaMismatchError(
+                "Host durable schema missing required index: "
+                f"{index_name}"
+            )
 
 
 def _read_user_version(connection: sqlite3.Connection) -> int:

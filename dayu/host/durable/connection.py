@@ -16,7 +16,7 @@ from dayu.host.durable.errors import HostDurableConfigError, HostDurableError
 from dayu.host.durable.options import HostDurableStoreOptions
 from dayu.host.durable.schema import (
     bootstrap_host_durable_store,
-    validate_host_schema_version,
+    validate_host_durable_schema,
 )
 from dayu.host.durable.transaction import (
     HostTransactionRunner,
@@ -80,7 +80,7 @@ class HostDurableStore:
         该方法供后续 Host durable 内部模块和测试验证 connection-level PRAGMA
         使用；调用方负责关闭返回的 connection。
 
-        :returns: 已设置 PRAGMA 并校验 schema version 的 SQLite connection。
+        :returns: 已设置 PRAGMA 并校验当前 schema 结构的 SQLite connection。
         :raises HostDurableConfigError: DB parent 目录不可用时抛出。
         :raises HostDurableError: SQLite connection 或 schema validation 失败时抛出。
         """
@@ -159,7 +159,6 @@ def open_host_durable_store(
     try:
         configure_connection_pragmas(connection, options.sqlite_policy)
         bootstrap_host_durable_store(connection)
-        validate_host_schema_version(connection)
     except (sqlite3.Error, HostDurableError) as exc:
         _close_connection_best_effort(connection)
         if isinstance(exc, HostDurableError):
@@ -174,7 +173,7 @@ def _open_configured_connection(
     """打开并配置独立 Host durable SQLite connection。
 
     :param options: Host durable store 打开选项。
-    :returns: 已配置并校验 schema version 的 SQLite connection。
+    :returns: 已配置并校验当前 schema 结构的 SQLite connection。
     :raises HostDurableConfigError: DB parent 目录不可用时抛出。
     :raises HostDurableError: SQLite connection 或 schema validation 失败时抛出。
     """
@@ -183,7 +182,7 @@ def _open_configured_connection(
     connection = _open_raw_connection(options)
     try:
         configure_connection_pragmas(connection, options.sqlite_policy)
-        validate_host_schema_version(connection)
+        validate_host_durable_schema(connection)
     except (sqlite3.Error, HostDurableError) as exc:
         _close_connection_best_effort(connection)
         if isinstance(exc, HostDurableError):
