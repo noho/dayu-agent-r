@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +70,7 @@ from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
 )
+from dayu.host.tool_runtime import DuplicateGovernancePolicy
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.dispatch import (
     ActiveCancelMessage,
@@ -142,10 +143,12 @@ from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.runtime.lane import (
     LaneAcquired,
+    LaneAcquireOutcome,
     LaneClaimToken,
     LaneConfig,
     LaneController,
     LaneOwner,
+    RuntimeLaneClosedError,
     SQLiteLaneCoordinatorConfig,
 )
 
@@ -157,7 +160,89 @@ _SOFT_CONTEXT_WINDOW_SIZE = 110
 _SOFT_RESERVED_OUTPUT_TOKENS = 10
 _SOFT_HARD_THRESHOLD_TOKENS = 80
 _SOFT_SAFETY_MARGIN_RATIO = 0.5
+_SCHEDULER_CLOSE_REASON = "scheduler_close"
+_SCHEDULER_CLOSE_TERMINAL_EVENT_TYPES = (
+    "CANCEL_REQUESTED",
+    "ATTEMPT_CANCELLED",
+    "RUN_CANCELLED",
+    "ATTEMPT_FAILED",
+    "RUN_FAILED",
+    "ATTEMPT_LOST",
+    "RUN_LOST",
+)
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True, slots=True)
+class _SchedulerCloseLifecycleCase:
+    """scheduler close lifecycle proof matrix 的单行场景。"""
+
+    scenario_id: str
+    window: str
+    expected_close_action: str
+    expected_durable_mutation: str
+    expected_resource_cleanup: str
+    coverage_classification: str
+
+
+_SCHEDULER_CLOSE_LIFECYCLE_MATRIX = (
+    _SchedulerCloseLifecycleCase(
+        scenario_id="close-active-worker",
+        window="active worker event stream",
+        expected_close_action="cancel active token with scheduler_close and await active task cleanup",
+        expected_durable_mutation="no scheduler-close-created terminal canonical fact",
+        expected_resource_cleanup="handle close once, registry unregister, lane token release",
+        coverage_classification="existing",
+    ),
+    _SchedulerCloseLifecycleCase(
+        scenario_id="cancel-all-after-register",
+        window="ActiveWorkerRegistry.cancel_all snapshot propagation",
+        expected_close_action="cancel only entries captured before lock release",
+        expected_durable_mutation="none",
+        expected_resource_cleanup="later registered entries require a later cancel_all call",
+        coverage_classification="new",
+    ),
+    _SchedulerCloseLifecycleCase(
+        scenario_id="dispatch-queue-non-empty-close",
+        window="pending dispatch queue before drain",
+        expected_close_action="fail closed without drain-until-empty",
+        expected_durable_mutation="run attempt and dispatch row remain recoverable by next open",
+        expected_resource_cleanup="wakeup and drain APIs reject after close",
+        coverage_classification="new",
+    ),
+    _SchedulerCloseLifecycleCase(
+        scenario_id="promotion-queue-non-empty-close",
+        window="promotion task running with queued session behind it",
+        expected_close_action="cancel tracked promotion task without draining queued sessions",
+        expected_durable_mutation="no terminal canonical fact",
+        expected_resource_cleanup="promotion task done and pending promotion queue remains local-only",
+        coverage_classification="new",
+    ),
+    _SchedulerCloseLifecycleCase(
+        scenario_id="lane-wait-pre-worker-close",
+        window="dispatch has entered lane wait before worker accept",
+        expected_close_action="cancel drain path or receive lane close cancellation",
+        expected_durable_mutation="no worker_startup_timeout terminal fact",
+        expected_resource_cleanup="drain task done and lane controller closed",
+        coverage_classification="new",
+    ),
+    _SchedulerCloseLifecycleCase(
+        scenario_id="close-cancelled-mid-cleanup-retry",
+        window="outer task cancellation during scheduler close cleanup",
+        expected_close_action="propagate CancelledError and allow later close retry to finish cleanup",
+        expected_durable_mutation="no scheduler-close-created terminal canonical fact",
+        expected_resource_cleanup="active registry empty, active tasks done, lane closed, duplicate registry cleared",
+        coverage_classification="new",
+    ),
+    _SchedulerCloseLifecycleCase(
+        scenario_id="close-drain-until-empty",
+        window="graceful completion of all pending local work",
+        expected_close_action="not a scheduler close contract",
+        expected_durable_mutation="none",
+        expected_resource_cleanup="none",
+        coverage_classification="non-goal",
+    ),
+)
 
 
 class _RetryExhaustedReadRunner(HostTransactionRunner):
@@ -549,6 +634,114 @@ class _ControlledBlockingHandle(_FakeHandle):
 
         self.close_count += 1
         await super().close()
+
+
+class _RegisteringCancelHandle(_FakeHandle):
+    """取消回调中注册第二个 active entry 的测试 handle。"""
+
+    def __init__(
+        self,
+        *,
+        registry: ActiveWorkerRegistry,
+        second_token: _HostCancellationToken,
+        second_handle: _FakeHandle,
+    ) -> None:
+        """初始化测试 handle。
+
+        :param registry: 待测试 active worker registry。
+        :param second_token: 后注册 entry 的 cancellation token。
+        :param second_handle: 后注册 entry 的 worker handle。
+        :returns: ``None``。
+        """
+
+        super().__init__()
+        self._registry = registry
+        self._second_token = second_token
+        self._second_handle = second_handle
+        self.cancel_reasons: list[str] = []
+
+    def on_cancel(self, reason: str) -> None:
+        """记录取消原因并在传播过程中注册第二个 entry。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        self.cancel_reasons.append(reason)
+        self._registry.register(
+            run_id="run-second",
+            attempt_id="attempt-second",
+            execution_id="execution-second",
+            handle=self._second_handle,
+            cancellation_token=self._second_token,
+        )
+
+
+class _BlockedLaneAcquire:
+    """阻塞 lane acquire 的确定性测试替身。"""
+
+    def __init__(self) -> None:
+        """初始化阻塞 acquire 替身。
+
+        :returns: ``None``。
+        """
+
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(
+        self,
+        name: str,
+        *,
+        token: CancellationToken | None = None,
+        timeout_seconds: float | None = None,
+    ) -> LaneAcquireOutcome:
+        """阻塞 acquire，直到外层 drain task 被取消。
+
+        :param name: lane 名称。
+        :param token: 可选取消 token。
+        :param timeout_seconds: acquire timeout。
+        :returns: 正常路径不会返回。
+        :raises AssertionError: 若测试错误释放阻塞点则抛出。
+        """
+
+        del name, token, timeout_seconds
+        self.started.set()
+        await self.release.wait()
+        raise AssertionError("blocked lane acquire must be cancelled by scheduler close")
+
+
+class _CloseOnceBlockedLaneClose:
+    """第一次 lane close 阻塞，后续调用转发到真实 close。"""
+
+    def __init__(
+        self,
+        original_close: Callable[[str | None], Awaitable[None]],
+    ) -> None:
+        """初始化阻塞 close 替身。
+
+        :param original_close: 真实 lane controller close 方法。
+        :returns: ``None``。
+        """
+
+        self._original_close = original_close
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def __call__(self, reason: str | None = None) -> None:
+        """第一次调用阻塞以便测试取消 close，第二次执行真实 close。
+
+        :param reason: close reason。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: 第一次调用被外层取消时透传。
+        """
+
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            await self.release.wait()
+        await self._original_close(reason)
 
 
 class _FlakyLocalWorkerIdHandle(_FakeHandle):
@@ -1190,6 +1383,73 @@ async def _empty_engine_events() -> AsyncIterator[EngineEvent]:
 
     if False:
         yield _final_answer_event("unused")
+
+
+def test_scheduler_close_lifecycle_matrix_covers_slice_b_windows() -> None:
+    """close lifecycle matrix 必须覆盖 Slice B 要求的窗口。
+
+    :returns: ``None``。
+    :raises AssertionError: matrix 缺失必要场景或字段为空时抛出。
+    """
+
+    required_ids = {
+        "cancel-all-after-register",
+        "dispatch-queue-non-empty-close",
+        "promotion-queue-non-empty-close",
+        "lane-wait-pre-worker-close",
+        "close-cancelled-mid-cleanup-retry",
+    }
+    actual_ids = {item.scenario_id for item in _SCHEDULER_CLOSE_LIFECYCLE_MATRIX}
+
+    assert required_ids <= actual_ids
+    assert {item.coverage_classification for item in _SCHEDULER_CLOSE_LIFECYCLE_MATRIX} == {
+        "existing",
+        "new",
+        "non-goal",
+    }
+    for item in _SCHEDULER_CLOSE_LIFECYCLE_MATRIX:
+        assert item.window.strip() != ""
+        assert item.expected_close_action.strip() != ""
+        assert item.expected_durable_mutation.strip() != ""
+        assert item.expected_resource_cleanup.strip() != ""
+
+
+def test_active_worker_registry_cancel_all_uses_snapshot_when_entry_registers_after_cancel() -> None:
+    """``cancel_all`` 只取消调用开始时的 active entry 快照。
+
+    :returns: ``None``。
+    """
+
+    registry = ActiveWorkerRegistry()
+    first_token = _HostCancellationToken()
+    second_token = _HostCancellationToken()
+    second_handle = _FakeHandle()
+    first_handle = _RegisteringCancelHandle(
+        registry=registry,
+        second_token=second_token,
+        second_handle=second_handle,
+    )
+    registry.register(
+        run_id="run-first",
+        attempt_id="attempt-first",
+        execution_id="execution-first",
+        handle=first_handle,
+        cancellation_token=first_token,
+    )
+
+    first_count = registry.cancel_all(_SCHEDULER_CLOSE_REASON)
+
+    assert first_count == 1
+    assert first_token.is_cancelled() is True
+    assert first_token.cancel_reason() == _SCHEDULER_CLOSE_REASON
+    assert first_handle.cancel_reasons == [_SCHEDULER_CLOSE_REASON]
+    assert second_token.is_cancelled() is False
+
+    second_count = registry.cancel_all(_SCHEDULER_CLOSE_REASON)
+
+    assert second_count == 2
+    assert second_token.is_cancelled() is True
+    assert second_token.cancel_reason() == _SCHEDULER_CLOSE_REASON
 
 
 @pytest.mark.asyncio
@@ -2339,6 +2599,150 @@ async def test_scheduler_close_during_active_events_releases_all_resources(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_close_with_non_empty_dispatch_queue_does_not_drain_or_write_terminal(
+    tmp_path: Path,
+) -> None:
+    """dispatch queue 非空 close 不处理 pending work，也不写 terminal fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        scheduler.wake_dispatch(_pending_dispatch(seeded))
+        await scheduler.close()
+
+        run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
+        assert scheduler._queue.qsize() == 1
+        assert factory.created == 0
+        assert run.status is RunStatus.RUNNING
+        assert attempt.status is AttemptStatus.STARTING
+        assert dispatch_record.status is DispatchRecordStatus.PENDING
+        assert dispatch_record.worker_accept_event_id is None
+        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
+        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+            await scheduler.drain_once()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_close_during_lane_wait_skips_worker_startup_timeout_terminal_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pre-worker lane wait 窗口 close 取消 drain path，不写 startup timeout。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    factory = _FakeWorkerFactory()
+    blocked_acquire = _BlockedLaneAcquire()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        original_acquire = scheduler._lane_controller.acquire
+        monkeypatch.setattr(scheduler._lane_controller, "acquire", blocked_acquire)
+        scheduler.wake_dispatch(_pending_dispatch(seeded))
+        scheduler._drain_task = asyncio.create_task(_run_scheduler_drain_once(scheduler))
+
+        await blocked_acquire.started.wait()
+        run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
+        assert run.status is RunStatus.RUNNING
+        assert attempt.status is AttemptStatus.STARTING
+        assert dispatch_record.status is DispatchRecordStatus.WAITING_FOR_LANE
+
+        await scheduler.close()
+        monkeypatch.setattr(scheduler._lane_controller, "acquire", original_acquire)
+
+        assert scheduler._drain_task is not None
+        assert scheduler._drain_task.done() is True
+        assert factory.created == 0
+        run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
+        assert run.status is RunStatus.RUNNING
+        assert attempt.status is AttemptStatus.STARTING
+        assert dispatch_record.status is DispatchRecordStatus.WAITING_FOR_LANE
+        assert dispatch_record.cancelled_event_id is None
+        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
+        with pytest.raises(RuntimeLaneClosedError):
+            await scheduler._lane_controller.acquire(_LANE_NAME, timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close cleanup 中途被取消后，再次 close 必须补完资源清理。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    handle = _ControlledBlockingHandle()
+    registry = ActiveWorkerRegistry()
+    factory = _FakeWorkerFactory(accepted_handle=handle)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            active_registry=registry,
+        )
+        scheduler.wake_dispatch(_pending_dispatch(seeded))
+        assert (await scheduler.drain_once()).dispatched == 1
+        await handle.events_started.wait()
+        scheduler._duplicate_governance_registry.duplicate_governance_for_run(
+            run_id=seeded.run_id,
+            policy=DuplicateGovernancePolicy(),
+        )
+        assert scheduler._duplicate_governance_registry.active_run_count() == 1
+        blocked_close = _CloseOnceBlockedLaneClose(scheduler._lane_controller.close)
+        monkeypatch.setattr(scheduler._lane_controller, "close", blocked_close)
+
+        close_task = asyncio.create_task(scheduler.close())
+        await blocked_close.started.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        assert scheduler._closed is True
+        assert scheduler._close_cleanup_done is False
+
+        await scheduler.close()
+
+        assert blocked_close.calls == 2
+        assert scheduler._close_cleanup_done is True
+        assert not scheduler._active_tasks
+        assert not scheduler._active_handles
+        assert handle.cancel_count == 1
+        assert handle.close_count == 1
+        assert (
+            registry.cancel(
+                ActiveCancelMessage(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    reason="after_close_retry",
+                )
+            )
+            is False
+        )
+        assert scheduler._duplicate_governance_registry.active_run_count() == 0
+        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
+        with pytest.raises(RuntimeLaneClosedError):
+            await scheduler._lane_controller.acquire(_LANE_NAME, timeout_seconds=0)
+
+
+@pytest.mark.asyncio
 async def test_default_active_registry_is_scheduler_local(tmp_path: Path) -> None:
     """未显式注入 registry 时，不同 host scheduler 不共享默认 registry。"""
 
@@ -2764,11 +3168,12 @@ async def test_scheduler_close_cancels_tracked_promotion_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """scheduler close 会取消并等待 wakeup 创建的 promotion task。"""
+    """scheduler close 会取消 promotion task，但不无限 drain 本地 promotion queue。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
         blocker = asyncio.Event()
+        promotion_started = asyncio.Event()
 
         async def _blocked_promotion(session_id: str) -> None:
             """模拟长期运行的 promotion。
@@ -2778,17 +3183,22 @@ async def test_scheduler_close_cancels_tracked_promotion_task(
             """
 
             del session_id
+            promotion_started.set()
             await blocker.wait()
 
         monkeypatch.setattr(scheduler, "run_queue_promotion", _blocked_promotion)
         scheduler.wake_queue_promotion("session-promotion-close")
         await _wait_for_promotion_task_started(scheduler)
+        await promotion_started.wait()
         promotion_task = scheduler._promotion_drain_task
         assert promotion_task is not None
+        scheduler._promotion_queue.put_nowait("session-promotion-pending")
 
         await scheduler.close()
 
         assert promotion_task.done() is True
+        assert scheduler._promotion_queue.qsize() == 1
+        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
 
 
 @pytest.mark.asyncio
@@ -3982,6 +4392,18 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
     return transaction_runner.run_read(_operation)
 
 
+def _assert_no_scheduler_close_terminal_events(transaction_runner: HostTransactionRunner) -> None:
+    """断言 scheduler close 未创建 terminal canonical facts。
+
+    :param transaction_runner: transaction runner。
+    :returns: ``None``。
+    :raises AssertionError: 存在 close 不应写入的 terminal fact 时抛出。
+    """
+
+    for event_type in _SCHEDULER_CLOSE_TERMINAL_EVENT_TYPES:
+        assert _event_count(transaction_runner, event_type) == 0
+
+
 async def _wait_for_event_count(
     transaction_runner: HostTransactionRunner,
     event_type: str,
@@ -4093,6 +4515,17 @@ async def _wait_for_promotion_task_started(
             return
         await asyncio.sleep(0.01)
     raise AssertionError("promotion task did not start")
+
+
+async def _run_scheduler_drain_once(scheduler: HostDispatchScheduler) -> None:
+    """以 ``Task[None]`` 形态运行一次 scheduler drain。
+
+    :param scheduler: dispatch scheduler。
+    :returns: ``None``。
+    :raises RuntimeError: scheduler 已关闭时透传。
+    """
+
+    await scheduler.drain_once()
 
 
 async def _dispatch_accepted_final_run(
