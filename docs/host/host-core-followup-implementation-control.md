@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-TOOL-01 Slice 3 accepted checkpoint complete；ready for implementation Slice 4 |
+| implementation status | WU-TOOL-01 Slice 4 code review passed；accepted slice checkpoint pending |
 | active work unit | WU-TOOL-01 |
 | default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-01 implementation Slice 4 handoff；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-01 accepted Slice 4 commit, then aggregate review；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -461,6 +461,8 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-01：Slice 3 fix artifact: `docs/reviews/wu-tool-01-fix-slice3-codex-20260601.md`；code re-review artifacts: `docs/reviews/wu-tool-01-code-rereview-slice3-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-rereview-slice3-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-code-rereview-slice3-controller-adjudication-20260601.md`。
 - 裁决：CR3-1 / CR3-2 全部 closed；tool trace `duplicate_scope` hot/cold projection、accept barrier scope/prior refs、duplicate governance scope assertions 均通过 re-review；本地验证通过 `tests/host/test_toolruntime_diagnostics.py` + `tests/host/test_toolruntime_accept_barrier.py` + `tests/host/test_tool_trace_projection.py` + `tests/host/test_toolruntime_duplicate_governance.py` 52 passed、`pyright` 0 errors。
 - Accepted Slice 3 commit: `98ccd7a` (`gateflow: accept WU-TOOL-01 slice3`)。
+- 2026-06-01：Slice 4 implementation artifact: `docs/reviews/wu-tool-01-implementation-slice4-codex-20260601.md`；code review artifacts: `docs/reviews/wu-tool-01-code-review-slice4-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-review-slice4-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-code-review-slice4-controller-adjudication-20260601.md`。
+- 裁决：Slice 4 code/doc review 0 blocking；cross-Attempt fresh request、fresh handle in-memory non-durable restart behavior、README sync 和 terminology cleanup 均通过 review；本地验证通过 target pytest 123 passed、`pyright` 0 errors；terminology grep 只剩 truncation cursor、reactive compaction token 或测试数据 id 等允许上下文。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 

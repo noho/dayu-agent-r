@@ -756,8 +756,8 @@ async def test_plain_policy_rejection_does_not_carry_duplicate_prior_refs() -> N
 
 
 @pytest.mark.asyncio
-async def test_duplicate_key_includes_attempt_id() -> None:
-    """不同 Attempt 的同工具同参数不会共享 duplicate key 或 accepted 记忆。"""
+async def test_cross_attempt_same_run_duplicate_executes_fresh_without_prior_refs() -> None:
+    """相同 run_id 不同 Attempt 的同工具同参数按 fresh request 执行。"""
 
     first_tool = _CountingTool({"accepted": "first-attempt"})
     second_tool = _CountingTool({"accepted": "second-attempt"})
@@ -779,6 +779,16 @@ async def test_duplicate_key_includes_attempt_id() -> None:
 
     assert first_tool.call_count == 1
     assert second_tool.call_count == 1
+    assert first_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
+    assert second_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
+    assert first_accept_port.candidates[0].duplicate_decision is (
+        DuplicateDecisionKind.ALLOW
+    )
+    assert second_accept_port.candidates[0].duplicate_decision is (
+        DuplicateDecisionKind.ALLOW
+    )
+    assert first_accept_port.candidates[0].reuse_prior_event_refs == ()
+    assert second_accept_port.candidates[0].reuse_prior_event_refs == ()
     assert first_accept_port.candidates[0].duplicate_key != (
         second_accept_port.candidates[0].duplicate_key
     )
@@ -788,6 +798,43 @@ async def test_duplicate_key_includes_attempt_id() -> None:
     assert second_accept_port.candidates[0].duplicate_scope.attempt_id == (
         "attempt-other"
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_toolruntime_handle_same_attempt_is_in_memory_non_durable_restart_behavior() -> None:
+    """新 ToolRuntime handle 不继承内存 duplicate index；该行为不是 correctness 前提。"""
+
+    first_tool = _CountingTool({"accepted": "before-restart"})
+    restarted_tool = _CountingTool({"accepted": "after-restart"})
+    first_accept_port = _AcceptingPort()
+    restarted_accept_port = _AcceptingPort()
+    policy = DuplicateGovernancePolicy(
+        default_duplicate_decision=DuplicateDecisionKind.REUSE
+    )
+
+    await _executor(first_tool, first_accept_port, policy).execute(
+        _request(_call("tool-call-before-restart", {"ticker": "DAYU"}, index=0))
+    )
+    await _executor(restarted_tool, restarted_accept_port, policy).execute(
+        _request(_call("tool-call-after-restart", {"ticker": "DAYU"}, index=0))
+    )
+
+    assert first_tool.call_count == 1
+    assert restarted_tool.call_count == 1
+    assert first_accept_port.candidates[0].duplicate_scope is not None
+    assert restarted_accept_port.candidates[0].duplicate_scope is not None
+    assert first_accept_port.candidates[0].duplicate_scope.attempt_id == _ATTEMPT_ID
+    assert restarted_accept_port.candidates[0].duplicate_scope.attempt_id == (
+        _ATTEMPT_ID
+    )
+    assert first_accept_port.candidates[0].duplicate_key == (
+        restarted_accept_port.candidates[0].duplicate_key
+    )
+    assert restarted_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
+    assert restarted_accept_port.candidates[0].duplicate_decision is (
+        DuplicateDecisionKind.ALLOW
+    )
+    assert restarted_accept_port.candidates[0].reuse_prior_event_refs == ()
 
 
 @pytest.mark.asyncio

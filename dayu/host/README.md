@@ -228,13 +228,15 @@ ToolRuntime 的稳定语义：
 - 工具结果、工具失败、工具取消、工具等待、治理拒绝、重复调用复用与截断结果必须经过 Host accept barrier。
 - accept barrier 校验 run / attempt / execution identity、schema digest、payload descriptor、幂等与 stale execution，接受后写入 canonical tool result facts。
 - side-effect 或付费工具必须具备工具级幂等依据；缺失时不调用实际 callable。
+- duplicate governance 是 attempt-local in-memory 治理能力，只治理当前 ToolRuntime Attempt 内同工具同参数的重复调用和 in-flight owner / waiter 串行化；新 Attempt、worker restart 或 Host restart 不继承旧内存索引，也不从 EventLog 重建 duplicate ledger。
+- duplicate governance 的默认动作、按工具覆盖动作、模型可见治理文案与 justification 参数名由 `HostToolingOptions.duplicate_governance_policy` 在 Host construction 阶段以 typed `DuplicateGovernancePolicy` 配置；ToolRuntime 执行路径不读取 raw config、profile id 或 extra payload。
 - `ToolTruncateSpec` 是 declaration/effective 分离契约：工具声明允许启用截断但省略策略 limit 或 TTL，层中立 runtime helper 按 policy defaults 补齐 effective spec 后交给 ToolRuntime 消费。
 - ToolRuntime 只在显式 truncation spec 或 truncation manager 存在时改写 LLM 可见工具结果；durable payload inline threshold 不作为 LLM inline result 限制。
 - `TOOL_RESULT_ACCEPTED` 的 durable payload 超过 inline threshold 时，由 ToolRuntime accept barrier 在同一 transaction 中写 SQLite payload descriptor；EventLog hot payload 只保留 evidence envelope、status、metadata 与 payload ref，不内联完整 raw tool outcome。
 - truncation cursor 是 run-scoped、短生命周期、单次使用的本地补读引用；一次 `fetch_more` 成功后同一 cursor 即失效。
 - `fetch_more` 是 framework tool 预留名，默认保留但不启用；业务工具不得占用预留 framework tool 名。
 
-ToolRuntime 内部 factory、run-scoped duplicate governance registry、truncation manager 和 accept port 不从 `dayu.host` 包根导出。
+ToolRuntime 内部 factory、attempt-local duplicate governance state、truncation manager 和 accept port 不从 `dayu.host` 包根导出。
 
 ## Wait 与 Resolve
 
