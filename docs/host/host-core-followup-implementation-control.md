@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-DUR-01 + WU-DUR-02 已完成：draft-PR-pass；WU-LIFE-01 + WU-LIFE-02 Slice A 与 Slice B implementation / review 已通过；下一步 aggregate deepreview |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-DUR-01 + WU-DUR-02 已完成：draft-PR-pass；WU-LIFE-01 + WU-LIFE-02 local implementation / review / aggregate deepreview 已通过，ready-to-open-draft-PR |
 | active work unit | WU-LIFE-01 + WU-LIFE-02 |
 | default next work unit | WU-LIFE-01 + WU-LIFE-02 |
-| next entry point | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview gate；WU-DUR-01 + WU-DUR-02 merge / ready-for-review / reviewer request require separate authorization |
+| next entry point | WU-LIFE-01 + WU-LIFE-02 draft PR gate；WU-DUR-01 + WU-DUR-02 merge / ready-for-review / reviewer request require separate authorization |
 | design source | docs/host/design.md |
 | plan artifacts | docs/host/wu-runtime-01-filelock-contraction-plan.md；docs/host/wu-runtime-02-lane-clock-cancellation-plan.md；docs/host/wu-stress-01-host-production-stress-suite-plan.md；docs/host/wu-dur-01-02-durable-bootstrap-concurrency-plan.md；docs/host/wu-life-01-02-recovery-scheduler-lifecycle-plan.md |
 | plan review artifacts | WU-STRESS-01 discussion/code inspection: docs/reviews/wu-stress-01-discussion-code-inspection-20260601.md；plan review: docs/reviews/wu-stress-01-plan-review-mimo-20260601.md, docs/reviews/wu-stress-01-plan-review-ds-20260601.md；controller adjudication: docs/reviews/wu-stress-01-plan-controller-adjudication-20260601.md；plan re-review: docs/reviews/wu-stress-01-plan-rereview-mimo-20260601.md, docs/reviews/wu-stress-01-plan-rereview-ds-20260601.md；WU-DUR-01 + WU-DUR-02 discussion/code inspection: docs/reviews/wu-dur-01-02-discussion-code-inspection-20260601.md；plan review: docs/reviews/wu-dur-01-02-plan-review-mimo-20260601.md, docs/reviews/wu-dur-01-02-plan-review-ds-20260601.md；controller adjudication: docs/reviews/wu-dur-01-02-plan-controller-adjudication-20260601.md；plan fix: docs/reviews/wu-dur-01-02-plan-fix-codex-20260601.md；plan re-review: docs/reviews/wu-dur-01-02-plan-rereview-mimo-20260601.md, docs/reviews/wu-dur-01-02-plan-rereview-ds-20260601.md；WU-LIFE-01 + WU-LIFE-02 discussion/code inspection: docs/reviews/wu-life-01-02-discussion-code-inspection-20260601.md；controller adjudication: docs/reviews/wu-life-01-02-discussion-controller-adjudication-20260601.md；plan review: docs/reviews/wu-life-01-02-plan-review-mimo-20260601.md, docs/reviews/wu-life-01-02-plan-review-ds-20260601.md；plan controller adjudication: docs/reviews/wu-life-01-02-plan-controller-adjudication-20260601.md |
@@ -140,6 +140,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | plan | accepted | docs/host/wu-life-01-02-recovery-scheduler-lifecycle-plan.md；docs/reviews/wu-life-01-02-plan-review-mimo-20260601.md；docs/reviews/wu-life-01-02-plan-review-ds-20260601.md；docs/reviews/wu-life-01-02-plan-controller-adjudication-20260601.md | n/a |
 | Slice A implementation / review / fix / re-review | passed | docs/reviews/wu-life-01-02-implementation-sliceA-codex-20260601.md；docs/reviews/wu-life-01-02-code-review-sliceA-mimo-20260601.md；docs/reviews/wu-life-01-02-code-review-sliceA-ds-20260601.md；docs/reviews/wu-life-01-02-code-controller-adjudication-sliceA-20260601.md；docs/reviews/wu-life-01-02-fix-sliceA-codex-20260601.md；docs/reviews/wu-life-01-02-code-rereview-sliceA-mimo-20260601.md；docs/reviews/wu-life-01-02-code-rereview-sliceA-ds-20260601.md | `pytest tests/host/test_recovery_scan.py tests/host/test_recovery_dispatch.py tests/host/test_recovery_orphan_classifier.py -q` -> 33 passed；`python -m pyright dayu/ tests/ utils/` -> 0 errors |
 | Slice B implementation / review | passed | docs/reviews/wu-life-01-02-implementation-sliceB-codex-20260601.md；docs/reviews/wu-life-01-02-code-review-sliceB-mimo-20260601.md；docs/reviews/wu-life-01-02-code-review-sliceB-ds-20260601.md；docs/reviews/wu-life-01-02-code-controller-adjudication-sliceB-20260601.md | `pytest tests/host/test_dispatch_scheduler.py -q` -> 54 passed；`pytest tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py tests/host/test_public_cancel_session_runs.py -q` -> 20 passed；`python -m pyright dayu/ tests/ utils/` -> 0 errors |
+| aggregate deepreview | passed | docs/reviews/wu-life-01-02-aggregate-deepreview-mimo-20260601.md；docs/reviews/wu-life-01-02-aggregate-deepreview-ds-20260601.md；docs/reviews/wu-life-01-02-aggregate-controller-adjudication-20260601.md | `pytest tests/host/test_recovery_scan.py tests/host/test_recovery_dispatch.py tests/host/test_recovery_orphan_classifier.py tests/host/test_dispatch_scheduler.py tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py tests/host/test_public_cancel_session_runs.py tests/host/test_recovery_multiprocess.py -q` -> 110 passed；`python -m pyright dayu/ tests/ utils/` -> 0 errors |
 
 状态约定：
 
@@ -187,6 +188,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-DUR-03 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | schema validation 批量缺失对象诊断 | deferred-with-owner | WU-LAYER-01 schema invariant hardening | 后续 schema invariant hardening 可把 fail-fast 单对象错误升级为批量缺失对象报告 | 当前 fail-closed 行为满足 WU-DUR 验收信号；批量诊断属于运维可读性增强。 |
 | RR-DUR-04 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | production long read transaction governance scan | closed | WU-LIFE-01 Slice A recovery lifecycle proof | 无后续动作 | Slice A 已将 RR-DUR-04 纳入 recovery lifecycle proof matrix，并由 tests/host/test_recovery_scan.py 的 deterministic scanner tests 与既有 projection-lag recovery tests 证明 recovery scanner 使用 durable truth；未发现 long read transaction 或 projection lag 作为 governance truth 的生产误用。 |
 | RR-DUR-05 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | index definition / DDL text invariant validation | deferred-with-owner | WU-LAYER-01 schema invariant hardening | 后续如需抵御同名但定义错误的 index，再扩展 schema invariant validation | WU-DUR 当前只要求 required table/index existence fail-closed；full DDL text/index definition validation 已由 plan 明确 defer。 |
+| RR-LIFE-01 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | worker-started-but-not-accepted deterministic close window / close cancellation boundary | deferred-with-owner | future scheduler lifecycle hardening if needed | 若后续 close() refactor 改变 cleanup 顺序、增加非幂等步骤，或需要覆盖 worker-started-but-not-accepted precise window，再补 deterministic instrumentation/test | 当前 Slice B 已覆盖 lane-wait pre-worker 与 active-worker close 两侧稳定窗口，并证明 close cancellation retry 可在 lane close 边界补完 cleanup；精确 worker-started-but-not-accepted 窗口未稳定构造，按 plan deferred。 |
+| RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
 
 ## 当前 Work Units
 
@@ -196,8 +199,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-STRESS-01 | Host production stress suite | crash / recovery / watch / scheduler 组合压力 | 已完成：draft-PR-pass |
 | WU-DUR-01 | Schema bootstrap / WAL checkpoint | durable bootstrap 原子性与维护策略 | 已完成：draft-PR-pass |
 | WU-DUR-02 | Durable concurrency matrix | durable 并发冲突测试矩阵 | 已完成：draft-PR-pass |
-| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | Slice A implementation / review / fix / re-review 已通过 |
-| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | Slice B implementation / review 已通过 |
+| WU-LIFE-01 | Recovery lifecycle proof | recovery 决策矩阵与诊断 | 已完成本地 gate；ready-to-open-draft-PR |
+| WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 已完成本地 gate；ready-to-open-draft-PR |
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 未开始 |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 未开始 |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 未开始 |
