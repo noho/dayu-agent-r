@@ -530,6 +530,9 @@ async def test_duplicate_governed_matrix_produces_diagnostics(
     assert tool.call_count == 1
     assert governed_candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
     assert governed_candidate.policy_decision.kind is expected_policy
+    assert governed_candidate.duplicate_scope is not None
+    assert governed_candidate.duplicate_scope.kind == "attempt"
+    assert governed_candidate.duplicate_scope.attempt_id == _ATTEMPT_ID
     assert governed_candidate.diagnostic_refs
     assert governed_candidate.reuse_prior_event_refs
     assert len(diagnostics.records) == 1
@@ -1149,6 +1152,9 @@ async def _governed_duplicate_candidate(
 
     candidate = accept_port.candidates[1]
     assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    assert candidate.duplicate_scope is not None
+    assert candidate.duplicate_scope.kind == "attempt"
+    assert candidate.duplicate_scope.attempt_id == _ATTEMPT_ID
     return candidate
 
 

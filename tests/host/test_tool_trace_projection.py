@@ -281,6 +281,10 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
                 "tool_name": "lookup_filing",
                 "duplicate_key": "dup-key",
                 "duplicate_decision": "reuse",
+                "duplicate_scope": {
+                    "kind": "attempt",
+                    "attempt_id": "attempt-trace",
+                },
                 "reuse_prior_event_refs": [
                     {"event_id": "event-old", "event_sequence": 1}
                 ],
@@ -345,6 +349,10 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         assert governed_row is not None
         assert governed_row.diagnostic_ref == "diag-duplicate"
         assert governed_row.trace_summary["duplicate_decision"] == "reuse"
+        assert governed_row.trace_summary["duplicate_scope"] == {
+            "kind": "attempt",
+            "attempt_id": "attempt-trace",
+        }
         assert result_row is not None
         assert result_row.result_digest == "sha256:outcome"
         assert result_row.diagnostic_ref == "diag-result"
@@ -377,6 +385,13 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         assert result_line["trace_summary"] == result_row.trace_summary
         assert result_line["cold_trace_ref"] == "tool-trace-cold:event-result"
         assert result_line["cold_trace_digest"] == result_line["line_digest"]
+        governed_line = cold_lines[1]
+        governed_summary = governed_line["trace_summary"]
+        assert isinstance(governed_summary, Mapping)
+        assert governed_summary["duplicate_scope"] == {
+            "kind": "attempt",
+            "attempt_id": "attempt-trace",
+        }
 
 
 def test_cold_writer_failure_records_projection_failure_without_checkpoint(

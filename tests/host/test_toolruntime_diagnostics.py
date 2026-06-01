@@ -51,6 +51,7 @@ from dayu.host.tool_runtime import (
     ToolRuntimeExecutionScope,
     ToolTraceDiagnosticRecord,
 )
+from dayu.host.tool_duplicate_governance import DuplicateGovernanceMessages
 from dayu.host.tooling import (
     default_framework_tool_policy_view,
 )
@@ -185,18 +186,24 @@ def test_deterministic_diagnostic_emitter_rejects_empty_fields() -> None:
 async def test_candidate_and_ack_carry_duplicate_diagnostic_refs() -> None:
     """duplicate governed candidate 与 accepted ack 携带 diagnostic refs。"""
 
+    configured_action_message = "配置化 hard stop duplicate message"
+    configured_diagnostic_message = "配置化 attempt-scope duplicate diagnostic"
     accept_port = _ScriptedAcceptPort()
     diagnostics = InMemoryToolTraceDiagnosticEmitter()
     executor = _executor(
         _CountingTool(),
         accept_port,
         DuplicateGovernancePolicy(
-            default_duplicate_decision=DuplicateDecisionKind.HARD_STOP
+            default_duplicate_decision=DuplicateDecisionKind.HARD_STOP,
+            messages=DuplicateGovernanceMessages(
+                hard_stop=configured_action_message,
+                attempt_scope_diagnostic=configured_diagnostic_message,
+            ),
         ),
         diagnostics,
     )
 
-    await executor.execute(
+    result = await executor.execute(
         _request(
             _call("tool-call-1", {"ticker": "DAYU"}),
             _call("tool-call-2", {"ticker": "DAYU"}),
@@ -205,10 +212,15 @@ async def test_candidate_and_ack_carry_duplicate_diagnostic_refs() -> None:
 
     governed_candidate = accept_port.candidates[1]
     governed_ack = accept_port.acks[1]
+    governed_outcome = result.records[1].outcome
     assert governed_candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    assert governed_candidate.policy_decision.message == configured_action_message
+    assert isinstance(governed_outcome, ToolFailedOutcome)
+    assert governed_outcome.result.message == configured_action_message
     assert governed_candidate.diagnostic_refs
     assert governed_ack.diagnostic_refs == governed_candidate.diagnostic_refs
     assert diagnostics.records[0].reason_code == "duplicate_hard_stop"
+    assert diagnostics.records[0].message == configured_diagnostic_message
 
 
 @pytest.mark.asyncio
