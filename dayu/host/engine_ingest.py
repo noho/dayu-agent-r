@@ -215,6 +215,7 @@ _REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD = (
 _REASON_CONTEXT_COMPACTION_REQUIRED = "context_compaction_required"
 _REASON_CONTEXT_COMPACTION_RECOVERY_FAILED = "context_compaction_recovery_failed"
 _RECOVERY_FAILURE_POLICY_DECISION = "reactive_compact_failed"
+_REACTIVE_PRECONDITION_OPERATION_PREFIX = "reactive_precondition"
 _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
@@ -1252,7 +1253,13 @@ class EngineEventIngestor:
             transaction,
             context=context,
             estimate=estimate,
+            operation_id=_reactive_precondition_compaction_operation_id(
+                context=context,
+                failure_reason=failure_reason,
+            ),
             failure_reason=failure_reason,
+            attempt_count=0,
+            retry_repair_budget_exhausted=False,
             budget_after_attempted_compact=None,
         )
         run_failed = self._fail_recovering_run(
@@ -1499,7 +1506,10 @@ class EngineEventIngestor:
                     transaction,
                     context=latest,
                     estimate=pending.estimate,
+                    operation_id=pending.operation_id,
                     failure_reason="stale_compaction_result",
+                    attempt_count=len(operation_result.rejected_attempts),
+                    retry_repair_budget_exhausted=False,
                     budget_after_attempted_compact=(
                         operation_result.budget_after_attempted_compact
                     ),
@@ -1536,8 +1546,13 @@ class EngineEventIngestor:
                     transaction,
                     context=latest,
                     estimate=pending.estimate,
+                    operation_id=pending.operation_id,
                     failure_reason=(
                         operation_result.failure_reason or "compaction_failed"
+                    ),
+                    attempt_count=len(operation_result.rejected_attempts),
+                    retry_repair_budget_exhausted=(
+                        len(operation_result.rejected_attempts) > 0
                     ),
                     budget_after_attempted_compact=(
                         operation_result.budget_after_attempted_compact
@@ -1674,7 +1689,10 @@ class EngineEventIngestor:
         *,
         context: _ValidatedCandidate,
         estimate: BudgetEstimate | None,
+        operation_id: str,
         failure_reason: str,
+        attempt_count: int,
+        retry_repair_budget_exhausted: bool,
         budget_after_attempted_compact: int | None,
     ) -> EventLogRow:
         """追加 reactive ``CONTEXT_COMPACTION_FAILED`` fact。
@@ -1682,7 +1700,10 @@ class EngineEventIngestor:
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
         :param estimate: 可选 Host budget estimate。
+        :param operation_id: compact operation 诊断 id。
         :param failure_reason: 失败原因。
+        :param attempt_count: operation 内已拒绝 proposal attempt 数。
+        :param retry_repair_budget_exhausted: semantic retry / repair 预算是否耗尽。
         :param budget_after_attempted_compact: compact 后估算；未知时为 ``None``。
         :returns: EventLog row。
         """
@@ -1715,9 +1736,14 @@ class EngineEventIngestor:
                 policy_decision=None,
                 reason={"failure_reason": failure_reason},
                 payload_json=build_context_compaction_failed_payload(
+                    operation_id=operation_id,
                     failure_reason=failure_reason,
                     policy_decision=_RECOVERY_FAILURE_POLICY_DECISION,
                     retryable=False,
+                    attempt_count=attempt_count,
+                    retry_repair_budget_exhausted=(
+                        retry_repair_budget_exhausted
+                    ),
                     diagnostic_refs=diagnostic_refs,
                     budget_after_attempted_compact=budget_after_attempted_compact,
                 ),
@@ -3600,6 +3626,22 @@ def _engine_event_ref(candidate: EngineEventCandidate) -> str:
     return (
         f"engine:{candidate.envelope.execution_id}:"
         f"{candidate.worker_event_index}:{event_type}"
+    )
+
+
+def _reactive_precondition_compaction_operation_id(
+    *, context: _ValidatedCandidate, failure_reason: str
+) -> str:
+    """构造未写 request fact 的 reactive precondition failure operation id。
+
+    :param context: 已校验 candidate 上下文。
+    :param failure_reason: precondition failure reason。
+    :returns: 可写入 failed payload 的稳定 operation id。
+    """
+
+    return (
+        f"{_REACTIVE_PRECONDITION_OPERATION_PREFIX}:"
+        f"{failure_reason}:{_engine_event_ref(context.candidate)}"
     )
 
 

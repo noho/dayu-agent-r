@@ -66,6 +66,7 @@ from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
     context_budget_policy_from_threshold_tokens,
 )
+from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
@@ -3280,7 +3281,19 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
                 seeded.run_id,
                 CONTEXT_COMPACTION_FAILED,
             )
-            assert _event_payload(failed)["failure_reason"] == "stale_compaction_result"
+            requested = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_REQUESTED,
+            )
+            payload = _event_payload(failed)
+            assert payload["failure_reason"] == "stale_compaction_result"
+            assert_failed_payload_no_fallback(
+                payload,
+                expected_operation_id=requested.event_id,
+                expected_attempt_count=1,
+                expected_retry_repair_budget_exhausted=False,
+            )
         finally:
             await scheduler.close()
 
@@ -3377,7 +3390,18 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                 seeded.run_id,
                 CONTEXT_COMPACTION_ATTEMPT_REJECTED,
             )
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
             assert _event_payload(rejected)["operation_id"] == requested.event_id
+            assert_failed_payload_no_fallback(
+                _event_payload(failed),
+                expected_operation_id=requested.event_id,
+                expected_attempt_count=2,
+                expected_retry_repair_budget_exhausted=True,
+            )
         finally:
             await scheduler.close()
 
@@ -3411,6 +3435,22 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
                 CONTEXT_COMPACTION_REQUESTED,
                 CONTEXT_COMPACTION_FAILED,
                 "RUN_FAILED",
+            )
+            requested = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_REQUESTED,
+            )
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            assert_failed_payload_no_fallback(
+                _event_payload(failed),
+                expected_operation_id=requested.event_id,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
             )
         finally:
             await scheduler.close()
@@ -3450,7 +3490,14 @@ async def test_pre_start_governance_proactive_count_limit_blocks_second_compact(
                 _event_types_for_run(store.transaction_runner, seeded.run_id).count(CONTEXT_COMPACTION_REQUESTED) == 1
             )
             failed = _read_event_by_type(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-            assert json.loads(_require_text(failed.payload_json))["failure_reason"] == "proactive_compact_limit_reached"
+            payload = _event_payload(failed)
+            assert payload["failure_reason"] == "proactive_compact_limit_reached"
+            assert_failed_payload_no_fallback(
+                payload,
+                expected_operation_id=None,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
+            )
         finally:
             await scheduler.close()
 
@@ -3486,8 +3533,13 @@ async def test_pre_start_governance_corrupted_compact_count_fails_closed(
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.FAILED)
             failed = _read_event_by_type(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-            assert (
-                json.loads(_require_text(failed.payload_json))["failure_reason"] == "proactive_compact_count_unreadable"
+            payload = _event_payload(failed)
+            assert payload["failure_reason"] == "proactive_compact_count_unreadable"
+            assert_failed_payload_no_fallback(
+                payload,
+                expected_operation_id=None,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
             )
         finally:
             await scheduler.close()

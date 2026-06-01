@@ -111,6 +111,7 @@ from dayu.host.durable.state import (
     steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
 from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
@@ -527,7 +528,14 @@ async def test_reactive_compaction_rejects_stale_input_sequence(
         stale_failed = _latest_event(
             store.transaction_runner, CONTEXT_COMPACTION_FAILED
         )
-        assert _payload(stale_failed)["failure_reason"] == "stale_compaction_result"
+        payload = _payload(stale_failed)
+        assert payload["failure_reason"] == "stale_compaction_result"
+        assert_failed_payload_no_fallback(
+            payload,
+            expected_operation_id=result.events[0].event_id,
+            expected_attempt_count=0,
+            expected_retry_repair_budget_exhausted=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -633,6 +641,13 @@ async def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -
         assert attempt_status == AttemptStatus.FAILED
         assert _event_count(store.transaction_runner, "RUN_LOST") == 0
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        failed_payload = _payload(result.events[3])
+        assert_failed_payload_no_fallback(
+            failed_payload,
+            expected_operation_id=result.events[0].event_id,
+            expected_attempt_count=0,
+            expected_retry_repair_budget_exhausted=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -744,7 +759,14 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
         assert run_status == RunStatus.FAILED
         assert attempt_status == AttemptStatus.FAILED
         failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-        assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
+        payload = _payload(failed)
+        assert payload["failure_reason"] == "reactive_compact_limit_reached"
+        assert_failed_payload_no_fallback(
+            payload,
+            expected_operation_id=None,
+            expected_attempt_count=0,
+            expected_retry_repair_budget_exhausted=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -775,6 +797,13 @@ async def test_reactive_repeated_overflow_respects_max_reactive_compactions_per_
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
         assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+        failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
+        assert_failed_payload_no_fallback(
+            _payload(failed),
+            expected_operation_id=None,
+            expected_attempt_count=0,
+            expected_retry_repair_budget_exhausted=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -844,7 +873,14 @@ async def test_reactive_compact_corrupt_count_fact_fails_closed(
         assert run_status == RunStatus.FAILED
         assert attempt_status == AttemptStatus.FAILED
         failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-        assert _payload(failed)["failure_reason"] == "reactive_compact_count_unreadable"
+        payload = _payload(failed)
+        assert payload["failure_reason"] == "reactive_compact_count_unreadable"
+        assert_failed_payload_no_fallback(
+            payload,
+            expected_operation_id=None,
+            expected_attempt_count=0,
+            expected_retry_repair_budget_exhausted=False,
+        )
 
 
 def test_run_suspended_only_writes_diagnostic_and_duplicate_is_idempotent(
@@ -2733,3 +2769,4 @@ def _payload(row: EventLogRow) -> Mapping[str, JsonValue]:
     value = cast(JsonValue, json.loads(row.payload_json))
     assert isinstance(value, Mapping)
     return cast(Mapping[str, JsonValue], value)
+

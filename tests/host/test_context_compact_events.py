@@ -51,6 +51,10 @@ from dayu.host.read_api import _host_event_from_row
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
+_FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
+_FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
+_FIELD_FALLBACK_BUDGET_RESULT = "fallback_budget_result"
 
 
 def test_requested_payload_builder_accepts_proactive_without_attempt() -> None:
@@ -256,26 +260,232 @@ def test_compacted_payload_rejects_rejected_quality_result() -> None:
         )
 
 
-def test_failed_payload_builder_and_validator() -> None:
-    """failed payload builder 输出失败原因、policy decision 与诊断 refs。"""
+def test_failed_payload_builder_and_validator_no_fallback() -> None:
+    """failed payload builder 输出无 fallback 时的完整诊断字段。"""
 
     payload = build_context_compaction_failed_payload(
+        operation_id="event-context-compaction-requested-1",
         failure_reason="quality_check_failed",
         policy_decision=ContextBudgetDecision.BLOCK_HARD_THRESHOLD,
         retryable=False,
+        attempt_count=2,
+        retry_repair_budget_exhausted=True,
         diagnostic_refs=("diagnostic:compact-1",),
         budget_after_attempted_compact=None,
     )
 
     validate_context_compaction_failed_payload(payload)
+    assert payload["operation_id"] == "event-context-compaction-requested-1"
     assert payload["policy_decision"] == "block_hard_threshold"
     assert payload["retryable"] is False
+    assert payload["attempt_count"] == 2
+    assert payload["retry_repair_budget_exhausted"] is True
+    assert payload["fallback_policy_decision"] is None
+    assert payload["fallback_input_window"] is None
+    assert payload["fallback_input_digest"] is None
+    assert payload["fallback_budget_result"] is None
+    assert payload["fallback_action"] == "not_applicable"
+
+
+def test_failed_payload_builder_and_validator_fallback_dispatch() -> None:
+    """failed payload 支持 fallback dispatch 的结构化诊断字段。"""
+
+    payload = build_context_compaction_failed_payload(
+        operation_id="event-context-compaction-requested-2",
+        failure_reason="quality_check_failed",
+        policy_decision="compact_failed_before_dispatch",
+        retryable=False,
+        attempt_count=1,
+        retry_repair_budget_exhausted=True,
+        diagnostic_refs=("diagnostic:compact-2",),
+        budget_after_attempted_compact=180,
+        fallback_policy_decision="recent_window_budget_passed",
+        fallback_input_window={
+            "selected_block_ids": ["block-current", "block-recent"],
+            "dropped_block_ids": ["block-old"],
+            "current_input_ref": "event-input-1",
+        },
+        fallback_input_digest=_DIGEST_A,
+        fallback_budget_result={
+            "estimated_input_tokens": 42,
+            "hard_threshold_tokens": 128,
+            "decision": "allow_dispatch",
+        },
+        fallback_action="dispatch",
+    )
+
+    validate_context_compaction_failed_payload(payload)
+    assert payload["fallback_action"] == "dispatch"
+    assert payload["fallback_input_digest"] == _DIGEST_A
+
+
+def test_failed_payload_builder_and_validator_fallback_fail_closed() -> None:
+    """failed payload 支持 fallback fail closed 的结构化诊断字段。"""
+
+    payload = build_context_compaction_failed_payload(
+        operation_id="event-context-compaction-requested-3",
+        failure_reason="quality_check_failed",
+        policy_decision="compact_failed_before_dispatch",
+        retryable=False,
+        attempt_count=1,
+        retry_repair_budget_exhausted=True,
+        diagnostic_refs=("diagnostic:compact-3",),
+        budget_after_attempted_compact=180,
+        fallback_policy_decision="recent_window_over_budget",
+        fallback_input_window={
+            "selected_block_ids": ["block-current"],
+            "dropped_block_ids": ["block-old"],
+            "current_input_ref": "event-input-1",
+        },
+        fallback_input_digest=_DIGEST_B,
+        fallback_budget_result={
+            "estimated_input_tokens": 256,
+            "hard_threshold_tokens": 128,
+            "decision": "block_hard_threshold",
+        },
+        fallback_action="fail_closed",
+    )
+
+    validate_context_compaction_failed_payload(payload)
+    assert payload["fallback_action"] == "fail_closed"
+    assert payload["fallback_budget_result"] is not None
+
+
+def test_failed_payload_rejects_negative_attempt_count() -> None:
+    """failed validator 拒绝负数 attempt count。"""
+
+    payload = build_context_compaction_failed_payload(
+        operation_id="event-context-compaction-requested-4",
+        failure_reason="quality_check_failed",
+        policy_decision="compact_failed_before_dispatch",
+        retryable=False,
+        attempt_count=0,
+        retry_repair_budget_exhausted=False,
+        diagnostic_refs=("diagnostic:compact-4",),
+        budget_after_attempted_compact=None,
+    )
+
+    invalid_payload = dict(payload)
+    invalid_payload["attempt_count"] = -1
+    with pytest.raises(ValueError, match="attempt_count must be non-negative"):
+        validate_context_compaction_failed_payload(invalid_payload)
+
+
+def test_failed_payload_rejects_invalid_fallback_action() -> None:
+    """failed validator 拒绝非法 fallback action。"""
+
+    payload = build_context_compaction_failed_payload(
+        operation_id="event-context-compaction-requested-5",
+        failure_reason="quality_check_failed",
+        policy_decision="compact_failed_before_dispatch",
+        retryable=False,
+        attempt_count=0,
+        retry_repair_budget_exhausted=False,
+        diagnostic_refs=("diagnostic:compact-5",),
+        budget_after_attempted_compact=None,
+    )
+
+    invalid_payload = dict(payload)
+    invalid_payload["fallback_action"] = "retry_later"
+    with pytest.raises(ValueError, match="fallback_action must be"):
+        validate_context_compaction_failed_payload(invalid_payload)
+
+
+def test_failed_payload_rejects_not_applicable_with_fallback_fields() -> None:
+    """failed validator 拒绝 not_applicable 携带 fallback 诊断字段。
+
+    :returns: ``None``。
+    :raises AssertionError: validator 未拒绝非法字段组合时抛出。
+    """
+
+    selected_block_ids: list[JsonValue] = ["block-current"]
+    fallback_input_window: Mapping[str, JsonValue] = {
+        "selected_block_ids": selected_block_ids,
+    }
+    fallback_budget_result: Mapping[str, JsonValue] = {
+        "decision": "allow_dispatch",
+    }
+    invalid_cases: tuple[tuple[str, JsonValue, str], ...] = (
+        (
+            _FIELD_FALLBACK_POLICY_DECISION,
+            "recent_window_budget_passed",
+            "fallback_policy_decision must be null",
+        ),
+        (
+            _FIELD_FALLBACK_INPUT_WINDOW,
+            fallback_input_window,
+            "fallback_input_window must be null",
+        ),
+        (
+            _FIELD_FALLBACK_INPUT_DIGEST,
+            _DIGEST_A,
+            "fallback_input_digest must be null",
+        ),
+        (
+            _FIELD_FALLBACK_BUDGET_RESULT,
+            fallback_budget_result,
+            "fallback_budget_result must be null",
+        ),
+    )
+
+    for field_name, field_value, expected_message in invalid_cases:
+        payload = build_context_compaction_failed_payload(
+            operation_id="event-context-compaction-requested-6",
+            failure_reason="quality_check_failed",
+            policy_decision="compact_failed_before_dispatch",
+            retryable=False,
+            attempt_count=0,
+            retry_repair_budget_exhausted=False,
+            diagnostic_refs=("diagnostic:compact-6",),
+            budget_after_attempted_compact=None,
+        )
+        invalid_payload = dict(payload)
+        invalid_payload[field_name] = field_value
+
+        with pytest.raises(ValueError, match=expected_message):
+            validate_context_compaction_failed_payload(invalid_payload)
+
+
+def test_failed_payload_rejects_dispatch_missing_or_null_fallback_field() -> None:
+    """failed validator 拒绝 dispatch 缺失或置空必需 fallback 字段。
+
+    :returns: ``None``。
+    :raises AssertionError: validator 未拒绝非法字段组合时抛出。
+    """
+
+    missing_payload = dict(_valid_failed_payload_with_fallback("dispatch"))
+    del missing_payload[_FIELD_FALLBACK_INPUT_WINDOW]
+    with pytest.raises(ValueError, match="fallback_input_window is required"):
+        validate_context_compaction_failed_payload(missing_payload)
+
+    null_payload = dict(_valid_failed_payload_with_fallback("dispatch"))
+    null_payload[_FIELD_FALLBACK_INPUT_WINDOW] = None
+    with pytest.raises(ValueError, match="fallback_input_window must be mapping"):
+        validate_context_compaction_failed_payload(null_payload)
+
+
+def test_failed_payload_rejects_fail_closed_missing_or_null_fallback_field() -> None:
+    """failed validator 拒绝 fail_closed 缺失或置空必需 fallback 字段。
+
+    :returns: ``None``。
+    :raises AssertionError: validator 未拒绝非法字段组合时抛出。
+    """
+
+    missing_payload = dict(_valid_failed_payload_with_fallback("fail_closed"))
+    del missing_payload[_FIELD_FALLBACK_BUDGET_RESULT]
+    with pytest.raises(ValueError, match="fallback_budget_result is required"):
+        validate_context_compaction_failed_payload(missing_payload)
+
+    null_payload = dict(_valid_failed_payload_with_fallback("fail_closed"))
+    null_payload[_FIELD_FALLBACK_BUDGET_RESULT] = None
+    with pytest.raises(ValueError, match="fallback_budget_result must be mapping"):
+        validate_context_compaction_failed_payload(null_payload)
 
 
 def test_failed_payload_rejects_missing_required_fields() -> None:
     """failed validator 拒绝缺少必填字段的 payload。"""
 
-    with pytest.raises(ValueError, match="failure_reason is required"):
+    with pytest.raises(ValueError, match="operation_id is required"):
         validate_context_compaction_failed_payload({})
 
 
@@ -362,6 +572,39 @@ def test_attempt_rejected_projects_to_progress_host_event(tmp_path: Path) -> Non
             return _host_event_from_row(transaction, row).kind
 
         assert store.transaction_runner.run_read(_operation) is HostEventKind.PROGRESS
+
+
+def _valid_failed_payload_with_fallback(fallback_action: str) -> Mapping[str, JsonValue]:
+    """构造带完整 fallback 诊断字段的 failed payload。
+
+    :param fallback_action: fallback action，必须是 validator 允许的非空文本。
+    :returns: ``CONTEXT_COMPACTION_FAILED`` payload。
+    :raises ValueError: fallback action 或构造出的 payload 不合法时抛出。
+    """
+
+    return build_context_compaction_failed_payload(
+        operation_id="event-context-compaction-requested-with-fallback",
+        failure_reason="quality_check_failed",
+        policy_decision="compact_failed_before_dispatch",
+        retryable=False,
+        attempt_count=1,
+        retry_repair_budget_exhausted=True,
+        diagnostic_refs=("diagnostic:compact-with-fallback",),
+        budget_after_attempted_compact=180,
+        fallback_policy_decision="recent_window_budget_checked",
+        fallback_input_window={
+            "selected_block_ids": ["block-current"],
+            "dropped_block_ids": ["block-old"],
+            "current_input_ref": "event-input-1",
+        },
+        fallback_input_digest=_DIGEST_A,
+        fallback_budget_result={
+            "estimated_input_tokens": 42,
+            "hard_threshold_tokens": 128,
+            "decision": "allow_dispatch",
+        },
+        fallback_action=fallback_action,
+    )
 
 
 def _valid_attempt_rejected_payload() -> Mapping[str, JsonValue]:

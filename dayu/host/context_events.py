@@ -85,8 +85,15 @@ _FIELD_RUNNER_ATTEMPT_SUMMARY_REFS = "runner_attempt_summary_refs"
 _FIELD_NEXT_POLICY_DECISION = "next_policy_decision"
 _FIELD_POLICY_DECISION = "policy_decision"
 _FIELD_RETRYABLE = "retryable"
+_FIELD_ATTEMPT_COUNT = "attempt_count"
+_FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED = "retry_repair_budget_exhausted"
 _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT = "budget_after_attempted_compact"
+_FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
+_FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
+_FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
+_FIELD_FALLBACK_BUDGET_RESULT = "fallback_budget_result"
+_FIELD_FALLBACK_ACTION = "fallback_action"
 _FIELD_EVIDENCE_REFS = "evidence_refs"
 _FIELD_EVIDENCE_ID = "evidence_id"
 _FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
@@ -151,11 +158,19 @@ _COMPACTED_REQUIRED_FIELDS = (
     _FIELD_BUDGET_AFTER_COMPACT,
 )
 _FAILED_REQUIRED_FIELDS = (
+    _FIELD_OPERATION_ID,
     _FIELD_FAILURE_REASON,
     _FIELD_POLICY_DECISION,
     _FIELD_RETRYABLE,
+    _FIELD_ATTEMPT_COUNT,
+    _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED,
     _FIELD_DIAGNOSTIC_REFS,
     _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT,
+    _FIELD_FALLBACK_POLICY_DECISION,
+    _FIELD_FALLBACK_INPUT_WINDOW,
+    _FIELD_FALLBACK_INPUT_DIGEST,
+    _FIELD_FALLBACK_BUDGET_RESULT,
+    _FIELD_FALLBACK_ACTION,
 )
 _ATTEMPT_REJECTED_REQUIRED_FIELDS = (
     _FIELD_OPERATION_ID,
@@ -174,6 +189,16 @@ _PATCH_ALLOWED_FIELDS = frozenset(
         _FIELD_CONFIRMED_SUBJECTS,
         _FIELD_USER_CONSTRAINTS,
         _FIELD_OPEN_QUESTIONS,
+    )
+)
+_FALLBACK_ACTION_DISPATCH = "dispatch"
+_FALLBACK_ACTION_FAIL_CLOSED = "fail_closed"
+_FALLBACK_ACTION_NOT_APPLICABLE = "not_applicable"
+_FALLBACK_ACTIONS = frozenset(
+    (
+        _FALLBACK_ACTION_DISPATCH,
+        _FALLBACK_ACTION_FAIL_CLOSED,
+        _FALLBACK_ACTION_NOT_APPLICABLE,
     )
 )
 
@@ -381,20 +406,40 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
 
 def build_context_compaction_failed_payload(
     *,
+    operation_id: str,
     failure_reason: str,
     policy_decision: ContextBudgetDecision | str,
     retryable: bool,
+    attempt_count: int,
+    retry_repair_budget_exhausted: bool,
     diagnostic_refs: tuple[str, ...],
     budget_after_attempted_compact: int | None,
+    fallback_policy_decision: str | None = None,
+    fallback_input_window: Mapping[str, JsonValue] | None = None,
+    fallback_input_digest: str | None = None,
+    fallback_budget_result: Mapping[str, JsonValue] | None = None,
+    fallback_action: str = _FALLBACK_ACTION_NOT_APPLICABLE,
 ) -> Mapping[str, JsonValue]:
     """构造 ``CONTEXT_COMPACTION_FAILED`` payload。
 
+    :param operation_id: compact operation 诊断 id；通常为 request fact event id。
     :param failure_reason: compact 失败原因。
     :param policy_decision: compact 失败后的 policy decision。
     :param retryable: 当前失败是否可重试。
+    :param attempt_count: operation 内已拒绝 proposal attempt 数。
+    :param retry_repair_budget_exhausted: semantic retry / repair 预算是否耗尽。
     :param diagnostic_refs: 诊断 ref 列表。
     :param budget_after_attempted_compact: compact 尝试后的预算估算；未知时为
         ``None``。
+    :param fallback_policy_decision: fallback policy decision；不适用时为
+        ``None``。
+    :param fallback_input_window: fallback 输入窗口结构化诊断；不适用时为
+        ``None``。
+    :param fallback_input_digest: fallback 输入窗口 digest；不适用时为
+        ``None``。
+    :param fallback_budget_result: fallback 预算重估结果；不适用时为
+        ``None``。
+    :param fallback_action: fallback 动作。
     :returns: 可写入 EventLog 的 JSON payload。
     :raises TypeError: 字段类型非法时抛出。
     :raises ValueError: 字段值非法时抛出。
@@ -405,11 +450,19 @@ def build_context_compaction_failed_payload(
     else:
         policy_decision_value = policy_decision
     payload: Mapping[str, JsonValue] = {
+        _FIELD_OPERATION_ID: operation_id,
         _FIELD_FAILURE_REASON: failure_reason,
         _FIELD_POLICY_DECISION: policy_decision_value,
         _FIELD_RETRYABLE: retryable,
+        _FIELD_ATTEMPT_COUNT: attempt_count,
+        _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED: retry_repair_budget_exhausted,
         _FIELD_DIAGNOSTIC_REFS: _string_list_json(diagnostic_refs),
         _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: budget_after_attempted_compact,
+        _FIELD_FALLBACK_POLICY_DECISION: fallback_policy_decision,
+        _FIELD_FALLBACK_INPUT_WINDOW: fallback_input_window,
+        _FIELD_FALLBACK_INPUT_DIGEST: fallback_input_digest,
+        _FIELD_FALLBACK_BUDGET_RESULT: fallback_budget_result,
+        _FIELD_FALLBACK_ACTION: fallback_action,
     }
     validate_context_compaction_failed_payload(payload)
     return payload
@@ -424,11 +477,45 @@ def validate_context_compaction_failed_payload(payload: Mapping[str, JsonValue])
     """
 
     _require_fields(payload, _FAILED_REQUIRED_FIELDS)
+    _required_text(payload, _FIELD_OPERATION_ID)
     _required_text(payload, _FIELD_FAILURE_REASON)
     _required_text(payload, _FIELD_POLICY_DECISION)
     _required_bool(payload, _FIELD_RETRYABLE)
+    _required_non_negative_int(payload, _FIELD_ATTEMPT_COUNT)
+    _required_bool(payload, _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED)
     _required_text_list(payload, _FIELD_DIAGNOSTIC_REFS)
     _optional_non_negative_int(payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT)
+    fallback_action = _required_text(payload, _FIELD_FALLBACK_ACTION)
+    if fallback_action not in _FALLBACK_ACTIONS:
+        raise ValueError("fallback_action must be dispatch, fail_closed or not_applicable")
+    _validate_failed_fallback_fields(payload, fallback_action=fallback_action)
+
+
+def _validate_failed_fallback_fields(
+    payload: Mapping[str, JsonValue], *, fallback_action: str
+) -> None:
+    """校验 failed payload 的 fallback 诊断字段一致性。
+
+    :param payload: 待校验 JSON payload。
+    :param fallback_action: 已校验为非空文本的 fallback action。
+    :returns: ``None``。
+    :raises ValueError: fallback 字段组合非法时抛出。
+    """
+
+    if fallback_action == _FALLBACK_ACTION_NOT_APPLICABLE:
+        for field_name in (
+            _FIELD_FALLBACK_POLICY_DECISION,
+            _FIELD_FALLBACK_INPUT_WINDOW,
+            _FIELD_FALLBACK_INPUT_DIGEST,
+            _FIELD_FALLBACK_BUDGET_RESULT,
+        ):
+            if payload[field_name] is not None:
+                raise ValueError(f"{field_name} must be null when fallback is not applicable")
+        return
+    _required_text(payload, _FIELD_FALLBACK_POLICY_DECISION)
+    _required_mapping(payload, _FIELD_FALLBACK_INPUT_WINDOW)
+    _required_text(payload, _FIELD_FALLBACK_INPUT_DIGEST)
+    _required_mapping(payload, _FIELD_FALLBACK_BUDGET_RESULT)
 
 
 def build_context_compaction_attempt_rejected_payload(

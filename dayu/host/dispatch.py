@@ -214,6 +214,7 @@ _COMPACTION_CANCEL_REASON_RUN_MISSING = "run_missing"
 _COMPACTION_CANCEL_REASON_INPUT_CHANGED = "run_input_event_sequence_changed"
 _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
+_COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
@@ -228,6 +229,22 @@ _LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED = (
     "dispatch drain loop durable retry exhausted; closing scheduler " "host_handle_id=%s error_type=%s"
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+def _precondition_compaction_operation_id(
+    *, failure_reason: str, estimate: BudgetEstimate
+) -> str:
+    """构造未写 request fact 的 precondition failure operation id。
+
+    :param failure_reason: precondition failure reason。
+    :param estimate: 触发该分支的预算估算。
+    :returns: 可写入 failed payload 的稳定 operation id。
+    """
+
+    return (
+        f"{_COMPACTION_PRECONDITION_OPERATION_PREFIX}:"
+        f"{failure_reason}:{estimate.estimator_digest}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -951,7 +968,13 @@ class HostDispatchScheduler:
                     run=run,
                     estimate=estimate,
                     decision=decision,
+                    operation_id=_precondition_compaction_operation_id(
+                        failure_reason="hard_threshold_before_dispatch",
+                        estimate=estimate,
+                    ),
                     failure_reason="hard_threshold_before_dispatch",
+                    attempt_count=0,
+                    retry_repair_budget_exhausted=False,
                 )
                 return _GovernanceStageResult(
                     pending_dispatch=self._fail_unstarted_in_transaction(
@@ -977,7 +1000,13 @@ class HostDispatchScheduler:
                     run=run,
                     estimate=estimate,
                     decision=decision,
+                    operation_id=_precondition_compaction_operation_id(
+                        failure_reason="proactive_compact_count_unreadable",
+                        estimate=estimate,
+                    ),
                     failure_reason="proactive_compact_count_unreadable",
+                    attempt_count=0,
+                    retry_repair_budget_exhausted=False,
                 )
                 return _GovernanceStageResult(
                     pending_dispatch=self._fail_unstarted_in_transaction(
@@ -1007,7 +1036,13 @@ class HostDispatchScheduler:
                     run=run,
                     estimate=estimate,
                     decision=decision,
+                    operation_id=_precondition_compaction_operation_id(
+                        failure_reason="proactive_compact_limit_reached",
+                        estimate=estimate,
+                    ),
                     failure_reason="proactive_compact_limit_reached",
+                    attempt_count=0,
+                    retry_repair_budget_exhausted=False,
                 )
                 return _GovernanceStageResult(
                     pending_dispatch=self._fail_unstarted_in_transaction(
@@ -1099,7 +1134,10 @@ class HostDispatchScheduler:
                         run=run,
                         estimate=pending.estimate,
                         decision=pending.decision,
+                        operation_id=pending.operation_id,
                         failure_reason="stale_compaction_result",
+                        attempt_count=len(result.rejected_attempts),
+                        retry_repair_budget_exhausted=False,
                         budget_after_attempted_compact=(result.budget_after_attempted_compact),
                     )
                 return None
@@ -1116,7 +1154,12 @@ class HostDispatchScheduler:
                     run=run,
                     estimate=pending.estimate,
                     decision=pending.decision,
+                    operation_id=pending.operation_id,
                     failure_reason=result.failure_reason or "compaction_failed",
+                    attempt_count=len(result.rejected_attempts),
+                    retry_repair_budget_exhausted=(
+                        len(result.rejected_attempts) > 0
+                    ),
                     budget_after_attempted_compact=(result.budget_after_attempted_compact),
                 )
                 self._fail_unstarted_in_transaction(
@@ -1329,7 +1372,10 @@ class HostDispatchScheduler:
                 run=run,
                 estimate=estimate,
                 decision=decision,
+                operation_id=requested.event_id,
                 failure_reason="compactor_or_artifact_store_missing",
+                attempt_count=0,
+                retry_repair_budget_exhausted=False,
             )
             self._fail_unstarted_in_transaction(
                 transaction,
@@ -1534,7 +1580,10 @@ class HostDispatchScheduler:
         run: RunRow,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
+        operation_id: str,
         failure_reason: str,
+        attempt_count: int,
+        retry_repair_budget_exhausted: bool,
         budget_after_attempted_compact: int | None = None,
     ) -> None:
         """追加 ``CONTEXT_COMPACTION_FAILED``。
@@ -1543,7 +1592,10 @@ class HostDispatchScheduler:
         :param run: 目标 Run。
         :param estimate: budget estimate。
         :param decision: budget decision。
+        :param operation_id: compact operation 诊断 id。
         :param failure_reason: compact failure reason。
+        :param attempt_count: operation 内已拒绝 proposal attempt 数。
+        :param retry_repair_budget_exhausted: semantic retry / repair 预算是否耗尽。
         :param budget_after_attempted_compact: compact 后预算；未执行时为 ``None``。
         :returns: ``None``。
         """
@@ -1566,9 +1618,14 @@ class HostDispatchScheduler:
                 policy_decision=None,
                 reason={"failure_reason": failure_reason},
                 payload_json=build_context_compaction_failed_payload(
+                    operation_id=operation_id,
                     failure_reason=failure_reason,
                     policy_decision=_COMPACT_FAILURE_POLICY_DECISION,
                     retryable=False,
+                    attempt_count=attempt_count,
+                    retry_repair_budget_exhausted=(
+                        retry_repair_budget_exhausted
+                    ),
                     diagnostic_refs=(estimate.estimator_digest,),
                     budget_after_attempted_compact=(budget_after_attempted_compact),
                 ),
