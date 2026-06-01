@@ -12,12 +12,12 @@ import asyncio
 import json
 import pathlib
 import sqlite3
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from multiprocessing import Process
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
@@ -29,6 +29,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.host import (
     AttemptDispatchSnapshot,
+    HostEvent,
     HostEventKind,
     HostTerminalStatus,
     LocalEngineWorker,
@@ -363,6 +364,7 @@ class DeterministicStressWorkerFactory:
         self._default_behavior = default_behavior
         self.content_prefix = content_prefix
         self._run_behaviors: dict[str, StressWorkerBehavior] = {}
+        self._queued_behaviors: list[StressWorkerBehavior] = []
         self._release_events: dict[str, asyncio.Event] = {}
         self._accepted_snapshots: list[AttemptDispatchSnapshot] = []
         self._cancel_reasons: list[str] = []
@@ -427,15 +429,40 @@ class DeterministicStressWorkerFactory:
             raise ValueError("run_id must be non-empty")
         self._run_behaviors[run_id] = behavior
 
-    def behavior_for_run(self, run_id: str) -> StressWorkerBehavior:
-        """读取指定 Run 的脚本行为。
+    def enqueue_run_behavior(self, behavior: StressWorkerBehavior) -> None:
+        """为下一次 worker accept 入队脚本行为。
 
-        :param run_id: Run id。
-        :returns: 该 Run 的脚本行为；未配置时返回默认行为。
+        该队列只服务 stress 测试中“先提交、后获得 run_id”的 public API
+        路径。调用方仍应在单线程 deterministic 调度点使用它，避免并发
+        accept 让行为分配变得不可诊断；本 helper 不进入生产代码。
+
+        :param behavior: 下一次 worker accept 使用的脚本行为。
+        :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
-        return self._run_behaviors.get(run_id, self._default_behavior)
+        self._queued_behaviors.append(behavior)
+
+    def behavior_for_run(self, run_id: str) -> StressWorkerBehavior:
+        """读取指定 Run 的脚本行为。
+
+        查找顺序固定为：显式 ``run_id`` 行为、预提交的下一次 accept 队列
+        行为、factory 默认行为。后续 stress 测试必须优先使用预提交队列
+        路径绑定故障脚本，避免 public submit 返回后再按 run_id 设置行为
+        造成调度竞态；显式 run 行为仅保留给已知 run_id 的受控场景。
+
+        :param run_id: Run id。
+        :returns: 该 Run 的脚本行为；未显式配置时依次尝试下一次 accept
+            队列和默认行为。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        configured = self._run_behaviors.get(run_id)
+        if configured is not None:
+            return configured
+        if len(self._queued_behaviors) > 0:
+            return self._queued_behaviors.pop(0)
+        return self._default_behavior
 
     def release_run(self, run_id: str) -> None:
         """释放 blocking final 行为的指定 Run。
@@ -500,6 +527,164 @@ class DeterministicStressWorkerFactory:
         """
 
         await asyncio.wait_for(self._accepted_event.wait(), timeout_seconds)
+
+
+async def consume_terminals(
+    iterator: AsyncIterator[HostEvent],
+    *,
+    expected_count: int,
+    delay_seconds: float,
+    timeout_seconds: float,
+    observed_events: asyncio.Queue[HostEvent] | None = None,
+) -> tuple[HostEvent, ...]:
+    """消费指定数量的 terminal HostEvent。
+
+    本 helper 只服务 WU-STRESS-01 watch stress。调用方可通过
+    ``delay_seconds`` 模拟慢消费者，并可通过 ``observed_events`` 获得
+    逐条观测用于 watch lag 诊断；这些观测只表达 live watcher 已读事实，
+    不表达 replay cursor truth，也不替代 EventLog / Run canonical facts。
+
+    :param iterator: public ``watch_session_events`` 返回的异步迭代器。
+    :param expected_count: 需要消费的 terminal 事件数量。
+    :param delay_seconds: 每条 terminal 后的人为消费延迟秒数。
+    :param timeout_seconds: 总超时秒数。
+    :param observed_events: 可选观测队列；传入时每条 terminal 会写入队列。
+    :returns: 按消费顺序返回的 terminal HostEvent 元组。
+    :raises ValueError: ``expected_count`` 或延迟参数非法时抛出。
+    :raises TimeoutError: 超时未消费到足够 terminal 时由 ``asyncio`` 抛出。
+    :raises StopAsyncIteration: iterator 提前结束时由底层透传。
+    """
+
+    if expected_count < 0:
+        raise ValueError("expected_count must be non-negative")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must be non-negative")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+
+    observed: list[HostEvent] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while len(observed) < expected_count:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("timed out while consuming terminal HostEvents")
+        event = await asyncio.wait_for(anext(iterator), timeout=remaining)
+        if event.kind not in {
+            HostEventKind.SUCCEEDED,
+            HostEventKind.FAILED,
+            HostEventKind.CANCELLED,
+        }:
+            continue
+        observed.append(event)
+        if observed_events is not None:
+            observed_events.put_nowait(event)
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+    return tuple(observed)
+
+
+async def close_host_event_iterator(iterator: AsyncIterator[HostEvent]) -> None:
+    """关闭测试持有的 HostEvent async generator。
+
+    本 helper 镜像 recovery 测试中的 watch iterator 清理语义，但归属
+    WU-STRESS-01 stress helper：它不是兼容 wrapper，不是生产生命周期抽象，
+    也不表达 Host close 治理。它只关闭 public watch iterator，不写
+    EventLog、不取消 Run，只服务测试清理。
+
+    :param iterator: HostEvent iterator。
+    :returns: ``None``。
+    :raises Exception: 底层 async generator close 失败时透传。
+    """
+
+    await cast(AsyncGenerator[HostEvent, None], iterator).aclose()
+
+
+def read_latest_event_sequence(root_path: pathlib.Path) -> int:
+    """读取 EventLog 当前最新全局序号。
+
+    每次调用都会打开新的短连接并执行 fresh short read transaction，得到
+    point-in-time diagnostic。该读取只用于测试诊断和 watch lag 估算，
+    不表达 watcher replay truth，不替代 EventLog / Run / Attempt
+    canonical facts，也不得复用长事务快照计算最终 lag。
+
+    :param root_path: pytest 临时根目录。
+    :returns: 当前最新 EventLog sequence；空 EventLog 返回 0。
+    :raises TypeError: durable row 字段类型不符合预期时抛出。
+    """
+
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
+        row = connection.execute("SELECT COALESCE(MAX(event_sequence), 0) FROM event_log").fetchone()
+    if row is None:
+        return 0
+    value = row[0]
+    if not isinstance(value, int):
+        raise TypeError("latest event_sequence must be int")
+    return value
+
+
+def read_event_log_count(root_path: pathlib.Path) -> int:
+    """读取 EventLog row 数量。
+
+    每次调用都会打开新的短连接并执行 fresh short read transaction，得到
+    point-in-time diagnostic。该读取只用于 consumer cancel 测试断言和
+    失败定位，不替代 EventLog canonical fact。
+
+    :param root_path: pytest 临时根目录。
+    :returns: EventLog row 数量。
+    :raises TypeError: durable row 字段类型不符合预期时抛出。
+    """
+
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
+        row = connection.execute("SELECT COUNT(*) FROM event_log").fetchone()
+    if row is None:
+        return 0
+    value = row[0]
+    if not isinstance(value, int):
+        raise TypeError("event log count must be int")
+    return value
+
+
+def read_session_terminal_sequences(
+    root_path: pathlib.Path,
+    session_id: str,
+) -> tuple[int, ...]:
+    """读取指定 Session 的 terminal EventLog sequence。
+
+    每次调用都会打开新的短连接并执行一次短读，得到 point-in-time
+    diagnostic。该读取只用于 watch lag drain、terminal 覆盖和断开窗口
+    durable 诊断，不表达 watcher replay truth，不替代 EventLog / Run /
+    Attempt canonical facts，也不复用长事务快照。
+
+    :param root_path: pytest 临时根目录。
+    :param session_id: 目标 Session id。
+    :returns: 按 EventLog sequence 升序排列的 terminal sequence 元组。
+    :raises ValueError: ``session_id`` 为空时抛出。
+    :raises TypeError: durable row 字段类型不符合预期时抛出。
+    """
+
+    if session_id.strip() == "":
+        raise ValueError("session_id must be non-empty")
+    terminal_type_placeholders = ",".join("?" for _ in _TERMINAL_EVENT_TYPES)
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT event_sequence
+            FROM event_log
+            WHERE session_id = ?
+              AND event_type IN ({terminal_type_placeholders})
+            ORDER BY event_sequence ASC
+            """,
+            (session_id,) + _TERMINAL_EVENT_TYPES,
+        ).fetchall()
+
+    sequences: list[int] = []
+    for row in rows:
+        value = row[0]
+        if not isinstance(value, int):
+            raise TypeError("terminal event_sequence must be int")
+        sequences.append(value)
+    return tuple(sequences)
 
 
 def summary_to_json(summary: HostStressSummary) -> str:
@@ -739,9 +924,7 @@ def start_and_crash_owner_for_stress(
         terminate_process(owner_process)
         wait_for_runtime_lane_claim_ttl_to_expire()
         force_owner_pid_missing_and_heartbeat_stale(root_path, accepted.run_id)
-        observed_attempt_count = recovery_attempt_count_for_run(
-            root_path, accepted.run_id
-        )
+        observed_attempt_count = recovery_attempt_count_for_run(root_path, accepted.run_id)
         if observed_attempt_count != 1:
             raise AssertionError("crashed owner run must have exactly one attempt")
         return accepted
