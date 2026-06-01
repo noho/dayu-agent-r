@@ -64,6 +64,7 @@ from dayu.host.context_events import (
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     ContextCompactionTriggerSource,
+    DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
     context_budget_policy_from_threshold_tokens,
 )
 from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
@@ -162,6 +163,7 @@ _SOFT_CONTEXT_WINDOW_SIZE = 110
 _SOFT_RESERVED_OUTPUT_TOKENS = 10
 _SOFT_HARD_THRESHOLD_TOKENS = 80
 _SOFT_SAFETY_MARGIN_RATIO = 0.5
+_REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS = 2.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _SCHEDULER_CLOSE_TERMINAL_EVENT_TYPES = (
     "CANCEL_REQUESTED",
@@ -1112,6 +1114,189 @@ class _ReactiveRecoveryWorkerFactory:
         del snapshot
         self.created += 1
         return _ReactiveRecoveryWorker(self)
+
+
+class _RepeatedReactiveOverflowHandle(_FakeHandle):
+    """每次 dispatch 后立即产出 reactive overflow 的 fake handle。"""
+
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        overflow_index: int,
+        factory: "_RepeatedReactiveOverflowWorkerFactory",
+    ) -> None:
+        """初始化 repeated-overflow handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param overflow_index: 当前 factory accept 序号，从 1 开始。
+        :param factory: 所属 factory，用于记录 close 同步点。
+        :returns: ``None``。
+        """
+
+        super().__init__(local_worker_id=f"worker-overflow-{overflow_index}")
+        self._snapshot = snapshot
+        self._overflow_index = overflow_index
+        self._factory = factory
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """立即产出单个 reactive overflow EngineEvent。
+
+        :returns: 只包含一个 ``CONTEXT_COMPACTION_REQUESTED`` 的异步迭代器。
+        """
+
+        yield EngineEvent(
+            occurred_at=_NOW,
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+            data=ContextCompactionRequestedData(
+                iteration_id=f"iter-reactive-{self._overflow_index}",
+                budget_state=None,
+                reason="provider_overflow",
+                provider_request_id=f"req-reactive-{self._overflow_index}",
+            ),
+            metadata=None,
+        )
+
+    async def close(self) -> None:
+        """记录 handle close，作为该次 overflow 已被 scheduler 收口的同步点。
+
+        :returns: ``None``。
+        """
+
+        await super().close()
+        await self._factory.record_closed()
+
+
+class _RepeatedReactiveOverflowWorker:
+    """每次 accept 都返回 repeated-overflow handle 的 fake worker。"""
+
+    def __init__(self, factory: "_RepeatedReactiveOverflowWorkerFactory") -> None:
+        """初始化 fake worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest) -> LocalWorkerHandle:
+        """记录 dispatch accept，并返回立即 overflow 的 handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 Engine request。
+        :returns: repeated-overflow handle。
+        """
+
+        accepted_index = await self._factory.record_accept(snapshot, request)
+        return _RepeatedReactiveOverflowHandle(snapshot, accepted_index, self._factory)
+
+
+class _RepeatedReactiveOverflowWorkerFactory:
+    """连续 reactive overflow dispatch-loop 的确定性 fake factory。"""
+
+    def __init__(self) -> None:
+        """初始化 fake factory。
+
+        :returns: ``None``。
+        """
+
+        self.created = 0
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+        self.closed_count = 0
+        self._accepted_condition = asyncio.Condition()
+        self._closed_condition = asyncio.Condition()
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 repeated-overflow worker。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :returns: repeated-overflow worker。
+        """
+
+        del snapshot
+        self.created += 1
+        return _RepeatedReactiveOverflowWorker(self)
+
+    async def record_accept(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> int:
+        """记录一次 worker accept 并唤醒测试同步点。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 Engine request。
+        :returns: 本次 accept 序号，从 1 开始。
+        """
+
+        async with self._accepted_condition:
+            self.accepted_snapshots.append(snapshot)
+            self.accepted_requests.append(request)
+            accepted_index = len(self.accepted_snapshots)
+            self._accepted_condition.notify_all()
+            return accepted_index
+
+    async def record_closed(self) -> None:
+        """记录一次 handle close 并唤醒测试同步点。
+
+        :returns: ``None``。
+        """
+
+        async with self._closed_condition:
+            self.closed_count += 1
+            self._closed_condition.notify_all()
+
+    async def wait_for_accepted_count(self, expected_count: int) -> None:
+        """等待 factory 观察到指定 accept 次数。
+
+        :param expected_count: 期望 accept 次数。
+        :returns: ``None``。
+        :raises TimeoutError: 超时仍未达到期望次数时抛出。
+        """
+
+        await asyncio.wait_for(
+            self._wait_for_accepted_count(expected_count),
+            timeout=_REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS,
+        )
+
+    async def wait_for_closed_count(self, expected_count: int) -> None:
+        """等待 factory 观察到指定 handle close 次数。
+
+        :param expected_count: 期望 close 次数。
+        :returns: ``None``。
+        :raises TimeoutError: 超时仍未达到期望次数时抛出。
+        """
+
+        await asyncio.wait_for(
+            self._wait_for_closed_count(expected_count),
+            timeout=_REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS,
+        )
+
+    async def _wait_for_accepted_count(self, expected_count: int) -> None:
+        """在 condition 上等待 accept 次数达标。
+
+        :param expected_count: 期望 accept 次数。
+        :returns: ``None``。
+        """
+
+        async with self._accepted_condition:
+            await self._accepted_condition.wait_for(
+                lambda: len(self.accepted_snapshots) >= expected_count
+            )
+
+    async def _wait_for_closed_count(self, expected_count: int) -> None:
+        """在 condition 上等待 handle close 次数达标。
+
+        :param expected_count: 期望 close 次数。
+        :returns: ``None``。
+        """
+
+        async with self._closed_condition:
+            await self._closed_condition.wait_for(
+                lambda: self.closed_count >= expected_count
+            )
 
 
 class _FinalAnswerWorker:
@@ -3774,6 +3959,84 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
 
 
 @pytest.mark.asyncio
+async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
+    tmp_path: Path,
+) -> None:
+    """连续 reactive overflow 达到上限后 fail closed，不无限创建 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _RepeatedReactiveOverflowWorkerFactory()
+        policy = _soft_compact_policy(max_reactive_compactions_per_run=2)
+        expected_attempt_count = 1 + policy.max_reactive_compactions_per_run
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=policy,
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+
+            await factory.wait_for_accepted_count(expected_attempt_count)
+            await factory.wait_for_closed_count(expected_attempt_count)
+
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            failed_payload = _event_payload(failed)
+            run_failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                "RUN_FAILED",
+            )
+            run_failed_payload = _event_payload(run_failed)
+            actual_attempt_count = _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+
+            assert run.status == RunStatus.FAILED
+            assert factory.created == expected_attempt_count
+            assert len(factory.accepted_snapshots) == expected_attempt_count
+            assert actual_attempt_count == expected_attempt_count
+            assert actual_attempt_count <= expected_attempt_count
+            assert event_types.count(CONTEXT_COMPACTION_REQUESTED) == (
+                policy.max_reactive_compactions_per_run
+            )
+            assert event_types.count(CONTEXT_COMPACTED) == (
+                policy.max_reactive_compactions_per_run
+            )
+            assert event_types.count(CONTEXT_COMPACTION_FAILED) == 1
+            assert event_types.count("RUN_LOST") == 0
+            assert event_types.count("RUN_FAILED") == 1
+            assert failed_payload["failure_reason"] == (
+                "reactive_compact_limit_reached"
+            )
+            assert_failed_payload_no_fallback(
+                failed_payload,
+                expected_operation_id=None,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
+            )
+            assert run_failed_payload["error_code"] == (
+                "reactive_compact_limit_reached"
+            )
+            assert run_failed_payload["context_compaction_failed_event_id"] == (
+                failed.event_id
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_reactive_recovery_does_not_clear_duplicate_registry(
     tmp_path: Path,
 ) -> None:
@@ -4174,9 +4437,15 @@ def _seed_accepted_run(
     return _AcceptedSeededRun(session_id=session_id, run_id=run_id)
 
 
-def _soft_compact_policy(*, max_compaction_attempts_per_operation: int = 1) -> ContextBudgetPolicy:
+def _soft_compact_policy(
+    *,
+    max_compaction_attempts_per_operation: int = 1,
+    max_reactive_compactions_per_run: int = DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
+) -> ContextBudgetPolicy:
     """构造会对测试 prompt 触发 soft compact 的预算策略。
 
+    :param max_compaction_attempts_per_operation: 单个 compaction operation 的 proposal attempt 上限。
+    :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
     :returns: context budget policy。
     """
 
@@ -4186,6 +4455,7 @@ def _soft_compact_policy(*, max_compaction_attempts_per_operation: int = 1) -> C
             (_SOFT_CONTEXT_WINDOW_SIZE - _SOFT_RESERVED_OUTPUT_TOKENS) * (1 - _SOFT_SAFETY_MARGIN_RATIO)
         ),
         hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
+        max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         max_compaction_attempts_per_operation=(max_compaction_attempts_per_operation),
         policy_ref="test-soft-compact-policy",
     )
