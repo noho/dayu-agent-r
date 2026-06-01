@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 import sqlite3
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from multiprocessing import Process
 from typing import Literal, TypeAlias, cast
@@ -29,6 +30,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.host import (
     AttemptDispatchSnapshot,
+    Host,
     HostEvent,
     HostEventKind,
     HostTerminalStatus,
@@ -36,6 +38,17 @@ from dayu.host import (
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
     OpenHostOptions,
+    RunSnapshot,
+    RunStatus,
+)
+from dayu.host.durable.codec import parse_utc_timestamp
+from dayu.host.durable.liveness import HostInstanceStatus
+from dayu.runtime.lane import (
+    LaneAcquired,
+    LaneConfig,
+    LaneController,
+    LaneOwner,
+    SQLiteLaneCoordinatorConfig,
 )
 from tests.host.public_smoke_support import (
     deterministic_runner_spec,
@@ -88,12 +101,20 @@ _HOST_DB_FILENAME = "host.sqlite3"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
+_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _TERMINAL_EVENT_TYPES = (
     _EVENT_TYPE_RUN_SUCCEEDED,
     _EVENT_TYPE_RUN_FAILED,
     _EVENT_TYPE_RUN_CANCELLED,
 )
+_ALL_RUN_TERMINAL_EVENT_TYPES = _TERMINAL_EVENT_TYPES + (_EVENT_TYPE_RUN_LOST,)
 _PROCESS_START_TIMEOUT_SECONDS = 5.0
+_POLL_INTERVAL_SECONDS = 0.01
+# 该阈值只用于 stress diagnostic 解释已被测试 helper 主动改旧的 heartbeat；
+# Host recovery stale policy 仍以生产 recovery scanner 为准。
+_HOST_INSTANCE_STALE_AFTER_SECONDS = 1.0
+_LANE_VERIFY_TIMEOUT_SECONDS = 0.0
+_LANE_VERIFY_OWNER_ID = "wu-stress-lane-verifier"
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +169,27 @@ class StressTerminalObservation:
     event_sequence: int
     terminal_kind: HostEventKind
     terminal_status: HostTerminalStatus
+
+
+@dataclass(frozen=True, slots=True)
+class StressHostInstanceDiagnostic:
+    """Host instance liveness row 的测试诊断视图。
+
+    :param host_instance_id: Host instance id。
+    :param pid: owner 进程 pid。
+    :param heartbeat_at: 最近 heartbeat 时间文本。
+    :param status: Host instance lifecycle 状态。
+    :param heartbeat_stale: 相对读取时刻与测试阈值是否 stale。
+    :returns: 不适用；dataclass 初始化返回
+        ``StressHostInstanceDiagnostic`` 实例。
+    :raises Exception: 本类型不主动抛出异常。
+    """
+
+    host_instance_id: str
+    pid: int
+    heartbeat_at: str
+    status: HostInstanceStatus
+    heartbeat_stale: bool
 
 
 class StressWorkerBehavior(StrEnum):
@@ -529,6 +571,51 @@ class DeterministicStressWorkerFactory:
         await asyncio.wait_for(self._accepted_event.wait(), timeout_seconds)
 
 
+class InspectableStressWorkerFactory(DeterministicStressWorkerFactory):
+    """Slice 4 使用的可检查 deterministic worker factory。
+
+    本类型在 ``DeterministicStressWorkerFactory`` 的脚本化 worker 能力之上，
+    增加 accepted handle 总数、worker cancel 总数和 handle close 总数的
+    聚合诊断入口。它只服务 WU-STRESS-01 public opener stress，不暴露
+    production scheduler internals，也不作为 Host durable truth。
+
+    :param default_behavior: 未设置 per-run 脚本时使用的默认行为。
+    :param content_prefix: final answer 内容前缀。
+    :returns: 不适用；初始化返回 ``InspectableStressWorkerFactory`` 实例。
+    :raises ValueError: ``content_prefix`` 为空时由父类抛出。
+    """
+
+    @property
+    def accepted_handle_count(self) -> int:
+        """返回已 accepted handle 数量。
+
+        :returns: accepted snapshot 数量。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return len(self.accepted_snapshots)
+
+    @property
+    def total_cancel_count(self) -> int:
+        """返回 worker handle 收到的取消通知数量。
+
+        :returns: 取消通知数量。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return len(self.cancel_reasons)
+
+    @property
+    def total_close_count(self) -> int:
+        """返回 worker handle close 数量。
+
+        :returns: close 调用数量。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.handle_close_count
+
+
 async def consume_terminals(
     iterator: AsyncIterator[HostEvent],
     *,
@@ -822,6 +909,150 @@ def build_stress_open_host_options(
     )
 
 
+async def wait_all_runs_terminal(
+    host: Host,
+    run_ids: Sequence[str],
+    timeout_seconds: float,
+) -> tuple[RunSnapshot, ...]:
+    """等待一组 Run 全部进入 Host public 终态。
+
+    本 helper 通过 public ``Host.get_run`` 轮询，不读取 scheduler private
+    registry，也不把 durable diagnostic 当作成功路径。``LOST`` 是 Host
+    public Run 终态，因此也视为 terminal。
+
+    :param host: public Host handle。
+    :param run_ids: 需要等待的 Run id 序列。
+    :param timeout_seconds: 总超时秒数。
+    :returns: 按 ``run_ids`` 顺序返回的 terminal Run snapshot。
+    :raises ValueError: 任一 Run id 为空或 timeout 非正时抛出。
+    :raises TimeoutError: 超时仍存在非终态 Run 时抛出。
+    :raises Exception: Host public API 失败时透传。
+    """
+
+    for run_id in run_ids:
+        if run_id.strip() == "":
+            raise ValueError("run_id must be non-empty")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+
+    terminal_by_run_id: dict[str, RunSnapshot] = {}
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        for run_id in run_ids:
+            if run_id in terminal_by_run_id:
+                continue
+            snapshot = await host.get_run(run_id)
+            if _is_public_run_terminal(snapshot.status):
+                terminal_by_run_id[run_id] = snapshot
+        if len(terminal_by_run_id) == len(run_ids):
+            return tuple(terminal_by_run_id[run_id] for run_id in run_ids)
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+    open_run_ids = tuple(run_id for run_id in run_ids if run_id not in terminal_by_run_id)
+    raise TimeoutError(f"runs did not reach terminal status: {open_run_ids}")
+
+
+def read_host_instances(root_path: pathlib.Path) -> tuple[StressHostInstanceDiagnostic, ...]:
+    """读取 Host instance liveness 诊断视图。
+
+    每次调用都会打开新的 SQLite 短连接读取 ``host_instances``，只用于
+    WU-STRESS-01 判断 running / stopping / stopped 与 stale heartbeat
+    诊断；它不替代 recovery orphan proof，不暴露生产 scheduler internals，
+    也不作为 Host durable truth 之外的新真源。stale 阈值只解释
+    ``force_owner_pid_missing_and_heartbeat_stale()`` 已经制造出的测试证据，
+    不替代 Host recovery policy，也不参与生产 orphan 判断。
+
+    :param root_path: pytest 临时根目录。
+    :returns: 按 ``host_instance_id`` 排序的 liveness 诊断元组。
+    :raises TypeError: durable row 字段类型不符合预期时抛出。
+    :raises ValueError: heartbeat timestamp 或 status 无法解析时抛出。
+    """
+
+    now = datetime.now(UTC)
+    stale_after = timedelta(seconds=_HOST_INSTANCE_STALE_AFTER_SECONDS)
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
+        rows = connection.execute(
+            """
+            SELECT host_instance_id, pid, heartbeat_at, status
+            FROM host_instances
+            ORDER BY host_instance_id ASC
+            """
+        ).fetchall()
+
+    diagnostics: list[StressHostInstanceDiagnostic] = []
+    for row in rows:
+        host_instance_id = row[0]
+        pid = row[1]
+        heartbeat_at = row[2]
+        status_text = row[3]
+        if not isinstance(host_instance_id, str):
+            raise TypeError("host_instance_id must be str")
+        if not isinstance(pid, int):
+            raise TypeError("host instance pid must be int")
+        if not isinstance(heartbeat_at, str):
+            raise TypeError("host instance heartbeat_at must be str")
+        if not isinstance(status_text, str):
+            raise TypeError("host instance status must be str")
+        heartbeat = parse_utc_timestamp(heartbeat_at)
+        diagnostics.append(
+            StressHostInstanceDiagnostic(
+                host_instance_id=host_instance_id,
+                pid=pid,
+                heartbeat_at=heartbeat_at,
+                status=HostInstanceStatus(status_text),
+                heartbeat_stale=(now - heartbeat > stale_after),
+            )
+        )
+    return tuple(diagnostics)
+
+
+async def verify_lane_released(lane_db_path: pathlib.Path, lane_name: str) -> bool:
+    """通过 runtime lane public acquire 验证 lane capacity 已释放。
+
+    本 diagnostic 打开一个独立 ``LaneController``，对同一 lane 立即
+    acquire 一次并立刻释放。它只证明 runtime lane capacity 没有被遗留
+    claim 阻塞，不读取 scheduler internals，不表达 Host durable truth，
+    也不构成 recovery proof。
+
+    :param lane_db_path: Host options 使用的 runtime lane SQLite DB 路径。
+    :param lane_name: 需要验证的 lane 名称。
+    :returns: 立即 acquire 成功时返回 ``True``，容量被占用时返回 ``False``。
+        如果调用方传入的不是同一个 Host lane DB，本证明无效。
+    :raises ValueError: ``lane_name`` 为空时抛出。
+    :raises Exception: runtime lane 打开或 SQLite 操作失败时透传。
+    """
+
+    if lane_name.strip() == "":
+        raise ValueError("lane_name must be non-empty")
+    controller = await LaneController.open(
+        [
+            LaneConfig(
+                name=lane_name,
+                capacity=1,
+                default_timeout_seconds=_LANE_VERIFY_TIMEOUT_SECONDS,
+                claim_ttl_seconds=_LANE_CLAIM_TTL_SECONDS,
+                heartbeat_interval_seconds=_LANE_HEARTBEAT_INTERVAL_SECONDS,
+            )
+        ],
+        coordinator=SQLiteLaneCoordinatorConfig(db_path=lane_db_path),
+        owner=LaneOwner(
+            owner_id=_LANE_VERIFY_OWNER_ID,
+            pid=os.getpid(),
+            process_start_token=None,
+        ),
+    )
+    try:
+        outcome = await controller.acquire(
+            lane_name,
+            timeout_seconds=_LANE_VERIFY_TIMEOUT_SECONDS,
+        )
+        if not isinstance(outcome, LaneAcquired):
+            return False
+        await outcome.token.release()
+        return True
+    finally:
+        await controller.close()
+
+
 def run_blocking_stress_owner_process(
     root_path_text: str,
     accepted_marker_text: str,
@@ -1040,6 +1271,71 @@ def terminal_events_for_runs(
     return tuple(observations)
 
 
+def terminal_event_count_for_runs(
+    root_path: pathlib.Path,
+    run_ids: Sequence[str],
+) -> int:
+    """读取指定 Run 的 Host-wide terminal EventLog 总数。
+
+    Slice 4 需要证明 ``RUN_LOST`` 不重复，但 ``HostEventKind`` 与
+    ``HostTerminalStatus`` 当前不建模 lost terminal observation；因此
+    ``terminal_events_for_runs()`` 仍只返回 succeeded/failed/cancelled
+    observation，而本 helper 在 count 层显式纳入 ``RUN_LOST``。两者组合
+    形成证明：public terminal observation 无重复，且包含 ``RUN_LOST`` 的
+    terminal EventLog 总数与 public terminal snapshot 数一致。
+
+    每次调用都会打开新的短连接并执行一次短读，得到 point-in-time
+    diagnostic；读取结果只用于 stress assertion message，不表达 watcher
+    replay truth，也不替代 EventLog canonical fact。
+
+    :param root_path: pytest 临时根目录。
+    :param run_ids: 需要读取 terminal event 数量的 Run id 序列。
+    :returns: 包含 ``RUN_LOST`` 的 terminal EventLog 总数。
+    :raises ValueError: 任一 Run id 为空时抛出。
+    :raises TypeError: durable row 字段类型不符合预期时抛出。
+    """
+
+    if len(run_ids) == 0:
+        return 0
+    for run_id in run_ids:
+        if run_id.strip() == "":
+            raise ValueError("run_id must be non-empty")
+
+    placeholders = ",".join("?" for _run_id in run_ids)
+    terminal_type_placeholders = ",".join("?" for _event_type in _ALL_RUN_TERMINAL_EVENT_TYPES)
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
+        row = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM event_log
+            WHERE run_id IN ({placeholders})
+              AND event_type IN ({terminal_type_placeholders})
+            """,
+            tuple(run_ids) + _ALL_RUN_TERMINAL_EVENT_TYPES,
+        ).fetchone()
+    if row is None:
+        return 0
+    value = row[0]
+    if not isinstance(value, int):
+        raise TypeError("terminal event count must be int")
+    return value
+
+
+def run_lost_event_count(root_path: pathlib.Path) -> int:
+    """统计 EventLog 中 ``RUN_LOST`` 事件数量。
+
+    本函数只服务 Slice 4 stream exception closeout 诊断，避免测试文件复制
+    durable event type 常量；读取结果不是生产 API，不替代 EventLog
+    canonical fact。
+
+    :param root_path: pytest 临时根目录。
+    :returns: ``RUN_LOST`` 事件数量。
+    :raises TypeError: 底层读取到非整数 count 时透传。
+    """
+
+    return recovery_event_type_count(root_path, _EVENT_TYPE_RUN_LOST)
+
+
 def _terminal_kind_for_event_type(event_type: str) -> HostEventKind:
     """把 durable terminal event type 映射为 public HostEvent kind。
 
@@ -1072,3 +1368,19 @@ def _terminal_status_for_event_type(event_type: str) -> HostTerminalStatus:
     if event_type == _EVENT_TYPE_RUN_CANCELLED:
         return HostTerminalStatus.CANCELLED
     raise ValueError(f"unsupported terminal event type: {event_type}")
+
+
+def _is_public_run_terminal(status: RunStatus) -> bool:
+    """判断 public Run 状态是否为终态。
+
+    :param status: Run 状态。
+    :returns: succeeded/failed/cancelled/lost 时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return status in {
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.LOST,
+    }

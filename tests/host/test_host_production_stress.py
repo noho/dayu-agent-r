@@ -41,6 +41,7 @@ from tests.host.recovery_support import (
 )
 from tests.host.stress_support import (
     HostStressSummary,
+    InspectableStressWorkerFactory,
     StressFailureBoundary,
     StressTerminalObservation,
     StressWorkerBehavior,
@@ -53,14 +54,19 @@ from tests.host.stress_support import (
     count_event_type,
     DeterministicStressWorkerFactory,
     read_event_log_count,
+    read_host_instances,
     read_session_terminal_sequences,
     run_blocking_stress_owner_process,
     run_open_probe_for_stress,
     start_and_crash_owner_for_stress,
     summary_to_json,
+    run_lost_event_count,
     terminal_dedupe_ok,
+    terminal_event_count_for_runs,
     terminal_events_for_runs,
     terminal_duplicate_count,
+    verify_lane_released,
+    wait_all_runs_terminal,
 )
 
 pytestmark = pytest.mark.stress
@@ -92,6 +98,14 @@ _SLICE3_SECONDARY_FIRST_TERMINAL_COUNT = 2
 _SLICE3_SECONDARY_RECONNECT_TERMINAL_COUNT = 1
 _SLICE3_DISCONNECT_GAP_RUN_COUNT = 3
 _SLICE3_WATCH_LAG_PER_SESSION_LIMIT = _SLICE3_RUNS_PER_SESSION
+_SLICE4_SCENARIO_NAME = "scheduler-liveness-long-run-mixed-flow"
+_SLICE4_SESSION_COUNT = 4
+_SLICE4_LANE_CAPACITY = 1
+_SLICE4_LANE_TIMEOUT_SECONDS = 1.0
+_SLICE4_WAIT_TIMEOUT_SECONDS = 20.0
+_SLICE4_CRASH_COUNT = 1
+_SLICE4_EXPECTED_RECOVERY_COUNT = 1
+_SLICE4_EXPECTED_LOST_COUNT = 1
 _SUMMARY_JSON_FIELDS: tuple[str, ...] = (
     "crash_count",
     "failure_boundary",
@@ -592,6 +606,153 @@ class Slice3WatchDiagnostics:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class Slice4SchedulerLivenessDiagnostics:
+    """Slice 4 scheduler / liveness long-run 诊断。
+
+    :param public_snapshots: 全部 Run 的 public terminal snapshot。
+    :param durable_observations: public terminal EventLog 观测。
+    :param all_terminal_event_count: 包含 ``RUN_LOST`` 的 terminal EventLog 数；
+        该计数字段来自 ``terminal_event_count_for_runs()``，用于补足
+        ``terminal_events_for_runs()`` 不建模 lost terminal observation 的
+        去重证明边界。
+    :param recovery_count: ``RUN_RECOVERING`` 事件数量。
+    :param attempt_lost_count: ``ATTEMPT_LOST`` 事件数量。
+    :param run_lost_count: ``RUN_LOST`` 事件数量。
+    :param accepted_handle_count: worker accepted handle 数量。
+    :param total_close_count: worker handle close 数量。
+    :param total_cancel_count: worker handle cancel 通知数量。
+    :param lane_released: Host close 后 lane 是否可立即 acquire。
+    :param stale_instance_count: stale Host instance 诊断数量。
+    :param clean_close_recovery_delta: clean close 后 reopen 的 recovery 事件增量。
+    :param clean_close_attempt_lost_delta: clean close 后 reopen 的 lost 事件增量。
+    :returns: 不适用；dataclass 初始化返回实例。
+    :raises Exception: 本类型不主动抛出异常。
+    """
+
+    public_snapshots: tuple[RunSnapshot, ...]
+    durable_observations: tuple[StressTerminalObservation, ...]
+    all_terminal_event_count: int
+    recovery_count: int
+    attempt_lost_count: int
+    run_lost_count: int
+    accepted_handle_count: int
+    total_close_count: int
+    total_cancel_count: int
+    lane_released: bool
+    stale_instance_count: int
+    clean_close_recovery_delta: int
+    clean_close_attempt_lost_delta: int
+
+    @property
+    def terminal_duplicate_count(self) -> int:
+        """返回 public terminal durable observation duplicate 数量。
+
+        :returns: duplicate 数量。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return terminal_duplicate_count(self.durable_observations)
+
+    @property
+    def terminal_dedupe_ok(self) -> bool:
+        """返回 terminal 去重是否通过。
+
+        ``terminal_events_for_runs()`` 只覆盖 HostEventKind /
+        HostTerminalStatus 可表达的 succeeded/failed/cancelled terminal；
+        ``RUN_LOST`` 当前没有对应 public terminal observation。因此 Slice 4
+        的去重证明分两层：先证明可表达 terminal observation 没有重复，再
+        用包含 ``RUN_LOST`` 的 EventLog terminal 总数等于 public terminal
+        snapshot 数，显式证明 lost closeout 没有额外重复 terminal fact。
+
+        :returns: 两层 terminal 去重证明均成立时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            self.terminal_duplicate_count == 0
+            and terminal_dedupe_ok(self.durable_observations)
+            and self.all_terminal_event_count == len(self.public_snapshots)
+        )
+
+    @property
+    def scheduler_drained(self) -> bool:
+        """返回 scheduler 是否已 drain 全部混合 Run。
+
+        :returns: 所有 public snapshot 终态、handle 全 close 且 close 后没有
+            clean recovery 增量时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            len(self.public_snapshots) == self.all_terminal_event_count
+            and all(_is_terminal_status(snapshot.status) for snapshot in self.public_snapshots)
+            and self.total_close_count == self.accepted_handle_count
+            and self.clean_close_recovery_delta == 0
+            and self.clean_close_attempt_lost_delta == 0
+        )
+
+    @property
+    def liveness_stale_detected(self) -> bool:
+        """返回是否只在 intentional crash/recovery 子流观测 stale。
+
+        :returns: recovery / lost 计数等于 intentional crash 数且存在 stale
+            instance diagnostic 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            self.recovery_count == _SLICE4_EXPECTED_RECOVERY_COUNT
+            and self.attempt_lost_count >= _SLICE4_EXPECTED_RECOVERY_COUNT
+            and self.stale_instance_count >= 1
+            and self.clean_close_recovery_delta == 0
+            and self.clean_close_attempt_lost_delta == 0
+        )
+
+    @property
+    def handle_cleanup_ok(self) -> bool:
+        """返回 handle close/cancel 诊断是否通过。
+
+        :returns: 所有 accepted handle 均 close，且至少一次 active cancel
+            传播到 worker 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.accepted_handle_count > 0 and self.total_close_count == self.accepted_handle_count and self.total_cancel_count >= 1
+
+    @property
+    def stream_exception_closeout_ok(self) -> bool:
+        """返回 stream exception lost closeout 是否符合预期。
+
+        :returns: ``RUN_LOST`` 数量符合 Slice 4 预期时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.run_lost_count == _SLICE4_EXPECTED_LOST_COUNT
+
+    @property
+    def failure_boundary(self) -> StressFailureBoundary | None:
+        """返回 Slice 4 失败边界。
+
+        :returns: 成功时返回 ``None``，否则返回封闭失败边界。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if not self.scheduler_drained:
+            return "scheduler"
+        if not self.liveness_stale_detected:
+            return "liveness"
+        if not self.handle_cleanup_ok:
+            return "active_cleanup"
+        if not self.lane_released:
+            return "scheduler_close"
+        if not self.stream_exception_closeout_ok:
+            return "scheduler"
+        if not self.terminal_dedupe_ok:
+            return "durable"
+        return None
+
+
 @pytest.mark.timeout(5)
 def test_stress_marker_summary_contract(
     record_property: Callable[[str, str], None],
@@ -642,6 +803,181 @@ def test_stress_marker_summary_contract(
     for field_name in _SUMMARY_JSON_FIELDS:
         assert f'"{field_name}"' in summary_json
     assert f'"scenario_name": "{_SCENARIO_NAME}"' in summary_json
+    assert_summary_ok(summary)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(90)
+async def test_scheduler_liveness_long_run_mixed_flow_stress(
+    tmp_path: pathlib.Path,
+    record_property: Callable[[str, str], None],
+) -> None:
+    """验证 queued/active/terminal/cancel/recovery 混合流的 scheduler liveness。
+
+    :param tmp_path: pytest 临时目录。
+    :param record_property: pytest 属性记录 fixture。
+    :returns: ``None``。
+    :raises AssertionError: scheduler drain、liveness、lane release、handle
+        cleanup 或 terminal duplicate 断言失败时抛出。
+    """
+
+    crashed = start_and_crash_owner_for_stress(
+        tmp_path,
+        slot_key="wu-stress-s4-crash",
+        client_request_id="wu-stress-s4-crash-followup",
+        user_prompt="slice4 intentional crash recovery",
+    )
+    factory = InspectableStressWorkerFactory()
+    options = build_stress_open_host_options(
+        tmp_path,
+        factory,
+        lane_capacity=_SLICE4_LANE_CAPACITY,
+        lane_timeout_seconds=_SLICE4_LANE_TIMEOUT_SECONDS,
+    )
+    run_ids: list[str] = [crashed.run_id]
+    public_snapshots: tuple[RunSnapshot, ...] = ()
+    recovery_count_before_clean_reopen = 0
+    attempt_lost_before_clean_reopen = 0
+
+    async with open_host(options) as host:
+        await wait_all_runs_terminal(
+            host,
+            (crashed.run_id,),
+            _SLICE4_WAIT_TIMEOUT_SECONDS,
+        )
+        session_list = []
+        for index in range(_SLICE4_SESSION_COUNT):
+            session_list.append(await host.ensure_session(ensure_request(f"wu-stress-s4-{index}")))
+        sessions = tuple(session_list)
+
+        active_success_run_id = await _submit_scripted_followup(
+            host,
+            factory,
+            sessions[0].session_id,
+            "wu-stress-s4-active-success",
+            StressWorkerBehavior.BLOCKING_FINAL,
+        )
+        run_ids.append(active_success_run_id)
+        await _wait_run_status(host, active_success_run_id, RunStatus.RUNNING)
+        queued_cancel_run_id = await _submit_followup(
+            host,
+            sessions[0].session_id,
+            "wu-stress-s4-queued-cancel",
+        )
+        run_ids.append(queued_cancel_run_id)
+        queued_tail_run_id = await _submit_followup(
+            host,
+            sessions[0].session_id,
+            "wu-stress-s4-queued-tail",
+        )
+        run_ids.append(queued_tail_run_id)
+        await _cancel_run(host, queued_cancel_run_id)
+        factory.release_run(active_success_run_id)
+        await wait_all_runs_terminal(
+            host,
+            (active_success_run_id, queued_cancel_run_id, queued_tail_run_id),
+            _SLICE4_WAIT_TIMEOUT_SECONDS,
+        )
+
+        active_cancel_run_id = await _submit_scripted_followup(
+            host,
+            factory,
+            sessions[1].session_id,
+            "wu-stress-s4-active-cancel",
+            StressWorkerBehavior.BLOCKING_FINAL,
+        )
+        run_ids.append(active_cancel_run_id)
+        await _wait_run_status(host, active_cancel_run_id, RunStatus.RUNNING)
+        await _cancel_run(host, active_cancel_run_id)
+        factory.release_run(active_cancel_run_id)
+        await wait_all_runs_terminal(
+            host,
+            (active_cancel_run_id,),
+            _SLICE4_WAIT_TIMEOUT_SECONDS,
+        )
+
+        stream_lost_run_id = await _submit_scripted_followup(
+            host,
+            factory,
+            sessions[2].session_id,
+            "wu-stress-s4-stream-exception",
+            StressWorkerBehavior.STREAM_EXCEPTION,
+        )
+        run_ids.append(stream_lost_run_id)
+        failed_run_id = await _submit_scripted_followup(
+            host,
+            factory,
+            sessions[3].session_id,
+            "wu-stress-s4-failed",
+            StressWorkerBehavior.FAILED,
+        )
+        run_ids.append(failed_run_id)
+        public_snapshots = await wait_all_runs_terminal(
+            host,
+            tuple(run_ids),
+            _SLICE4_WAIT_TIMEOUT_SECONDS,
+        )
+        recovery_count_before_clean_reopen = count_event_type(tmp_path, _EVENT_TYPE_RUN_RECOVERING)
+        attempt_lost_before_clean_reopen = count_event_type(tmp_path, _EVENT_TYPE_ATTEMPT_LOST)
+
+    lane_released = await verify_lane_released(options.lane_db_path, options.lane_name)
+    reopen_factory = InspectableStressWorkerFactory()
+    async with open_host(
+        build_stress_open_host_options(
+            tmp_path,
+            reopen_factory,
+            lane_capacity=_SLICE4_LANE_CAPACITY,
+            lane_timeout_seconds=_SLICE4_LANE_TIMEOUT_SECONDS,
+        )
+    ) as reopened:
+        public_snapshots = await wait_all_runs_terminal(
+            reopened,
+            tuple(run_ids),
+            _SLICE4_WAIT_TIMEOUT_SECONDS,
+        )
+
+    recovery_count = count_event_type(tmp_path, _EVENT_TYPE_RUN_RECOVERING)
+    attempt_lost_count = count_event_type(tmp_path, _EVENT_TYPE_ATTEMPT_LOST)
+    durable_observations = terminal_events_for_runs(tmp_path, tuple(run_ids))
+    host_instances = read_host_instances(tmp_path)
+    diagnostics = Slice4SchedulerLivenessDiagnostics(
+        public_snapshots=public_snapshots,
+        durable_observations=durable_observations,
+        all_terminal_event_count=terminal_event_count_for_runs(tmp_path, tuple(run_ids)),
+        recovery_count=recovery_count,
+        attempt_lost_count=attempt_lost_count,
+        run_lost_count=run_lost_event_count(tmp_path),
+        accepted_handle_count=factory.accepted_handle_count,
+        total_close_count=factory.total_close_count,
+        total_cancel_count=factory.total_cancel_count,
+        lane_released=lane_released,
+        stale_instance_count=sum(1 for item in host_instances if item.heartbeat_stale),
+        clean_close_recovery_delta=recovery_count - recovery_count_before_clean_reopen,
+        clean_close_attempt_lost_delta=attempt_lost_count - attempt_lost_before_clean_reopen,
+    )
+    watch_lag_max, watch_lag_samples = _slice2_watch_lag_placeholder()
+    summary = HostStressSummary(
+        scenario_name=_SLICE4_SCENARIO_NAME,
+        session_count=_SLICE4_SESSION_COUNT + 1,
+        run_count=len(run_ids),
+        crash_count=_SLICE4_CRASH_COUNT,
+        recovery_count=recovery_count,
+        watch_lag_max=watch_lag_max,
+        watch_lag_samples=watch_lag_samples,
+        scheduler_drained=diagnostics.scheduler_drained,
+        liveness_stale_detected=diagnostics.liveness_stale_detected,
+        terminal_duplicate_count=diagnostics.terminal_duplicate_count,
+        terminal_dedupe_ok=diagnostics.terminal_dedupe_ok,
+        failure_boundary=diagnostics.failure_boundary,
+    )
+    summary_json = summary_to_json(summary)
+    record_property(_SUMMARY_JSON_PROPERTY, summary_json)
+
+    assert RunStatus.SUCCEEDED in _snapshot_statuses(public_snapshots), summary_json
+    assert RunStatus.FAILED in _snapshot_statuses(public_snapshots), summary_json
+    assert RunStatus.CANCELLED in _snapshot_statuses(public_snapshots), summary_json
+    assert RunStatus.LOST in _snapshot_statuses(public_snapshots), summary_json
+    assert diagnostics.failure_boundary is None, summary_json
     assert_summary_ok(summary)
 
 
@@ -1456,6 +1792,17 @@ def _flatten_int_groups(
     return tuple(values)
 
 
+def _snapshot_statuses(snapshots: Sequence[RunSnapshot]) -> frozenset[RunStatus]:
+    """从 Run snapshot 序列提取状态集合。
+
+    :param snapshots: Run snapshot 序列。
+    :returns: RunStatus 集合。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return frozenset(snapshot.status for snapshot in snapshots)
+
+
 def _run_ids_from_events(events: Sequence[HostEvent]) -> frozenset[str]:
     """从 HostEvent 序列提取非空 Run id 集合。
 
@@ -1481,10 +1828,12 @@ def _run_ids_from_observations(
 
 
 def _is_terminal_status(status: RunStatus) -> bool:
-    """判断 RunStatus 是否为终态。
+    """判断 RunStatus 是否为 Host public Run 终态。
 
     :param status: Run 状态。
-    :returns: succeeded/failed/cancelled 时返回 ``True``。
+    :returns: succeeded/failed/cancelled/lost 时返回 ``True``；这里刻意使用
+        Host-wide public Run terminal 语义，不等同于 HostEventKind /
+        HostTerminalStatus 可表达的 terminal observation 集合。
     :raises Exception: 不主动抛出异常。
     """
 
@@ -1492,6 +1841,7 @@ def _is_terminal_status(status: RunStatus) -> bool:
         RunStatus.SUCCEEDED,
         RunStatus.FAILED,
         RunStatus.CANCELLED,
+        RunStatus.LOST,
     }
 
 
