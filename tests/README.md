@@ -38,7 +38,10 @@ pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 pytest tests/contracts -q
 pytest tests/host -q
 pytest tests/host/test_tooling_options.py tests/host/test_package_exports.py tests/host/test_import_boundary.py -q
-pytest tests/host/test_durable_schema.py tests/host/test_durable_transaction.py tests/host/test_event_log_store.py tests/host/test_event_log_multiprocess.py tests/host/test_idempotency_store.py tests/host/test_durable_concurrency_matrix.py -q
+pytest tests/host/test_durable_schema.py tests/host/test_event_log_store.py -q
+pytest tests/host/test_durable_connection.py tests/host/test_durable_transaction.py -q
+pytest tests/host/test_durable_concurrency_matrix.py tests/host/test_idempotency_store.py tests/host/test_projection_checkpoint.py tests/host/test_memory_projection.py -q
+pytest tests/host/test_event_log_multiprocess.py tests/host/test_admission_multiprocess.py tests/host/test_host_instance_liveness.py -q
 pytest tests/host/test_durable_schema.py tests/host/test_projection_checkpoint.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_admission_queue.py tests/host/test_dispatch_scheduler.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py -q
 pytest tests/host/test_payload_store.py tests/host/test_artifact_store.py tests/host/test_host_instance_liveness.py -q
 pytest tests/host/test_session_lifecycle.py tests/host/test_run_attempt_transitions.py -q
