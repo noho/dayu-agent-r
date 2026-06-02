@@ -72,7 +72,10 @@ from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
 )
-from dayu.host.tool_runtime import DuplicateGovernancePolicy
+from dayu.host.tool_duplicate_governance import (
+    DuplicateDecisionKind,
+    DuplicateGovernancePolicy,
+)
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.dispatch import (
     ActiveCancelMessage,
@@ -235,7 +238,7 @@ _SCHEDULER_CLOSE_LIFECYCLE_MATRIX = (
         window="outer task cancellation during scheduler close cleanup",
         expected_close_action="propagate CancelledError and allow later close retry to finish cleanup",
         expected_durable_mutation="no scheduler-close-created terminal canonical fact",
-        expected_resource_cleanup="active registry empty, active tasks done, lane closed, duplicate registry cleared",
+        expected_resource_cleanup="active registry empty, active tasks done, lane closed",
         coverage_classification="new",
     ),
     _SchedulerCloseLifecycleCase(
@@ -1034,6 +1037,37 @@ class _SnapshotEventHandle(_FakeHandle):
         yield self._event
 
 
+class _GatedSnapshotEventHandle(_FakeHandle):
+    """等待测试同步门后再产出单个 EngineEvent 的 handle。"""
+
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        event: EngineEvent,
+        gate: asyncio.Event,
+    ) -> None:
+        """初始化 gated handle。
+
+        :param snapshot: dispatch snapshot。
+        :param event: 要产出的 EngineEvent。
+        :param gate: 控制事件产出时机的同步门。
+        :returns: ``None``。
+        """
+
+        super().__init__(local_worker_id=f"worker-{snapshot.attempt_id}")
+        self._event = event
+        self._gate = gate
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """等待同步门打开后产出单个事件。
+
+        :returns: EngineEvent 异步迭代器。
+        """
+
+        await self._gate.wait()
+        yield self._event
+
+
 class _ReactiveRecoveryWorker:
     """第一轮产出 reactive overflow，第二轮产出 final answer。"""
 
@@ -1070,6 +1104,12 @@ class _ReactiveRecoveryWorker:
                 ),
                 metadata=None,
             )
+            if self._factory.first_event_gate is not None:
+                return _GatedSnapshotEventHandle(
+                    snapshot,
+                    event,
+                    self._factory.first_event_gate,
+                )
         elif self._factory.final_blocks:
             return _ControlledBlockingHandle()
         else:
@@ -1092,14 +1132,21 @@ class _ReactiveRecoveryWorker:
 class _ReactiveRecoveryWorkerFactory:
     """测试 reactive recovery dispatch 的 worker factory。"""
 
-    def __init__(self, *, final_blocks: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        final_blocks: bool = False,
+        first_event_gate: asyncio.Event | None = None,
+    ) -> None:
         """初始化 factory。
 
         :param final_blocks: recovery Attempt 是否阻塞不产出 terminal。
+        :param first_event_gate: 第一轮 reactive 事件产出前等待的同步门。
         :returns: ``None``。
         """
 
         self.final_blocks = final_blocks
+        self.first_event_gate = first_event_gate
         self.created = 0
         self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
         self.accepted_requests: list[AgentRunRequest] = []
@@ -2105,7 +2152,6 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             assert request.agent_policy.allow_tool_calls is True
             assert "tool-enabled previous memory prompt" in contents
             assert [schema.function.name for schema in request.tool_schemas] == ["fake_dispatch_tool"]
-            assert scheduler._duplicate_governance_registry.active_run_count() == 1
 
             tool_outcome = await request.tool_executor.execute(
                 _tool_execution_request(
@@ -2128,7 +2174,6 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             assert projection.calls == 1
         finally:
             await scheduler.close()
-            assert scheduler._duplicate_governance_registry.active_run_count() == 0
 
 
 @pytest.mark.asyncio
@@ -2887,11 +2932,6 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
         scheduler.wake_dispatch(_pending_dispatch(seeded))
         assert (await scheduler.drain_once()).dispatched == 1
         await handle.events_started.wait()
-        scheduler._duplicate_governance_registry.duplicate_governance_for_run(
-            run_id=seeded.run_id,
-            policy=DuplicateGovernancePolicy(),
-        )
-        assert scheduler._duplicate_governance_registry.active_run_count() == 1
         blocked_close = _CloseOnceBlockedLaneClose(scheduler._lane_controller.close)
         monkeypatch.setattr(scheduler._lane_controller, "close", blocked_close)
 
@@ -2923,7 +2963,6 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
             )
             is False
         )
-        assert scheduler._duplicate_governance_registry.active_run_count() == 0
         _assert_no_scheduler_close_terminal_events(store.transaction_runner)
         with pytest.raises(RuntimeLaneClosedError):
             await scheduler._lane_controller.acquire(_LANE_NAME, timeout_seconds=0)
@@ -4037,21 +4076,31 @@ async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
 
 
 @pytest.mark.asyncio
-async def test_reactive_recovery_does_not_clear_duplicate_registry(
+async def test_reactive_recovery_uses_fresh_duplicate_governance_attempt(
     tmp_path: Path,
 ) -> None:
-    """reactive recovery accepted 停止旧 worker 但不清理同 Run duplicate registry。"""
+    """reactive recovery 新 Attempt 对相同工具参数执行 fresh request。"""
 
+    first_event_gate = asyncio.Event()
     tool = _CountingTool()
+    duplicate_policy = DuplicateGovernancePolicy(
+        default_duplicate_decision=DuplicateDecisionKind.REUSE
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        factory = _ReactiveRecoveryWorkerFactory(final_blocks=True)
+        factory = _ReactiveRecoveryWorkerFactory(
+            final_blocks=True,
+            first_event_gate=first_event_gate,
+        )
         scheduler = await _open_scheduler(
             tmp_path,
             store,
             factory,
             agent_policy=_agent_policy(True),
-            tooling_options=_tooling_options(tool),
+            tooling_options=_tooling_options(
+                tool,
+                duplicate_governance_policy=duplicate_policy,
+            ),
             context_budget_policy=_soft_compact_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -4059,11 +4108,68 @@ async def test_reactive_recovery_does_not_clear_duplicate_registry(
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
             assert (await scheduler.drain_once()).dispatched == 1
+            first_request = factory.accepted_requests[0]
+            first_tool_outcome = await first_request.tool_executor.execute(
+                _tool_execution_request(
+                    seeded,
+                    first_request,
+                    ToolCallRequest(
+                        tool_call_id="tool-call-first-attempt",
+                        name="fake_dispatch_tool",
+                        arguments={"ticker": "DAYU"},
+                        index_in_iteration=0,
+                        provider_state=None,
+                    ),
+                )
+            )
+            first_duplicate_outcome = await first_request.tool_executor.execute(
+                _tool_execution_request(
+                    seeded,
+                    first_request,
+                    ToolCallRequest(
+                        tool_call_id="tool-call-first-attempt-duplicate",
+                        name="fake_dispatch_tool",
+                        arguments={"ticker": "DAYU"},
+                        index_in_iteration=0,
+                        provider_state=None,
+                    ),
+                )
+            )
+
+            assert isinstance(
+                first_tool_outcome.records[0].outcome,
+                ToolCompletedOutcome,
+            )
+            assert isinstance(
+                first_duplicate_outcome.records[0].outcome,
+                ToolCompletedOutcome,
+            )
+            assert tool.call_count == 1
+
+            first_event_gate.set()
             await _wait_for_accepted_snapshot_count(factory, 2)
+            second_request = factory.accepted_requests[1]
+            second_tool_outcome = await second_request.tool_executor.execute(
+                _tool_execution_request(
+                    seeded,
+                    second_request,
+                    ToolCallRequest(
+                        tool_call_id="tool-call-second-attempt",
+                        name="fake_dispatch_tool",
+                        arguments={"ticker": "DAYU"},
+                        index_in_iteration=0,
+                        provider_state=None,
+                    ),
+                )
+            )
 
             assert factory.accepted_snapshots[0].attempt_id == seeded.attempt_id
             assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
-            assert scheduler._duplicate_governance_registry.active_run_count() == 1
+            assert isinstance(
+                second_tool_outcome.records[0].outcome,
+                ToolCompletedOutcome,
+            )
+            assert tool.call_count == 2
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
         finally:
             await scheduler.close()
@@ -4221,10 +4327,15 @@ def _runner_spec() -> RunnerSpec:
     )
 
 
-def _tooling_options(tool: _CountingTool) -> HostToolingOptions:
+def _tooling_options(
+    tool: _CountingTool,
+    *,
+    duplicate_governance_policy: DuplicateGovernancePolicy | None = None,
+) -> HostToolingOptions:
     """构造 tool-enabled dispatch 测试用工具装配选项。
 
     :param tool: 测试业务工具 callable。
+    :param duplicate_governance_policy: 可选 duplicate governance 策略。
     :returns: HostToolingOptions。
     """
 
@@ -4235,6 +4346,11 @@ def _tooling_options(tool: _CountingTool) -> HostToolingOptions:
                 source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
                 source_id="dispatch-tool-test",
             ),
+        ),
+        duplicate_governance_policy=(
+            duplicate_governance_policy
+            if duplicate_governance_policy is not None
+            else DuplicateGovernancePolicy()
         ),
     )
 

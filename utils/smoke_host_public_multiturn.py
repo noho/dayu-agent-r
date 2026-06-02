@@ -82,6 +82,9 @@ from dayu.service.host_assembly import (
     compose_submit_followup_request,
     discover_service_tools,
 )
+from utils.smoke_host_public_diagnostics import (
+    print_duplicate_governance_diagnostics,
+)
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
@@ -353,7 +356,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     """
 
     assembly = _prepare_runtime_assembly(args, env=env)
-    _print_assembly_diagnostics(assembly.diagnostics)
+    _print_assembly_diagnostics(assembly.diagnostics, assembly.options)
     smoke_run_id = _new_smoke_run_id()
 
     print("SMOKE START Host public multi-turn runtime assembly")
@@ -996,10 +999,12 @@ def _print_compact_pressure_plan(options: OpenHostOptions) -> None:
 
 def _print_assembly_diagnostics(
     diagnostics: ServiceOpenHostAssemblyDiagnostics,
+    options: OpenHostOptions,
 ) -> None:
     """打印 Host 调用前 assembly diagnostics。
 
     :param diagnostics: assembly diagnostics。
+    :param options: Host opener options，用于打印 effective tooling policy。
     :returns: ``None``。
     :raises Exception: 不主动抛出异常。
     """
@@ -1045,6 +1050,7 @@ def _print_assembly_diagnostics(
         f"context_budget:{diagnostics.context_budget_policy_ref},"
         f"tool_truncation:{diagnostics.tool_truncation_policy}"
     )
+    print_duplicate_governance_diagnostics(options)
     print(
         "SMOKE ASSEMBLY agent_policy_sources="
         f"{','.join(diagnostics.agent_policy_sources)}"

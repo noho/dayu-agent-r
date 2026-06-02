@@ -1,7 +1,8 @@
-"""Host ToolRuntime P6-S5 run-local duplicate governance 测试。"""
+"""Host ToolRuntime attempt-scoped duplicate governance 测试。"""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
@@ -14,9 +15,13 @@ from dayu.contracts.tool_call import (
     BatchToolExecutionRequest,
     ToolCallRequest,
 )
-from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_declaration import ToolBundle, ToolCallable, ToolDefinition
 from dayu.contracts.tool_executor import ToolExecutor
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
+from dayu.contracts.tool_outcome import (
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
@@ -25,19 +30,19 @@ from dayu.contracts.tool_schema import (
 )
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
-    DuplicateDecisionKind,
-    DuplicateGovernancePolicy,
     EffectiveToolBundleBuildRequest,
     EffectiveToolBundleBuilder,
     HostEventRef,
     HostPayloadRef,
     HostToolFactAcceptPort,
-    InMemoryRunScopedDuplicateGovernanceRegistry,
     InMemoryToolTraceDiagnosticEmitter,
+    ToolAcceptRejectReason,
     ToolAcceptRetryPolicy,
     ToolFactAcceptCandidate,
     ToolFactAcceptResult,
+    ToolFactAcceptTimedOut,
     ToolFactAcceptedAck,
+    ToolFactRejectedAck,
     ToolFactKind,
     ToolPolicyDecision,
     ToolPolicyDecisionKind,
@@ -47,6 +52,11 @@ from dayu.host.tool_runtime import (
 )
 from dayu.host.tooling import (
     default_framework_tool_policy_view,
+)
+from dayu.host.tool_duplicate_governance import (
+    DuplicateDecisionKind,
+    DuplicateGovernanceMessages,
+    DuplicateGovernancePolicy,
 )
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
@@ -86,6 +96,55 @@ class _OpenCancellationToken:
         return None
 
 
+class _ControllableCancellationToken:
+    """测试用可控取消 token。"""
+
+    def __init__(self) -> None:
+        """初始化未取消 token。
+
+        :returns: ``None``。
+        """
+
+        self._cancelled = False
+        self._reason: str | None = None
+        self._requested_at: datetime | None = None
+
+    def cancel(self, reason: str) -> None:
+        """请求取消。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        self._cancelled = True
+        self._reason = reason
+        self._requested_at = datetime.now()
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 已请求取消时返回 ``True``。
+        """
+
+        return self._cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 取消原因；未取消时为 ``None``。
+        """
+
+        return self._reason
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 取消请求时间；未取消时为 ``None``。
+        """
+
+        return self._requested_at
+
+
 class _CountingTool:
     """返回固定成功结果并记录调用次数的测试工具。"""
 
@@ -118,6 +177,114 @@ class _CountingTool:
         )
 
 
+class _BlockingCountingTool:
+    """等待测试事件释放后返回固定成功结果的测试工具。"""
+
+    def __init__(
+        self,
+        value: JsonValue,
+        *,
+        entered: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        """初始化阻塞测试工具。
+
+        :param value: 工具返回值。
+        :param entered: 工具开始执行时置位的事件。
+        :param release: 允许工具返回的事件。
+        :returns: ``None``。
+        """
+
+        self._value = value
+        self._entered = entered
+        self._release = release
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """等待 release 事件后返回固定成功结果。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具上下文。
+        :returns: 成功 outcome。
+        """
+
+        del call, context
+        self.call_count += 1
+        self._entered.set()
+        await self._release.wait()
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value=self._value, meta=None)
+        )
+
+
+class _FailingTool:
+    """抛出业务异常的测试工具。"""
+
+    def __init__(self) -> None:
+        """初始化失败工具。
+
+        :returns: ``None``。
+        """
+
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """抛出业务异常。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具上下文。
+        :returns: 不返回；始终抛出异常。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        del call, context
+        self.call_count += 1
+        raise RuntimeError("boom")
+
+
+class _BlockingFailingTool:
+    """等待测试事件释放后抛出业务异常的测试工具。"""
+
+    def __init__(self, *, entered: asyncio.Event, release: asyncio.Event) -> None:
+        """初始化阻塞失败工具。
+
+        :param entered: 工具开始执行时置位的事件。
+        :param release: 允许工具抛出异常的事件。
+        :returns: ``None``。
+        """
+
+        self._entered = entered
+        self._release = release
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """等待 release 事件后抛出业务异常。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具上下文。
+        :returns: 不返回；始终抛出异常。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        del call, context
+        self.call_count += 1
+        self._entered.set()
+        await self._release.wait()
+        raise RuntimeError("boom")
+
+
 class _AcceptingPort(HostToolFactAcceptPort):
     """记录 candidate 并始终 accepted 的测试 accept port。"""
 
@@ -143,6 +310,63 @@ class _AcceptingPort(HostToolFactAcceptPort):
         ack = _accepted_ack(candidate)
         self.acks.append(ack)
         return ack
+
+
+class _RejectingPort(HostToolFactAcceptPort):
+    """记录 candidate 并始终 rejected 的测试 accept port。"""
+
+    def __init__(self) -> None:
+        """初始化测试 accept port。
+
+        :returns: ``None``。
+        """
+
+        self.candidates: list[ToolFactAcceptCandidate] = []
+
+    def accept_tool_fact(
+        self, candidate: ToolFactAcceptCandidate
+    ) -> ToolFactAcceptResult:
+        """记录 candidate 并返回 rejected ack。
+
+        :param candidate: 工具事实候选。
+        :returns: rejected ack。
+        """
+
+        self.candidates.append(candidate)
+        return ToolFactRejectedAck(
+            reason_code=ToolAcceptRejectReason.EXPLICIT_POLICY_REJECT,
+            message="reject for duplicate governance test",
+            diagnostic_refs=(),
+            retryable=False,
+        )
+
+
+class _TimedOutPort(HostToolFactAcceptPort):
+    """记录 candidate 并始终返回 timed out 的测试 accept port。"""
+
+    def __init__(self) -> None:
+        """初始化测试 accept port。
+
+        :returns: ``None``。
+        """
+
+        self.candidates: list[ToolFactAcceptCandidate] = []
+
+    def accept_tool_fact(
+        self, candidate: ToolFactAcceptCandidate
+    ) -> ToolFactAcceptResult:
+        """记录 candidate 并返回 timed out。
+
+        :param candidate: 工具事实候选。
+        :returns: timed out 结果。
+        """
+
+        self.candidates.append(candidate)
+        return ToolFactAcceptTimedOut(
+            attempt_count=1,
+            last_error_code="forced-timeout",
+            diagnostic_refs=(),
+        )
 
 
 @pytest.mark.asyncio
@@ -206,11 +430,17 @@ async def test_duplicate_key_excludes_index_in_iteration() -> None:
 
 @pytest.mark.asyncio
 async def test_allow_duplicate_decision_executes_and_accepts_each_call() -> None:
-    """默认 allow 策略下重复调用仍执行并各自进入 accept path。"""
+    """显式 allow 策略下重复调用仍执行并各自进入 accept path。"""
 
     tool = _CountingTool({"accepted": True})
     accept_port = _AcceptingPort()
-    executor = _executor(tool, accept_port, DuplicateGovernancePolicy())
+    executor = _executor(
+        tool,
+        accept_port,
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.ALLOW
+        ),
+    )
 
     await executor.execute(
         _request(
@@ -306,6 +536,9 @@ async def test_duplicate_governed_matrix_produces_diagnostics(
     assert tool.call_count == 1
     assert governed_candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
     assert governed_candidate.policy_decision.kind is expected_policy
+    assert governed_candidate.duplicate_scope is not None
+    assert governed_candidate.duplicate_scope.kind == "attempt"
+    assert governed_candidate.duplicate_scope.attempt_id == _ATTEMPT_ID
     assert governed_candidate.diagnostic_refs
     assert governed_candidate.reuse_prior_event_refs
     assert len(diagnostics.records) == 1
@@ -338,8 +571,8 @@ async def test_governed_duplicate_candidate_validation_rejects_policy_mismatch()
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
                 message=(
-                    "duplicate tool call should use prior accepted result "
-                    "or change evidence scope"
+                    "请优先使用上一次工具结果继续推理；只有当需要不同主体、"
+                    "期间、指标或证据范围时，才重新调用工具并修改参数。"
                 ),
             ),
         )
@@ -359,7 +592,10 @@ async def test_governed_duplicate_candidate_validation_rejects_reason_mismatch()
             policy_decision=ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
-                message="duplicate tool call hard-stopped by Host governance",
+                message=(
+                    "本次重复工具调用已被拒绝。请使用上一次工具结果继续推理；"
+                    "如果信息不足，请说明不确定性，不要编造。"
+                ),
             ),
         )
 
@@ -529,92 +765,387 @@ async def test_plain_policy_rejection_does_not_carry_duplicate_prior_refs() -> N
 
 
 @pytest.mark.asyncio
-async def test_same_run_runtime_handles_share_duplicate_index() -> None:
-    """同 Run 同进程多个 ToolRuntime handle 共享 duplicate accepted 记忆。"""
+async def test_cross_attempt_same_run_duplicate_executes_fresh_without_prior_refs() -> None:
+    """相同 run_id 不同 Attempt 的同工具同参数按 fresh request 执行。"""
 
-    first_tool = _CountingTool({"accepted": "first-runtime"})
-    second_tool = _CountingTool({"accepted": "second-runtime"})
+    first_tool = _CountingTool({"accepted": "first-attempt"})
+    second_tool = _CountingTool({"accepted": "second-attempt"})
     first_accept_port = _AcceptingPort()
     second_accept_port = _AcceptingPort()
-    registry = InMemoryRunScopedDuplicateGovernanceRegistry()
     policy = DuplicateGovernancePolicy(
         default_duplicate_decision=DuplicateDecisionKind.REUSE
     )
 
-    await _executor(
-        first_tool,
-        first_accept_port,
-        policy,
-        duplicate_governance_registry=registry,
-    ).execute(
+    await _executor(first_tool, first_accept_port, policy).execute(
         _request(_call("tool-call-1", {"ticker": "DAYU"}, index=0))
     )
-    outcome = await _executor(
+    await _executor(
         second_tool,
         second_accept_port,
         policy,
-        duplicate_governance_registry=registry,
-    ).execute(
-        _request(_call("tool-call-2", {"ticker": "DAYU"}, index=0))
-    )
+        attempt_id="attempt-other",
+    ).execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=0)))
 
     assert first_tool.call_count == 1
-    assert second_tool.call_count == 0
-    assert isinstance(outcome.records[0].outcome, ToolCompletedOutcome)
-    assert outcome.records[0].outcome.result.value == {"accepted": "first-runtime"}
-    assert second_accept_port.candidates[0].tool_fact_kind is ToolFactKind.REUSE
-    assert second_accept_port.candidates[0].reuse_prior_event_refs == (
-        first_accept_port.acks[0].accepted_event_refs
+    assert second_tool.call_count == 1
+    assert first_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
+    assert second_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
+    assert first_accept_port.candidates[0].duplicate_decision is (
+        DuplicateDecisionKind.ALLOW
+    )
+    assert second_accept_port.candidates[0].duplicate_decision is (
+        DuplicateDecisionKind.ALLOW
+    )
+    assert first_accept_port.candidates[0].reuse_prior_event_refs == ()
+    assert second_accept_port.candidates[0].reuse_prior_event_refs == ()
+    assert first_accept_port.candidates[0].duplicate_key != (
+        second_accept_port.candidates[0].duplicate_key
+    )
+    assert first_accept_port.candidates[0].duplicate_scope is not None
+    assert first_accept_port.candidates[0].duplicate_scope.attempt_id == _ATTEMPT_ID
+    assert second_accept_port.candidates[0].duplicate_scope is not None
+    assert second_accept_port.candidates[0].duplicate_scope.attempt_id == (
+        "attempt-other"
     )
 
 
 @pytest.mark.asyncio
-async def test_different_runs_do_not_share_duplicate_index() -> None:
-    """不同 Run 即使共用同一进程 registry 也不共享 duplicate accepted 记忆。"""
+async def test_fresh_toolruntime_handle_same_attempt_is_in_memory_non_durable_restart_behavior() -> None:
+    """新 ToolRuntime handle 不继承内存 duplicate index；该行为不是 correctness 前提。"""
 
-    first_tool = _CountingTool({"accepted": "first-run"})
-    second_tool = _CountingTool({"accepted": "second-run"})
-    registry = InMemoryRunScopedDuplicateGovernanceRegistry()
+    first_tool = _CountingTool({"accepted": "before-restart"})
+    restarted_tool = _CountingTool({"accepted": "after-restart"})
+    first_accept_port = _AcceptingPort()
+    restarted_accept_port = _AcceptingPort()
     policy = DuplicateGovernancePolicy(
         default_duplicate_decision=DuplicateDecisionKind.REUSE
     )
 
-    await _executor(
-        first_tool,
-        _AcceptingPort(),
-        policy,
-        duplicate_governance_registry=registry,
-    ).execute(
-        _request(_call("tool-call-1", {"ticker": "DAYU"}, index=0))
+    await _executor(first_tool, first_accept_port, policy).execute(
+        _request(_call("tool-call-before-restart", {"ticker": "DAYU"}, index=0))
     )
-    await _executor(
-        second_tool,
-        _AcceptingPort(),
-        policy,
-        run_id="run-other",
-        duplicate_governance_registry=registry,
-    ).execute(
-        _request(
-            _call("tool-call-2", {"ticker": "DAYU"}, index=0),
-            run_id="run-other",
-        )
+    await _executor(restarted_tool, restarted_accept_port, policy).execute(
+        _request(_call("tool-call-after-restart", {"ticker": "DAYU"}, index=0))
     )
 
     assert first_tool.call_count == 1
-    assert second_tool.call_count == 1
+    assert restarted_tool.call_count == 1
+    assert first_accept_port.candidates[0].duplicate_scope is not None
+    assert restarted_accept_port.candidates[0].duplicate_scope is not None
+    assert first_accept_port.candidates[0].duplicate_scope.attempt_id == _ATTEMPT_ID
+    assert restarted_accept_port.candidates[0].duplicate_scope.attempt_id == (
+        _ATTEMPT_ID
+    )
+    assert first_accept_port.candidates[0].duplicate_key == (
+        restarted_accept_port.candidates[0].duplicate_key
+    )
+    assert restarted_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
+    assert restarted_accept_port.candidates[0].duplicate_decision is (
+        DuplicateDecisionKind.ALLOW
+    )
+    assert restarted_accept_port.candidates[0].reuse_prior_event_refs == ()
+
+
+@pytest.mark.asyncio
+async def test_same_attempt_concurrent_reuse_waits_for_owner_accept() -> None:
+    """同 Attempt 并发重复调用等待 owner accepted 后复用结果。"""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tool = _BlockingCountingTool(
+        {"accepted": "owner"}, entered=entered, release=release
+    )
+    accept_port = _AcceptingPort()
+    executor = _executor(
+        tool,
+        accept_port,
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
+    )
+    await entered.wait()
+    waiter = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    await asyncio.sleep(0)
+    assert tool.call_count == 1
+    assert not waiter.done()
+
+    release.set()
+    owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
+
+    assert tool.call_count == 1
+    assert isinstance(owner_outcome.records[0].outcome, ToolCompletedOutcome)
+    assert isinstance(waiter_outcome.records[0].outcome, ToolCompletedOutcome)
+    assert waiter_outcome.records[0].outcome.result.value == {"accepted": "owner"}
+    assert accept_port.candidates[1].tool_fact_kind is ToolFactKind.REUSE
+    assert accept_port.candidates[1].reuse_prior_event_refs == (
+        accept_port.acks[0].accepted_event_refs
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_attempt_concurrent_rejected_accept_reports_durable_missing() -> None:
+    """owner accept rejected 时 waiter 得到 durable-missing 治理错误且不二次执行。"""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tool = _BlockingCountingTool(
+        {"accepted": "owner"}, entered=entered, release=release
+    )
+    accept_port = _RejectingPort()
+    executor = _executor(
+        tool,
+        accept_port,
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
+    )
+    await entered.wait()
+    waiter = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    await asyncio.sleep(0)
+    release.set()
+    owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
+
+    assert tool.call_count == 1
+    assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
+    assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
+    assert waiter_outcome.records[0].outcome.result.hint == (
+        "duplicate_prior_accept_missing"
+    )
+
+    later = await executor.execute(
+        _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
+    )
+    assert tool.call_count == 2
+    assert isinstance(later.records[0].outcome, ToolFailedOutcome)
+
+
+@pytest.mark.asyncio
+async def test_same_attempt_concurrent_timed_out_accept_reports_durable_missing() -> None:
+    """owner accept timeout 时 waiter 得到 durable-missing 治理错误且不二次执行。"""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tool = _BlockingCountingTool(
+        {"accepted": "owner"}, entered=entered, release=release
+    )
+    executor = _executor(
+        tool,
+        _TimedOutPort(),
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
+    )
+    await entered.wait()
+    waiter = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    await asyncio.sleep(0)
+    release.set()
+    owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
+
+    assert tool.call_count == 1
+    assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
+    assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
+    assert waiter_outcome.records[0].outcome.result.hint == (
+        "duplicate_prior_accept_missing"
+    )
+
+    later = await executor.execute(
+        _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
+    )
+    assert tool.call_count == 2
+    assert isinstance(later.records[0].outcome, ToolFailedOutcome)
+
+
+@pytest.mark.asyncio
+async def test_same_attempt_concurrent_tool_exception_reports_durable_missing() -> None:
+    """owner 工具异常时 waiter 得到 durable-missing 治理错误且后续可重新执行。"""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tool = _BlockingFailingTool(entered=entered, release=release)
+    executor = _executor(
+        tool,
+        _AcceptingPort(),
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
+    )
+    await entered.wait()
+    waiter = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    await asyncio.sleep(0)
+    release.set()
+    owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
+
+    assert tool.call_count == 1
+    assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
+    assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
+    assert waiter_outcome.records[0].outcome.result.hint == (
+        "duplicate_prior_accept_missing"
+    )
+
+    later = await executor.execute(
+        _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
+    )
+    assert tool.call_count == 2
+    assert isinstance(later.records[0].outcome, ToolFailedOutcome)
+
+
+@pytest.mark.asyncio
+async def test_same_attempt_concurrent_owner_cancellation_reports_durable_missing() -> None:
+    """owner 取消时 waiter 得到 durable-missing 治理错误且后续可重新执行。"""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    token = _ControllableCancellationToken()
+    tool = _BlockingCountingTool(
+        {"accepted": "owner"}, entered=entered, release=release
+    )
+    executor = _executor(
+        tool,
+        _AcceptingPort(),
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(
+            _request(
+                _call("tool-call-1", {"ticker": "DAYU"}, index=0),
+                cancellation_token=token,
+            )
+        )
+    )
+    await entered.wait()
+    waiter = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    await asyncio.sleep(0)
+    token.cancel("owner cancelled by test")
+    owner_outcome, waiter_outcome = await asyncio.wait_for(
+        asyncio.gather(owner, waiter),
+        timeout=1.0,
+    )
+
+    assert tool.call_count == 1
+    assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
+    assert owner_outcome.records[0].outcome.result.hint == "tool_runtime_cancelled"
+    assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
+    assert waiter_outcome.records[0].outcome.result.hint == (
+        "duplicate_prior_accept_missing"
+    )
+
+    release.set()
+    later = await executor.execute(
+        _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
+    )
+    assert tool.call_count == 2
+    assert isinstance(later.records[0].outcome, ToolCompletedOutcome)
+
+
+@pytest.mark.asyncio
+async def test_allow_policy_concurrent_waits_for_owner_before_second_execution() -> None:
+    """allow policy 的并发 duplicate 也必须等 owner terminal 后才二次执行。"""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    tool = _BlockingCountingTool(
+        {"accepted": "owner"}, entered=entered, release=release
+    )
+    executor = _executor(
+        tool,
+        _AcceptingPort(),
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.ALLOW
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
+    )
+    await entered.wait()
+    waiter = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    await asyncio.sleep(0)
+    assert tool.call_count == 1
+
+    release.set()
+    await asyncio.gather(owner, waiter)
+
+    assert tool.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_allow_policy_post_owner_completion_executes_again() -> None:
+    """allow policy 在 owner 完成后的重复调用会再次真实执行。"""
+
+    tool = _CountingTool({"accepted": True})
+    executor = _executor(
+        tool,
+        _AcceptingPort(),
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.ALLOW
+        ),
+    )
+
+    await executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
+    await executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+
+    assert tool.call_count == 2
+
+
+def test_duplicate_governance_messages_reject_empty_text() -> None:
+    """duplicate governance messages 拒绝空白消息配置。"""
+
+    with pytest.raises(ValueError, match="reuse must be non-empty"):
+        DuplicateGovernanceMessages(reuse=" ")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_candidate_validation_rejects_missing_duplicate_message() -> None:
+    """duplicate candidate 缺少配置消息时 fail fast。"""
+
+    governed_candidate = await _governed_duplicate_candidate(
+        DuplicateDecisionKind.HINT
+    )
+
+    with pytest.raises(ValueError, match="requires duplicate_decision_message"):
+        replace(governed_candidate, duplicate_decision_message=None)
 
 
 def _executor(
-    tool: _CountingTool,
+    tool: ToolCallable,
     accept_port: HostToolFactAcceptPort,
     duplicate_policy: DuplicateGovernancePolicy,
     *,
     diagnostic_emitter: InMemoryToolTraceDiagnosticEmitter | None = None,
     policy_view: ToolRuntimePolicyView | None = None,
     run_id: str = _RUN_ID,
-    duplicate_governance_registry: (
-        InMemoryRunScopedDuplicateGovernanceRegistry | None
-    ) = None,
+    attempt_id: str = _ATTEMPT_ID,
 ) -> ToolExecutor:
     """构造测试用 ToolRuntime executor。
 
@@ -624,7 +1155,7 @@ def _executor(
     :param diagnostic_emitter: 可选内存诊断 emitter。
     :param policy_view: 可选工具 policy view。
     :param run_id: ToolRuntime execution scope 的 Run id。
-    :param duplicate_governance_registry: 可选 Run-scoped duplicate registry。
+    :param attempt_id: ToolRuntime execution scope 的 Attempt id。
     :returns: ToolExecutor protocol 实现。
     """
 
@@ -641,7 +1172,7 @@ def _executor(
             execution_scope=ToolRuntimeExecutionScope(
                 session_id=_SESSION_ID,
                 run_id=run_id,
-                attempt_id=_ATTEMPT_ID,
+                attempt_id=attempt_id,
                 execution_id=_EXECUTION_ID,
                 allow_tool_calls=True,
             ),
@@ -651,7 +1182,6 @@ def _executor(
                 policy_view if policy_view is not None else ToolRuntimePolicyView()
             ),
             duplicate_governance_policy=duplicate_policy,
-            duplicate_governance_registry=duplicate_governance_registry,
             diagnostic_emitter=diagnostic_emitter,
         )
     ).tool_executor
@@ -690,19 +1220,26 @@ async def _governed_duplicate_candidate(
 
     candidate = accept_port.candidates[1]
     assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    assert candidate.duplicate_scope is not None
+    assert candidate.duplicate_scope.kind == "attempt"
+    assert candidate.duplicate_scope.attempt_id == _ATTEMPT_ID
     return candidate
 
 
 def _request(
-    *calls: ToolCallRequest, run_id: str = _RUN_ID
+    *calls: ToolCallRequest,
+    run_id: str = _RUN_ID,
+    cancellation_token: _OpenCancellationToken | _ControllableCancellationToken | None = None,
 ) -> BatchToolExecutionRequest:
     """构造批式工具执行请求。
 
     :param calls: 单次工具调用请求。
     :param run_id: 请求上下文 run id。
+    :param cancellation_token: 可选取消 token；无则使用未取消 token。
     :returns: 批式工具执行请求。
     """
 
+    token = cancellation_token if cancellation_token is not None else _OpenCancellationToken()
     return BatchToolExecutionRequest(
         calls=calls,
         context=BatchToolExecutionContext(
@@ -710,7 +1247,7 @@ def _request(
             session_id=_SESSION_ID,
             iteration_id=_ITERATION_ID,
             timeout_seconds=10.0,
-            cancellation_token=_OpenCancellationToken(),
+            cancellation_token=token,
             correlation_id="correlation-duplicate",
         ),
     )
@@ -736,7 +1273,7 @@ def _call(
     )
 
 
-def _definition(name: str, tool: _CountingTool) -> ToolDefinition:
+def _definition(name: str, tool: ToolCallable) -> ToolDefinition:
     """构造测试工具声明。
 
     :param name: 工具名。

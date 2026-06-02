@@ -148,11 +148,12 @@ def test_assembly_diagnostics_output_uses_current_agent_policy_sources(
         env={"DEEPSEEK_API_KEY": _API_KEY},
     )
 
-    _print_assembly_diagnostics(assembly.diagnostics)
+    _print_assembly_diagnostics(assembly.diagnostics, assembly.options)
 
     output = capsys.readouterr().out
     assert "agent_policy_profile" not in output
     assert "SMOKE ASSEMBLY agent_policy_sources=" in output
+    assert "SMOKE ASSEMBLY tool_duplicate_governance_default=hint" in output
 
 
 def test_smoke_uses_fresh_session_slot_by_default(tmp_path: pathlib.Path) -> None:

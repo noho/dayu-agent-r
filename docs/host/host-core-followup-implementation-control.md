@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | WU-CTX-02 + WU-CTX-03 已完成：draft-PR-pass；下一项进入 WU-TOOL-01 |
+| gate | draft-PR-pass |
+| implementation status | WU-TOOL-01 draft PR gate passed |
 | active work unit | WU-TOOL-01 |
 | default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-01 discussion / code inspection；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-02 discussion-ready；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -171,6 +171,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-LIFE-01 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | worker-started-but-not-accepted deterministic close window / close cancellation boundary | deferred-with-owner | future scheduler lifecycle hardening if needed | 若后续 close() refactor 改变 cleanup 顺序、增加非幂等步骤，或需要覆盖 worker-started-but-not-accepted precise window，再补 deterministic instrumentation/test | 当前 Slice B 已覆盖 lane-wait pre-worker 与 active-worker close 两侧稳定窗口，并证明 close cancellation retry 可在 lane close 边界补完 cleanup；精确 worker-started-but-not-accepted 窗口未稳定构造，按 plan deferred。 |
 | RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
 | RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
+| RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
+| RR-TOOL-02 | WU-TOOL-01 Slice 1 code re-review | tool trace duplicate scope 透传 | closed | WU-TOOL-01 Slice 3 | 已完成；无需后续动作 | Slice 3 已为 `TOOL_CALL_GOVERNED` 和 tool trace summary 增加 machine-readable attempt duplicate scope，并由 `tests/host/test_tool_trace_projection.py` 覆盖 hot/cold trace。 |
 
 ## 当前 Work Units
 
@@ -184,7 +186,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-LIFE-02 | Scheduler close / cancel_all | scheduler close 极端窗口治理 | 已完成：draft-PR-pass |
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 已完成：draft-PR-pass |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
-| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | discussion-ready |
+| WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
@@ -418,6 +420,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 明确 cross-Attempt ToolRuntime state 不继承 duplicate index；resume、steer、recovery 或 compact recovery 创建的新 Attempt 中，重复工具调用按新的工具请求处理。
 - 清理或改写当前 run-local duplicate index 代码路径，避免 worker-local cache 成为跨 Attempt correctness 前提。
 - 修改 production diagnostic / trace，使 `TOOL_CALL_GOVERNED` 或等价 diagnostic 能表达 duplicate scope 是当前 Attempt，并记录当前 Attempt 内 prior event refs。
+- duplicate governance 的治理动作、提示文案和 justification 参数名必须通过 typed policy 配置或 Attempt snapshot 传入；禁止把提示或 policy 继续硬编码在执行路径里。
 
 ### 非目标
 
@@ -432,7 +435,46 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 跨 Attempt duplicate 有明确测试，证明不会命中旧 Attempt 的 duplicate index；新的 Attempt 按新工具请求执行或由工具自身 policy 处理。
 - worker restart / Host restart 后不要求继承 duplicate index，测试或文档明确该行为不是 correctness 前提。
 - diagnostic 能区分 attempt-scoped dedup 命中、重复拒绝、执行失败和 durable 缺失。
+- 测试覆盖可配置 duplicate policy、可配置提示文案与 justification 参数名；不同配置不得改变 attempt-local scope 边界。
 - 现有依赖 run-scope duplicate 命中的测试被删除或改写；不得通过兼容分支同时保留 run-scope 与 attempt-scope 两套行为。
+
+### Discussion / Code Inspection 记录
+
+- 2026-06-01：controller 完成 WU-TOOL-01 discussion / code inspection，artifact: `docs/reviews/wu-tool-01-discussion-code-inspection-20260601.md`。
+- 裁决：当前代码仍存在 run-scoped registry、run-local duplicate key 和硬编码 duplicate message；WU-TOOL-01 风险真实存在，且需要在 attempt-scope 改造中同步补齐 typed policy / prompt 配置边界。
+- 2026-06-01：planning artifact 已生成，artifact: `docs/host/wu-tool-01-attempt-scoped-duplicate-governance-plan.md`；plan review artifacts: `docs/reviews/wu-tool-01-plan-review-mimo-20260601.md`, `docs/reviews/wu-tool-01-plan-review-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-plan-review-controller-adjudication-20260601.md`。
+- 裁决：接受 in-flight 并发契约、测试构造、typed policy module、默认 messages、allow 并发测试和术语收口相关 findings；进入 plan fix。
+- 2026-06-01：plan fix artifact: `docs/reviews/wu-tool-01-plan-fix-codex-20260601.md`；plan re-review artifacts: `docs/reviews/wu-tool-01-plan-rereview-mimo-20260601.md`, `docs/reviews/wu-tool-01-plan-rereview-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-plan-rereview-controller-adjudication-20260601.md`。
+- 裁决：ADJ-001 至 ADJ-007 全部 closed；plan code-generation-ready；进入 accepted plan checkpoint。
+- Accepted plan commit: `c9a0c71` (`gateflow: accept plan for WU-TOOL-01`)。
+- 2026-06-01：Slice 1 implementation artifact: `docs/reviews/wu-tool-01-implementation-slice1-codex-20260601.md`；code review artifacts: `docs/reviews/wu-tool-01-code-review-slice1-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-review-slice1-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-code-review-slice1-controller-adjudication-20260601.md`。
+- 裁决：接受 CR1 至 CR6；要求删除 `tool_runtime.py` duplicate governance re-export、删除 run-scoped registry lifecycle、迁移 `DuplicateGovernancePort`、补 owner cancellation / timeout durable-missing 测试，并移除 hardcoded duplicate message fallback。
+- 2026-06-01：Slice 1 fix artifact: `docs/reviews/wu-tool-01-fix-slice1-codex-20260601.md`；code re-review artifacts: `docs/reviews/wu-tool-01-code-rereview-slice1-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-rereview-slice1-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-code-rereview-slice1-controller-adjudication-20260601.md`。
+- 裁决：CR1 至 CR6 全部 closed；Slice 1 code re-review pass；本地验证通过 `tests/host/test_toolruntime_duplicate_governance.py` 26 passed、`tests/host/test_dispatch_scheduler.py` 57 passed、`pyright` 0 errors。
+- Slice 1 deferred items：`tool_trace.py` duplicate scope 由 Slice 3 处理；README sync 由 Slice 4 处理；旧 registry 测试名清理由 Slice 2 dispatch behavior 改写处理；awaiting fanout 更宽并发治理记录为 `RR-TOOL-01`。
+- Accepted Slice 1 commit: `bd782be` (`gateflow: accept WU-TOOL-01 slice1`)。
+- 2026-06-01：Slice 2 implementation artifact: `docs/reviews/wu-tool-01-implementation-slice2-codex-20260601.md`；code review artifacts: `docs/reviews/wu-tool-01-code-review-slice2-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-review-slice2-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-code-review-slice2-controller-adjudication-20260601.md`。
+- 裁决：Slice 2 code review 0 blocking；test-only `cast` 与 `_tooling_options()` helper 默认 policy 构造均为可接受测试实现，不需要 fix loop；本地验证通过 `tests/host/test_tooling_options.py` + `tests/host/test_dispatch_scheduler.py` 70 passed、`pyright` 0 errors。
+- Accepted Slice 2 commit: `5f09506` (`gateflow: accept WU-TOOL-01 slice2`)。
+- 2026-06-01：Slice 3 implementation artifact: `docs/reviews/wu-tool-01-implementation-slice3-codex-20260601.md`；code review artifacts: `docs/reviews/wu-tool-01-code-review-slice3-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-review-slice3-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-code-review-slice3-controller-adjudication-20260601.md`。
+- 裁决：接受 CR3-1 / CR3-2 blocking findings；duplicate diagnostic record 必须使用 `attempt_scope_diagnostic`，policy decision / governed failure outcome 才使用 action message；进入 fix loop。
+- 2026-06-01：Slice 3 fix artifact: `docs/reviews/wu-tool-01-fix-slice3-codex-20260601.md`；code re-review artifacts: `docs/reviews/wu-tool-01-code-rereview-slice3-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-rereview-slice3-ds-20260601.md`；controller re-review adjudication: `docs/reviews/wu-tool-01-code-rereview-slice3-controller-adjudication-20260601.md`。
+- 裁决：CR3-1 / CR3-2 全部 closed；tool trace `duplicate_scope` hot/cold projection、accept barrier scope/prior refs、duplicate governance scope assertions 均通过 re-review；本地验证通过 `tests/host/test_toolruntime_diagnostics.py` + `tests/host/test_toolruntime_accept_barrier.py` + `tests/host/test_tool_trace_projection.py` + `tests/host/test_toolruntime_duplicate_governance.py` 52 passed、`pyright` 0 errors。
+- Accepted Slice 3 commit: `98ccd7a` (`gateflow: accept WU-TOOL-01 slice3`)。
+- 2026-06-01：Slice 4 implementation artifact: `docs/reviews/wu-tool-01-implementation-slice4-codex-20260601.md`；code review artifacts: `docs/reviews/wu-tool-01-code-review-slice4-mimo-20260601.md`, `docs/reviews/wu-tool-01-code-review-slice4-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-code-review-slice4-controller-adjudication-20260601.md`。
+- 裁决：Slice 4 code/doc review 0 blocking；cross-Attempt fresh request、fresh handle in-memory non-durable restart behavior、README sync 和 terminology cleanup 均通过 review；本地验证通过 target pytest 123 passed、`pyright` 0 errors；terminology grep 只剩 truncation cursor、reactive compaction token 或测试数据 id 等允许上下文。
+- Accepted Slice 4 commit: `660561a` (`gateflow: accept WU-TOOL-01 slice4`)。
+- 2026-06-01：aggregate review artifacts: `docs/reviews/wu-tool-01-aggregate-review-mimo-20260601.md`, `docs/reviews/wu-tool-01-aggregate-review-ds-20260601.md`；controller adjudication: `docs/reviews/wu-tool-01-aggregate-review-controller-adjudication-20260601.md`。
+- 裁决：aggregate review 0 blocking；WU-TOOL-01 attempt-scoped duplicate governance、typed policy/configurable message/justification、production dispatch wiring、diagnostic/trace scope、restart non-durable behavior、README/test sync 全部通过 aggregate review；`RR-TOOL-02` closed，`RR-TOOL-01` 保持 deferred-with-owner。
+- Local gate closeout commit: `1aff6e4` (`gateflow: record WU-TOOL-01 aggregate review`)；worktree clean；进入 `ready-to-open-draft-PR`。
+- 2026-06-01：draft PR opened: `https://github.com/noho/dayu-agent-r/pull/106`；draft PR review artifact: `docs/reviews/wu-tool-01-draft-pr-review-controller-20260601.md`。
+- 裁决：PR branch head 与本地 accepted head 一致；PR mergeable；GitHub 未上报 checks；draft PR gate pass。merge、approve、mark ready for review、request reviewers、delete branch 或外部 comment 仍需额外授权。
+- 2026-06-02：post-draft PR follow-up 根据用户反馈补齐 duplicate governance 配置链路：`execution_profiles.json` 增加 `tool_duplicate_governance_policy`，`ConfigLoader` typed schema 解析并 fail-fast，`dayu.service.host_assembly` 从 execution profile 映射到 `HostToolingOptions.duplicate_governance_policy`；同时为三个 `utils/smoke_host_public_*` smoke 增加 duplicate governance assembly diagnostics。
+- Follow-up commits: `d4cfbe0` (`wire duplicate governance config through service`), `0c1640d` (`surface duplicate governance in smoke diagnostics`)。
+- 2026-06-02：按 `$init-agents` 路由 AgentMiMo 与 AgentDS 做 PR review，artifacts: `docs/reviews/pr-106-agentmimo-duplicate-governance-config-review.md`, `docs/reviews/pr-106-agentds-duplicate-governance-config-review.md`。
+- 裁决：AgentMiMo / AgentDS 均未发现阻断问题；两项低严重 maintainability 观察已处理：`DuplicateGovernanceMessages.message_for` 显式覆盖 `DURABLE_MISSING` 并对未知决策 fail-fast，Service 仅在非空工具 bundle 分支内从 runtime config 构造 Host duplicate policy，`_duplicate_decision_from_config` 增加清晰错误上下文。
+- Review follow-up commit: `612242f` (`address duplicate governance PR review notes`)；验证通过 `pytest tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/host/test_tooling_options.py tests/runtime/test_smoke_host_public_multiturn_assembly.py` 87 passed、`pyright` 0 errors。
+- 2026-06-02：用户指出默认 duplicate governance messages 不应包含 `Host`、`ToolRuntime`、`attempt-local` 等内部实现概念；裁决成立。默认 action / diagnostic messages 已按 `agent_policy.fallback_prompt` / `continuation_prompt` 风格改为中文、模型可执行、人工可读的行为指令；默认 `default_duplicate_decision` 从 `allow` 改为 `hint`，使同一推理步骤内重复请求相同工具证据时默认提示模型使用上一次工具结果或改变证据范围。同步 `execution_profiles.json`、Host typed default、tests 与 `dayu/config/README.md`。验证通过 `pytest tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/host/test_toolruntime_duplicate_governance.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_tooling_options.py tests/runtime/test_smoke_host_public_multiturn_assembly.py` 130 passed、`pyright` 0 errors。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 

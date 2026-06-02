@@ -2095,6 +2095,11 @@ policy action 必须分级：
 - `require_justification`：允许继续，但要求下一轮 messages 中保留模型为什么需要重复调用的上下文。
 - `hard_stop`：判定为工具循环或违反幂等 policy，关闭当前 Attempt 为 failed / governed stop，并由 Host policy 决定 retry、replay 或失败。
 
+duplicate governance policy 与模型可见提示必须来自 Host / ToolRuntime 的 typed 配置或 Attempt snapshot，不能把治理动作、
+提示文案或 justification 参数名硬编码在执行路径里。配置边界必须保持 attempt-local：可以按默认值或工具名选择 `allow` /
+`reuse` / `hint` / `require_justification` / `hard_stop`，也可以配置对应治理提示和结构化 justification 参数名；但这些配置不得
+引入跨 Attempt duplicate index、durable duplicate ledger、工具 freshness 策略或跨历史结果复用策略。
+
 EventLog 规则：
 
 - 工具调用意图进入 `TOOL_CALL_REQUESTED`。

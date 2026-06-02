@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from dayu.contracts.tool_declaration import ToolBundle
 from dayu.contracts.tool_source import ToolBundleSourceRef
+from dayu.host.tool_duplicate_governance import DuplicateGovernancePolicy
 
 if TYPE_CHECKING:
     from dayu.host.wait_adapter import WaitAdapterRegistry
@@ -75,23 +76,35 @@ class HostToolingOptions:
     :param framework_tool_policy: framework tool 预留名与启用集合视图。
     :param wait_adapter_registry: 可选等待 adapter registry；仅用于本地
         ToolRuntime awaiting production wiring，不进入 durable row 或 per-run request。
+    :param duplicate_governance_policy: ToolRuntime duplicate governance typed
+        policy；生产 dispatch 会传入每个 Attempt 的 ToolRuntime。
     """
 
     business_tool_bundle: ToolBundle
     source_refs: tuple[ToolBundleSourceRef, ...]
     framework_tool_policy: FrameworkToolPolicyView = field(default_factory=default_framework_tool_policy_view)
     wait_adapter_registry: WaitAdapterRegistry | None = None
+    duplicate_governance_policy: DuplicateGovernancePolicy = field(
+        default_factory=DuplicateGovernancePolicy
+    )
 
     def __post_init__(self) -> None:
         """校验 Host 工具输入选项。
 
         :returns: 无返回值。
         :raises ValueError: ``source_refs`` 为空，或业务工具名占用预留
-            framework tool 名称时抛出。
+            framework tool 名称，或 duplicate governance policy 类型非法时抛出。
         """
 
         if not self.source_refs:
             raise ValueError("HostToolingOptions.source_refs must be non-empty")
+        if not isinstance(
+            self.duplicate_governance_policy, DuplicateGovernancePolicy
+        ):
+            raise ValueError(
+                "HostToolingOptions.duplicate_governance_policy must be "
+                "DuplicateGovernancePolicy"
+            )
         reserved_names = frozenset(
             tool_name.value for tool_name in self.framework_tool_policy.reserved_framework_tool_names
         )

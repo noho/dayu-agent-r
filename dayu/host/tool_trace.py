@@ -75,6 +75,7 @@ _FIELD_NORMALIZED_ARGUMENTS_DIGEST = "normalized_arguments_digest"
 _FIELD_SEMANTIC_INPUT_DIGEST = "semantic_input_digest"
 _FIELD_DUPLICATE_KEY = "duplicate_key"
 _FIELD_DUPLICATE_DECISION = "duplicate_decision"
+_FIELD_DUPLICATE_SCOPE = "duplicate_scope"
 _FIELD_REUSE_PRIOR_EVENT_REFS = "reuse_prior_event_refs"
 _FIELD_OUTCOME_DIGEST = "outcome_digest"
 _FIELD_PAYLOAD_REF = "payload_ref"
@@ -478,6 +479,7 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
         tool_identity_digest=_optional_text(payload, _FIELD_TOOL_IDENTITY_DIGEST),
         duplicate_key=_optional_text(payload, _FIELD_DUPLICATE_KEY),
         duplicate_decision=_optional_text(payload, _FIELD_DUPLICATE_DECISION),
+        duplicate_scope=_json_value_or_none(payload, _FIELD_DUPLICATE_SCOPE),
         reuse_prior_event_refs=_json_value_or_none(
             payload, _FIELD_REUSE_PRIOR_EVENT_REFS
         ),
@@ -545,6 +547,7 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
             tool_identity_digest=None,
             duplicate_key=None,
             duplicate_decision=None,
+            duplicate_scope=None,
             reuse_prior_event_refs=None,
             truncation=None,
             diagnostic_refs=diagnostic_refs,
@@ -591,6 +594,7 @@ def _extract_usage_trace(event: ProjectionEventView) -> _ToolTraceExtract | None
             tool_identity_digest=None,
             duplicate_key=None,
             duplicate_decision=None,
+            duplicate_scope=None,
             reuse_prior_event_refs=None,
             truncation=None,
             diagnostic_refs=diagnostic_refs,
@@ -721,6 +725,7 @@ def _trace_summary(
     tool_identity_digest: str | None,
     duplicate_key: str | None,
     duplicate_decision: str | None,
+    duplicate_scope: JsonValue | None,
     reuse_prior_event_refs: JsonValue | None,
     truncation: JsonValue | None,
     diagnostic_refs: tuple[str, ...],
@@ -737,6 +742,7 @@ def _trace_summary(
     :param tool_identity_digest: 可选工具身份 digest。
     :param duplicate_key: 可选 duplicate key。
     :param duplicate_decision: 可选 duplicate 决策。
+    :param duplicate_scope: 可选 duplicate scope JSON。
     :param reuse_prior_event_refs: 可选 prior refs JSON。
     :param truncation: 可选截断 JSON。
     :param diagnostic_refs: 诊断 refs。
@@ -765,6 +771,7 @@ def _trace_summary(
         _FIELD_TOOL_IDENTITY_DIGEST: tool_identity_digest,
         _FIELD_DUPLICATE_KEY: duplicate_key,
         _FIELD_DUPLICATE_DECISION: duplicate_decision,
+        _FIELD_DUPLICATE_SCOPE: duplicate_scope,
         _FIELD_REUSE_PRIOR_EVENT_REFS: reuse_prior_event_refs,
         _FIELD_TRUNCATION: truncation,
         _FIELD_DIAGNOSTIC_REFS: list(diagnostic_refs),

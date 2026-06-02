@@ -31,6 +31,11 @@ from dayu.host import (
     HostToolingOptions,
     default_framework_tool_policy_view,
 )
+from dayu.host.tool_duplicate_governance import (
+    DuplicateDecisionKind,
+    DuplicateGovernanceMessages,
+    DuplicateGovernancePolicy,
+)
 
 
 class _DataclassParams(Protocol):
@@ -218,4 +223,134 @@ def test_host_tooling_options_accepts_normal_business_bundle() -> None:
     assert options.business_tool_bundle.to_tool_schemas()[0].function.name == ("lookup_filing")
     assert options.source_refs == (_source_ref(),)
     assert options.framework_tool_policy == default_framework_tool_policy_view()
+    assert isinstance(options.duplicate_governance_policy, DuplicateGovernancePolicy)
+    assert isinstance(
+        options.duplicate_governance_policy.messages,
+        DuplicateGovernanceMessages,
+    )
+    assert options.duplicate_governance_policy.messages.reuse.strip() != ""
     assert cast(tuple[str, ...], options.__slots__) != ()
+
+
+def test_duplicate_governance_policy_zero_config_uses_default_messages() -> None:
+    """零配置 duplicate policy 必须通过 default_factory 获得非空消息。"""
+
+    first = DuplicateGovernancePolicy()
+    second = DuplicateGovernancePolicy()
+
+    assert first.default_duplicate_decision is DuplicateDecisionKind.HINT
+    assert first.messages is not second.messages
+    assert first.messages.allow.strip() != ""
+    assert first.messages.reuse.strip() != ""
+    assert first.messages.hint.strip() != ""
+    assert first.messages.require_justification.strip() != ""
+    assert first.messages.hard_stop.strip() != ""
+    assert first.messages.attempt_scope_diagnostic.strip() != ""
+    assert first.messages.prior_accept_missing.strip() != ""
+
+
+def test_host_tooling_options_accepts_custom_duplicate_messages() -> None:
+    """Host tooling options 必须保留调用方传入的 duplicate 消息 policy。"""
+
+    messages = DuplicateGovernanceMessages(
+        allow="allow custom duplicate request",
+        reuse="reuse custom accepted result",
+        hint="hint custom duplicate evidence",
+        require_justification="require custom justification",
+        hard_stop="hard stop custom duplicate request",
+        attempt_scope_diagnostic="attempt custom duplicate diagnostic",
+        prior_accept_missing="prior custom accepted result missing",
+    )
+    policy = DuplicateGovernancePolicy(messages=messages)
+    options = HostToolingOptions(
+        business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+        source_refs=(_source_ref(),),
+        duplicate_governance_policy=policy,
+    )
+
+    assert options.duplicate_governance_policy is policy
+    assert options.duplicate_governance_policy.messages.reuse == (
+        "reuse custom accepted result"
+    )
+
+
+def test_duplicate_governance_messages_map_all_decision_kinds() -> None:
+    """duplicate governance messages 必须显式覆盖所有决策类别。"""
+
+    messages = DuplicateGovernanceMessages(
+        allow="allow message",
+        reuse="reuse message",
+        hint="hint message",
+        require_justification="require justification message",
+        hard_stop="hard stop message",
+        attempt_scope_diagnostic="attempt diagnostic message",
+        prior_accept_missing="prior accept missing message",
+    )
+
+    assert messages.message_for(DuplicateDecisionKind.ALLOW) == "allow message"
+    assert messages.message_for(DuplicateDecisionKind.REUSE) == "reuse message"
+    assert messages.message_for(DuplicateDecisionKind.HINT) == "hint message"
+    assert (
+        messages.message_for(DuplicateDecisionKind.REQUIRE_JUSTIFICATION)
+        == "require justification message"
+    )
+    assert messages.message_for(DuplicateDecisionKind.HARD_STOP) == "hard stop message"
+    assert (
+        messages.message_for(DuplicateDecisionKind.DURABLE_MISSING)
+        == "prior accept missing message"
+    )
+
+
+def test_host_tooling_options_accepts_custom_duplicate_justification_name() -> None:
+    """Host tooling options 必须保留 duplicate justification 参数名配置。"""
+
+    policy = DuplicateGovernancePolicy(
+        default_duplicate_decision=DuplicateDecisionKind.REQUIRE_JUSTIFICATION,
+        justification_argument_names_by_tool_name={
+            "lookup_filing": "duplicate_reason"
+        },
+    )
+    options = HostToolingOptions(
+        business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+        source_refs=(_source_ref(),),
+        duplicate_governance_policy=policy,
+    )
+
+    assert options.duplicate_governance_policy.default_duplicate_decision is (
+        DuplicateDecisionKind.REQUIRE_JUSTIFICATION
+    )
+    assert (
+        options.duplicate_governance_policy.justification_argument_names_by_tool_name[
+            "lookup_filing"
+        ]
+        == "duplicate_reason"
+    )
+
+
+def test_duplicate_governance_policy_rejects_empty_messages_and_argument_names() -> None:
+    """duplicate policy 必须拒绝空消息和空 justification 参数名。"""
+
+    with pytest.raises(ValueError, match="reuse"):
+        DuplicateGovernanceMessages(reuse=" ")
+    with pytest.raises(ValueError, match="argument_name"):
+        DuplicateGovernancePolicy(
+            justification_argument_names_by_tool_name={"lookup_filing": " "}
+        )
+    with pytest.raises(ValueError, match="tool_name"):
+        DuplicateGovernancePolicy(
+            justification_argument_names_by_tool_name={" ": "duplicate_reason"}
+        )
+
+
+def test_host_tooling_options_rejects_invalid_duplicate_policy_type() -> None:
+    """Host tooling options 必须拒绝非 typed duplicate policy 对象。"""
+
+    with pytest.raises(ValueError, match="duplicate_governance_policy"):
+        HostToolingOptions(
+            business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+            source_refs=(_source_ref(),),
+            duplicate_governance_policy=cast(
+                DuplicateGovernancePolicy,
+                "invalid-policy",
+            ),
+        )

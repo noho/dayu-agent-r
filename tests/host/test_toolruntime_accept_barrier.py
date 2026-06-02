@@ -70,6 +70,7 @@ from dayu.host.tool_runtime import (
     ToolPolicyDecision,
     ToolPolicyDecisionKind,
 )
+from dayu.host.tool_duplicate_governance import DuplicateGovernanceScope
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
@@ -489,6 +490,7 @@ def test_event_sequence_monotonic_and_reuse_has_canonical_governance_only(
 
         assert isinstance(second, ToolFactAcceptedAck)
         assert second.tool_result_event_ref is None
+        assert reuse.reuse_prior_event_refs == (first.tool_result_event_ref,)
         assert [row.event_sequence for row in tool_events] == sorted(
             row.event_sequence for row in tool_events
         )
@@ -498,6 +500,17 @@ def test_event_sequence_monotonic_and_reuse_has_canonical_governance_only(
             "TOOL_RESULT_ACCEPTED",
             "TOOL_CALL_REQUESTED",
             "TOOL_CALL_GOVERNED",
+        ]
+        governed_payload = payload_object(tool_events[-1])
+        duplicate_scope = governed_payload["duplicate_scope"]
+        assert isinstance(duplicate_scope, Mapping)
+        assert duplicate_scope["kind"] == "attempt"
+        assert duplicate_scope["attempt_id"] == reuse.attempt_id
+        assert governed_payload["reuse_prior_event_refs"] == [
+            {
+                "event_id": first.tool_result_event_ref.event_id,
+                "event_sequence": first.tool_result_event_ref.event_sequence,
+            }
         ]
 
 
@@ -513,6 +526,10 @@ def test_duplicate_allow_does_not_append_governed_event(tmp_path: Path) -> None:
             _completed_candidate(seeded, tool_call_id="tool-call-allow"),
             duplicate_key="duplicate-lookup-MSFT",
             duplicate_decision=DuplicateDecisionKind.ALLOW,
+            duplicate_scope=DuplicateGovernanceScope(
+                kind="attempt", attempt_id=seeded.attempt_id
+            ),
+            duplicate_decision_message="本次重复工具调用已允许执行。",
         )
 
         result = accept_port.accept_tool_fact(candidate)
@@ -855,11 +872,15 @@ def _reuse_candidate(
         raw_tool_outcome=None,
         duplicate_key="duplicate-lookup-MSFT",
         duplicate_decision=DuplicateDecisionKind.REUSE,
+        duplicate_scope=DuplicateGovernanceScope(
+            kind="attempt", attempt_id=seeded.attempt_id
+        ),
+        duplicate_decision_message="请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
         reuse_prior_event_refs=(prior_ref,),
         policy_decision=ToolPolicyDecision(
             kind=ToolPolicyDecisionKind.REUSE,
             reason_code="duplicate_reuse",
-            message="reuse prior accepted tool result",
+            message="请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
         ),
         tool_idempotency_key=None,
         diagnostic_refs=(),
