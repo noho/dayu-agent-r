@@ -510,7 +510,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：controller 完成 discussion / code inspection。裁决：动机成立，但风险性质是维护性、可测试性和后续演进风险，不是当前运行时 correctness blocker；进入 plan gate。Artifacts: `docs/reviews/wu-tool-02-discussion-code-inspection-20260602.md`, `docs/reviews/wu-tool-02-planning-handoff-20260602.md`。
 - 2026-06-02：用户补充要求：WU-TOOL-02 全部完成后，ready-to-open-draft-PR 前追加 AgentMiMo 与 AgentDS 并行全仓 review；该 review gate 是本 work unit 的额外前置条件，不替代常规 slice review、aggregate deepreview、测试和 pyright。
 - 2026-06-02：plan artifact 已生成，artifact: `docs/host/wu-tool-02-accept-candidate-cleanup-plan.md`。Plan review artifacts: `docs/reviews/wu-tool-02-plan-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-plan-review-controller-adjudication-20260602.md`。裁决：接受 DS Finding 01 及若干低严重 clarification findings；进入 plan fix gate，必须修正 slice 中间态类型失败风险后再 re-review。
-- 2026-06-02：plan fix 后 re-review 通过。Re-review artifacts: `docs/reviews/wu-tool-02-plan-re-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-re-review-ds-20260602.md`。裁决：全部 accepted findings closed，plan handoff-ready / code-generation-ready；进入 implementation gate。Accepted plan commit: `77a2871`.
+- 2026-06-02：plan fix 后 re-review 通过。Re-review artifacts: `docs/reviews/wu-tool-02-plan-re-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-re-review-ds-20260602.md`。裁决：全部 accepted findings closed，plan handoff-ready / code-generation-ready；进入 implementation gate。Accepted plan commit: `11a8144`.
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
