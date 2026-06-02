@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | planning |
-| implementation status | WU-LAYER-01 plan re-review passed; accepted plan commit pending |
+| implementation status | WU-LAYER-01 plan accepted; implementation Slice 1 pending |
 | active work unit | WU-LAYER-01 |
 | default next work unit | WU-LAYER-02 |
-| accepted plan commit | pending |
+| accepted plan commit | 278e5be |
 | plan artifact | docs/host/wu-layer-01-durable-row-primitive-cleanup-plan.md |
 | plan review artifacts | docs/reviews/wu-layer-01-plan-review-mimo-20260602.md; docs/reviews/wu-layer-01-plan-review-ds-20260602.md; docs/reviews/wu-layer-01-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-01-plan-rereview-ds-20260602.md |
 | accepted slice commits | none |
