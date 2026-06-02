@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-TOOL-02 Slice 4 accepted; Slice 5 aggregate verification ready |
+| gate | review |
+| implementation status | WU-TOOL-02 aggregate deepreview passed; extra full-repository review ready |
 | active work unit | WU-TOOL-02 |
 | default next work unit | WU-TOOL-02 |
-| next entry point | WU-TOOL-02 Slice 5 aggregate verification；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-02 extra AgentMiMo/AgentDS parallel full-repository review；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -520,6 +520,8 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：Slice 3 code review artifacts: `docs/reviews/wu-tool-02-slice3-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice3-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice3-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；DS helper style suggestion rejected。Controller verification: Slice 3 focused tests 32 passed，Slice 3 pyright 0 errors。Slice 3 accepted commit: `2ad0dc7`.
 - 2026-06-02：Slice 4 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice4-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice4-implementation-report-20260602.md`。报告结论：未修改 production、tests 或 README；payload consumer regression tests 121 passed，指定 Host production consumer pyright 0 errors；README/doc sync 无稳定事实变化，未触发更新。进入 Slice 4 code review gate，review handoff: `docs/reviews/wu-tool-02-slice4-code-review-handoff-20260602.md`。
 - 2026-06-02：Slice 4 code review artifacts: `docs/reviews/wu-tool-02-slice4-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice4-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice4-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；`rg` 辅助检查局限与全仓验证缺口均按 approved plan defer 到 aggregate gate。Controller verification: payload consumer regression tests 121 passed，指定 Host production consumer pyright 0 errors；旧 flat field `rg` 命中仅 awaiting candidate 路径。Slice 4 accepted commit: `d982759`。
+- 2026-06-02：Slice 5 aggregate verification passed。Controller verification: affected Host tests 206 passed，全量 pyright 0 errors。进入 aggregate deepreview gate，review handoff: `docs/reviews/wu-tool-02-aggregate-deepreview-handoff-20260602.md`。
+- 2026-06-02：Aggregate deepreview artifacts: `docs/reviews/wu-tool-02-aggregate-deepreview-mimo-20260602.md`, `docs/reviews/wu-tool-02-aggregate-deepreview-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-aggregate-deepreview-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；MiMo/DS nonblocking notes 均不要求当前 gate 修复。进入用户追加的 ready-to-open-draft-PR 前置 gate：AgentMiMo + AgentDS 并行全仓 review。
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
