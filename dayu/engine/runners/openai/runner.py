@@ -49,6 +49,9 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.runners.openai.cancellation_helpers import _RunnerInterrupted
+from dayu.engine.runners.openai.diagnostic_payload import (
+    http_error_diagnostic_payload,
+)
 from dayu.engine.runners.openai.error_classifier import (
     classify_exception,
     classify_http_status,
@@ -94,7 +97,8 @@ class _HTTPErrorBody:
     """HTTP 错误响应体读取结果。
 
     :param message_text: 尽力读取到的人类可读 body 文本。
-    :param raw_payload: 当 body 是 JSON object 时保留的原始载荷。
+    :param raw_payload: 从有界 HTTP body 派生的有界诊断载荷；解析失败或
+        非 JSON object 时为 ``None``。
     """
 
     message_text: str
@@ -878,10 +882,10 @@ class AsyncOpenAIRunner:
     async def _safe_read_error_body(
         self, response: aiohttp.ClientResponse
     ) -> _HTTPErrorBody:
-        """尽力读取错误响应 body，并保留 JSON object 载荷。
+        """尽力读取错误响应 body，并派生 JSON object 诊断载荷。
 
         :param response: HTTP 错误响应。
-        :returns: body 文本与可选 JSON object 载荷。
+        :returns: body 文本与可选有界诊断载荷。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -893,7 +897,7 @@ class AsyncOpenAIRunner:
         if isinstance(decoded, dict):
             return _HTTPErrorBody(
                 message_text=message_text,
-                raw_payload=decoded,
+                raw_payload=http_error_diagnostic_payload(decoded),
             )
         return _HTTPErrorBody(message_text=message_text, raw_payload=None)
 

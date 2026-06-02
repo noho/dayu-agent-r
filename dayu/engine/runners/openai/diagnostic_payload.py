@@ -43,9 +43,11 @@ _PROVIDER_ERROR_FIELD: str = "provider_error"
 _REDACTED_MARKER: str = "<redacted>"
 _ERROR_FIELD: str = "error"
 _INVALID_UTF8_SOURCE: str = "invalid_utf8_chunk"
+_HTTP_ERROR_SOURCE: str = "http_error_body"
 _PROVIDER_ERROR_KIND: str = "provider_error"
 _PROTOCOL_OBJECT_KIND: str = "protocol_object"
 _INVALID_UTF8_KIND: str = "invalid_utf8"
+_HTTP_ERROR_KIND: str = "http_error"
 _REASON_FIELD: str = "reason"
 _CHUNK_BYTE_SIZE_FIELD: str = "chunk_byte_size"
 _CHUNK_SHA256_DIGEST_FIELD: str = "chunk_sha256_digest"
@@ -138,6 +140,31 @@ def invalid_utf8_diagnostic_payload(
         chunk[:_DIAGNOSTIC_CHUNK_PREFIX_MAX_BYTES]
     ).decode("ascii")
     diagnostic[_FINAL_DECODE_FIELD] = final_decode
+    return _bounded_payload(diagnostic)
+
+
+def http_error_diagnostic_payload(payload: dict[str, JsonValue]) -> JsonValue:
+    """生成 HTTP JSON error body 的有界诊断载荷。
+
+    HTTP 错误体在调用本函数前已由 Runner 按字节上限读取；本函数只从
+    JSON object 中派生脱敏、摘要化诊断结构，不保存完整 provider JSON。
+
+    :param payload: HTTP error body 解析得到的 JSON object。
+    :returns: 有界、脱敏、摘要化的 JSON 诊断对象。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    canonical = _canonical_payload_metadata(payload)
+    diagnostic: dict[str, JsonValue] = _base_diagnostic_payload(
+        source=_HTTP_ERROR_SOURCE,
+        kind=_HTTP_ERROR_KIND,
+        canonical=canonical,
+    )
+    diagnostic[_TOP_LEVEL_KEYS_FIELD] = _bounded_keys(payload)
+    diagnostic[_PREVIEW_FIELD] = _top_level_preview(payload)
+    error_value = payload.get(_ERROR_FIELD)
+    if isinstance(error_value, dict):
+        diagnostic[_PROVIDER_ERROR_FIELD] = _provider_error_summary(error_value)
     return _bounded_payload(diagnostic)
 
 
@@ -402,6 +429,7 @@ def _is_sensitive_key(key: str) -> bool:
 
 
 __all__ = [
+    "http_error_diagnostic_payload",
     "invalid_utf8_diagnostic_payload",
     "protocol_object_diagnostic_payload",
     "provider_error_diagnostic_payload",

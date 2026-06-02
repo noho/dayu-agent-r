@@ -187,6 +187,7 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 - `cancellation_token`：Engine 可观察的取消入口。形状是 `CancellationToken`，包含 `is_cancelled()`、`cancel_reason()`、`requested_at()`。
 - `RunnerHTTPErrorCode`：Runner HTTP / 网络 / 超时错误枚举。成员包括 `rate_limit_exceeded`、`server_error`、`client_error`、`network_error`、`timeout`、`context_length_exceeded`、`unknown_http_status`。
 - `provider_request_id`：provider response 关联标识。形状是 `str | None`，出现在 `RunnerHTTPErrorData`、`RunnerProtocolErrorData`、`RunnerDoneData`、`IterationCompletedData`、`ProviderProtocolErrorData`、`ContextCompactionRequestedData` 与 `RunFailedData`。
+- `raw_payload`：Runner / Provider 诊断事件上的可选诊断 JSON。该字段是有界、脱敏、摘要化的诊断载荷，不保证保留 provider 原始 payload；核心错误事实仍通过 `message`、`error_code`、`provider_request_id` 等强类型字段表达。
 
 ## 架构
 

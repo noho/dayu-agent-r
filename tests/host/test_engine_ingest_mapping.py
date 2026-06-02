@@ -1538,7 +1538,20 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
                 error_code="invalid_stream",
                 message="bad stream",
                 provider_request_id="req-protocol",
-                raw_payload={"raw": "payload"},
+                raw_payload={
+                    "version": 1,
+                    "source": "provider_protocol_error",
+                    "kind": "provider_error",
+                    "canonical_byte_size": 128,
+                    "sha256_digest": (
+                        "0123456789abcdef0123456789abcdef"
+                        "0123456789abcdef0123456789abcdef"
+                    ),
+                    "provider_error": {
+                        "code": "invalid_stream",
+                        "type": "protocol_error",
+                    },
+                },
                 partial_tool_calls=(),
             ),
             event_type=EngineEventType.PROVIDER_PROTOCOL_ERROR,

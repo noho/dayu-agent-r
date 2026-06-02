@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import json
 from types import TracebackType
 
 import aiohttp
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_events import (
@@ -34,6 +35,12 @@ from dayu.engine.runners.openai.runner import (
     _HTTP_ERROR_BODY_MAX_BYTES,
     AsyncOpenAIRunner,
 )
+from dayu.engine.runners.openai.diagnostic_payload import (
+    _CANONICAL_BYTE_SIZE_FIELD,
+    _DIAGNOSTIC_PAYLOAD_MAX_BYTES,
+    _PROVIDER_ERROR_FIELD,
+    _SHA256_DIGEST_FIELD,
+)
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
@@ -43,6 +50,15 @@ from tests.engine.runners.openai._fakes import (
     FakeResponseSpec,
     FakeSession,
 )
+
+_HTTP_ERROR_CODE: str = "bad_request"
+_HTTP_ERROR_TYPE: str = "invalid_request_error"
+_HTTP_CONTEXT_CODE: str = "context_length_exceeded"
+_PAYLOAD_REQUEST_ID: str = "payload-id-ignored"
+_HEADER_REQUEST_ID: str = "req_header"
+_SECRET_API_KEY: str = "sk-http-secret"
+_SECRET_TOKEN: str = "http-token-secret"
+_SECRET_PASSWORD: str = "http-password-secret"
 
 
 class _ReadanyFailingContent(FakeContent):
@@ -319,6 +335,62 @@ def _check_http_error_then_done(
     assert done.finish_reason is FinishReason.ERROR
 
 
+def _leaf_strings(value: JsonValue) -> Iterator[str]:
+    """遍历 JSON 值中的字符串叶子。
+
+    :param value: JSON 值。
+    :returns: 字符串叶子迭代器。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, Mapping):
+        for child_value in value.values():
+            yield from _leaf_strings(child_value)
+        return
+    if isinstance(value, list):
+        for child_value in value:
+            yield from _leaf_strings(child_value)
+
+
+def _serialized_size(value: JsonValue) -> int:
+    """计算 JSON 值序列化后的 UTF-8 字节数。
+
+    :param value: JSON 值。
+    :returns: 使用非 ASCII 转义关闭后的 JSON 字节数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _assert_http_diagnostic_payload(
+    raw_payload: JsonValue | None,
+    *,
+    expected_error_code: str,
+    expected_error_type: str,
+) -> None:
+    """断言 HTTP raw payload 是有界诊断载荷。
+
+    :param raw_payload: Runner HTTP error 事件上的 raw payload。
+    :param expected_error_code: provider error 子对象内应保留的 code。
+    :param expected_error_type: provider error 子对象内应保留的 type。
+    :returns: ``None``。
+    :raises AssertionError: 诊断载荷不符合预期时由断言抛出。
+    """
+
+    assert isinstance(raw_payload, Mapping)
+    assert _CANONICAL_BYTE_SIZE_FIELD in raw_payload
+    assert _SHA256_DIGEST_FIELD in raw_payload
+    provider_error = raw_payload[_PROVIDER_ERROR_FIELD]
+    assert isinstance(provider_error, Mapping)
+    assert provider_error["code"] == expected_error_code
+    assert provider_error["type"] == expected_error_type
+    assert _serialized_size(raw_payload) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+
+
 @pytest.mark.asyncio
 async def test_http_429_retry_exhausted_rate_limit_exceeded(
     monkeypatch: pytest.MonkeyPatch,
@@ -380,14 +452,20 @@ async def test_retry_exhausted_keeps_final_attempt_provider_request_id(
         _http_response_with_headers(
             500,
             headers={"X-Request-Id": " req_first "},
-            body=b'{"error":{"message":"first"}}',
+            body=(
+                b'{"error":{"message":"first","code":"bad_request",'
+                b'"type":"invalid_request_error"}}'
+            ),
         )
     )
     session.enqueue_response(
         _http_response_with_headers(
             503,
             headers={"x-request-id": "req_final"},
-            body=b'{"error":{"message":"final"}}',
+            body=(
+                b'{"error":{"message":"final","code":"bad_request",'
+                b'"type":"invalid_request_error"}}'
+            ),
         )
     )
     _install_session(runner, session)
@@ -396,9 +474,11 @@ async def test_retry_exhausted_keeps_final_attempt_provider_request_id(
 
     assert isinstance(events[-2].data, RunnerHTTPErrorData)
     assert events[-2].data.provider_request_id == "req_final"
-    assert events[-2].data.raw_payload == {
-        "error": {"message": "final"}
-    }
+    _assert_http_diagnostic_payload(
+        events[-2].data.raw_payload,
+        expected_error_code=_HTTP_ERROR_CODE,
+        expected_error_type=_HTTP_ERROR_TYPE,
+    )
     assert isinstance(events[-1].data, RunnerDoneData)
     assert events[-1].data.provider_request_id == "req_final"
     await runner.close()
@@ -451,22 +531,30 @@ async def test_stream_read_failure_after_event_does_not_retry(
 
 
 @pytest.mark.asyncio
-async def test_http_json_object_error_body_preserved_as_raw_payload() -> None:
-    """HTTP JSON object 错误体必须进入 raw_payload，request id 仅来自 header。"""
+async def test_http_json_object_error_body_produces_bounded_diagnostic_payload() -> None:
+    """HTTP JSON object 错误体只生成有界诊断载荷。"""
 
     runner = _make_runner(max_retries=0)
     session = FakeSession()
-    payload = {
+    payload: dict[str, JsonValue] = {
+        "api_key": _SECRET_API_KEY,
+        "metadata": {
+            "access_token": _SECRET_TOKEN,
+            "user_password": _SECRET_PASSWORD,
+        },
         "error": {
             "message": "bad",
-            "request_id": "payload-id-ignored",
+            "code": _HTTP_ERROR_CODE,
+            "type": _HTTP_ERROR_TYPE,
+            "request_id": _PAYLOAD_REQUEST_ID,
         }
     }
+    body_text = json.dumps(payload, ensure_ascii=False)
     session.enqueue_response(
         _http_response_with_headers(
             400,
-            headers={"x-ReQuEsT-id": " req_header "},
-            body=json.dumps(payload).encode("utf-8"),
+            headers={"x-ReQuEsT-id": f" {_HEADER_REQUEST_ID} "},
+            body=body_text.encode("utf-8"),
         )
     )
     _install_session(runner, session)
@@ -474,10 +562,30 @@ async def test_http_json_object_error_body_preserved_as_raw_payload() -> None:
     events = await _run(runner)
 
     assert isinstance(events[-2].data, RunnerHTTPErrorData)
-    assert events[-2].data.provider_request_id == "req_header"
-    assert events[-2].data.raw_payload == payload
+    assert events[-2].data.message == body_text
+    assert events[-2].data.provider_request_id == _HEADER_REQUEST_ID
+    _assert_http_diagnostic_payload(
+        events[-2].data.raw_payload,
+        expected_error_code=_HTTP_ERROR_CODE,
+        expected_error_type=_HTTP_ERROR_TYPE,
+    )
+    assert events[-2].data.raw_payload != payload
+    assert isinstance(events[-2].data.raw_payload, Mapping)
+    serialized_payload = json.dumps(
+        events[-2].data.raw_payload,
+        ensure_ascii=False,
+    )
+    leaf_strings = tuple(_leaf_strings(events[-2].data.raw_payload))
+    for forbidden_value in (
+        _SECRET_API_KEY,
+        _SECRET_TOKEN,
+        _SECRET_PASSWORD,
+        _PAYLOAD_REQUEST_ID,
+    ):
+        assert forbidden_value not in serialized_payload
+        assert forbidden_value not in leaf_strings
     assert isinstance(events[-1].data, RunnerDoneData)
-    assert events[-1].data.provider_request_id == "req_header"
+    assert events[-1].data.provider_request_id == _HEADER_REQUEST_ID
     await runner.close()
 
 
@@ -511,7 +619,17 @@ async def test_http_error_body_is_capped_before_decode() -> None:
 
     runner = _make_runner(max_retries=0)
     session = FakeSession()
-    body = b"x" * (_HTTP_ERROR_BODY_MAX_BYTES + 1024)
+    large_value = "x" * (_HTTP_ERROR_BODY_MAX_BYTES + 1024)
+    body = json.dumps(
+        {
+            "error": {
+                "code": _HTTP_ERROR_CODE,
+                "type": _HTTP_ERROR_TYPE,
+            },
+            "large": large_value,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
     session.enqueue_response(
         _http_response_with_headers(
             400,
@@ -524,8 +642,18 @@ async def test_http_error_body_is_capped_before_decode() -> None:
     events = await _run(runner)
 
     assert isinstance(events[-2].data, RunnerHTTPErrorData)
-    assert events[-2].data.message == "x" * _HTTP_ERROR_BODY_MAX_BYTES
+    assert events[-2].data.message == body[:_HTTP_ERROR_BODY_MAX_BYTES].decode(
+        "utf-8",
+        errors="replace",
+    )
     assert events[-2].data.raw_payload is None
+    assert events[-2].data.raw_payload != {
+        "error": {
+            "code": _HTTP_ERROR_CODE,
+            "type": _HTTP_ERROR_TYPE,
+        },
+        "large": large_value,
+    }
     await runner.close()
 
 
@@ -541,6 +669,7 @@ async def test_http_context_overflow_maps_to_context_length_exceeded() -> None:
             headers={"x-request-id": "req_context"},
             body=(
                 b'{"error":{"code":"context_length_exceeded",'
+                b'"type":"invalid_request_error",'
                 b'"message":"maximum context length is 128000 tokens"}}'
             ),
         )
@@ -558,6 +687,11 @@ async def test_http_context_overflow_maps_to_context_length_exceeded() -> None:
     )
     assert isinstance(events[-2].data, RunnerHTTPErrorData)
     assert events[-2].data.provider_request_id == "req_context"
+    _assert_http_diagnostic_payload(
+        events[-2].data.raw_payload,
+        expected_error_code=_HTTP_CONTEXT_CODE,
+        expected_error_type=_HTTP_ERROR_TYPE,
+    )
     assert isinstance(events[-1].data, RunnerDoneData)
     assert events[-1].data.finish_reason is FinishReason.ERROR
     assert events[-1].data.provider_request_id == "req_context"
