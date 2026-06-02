@@ -469,6 +469,11 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - Local gate closeout commit: `1aff6e4` (`gateflow: record WU-TOOL-01 aggregate review`)；worktree clean；进入 `ready-to-open-draft-PR`。
 - 2026-06-01：draft PR opened: `https://github.com/noho/dayu-agent-r/pull/106`；draft PR review artifact: `docs/reviews/wu-tool-01-draft-pr-review-controller-20260601.md`。
 - 裁决：PR branch head 与本地 accepted head 一致；PR mergeable；GitHub 未上报 checks；draft PR gate pass。merge、approve、mark ready for review、request reviewers、delete branch 或外部 comment 仍需额外授权。
+- 2026-06-02：post-draft PR follow-up 根据用户反馈补齐 duplicate governance 配置链路：`execution_profiles.json` 增加 `tool_duplicate_governance_policy`，`ConfigLoader` typed schema 解析并 fail-fast，`dayu.service.host_assembly` 从 execution profile 映射到 `HostToolingOptions.duplicate_governance_policy`；同时为三个 `utils/smoke_host_public_*` smoke 增加 duplicate governance assembly diagnostics。
+- Follow-up commits: `d4cfbe0` (`wire duplicate governance config through service`), `0c1640d` (`surface duplicate governance in smoke diagnostics`)。
+- 2026-06-02：按 `$init-agents` 路由 AgentMiMo 与 AgentDS 做 PR review，artifacts: `docs/reviews/pr-106-agentmimo-duplicate-governance-config-review.md`, `docs/reviews/pr-106-agentds-duplicate-governance-config-review.md`。
+- 裁决：AgentMiMo / AgentDS 均未发现阻断问题；两项低严重 maintainability 观察已处理：`DuplicateGovernanceMessages.message_for` 显式覆盖 `DURABLE_MISSING` 并对未知决策 fail-fast，Service 仅在非空工具 bundle 分支内从 runtime config 构造 Host duplicate policy，`_duplicate_decision_from_config` 增加清晰错误上下文。
+- Review follow-up commit: `612242f` (`address duplicate governance PR review notes`)；验证通过 `pytest tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/host/test_tooling_options.py tests/runtime/test_smoke_host_public_multiturn_assembly.py` 87 passed、`pyright` 0 errors。
 
 ## WU-TOOL-02 Accept Candidate Structure Cleanup
 
