@@ -564,62 +564,26 @@ class ToolAcceptDiagnostics:
 
 @dataclass(frozen=True, slots=True)
 class ToolFactAcceptCandidate:
-    """Host accept barrier 的工具事实候选。
+    """Host accept barrier 的工具事实候选组合根。
 
-    :param session_id: Session id。
-    :param run_id: Run id。
-    :param attempt_id: Attempt id。
-    :param execution_id: execution id。
-    :param iteration_id: Engine iteration id。
-    :param tool_call_id: tool call id。
-    :param tool_name: 工具名。
-    :param tool_schema_digest: 工具 schema digest。
-    :param tool_identity_digest: 工具身份 digest。
-    :param normalized_arguments_digest: 规范化参数 digest。
+    :param identity: accept precondition 与 EventLog row 使用的执行身份。
+    :param call: 工具调用身份、schema 与参数 digest。
     :param tool_fact_kind: canonical 工具事实类别。
-    :param outcome_digest: outcome digest；无新 outcome 的 reuse 可为 ``None``。
-    :param payload_digest: result payload digest；无 result payload 时为 ``None``。
-    :param payload_ref: result payload descriptor 引用。
-    :param truncation: 截断事实；无截断时为 ``None``。
-    :param raw_tool_outcome: Host accepted 后写入 raw transcript 的工具 outcome。
-    :param duplicate_key: attempt-scoped duplicate key。
-    :param duplicate_decision: duplicate governance 决策。
-    :param reuse_prior_event_refs: reuse 指向的既有 accepted event refs。
-    :param policy_decision: 工具治理决策。
-    :param tool_idempotency_key: 工具自身幂等 key；无则为 ``None``。
-    :param diagnostic_refs: 工具诊断引用。
-    :param accept_idempotency_key: Host accept 幂等 key。
-    :param semantic_input_digest: Host accept semantic input digest。
-    :param duplicate_scope: duplicate governance 作用域。
-    :param duplicate_decision_message: duplicate governance 决策消息。
+    :param result: 新 accepted result；reuse 不携带该结构。
+    :param governance: policy 与 duplicate governance 信息。
+    :param idempotency: Host accept 幂等信息。
+    :param diagnostics: accept 诊断引用。
+    :returns: 构造完成的工具事实候选组合根。
+    :raises ValueError: 子结构类型或 fact kind 跨结构约束非法时抛出。
     """
 
-    session_id: str
-    run_id: str
-    attempt_id: str
-    execution_id: str
-    iteration_id: str
-    tool_call_id: str
-    tool_name: str
-    tool_schema_digest: str
-    tool_identity_digest: str
-    normalized_arguments_digest: str
+    identity: ToolAcceptIdentity
+    call: ToolAcceptCall
     tool_fact_kind: ToolFactKind
-    outcome_digest: str | None
-    payload_digest: str | None
-    payload_ref: HostPayloadRef | None
-    truncation: ToolTruncationFact | None
-    raw_tool_outcome: JsonValue | None
-    duplicate_key: str | None
-    duplicate_decision: DuplicateDecisionKind | None
-    reuse_prior_event_refs: tuple[HostEventRef, ...]
-    policy_decision: ToolPolicyDecision
-    tool_idempotency_key: str | None
-    diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...]
-    accept_idempotency_key: str
-    semantic_input_digest: str
-    duplicate_scope: DuplicateGovernanceScope | None = None
-    duplicate_decision_message: str | None = None
+    result: ToolAcceptResult | None
+    governance: ToolAcceptGovernance
+    idempotency: ToolAcceptIdempotency
+    diagnostics: ToolAcceptDiagnostics
 
     def __post_init__(self) -> None:
         """按工具事实类别校验候选字段。
@@ -633,19 +597,17 @@ class ToolFactAcceptCandidate:
         if self.tool_fact_kind is ToolFactKind.COMPLETED:
             _validate_result_fact_policy(self)
             _require_raw_tool_outcome(self)
-            _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
-            _require_sha256_digest(self.payload_digest, field_name="payload_digest")
+            if _candidate_result(self).payload_digest is None:
+                raise ValueError("completed requires payload_digest")
         elif self.tool_fact_kind in (ToolFactKind.FAILED, ToolFactKind.CANCELLED):
             _validate_result_fact_policy(self)
             _require_raw_tool_outcome(self)
-            _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
-            if self.reuse_prior_event_refs:
+            if _candidate_reuse_prior_event_refs(self):
                 raise ValueError(
                     f"{self.tool_fact_kind.value} must not carry prior reuse refs"
                 )
         elif self.tool_fact_kind is ToolFactKind.GOVERNED_ERROR:
             _require_raw_tool_outcome(self)
-            _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             _validate_governed_error_candidate(self)
         elif self.tool_fact_kind is ToolFactKind.REUSE:
             _validate_reuse_candidate(self)
@@ -1742,12 +1704,12 @@ class DefaultHostToolFactAcceptPort:
                     "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
                     "tool_call_id=%s tool_name=%s tool_fact_kind=%s"
                 ),
-                candidate.session_id,
-                candidate.run_id,
-                candidate.attempt_id,
-                candidate.execution_id,
-                candidate.tool_call_id,
-                candidate.tool_name,
+                candidate.identity.session_id,
+                candidate.identity.run_id,
+                candidate.identity.attempt_id,
+                candidate.identity.execution_id,
+                candidate.call.tool_call_id,
+                candidate.call.tool_name,
                 candidate.tool_fact_kind.value,
             )
             result = self._transaction_runner.run_write(
@@ -1796,7 +1758,10 @@ class DefaultHostToolFactAcceptPort:
             transaction, scope
         )
         if existing is not None:
-            if existing.semantic_input_digest != candidate.semantic_input_digest:
+            if (
+                existing.semantic_input_digest
+                != candidate.idempotency.semantic_input_digest
+            ):
                 return _rejected_ack(
                     candidate,
                     ToolAcceptRejectReason.IDEMPOTENCY_CONFLICT,
@@ -1848,7 +1813,7 @@ class DefaultHostToolFactAcceptPort:
         record = self._idempotency_store.record_idempotent_result(
             transaction,
             scope,
-            candidate.semantic_input_digest,
+            candidate.idempotency.semantic_input_digest,
             IdempotencyResultRef(
                 result_kind=_TOOL_FACT_ACCEPT_RESULT_KIND,
                 result_ref=event_plan.tool_fact_id,
@@ -3048,12 +3013,12 @@ def _log_tool_fact_accept_result(
                 "tool_call_id=%s tool_name=%s tool_fact_kind=%s "
                 "tool_fact_id=%s tool_result_event_id=%s accepted_event_count=%s"
             ),
-            candidate.session_id,
-            candidate.run_id,
-            candidate.attempt_id,
-            candidate.execution_id,
-            candidate.tool_call_id,
-            candidate.tool_name,
+            candidate.identity.session_id,
+            candidate.identity.run_id,
+            candidate.identity.attempt_id,
+            candidate.identity.execution_id,
+            candidate.call.tool_call_id,
+            candidate.call.tool_name,
             candidate.tool_fact_kind.value,
             result.tool_fact_id,
             None
@@ -3069,12 +3034,12 @@ def _log_tool_fact_accept_result(
                 "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
                 "tool_call_id=%s tool_name=%s reason=%s retryable=%s"
             ),
-            candidate.session_id,
-            candidate.run_id,
-            candidate.attempt_id,
-            candidate.execution_id,
-            candidate.tool_call_id,
-            candidate.tool_name,
+            candidate.identity.session_id,
+            candidate.identity.run_id,
+            candidate.identity.attempt_id,
+            candidate.identity.execution_id,
+            candidate.call.tool_call_id,
+            candidate.call.tool_name,
             result.reason_code.value,
             result.retryable,
         )
@@ -3085,12 +3050,12 @@ def _log_tool_fact_accept_result(
             "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
             "tool_call_id=%s tool_name=%s attempt_count=%s last_error_code=%s"
         ),
-        candidate.session_id,
-        candidate.run_id,
-        candidate.attempt_id,
-        candidate.execution_id,
-        candidate.tool_call_id,
-        candidate.tool_name,
+        candidate.identity.session_id,
+        candidate.identity.run_id,
+        candidate.identity.attempt_id,
+        candidate.identity.execution_id,
+        candidate.call.tool_call_id,
+        candidate.call.tool_name,
         result.attempt_count,
         result.last_error_code,
     )
@@ -3105,8 +3070,11 @@ def _accept_idempotency_scope(candidate: ToolFactAcceptCandidate) -> Idempotency
 
     return IdempotencyScope(
         scope_kind=_TOOL_FACT_ACCEPT_SCOPE_KIND,
-        scope_id=f"{candidate.attempt_id}:{candidate.tool_call_id}",
-        idempotency_key=candidate.accept_idempotency_key,
+        scope_id=(
+            f"{candidate.identity.attempt_id}:"
+            f"{candidate.call.tool_call_id}"
+        ),
+        idempotency_key=candidate.idempotency.accept_idempotency_key,
     )
 
 
@@ -3121,10 +3089,10 @@ def _read_accept_context(
     """
 
     return _AcceptContext(
-        run=read_run_by_id(transaction, candidate.run_id),
-        attempt=read_attempt_by_id(transaction, candidate.attempt_id),
+        run=read_run_by_id(transaction, candidate.identity.run_id),
+        attempt=read_attempt_by_id(transaction, candidate.identity.attempt_id),
         dispatch_record=read_dispatch_record_by_attempt_id(
-            transaction, candidate.attempt_id
+            transaction, candidate.identity.attempt_id
         ),
     )
 
@@ -3144,16 +3112,16 @@ def _invalid_accept_context_reason(
     if context.dispatch_record is None:
         return ToolAcceptRejectReason.INVALID_ATTEMPT
     if (
-        context.run.session_id != candidate.session_id
-        or context.run.run_id != candidate.run_id
-        or context.run.current_attempt_id != candidate.attempt_id
-        or context.attempt.run_id != candidate.run_id
+        context.run.session_id != candidate.identity.session_id
+        or context.run.run_id != candidate.identity.run_id
+        or context.run.current_attempt_id != candidate.identity.attempt_id
+        or context.attempt.run_id != candidate.identity.run_id
     ):
         return ToolAcceptRejectReason.INVALID_ATTEMPT
     if (
-        context.attempt.execution_id != candidate.execution_id
-        or context.dispatch_record.execution_id != candidate.execution_id
-        or context.dispatch_record.run_id != candidate.run_id
+        context.attempt.execution_id != candidate.identity.execution_id
+        or context.dispatch_record.execution_id != candidate.identity.execution_id
+        or context.dispatch_record.run_id != candidate.identity.run_id
     ):
         return ToolAcceptRejectReason.STALE_EXECUTION
     if (
@@ -3176,15 +3144,16 @@ def _candidate_payload_descriptor_exists(
     :returns: 无 payload ref 或 descriptor 存在时返回 ``True``。
     """
 
-    if candidate.payload_ref is None:
+    result = candidate.result
+    if result is None or result.payload_ref is None:
         return True
     descriptor = read_payload_descriptor(
         transaction,
-        candidate.payload_ref.payload_ref,
+        result.payload_ref.payload_ref,
     )
     return (
         descriptor is not None
-        and descriptor.payload_digest == candidate.payload_ref.payload_digest
+        and descriptor.payload_digest == result.payload_ref.payload_digest
     )
 
 
@@ -3196,15 +3165,15 @@ def _tool_accept_event_plan(candidate: ToolFactAcceptCandidate) -> _ToolAcceptEv
     """
 
     digest_input: dict[str, JsonValue] = {
-        "session_id": candidate.session_id,
-        "run_id": candidate.run_id,
-        "attempt_id": candidate.attempt_id,
-        "execution_id": candidate.execution_id,
-        "iteration_id": candidate.iteration_id,
-        "tool_call_id": candidate.tool_call_id,
+        "session_id": candidate.identity.session_id,
+        "run_id": candidate.identity.run_id,
+        "attempt_id": candidate.identity.attempt_id,
+        "execution_id": candidate.identity.execution_id,
+        "iteration_id": candidate.call.iteration_id,
+        "tool_call_id": candidate.call.tool_call_id,
         "tool_fact_kind": candidate.tool_fact_kind.value,
-        "accept_idempotency_key": candidate.accept_idempotency_key,
-        "semantic_input_digest": candidate.semantic_input_digest,
+        "accept_idempotency_key": candidate.idempotency.accept_idempotency_key,
+        "semantic_input_digest": candidate.idempotency.semantic_input_digest,
     }
     digest = sha256_digest_json(digest_input).removeprefix("sha256:")
     tool_fact_id = f"tool-fact-{digest}"
@@ -3233,19 +3202,21 @@ def _tool_call_requested_event_request(
         policy_decision=None,
         reason=None,
         payload={
-            "session_id": candidate.session_id,
-            "run_id": candidate.run_id,
-            "attempt_id": candidate.attempt_id,
-            "execution_id": candidate.execution_id,
-            "iteration_id": candidate.iteration_id,
-            "tool_call_id": candidate.tool_call_id,
-            "tool_name": candidate.tool_name,
-            "tool_schema_digest": candidate.tool_schema_digest,
-            "tool_identity_digest": candidate.tool_identity_digest,
-            "normalized_arguments_digest": candidate.normalized_arguments_digest,
+            "session_id": candidate.identity.session_id,
+            "run_id": candidate.identity.run_id,
+            "attempt_id": candidate.identity.attempt_id,
+            "execution_id": candidate.identity.execution_id,
+            "iteration_id": candidate.call.iteration_id,
+            "tool_call_id": candidate.call.tool_call_id,
+            "tool_name": candidate.call.tool_name,
+            "tool_schema_digest": candidate.call.tool_schema_digest,
+            "tool_identity_digest": candidate.call.tool_identity_digest,
+            "normalized_arguments_digest": (
+                candidate.call.normalized_arguments_digest
+            ),
             "tool_fact_kind": candidate.tool_fact_kind.value,
-            "accept_idempotency_key": candidate.accept_idempotency_key,
-            "semantic_input_digest": candidate.semantic_input_digest,
+            "accept_idempotency_key": candidate.idempotency.accept_idempotency_key,
+            "semantic_input_digest": candidate.idempotency.semantic_input_digest,
         },
     )
 
@@ -3269,45 +3240,53 @@ def _append_tool_call_governed_if_needed(
 
     if not _should_append_governed_event(candidate):
         return None
+    duplicate = candidate.governance.duplicate
     return event_log_store.append_event(
         transaction,
         _tool_event_request(
             candidate,
             event_id=event_id,
             event_type=_EVENT_TYPE_TOOL_CALL_GOVERNED,
-            policy_decision=_policy_decision_json(candidate.policy_decision),
-            reason=_policy_reason_json(candidate.policy_decision),
+            policy_decision=_policy_decision_json(
+                candidate.governance.policy_decision
+            ),
+            reason=_policy_reason_json(candidate.governance.policy_decision),
             payload={
-                "session_id": candidate.session_id,
-                "run_id": candidate.run_id,
-                "attempt_id": candidate.attempt_id,
-                "execution_id": candidate.execution_id,
-                "iteration_id": candidate.iteration_id,
-                "tool_call_id": candidate.tool_call_id,
-                "tool_name": candidate.tool_name,
+                "session_id": candidate.identity.session_id,
+                "run_id": candidate.identity.run_id,
+                "attempt_id": candidate.identity.attempt_id,
+                "execution_id": candidate.identity.execution_id,
+                "iteration_id": candidate.call.iteration_id,
+                "tool_call_id": candidate.call.tool_call_id,
+                "tool_name": candidate.call.tool_name,
                 "tool_fact_kind": candidate.tool_fact_kind.value,
                 "tool_call_requested_event_ref": _event_ref_json(
                     _event_ref_from_row(requested)
                 ),
                 "policy_decision": _policy_decision_json(
-                    candidate.policy_decision
+                    candidate.governance.policy_decision
                 ),
-                "duplicate_key": candidate.duplicate_key,
+                "duplicate_key": (
+                    duplicate.duplicate_key if duplicate is not None else None
+                ),
                 "duplicate_decision": (
-                    candidate.duplicate_decision.value
-                    if candidate.duplicate_decision is not None
+                    duplicate.duplicate_decision.value
+                    if duplicate is not None
                     else None
                 ),
                 "duplicate_scope": _duplicate_scope_json(
-                    candidate.duplicate_scope
+                    duplicate.duplicate_scope if duplicate is not None else None
                 ),
                 "reuse_prior_event_refs": [
                     _event_ref_json(ref)
-                    for ref in candidate.reuse_prior_event_refs
+                    for ref in _candidate_reuse_prior_event_refs(candidate)
                 ],
-                "tool_idempotency_key": candidate.tool_idempotency_key,
+                "tool_idempotency_key": (
+                    candidate.governance.tool_idempotency_key
+                ),
                 "diagnostic_refs": [
-                    _diagnostic_ref_json(ref) for ref in candidate.diagnostic_refs
+                    _diagnostic_ref_json(ref)
+                    for ref in candidate.diagnostics.diagnostic_refs
                 ],
             },
         ),
@@ -3358,8 +3337,10 @@ def _append_tool_result_if_needed(
             candidate,
             event_id=event_id,
             event_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-            policy_decision=_policy_decision_json(candidate.policy_decision),
-            reason=_policy_reason_json(candidate.policy_decision),
+            policy_decision=_policy_decision_json(
+                candidate.governance.policy_decision
+            ),
+            reason=_policy_reason_json(candidate.governance.policy_decision),
             payload=payload_plan.inline_payload,
             payload_ref=payload_ref,
             payload_digest=payload_digest,
@@ -3389,32 +3370,33 @@ def _tool_result_payload_plan(
     :returns: EventLog payload 写入计划。
     """
 
+    result = _candidate_result(candidate)
     inline_payload = _tool_result_payload(
         candidate=candidate,
         result_event_id=result_event_id,
         requested=requested,
         governed=governed,
-        event_payload_ref=candidate.payload_ref,
+        event_payload_ref=result.payload_ref,
         evidence_payload_ref=(
-            candidate.payload_ref.payload_ref
-            if candidate.payload_ref is not None
+            result.payload_ref.payload_ref
+            if result.payload_ref is not None
             else None
         ),
         evidence_payload_digest=(
-            candidate.payload_ref.payload_digest
-            if candidate.payload_ref is not None
-            else candidate.payload_digest
+            result.payload_ref.payload_digest
+            if result.payload_ref is not None
+            else result.payload_digest
         ),
         include_raw_tool_outcome=True,
     )
     if (
-        candidate.payload_ref is not None
+        result.payload_ref is not None
         or _payload_size_bytes(inline_payload)
         <= transaction.payload_inline_threshold_bytes
     ):
         return _ToolResultPayloadPlan(
             inline_payload=inline_payload,
-            payload_ref=candidate.payload_ref,
+            payload_ref=result.payload_ref,
         )
 
     payload_ref = _tool_result_payload_ref(result_event_id)
@@ -3439,8 +3421,8 @@ def _tool_result_payload_plan(
             metadata={
                 "event_type": _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
                 "event_id": result_event_id,
-                "tool_name": candidate.tool_name,
-                "tool_call_id": candidate.tool_call_id,
+                "tool_name": candidate.call.tool_name,
+                "tool_call_id": candidate.call.tool_call_id,
             },
             expected_digest=None,
         ),
@@ -3489,6 +3471,8 @@ def _tool_result_payload(
     :returns: 可写入 EventLog 或 SQLite payload descriptor 的 JSON object。
     """
 
+    result = _candidate_result(candidate)
+    duplicate = candidate.governance.duplicate
     accepted_evidence_envelope = _accepted_evidence_envelope(
         candidate=candidate,
         result_event_id=result_event_id,
@@ -3497,31 +3481,36 @@ def _tool_result_payload(
         payload_digest=evidence_payload_digest,
     )
     payload: dict[str, JsonValue] = {
-        "session_id": candidate.session_id,
-        "run_id": candidate.run_id,
-        "attempt_id": candidate.attempt_id,
-        "execution_id": candidate.execution_id,
-        "iteration_id": candidate.iteration_id,
-        "tool_call_id": candidate.tool_call_id,
-        "tool_name": candidate.tool_name,
+        "session_id": candidate.identity.session_id,
+        "run_id": candidate.identity.run_id,
+        "attempt_id": candidate.identity.attempt_id,
+        "execution_id": candidate.identity.execution_id,
+        "iteration_id": candidate.call.iteration_id,
+        "tool_call_id": candidate.call.tool_call_id,
+        "tool_name": candidate.call.tool_name,
         "tool_fact_kind": candidate.tool_fact_kind.value,
-        "tool_schema_digest": candidate.tool_schema_digest,
-        "tool_identity_digest": candidate.tool_identity_digest,
-        "normalized_arguments_digest": candidate.normalized_arguments_digest,
-        "outcome_digest": candidate.outcome_digest,
-        "payload_digest": candidate.payload_digest,
+        "tool_schema_digest": candidate.call.tool_schema_digest,
+        "tool_identity_digest": candidate.call.tool_identity_digest,
+        "normalized_arguments_digest": candidate.call.normalized_arguments_digest,
+        "outcome_digest": result.outcome_digest,
+        "payload_digest": result.payload_digest,
         "payload_ref": _payload_ref_json(event_payload_ref),
-        "truncation": _truncation_json(candidate.truncation),
-        "duplicate_key": candidate.duplicate_key,
+        "truncation": _truncation_json(result.truncation),
+        "duplicate_key": (
+            duplicate.duplicate_key if duplicate is not None else None
+        ),
         "duplicate_decision": (
-            candidate.duplicate_decision.value
-            if candidate.duplicate_decision is not None
+            duplicate.duplicate_decision.value
+            if duplicate is not None
             else None
         ),
-        "policy_decision": _policy_decision_json(candidate.policy_decision),
-        "tool_idempotency_key": candidate.tool_idempotency_key,
+        "policy_decision": _policy_decision_json(
+            candidate.governance.policy_decision
+        ),
+        "tool_idempotency_key": candidate.governance.tool_idempotency_key,
         "diagnostic_refs": [
-            _diagnostic_ref_json(ref) for ref in candidate.diagnostic_refs
+            _diagnostic_ref_json(ref)
+            for ref in candidate.diagnostics.diagnostic_refs
         ],
         "tool_call_requested_event_ref": _event_ref_json(
             _event_ref_from_row(requested)
@@ -3529,16 +3518,16 @@ def _tool_result_payload(
         "tool_call_governed_event_ref": (
             _event_ref_json(_event_ref_from_row(governed))
             if governed is not None
-            else None
+                else None
         ),
-        "accept_idempotency_key": candidate.accept_idempotency_key,
-        "semantic_input_digest": candidate.semantic_input_digest,
+        "accept_idempotency_key": candidate.idempotency.accept_idempotency_key,
+        "semantic_input_digest": candidate.idempotency.semantic_input_digest,
         _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE: (
             accepted_evidence_envelope_to_json_value(accepted_evidence_envelope)
         ),
     }
     if include_raw_tool_outcome:
-        payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] = candidate.raw_tool_outcome
+        payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] = result.raw_tool_outcome
     return payload
 
 
@@ -3590,23 +3579,24 @@ def _accepted_evidence_envelope(
     :returns: accepted evidence envelope。
     """
 
+    result = _candidate_result(candidate)
     return AcceptedEvidenceEnvelope(
         evidence_id=derive_accepted_evidence_id(result_event_id),
         producer_event_ref=result_event_id,
-        tool_name=candidate.tool_name,
-        tool_call_id=candidate.tool_call_id,
+        tool_name=candidate.call.tool_name,
+        tool_call_id=candidate.call.tool_call_id,
         tool_query=AcceptedEvidenceToolQuery(
             tool_call_requested_event_ref=requested.event_id,
-            normalized_arguments_digest=candidate.normalized_arguments_digest,
-            semantic_input_digest=candidate.semantic_input_digest,
+            normalized_arguments_digest=candidate.call.normalized_arguments_digest,
+            semantic_input_digest=candidate.idempotency.semantic_input_digest,
         ),
         result_ref=AcceptedEvidenceResultRef(
             payload_ref=payload_ref,
             payload_digest=payload_digest,
-            outcome_digest=candidate.outcome_digest,
+            outcome_digest=result.outcome_digest,
             truncation_applied=(
-                candidate.truncation.applied
-                if candidate.truncation is not None
+                result.truncation.applied
+                if result.truncation is not None
                 else False
             ),
         ),
@@ -3642,16 +3632,16 @@ def _tool_event_request(
     return EventLogAppendRequest(
         event_id=event_id,
         event_class=EventClass.CANONICAL_FACT,
-        session_id=candidate.session_id,
-        run_id=candidate.run_id,
-        attempt_id=candidate.attempt_id,
-        execution_id=candidate.execution_id,
+        session_id=candidate.identity.session_id,
+        run_id=candidate.identity.run_id,
+        attempt_id=candidate.identity.attempt_id,
+        execution_id=candidate.identity.execution_id,
         event_type=event_type,
         occurred_at=datetime.now(UTC),
         actor=_TOOL_ACCEPT_EVENT_ACTOR,
         source=_TOOL_ACCEPT_EVENT_SOURCE,
         client_request_id=None,
-        idempotency_key=candidate.accept_idempotency_key,
+        idempotency_key=candidate.idempotency.accept_idempotency_key,
         policy_decision=policy_decision,
         reason=reason,
         payload_json=payload,
@@ -3669,10 +3659,12 @@ def _should_append_governed_event(candidate: ToolFactAcceptCandidate) -> bool:
 
     return (
         candidate.tool_fact_kind is ToolFactKind.REUSE
-        or candidate.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
+        or candidate.governance.policy_decision.kind
+        is not ToolPolicyDecisionKind.ALLOW
         or (
-            candidate.duplicate_decision is not None
-            and candidate.duplicate_decision is not DuplicateDecisionKind.ALLOW
+            candidate.governance.duplicate is not None
+            and candidate.governance.duplicate.duplicate_decision
+            is not DuplicateDecisionKind.ALLOW
         )
     )
 
@@ -3770,8 +3762,8 @@ def _accepted_ack_from_rows(
         tool_result_event_ref=result_ref,
         result_payload_ref=result_payload_ref,
         result_digest=_ack_result_digest(candidate),
-        reuse_prior_event_refs=candidate.reuse_prior_event_refs,
-        diagnostic_refs=candidate.diagnostic_refs,
+        reuse_prior_event_refs=_candidate_reuse_prior_event_refs(candidate),
+        diagnostic_refs=candidate.diagnostics.diagnostic_refs,
         idempotency_record_ref=_idempotency_record_ref(idempotency_record),
     )
 
@@ -3803,9 +3795,9 @@ def _ack_result_digest(candidate: ToolFactAcceptCandidate) -> str:
     :returns: outcome digest，reuse 无 outcome 时回退 semantic input digest。
     """
 
-    if candidate.outcome_digest is not None:
-        return candidate.outcome_digest
-    return candidate.semantic_input_digest
+    if candidate.result is not None:
+        return candidate.result.outcome_digest
+    return candidate.idempotency.semantic_input_digest
 
 
 def _idempotency_record_ref(record: IdempotencyRecord) -> str:
@@ -3840,7 +3832,7 @@ def _rejected_ack(
     return ToolFactRejectedAck(
         reason_code=reason_code,
         message=message,
-        diagnostic_refs=candidate.diagnostic_refs,
+        diagnostic_refs=candidate.diagnostics.diagnostic_refs,
         retryable=retryable,
     )
 
@@ -4107,44 +4099,20 @@ def _validate_common_candidate_fields(candidate: ToolFactAcceptCandidate) -> Non
     :raises ValueError: 字段缺失或 digest 非法时抛出。
     """
 
-    for field_name, value in (
-        ("session_id", candidate.session_id),
-        ("run_id", candidate.run_id),
-        ("attempt_id", candidate.attempt_id),
-        ("execution_id", candidate.execution_id),
-        ("iteration_id", candidate.iteration_id),
-        ("tool_call_id", candidate.tool_call_id),
-        ("tool_name", candidate.tool_name),
-        ("accept_idempotency_key", candidate.accept_idempotency_key),
+    if not isinstance(candidate.identity, ToolAcceptIdentity):
+        raise ValueError("identity must be ToolAcceptIdentity")
+    if not isinstance(candidate.call, ToolAcceptCall):
+        raise ValueError("call must be ToolAcceptCall")
+    if candidate.result is not None and not isinstance(
+        candidate.result, ToolAcceptResult
     ):
-        _require_non_empty_text(value, field_name=field_name)
-    _require_sha256_digest(
-        candidate.tool_schema_digest, field_name="tool_schema_digest"
-    )
-    _require_sha256_digest(
-        candidate.tool_identity_digest, field_name="tool_identity_digest"
-    )
-    _require_sha256_digest(
-        candidate.normalized_arguments_digest,
-        field_name="normalized_arguments_digest",
-    )
-    _require_sha256_digest(
-        candidate.semantic_input_digest, field_name="semantic_input_digest"
-    )
-    _require_optional_sha256_digest(
-        candidate.payload_digest, field_name="payload_digest"
-    )
-    if (
-        candidate.payload_ref is not None
-        and candidate.payload_digest != candidate.payload_ref.payload_digest
-    ):
-        raise ValueError("payload_digest must match payload_ref digest")
-    _require_optional_non_empty_text(
-        candidate.tool_idempotency_key, field_name="tool_idempotency_key"
-    )
-    if not isinstance(candidate.policy_decision, ToolPolicyDecision):
-        raise ValueError("policy_decision must be ToolPolicyDecision")
-    _validate_policy_decision_fields(candidate.policy_decision)
+        raise ValueError("result must be ToolAcceptResult")
+    if not isinstance(candidate.governance, ToolAcceptGovernance):
+        raise ValueError("governance must be ToolAcceptGovernance")
+    if not isinstance(candidate.idempotency, ToolAcceptIdempotency):
+        raise ValueError("idempotency must be ToolAcceptIdempotency")
+    if not isinstance(candidate.diagnostics, ToolAcceptDiagnostics):
+        raise ValueError("diagnostics must be ToolAcceptDiagnostics")
     if not isinstance(candidate.tool_fact_kind, ToolFactKind):
         raise ValueError("tool_fact_kind must be ToolFactKind")
 
@@ -4157,30 +4125,10 @@ def _validate_duplicate_fields(candidate: ToolFactAcceptCandidate) -> None:
     :raises ValueError: duplicate decision 与 duplicate key 组合非法时抛出。
     """
 
-    _require_optional_non_empty_text(candidate.duplicate_key, field_name="duplicate_key")
-    if candidate.duplicate_decision is None:
+    duplicate = candidate.governance.duplicate
+    if duplicate is None:
         return
-    if not isinstance(candidate.duplicate_decision, DuplicateDecisionKind):
-        raise ValueError("duplicate_decision must be DuplicateDecisionKind")
-    if (
-        candidate.duplicate_decision
-        in (
-            DuplicateDecisionKind.REUSE,
-            DuplicateDecisionKind.HINT,
-            DuplicateDecisionKind.REQUIRE_JUSTIFICATION,
-            DuplicateDecisionKind.HARD_STOP,
-            DuplicateDecisionKind.DURABLE_MISSING,
-        )
-        and candidate.duplicate_key is None
-    ):
-        raise ValueError("duplicate decision requires duplicate_key")
-    if candidate.duplicate_scope is None:
-        raise ValueError("duplicate decision requires duplicate_scope")
-    if candidate.duplicate_decision_message is None:
-        raise ValueError("duplicate decision requires duplicate_decision_message")
-    _require_non_empty_text(
-        candidate.duplicate_decision_message, field_name="duplicate_decision_message"
-    )
+    _validate_tool_accept_duplicate_governance(duplicate)
 
 
 def _validate_policy_decision_fields(decision: ToolPolicyDecision) -> None:
@@ -4216,13 +4164,14 @@ def _validate_governed_error_candidate(candidate: ToolFactAcceptCandidate) -> No
         语义时抛出。
     """
 
-    if candidate.policy_decision.kind in (
+    policy_decision = candidate.governance.policy_decision
+    if policy_decision.kind in (
         ToolPolicyDecisionKind.ALLOW,
         ToolPolicyDecisionKind.REUSE,
     ):
         raise ValueError("governed_error requires governed policy decision")
-    if candidate.policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR:
-        if candidate.reuse_prior_event_refs:
+    if policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR:
+        if _candidate_reuse_prior_event_refs(candidate):
             raise ValueError("plain governed_error must not carry prior reuse refs")
         return
     _validate_duplicate_governed_candidate(candidate)
@@ -4239,12 +4188,13 @@ def _validate_duplicate_governed_candidate(
         与 policy 决策不一致时抛出。
     """
 
-    decision = candidate.duplicate_decision
+    duplicate = candidate.governance.duplicate
+    decision = duplicate.duplicate_decision if duplicate is not None else None
     if decision is DuplicateDecisionKind.DURABLE_MISSING:
-        if candidate.reuse_prior_event_refs:
+        if _candidate_reuse_prior_event_refs(candidate):
             raise ValueError("durable-missing duplicate must not carry prior refs")
         expected_reason = _duplicate_reason_code(decision)
-        if candidate.policy_decision.reason_code != expected_reason:
+        if candidate.governance.policy_decision.reason_code != expected_reason:
             raise ValueError("durable-missing duplicate reason must match decision")
         return
     if decision is None or decision not in (
@@ -4253,15 +4203,17 @@ def _validate_duplicate_governed_candidate(
         DuplicateDecisionKind.HARD_STOP,
     ):
         raise ValueError("duplicate governed error requires duplicate decision")
-    if candidate.policy_decision.kind.value != decision.value:
+    if candidate.governance.policy_decision.kind.value != decision.value:
         raise ValueError("duplicate governed policy kind must match decision")
-    if not candidate.reuse_prior_event_refs:
+    if not _candidate_reuse_prior_event_refs(candidate):
         raise ValueError("duplicate governed error requires prior event refs")
     expected_reason = _duplicate_reason_code(decision)
-    if candidate.policy_decision.reason_code != expected_reason:
+    if candidate.governance.policy_decision.reason_code != expected_reason:
         raise ValueError("duplicate governed reason must match decision")
-    expected_message = candidate.duplicate_decision_message
-    if candidate.policy_decision.message != expected_message:
+    if duplicate is None:
+        raise ValueError("duplicate governed error requires duplicate decision")
+    expected_message = duplicate.duplicate_decision_message
+    if candidate.governance.policy_decision.message != expected_message:
         raise ValueError("duplicate governed message must match decision")
 
 
@@ -4274,7 +4226,9 @@ def _validate_result_fact_policy(candidate: ToolFactAcceptCandidate) -> None:
         allow policy 时抛出。
     """
 
-    if candidate.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
+    if candidate.result is None:
+        raise ValueError(f"{candidate.tool_fact_kind.value} requires result")
+    if candidate.governance.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
         raise ValueError(f"{candidate.tool_fact_kind.value} requires allow policy")
 
 
@@ -4286,27 +4240,26 @@ def _validate_reuse_candidate(candidate: ToolFactAcceptCandidate) -> None:
     :raises ValueError: reuse 字段不满足 canonical 语义时抛出。
     """
 
-    if candidate.duplicate_key is None:
+    duplicate = candidate.governance.duplicate
+    if duplicate is None or duplicate.duplicate_key is None:
         raise ValueError("reuse requires duplicate_key")
-    if candidate.duplicate_decision is not DuplicateDecisionKind.REUSE:
+    if duplicate.duplicate_decision is not DuplicateDecisionKind.REUSE:
         raise ValueError("reuse requires duplicate_decision=reuse")
-    if candidate.policy_decision.kind is not ToolPolicyDecisionKind.REUSE:
+    if candidate.governance.policy_decision.kind is not ToolPolicyDecisionKind.REUSE:
         raise ValueError("reuse requires policy_decision=reuse")
-    if candidate.policy_decision.reason_code != _duplicate_reason_code(
+    if candidate.governance.policy_decision.reason_code != _duplicate_reason_code(
         DuplicateDecisionKind.REUSE
     ):
         raise ValueError("reuse reason must match duplicate decision")
-    if candidate.duplicate_decision_message is None:
+    if duplicate.duplicate_decision_message is None:
         raise ValueError("reuse requires duplicate_decision_message")
-    expected_message = candidate.duplicate_decision_message
-    if candidate.policy_decision.message != expected_message:
+    expected_message = duplicate.duplicate_decision_message
+    if candidate.governance.policy_decision.message != expected_message:
         raise ValueError("reuse message must match duplicate decision")
-    if not candidate.reuse_prior_event_refs:
+    if not duplicate.reuse_prior_event_refs:
         raise ValueError("reuse requires prior event refs")
-    if candidate.payload_ref is not None or candidate.payload_digest is not None:
-        raise ValueError("reuse must not carry new result payload")
-    if candidate.raw_tool_outcome is not None:
-        raise ValueError("reuse must not carry raw_tool_outcome")
+    if candidate.result is not None:
+        raise ValueError("reuse must not carry result")
 
 
 def _require_raw_tool_outcome(candidate: ToolFactAcceptCandidate) -> None:
@@ -4317,8 +4270,38 @@ def _require_raw_tool_outcome(candidate: ToolFactAcceptCandidate) -> None:
     :raises ValueError: raw 工具 outcome 缺失时抛出。
     """
 
-    if candidate.raw_tool_outcome is None:
+    if candidate.result is None:
+        raise ValueError(f"{candidate.tool_fact_kind.value} requires result")
+    if candidate.result.raw_tool_outcome is None:
         raise ValueError(f"{candidate.tool_fact_kind.value} requires raw_tool_outcome")
+
+
+def _candidate_result(candidate: ToolFactAcceptCandidate) -> ToolAcceptResult:
+    """返回非 reuse candidate 的 result 子结构。
+
+    :param candidate: 工具事实候选。
+    :returns: result 子结构。
+    :raises ValueError: candidate 未携带 result 时抛出。
+    """
+
+    if candidate.result is None:
+        raise ValueError(f"{candidate.tool_fact_kind.value} requires result")
+    return candidate.result
+
+
+def _candidate_reuse_prior_event_refs(
+    candidate: ToolFactAcceptCandidate,
+) -> tuple[HostEventRef, ...]:
+    """返回 candidate duplicate governance 中的 prior event refs。
+
+    :param candidate: 工具事实候选。
+    :returns: prior event refs；无 duplicate governance 时为空元组。
+    """
+
+    duplicate = candidate.governance.duplicate
+    if duplicate is None:
+        return ()
+    return duplicate.reuse_prior_event_refs
 
 
 def _require_non_empty_text(value: str, *, field_name: str) -> None:
@@ -4941,6 +4924,28 @@ def _duplicate_reason_code(kind: DuplicateDecisionKind) -> str:
     return "duplicate_allowed"
 
 
+def _tool_accept_duplicate_governance_from_decision(
+    decision: DuplicateDecision,
+    *,
+    reuse_prior_event_refs: tuple[HostEventRef, ...],
+) -> ToolAcceptDuplicateGovernance:
+    """从 duplicate 决策构造 accept candidate 的治理子结构。
+
+    :param decision: duplicate governance 决策。
+    :param reuse_prior_event_refs: 当前 fact kind 允许携带的 prior event refs。
+    :returns: duplicate governance 子结构。
+    :raises ValueError: duplicate 决策缺少必填消息或作用域时抛出。
+    """
+
+    return ToolAcceptDuplicateGovernance(
+        duplicate_key=decision.duplicate_key,
+        duplicate_decision=decision.kind,
+        duplicate_scope=decision.scope,
+        duplicate_decision_message=decision.message,
+        reuse_prior_event_refs=reuse_prior_event_refs,
+    )
+
+
 def _tool_fact_accept_candidate(
     *,
     scope: ToolRuntimeExecutionScope,
@@ -4995,42 +5000,54 @@ def _tool_fact_accept_candidate(
         truncation_fact=truncation_fact,
     )
     return ToolFactAcceptCandidate(
-        session_id=scope.session_id,
-        run_id=scope.run_id,
-        attempt_id=scope.attempt_id,
-        execution_id=scope.execution_id,
-        iteration_id=iteration_id,
-        tool_call_id=call.tool_call_id,
-        tool_name=call.name,
-        tool_schema_digest=schema_digest,
-        tool_identity_digest=identity_digest,
-        normalized_arguments_digest=normalized_arguments_digest,
+        identity=ToolAcceptIdentity(
+            session_id=scope.session_id,
+            run_id=scope.run_id,
+            attempt_id=scope.attempt_id,
+            execution_id=scope.execution_id,
+        ),
+        call=ToolAcceptCall(
+            iteration_id=iteration_id,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            tool_schema_digest=schema_digest,
+            tool_identity_digest=identity_digest,
+            normalized_arguments_digest=normalized_arguments_digest,
+        ),
         tool_fact_kind=tool_fact_kind,
-        outcome_digest=outcome_digest,
-        payload_digest=payload_digest,
-        payload_ref=None,
-        truncation=truncation_fact,
-        raw_tool_outcome=_tool_outcome_json(outcome),
-        duplicate_key=duplicate_decision.duplicate_key,
-        duplicate_decision=duplicate_decision.kind,
-        reuse_prior_event_refs=(
-            duplicate_decision.prior_event_refs
-            if tool_fact_kind is ToolFactKind.GOVERNED_ERROR and duplicate_governed
-            else ()
-        ),
-        policy_decision=policy_decision,
-        tool_idempotency_key=tool_idempotency_key,
-        diagnostic_refs=diagnostic_refs,
-        accept_idempotency_key=_tool_accept_idempotency_key(
-            scope=scope,
-            call=call,
-            tool_fact_kind=tool_fact_kind,
+        result=ToolAcceptResult(
             outcome_digest=outcome_digest,
-            policy_decision=policy_decision,
+            payload_digest=payload_digest,
+            payload_ref=None,
+            truncation=truncation_fact,
+            raw_tool_outcome=_tool_outcome_json(outcome),
         ),
-        semantic_input_digest=semantic_input_digest,
-        duplicate_scope=duplicate_decision.scope,
-        duplicate_decision_message=duplicate_decision.message,
+        governance=ToolAcceptGovernance(
+            policy_decision=policy_decision,
+            tool_idempotency_key=tool_idempotency_key,
+            duplicate=_tool_accept_duplicate_governance_from_decision(
+                duplicate_decision,
+                reuse_prior_event_refs=(
+                    duplicate_decision.prior_event_refs
+                    if (
+                        tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+                        and duplicate_governed
+                    )
+                    else ()
+                ),
+            ),
+        ),
+        idempotency=ToolAcceptIdempotency(
+            accept_idempotency_key=_tool_accept_idempotency_key(
+                scope=scope,
+                call=call,
+                tool_fact_kind=tool_fact_kind,
+                outcome_digest=outcome_digest,
+                policy_decision=policy_decision,
+            ),
+            semantic_input_digest=semantic_input_digest,
+        ),
+        diagnostics=ToolAcceptDiagnostics(diagnostic_refs=diagnostic_refs),
     )
 
 
@@ -5086,38 +5103,41 @@ def _tool_fact_reuse_accept_candidate(
         truncation_fact=None,
     )
     return ToolFactAcceptCandidate(
-        session_id=scope.session_id,
-        run_id=scope.run_id,
-        attempt_id=scope.attempt_id,
-        execution_id=scope.execution_id,
-        iteration_id=iteration_id,
-        tool_call_id=call.tool_call_id,
-        tool_name=call.name,
-        tool_schema_digest=schema_digest,
-        tool_identity_digest=identity_digest,
-        normalized_arguments_digest=normalized_arguments_digest,
-        tool_fact_kind=ToolFactKind.REUSE,
-        outcome_digest=None,
-        payload_digest=None,
-        payload_ref=None,
-        truncation=None,
-        raw_tool_outcome=None,
-        duplicate_key=duplicate_decision.duplicate_key,
-        duplicate_decision=duplicate_decision.kind,
-        reuse_prior_event_refs=duplicate_decision.prior_event_refs,
-        policy_decision=policy_decision,
-        tool_idempotency_key=tool_idempotency_key,
-        diagnostic_refs=diagnostic_refs,
-        accept_idempotency_key=_tool_accept_idempotency_key(
-            scope=scope,
-            call=call,
-            tool_fact_kind=ToolFactKind.REUSE,
-            outcome_digest=prior_outcome_digest,
-            policy_decision=policy_decision,
+        identity=ToolAcceptIdentity(
+            session_id=scope.session_id,
+            run_id=scope.run_id,
+            attempt_id=scope.attempt_id,
+            execution_id=scope.execution_id,
         ),
-        semantic_input_digest=semantic_input_digest,
-        duplicate_scope=duplicate_decision.scope,
-        duplicate_decision_message=duplicate_decision.message,
+        call=ToolAcceptCall(
+            iteration_id=iteration_id,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            tool_schema_digest=schema_digest,
+            tool_identity_digest=identity_digest,
+            normalized_arguments_digest=normalized_arguments_digest,
+        ),
+        tool_fact_kind=ToolFactKind.REUSE,
+        result=None,
+        governance=ToolAcceptGovernance(
+            policy_decision=policy_decision,
+            tool_idempotency_key=tool_idempotency_key,
+            duplicate=_tool_accept_duplicate_governance_from_decision(
+                duplicate_decision,
+                reuse_prior_event_refs=duplicate_decision.prior_event_refs,
+            ),
+        ),
+        idempotency=ToolAcceptIdempotency(
+            accept_idempotency_key=_tool_accept_idempotency_key(
+                scope=scope,
+                call=call,
+                tool_fact_kind=ToolFactKind.REUSE,
+                outcome_digest=prior_outcome_digest,
+                policy_decision=policy_decision,
+            ),
+            semantic_input_digest=semantic_input_digest,
+        ),
+        diagnostics=ToolAcceptDiagnostics(diagnostic_refs=diagnostic_refs),
     )
 
 
