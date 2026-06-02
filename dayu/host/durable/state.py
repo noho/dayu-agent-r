@@ -7,6 +7,7 @@ Session lifecycle、admission、promotion、cancel 或 command path 语义。
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -53,7 +54,7 @@ from dayu.host.durable._validation import (
     require_optional_non_empty_text as _require_optional_non_empty_text,
     require_text as _require_text,
 )
-from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.errors import HostDurableError, HostRowDecodeError
 from dayu.host.durable.schema import (
     TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
     TABLE_HOST_ATTEMPTS,
@@ -62,7 +63,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_SESSIONS,
     TABLE_HOST_WAIT_RECORDS,
 )
-from dayu.host.durable.transaction import HostRow
+from dayu.host.durable.transaction import HostRow, SQLiteScalar
 from dayu.host.durable.transaction import HostTransaction
 
 _StatusT = TypeVar("_StatusT", bound=StrEnum)
@@ -721,24 +722,201 @@ def deserialize_external_job_ref(adapter_key: WaitAdapterKey, external_job_id: s
     return ExternalJobRef(adapter_key=adapter_key, external_job_id=external_job_id)
 
 
+def _decode_scalar(row: HostRow, *, row_name: str, column: str) -> SQLiteScalar:
+    """从 HostRow 读取 SQLite scalar，并稳定缺列错误边界。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param column: 需要读取的列名。
+    :returns: SQLite scalar 值。
+    :raises HostRowDecodeError: row 缺少指定列时抛出。
+    """
+
+    try:
+        return row.get(column)
+    except KeyError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name=column, detail="missing column"),
+            row_name=row_name,
+            field_name=column,
+        ) from exc
+
+
+def _decode_required_text(row: HostRow, *, row_name: str, column: str) -> str:
+    """从 HostRow 读取必填文本列。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param column: 需要读取的列名。
+    :returns: 文本值。
+    :raises HostRowDecodeError: 列缺失或值不是 SQLite text 时抛出。
+    """
+
+    try:
+        return _require_text(_decode_scalar(row, row_name=row_name, column=column), field_name=column)
+    except HostRowDecodeError:
+        raise
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name=column, detail=str(exc)),
+            row_name=row_name,
+            field_name=column,
+        ) from exc
+
+
+def _decode_optional_text(row: HostRow, *, row_name: str, column: str) -> str | None:
+    """从 HostRow 读取 optional 文本列。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param column: 需要读取的列名。
+    :returns: 文本值或 ``None``。
+    :raises HostRowDecodeError: 列缺失或值不是 SQLite text / null 时抛出。
+    """
+
+    try:
+        return _optional_text(_decode_scalar(row, row_name=row_name, column=column), field_name=column)
+    except HostRowDecodeError:
+        raise
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name=column, detail=str(exc)),
+            row_name=row_name,
+            field_name=column,
+        ) from exc
+
+
+def _decode_required_int(row: HostRow, *, row_name: str, column: str) -> int:
+    """从 HostRow 读取必填整数列。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param column: 需要读取的列名。
+    :returns: 整数值。
+    :raises HostRowDecodeError: 列缺失或值不是 SQLite integer 时抛出。
+    """
+
+    try:
+        return _require_int(_decode_scalar(row, row_name=row_name, column=column), field_name=column)
+    except HostRowDecodeError:
+        raise
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name=column, detail=str(exc)),
+            row_name=row_name,
+            field_name=column,
+        ) from exc
+
+
+def _decode_optional_int(row: HostRow, *, row_name: str, column: str) -> int | None:
+    """从 HostRow 读取 optional 整数列。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param column: 需要读取的列名。
+    :returns: 整数值或 ``None``。
+    :raises HostRowDecodeError: 列缺失或值不是 SQLite integer / null 时抛出。
+    """
+
+    try:
+        return _optional_int(_decode_scalar(row, row_name=row_name, column=column), field_name=column)
+    except HostRowDecodeError:
+        raise
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name=column, detail=str(exc)),
+            row_name=row_name,
+            field_name=column,
+        ) from exc
+
+
+def _decode_enum(
+    row: HostRow,
+    *,
+    row_name: str,
+    column: str,
+    deserializer: Callable[[str], _StatusT],
+) -> _StatusT:
+    """从 HostRow 读取文本列并反序列化为 enum。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param column: 需要读取的 enum 文本列名。
+    :param deserializer: enum 反序列化函数。
+    :returns: enum 值。
+    :raises HostRowDecodeError: 列缺失、标量类型错误或 enum 文本非法时抛出。
+    """
+
+    value = _decode_required_text(row, row_name=row_name, column=column)
+    try:
+        return deserializer(value)
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name=column, detail=str(exc)),
+            row_name=row_name,
+            field_name=column,
+        ) from exc
+
+
+def _wrap_row_decode_shape_error(
+    *,
+    row_name: str,
+    detail: str,
+) -> HostRowDecodeError:
+    """把 row 级形状校验错误转换为 HostRowDecodeError。
+
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param detail: 形状错误诊断。
+    :returns: 待抛出的 ``HostRowDecodeError``。
+    :raises HostDurableError: 本函数不主动抛出。
+    """
+
+    return HostRowDecodeError(
+        _format_row_decode_error(row_name=row_name, field_name=None, detail=detail),
+        row_name=row_name,
+        field_name=None,
+    )
+
+
+def _format_row_decode_error(*, row_name: str, field_name: str | None, detail: str) -> str:
+    """格式化 durable row decode 错误消息。
+
+    :param row_name: 发生 decode 的 durable row 名称。
+    :param field_name: 发生 decode 失败的字段名；row 级形状错误时为 ``None``。
+    :param detail: 具体错误诊断。
+    :returns: 稳定 row decode 错误消息。
+    :raises HostDurableError: 本函数不主动抛出。
+    """
+
+    if field_name is None:
+        return f"Host durable row decode failed: row={row_name}: {detail}"
+    return f"Host durable row decode failed: row={row_name} field={field_name}: {detail}"
+
+
 def session_row_from_host_row(row: HostRow) -> SessionRow:
     """把通用 HostRow 转换为 SessionRow。
 
     :param row: ``HostTransaction`` 查询返回的 row。
     :returns: ``SessionRow``。
-    :raises HostDurableError: row 字段类型或状态 enum 值无效时抛出。
+    :raises HostRowDecodeError: row 缺列、字段类型或状态 enum 值无效时抛出。
     """
 
+    row_name = TABLE_HOST_SESSIONS
     return SessionRow(
-        session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        status=deserialize_session_status(_require_text(row.get("status"), field_name="status")),
-        metadata_json=_require_text(row.get("metadata_json"), field_name="metadata_json"),
-        created_event_id=_require_text(row.get("created_event_id"), field_name="created_event_id"),
-        created_event_sequence=_require_int(row.get("created_event_sequence"), field_name="created_event_sequence"),
-        closed_event_id=_optional_text(row.get("closed_event_id"), field_name="closed_event_id"),
-        closed_event_sequence=_optional_int(row.get("closed_event_sequence"), field_name="closed_event_sequence"),
-        created_at=_require_text(row.get("created_at"), field_name="created_at"),
-        closed_at=_optional_text(row.get("closed_at"), field_name="closed_at"),
+        session_id=_decode_required_text(row, row_name=row_name, column="session_id"),
+        status=_decode_enum(
+            row,
+            row_name=row_name,
+            column="status",
+            deserializer=deserialize_session_status,
+        ),
+        metadata_json=_decode_required_text(row, row_name=row_name, column="metadata_json"),
+        created_event_id=_decode_required_text(row, row_name=row_name, column="created_event_id"),
+        created_event_sequence=_decode_required_int(row, row_name=row_name, column="created_event_sequence"),
+        closed_event_id=_decode_optional_text(row, row_name=row_name, column="closed_event_id"),
+        closed_event_sequence=_decode_optional_int(row, row_name=row_name, column="closed_event_sequence"),
+        created_at=_decode_required_text(row, row_name=row_name, column="created_at"),
+        closed_at=_decode_optional_text(row, row_name=row_name, column="closed_at"),
     )
 
 
@@ -747,17 +925,18 @@ def session_slot_row_from_host_row(row: HostRow) -> SessionSlotRow:
 
     :param row: ``HostTransaction`` 查询返回的 row。
     :returns: ``SessionSlotRow``。
-    :raises HostDurableError: row 字段类型无效时抛出。
+    :raises HostRowDecodeError: row 缺列或字段类型无效时抛出。
     """
 
+    row_name = TABLE_HOST_SESSION_SLOTS
     return SessionSlotRow(
-        scope=_require_text(row.get("scope"), field_name="scope"),
-        slot_key=_require_text(row.get("slot_key"), field_name="slot_key"),
-        session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        bound_event_id=_require_text(row.get("bound_event_id"), field_name="bound_event_id"),
-        bound_event_sequence=_require_int(row.get("bound_event_sequence"), field_name="bound_event_sequence"),
-        metadata_json=_require_text(row.get("metadata_json"), field_name="metadata_json"),
-        updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
+        scope=_decode_required_text(row, row_name=row_name, column="scope"),
+        slot_key=_decode_required_text(row, row_name=row_name, column="slot_key"),
+        session_id=_decode_required_text(row, row_name=row_name, column="session_id"),
+        bound_event_id=_decode_required_text(row, row_name=row_name, column="bound_event_id"),
+        bound_event_sequence=_decode_required_int(row, row_name=row_name, column="bound_event_sequence"),
+        metadata_json=_decode_required_text(row, row_name=row_name, column="metadata_json"),
+        updated_at=_decode_required_text(row, row_name=row_name, column="updated_at"),
     )
 
 
@@ -766,34 +945,58 @@ def run_row_from_host_row(row: HostRow) -> RunRow:
 
     :param row: ``HostTransaction`` 查询返回的 row。
     :returns: ``RunRow``。
-    :raises HostDurableError: row 字段类型或状态 enum 值无效时抛出。
+    :raises HostRowDecodeError: row 缺列、字段类型、状态 enum 或终态形状无效时抛出。
     """
 
-    source_relation_text = _optional_text(row.get("source_run_relation"), field_name="source_run_relation")
-    return RunRow(
-        run_id=_require_text(row.get("run_id"), field_name="run_id"),
-        session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        status=deserialize_run_status(_require_text(row.get("status"), field_name="status")),
-        client_request_id=_require_text(row.get("client_request_id"), field_name="client_request_id"),
-        input_event_id=_require_text(row.get("input_event_id"), field_name="input_event_id"),
-        input_event_sequence=_require_int(row.get("input_event_sequence"), field_name="input_event_sequence"),
-        accepted_event_id=_require_text(row.get("accepted_event_id"), field_name="accepted_event_id"),
-        accepted_event_sequence=_require_int(row.get("accepted_event_sequence"), field_name="accepted_event_sequence"),
-        queued_event_id=_optional_text(row.get("queued_event_id"), field_name="queued_event_id"),
-        queued_event_sequence=_optional_int(row.get("queued_event_sequence"), field_name="queued_event_sequence"),
-        started_event_id=_optional_text(row.get("started_event_id"), field_name="started_event_id"),
-        started_event_sequence=_optional_int(row.get("started_event_sequence"), field_name="started_event_sequence"),
-        terminal_event_id=_optional_text(row.get("terminal_event_id"), field_name="terminal_event_id"),
-        terminal_event_sequence=_optional_int(row.get("terminal_event_sequence"), field_name="terminal_event_sequence"),
-        current_attempt_id=_optional_text(row.get("current_attempt_id"), field_name="current_attempt_id"),
-        source_run_id=_optional_text(row.get("source_run_id"), field_name="source_run_id"),
-        source_run_relation=_optional_source_run_relation(source_relation_text),
-        execution_target=_require_text(row.get("execution_target"), field_name="execution_target"),
-        queue_policy=_require_text(row.get("queue_policy"), field_name="queue_policy"),
-        created_at=_require_text(row.get("created_at"), field_name="created_at"),
-        updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
-        terminal_at=_optional_text(row.get("terminal_at"), field_name="terminal_at"),
+    row_name = TABLE_HOST_RUNS
+    source_relation_text = _decode_optional_text(row, row_name=row_name, column="source_run_relation")
+    try:
+        source_run_relation = _optional_source_run_relation(source_relation_text)
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name="source_run_relation", detail=str(exc)),
+            row_name=row_name,
+            field_name="source_run_relation",
+        ) from exc
+    status = _decode_enum(row, row_name=row_name, column="status", deserializer=deserialize_run_status)
+    terminal_event_id = _decode_optional_text(row, row_name=row_name, column="terminal_event_id")
+    terminal_event_sequence = _decode_optional_int(row, row_name=row_name, column="terminal_event_sequence")
+    terminal_at = _decode_optional_text(row, row_name=row_name, column="terminal_at")
+    run_row = RunRow(
+        run_id=_decode_required_text(row, row_name=row_name, column="run_id"),
+        session_id=_decode_required_text(row, row_name=row_name, column="session_id"),
+        status=status,
+        client_request_id=_decode_required_text(row, row_name=row_name, column="client_request_id"),
+        input_event_id=_decode_required_text(row, row_name=row_name, column="input_event_id"),
+        input_event_sequence=_decode_required_int(row, row_name=row_name, column="input_event_sequence"),
+        accepted_event_id=_decode_required_text(row, row_name=row_name, column="accepted_event_id"),
+        accepted_event_sequence=_decode_required_int(row, row_name=row_name, column="accepted_event_sequence"),
+        queued_event_id=_decode_optional_text(row, row_name=row_name, column="queued_event_id"),
+        queued_event_sequence=_decode_optional_int(row, row_name=row_name, column="queued_event_sequence"),
+        started_event_id=_decode_optional_text(row, row_name=row_name, column="started_event_id"),
+        started_event_sequence=_decode_optional_int(row, row_name=row_name, column="started_event_sequence"),
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        current_attempt_id=_decode_optional_text(row, row_name=row_name, column="current_attempt_id"),
+        source_run_id=_decode_optional_text(row, row_name=row_name, column="source_run_id"),
+        source_run_relation=source_run_relation,
+        execution_target=_decode_required_text(row, row_name=row_name, column="execution_target"),
+        queue_policy=_decode_required_text(row, row_name=row_name, column="queue_policy"),
+        created_at=_decode_required_text(row, row_name=row_name, column="created_at"),
+        updated_at=_decode_required_text(row, row_name=row_name, column="updated_at"),
+        terminal_at=terminal_at,
     )
+    try:
+        validate_terminal_event_refs_shape(
+            terminal_event_id=run_row.terminal_event_id,
+            terminal_event_sequence=run_row.terminal_event_sequence,
+            terminal_at=run_row.terminal_at,
+            is_terminal=_is_terminal_run_status(run_row.status),
+            owner_label="Run",
+        )
+    except HostDurableError as exc:
+        raise _wrap_row_decode_shape_error(row_name=row_name, detail=str(exc)) from exc
+    return run_row
 
 
 def attempt_row_from_host_row(row: HostRow) -> AttemptRow:
@@ -801,22 +1004,38 @@ def attempt_row_from_host_row(row: HostRow) -> AttemptRow:
 
     :param row: ``HostTransaction`` 查询返回的 row。
     :returns: ``AttemptRow``。
-    :raises HostDurableError: row 字段类型或状态 enum 值无效时抛出。
+    :raises HostRowDecodeError: row 缺列、字段类型、状态 enum 或终态形状无效时抛出。
     """
 
-    return AttemptRow(
-        attempt_id=_require_text(row.get("attempt_id"), field_name="attempt_id"),
-        run_id=_require_text(row.get("run_id"), field_name="run_id"),
-        execution_id=_require_text(row.get("execution_id"), field_name="execution_id"),
-        status=deserialize_attempt_status(_require_text(row.get("status"), field_name="status")),
-        started_event_id=_require_text(row.get("started_event_id"), field_name="started_event_id"),
-        started_event_sequence=_require_int(row.get("started_event_sequence"), field_name="started_event_sequence"),
-        terminal_event_id=_optional_text(row.get("terminal_event_id"), field_name="terminal_event_id"),
-        terminal_event_sequence=_optional_int(row.get("terminal_event_sequence"), field_name="terminal_event_sequence"),
-        created_at=_require_text(row.get("created_at"), field_name="created_at"),
-        updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
-        terminal_at=_optional_text(row.get("terminal_at"), field_name="terminal_at"),
+    row_name = TABLE_HOST_ATTEMPTS
+    status = _decode_enum(row, row_name=row_name, column="status", deserializer=deserialize_attempt_status)
+    terminal_event_id = _decode_optional_text(row, row_name=row_name, column="terminal_event_id")
+    terminal_event_sequence = _decode_optional_int(row, row_name=row_name, column="terminal_event_sequence")
+    terminal_at = _decode_optional_text(row, row_name=row_name, column="terminal_at")
+    attempt_row = AttemptRow(
+        attempt_id=_decode_required_text(row, row_name=row_name, column="attempt_id"),
+        run_id=_decode_required_text(row, row_name=row_name, column="run_id"),
+        execution_id=_decode_required_text(row, row_name=row_name, column="execution_id"),
+        status=status,
+        started_event_id=_decode_required_text(row, row_name=row_name, column="started_event_id"),
+        started_event_sequence=_decode_required_int(row, row_name=row_name, column="started_event_sequence"),
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        created_at=_decode_required_text(row, row_name=row_name, column="created_at"),
+        updated_at=_decode_required_text(row, row_name=row_name, column="updated_at"),
+        terminal_at=terminal_at,
     )
+    try:
+        validate_terminal_event_refs_shape(
+            terminal_event_id=attempt_row.terminal_event_id,
+            terminal_event_sequence=attempt_row.terminal_event_sequence,
+            terminal_at=attempt_row.terminal_at,
+            is_terminal=attempt_row.status in _TERMINAL_ATTEMPT_STATUSES,
+            owner_label="Attempt",
+        )
+    except HostDurableError as exc:
+        raise _wrap_row_decode_shape_error(row_name=row_name, detail=str(exc)) from exc
+    return attempt_row
 
 
 def dispatch_record_row_from_host_row(row: HostRow) -> DispatchRecordRow:
@@ -824,39 +1043,44 @@ def dispatch_record_row_from_host_row(row: HostRow) -> DispatchRecordRow:
 
     :param row: ``HostTransaction`` 查询返回的 row。
     :returns: ``DispatchRecordRow``。
-    :raises HostDurableError: row 字段类型或状态 enum 值无效时抛出。
+    :raises HostRowDecodeError: row 缺列、字段类型或状态 enum 值无效时抛出。
     """
 
+    row_name = TABLE_HOST_ATTEMPT_DISPATCH_RECORDS
     return DispatchRecordRow(
-        dispatch_record_id=_require_text(row.get("dispatch_record_id"), field_name="dispatch_record_id"),
-        run_id=_require_text(row.get("run_id"), field_name="run_id"),
-        attempt_id=_require_text(row.get("attempt_id"), field_name="attempt_id"),
-        execution_id=_require_text(row.get("execution_id"), field_name="execution_id"),
-        status=deserialize_dispatch_record_status(_require_text(row.get("status"), field_name="status")),
-        worker_kind=deserialize_worker_kind(_require_text(row.get("worker_kind"), field_name="worker_kind")),
-        execution_target=_require_text(row.get("execution_target"), field_name="execution_target"),
-        owner_host_instance_id=_optional_text(row.get("owner_host_instance_id"), field_name="owner_host_instance_id"),
-        created_event_id=_require_text(row.get("created_event_id"), field_name="created_event_id"),
-        created_event_sequence=_require_int(row.get("created_event_sequence"), field_name="created_event_sequence"),
-        waiting_for_lane_at=_optional_text(row.get("waiting_for_lane_at"), field_name="waiting_for_lane_at"),
-        lane_name=_optional_text(row.get("lane_name"), field_name="lane_name"),
-        lane_claim_id=_optional_text(row.get("lane_claim_id"), field_name="lane_claim_id"),
-        lane_owner_id=_optional_text(row.get("lane_owner_id"), field_name="lane_owner_id"),
-        lane_acquired_at=_optional_text(row.get("lane_acquired_at"), field_name="lane_acquired_at"),
-        dispatching_at=_optional_text(row.get("dispatching_at"), field_name="dispatching_at"),
-        worker_accepted_at=_optional_text(row.get("worker_accepted_at"), field_name="worker_accepted_at"),
-        worker_accept_event_id=_optional_text(row.get("worker_accept_event_id"), field_name="worker_accept_event_id"),
-        worker_accept_event_sequence=_optional_int(
-            row.get("worker_accept_event_sequence"),
-            field_name="worker_accept_event_sequence",
+        dispatch_record_id=_decode_required_text(row, row_name=row_name, column="dispatch_record_id"),
+        run_id=_decode_required_text(row, row_name=row_name, column="run_id"),
+        attempt_id=_decode_required_text(row, row_name=row_name, column="attempt_id"),
+        execution_id=_decode_required_text(row, row_name=row_name, column="execution_id"),
+        status=_decode_enum(
+            row,
+            row_name=row_name,
+            column="status",
+            deserializer=deserialize_dispatch_record_status,
         ),
-        cancelled_event_id=_optional_text(row.get("cancelled_event_id"), field_name="cancelled_event_id"),
-        cancelled_event_sequence=_optional_int(
-            row.get("cancelled_event_sequence"), field_name="cancelled_event_sequence"
+        worker_kind=_decode_enum(row, row_name=row_name, column="worker_kind", deserializer=deserialize_worker_kind),
+        execution_target=_decode_required_text(row, row_name=row_name, column="execution_target"),
+        owner_host_instance_id=_decode_optional_text(row, row_name=row_name, column="owner_host_instance_id"),
+        created_event_id=_decode_required_text(row, row_name=row_name, column="created_event_id"),
+        created_event_sequence=_decode_required_int(row, row_name=row_name, column="created_event_sequence"),
+        waiting_for_lane_at=_decode_optional_text(row, row_name=row_name, column="waiting_for_lane_at"),
+        lane_name=_decode_optional_text(row, row_name=row_name, column="lane_name"),
+        lane_claim_id=_decode_optional_text(row, row_name=row_name, column="lane_claim_id"),
+        lane_owner_id=_decode_optional_text(row, row_name=row_name, column="lane_owner_id"),
+        lane_acquired_at=_decode_optional_text(row, row_name=row_name, column="lane_acquired_at"),
+        dispatching_at=_decode_optional_text(row, row_name=row_name, column="dispatching_at"),
+        worker_accepted_at=_decode_optional_text(row, row_name=row_name, column="worker_accepted_at"),
+        worker_accept_event_id=_decode_optional_text(row, row_name=row_name, column="worker_accept_event_id"),
+        worker_accept_event_sequence=_decode_optional_int(
+            row,
+            row_name=row_name,
+            column="worker_accept_event_sequence",
         ),
-        created_at=_require_text(row.get("created_at"), field_name="created_at"),
-        updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
-        cancelled_at=_optional_text(row.get("cancelled_at"), field_name="cancelled_at"),
+        cancelled_event_id=_decode_optional_text(row, row_name=row_name, column="cancelled_event_id"),
+        cancelled_event_sequence=_decode_optional_int(row, row_name=row_name, column="cancelled_event_sequence"),
+        created_at=_decode_required_text(row, row_name=row_name, column="created_at"),
+        updated_at=_decode_required_text(row, row_name=row_name, column="updated_at"),
+        cancelled_at=_decode_optional_text(row, row_name=row_name, column="cancelled_at"),
     )
 
 
@@ -865,55 +1089,79 @@ def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
 
     :param row: ``HostTransaction`` 查询返回的 row。
     :returns: ``WaitRecordRow``。
-    :raises HostDurableError: row 字段类型、状态 enum 或 typed ref 无效时抛出。
+    :raises HostRowDecodeError: row 缺列、字段类型、状态 enum、typed ref 或终态形状无效时抛出。
     """
 
-    adapter_key = _wait_adapter_key_from_text(_require_text(row.get("adapter_key"), field_name="adapter_key"))
-    snapshot_ref = deserialize_wait_snapshot_ref(
-        _optional_text(row.get("snapshot_ref"), field_name="snapshot_ref"),
-        _optional_text(row.get("snapshot_captured_at"), field_name="snapshot_captured_at"),
-        _optional_text(row.get("snapshot_digest"), field_name="snapshot_digest"),
-    )
-    external_job_ref = deserialize_external_job_ref(
-        adapter_key,
-        _optional_text(row.get("external_job_id"), field_name="external_job_id"),
-    )
-    return WaitRecordRow(
-        wait_id=_require_text(row.get("wait_id"), field_name="wait_id"),
-        session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        run_id=_require_text(row.get("run_id"), field_name="run_id"),
-        attempt_id=_require_text(row.get("attempt_id"), field_name="attempt_id"),
-        execution_id=_require_text(row.get("execution_id"), field_name="execution_id"),
-        tool_call_id=_require_text(row.get("tool_call_id"), field_name="tool_call_id"),
-        tool_name=_require_text(row.get("tool_name"), field_name="tool_name"),
+    row_name = TABLE_HOST_WAIT_RECORDS
+    adapter_key_text = _decode_required_text(row, row_name=row_name, column="adapter_key")
+    try:
+        adapter_key = _wait_adapter_key_from_text(adapter_key_text)
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name="adapter_key", detail=str(exc)),
+            row_name=row_name,
+            field_name="adapter_key",
+        ) from exc
+    snapshot_ref_id = _decode_optional_text(row, row_name=row_name, column="snapshot_ref")
+    snapshot_captured_at = _decode_optional_text(row, row_name=row_name, column="snapshot_captured_at")
+    snapshot_digest = _decode_optional_text(row, row_name=row_name, column="snapshot_digest")
+    try:
+        snapshot_ref = deserialize_wait_snapshot_ref(
+            snapshot_ref_id,
+            snapshot_captured_at,
+            snapshot_digest,
+        )
+    except HostDurableError as exc:
+        raise _wrap_row_decode_shape_error(row_name=row_name, detail=str(exc)) from exc
+    external_job_id = _decode_optional_text(row, row_name=row_name, column="external_job_id")
+    try:
+        external_job_ref = deserialize_external_job_ref(adapter_key, external_job_id)
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(row_name=row_name, field_name="external_job_id", detail=str(exc)),
+            row_name=row_name,
+            field_name="external_job_id",
+        ) from exc
+    status = _decode_enum(row, row_name=row_name, column="status", deserializer=deserialize_wait_record_status)
+    terminal_at = _decode_optional_text(row, row_name=row_name, column="terminal_at")
+    wait_row = WaitRecordRow(
+        wait_id=_decode_required_text(row, row_name=row_name, column="wait_id"),
+        session_id=_decode_required_text(row, row_name=row_name, column="session_id"),
+        run_id=_decode_required_text(row, row_name=row_name, column="run_id"),
+        attempt_id=_decode_required_text(row, row_name=row_name, column="attempt_id"),
+        execution_id=_decode_required_text(row, row_name=row_name, column="execution_id"),
+        tool_call_id=_decode_required_text(row, row_name=row_name, column="tool_call_id"),
+        tool_name=_decode_required_text(row, row_name=row_name, column="tool_name"),
         adapter_key=adapter_key,
-        await_kind=_require_text(row.get("await_kind"), field_name="await_kind"),
-        resume_policy=deserialize_wait_resume_policy(
-            _require_text(row.get("resume_policy"), field_name="resume_policy")
+        await_kind=_decode_required_text(row, row_name=row_name, column="await_kind"),
+        resume_policy=_decode_enum(
+            row,
+            row_name=row_name,
+            column="resume_policy",
+            deserializer=deserialize_wait_resume_policy,
         ),
-        resume_token=_require_text(row.get("resume_token"), field_name="resume_token"),
+        resume_token=_decode_required_text(row, row_name=row_name, column="resume_token"),
         snapshot_ref=snapshot_ref,
         external_job_ref=external_job_ref,
-        accept_idempotency_key=_require_text(row.get("accept_idempotency_key"), field_name="accept_idempotency_key"),
-        resolve_idempotency_key=_optional_text(
-            row.get("resolve_idempotency_key"),
-            field_name="resolve_idempotency_key",
-        ),
-        resolve_semantic_digest=_optional_text(
-            row.get("resolve_semantic_digest"),
-            field_name="resolve_semantic_digest",
-        ),
-        deadline_at=_optional_text(row.get("deadline_at"), field_name="deadline_at"),
-        expires_at=_optional_text(row.get("expires_at"), field_name="expires_at"),
-        status=deserialize_wait_record_status(_require_text(row.get("status"), field_name="status")),
-        created_event_id=_require_text(row.get("created_event_id"), field_name="created_event_id"),
-        created_event_sequence=_require_int(row.get("created_event_sequence"), field_name="created_event_sequence"),
-        updated_event_id=_require_text(row.get("updated_event_id"), field_name="updated_event_id"),
-        updated_event_sequence=_require_int(row.get("updated_event_sequence"), field_name="updated_event_sequence"),
-        created_at=_require_text(row.get("created_at"), field_name="created_at"),
-        updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
-        terminal_at=_optional_text(row.get("terminal_at"), field_name="terminal_at"),
+        accept_idempotency_key=_decode_required_text(row, row_name=row_name, column="accept_idempotency_key"),
+        resolve_idempotency_key=_decode_optional_text(row, row_name=row_name, column="resolve_idempotency_key"),
+        resolve_semantic_digest=_decode_optional_text(row, row_name=row_name, column="resolve_semantic_digest"),
+        deadline_at=_decode_optional_text(row, row_name=row_name, column="deadline_at"),
+        expires_at=_decode_optional_text(row, row_name=row_name, column="expires_at"),
+        status=status,
+        created_event_id=_decode_required_text(row, row_name=row_name, column="created_event_id"),
+        created_event_sequence=_decode_required_int(row, row_name=row_name, column="created_event_sequence"),
+        updated_event_id=_decode_required_text(row, row_name=row_name, column="updated_event_id"),
+        updated_event_sequence=_decode_required_int(row, row_name=row_name, column="updated_event_sequence"),
+        created_at=_decode_required_text(row, row_name=row_name, column="created_at"),
+        updated_at=_decode_required_text(row, row_name=row_name, column="updated_at"),
+        terminal_at=terminal_at,
     )
+    try:
+        validate_wait_terminal_at_shape(status_value=wait_row.status.value, terminal_at=wait_row.terminal_at)
+    except HostDurableError as exc:
+        raise _wrap_row_decode_shape_error(row_name=row_name, detail=str(exc)) from exc
+    return wait_row
 
 
 def read_session_by_id(transaction: HostTransaction, session_id: str) -> SessionRow | None:

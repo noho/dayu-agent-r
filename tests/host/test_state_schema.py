@@ -9,7 +9,7 @@ import pytest
 
 from dayu.host.api import AttemptStatus, RunStatus, SessionStatus
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
-from dayu.host.durable.errors import HostDurableError, HostUniqueConstraintError
+from dayu.host.durable.errors import HostDurableError, HostRowDecodeError, HostUniqueConstraintError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -776,6 +776,88 @@ def test_state_row_codecs_round_trip_from_host_rows(tmp_path: Path) -> None:
         )
 
 
+def test_run_row_decode_missing_status_column_raises_row_decode_error() -> None:
+    """Run row decode 缺少 status 列时抛出稳定 row decode 错误。
+
+    :returns: ``None``。
+    :raises AssertionError: 未抛出 ``HostRowDecodeError`` 或错误属性不符合预期时抛出。
+    """
+
+    with pytest.raises(HostRowDecodeError) as error_info:
+        run_row_from_host_row(_run_host_row(include_status_column=False))
+
+    _assert_host_row_decode_error(
+        error_info.value,
+        row_name=TABLE_HOST_RUNS,
+        field_name="status",
+    )
+
+
+def test_run_row_decode_integer_status_raises_row_decode_error() -> None:
+    """Run row decode 读取到整数 status 时抛出稳定 row decode 错误。
+
+    :returns: ``None``。
+    :raises AssertionError: 未抛出 ``HostRowDecodeError`` 或错误属性不符合预期时抛出。
+    """
+
+    with pytest.raises(HostRowDecodeError) as error_info:
+        run_row_from_host_row(_run_host_row(status=1))
+
+    _assert_host_row_decode_error(
+        error_info.value,
+        row_name=TABLE_HOST_RUNS,
+        field_name="status",
+    )
+
+
+def test_run_row_decode_terminal_missing_terminal_at_raises_row_decode_error() -> None:
+    """Run row decode 终态缺少 terminal_at 时抛出稳定 row decode 错误。
+
+    :returns: ``None``。
+    :raises AssertionError: 未抛出 ``HostRowDecodeError`` 或错误属性不符合预期时抛出。
+    """
+
+    with pytest.raises(HostRowDecodeError) as error_info:
+        run_row_from_host_row(
+            _run_host_row(
+                status=serialize_run_status(RunStatus.SUCCEEDED),
+                terminal_event_id="event-terminal-run-1",
+                terminal_event_sequence=3,
+                terminal_at=None,
+            )
+        )
+
+    _assert_host_row_decode_error(
+        error_info.value,
+        row_name=TABLE_HOST_RUNS,
+        field_name=None,
+    )
+
+
+def test_attempt_row_decode_terminal_missing_refs_raises_row_decode_error() -> None:
+    """Attempt row decode 终态缺少 terminal refs 时抛出稳定 row decode 错误。
+
+    :returns: ``None``。
+    :raises AssertionError: 未抛出 ``HostRowDecodeError`` 或错误属性不符合预期时抛出。
+    """
+
+    with pytest.raises(HostRowDecodeError) as error_info:
+        attempt_row_from_host_row(
+            _attempt_host_row(
+                status=serialize_attempt_status(AttemptStatus.SUCCEEDED),
+                terminal_event_id=None,
+                terminal_event_sequence=None,
+                terminal_at=None,
+            )
+        )
+
+    _assert_host_row_decode_error(
+        error_info.value,
+        row_name=TABLE_HOST_ATTEMPTS,
+        field_name=None,
+    )
+
+
 def test_dispatch_record_nullability_rules_reject_invalid_shapes(
     tmp_path: Path,
 ) -> None:
@@ -897,6 +979,197 @@ def test_status_deserializers_reject_unknown_values() -> None:
         deserialize_dispatch_record_status("accepted")
     with pytest.raises(HostDurableError):
         deserialize_worker_kind("thread")
+
+
+def _assert_host_row_decode_error(
+    error: HostDurableError,
+    *,
+    row_name: str,
+    field_name: str | None,
+) -> None:
+    """断言错误保持 durable row decode 边界属性。
+
+    :param error: 捕获到的 durable 错误。
+    :param row_name: 期望的 row 名称。
+    :param field_name: 期望的字段名；row 级形状错误时为 ``None``。
+    :returns: ``None``。
+    :raises AssertionError: 错误类型、属性或消息不符合预期时抛出。
+    """
+
+    assert isinstance(error, HostDurableError)
+    assert isinstance(error, HostRowDecodeError)
+    assert error.row_name == row_name
+    assert error.field_name == field_name
+    assert row_name in str(error)
+    if field_name is not None:
+        assert field_name in str(error)
+
+
+def _run_host_row(
+    *,
+    status: str | int = "running",
+    terminal_event_id: str | None = None,
+    terminal_event_sequence: int | None = None,
+    terminal_at: str | None = None,
+    include_status_column: bool = True,
+) -> HostRow:
+    """构造 Run row codec 测试用 HostRow。
+
+    :param status: status 列的原始 SQLite 值。
+    :param terminal_event_id: terminal EventLog id。
+    :param terminal_event_sequence: terminal EventLog sequence。
+    :param terminal_at: terminal timestamp。
+    :param include_status_column: 是否包含 status 列。
+    :returns: ``HostRow``。
+    :raises AssertionError: 本 helper 不主动触发断言。
+    """
+
+    if include_status_column:
+        return HostRow(
+            columns=(
+                "run_id",
+                "session_id",
+                "status",
+                "client_request_id",
+                "input_event_id",
+                "input_event_sequence",
+                "accepted_event_id",
+                "accepted_event_sequence",
+                "queued_event_id",
+                "queued_event_sequence",
+                "started_event_id",
+                "started_event_sequence",
+                "terminal_event_id",
+                "terminal_event_sequence",
+                "current_attempt_id",
+                "source_run_id",
+                "source_run_relation",
+                "execution_target",
+                "queue_policy",
+                "created_at",
+                "updated_at",
+                "terminal_at",
+            ),
+            values=(
+                "run-1",
+                "session-1",
+                status,
+                "request-1",
+                "event-input-run-1",
+                1,
+                "event-accepted-run-1",
+                2,
+                None,
+                None,
+                "event-started-run-1",
+                3,
+                terminal_event_id,
+                terminal_event_sequence,
+                None,
+                None,
+                None,
+                "local-default",
+                "queue",
+                _TIMESTAMP,
+                _TIMESTAMP,
+                terminal_at,
+            ),
+        )
+    return HostRow(
+        columns=(
+            "run_id",
+            "session_id",
+            "client_request_id",
+            "input_event_id",
+            "input_event_sequence",
+            "accepted_event_id",
+            "accepted_event_sequence",
+            "queued_event_id",
+            "queued_event_sequence",
+            "started_event_id",
+            "started_event_sequence",
+            "terminal_event_id",
+            "terminal_event_sequence",
+            "current_attempt_id",
+            "source_run_id",
+            "source_run_relation",
+            "execution_target",
+            "queue_policy",
+            "created_at",
+            "updated_at",
+            "terminal_at",
+        ),
+        values=(
+            "run-1",
+            "session-1",
+            "request-1",
+            "event-input-run-1",
+            1,
+            "event-accepted-run-1",
+            2,
+            None,
+            None,
+            "event-started-run-1",
+            3,
+            terminal_event_id,
+            terminal_event_sequence,
+            None,
+            None,
+            None,
+            "local-default",
+            "queue",
+            _TIMESTAMP,
+            _TIMESTAMP,
+            terminal_at,
+        ),
+    )
+
+
+def _attempt_host_row(
+    *,
+    status: str = "starting",
+    terminal_event_id: str | None = None,
+    terminal_event_sequence: int | None = None,
+    terminal_at: str | None = None,
+) -> HostRow:
+    """构造 Attempt row codec 测试用 HostRow。
+
+    :param status: status 列文本。
+    :param terminal_event_id: terminal EventLog id。
+    :param terminal_event_sequence: terminal EventLog sequence。
+    :param terminal_at: terminal timestamp。
+    :returns: ``HostRow``。
+    :raises AssertionError: 本 helper 不主动触发断言。
+    """
+
+    return HostRow(
+        columns=(
+            "attempt_id",
+            "run_id",
+            "execution_id",
+            "status",
+            "started_event_id",
+            "started_event_sequence",
+            "terminal_event_id",
+            "terminal_event_sequence",
+            "created_at",
+            "updated_at",
+            "terminal_at",
+        ),
+        values=(
+            "attempt-1",
+            "run-1",
+            "execution-1",
+            status,
+            "event-attempt-started-attempt-1",
+            1,
+            terminal_event_id,
+            terminal_event_sequence,
+            _TIMESTAMP,
+            _TIMESTAMP,
+            terminal_at,
+        ),
+    )
 
 
 def _insert_event_tx(

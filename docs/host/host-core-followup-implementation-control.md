@@ -117,25 +117,26 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-LAYER-01 Slice 2 accepted; Slice 3 pending |
+| implementation status | WU-LAYER-01 Slice 3 code review passed; accepted slice commit pending |
 | active work unit | WU-LAYER-01 |
 | default next work unit | WU-LAYER-02 |
 | accepted plan commit | 278e5be |
 | plan artifact | docs/host/wu-layer-01-durable-row-primitive-cleanup-plan.md |
 | plan review artifacts | docs/reviews/wu-layer-01-plan-review-mimo-20260602.md; docs/reviews/wu-layer-01-plan-review-ds-20260602.md; docs/reviews/wu-layer-01-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-01-plan-rereview-ds-20260602.md |
-| accepted slice commits | Slice 1: 02396e5; Slice 2: ff64f0b |
+| accepted slice commits | Slice 1: 02396e5; Slice 2: ff64f0b; Slice 3: pending |
 | Slice 1 status | accepted; target tests 33 passed; pyright 0 errors |
 | Slice 2 status | accepted; target tests 115 passed; pyright 0 errors |
-| current slice | WU-LAYER-01 implementation Slice 3 pending |
-| implementation artifact | docs/reviews/wu-layer-01-slice1-schema-definition-validation-codex-20260602.md; docs/reviews/wu-layer-01-slice2-terminal-shape-rules-codex-20260602.md |
-| code review artifacts | docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-controller-adjudication-20260602.md |
+| Slice 3 status | code review passed; target tests 47 passed; pyright 0 errors; accepted commit pending |
+| current slice | WU-LAYER-01 Slice 3 code review |
+| implementation artifact | docs/reviews/wu-layer-01-slice1-schema-definition-validation-codex-20260602.md; docs/reviews/wu-layer-01-slice2-terminal-shape-rules-codex-20260602.md; docs/reviews/wu-layer-01-slice3-row-decode-error-boundary-codex-20260602.md |
+| code review artifacts | docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-controller-adjudication-20260602.md |
 | accepted aggregate deepreview commit | none |
 | draft PR | none |
 | PR review artifacts | none |
 | accepted PR review commit | none |
 | PR follow-up artifacts | none |
-| validation | WU-LAYER-01 Slice 2: target tests 115 passed; pyright 0 errors |
-| next entry point | WU-LAYER-01 implementation Slice 3 |
+| validation | WU-LAYER-01 Slice 3: target tests 47 passed; pyright 0 errors |
+| next entry point | WU-LAYER-01 Slice 3 accepted slice commit |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
