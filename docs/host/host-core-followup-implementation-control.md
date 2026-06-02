@@ -129,7 +129,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | current slice | aggregate deepreview closeout |
 | implementation artifact | docs/reviews/wu-engine-01-slice3-validation-codex-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-codex-20260602.md |
 | code review artifacts | docs/reviews/wu-engine-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-engine-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-ds-20260602.md |
-| accepted aggregate deepreview commit | a50d6ef |
+| accepted aggregate deepreview commit | cb190ee |
 | validation | WU-ENGINE-01 target tests 97 passed; pyright 0 errors |
 | next entry point | draft PR gate |
 | design source | docs/host/design.md |
@@ -581,7 +581,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：aggregate deepreview artifacts: `docs/reviews/wu-engine-01-aggregate-deepreview-mimo-20260602.md`, `docs/reviews/wu-engine-01-aggregate-deepreview-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-engine-01-aggregate-deepreview-controller-adjudication-20260602.md`。
 - 裁决：aggregate deepreview 无 blocking/high/medium finding。接受 DS F-01/F-02 作为当前 gate 小修复；MiMo 测试 helper 重复 finding 记录为 `RR-ENGINE-01-01` 并 deferred-with-owner。
 - 2026-06-02：aggregate fix completed by AgentCodex，artifact: `docs/reviews/wu-engine-01-aggregate-fix-codex-20260602.md`。Fix re-review artifacts: `docs/reviews/wu-engine-01-aggregate-fix-rereview-mimo-20260602.md`, `docs/reviews/wu-engine-01-aggregate-fix-rereview-ds-20260602.md`。裁决：DS F-01/F-02 均 closed，无新增 finding。Controller verification: WU-ENGINE-01 target tests 97 passed; pyright 0 errors。
-- 2026-06-02：WU-ENGINE-01 local gates passed，进入 `ready-to-open-draft-PR`。Accepted aggregate deepreview commit: a50d6ef。用户已授权进入 draft PR gate，下一步自动 push 并创建 draft PR；merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
+- 2026-06-02：WU-ENGINE-01 local gates passed，进入 `ready-to-open-draft-PR`。Accepted aggregate deepreview commit: cb190ee。用户已授权进入 draft PR gate，下一步自动 push 并创建 draft PR；merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
 
 ## WU-LAYER-01 Durable Row Primitive / Type Owner Cleanup
 
