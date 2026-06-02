@@ -116,8 +116,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-LAYER-02 aggregate accepted; local commit pending |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-LAYER-01 and WU-LAYER-02 local gates complete; ready to open draft PR |
 | active work unit | WU-LAYER-02 |
 | default next work unit | WU-LAYER-02 |
 | accepted plan commit | WU-LAYER-01: 278e5be; WU-LAYER-02: 76ecdb8 |
@@ -131,17 +131,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-LAYER-02 Slice 1 status | accepted; target tests 47 passed; pyright 0 errors |
 | WU-LAYER-02 Slice 2 status | accepted; target tests 125 passed; pyright 0 errors |
 | WU-LAYER-02 Slice 3 status | accepted; target tests plus regression 168 passed; pyright 0 errors |
-| current slice | WU-LAYER-02 aggregate accepted local commit |
+| current slice | none |
 | aggregate deepreview artifacts | docs/reviews/wu-layer-01-aggregate-deepreview-mimo-20260602.md; docs/reviews/wu-layer-01-aggregate-deepreview-ds-20260602.md; docs/reviews/wu-layer-01-aggregate-deepreview-controller-adjudication-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-aggregate-review-mimo-20260602.md; docs/reviews/wu-layer-02-aggregate-review-ds-20260602.md; docs/reviews/wu-layer-02-aggregate-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-aggregate-fix-llm-compaction-report-20260602.md; docs/reviews/wu-layer-02-aggregate-fix-llm-compaction-rereview-mimo-20260602.md; docs/reviews/wu-layer-02-aggregate-fix-llm-compaction-rereview-ds-20260602.md |
 | implementation artifact | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-schema-definition-validation-codex-20260602.md; docs/reviews/wu-layer-01-slice2-terminal-shape-rules-codex-20260602.md; docs/reviews/wu-layer-01-slice3-row-decode-error-boundary-codex-20260602.md; docs/reviews/wu-layer-01-slice4-integration-verification-codex-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-implementation-report-20260602.md; docs/reviews/wu-layer-02-slice2-implementation-report-20260602.md; docs/reviews/wu-layer-02-slice2-blocker-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice3-implementation-report-20260602.md |
 | code review artifacts | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-controller-adjudication-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-controller-adjudication-20260602.md |
-| accepted aggregate deepreview commit | WU-LAYER-01: 351eb53 |
+| accepted aggregate deepreview commit | WU-LAYER-01: 351eb53; WU-LAYER-02: 4921d73 |
 | draft PR | none |
 | PR review artifacts | none |
 | accepted PR review commit | none |
 | PR follow-up artifacts | none |
 | validation | WU-LAYER-02 Slice 1: target tests 47 passed; pyright 0 errors; WU-LAYER-02 Slice 2: target tests plus import boundary 125 passed; pyright 0 errors; WU-LAYER-02 Slice 3: target tests plus regression 168 passed; pyright 0 errors; WU-LAYER-02 aggregate final: cross-slice tests 469 passed; pyright 0 errors |
-| next entry point | WU-LAYER-02 aggregate acceptance record |
+| next entry point | draft PR gate |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -191,7 +191,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-DUR-05 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | index definition / DDL text invariant validation | deferred-with-owner | WU-LAYER-01 schema invariant hardening | 后续如需抵御同名但定义错误的 index，再扩展 schema invariant validation | WU-DUR 当前只要求 required table/index existence fail-closed；full DDL text/index definition validation 已由 plan 明确 defer。 |
 | RR-LIFE-01 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | worker-started-but-not-accepted deterministic close window / close cancellation boundary | deferred-with-owner | future scheduler lifecycle hardening if needed | 若后续 close() refactor 改变 cleanup 顺序、增加非幂等步骤，或需要覆盖 worker-started-but-not-accepted precise window，再补 deterministic instrumentation/test | 当前 Slice B 已覆盖 lane-wait pre-worker 与 active-worker close 两侧稳定窗口，并证明 close cancellation retry 可在 lane close 边界补完 cleanup；精确 worker-started-but-not-accepted 窗口未稳定构造，按 plan deferred。 |
 | RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
-| RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
+| RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | future Host internal constant cleanup if concrete correctness risk appears | 当前 WU-LAYER-02 不处理 fallback action 常量；如后续出现具体 correctness 风险，再单独进入 Host internal constant cleanup | WU-LAYER-02 plan 与 aggregate review 均将 scope 收窄到层中立 diagnostic text primitive；fallback action 私有常量重复没有当前 correctness 证据，不作为本轮 ready gate 阻塞项。 |
 | RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
 | RR-ENGINE-01-01 | WU-ENGINE-01 aggregate deepreview / PR follow-up | 测试 helper 维护性 | closed | WU-ENGINE-01 PR follow-up | 已提取 `tests/engine/runners/openai/_diagnostic_helpers.py`，三个测试文件统一导入 `leaf_strings` / `serialized_size` | Controller verification: affected tests 48 passed; WU-ENGINE-01 target tests 97 passed; target pyright 0 errors; full pyright 0 errors。MiMo/DS follow-up review PASS。 |
 
@@ -210,8 +210,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | draft-PR-pass |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | draft-PR-pass |
-| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
-| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
+| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 本轮已完成：local-pass |
+| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 本轮已完成：local-pass |
 | WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 已完成 |
 | WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 | 已完成 |
 
