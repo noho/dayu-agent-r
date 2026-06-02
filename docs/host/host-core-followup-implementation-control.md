@@ -116,14 +116,20 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-ENGINE-01 accepted plan commit recorded; ready for Slice 1 implementation |
+| gate | accepted slice commit |
+| implementation status | WU-ENGINE-01 Slice 1 re-review passed; ready for accepted slice commit |
 | active work unit | WU-ENGINE-01 |
 | default next work unit | WU-ENGINE-01 |
 | accepted plan commit | 10b0eaa |
 | plan artifact | docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md |
 | plan review artifacts | docs/reviews/wu-engine-01-plan-review-mimo-20260602.md; docs/reviews/wu-engine-01-plan-review-ds-20260602.md; docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md |
-| next entry point | WU-ENGINE-01 Slice 1 implementation |
+| current slice | Slice 1 Protocol Diagnostic Payload Helper + Parser 收口 |
+| implementation artifact | docs/reviews/wu-engine-01-slice1-implementation-codex-20260602.md |
+| code review artifacts | docs/reviews/wu-engine-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-engine-01-slice1-code-review-ds-20260602.md |
+| fix artifact | docs/reviews/wu-engine-01-slice1-fix-codex-20260602.md |
+| re-review artifacts | docs/reviews/wu-engine-01-slice1-code-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-slice1-code-rereview-ds-20260602.md |
+| validation | Slice 1 target tests 35 passed; pyright 0 errors |
+| next entry point | WU-ENGINE-01 Slice 1 accepted commit |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 

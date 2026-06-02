@@ -23,7 +23,6 @@ Phase 1 不引入会话级状态：本类对单次 :meth:`AsyncRunner.call` 调�
 
 from __future__ import annotations
 
-import base64
 import codecs
 import json
 import logging
@@ -50,6 +49,11 @@ from dayu.engine.runners.openai._types import (
     _OpenAIToolCallFunction,
     _ReasoningProtocolHook,
 )
+from dayu.engine.runners.openai.diagnostic_payload import (
+    invalid_utf8_diagnostic_payload,
+    protocol_object_diagnostic_payload,
+    provider_error_diagnostic_payload,
+)
 from dayu.engine.runners.openai.tool_call_aggregator import (
     ToolCallAggregator,
     _is_tool_call_index,
@@ -66,6 +70,12 @@ _ERROR_FIELD: str = "error"
 _ERROR_MESSAGE_FIELD: str = "message"
 _MISSING_CHOICES_CODE: str = "sse_missing_choices"
 _PROVIDER_ERROR_CODE: str = "sse_provider_error"
+_INVALID_JSON_CODE: str = "sse_invalid_json"
+_PAYLOAD_NOT_OBJECT_CODE: str = "sse_payload_not_object"
+_INVALID_UTF8_CODE: str = "invalid_utf8"
+_TRUNCATED_UTF8_TAIL_CODE: str = "truncated_utf8_tail"
+_MISSING_CHOICES_AND_USAGE_REASON: str = "missing_choices_and_usage"
+_NO_VALID_CHOICE_OBJECT_REASON: str = "no_valid_choice_object"
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "stop": FinishReason.STOP,
     "length": FinishReason.LENGTH,
@@ -219,7 +229,9 @@ class SSEParser:
         :returns: 协议错误与 Done(ERROR) 事件。
         """
 
-        error_code = "truncated_utf8_tail" if final_decode else "invalid_utf8"
+        error_code = (
+            _TRUNCATED_UTF8_TAIL_CODE if final_decode else _INVALID_UTF8_CODE
+        )
         message = (
             "SSE stream ended with an incomplete UTF-8 sequence"
             if final_decode
@@ -230,14 +242,15 @@ class SSEParser:
             error_code,
             len(chunk),
         )
-        encoded = base64.b64encode(chunk).decode("ascii")
-        raw_payload: JsonValue = {"chunk_base64": encoded, "final_decode": final_decode}
         yield _make_event(
             RunnerProtocolErrorData(
                 error_code=error_code,
                 message=message,
                 provider_request_id=self._provider_request_id,
-                raw_payload=raw_payload,
+                raw_payload=invalid_utf8_diagnostic_payload(
+                    chunk,
+                    final_decode=final_decode,
+                ),
                 partial_tool_calls=self._aggregator.partial_summaries(),
             )
         )
@@ -278,12 +291,13 @@ class SSEParser:
             parsed = json.loads(joined)
         except json.JSONDecodeError as exc:
             _LOGGER.warning(
-                "sse.protocol_error code=sse_invalid_json detail=%s",
+                "sse.protocol_error code=%s detail=%s",
+                _INVALID_JSON_CODE,
                 exc.__class__.__name__,
             )
             yield _make_event(
                 RunnerProtocolErrorData(
-                    error_code="sse_invalid_json",
+                    error_code=_INVALID_JSON_CODE,
                     message=f"SSE data line is not valid JSON: {exc}",
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
@@ -301,7 +315,7 @@ class SSEParser:
         if not isinstance(parsed, dict):
             yield _make_event(
                 RunnerProtocolErrorData(
-                    error_code="sse_payload_not_object",
+                    error_code=_PAYLOAD_NOT_OBJECT_CODE,
                     message="SSE data line is not a JSON object",
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
@@ -335,7 +349,10 @@ class SSEParser:
                     error_code=_PROVIDER_ERROR_CODE,
                     message=_provider_error_message(parsed[_ERROR_FIELD]),
                     provider_request_id=self._provider_request_id,
-                    raw_payload=dict(parsed),
+                    raw_payload=provider_error_diagnostic_payload(
+                        parsed,
+                        source=_PROVIDER_ERROR_CODE,
+                    ),
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
@@ -364,7 +381,11 @@ class SSEParser:
                     error_code=_MISSING_CHOICES_CODE,
                     message=("SSE data line must contain non-empty choices or " "valid usage"),
                     provider_request_id=self._provider_request_id,
-                    raw_payload=dict(parsed),
+                    raw_payload=protocol_object_diagnostic_payload(
+                        parsed,
+                        source=_MISSING_CHOICES_CODE,
+                        reason=_MISSING_CHOICES_AND_USAGE_REASON,
+                    ),
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
@@ -399,7 +420,11 @@ class SSEParser:
                         error_code=_MISSING_CHOICES_CODE,
                         message="SSE data line choices must contain an object choice",
                         provider_request_id=self._provider_request_id,
-                        raw_payload=dict(parsed),
+                        raw_payload=protocol_object_diagnostic_payload(
+                            parsed,
+                            source=_MISSING_CHOICES_CODE,
+                            reason=_NO_VALID_CHOICE_OBJECT_REASON,
+                        ),
                         partial_tool_calls=self._aggregator.partial_summaries(),
                     )
                 )

@@ -152,7 +152,8 @@ class RunnerProtocolErrorData:
     :param message: 人类可读错误描述。
     :param provider_request_id: provider 侧请求 id；为 ``None`` 表示
         未提供。
-    :param raw_payload: provider 原始报错载荷；为 ``None`` 表示无。
+    :param raw_payload: 有界诊断载荷；为 ``None`` 表示无。不承诺保留
+        provider 原始报错载荷。
     :param partial_tool_calls: SSE 失败前已解析但未完成的 tool call 有界
         摘要；不包含 raw argument payload。
     """

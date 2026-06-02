@@ -22,6 +22,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerDoneData,
     RunnerEvent,
     RunnerEventType,
+    RunnerProtocolErrorData,
 )
 from dayu.engine.runners.openai.non_stream_parser import (
     parse_non_stream_response,
@@ -55,6 +56,30 @@ def _extract_completed_and_done(
     assert completed is not None, "RUNNER_CONTENT_COMPLETED missing"
     assert done is not None, "RUNNER_DONE missing"
     return completed, done
+
+
+def _extract_protocol_error_and_done(
+    events: list[RunnerEvent],
+) -> tuple[RunnerProtocolErrorData, RunnerDoneData]:
+    """从事件列表中抽取协议错误与 ``done`` 数据。
+
+    :param events: :class:`RunnerEvent` 列表。
+    :returns: ``(protocol_error_data, done_data)`` 二元组。
+    :raises AssertionError: 缺少目标事件时由 pytest 抛出。
+    """
+
+    protocol_error: RunnerProtocolErrorData | None = None
+    done: RunnerDoneData | None = None
+    for ev in events:
+        if ev.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR:
+            assert isinstance(ev.data, RunnerProtocolErrorData)
+            protocol_error = ev.data
+        elif ev.type is RunnerEventType.RUNNER_DONE:
+            assert isinstance(ev.data, RunnerDoneData)
+            done = ev.data
+    assert protocol_error is not None, "PROVIDER_PROTOCOL_ERROR missing"
+    assert done is not None, "RUNNER_DONE missing"
+    return protocol_error, done
 
 
 @pytest.mark.asyncio
@@ -177,3 +202,74 @@ async def test_stream_and_non_stream_content_finish_reason_parity(
     assert stream_completed.finish_reason is expected
     assert stream_done.finish_reason is ns_done.finish_reason
     assert stream_done.finish_reason is expected
+
+
+@pytest.mark.asyncio
+async def test_stream_and_non_stream_provider_error_object_parity() -> None:
+    """stream / non-stream provider error object 的诊断核心字段一致。"""
+
+    provider_error_payload = {
+        "error": {
+            "code": "context_length_exceeded",
+            "type": "invalid_request_error",
+            "message": "too long",
+        }
+    }
+    stream_payload_json = json.dumps(
+        provider_error_payload,
+        separators=(",", ":"),
+    )
+    stream_events = await parse_sse(
+        [f"data: {stream_payload_json}\n\n".encode("utf-8")],
+        hook=make_no_thought_hook(),
+        provider_request_id="req_stream",
+    )
+    stream_error, stream_done = _extract_protocol_error_and_done(
+        list(stream_events)
+    )
+
+    non_stream_payload = json.dumps(
+        provider_error_payload,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    non_stream_events = list(
+        parse_non_stream_response(
+            non_stream_payload,
+            hook=make_no_thought_hook(),
+            provider_request_id="req_non_stream",
+        )
+    )
+    ns_error, ns_done = _extract_protocol_error_and_done(non_stream_events)
+
+    assert [event.type for event in stream_events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    assert [event.type for event in non_stream_events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    assert stream_error.error_code == "sse_provider_error"
+    assert ns_error.error_code == "non_stream_provider_error"
+    assert stream_error.message == ns_error.message == "too long"
+    assert stream_error.provider_request_id == "req_stream"
+    assert ns_error.provider_request_id == "req_non_stream"
+    assert stream_done.finish_reason is ns_done.finish_reason is FinishReason.ERROR
+    assert isinstance(stream_error.raw_payload, dict)
+    assert isinstance(ns_error.raw_payload, dict)
+    assert (
+        stream_error.raw_payload["canonical_byte_size"]
+        == ns_error.raw_payload["canonical_byte_size"]
+    )
+    assert (
+        stream_error.raw_payload["sha256_digest"]
+        == ns_error.raw_payload["sha256_digest"]
+    )
+    assert (
+        stream_error.raw_payload["provider_error"]
+        == ns_error.raw_payload["provider_error"]
+        == {
+            "code": "context_length_exceeded",
+            "type": "invalid_request_error",
+        }
+    )
