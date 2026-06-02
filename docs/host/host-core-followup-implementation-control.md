@@ -117,7 +117,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft PR gate |
-| implementation status | draft PR opened; PR review pending |
+| implementation status | PR review passed; accepted PR review commit pending |
 | active work unit | WU-LAYER-02 |
 | default next work unit | WU-LAYER-02 |
 | accepted plan commit | WU-LAYER-01: 278e5be; WU-LAYER-02: 76ecdb8 |
@@ -137,11 +137,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | code review artifacts | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-controller-adjudication-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-controller-adjudication-20260602.md |
 | accepted aggregate deepreview commit | WU-LAYER-01: 351eb53; WU-LAYER-02: 4921d73 |
 | draft PR | https://github.com/noho/dayu-agent-r/pull/110 |
-| PR review artifacts | none |
+| PR review artifacts | docs/reviews/pr-110-review-mimo-20260602.md; docs/reviews/pr-110-review-ds-20260602.md; docs/reviews/pr-110-review-controller-adjudication-20260602.md |
 | accepted PR review commit | none |
-| PR follow-up artifacts | none |
+| PR follow-up artifacts | GitHub checks: none reported by `gh pr checks 110 --repo noho/dayu-agent-r` |
 | validation | WU-LAYER-02 Slice 1: target tests 47 passed; pyright 0 errors; WU-LAYER-02 Slice 2: target tests plus import boundary 125 passed; pyright 0 errors; WU-LAYER-02 Slice 3: target tests plus regression 168 passed; pyright 0 errors; WU-LAYER-02 aggregate final: cross-slice tests 469 passed; pyright 0 errors |
-| next entry point | PR review artifacts |
+| next entry point | accepted PR review commit |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
