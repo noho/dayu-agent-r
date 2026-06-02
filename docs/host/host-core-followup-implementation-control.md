@@ -132,7 +132,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | accepted aggregate deepreview commit | cb190ee |
 | draft PR | https://github.com/noho/dayu-agent-r/pull/109 |
 | PR review artifacts | docs/reviews/wu-engine-01-draft-pr-review-handoff-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-mimo-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-ds-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-controller-adjudication-20260602.md |
-| accepted PR review commit | pending in PR review artifact commit |
+| accepted PR review commit | ee29e2c |
 | validation | WU-ENGINE-01 target tests 97 passed; pyright 0 errors |
 | next entry point | WU-LAYER-01 discussion / code inspection |
 | design source | docs/host/design.md |
@@ -586,7 +586,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：aggregate fix completed by AgentCodex，artifact: `docs/reviews/wu-engine-01-aggregate-fix-codex-20260602.md`。Fix re-review artifacts: `docs/reviews/wu-engine-01-aggregate-fix-rereview-mimo-20260602.md`, `docs/reviews/wu-engine-01-aggregate-fix-rereview-ds-20260602.md`。裁决：DS F-01/F-02 均 closed，无新增 finding。Controller verification: WU-ENGINE-01 target tests 97 passed; pyright 0 errors。
 - 2026-06-02：WU-ENGINE-01 local gates passed，进入 `ready-to-open-draft-PR`。Accepted aggregate deepreview commit: cb190ee。用户已授权进入 draft PR gate，下一步自动 push 并创建 draft PR；merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
 - 2026-06-02：Draft PR opened: `https://github.com/noho/dayu-agent-r/pull/109`。PR is draft and mergeable; GitHub checks reported none. Draft PR review artifacts: `docs/reviews/wu-engine-01-draft-pr-review-mimo-20260602.md`, `docs/reviews/wu-engine-01-draft-pr-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-engine-01-draft-pr-review-controller-adjudication-20260602.md`。
-- 裁决：draft PR review gate PASS；无 accepted blocking/high/medium finding。MiMo L1 已由 `RR-ENGINE-01-01` deferred-with-owner 追踪；MiMo L2 判定不是 defect。Accepted PR review commit: pending in PR review artifact commit。WU-ENGINE-01 进入 `draft-PR-pass`；下一入口为 WU-LAYER-01 discussion / code inspection。merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
+- 裁决：draft PR review gate PASS；无 accepted blocking/high/medium finding。MiMo L1 已由 `RR-ENGINE-01-01` deferred-with-owner 追踪；MiMo L2 判定不是 defect。Accepted PR review commit: ee29e2c。WU-ENGINE-01 进入 `draft-PR-pass`；下一入口为 WU-LAYER-01 discussion / code inspection。merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
 
 ## WU-LAYER-01 Durable Row Primitive / Type Owner Cleanup
 
