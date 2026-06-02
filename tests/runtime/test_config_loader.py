@@ -170,31 +170,25 @@ def _tool_duplicate_governance_policy_record() -> dict[str, JsonValue]:
     """
 
     return {
-        "default_duplicate_decision": "allow",
+        "default_duplicate_decision": "hint",
         "decisions_by_tool_name": {},
         "justification_argument_names_by_tool_name": {},
         "messages": {
-            "allow": "Repeated tool call allowed.",
-            "reuse": "Use the earlier tool result for this repeated request.",
+            "allow": "本次重复工具调用已允许执行。",
+            "reuse": "请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
             "hint": (
-                "Use the earlier tool result, or call again only with a different "
-                "evidence scope."
+                "请优先使用上一次工具结果继续推理；只有当需要不同主体、期间、"
+                "指标或证据范围时，才重新调用工具并修改参数。"
             ),
             "require_justification": (
-                "Repeated tool call needs a justification argument explaining why "
-                "the earlier result is insufficient."
+                "重复调用同一工具前，必须在参数中说明为什么上一次工具结果不足，"
+                "以及本次需要补充的不同证据范围。"
             ),
-            "hard_stop": (
-                "Repeated tool call blocked. Use the earlier tool result or change "
-                "the request."
-            ),
+            "hard_stop": "本次重复工具调用已被拒绝。请使用上一次工具结果继续推理；如果信息不足，请说明不确定性，不要编造。",
             "attempt_scope_diagnostic": (
-                "Repeated tool call matched an earlier tool result in the "
-                "current reasoning step."
+                "检测到当前推理步骤中重复请求相同工具证据。"
             ),
-            "prior_accept_missing": (
-                "The earlier matching tool call did not produce a usable result."
-            ),
+            "prior_accept_missing": "上一次相同工具请求没有产生可用结果。请说明信息不足，或在改变证据范围后再调用工具。",
         },
     }
 
@@ -351,11 +345,11 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     )
     assert (
         standard_256k.tool_duplicate_governance_policy.default_duplicate_decision
-        == "allow"
+        == "hint"
     )
     assert (
         standard_256k.tool_duplicate_governance_policy.messages.hint
-        == "Use the earlier tool result, or call again only with a different evidence scope."
+        == "请优先使用上一次工具结果继续推理；只有当需要不同主体、期间、指标或证据范围时，才重新调用工具并修改参数。"
     )
     assert standard_256k.agent_policy.max_iterations == 24
     assert standard_256k.agent_policy.fallback_prompt == default_fallback_prompt()

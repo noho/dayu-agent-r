@@ -430,11 +430,17 @@ async def test_duplicate_key_excludes_index_in_iteration() -> None:
 
 @pytest.mark.asyncio
 async def test_allow_duplicate_decision_executes_and_accepts_each_call() -> None:
-    """默认 allow 策略下重复调用仍执行并各自进入 accept path。"""
+    """显式 allow 策略下重复调用仍执行并各自进入 accept path。"""
 
     tool = _CountingTool({"accepted": True})
     accept_port = _AcceptingPort()
-    executor = _executor(tool, accept_port, DuplicateGovernancePolicy())
+    executor = _executor(
+        tool,
+        accept_port,
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.ALLOW
+        ),
+    )
 
     await executor.execute(
         _request(
@@ -565,8 +571,8 @@ async def test_governed_duplicate_candidate_validation_rejects_policy_mismatch()
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
                 message=(
-                    "Use the earlier tool result, or call again only with a "
-                    "different evidence scope."
+                    "请优先使用上一次工具结果继续推理；只有当需要不同主体、"
+                    "期间、指标或证据范围时，才重新调用工具并修改参数。"
                 ),
             ),
         )
@@ -587,8 +593,8 @@ async def test_governed_duplicate_candidate_validation_rejects_reason_mismatch()
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
                 message=(
-                    "Repeated tool call blocked. Use the earlier tool result "
-                    "or change the request."
+                    "本次重复工具调用已被拒绝。请使用上一次工具结果继续推理；"
+                    "如果信息不足，请说明不确定性，不要编造。"
                 ),
             ),
         )
@@ -1069,7 +1075,13 @@ async def test_allow_policy_concurrent_waits_for_owner_before_second_execution()
     tool = _BlockingCountingTool(
         {"accepted": "owner"}, entered=entered, release=release
     )
-    executor = _executor(tool, _AcceptingPort(), DuplicateGovernancePolicy())
+    executor = _executor(
+        tool,
+        _AcceptingPort(),
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.ALLOW
+        ),
+    )
 
     owner = asyncio.create_task(
         executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
@@ -1092,7 +1104,13 @@ async def test_allow_policy_post_owner_completion_executes_again() -> None:
     """allow policy 在 owner 完成后的重复调用会再次真实执行。"""
 
     tool = _CountingTool({"accepted": True})
-    executor = _executor(tool, _AcceptingPort(), DuplicateGovernancePolicy())
+    executor = _executor(
+        tool,
+        _AcceptingPort(),
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.ALLOW
+        ),
+    )
 
     await executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
     await executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))

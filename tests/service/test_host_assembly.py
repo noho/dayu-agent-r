@@ -707,7 +707,7 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
         policy.justification_argument_names_by_tool_name["explain_fact"]
         == "duplicate_justification"
     )
-    assert policy.messages.reuse == "Use the earlier tool result for this repeated request."
+    assert policy.messages.reuse == "请直接使用上一次工具结果继续推理，不要重复请求相同证据。"
 
 
 def test_duplicate_decision_from_config_reports_clear_error() -> None:
@@ -863,30 +863,28 @@ def _duplicate_governance_policy_config() -> ToolDuplicateGovernancePolicyConfig
     """
 
     return ToolDuplicateGovernancePolicyConfig(
-        default_duplicate_decision="allow",
+        default_duplicate_decision="hint",
         decisions_by_tool_name={},
         justification_argument_names_by_tool_name={},
         messages=ToolDuplicateGovernanceMessagesConfig(
-            allow="Repeated tool call allowed.",
-            reuse="Use the earlier tool result for this repeated request.",
+            allow="本次重复工具调用已允许执行。",
+            reuse="请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
             hint=(
-                "Use the earlier tool result, or call again only with a different "
-                "evidence scope."
+                "请优先使用上一次工具结果继续推理；只有当需要不同主体、期间、"
+                "指标或证据范围时，才重新调用工具并修改参数。"
             ),
             require_justification=(
-                "Repeated tool call needs a justification argument explaining why "
-                "the earlier result is insufficient."
+                "重复调用同一工具前，必须在参数中说明为什么上一次工具结果不足，"
+                "以及本次需要补充的不同证据范围。"
             ),
             hard_stop=(
-                "Repeated tool call blocked. Use the earlier tool result or change "
-                "the request."
+                "本次重复工具调用已被拒绝。请使用上一次工具结果继续推理；"
+                "如果信息不足，请说明不确定性，不要编造。"
             ),
-            attempt_scope_diagnostic=(
-                "Repeated tool call matched an earlier tool result in the "
-                "current reasoning step."
-            ),
+            attempt_scope_diagnostic="检测到当前推理步骤中重复请求相同工具证据。",
             prior_accept_missing=(
-                "The earlier matching tool call did not produce a usable result."
+                "上一次相同工具请求没有产生可用结果。请说明信息不足，"
+                "或在改变证据范围后再调用工具。"
             ),
         ),
     )
@@ -957,7 +955,7 @@ def _write_execution_profile_overlay(
     workspace_root: Path,
     *,
     truncation_enabled: bool,
-    duplicate_default_decision: str = "allow",
+    duplicate_default_decision: str = "hint",
     profile_id: str = "standard-256k",
     context_window_class: str = "256k",
     min_context_window_tokens: int = 262144,
@@ -1040,27 +1038,24 @@ def _write_execution_profile_overlay(
                             "explain_fact": "duplicate_justification",
                         },
                         "messages": {
-                            "allow": "Repeated tool call allowed.",
-                            "reuse": "Use the earlier tool result for this repeated request.",
+                            "allow": "本次重复工具调用已允许执行。",
+                            "reuse": "请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
                             "hint": (
-                                "Use the earlier tool result, or call again only "
-                                "with a different evidence scope."
+                                "请优先使用上一次工具结果继续推理；只有当需要不同主体、"
+                                "期间、指标或证据范围时，才重新调用工具并修改参数。"
                             ),
                             "require_justification": (
-                                "Repeated tool call needs a justification argument "
-                                "explaining why the earlier result is insufficient."
+                                "重复调用同一工具前，必须在参数中说明为什么上一次"
+                                "工具结果不足，以及本次需要补充的不同证据范围。"
                             ),
                             "hard_stop": (
-                                "Repeated tool call blocked. Use the earlier tool "
-                                "result or change the request."
+                                "本次重复工具调用已被拒绝。请使用上一次工具结果继续"
+                                "推理；如果信息不足，请说明不确定性，不要编造。"
                             ),
-                            "attempt_scope_diagnostic": (
-                                "Repeated tool call matched an earlier tool result "
-                                "in the current reasoning step."
-                            ),
+                            "attempt_scope_diagnostic": "检测到当前推理步骤中重复请求相同工具证据。",
                             "prior_accept_missing": (
-                                "The earlier matching tool call did not produce a "
-                                "usable result."
+                                "上一次相同工具请求没有产生可用结果。请说明信息不足，"
+                                "或在改变证据范围后再调用工具。"
                             ),
                         },
                     },

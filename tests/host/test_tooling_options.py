@@ -238,6 +238,7 @@ def test_duplicate_governance_policy_zero_config_uses_default_messages() -> None
     first = DuplicateGovernancePolicy()
     second = DuplicateGovernancePolicy()
 
+    assert first.default_duplicate_decision is DuplicateDecisionKind.HINT
     assert first.messages is not second.messages
     assert first.messages.allow.strip() != ""
     assert first.messages.reuse.strip() != ""
