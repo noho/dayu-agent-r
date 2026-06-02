@@ -323,12 +323,32 @@ def _provider_error_summary(
             summary[key] = _REDACTED_MARKER
             continue
         value = error_payload[key]
-        if isinstance(value, str) and value.strip() != "":
-            summary[key] = _scalar_preview(
-                value,
-                max_chars=_DIAGNOSTIC_SCALAR_MAX_CHARS,
-            )
+        keep_value, preview = _provider_error_scalar_preview(value)
+        if keep_value:
+            summary[key] = preview
     return summary
+
+
+def _provider_error_scalar_preview(value: JsonValue) -> tuple[bool, JsonValue]:
+    """生成 provider error 低风险字段的标量预览。
+
+    :param value: provider ``error`` 子对象中的候选字段值。
+    :returns: ``(是否保留, 预览值)``；空字符串与容器值不保留。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, str):
+        if value.strip() == "":
+            return False, ""
+        return True, _scalar_preview(
+            value,
+            max_chars=_DIAGNOSTIC_SCALAR_MAX_CHARS,
+        )
+    if isinstance(value, bool) or isinstance(value, int) or isinstance(value, float):
+        return True, value
+    if value is None:
+        return True, None
+    return False, ""
 
 
 def _container_summary(value: JsonValue) -> JsonValue:
@@ -424,8 +444,19 @@ def _is_sensitive_key(key: str) -> bool:
     :raises Exception: 不主动抛出异常。
     """
 
-    lowered = key.lower()
-    return any(fragment in lowered for fragment in _SENSITIVE_KEY_FRAGMENTS)
+    normalized = _normalized_sensitive_key(key)
+    return any(fragment in normalized for fragment in _SENSITIVE_KEY_FRAGMENTS)
+
+
+def _normalized_sensitive_key(key: str) -> str:
+    """规范化字段名以便敏感片段匹配。
+
+    :param key: JSON object 字段名。
+    :returns: 小写且将破折号规范化为下划线后的字段名。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return key.lower().replace("-", "_")
 
 
 __all__ = [

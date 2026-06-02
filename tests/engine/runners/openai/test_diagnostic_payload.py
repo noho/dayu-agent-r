@@ -110,8 +110,12 @@ def test_diagnostic_payload_redacts_sensitive_values() -> None:
 
     payload: dict[str, JsonValue] = {
         "api_key": "sk-secret-api-key",
+        "api-key": "sk-secret-dashed-api-key",
+        "x-api-key": "sk-secret-prefixed-dashed-api-key",
         "client_secret": "client-secret-value",
+        "client-secret": "client-secret-dashed-value",
         "access_token": "token-value",
+        "access-token": "token-dashed-value",
         "user_password": "password-value",
         "Authorization": "Bearer auth-value",
         "credential_id": "credential-value",
@@ -127,14 +131,57 @@ def test_diagnostic_payload_redacts_sensitive_values() -> None:
     leaves = tuple(_leaf_strings(diagnostic))
     forbidden_values = (
         "sk-secret-api-key",
+        "sk-secret-dashed-api-key",
+        "sk-secret-prefixed-dashed-api-key",
         "client-secret-value",
+        "client-secret-dashed-value",
         "token-value",
+        "token-dashed-value",
         "password-value",
         "Bearer auth-value",
         "credential-value",
     )
     for forbidden_value in forbidden_values:
         assert forbidden_value not in leaves
+
+
+def test_provider_error_summary_preserves_json_scalar_values() -> None:
+    """provider error 摘要保留非字符串 JSON 标量并过滤空字符串。"""
+
+    payload: dict[str, JsonValue] = {
+        "error": {
+            "code": 429,
+            "type": True,
+            "param": None,
+            "message": "rate limited",
+        },
+    }
+
+    diagnostic = provider_error_diagnostic_payload(payload, source=_SOURCE)
+
+    assert isinstance(diagnostic, dict)
+    assert diagnostic[_PROVIDER_ERROR_FIELD] == {
+        "code": 429,
+        "type": True,
+        "param": None,
+    }
+
+
+def test_provider_error_summary_filters_empty_strings_and_containers() -> None:
+    """provider error 摘要不保留空字符串与容器字段。"""
+
+    payload: dict[str, JsonValue] = {
+        "error": {
+            "code": "",
+            "type": "   ",
+            "param": {"name": "messages"},
+        },
+    }
+
+    diagnostic = provider_error_diagnostic_payload(payload, source=_SOURCE)
+
+    assert isinstance(diagnostic, dict)
+    assert diagnostic[_PROVIDER_ERROR_FIELD] == {}
 
 
 def test_large_payload_falls_back_to_minimal_structure() -> None:
