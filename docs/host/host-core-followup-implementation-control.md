@@ -117,10 +117,25 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | WU-TOOL-02 draft PR pass complete; user preparing merge |
-| active work unit | WU-TOOL-02 |
-| default next work unit | WU-ENGINE-01 |
-| next entry point | 用户侧准备 merge PR #108；merge 后进入 WU-ENGINE-01 discussion / code inspection |
+| implementation status | WU-ENGINE-01 draft PR gate passed; RR-ENGINE-01-01 closed by PR follow-up |
+| active work unit | WU-ENGINE-01 |
+| default next work unit | WU-LAYER-01 |
+| accepted plan commit | 10b0eaa |
+| plan artifact | docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md |
+| plan review artifacts | docs/reviews/wu-engine-01-plan-review-mimo-20260602.md; docs/reviews/wu-engine-01-plan-review-ds-20260602.md; docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md |
+| accepted slice commits | Slice 1: dba6513; Slice 2: 3857e23; Slice 3: c7308f7 |
+| Slice 1 status | accepted; target tests 35 passed; pyright 0 errors |
+| Slice 2 status | accepted; target tests 67 passed; pyright 0 errors |
+| current slice | aggregate deepreview closeout |
+| implementation artifact | docs/reviews/wu-engine-01-slice3-validation-codex-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-codex-20260602.md |
+| code review artifacts | docs/reviews/wu-engine-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-engine-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-ds-20260602.md |
+| accepted aggregate deepreview commit | cb190ee |
+| draft PR | https://github.com/noho/dayu-agent-r/pull/109 |
+| PR review artifacts | docs/reviews/wu-engine-01-draft-pr-review-handoff-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-mimo-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-ds-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-controller-adjudication-20260602.md |
+| accepted PR review commit | ee29e2c |
+| PR follow-up artifacts | docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-codex-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-mimo-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-ds-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-controller-adjudication-20260602.md |
+| validation | WU-ENGINE-01 target tests 97 passed; pyright 0 errors |
+| next entry point | WU-LAYER-01 discussion / code inspection |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -172,6 +187,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
 | RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
 | RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
+| RR-ENGINE-01-01 | WU-ENGINE-01 aggregate deepreview / PR follow-up | 测试 helper 维护性 | closed | WU-ENGINE-01 PR follow-up | 已提取 `tests/engine/runners/openai/_diagnostic_helpers.py`，三个测试文件统一导入 `leaf_strings` / `serialized_size` | Controller verification: affected tests 48 passed; WU-ENGINE-01 target tests 97 passed; target pyright 0 errors; full pyright 0 errors。MiMo/DS follow-up review PASS。 |
 
 ## 当前 Work Units
 
@@ -187,7 +203,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | draft-PR-pass |
-| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
+| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | draft-PR-pass |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
 | WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
 | WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 已完成 |
@@ -556,6 +572,23 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - OpenAI / Gemini 等 provider state 继续通过统一 typed contract 暴露，且无 raw SDK object 泄漏。
 - stream / non-stream error object consistency 有测试。
 - diagnostic raw payload 若保留，必须有明确边界；若删除或摘要化，Host / Engine 测试同步收敛。
+
+### Discussion / Code Inspection / Plan 记录
+
+- 2026-06-02：controller 完成 WU-ENGINE-01 discussion / code inspection，artifact: `docs/reviews/wu-engine-01-code-inspection-controller-20260602.md`。
+- 裁决：动机成立但边界比历史标题窄；不推翻 typed provider state，收窄为 Engine runner diagnostic payload audit；风险真实存在。
+- 2026-06-02：plan artifact 已生成，artifact: `docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md`。Plan review artifacts: `docs/reviews/wu-engine-01-plan-review-mimo-20260602.md`, `docs/reviews/wu-engine-01-plan-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-engine-01-plan-review-controller-adjudication-20260602.md`。
+- 裁决：无 blocking finding；接受 MIMO-M-01/M-02、DS-FIND-01 至 DS-FIND-10、DS-RR-01/RR-02 等 medium/low findings 作为 plan fix 要求；进入 plan fix gate。
+- 2026-06-02：plan fix artifact: `docs/reviews/wu-engine-01-plan-fix-codex-20260602.md`；plan re-review artifacts: `docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md`, `docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md`；controller re-review adjudication: `docs/reviews/wu-engine-01-plan-rereview-controller-adjudication-20260602.md`。
+- 裁决：全部 accepted findings 已修入 plan；plan code-generation-ready；进入 accepted plan commit。
+- 2026-06-02：Slice 1/2/3 implementation and review gates passed。Accepted slice commits: Slice 1 `dba6513`, Slice 2 `3857e23`, Slice 3 `c7308f7`。Slice 3 controller verification: WU-ENGINE-01 target tests 95 passed; pyright 0 errors。
+- 2026-06-02：aggregate deepreview artifacts: `docs/reviews/wu-engine-01-aggregate-deepreview-mimo-20260602.md`, `docs/reviews/wu-engine-01-aggregate-deepreview-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-engine-01-aggregate-deepreview-controller-adjudication-20260602.md`。
+- 裁决：aggregate deepreview 无 blocking/high/medium finding。接受 DS F-01/F-02 作为当前 gate 小修复；MiMo 测试 helper 重复 finding 记录为 `RR-ENGINE-01-01` 并 deferred-with-owner。
+- 2026-06-02：aggregate fix completed by AgentCodex，artifact: `docs/reviews/wu-engine-01-aggregate-fix-codex-20260602.md`。Fix re-review artifacts: `docs/reviews/wu-engine-01-aggregate-fix-rereview-mimo-20260602.md`, `docs/reviews/wu-engine-01-aggregate-fix-rereview-ds-20260602.md`。裁决：DS F-01/F-02 均 closed，无新增 finding。Controller verification: WU-ENGINE-01 target tests 97 passed; pyright 0 errors。
+- 2026-06-02：WU-ENGINE-01 local gates passed，进入 `ready-to-open-draft-PR`。Accepted aggregate deepreview commit: cb190ee。用户已授权进入 draft PR gate，下一步自动 push 并创建 draft PR；merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
+- 2026-06-02：Draft PR opened: `https://github.com/noho/dayu-agent-r/pull/109`。PR is draft and mergeable; GitHub checks reported none. Draft PR review artifacts: `docs/reviews/wu-engine-01-draft-pr-review-mimo-20260602.md`, `docs/reviews/wu-engine-01-draft-pr-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-engine-01-draft-pr-review-controller-adjudication-20260602.md`。
+- 裁决：draft PR review gate PASS；无 accepted blocking/high/medium finding。MiMo L1 已由 `RR-ENGINE-01-01` deferred-with-owner 追踪；MiMo L2 判定不是 defect。Accepted PR review commit: ee29e2c。WU-ENGINE-01 进入 `draft-PR-pass`；下一入口为 WU-LAYER-01 discussion / code inspection。merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
+- 2026-06-02：用户要求立即清理 `RR-ENGINE-01-01`。AgentCodex 完成测试 helper 提取，artifact: `docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-codex-20260602.md`。Review artifacts: `docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-mimo-20260602.md`, `docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-controller-adjudication-20260602.md`。裁决：review PASS，`RR-ENGINE-01-01` closed；`tests/README.md` 已同步新增 `_diagnostic_helpers.py` helper 事实描述。Controller verification: affected tests 48 passed; WU-ENGINE-01 target tests 97 passed; target pyright 0 errors; full pyright 0 errors。
 
 ## WU-LAYER-01 Durable Row Primitive / Type Owner Cleanup
 

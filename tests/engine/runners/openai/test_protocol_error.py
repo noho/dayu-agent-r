@@ -8,6 +8,7 @@ import logging
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -22,6 +23,11 @@ from dayu.engine.contracts.partial_tool_call import (
 from dayu.engine.runners.openai.non_stream_parser import (
     parse_non_stream_response,
 )
+from dayu.engine.runners.openai.diagnostic_payload import (
+    _DIAGNOSTIC_PAYLOAD_MAX_BYTES,
+    _PREVIEW_FIELD,
+    _TOP_LEVEL_KEYS_FIELD,
+)
 from dayu.engine.runners.openai.tool_call_aggregator import (
     PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS,
     PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS,
@@ -30,6 +36,10 @@ from dayu.engine.runners.openai.tool_call_aggregator import (
 from tests.engine.runners.openai._sse_helpers import (
     make_no_thought_hook,
     parse_sse,
+)
+from tests.engine.runners.openai._diagnostic_helpers import (
+    leaf_strings,
+    serialized_size,
 )
 
 
@@ -42,6 +52,18 @@ def _sse_json_chunk(payload_json: str) -> bytes:
     """
 
     return f"data: {payload_json}\n\n".encode("utf-8")
+
+
+def _diagnostic_payload(raw_payload: JsonValue | None) -> dict[str, JsonValue]:
+    """把协议错误 raw payload 收窄为诊断 JSON object。
+
+    :param raw_payload: 协议错误携带的 raw payload 字段。
+    :returns: 诊断 JSON object。
+    :raises AssertionError: ``raw_payload`` 不是 JSON object 时由 pytest 抛出。
+    """
+
+    assert isinstance(raw_payload, dict)
+    return raw_payload
 
 
 @pytest.mark.asyncio
@@ -104,7 +126,14 @@ async def test_sse_provider_error_object_emits_protocol_error() -> None:
     """SSE 200 流内 provider error object 必须失败收口。"""
 
     payload_json = json.dumps(
-        {"error": {"message": "bad upstream", "type": "server_error"}},
+        {
+            "api_key": "sse-secret-value",
+            "error": {
+                "message": "bad upstream",
+                "type": "server_error",
+                "code": "bad_request",
+            },
+        },
         separators=(",", ":"),
     )
     events = await parse_sse(
@@ -121,22 +150,32 @@ async def test_sse_provider_error_object_emits_protocol_error() -> None:
     assert error.error_code == "sse_provider_error"
     assert error.message == "bad upstream"
     assert error.provider_request_id == "req_provider_error"
-    assert error.raw_payload == {
-        "error": {"message": "bad upstream", "type": "server_error"}
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert diagnostic["source"] == "sse_provider_error"
+    assert diagnostic["kind"] == "provider_error"
+    assert isinstance(diagnostic["canonical_byte_size"], int)
+    assert isinstance(diagnostic["sha256_digest"], str)
+    assert diagnostic["provider_error"] == {
+        "code": "bad_request",
+        "type": "server_error",
     }
+    assert "sse-secret-value" not in tuple(leaf_strings(diagnostic))
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
 
 
 def test_non_stream_provider_error_object_emits_protocol_error() -> None:
-    """非流式 200 顶层 provider error object 必须保留 provider 信息。"""
+    """非流式 200 顶层 provider error object 必须产出有界诊断载荷。"""
 
     payload = json.dumps(
         {
+            "token": "non-stream-secret-value",
             "error": {
                 "code": "context_length_exceeded",
                 "message": "too long",
+                "type": "invalid_request_error",
             }
         },
         separators=(",", ":"),
@@ -159,12 +198,56 @@ def test_non_stream_provider_error_object_emits_protocol_error() -> None:
     assert error.error_code == "non_stream_provider_error"
     assert error.message == "too long"
     assert error.provider_request_id == "req_non_stream_provider_error"
-    assert error.raw_payload == {
-        "error": {"code": "context_length_exceeded", "message": "too long"}
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert diagnostic["source"] == "non_stream_provider_error"
+    assert diagnostic["kind"] == "provider_error"
+    assert isinstance(diagnostic["canonical_byte_size"], int)
+    assert isinstance(diagnostic["sha256_digest"], str)
+    assert diagnostic["provider_error"] == {
+        "code": "context_length_exceeded",
+        "type": "invalid_request_error",
     }
+    assert "non-stream-secret-value" not in tuple(leaf_strings(diagnostic))
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
+
+
+def test_non_stream_large_provider_error_raw_payload_is_bounded() -> None:
+    """非流式 provider error 的诊断载荷不得随 provider payload 无界增长。"""
+
+    payload = json.dumps(
+        {
+            f"key_{index}_{'x' * 512}": "value"
+            for index in range(32)
+        }
+        | {
+            "error": {
+                "code": "bad_request",
+                "message": "too long",
+                "type": "invalid_request_error",
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload,
+            hook=make_no_thought_hook(),
+            provider_request_id="req_large_provider_error",
+        )
+    )
+
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert diagnostic["source"] == "non_stream_provider_error"
+    assert diagnostic["kind"] == "provider_error"
+    assert _PREVIEW_FIELD not in diagnostic
+    assert _TOP_LEVEL_KEYS_FIELD not in diagnostic
 
 
 @pytest.mark.asyncio
@@ -182,6 +265,11 @@ async def test_sse_missing_choices_without_usage_emits_protocol_error() -> None:
     error = events[0].data
     assert isinstance(error, RunnerProtocolErrorData)
     assert error.error_code == "sse_missing_choices"
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert diagnostic["source"] == "sse_missing_choices"
+    assert diagnostic["kind"] == "protocol_object"
+    assert diagnostic["reason"] == "missing_choices_and_usage"
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
@@ -586,6 +674,8 @@ async def test_sse_all_non_object_choices_end_with_protocol_error() -> None:
     assert len(errors) == 1
     assert isinstance(errors[0], RunnerProtocolErrorData)
     assert errors[0].error_code == "sse_missing_choices"
+    diagnostic = _diagnostic_payload(errors[0].raw_payload)
+    assert diagnostic["reason"] == "no_valid_choice_object"
     done = [event for event in events if event.type is RunnerEventType.RUNNER_DONE]
     assert len(done) == 1
 
@@ -614,6 +704,8 @@ async def test_sse_all_non_object_choices_with_usage_protocol_error() -> None:
     error = events[0].data
     assert isinstance(error, RunnerProtocolErrorData)
     assert error.error_code == "sse_missing_choices"
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert diagnostic["reason"] == "no_valid_choice_object"
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR

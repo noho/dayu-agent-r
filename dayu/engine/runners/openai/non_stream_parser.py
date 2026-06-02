@@ -44,6 +44,9 @@ from dayu.engine.runners.openai._types import (
     _OpenAIToolCallFunction,
     _ReasoningProtocolHook,
 )
+from dayu.engine.runners.openai.diagnostic_payload import (
+    provider_error_diagnostic_payload,
+)
 from dayu.engine.runners.openai.tool_call_aggregator import ToolCallAggregator
 from dayu.engine.runners.openai.usage import coerce_usage
 from dayu.engine.runners.openai.xml_tag_extractor import (
@@ -60,9 +63,15 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 _ERROR_FIELD: str = "error"
 _ERROR_MESSAGE_FIELD: str = "message"
+_INVALID_UTF8_CODE: str = "invalid_utf8"
+_INVALID_JSON_CODE: str = "non_stream_invalid_json"
+_PAYLOAD_NOT_OBJECT_CODE: str = "non_stream_payload_not_object"
+_MISSING_CHOICES_CODE: str = "non_stream_missing_choices"
+_CHOICE_NOT_OBJECT_CODE: str = "non_stream_choice_not_object"
 _PROVIDER_ERROR_CODE: str = "non_stream_provider_error"
 _TOOL_CALL_NOT_OBJECT_CODE: str = "non_stream_tool_call_not_object"
 _TOOL_CALLS_EMPTY_AFTER_FILTER_CODE: str = "non_stream_tool_calls_empty_after_filter"
+_TOOL_CALL_ARGUMENTS_NOT_OBJECT_CODE: str = "tool_call_arguments_not_object"
 
 _NonStreamRunnerEventData: TypeAlias = (
     RunnerContentCompletedData
@@ -117,12 +126,13 @@ def parse_non_stream_response(
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         _LOGGER.warning(
-            "non_stream.protocol_error code=invalid_utf8 detail=%s",
+            "non_stream.protocol_error code=%s detail=%s",
+            _INVALID_UTF8_CODE,
             exc.__class__.__name__,
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code="invalid_utf8",
+                error_code=_INVALID_UTF8_CODE,
                 message=f"non-stream response not utf-8: {exc}",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -139,13 +149,13 @@ def parse_non_stream_response(
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
         _LOGGER.warning(
-            "non_stream.protocol_error code=non_stream_invalid_json "
-            "detail=%s",
+            "non_stream.protocol_error code=%s detail=%s",
+            _INVALID_JSON_CODE,
             exc.__class__.__name__,
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code="non_stream_invalid_json",
+                error_code=_INVALID_JSON_CODE,
                 message=f"non-stream response is not valid JSON: {exc}",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -160,11 +170,12 @@ def parse_non_stream_response(
         return
     if not isinstance(parsed, dict):
         _LOGGER.warning(
-            "non_stream.protocol_error code=non_stream_payload_not_object"
+            "non_stream.protocol_error code=%s",
+            _PAYLOAD_NOT_OBJECT_CODE,
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code="non_stream_payload_not_object",
+                error_code=_PAYLOAD_NOT_OBJECT_CODE,
                 message="non-stream response top-level is not a JSON object",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -224,7 +235,10 @@ def _emit_from_dict(
                 error_code=_PROVIDER_ERROR_CODE,
                 message=_provider_error_message(parsed[_ERROR_FIELD]),
                 provider_request_id=provider_request_id,
-                raw_payload=dict(parsed),
+                raw_payload=provider_error_diagnostic_payload(
+                    parsed,
+                    source=_PROVIDER_ERROR_CODE,
+                ),
             )
         )
         yield _make_event(
@@ -239,7 +253,7 @@ def _emit_from_dict(
     if not isinstance(choices, list) or not choices:
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code="non_stream_missing_choices",
+                error_code=_MISSING_CHOICES_CODE,
                 message="non-stream response missing choices",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -256,7 +270,7 @@ def _emit_from_dict(
     if not isinstance(choice, dict):
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code="non_stream_choice_not_object",
+                error_code=_CHOICE_NOT_OBJECT_CODE,
                 message="non-stream choice is not a JSON object",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -526,7 +540,7 @@ def _coerce_final_tool_call(
                 delta_id if isinstance(delta_id, str) else f"#{index}"
             )
             pre_error = RunnerProtocolErrorData(
-                error_code="tool_call_arguments_not_object",
+                error_code=_TOOL_CALL_ARGUMENTS_NOT_OBJECT_CODE,
                 message=(
                     f"tool call {tool_id_for_msg} arguments is neither a "
                     "JSON string nor a JSON object"
