@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -76,6 +77,7 @@ from dayu.host.tool_runtime import (
     ToolFactRejectedAck,
     ToolPolicyDecision,
     ToolPolicyDecisionKind,
+    ToolTraceDiagnosticRef,
 )
 from dayu.host.tool_duplicate_governance import DuplicateGovernanceScope
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
@@ -685,6 +687,178 @@ def test_non_reuse_fact_rejects_prior_reuse_refs(tmp_path: Path) -> None:
                     ),
                 ),
             )
+
+
+def test_lost_tool_fact_kind_fails_fast_as_unsupported() -> None:
+    """LOST 工具事实类别在 accept candidate 构造期明确 fail-fast。
+
+    :returns: ``None``。
+    :raises AssertionError: LOST 未按 unsupported fact kind 拒绝时抛出。
+    """
+
+    seeded = _SeededRun(
+        session_id="session-tool-accept",
+        run_id="run-tool-accept",
+        attempt_id="attempt-tool-accept",
+        execution_id="execution-tool-accept",
+        dispatch_record_id="dispatch-tool-accept",
+    )
+    base = _completed_candidate(seeded, tool_call_id="tool-call-lost")
+
+    with pytest.raises(ValueError, match="unsupported tool_fact_kind"):
+        replace(base, tool_fact_kind=ToolFactKind.LOST)
+
+
+def test_tool_accept_identity_rejects_empty_fields() -> None:
+    """ToolAcceptIdentity 直接拒绝任一空身份字段。
+
+    :returns: ``None``。
+    :raises AssertionError: 空身份字段未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="session_id"):
+        ToolAcceptIdentity(
+            session_id="",
+            run_id="run-tool-accept",
+            attempt_id="attempt-tool-accept",
+            execution_id="execution-tool-accept",
+        )
+    with pytest.raises(ValueError, match="run_id"):
+        ToolAcceptIdentity(
+            session_id="session-tool-accept",
+            run_id="",
+            attempt_id="attempt-tool-accept",
+            execution_id="execution-tool-accept",
+        )
+    with pytest.raises(ValueError, match="attempt_id"):
+        ToolAcceptIdentity(
+            session_id="session-tool-accept",
+            run_id="run-tool-accept",
+            attempt_id="",
+            execution_id="execution-tool-accept",
+        )
+    with pytest.raises(ValueError, match="execution_id"):
+        ToolAcceptIdentity(
+            session_id="session-tool-accept",
+            run_id="run-tool-accept",
+            attempt_id="attempt-tool-accept",
+            execution_id="",
+        )
+
+
+def test_tool_accept_call_rejects_invalid_digest() -> None:
+    """ToolAcceptCall 直接拒绝非法 digest 字段。
+
+    :returns: ``None``。
+    :raises AssertionError: 非法 digest 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="tool_schema_digest"):
+        ToolAcceptCall(
+            iteration_id="iteration-1",
+            tool_call_id="tool-call-invalid-digest",
+            tool_name="lookup",
+            tool_schema_digest="not-a-sha256-digest",
+            tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
+            normalized_arguments_digest=sha256_digest_json({"ticker": "MSFT"}),
+        )
+
+
+def test_tool_accept_result_rejects_payload_ref_digest_mismatch() -> None:
+    """ToolAcceptResult 直接拒绝 payload_digest 与 payload_ref digest 不一致。
+
+    :returns: ``None``。
+    :raises AssertionError: payload digest 不一致未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="payload_digest must match"):
+        ToolAcceptResult(
+            outcome_digest=sha256_digest_json({"outcome": "payload-mismatch"}),
+            payload_digest=sha256_digest_json({"payload": "candidate"}),
+            payload_ref=HostPayloadRef(
+                payload_ref="payload:result-mismatch",
+                payload_digest=sha256_digest_json({"payload": "ref"}),
+            ),
+            truncation=None,
+            raw_tool_outcome=_raw_tool_outcome("tool-call-payload-mismatch"),
+        )
+
+
+def test_tool_accept_duplicate_governance_rejects_invalid_fields() -> None:
+    """ToolAcceptDuplicateGovernance 直接拒绝缺失字段与非法 prior ref。
+
+    :returns: ``None``。
+    :raises AssertionError: duplicate governance 非法字段未被拒绝时抛出。
+    """
+
+    scope = DuplicateGovernanceScope(kind="attempt", attempt_id="attempt-tool-accept")
+
+    with pytest.raises(ValueError, match="duplicate_scope"):
+        ToolAcceptDuplicateGovernance(
+            duplicate_key=None,
+            duplicate_decision=DuplicateDecisionKind.ALLOW,
+            duplicate_scope=None,
+            duplicate_decision_message="本次重复工具调用已允许执行。",
+            reuse_prior_event_refs=(),
+        )
+    with pytest.raises(ValueError, match="duplicate_decision_message"):
+        ToolAcceptDuplicateGovernance(
+            duplicate_key=None,
+            duplicate_decision=DuplicateDecisionKind.ALLOW,
+            duplicate_scope=scope,
+            duplicate_decision_message=None,
+            reuse_prior_event_refs=(),
+        )
+    with pytest.raises(ValueError, match="reuse_prior_event_refs"):
+        ToolAcceptDuplicateGovernance(
+            duplicate_key=None,
+            duplicate_decision=DuplicateDecisionKind.ALLOW,
+            duplicate_scope=scope,
+            duplicate_decision_message="本次重复工具调用已允许执行。",
+            reuse_prior_event_refs=(cast(HostEventRef, "bad-prior-ref"),),
+        )
+
+
+def test_tool_accept_governance_rejects_non_policy_decision() -> None:
+    """ToolAcceptGovernance 直接拒绝非 ToolPolicyDecision。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 ToolPolicyDecision 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="policy_decision"):
+        ToolAcceptGovernance(
+            policy_decision=cast(ToolPolicyDecision, "bad-policy-decision"),
+            tool_idempotency_key=None,
+            duplicate=None,
+        )
+
+
+def test_tool_accept_idempotency_rejects_invalid_semantic_digest() -> None:
+    """ToolAcceptIdempotency 直接拒绝非法 semantic input digest。
+
+    :returns: ``None``。
+    :raises AssertionError: 非法 semantic input digest 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="semantic_input_digest"):
+        ToolAcceptIdempotency(
+            accept_idempotency_key="accept-invalid-semantic",
+            semantic_input_digest="not-a-sha256-digest",
+        )
+
+
+def test_tool_accept_diagnostics_rejects_non_diagnostic_ref() -> None:
+    """ToolAcceptDiagnostics 直接拒绝非 ToolTraceDiagnosticRef 引用。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 ToolTraceDiagnosticRef 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="diagnostic_refs"):
+        ToolAcceptDiagnostics(
+            diagnostic_refs=(cast(ToolTraceDiagnosticRef, "bad-diagnostic-ref"),)
+        )
 
 
 def test_accept_retry_policy_and_timeout_guard_invalid_values() -> None:
