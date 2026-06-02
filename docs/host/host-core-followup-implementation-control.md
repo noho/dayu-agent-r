@@ -116,8 +116,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-ENGINE-01 Slice 2 re-review passed; ready for accepted slice commit |
+| gate | implementation |
+| implementation status | WU-ENGINE-01 Slice 2 accepted; ready for Slice 3 full validation / docs sync |
 | active work unit | WU-ENGINE-01 |
 | default next work unit | WU-ENGINE-01 |
 | accepted plan commit | 10b0eaa |
@@ -126,14 +126,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | completed slice | Slice 1 Protocol Diagnostic Payload Helper + Parser 收口 |
 | Slice 1 artifacts | implementation: docs/reviews/wu-engine-01-slice1-implementation-codex-20260602.md; review: docs/reviews/wu-engine-01-slice1-code-review-mimo-20260602.md, docs/reviews/wu-engine-01-slice1-code-review-ds-20260602.md; fix: docs/reviews/wu-engine-01-slice1-fix-codex-20260602.md; re-review: docs/reviews/wu-engine-01-slice1-code-rereview-mimo-20260602.md, docs/reviews/wu-engine-01-slice1-code-rereview-ds-20260602.md |
 | Slice 1 validation | target tests 35 passed; pyright 0 errors |
-| accepted slice commits | Slice 1: dba6513 |
+| accepted slice commits | Slice 1: dba6513; Slice 2: 3857e23 |
 | current slice | Slice 2 HTTP Error Raw Payload 摘要化 + Host 诊断映射守卫 |
 | implementation artifact | docs/reviews/wu-engine-01-slice2-implementation-codex-20260602.md |
 | code review artifacts | docs/reviews/wu-engine-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-engine-01-slice2-code-review-ds-20260602.md |
 | fix artifact | docs/reviews/wu-engine-01-slice2-fix-codex-20260602.md |
 | re-review artifacts | docs/reviews/wu-engine-01-slice2-code-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-slice2-code-rereview-ds-20260602.md |
 | validation | Slice 2 target tests 67 passed; pyright 0 errors |
-| next entry point | WU-ENGINE-01 Slice 2 accepted commit |
+| next entry point | WU-ENGINE-01 Slice 3 full validation / docs sync |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
