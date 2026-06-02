@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-TOOL-02 accepted plan; implementation gate ready |
+| implementation status | WU-TOOL-02 Slice 1 accepted; Slice 2 ready |
 | active work unit | WU-TOOL-02 |
 | default next work unit | WU-TOOL-02 |
-| next entry point | WU-TOOL-02 implementation Slice 1；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-02 implementation Slice 2；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -511,6 +511,9 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：用户补充要求：WU-TOOL-02 全部完成后，ready-to-open-draft-PR 前追加 AgentMiMo 与 AgentDS 并行全仓 review；该 review gate 是本 work unit 的额外前置条件，不替代常规 slice review、aggregate deepreview、测试和 pyright。
 - 2026-06-02：plan artifact 已生成，artifact: `docs/host/wu-tool-02-accept-candidate-cleanup-plan.md`。Plan review artifacts: `docs/reviews/wu-tool-02-plan-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-plan-review-controller-adjudication-20260602.md`。裁决：接受 DS Finding 01 及若干低严重 clarification findings；进入 plan fix gate，必须修正 slice 中间态类型失败风险后再 re-review。
 - 2026-06-02：plan fix 后 re-review 通过。Re-review artifacts: `docs/reviews/wu-tool-02-plan-re-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-re-review-ds-20260602.md`。裁决：全部 accepted findings closed，plan handoff-ready / code-generation-ready；进入 implementation gate。Accepted plan commit: `11a8144`.
+- 2026-06-02：Slice 1 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice1-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice1-implementation-report-20260602.md`。验证报告：`tests/host/test_toolruntime_accept_barrier.py` 16 passed，`pyright dayu/host/tool_runtime.py` 0 errors。进入 Slice 1 code review gate。
+- 2026-06-02：Slice 1 code review artifacts: `docs/reviews/wu-tool-02-slice1-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice1-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice1-code-review-controller-adjudication-20260602.md`。裁决：接受 MiMo Finding 01，要求 `_validate_tool_accept_duplicate_governance` 对齐现有 duplicate field validation；进入 Slice 1 fix gate。
+- 2026-06-02：Slice 1 fix completed。Fix report: `docs/reviews/wu-tool-02-slice1-fix-report-20260602.md`。Code re-review artifacts: `docs/reviews/wu-tool-02-slice1-code-re-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice1-code-re-review-ds-20260602.md`。裁决：accepted finding closed，Slice 1 code re-review pass。Controller verification: `tests/host/test_toolruntime_accept_barrier.py` 16 passed，`pyright dayu/host/tool_runtime.py` 0 errors。Slice 1 accepted commit: pending.
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 

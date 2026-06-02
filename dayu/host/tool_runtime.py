@@ -378,6 +378,191 @@ class ToolTruncationFact:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolAcceptIdentity:
+    """Host 工具事实 accept 的执行身份子结构。
+
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :returns: 构造完成的执行身份值对象。
+    :raises ValueError: 任一身份字段为空时抛出。
+    """
+
+    session_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+
+    def __post_init__(self) -> None:
+        """校验执行身份内部字段。
+
+        :returns: ``None``。
+        :raises ValueError: 任一身份字段为空时抛出。
+        """
+
+        _validate_tool_accept_identity(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAcceptCall:
+    """Host 工具事实 accept 的工具调用子结构。
+
+    :param iteration_id: Engine iteration id。
+    :param tool_call_id: tool call id。
+    :param tool_name: 工具名。
+    :param tool_schema_digest: 工具 schema digest。
+    :param tool_identity_digest: 工具身份 digest。
+    :param normalized_arguments_digest: 规范化参数 digest。
+    :returns: 构造完成的工具调用值对象。
+    :raises ValueError: 文本字段为空或 digest 非法时抛出。
+    """
+
+    iteration_id: str
+    tool_call_id: str
+    tool_name: str
+    tool_schema_digest: str
+    tool_identity_digest: str
+    normalized_arguments_digest: str
+
+    def __post_init__(self) -> None:
+        """校验工具调用内部字段。
+
+        :returns: ``None``。
+        :raises ValueError: 文本字段为空或 digest 非法时抛出。
+        """
+
+        _validate_tool_accept_call(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAcceptResult:
+    """Host 工具事实 accept 的结果子结构。
+
+    :param outcome_digest: 工具 outcome digest。
+    :param payload_digest: result payload digest；无 result payload 时为 ``None``。
+    :param payload_ref: result payload descriptor 引用；无则为 ``None``。
+    :param truncation: 截断事实；无截断时为 ``None``。
+    :param raw_tool_outcome: Host accepted 后写入 raw transcript 的工具 outcome。
+    :returns: 构造完成的结果值对象。
+    :raises ValueError: digest 非法、payload 引用不一致或截断事实类型非法时抛出。
+    """
+
+    outcome_digest: str
+    payload_digest: str | None
+    payload_ref: HostPayloadRef | None
+    truncation: ToolTruncationFact | None
+    raw_tool_outcome: JsonValue
+
+    def __post_init__(self) -> None:
+        """校验结果内部字段。
+
+        :returns: ``None``。
+        :raises ValueError: digest 非法、payload 引用不一致或截断事实类型非法时抛出。
+        """
+
+        _validate_tool_accept_result(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAcceptDuplicateGovernance:
+    """Host 工具事实 accept 的 duplicate governance 子结构。
+
+    :param duplicate_key: attempt-scoped duplicate key。
+    :param duplicate_decision: duplicate governance 决策类别。
+    :param duplicate_scope: duplicate governance 作用域。
+    :param duplicate_decision_message: duplicate governance 决策消息。
+    :param reuse_prior_event_refs: 可复用的既有 accepted event refs。
+    :returns: 构造完成的 duplicate governance 值对象。
+    :raises ValueError: duplicate 决策、key、scope、message 或 prior refs 非法时抛出。
+    """
+
+    duplicate_key: str | None
+    duplicate_decision: DuplicateDecisionKind
+    duplicate_scope: DuplicateGovernanceScope | None
+    duplicate_decision_message: str | None
+    reuse_prior_event_refs: tuple[HostEventRef, ...]
+
+    def __post_init__(self) -> None:
+        """校验 duplicate governance 内部字段。
+
+        :returns: ``None``。
+        :raises ValueError: duplicate 决策、key、scope、message 或 prior refs 非法时抛出。
+        """
+
+        _validate_tool_accept_duplicate_governance(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAcceptGovernance:
+    """Host 工具事实 accept 的治理子结构。
+
+    :param policy_decision: 工具调用治理决策。
+    :param tool_idempotency_key: 工具自身幂等 key；无则为 ``None``。
+    :param duplicate: duplicate governance 信息；无则为 ``None``。
+    :returns: 构造完成的治理值对象。
+    :raises ValueError: policy、工具幂等 key 或 duplicate governance 非法时抛出。
+    """
+
+    policy_decision: ToolPolicyDecision
+    tool_idempotency_key: str | None
+    duplicate: ToolAcceptDuplicateGovernance | None
+
+    def __post_init__(self) -> None:
+        """校验治理内部字段。
+
+        :returns: ``None``。
+        :raises ValueError: policy、工具幂等 key 或 duplicate governance 非法时抛出。
+        """
+
+        _validate_tool_accept_governance(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAcceptIdempotency:
+    """Host 工具事实 accept 的幂等子结构。
+
+    :param accept_idempotency_key: Host accept 幂等 key。
+    :param semantic_input_digest: Host accept semantic input digest。
+    :returns: 构造完成的幂等值对象。
+    :raises ValueError: 幂等 key 为空或 semantic input digest 非法时抛出。
+    """
+
+    accept_idempotency_key: str
+    semantic_input_digest: str
+
+    def __post_init__(self) -> None:
+        """校验幂等内部字段。
+
+        :returns: ``None``。
+        :raises ValueError: 幂等 key 为空或 semantic input digest 非法时抛出。
+        """
+
+        _validate_tool_accept_idempotency(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAcceptDiagnostics:
+    """Host 工具事实 accept 的诊断子结构。
+
+    :param diagnostic_refs: 工具诊断引用。
+    :returns: 构造完成的诊断值对象。
+    :raises ValueError: 任一诊断引用类型非法时抛出。
+    """
+
+    diagnostic_refs: tuple["ToolTraceDiagnosticRef", ...]
+
+    def __post_init__(self) -> None:
+        """校验诊断内部字段。
+
+        :returns: ``None``。
+        :raises ValueError: 任一诊断引用类型非法时抛出。
+        """
+
+        _validate_tool_accept_diagnostics(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ToolFactAcceptCandidate:
     """Host accept barrier 的工具事实候选。
 
@@ -3754,6 +3939,164 @@ def _diagnostic_ref_json(ref: ToolTraceDiagnosticRef) -> JsonValue:
     """
 
     return {"ref_id": ref.ref_id}
+
+
+def _validate_tool_accept_identity(identity: ToolAcceptIdentity) -> None:
+    """校验工具事实 accept identity 子结构内部字段。
+
+    :param identity: 待校验的执行身份子结构。
+    :returns: ``None``。
+    :raises ValueError: 任一 identity 字段为空时抛出。
+    """
+
+    for field_name, value in (
+        ("session_id", identity.session_id),
+        ("run_id", identity.run_id),
+        ("attempt_id", identity.attempt_id),
+        ("execution_id", identity.execution_id),
+    ):
+        _require_non_empty_text(value, field_name=field_name)
+
+
+def _validate_tool_accept_call(call: ToolAcceptCall) -> None:
+    """校验工具事实 accept call 子结构内部字段。
+
+    :param call: 待校验的工具调用子结构。
+    :returns: ``None``。
+    :raises ValueError: 文本字段为空或 digest 非法时抛出。
+    """
+
+    for field_name, value in (
+        ("iteration_id", call.iteration_id),
+        ("tool_call_id", call.tool_call_id),
+        ("tool_name", call.tool_name),
+    ):
+        _require_non_empty_text(value, field_name=field_name)
+    _require_sha256_digest(
+        call.tool_schema_digest, field_name="tool_schema_digest"
+    )
+    _require_sha256_digest(
+        call.tool_identity_digest, field_name="tool_identity_digest"
+    )
+    _require_sha256_digest(
+        call.normalized_arguments_digest,
+        field_name="normalized_arguments_digest",
+    )
+
+
+def _validate_tool_accept_result(result: ToolAcceptResult) -> None:
+    """校验工具事实 accept result 子结构内部字段。
+
+    :param result: 待校验的工具结果子结构。
+    :returns: ``None``。
+    :raises ValueError: digest 非法、payload ref 不一致或截断事实类型非法时抛出。
+    """
+
+    _require_sha256_digest(result.outcome_digest, field_name="outcome_digest")
+    _require_optional_sha256_digest(
+        result.payload_digest, field_name="payload_digest"
+    )
+    if (
+        result.payload_ref is not None
+        and result.payload_digest != result.payload_ref.payload_digest
+    ):
+        raise ValueError("payload_digest must match payload_ref digest")
+    if result.truncation is not None and not isinstance(
+        result.truncation, ToolTruncationFact
+    ):
+        raise ValueError("truncation must be ToolTruncationFact")
+
+
+def _validate_tool_accept_duplicate_governance(
+    duplicate: ToolAcceptDuplicateGovernance,
+) -> None:
+    """校验工具事实 accept duplicate governance 子结构内部字段。
+
+    :param duplicate: 待校验的 duplicate governance 子结构。
+    :returns: ``None``。
+    :raises ValueError: duplicate 决策、key、scope、message 或 prior refs 非法时抛出。
+    """
+
+    _require_optional_non_empty_text(
+        duplicate.duplicate_key, field_name="duplicate_key"
+    )
+    _require_optional_non_empty_text(
+        duplicate.duplicate_decision_message,
+        field_name="duplicate_decision_message",
+    )
+    if not isinstance(duplicate.duplicate_decision, DuplicateDecisionKind):
+        raise ValueError("duplicate_decision must be DuplicateDecisionKind")
+    if duplicate.duplicate_scope is not None and not isinstance(
+        duplicate.duplicate_scope, DuplicateGovernanceScope
+    ):
+        raise ValueError("duplicate_scope must be DuplicateGovernanceScope")
+    if duplicate.duplicate_decision in (
+        DuplicateDecisionKind.REUSE,
+        DuplicateDecisionKind.HINT,
+        DuplicateDecisionKind.REQUIRE_JUSTIFICATION,
+        DuplicateDecisionKind.HARD_STOP,
+        DuplicateDecisionKind.DURABLE_MISSING,
+    ):
+        if duplicate.duplicate_key is None:
+            raise ValueError("duplicate decision requires duplicate_key")
+    if duplicate.duplicate_scope is None:
+        raise ValueError("duplicate decision requires duplicate_scope")
+    if duplicate.duplicate_decision_message is None:
+        raise ValueError("duplicate decision requires duplicate_decision_message")
+    for prior_ref in duplicate.reuse_prior_event_refs:
+        if not isinstance(prior_ref, HostEventRef):
+            raise ValueError("reuse_prior_event_refs must contain HostEventRef")
+
+
+def _validate_tool_accept_governance(governance: ToolAcceptGovernance) -> None:
+    """校验工具事实 accept governance 子结构内部字段。
+
+    :param governance: 待校验的治理子结构。
+    :returns: ``None``。
+    :raises ValueError: policy、工具幂等 key 或 duplicate governance 非法时抛出。
+    """
+
+    if not isinstance(governance.policy_decision, ToolPolicyDecision):
+        raise ValueError("policy_decision must be ToolPolicyDecision")
+    _validate_policy_decision_fields(governance.policy_decision)
+    _require_optional_non_empty_text(
+        governance.tool_idempotency_key, field_name="tool_idempotency_key"
+    )
+    if governance.duplicate is not None and not isinstance(
+        governance.duplicate, ToolAcceptDuplicateGovernance
+    ):
+        raise ValueError("duplicate must be ToolAcceptDuplicateGovernance")
+
+
+def _validate_tool_accept_idempotency(idempotency: ToolAcceptIdempotency) -> None:
+    """校验工具事实 accept idempotency 子结构内部字段。
+
+    :param idempotency: 待校验的幂等子结构。
+    :returns: ``None``。
+    :raises ValueError: 幂等 key 为空或 semantic input digest 非法时抛出。
+    """
+
+    _require_non_empty_text(
+        idempotency.accept_idempotency_key,
+        field_name="accept_idempotency_key",
+    )
+    _require_sha256_digest(
+        idempotency.semantic_input_digest,
+        field_name="semantic_input_digest",
+    )
+
+
+def _validate_tool_accept_diagnostics(diagnostics: ToolAcceptDiagnostics) -> None:
+    """校验工具事实 accept diagnostics 子结构内部字段。
+
+    :param diagnostics: 待校验的诊断子结构。
+    :returns: ``None``。
+    :raises ValueError: 任一诊断引用类型非法时抛出。
+    """
+
+    for ref in diagnostics.diagnostic_refs:
+        if not isinstance(ref, ToolTraceDiagnosticRef):
+            raise ValueError("diagnostic_refs must contain ToolTraceDiagnosticRef")
 
 
 def _validate_common_candidate_fields(candidate: ToolFactAcceptCandidate) -> None:
