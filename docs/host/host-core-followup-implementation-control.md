@@ -117,19 +117,19 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-LAYER-02 Slice 1 code review passed; accepted slice commit pending |
+| implementation status | WU-LAYER-02 Slice 1 accepted; Slice 2 pending |
 | active work unit | WU-LAYER-02 |
 | default next work unit | WU-LAYER-02 |
 | accepted plan commit | WU-LAYER-01: 278e5be; WU-LAYER-02: 76ecdb8 |
 | plan artifact | WU-LAYER-01: docs/host/wu-layer-01-durable-row-primitive-cleanup-plan.md; WU-LAYER-02: docs/host/wu-layer-02-shared-runtime-helper-consolidation-plan.md |
 | plan review artifacts | WU-LAYER-01: docs/reviews/wu-layer-01-plan-review-mimo-20260602.md; docs/reviews/wu-layer-01-plan-review-ds-20260602.md; docs/reviews/wu-layer-01-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-01-plan-rereview-ds-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-plan-review-mimo-20260602.md; docs/reviews/wu-layer-02-plan-review-ds-20260602.md; docs/reviews/wu-layer-02-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-02-plan-rereview-ds-20260602.md |
-| accepted slice commits | WU-LAYER-01: Slice 1 02396e5; Slice 2 ff64f0b; Slice 3 b4fc923; Slice 4 2397e72; WU-LAYER-02: none |
+| accepted slice commits | WU-LAYER-01: Slice 1 02396e5; Slice 2 ff64f0b; Slice 3 b4fc923; Slice 4 2397e72; WU-LAYER-02: Slice 1 7d1a9de |
 | WU-LAYER-01 Slice 1 status | accepted; target tests 33 passed; pyright 0 errors |
 | WU-LAYER-01 Slice 2 status | accepted; target tests 115 passed; pyright 0 errors |
 | WU-LAYER-01 Slice 3 status | accepted; target tests 47 passed; pyright 0 errors |
 | WU-LAYER-01 Slice 4 status | accepted; aggregate tests 136 passed; pyright 0 errors |
-| WU-LAYER-02 Slice 1 status | code review passed; target tests 47 passed; pyright 0 errors; accepted commit pending |
-| current slice | WU-LAYER-02 Slice 1 code review |
+| WU-LAYER-02 Slice 1 status | accepted; target tests 47 passed; pyright 0 errors |
+| current slice | WU-LAYER-02 implementation Slice 2 pending |
 | aggregate deepreview artifacts | docs/reviews/wu-layer-01-aggregate-deepreview-mimo-20260602.md; docs/reviews/wu-layer-01-aggregate-deepreview-ds-20260602.md; docs/reviews/wu-layer-01-aggregate-deepreview-controller-adjudication-20260602.md |
 | implementation artifact | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-schema-definition-validation-codex-20260602.md; docs/reviews/wu-layer-01-slice2-terminal-shape-rules-codex-20260602.md; docs/reviews/wu-layer-01-slice3-row-decode-error-boundary-codex-20260602.md; docs/reviews/wu-layer-01-slice4-integration-verification-codex-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-implementation-report-20260602.md |
 | code review artifacts | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-controller-adjudication-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-controller-adjudication-20260602.md |
@@ -139,7 +139,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | accepted PR review commit | none |
 | PR follow-up artifacts | none |
 | validation | WU-LAYER-02 Slice 1: target tests 47 passed; pyright 0 errors |
-| next entry point | WU-LAYER-02 Slice 1 accepted slice commit |
+| next entry point | WU-LAYER-02 implementation Slice 2 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
