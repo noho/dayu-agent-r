@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | review |
-| implementation status | WU-TOOL-02 aggregate deepreview passed; extra full-repository review ready |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-TOOL-02 local gates passed; draft PR gate authorized |
 | active work unit | WU-TOOL-02 |
 | default next work unit | WU-TOOL-02 |
-| next entry point | WU-TOOL-02 extra AgentMiMo/AgentDS parallel full-repository review；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-02 draft PR gate；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -173,6 +173,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
 | RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
 | RR-TOOL-02 | WU-TOOL-01 Slice 1 code re-review | tool trace duplicate scope 透传 | closed | WU-TOOL-01 Slice 3 | 已完成；无需后续动作 | Slice 3 已为 `TOOL_CALL_GOVERNED` 和 tool trace summary 增加 machine-readable attempt duplicate scope，并由 `tests/host/test_tool_trace_projection.py` 覆盖 hot/cold trace。 |
+| RR-TOOL-03 | WU-TOOL-02 aggregate / full-repo review | `ToolFactKind.LOST` accept candidate fail-fast 显式测试缺口 | deferred-with-owner | future ToolRuntime fact-kind expansion | 若未来要让 ToolRuntime accept candidate 表达 lost tool fact，先进入设计与 implementation work unit，并补 LOST candidate negative / positive tests | 当前 approved plan 明确 LOST 不在 `ToolFactAcceptCandidate` 支持范围内；代码 fail-fast，缺口为 pre-existing regression protection gap，不阻塞当前 PR。 |
+| RR-TOOL-04 | WU-TOOL-02 full-repo review | Tool accept candidate 子结构直接单元测试与测试 helper 进一步收敛 | deferred-with-owner | WU-LAYER-02 / future test organization cleanup | 后续测试组织清理时，可为子结构 validator 增加直接单元测试，并评估跨测试文件 candidate helper 是否应收敛 | 当前组合根路径、focused tests、projection tests 与 pyright 已覆盖 WU-TOOL-02 关键行为；不为当前 PR 扩大测试 helper 抽象。 |
 
 ## 当前 Work Units
 
@@ -187,7 +189,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 已完成：draft-PR-pass |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
-| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | planning |
+| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | ready-to-open-draft-PR |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
 | WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
@@ -522,6 +524,8 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：Slice 4 code review artifacts: `docs/reviews/wu-tool-02-slice4-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice4-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice4-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；`rg` 辅助检查局限与全仓验证缺口均按 approved plan defer 到 aggregate gate。Controller verification: payload consumer regression tests 121 passed，指定 Host production consumer pyright 0 errors；旧 flat field `rg` 命中仅 awaiting candidate 路径。Slice 4 accepted commit: `d982759`。
 - 2026-06-02：Slice 5 aggregate verification passed。Controller verification: affected Host tests 206 passed，全量 pyright 0 errors。进入 aggregate deepreview gate，review handoff: `docs/reviews/wu-tool-02-aggregate-deepreview-handoff-20260602.md`。
 - 2026-06-02：Aggregate deepreview artifacts: `docs/reviews/wu-tool-02-aggregate-deepreview-mimo-20260602.md`, `docs/reviews/wu-tool-02-aggregate-deepreview-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-aggregate-deepreview-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；MiMo/DS nonblocking notes 均不要求当前 gate 修复。Accepted aggregate deepreview commit: `a346842`。进入用户追加的 ready-to-open-draft-PR 前置 gate：AgentMiMo + AgentDS 并行全仓 review。
+- 2026-06-02：用户追加 full-repository review gate 已开始。Handoff: `docs/reviews/wu-tool-02-extra-full-repo-review-handoff-20260602.md`。Reviewers: AgentMiMo + AgentDS。
+- 2026-06-02：用户追加 full-repository review artifacts: `docs/reviews/wu-tool-02-extra-full-repo-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-extra-full-repo-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-extra-full-repo-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；控制文档状态滞后已在 closeout 修正，低风险 coverage / helper notes 已记录到 residual risk table 并明确 owner。WU-TOOL-02 local gates passed，进入 ready-to-open-draft-PR。
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
