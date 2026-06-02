@@ -291,6 +291,192 @@ def test_same_session_active_and_terminal_runs_succeed(tmp_path: Path, terminal_
         assert store.transaction_runner.run_write(operation) == 2
 
 
+@pytest.mark.parametrize("terminal_status", _TERMINAL_RUN_STATUSES)
+def test_run_terminal_shape_check_rejects_terminal_missing_ref(
+    tmp_path: Path,
+    terminal_status: RunStatus,
+) -> None:
+    """Run DDL CHECK 拒绝终态 Run 缺少任一 terminal ref。
+
+    :param tmp_path: pytest 临时目录。
+    :param terminal_status: 待验证的 Run 终态。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入合法终态 Run 后清空 terminal_at 以触发 DDL CHECK。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-terminal",
+                session_id="session-1",
+                status=terminal_status,
+                client_request_id="request-terminal",
+            )
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_RUNS} SET terminal_at = NULL WHERE run_id = ?",
+                ("run-terminal",),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+@pytest.mark.parametrize("status", _STARTED_RUN_STATUSES)
+def test_run_terminal_shape_check_rejects_non_terminal_ref(
+    tmp_path: Path,
+    status: RunStatus,
+) -> None:
+    """Run DDL CHECK 拒绝非终态 Run 携带任一 terminal ref。
+
+    :param tmp_path: pytest 临时目录。
+    :param status: 待验证的非终态 Run 状态。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入非终态 Run 后补入 terminal_at 以触发 DDL CHECK。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-active",
+                session_id="session-1",
+                status=status,
+                client_request_id="request-active",
+            )
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_RUNS} SET terminal_at = ? WHERE run_id = ?",
+                (_TIMESTAMP, "run-active"),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_attempt_terminal_shape_check_rejects_terminal_missing_ref(
+    tmp_path: Path,
+) -> None:
+    """Attempt DDL CHECK 拒绝终态 Attempt 缺少任一 terminal ref。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入 Attempt 并尝试设为缺 terminal_at 的终态。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-1",
+                session_id="session-1",
+                status=RunStatus.RUNNING,
+                client_request_id="request-1",
+            )
+            _insert_attempt_tx(
+                transaction,
+                attempt_id="attempt-1",
+                run_id="run-1",
+                execution_id="execution-1",
+            )
+            terminal_sequence = _insert_event_tx(
+                transaction,
+                event_id="event-attempt-terminal",
+                session_id="session-1",
+                run_id="run-1",
+                attempt_id="attempt-1",
+                execution_id="execution-1",
+            )
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_ATTEMPTS}
+                SET status = ?,
+                    terminal_event_id = ?,
+                    terminal_event_sequence = ?,
+                    terminal_at = NULL
+                WHERE attempt_id = ?
+                """,
+                (
+                    serialize_attempt_status(AttemptStatus.SUCCEEDED),
+                    "event-attempt-terminal",
+                    terminal_sequence,
+                    "attempt-1",
+                ),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_attempt_terminal_shape_check_rejects_non_terminal_ref(
+    tmp_path: Path,
+) -> None:
+    """Attempt DDL CHECK 拒绝非终态 Attempt 携带任一 terminal ref。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入 STARTING Attempt 后补入 terminal_at 以触发 DDL CHECK。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-1",
+                session_id="session-1",
+                status=RunStatus.RUNNING,
+                client_request_id="request-1",
+            )
+            _insert_attempt_tx(
+                transaction,
+                attempt_id="attempt-1",
+                run_id="run-1",
+                execution_id="execution-1",
+            )
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_ATTEMPTS} SET terminal_at = ? WHERE attempt_id = ?",
+                (_TIMESTAMP, "attempt-1"),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
 def test_multiple_queued_runs_for_one_session_succeed(tmp_path: Path) -> None:
     """同一 Session 可以 durable 保存多个 queued Run。"""
 

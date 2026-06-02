@@ -12,6 +12,13 @@ from __future__ import annotations
 import re
 import sqlite3
 
+from dayu.host.durable._row_rules import (
+    TERMINAL_ATTEMPT_STATUS_VALUES,
+    TERMINAL_RUN_STATUS_VALUES,
+    terminal_event_refs_required_check_sql,
+    terminal_event_refs_unset_check_sql,
+    wait_terminal_at_check_sql,
+)
 from dayu.host.api import (
     HOST_WAIT_ADAPTER_KEY_MAX_LENGTH,
     HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
@@ -162,6 +169,33 @@ HOST_DURABLE_INDEXES: tuple[str, ...] = (
     INDEX_HOST_PURGE_TOMBSTONES_SESSION,
 )
 """当前 Host durable schema 必须存在的 index 名称集合。"""
+
+_HOST_RUN_TERMINAL_REFS_REQUIRED_CHECK_SQL = terminal_event_refs_required_check_sql(
+    status_column="status",
+    terminal_status_values=TERMINAL_RUN_STATUS_VALUES,
+)
+"""Run 终态必须携带 terminal refs 的 CHECK 表达式。"""
+
+_HOST_RUN_TERMINAL_REFS_UNSET_CHECK_SQL = terminal_event_refs_unset_check_sql(
+    status_column="status",
+    terminal_status_values=TERMINAL_RUN_STATUS_VALUES,
+)
+"""Run 非终态必须清空 terminal refs 的 CHECK 表达式。"""
+
+_HOST_ATTEMPT_TERMINAL_REFS_REQUIRED_CHECK_SQL = terminal_event_refs_required_check_sql(
+    status_column="status",
+    terminal_status_values=TERMINAL_ATTEMPT_STATUS_VALUES,
+)
+"""Attempt 终态必须携带 terminal refs 的 CHECK 表达式。"""
+
+_HOST_ATTEMPT_TERMINAL_REFS_UNSET_CHECK_SQL = terminal_event_refs_unset_check_sql(
+    status_column="status",
+    terminal_status_values=TERMINAL_ATTEMPT_STATUS_VALUES,
+)
+"""Attempt 非终态必须清空 terminal refs 的 CHECK 表达式。"""
+
+_HOST_WAIT_TERMINAL_AT_CHECK_SQL = wait_terminal_at_check_sql(status_column="status")
+"""WaitRecord status 与 terminal_at 形状 CHECK 表达式。"""
 
 _SQLITE_PAYLOADS_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_SQLITE_PAYLOADS} (
@@ -419,18 +453,10 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
       AND started_event_sequence IS NOT NULL)
   ),
   CHECK (
-    status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')
-    OR
-    (terminal_event_id IS NOT NULL
-      AND terminal_event_sequence IS NOT NULL
-      AND terminal_at IS NOT NULL)
+    {_HOST_RUN_TERMINAL_REFS_REQUIRED_CHECK_SQL}
   ),
   CHECK (
-    status IN ('succeeded', 'failed', 'cancelled', 'lost')
-    OR
-    (terminal_event_id IS NULL
-      AND terminal_event_sequence IS NULL
-      AND terminal_at IS NULL)
+    {_HOST_RUN_TERMINAL_REFS_UNSET_CHECK_SQL}
   ),
   CHECK (
     (source_run_id IS NULL AND source_run_relation IS NULL)
@@ -470,18 +496,10 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_ATTEMPTS} (
   FOREIGN KEY(terminal_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
   FOREIGN KEY(terminal_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
   CHECK (
-    status NOT IN ('succeeded', 'failed', 'cancelled', 'suspended', 'steered', 'lost')
-    OR
-    (terminal_event_id IS NOT NULL
-      AND terminal_event_sequence IS NOT NULL
-      AND terminal_at IS NOT NULL)
+    {_HOST_ATTEMPT_TERMINAL_REFS_REQUIRED_CHECK_SQL}
   ),
   CHECK (
-    status IN ('succeeded', 'failed', 'cancelled', 'suspended', 'steered', 'lost')
-    OR
-    (terminal_event_id IS NULL
-      AND terminal_event_sequence IS NULL
-      AND terminal_at IS NULL)
+    {_HOST_ATTEMPT_TERMINAL_REFS_UNSET_CHECK_SQL}
   )
 )
 """
@@ -661,10 +679,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
       AND snapshot_digest IS NOT NULL)
   ),
   CHECK (
-    (status = 'waiting' AND terminal_at IS NULL)
-    OR
-    (status IN ('resolved', 'failed', 'cancelled', 'lost')
-      AND terminal_at IS NOT NULL)
+    {_HOST_WAIT_TERMINAL_AT_CHECK_SQL}
   ),
   CHECK (
     (resolve_idempotency_key IS NULL AND resolve_semantic_digest IS NULL)

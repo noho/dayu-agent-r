@@ -31,6 +31,19 @@ from dayu.host.api import (
     TerminalResultSummary,
     WaitAdapterKey,
 )
+from dayu.host.durable._row_rules import (
+    TERMINAL_ATTEMPT_STATUS_VALUES,
+    TERMINAL_RUN_STATUS_VALUES,
+    WAIT_RECORD_CANCELLED_STATUS_VALUE,
+    WAIT_RECORD_FAILED_STATUS_VALUE,
+    WAIT_RECORD_LOST_STATUS_VALUE,
+    WAIT_RECORD_RESOLVED_STATUS_VALUE,
+    WAIT_RECORD_WAITING_STATUS_VALUE,
+    terminal_event_refs_unset_where_sql,
+    validate_terminal_event_refs_shape,
+    validate_wait_terminal_at_shape,
+    wait_terminal_at_unset_where_sql,
+)
 from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable._validation import (
     optional_int as _optional_int,
@@ -53,11 +66,20 @@ from dayu.host.durable.transaction import HostRow
 from dayu.host.durable.transaction import HostTransaction
 
 _StatusT = TypeVar("_StatusT", bound=StrEnum)
-TERMINAL_RUN_STATUSES = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST))
+TERMINAL_RUN_STATUSES = frozenset(RunStatus(value) for value in TERMINAL_RUN_STATUS_VALUES)
 """Run 终态集合，作为 durable state / purge 等持久化逻辑的状态真源。"""
 
 NON_TERMINAL_RUN_STATUSES = frozenset(status for status in RunStatus if status not in TERMINAL_RUN_STATUSES)
 """Run 非终态集合，由 :class:`RunStatus` 与终态集合派生。"""
+
+_TERMINAL_ATTEMPT_STATUSES = frozenset(AttemptStatus(value) for value in TERMINAL_ATTEMPT_STATUS_VALUES)
+"""Attempt 终态集合，作为 durable state terminal shape 的状态真源。"""
+
+_TERMINAL_REFS_UNSET_WHERE_SQL = terminal_event_refs_unset_where_sql(indent="          ")
+"""CAS WHERE 中 Run / Attempt terminal refs 全空谓词。"""
+
+_WAIT_TERMINAL_AT_UNSET_WHERE_SQL = wait_terminal_at_unset_where_sql(indent="          ")
+"""CAS WHERE 中 WaitRecord terminal_at 为空谓词。"""
 _WAIT_RECORD_SELECT_SQL = f"""
 SELECT
   wait_id,
@@ -126,11 +148,11 @@ class RunStartReason(StrEnum):
 class WaitRecordStatus(StrEnum):
     """Host durable wait record 状态。"""
 
-    WAITING = "waiting"
-    RESOLVED = "resolved"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-    LOST = "lost"
+    WAITING = WAIT_RECORD_WAITING_STATUS_VALUE
+    RESOLVED = WAIT_RECORD_RESOLVED_STATUS_VALUE
+    FAILED = WAIT_RECORD_FAILED_STATUS_VALUE
+    CANCELLED = WAIT_RECORD_CANCELLED_STATUS_VALUE
+    LOST = WAIT_RECORD_LOST_STATUS_VALUE
 
 
 class WaitResumePolicy(StrEnum):
@@ -1797,9 +1819,7 @@ def set_new_run_source_relation_row(
           AND source_run_id IS NULL
           AND source_run_relation IS NULL
           AND current_attempt_id IS NULL
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             source_run_id,
@@ -2198,6 +2218,7 @@ def cancel_active_wait_records_for_run(
           updated_at = ?,
           terminal_at = ?
         WHERE run_id = ? AND status = ?
+{_WAIT_TERMINAL_AT_UNSET_WHERE_SQL}
         """,
         (
             serialize_wait_record_status(WaitRecordStatus.CANCELLED),
@@ -2352,9 +2373,7 @@ def start_unstarted_run_row(
           AND started_event_id IS NULL
           AND started_event_sequence IS NULL
           AND current_attempt_id IS NULL
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
           AND NOT EXISTS (
             SELECT 1
             FROM {TABLE_HOST_RUNS} active_run
@@ -2437,9 +2456,7 @@ def terminal_unstarted_run_row(
           AND started_event_id IS NULL
           AND started_event_sequence IS NULL
           AND current_attempt_id IS NULL
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(terminal_status),
@@ -2497,9 +2514,7 @@ def cancel_queued_run_row(
           terminal_at = ?
         WHERE run_id = ?
           AND status = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.CANCELLED),
@@ -2561,9 +2576,7 @@ def cancel_running_run_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.CANCELLED),
@@ -2626,9 +2639,7 @@ def cancel_cancelling_run_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.CANCELLED),
@@ -2678,9 +2689,7 @@ def mark_run_cancelling_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.CANCELLING),
@@ -2729,9 +2738,7 @@ def mark_run_waiting_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.WAITING),
@@ -2797,9 +2804,7 @@ def resume_waiting_run_row(
           AND session_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
           AND NOT EXISTS (
             SELECT 1
             FROM {TABLE_HOST_RUNS} active_run
@@ -2891,9 +2896,7 @@ def steer_active_run_row(
           AND session_id = ?
           AND status IN (?, ?)
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.RUNNING),
@@ -3011,9 +3014,7 @@ def mark_running_run_recovering_row(
           AND session_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.RECOVERING),
@@ -3080,9 +3081,7 @@ def start_recovering_run_row(
           AND session_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
           AND NOT EXISTS (
             SELECT 1
             FROM {TABLE_HOST_RUNS} active_run
@@ -3159,9 +3158,7 @@ def terminal_recovering_run_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.FAILED),
@@ -3219,9 +3216,7 @@ def cancel_recovering_run_row(
           terminal_at = ?
         WHERE run_id = ?
           AND status = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.CANCELLED),
@@ -3281,9 +3276,7 @@ def cancel_waiting_run_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.CANCELLED),
@@ -3421,9 +3414,7 @@ def terminal_orphaned_run_lost_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.LOST),
@@ -3485,9 +3476,7 @@ def terminal_recovering_run_lost_row(
         WHERE run_id = ?
           AND status = ?
           AND current_attempt_id = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(RunStatus.LOST),
@@ -3666,9 +3655,7 @@ def cancel_running_attempt_row(
           terminal_at = ?
         WHERE attempt_id = ?
           AND status = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_attempt_status(AttemptStatus.CANCELLED),
@@ -3713,9 +3700,7 @@ def mark_attempt_running_row(
           updated_at = ?
         WHERE attempt_id = ?
           AND status = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_attempt_status(AttemptStatus.RUNNING),
@@ -3770,9 +3755,7 @@ def mark_attempt_suspended_row(
           terminal_at = ?
         WHERE attempt_id = ?
           AND status = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_attempt_status(AttemptStatus.SUSPENDED),
@@ -4298,11 +4281,13 @@ def _validate_run_for_insert(run: RunRow) -> None:
             raise HostDurableError("accepted Run start refs must be unset")
         if run.current_attempt_id is not None:
             raise HostDurableError("accepted Run current_attempt_id must be unset")
-    if _is_terminal_run_status(run.status):
-        if run.terminal_event_id is None or run.terminal_event_sequence is None or run.terminal_at is None:
-            raise HostDurableError("terminal Run requires terminal refs")
-    elif run.terminal_event_id is not None or run.terminal_event_sequence is not None or run.terminal_at is not None:
-        raise HostDurableError("non-terminal Run terminal refs must be unset")
+    validate_terminal_event_refs_shape(
+        terminal_event_id=run.terminal_event_id,
+        terminal_event_sequence=run.terminal_event_sequence,
+        terminal_at=run.terminal_at,
+        is_terminal=_is_terminal_run_status(run.status),
+        owner_label="Run",
+    )
     if (run.source_run_id is None) != (run.source_run_relation is None):
         raise HostDurableError("Run source relation fields must be paired")
 
@@ -4322,14 +4307,18 @@ def _validate_attempt_for_insert(attempt: AttemptRow) -> None:
         raise HostDurableError("insert_attempt only accepts STARTING Attempt")
     _require_non_empty_text(attempt.started_event_id, field_name="started_event_id")
     _require_positive_sequence(attempt.started_event_sequence, "started_event_sequence")
-    if attempt.terminal_event_id is not None:
-        raise HostDurableError("STARTING Attempt terminal_event_id must be unset")
-    if attempt.terminal_event_sequence is not None:
-        raise HostDurableError("STARTING Attempt terminal_event_sequence must be unset")
+    _require_optional_non_empty_text(attempt.terminal_event_id, field_name="terminal_event_id")
+    _require_optional_positive_sequence(attempt.terminal_event_sequence, "terminal_event_sequence")
     _require_non_empty_text(attempt.created_at, field_name="created_at")
     _require_non_empty_text(attempt.updated_at, field_name="updated_at")
-    if attempt.terminal_at is not None:
-        raise HostDurableError("STARTING Attempt terminal_at must be unset")
+    _require_optional_non_empty_text(attempt.terminal_at, field_name="terminal_at")
+    validate_terminal_event_refs_shape(
+        terminal_event_id=attempt.terminal_event_id,
+        terminal_event_sequence=attempt.terminal_event_sequence,
+        terminal_at=attempt.terminal_at,
+        is_terminal=attempt.status in _TERMINAL_ATTEMPT_STATUSES,
+        owner_label="Attempt",
+    )
 
 
 def _validate_dispatch_record_for_insert(
@@ -4949,10 +4938,7 @@ def _validate_wait_record_for_insert(row: WaitRecordRow) -> None:
     _require_non_empty_text(row.created_at, field_name="created_at")
     _require_non_empty_text(row.updated_at, field_name="updated_at")
     _require_optional_non_empty_text(row.terminal_at, field_name="terminal_at")
-    if row.status == WaitRecordStatus.WAITING and row.terminal_at is not None:
-        raise HostDurableError("waiting wait record terminal_at must be unset")
-    if row.status != WaitRecordStatus.WAITING and row.terminal_at is None:
-        raise HostDurableError("terminal wait record requires terminal_at")
+    validate_wait_terminal_at_shape(status_value=row.status.value, terminal_at=row.terminal_at)
 
 
 def _validate_wait_external_job_ref(row: WaitRecordRow) -> None:
@@ -5058,6 +5044,7 @@ def _mark_wait_record_terminal_row(
           updated_at = ?,
           terminal_at = ?
         WHERE wait_id = ? AND status = ?
+{_WAIT_TERMINAL_AT_UNSET_WHERE_SQL}
         """,
         (
             serialize_wait_record_status(status),
@@ -5268,12 +5255,7 @@ def _is_terminal_run_status(status: RunStatus) -> bool:
     :returns: 是终态时返回 ``True``。
     """
 
-    return status in (
-        RunStatus.SUCCEEDED,
-        RunStatus.FAILED,
-        RunStatus.CANCELLED,
-        RunStatus.LOST,
-    )
+    return status in TERMINAL_RUN_STATUSES
 
 
 def _slot_ref_from_row(slot: SessionSlotRow | None) -> SessionSlotRef | None:

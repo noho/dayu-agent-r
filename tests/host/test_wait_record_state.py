@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -577,6 +578,132 @@ def test_wait_record_ddl_rejects_orphan_snapshot_digest(
             store.transaction_runner.run_write(operation)
 
 
+def test_wait_record_ddl_rejects_waiting_terminal_at(
+    tmp_path: Path,
+) -> None:
+    """WaitRecord DDL CHECK 拒绝 waiting row 携带 terminal_at。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入合法 waiting wait 后补入 terminal_at。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET terminal_at = ? WHERE wait_id = ?",
+                (_TIMESTAMP, "wait-1"),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_wait_record_ddl_rejects_terminal_missing_terminal_at(
+    tmp_path: Path,
+) -> None:
+    """WaitRecord DDL CHECK 拒绝 terminal row 缺少 terminal_at。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入合法 waiting wait 后尝试改为缺 terminal_at 的 resolved。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET status = ?,
+                    resolve_idempotency_key = ?,
+                    resolve_semantic_digest = ?
+                WHERE wait_id = ?
+                """,
+                (
+                    serialize_wait_record_status(WaitRecordStatus.RESOLVED),
+                    "resolve-1",
+                    _RESOLVE_DIGEST,
+                    "wait-1",
+                ),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_wait_record_python_validation_rejects_terminal_at_shape(
+    tmp_path: Path,
+) -> None:
+    """WaitRecord Python insert validation 与 DDL terminal_at 形状一致。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Python validation 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def waiting_with_terminal_at(transaction: HostTransaction) -> None:
+            """尝试插入携带 terminal_at 的 waiting wait。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(
+                transaction,
+                replace(_wait_row(transaction), terminal_at=_TIMESTAMP),
+            )
+
+        def terminal_without_terminal_at(transaction: HostTransaction) -> None:
+            """尝试插入缺少 terminal_at 的 resolved wait。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction, run_id="run-2")
+            insert_wait_record(
+                transaction,
+                replace(
+                    _wait_row(
+                        transaction,
+                        wait_id="wait-2",
+                        run_id="run-2",
+                        status=WaitRecordStatus.RESOLVED,
+                    ),
+                    terminal_at=None,
+                ),
+            )
+
+        with pytest.raises(HostDurableError, match="waiting wait record terminal_at"):
+            store.transaction_runner.run_write(waiting_with_terminal_at)
+        with pytest.raises(HostDurableError, match="terminal wait record requires terminal_at"):
+            store.transaction_runner.run_write(terminal_without_terminal_at)
+
+
 def test_wait_record_cas_helpers_update_waiting_only(tmp_path: Path) -> None:
     """CAS helper 只更新 waiting wait，并区分 updated/not_found/invalid_state。"""
 
@@ -630,6 +757,52 @@ def test_wait_record_cas_helpers_update_waiting_only(tmp_path: Path) -> None:
             StateMutationStatus.UPDATED,
             StateMutationStatus.INVALID_STATE,
             StateMutationStatus.NOT_FOUND,
+        )
+
+
+def test_wait_record_terminal_cas_rejects_corrupted_waiting_terminal_at(
+    tmp_path: Path,
+) -> None:
+    """terminal CAS 拒绝测试专用 corrupted waiting + terminal_at row。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: terminal CAS 未拒绝 corrupted row 时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> StateMutationStatus:
+            """绕过 CHECK 构造 corrupted wait row 并执行 terminal CAS。
+
+            :param transaction: Host transaction。
+            :returns: terminal CAS mutation 状态。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute("PRAGMA ignore_check_constraints=ON")
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET terminal_at = ? WHERE wait_id = ?",
+                (_TIMESTAMP, "wait-1"),
+            )
+            transaction.execute("PRAGMA ignore_check_constraints=OFF")
+            result = mark_wait_record_resolved_row(
+                transaction,
+                wait_id="wait-1",
+                resolve_idempotency_key="resolve-1",
+                resolve_semantic_digest=_RESOLVE_DIGEST,
+                updated_event_id="event-wait-updated-wait-1",
+                updated_event_sequence=4,
+                updated_at=_TIMESTAMP,
+                terminal_at=_TIMESTAMP,
+            )
+            return result.status
+
+        assert store.transaction_runner.run_write(operation) in (
+            StateMutationStatus.CAS_LOST,
+            StateMutationStatus.INVALID_STATE,
         )
 
 
