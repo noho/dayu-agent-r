@@ -489,9 +489,12 @@ def test_current_schema_missing_table_opener_raises_without_repair(
 
     with pytest.raises(
         HostSchemaMismatchError,
-        match=f"missing required table: {TABLE_EVENT_LOG}",
-    ):
+        match="missing required objects",
+    ) as exc_info:
         open_host_durable_store(options)
+    error_message = str(exc_info.value)
+    assert f"tables: {TABLE_EVENT_LOG}" in error_message
+    assert INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE in error_message
 
     verify_connection = sqlite3.connect(options.db_path)
     try:
@@ -526,6 +529,36 @@ def test_current_schema_missing_index_opener_raises_without_repair(
         assert not _index_exists(verify_connection, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
     finally:
         verify_connection.close()
+
+
+def test_current_schema_multiple_missing_objects_are_reported_together(
+    tmp_path: Path,
+) -> None:
+    """current user_version 多个对象缺失时 schema validation 必须批量诊断。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 诊断未同时列出缺失 table 与 index 时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options):
+        pass
+    _drop_table(options.db_path, TABLE_HOST_MEMORY_DIAGNOSTICS)
+    _drop_index(options.db_path, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
+
+    with pytest.raises(
+        HostSchemaMismatchError,
+        match="missing required objects",
+    ) as exc_info:
+        open_host_durable_store(options)
+
+    error_message = str(exc_info.value)
+    assert f"tables: {TABLE_HOST_MEMORY_DIAGNOSTICS}" in error_message
+    assert (
+        f"indexes: {INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON}, "
+        f"{INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE}"
+    ) in error_message
 
 
 def test_current_schema_wrong_index_definition_opener_raises_without_repair(
@@ -626,9 +659,12 @@ def test_secondary_connection_missing_table_raises_without_repair(
         _drop_table(options.db_path, TABLE_HOST_MEMORY_DIAGNOSTICS)
         with pytest.raises(
             HostSchemaMismatchError,
-            match=f"missing required table: {TABLE_HOST_MEMORY_DIAGNOSTICS}",
-        ):
+            match="missing required objects",
+        ) as exc_info:
             store.connect()
+        error_message = str(exc_info.value)
+        assert f"tables: {TABLE_HOST_MEMORY_DIAGNOSTICS}" in error_message
+        assert f"indexes: {INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON}" in error_message
 
     verify_connection = sqlite3.connect(options.db_path)
     try:

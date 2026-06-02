@@ -1285,6 +1285,9 @@ _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
 _SchemaObjectKey = tuple[str, str]
 """SQLite schema object key，格式为 ``(object_type, object_name)``。"""
 
+_MISSING_REQUIRED_OBJECTS_SEPARATOR = "; "
+"""批量缺失 schema object 诊断片段分隔符。"""
+
 
 def bootstrap_host_durable_store(connection: sqlite3.Connection) -> None:
     """初始化 fresh Host durable SQLite schema 或校验当前 schema。
@@ -1337,8 +1340,7 @@ def validate_host_durable_schema(connection: sqlite3.Connection) -> None:
             f"expected fresh schema {HOST_SCHEMA_VERSION}, got {current_version}; "
             "recreate the durable database for this version"
         )
-    _validate_required_tables(connection)
-    _validate_required_indexes(connection)
+    _validate_required_objects_exist(connection)
     _validate_required_object_definitions(connection)
 
 
@@ -1367,12 +1369,32 @@ def _bootstrap_fresh_schema(connection: sqlite3.Connection) -> None:
         raise
 
 
-def _validate_required_tables(connection: sqlite3.Connection) -> None:
-    """校验当前 DB 包含所有 Host durable required tables。
+def _validate_required_objects_exist(connection: sqlite3.Connection) -> None:
+    """校验当前 DB 包含所有 Host durable required schema objects。
 
     :param connection: SQLite connection。
     :returns: ``None``。
-    :raises HostSchemaMismatchError: 缺少 required table 时抛出。
+    :raises HostSchemaMismatchError: 缺少 required table / index 时抛出，并在
+        多个对象缺失时批量报告。
+    :raises sqlite3.Error: sqlite_master 查询失败时抛出。
+    """
+
+    missing_tables = _missing_required_tables(connection)
+    missing_indexes = _missing_required_indexes(connection)
+    if missing_tables or missing_indexes:
+        raise HostSchemaMismatchError(
+            _missing_required_objects_message(
+                missing_tables=missing_tables,
+                missing_indexes=missing_indexes,
+            )
+        )
+
+
+def _missing_required_tables(connection: sqlite3.Connection) -> tuple[str, ...]:
+    """返回当前 DB 缺失的 Host durable required tables。
+
+    :param connection: SQLite connection。
+    :returns: 按 ``HOST_DURABLE_TABLES`` 顺序排列的缺失 table 名称。
     :raises sqlite3.Error: sqlite_master 查询失败时抛出。
     """
 
@@ -1380,20 +1402,18 @@ def _validate_required_tables(connection: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()
     existing_tables = frozenset(str(row[0]) for row in rows)
-    for table_name in HOST_DURABLE_TABLES:
-        if table_name not in existing_tables:
-            raise HostSchemaMismatchError(
-                "Host durable schema missing required table: "
-                f"{table_name}"
-            )
+    return tuple(
+        table_name
+        for table_name in HOST_DURABLE_TABLES
+        if table_name not in existing_tables
+    )
 
 
-def _validate_required_indexes(connection: sqlite3.Connection) -> None:
-    """校验当前 DB 包含所有 Host durable required indexes。
+def _missing_required_indexes(connection: sqlite3.Connection) -> tuple[str, ...]:
+    """返回当前 DB 缺失的 Host durable required indexes。
 
     :param connection: SQLite connection。
-    :returns: ``None``。
-    :raises HostSchemaMismatchError: 缺少 required index 时抛出。
+    :returns: 按 ``HOST_DURABLE_INDEXES`` 顺序排列的缺失 index 名称。
     :raises sqlite3.Error: sqlite_master 查询失败时抛出。
     """
 
@@ -1401,12 +1421,43 @@ def _validate_required_indexes(connection: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='index'"
     ).fetchall()
     existing_indexes = frozenset(str(row[0]) for row in rows)
-    for index_name in HOST_DURABLE_INDEXES:
-        if index_name not in existing_indexes:
-            raise HostSchemaMismatchError(
-                "Host durable schema missing required index: "
-                f"{index_name}"
-            )
+    return tuple(
+        index_name
+        for index_name in HOST_DURABLE_INDEXES
+        if index_name not in existing_indexes
+    )
+
+
+def _missing_required_objects_message(
+    *,
+    missing_tables: tuple[str, ...],
+    missing_indexes: tuple[str, ...],
+) -> str:
+    """构造 required schema object 缺失诊断消息。
+
+    单个 table 或 index 缺失时保留精确单对象消息；多个对象缺失时批量列出，
+    方便一次定位 schema 损坏范围。
+
+    :param missing_tables: 缺失的 required table 名称。
+    :param missing_indexes: 缺失的 required index 名称。
+    :returns: Host schema mismatch 诊断消息。
+    :raises HostSchemaMismatchError: 本函数不主动抛出。
+    """
+
+    if len(missing_tables) == 1 and not missing_indexes:
+        return f"Host durable schema missing required table: {missing_tables[0]}"
+    if len(missing_indexes) == 1 and not missing_tables:
+        return f"Host durable schema missing required index: {missing_indexes[0]}"
+
+    message_parts: list[str] = []
+    if missing_tables:
+        message_parts.append("tables: " + ", ".join(missing_tables))
+    if missing_indexes:
+        message_parts.append("indexes: " + ", ".join(missing_indexes))
+    return (
+        "Host durable schema missing required objects: "
+        + _MISSING_REQUIRED_OBJECTS_SEPARATOR.join(message_parts)
+    )
 
 
 def _validate_required_object_definitions(connection: sqlite3.Connection) -> None:

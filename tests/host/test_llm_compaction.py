@@ -119,12 +119,11 @@ def test_safe_outcome_text_does_not_redact_plain_token_diagnostic() -> None:
     assert llm_compaction_module._safe_outcome_text(message) == message
 
 
-def test_safe_outcome_text_preserves_existing_truncation_shape() -> None:
-    """_safe_outcome_text 保留旧 outcome 截断可见形状。
+def test_safe_outcome_text_uses_runtime_truncation_shape() -> None:
+    """_safe_outcome_text 使用 runtime diagnostic 截断语义。
 
-    旧 Host outcome 策略在超限时返回前 240 个字符再追加后缀，因此返回总长
-    可能超过 240。该形状属于当前 proposal error 文本的可见行为，本聚合修复只
-    收敛 redaction helper，不改变它。
+    outcome 摘要超限时，返回总长必须不超过 ``_MAX_SAFE_OUTCOME_MESSAGE_CHARS``，
+    截断后缀也计入最大长度。
 
     :returns: ``None``。
     :raises AssertionError: 截断正文长度或后缀形状变化时抛出。
@@ -134,8 +133,8 @@ def test_safe_outcome_text_preserves_existing_truncation_shape() -> None:
 
     safe_message = llm_compaction_module._safe_outcome_text(message)
 
-    assert safe_message == ("x" * 240) + "..."
-    assert len(safe_message) == 243
+    assert safe_message == ("x" * 237) + "..."
+    assert len(safe_message) == 240
 
 
 def _llm_compactor(

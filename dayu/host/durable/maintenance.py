@@ -21,6 +21,17 @@ _SQLITE_CHECKPOINT_ROW_LENGTH = 3
 _SQLITE_CHECKPOINT_BUSY_INDEX = 0
 _SQLITE_CHECKPOINT_LOG_INDEX = 1
 _SQLITE_CHECKPOINT_CHECKPOINTED_INDEX = 2
+_SQLITE_DATABASE_LIST_ROW_LENGTH = 3
+_SQLITE_DATABASE_LIST_NAME_INDEX = 1
+_SQLITE_DATABASE_LIST_FILE_INDEX = 2
+_SQLITE_MAIN_DATABASE_NAME = "main"
+_SQLITE_DATABASE_LIST_PRAGMA = "PRAGMA database_list"
+_HOST_WAL_CHECKPOINT_INSPECT_DATABASE_ERROR = (
+    "Host durable WAL checkpoint failed to inspect connection database"
+)
+_HOST_WAL_CHECKPOINT_DATABASE_MISMATCH_ERROR = (
+    "Host durable WAL checkpoint connection does not match db_path"
+)
 
 
 class HostWalCheckpointMode(StrEnum):
@@ -63,6 +74,7 @@ def run_host_wal_checkpoint(
     :raises HostDurableError: SQLite checkpoint 失败或 SQLite 未返回结果时抛出。
     """
 
+    _assert_connection_matches_db_path(connection, db_path=db_path)
     try:
         row = connection.execute(f"PRAGMA wal_checkpoint({mode.value})").fetchone()
     except sqlite3.Error as exc:
@@ -91,6 +103,54 @@ def run_host_wal_checkpoint(
         ),
         wal_size_bytes=_read_wal_size_bytes(db_path),
     )
+
+
+def _assert_connection_matches_db_path(
+    connection: sqlite3.Connection,
+    *,
+    db_path: Path,
+) -> None:
+    """校验 checkpoint connection 与 DB 路径同源。
+
+    :param connection: 即将执行 WAL checkpoint 的 SQLite connection。
+    :param db_path: 调用方声明的 Host durable SQLite DB 文件路径。
+    :returns: ``None``。
+    :raises HostDurableError: 无法读取 connection database list、connection 没有
+        文件型 main database，或 main database 文件路径与 ``db_path`` 不一致时抛出。
+    """
+
+    connection_db_path = _read_main_database_path(connection)
+    if connection_db_path.resolve(strict=False) != db_path.resolve(strict=False):
+        raise HostDurableError(_HOST_WAL_CHECKPOINT_DATABASE_MISMATCH_ERROR)
+
+
+def _read_main_database_path(connection: sqlite3.Connection) -> Path:
+    """读取 SQLite connection 的 main database 文件路径。
+
+    :param connection: 已配置的 Host durable SQLite connection。
+    :returns: ``main`` database 对应的文件路径。
+    :raises HostDurableError: database list 查询失败、返回 shape 异常、缺失
+        ``main`` database，或 ``main`` database 不是文件型数据库时抛出。
+    """
+
+    try:
+        rows = connection.execute(_SQLITE_DATABASE_LIST_PRAGMA).fetchall()
+    except sqlite3.Error as exc:
+        raise HostDurableError(_HOST_WAL_CHECKPOINT_INSPECT_DATABASE_ERROR) from exc
+
+    for row in rows:
+        row_values = cast(tuple[SQLiteScalar, ...], tuple(row))
+        if len(row_values) != _SQLITE_DATABASE_LIST_ROW_LENGTH:
+            raise HostDurableError(_HOST_WAL_CHECKPOINT_INSPECT_DATABASE_ERROR)
+        if row_values[_SQLITE_DATABASE_LIST_NAME_INDEX] != _SQLITE_MAIN_DATABASE_NAME:
+            continue
+
+        database_file = row_values[_SQLITE_DATABASE_LIST_FILE_INDEX]
+        if not isinstance(database_file, str) or database_file == "":
+            raise HostDurableError(_HOST_WAL_CHECKPOINT_INSPECT_DATABASE_ERROR)
+        return Path(database_file)
+
+    raise HostDurableError(_HOST_WAL_CHECKPOINT_INSPECT_DATABASE_ERROR)
 
 
 def _checkpoint_int(value: SQLiteScalar, *, field_name: str) -> int:

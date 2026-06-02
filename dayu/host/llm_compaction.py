@@ -67,7 +67,10 @@ from dayu.host.context_budget import (
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
 )
 from dayu.host.opaque_ref import validate_host_neutral_opaque_ref_text
-from dayu.runtime.diagnostic_text import redact_sensitive_diagnostic_values
+from dayu.runtime.diagnostic_text import (
+    redact_sensitive_diagnostic_values,
+    truncate_diagnostic_text,
+)
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _MIN_PROPOSAL_LENGTH = 1
@@ -344,9 +347,11 @@ def _safe_outcome_text(text: str) -> str:
     """
 
     redacted = redact_sensitive_diagnostic_values(text, redaction_marker=_REDACTED_SECRET)
-    if len(redacted) <= _MAX_SAFE_OUTCOME_MESSAGE_CHARS:
-        return redacted
-    return redacted[:_MAX_SAFE_OUTCOME_MESSAGE_CHARS] + _TRUNCATED_SUFFIX
+    return truncate_diagnostic_text(
+        redacted,
+        max_chars=_MAX_SAFE_OUTCOME_MESSAGE_CHARS,
+        truncated_suffix=_TRUNCATED_SUFFIX,
+    )
 
 
 def _user_prompt(request: CompactionRequest, template: str) -> str:

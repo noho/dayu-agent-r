@@ -33,6 +33,7 @@ from dayu.host.payload_resolution import event_payload_object
 
 FALLBACK_ACTION_DISPATCH = "dispatch"
 FALLBACK_ACTION_FAIL_CLOSED = "fail_closed"
+FALLBACK_ACTION_NOT_APPLICABLE = "not_applicable"
 FALLBACK_POLICY_DECISION_RECENT_WINDOW = "deterministic_recent_window"
 FALLBACK_POLICY_DECISION_SELECTION_FAILED = "deterministic_recent_window_selection_failed"
 FALLBACK_BUDGET_STATUS_WITHIN_BUDGET = "within_hard_budget"

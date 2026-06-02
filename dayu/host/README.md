@@ -228,7 +228,7 @@ ToolRuntime 的稳定语义：
 - 工具结果、工具失败、工具取消、工具等待、治理拒绝、重复调用复用与截断结果必须经过 Host accept barrier。
 - accept barrier 校验 run / attempt / execution identity、schema digest、payload descriptor、幂等与 stale execution，接受后写入 canonical tool result facts。
 - side-effect 或付费工具必须具备工具级幂等依据；缺失时不调用实际 callable。
-- duplicate governance 是 attempt-local in-memory 治理能力，只治理当前 ToolRuntime Attempt 内同工具同参数的重复调用和 in-flight owner / waiter 串行化；新 Attempt、worker restart 或 Host restart 不继承旧内存索引，也不从 EventLog 重建 duplicate ledger。
+- duplicate governance 是 attempt-local in-memory 治理能力，只治理当前 ToolRuntime Attempt 内同工具同参数的重复调用和 in-flight owner / waiter 串行化；owner 未产生可复用 accepted fact 时，等待者中只允许一个接棒成为新 owner，其它等待者继续等待新 owner；新 Attempt、worker restart 或 Host restart 不继承旧内存索引，也不从 EventLog 重建 duplicate ledger。
 - duplicate governance 的默认动作、按工具覆盖动作、模型可见治理文案与 justification 参数名由 `HostToolingOptions.duplicate_governance_policy` 在 Host construction 阶段以 typed `DuplicateGovernancePolicy` 配置；ToolRuntime 执行路径不读取 raw config、profile id 或 extra payload。
 - `ToolTruncateSpec` 是 declaration/effective 分离契约：工具声明允许启用截断但省略策略 limit 或 TTL，层中立 runtime helper 按 policy defaults 补齐 effective spec 后交给 ToolRuntime 消费。
 - ToolRuntime 只在显式 truncation spec 或 truncation manager 存在时改写 LLM 可见工具结果；durable payload inline threshold 不作为 LLM inline result 限制。
@@ -294,10 +294,10 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 - run-level `stream_run_events`。
 - durable foundation：
   - durable store、transaction runner、schema、state row codec、payload table helper。
-  - schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；主连接与 secondary durable connections 都会执行当前 schema validation，校验 schema version、required object 存在性与 required object 定义一致性。
+  - schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；主连接与 secondary durable connections 都会执行当前 schema validation，校验 schema version、required object 存在性与 required object 定义一致性，缺失 required objects 时批量诊断。
   - SQLite 连接启用 WAL 与 auto-checkpoint。
   - transaction runner 的 read transaction 使用 SQLite snapshot 语义，新的短读事务读取最新 committed truth。
-  - 内部 WAL checkpoint primitive 只服务显式 diagnostic / test entry，不属于 public maintenance API，也不作为 EventLog 或状态正确性的前置条件。
+  - 内部 WAL checkpoint primitive 只服务显式 diagnostic / test entry，不属于 public maintenance API，也不作为 EventLog 或状态正确性的前置条件；调用时会校验 connection 的 main database 与传入 DB path 同源。
   - store close 会拒绝活跃 transaction，避免 SQLite 隐式 rollback 未提交写入。
 - dispatch scheduler、ToolRuntime factory、projection runner、memory repair runner。
 - recovery scanner、orphan proof classifier、Host instance liveness helper 与 startup recovery diagnostic。

@@ -160,6 +160,7 @@ from dayu.host.context_budget import (
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
     FALLBACK_ACTION_FAIL_CLOSED,
+    FALLBACK_ACTION_NOT_APPLICABLE,
     FALLBACK_POLICY_DECISION_RECENT_WINDOW,
     FALLBACK_POLICY_DECISION_SELECTION_FAILED,
     EventLogContextFallbackProvider,
@@ -227,7 +228,6 @@ _COMPACTION_CANCEL_REASON_INPUT_CHANGED = "run_input_event_sequence_changed"
 _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
 _COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
-_FALLBACK_ACTION_NOT_APPLICABLE = "not_applicable"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
@@ -497,6 +497,15 @@ class ActiveWorkerRegistry:
         for message, entry in entries:
             _propagate_active_worker_cancel(message, entry)
         return len(entries)
+
+    def clear(self) -> None:
+        """清空 active worker registry。
+
+        :returns: ``None``。
+        """
+
+        with self._lock:
+            self._entries.clear()
 
 
 def _propagate_active_worker_cancel(
@@ -1808,7 +1817,7 @@ class HostDispatchScheduler:
         fallback_input_window: Mapping[str, JsonValue] | None = None,
         fallback_input_digest: str | None = None,
         fallback_budget_result: Mapping[str, JsonValue] | None = None,
-        fallback_action: str = _FALLBACK_ACTION_NOT_APPLICABLE,
+        fallback_action: str = FALLBACK_ACTION_NOT_APPLICABLE,
     ) -> None:
         """追加 ``CONTEXT_COMPACTION_FAILED``。
 
@@ -1979,6 +1988,10 @@ class HostDispatchScheduler:
         for active_task in tuple(self._active_tasks):
             active_task.cancel()
             await _suppress_task_cancel(active_task)
+        for active_handle in tuple(self._active_handles):
+            await _safe_close_worker_handle(active_handle)
+            self._active_handles.discard(active_handle)
+        self._active_registry.clear()
         await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
         self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
         self._close_cleanup_done = True

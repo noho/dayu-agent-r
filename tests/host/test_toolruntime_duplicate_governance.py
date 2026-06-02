@@ -68,6 +68,8 @@ _ATTEMPT_ID = "attempt-duplicate"
 _EXECUTION_ID = "execution-duplicate"
 _ITERATION_ID = "iteration-duplicate"
 _POLICY_DIGEST = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+_GOVERNED_BEFORE_ACCEPT_TIMEOUT_SECONDS = 0.1
+_GOVERNED_BEFORE_ACCEPT_WAIT_SECONDS = 1.0
 
 
 class _OpenCancellationToken:
@@ -223,6 +225,61 @@ class _BlockingCountingTool:
         )
 
 
+class _SequencedBlockingCountingTool:
+    """按调用序号使用独立事件阻塞并返回对应结果的测试工具。"""
+
+    def __init__(
+        self,
+        values: tuple[JsonValue, ...],
+        *,
+        entered_events: tuple[asyncio.Event, ...],
+        release_events: tuple[asyncio.Event, ...],
+    ) -> None:
+        """初始化序列阻塞测试工具。
+
+        :param values: 每次调用返回的结果值。
+        :param entered_events: 每次调用开始执行时置位的事件。
+        :param release_events: 每次调用允许返回的事件。
+        :returns: ``None``。
+        :raises ValueError: 三个序列长度不一致时抛出。
+        """
+
+        if len(values) != len(entered_events) or len(values) != len(release_events):
+            raise ValueError("sequenced blocking tool requires aligned sequences")
+        self._values = values
+        self._entered_events = entered_events
+        self._release_events = release_events
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """等待当前调用对应 release 事件后返回固定成功结果。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具上下文。
+        :returns: 成功 outcome。
+        :raises RuntimeError: 调用次数超过已配置序列长度时抛出。
+        """
+
+        del call, context
+        call_index = self.call_count
+        self.call_count += 1
+        if call_index >= len(self._values):
+            raise RuntimeError("unexpected sequenced blocking tool call")
+        self._entered_events[call_index].set()
+        await self._release_events[call_index].wait()
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=self._values[call_index],
+                meta=None,
+            )
+        )
+
+
 class _FailingTool:
     """抛出业务异常的测试工具。"""
 
@@ -369,6 +426,40 @@ class _TimedOutPort(HostToolFactAcceptPort):
             last_error_code="forced-timeout",
             diagnostic_refs=(),
         )
+
+
+class _RejectOnceThenAcceptingPort(HostToolFactAcceptPort):
+    """第一次 rejected、后续 accepted 的测试 accept port。"""
+
+    def __init__(self) -> None:
+        """初始化测试 accept port。
+
+        :returns: ``None``。
+        """
+
+        self.candidates: list[ToolFactAcceptCandidate] = []
+        self.acks: list[ToolFactAcceptedAck] = []
+
+    def accept_tool_fact(
+        self, candidate: ToolFactAcceptCandidate
+    ) -> ToolFactAcceptResult:
+        """记录 candidate 并按调用序号返回 rejected 或 accepted。
+
+        :param candidate: 工具事实候选。
+        :returns: 第一次为 rejected ack，后续为 accepted ack。
+        """
+
+        self.candidates.append(candidate)
+        if len(self.candidates) == 1:
+            return ToolFactRejectedAck(
+                reason_code=ToolAcceptRejectReason.EXPLICIT_POLICY_REJECT,
+                message="reject first candidate for duplicate handoff test",
+                diagnostic_refs=(),
+                retryable=False,
+            )
+        ack = _accepted_ack(candidate)
+        self.acks.append(ack)
+        return ack
 
 
 @pytest.mark.asyncio
@@ -921,15 +1012,19 @@ async def test_same_attempt_concurrent_reuse_waits_for_owner_accept() -> None:
 
 
 @pytest.mark.asyncio
-async def test_same_attempt_concurrent_rejected_accept_reports_durable_missing() -> None:
-    """owner accept rejected 时 waiter 得到 durable-missing 治理错误且不二次执行。"""
+async def test_same_attempt_concurrent_rejected_accept_hands_off_to_waiter() -> None:
+    """owner accept rejected 时 waiter 接棒成为新 owner 并真实执行。"""
 
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    tool = _BlockingCountingTool(
-        {"accepted": "owner"}, entered=entered, release=release
+    owner_entered = asyncio.Event()
+    replacement_entered = asyncio.Event()
+    owner_release = asyncio.Event()
+    replacement_release = asyncio.Event()
+    tool = _SequencedBlockingCountingTool(
+        ({"accepted": "owner"}, {"accepted": "replacement"}),
+        entered_events=(owner_entered, replacement_entered),
+        release_events=(owner_release, replacement_release),
     )
-    accept_port = _RejectingPort()
+    accept_port = _RejectOnceThenAcceptingPort()
     executor = _executor(
         tool,
         accept_port,
@@ -941,31 +1036,184 @@ async def test_same_attempt_concurrent_rejected_accept_reports_durable_missing()
     owner = asyncio.create_task(
         executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
     )
-    await entered.wait()
+    await owner_entered.wait()
     waiter = asyncio.create_task(
         executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
     )
     await asyncio.sleep(0)
-    release.set()
+    owner_release.set()
+    await replacement_entered.wait()
+    replacement_release.set()
     owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
 
-    assert tool.call_count == 1
+    assert tool.call_count == 2
     assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
-    assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
-    assert waiter_outcome.records[0].outcome.result.hint == (
-        "duplicate_prior_accept_missing"
-    )
+    assert isinstance(waiter_outcome.records[0].outcome, ToolCompletedOutcome)
+    assert waiter_outcome.records[0].outcome.result.value == {
+        "accepted": "replacement"
+    }
+    assert [candidate.tool_fact_kind for candidate in accept_port.candidates] == [
+        ToolFactKind.COMPLETED,
+        ToolFactKind.COMPLETED,
+    ]
 
     later = await executor.execute(
         _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
     )
     assert tool.call_count == 2
-    assert isinstance(later.records[0].outcome, ToolFailedOutcome)
+    assert isinstance(later.records[0].outcome, ToolCompletedOutcome)
+    assert later.records[0].outcome.result.value == {"accepted": "replacement"}
+    assert accept_port.candidates[2].tool_fact_kind is ToolFactKind.REUSE
+    assert _candidate_reuse_prior_event_refs(accept_port.candidates[2]) == (
+        accept_port.acks[0].accepted_event_refs
+    )
 
 
 @pytest.mark.asyncio
-async def test_same_attempt_concurrent_timed_out_accept_reports_durable_missing() -> None:
-    """owner accept timeout 时 waiter 得到 durable-missing 治理错误且不二次执行。"""
+async def test_durable_missing_only_one_waiter_replaces_owner_and_others_reuse() -> None:
+    """owner durable-missing 后只有一个 waiter 接棒，其它 waiter 继续等待复用。"""
+
+    owner_entered = asyncio.Event()
+    replacement_entered = asyncio.Event()
+    owner_release = asyncio.Event()
+    replacement_release = asyncio.Event()
+    tool = _SequencedBlockingCountingTool(
+        ({"accepted": "owner"}, {"accepted": "replacement"}),
+        entered_events=(owner_entered, replacement_entered),
+        release_events=(owner_release, replacement_release),
+    )
+    accept_port = _RejectOnceThenAcceptingPort()
+    executor = _executor(
+        tool,
+        accept_port,
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1", {"ticker": "DAYU"}, index=0)))
+    )
+    await owner_entered.wait()
+    waiter_one = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    waiter_two = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-3", {"ticker": "DAYU"}, index=2)))
+    )
+    await asyncio.sleep(0)
+    assert tool.call_count == 1
+
+    owner_release.set()
+    await replacement_entered.wait()
+    await asyncio.sleep(0)
+    assert tool.call_count == 2
+    assert not waiter_one.done() or not waiter_two.done()
+
+    replacement_release.set()
+    owner_outcome, waiter_one_outcome, waiter_two_outcome = await asyncio.gather(
+        owner,
+        waiter_one,
+        waiter_two,
+    )
+
+    waiter_outcomes = (
+        waiter_one_outcome.records[0].outcome,
+        waiter_two_outcome.records[0].outcome,
+    )
+    assert tool.call_count == 2
+    assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
+    assert all(isinstance(outcome, ToolCompletedOutcome) for outcome in waiter_outcomes)
+    assert all(
+        outcome.result.value == {"accepted": "replacement"}
+        for outcome in waiter_outcomes
+        if isinstance(outcome, ToolCompletedOutcome)
+    )
+    assert [candidate.tool_fact_kind for candidate in accept_port.candidates] == [
+        ToolFactKind.COMPLETED,
+        ToolFactKind.COMPLETED,
+        ToolFactKind.REUSE,
+    ]
+    assert accept_port.candidates[2].call.tool_call_id in {
+        "tool-call-2",
+        "tool-call-3",
+    }
+    assert _candidate_reuse_prior_event_refs(accept_port.candidates[2]) == (
+        accept_port.acks[0].accepted_event_refs
+    )
+
+
+@pytest.mark.asyncio
+async def test_governed_before_accept_hands_off_to_waiter() -> None:
+    """owner 工具超时并在 accept 前受治理时，waiter 接棒执行。"""
+
+    owner_entered = asyncio.Event()
+    replacement_entered = asyncio.Event()
+    owner_release = asyncio.Event()
+    replacement_release = asyncio.Event()
+    tool = _SequencedBlockingCountingTool(
+        ({"accepted": "owner"}, {"accepted": "replacement"}),
+        entered_events=(owner_entered, replacement_entered),
+        release_events=(owner_release, replacement_release),
+    )
+    accept_port = _AcceptingPort()
+    executor = _executor(
+        tool,
+        accept_port,
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        ),
+    )
+
+    owner = asyncio.create_task(
+        executor.execute(
+            _request(
+                _call("tool-call-1", {"ticker": "DAYU"}, index=0),
+                timeout_seconds=_GOVERNED_BEFORE_ACCEPT_TIMEOUT_SECONDS,
+            )
+        )
+    )
+    await owner_entered.wait()
+    waiter = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
+    )
+    await asyncio.sleep(0)
+    assert tool.call_count == 1
+    assert not waiter.done()
+
+    await asyncio.wait_for(
+        replacement_entered.wait(),
+        timeout=_GOVERNED_BEFORE_ACCEPT_WAIT_SECONDS,
+    )
+    replacement_release.set()
+    owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
+
+    assert tool.call_count == 2
+    assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
+    assert isinstance(waiter_outcome.records[0].outcome, ToolCompletedOutcome)
+    assert waiter_outcome.records[0].outcome.result.value == {
+        "accepted": "replacement"
+    }
+    assert [candidate.tool_fact_kind for candidate in accept_port.candidates] == [
+        ToolFactKind.GOVERNED_ERROR,
+        ToolFactKind.COMPLETED,
+    ]
+
+    later = await executor.execute(
+        _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
+    )
+    assert tool.call_count == 2
+    assert isinstance(later.records[0].outcome, ToolCompletedOutcome)
+    assert later.records[0].outcome.result.value == {"accepted": "replacement"}
+    assert accept_port.candidates[2].tool_fact_kind is ToolFactKind.REUSE
+    assert _candidate_reuse_prior_event_refs(accept_port.candidates[2]) == (
+        accept_port.acks[1].accepted_event_refs
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_attempt_concurrent_timed_out_accept_hands_off_to_waiter() -> None:
+    """owner accept timeout 时 waiter 接棒成为新 owner 并真实执行。"""
 
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -991,23 +1239,23 @@ async def test_same_attempt_concurrent_timed_out_accept_reports_durable_missing(
     release.set()
     owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
 
-    assert tool.call_count == 1
+    assert tool.call_count == 2
     assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
     assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
-    assert waiter_outcome.records[0].outcome.result.hint == (
+    assert waiter_outcome.records[0].outcome.result.hint != (
         "duplicate_prior_accept_missing"
     )
 
     later = await executor.execute(
         _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
     )
-    assert tool.call_count == 2
+    assert tool.call_count == 3
     assert isinstance(later.records[0].outcome, ToolFailedOutcome)
 
 
 @pytest.mark.asyncio
-async def test_same_attempt_concurrent_tool_exception_reports_durable_missing() -> None:
-    """owner 工具异常时 waiter 得到 durable-missing 治理错误且后续可重新执行。"""
+async def test_same_attempt_concurrent_tool_exception_hands_off_to_waiter() -> None:
+    """owner 工具异常时 waiter 接棒成为新 owner 并真实执行。"""
 
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1031,29 +1279,33 @@ async def test_same_attempt_concurrent_tool_exception_reports_durable_missing() 
     release.set()
     owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
 
-    assert tool.call_count == 1
+    assert tool.call_count == 2
     assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
     assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
-    assert waiter_outcome.records[0].outcome.result.hint == (
+    assert waiter_outcome.records[0].outcome.result.hint != (
         "duplicate_prior_accept_missing"
     )
 
     later = await executor.execute(
         _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
     )
-    assert tool.call_count == 2
+    assert tool.call_count == 3
     assert isinstance(later.records[0].outcome, ToolFailedOutcome)
 
 
 @pytest.mark.asyncio
-async def test_same_attempt_concurrent_owner_cancellation_reports_durable_missing() -> None:
-    """owner 取消时 waiter 得到 durable-missing 治理错误且后续可重新执行。"""
+async def test_same_attempt_concurrent_owner_cancellation_hands_off_to_waiter() -> None:
+    """owner 取消时 waiter 接棒成为新 owner 并真实执行。"""
 
-    entered = asyncio.Event()
-    release = asyncio.Event()
+    owner_entered = asyncio.Event()
+    replacement_entered = asyncio.Event()
+    owner_release = asyncio.Event()
+    replacement_release = asyncio.Event()
     token = _ControllableCancellationToken()
-    tool = _BlockingCountingTool(
-        {"accepted": "owner"}, entered=entered, release=release
+    tool = _SequencedBlockingCountingTool(
+        ({"accepted": "owner"}, {"accepted": "replacement"}),
+        entered_events=(owner_entered, replacement_entered),
+        release_events=(owner_release, replacement_release),
     )
     executor = _executor(
         tool,
@@ -1071,26 +1323,27 @@ async def test_same_attempt_concurrent_owner_cancellation_reports_durable_missin
             )
         )
     )
-    await entered.wait()
+    await owner_entered.wait()
     waiter = asyncio.create_task(
         executor.execute(_request(_call("tool-call-2", {"ticker": "DAYU"}, index=1)))
     )
     await asyncio.sleep(0)
     token.cancel("owner cancelled by test")
+    await replacement_entered.wait()
+    replacement_release.set()
     owner_outcome, waiter_outcome = await asyncio.wait_for(
         asyncio.gather(owner, waiter),
         timeout=1.0,
     )
 
-    assert tool.call_count == 1
+    assert tool.call_count == 2
     assert isinstance(owner_outcome.records[0].outcome, ToolFailedOutcome)
     assert owner_outcome.records[0].outcome.result.hint == "tool_runtime_cancelled"
-    assert isinstance(waiter_outcome.records[0].outcome, ToolFailedOutcome)
-    assert waiter_outcome.records[0].outcome.result.hint == (
-        "duplicate_prior_accept_missing"
-    )
+    assert isinstance(waiter_outcome.records[0].outcome, ToolCompletedOutcome)
+    assert waiter_outcome.records[0].outcome.result.value == {
+        "accepted": "replacement"
+    }
 
-    release.set()
     later = await executor.execute(
         _request(_call("tool-call-3", {"ticker": "DAYU"}, index=2))
     )
@@ -1266,12 +1519,14 @@ async def _governed_duplicate_candidate(
 def _request(
     *calls: ToolCallRequest,
     run_id: str = _RUN_ID,
+    timeout_seconds: float | None = 10.0,
     cancellation_token: _OpenCancellationToken | _ControllableCancellationToken | None = None,
 ) -> BatchToolExecutionRequest:
     """构造批式工具执行请求。
 
     :param calls: 单次工具调用请求。
     :param run_id: 请求上下文 run id。
+    :param timeout_seconds: 批级 timeout 秒数；无 timeout 时为 ``None``。
     :param cancellation_token: 可选取消 token；无则使用未取消 token。
     :returns: 批式工具执行请求。
     """
@@ -1283,7 +1538,7 @@ def _request(
             run_id=run_id,
             session_id=_SESSION_ID,
             iteration_id=_ITERATION_ID,
-            timeout_seconds=10.0,
+            timeout_seconds=timeout_seconds,
             cancellation_token=token,
             correlation_id="correlation-duplicate",
         ),
