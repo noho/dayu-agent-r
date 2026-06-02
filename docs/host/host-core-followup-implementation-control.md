@@ -116,11 +116,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | accepted plan commit |
-| implementation status | WU-ENGINE-01 plan re-review passed; ready for accepted plan commit / implementation |
+| gate | implementation |
+| implementation status | WU-ENGINE-01 accepted plan commit recorded; ready for Slice 1 implementation |
 | active work unit | WU-ENGINE-01 |
 | default next work unit | WU-ENGINE-01 |
-| next entry point | WU-ENGINE-01 accepted plan commit |
+| accepted plan commit | 10b0eaa |
+| plan artifact | docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md |
+| plan review artifacts | docs/reviews/wu-engine-01-plan-review-mimo-20260602.md; docs/reviews/wu-engine-01-plan-review-ds-20260602.md; docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md |
+| next entry point | WU-ENGINE-01 Slice 1 implementation |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
