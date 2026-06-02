@@ -67,6 +67,101 @@ def test_contains_sensitive_diagnostic_value_ignores_plain_diagnostics(
     assert not contains_sensitive_diagnostic_value(message)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "provider returned api_key=;",
+        "provider returned api-key:;",
+        "provider returned apikey=;",
+        "provider returned authorization=;",
+        "provider returned password=;",
+        "provider returned secret=;",
+        "provider returned token=;",
+    ],
+)
+def test_contains_sensitive_diagnostic_value_keeps_semicolon_value_start(
+    message: str,
+) -> None:
+    """赋值类字段的分号 value start 必须保持敏感。
+
+    :param message: 以分号作为 value 起点的诊断文本。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    assert contains_sensitive_diagnostic_value(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "provider returned api_key=}",
+        "provider returned api_key=]",
+        "provider returned token=}",
+        "provider returned token=]",
+        "provider returned Bearer }",
+        "provider returned Bearer ]",
+    ],
+)
+def test_contains_sensitive_diagnostic_value_ignores_closing_punctuation_start(
+    message: str,
+) -> None:
+    """右括号类 value start 不应被识别为敏感值。
+
+    :param message: 以右括号类标点作为 value 起点的诊断文本。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    assert not contains_sensitive_diagnostic_value(message)
+
+
+def test_redact_sensitive_diagnostic_values_redacts_semicolon_value_start() -> None:
+    """分号 value start 脱敏后不得保留原始敏感 value。
+
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    redacted = redact_sensitive_diagnostic_values(
+        "runtime failed api_key=; token=;",
+        redaction_marker=_REDACTION_MARKER,
+    )
+
+    assert redacted == "runtime failed api_key=<redacted> token=<redacted>"
+    assert "api_key=;" not in redacted
+    assert "token=;" not in redacted
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "provider returned api_key=}",
+        "provider returned api_key=]",
+        "provider returned token=}",
+        "provider returned token=]",
+        "provider returned Bearer }",
+        "provider returned Bearer ]",
+    ],
+)
+def test_redact_sensitive_diagnostic_values_preserves_closing_punctuation_start(
+    message: str,
+) -> None:
+    """非敏感右括号类 value start 不应被 runtime 脱敏改写。
+
+    :param message: 以右括号类标点作为 value 起点的诊断文本。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    redacted = redact_sensitive_diagnostic_values(
+        message,
+        redaction_marker=_REDACTION_MARKER,
+    )
+
+    assert redacted == message
+
+
 def test_redact_sensitive_diagnostic_values_preserves_context_and_prefix() -> None:
     """局部脱敏只替换 value，保留字段名前缀和非敏感上下文。
 

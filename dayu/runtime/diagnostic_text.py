@@ -12,7 +12,7 @@ from typing import Final
 
 _REDACTED_BEARER_PREFIX: Final[str] = "Bearer "
 _BEARER_SECRET_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\bBearer\s+([^\s,;]+)",
+    r"\bBearer\s+([A-Za-z0-9._~+/=-]+)",
     re.IGNORECASE,
 )
 _ASSIGNED_SECRET_VALUE_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -20,7 +20,7 @@ _ASSIGNED_SECRET_VALUE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?:api\s+key|api[_-]?key)\b\s*[:=]\s*"
     r"|(?:api\s+key|apikey)\b\s+"
     r"|(?:authorization|password|secret|token)\b\s*[:=]\s*"
-    r")([^\s,;]+)",
+    r")([^,\s}\]]+)",
     re.IGNORECASE,
 )
 _INVALID_MAX_CHARS_MESSAGE: Final[str] = "max_chars must be a positive integer"
