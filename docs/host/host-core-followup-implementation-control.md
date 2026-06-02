@@ -184,7 +184,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| RR-STRESS-01 | WU-STRESS-01 aggregate deepreview | 测试边界 | deferred-with-owner | WU-STRESS residual risk / future hardening if needed | 当前 work unit 不扩展为 fuzz / soak；若未来需要更高规格覆盖，单独开 hardening work unit | 当前 stress suite 是可重复、确定性、有限预算 production hardening suite，验收信号未要求不可控 fuzz 或长时 soak。 |
+| RR-STRESS-01 | WU-STRESS-01 aggregate deepreview | 测试边界 | transferred-to-issue | GitHub Issue #38: Host SQLite multiprocess stress high-spec slow-disk Docker run | 当前总控 residual finding reject；高强度慢盘 / Docker stress 已由 Issue #38 独立跟踪 | 当前 stress suite 是可重复、确定性、有限预算 production hardening suite；更高规格慢盘 / Docker stress 已有独立 issue owner，不作为本文档 residual risk 继续追踪。 |
 | RR-STRESS-02 | WU-STRESS-01 aggregate deepreview | 测试工具限制 | deferred-with-owner | pytest-timeout limitation accepted by WU-STRESS-01 | 保留 pytest-timeout 作为外层兜底；若 event loop 全局卡死，允许 timeout 先于内部 summary 终止 | 内部摘要覆盖可恢复失败；全局卡死时测试框架强杀是预期兜底，不改变 Host 语义。 |
 | RR-DUR-02 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | WAL checkpoint connection / db_path 一致性校验 | deferred-with-owner | future Host maintenance hardening | 若后续把 checkpoint primitive 接入 production maintenance caller，先增加 connection 与 db_path 一致性校验 | 当前 primitive 是内部 diagnostic-only/test entry，未接入 hot path 或 public API，现有调用方传入同一 store 的 connection/path pair。 |
 | RR-DUR-03 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | schema validation 批量缺失对象诊断 | deferred-with-owner | WU-LAYER-01 schema invariant hardening | 后续 schema invariant hardening 可把 fail-fast 单对象错误升级为批量缺失对象报告 | 当前 fail-closed 行为满足 WU-DUR 验收信号；批量诊断属于运维可读性增强。 |
