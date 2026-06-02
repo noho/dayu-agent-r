@@ -529,7 +529,7 @@ def test_duplicate_allow_does_not_append_governed_event(tmp_path: Path) -> None:
             duplicate_scope=DuplicateGovernanceScope(
                 kind="attempt", attempt_id=seeded.attempt_id
             ),
-            duplicate_decision_message="duplicate tool call allowed",
+            duplicate_decision_message="Repeated tool call allowed.",
         )
 
         result = accept_port.accept_tool_fact(candidate)
@@ -875,12 +875,12 @@ def _reuse_candidate(
         duplicate_scope=DuplicateGovernanceScope(
             kind="attempt", attempt_id=seeded.attempt_id
         ),
-        duplicate_decision_message="reuse prior accepted tool result",
+        duplicate_decision_message="Use the earlier tool result for this repeated request.",
         reuse_prior_event_refs=(prior_ref,),
         policy_decision=ToolPolicyDecision(
             kind=ToolPolicyDecisionKind.REUSE,
             reason_code="duplicate_reuse",
-            message="reuse prior accepted tool result",
+            message="Use the earlier tool result for this repeated request.",
         ),
         tool_idempotency_key=None,
         diagnostic_refs=(),

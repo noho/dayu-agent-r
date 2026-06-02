@@ -565,8 +565,8 @@ async def test_governed_duplicate_candidate_validation_rejects_policy_mismatch()
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
                 message=(
-                    "duplicate tool call should use prior accepted result "
-                    "or change evidence scope"
+                    "Use the earlier tool result, or call again only with a "
+                    "different evidence scope."
                 ),
             ),
         )
@@ -586,7 +586,10 @@ async def test_governed_duplicate_candidate_validation_rejects_reason_mismatch()
             policy_decision=ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
-                message="duplicate tool call hard-stopped by Host governance",
+                message=(
+                    "Repeated tool call blocked. Use the earlier tool result "
+                    "or change the request."
+                ),
             ),
         )
 

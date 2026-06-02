@@ -707,7 +707,7 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
         policy.justification_argument_names_by_tool_name["explain_fact"]
         == "duplicate_justification"
     )
-    assert policy.messages.reuse == "reuse prior accepted tool result"
+    assert policy.messages.reuse == "Use the earlier tool result for this repeated request."
 
 
 def test_duplicate_decision_from_config_reports_clear_error() -> None:
@@ -867,21 +867,26 @@ def _duplicate_governance_policy_config() -> ToolDuplicateGovernancePolicyConfig
         decisions_by_tool_name={},
         justification_argument_names_by_tool_name={},
         messages=ToolDuplicateGovernanceMessagesConfig(
-            allow="duplicate tool call allowed",
-            reuse="reuse prior accepted tool result",
+            allow="Repeated tool call allowed.",
+            reuse="Use the earlier tool result for this repeated request.",
             hint=(
-                "duplicate tool call should use prior accepted result "
-                "or change evidence scope"
+                "Use the earlier tool result, or call again only with a different "
+                "evidence scope."
             ),
             require_justification=(
-                "duplicate tool call requires structured justification"
+                "Repeated tool call needs a justification argument explaining why "
+                "the earlier result is insufficient."
             ),
-            hard_stop="duplicate tool call hard-stopped by Host governance",
+            hard_stop=(
+                "Repeated tool call blocked. Use the earlier tool result or change "
+                "the request."
+            ),
             attempt_scope_diagnostic=(
-                "duplicate tool call governed by attempt-local ToolRuntime index"
+                "Repeated tool call matched an earlier tool result in the "
+                "current reasoning step."
             ),
             prior_accept_missing=(
-                "prior duplicate owner did not produce an accepted tool result"
+                "The earlier matching tool call did not produce a usable result."
             ),
         ),
     )
@@ -1035,25 +1040,27 @@ def _write_execution_profile_overlay(
                             "explain_fact": "duplicate_justification",
                         },
                         "messages": {
-                            "allow": "duplicate tool call allowed",
-                            "reuse": "reuse prior accepted tool result",
+                            "allow": "Repeated tool call allowed.",
+                            "reuse": "Use the earlier tool result for this repeated request.",
                             "hint": (
-                                "duplicate tool call should use prior accepted result "
-                                "or change evidence scope"
+                                "Use the earlier tool result, or call again only "
+                                "with a different evidence scope."
                             ),
                             "require_justification": (
-                                "duplicate tool call requires structured justification"
+                                "Repeated tool call needs a justification argument "
+                                "explaining why the earlier result is insufficient."
                             ),
                             "hard_stop": (
-                                "duplicate tool call hard-stopped by Host governance"
+                                "Repeated tool call blocked. Use the earlier tool "
+                                "result or change the request."
                             ),
                             "attempt_scope_diagnostic": (
-                                "duplicate tool call governed by attempt-local "
-                                "ToolRuntime index"
+                                "Repeated tool call matched an earlier tool result "
+                                "in the current reasoning step."
                             ),
                             "prior_accept_missing": (
-                                "prior duplicate owner did not produce an accepted "
-                                "tool result"
+                                "The earlier matching tool call did not produce a "
+                                "usable result."
                             ),
                         },
                     },

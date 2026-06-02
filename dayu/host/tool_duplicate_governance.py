@@ -81,21 +81,26 @@ class DuplicateGovernanceMessages:
     :param prior_accept_missing: owner 未产生 accepted fact 时的等待者说明。
     """
 
-    allow: str = "duplicate tool call allowed"
-    reuse: str = "reuse prior accepted tool result"
+    allow: str = "Repeated tool call allowed."
+    reuse: str = "Use the earlier tool result for this repeated request."
     hint: str = (
-        "duplicate tool call should use prior accepted result "
-        "or change evidence scope"
+        "Use the earlier tool result, or call again only with a different "
+        "evidence scope."
     )
     require_justification: str = (
-        "duplicate tool call requires structured justification"
+        "Repeated tool call needs a justification argument explaining why "
+        "the earlier result is insufficient."
     )
-    hard_stop: str = "duplicate tool call hard-stopped by Host governance"
+    hard_stop: str = (
+        "Repeated tool call blocked. Use the earlier tool result or change "
+        "the request."
+    )
     attempt_scope_diagnostic: str = (
-        "duplicate tool call governed by attempt-local ToolRuntime index"
+        "Repeated tool call matched an earlier tool result in the "
+        "current reasoning step."
     )
     prior_accept_missing: str = (
-        "prior duplicate owner did not produce an accepted tool result"
+        "The earlier matching tool call did not produce a usable result."
     )
 
     def __post_init__(self) -> None:

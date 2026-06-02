@@ -89,7 +89,7 @@ dayu/config/
 - `tool_duplicate_governance_policy`：配置 attempt-scoped 重复工具调用治理，包含默认 duplicate decision、按工具名覆盖的 decision、require-justification 参数名映射，以及治理消息文本。
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
 
-`tool_duplicate_governance_policy.default_duplicate_decision` 与 `decisions_by_tool_name` 只允许 `allow`、`reuse`、`hint`、`require_justification`、`hard_stop`。`messages` 是 Host duplicate governance 返回给模型和诊断的文本，workspace overlay 可以按 profile 覆盖；这些文本不是 scene prompt asset，不放在 `prompts/` 目录。
+`tool_duplicate_governance_policy.default_duplicate_decision` 与 `decisions_by_tool_name` 只允许 `allow`、`reuse`、`hint`、`require_justification`、`hard_stop`。`messages` 是 duplicate governance 返回给模型和诊断的文本，workspace overlay 可以按 profile 覆盖；这些文本不是 scene prompt asset，不放在 `prompts/` 目录。默认 messages 只使用模型可执行、人工可读的外部语义，不要求模型理解 Host、ToolRuntime、Attempt 等内部实现概念。
 
 `agent_policy` 使用 `continuation_max_attempts`、`allow_tool_calls`、`max_consecutive_failed_tool_batches` 等当前 AgentPolicy 字段。`fallback_mode` 只允许 `force_answer` 与 `raise_error`；默认 fallback prompt 文本为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”
 

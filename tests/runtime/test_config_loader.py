@@ -174,21 +174,26 @@ def _tool_duplicate_governance_policy_record() -> dict[str, JsonValue]:
         "decisions_by_tool_name": {},
         "justification_argument_names_by_tool_name": {},
         "messages": {
-            "allow": "duplicate tool call allowed",
-            "reuse": "reuse prior accepted tool result",
+            "allow": "Repeated tool call allowed.",
+            "reuse": "Use the earlier tool result for this repeated request.",
             "hint": (
-                "duplicate tool call should use prior accepted result "
-                "or change evidence scope"
+                "Use the earlier tool result, or call again only with a different "
+                "evidence scope."
             ),
             "require_justification": (
-                "duplicate tool call requires structured justification"
+                "Repeated tool call needs a justification argument explaining why "
+                "the earlier result is insufficient."
             ),
-            "hard_stop": "duplicate tool call hard-stopped by Host governance",
+            "hard_stop": (
+                "Repeated tool call blocked. Use the earlier tool result or change "
+                "the request."
+            ),
             "attempt_scope_diagnostic": (
-                "duplicate tool call governed by attempt-local ToolRuntime index"
+                "Repeated tool call matched an earlier tool result in the "
+                "current reasoning step."
             ),
             "prior_accept_missing": (
-                "prior duplicate owner did not produce an accepted tool result"
+                "The earlier matching tool call did not produce a usable result."
             ),
         },
     }
@@ -350,7 +355,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     )
     assert (
         standard_256k.tool_duplicate_governance_policy.messages.hint
-        == "duplicate tool call should use prior accepted result or change evidence scope"
+        == "Use the earlier tool result, or call again only with a different evidence scope."
     )
     assert standard_256k.agent_policy.max_iterations == 24
     assert standard_256k.agent_policy.fallback_prompt == default_fallback_prompt()
