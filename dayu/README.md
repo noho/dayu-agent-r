@@ -34,7 +34,7 @@ UI -> Service -> Host -> Engine
 
 依赖只能沿 `UI -> Service -> Host -> Engine` 向下发生。Engine 不读取 Host durable store，不管理 Session / Run / Attempt；Host 不承载财报业务语义，不直接管理财报原文仓储规则；Service 不绕过 Host 直接控制 Engine。
 
-`dayu.runtime` 是层中立运行期基础设施包，不属于上述任一业务层。它只能承载日志、取消等待、cross-process lane、同步 filelock wrapper、工具发现装配、配置加载、scene manifest 装配、工具截断声明补齐等通用运行期能力，不持有 Host truth、业务语义或 Engine 协议状态机。
+`dayu.runtime` 是层中立运行期基础设施包，不属于上述任一业务层。它只能承载日志、取消等待、cross-process lane、同步 filelock wrapper、diagnostic 文本脱敏与有界截断、工具发现装配、配置加载、scene manifest 装配、工具截断声明补齐等通用运行期能力，不持有 Host truth、业务语义或 Engine 协议状态机。
 
 ## 稳定边界
 
@@ -82,6 +82,7 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 - `scene_prepare`：读取调用方显式传入的 scene manifest root 与 prompt asset root，校验 scene-only manifest、加载直接引用的 prompt fragments，用 typed context slot values 渲染 system messages，并输出已拼接的 system prompt、工具选择、model hints、typed agent policy override、fragment refs、source refs 与 content digest；不读取 ConfigLoader，不做工具发现，不表达 workflow、conversation lifecycle 或 Host runtime 部署。
 - `assembly`：提供 runtime-neutral 的 catalog selection、typed allowlist override merge、Agent policy 字段来源诊断与工具截断 policy defaults 投影；不构造 Host / Engine typed object。
 - `tool_truncation`：把允许缺省 limit / TTL 的 `ToolTruncateSpec` declaration 按调用方提供的 policy defaults 补齐为 effective spec；不导入 Host 或 Engine。
+- `diagnostic_text`：提供层中立 diagnostic 文本敏感值检测、局部脱敏和有界截断；不承载 Host / Engine 诊断事件语义、provider payload 语义或业务字段语义。
 
 ### `dayu.fins`
 

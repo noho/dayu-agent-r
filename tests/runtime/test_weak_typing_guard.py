@@ -14,6 +14,7 @@ _PHASE12_RUNTIME_HELPERS: frozenset[str] = frozenset(
     {
         "assembly.py",
         "config_loader.py",
+        "diagnostic_text.py",
         "location.py",
         "scene_prepare.py",
         "tool_truncation.py",
