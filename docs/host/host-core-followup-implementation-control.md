@@ -116,8 +116,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | ready-to-open-draft-PR |
-| implementation status | WU-LAYER-01 and WU-LAYER-02 local gates complete; ready to open draft PR |
+| gate | draft PR gate |
+| implementation status | draft PR opened; PR review pending |
 | active work unit | WU-LAYER-02 |
 | default next work unit | WU-LAYER-02 |
 | accepted plan commit | WU-LAYER-01: 278e5be; WU-LAYER-02: 76ecdb8 |
@@ -136,12 +136,12 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | implementation artifact | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-schema-definition-validation-codex-20260602.md; docs/reviews/wu-layer-01-slice2-terminal-shape-rules-codex-20260602.md; docs/reviews/wu-layer-01-slice3-row-decode-error-boundary-codex-20260602.md; docs/reviews/wu-layer-01-slice4-integration-verification-codex-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-implementation-report-20260602.md; docs/reviews/wu-layer-02-slice2-implementation-report-20260602.md; docs/reviews/wu-layer-02-slice2-blocker-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice3-implementation-report-20260602.md |
 | code review artifacts | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-controller-adjudication-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-controller-adjudication-20260602.md |
 | accepted aggregate deepreview commit | WU-LAYER-01: 351eb53; WU-LAYER-02: 4921d73 |
-| draft PR | none |
+| draft PR | https://github.com/noho/dayu-agent-r/pull/110 |
 | PR review artifacts | none |
 | accepted PR review commit | none |
 | PR follow-up artifacts | none |
 | validation | WU-LAYER-02 Slice 1: target tests 47 passed; pyright 0 errors; WU-LAYER-02 Slice 2: target tests plus import boundary 125 passed; pyright 0 errors; WU-LAYER-02 Slice 3: target tests plus regression 168 passed; pyright 0 errors; WU-LAYER-02 aggregate final: cross-slice tests 469 passed; pyright 0 errors |
-| next entry point | draft PR gate |
+| next entry point | PR review artifacts |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
