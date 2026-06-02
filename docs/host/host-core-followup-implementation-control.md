@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | WU-TOOL-02 draft PR follow-up RR-TOOL-03/RR-TOOL-04 passed |
+| implementation status | WU-TOOL-02 draft PR pass complete; user preparing merge |
 | active work unit | WU-TOOL-02 |
 | default next work unit | WU-TOOL-02 |
-| next entry point | WU-TOOL-02 draft PR pass complete；merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | 用户侧准备 merge PR #108；ready-for-review / reviewer request / merge 仍由用户执行或另行授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -172,9 +172,6 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
 | RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
 | RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
-| RR-TOOL-02 | WU-TOOL-01 Slice 1 code re-review | tool trace duplicate scope 透传 | closed | WU-TOOL-01 Slice 3 | 已完成；无需后续动作 | Slice 3 已为 `TOOL_CALL_GOVERNED` 和 tool trace summary 增加 machine-readable attempt duplicate scope，并由 `tests/host/test_tool_trace_projection.py` 覆盖 hot/cold trace。 |
-| RR-TOOL-03 | WU-TOOL-02 aggregate / full-repo review | `ToolFactKind.LOST` accept candidate fail-fast 显式测试缺口 | closed | WU-TOOL-02 PR follow-up RR-TOOL-03/RR-TOOL-04 fix | 已完成；无需后续动作 | `tests/host/test_toolruntime_accept_barrier.py` 已新增 `test_lost_tool_fact_kind_fails_fast_as_unsupported`，显式证明 LOST 在 `ToolFactAcceptCandidate` 构造期以 unsupported fact kind fail-fast。 |
-| RR-TOOL-04 | WU-TOOL-02 full-repo review | Tool accept candidate 子结构直接单元测试与测试 helper 进一步收敛 | closed | WU-TOOL-02 PR follow-up RR-TOOL-03/RR-TOOL-04 fix | 已完成；无需后续动作 | `tests/host/test_toolruntime_accept_barrier.py` 已新增 7 个 `ToolAccept*` 子结构 direct validator negative tests；未引入跨文件共享 test builder，保留本文件局部 helper 边界。 |
 
 ## 当前 Work Units
 
@@ -532,6 +529,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up implementation completed by AgentCodex。Implementation report: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-implementation-report-20260602.md`。Controller verification: `tests/host/test_toolruntime_accept_barrier.py` 24 passed；`tests/host/test_toolruntime_accept_barrier.py` + duplicate governance + diagnostics 56 passed；`pyright tests/host/test_toolruntime_accept_barrier.py dayu/host/tool_runtime.py` 0 errors。进入 code review gate，handoff: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-handoff-20260602.md`。
 - 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up code review artifacts: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-controller-adjudication-20260602.md`。裁决：无 blocking finding；`RR-TOOL-03` 与 `RR-TOOL-04` closed；MiMo/DS validator matrix nonblocking notes 不要求当前 gate 扩展为 exhaustive branch matrix。
 - 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up final verification passed。Controller verification: affected Host tests 214 passed；full pyright 0 errors。Accepted follow-up commit: `c1c909c`。WU-TOOL-02 恢复 draft-PR-pass。
+- 2026-06-02：用户准备 merge PR `#108`。Controller 更新总控状态，并按用户要求从 Residual Risk 表中删除已 `closed` 的条目；当前 Residual Risk 表仅保留仍 deferred-with-owner / transferred-to-issue / open 的追踪项。
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
