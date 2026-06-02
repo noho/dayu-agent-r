@@ -116,8 +116,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | draft PR gate |
-| implementation status | PR review passed; accepted PR review commit pending |
+| gate | draft-PR-pass |
+| implementation status | draft PR gate passed; PR review artifacts pushed |
 | active work unit | WU-LAYER-02 |
 | default next work unit | WU-LAYER-02 |
 | accepted plan commit | WU-LAYER-01: 278e5be; WU-LAYER-02: 76ecdb8 |
@@ -138,10 +138,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | accepted aggregate deepreview commit | WU-LAYER-01: 351eb53; WU-LAYER-02: 4921d73 |
 | draft PR | https://github.com/noho/dayu-agent-r/pull/110 |
 | PR review artifacts | docs/reviews/pr-110-review-mimo-20260602.md; docs/reviews/pr-110-review-ds-20260602.md; docs/reviews/pr-110-review-controller-adjudication-20260602.md |
-| accepted PR review commit | none |
+| accepted PR review commit | c997c4c |
 | PR follow-up artifacts | GitHub checks: none reported by `gh pr checks 110 --repo noho/dayu-agent-r` |
 | validation | WU-LAYER-02 Slice 1: target tests 47 passed; pyright 0 errors; WU-LAYER-02 Slice 2: target tests plus import boundary 125 passed; pyright 0 errors; WU-LAYER-02 Slice 3: target tests plus regression 168 passed; pyright 0 errors; WU-LAYER-02 aggregate final: cross-slice tests 469 passed; pyright 0 errors |
-| next entry point | accepted PR review commit |
+| next entry point | draft-PR-pass complete |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
