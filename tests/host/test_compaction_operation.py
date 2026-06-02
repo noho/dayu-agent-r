@@ -68,6 +68,13 @@ from tests.host.fake_compaction import FakeContextCompactor
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _NOW = datetime(2026, 5, 22, 1, 2, 3, tzinfo=UTC)
+_DEFAULT_SENSITIVE_EXCEPTION_MESSAGE = (
+    "provider failed Bearer bearer-secret "
+    "api_key=plain-secret token=token-secret secret=raw-secret "
+    "password=password-secret api key api-key-space-secret "
+    "apikey=apikey-secret api-key:api-key-colon-secret "
+    "api-key: api-key-colon-space-secret"
+)
 
 
 class _FailOnceCompactor(ContextCompactor):
@@ -117,6 +124,16 @@ class _AlwaysFailingCompactor(ContextCompactor):
 class _SensitiveFailingCompactor(ContextCompactor):
     """始终抛出带敏感字段的 proposal 异常。"""
 
+    def __init__(self, exception_message: str = _DEFAULT_SENSITIVE_EXCEPTION_MESSAGE) -> None:
+        """初始化异常消息。
+
+        :param exception_message: compactor 抛出的 provider 错误消息。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._exception_message = exception_message
+
     async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
         """模拟 provider 错误消息携带 secret。
 
@@ -128,9 +145,24 @@ class _SensitiveFailingCompactor(ContextCompactor):
 
         del request
         del cancellation_token
-        raise RuntimeError(
-            "provider failed Bearer secret-token " "api_key=plain-secret token=token-secret secret=raw-secret"
-        )
+        raise RuntimeError(self._exception_message)
+
+
+class _EmptyMessageFailingCompactor(ContextCompactor):
+    """始终抛出空消息 proposal 异常。"""
+
+    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+        """模拟 provider 抛出空消息异常。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出空消息 proposal failure。
+        """
+
+        del request
+        del cancellation_token
+        raise RuntimeError()
 
 
 class _CancelAfterFailureCompactor(ContextCompactor):
@@ -504,7 +536,11 @@ async def test_run_compaction_operation_stops_before_retry_when_cancelled() -> N
 
 @pytest.mark.asyncio
 async def test_run_compaction_operation_redacts_exception_diagnostic_refs() -> None:
-    """proposal 异常诊断 ref 不能持久化 Bearer token 或 secret 赋值。"""
+    """proposal 异常诊断 ref 不能持久化 value-bearing secret 原文。
+
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
 
     result = await run_compaction_operation(
         request=_request(),
@@ -514,11 +550,106 @@ async def test_run_compaction_operation_redacts_exception_diagnostic_refs() -> N
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
-    assert "secret-token" not in diagnostic_ref
-    assert "plain-secret" not in diagnostic_ref
-    assert "token-secret" not in diagnostic_ref
-    assert "raw-secret" not in diagnostic_ref
+    secret_values = (
+        "bearer-secret",
+        "plain-secret",
+        "token-secret",
+        "raw-secret",
+        "password-secret",
+        "api-key-space-secret",
+        "apikey-secret",
+        "api-key-colon-secret",
+        "api-key-colon-space-secret",
+    )
+    for secret_value in secret_values:
+        assert secret_value not in diagnostic_ref
     assert "<redacted>" in diagnostic_ref
+
+
+@pytest.mark.parametrize(
+    ("message", "secret_value", "redacted_fragment"),
+    [
+        ("provider failed Bearer bearer-secret", "bearer-secret", "Bearer <redacted>"),
+        ("provider failed api_key=plain-secret", "plain-secret", "api_key=<redacted>"),
+        ("provider failed token=token-secret", "token-secret", "token=<redacted>"),
+        ("provider failed secret=raw-secret", "raw-secret", "secret=<redacted>"),
+        ("provider failed password=password-secret", "password-secret", "password=<redacted>"),
+        ("provider failed api key api-key-space-secret", "api-key-space-secret", "api key <redacted>"),
+        ("provider failed apikey=apikey-secret", "apikey-secret", "apikey=<redacted>"),
+        ("provider failed api-key:api-key-colon-secret", "api-key-colon-secret", "api-key:<redacted>"),
+        (
+            "provider failed api-key: api-key-colon-space-secret",
+            "api-key-colon-space-secret",
+            "api-key: <redacted>",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_compaction_operation_redacts_each_value_bearing_secret_pattern(
+    message: str,
+    secret_value: str,
+    redacted_fragment: str,
+) -> None:
+    """Host proposal 异常诊断必须局部脱敏每类 value-bearing secret。
+
+    :param message: 带单个敏感值的 proposal 异常消息。
+    :param secret_value: 不应出现在 diagnostic ref 中的原始 secret value。
+    :param redacted_fragment: 应保留字段上下文的脱敏片段。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_SensitiveFailingCompactor(message),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+    )
+
+    diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
+    assert secret_value not in diagnostic_ref
+    assert redacted_fragment in diagnostic_ref
+    assert "<redacted>" in diagnostic_ref
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_keeps_plain_token_expired_context() -> None:
+    """普通 token 诊断句不应被整体删除或误脱敏。
+
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_SensitiveFailingCompactor("provider failed: JWT token has expired"),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+    )
+
+    diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
+    assert "JWT token has expired" in diagnostic_ref
+    assert "<redacted>" not in diagnostic_ref
+
+
+@pytest.mark.asyncio
+async def test_exception_diagnostic_suffix_uses_exception_type_for_empty_message() -> None:
+    """异常消息为空时 diagnostic suffix 只保留异常类名。
+
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_EmptyMessageFailingCompactor(),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+    )
+
+    diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
+    assert diagnostic_ref.endswith(":RuntimeError")
+    assert ":RuntimeError:" not in diagnostic_ref
 
 
 @pytest.mark.asyncio
