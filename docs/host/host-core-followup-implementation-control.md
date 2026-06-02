@@ -116,26 +116,26 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-ENGINE-01 draft PR gate passed; RR-ENGINE-01-01 closed by PR follow-up |
-| active work unit | WU-ENGINE-01 |
-| default next work unit | WU-LAYER-01 |
-| accepted plan commit | 10b0eaa |
-| plan artifact | docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md |
-| plan review artifacts | docs/reviews/wu-engine-01-plan-review-mimo-20260602.md; docs/reviews/wu-engine-01-plan-review-ds-20260602.md; docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md |
-| accepted slice commits | Slice 1: dba6513; Slice 2: 3857e23; Slice 3: c7308f7 |
-| Slice 1 status | accepted; target tests 35 passed; pyright 0 errors |
-| Slice 2 status | accepted; target tests 67 passed; pyright 0 errors |
-| current slice | aggregate deepreview closeout |
-| implementation artifact | docs/reviews/wu-engine-01-slice3-validation-codex-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-codex-20260602.md |
-| code review artifacts | docs/reviews/wu-engine-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-engine-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-ds-20260602.md |
-| accepted aggregate deepreview commit | cb190ee |
-| draft PR | https://github.com/noho/dayu-agent-r/pull/109 |
-| PR review artifacts | docs/reviews/wu-engine-01-draft-pr-review-handoff-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-mimo-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-ds-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-controller-adjudication-20260602.md |
-| accepted PR review commit | ee29e2c |
-| PR follow-up artifacts | docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-codex-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-mimo-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-ds-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-controller-adjudication-20260602.md |
-| validation | WU-ENGINE-01 target tests 97 passed; pyright 0 errors |
-| next entry point | WU-LAYER-01 discussion / code inspection |
+| gate | planning |
+| implementation status | WU-LAYER-01 plan re-review passed; accepted plan commit pending |
+| active work unit | WU-LAYER-01 |
+| default next work unit | WU-LAYER-02 |
+| accepted plan commit | pending |
+| plan artifact | docs/host/wu-layer-01-durable-row-primitive-cleanup-plan.md |
+| plan review artifacts | docs/reviews/wu-layer-01-plan-review-mimo-20260602.md; docs/reviews/wu-layer-01-plan-review-ds-20260602.md; docs/reviews/wu-layer-01-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-01-plan-rereview-ds-20260602.md |
+| accepted slice commits | none |
+| Slice 1 status | pending |
+| Slice 2 status | pending |
+| current slice | WU-LAYER-01 implementation Slice 1 pending |
+| implementation artifact | none |
+| code review artifacts | none |
+| accepted aggregate deepreview commit | none |
+| draft PR | none |
+| PR review artifacts | none |
+| accepted PR review commit | none |
+| PR follow-up artifacts | none |
+| validation | pending WU-LAYER-01 implementation |
+| next entry point | WU-LAYER-01 implementation Slice 1 after accepted plan commit |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
