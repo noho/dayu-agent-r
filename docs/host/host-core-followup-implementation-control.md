@@ -116,8 +116,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-ENGINE-01 Slice 1 re-review passed; ready for accepted slice commit |
+| gate | implementation |
+| implementation status | WU-ENGINE-01 Slice 1 accepted; ready for Slice 2 implementation |
 | active work unit | WU-ENGINE-01 |
 | default next work unit | WU-ENGINE-01 |
 | accepted plan commit | 10b0eaa |
@@ -129,7 +129,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | fix artifact | docs/reviews/wu-engine-01-slice1-fix-codex-20260602.md |
 | re-review artifacts | docs/reviews/wu-engine-01-slice1-code-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-slice1-code-rereview-ds-20260602.md |
 | validation | Slice 1 target tests 35 passed; pyright 0 errors |
-| next entry point | WU-ENGINE-01 Slice 1 accepted commit |
+| accepted slice commits | Slice 1: dba6513 |
+| next entry point | WU-ENGINE-01 Slice 2 implementation |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
