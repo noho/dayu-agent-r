@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-TOOL-01 draft PR gate passed |
-| active work unit | WU-TOOL-01 |
-| default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-02 discussion-ready；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| gate | implementation |
+| implementation status | WU-TOOL-02 accepted plan; implementation gate ready |
+| active work unit | WU-TOOL-02 |
+| default next work unit | WU-TOOL-02 |
+| next entry point | WU-TOOL-02 implementation Slice 1；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -187,7 +187,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 已完成：draft-PR-pass |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
-| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
+| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | planning |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
 | WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
@@ -504,6 +504,13 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 类型检查不依赖 `object` / `Any` / magic payload。
 - 测试 helper 不再到处手写超宽 `ToolFactAcceptCandidate` 构造参数。
 - 拆分后无 god dataclass / god builder 回流，普通 result、reuse、governed error 的校验逻辑各自清晰。
+
+### 进展记录
+
+- 2026-06-02：controller 完成 discussion / code inspection。裁决：动机成立，但风险性质是维护性、可测试性和后续演进风险，不是当前运行时 correctness blocker；进入 plan gate。Artifacts: `docs/reviews/wu-tool-02-discussion-code-inspection-20260602.md`, `docs/reviews/wu-tool-02-planning-handoff-20260602.md`。
+- 2026-06-02：用户补充要求：WU-TOOL-02 全部完成后，ready-to-open-draft-PR 前追加 AgentMiMo 与 AgentDS 并行全仓 review；该 review gate 是本 work unit 的额外前置条件，不替代常规 slice review、aggregate deepreview、测试和 pyright。
+- 2026-06-02：plan artifact 已生成，artifact: `docs/host/wu-tool-02-accept-candidate-cleanup-plan.md`。Plan review artifacts: `docs/reviews/wu-tool-02-plan-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-plan-review-controller-adjudication-20260602.md`。裁决：接受 DS Finding 01 及若干低严重 clarification findings；进入 plan fix gate，必须修正 slice 中间态类型失败风险后再 re-review。
+- 2026-06-02：plan fix 后 re-review 通过。Re-review artifacts: `docs/reviews/wu-tool-02-plan-re-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-re-review-ds-20260602.md`。裁决：全部 accepted findings closed，plan handoff-ready / code-generation-ready；进入 implementation gate。Accepted plan commit: `77a2871`.
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
