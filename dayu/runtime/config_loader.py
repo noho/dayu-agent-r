@@ -64,6 +64,15 @@ _TOOL_DISCOVERY_SOURCE_KINDS: Final[frozenset[ToolBundleSourceKind]] = frozenset
         ToolBundleSourceKind.PACKAGE_ENTRYPOINT,
     }
 )
+_TOOL_DUPLICATE_GOVERNANCE_DECISIONS: Final[frozenset[str]] = frozenset(
+    {
+        "allow",
+        "reuse",
+        "hint",
+        "require_justification",
+        "hard_stop",
+    }
+)
 
 JsonObject: TypeAlias = Mapping[str, JsonValue]
 """JSON object 的只读映射类型。"""
@@ -343,6 +352,7 @@ class ExecutionProfileConfig:
     :param context_budget_policy: 上下文预算基线。
     :param memory_projection_policy: memory projection 基线。
     :param tool_truncation_policy: 截断治理基线。
+    :param tool_duplicate_governance_policy: 工具重复调用治理基线。
     :param agent_policy: 内嵌 Agent policy 基线。
     """
 
@@ -354,7 +364,46 @@ class ExecutionProfileConfig:
     context_budget_policy: ContextBudgetConfig
     memory_projection_policy: MemoryProjectionConfig
     tool_truncation_policy: ToolTruncationPolicyConfig
+    tool_duplicate_governance_policy: ToolDuplicateGovernancePolicyConfig
     agent_policy: AgentPolicyConfig
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDuplicateGovernanceMessagesConfig:
+    """工具重复调用治理消息配置。
+
+    :param allow: allow 决策说明。
+    :param reuse: reuse 决策说明。
+    :param hint: hint 决策说明。
+    :param require_justification: require_justification 决策说明。
+    :param hard_stop: hard_stop 决策说明。
+    :param attempt_scope_diagnostic: attempt-scoped 诊断说明。
+    :param prior_accept_missing: owner 未产生 accepted fact 时的说明。
+    """
+
+    allow: str
+    reuse: str
+    hint: str
+    require_justification: str
+    hard_stop: str
+    attempt_scope_diagnostic: str
+    prior_accept_missing: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDuplicateGovernancePolicyConfig:
+    """Execution profile 内嵌工具重复调用治理配置。
+
+    :param default_duplicate_decision: 默认重复调用治理动作。
+    :param decisions_by_tool_name: 按工具名覆盖的治理动作。
+    :param justification_argument_names_by_tool_name: 按工具名配置的 justification 参数名。
+    :param messages: 面向模型与诊断的治理消息。
+    """
+
+    default_duplicate_decision: str
+    decisions_by_tool_name: Mapping[str, str]
+    justification_argument_names_by_tool_name: Mapping[str, str]
+    messages: ToolDuplicateGovernanceMessagesConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -1224,6 +1273,7 @@ def _parse_execution_profile(
                 "context_budget_policy",
                 "memory_projection_policy",
                 "tool_truncation_policy",
+                "tool_duplicate_governance_policy",
                 "agent_policy",
             }
         ),
@@ -1290,6 +1340,14 @@ def _parse_execution_profile(
                 context=context,
             ),
             context=f"{context}.tool_truncation_policy",
+        ),
+        tool_duplicate_governance_policy=_parse_tool_duplicate_governance_policy(
+            _require_mapping_field(
+                record,
+                field_name="tool_duplicate_governance_policy",
+                context=context,
+            ),
+            context=f"{context}.tool_duplicate_governance_policy",
         ),
         agent_policy=_parse_agent_policy(
             _require_mapping_field(
@@ -1566,6 +1624,149 @@ def _parse_tool_truncation_limits(
             max_bytes=_require_positive_int_field(binary_bytes, field_name="max_bytes", context=f"{context}.binary_bytes")
         ),
     )
+
+
+def _parse_tool_duplicate_governance_policy(
+    record: JsonObject, *, context: str
+) -> ToolDuplicateGovernancePolicyConfig:
+    """解析工具重复调用治理 policy。
+
+    :param record: duplicate governance policy JSON object。
+    :param context: 错误消息上下文。
+    :returns: duplicate governance policy typed config。
+    :raises ConfigFieldError: 字段缺失、非法类型或决策值非法时抛出。
+    """
+
+    _require_exact_fields(
+        record,
+        allowed=frozenset(
+            {
+                "default_duplicate_decision",
+                "decisions_by_tool_name",
+                "justification_argument_names_by_tool_name",
+                "messages",
+            }
+        ),
+        context=context,
+    )
+    default_duplicate_decision = _parse_tool_duplicate_governance_decision(
+        _require_str_field(
+            record,
+            field_name="default_duplicate_decision",
+            context=context,
+        ),
+        context=f"{context}.default_duplicate_decision",
+    )
+    return ToolDuplicateGovernancePolicyConfig(
+        default_duplicate_decision=default_duplicate_decision,
+        decisions_by_tool_name=_parse_tool_duplicate_decision_mapping(
+            _require_mapping_field(
+                record,
+                field_name="decisions_by_tool_name",
+                context=context,
+            ),
+            context=f"{context}.decisions_by_tool_name",
+        ),
+        justification_argument_names_by_tool_name=_parse_non_empty_str_mapping(
+            _require_mapping_field(
+                record,
+                field_name="justification_argument_names_by_tool_name",
+                context=context,
+            ),
+            context=f"{context}.justification_argument_names_by_tool_name",
+        ),
+        messages=_parse_tool_duplicate_governance_messages(
+            _require_mapping_field(record, field_name="messages", context=context),
+            context=f"{context}.messages",
+        ),
+    )
+
+
+def _parse_tool_duplicate_governance_messages(
+    record: JsonObject, *, context: str
+) -> ToolDuplicateGovernanceMessagesConfig:
+    """解析工具重复调用治理消息。
+
+    :param record: messages JSON object。
+    :param context: 错误消息上下文。
+    :returns: duplicate governance messages typed config。
+    :raises ConfigFieldError: 字段缺失、非法类型或空文本时抛出。
+    """
+
+    _require_exact_fields(
+        record,
+        allowed=frozenset(
+            {
+                "allow",
+                "reuse",
+                "hint",
+                "require_justification",
+                "hard_stop",
+                "attempt_scope_diagnostic",
+                "prior_accept_missing",
+            }
+        ),
+        context=context,
+    )
+    return ToolDuplicateGovernanceMessagesConfig(
+        allow=_require_str_field(record, field_name="allow", context=context),
+        reuse=_require_str_field(record, field_name="reuse", context=context),
+        hint=_require_str_field(record, field_name="hint", context=context),
+        require_justification=_require_str_field(
+            record,
+            field_name="require_justification",
+            context=context,
+        ),
+        hard_stop=_require_str_field(record, field_name="hard_stop", context=context),
+        attempt_scope_diagnostic=_require_str_field(
+            record,
+            field_name="attempt_scope_diagnostic",
+            context=context,
+        ),
+        prior_accept_missing=_require_str_field(
+            record,
+            field_name="prior_accept_missing",
+            context=context,
+        ),
+    )
+
+
+def _parse_tool_duplicate_decision_mapping(
+    record: JsonObject, *, context: str
+) -> Mapping[str, str]:
+    """解析工具名到重复治理决策的映射。
+
+    :param record: 工具名到决策字符串的 JSON object。
+    :param context: 错误消息上下文。
+    :returns: 工具名到合法决策字符串的映射。
+    :raises ConfigFieldError: 工具名为空、值非字符串或决策非法时抛出。
+    """
+
+    result: dict[str, str] = {}
+    for tool_name, decision in record.items():
+        if not tool_name.strip():
+            raise ConfigFieldError(f"{context} contains empty tool name")
+        if not isinstance(decision, str):
+            raise ConfigFieldError(f"{context}.{tool_name} must be a string")
+        result[tool_name] = _parse_tool_duplicate_governance_decision(
+            decision,
+            context=f"{context}.{tool_name}",
+        )
+    return result
+
+
+def _parse_tool_duplicate_governance_decision(value: str, *, context: str) -> str:
+    """校验工具重复调用治理决策值。
+
+    :param value: 配置中的决策字符串。
+    :param context: 错误消息上下文。
+    :returns: 合法决策字符串。
+    :raises ConfigFieldError: 决策值不在允许集合内时抛出。
+    """
+
+    if value not in _TOOL_DUPLICATE_GOVERNANCE_DECISIONS:
+        raise ConfigFieldError(f"{context} has unsupported value: {value}")
+    return value
 
 
 def _parse_agent_policy(
@@ -2090,6 +2291,29 @@ def _require_str_mapping_field(
     for key, value in raw.items():
         if not isinstance(value, str):
             raise ConfigFieldError(f"{context}.{field_name}.{key} must be a string")
+        result[key] = value
+    return result
+
+
+def _parse_non_empty_str_mapping(
+    record: JsonObject, *, context: str
+) -> Mapping[str, str]:
+    """解析非空字符串 key/value 映射。
+
+    :param record: JSON object。
+    :param context: 错误消息上下文。
+    :returns: 非空字符串 key/value 映射。
+    :raises ConfigFieldError: key 或 value 为空、value 不是字符串时抛出。
+    """
+
+    result: dict[str, str] = {}
+    for key, value in record.items():
+        if not key.strip():
+            raise ConfigFieldError(f"{context} contains empty key")
+        if not isinstance(value, str):
+            raise ConfigFieldError(f"{context}.{key} must be a string")
+        if not value.strip():
+            raise ConfigFieldError(f"{context}.{key} must be non-empty")
         result[key] = value
     return result
 

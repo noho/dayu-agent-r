@@ -30,6 +30,10 @@ from dayu.host.api import (
     HostCallContext,
     OperationContext,
 )
+from dayu.host.tool_duplicate_governance import (
+    DuplicateDecisionKind,
+    DuplicateGovernancePolicy,
+)
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.config_loader import (
     ToolDiscoveryEntryPointConfig,
@@ -529,6 +533,7 @@ def test_tooling_options_from_discovery_requires_source_refs() -> None:
         _tooling_options_from_discovery(
             tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_fact"),)),
             source_refs=(),
+            duplicate_governance_policy=DuplicateGovernancePolicy(),
         )
 
 
@@ -632,6 +637,75 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
 
     assert result.options.enable_truncation_manager is False
     assert result.diagnostics.tool_truncation_policy.startswith("enabled=False")
+
+
+def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
+    tmp_path: Path,
+) -> None:
+    """重复工具调用治理策略必须由 execution profile 派生后传入 Host tooling。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: helper 未把配置映射进 HostToolingOptions 时抛出。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    _write_execution_profile_overlay(
+        tmp_path,
+        truncation_enabled=True,
+        duplicate_default_decision="hint",
+    )
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = discover_service_tools(config)
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "service-assembly-test",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=config,
+            locations=locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    assert result.options.tooling_options is not None
+    policy = result.options.tooling_options.duplicate_governance_policy
+    assert policy.default_duplicate_decision is DuplicateDecisionKind.HINT
+    assert policy.decisions_by_tool_name["lookup_fact"] is DuplicateDecisionKind.REUSE
+    assert (
+        policy.decisions_by_tool_name["explain_fact"]
+        is DuplicateDecisionKind.REQUIRE_JUSTIFICATION
+    )
+    assert (
+        policy.justification_argument_names_by_tool_name["explain_fact"]
+        == "duplicate_justification"
+    )
+    assert policy.messages.reuse == "reuse prior accepted tool result"
 
 
 def test_explicit_1m_profile_with_256k_model_fails_fast(
@@ -830,6 +904,7 @@ def _write_execution_profile_overlay(
     workspace_root: Path,
     *,
     truncation_enabled: bool,
+    duplicate_default_decision: str = "allow",
     profile_id: str = "standard-256k",
     context_window_class: str = "256k",
     min_context_window_tokens: int = 262144,
@@ -839,6 +914,7 @@ def _write_execution_profile_overlay(
 
     :param workspace_root: pytest 临时 workspace root。
     :param truncation_enabled: tool truncation policy 是否启用。
+    :param duplicate_default_decision: duplicate governance 默认决策。
     :param profile_id: 写入的 execution profile id。
     :param context_window_class: profile 上下文窗口分档。
     :param min_context_window_tokens: profile 最小上下文窗口 token 数。
@@ -899,6 +975,38 @@ def _write_execution_profile_overlay(
                             "text_lines": {"max_lines": 400},
                             "list_items": {"max_items": 200},
                             "binary_bytes": {"max_bytes": 1048576},
+                        },
+                    },
+                    "tool_duplicate_governance_policy": {
+                        "default_duplicate_decision": duplicate_default_decision,
+                        "decisions_by_tool_name": {
+                            "lookup_fact": "reuse",
+                            "explain_fact": "require_justification",
+                        },
+                        "justification_argument_names_by_tool_name": {
+                            "explain_fact": "duplicate_justification",
+                        },
+                        "messages": {
+                            "allow": "duplicate tool call allowed",
+                            "reuse": "reuse prior accepted tool result",
+                            "hint": (
+                                "duplicate tool call should use prior accepted result "
+                                "or change evidence scope"
+                            ),
+                            "require_justification": (
+                                "duplicate tool call requires structured justification"
+                            ),
+                            "hard_stop": (
+                                "duplicate tool call hard-stopped by Host governance"
+                            ),
+                            "attempt_scope_diagnostic": (
+                                "duplicate tool call governed by attempt-local "
+                                "ToolRuntime index"
+                            ),
+                            "prior_accept_missing": (
+                                "prior duplicate owner did not produce an accepted "
+                                "tool result"
+                            ),
                         },
                     },
                     "agent_policy": {

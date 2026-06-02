@@ -157,7 +157,40 @@ def _execution_profile_record() -> dict[str, JsonValue]:
                 "binary_bytes": {"max_bytes": 1024},
             },
         },
+        "tool_duplicate_governance_policy": _tool_duplicate_governance_policy_record(),
         "agent_policy": _agent_policy_record(),
+    }
+
+
+def _tool_duplicate_governance_policy_record() -> dict[str, JsonValue]:
+    """构造完整工具重复调用治理 policy fixture。
+
+    :returns: 工具重复调用治理 policy JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "default_duplicate_decision": "allow",
+        "decisions_by_tool_name": {},
+        "justification_argument_names_by_tool_name": {},
+        "messages": {
+            "allow": "duplicate tool call allowed",
+            "reuse": "reuse prior accepted tool result",
+            "hint": (
+                "duplicate tool call should use prior accepted result "
+                "or change evidence scope"
+            ),
+            "require_justification": (
+                "duplicate tool call requires structured justification"
+            ),
+            "hard_stop": "duplicate tool call hard-stopped by Host governance",
+            "attempt_scope_diagnostic": (
+                "duplicate tool call governed by attempt-local ToolRuntime index"
+            ),
+            "prior_accept_missing": (
+                "prior duplicate owner did not produce an accepted tool result"
+            ),
+        },
     }
 
 
@@ -310,6 +343,14 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert (
         standard_256k.memory_projection_policy.max_evidence_backed_facts
         == 256
+    )
+    assert (
+        standard_256k.tool_duplicate_governance_policy.default_duplicate_decision
+        == "allow"
+    )
+    assert (
+        standard_256k.tool_duplicate_governance_policy.messages.hint
+        == "duplicate tool call should use prior accepted result or change evidence scope"
     )
     assert standard_256k.agent_policy.max_iterations == 24
     assert standard_256k.agent_policy.fallback_prompt == default_fallback_prompt()
@@ -850,6 +891,32 @@ def test_agent_policy_missing_field_fails_fast(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigFieldError, match="missing required fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_tool_duplicate_governance_unknown_decision_fails_fast(tmp_path: Path) -> None:
+    """工具重复治理 policy 不接受未知 duplicate decision。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 未在配置加载期 fail-fast 时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    duplicate_policy = profile["tool_duplicate_governance_policy"]
+    assert isinstance(duplicate_policy, dict)
+    duplicate_policy["default_duplicate_decision"] = "retry"
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unsupported value"):
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 

@@ -58,6 +58,20 @@
           }
         }
       },
+      "tool_duplicate_governance_policy": {
+        "default_duplicate_decision": "allow",
+        "decisions_by_tool_name": {},
+        "justification_argument_names_by_tool_name": {},
+        "messages": {
+          "allow": "duplicate tool call allowed",
+          "reuse": "reuse prior accepted tool result",
+          "hint": "duplicate tool call should use prior accepted result or change evidence scope",
+          "require_justification": "duplicate tool call requires structured justification",
+          "hard_stop": "duplicate tool call hard-stopped by Host governance",
+          "attempt_scope_diagnostic": "duplicate tool call governed by attempt-local ToolRuntime index",
+          "prior_accept_missing": "prior duplicate owner did not produce an accepted tool result"
+        }
+      },
       "agent_policy": {
         "max_iterations": 24,
         "continuation_max_attempts": 2,
@@ -124,6 +138,20 @@
           "binary_bytes": {
             "max_bytes": 1048576
           }
+        }
+      },
+      "tool_duplicate_governance_policy": {
+        "default_duplicate_decision": "allow",
+        "decisions_by_tool_name": {},
+        "justification_argument_names_by_tool_name": {},
+        "messages": {
+          "allow": "duplicate tool call allowed",
+          "reuse": "reuse prior accepted tool result",
+          "hint": "duplicate tool call should use prior accepted result or change evidence scope",
+          "require_justification": "duplicate tool call requires structured justification",
+          "hard_stop": "duplicate tool call hard-stopped by Host governance",
+          "attempt_scope_diagnostic": "duplicate tool call governed by attempt-local ToolRuntime index",
+          "prior_accept_missing": "prior duplicate owner did not produce an accepted tool result"
         }
       },
       "agent_policy": {
@@ -194,6 +222,20 @@
           }
         }
       },
+      "tool_duplicate_governance_policy": {
+        "default_duplicate_decision": "allow",
+        "decisions_by_tool_name": {},
+        "justification_argument_names_by_tool_name": {},
+        "messages": {
+          "allow": "duplicate tool call allowed",
+          "reuse": "reuse prior accepted tool result",
+          "hint": "duplicate tool call should use prior accepted result or change evidence scope",
+          "require_justification": "duplicate tool call requires structured justification",
+          "hard_stop": "duplicate tool call hard-stopped by Host governance",
+          "attempt_scope_diagnostic": "duplicate tool call governed by attempt-local ToolRuntime index",
+          "prior_accept_missing": "prior duplicate owner did not produce an accepted tool result"
+        }
+      },
       "agent_policy": {
         "max_iterations": 24,
         "continuation_max_attempts": 2,
@@ -260,6 +302,20 @@
           "binary_bytes": {
             "max_bytes": 1048576
           }
+        }
+      },
+      "tool_duplicate_governance_policy": {
+        "default_duplicate_decision": "allow",
+        "decisions_by_tool_name": {},
+        "justification_argument_names_by_tool_name": {},
+        "messages": {
+          "allow": "duplicate tool call allowed",
+          "reuse": "reuse prior accepted tool result",
+          "hint": "duplicate tool call should use prior accepted result or change evidence scope",
+          "require_justification": "duplicate tool call requires structured justification",
+          "hard_stop": "duplicate tool call hard-stopped by Host governance",
+          "attempt_scope_diagnostic": "duplicate tool call governed by attempt-local ToolRuntime index",
+          "prior_accept_missing": "prior duplicate owner did not produce an accepted tool result"
         }
       },
       "agent_policy": {

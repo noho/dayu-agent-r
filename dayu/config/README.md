@@ -75,7 +75,7 @@ dayu/config/
 | 字段 | 含义 |
 |---|---|
 | `default_execution_profile_id` | 默认 execution profile id，默认值为 `standard-256k` |
-| `execution_profiles` | 普通 Run、compactor、context budget、memory projection、truncation 与 agent policy 的完整基线 |
+| `execution_profiles` | 普通 Run、compactor、context budget、memory projection、工具治理与 agent policy 的完整基线 |
 
 单个 execution profile 包含：
 
@@ -86,7 +86,10 @@ dayu/config/
 - `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
 - `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`，其中 `max_evidence_backed_facts` 限制 stable evidence-backed facts 的数量。
 - `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
+- `tool_duplicate_governance_policy`：配置 attempt-scoped 重复工具调用治理，包含默认 duplicate decision、按工具名覆盖的 decision、require-justification 参数名映射，以及治理消息文本。
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
+
+`tool_duplicate_governance_policy.default_duplicate_decision` 与 `decisions_by_tool_name` 只允许 `allow`、`reuse`、`hint`、`require_justification`、`hard_stop`。`messages` 是 Host duplicate governance 返回给模型和诊断的文本，workspace overlay 可以按 profile 覆盖；这些文本不是 scene prompt asset，不放在 `prompts/` 目录。
 
 `agent_policy` 使用 `continuation_max_attempts`、`allow_tool_calls`、`max_consecutive_failed_tool_batches` 等当前 AgentPolicy 字段。`fallback_mode` 只允许 `force_answer` 与 `raise_error`；默认 fallback prompt 文本为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”
 

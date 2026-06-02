@@ -30,6 +30,11 @@ from dayu.host.api import (
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import MemoryProjectionPolicy
+from dayu.host.tool_duplicate_governance import (
+    DuplicateDecisionKind,
+    DuplicateGovernanceMessages,
+    DuplicateGovernancePolicy,
+)
 from dayu.host.tooling import HostToolingOptions
 from dayu.runtime.assembly import (
     AgentPolicyDefaults,
@@ -53,6 +58,8 @@ from dayu.runtime.config_loader import (
     RuntimeConfig,
     RuntimeLaneConfig,
     RunnerOptionHintConfig,
+    ToolDuplicateGovernanceMessagesConfig,
+    ToolDuplicateGovernancePolicyConfig,
     ToolDiscoveryProviderConfig,
 )
 from dayu.runtime.location import RuntimeLocations
@@ -455,6 +462,11 @@ def _compose_options(
         tooling_options=_tooling_options_from_discovery(
             tool_bundle=effective_tool_bundle,
             source_refs=request.discovered_tools.source_refs,
+            duplicate_governance_policy=(
+                _duplicate_governance_policy_from_config(
+                    execution_profile.tool_duplicate_governance_policy
+                )
+            ),
         ),
         context_budget_policy=default_context_budget_policy(
             context_window_size=ordinary_selection.model.context_window_tokens,
@@ -1003,12 +1015,16 @@ def _memory_projection_policy_from_config(
 
 
 def _tooling_options_from_discovery(
-    *, tool_bundle: ToolBundle, source_refs: tuple[ToolBundleSourceRef, ...]
+    *,
+    tool_bundle: ToolBundle,
+    source_refs: tuple[ToolBundleSourceRef, ...],
+    duplicate_governance_policy: DuplicateGovernancePolicy,
 ) -> HostToolingOptions | None:
     """把 ToolsDiscovery 输出映射为 HostToolingOptions。
 
     :param tool_bundle: 已发现业务工具 bundle。
     :param source_refs: 工具来源引用。
+    :param duplicate_governance_policy: execution profile 派生的重复调用治理策略。
     :returns: HostToolingOptions；没有业务工具时为 ``None``。
     :raises ValueError: source refs 缺失但工具非空时抛出。
     """
@@ -1021,7 +1037,65 @@ def _tooling_options_from_discovery(
         business_tool_bundle=tool_bundle,
         source_refs=source_refs,
         wait_adapter_registry=None,
+        duplicate_governance_policy=duplicate_governance_policy,
     )
+
+
+def _duplicate_governance_policy_from_config(
+    config: ToolDuplicateGovernancePolicyConfig,
+) -> DuplicateGovernancePolicy:
+    """把 runtime config 映射为 Host duplicate governance policy。
+
+    :param config: execution profile 中的重复调用治理配置。
+    :returns: Host duplicate governance policy。
+    :raises ValueError: 决策字符串无法映射为 Host enum 时抛出。
+    """
+
+    return DuplicateGovernancePolicy(
+        default_duplicate_decision=_duplicate_decision_from_config(
+            config.default_duplicate_decision
+        ),
+        decisions_by_tool_name={
+            tool_name: _duplicate_decision_from_config(decision)
+            for tool_name, decision in config.decisions_by_tool_name.items()
+        },
+        justification_argument_names_by_tool_name=(
+            dict(config.justification_argument_names_by_tool_name)
+        ),
+        messages=_duplicate_governance_messages_from_config(config.messages),
+    )
+
+
+def _duplicate_governance_messages_from_config(
+    config: ToolDuplicateGovernanceMessagesConfig,
+) -> DuplicateGovernanceMessages:
+    """把 runtime config 映射为 Host duplicate governance messages。
+
+    :param config: execution profile 中的重复调用治理消息配置。
+    :returns: Host duplicate governance messages。
+    :raises ValueError: 消息字段非法时由 Host typed contract 抛出。
+    """
+
+    return DuplicateGovernanceMessages(
+        allow=config.allow,
+        reuse=config.reuse,
+        hint=config.hint,
+        require_justification=config.require_justification,
+        hard_stop=config.hard_stop,
+        attempt_scope_diagnostic=config.attempt_scope_diagnostic,
+        prior_accept_missing=config.prior_accept_missing,
+    )
+
+
+def _duplicate_decision_from_config(value: str) -> DuplicateDecisionKind:
+    """把配置字符串映射为 Host duplicate decision enum。
+
+    :param value: runtime config 中的 duplicate decision 字符串。
+    :returns: Host duplicate decision enum。
+    :raises ValueError: 字符串不是 Host 支持的 duplicate decision 时抛出。
+    """
+
+    return DuplicateDecisionKind(value)
 
 
 def _resolve_project_path(workspace_root: pathlib.Path, configured_path: str) -> pathlib.Path:
