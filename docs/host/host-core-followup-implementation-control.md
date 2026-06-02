@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-TOOL-02 Slice 3 accepted; Slice 4 ready |
+| implementation status | WU-TOOL-02 Slice 4 accepted; Slice 5 aggregate verification ready |
 | active work unit | WU-TOOL-02 |
 | default next work unit | WU-TOOL-02 |
-| next entry point | WU-TOOL-02 implementation Slice 4；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-02 Slice 5 aggregate verification；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -518,6 +518,8 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：Slice 2 code review artifacts: `docs/reviews/wu-tool-02-slice2-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice2-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice2-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；MiMo validation finding rejected，DS Slice 3/4 test failures deferred to planned later slices。Controller verification: Slice 2 focused tests 53 passed，Slice 2 pyright 0 errors。Slice 2 accepted commit: `8dcee28`.
 - 2026-06-02：Slice 3 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice3-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice3-implementation-report-20260602.md`。验证报告：`tests/host/test_toolruntime_duplicate_governance.py` + `tests/host/test_toolruntime_diagnostics.py` 32 passed，slice pyright 0 errors。进入 Slice 3 code review gate。
 - 2026-06-02：Slice 3 code review artifacts: `docs/reviews/wu-tool-02-slice3-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice3-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice3-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；DS helper style suggestion rejected。Controller verification: Slice 3 focused tests 32 passed，Slice 3 pyright 0 errors。Slice 3 accepted commit: `2ad0dc7`.
+- 2026-06-02：Slice 4 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice4-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice4-implementation-report-20260602.md`。报告结论：未修改 production、tests 或 README；payload consumer regression tests 121 passed，指定 Host production consumer pyright 0 errors；README/doc sync 无稳定事实变化，未触发更新。进入 Slice 4 code review gate，review handoff: `docs/reviews/wu-tool-02-slice4-code-review-handoff-20260602.md`。
+- 2026-06-02：Slice 4 code review artifacts: `docs/reviews/wu-tool-02-slice4-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice4-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice4-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；`rg` 辅助检查局限与全仓验证缺口均按 approved plan defer 到 aggregate gate。Controller verification: payload consumer regression tests 121 passed，指定 Host production consumer pyright 0 errors；旧 flat field `rg` 命中仅 awaiting candidate 路径。Slice 4 accepted commit: pending。
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
