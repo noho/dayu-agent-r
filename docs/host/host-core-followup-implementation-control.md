@@ -116,21 +116,21 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-ENGINE-01 Slice 3 review passed; ready for accepted Slice 3 checkpoint |
+| gate | aggregate deepreview |
+| implementation status | WU-ENGINE-01 all implementation slices accepted; aggregate deepreview in progress |
 | active work unit | WU-ENGINE-01 |
 | default next work unit | WU-ENGINE-01 |
 | accepted plan commit | 10b0eaa |
 | plan artifact | docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md |
 | plan review artifacts | docs/reviews/wu-engine-01-plan-review-mimo-20260602.md; docs/reviews/wu-engine-01-plan-review-ds-20260602.md; docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md |
-| accepted slice commits | Slice 1: dba6513; Slice 2: 3857e23 |
+| accepted slice commits | Slice 1: dba6513; Slice 2: 3857e23; Slice 3: c7308f7 |
 | Slice 1 status | accepted; target tests 35 passed; pyright 0 errors |
 | Slice 2 status | accepted; target tests 67 passed; pyright 0 errors |
 | current slice | Slice 3 Full Validation / Docs Sync |
 | implementation artifact | docs/reviews/wu-engine-01-slice3-validation-codex-20260602.md |
 | code review artifacts | docs/reviews/wu-engine-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-engine-01-slice3-code-review-ds-20260602.md |
 | validation | Slice 3 target tests 95 passed; pyright 0 errors |
-| next entry point | WU-ENGINE-01 Slice 3 accepted commit |
+| next entry point | WU-ENGINE-01 aggregate deepreview |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
