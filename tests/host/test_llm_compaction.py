@@ -72,6 +72,72 @@ def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
     assert "asyncio.run" not in source
 
 
+@pytest.mark.parametrize(
+    ("raw_message", "secret_value"),
+    (
+        ("provider failed Authorization: Bearer bearer-secret tail", "bearer-secret"),
+        ("provider failed api_key=api-key-secret tail", "api-key-secret"),
+        ("provider failed token=token-secret tail", "token-secret"),
+        ("provider failed secret=secret-value tail", "secret-value"),
+        ("provider failed authorization=authorization-secret tail", "authorization-secret"),
+        ("provider failed password=password-secret tail", "password-secret"),
+        ("provider failed api key spaced-secret tail", "spaced-secret"),
+        ("provider failed apikey=apikey-secret tail", "apikey-secret"),
+        ("provider failed api-key:colon-secret tail", "colon-secret"),
+        ("provider failed api-key: spaced-colon-secret tail", "spaced-colon-secret"),
+    ),
+)
+def test_safe_outcome_text_redacts_sensitive_diagnostic_values(
+    raw_message: str,
+    secret_value: str,
+) -> None:
+    """_safe_outcome_text 脱敏 runner outcome 中的敏感值。
+
+    :param raw_message: 包含敏感值写法的原始 outcome 文本。
+    :param secret_value: 不允许出现在脱敏结果中的明文值。
+    :returns: ``None``。
+    :raises AssertionError: 敏感值泄漏或非敏感上下文丢失时抛出。
+    """
+
+    safe_message = llm_compaction_module._safe_outcome_text(raw_message)
+
+    assert secret_value not in safe_message
+    assert "<redacted>" in safe_message
+    assert "provider failed" in safe_message
+    assert "tail" in safe_message
+
+
+def test_safe_outcome_text_does_not_redact_plain_token_diagnostic() -> None:
+    """_safe_outcome_text 不误脱敏普通 token 诊断句。
+
+    :returns: ``None``。
+    :raises AssertionError: 普通诊断文本被误改写时抛出。
+    """
+
+    message = "JWT token has expired"
+
+    assert llm_compaction_module._safe_outcome_text(message) == message
+
+
+def test_safe_outcome_text_preserves_existing_truncation_shape() -> None:
+    """_safe_outcome_text 保留旧 outcome 截断可见形状。
+
+    旧 Host outcome 策略在超限时返回前 240 个字符再追加后缀，因此返回总长
+    可能超过 240。该形状属于当前 proposal error 文本的可见行为，本聚合修复只
+    收敛 redaction helper，不改变它。
+
+    :returns: ``None``。
+    :raises AssertionError: 截断正文长度或后缀形状变化时抛出。
+    """
+
+    message = "x" * 241
+
+    safe_message = llm_compaction_module._safe_outcome_text(message)
+
+    assert safe_message == ("x" * 240) + "..."
+    assert len(safe_message) == 243
+
+
 def _llm_compactor(
     *,
     runner_spec: RunnerSpec,

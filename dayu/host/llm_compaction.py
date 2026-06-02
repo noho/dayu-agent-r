@@ -67,14 +67,13 @@ from dayu.host.context_budget import (
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
 )
 from dayu.host.opaque_ref import validate_host_neutral_opaque_ref_text
+from dayu.runtime.diagnostic_text import redact_sensitive_diagnostic_values
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _MIN_PROPOSAL_LENGTH = 1
 _MAX_SAFE_OUTCOME_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
-_BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
-_ASSIGNMENT_SECRET_PATTERN = re.compile(r"(?i)((?:api[_-]?key|authorization|secret|token)\s*[:=]\s*)[^,\s}\]]+")
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
@@ -344,8 +343,7 @@ def _safe_outcome_text(text: str) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
-    redacted = _BEARER_SECRET_PATTERN.sub(f"Bearer {_REDACTED_SECRET}", text)
-    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(rf"\1{_REDACTED_SECRET}", redacted)
+    redacted = redact_sensitive_diagnostic_values(text, redaction_marker=_REDACTED_SECRET)
     if len(redacted) <= _MAX_SAFE_OUTCOME_MESSAGE_CHARS:
         return redacted
     return redacted[:_MAX_SAFE_OUTCOME_MESSAGE_CHARS] + _TRUNCATED_SUFFIX
