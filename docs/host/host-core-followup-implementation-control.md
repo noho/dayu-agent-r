@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-TOOL-02 draft PR pass complete; user preparing merge |
-| active work unit | WU-TOOL-02 |
+| gate | accepted plan commit |
+| implementation status | WU-ENGINE-01 plan re-review passed; ready for accepted plan commit / implementation |
+| active work unit | WU-ENGINE-01 |
 | default next work unit | WU-ENGINE-01 |
-| next entry point | 用户侧准备 merge PR #108；merge 后进入 WU-ENGINE-01 discussion / code inspection |
+| next entry point | WU-ENGINE-01 accepted plan commit |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -187,7 +187,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | draft-PR-pass |
-| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
+| WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | plan re-review passed |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
 | WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
 | WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 已完成 |
@@ -556,6 +556,15 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - OpenAI / Gemini 等 provider state 继续通过统一 typed contract 暴露，且无 raw SDK object 泄漏。
 - stream / non-stream error object consistency 有测试。
 - diagnostic raw payload 若保留，必须有明确边界；若删除或摘要化，Host / Engine 测试同步收敛。
+
+### Discussion / Code Inspection / Plan 记录
+
+- 2026-06-02：controller 完成 WU-ENGINE-01 discussion / code inspection，artifact: `docs/reviews/wu-engine-01-code-inspection-controller-20260602.md`。
+- 裁决：动机成立但边界比历史标题窄；不推翻 typed provider state，收窄为 Engine runner diagnostic payload audit；风险真实存在。
+- 2026-06-02：plan artifact 已生成，artifact: `docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md`。Plan review artifacts: `docs/reviews/wu-engine-01-plan-review-mimo-20260602.md`, `docs/reviews/wu-engine-01-plan-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-engine-01-plan-review-controller-adjudication-20260602.md`。
+- 裁决：无 blocking finding；接受 MIMO-M-01/M-02、DS-FIND-01 至 DS-FIND-10、DS-RR-01/RR-02 等 medium/low findings 作为 plan fix 要求；进入 plan fix gate。
+- 2026-06-02：plan fix artifact: `docs/reviews/wu-engine-01-plan-fix-codex-20260602.md`；plan re-review artifacts: `docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md`, `docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md`；controller re-review adjudication: `docs/reviews/wu-engine-01-plan-rereview-controller-adjudication-20260602.md`。
+- 裁决：全部 accepted findings 已修入 plan；plan code-generation-ready；进入 accepted plan commit。
 
 ## WU-LAYER-01 Durable Row Primitive / Type Owner Cleanup
 
