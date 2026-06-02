@@ -116,26 +116,26 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | planning |
-| implementation status | WU-LAYER-01 plan accepted; implementation Slice 1 pending |
+| gate | implementation |
+| implementation status | WU-LAYER-01 Slice 1 code review passed; accepted slice commit pending |
 | active work unit | WU-LAYER-01 |
 | default next work unit | WU-LAYER-02 |
 | accepted plan commit | 278e5be |
 | plan artifact | docs/host/wu-layer-01-durable-row-primitive-cleanup-plan.md |
 | plan review artifacts | docs/reviews/wu-layer-01-plan-review-mimo-20260602.md; docs/reviews/wu-layer-01-plan-review-ds-20260602.md; docs/reviews/wu-layer-01-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-01-plan-rereview-ds-20260602.md |
-| accepted slice commits | none |
-| Slice 1 status | pending |
+| accepted slice commits | Slice 1: pending |
+| Slice 1 status | code review passed; target tests 33 passed; pyright 0 errors; accepted commit pending |
 | Slice 2 status | pending |
-| current slice | WU-LAYER-01 implementation Slice 1 pending |
-| implementation artifact | none |
-| code review artifacts | none |
+| current slice | WU-LAYER-01 Slice 1 code review |
+| implementation artifact | docs/reviews/wu-layer-01-slice1-schema-definition-validation-codex-20260602.md |
+| code review artifacts | docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md |
 | accepted aggregate deepreview commit | none |
 | draft PR | none |
 | PR review artifacts | none |
 | accepted PR review commit | none |
 | PR follow-up artifacts | none |
-| validation | pending WU-LAYER-01 implementation |
-| next entry point | WU-LAYER-01 implementation Slice 1 after accepted plan commit |
+| validation | WU-LAYER-01 Slice 1: test_durable_schema 33 passed; pyright 0 errors |
+| next entry point | WU-LAYER-01 Slice 1 code review |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 

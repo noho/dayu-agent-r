@@ -9,6 +9,7 @@ purge tombstone governance table；不承载 command、admission 或删除矩阵
 
 from __future__ import annotations
 
+import re
 import sqlite3
 
 from dayu.host.api import (
@@ -1249,6 +1250,26 @@ HOST_DURABLE_DDL: tuple[str, ...] = (
 )
 """当前 Host durable fresh bootstrap 全量 DDL。"""
 
+_SCHEMA_OBJECT_TYPE_TABLE = "table"
+"""SQLite catalog 中 table object type 名称。"""
+
+_SCHEMA_OBJECT_TYPE_INDEX = "index"
+"""SQLite catalog 中 index object type 名称。"""
+
+_SQLITE_MASTER_SQL_QUERY_TEMPLATE = """
+SELECT type, name, sql
+FROM sqlite_master
+WHERE (type = ? AND name IN ({table_placeholders}))
+OR (type = ? AND name IN ({index_placeholders}))
+"""
+"""读取 required table / index SQLite catalog SQL 的查询模板。"""
+
+_WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
+"""schema SQL 最小归一化使用的连续空白匹配模式。"""
+
+_SchemaObjectKey = tuple[str, str]
+"""SQLite schema object key，格式为 ``(object_type, object_name)``。"""
+
 
 def bootstrap_host_durable_store(connection: sqlite3.Connection) -> None:
     """初始化 fresh Host durable SQLite schema 或校验当前 schema。
@@ -1283,13 +1304,14 @@ def bootstrap_host_durable_store(connection: sqlite3.Connection) -> None:
 def validate_host_durable_schema(connection: sqlite3.Connection) -> None:
     """校验 Host durable SQLite 当前 schema 结构。
 
-    校验范围包括 ``PRAGMA user_version``、required tables 和 required indexes。
-    本函数不执行 DDL，不尝试迁移或修复缺失对象。
+    校验范围包括 ``PRAGMA user_version``、required tables、required indexes，
+    以及 required table / index 的 SQLite catalog SQL 定义。本函数不执行 DDL，
+    不尝试迁移或修复缺失对象。
 
     :param connection: SQLite connection。
     :returns: ``None``。
-    :raises HostSchemaMismatchError: ``user_version`` 不是当前版本，或缺少
-        required table / index 时抛出。
+    :raises HostSchemaMismatchError: ``user_version`` 不是当前版本，缺少
+        required table / index，或 required object 定义不匹配时抛出。
     :raises sqlite3.Error: PRAGMA 或 sqlite_master 查询失败时抛出。
     """
 
@@ -1302,6 +1324,7 @@ def validate_host_durable_schema(connection: sqlite3.Connection) -> None:
         )
     _validate_required_tables(connection)
     _validate_required_indexes(connection)
+    _validate_required_object_definitions(connection)
 
 
 def _bootstrap_fresh_schema(connection: sqlite3.Connection) -> None:
@@ -1369,6 +1392,135 @@ def _validate_required_indexes(connection: sqlite3.Connection) -> None:
                 "Host durable schema missing required index: "
                 f"{index_name}"
             )
+
+
+def _validate_required_object_definitions(connection: sqlite3.Connection) -> None:
+    """校验 required table / index 的 SQLite catalog SQL 定义。
+
+    expected 定义由当前 ``HOST_DURABLE_DDL`` 在内存 fresh DB 中生成，确保 DDL
+    真源仍只有一份；目标 DB 只比较 ``HOST_DURABLE_TABLES`` 与
+    ``HOST_DURABLE_INDEXES`` 指定的对象，忽略 SQLite 内部对象。
+
+    :param connection: SQLite connection。
+    :returns: ``None``。
+    :raises HostSchemaMismatchError: required object 定义缺失或不匹配时抛出。
+    :raises sqlite3.Error: sqlite_master 查询或内存 DDL 执行失败时抛出。
+    """
+
+    expected_sql_by_name = _expected_schema_sql_by_name()
+    actual_sql_by_name = _read_schema_sql_by_name(connection)
+    for object_type, object_name in _required_schema_object_keys():
+        expected_sql = expected_sql_by_name.get((object_type, object_name))
+        actual_sql = actual_sql_by_name.get((object_type, object_name))
+        if expected_sql is None or actual_sql is None or actual_sql != expected_sql:
+            raise HostSchemaMismatchError(
+                "Host durable schema definition mismatch: "
+                f"{object_type} {object_name}"
+            )
+
+
+def _expected_schema_sql_by_name() -> dict[_SchemaObjectKey, str]:
+    """从当前 DDL 真源生成 expected SQLite catalog SQL。
+
+    本函数创建内存 SQLite fresh DB，执行 ``HOST_DURABLE_DDL``，再读取 required
+    table / index 的 ``sqlite_master.sql``，避免维护第二份手写 expected DDL。
+
+    :returns: 以 ``(object_type, object_name)`` 为 key 的归一化 catalog SQL。
+    :raises HostSchemaMismatchError: DDL 执行后 required object 未出现在 catalog
+        中时抛出。
+    :raises sqlite3.Error: 内存 DDL 执行或 sqlite_master 查询失败时抛出。
+    """
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        for statement in HOST_DURABLE_DDL:
+            connection.execute(statement)
+        sql_by_name = _read_schema_sql_by_name(connection)
+    finally:
+        connection.close()
+
+    for object_type, object_name in _required_schema_object_keys():
+        if (object_type, object_name) not in sql_by_name:
+            raise HostSchemaMismatchError(
+                "Host durable schema definition mismatch: "
+                f"{object_type} {object_name}"
+            )
+    return sql_by_name
+
+
+def _read_schema_sql_by_name(connection: sqlite3.Connection) -> dict[_SchemaObjectKey, str]:
+    """读取 required table / index 的 SQLite catalog SQL。
+
+    :param connection: SQLite connection。
+    :returns: 以 ``(object_type, object_name)`` 为 key 的归一化 catalog SQL。
+    :raises sqlite3.Error: sqlite_master 查询失败时抛出。
+    """
+
+    table_placeholders = _sqlite_placeholders(len(HOST_DURABLE_TABLES))
+    index_placeholders = _sqlite_placeholders(len(HOST_DURABLE_INDEXES))
+    rows = connection.execute(
+        _SQLITE_MASTER_SQL_QUERY_TEMPLATE.format(
+            table_placeholders=table_placeholders,
+            index_placeholders=index_placeholders,
+        ),
+        (
+            _SCHEMA_OBJECT_TYPE_TABLE,
+            *HOST_DURABLE_TABLES,
+            _SCHEMA_OBJECT_TYPE_INDEX,
+            *HOST_DURABLE_INDEXES,
+        ),
+    ).fetchall()
+    sql_by_name: dict[_SchemaObjectKey, str] = {}
+    for row in rows:
+        object_type = str(row[0])
+        object_name = str(row[1])
+        schema_sql_value = row[2]
+        if schema_sql_value is not None:
+            sql_by_name[(object_type, object_name)] = _normalize_schema_sql(str(schema_sql_value))
+    return sql_by_name
+
+
+def _required_schema_object_keys() -> tuple[_SchemaObjectKey, ...]:
+    """返回需要比较 SQLite catalog SQL 的 required object key。
+
+    :returns: required table / index key 元组。
+    :raises HostSchemaMismatchError: 本函数不主动抛出。
+    """
+
+    return tuple(
+        (_SCHEMA_OBJECT_TYPE_TABLE, table_name) for table_name in HOST_DURABLE_TABLES
+    ) + tuple(
+        (_SCHEMA_OBJECT_TYPE_INDEX, index_name) for index_name in HOST_DURABLE_INDEXES
+    )
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    """按最小规则归一化 SQLite catalog SQL。
+
+    归一化只去除首尾空白，并把任意连续空白折叠为单个 ASCII space。函数保持
+    大小写、identifier quoting、标点和 SQL clause 顺序，不解析 SQL。
+
+    :param sql: SQLite catalog SQL。
+    :returns: 最小 whitespace 归一化后的 SQL。
+    :raises HostSchemaMismatchError: 本函数不主动抛出。
+    """
+
+    return _WHITESPACE_RUN_PATTERN.sub(" ", sql.strip())
+
+
+def _sqlite_placeholders(value_count: int) -> str:
+    """生成 SQLite 参数占位符列表。
+
+    :param value_count: 需要生成的占位符数量。
+    :returns: 逗号分隔的 ``?`` 占位符字符串。
+    :raises HostSchemaMismatchError: 占位符数量不是正整数时抛出。
+    """
+
+    if value_count <= 0:
+        raise HostSchemaMismatchError(
+            "Host durable schema definition mismatch: required object set is empty"
+        )
+    return ",".join("?" for _index in range(value_count))
 
 
 def _read_user_version(connection: sqlite3.Connection) -> int:
