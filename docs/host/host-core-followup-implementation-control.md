@@ -117,10 +117,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | WU-TOOL-01 draft PR gate passed |
-| active work unit | WU-TOOL-01 |
-| default next work unit | WU-TOOL-01 |
-| next entry point | WU-TOOL-02 discussion-ready；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| implementation status | WU-TOOL-02 draft PR pass complete; user preparing merge |
+| active work unit | WU-TOOL-02 |
+| default next work unit | WU-ENGINE-01 |
+| next entry point | 用户侧准备 merge PR #108；merge 后进入 WU-ENGINE-01 discussion / code inspection |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -172,7 +172,6 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
 | RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
 | RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
-| RR-TOOL-02 | WU-TOOL-01 Slice 1 code re-review | tool trace duplicate scope 透传 | closed | WU-TOOL-01 Slice 3 | 已完成；无需后续动作 | Slice 3 已为 `TOOL_CALL_GOVERNED` 和 tool trace summary 增加 machine-readable attempt duplicate scope，并由 `tests/host/test_tool_trace_projection.py` 覆盖 hot/cold trace。 |
 
 ## 当前 Work Units
 
@@ -187,7 +186,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-CTX-02 | Compact failure policy | compact failure 策略矩阵与 E2E | 已完成：draft-PR-pass |
 | WU-CTX-03 | Reactive overflow loop E2E | reactive overflow 循环收口测试 | 已完成：draft-PR-pass |
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
-| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | 未开始 |
+| WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | draft-PR-pass |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | 未开始 |
 | WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
 | WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
@@ -504,6 +503,34 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 类型检查不依赖 `object` / `Any` / magic payload。
 - 测试 helper 不再到处手写超宽 `ToolFactAcceptCandidate` 构造参数。
 - 拆分后无 god dataclass / god builder 回流，普通 result、reuse、governed error 的校验逻辑各自清晰。
+
+### 进展记录
+
+- 2026-06-02：controller 完成 discussion / code inspection。裁决：动机成立，但风险性质是维护性、可测试性和后续演进风险，不是当前运行时 correctness blocker；进入 plan gate。Artifacts: `docs/reviews/wu-tool-02-discussion-code-inspection-20260602.md`, `docs/reviews/wu-tool-02-planning-handoff-20260602.md`。
+- 2026-06-02：用户补充要求：WU-TOOL-02 全部完成后，ready-to-open-draft-PR 前追加 AgentMiMo 与 AgentDS 并行全仓 review；该 review gate 是本 work unit 的额外前置条件，不替代常规 slice review、aggregate deepreview、测试和 pyright。
+- 2026-06-02：plan artifact 已生成，artifact: `docs/host/wu-tool-02-accept-candidate-cleanup-plan.md`。Plan review artifacts: `docs/reviews/wu-tool-02-plan-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-plan-review-controller-adjudication-20260602.md`。裁决：接受 DS Finding 01 及若干低严重 clarification findings；进入 plan fix gate，必须修正 slice 中间态类型失败风险后再 re-review。
+- 2026-06-02：plan fix 后 re-review 通过。Re-review artifacts: `docs/reviews/wu-tool-02-plan-re-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-plan-re-review-ds-20260602.md`。裁决：全部 accepted findings closed，plan handoff-ready / code-generation-ready；进入 implementation gate。Accepted plan commit: `11a8144`.
+- 2026-06-02：Slice 1 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice1-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice1-implementation-report-20260602.md`。验证报告：`tests/host/test_toolruntime_accept_barrier.py` 16 passed，`pyright dayu/host/tool_runtime.py` 0 errors。进入 Slice 1 code review gate。
+- 2026-06-02：Slice 1 code review artifacts: `docs/reviews/wu-tool-02-slice1-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice1-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice1-code-review-controller-adjudication-20260602.md`。裁决：接受 MiMo Finding 01，要求 `_validate_tool_accept_duplicate_governance` 对齐现有 duplicate field validation；进入 Slice 1 fix gate。
+- 2026-06-02：Slice 1 fix completed。Fix report: `docs/reviews/wu-tool-02-slice1-fix-report-20260602.md`。Code re-review artifacts: `docs/reviews/wu-tool-02-slice1-code-re-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice1-code-re-review-ds-20260602.md`。裁决：accepted finding closed，Slice 1 code re-review pass。Controller verification: `tests/host/test_toolruntime_accept_barrier.py` 16 passed，`pyright dayu/host/tool_runtime.py` 0 errors。Slice 1 accepted commit: `d2916aa`.
+- 2026-06-02：Slice 2 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice2-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice2-implementation-report-20260602.md`。验证报告：`tests/host/test_toolruntime_accept_barrier.py` + `tests/host/test_toolruntime_executor.py` + `tests/host/test_toolruntime_truncation_fetch_more.py` 53 passed，slice pyright 0 errors。进入 Slice 2 code review gate。
+- 2026-06-02：Slice 2 code review artifacts: `docs/reviews/wu-tool-02-slice2-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice2-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice2-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；MiMo validation finding rejected，DS Slice 3/4 test failures deferred to planned later slices。Controller verification: Slice 2 focused tests 53 passed，Slice 2 pyright 0 errors。Slice 2 accepted commit: `8dcee28`.
+- 2026-06-02：Slice 3 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice3-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice3-implementation-report-20260602.md`。验证报告：`tests/host/test_toolruntime_duplicate_governance.py` + `tests/host/test_toolruntime_diagnostics.py` 32 passed，slice pyright 0 errors。进入 Slice 3 code review gate。
+- 2026-06-02：Slice 3 code review artifacts: `docs/reviews/wu-tool-02-slice3-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice3-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice3-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；DS helper style suggestion rejected。Controller verification: Slice 3 focused tests 32 passed，Slice 3 pyright 0 errors。Slice 3 accepted commit: `2ad0dc7`.
+- 2026-06-02：Slice 4 implementation completed by AgentCodex。Implementation handoff: `docs/reviews/wu-tool-02-slice4-implementation-handoff-20260602.md`；implementation report: `docs/reviews/wu-tool-02-slice4-implementation-report-20260602.md`。报告结论：未修改 production、tests 或 README；payload consumer regression tests 121 passed，指定 Host production consumer pyright 0 errors；README/doc sync 无稳定事实变化，未触发更新。进入 Slice 4 code review gate，review handoff: `docs/reviews/wu-tool-02-slice4-code-review-handoff-20260602.md`。
+- 2026-06-02：Slice 4 code review artifacts: `docs/reviews/wu-tool-02-slice4-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-slice4-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-slice4-code-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；`rg` 辅助检查局限与全仓验证缺口均按 approved plan defer 到 aggregate gate。Controller verification: payload consumer regression tests 121 passed，指定 Host production consumer pyright 0 errors；旧 flat field `rg` 命中仅 awaiting candidate 路径。Slice 4 accepted commit: `d982759`。
+- 2026-06-02：Slice 5 aggregate verification passed。Controller verification: affected Host tests 206 passed，全量 pyright 0 errors。进入 aggregate deepreview gate，review handoff: `docs/reviews/wu-tool-02-aggregate-deepreview-handoff-20260602.md`。
+- 2026-06-02：Aggregate deepreview artifacts: `docs/reviews/wu-tool-02-aggregate-deepreview-mimo-20260602.md`, `docs/reviews/wu-tool-02-aggregate-deepreview-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-aggregate-deepreview-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；MiMo/DS nonblocking notes 均不要求当前 gate 修复。Accepted aggregate deepreview commit: `a346842`。进入用户追加的 ready-to-open-draft-PR 前置 gate：AgentMiMo + AgentDS 并行全仓 review。
+- 2026-06-02：用户追加 full-repository review gate 已开始。Handoff: `docs/reviews/wu-tool-02-extra-full-repo-review-handoff-20260602.md`。Reviewers: AgentMiMo + AgentDS。
+- 2026-06-02：用户追加 full-repository review artifacts: `docs/reviews/wu-tool-02-extra-full-repo-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-extra-full-repo-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-extra-full-repo-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；控制文档状态滞后已在 closeout 修正，低风险 coverage / helper notes 已记录到 residual risk table 并明确 owner。Accepted full-repository review commit: `c5f28c0`。WU-TOOL-02 local gates passed，进入 ready-to-open-draft-PR。
+- 2026-06-02：Draft PR opened: `https://github.com/noho/dayu-agent-r/pull/108`。进入 draft PR review gate，handoff: `docs/reviews/wu-tool-02-draft-pr-review-handoff-20260602.md`。
+- 2026-06-02：Draft PR review artifacts: `docs/reviews/wu-tool-02-draft-pr-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-draft-pr-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-draft-pr-review-controller-adjudication-20260602.md`。裁决：无 blocking finding，无需 fix / re-review。Accepted PR review commit: `2942f25`。PR `#108` 当前为 draft/open，mergeable，GitHub no checks reported；本地 required tests / pyright / reviews 已通过。WU-TOOL-02 达到 draft-PR-pass。
+- 2026-06-02：用户要求立即关闭 `RR-TOOL-03` 与 `RR-TOOL-04`，不再 defer。Controller 裁决：动机成立；`RR-TOOL-03` 补 LOST fail-fast explicit negative test，`RR-TOOL-04` 补子结构直接 validator tests；不做跨文件共享 test builder，避免测试耦合。Implementation handoff: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-implementation-handoff-20260602.md`。
+- 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up implementation completed by AgentCodex。Implementation report: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-implementation-report-20260602.md`。Controller verification: `tests/host/test_toolruntime_accept_barrier.py` 24 passed；`tests/host/test_toolruntime_accept_barrier.py` + duplicate governance + diagnostics 56 passed；`pyright tests/host/test_toolruntime_accept_barrier.py dayu/host/tool_runtime.py` 0 errors。进入 code review gate，handoff: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-handoff-20260602.md`。
+- 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up code review artifacts: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-controller-adjudication-20260602.md`。裁决：无 blocking finding；`RR-TOOL-03` 与 `RR-TOOL-04` closed；MiMo/DS validator matrix nonblocking notes 不要求当前 gate 扩展为 exhaustive branch matrix。
+- 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up final verification passed。Controller verification: affected Host tests 214 passed；full pyright 0 errors。Accepted follow-up commit: `c1c909c`。WU-TOOL-02 恢复 draft-PR-pass。
+- 2026-06-02：用户准备 merge PR `#108`。Controller 更新总控状态，并按用户要求从 Residual Risk 表中删除已 `closed` 的条目；当前 Residual Risk 表仅保留仍 deferred-with-owner / transferred-to-issue / open 的追踪项。
+- 2026-06-02：用户准备 merge PR `#108` 后继续实施下一个 work unit。Controller 将 `default next work unit` 更新为 `WU-ENGINE-01`；merge 后 next entry point 为 WU-ENGINE-01 discussion / code inspection。
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 

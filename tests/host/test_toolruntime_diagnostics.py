@@ -214,11 +214,15 @@ async def test_candidate_and_ack_carry_duplicate_diagnostic_refs() -> None:
     governed_ack = accept_port.acks[1]
     governed_outcome = result.records[1].outcome
     assert governed_candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert governed_candidate.policy_decision.message == configured_action_message
+    assert governed_candidate.governance.policy_decision.message == (
+        configured_action_message
+    )
     assert isinstance(governed_outcome, ToolFailedOutcome)
     assert governed_outcome.result.message == configured_action_message
-    assert governed_candidate.diagnostic_refs
-    assert governed_ack.diagnostic_refs == governed_candidate.diagnostic_refs
+    assert governed_candidate.diagnostics.diagnostic_refs
+    assert governed_ack.diagnostic_refs == (
+        governed_candidate.diagnostics.diagnostic_refs
+    )
     assert diagnostics.records[0].reason_code == "duplicate_hard_stop"
     assert diagnostics.records[0].message == configured_diagnostic_message
 
@@ -414,47 +418,53 @@ def _accepted_ack(candidate: ToolFactAcceptCandidate) -> ToolFactAcceptedAck:
     :returns: accepted ack。
     """
 
+    tool_call_id = candidate.call.tool_call_id
+    policy_decision = candidate.governance.policy_decision
+    result = candidate.result
+    duplicate = candidate.governance.duplicate
     requested_ref = HostEventRef(
-        event_id=f"event-requested-{candidate.tool_call_id}",
-        event_sequence=len(candidate.tool_call_id) + 1,
+        event_id=f"event-requested-{tool_call_id}",
+        event_sequence=len(tool_call_id) + 1,
     )
     governed_ref = (
         HostEventRef(
-            event_id=f"event-governed-{candidate.tool_call_id}",
-            event_sequence=len(candidate.tool_call_id) + 2,
+            event_id=f"event-governed-{tool_call_id}",
+            event_sequence=len(tool_call_id) + 2,
         )
-        if candidate.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
+        if policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
         else None
     )
     result_ref = (
         None
         if candidate.tool_fact_kind is ToolFactKind.REUSE
         else HostEventRef(
-            event_id=f"event-result-{candidate.tool_call_id}",
-            event_sequence=len(candidate.tool_call_id) + 3,
+            event_id=f"event-result-{tool_call_id}",
+            event_sequence=len(tool_call_id) + 3,
         )
     )
     accepted_event_refs = tuple(
         ref for ref in (requested_ref, governed_ref, result_ref) if ref is not None
     )
     result_digest = (
-        candidate.outcome_digest
-        if candidate.outcome_digest is not None
-        else candidate.semantic_input_digest
+        result.outcome_digest
+        if result is not None
+        else candidate.idempotency.semantic_input_digest
     )
     return ToolFactAcceptedAck(
         accepted_event_refs=accepted_event_refs,
-        tool_fact_id=f"tool-fact-{candidate.tool_call_id}",
+        tool_fact_id=f"tool-fact-{tool_call_id}",
         tool_call_requested_event_ref=requested_ref,
         tool_call_governed_event_ref=governed_ref,
         tool_result_event_ref=result_ref,
         result_payload_ref=(
-            HostPayloadRef("payload-ref", candidate.payload_digest)
-            if candidate.payload_digest is not None
+            HostPayloadRef("payload-ref", result.payload_digest)
+            if result is not None and result.payload_digest is not None
             else None
         ),
         result_digest=result_digest,
-        reuse_prior_event_refs=candidate.reuse_prior_event_refs,
-        diagnostic_refs=candidate.diagnostic_refs,
-        idempotency_record_ref=f"idempotency-{candidate.tool_call_id}",
+        reuse_prior_event_refs=(
+            duplicate.reuse_prior_event_refs if duplicate is not None else ()
+        ),
+        diagnostic_refs=candidate.diagnostics.diagnostic_refs,
+        idempotency_record_ref=f"idempotency-{tool_call_id}",
     )

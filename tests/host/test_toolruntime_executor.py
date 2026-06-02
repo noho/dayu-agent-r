@@ -45,6 +45,12 @@ from dayu.host.tool_runtime import (
     InMemoryToolTraceDiagnosticEmitter,
     ToolAcceptRejectReason,
     ToolAcceptRetryPolicy,
+    ToolAcceptCall,
+    ToolAcceptDiagnostics,
+    ToolAcceptGovernance,
+    ToolAcceptIdentity,
+    ToolAcceptIdempotency,
+    ToolAcceptResult,
     ToolFactAcceptCandidate,
     ToolFactAcceptResult,
     ToolFactAcceptTimedOut,
@@ -479,8 +485,8 @@ async def test_oversized_tool_result_returns_completed_outcome_without_default_g
     assert len(accept_port.candidates) == 1
     candidate = accept_port.candidates[0]
     assert candidate.tool_fact_kind is ToolFactKind.COMPLETED
-    assert candidate.policy_decision.kind is ToolPolicyDecisionKind.ALLOW
-    assert candidate.raw_tool_outcome == {
+    assert candidate.governance.policy_decision.kind is ToolPolicyDecisionKind.ALLOW
+    assert _required_result(candidate).raw_tool_outcome == {
         "kind": "completed",
         "result": {
             "ok": True,
@@ -694,7 +700,7 @@ async def test_side_effect_tool_missing_idempotency_key_never_calls_callable() -
     record = outcome.records[0]
     assert callable_.call_count == 0
     assert accept_port.candidates[0].tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert accept_port.candidates[0].policy_decision.reason_code == (
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
         "tool_idempotency_key_required"
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
@@ -716,7 +722,7 @@ async def test_tool_runtime_timeout_returns_governed_failure() -> None:
     assert callable_.call_count == 1
     assert callable_.cancelled
     assert len(accept_port.candidates) == 1
-    assert accept_port.candidates[0].policy_decision.reason_code == (
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
         "tool_runtime_timeout"
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
@@ -739,7 +745,7 @@ async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> 
     record = outcome.records[0]
     assert callable_.call_count == 0
     assert len(accept_port.candidates) == 1
-    assert accept_port.candidates[0].policy_decision.reason_code == (
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
         "tool_runtime_cancelled"
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
@@ -958,7 +964,7 @@ async def test_no_tool_scope_rejects_model_tool_call() -> None:
     record = outcome.records[0]
     assert callable_.call_count == 0
     assert accept_port.candidates[0].tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert accept_port.candidates[0].policy_decision.reason_code == (
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
         "tool_call_not_allowed_in_scope"
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
@@ -993,9 +999,9 @@ async def test_batch_mixed_accept_outcomes_keep_accepted_visible() -> None:
 
     outcome = await executor.execute(
         _request(
-            _call("tool-call-1"),
-            _call("tool-call-2"),
-            _call("tool-call-3"),
+            _call("tool-call-1", ticker="DAYU-1"),
+            _call("tool-call-2", ticker="DAYU-2"),
+            _call("tool-call-3", ticker="DAYU-3"),
         )
     )
 
@@ -1095,17 +1101,18 @@ def _request(
     )
 
 
-def _call(tool_call_id: str) -> ToolCallRequest:
+def _call(tool_call_id: str, *, ticker: str = "DAYU") -> ToolCallRequest:
     """构造 fake 工具调用。
 
     :param tool_call_id: 工具调用 id。
+    :param ticker: fake ticker 参数。
     :returns: 工具调用请求。
     """
 
     return ToolCallRequest(
         tool_call_id=tool_call_id,
         name="fake_tool",
-        arguments={"ticker": "DAYU"},
+        arguments={"ticker": ticker},
         index_in_iteration=0,
         provider_state=None,
     )
@@ -1214,41 +1221,51 @@ def _accepted_ack_for_call(tool_call_id: str) -> ToolFactAcceptedAck:
     """
 
     candidate = ToolFactAcceptCandidate(
-        session_id=_SESSION_ID,
-        run_id=_RUN_ID,
-        attempt_id=_ATTEMPT_ID,
-        execution_id=_EXECUTION_ID,
-        iteration_id=_ITERATION_ID,
-        tool_call_id=tool_call_id,
-        tool_name="fake_tool",
-        tool_schema_digest=sha256_digest_json({"schema": tool_call_id}),
-        tool_identity_digest=sha256_digest_json({"identity": tool_call_id}),
-        normalized_arguments_digest=sha256_digest_json({"arguments": tool_call_id}),
-        tool_fact_kind=ToolFactKind.COMPLETED,
-        outcome_digest=sha256_digest_json({"outcome": tool_call_id}),
-        payload_digest=sha256_digest_json({"payload": tool_call_id}),
-        payload_ref=None,
-        truncation=None,
-        raw_tool_outcome={
-            "kind": "completed",
-            "result": {
-                "ok": True,
-                "value": {"tool_call_id": tool_call_id},
-                "meta": None,
-            },
-        },
-        duplicate_key=None,
-        duplicate_decision=None,
-        reuse_prior_event_refs=(),
-        policy_decision=ToolPolicyDecision(
-            kind=ToolPolicyDecisionKind.ALLOW,
-            reason_code=None,
-            message=None,
+        identity=ToolAcceptIdentity(
+            session_id=_SESSION_ID,
+            run_id=_RUN_ID,
+            attempt_id=_ATTEMPT_ID,
+            execution_id=_EXECUTION_ID,
         ),
-        tool_idempotency_key=None,
-        diagnostic_refs=(),
-        accept_idempotency_key=f"accept-{tool_call_id}",
-        semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
+        call=ToolAcceptCall(
+            iteration_id=_ITERATION_ID,
+            tool_call_id=tool_call_id,
+            tool_name="fake_tool",
+            tool_schema_digest=sha256_digest_json({"schema": tool_call_id}),
+            tool_identity_digest=sha256_digest_json({"identity": tool_call_id}),
+            normalized_arguments_digest=sha256_digest_json(
+                {"arguments": tool_call_id}
+            ),
+        ),
+        tool_fact_kind=ToolFactKind.COMPLETED,
+        result=ToolAcceptResult(
+            outcome_digest=sha256_digest_json({"outcome": tool_call_id}),
+            payload_digest=sha256_digest_json({"payload": tool_call_id}),
+            payload_ref=None,
+            truncation=None,
+            raw_tool_outcome={
+                "kind": "completed",
+                "result": {
+                    "ok": True,
+                    "value": {"tool_call_id": tool_call_id},
+                    "meta": None,
+                },
+            },
+        ),
+        governance=ToolAcceptGovernance(
+            policy_decision=ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.ALLOW,
+                reason_code=None,
+                message=None,
+            ),
+            tool_idempotency_key=None,
+            duplicate=None,
+        ),
+        idempotency=ToolAcceptIdempotency(
+            accept_idempotency_key=f"accept-{tool_call_id}",
+            semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
+        ),
+        diagnostics=ToolAcceptDiagnostics(diagnostic_refs=()),
     )
     return _accepted_ack(candidate)
 
@@ -1261,26 +1278,27 @@ def _accepted_ack(candidate: ToolFactAcceptCandidate) -> ToolFactAcceptedAck:
     """
 
     requested_ref = HostEventRef(
-        event_id=f"event-requested-{candidate.tool_call_id}",
+        event_id=f"event-requested-{candidate.call.tool_call_id}",
         event_sequence=1,
     )
     result_ref = HostEventRef(
-        event_id=f"event-result-{candidate.tool_call_id}",
+        event_id=f"event-result-{candidate.call.tool_call_id}",
         event_sequence=2,
     )
+    result = candidate.result
     result_digest = (
-        candidate.outcome_digest
-        if candidate.outcome_digest is not None
-        else candidate.semantic_input_digest
+        result.outcome_digest
+        if result is not None
+        else candidate.idempotency.semantic_input_digest
     )
     result_payload_ref = (
-        HostPayloadRef("payload-ref", candidate.payload_digest)
-        if candidate.payload_digest is not None
+        HostPayloadRef("payload-ref", result.payload_digest)
+        if result is not None and result.payload_digest is not None
         else None
     )
     return ToolFactAcceptedAck(
         accepted_event_refs=(requested_ref, result_ref),
-        tool_fact_id=f"tool-fact-{candidate.tool_call_id}",
+        tool_fact_id=f"tool-fact-{candidate.call.tool_call_id}",
         tool_call_requested_event_ref=requested_ref,
         tool_call_governed_event_ref=None,
         tool_result_event_ref=result_ref,
@@ -1288,5 +1306,17 @@ def _accepted_ack(candidate: ToolFactAcceptCandidate) -> ToolFactAcceptedAck:
         result_digest=result_digest,
         reuse_prior_event_refs=(),
         diagnostic_refs=(),
-        idempotency_record_ref=f"idempotency-{candidate.tool_call_id}",
+        idempotency_record_ref=f"idempotency-{candidate.call.tool_call_id}",
     )
+
+
+def _required_result(candidate: ToolFactAcceptCandidate) -> ToolAcceptResult:
+    """读取必须存在的 result 子结构。
+
+    :param candidate: 工具事实候选。
+    :returns: result 子结构。
+    :raises AssertionError: candidate 未携带 result 时抛出。
+    """
+
+    assert candidate.result is not None
+    return candidate.result

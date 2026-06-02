@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -60,7 +61,14 @@ from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
     DuplicateDecisionKind,
     HostEventRef,
+    ToolAcceptCall,
+    ToolAcceptDiagnostics,
+    ToolAcceptDuplicateGovernance,
+    ToolAcceptGovernance,
+    ToolAcceptIdentity,
+    ToolAcceptIdempotency,
     ToolAcceptRejectReason,
+    ToolAcceptResult,
     ToolAcceptRetryPolicy,
     ToolFactAcceptTimedOut,
     ToolFactAcceptCandidate,
@@ -69,6 +77,7 @@ from dayu.host.tool_runtime import (
     ToolFactRejectedAck,
     ToolPolicyDecision,
     ToolPolicyDecisionKind,
+    ToolTraceDiagnosticRef,
 )
 from dayu.host.tool_duplicate_governance import DuplicateGovernanceScope
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
@@ -195,18 +204,19 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
             result.tool_call_requested_event_ref.event_id
         )
         assert envelope.tool_query.normalized_arguments_digest == (
-            candidate.normalized_arguments_digest
+            candidate.call.normalized_arguments_digest
         )
         assert envelope.tool_query.semantic_input_digest == (
-            candidate.semantic_input_digest
+            candidate.idempotency.semantic_input_digest
         )
+        candidate_result = _required_result(candidate)
         assert envelope.result_ref.payload_ref is None
-        assert envelope.result_ref.payload_digest == candidate.payload_digest
-        assert envelope.result_ref.outcome_digest == candidate.outcome_digest
+        assert envelope.result_ref.payload_digest == candidate_result.payload_digest
+        assert envelope.result_ref.outcome_digest == candidate_result.outcome_digest
         assert envelope.result_ref.truncation_applied is False
         assert envelope.source_refs == ()
         assert envelope.locator_refs == ()
-        assert payload["raw_tool_outcome"] == candidate.raw_tool_outcome
+        assert payload["raw_tool_outcome"] == candidate_result.raw_tool_outcome
         assert "result_preview" not in payload
 
 
@@ -219,11 +229,21 @@ def test_tool_result_accepted_large_payload_uses_sqlite_payload_descriptor(
         _options(tmp_path, payload_inline_threshold_bytes=4096)
     ) as store:
         seeded = _seed_active_run(store.transaction_runner)
+        base = _completed_candidate(seeded, tool_call_id="tool-call-large-payload")
         candidate = replace(
-            _completed_candidate(seeded, tool_call_id="tool-call-large-payload"),
-            raw_tool_outcome=_large_raw_tool_outcome("tool-call-large-payload"),
-            outcome_digest=sha256_digest_json({"outcome": "tool-call-large-payload"}),
-            payload_digest=sha256_digest_json({"payload": "tool-call-large-payload"}),
+            base,
+            result=replace(
+                _required_result(base),
+                raw_tool_outcome=_large_raw_tool_outcome(
+                    "tool-call-large-payload"
+                ),
+                outcome_digest=sha256_digest_json(
+                    {"outcome": "tool-call-large-payload"}
+                ),
+                payload_digest=sha256_digest_json(
+                    {"payload": "tool-call-large-payload"}
+                ),
+            ),
         )
         accept_port = DefaultHostToolFactAcceptPort(
             transaction_runner=store.transaction_runner
@@ -250,10 +270,15 @@ def test_tool_result_accepted_large_payload_uses_sqlite_payload_descriptor(
         envelope = accepted_evidence_envelope_from_json_value(
             cold_payload[_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE]
         )
-        assert cold_payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] == candidate.raw_tool_outcome
+        assert (
+            cold_payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME]
+            == _required_result(candidate).raw_tool_outcome
+        )
         assert envelope.result_ref.payload_ref == row.payload_ref
         assert envelope.result_ref.payload_digest is None
-        assert envelope.result_ref.outcome_digest == candidate.outcome_digest
+        assert envelope.result_ref.outcome_digest == _required_result(
+            candidate
+        ).outcome_digest
 
 
 def test_accept_rejects_missing_payload_descriptor_before_writing_events(
@@ -264,12 +289,16 @@ def test_accept_rejects_missing_payload_descriptor_before_writing_events(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         payload_digest = sha256_digest_json({"payload": "missing-descriptor"})
+        base = _completed_candidate(seeded, tool_call_id="tool-call-missing-payload")
         candidate = replace(
-            _completed_candidate(seeded, tool_call_id="tool-call-missing-payload"),
-            payload_digest=payload_digest,
-            payload_ref=HostPayloadRef(
-                payload_ref="payload:missing-descriptor",
+            base,
+            result=replace(
+                _required_result(base),
                 payload_digest=payload_digest,
+                payload_ref=HostPayloadRef(
+                    payload_ref="payload:missing-descriptor",
+                    payload_digest=payload_digest,
+                ),
             ),
         )
         accept_port = DefaultHostToolFactAcceptPort(
@@ -300,12 +329,16 @@ def test_accept_rejects_payload_descriptor_digest_mismatch(
                 payload_digest=stored_digest,
             )
         )
+        base = _completed_candidate(seeded, tool_call_id="tool-call-payload-mismatch")
         candidate = replace(
-            _completed_candidate(seeded, tool_call_id="tool-call-payload-mismatch"),
-            payload_digest=candidate_digest,
-            payload_ref=HostPayloadRef(
-                payload_ref=payload_ref,
+            base,
+            result=replace(
+                _required_result(base),
                 payload_digest=candidate_digest,
+                payload_ref=HostPayloadRef(
+                    payload_ref=payload_ref,
+                    payload_digest=candidate_digest,
+                ),
             ),
         )
         accept_port = DefaultHostToolFactAcceptPort(
@@ -414,8 +447,14 @@ def test_same_accept_key_with_different_digest_returns_idempotency_conflict(
         candidate = _completed_candidate(seeded, tool_call_id="tool-call-1")
         conflict = replace(
             candidate,
-            semantic_input_digest=sha256_digest_json({"semantic": "changed"}),
-            outcome_digest=sha256_digest_json({"outcome": "changed"}),
+            idempotency=replace(
+                candidate.idempotency,
+                semantic_input_digest=sha256_digest_json({"semantic": "changed"}),
+            ),
+            result=replace(
+                _required_result(candidate),
+                outcome_digest=sha256_digest_json({"outcome": "changed"}),
+            ),
         )
         accept_port = DefaultHostToolFactAcceptPort(
             transaction_runner=store.transaction_runner
@@ -442,14 +481,20 @@ def test_invalid_attempt_and_stale_execution_reject_without_tool_facts(
         base = _completed_candidate(seeded, tool_call_id="tool-call-1")
         invalid_attempt = replace(
             base,
-            attempt_id="attempt-missing",
-            accept_idempotency_key="accept-missing",
+            identity=replace(base.identity, attempt_id="attempt-missing"),
+            idempotency=replace(
+                base.idempotency,
+                accept_idempotency_key="accept-missing",
+            ),
         )
         stale_execution = replace(
             base,
-            execution_id="execution-stale",
-            tool_call_id="tool-call-stale",
-            accept_idempotency_key="accept-stale",
+            identity=replace(base.identity, execution_id="execution-stale"),
+            call=replace(base.call, tool_call_id="tool-call-stale"),
+            idempotency=replace(
+                base.idempotency,
+                accept_idempotency_key="accept-stale",
+            ),
         )
         accept_port = DefaultHostToolFactAcceptPort(
             transaction_runner=store.transaction_runner
@@ -490,7 +535,9 @@ def test_event_sequence_monotonic_and_reuse_has_canonical_governance_only(
 
         assert isinstance(second, ToolFactAcceptedAck)
         assert second.tool_result_event_ref is None
-        assert reuse.reuse_prior_event_refs == (first.tool_result_event_ref,)
+        assert _required_duplicate(reuse).reuse_prior_event_refs == (
+            first.tool_result_event_ref,
+        )
         assert [row.event_sequence for row in tool_events] == sorted(
             row.event_sequence for row in tool_events
         )
@@ -505,7 +552,7 @@ def test_event_sequence_monotonic_and_reuse_has_canonical_governance_only(
         duplicate_scope = governed_payload["duplicate_scope"]
         assert isinstance(duplicate_scope, Mapping)
         assert duplicate_scope["kind"] == "attempt"
-        assert duplicate_scope["attempt_id"] == reuse.attempt_id
+        assert duplicate_scope["attempt_id"] == reuse.identity.attempt_id
         assert governed_payload["reuse_prior_event_refs"] == [
             {
                 "event_id": first.tool_result_event_ref.event_id,
@@ -524,12 +571,23 @@ def test_duplicate_allow_does_not_append_governed_event(tmp_path: Path) -> None:
         )
         candidate = replace(
             _completed_candidate(seeded, tool_call_id="tool-call-allow"),
-            duplicate_key="duplicate-lookup-MSFT",
-            duplicate_decision=DuplicateDecisionKind.ALLOW,
-            duplicate_scope=DuplicateGovernanceScope(
-                kind="attempt", attempt_id=seeded.attempt_id
+            governance=ToolAcceptGovernance(
+                policy_decision=ToolPolicyDecision(
+                    kind=ToolPolicyDecisionKind.ALLOW,
+                    reason_code=None,
+                    message=None,
+                ),
+                tool_idempotency_key=None,
+                duplicate=ToolAcceptDuplicateGovernance(
+                    duplicate_key="duplicate-lookup-MSFT",
+                    duplicate_decision=DuplicateDecisionKind.ALLOW,
+                    duplicate_scope=DuplicateGovernanceScope(
+                        kind="attempt", attempt_id=seeded.attempt_id
+                    ),
+                    duplicate_decision_message="本次重复工具调用已允许执行。",
+                    reuse_prior_event_refs=(),
+                ),
             ),
-            duplicate_decision_message="本次重复工具调用已允许执行。",
         )
 
         result = accept_port.accept_tool_fact(candidate)
@@ -611,8 +669,196 @@ def test_non_reuse_fact_rejects_prior_reuse_refs(tmp_path: Path) -> None:
                     fact_kind=ToolFactKind.FAILED,
                     policy_kind=ToolPolicyDecisionKind.ALLOW,
                 ),
-                reuse_prior_event_refs=(accepted.tool_result_event_ref,),
+                governance=ToolAcceptGovernance(
+                    policy_decision=ToolPolicyDecision(
+                        kind=ToolPolicyDecisionKind.ALLOW,
+                        reason_code=None,
+                        message=None,
+                    ),
+                    tool_idempotency_key=None,
+                    duplicate=ToolAcceptDuplicateGovernance(
+                        duplicate_key=None,
+                        duplicate_decision=DuplicateDecisionKind.ALLOW,
+                        duplicate_scope=DuplicateGovernanceScope(
+                            kind="attempt", attempt_id=seeded.attempt_id
+                        ),
+                        duplicate_decision_message="本次重复工具调用已允许执行。",
+                        reuse_prior_event_refs=(accepted.tool_result_event_ref,),
+                    ),
+                ),
             )
+
+
+def test_lost_tool_fact_kind_fails_fast_as_unsupported() -> None:
+    """LOST 工具事实类别在 accept candidate 构造期明确 fail-fast。
+
+    :returns: ``None``。
+    :raises AssertionError: LOST 未按 unsupported fact kind 拒绝时抛出。
+    """
+
+    seeded = _SeededRun(
+        session_id="session-tool-accept",
+        run_id="run-tool-accept",
+        attempt_id="attempt-tool-accept",
+        execution_id="execution-tool-accept",
+        dispatch_record_id="dispatch-tool-accept",
+    )
+    base = _completed_candidate(seeded, tool_call_id="tool-call-lost")
+
+    with pytest.raises(ValueError, match="unsupported tool_fact_kind"):
+        replace(base, tool_fact_kind=ToolFactKind.LOST)
+
+
+def test_tool_accept_identity_rejects_empty_fields() -> None:
+    """ToolAcceptIdentity 直接拒绝任一空身份字段。
+
+    :returns: ``None``。
+    :raises AssertionError: 空身份字段未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="session_id"):
+        ToolAcceptIdentity(
+            session_id="",
+            run_id="run-tool-accept",
+            attempt_id="attempt-tool-accept",
+            execution_id="execution-tool-accept",
+        )
+    with pytest.raises(ValueError, match="run_id"):
+        ToolAcceptIdentity(
+            session_id="session-tool-accept",
+            run_id="",
+            attempt_id="attempt-tool-accept",
+            execution_id="execution-tool-accept",
+        )
+    with pytest.raises(ValueError, match="attempt_id"):
+        ToolAcceptIdentity(
+            session_id="session-tool-accept",
+            run_id="run-tool-accept",
+            attempt_id="",
+            execution_id="execution-tool-accept",
+        )
+    with pytest.raises(ValueError, match="execution_id"):
+        ToolAcceptIdentity(
+            session_id="session-tool-accept",
+            run_id="run-tool-accept",
+            attempt_id="attempt-tool-accept",
+            execution_id="",
+        )
+
+
+def test_tool_accept_call_rejects_invalid_digest() -> None:
+    """ToolAcceptCall 直接拒绝非法 digest 字段。
+
+    :returns: ``None``。
+    :raises AssertionError: 非法 digest 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="tool_schema_digest"):
+        ToolAcceptCall(
+            iteration_id="iteration-1",
+            tool_call_id="tool-call-invalid-digest",
+            tool_name="lookup",
+            tool_schema_digest="not-a-sha256-digest",
+            tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
+            normalized_arguments_digest=sha256_digest_json({"ticker": "MSFT"}),
+        )
+
+
+def test_tool_accept_result_rejects_payload_ref_digest_mismatch() -> None:
+    """ToolAcceptResult 直接拒绝 payload_digest 与 payload_ref digest 不一致。
+
+    :returns: ``None``。
+    :raises AssertionError: payload digest 不一致未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="payload_digest must match"):
+        ToolAcceptResult(
+            outcome_digest=sha256_digest_json({"outcome": "payload-mismatch"}),
+            payload_digest=sha256_digest_json({"payload": "candidate"}),
+            payload_ref=HostPayloadRef(
+                payload_ref="payload:result-mismatch",
+                payload_digest=sha256_digest_json({"payload": "ref"}),
+            ),
+            truncation=None,
+            raw_tool_outcome=_raw_tool_outcome("tool-call-payload-mismatch"),
+        )
+
+
+def test_tool_accept_duplicate_governance_rejects_invalid_fields() -> None:
+    """ToolAcceptDuplicateGovernance 直接拒绝缺失字段与非法 prior ref。
+
+    :returns: ``None``。
+    :raises AssertionError: duplicate governance 非法字段未被拒绝时抛出。
+    """
+
+    scope = DuplicateGovernanceScope(kind="attempt", attempt_id="attempt-tool-accept")
+
+    with pytest.raises(ValueError, match="duplicate_scope"):
+        ToolAcceptDuplicateGovernance(
+            duplicate_key=None,
+            duplicate_decision=DuplicateDecisionKind.ALLOW,
+            duplicate_scope=None,
+            duplicate_decision_message="本次重复工具调用已允许执行。",
+            reuse_prior_event_refs=(),
+        )
+    with pytest.raises(ValueError, match="duplicate_decision_message"):
+        ToolAcceptDuplicateGovernance(
+            duplicate_key=None,
+            duplicate_decision=DuplicateDecisionKind.ALLOW,
+            duplicate_scope=scope,
+            duplicate_decision_message=None,
+            reuse_prior_event_refs=(),
+        )
+    with pytest.raises(ValueError, match="reuse_prior_event_refs"):
+        ToolAcceptDuplicateGovernance(
+            duplicate_key=None,
+            duplicate_decision=DuplicateDecisionKind.ALLOW,
+            duplicate_scope=scope,
+            duplicate_decision_message="本次重复工具调用已允许执行。",
+            reuse_prior_event_refs=(cast(HostEventRef, "bad-prior-ref"),),
+        )
+
+
+def test_tool_accept_governance_rejects_non_policy_decision() -> None:
+    """ToolAcceptGovernance 直接拒绝非 ToolPolicyDecision。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 ToolPolicyDecision 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="policy_decision"):
+        ToolAcceptGovernance(
+            policy_decision=cast(ToolPolicyDecision, "bad-policy-decision"),
+            tool_idempotency_key=None,
+            duplicate=None,
+        )
+
+
+def test_tool_accept_idempotency_rejects_invalid_semantic_digest() -> None:
+    """ToolAcceptIdempotency 直接拒绝非法 semantic input digest。
+
+    :returns: ``None``。
+    :raises AssertionError: 非法 semantic input digest 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="semantic_input_digest"):
+        ToolAcceptIdempotency(
+            accept_idempotency_key="accept-invalid-semantic",
+            semantic_input_digest="not-a-sha256-digest",
+        )
+
+
+def test_tool_accept_diagnostics_rejects_non_diagnostic_ref() -> None:
+    """ToolAcceptDiagnostics 直接拒绝非 ToolTraceDiagnosticRef 引用。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 ToolTraceDiagnosticRef 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="diagnostic_refs"):
+        ToolAcceptDiagnostics(
+            diagnostic_refs=(cast(ToolTraceDiagnosticRef, "bad-diagnostic-ref"),)
+        )
 
 
 def test_accept_retry_policy_and_timeout_guard_invalid_values() -> None:
@@ -811,34 +1057,19 @@ def _completed_candidate(
     """
 
     return ToolFactAcceptCandidate(
-        session_id=seeded.session_id,
-        run_id=seeded.run_id,
-        attempt_id=seeded.attempt_id,
-        execution_id=seeded.execution_id,
-        iteration_id="iteration-1",
-        tool_call_id=tool_call_id,
-        tool_name="lookup",
-        tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
-        tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-        normalized_arguments_digest=sha256_digest_json({"ticker": "MSFT"}),
+        identity=_candidate_identity(seeded),
+        call=_candidate_call(tool_call_id, iteration_id="iteration-1"),
         tool_fact_kind=ToolFactKind.COMPLETED,
-        outcome_digest=sha256_digest_json({"outcome": tool_call_id}),
-        payload_digest=sha256_digest_json({"payload": tool_call_id}),
-        payload_ref=None,
-        truncation=None,
-        raw_tool_outcome=_raw_tool_outcome(tool_call_id),
-        duplicate_key=None,
-        duplicate_decision=None,
-        reuse_prior_event_refs=(),
-        policy_decision=ToolPolicyDecision(
-            kind=ToolPolicyDecisionKind.ALLOW,
-            reason_code=None,
-            message=None,
+        result=ToolAcceptResult(
+            outcome_digest=sha256_digest_json({"outcome": tool_call_id}),
+            payload_digest=sha256_digest_json({"payload": tool_call_id}),
+            payload_ref=None,
+            truncation=None,
+            raw_tool_outcome=_raw_tool_outcome(tool_call_id),
         ),
-        tool_idempotency_key=None,
-        diagnostic_refs=(),
-        accept_idempotency_key=f"accept-{tool_call_id}",
-        semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
+        governance=_allow_governance(duplicate=None),
+        idempotency=_candidate_idempotency(tool_call_id),
+        diagnostics=ToolAcceptDiagnostics(diagnostic_refs=()),
     )
 
 
@@ -854,38 +1085,31 @@ def _reuse_candidate(
     """
 
     return ToolFactAcceptCandidate(
-        session_id=seeded.session_id,
-        run_id=seeded.run_id,
-        attempt_id=seeded.attempt_id,
-        execution_id=seeded.execution_id,
-        iteration_id="iteration-2",
-        tool_call_id=tool_call_id,
-        tool_name="lookup",
-        tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
-        tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-        normalized_arguments_digest=sha256_digest_json({"ticker": "MSFT"}),
+        identity=_candidate_identity(seeded),
+        call=_candidate_call(tool_call_id, iteration_id="iteration-2"),
         tool_fact_kind=ToolFactKind.REUSE,
-        outcome_digest=None,
-        payload_digest=None,
-        payload_ref=None,
-        truncation=None,
-        raw_tool_outcome=None,
-        duplicate_key="duplicate-lookup-MSFT",
-        duplicate_decision=DuplicateDecisionKind.REUSE,
-        duplicate_scope=DuplicateGovernanceScope(
-            kind="attempt", attempt_id=seeded.attempt_id
+        result=None,
+        governance=ToolAcceptGovernance(
+            policy_decision=ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.REUSE,
+                reason_code="duplicate_reuse",
+                message="请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
+            ),
+            tool_idempotency_key=None,
+            duplicate=ToolAcceptDuplicateGovernance(
+                duplicate_key="duplicate-lookup-MSFT",
+                duplicate_decision=DuplicateDecisionKind.REUSE,
+                duplicate_scope=DuplicateGovernanceScope(
+                    kind="attempt", attempt_id=seeded.attempt_id
+                ),
+                duplicate_decision_message=(
+                    "请直接使用上一次工具结果继续推理，不要重复请求相同证据。"
+                ),
+                reuse_prior_event_refs=(prior_ref,),
+            ),
         ),
-        duplicate_decision_message="请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
-        reuse_prior_event_refs=(prior_ref,),
-        policy_decision=ToolPolicyDecision(
-            kind=ToolPolicyDecisionKind.REUSE,
-            reason_code="duplicate_reuse",
-            message="请直接使用上一次工具结果继续推理，不要重复请求相同证据。",
-        ),
-        tool_idempotency_key=None,
-        diagnostic_refs=(),
-        accept_idempotency_key=f"accept-{tool_call_id}",
-        semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
+        idempotency=_candidate_idempotency(tool_call_id),
+        diagnostics=ToolAcceptDiagnostics(diagnostic_refs=()),
     )
 
 
@@ -906,35 +1130,137 @@ def _fact_kind_candidate(
     """
 
     return ToolFactAcceptCandidate(
+        identity=_candidate_identity(seeded),
+        call=ToolAcceptCall(
+            iteration_id="iteration-3",
+            tool_call_id=tool_call_id,
+            tool_name="lookup",
+            tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
+            tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
+            normalized_arguments_digest=sha256_digest_json(
+                {"ticker": tool_call_id}
+            ),
+        ),
+        tool_fact_kind=fact_kind,
+        result=ToolAcceptResult(
+            outcome_digest=sha256_digest_json({"outcome": tool_call_id}),
+            payload_digest=None,
+            payload_ref=None,
+            truncation=None,
+            raw_tool_outcome=_raw_tool_outcome(tool_call_id),
+        ),
+        governance=ToolAcceptGovernance(
+            policy_decision=ToolPolicyDecision(
+                kind=policy_kind,
+                reason_code=(
+                    policy_kind.value
+                    if policy_kind is not ToolPolicyDecisionKind.ALLOW
+                    else None
+                ),
+                message=(
+                    policy_kind.value
+                    if policy_kind is not ToolPolicyDecisionKind.ALLOW
+                    else None
+                ),
+            ),
+            tool_idempotency_key=None,
+            duplicate=None,
+        ),
+        idempotency=_candidate_idempotency(tool_call_id),
+        diagnostics=ToolAcceptDiagnostics(diagnostic_refs=()),
+    )
+
+
+def _candidate_identity(seeded: _SeededRun) -> ToolAcceptIdentity:
+    """构造测试 candidate identity 子结构。
+
+    :param seeded: active Run refs。
+    :returns: candidate identity。
+    """
+
+    return ToolAcceptIdentity(
         session_id=seeded.session_id,
         run_id=seeded.run_id,
         attempt_id=seeded.attempt_id,
         execution_id=seeded.execution_id,
-        iteration_id="iteration-3",
+    )
+
+
+def _candidate_call(tool_call_id: str, *, iteration_id: str) -> ToolAcceptCall:
+    """构造测试 candidate call 子结构。
+
+    :param tool_call_id: tool call id。
+    :param iteration_id: iteration id。
+    :returns: candidate call。
+    """
+
+    return ToolAcceptCall(
+        iteration_id=iteration_id,
         tool_call_id=tool_call_id,
         tool_name="lookup",
         tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
         tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-        normalized_arguments_digest=sha256_digest_json({"ticker": tool_call_id}),
-        tool_fact_kind=fact_kind,
-        outcome_digest=sha256_digest_json({"outcome": tool_call_id}),
-        payload_digest=None,
-        payload_ref=None,
-        truncation=None,
-        raw_tool_outcome=_raw_tool_outcome(tool_call_id),
-        duplicate_key=None,
-        duplicate_decision=None,
-        reuse_prior_event_refs=(),
+        normalized_arguments_digest=sha256_digest_json({"ticker": "MSFT"}),
+    )
+
+
+def _allow_governance(
+    *, duplicate: ToolAcceptDuplicateGovernance | None
+) -> ToolAcceptGovernance:
+    """构造 allow policy governance 子结构。
+
+    :param duplicate: 可选 duplicate governance。
+    :returns: candidate governance。
+    """
+
+    return ToolAcceptGovernance(
         policy_decision=ToolPolicyDecision(
-            kind=policy_kind,
-            reason_code=policy_kind.value if policy_kind is not ToolPolicyDecisionKind.ALLOW else None,
-            message=policy_kind.value if policy_kind is not ToolPolicyDecisionKind.ALLOW else None,
+            kind=ToolPolicyDecisionKind.ALLOW,
+            reason_code=None,
+            message=None,
         ),
         tool_idempotency_key=None,
-        diagnostic_refs=(),
+        duplicate=duplicate,
+    )
+
+
+def _candidate_idempotency(tool_call_id: str) -> ToolAcceptIdempotency:
+    """构造测试 candidate idempotency 子结构。
+
+    :param tool_call_id: tool call id。
+    :returns: candidate idempotency。
+    """
+
+    return ToolAcceptIdempotency(
         accept_idempotency_key=f"accept-{tool_call_id}",
         semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
     )
+
+
+def _required_result(candidate: ToolFactAcceptCandidate) -> ToolAcceptResult:
+    """读取必须存在的 result 子结构。
+
+    :param candidate: 工具事实候选。
+    :returns: result 子结构。
+    :raises AssertionError: candidate 未携带 result 时抛出。
+    """
+
+    assert candidate.result is not None
+    return candidate.result
+
+
+def _required_duplicate(
+    candidate: ToolFactAcceptCandidate,
+) -> ToolAcceptDuplicateGovernance:
+    """读取必须存在的 duplicate governance 子结构。
+
+    :param candidate: 工具事实候选。
+    :returns: duplicate governance 子结构。
+    :raises AssertionError: candidate 未携带 duplicate governance 时抛出。
+    """
+
+    assert candidate.governance.duplicate is not None
+    return candidate.governance.duplicate
 
 
 def _raw_tool_outcome(tool_call_id: str) -> JsonValue:

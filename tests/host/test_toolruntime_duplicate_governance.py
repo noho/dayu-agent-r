@@ -36,6 +36,7 @@ from dayu.host.tool_runtime import (
     HostPayloadRef,
     HostToolFactAcceptPort,
     InMemoryToolTraceDiagnosticEmitter,
+    ToolAcceptDuplicateGovernance,
     ToolAcceptRejectReason,
     ToolAcceptRetryPolicy,
     ToolFactAcceptCandidate,
@@ -55,6 +56,7 @@ from dayu.host.tooling import (
 )
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
+    DuplicateGovernanceScope,
     DuplicateGovernanceMessages,
     DuplicateGovernancePolicy,
 )
@@ -392,11 +394,11 @@ async def test_duplicate_key_normalizes_arguments_deterministically() -> None:
 
     assert tool.call_count == 1
     assert isinstance(outcome.records[1].outcome, ToolCompletedOutcome)
-    assert accept_port.candidates[0].normalized_arguments_digest == (
-        accept_port.candidates[1].normalized_arguments_digest
+    assert accept_port.candidates[0].call.normalized_arguments_digest == (
+        accept_port.candidates[1].call.normalized_arguments_digest
     )
-    assert accept_port.candidates[0].duplicate_key == (
-        accept_port.candidates[1].duplicate_key
+    assert _candidate_duplicate(accept_port.candidates[0]).duplicate_key == (
+        _candidate_duplicate(accept_port.candidates[1]).duplicate_key
     )
     assert accept_port.candidates[1].tool_fact_kind is ToolFactKind.REUSE
 
@@ -424,8 +426,10 @@ async def test_duplicate_key_excludes_index_in_iteration() -> None:
 
     assert tool.call_count == 1
     assert accept_port.candidates[1].tool_fact_kind is ToolFactKind.REUSE
-    assert accept_port.candidates[1].duplicate_decision is DuplicateDecisionKind.REUSE
-    assert accept_port.candidates[1].reuse_prior_event_refs
+    assert _candidate_duplicate_decision(
+        accept_port.candidates[1]
+    ) is DuplicateDecisionKind.REUSE
+    assert _candidate_reuse_prior_event_refs(accept_port.candidates[1])
 
 
 @pytest.mark.asyncio
@@ -455,7 +459,7 @@ async def test_allow_duplicate_decision_executes_and_accepts_each_call() -> None
         ToolFactKind.COMPLETED,
     ]
     assert all(
-        candidate.duplicate_decision is DuplicateDecisionKind.ALLOW
+        _candidate_duplicate_decision(candidate) is DuplicateDecisionKind.ALLOW
         for candidate in accept_port.candidates
     )
 
@@ -487,7 +491,7 @@ async def test_reuse_references_prior_refs_without_second_result_fact() -> None:
     assert isinstance(outcome.records[1].outcome, ToolCompletedOutcome)
     assert outcome.records[1].outcome.result.value == {"accepted": "prior"}
     assert reuse_candidate.tool_fact_kind is ToolFactKind.REUSE
-    assert reuse_candidate.reuse_prior_event_refs == (
+    assert _candidate_reuse_prior_event_refs(reuse_candidate) == (
         accept_port.acks[0].accepted_event_refs
     )
     assert reuse_ack.tool_result_event_ref is None
@@ -533,14 +537,14 @@ async def test_duplicate_governed_matrix_produces_diagnostics(
     )
 
     governed_candidate = accept_port.candidates[1]
+    duplicate_scope = _candidate_duplicate_scope(governed_candidate)
     assert tool.call_count == 1
     assert governed_candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert governed_candidate.policy_decision.kind is expected_policy
-    assert governed_candidate.duplicate_scope is not None
-    assert governed_candidate.duplicate_scope.kind == "attempt"
-    assert governed_candidate.duplicate_scope.attempt_id == _ATTEMPT_ID
-    assert governed_candidate.diagnostic_refs
-    assert governed_candidate.reuse_prior_event_refs
+    assert governed_candidate.governance.policy_decision.kind is expected_policy
+    assert duplicate_scope.kind == "attempt"
+    assert duplicate_scope.attempt_id == _ATTEMPT_ID
+    assert governed_candidate.diagnostics.diagnostic_refs
+    assert _candidate_reuse_prior_event_refs(governed_candidate)
     assert len(diagnostics.records) == 1
 
 
@@ -553,7 +557,11 @@ async def test_governed_duplicate_candidate_validation_rejects_missing_prior_ref
     )
 
     with pytest.raises(ValueError, match="requires prior event refs"):
-        replace(governed_candidate, reuse_prior_event_refs=())
+        duplicate = replace(
+            _candidate_duplicate(governed_candidate), reuse_prior_event_refs=()
+        )
+        governance = replace(governed_candidate.governance, duplicate=duplicate)
+        replace(governed_candidate, governance=governance)
 
 
 @pytest.mark.asyncio
@@ -565,8 +573,8 @@ async def test_governed_duplicate_candidate_validation_rejects_policy_mismatch()
     )
 
     with pytest.raises(ValueError, match="policy kind must match decision"):
-        replace(
-            governed_candidate,
+        governance = replace(
+            governed_candidate.governance,
             policy_decision=ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
@@ -575,6 +583,10 @@ async def test_governed_duplicate_candidate_validation_rejects_policy_mismatch()
                     "期间、指标或证据范围时，才重新调用工具并修改参数。"
                 ),
             ),
+        )
+        replace(
+            governed_candidate,
+            governance=governance,
         )
 
 
@@ -587,8 +599,8 @@ async def test_governed_duplicate_candidate_validation_rejects_reason_mismatch()
     )
 
     with pytest.raises(ValueError, match="reason must match decision"):
-        replace(
-            governed_candidate,
+        governance = replace(
+            governed_candidate.governance,
             policy_decision=ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.HARD_STOP,
                 reason_code="duplicate_hint",
@@ -597,6 +609,10 @@ async def test_governed_duplicate_candidate_validation_rejects_reason_mismatch()
                     "如果信息不足，请说明不确定性，不要编造。"
                 ),
             ),
+        )
+        replace(
+            governed_candidate,
+            governance=governance,
         )
 
 
@@ -609,13 +625,17 @@ async def test_governed_duplicate_candidate_validation_rejects_message_mismatch(
     )
 
     with pytest.raises(ValueError, match="message must match decision"):
-        replace(
-            governed_candidate,
+        governance = replace(
+            governed_candidate.governance,
             policy_decision=ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.REQUIRE_JUSTIFICATION,
                 reason_code="duplicate_requires_justification",
                 message="wrong duplicate governance message",
             ),
+        )
+        replace(
+            governed_candidate,
+            governance=governance,
         )
 
 
@@ -628,15 +648,18 @@ async def test_governed_error_candidate_validation_rejects_allow_policy() -> Non
     )
 
     with pytest.raises(ValueError, match="requires governed policy decision"):
-        replace(
-            governed_candidate,
-            duplicate_decision=None,
-            reuse_prior_event_refs=(),
+        governance = replace(
+            governed_candidate.governance,
+            duplicate=None,
             policy_decision=ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.ALLOW,
                 reason_code=None,
                 message=None,
             ),
+        )
+        replace(
+            governed_candidate,
+            governance=governance,
         )
 
 
@@ -670,7 +693,9 @@ async def test_require_justification_with_valid_argument_allows_execution() -> N
 
     assert tool.call_count == 2
     assert accept_port.candidates[1].tool_fact_kind is ToolFactKind.COMPLETED
-    assert accept_port.candidates[1].duplicate_decision is DuplicateDecisionKind.ALLOW
+    assert _candidate_duplicate_decision(
+        accept_port.candidates[1]
+    ) is DuplicateDecisionKind.ALLOW
 
 
 @pytest.mark.asyncio
@@ -696,8 +721,13 @@ async def test_require_justification_without_argument_binding_downgrades_to_hint
 
     assert tool.call_count == 1
     assert accept_port.candidates[1].tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert accept_port.candidates[1].duplicate_decision is DuplicateDecisionKind.HINT
-    assert accept_port.candidates[1].policy_decision.kind is ToolPolicyDecisionKind.HINT
+    assert _candidate_duplicate_decision(
+        accept_port.candidates[1]
+    ) is DuplicateDecisionKind.HINT
+    assert (
+        accept_port.candidates[1].governance.policy_decision.kind
+        is ToolPolicyDecisionKind.HINT
+    )
 
 
 @pytest.mark.asyncio
@@ -757,11 +787,13 @@ async def test_plain_policy_rejection_does_not_carry_duplicate_prior_refs() -> N
     )
 
     assert accept_port.candidates[1].tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert accept_port.candidates[1].policy_decision.reason_code == (
+    assert accept_port.candidates[1].governance.policy_decision.reason_code == (
         "tool_call_not_allowed_in_scope"
     )
-    assert accept_port.candidates[1].duplicate_decision is DuplicateDecisionKind.HARD_STOP
-    assert accept_port.candidates[1].reuse_prior_event_refs == ()
+    assert _candidate_duplicate_decision(
+        accept_port.candidates[1]
+    ) is DuplicateDecisionKind.HARD_STOP
+    assert _candidate_reuse_prior_event_refs(accept_port.candidates[1]) == ()
 
 
 @pytest.mark.asyncio
@@ -790,21 +822,21 @@ async def test_cross_attempt_same_run_duplicate_executes_fresh_without_prior_ref
     assert second_tool.call_count == 1
     assert first_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
     assert second_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
-    assert first_accept_port.candidates[0].duplicate_decision is (
+    assert _candidate_duplicate_decision(first_accept_port.candidates[0]) is (
         DuplicateDecisionKind.ALLOW
     )
-    assert second_accept_port.candidates[0].duplicate_decision is (
+    assert _candidate_duplicate_decision(second_accept_port.candidates[0]) is (
         DuplicateDecisionKind.ALLOW
     )
-    assert first_accept_port.candidates[0].reuse_prior_event_refs == ()
-    assert second_accept_port.candidates[0].reuse_prior_event_refs == ()
-    assert first_accept_port.candidates[0].duplicate_key != (
-        second_accept_port.candidates[0].duplicate_key
+    assert _candidate_reuse_prior_event_refs(first_accept_port.candidates[0]) == ()
+    assert _candidate_reuse_prior_event_refs(second_accept_port.candidates[0]) == ()
+    assert _candidate_duplicate(first_accept_port.candidates[0]).duplicate_key != (
+        _candidate_duplicate(second_accept_port.candidates[0]).duplicate_key
     )
-    assert first_accept_port.candidates[0].duplicate_scope is not None
-    assert first_accept_port.candidates[0].duplicate_scope.attempt_id == _ATTEMPT_ID
-    assert second_accept_port.candidates[0].duplicate_scope is not None
-    assert second_accept_port.candidates[0].duplicate_scope.attempt_id == (
+    assert _candidate_duplicate_scope(
+        first_accept_port.candidates[0]
+    ).attempt_id == _ATTEMPT_ID
+    assert _candidate_duplicate_scope(second_accept_port.candidates[0]).attempt_id == (
         "attempt-other"
     )
 
@@ -830,20 +862,20 @@ async def test_fresh_toolruntime_handle_same_attempt_is_in_memory_non_durable_re
 
     assert first_tool.call_count == 1
     assert restarted_tool.call_count == 1
-    assert first_accept_port.candidates[0].duplicate_scope is not None
-    assert restarted_accept_port.candidates[0].duplicate_scope is not None
-    assert first_accept_port.candidates[0].duplicate_scope.attempt_id == _ATTEMPT_ID
-    assert restarted_accept_port.candidates[0].duplicate_scope.attempt_id == (
+    assert _candidate_duplicate_scope(
+        first_accept_port.candidates[0]
+    ).attempt_id == _ATTEMPT_ID
+    assert _candidate_duplicate_scope(restarted_accept_port.candidates[0]).attempt_id == (
         _ATTEMPT_ID
     )
-    assert first_accept_port.candidates[0].duplicate_key == (
-        restarted_accept_port.candidates[0].duplicate_key
+    assert _candidate_duplicate(first_accept_port.candidates[0]).duplicate_key == (
+        _candidate_duplicate(restarted_accept_port.candidates[0]).duplicate_key
     )
     assert restarted_accept_port.candidates[0].tool_fact_kind is ToolFactKind.COMPLETED
-    assert restarted_accept_port.candidates[0].duplicate_decision is (
+    assert _candidate_duplicate_decision(restarted_accept_port.candidates[0]) is (
         DuplicateDecisionKind.ALLOW
     )
-    assert restarted_accept_port.candidates[0].reuse_prior_event_refs == ()
+    assert _candidate_reuse_prior_event_refs(restarted_accept_port.candidates[0]) == ()
 
 
 @pytest.mark.asyncio
@@ -883,7 +915,7 @@ async def test_same_attempt_concurrent_reuse_waits_for_owner_accept() -> None:
     assert isinstance(waiter_outcome.records[0].outcome, ToolCompletedOutcome)
     assert waiter_outcome.records[0].outcome.result.value == {"accepted": "owner"}
     assert accept_port.candidates[1].tool_fact_kind is ToolFactKind.REUSE
-    assert accept_port.candidates[1].reuse_prior_event_refs == (
+    assert _candidate_reuse_prior_event_refs(accept_port.candidates[1]) == (
         accept_port.acks[0].accepted_event_refs
     )
 
@@ -1134,7 +1166,12 @@ async def test_duplicate_candidate_validation_rejects_missing_duplicate_message(
     )
 
     with pytest.raises(ValueError, match="requires duplicate_decision_message"):
-        replace(governed_candidate, duplicate_decision_message=None)
+        duplicate = replace(
+            _candidate_duplicate(governed_candidate),
+            duplicate_decision_message=None,
+        )
+        governance = replace(governed_candidate.governance, duplicate=duplicate)
+        replace(governed_candidate, governance=governance)
 
 
 def _executor(
@@ -1219,10 +1256,10 @@ async def _governed_duplicate_candidate(
     )
 
     candidate = accept_port.candidates[1]
+    duplicate_scope = _candidate_duplicate_scope(candidate)
     assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert candidate.duplicate_scope is not None
-    assert candidate.duplicate_scope.kind == "attempt"
-    assert candidate.duplicate_scope.attempt_id == _ATTEMPT_ID
+    assert duplicate_scope.kind == "attempt"
+    assert duplicate_scope.attempt_id == _ATTEMPT_ID
     return candidate
 
 
@@ -1336,48 +1373,103 @@ def _accepted_ack(candidate: ToolFactAcceptCandidate) -> ToolFactAcceptedAck:
     :returns: accepted ack。
     """
 
+    tool_call_id = candidate.call.tool_call_id
+    policy_decision = candidate.governance.policy_decision
+    result = candidate.result
     requested_ref = HostEventRef(
-        event_id=f"event-requested-{candidate.tool_call_id}",
-        event_sequence=len(candidate.tool_call_id) + 1,
+        event_id=f"event-requested-{tool_call_id}",
+        event_sequence=len(tool_call_id) + 1,
     )
     governed_ref = (
         HostEventRef(
-            event_id=f"event-governed-{candidate.tool_call_id}",
-            event_sequence=len(candidate.tool_call_id) + 2,
+            event_id=f"event-governed-{tool_call_id}",
+            event_sequence=len(tool_call_id) + 2,
         )
         if candidate.tool_fact_kind is ToolFactKind.REUSE
-        or candidate.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
+        or policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
         else None
     )
     result_ref = (
         None
         if candidate.tool_fact_kind is ToolFactKind.REUSE
         else HostEventRef(
-            event_id=f"event-result-{candidate.tool_call_id}",
-            event_sequence=len(candidate.tool_call_id) + 3,
+            event_id=f"event-result-{tool_call_id}",
+            event_sequence=len(tool_call_id) + 3,
         )
     )
     accepted_event_refs = tuple(
         ref for ref in (requested_ref, governed_ref, result_ref) if ref is not None
     )
     result_digest = (
-        candidate.outcome_digest
-        if candidate.outcome_digest is not None
-        else candidate.semantic_input_digest
+        result.outcome_digest
+        if result is not None
+        else candidate.idempotency.semantic_input_digest
     )
     return ToolFactAcceptedAck(
         accepted_event_refs=accepted_event_refs,
-        tool_fact_id=f"tool-fact-{candidate.tool_call_id}",
+        tool_fact_id=f"tool-fact-{tool_call_id}",
         tool_call_requested_event_ref=requested_ref,
         tool_call_governed_event_ref=governed_ref,
         tool_result_event_ref=result_ref,
         result_payload_ref=(
-            HostPayloadRef("payload-ref", candidate.payload_digest)
-            if candidate.payload_digest is not None
+            HostPayloadRef("payload-ref", result.payload_digest)
+            if result is not None and result.payload_digest is not None
             else None
         ),
         result_digest=result_digest,
-        reuse_prior_event_refs=candidate.reuse_prior_event_refs,
-        diagnostic_refs=candidate.diagnostic_refs,
-        idempotency_record_ref=f"idempotency-{candidate.tool_call_id}",
+        reuse_prior_event_refs=_candidate_reuse_prior_event_refs(candidate),
+        diagnostic_refs=candidate.diagnostics.diagnostic_refs,
+        idempotency_record_ref=f"idempotency-{tool_call_id}",
     )
+
+
+def _candidate_duplicate(
+    candidate: ToolFactAcceptCandidate,
+) -> ToolAcceptDuplicateGovernance:
+    """返回 candidate 的 duplicate governance 子结构。
+
+    :param candidate: 工具事实候选。
+    :returns: 非空 duplicate governance 子结构。
+    """
+
+    duplicate = candidate.governance.duplicate
+    assert duplicate is not None
+    return duplicate
+
+
+def _candidate_duplicate_decision(
+    candidate: ToolFactAcceptCandidate,
+) -> DuplicateDecisionKind:
+    """返回 candidate 的 duplicate governance 决策。
+
+    :param candidate: 工具事实候选。
+    :returns: duplicate governance 决策类别。
+    """
+
+    return _candidate_duplicate(candidate).duplicate_decision
+
+
+def _candidate_duplicate_scope(
+    candidate: ToolFactAcceptCandidate,
+) -> DuplicateGovernanceScope:
+    """返回 candidate 的 duplicate governance 作用域。
+
+    :param candidate: 工具事实候选。
+    :returns: 非空 duplicate governance 作用域。
+    """
+
+    duplicate_scope = _candidate_duplicate(candidate).duplicate_scope
+    assert duplicate_scope is not None
+    return duplicate_scope
+
+
+def _candidate_reuse_prior_event_refs(
+    candidate: ToolFactAcceptCandidate,
+) -> tuple[HostEventRef, ...]:
+    """返回 candidate 的 duplicate prior refs。
+
+    :param candidate: 工具事实候选。
+    :returns: candidate 携带的 prior accepted event refs。
+    """
+
+    return _candidate_duplicate(candidate).reuse_prior_event_refs

@@ -206,8 +206,10 @@ async def test_truncated_result_exposes_only_cursor_and_scope_token() -> None:
     assert isinstance(fetch_more["cursor"], str)
     assert isinstance(fetch_more["scope_token"], str)
     assert "EFGHIJ" not in str(value)
-    assert accept_port.candidates[0].truncation is not None
-    assert accept_port.candidates[0].truncation.cursor_hint == fetch_more["cursor"]
+    candidate_result = accept_port.candidates[0].result
+    assert candidate_result is not None
+    assert candidate_result.truncation is not None
+    assert candidate_result.truncation.cursor_hint == fetch_more["cursor"]
 
 
 @pytest.mark.asyncio
@@ -222,7 +224,7 @@ async def test_fetch_more_dispatches_as_normal_tool_and_is_single_use() -> None:
         _request(_fetch_more_call("fetch-call-1", cursor, scope_token))
     )
     second = await handle.tool_executor.execute(
-        _request(_fetch_more_call("fetch-call-2", cursor, scope_token))
+        _request(_fetch_more_call("fetch-call-2", cursor, scope_token, limit=99))
     )
 
     first_outcome = first.records[0].outcome
@@ -232,7 +234,7 @@ async def test_fetch_more_dispatches_as_normal_tool_and_is_single_use() -> None:
     assert cursor not in _manager_from_handle(handle)._cursors
     assert isinstance(second_outcome, ToolFailedOutcome)
     assert second_outcome.result.hint == "missing_cursor"
-    assert [candidate.tool_name for candidate in accept_port.candidates] == [
+    assert [candidate.call.tool_name for candidate in accept_port.candidates] == [
         "fake_tool",
         "fetch_more",
         "fetch_more",
@@ -461,7 +463,10 @@ async def test_store_cursor_cleans_expired_cursors_bounded() -> None:
         expires_at=stored.created_at,
     )
 
-    second_cursor, _second_scope_token = await _create_cursor(handle)
+    second_cursor, _second_scope_token = await _create_cursor(
+        handle,
+        ticker="DAYU-SECOND",
+    )
 
     assert first_cursor not in manager._cursors
     assert second_cursor in manager._cursors
@@ -554,14 +559,19 @@ def _handle(
     return handle, accept_port
 
 
-async def _create_cursor(handle: ToolRuntimeHandle) -> tuple[str, str]:
+async def _create_cursor(
+    handle: ToolRuntimeHandle, *, ticker: str = "DAYU"
+) -> tuple[str, str]:
     """执行一次普通工具调用并提取 cursor 与 scope token。
 
     :param handle: ToolRuntime handle。
+    :param ticker: fake ticker 参数。
     :returns: cursor 与 scope token。
     """
 
-    outcome = await handle.tool_executor.execute(_request(_call("tool-call-1")))
+    outcome = await handle.tool_executor.execute(
+        _request(_call("tool-call-1", ticker=ticker))
+    )
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolCompletedOutcome)
     value = record.outcome.result.value
@@ -610,17 +620,18 @@ def _request(*calls: ToolCallRequest) -> BatchToolExecutionRequest:
     )
 
 
-def _call(tool_call_id: str) -> ToolCallRequest:
+def _call(tool_call_id: str, *, ticker: str = "DAYU") -> ToolCallRequest:
     """构造普通 fake tool 调用。
 
     :param tool_call_id: 工具调用 id。
+    :param ticker: fake ticker 参数。
     :returns: 工具调用请求。
     """
 
     return ToolCallRequest(
         tool_call_id=tool_call_id,
         name="fake_tool",
-        arguments={"ticker": "DAYU"},
+        arguments={"ticker": ticker},
         index_in_iteration=0,
         provider_state=None,
     )
@@ -756,31 +767,34 @@ def _accepted_ack(candidate: ToolFactAcceptCandidate) -> ToolFactAcceptedAck:
     """
 
     requested_ref = HostEventRef(
-        event_id=f"event-requested-{candidate.tool_call_id}",
+        event_id=f"event-requested-{candidate.call.tool_call_id}",
         event_sequence=1,
     )
     result_ref = HostEventRef(
-        event_id=f"event-result-{candidate.tool_call_id}",
+        event_id=f"event-result-{candidate.call.tool_call_id}",
         event_sequence=2,
     )
+    result = candidate.result
     result_payload_ref = (
-        HostPayloadRef("payload-ref", candidate.payload_digest)
-        if candidate.payload_digest is not None
+        HostPayloadRef("payload-ref", result.payload_digest)
+        if result is not None and result.payload_digest is not None
         else None
     )
     return ToolFactAcceptedAck(
         accepted_event_refs=(requested_ref, result_ref),
-        tool_fact_id=f"tool-fact-{candidate.tool_call_id}",
+        tool_fact_id=f"tool-fact-{candidate.call.tool_call_id}",
         tool_call_requested_event_ref=requested_ref,
         tool_call_governed_event_ref=None,
         tool_result_event_ref=result_ref,
         result_payload_ref=result_payload_ref,
-        result_digest=candidate.outcome_digest
-        if candidate.outcome_digest is not None
-        else candidate.semantic_input_digest,
+        result_digest=(
+            result.outcome_digest
+            if result is not None
+            else candidate.idempotency.semantic_input_digest
+        ),
         reuse_prior_event_refs=(),
         diagnostic_refs=(),
         idempotency_record_ref=sha256_digest_json(
-            {"idempotency": candidate.tool_call_id}
+            {"idempotency": candidate.call.tool_call_id}
         ),
     )
