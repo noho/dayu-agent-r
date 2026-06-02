@@ -462,10 +462,8 @@ def _compose_options(
         tooling_options=_tooling_options_from_discovery(
             tool_bundle=effective_tool_bundle,
             source_refs=request.discovered_tools.source_refs,
-            duplicate_governance_policy=(
-                _duplicate_governance_policy_from_config(
-                    execution_profile.tool_duplicate_governance_policy
-                )
+            duplicate_governance_policy_config=(
+                execution_profile.tool_duplicate_governance_policy
             ),
         ),
         context_budget_policy=default_context_budget_policy(
@@ -1018,13 +1016,13 @@ def _tooling_options_from_discovery(
     *,
     tool_bundle: ToolBundle,
     source_refs: tuple[ToolBundleSourceRef, ...],
-    duplicate_governance_policy: DuplicateGovernancePolicy,
+    duplicate_governance_policy_config: ToolDuplicateGovernancePolicyConfig,
 ) -> HostToolingOptions | None:
     """把 ToolsDiscovery 输出映射为 HostToolingOptions。
 
     :param tool_bundle: 已发现业务工具 bundle。
     :param source_refs: 工具来源引用。
-    :param duplicate_governance_policy: execution profile 派生的重复调用治理策略。
+    :param duplicate_governance_policy_config: execution profile 中的重复调用治理配置。
     :returns: HostToolingOptions；没有业务工具时为 ``None``。
     :raises ValueError: source refs 缺失但工具非空时抛出。
     """
@@ -1037,7 +1035,9 @@ def _tooling_options_from_discovery(
         business_tool_bundle=tool_bundle,
         source_refs=source_refs,
         wait_adapter_registry=None,
-        duplicate_governance_policy=duplicate_governance_policy,
+        duplicate_governance_policy=_duplicate_governance_policy_from_config(
+            duplicate_governance_policy_config
+        ),
     )
 
 
@@ -1095,7 +1095,12 @@ def _duplicate_decision_from_config(value: str) -> DuplicateDecisionKind:
     :raises ValueError: 字符串不是 Host 支持的 duplicate decision 时抛出。
     """
 
-    return DuplicateDecisionKind(value)
+    try:
+        return DuplicateDecisionKind(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"unsupported duplicate governance decision: {value}"
+        ) from exc
 
 
 def _resolve_project_path(workspace_root: pathlib.Path, configured_path: str) -> pathlib.Path:

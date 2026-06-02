@@ -133,7 +133,9 @@ class DuplicateGovernanceMessages:
             return self.require_justification
         if kind is DuplicateDecisionKind.HARD_STOP:
             return self.hard_stop
-        return self.prior_accept_missing
+        if kind is DuplicateDecisionKind.DURABLE_MISSING:
+            return self.prior_accept_missing
+        raise ValueError(f"unsupported duplicate decision kind: {kind}")
 
 
 @dataclass(frozen=True, slots=True)

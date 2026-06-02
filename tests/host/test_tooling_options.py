@@ -273,6 +273,33 @@ def test_host_tooling_options_accepts_custom_duplicate_messages() -> None:
     )
 
 
+def test_duplicate_governance_messages_map_all_decision_kinds() -> None:
+    """duplicate governance messages 必须显式覆盖所有决策类别。"""
+
+    messages = DuplicateGovernanceMessages(
+        allow="allow message",
+        reuse="reuse message",
+        hint="hint message",
+        require_justification="require justification message",
+        hard_stop="hard stop message",
+        attempt_scope_diagnostic="attempt diagnostic message",
+        prior_accept_missing="prior accept missing message",
+    )
+
+    assert messages.message_for(DuplicateDecisionKind.ALLOW) == "allow message"
+    assert messages.message_for(DuplicateDecisionKind.REUSE) == "reuse message"
+    assert messages.message_for(DuplicateDecisionKind.HINT) == "hint message"
+    assert (
+        messages.message_for(DuplicateDecisionKind.REQUIRE_JUSTIFICATION)
+        == "require justification message"
+    )
+    assert messages.message_for(DuplicateDecisionKind.HARD_STOP) == "hard stop message"
+    assert (
+        messages.message_for(DuplicateDecisionKind.DURABLE_MISSING)
+        == "prior accept missing message"
+    )
+
+
 def test_host_tooling_options_accepts_custom_duplicate_justification_name() -> None:
     """Host tooling options 必须保留 duplicate justification 参数名配置。"""
 

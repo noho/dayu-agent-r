@@ -32,10 +32,11 @@ from dayu.host.api import (
 )
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
-    DuplicateGovernancePolicy,
 )
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.config_loader import (
+    ToolDuplicateGovernanceMessagesConfig,
+    ToolDuplicateGovernancePolicyConfig,
     ToolDiscoveryEntryPointConfig,
     ToolDiscoveryProviderConfig,
 )
@@ -58,6 +59,7 @@ from dayu.service.host_assembly import (
     _agent_fallback_mode_from_config,
     _compactor_agent_policy_from_scene_inputs,
     _compactor_prompts_from_scene_inputs,
+    _duplicate_decision_from_config,
     _render_headers,
     _resolve_prompt_asset_path,
     _resolve_project_path,
@@ -533,7 +535,7 @@ def test_tooling_options_from_discovery_requires_source_refs() -> None:
         _tooling_options_from_discovery(
             tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_fact"),)),
             source_refs=(),
-            duplicate_governance_policy=DuplicateGovernancePolicy(),
+            duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
 
@@ -708,6 +710,20 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
     assert policy.messages.reuse == "reuse prior accepted tool result"
 
 
+def test_duplicate_decision_from_config_reports_clear_error() -> None:
+    """Service duplicate decision 映射失败时必须给出清晰上下文。
+
+    :returns: ``None``。
+    :raises AssertionError: 错误消息缺少治理决策上下文时抛出。
+    """
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported duplicate governance decision: retry",
+    ):
+        _duplicate_decision_from_config("retry")
+
+
 def test_explicit_1m_profile_with_256k_model_fails_fast(
     tmp_path: Path,
 ) -> None:
@@ -837,6 +853,38 @@ def test_resolve_project_path_keeps_absolute_path(tmp_path: Path) -> None:
     absolute_path = tmp_path.parent / "outside.sqlite3"
 
     assert _resolve_project_path(tmp_path, str(absolute_path)) == absolute_path
+
+
+def _duplicate_governance_policy_config() -> ToolDuplicateGovernancePolicyConfig:
+    """构造 Service 测试使用的 duplicate governance typed config。
+
+    :returns: duplicate governance policy typed config。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ToolDuplicateGovernancePolicyConfig(
+        default_duplicate_decision="allow",
+        decisions_by_tool_name={},
+        justification_argument_names_by_tool_name={},
+        messages=ToolDuplicateGovernanceMessagesConfig(
+            allow="duplicate tool call allowed",
+            reuse="reuse prior accepted tool result",
+            hint=(
+                "duplicate tool call should use prior accepted result "
+                "or change evidence scope"
+            ),
+            require_justification=(
+                "duplicate tool call requires structured justification"
+            ),
+            hard_stop="duplicate tool call hard-stopped by Host governance",
+            attempt_scope_diagnostic=(
+                "duplicate tool call governed by attempt-local ToolRuntime index"
+            ),
+            prior_accept_missing=(
+                "prior duplicate owner did not produce an accepted tool result"
+            ),
+        ),
+    )
 
 
 def _write_tool_discovery_overlay(workspace_root: Path) -> None:
