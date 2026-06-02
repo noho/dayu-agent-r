@@ -294,7 +294,7 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 - run-level `stream_run_events`。
 - durable foundation：
   - durable store、transaction runner、schema、state row codec、payload table helper。
-  - schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；主连接与 secondary durable connections 都会执行完整当前 schema validation。
+  - schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；主连接与 secondary durable connections 都会执行当前 schema validation，校验 schema version、required object 存在性与 required object 定义一致性。
   - SQLite 连接启用 WAL 与 auto-checkpoint。
   - transaction runner 的 read transaction 使用 SQLite snapshot 语义，新的短读事务读取最新 committed truth。
   - 内部 WAL checkpoint primitive 只服务显式 diagnostic / test entry，不属于 public maintenance API，也不作为 EventLog 或状态正确性的前置条件。

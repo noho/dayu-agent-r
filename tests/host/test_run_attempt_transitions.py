@@ -35,7 +35,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.errors import HostDurableError, HostRowDecodeError
 from dayu.host.durable.liveness import HostInstanceStatus
 from dayu.host.durable.schema import TABLE_HOST_RUNS
 from dayu.host.durable.run_transition import (
@@ -1494,16 +1494,22 @@ def test_cancel_queued_terminal_run_returns_invalid_state(
 def test_cancel_queued_run_row_requires_empty_terminal_refs(
     tmp_path: Path,
 ) -> None:
-    """queued Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。"""
+    """queued Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: CAS 覆盖 corrupted row 或错误边界不符合预期时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
 
-        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+        def operation(transaction: HostTransaction) -> None:
             """构造带 terminal refs 的 queued 行并尝试 cancel。
 
             :param transaction: Host transaction。
-            :returns: mutation 状态与保留的 terminal event id。
+            :returns: ``None``。
+            :raises HostRowDecodeError: CAS 拒绝 corrupted row 后读取 row 时抛出。
             """
 
             input_event = _append_user_input(
@@ -1549,35 +1555,37 @@ def test_cancel_queued_run_row_requires_empty_terminal_refs(
                 ),
             )
             transaction.execute("PRAGMA ignore_check_constraints = OFF")
-            result = cancel_queued_run_row(
+            cancel_queued_run_row(
                 transaction,
                 run_id="run-queued-guard",
                 terminal_event_id="event-cancel-queued-guard",
                 terminal_event_sequence=terminal_event.event_sequence + 1,
                 terminal_at="2026-05-14T01:02:10Z",
             )
-            assert result.row is not None
-            return result.status.value, result.row.terminal_event_id
 
-        assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.INVALID_STATE.value,
-            "event-terminal-queued-guard",
-        )
+        with pytest.raises(HostRowDecodeError, match="non-terminal Run terminal refs"):
+            store.transaction_runner.run_write(operation)
 
 
 def test_cancel_running_run_row_requires_empty_terminal_refs(
     tmp_path: Path,
 ) -> None:
-    """running Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。"""
+    """running Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: CAS 覆盖 corrupted row 或错误边界不符合预期时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
-        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+        def operation(transaction: HostTransaction) -> None:
             """构造带 terminal refs 的 running 行并尝试 cancel。
 
             :param transaction: Host transaction。
-            :returns: mutation 状态与保留的 terminal event id。
+            :returns: ``None``。
+            :raises HostRowDecodeError: CAS 拒绝 corrupted row 后读取 row 时抛出。
             """
 
             terminal_event = EventLogStore().append_event(
@@ -1607,7 +1615,7 @@ def test_cancel_running_run_row_requires_empty_terminal_refs(
                 ),
             )
             transaction.execute("PRAGMA ignore_check_constraints = OFF")
-            result = cancel_running_run_row(
+            cancel_running_run_row(
                 transaction,
                 run_id=seeded.run_id,
                 current_attempt_id=seeded.attempt_id,
@@ -1615,13 +1623,9 @@ def test_cancel_running_run_row_requires_empty_terminal_refs(
                 terminal_event_sequence=terminal_event.event_sequence + 1,
                 terminal_at="2026-05-14T01:02:10Z",
             )
-            assert result.row is not None
-            return result.status.value, result.row.terminal_event_id
 
-        assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.CAS_LOST.value,
-            "event-terminal-running-guard",
-        )
+        with pytest.raises(HostRowDecodeError, match="non-terminal Run terminal refs"):
+            store.transaction_runner.run_write(operation)
 
 
 def test_rollback_prevents_partial_event_and_state_persistence(
