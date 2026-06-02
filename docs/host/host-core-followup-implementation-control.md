@@ -116,11 +116,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host follow-up implementation backlog |
-| gate | ready-to-open-draft-PR |
-| implementation status | WU-TOOL-02 local gates passed; draft PR gate authorized |
+| gate | draft PR gate |
+| implementation status | WU-TOOL-02 draft PR opened; PR review in progress |
 | active work unit | WU-TOOL-02 |
 | default next work unit | WU-TOOL-02 |
-| next entry point | WU-TOOL-02 draft PR gate；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
+| next entry point | WU-TOOL-02 draft PR review；已完成 draft PR 的 merge / ready-for-review / reviewer request 仍需额外授权 |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -526,6 +526,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：Aggregate deepreview artifacts: `docs/reviews/wu-tool-02-aggregate-deepreview-mimo-20260602.md`, `docs/reviews/wu-tool-02-aggregate-deepreview-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-aggregate-deepreview-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；MiMo/DS nonblocking notes 均不要求当前 gate 修复。Accepted aggregate deepreview commit: `a346842`。进入用户追加的 ready-to-open-draft-PR 前置 gate：AgentMiMo + AgentDS 并行全仓 review。
 - 2026-06-02：用户追加 full-repository review gate 已开始。Handoff: `docs/reviews/wu-tool-02-extra-full-repo-review-handoff-20260602.md`。Reviewers: AgentMiMo + AgentDS。
 - 2026-06-02：用户追加 full-repository review artifacts: `docs/reviews/wu-tool-02-extra-full-repo-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-extra-full-repo-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-extra-full-repo-review-controller-adjudication-20260602.md`。裁决：无 accepted blocking finding；控制文档状态滞后已在 closeout 修正，低风险 coverage / helper notes 已记录到 residual risk table 并明确 owner。Accepted full-repository review commit: `c5f28c0`。WU-TOOL-02 local gates passed，进入 ready-to-open-draft-PR。
+- 2026-06-02：Draft PR opened: `https://github.com/noho/dayu-agent-r/pull/108`。进入 draft PR review gate，handoff: `docs/reviews/wu-tool-02-draft-pr-review-handoff-20260602.md`。
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
