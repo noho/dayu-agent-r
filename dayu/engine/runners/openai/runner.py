@@ -135,7 +135,7 @@ def _is_sse_response(*, content_type: str, stream: bool) -> bool:
     if not stream:
         return False
     if content_type.strip() == "":
-        return False
+        return True
     if _SSE_CONTENT_TYPE_FRAGMENT in content_type:
         return True
     return _JSON_CONTENT_TYPE_FRAGMENT not in content_type

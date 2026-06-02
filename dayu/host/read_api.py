@@ -73,6 +73,7 @@ _SESSION_WATCH_BATCH_LIMIT = 64
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
+_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _PAYLOAD_FIELD_SUMMARY = "summary"
@@ -735,6 +736,8 @@ def _host_event_from_row(
         return _failed_host_event(row)
     if row.event_type == _EVENT_TYPE_RUN_CANCELLED:
         return _cancelled_host_event(row)
+    if row.event_type == _EVENT_TYPE_RUN_LOST:
+        return _lost_host_event(row)
     return HostEvent(
         event_id=row.event_id,
         event_sequence=row.event_sequence,
@@ -865,6 +868,33 @@ def _cancelled_host_event(row: EventLogRow) -> HostEvent:
             field_name=_PAYLOAD_FIELD_REASON,
             row=row,
         ),
+    )
+
+
+def _lost_host_event(row: EventLogRow) -> HostEvent:
+    """把 ``RUN_LOST`` row 投影为 lost 终态 HostEvent。
+
+    :param row: ``RUN_LOST`` EventLog row。
+    :returns: lost 终态 HostEvent。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    payload = _payload_object(row)
+    return HostEvent(
+        event_id=row.event_id,
+        event_sequence=row.event_sequence,
+        session_id=row.session_id,
+        run_id=row.run_id,
+        kind=HostEventKind.LOST,
+        dedupe_key=row.event_id,
+        terminal_status=HostTerminalStatus.LOST,
+        final_answer=None,
+        error_message=_optional_payload_text(
+            payload,
+            field_name=_PAYLOAD_FIELD_MESSAGE,
+            row=row,
+        ),
+        cancel_reason=None,
     )
 
 

@@ -236,6 +236,8 @@ async def test_prompt_renders_material_pack_without_ledger_dump(
     user_message = seen[0].messages[1]
     prompt = user_message.content
     assert prompt is not None
+    assert "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN" in prompt
+    assert "UNTRUSTED_COMPACTION_MATERIAL_JSON_END" in prompt
     assert '"stable_input":' in prompt
     assert '"history_input":' in prompt
     assert '"evidence_input":' in prompt
@@ -257,6 +259,13 @@ async def test_prompt_renders_material_pack_without_ledger_dump(
     assert "outcome_digest" not in prompt
     assert "canonical_source_refs" not in prompt
     assert "Revenue grew 12% year over year." in prompt
+
+
+def test_llm_compaction_text_estimator_uses_cjk_conservative_budget() -> None:
+    """LLM compaction 文本估算复用 Host CJK 保守估算语义。"""
+
+    assert llm_compaction_module._estimate_text_tokens("abcdef") == 2
+    assert llm_compaction_module._estimate_text_tokens("收入增长明显") == 6
 
 
 @pytest.mark.asyncio

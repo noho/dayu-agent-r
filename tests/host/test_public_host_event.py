@@ -98,3 +98,43 @@ def test_failed_and_cancelled_events_reject_final_answer_payload() -> None:
             error_message=None,
             cancel_reason="user_stop",
         )
+
+
+def test_lost_event_rejects_final_answer_payload() -> None:
+    """LOST terminal HostEvent 不携带 final answer。"""
+
+    final_answer = HostFinalAnswerView(
+        content="answer",
+        filtered=False,
+        degraded=False,
+        finish_reason="stop",
+        terminal_status=HostTerminalStatus.SUCCEEDED,
+    )
+    event = HostEvent(
+        event_id="event-lost",
+        event_sequence=5,
+        session_id="session-1",
+        run_id="run-1",
+        kind=HostEventKind.LOST,
+        dedupe_key="event-lost",
+        terminal_status=HostTerminalStatus.LOST,
+        final_answer=None,
+        error_message="worker lost",
+        cancel_reason=None,
+    )
+
+    assert event.terminal_status is HostTerminalStatus.LOST
+
+    with pytest.raises(ValueError, match="must not include final_answer"):
+        HostEvent(
+            event_id="event-lost-with-answer",
+            event_sequence=6,
+            session_id="session-1",
+            run_id="run-1",
+            kind=HostEventKind.LOST,
+            dedupe_key="event-lost-with-answer",
+            terminal_status=HostTerminalStatus.LOST,
+            final_answer=final_answer,
+            error_message="worker lost",
+            cancel_reason=None,
+        )

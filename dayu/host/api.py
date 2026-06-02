@@ -2495,12 +2495,14 @@ class HostEventKind(StrEnum):
     - ``SUCCEEDED``：Run 成功终态事件。
     - ``FAILED``：Run 失败终态事件。
     - ``CANCELLED``：Run 取消终态事件。
+    - ``LOST``：Run 因 worker / recovery / waiting 丢失而收口的终态事件。
     """
 
     PROGRESS = "progress"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    LOST = "lost"
 
 
 class HostTerminalStatus(StrEnum):
@@ -2511,11 +2513,13 @@ class HostTerminalStatus(StrEnum):
     - ``SUCCEEDED``：Run 成功完成。
     - ``FAILED``：Run 失败完成。
     - ``CANCELLED``：Run 被用户治理取消。
+    - ``LOST``：Run 因本地 worker、恢复或等待结果丢失而完成。
     """
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    LOST = "lost"
 
 
 class OutboxTerminalItemState(StrEnum):
@@ -2949,7 +2953,7 @@ def _validate_host_event_terminal_payload(event: HostEvent) -> None:
         return
     if event.final_answer is not None:
         raise ValueError(
-            "HostEvent failed or cancelled kind must not include final_answer"
+            "HostEvent failed, cancelled or lost kind must not include final_answer"
         )
 
 
@@ -2967,6 +2971,8 @@ def _terminal_status_for_event_kind(kind: HostEventKind) -> HostTerminalStatus:
         return HostTerminalStatus.FAILED
     if kind == HostEventKind.CANCELLED:
         return HostTerminalStatus.CANCELLED
+    if kind == HostEventKind.LOST:
+        return HostTerminalStatus.LOST
     raise ValueError("HostEventKind.PROGRESS has no terminal status")
 
 

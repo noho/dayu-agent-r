@@ -689,6 +689,7 @@ async def consume_terminals(
             HostEventKind.SUCCEEDED,
             HostEventKind.FAILED,
             HostEventKind.CANCELLED,
+            HostEventKind.LOST,
         }:
             continue
         observed.append(event)
@@ -1305,12 +1306,8 @@ def terminal_event_count_for_runs(
 ) -> int:
     """读取指定 Run 的 Host-wide terminal EventLog 总数。
 
-    Slice 4 需要证明 ``RUN_LOST`` 不重复，但 ``HostEventKind`` 与
-    ``HostTerminalStatus`` 当前不建模 lost terminal observation；因此
-    ``terminal_events_for_runs()`` 仍只返回 succeeded/failed/cancelled
-    observation，而本 helper 在 count 层显式纳入 ``RUN_LOST``。两者组合
-    形成证明：public terminal observation 无重复，且包含 ``RUN_LOST`` 的
-    terminal EventLog 总数与 public terminal snapshot 数一致。
+    本 helper 在 EventLog count 层显式纳入 ``RUN_LOST``，用于和 public
+    terminal observation 交叉证明 Host-wide terminal closeout 不重复。
 
     每次调用都会打开新的短连接并执行一次短读，得到 point-in-time
     diagnostic；读取结果只用于 stress assertion message，不表达 watcher
@@ -1418,6 +1415,8 @@ def _terminal_kind_for_event_type(event_type: str) -> HostEventKind:
         return HostEventKind.FAILED
     if event_type == _EVENT_TYPE_RUN_CANCELLED:
         return HostEventKind.CANCELLED
+    if event_type == _EVENT_TYPE_RUN_LOST:
+        return HostEventKind.LOST
     raise ValueError(f"unsupported terminal event type: {event_type}")
 
 
@@ -1435,6 +1434,8 @@ def _terminal_status_for_event_type(event_type: str) -> HostTerminalStatus:
         return HostTerminalStatus.FAILED
     if event_type == _EVENT_TYPE_RUN_CANCELLED:
         return HostTerminalStatus.CANCELLED
+    if event_type == _EVENT_TYPE_RUN_LOST:
+        return HostTerminalStatus.LOST
     raise ValueError(f"unsupported terminal event type: {event_type}")
 
 

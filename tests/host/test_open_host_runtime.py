@@ -755,6 +755,7 @@ async def _next_terminal(watcher: AsyncIterator[HostEvent]) -> HostEvent:
             HostEventKind.SUCCEEDED,
             HostEventKind.FAILED,
             HostEventKind.CANCELLED,
+            HostEventKind.LOST,
         ):
             return event
     raise AssertionError("watcher ended before terminal event")

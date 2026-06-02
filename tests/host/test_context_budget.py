@@ -15,6 +15,8 @@ from dayu.host.context_budget import (
     BudgetTextFragment,
     ContextBudgetDecision,
     ContextBudgetOverageReason,
+    DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN,
+    DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
     DEFAULT_INPUT_SOFT_THRESHOLD_RATIO,
     UsageObservation,
@@ -22,6 +24,7 @@ from dayu.host.context_budget import (
     USAGE_OBSERVATION_STATUS_OBSERVED,
     build_usage_observation_diagnostic,
     decide_context_budget,
+    estimate_budget_text_tokens,
     estimate_context_budget,
 )
 from dayu.host.context_policy import (
@@ -92,6 +95,21 @@ def test_static_context_budget_provider_rejects_invalid_policy() -> None:
         StaticContextBudgetProvider(
             policy=cast(ContextBudgetPolicy, "bad-policy")
         )
+
+
+def test_text_token_estimator_keeps_english_chars_per_token_semantics() -> None:
+    """英文文本估算保持既有 chars/3 近似语义。"""
+
+    assert DEFAULT_ESTIMATOR_CHARS_PER_TOKEN == 3
+    assert estimate_budget_text_tokens("abcdef") == 2
+
+
+def test_text_token_estimator_counts_cjk_more_conservatively() -> None:
+    """CJK 文本不再按 chars/3 低估。"""
+
+    assert DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN == 1
+    assert estimate_budget_text_tokens("收入增长明显") == 6
+    assert estimate_budget_text_tokens("收入abc增长") == 5
 
 
 @pytest.mark.parametrize(

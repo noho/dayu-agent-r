@@ -7,7 +7,7 @@
 - :class:`CancellationToken` 取消观察 Protocol（**不**导出取消异常）。
 - :class:`ToolSchema` / :class:`ToolFunctionSchema` /
   :class:`ToolParametersSchema` / :class:`ToolTruncateSpec` 工具 schema
-  与截断声明。
+  与截断声明，及 :func:`truncate_limit_key_for_strategy` 截断策略字段映射。
 - :class:`ToolCallRequest` / :class:`BatchToolExecutionContext` /
   :class:`BatchToolExecutionRequest`：批式工具握手输入。
 - :class:`ToolResultSuccess` / :class:`ToolResultFailure` /
@@ -79,6 +79,7 @@ from dayu.contracts.tool_schema import (
     ToolSchema,
     ToolTruncateSpec,
     ToolTruncationStrategy,
+    truncate_limit_key_for_strategy,
 )
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
@@ -122,4 +123,5 @@ __all__ = [
     "ToolTruncateSpec",
     "ToolTruncationStrategy",
     "tool",
+    "truncate_limit_key_for_strategy",
 ]

@@ -202,6 +202,7 @@ _TOOL_RUNTIME_TIMEOUT_REASON = "tool_runtime_timeout"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON = "accept_timeout"
 _TOOL_RUNTIME_ACCEPT_REJECTED_REASON = "accept_rejected"
 _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
+_TOOL_RUNTIME_DUPLICATE_CLEANUP_FAILURE_REASON = "duplicate_cleanup_failed"
 _TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY = "diagnostic_refs"
 _TOOL_RUNTIME_HINT_SECTION_SEPARATOR = ";"
 _TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR = ","
@@ -2359,10 +2360,73 @@ class ToolRuntimeExecutor:
             )
         finally:
             if duplicate_owner_needs_terminal and not duplicate_terminal_recorded:
-                await self._duplicate_governance.record_durable_missing(
+                await self._record_duplicate_durable_missing_best_effort(
                     duplicate_request,
                     durable_missing_reason,
                 )
+
+    async def _record_duplicate_durable_missing_best_effort(
+        self,
+        duplicate_request: DuplicateGovernanceRequest,
+        durable_missing_reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """best-effort 记录 duplicate owner 未产出 durable fact。
+
+        cleanup 只用于释放同 Attempt 内等待相同 duplicate key 的调用者，不能
+        覆盖工具执行、accept barrier 或 return path 的原始结果。
+
+        :param duplicate_request: duplicate governance 查询输入。
+        :param durable_missing_reason: owner 未产出 durable fact 的原因。
+        :returns: ``None``。
+        :raises: 不向调用方传播 cleanup 或诊断失败。
+        """
+
+        try:
+            await self._duplicate_governance.record_durable_missing(
+                duplicate_request,
+                durable_missing_reason,
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                "host.tool_runtime.duplicate_cleanup_failed "
+                "session_id=%s run_id=%s attempt_id=%s tool_name=%s "
+                "error_type=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                duplicate_request.tool_name,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+            self._emit_duplicate_cleanup_diagnostic_best_effort(exc)
+
+    def _emit_duplicate_cleanup_diagnostic_best_effort(self, exc: Exception) -> None:
+        """best-effort 发出 duplicate cleanup 失败诊断。
+
+        :param exc: cleanup 抛出的异常。
+        :returns: ``None``。
+        :raises: 不向调用方传播诊断失败。
+        """
+
+        try:
+            self._diagnostic_emitter.emit(
+                ToolTraceDiagnosticRecord(
+                    reason_code=_TOOL_RUNTIME_DUPLICATE_CLEANUP_FAILURE_REASON,
+                    message=(
+                        "duplicate durable-missing cleanup failed: "
+                        f"{exc.__class__.__name__}"
+                    ),
+                )
+            )
+        except Exception:
+            _LOGGER.warning(
+                "host.tool_runtime.duplicate_cleanup_diagnostic_failed "
+                "session_id=%s run_id=%s attempt_id=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                exc_info=True,
+            )
 
     def _observe_llm_inline_tool_result(
         self,

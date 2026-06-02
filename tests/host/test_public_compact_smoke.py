@@ -75,6 +75,8 @@ _ACCEPTED_CANDIDATE_FIELD = "accepted_candidate"
 _CANDIDATE_ID_FIELD = "candidate_id"
 _INPUT_SNAPSHOT_REFS_FIELD = "input_snapshot_refs"
 _CURRENT_USER_INPUT_REF_FIELD = "current_user_input_ref"
+_UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
+_UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _FAKE_COMPACT_CONTEXT_WINDOW_SIZE = 12000
 _FAKE_COMPACT_SOFT_THRESHOLD_TOKENS = 90
 _FAKE_COMPACT_HARD_THRESHOLD_TOKENS = 9000
@@ -650,9 +652,25 @@ def _material_json_from_compactor_request(
     """
 
     prompt = _compactor_user_prompt(request)
-    parsed = cast(JsonValue, json.loads(prompt))
+    parsed = cast(JsonValue, json.loads(_material_json_text_from_prompt(prompt)))
     assert isinstance(parsed, Mapping)
     return cast(Mapping[str, JsonValue], parsed)
+
+
+def _material_json_text_from_prompt(prompt: str) -> str:
+    """从 fake compactor prompt 中提取 material JSON 文本。
+
+    :param prompt: compactor user prompt。
+    :returns: untrusted delimiter 中间的 JSON 文本。
+    :raises AssertionError: prompt 缺少 material delimiter 时抛出。
+    """
+
+    begin_index = prompt.find(_UNTRUSTED_COMPACTION_MATERIAL_BEGIN)
+    end_index = prompt.find(_UNTRUSTED_COMPACTION_MATERIAL_END)
+    assert begin_index >= 0
+    assert end_index > begin_index
+    json_start = begin_index + len(_UNTRUSTED_COMPACTION_MATERIAL_BEGIN)
+    return prompt[json_start:end_index].strip()
 
 
 def _first_material_json_with_evidence(

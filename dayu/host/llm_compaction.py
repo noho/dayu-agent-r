@@ -62,9 +62,9 @@ from dayu.host.compaction import (
     PreservationEvidence,
 )
 from dayu.host.context_budget import (
-    DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
+    estimate_budget_text_tokens,
 )
 from dayu.host.opaque_ref import validate_host_neutral_opaque_ref_text
 from dayu.runtime.diagnostic_text import (
@@ -79,6 +79,8 @@ _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"
+_UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
+_UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
 _COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON = "compactor_proposal_timeout"
 _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
@@ -380,11 +382,16 @@ def _compaction_request_prompt_block(request: CompactionRequest) -> str:
     :returns: compaction request prompt 数据块。
     """
 
-    return json.dumps(
+    material_json = json.dumps(
         request.llm_material_json(),
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
+    )
+    return (
+        f"{_UNTRUSTED_COMPACTION_MATERIAL_BEGIN}\n"
+        f"{material_json}\n"
+        f"{_UNTRUSTED_COMPACTION_MATERIAL_END}"
     )
 
 
@@ -1391,7 +1398,7 @@ def _estimate_text_tokens(text: str) -> int:
     :returns: 至少为 1 的 token 估算。
     """
 
-    return max(1, ceil(len(text) / DEFAULT_ESTIMATOR_CHARS_PER_TOKEN))
+    return max(1, estimate_budget_text_tokens(text))
 
 
 __all__ = ["LLMCompactionProposalError", "LLMContextCompactor"]

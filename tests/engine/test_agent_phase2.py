@@ -1385,6 +1385,7 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
     with pytest.raises(RuntimeError):
         async for _event_item in agent.run_messages():
             pass
+    assert runner.close_count == 0
     runner.release_event.set()
     await task
 

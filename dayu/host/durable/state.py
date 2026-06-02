@@ -2904,6 +2904,8 @@ def cancel_cancelling_run_row(
         transaction,
         run_id=run_id,
         rowcount=result.rowcount,
+        terminal_status=RunStatus.CANCELLED,
+        terminal_event_id=terminal_event_id,
     )
 
 
@@ -3165,6 +3167,8 @@ def steer_active_run_row(
         transaction,
         run_id=run_id,
         rowcount=result.rowcount,
+        terminal_status=None,
+        terminal_event_id=None,
     )
 
 
@@ -3598,6 +3602,7 @@ def terminal_run_row(
         WHERE run_id = ?
           AND status IN (?, ?)
           AND current_attempt_id = ?
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_run_status(terminal_status),
@@ -3615,6 +3620,8 @@ def terminal_run_row(
         transaction,
         run_id=run_id,
         rowcount=result.rowcount,
+        terminal_status=terminal_status,
+        terminal_event_id=terminal_event_id,
     )
 
 
@@ -4903,12 +4910,23 @@ def _run_mutation_result(
     return RunMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
 
-def _run_mutation_result_for_active(transaction: HostTransaction, *, run_id: str, rowcount: int) -> RunMutationResult:
+def _run_mutation_result_for_active(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    rowcount: int,
+    terminal_status: RunStatus | None,
+    terminal_event_id: str | None,
+) -> RunMutationResult:
     """构造 active Run terminal mutation 结果。
 
     :param transaction: 调用方提供的 Host transaction。
     :param run_id: Run id。
     :param rowcount: UPDATE rowcount。
+    :param terminal_status: 本次写入期望的终态；非终态 active mutation 传
+        ``None``。
+    :param terminal_event_id: 本次写入期望的 terminal event id；非终态
+        active mutation 传 ``None``。
     :returns: Run mutation 结果。
     """
 
@@ -4917,6 +4935,13 @@ def _run_mutation_result_for_active(transaction: HostTransaction, *, run_id: str
         return RunMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
         return RunMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
+    if (
+        terminal_status is not None
+        and terminal_event_id is not None
+        and latest.status == terminal_status
+        and latest.terminal_event_id == terminal_event_id
+    ):
+        return RunMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest.status in (
         RunStatus.RUNNING,
         RunStatus.WAITING,

@@ -50,6 +50,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolTruncateSpec",
         "ToolTruncationStrategy",
         "tool",
+        "truncate_limit_key_for_strategy",
     }
 )
 

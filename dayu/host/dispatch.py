@@ -241,6 +241,17 @@ _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION = (
 _LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED = (
     "dispatch drain loop durable retry exhausted; closing scheduler " "host_handle_id=%s error_type=%s"
 )
+_LOG_DRAIN_LOOP_QUEUE_CLOSEOUT = (
+    "dispatch.drain_loop.queue_closeout host_handle_id=%s reason=%s "
+    "closeout_count=%s"
+)
+_LOG_WORKER_LOST_CLOSEOUT_FAILED = (
+    "dispatch.worker_events.close_worker_lost_failed run_id=%s "
+    "attempt_id=%s execution_id=%s dispatch_record_id=%s "
+    "local_worker_id=%s worker_lifecycle_signal=%s "
+    "last_observed_worker_event_index=%s closeout_error_type=%s "
+    "original_error_type=%s"
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -2147,6 +2158,10 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
+                    self._best_effort_closeout_pending_queue_for_shutdown(
+                        reason=_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON,
+                        original_error=exc,
+                    )
                     self._closed = True
                     self._active_registry.cancel_all(
                         _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON
@@ -3014,6 +3029,93 @@ class HostDispatchScheduler:
                 exc_info=True,
             )
 
+    def _best_effort_closeout_pending_queue_for_shutdown(
+        self,
+        *,
+        reason: str,
+        original_error: BaseException,
+    ) -> None:
+        """关闭 scheduler 前尽力收口尚未 dispatch 的队列记录。
+
+        :param reason: 写入 terminal closeout 的结构化原因。
+        :param original_error: 触发 scheduler shutdown 的原始异常。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        closeout_count = 0
+        while not self._queue.empty():
+            record = self._queue.get_nowait()
+            self._safe_closeout_worker_startup_timeout(
+                record,
+                reason=reason,
+                original_error=original_error,
+            )
+            closeout_count += 1
+        if closeout_count > 0:
+            _LOGGER.warning(
+                _LOG_DRAIN_LOOP_QUEUE_CLOSEOUT,
+                self._host_handle_id,
+                reason,
+                closeout_count,
+            )
+
+    def _safe_close_worker_lost(
+        self,
+        *,
+        ingestor: EngineEventIngestor,
+        envelope: LocalEngineEnvelope,
+        record: PendingDispatchRecord,
+        local_worker_id: str | None,
+        worker_lifecycle_signal: str,
+        stream_error_code: str,
+        last_observed_worker_event_index: int,
+        last_accepted_event_id: str | None,
+        original_error: BaseException,
+    ) -> bool:
+        """best-effort 执行 worker lost closeout 并保留原始异常诊断。
+
+        :param ingestor: Engine event ingestor。
+        :param envelope: 当前 worker envelope。
+        :param record: pending dispatch 摘要。
+        :param local_worker_id: 本地 worker id；构造 envelope 前失败时为
+            ``None``。
+        :param worker_lifecycle_signal: worker lifecycle signal。
+        :param stream_error_code: 原始 stream/ingest 异常类型名。
+        :param last_observed_worker_event_index: 最后观测到的 worker event index。
+        :param last_accepted_event_id: 最后已接受 EventLog id；无时为
+            ``None``。
+        :param original_error: 触发 lost closeout 的原始异常。
+        :returns: closeout 成功且关闭 Run 时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        try:
+            result = ingestor.close_worker_lost(
+                envelope,
+                observed_at=datetime.now(UTC),
+                worker_lifecycle_signal=worker_lifecycle_signal,
+                stream_error_code=stream_error_code,
+                last_observed_worker_event_index=last_observed_worker_event_index,
+                last_accepted_event_id=last_accepted_event_id,
+            )
+        except Exception as exc:
+            _LOGGER.error(
+                _LOG_WORKER_LOST_CLOSEOUT_FAILED,
+                record.run_id,
+                record.attempt_id,
+                record.execution_id,
+                record.dispatch_record_id,
+                local_worker_id,
+                worker_lifecycle_signal,
+                last_observed_worker_event_index,
+                exc.__class__.__name__,
+                original_error.__class__.__name__,
+                exc_info=True,
+            )
+            return False
+        return _ingest_closed_run(result)
+
     async def _consume_worker_events(
         self,
         *,
@@ -3120,15 +3222,17 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
-                    result = ingestor.close_worker_lost(
-                        envelope,
-                        observed_at=datetime.now(UTC),
+                    run_terminal_closed = self._safe_close_worker_lost(
+                        ingestor=ingestor,
+                        envelope=envelope,
+                        record=record,
+                        local_worker_id=local_worker_id,
                         worker_lifecycle_signal="worker_stream_error",
                         stream_error_code=exc.__class__.__name__,
                         last_observed_worker_event_index=worker_event_index,
                         last_accepted_event_id=last_accepted_event_id,
+                        original_error=exc,
                     )
-                    run_terminal_closed = _ingest_closed_run(result)
                     break
                 worker_event_index += 1
                 try:
@@ -3156,15 +3260,17 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
-                    result = ingestor.close_worker_lost(
-                        envelope,
-                        observed_at=datetime.now(UTC),
+                    run_terminal_closed = self._safe_close_worker_lost(
+                        ingestor=ingestor,
+                        envelope=envelope,
+                        record=record,
+                        local_worker_id=local_worker_id,
                         worker_lifecycle_signal="ingest_exception",
                         stream_error_code=exc.__class__.__name__,
                         last_observed_worker_event_index=worker_event_index,
                         last_accepted_event_id=last_accepted_event_id,
+                        original_error=exc,
                     )
-                    run_terminal_closed = _ingest_closed_run(result)
                     break
                 if result.status in (
                     EngineIngestStatus.ACCEPTED,

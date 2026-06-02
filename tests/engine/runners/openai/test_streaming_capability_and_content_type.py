@@ -352,10 +352,10 @@ async def test_stream_true_json_content_type_uses_non_stream_parser() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_true_missing_content_type_uses_non_stream_parser(
+async def test_stream_true_missing_content_type_falls_back_to_sse(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """stream=True 但缺 Content-Type 时保守按非流式 JSON 解析并记录诊断。"""
+    """stream=True 但缺 Content-Type 时按 SSE 尝试并记录诊断。"""
 
     caplog.set_level(
         "WARNING", logger="dayu.engine.runners.openai.runner"
@@ -370,8 +370,9 @@ async def test_stream_true_missing_content_type_uses_non_stream_parser(
             status=200,
             headers={"x-request-id": "req_missing_content_type"},
             body_chunks=[
-                b'{"choices":[{"message":{"role":"assistant",'
-                b'"content":"json"},"finish_reason":"stop"}]}'
+                b'data: {"choices":[{"delta":{"content":"hi"},'
+                b'"finish_reason":"stop"}]}\n\n',
+                b"data: [DONE]\n\n",
             ],
         )
     )
@@ -380,13 +381,14 @@ async def test_stream_true_missing_content_type_uses_non_stream_parser(
     events = await _collect(runner)
 
     assert [event.type for event in events] == [
+        RunnerEventType.RUNNER_CONTENT_DELTA,
         RunnerEventType.RUNNER_CONTENT_COMPLETED,
         RunnerEventType.RUNNER_DONE,
     ]
-    assert isinstance(events[0].data, RunnerContentCompletedData)
-    assert events[0].data.content == "json"
-    assert isinstance(events[1].data, RunnerDoneData)
-    assert events[1].data.provider_request_id == "req_missing_content_type"
+    assert isinstance(events[1].data, RunnerContentCompletedData)
+    assert events[1].data.content == "hi"
+    assert isinstance(events[2].data, RunnerDoneData)
+    assert events[2].data.provider_request_id == "req_missing_content_type"
     assert "runner.http.missing_content_type" in caplog.text
     await runner.close()
 

@@ -87,6 +87,11 @@ from dayu.host.dispatch import (
     _safe_close_worker_handle,
     _safe_release_lane_token,
 )
+from dayu.host.engine_ingest import (
+    EngineIngestResult,
+    EngineEventIngestor,
+    LocalEngineEnvelope,
+)
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     MemoryRepairReason,
@@ -1579,6 +1584,42 @@ class _RetryExhaustedDrainLoopScheduler(HostDispatchScheduler):
         raise HostTransactionRetryExhaustedError("drain retry exhausted", attempts=3)
 
 
+class _CloseWorkerLostFailingIngestor:
+    """测试用 close_worker_lost 失败 ingestor。"""
+
+    def close_worker_lost(
+        self,
+        envelope: LocalEngineEnvelope,
+        *,
+        observed_at: datetime,
+        worker_lifecycle_signal: str,
+        stream_error_code: str,
+        last_observed_worker_event_index: int,
+        last_accepted_event_id: str | None,
+    ) -> EngineIngestResult:
+        """模拟 lost closeout 写入失败。
+
+        :param envelope: worker envelope。
+        :param observed_at: Host 观察时间。
+        :param worker_lifecycle_signal: worker lifecycle signal。
+        :param stream_error_code: 原始异常类型名。
+        :param last_observed_worker_event_index: 最后观测到的 worker event index。
+        :param last_accepted_event_id: 最后已接受 EventLog id。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出 closeout 失败。
+        """
+
+        del (
+            envelope,
+            observed_at,
+            worker_lifecycle_signal,
+            stream_error_code,
+            last_observed_worker_event_index,
+            last_accepted_event_id,
+        )
+        raise RuntimeError("close worker lost failed")
+
+
 class _FailingCloseWorkerHandle:
     """关闭时抛错的 worker handle fake。"""
 
@@ -2062,6 +2103,111 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
         await scheduler.close()
 
     assert any("dispatch drain loop durable retry exhausted" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """drain loop retry exhausted 关闭前尽力收口队列剩余 dispatch。"""
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        lane_controller = await LaneController.open(
+            [
+                LaneConfig(
+                    name=_LANE_NAME,
+                    capacity=1,
+                    default_timeout_seconds=0.1,
+                    claim_ttl_seconds=1.0,
+                    heartbeat_interval_seconds=0.1,
+                )
+            ],
+            coordinator=SQLiteLaneCoordinatorConfig(db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3"),
+        )
+        scheduler = _RetryExhaustedDrainLoopScheduler(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            local_execution=HostLocalExecutionOptions(
+                lane_db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3",
+                lane_name=_LANE_NAME,
+                lane_capacity=1,
+                lane_default_timeout_seconds=0.1,
+                lane_claim_ttl_seconds=1.0,
+                lane_heartbeat_interval_seconds=0.1,
+                worker_startup_timeout_seconds=1.0,
+                dispatch_poll_interval_seconds=0.01,
+                runner_spec=_runner_spec(),
+                runner_options=RunnerCallOptions(temperature=None, max_tokens=None, top_p=None, stream=False),
+                agent_policy=_agent_policy(False),
+                worker_factory=_FakeWorkerFactory(),
+            ),
+            lane_controller=lane_controller,
+            host_handle_id="host-drain-loop-queue-closeout",
+        )
+        scheduler._queue.put_nowait(_pending_dispatch(seeded))
+        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
+        await asyncio.sleep(0.03)
+        await scheduler.close()
+
+        run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
+        assert scheduler._queue.qsize() == 0
+        assert run.status is RunStatus.FAILED
+        assert attempt.status is AttemptStatus.FAILED
+        assert dispatch_record.status is DispatchRecordStatus.CANCELLED
+
+    assert "dispatch.drain_loop.queue_closeout" in caplog.text
+    assert "closeout_count=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_close_worker_lost_failure_logs_context_without_raising(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """lost closeout 自身失败时记录结构化上下文且不传播异常。"""
+
+    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+        try:
+            token = _HostCancellationToken()
+            envelope = LocalEngineEnvelope(
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                dispatch_record_id=seeded.dispatch_record_id,
+                worker_kind=WorkerKind.LOCAL,
+                execution_target="target-dispatch",
+                local_worker_id="worker-lost-closeout-fails",
+                cancellation_token=token,
+            )
+            closed = scheduler._safe_close_worker_lost(
+                ingestor=cast(
+                    EngineEventIngestor,
+                    _CloseWorkerLostFailingIngestor(),
+                ),
+                envelope=envelope,
+                record=_pending_dispatch(seeded),
+                local_worker_id="worker-lost-closeout-fails",
+                worker_lifecycle_signal="ingest_exception",
+                stream_error_code="RuntimeError",
+                last_observed_worker_event_index=3,
+                last_accepted_event_id=None,
+                original_error=RuntimeError("original ingest failure"),
+            )
+            assert closed is False
+        finally:
+            await scheduler.close()
+
+    assert "dispatch.worker_events.close_worker_lost_failed" in caplog.text
+    assert "run_id=run-dispatch" in caplog.text
+    assert "closeout_error_type=RuntimeError" in caplog.text
+    assert "original_error_type=RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio

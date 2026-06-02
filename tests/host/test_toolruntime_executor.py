@@ -80,6 +80,11 @@ from dayu.host.wait_adapter import (
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
+from dayu.host.tool_duplicate_governance import (
+    DuplicateDurableMissingReason,
+    DuplicateGovernanceRequest,
+    InMemoryAttemptDuplicateGovernance,
+)
 from dayu.host.tooling import (
     default_framework_tool_policy_view,
 )
@@ -672,6 +677,88 @@ async def test_accept_retry_exhausted_returns_governed_timeout() -> None:
 async def test_sync_timeout_error_from_accept_port_is_not_caught() -> None:
     """同步 accept port 的 TimeoutError 不应被误分类为 retry timeout。"""
 
+    callable_ = _CountingCallable({"secret": "timeout-error"})
+    executor = _executor(callable_, _TimeoutAcceptPort())
+
+    with pytest.raises(TimeoutError, match="sync timeout"):
+        await executor.execute(_request(_call("tool-call-1")))
+
+
+@pytest.mark.asyncio
+async def test_duplicate_cleanup_failure_does_not_replace_tool_timeout_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """duplicate cleanup 失败不覆盖工具 timeout 返回结果。"""
+
+    async def _raise_cleanup_failure(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """模拟 duplicate cleanup 失败。
+
+        :param self: duplicate governance 实例。
+        :param request: cleanup 请求。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出 cleanup 失败。
+        """
+
+        del self, request, reason
+        raise RuntimeError("duplicate cleanup failed")
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _raise_cleanup_failure,
+    )
+    callable_ = _BlockingCallable()
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    executor = _executor(
+        callable_,
+        _SequencedAcceptPort(()),
+        diagnostic_emitter=diagnostics,
+    )
+
+    outcome = await executor.execute(
+        _request(_call("tool-call-1"), timeout_seconds=_FAST_TOOL_TIMEOUT_SECONDS)
+    )
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_call_governed"
+    assert record.outcome.result.hint == "tool_runtime_timeout"
+    assert diagnostics.records[-1].reason_code == "duplicate_cleanup_failed"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_cleanup_failure_does_not_replace_original_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """duplicate cleanup 失败不覆盖 try 块原始异常。"""
+
+    async def _raise_cleanup_failure(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """模拟 duplicate cleanup 失败。
+
+        :param self: duplicate governance 实例。
+        :param request: cleanup 请求。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出 cleanup 失败。
+        """
+
+        del self, request, reason
+        raise RuntimeError("duplicate cleanup failed")
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _raise_cleanup_failure,
+    )
     callable_ = _CountingCallable({"secret": "timeout-error"})
     executor = _executor(callable_, _TimeoutAcceptPort())
 
