@@ -119,8 +119,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | gate | draft-PR-pass |
 | implementation status | WU-TOOL-02 draft PR pass complete; user preparing merge |
 | active work unit | WU-TOOL-02 |
-| default next work unit | WU-TOOL-02 |
-| next entry point | 用户侧准备 merge PR #108；ready-for-review / reviewer request / merge 仍由用户执行或另行授权 |
+| default next work unit | WU-ENGINE-01 |
+| next entry point | 用户侧准备 merge PR #108；merge 后进入 WU-ENGINE-01 discussion / code inspection |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -530,6 +530,7 @@ Deterministic recent-window fallback 落地后，reactive overflow 反复 compac
 - 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up code review artifacts: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-mimo-20260602.md`, `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-ds-20260602.md`。Controller adjudication: `docs/reviews/wu-tool-02-pr-followup-rr-tool-03-04-code-review-controller-adjudication-20260602.md`。裁决：无 blocking finding；`RR-TOOL-03` 与 `RR-TOOL-04` closed；MiMo/DS validator matrix nonblocking notes 不要求当前 gate 扩展为 exhaustive branch matrix。
 - 2026-06-02：RR-TOOL-03 / RR-TOOL-04 follow-up final verification passed。Controller verification: affected Host tests 214 passed；full pyright 0 errors。Accepted follow-up commit: `c1c909c`。WU-TOOL-02 恢复 draft-PR-pass。
 - 2026-06-02：用户准备 merge PR `#108`。Controller 更新总控状态，并按用户要求从 Residual Risk 表中删除已 `closed` 的条目；当前 Residual Risk 表仅保留仍 deferred-with-owner / transferred-to-issue / open 的追踪项。
+- 2026-06-02：用户准备 merge PR `#108` 后继续实施下一个 work unit。Controller 将 `default next work unit` 更新为 `WU-ENGINE-01`；merge 后 next entry point 为 WU-ENGINE-01 discussion / code inspection。
 
 ## WU-ENGINE-01 Provider State Neutralization and Runner Abstraction
 
