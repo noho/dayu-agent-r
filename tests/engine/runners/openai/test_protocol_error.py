@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Iterator, Mapping
 
 import pytest
 
@@ -38,6 +37,10 @@ from tests.engine.runners.openai._sse_helpers import (
     make_no_thought_hook,
     parse_sse,
 )
+from tests.engine.runners.openai._diagnostic_helpers import (
+    leaf_strings,
+    serialized_size,
+)
 
 
 def _sse_json_chunk(payload_json: str) -> bytes:
@@ -61,37 +64,6 @@ def _diagnostic_payload(raw_payload: JsonValue | None) -> dict[str, JsonValue]:
 
     assert isinstance(raw_payload, dict)
     return raw_payload
-
-
-def _leaf_strings(value: JsonValue) -> Iterator[str]:
-    """遍历 JSON 值中的字符串叶子。
-
-    :param value: JSON 值。
-    :returns: 字符串叶子迭代器。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if isinstance(value, str):
-        yield value
-        return
-    if isinstance(value, Mapping):
-        for child_value in value.values():
-            yield from _leaf_strings(child_value)
-        return
-    if isinstance(value, list):
-        for child_value in value:
-            yield from _leaf_strings(child_value)
-
-
-def _serialized_size(value: JsonValue) -> int:
-    """计算 JSON 值序列化后的 UTF-8 字节数。
-
-    :param value: JSON 值。
-    :returns: 紧凑 JSON 序列化后的字节数。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
 
 @pytest.mark.asyncio
@@ -187,8 +159,8 @@ async def test_sse_provider_error_object_emits_protocol_error() -> None:
         "code": "bad_request",
         "type": "server_error",
     }
-    assert "sse-secret-value" not in tuple(_leaf_strings(diagnostic))
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert "sse-secret-value" not in tuple(leaf_strings(diagnostic))
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
@@ -235,8 +207,8 @@ def test_non_stream_provider_error_object_emits_protocol_error() -> None:
         "code": "context_length_exceeded",
         "type": "invalid_request_error",
     }
-    assert "non-stream-secret-value" not in tuple(_leaf_strings(diagnostic))
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert "non-stream-secret-value" not in tuple(leaf_strings(diagnostic))
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
@@ -271,7 +243,7 @@ def test_non_stream_large_provider_error_raw_payload_is_bounded() -> None:
     error = events[0].data
     assert isinstance(error, RunnerProtocolErrorData)
     diagnostic = _diagnostic_payload(error.raw_payload)
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     assert diagnostic["source"] == "non_stream_provider_error"
     assert diagnostic["kind"] == "provider_error"
     assert _PREVIEW_FIELD not in diagnostic
@@ -297,7 +269,7 @@ async def test_sse_missing_choices_without_usage_emits_protocol_error() -> None:
     assert diagnostic["source"] == "sse_missing_choices"
     assert diagnostic["kind"] == "protocol_object"
     assert diagnostic["reason"] == "missing_choices_and_usage"
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR

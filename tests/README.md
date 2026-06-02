@@ -173,7 +173,7 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 - 取消与资源：取消边界、取消后不补 done 事件、close 释放资源。
 - 架构边界与协议表面：Runner 只产出 RunnerEvent，不依赖 ToolExecutor，不暴露任意 `**kwargs` 或 `set_tools`，事件流顺序保持单调并以唯一终态收口。
 
-本目录内已有 `_fakes.py`、`_factories.py`、`_sse_helpers.py` 作为局部测试 helper。
+本目录内已有 `_fakes.py`、`_factories.py`、`_sse_helpers.py`、`_diagnostic_helpers.py` 作为局部测试 helper。
 
 ## 维护约定
 

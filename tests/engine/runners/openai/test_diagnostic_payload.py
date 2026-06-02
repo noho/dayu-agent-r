@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator, Mapping
 
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.runners.openai.diagnostic_payload import (
@@ -21,40 +20,13 @@ from dayu.engine.runners.openai.diagnostic_payload import (
     protocol_object_diagnostic_payload,
     provider_error_diagnostic_payload,
 )
+from tests.engine.runners.openai._diagnostic_helpers import (
+    leaf_strings,
+    serialized_size,
+)
 
 _SOURCE: str = "unit_source"
 _REASON: str = "unit_reason"
-
-
-def _serialized_size(value: JsonValue) -> int:
-    """计算 JSON 值序列化后的 UTF-8 字节数。
-
-    :param value: JSON 值。
-    :returns: 紧凑 JSON 序列化后的字节数。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
-
-
-def _leaf_strings(value: JsonValue) -> Iterator[str]:
-    """遍历 JSON 值中的字符串叶子。
-
-    :param value: JSON 值。
-    :returns: 字符串叶子迭代器。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if isinstance(value, str):
-        yield value
-        return
-    if isinstance(value, Mapping):
-        for child_value in value.values():
-            yield from _leaf_strings(child_value)
-        return
-    if isinstance(value, list):
-        for child_value in value:
-            yield from _leaf_strings(child_value)
 
 
 def _canonical_metadata(payload: dict[str, JsonValue]) -> tuple[int, str]:
@@ -102,7 +74,7 @@ def test_provider_error_diagnostic_payload_structure_and_digest() -> None:
         "type": "invalid_request_error",
         "param": "messages",
     }
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
 
 
 def test_diagnostic_payload_redacts_sensitive_values() -> None:
@@ -128,7 +100,7 @@ def test_diagnostic_payload_redacts_sensitive_values() -> None:
     diagnostic = provider_error_diagnostic_payload(payload, source=_SOURCE)
 
     assert isinstance(diagnostic, dict)
-    leaves = tuple(_leaf_strings(diagnostic))
+    leaves = tuple(leaf_strings(diagnostic))
     forbidden_values = (
         "sk-secret-api-key",
         "sk-secret-dashed-api-key",
@@ -199,7 +171,7 @@ def test_large_payload_falls_back_to_minimal_structure() -> None:
     diagnostic = provider_error_diagnostic_payload(payload, source=_SOURCE)
 
     assert isinstance(diagnostic, dict)
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
     assert set(diagnostic.keys()) == {
         _VERSION_FIELD,
         _SOURCE_FIELD,
@@ -226,7 +198,7 @@ def test_protocol_object_diagnostic_payload_records_reason() -> None:
     assert diagnostic["reason"] == _REASON
     assert diagnostic[_SOURCE_FIELD] == _SOURCE
     assert diagnostic[_KIND_FIELD] == "protocol_object"
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
 
 
 def test_protocol_object_diagnostic_payload_redacts_sensitive_values() -> None:
@@ -248,7 +220,7 @@ def test_protocol_object_diagnostic_payload_redacts_sensitive_values() -> None:
     )
 
     assert isinstance(diagnostic, dict)
-    leaves = tuple(_leaf_strings(diagnostic))
+    leaves = tuple(leaf_strings(diagnostic))
     assert "Bearer protocol-secret" not in leaves
     assert "nested-token-value" not in leaves
 
@@ -268,7 +240,7 @@ def test_invalid_utf8_diagnostic_payload_is_bounded() -> None:
     assert diagnostic["chunk_sha256_digest"] == hashlib.sha256(chunk).hexdigest()
     assert "chunk_prefix_base64" in diagnostic
     assert diagnostic["final_decode"] is False
-    assert _serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert serialized_size(diagnostic) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
 
 
 def test_invalid_utf8_diagnostic_payload_final_decode_empty_chunk() -> None:

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 import json
 from types import TracebackType
 
@@ -42,6 +42,10 @@ from dayu.engine.runners.openai.diagnostic_payload import (
     _SHA256_DIGEST_FIELD,
 )
 
+from tests.engine.runners.openai._diagnostic_helpers import (
+    leaf_strings,
+    serialized_size,
+)
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
     FakeCancellationToken,
@@ -335,37 +339,6 @@ def _check_http_error_then_done(
     assert done.finish_reason is FinishReason.ERROR
 
 
-def _leaf_strings(value: JsonValue) -> Iterator[str]:
-    """遍历 JSON 值中的字符串叶子。
-
-    :param value: JSON 值。
-    :returns: 字符串叶子迭代器。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if isinstance(value, str):
-        yield value
-        return
-    if isinstance(value, Mapping):
-        for child_value in value.values():
-            yield from _leaf_strings(child_value)
-        return
-    if isinstance(value, list):
-        for child_value in value:
-            yield from _leaf_strings(child_value)
-
-
-def _serialized_size(value: JsonValue) -> int:
-    """计算 JSON 值序列化后的 UTF-8 字节数。
-
-    :param value: JSON 值。
-    :returns: 使用非 ASCII 转义关闭后的 JSON 字节数。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
-
-
 def _assert_http_diagnostic_payload(
     raw_payload: JsonValue | None,
     *,
@@ -388,7 +361,7 @@ def _assert_http_diagnostic_payload(
     assert isinstance(provider_error, Mapping)
     assert provider_error["code"] == expected_error_code
     assert provider_error["type"] == expected_error_type
-    assert _serialized_size(raw_payload) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
+    assert serialized_size(raw_payload) <= _DIAGNOSTIC_PAYLOAD_MAX_BYTES
 
 
 @pytest.mark.asyncio
@@ -575,7 +548,7 @@ async def test_http_json_object_error_body_produces_bounded_diagnostic_payload()
         events[-2].data.raw_payload,
         ensure_ascii=False,
     )
-    leaf_strings = tuple(_leaf_strings(events[-2].data.raw_payload))
+    leaf_values = tuple(leaf_strings(events[-2].data.raw_payload))
     for forbidden_value in (
         _SECRET_API_KEY,
         _SECRET_TOKEN,
@@ -583,7 +556,7 @@ async def test_http_json_object_error_body_produces_bounded_diagnostic_payload()
         _PAYLOAD_REQUEST_ID,
     ):
         assert forbidden_value not in serialized_payload
-        assert forbidden_value not in leaf_strings
+        assert forbidden_value not in leaf_values
     assert isinstance(events[-1].data, RunnerDoneData)
     assert events[-1].data.provider_request_id == _HEADER_REQUEST_ID
     await runner.close()
