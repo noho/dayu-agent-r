@@ -42,7 +42,8 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
     RunnerToolCallsCompletedData,
 )
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.api import EnsureSessionRequest, AttemptStatus, RunStatus
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.durable.codec import sha256_digest_json
@@ -174,16 +175,19 @@ class _ScriptedRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
 
         :param messages: Agent messages。
         :param options: Runner options。
         :param tools: 当前暴露的工具 schemas。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         """
 
-        del options, tools
+        del options, tools, request_identity
         self.messages_seen.append(tuple(messages))
         index = self.call_count
         self.call_count += 1
@@ -592,6 +596,7 @@ def _policy_snapshot() -> PolicySnapshot:
             endpoint="https://example.test/v1/chat/completions",
             api_key_ref="TEST_KEY",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,

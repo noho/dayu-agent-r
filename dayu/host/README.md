@@ -197,11 +197,15 @@ Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_i
 
 worker startup timeout、worker accept failure、worker stream crash 和未知 terminal 都由 Host closeout 为结构化终态或 diagnostic。worker stream 在 Host 已请求 active cancel 后 clean EOF 时，Host 以 cancel terminal 收口；非取消 clean EOF 仍按 lost closeout 处理。lost closeout 自身失败时只记录带 run / attempt / execution / 原始异常类型的诊断，不替换原始 stream / ingest 异常路径。drain loop 因 durable retry exhausted fail-close 时，会在关闭前 best-effort 收口本地 dispatch 队列中尚未派发的记录；收口失败继续按 best-effort 诊断处理。terminal closeout 后会触发同 Session queued Run promotion。
 
+RunInputBuilder 构造 ordinary Engine `AgentRunRequest` 时，会把当前 `AttemptDispatchSnapshot.attempt_id` 与 `execution_id` 投影到 Engine request。Engine 用这些字段和 run / iteration / logical Runner call 序号生成 `RunnerRequestIdentity.client_correlation_id`；Host 仍是 Attempt / execution 生命周期真源，Engine 不拥有 Host 状态机。
+
 ## EventLog 与 HostEvent
 
 EventLog 是 append-only ledger。`canonical_fact` 子集是恢复、memory、tool governance、terminal summary 和状态索引的事实来源；非 canonical 的展示事件、`diagnostic` 与 `projection_signal` 只能服务展示、诊断或投影追平。
 
 `event_sequence` 是 Host 全局单调游标，供 read model、watch、projection catch-up、memory snapshot cursor 和 outbox 类能力对齐。EventLog append 与必要状态索引更新必须在同一 transaction 内完成。同一 `event_id` 重放时，事件体 digest 相同会幂等返回既有 row，digest 不同会抛出 event identity conflict；INSERT 阶段撞上并发同 id row 也按同一规则重新分类。
+
+EngineEvent ingest 在 provider-related payload 中保留 Engine 提供的 `provider_request_id` 与 `client_correlation_id`。当前覆盖 provider protocol diagnostic、reactive context compaction request / recovery closeout、failed terminal closeout 和 iteration completed preview。两者都是诊断关联字段，不改变 Run / Attempt 状态迁移规则，也不新增 durable hot-table schema column。
 
 `watch_session_events(session_id)` 是普通 Service-facing session-level live event entry，返回 Host-owned typed `HostEvent` async iterator。它不接收 cursor，不做离线补读；terminal event 不结束 iterator；consumer 取消订阅只关闭本次 watch，不取消 Run、不写 EventLog。
 
@@ -268,6 +272,8 @@ Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，�
 Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservative estimator、memory snapshot、compact material pack、当前用户输入和 compact artifact refs 进行上下文预算治理。compact input 使用与 RunInputBuilder 同源的 ordinary input material block view；segment selection 在给定 trigger、input cursor、memory snapshot cursor、policy digest 与 material list 时确定性输出 selected block ids、excluded reason codes 与 selection digest。proactive pre-start material 会补入当前输入 cursor 之前、当前 Session 内、未被 stable fact / compact artifact 表示的 bounded accepted tool evidence；proactive selection 排除 current input anchor、protected recent raw turns floor、stable input 和已充分代表的 block；reactive selection 消费冻结的 overflow material list。`CompactMaterialPack` 由 selected segment、memory stable view、inline delta repair view、accepted evidence material 和 bounded current input anchor 构造，stable input、history input、accepted tool evidence input 与 current input anchor 分区使用 prompt-local labels，Host 内部用 provenance map 把 labels 映射回 canonical source refs、evidence refs、source locator refs 与 artifact refs；LLM-facing JSON 不暴露 EventLog ledger wrapper、payload descriptor、digest、cursor 或 Host provenance key。selection 没有 accepted tool evidence 时使用显式空 evidence input。
 
 Runner usage 进入 Host 后只写 `USAGE_REPORTED` projection signal，并附带 Session / Run / Attempt / execution、policy ref、estimator digest、估算输入 token 与 observation digest 等诊断字段。usage 是 post-call observation，只用于后续估算校准、diagnostic 和后续治理参考；缺少 policy、input event 或估算失败时 projection 仍提交为 `estimate_unavailable`，不改变当前 Run / Attempt 状态，也不回改当前 dispatch decision。
+
+Tool Trace 是 EventLog 的派生投影。当前 hot row 仍只把 `provider_request_id` 作为查询列；`client_correlation_id` 进入 `trace_summary_json`，cold JSONL 的 `trace_summary` 也保留同名字段。因此同一条 trace 可以同时呈现 provider-native request id、本地 client correlation id、Run / Attempt / execution、Engine event ref 与工具相关诊断 refs。Tool Trace projection 遇到 payload 中非文本 `client_correlation_id` 会按 durable payload 字段校验失败。
 
 当前已实现两类 compaction 路径：
 

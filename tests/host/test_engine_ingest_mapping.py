@@ -25,6 +25,7 @@ from dayu.engine.contracts.engine_events import (
     EngineEventData,
     EngineEventType,
     FinalAnswerData,
+    IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
     RunCancelledData,
@@ -344,6 +345,7 @@ def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
                 error_code="provider_error",
                 message="provider failed",
                 provider_request_id="req-1",
+                client_correlation_id="client-req-1",
                 recoverable=False,
             ),
             event_type=EngineEventType.RUN_FAILED,
@@ -359,7 +361,9 @@ def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
         ]
         payload = _payload(result.events[0])
         assert payload["error_code"] == "provider_error"
+        assert payload["client_correlation_id"] == "client-req-1"
         assert payload["recoverable"] is False
+        assert _payload(result.events[1])["client_correlation_id"] == "client-req-1"
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.FAILED
         assert attempt_status == AttemptStatus.FAILED
@@ -377,6 +381,7 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
                 error_code="context_recovery_needed",
                 message="recoverable",
                 provider_request_id="req-2",
+                client_correlation_id="client-req-2",
                 recoverable=True,
             ),
             event_type=EngineEventType.RUN_FAILED,
@@ -392,8 +397,10 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
             EventClass.CANONICAL_FACT,
         ]
         assert result.events[1].event_type == "ATTEMPT_FAILED"
+        assert _payload(result.events[0])["client_correlation_id"] == "client-req-2"
         payload = _payload(result.events[1])
         assert payload["unsupported_later_owner"] == "phase10"
+        assert payload["client_correlation_id"] == "client-req-2"
         run_status, _attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.FAILED
 
@@ -414,7 +421,8 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
                 iteration_id="iter-1",
                 budget_state=None,
                 reason="provider_overflow",
-                provider_request_id=None,
+                provider_request_id="req-overflow",
+                client_correlation_id="client-overflow",
             ),
             event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
         )
@@ -439,7 +447,8 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         )
         requested_payload = _payload(result.events[0])
         assert requested_payload["trigger_source"] == "reactive"
-        assert requested_payload["provider_request_id"] is None
+        assert requested_payload["provider_request_id"] == "req-overflow"
+        assert requested_payload["client_correlation_id"] == "client-overflow"
         assert requested_payload["attempt_id"] == seeded.attempt_id
         assert requested_payload["execution_id"] == seeded.execution_id
         assert requested_payload["frozen_material_refs"] == ["event-input-ingest"]
@@ -1538,6 +1547,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
                 error_code="invalid_stream",
                 message="bad stream",
                 provider_request_id="req-protocol",
+                client_correlation_id="client-protocol",
                 raw_payload={
                     "version": 1,
                     "source": "provider_protocol_error",
@@ -1563,6 +1573,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
 
         assert result.events[0].event_class == EventClass.DIAGNOSTIC
         assert result.events[0].event_type == "PROVIDER_PROTOCOL_ERROR"
+        assert _payload(result.events[0])["client_correlation_id"] == "client-protocol"
         assert _payload(result.events[0])["raw_payload_ref"] is not None
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
@@ -1949,6 +1960,36 @@ def test_preview_event_accepts_matching_type_and_data(tmp_path: Path) -> None:
         assert result.status == EngineIngestStatus.ACCEPTED
         assert result.events[0].event_class == EventClass.PREVIEW
         assert _payload(result.events[0])["delta"] == "hello"
+
+
+def test_iteration_completed_preview_includes_client_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """iteration completed preview 同步暴露 provider 与 client correlation。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=20,
+            data=IterationCompletedData(
+                iteration_id="iter-completed",
+                finish_reason=FinishReason.STOP,
+                provider_request_id="req-iteration",
+                client_correlation_id="client-iteration",
+            ),
+            event_type=EngineEventType.ITERATION_COMPLETED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.events[0].event_class == EventClass.PREVIEW
+        payload = _payload(result.events[0])
+        assert payload["provider_request_id"] == "req-iteration"
+        assert payload["client_correlation_id"] == "client-iteration"
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:

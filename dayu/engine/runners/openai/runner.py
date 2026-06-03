@@ -27,6 +27,7 @@ from collections.abc import (
     Awaitable,
     Coroutine,
     Iterable,
+    Mapping,
     Sequence,
 )
 from dataclasses import dataclass
@@ -47,7 +48,13 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
 )
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    OPENAI_CLIENT_REQUEST_ID_HEADER_NAME,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.engine.runners.openai.cancellation_helpers import _RunnerInterrupted
 from dayu.engine.runners.openai.diagnostic_payload import (
     http_error_diagnostic_payload,
@@ -137,6 +144,45 @@ def _is_sse_response(*, content_type: str, stream: bool) -> bool:
         return True
     media_type = content_type.split(";", maxsplit=1)[0].strip().lower()
     return media_type == _SSE_CONTENT_TYPE_FRAGMENT
+
+
+def _build_request_headers(
+    *,
+    spec: RunnerSpec,
+    request_identity: RunnerRequestIdentity | None,
+) -> dict[str, str]:
+    """构造 OpenAI-compatible HTTP 请求头。
+
+    请求头由默认 ``Content-Type``、静态 ``RunnerSpec.headers`` 与
+    ``RunnerSpec`` 显式策略允许的 ``X-Client-Request-Id`` 组成。静态
+    header 冲突由 ``RunnerSpec`` construction-time validation 统一拒绝。
+
+    :param spec: Runner 规约。
+    :param request_identity: 本次逻辑 Runner 调用的请求身份；为 ``None`` 时
+        不发送客户端关联 id。
+    :returns: HTTP 请求头映射。
+    :raises ValueError: policy 值不受当前 adapter 支持时抛出。
+    """
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        **dict(spec.headers),
+    }
+    if spec.client_correlation_policy is ClientCorrelationPolicy.DISABLED:
+        return headers
+    if (
+        spec.client_correlation_policy
+        is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    ):
+        if request_identity is not None:
+            headers[OPENAI_CLIENT_REQUEST_ID_HEADER_NAME] = (
+                request_identity.client_correlation_id
+            )
+        return headers
+    raise ValueError(
+        "unsupported client_correlation_policy: "
+        f"{spec.client_correlation_policy.value}"
+    )
 
 
 async def await_or_cancel(
@@ -245,16 +291,22 @@ class AsyncOpenAIRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None = None,
     ) -> AsyncIterator[RunnerEvent]:
         """发起一次 LLM 调用并返回 :class:`RunnerEvent` 异步流。
 
         :param messages: 消息序列。
         :param options: 单次调用参数。
         :param tools: 工具 schema 序列。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份；policy
+            开启时会映射为 OpenAI-compatible 客户端关联 header。
         :returns: :class:`RunnerEvent` 异步迭代器。
         """
 
-        return self._call_impl(messages, options, tools)
+        return self._call_impl(
+            messages, options, tools, request_identity=request_identity
+        )
 
     def is_supports_tool_calling(self) -> bool:
         """返回 Runner 是否支持工具调用。
@@ -277,8 +329,20 @@ class AsyncOpenAIRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
-        """``call`` 的真实异步生成器实现。"""
+        """``call`` 的真实异步生成器实现。
+
+        :param messages: 消息序列。
+        :param options: 单次调用参数。
+        :param tools: 工具 schema 序列。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份；为 ``None``
+            时不会发送客户端关联 id。
+        :returns: :class:`RunnerEvent` 异步迭代器。
+        :raises ValueError: client correlation policy 与静态 headers 冲突时
+            抛出。
+        """
 
         effective_options = self._effective_options(options)
         payload = build_request_payload(
@@ -286,6 +350,10 @@ class AsyncOpenAIRunner:
             options=effective_options,
             tools=tools,
             spec=self._spec,
+        )
+        headers = _build_request_headers(
+            spec=self._spec,
+            request_identity=request_identity,
         )
         attempt = 0
         event_count = 0
@@ -313,7 +381,7 @@ class AsyncOpenAIRunner:
                 attempt_yielded_event = False
                 try:
                     async for event in self._do_attempt(
-                        payload, effective_options
+                        payload, effective_options, headers=headers
                     ):
                         attempt_yielded_event = True
                         event_count += 1
@@ -491,12 +559,15 @@ class AsyncOpenAIRunner:
         self,
         payload: _OpenAIRequestPayload,
         options: RunnerCallOptions,
+        *,
+        headers: Mapping[str, str],
     ) -> AsyncIterator[RunnerEvent]:
         """执行 HTTP 请求并归一为事件。
 
         :param payload: 已构建的请求 payload（投影后的强类型 TypedDict
             视图，本路径仅做 JSON 序列化）。
         :param options: 调用参数。
+        :param headers: 本次逻辑 Runner 调用复用的 HTTP 请求头。
         :returns: :class:`RunnerEvent` 异步迭代器。
 
         :raises _AttemptFailedRetriable: 当本次尝试失败且属于可重试
@@ -507,10 +578,6 @@ class AsyncOpenAIRunner:
 
         session = self._http_client.session()
         body_bytes = json.dumps(dict(payload)).encode("utf-8")
-        headers: dict[str, str] = {
-            "Content-Type": "application/json",
-            **dict(self._spec.headers),
-        }
         _LOGGER.debug(
             "runner.http.post endpoint=%s body_bytes=%d stream=%s",
             self._spec.endpoint,

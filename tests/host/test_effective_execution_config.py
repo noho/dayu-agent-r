@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import pathlib
 from collections.abc import AsyncIterator
 from collections.abc import Mapping
@@ -21,7 +22,11 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessageRole
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.host import (
     AttemptDispatchSnapshot,
     EnsureSessionRequest,
@@ -42,6 +47,7 @@ from dayu.host import (
 from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import create_host_command_handle
 from dayu.host._execution_config_projection import (
+    effective_execution_config_json,
     effective_execution_snapshot_from_json,
     required_json_mapping as _required_json_mapping,
 )
@@ -252,6 +258,43 @@ def test_effective_execution_snapshot_rejects_corrupted_json_with_durable_error(
         )
 
 
+def test_effective_execution_config_round_trips_client_correlation_policy() -> None:
+    """冻结 execution config 必须保留 RunnerSpec 客户端关联策略。"""
+
+    runner_spec = _runner_spec("policy-model")
+    runner_spec = dataclasses.replace(
+        runner_spec,
+        client_correlation_policy=(
+            ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+        ),
+    )
+    config_json = effective_execution_config_json(
+        runner_spec=runner_spec,
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
+        runner_spec_source="test",
+        runner_options_source="test",
+        agent_policy_source="test",
+    )
+
+    snapshot = effective_execution_snapshot_from_json(config_json)
+
+    assert (
+        snapshot.runner_spec.client_correlation_policy
+        is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    )
+
+
 def test_effective_execution_snapshot_rejects_unknown_provider_request_with_durable_error() -> None:
     """冻结 execution config 中的未知 provider request kind 按 durable 损坏处理。"""
 
@@ -266,6 +309,7 @@ def test_effective_execution_snapshot_rejects_unknown_provider_request_with_dura
                         "endpoint": "http://localhost",
                         "api_key_ref": None,
                         "headers": {},
+                        "client_correlation_policy": "disabled",
                         "supports_tool_calling": False,
                         "supports_streaming": False,
                         "supports_stream_usage": False,
@@ -733,6 +777,7 @@ def _runner_spec(model: str) -> RunnerSpec:
         endpoint="https://example.invalid",
         api_key_ref="secret:test",
         headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,

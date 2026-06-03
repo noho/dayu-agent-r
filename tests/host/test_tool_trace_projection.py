@@ -8,8 +8,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -39,6 +42,7 @@ from dayu.host.durable.tool_trace import read_tool_trace_hot_row
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.open_host import _default_tool_trace_cold_jsonl_path
 from dayu.host.projection import ProjectionRunner
+from dayu.host.projection import projection_event_view_from_row
 from dayu.host.tool_trace import (
     TOOL_TRACE_CONSUMER_ID,
     ToolTraceProjectionConsumer,
@@ -392,6 +396,72 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             "kind": "attempt",
             "attempt_id": "attempt-trace",
         }
+
+
+def test_tool_trace_projection_includes_client_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace summary / cold JSONL trace_summary 暴露 client correlation。"""
+
+    cold_path = tmp_path / "trace" / "tool-trace.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-terminal-correlation",
+            event_type="RUN_FAILED",
+            payload={
+                "provider_request_id": "req-terminal",
+                "client_correlation_id": "client-terminal",
+                "engine_event_ref": "event-engine-terminal",
+                "terminal_summary_ref": "summary-ref",
+                "terminal_summary_digest": "sha256:summary",
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, event.event_id
+            )
+        )
+
+        assert row is not None
+        assert row.trace_summary["client_correlation_id"] == "client-terminal"
+        cold_lines = _json_lines(cold_path)
+        assert len(cold_lines) == 1
+        trace_summary = cold_lines[0]["trace_summary"]
+        assert isinstance(trace_summary, Mapping)
+        assert (
+            trace_summary["client_correlation_id"] == "client-terminal"
+        )
+
+
+def test_tool_trace_projection_rejects_non_text_client_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """payload 中非文本 client_correlation_id 按字段校验抛 durable error。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-invalid-correlation",
+            event_type="RUN_FAILED",
+            payload={
+                "provider_request_id": "req-terminal",
+                "client_correlation_id": 123,
+            },
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
+        )
+
+        with pytest.raises(HostDurableError, match="client_correlation_id"):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(event),
+                )
+            )
 
 
 def test_cold_writer_failure_records_projection_failure_without_checkpoint(

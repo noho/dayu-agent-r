@@ -17,7 +17,7 @@ from typing import Final
 from dayu.contracts import ToolBundle, ToolBundleSourceRef
 from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.engine import AgentFallbackMode, AgentPolicy
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.engine.provider_extensions import provider_request_extension_from_json
 from dayu.host.api import (
     CompactorRunnerBaseline,
@@ -867,6 +867,7 @@ def _runner_spec_from_model(*, model: ModelConfig, env: Mapping[str, str]) -> Ru
             api_key_ref=model.api_key_ref,
             env=env,
         ),
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=model.supports_tool_calling,
         supports_streaming=model.supports_stream,
         supports_stream_usage=model.supports_stream_usage,

@@ -140,17 +140,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft PR gate |
-| implementation status | completed |
-| active work unit | WU-ENG-01 |
-| default next work unit | WU-ENG-02 |
-| next entry point | PR review / draft-PR-pass gate |
+| gate | draft-PR-pass |
+| implementation status | draft-pr-pass |
+| active work unit | WU-ENG-02 |
+| default next work unit | WU-CM-01 |
+| next entry point | wait for PR 114 merge, then WU-CM-01 discussion / plan gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
-| plan artifacts | none |
-| implementation commits | 70a5a4e |
-| review artifacts | discussion / code / provider API evidence recorded inline in WU-ENG-01 |
-| aggregate review artifacts | none |
-| draft PR status | draft-created: https://github.com/noho/dayu-agent-r/pull/113 |
+| plan artifacts | docs/host/wu-eng-02-provider-request-identity-plan.md |
+| implementation commits | accepted plan commit 59f66b7; Slice 1 accepted commit c4826e0; Slice 2 accepted commit c3856b9; Slice 3 accepted commit 5ddc4cb; Slice 4 accepted commit 896d483; accepted deepreview commit 24af62b; accepted PR review commit 824665c; accepted residual risk fix commit 8298958; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
+| review artifacts | docs/reviews/wu-eng-02-plan-review-mimo.md; docs/reviews/wu-eng-02-plan-review-ds.md; docs/reviews/wu-eng-02-plan-fix-codex.md; docs/reviews/wu-eng-02-plan-rereview-mimo.md; docs/reviews/wu-eng-02-plan-rereview-ds.md; docs/reviews/wu-eng-02-slice1-implementation-codex.md; docs/reviews/wu-eng-02-slice1-code-review-mimo.md; docs/reviews/wu-eng-02-slice1-code-review-ds.md; docs/reviews/wu-eng-02-slice1-fix-codex.md; docs/reviews/wu-eng-02-slice1-rereview-mimo.md; docs/reviews/wu-eng-02-slice1-rereview-ds.md; docs/reviews/wu-eng-02-slice2-implementation-codex.md; docs/reviews/wu-eng-02-slice2-code-review-mimo.md; docs/reviews/wu-eng-02-slice2-code-review-ds.md; docs/reviews/wu-eng-02-slice2-fix-codex.md; docs/reviews/wu-eng-02-slice2-rereview-mimo.md; docs/reviews/wu-eng-02-slice2-rereview-ds.md; docs/reviews/wu-eng-02-slice3-implementation-codex.md; docs/reviews/wu-eng-02-slice3-code-review-mimo.md; docs/reviews/wu-eng-02-slice3-code-review-ds.md; docs/reviews/wu-eng-02-slice4-implementation-codex.md; docs/reviews/wu-eng-02-slice4-code-review-mimo.md; docs/reviews/wu-eng-02-slice4-code-review-ds.md; docs/reviews/wu-eng-02-pr-review-mimo.md; docs/reviews/wu-eng-02-pr-review-ds.md; docs/reviews/wu-eng-02-residual-risk-fix-codex.md; docs/reviews/wu-eng-02-residual-risk-review-mimo.md; docs/reviews/wu-eng-02-residual-risk-review-ds.md; docs/reviews/wu-eng-02-residual-risk-review-fix-codex.md; docs/reviews/wu-eng-02-residual-risk-rereview-mimo.md; docs/reviews/wu-eng-02-residual-risk-rereview-ds.md; docs/reviews/wu-eng-02-residual-risk-reconciliation.md |
+| aggregate review artifacts | docs/reviews/wu-eng-02-aggregate-deepreview-mimo.md; docs/reviews/wu-eng-02-aggregate-deepreview-ds.md |
+| draft PR status | WU-ENG-02 draft PR https://github.com/noho/dayu-agent-r/pull/114 draft-PR-pass after residual risk reconciliation; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |
 
 状态约定：
@@ -194,16 +194,18 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 - `transferred-to-issue`：已迁移到独立 GitHub Issue 或等价外部追踪项。
 - `closed`：已通过实现、测试、设计裁决或代码核对关闭。
 
+Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；已关闭项从 active 表删除，关闭依据保存在对应 review / reconciliation artifact 中。
+
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| none | - | - | closed | - | - | 当前没有未分配 residual risk 或遗留问题。 |
+| WU-ENG-02-S3-R1 | WU-ENG-02 Slice 3 code review | analyzer 需求边界 | deferred-with-owner | WU-OBS-00 / GitHub Issue #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要 `client_correlation_id` 与 `provider_request_id`，若需要先扩展 Engine `UsageReportedData` / Runner usage event contract，再补 Host payload / Tool Trace tests | PR 114 residual review 裁决保留 defer：usage 是 post-call observation / analyzer signal，不是 provider debugging terminal 主链路；`UsageReportedData` 当前无 correlation fields，且 usage event 发生时 provider request id 不总是可用，不能在 residual fix gate 单独定死 analyzer 关联语义。已在 issue-70 留痕：https://github.com/noho/dayu-agent-r/issues/70#issuecomment-4610820571 |
 
 ## 当前 Work Units
 
 | Work Unit | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|
-| WU-ENG-01 | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | Engine provider-specific reasoning roundtrip；仍有效，优先于依赖真实 provider tool-calling 的后续工作 |
-| WU-ENG-02 | Provider request identity and vendor debugging correlation | GitHub Issue #63 / #64 | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；必须统一实现 typed request identity，避免 provider 硬编码 |
+| WU-ENG-01 | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | completed；PR 113 已 merge，稳定结论是 provider reasoning roundtrip 为协议要求，不进入 payload behavior change |
+| WU-ENG-02 | Provider request identity and vendor debugging correlation | GitHub Issue #63 closed；#64 current shared scope completed, native adapter-specific scope remains open | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；typed request identity 与 OpenAI-compatible correlation scope 已完成，#64 保留 native Anthropic / Claude Code gateway adapter-specific 后续语义 |
 | WU-CM-01 | Conversation Memory overall optimization | GitHub Issue #81 | #81 umbrella 的正式 implementation entry point |
 | WU-CM-02 | working_assumptions 生产者语义 | GitHub Issue #81 | 已纳入 Conversation Memory 整体优化，不单独实施 |
 | WU-CM-03 | fact-candidate-only validation failure 策略 | GitHub Issue #81 | 已纳入 Conversation Memory 整体优化，不单独实施 |
@@ -241,7 +243,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 ### 状态
 
-GitHub Issue #10 当前仍为 OPEN，但 discussion / 代码 / provider API 文档核对后裁决：原先把 `AssistantMessage.reasoning_content is not None` 时写回 outbound `reasoning_content` 视为“无条件写回 bug”的动机被高估。MiMo、DeepSeek、Qwen 等 thinking + tool-call provider 要求把上一轮 assistant 的 `reasoning_content` 原样带回；Gemini 要求把 `thought_signature` 原样带回。因此当前 work unit 不进入 payload behavior change，先收敛为 issue 记录、docstring / 测试说明修正与 provider roundtrip 证据固化。
+completed。PR 113 已 merge，merge commit 为 `bc50e26c45296171487272ff5fc2293db67a9246`。GitHub Issue #10 当前仍为 OPEN，但 discussion / 代码 / provider API 文档核对后裁决：原先把 `AssistantMessage.reasoning_content is not None` 时写回 outbound `reasoning_content` 视为“无条件写回 bug”的动机被高估。MiMo、DeepSeek、Qwen 等 thinking + tool-call provider 要求把上一轮 assistant 的 `reasoning_content` 原样带回；Gemini 要求把 `thought_signature` 原样带回。因此当前 work unit 不进入 payload behavior change，已收敛为 issue 记录、docstring / 测试说明修正与 provider roundtrip 证据固化。
 
 ### 设计与代码核对
 
@@ -283,7 +285,45 @@ GitHub Issue #10 当前仍为 OPEN，但 discussion / 代码 / provider API 文�
 
 ### 状态
 
-GitHub Issue #63 与 #64 当前仍为 OPEN，必须作为同一个 Engine request identity / provider debugging correlation work unit 统一考虑。两条 issue 的真实目标不是引入用户治理字段，而是：当 `tool trace analyze` 发现 provider/model 行为疑似 bug 时，分析报告里必须能给出 provider 厂商可定位的 request id，并能回链到本地 `run_id` / iteration / attempt / tool trace。
+GitHub Issue #63 已关闭，关闭依据为 WU-ENG-02 / PR 114 accepted scope 已完成 OpenAI-compatible provider debugging correlation。GitHub Issue #64 保持 OPEN；WU-ENG-02 已完成 #64 在当前仓库可实施的 shared typed request identity / provider policy boundary scope，剩余 native Anthropic response `request-id` 与 Claude Code gateway `X-Claude-Code-Session-Id` 行为属于未来 native adapter-specific scope。两条 issue 的共同目标不是引入用户治理字段，而是：当 `tool trace analyze` 发现 provider/model 行为疑似 bug 时，分析报告里必须能给出 provider 厂商可定位的 request id，并能回链到本地 `run_id` / iteration / attempt / tool trace。
+
+Plan gate 已完成，artifact 为 `docs/host/wu-eng-02-provider-request-identity-plan.md`，无 blocking open questions。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings` 且无 blocking open questions。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-plan-fix-codex.md`，8 条 accepted findings 均标记已修复。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无新增 blocking issue。当前 plan 已接受，accepted plan commit 为 `59f66b7`。Implementation Slice 1（Engine contract and Agent identity）已由 AgentCodex 实施，artifact 为 `docs/reviews/wu-eng-02-slice1-implementation-codex.md`；验证结果为 127 个受影响 Engine tests passed，pyright 0 errors。Slice 1 code review gate 已完成，AgentMiMo 裁决 `pass`，AgentDS 裁决 `pass-with-findings`，均无 blocking open questions。当前进入 Slice 1 fix gate。
+
+Slice 1 code review findings 裁决：
+
+- accepted：EngineEvent / Agent outcome 中的 `client_correlation_id` 值缺少直接断言；应在现有 Engine Agent 测试中补齐关键 emitted event 的 correlation id 断言。
+- accepted：`_validate_batch_bijection` 生成的 `RunFailedData` 未携带当前 tool batch 的 `client_correlation_id`，与同一路径 duplicate 检查不一致；应传入并写入该字段。
+- rejected-with-reason：`RunnerRequestIdentity.__post_init__` 与 builder 重复校验属于防御性冗余，直接构造路径需要保留，不要求修改。
+- rejected-with-reason：canonical part 编码方案已由类型前缀与长度前缀证明无歧义，不要求修改。
+- deferred-with-owner：OpenAI header policy、Host projection / ingest、Tool Trace、README sync 按 accepted plan 进入 Slice 2 / Slice 3 / Slice 4。
+
+Slice 1 fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice1-fix-codex.md`。两个 accepted findings 均标记已修复；验证结果为 127 个受影响 Engine tests passed，pyright 0 errors。Slice 1 re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无 blocking open questions。Slice 1 accepted commit 为 `c4826e0`。Slice 2 implementation gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice2-implementation-codex.md`；验证结果为 61 个受影响 tests passed，pyright 0 errors。Slice 2 code review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，无 blocking open questions。Slice 2 fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice2-fix-codex.md`；已补充 `ClientCorrelationPolicy.DISABLED` 且 `request_identity=None` 时不发送 `X-Client-Request-Id` 的直接测试；验证结果为 40 个受影响 tests passed，pyright 0 errors。Slice 2 re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条 blocking findings；本地复验 `pytest tests/engine/runners/openai/test_request_identity.py tests/engine/contracts/test_runner_spec.py tests/engine/runners/openai/test_streaming_capability_and_content_type.py tests/engine/runners/openai/test_http_error_event.py tests/host/test_effective_execution_config.py` 结果为 62 passed，pyright 0 errors。Slice 2 accepted commit 为 `c3856b9`。Slice 3 implementation gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice3-implementation-codex.md`；验证结果为 184 个受影响 Host tests passed，pyright 0 errors。Slice 3 code review gate 已完成，AgentMiMo 裁决 `pass-with-findings`，AgentDS 裁决 `pass`，0 条 blocking findings；Controller 裁决无 accepted fix，新增 residual risks `WU-ENG-02-S3-R1` / `WU-ENG-02-S3-R2`。Slice 3 accepted commit 为 `5ddc4cb`。Slice 4 implementation gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice4-implementation-codex.md`；验证结果为 174 个 Engine tests passed、198 个 Host tests passed，pyright 0 errors。Slice 4 code review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条 blocking findings；Controller 裁决无 accepted fix，并关闭 `WU-ENG-02-S2-R1`。Slice 4 accepted commit 为 `896d483`。Aggregate deepreview gate 已完成，AgentMiMo 裁决 `pass-with-findings`，AgentDS 裁决 `pass`，0 条 blocking findings；Controller 裁决无 accepted fix，existing residual risks 均已有 owner。Accepted deepreview commit 为 `24af62b`。WU-ENG-02 draft PR 已创建：`https://github.com/noho/dayu-agent-r/pull/114`。PR review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条 blocking findings，PR diff 与本地 diff 一致，372 tests passed，pyright 0 errors。Accepted PR review commit 为 `824665c`。用户裁决 residual risks 若无硬性 defer 理由则在 PR 114 内关闭；residual risk fix gate 已由 AgentCodex 完成，artifact 为 `docs/reviews/wu-eng-02-residual-risk-fix-codex.md`。`WU-ENG-02-S1-R1`、`WU-ENG-02-S1-R2`、`WU-ENG-02-S2-R2`、`WU-ENG-02-S3-R2` 已改为 closed；`WU-ENG-02-S3-R1` 保留 deferred-with-owner，理由是需要 WU-OBS-00 / GitHub Issue #70 先扩展 usage observation / analyzer signal contract。Residual risk review gate 已完成，AgentMiMo 裁决 pass，AgentDS 裁决 pass-with-finding；Controller 接受 DS 低严重度测试覆盖 finding。Residual risk review fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-residual-risk-review-fix-codex.md`；已补齐第三个工具超时变体的 `client_correlation_id` 断言，验证结果为 125 tests passed，pyright 0 errors。Residual risk re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 pass，0 条 blocking findings；Controller 最终复验 125 个受影响 tests passed、71 个相关回归 tests passed、pyright 0 errors。Residual risk accepted commit 为 `8298958`。Residual Risk Reconciliation 已完成，artifact 为 `docs/reviews/wu-eng-02-residual-risk-reconciliation.md`；已关闭的 residual risk 已从 active residual 表删除，当前仅保留 `WU-ENG-02-S3-R1`，且 owner 为 WU-OBS-00 / GitHub Issue #70 analyzer。GitHub Issue #63 已关闭；GitHub Issue #64 已更新说明当前 shared contract scope 已由 PR 114 完成，native Anthropic / Claude Code gateway adapter-specific scope 继续保留。当前状态为 draft-PR-pass；等待 PR 114 merge 后进入 WU-CM-01。
+
+Slice 2 code review findings 裁决：
+
+- accepted：补充 `ClientCorrelationPolicy.DISABLED` 且 `request_identity=None` 时不发送 `X-Client-Request-Id` 的直接测试。
+- rejected-with-reason：`_has_client_request_id_header` 的 `:raises Exception: 不主动抛出异常。` 符合本仓库中文 docstring 异常说明风格，不要求修改。
+- rejected-with-reason：`_build_request_headers` 的不可达 `ValueError` 是枚举扩展时的 fail-fast 防御分支，保留。
+- deferred-with-owner：production assembly 默认 `DISABLED`、静态 header 冲突 `ValueError` 是否需上层结构化收口，交由 Slice 3 / aggregate review 裁决。
+
+Slice 3 code review findings 裁决：
+
+- deferred-with-owner：usage observation payload 不含 `client_correlation_id`。当前 `UsageReportedData` Engine contract 不含该字段，且该 projection signal 的 `provider_request_id` 是 hardcoded `None`，不属于本 Slice provider-related EngineEvent payload 主链路；若 issue-70 analyzer 需要该信号，交由 WU-OBS-00 / analyzer gate 先扩展 contract。
+- rejected-with-reason：`CONTEXT_COMPACTION_REQUESTED` payload 通过 dict spread 附加 `client_correlation_id` 当前符合 plan，因为 context compaction builder / validator 负责 base payload，Host ingest 附加诊断字段不改变 base schema；未来若 builder 引入 strict whitelist，再由对应变更同步处理。
+- rejected-with-reason：`_close_worker_lifecycle` 合成 `RunFailedData` 未显式传 `client_correlation_id=None` 只有风格差异，运行时语义与默认值一致，不进入 fix。
+- rejected-with-reason：`_TerminalPlan` 无默认值而 `TerminalCloseoutInput` / `ContextRecoveryCloseInput` 有默认值是合理边界差异：内部 plan 强制调用方显式思考，run_transition 公共输入保持可选字段默认 `None`。
+- deferred-with-owner：`ContextRecoveryCloseInput.client_correlation_id` 是否需要专用 validation / payload 单测交由 Slice 4 final validation 核对；当前间接覆盖与对称校验足以通过 Slice 3。
+
+Plan review findings 裁决：
+
+- accepted：force-answer / continuation / fallback 等所有 logical Runner call 都必须递增 `runner_call_index`，并补计划测试要求。
+- accepted：`request_identity: RunnerRequestIdentity | None` 只允许 direct Runner / compactor 等非普通 Agent path 显式传 `None`；普通 Agent -> Runner call path 必须传 non-None identity，计划完成信号需改写。
+- accepted：`AsyncRunner.call` 只新增 keyword-only `request_identity`，保留 `messages/options/tools` 位置参数以最小化变更。
+- accepted：计划需避免 `_AsyncAgent` 重复散落 correlation 取值逻辑，优先模块级 helper 或 iteration state。
+- accepted：`EngineRunOutcomeFailed` 应明确归类为 `AgentRunResult` outcome，不是 EngineEvent data class。
+- accepted：`client_correlation_id` digest 长度需明确为完整 SHA-256 hex，即 `dayu-` + 64 hex。
+- accepted：`ClientCorrelationPolicy` docstring 需说明 enum 是 provider-protocol-specific outbound mapping policy，不是 provider 名称分支。
+- rejected-with-reason：`iteration_id` 与 `run_id` digest input 冗余不要求修改；冗余不影响正确性，且保留 `run_id` 作为本地根关联更贴合 issue-63 / issue-64。
 
 ### 设计与代码核对
 
@@ -677,7 +717,7 @@ GitHub Issue #35 当前为 OPEN。本条是 WU-OBS-00 / GitHub Issue #70 的前�
 
 ### 状态
 
-GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。本条依赖 WU-OBS-P01 / #29、WU-OBS-P02 / #30、WU-OBS-P03 / #31、WU-OBS-P04 / #35 先裁决或补齐 analyzer 所需的核心 trace signals，避免先做出一个只能覆盖 OLD / dayu-agent 受限子集的 analyzer。对 provider / model bug 报障场景，本条还应消费 WU-ENG-02 / #63 / #64 提供的 provider debugging correlation signals。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
+GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。本条依赖 WU-OBS-P01 / #29、WU-OBS-P02 / #30、WU-OBS-P03 / #31、WU-OBS-P04 / #35 先裁决或补齐 analyzer 所需的核心 trace signals，避免先做出一个只能覆盖 OLD / dayu-agent 受限子集的 analyzer。对 provider / model bug 报障场景，本条应消费 WU-ENG-02 / #63 已完成的 OpenAI-compatible provider debugging correlation signals；#64 的 native Anthropic / Claude Code gateway adapter-specific signals 若尚未实现，报告必须明确 limited signal。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
 
 ### 设计与代码核对
 
@@ -720,7 +760,7 @@ GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug too
 - 对当前 Tool Trace 文件或目录可以生成诊断报告。
 - 报告明确分组 Host / Engine / Tool 问题，并给出直接 trace 证据。
 - 至少覆盖重复调用、工具失败、SSE / protocol 异常、过大 payload、截断后未续读、trace 缺字段或冷热引用不一致。
-- provider / model bug 相关报告必须展示厂商可查的 provider-native request id，并回链本地 `run_id` / iteration / attempt / tool trace；若 #63 / #64 的 client correlation signal 尚不可用，报告必须明确说明 limited signal，而不是静默省略。
+- provider / model bug 相关报告必须展示厂商可查的 provider-native request id，并回链本地 `run_id` / iteration / attempt / tool trace；OpenAI-compatible path 应消费 #63 已完成的 client correlation signal；#64 native Anthropic / Claude Code gateway adapter-specific signal 尚不可用时，报告必须明确说明 limited signal，而不是静默省略。
 - #34 覆盖的 integrity checks 有测试 fixture：missing cold line、corrupt JSONL line、line digest mismatch、hot / cold source key mismatch、payload ref missing / digest mismatch 或等价当前形态的不一致。
 - #34 覆盖的 large payload diagnostics 有测试 fixture：large raw input、large tool result、large provider diagnostic payload、large prompt / messages 或等价 payload descriptor 超阈值。
 - 核心解析、聚合逻辑和代表性诊断规则有测试。

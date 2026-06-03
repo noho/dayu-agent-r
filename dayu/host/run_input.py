@@ -1677,6 +1677,8 @@ class RunInputBuilder:
         return AgentRunRequest(
             run_id=attempt_snapshot.run_id,
             session_id=attempt_snapshot.session_id,
+            attempt_id=attempt_snapshot.attempt_id,
+            execution_id=attempt_snapshot.execution_id,
             messages=messages,
             disable_tools=tool_snapshot.disable_tools,
             runner_spec=policy_snapshot.runner_spec,

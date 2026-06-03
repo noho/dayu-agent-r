@@ -13,6 +13,7 @@ from typing import Protocol, runtime_checkable
 
 from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_events import RunnerEvent
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import RunnerCallOptions
 from dayu.contracts.tool_schema import ToolSchema
 
@@ -26,12 +27,16 @@ class AsyncRunner(Protocol):
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """发起一次 LLM 调用并返回 :class:`RunnerEvent` 异步流。
 
         :param messages: Agent 消息序列。
         :param options: 单次调用参数。
         :param tools: 本次调用暴露给 LLM 的工具 schema 序列。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份；直接
+            Runner 调用或非普通 Agent attempt 路径可显式传入 ``None``。
         :returns: :class:`RunnerEvent` 异步迭代器。
 
         实现必须协作式观察由 Engine / Runner 调用边界注入的

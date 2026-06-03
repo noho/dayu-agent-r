@@ -84,6 +84,7 @@ _FIELD_POLICY_DECISION = "policy_decision"
 _FIELD_TRUNCATION = "truncation"
 _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
+_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
 _FIELD_ENGINE_EVENT_REF = "engine_event_ref"
 _FIELD_PROVIDER_ERROR_REF = "provider_error_ref"
 _FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
@@ -220,6 +221,7 @@ class _ToolTraceExtract:
     tool_call_id: str | None
     tool_name: str | None
     provider_request_id: str | None
+    client_correlation_id: str | None
     diagnostic_ref: str | None
     diagnostic_refs: tuple[str, ...]
     normalized_arguments_digest: str | None
@@ -449,6 +451,7 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
     payload = event.payload
     diagnostic_refs = _diagnostic_refs(payload)
     provider_request_id = _optional_text(payload, _FIELD_PROVIDER_REQUEST_ID)
+    client_correlation_id = _optional_text(payload, _FIELD_CLIENT_CORRELATION_ID)
     provider_error_ref = _optional_text(payload, _FIELD_PROVIDER_ERROR_REF)
     engine_event_ref = _optional_text(payload, _FIELD_ENGINE_EVENT_REF)
     tool_call_id = _optional_text(payload, _FIELD_TOOL_CALL_ID)
@@ -492,11 +495,13 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
             payload, _FIELD_TERMINAL_SUMMARY_DIGEST
         ),
         policy_decision=_json_value_or_none(payload, _FIELD_POLICY_DECISION),
+        client_correlation_id=client_correlation_id,
     )
     return _ToolTraceExtract(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
         provider_request_id=provider_request_id,
+        client_correlation_id=client_correlation_id,
         diagnostic_ref=refs[0] if len(refs) > 0 else None,
         diagnostic_refs=refs,
         normalized_arguments_digest=_optional_text(
@@ -520,6 +525,7 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
 
     payload = event.payload
     provider_request_id = _optional_text(payload, _FIELD_PROVIDER_REQUEST_ID)
+    client_correlation_id = _optional_text(payload, _FIELD_CLIENT_CORRELATION_ID)
     if (
         event.event_type == _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC
         and provider_request_id is None
@@ -534,6 +540,7 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
         tool_call_id=_optional_text(payload, _FIELD_TOOL_CALL_ID),
         tool_name=_optional_text(payload, _FIELD_TOOL_NAME),
         provider_request_id=provider_request_id,
+        client_correlation_id=client_correlation_id,
         diagnostic_ref=diagnostic_refs[0] if len(diagnostic_refs) > 0 else None,
         diagnostic_refs=diagnostic_refs,
         normalized_arguments_digest=None,
@@ -556,6 +563,7 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
             terminal_summary_ref=None,
             terminal_summary_digest=None,
             policy_decision=None,
+            client_correlation_id=client_correlation_id,
         ),
     )
 
@@ -570,6 +578,7 @@ def _extract_usage_trace(event: ProjectionEventView) -> _ToolTraceExtract | None
 
     payload = event.payload
     provider_request_id = _optional_text(payload, _FIELD_PROVIDER_REQUEST_ID)
+    client_correlation_id = _optional_text(payload, _FIELD_CLIENT_CORRELATION_ID)
     usage_digest = _optional_text(payload, "usage_observation_digest")
     estimator_digest = _optional_text(payload, "estimator_digest")
     diagnostic_refs = tuple(
@@ -581,6 +590,7 @@ def _extract_usage_trace(event: ProjectionEventView) -> _ToolTraceExtract | None
         tool_call_id=None,
         tool_name=None,
         provider_request_id=provider_request_id,
+        client_correlation_id=client_correlation_id,
         diagnostic_ref=diagnostic_refs[0] if len(diagnostic_refs) > 0 else None,
         diagnostic_refs=diagnostic_refs,
         normalized_arguments_digest=None,
@@ -603,6 +613,7 @@ def _extract_usage_trace(event: ProjectionEventView) -> _ToolTraceExtract | None
             terminal_summary_ref=None,
             terminal_summary_digest=None,
             policy_decision=None,
+            client_correlation_id=client_correlation_id,
         ),
     )
 
@@ -697,6 +708,7 @@ def _build_cold_line(
         _FIELD_TOOL_CALL_ID: extracted.tool_call_id,
         _FIELD_TOOL_NAME: extracted.tool_name,
         _FIELD_PROVIDER_REQUEST_ID: extracted.provider_request_id,
+        _FIELD_CLIENT_CORRELATION_ID: extracted.client_correlation_id,
         _FIELD_DIAGNOSTIC_REFS: list(extracted.diagnostic_refs),
         _FIELD_OPERATION_CONTEXT_REFS: list(operation_context_refs),
         _FIELD_OPERATION_CONTEXT_DIGEST: operation_context_digest,
@@ -734,6 +746,7 @@ def _trace_summary(
     terminal_summary_ref: str | None,
     terminal_summary_digest: str | None,
     policy_decision: JsonValue | None,
+    client_correlation_id: str | None,
 ) -> Mapping[str, JsonValue]:
     """构造 hot trace summary JSON object。
 
@@ -751,6 +764,7 @@ def _trace_summary(
     :param terminal_summary_ref: 可选 terminal summary ref。
     :param terminal_summary_digest: 可选 terminal summary digest。
     :param policy_decision: 可选 policy decision JSON。
+    :param client_correlation_id: 可选本地客户端关联 id。
     :returns: trace summary JSON object。
     :raises HostDurableError: operation context 字段类型非法时抛出。
     """
@@ -776,6 +790,7 @@ def _trace_summary(
         _FIELD_TRUNCATION: truncation,
         _FIELD_DIAGNOSTIC_REFS: list(diagnostic_refs),
         _FIELD_PROVIDER_ERROR_REF: provider_error_ref,
+        _FIELD_CLIENT_CORRELATION_ID: client_correlation_id,
         _FIELD_ENGINE_EVENT_REF: engine_event_ref,
         _FIELD_TERMINAL_SUMMARY_REF: terminal_summary_ref,
         _FIELD_TERMINAL_SUMMARY_DIGEST: terminal_summary_digest,

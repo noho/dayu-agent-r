@@ -24,7 +24,7 @@ from dayu.engine.contracts.agent_run import (
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
     CompactMaterialPack,
     CompactMaterialBlockKind,
@@ -922,6 +922,71 @@ async def test_llm_context_compactor_uses_runner_retry_policy_without_owning_sem
     assert calls[0].runner_spec.max_retries == 5
 
 
+@pytest.mark.asyncio
+async def test_llm_context_compactor_projects_reactive_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reactive compaction request 透传 Attempt / execution identity。"""
+
+    calls: list[AgentRunRequest] = []
+
+    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """记录 Engine request 并返回合法 proposal。
+
+        :param request: compactor 构造的 Engine request。
+        :returns: final answer outcome。
+        """
+
+        calls.append(request)
+        return _final(_proposal_json())
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    await compactor.compact(
+        _request(attempt_id="attempt-reactive", execution_id="execution-reactive"),
+        StubCancellationToken(),
+    )
+
+    assert len(calls) == 1
+    assert calls[0].attempt_id == "attempt-reactive"
+    assert calls[0].execution_id == "execution-reactive"
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_projects_proactive_identity_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """proactive compaction request 保持 Attempt / execution identity 为空。"""
+
+    calls: list[AgentRunRequest] = []
+
+    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """记录 Engine request 并返回合法 proposal。
+
+        :param request: compactor 构造的 Engine request。
+        :returns: final answer outcome。
+        """
+
+        calls.append(request)
+        return _final(_proposal_json())
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    await compactor.compact(_request(), StubCancellationToken())
+
+    assert len(calls) == 1
+    assert calls[0].attempt_id is None
+    assert calls[0].execution_id is None
+
+
 def _fake_run_factory(
     outcome: AgentRunResult,
 ) -> Callable[[AgentRunRequest], Awaitable[AgentRunResult]]:
@@ -941,23 +1006,37 @@ def _fake_run_factory(
 def _request(
     *,
     raw_tool_content: str = "Revenue grew 12% year over year.",
+    attempt_id: str | None = None,
+    execution_id: str | None = None,
 ) -> CompactionRequest:
     """构造 compaction request。
 
     :param raw_tool_content: accepted 工具结果 raw 内容。
+    :param attempt_id: reactive compaction 对应 Attempt id。
+    :param execution_id: reactive compaction 对应 execution id。
     :returns: CompactionRequest。
     """
 
+    trigger_source = (
+        ContextCompactionTriggerSource.REACTIVE
+        if attempt_id is not None
+        else ContextCompactionTriggerSource.PROACTIVE
+    )
+    segment_trigger = (
+        CompactSegmentTrigger.REACTIVE
+        if attempt_id is not None
+        else CompactSegmentTrigger.PROACTIVE
+    )
     return CompactionRequest(
-        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        trigger_source=trigger_source,
         session_id="session-1",
         run_id="run-1",
-        attempt_id=None,
-        execution_id=None,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
         memory_snapshot_cursor=7,
         material_pack=_material_pack(raw_tool_content),
         segment_selection=initial_segment_selection(
-            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            trigger_source=segment_trigger,
             input_cursor=2,
             material_pack=_material_pack(raw_tool_content),
         ),
@@ -1188,6 +1267,7 @@ def _runner_spec(max_retries: int = 0, default_timeout_seconds: float = 1.0) -> 
         endpoint="https://example.invalid",
         api_key_ref="secret:test",
         headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,

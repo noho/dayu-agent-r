@@ -106,6 +106,10 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
+from dayu.engine.contracts.runner_identity import (
+    RunnerRequestIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine._default_runner import build_default_runner
 from dayu.runtime.cancellation import (
     WaitCancelled,
@@ -365,8 +369,24 @@ def _project_tool_outcome_for_llm(
 
 @dataclass(slots=True)
 class _IterationState:
-    """单次 Runner 调用的消费状态。"""
+    """单次 Runner 调用的消费状态。
 
+    :param request_identity: 当前逻辑 Runner 调用的请求身份。
+    :param content_chunks: 已收到的正文增量片段。
+    :param reasoning_chunks: 已收到的推理链增量片段。
+    :param completed_content: content completed 事件中的完整正文。
+    :param completed_reasoning_content: content completed 事件中的完整推理链。
+    :param finish_reason: 当前已知完成原因。
+    :param failure_candidate: 当前 Runner 调用产生的失败候选。
+    :param provider_request_id: 当前 Runner 调用最终采用的 provider request id。
+    :param done_seen: 是否已看到 Runner done。
+    :param tool_call_signal_seen: 是否已看到工具调用信号。
+    :param tool_calls: 已完成聚合的工具调用。
+    :param tool_calls_content: 工具调用完成事件携带的正文。
+    :param tool_calls_reasoning_content: 工具调用完成事件携带的推理链。
+    """
+
+    request_identity: RunnerRequestIdentity
     content_chunks: list[str]
     reasoning_chunks: list[str]
     completed_content: str | None
@@ -393,13 +413,23 @@ class _FinalDecision:
 
 @dataclass(frozen=True, slots=True)
 class _ToolCallsDecision:
-    """进入工具执行阶段的决策。"""
+    """进入工具执行阶段的决策。
+
+    :param iteration_id: 当前迭代 id。
+    :param iteration_index: 当前迭代序号。
+    :param content: 需要注入下一轮上下文的 assistant 正文。
+    :param reasoning_content: 需要注入下一轮上下文的 assistant 推理链。
+    :param provider_request_id: 产出本批工具调用的 provider request id。
+    :param client_correlation_id: 产出本批工具调用的客户端关联 id。
+    :param tool_calls: 本轮待执行的工具调用。
+    """
 
     iteration_id: str
     iteration_index: int
     content: str | None
     reasoning_content: str | None
     provider_request_id: str | None
+    client_correlation_id: str | None
     tool_calls: tuple[ToolCallRequest, ...]
 
 
@@ -500,6 +530,22 @@ def _tool_call_count(tool_calls: tuple[ToolCallRequest, ...] | None) -> int:
     return len(tool_calls)
 
 
+def _client_correlation_id_from_state(
+    state: _IterationState | None,
+) -> str | None:
+    """从迭代状态中读取当前逻辑 Runner 调用的客户端关联 id。
+
+    :param state: 当前迭代状态；状态缺失时为 ``None``。
+    :returns: 状态存在时返回请求身份中的 ``client_correlation_id``，否则
+        返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if state is None:
+        return None
+    return state.request_identity.client_correlation_id
+
+
 @dataclass(frozen=True, slots=True)
 class _ToolBatchCompleted:
     """一批工具调用执行完成。"""
@@ -583,6 +629,7 @@ class _AsyncAgent:
         self._last_tool_batch_result: _ToolBatchResult | None = None
         self._executed_tool_call_ids: set[str] = set()
         self._consecutive_failed_tool_batches: int = 0
+        self._runner_call_index: int = 0
 
     async def run_messages(self) -> AsyncGenerator[EngineEvent, None]:
         """运行 Agent 并产出 EngineEvent 流。
@@ -974,6 +1021,7 @@ class _AsyncAgent:
                 error_code=_ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED,
                 message=_CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE,
                 provider_request_id=state.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
         return None
@@ -1021,7 +1069,12 @@ class _AsyncAgent:
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """
 
+        request_identity = self._next_runner_request_identity(
+            iteration_id=iteration_id,
+            iteration_index=iteration_index,
+        )
         self._last_iteration_state = _IterationState(
+            request_identity=request_identity,
             content_chunks=[],
             reasoning_chunks=[],
             completed_content=None,
@@ -1039,13 +1092,14 @@ class _AsyncAgent:
             VERBOSE_LOG_LEVEL,
             "engine.agent.runner_call_start session_id=%s run_id=%s "
             "iteration_id=%s iteration_index=%s message_count=%s "
-            "tool_count=%s",
+            "tool_count=%s runner_call_index=%s",
             self._request.session_id,
             self._request.run_id,
             iteration_id,
             iteration_index,
             len(messages),
             len(tools),
+            request_identity.runner_call_index,
         )
         yield self._make_event(
             event_type=EngineEventType.ITERATION_STARTED,
@@ -1066,6 +1120,7 @@ class _AsyncAgent:
                 messages,
                 self._request.runner_options,
                 tools,
+                request_identity=request_identity,
             ):
                 engine_event = self._consume_runner_event(
                     runner_event=runner_event,
@@ -1120,6 +1175,7 @@ class _AsyncAgent:
                 error_code=_ERROR_RUNNER_EXCEPTION,
                 message=_exception_diagnostic_message(exc),
                 provider_request_id=None,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
 
@@ -1223,6 +1279,7 @@ class _AsyncAgent:
                 error_code=data.error_code,
                 message=data.message,
                 provider_request_id=data.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
             return self._make_event(
@@ -1234,6 +1291,9 @@ class _AsyncAgent:
                     provider_request_id=data.provider_request_id,
                     raw_payload=data.raw_payload,
                     partial_tool_calls=data.partial_tool_calls,
+                    client_correlation_id=_client_correlation_id_from_state(
+                        state
+                    ),
                 ),
                 occurred_at=runner_event.occurred_at,
             )
@@ -1267,6 +1327,9 @@ class _AsyncAgent:
                     error_code=_ERROR_CONTEXT_COMPACTION_REQUIRED,
                     message=_CONTEXT_COMPACTION_REQUIRED_MESSAGE,
                     provider_request_id=data.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(
+                        state
+                    ),
                     recoverable=True,
                 )
                 return self._make_event(
@@ -1276,6 +1339,9 @@ class _AsyncAgent:
                         budget_state=None,
                         reason=_ERROR_CONTEXT_COMPACTION_REQUIRED,
                         provider_request_id=data.provider_request_id,
+                        client_correlation_id=_client_correlation_id_from_state(
+                            state
+                        ),
                     ),
                     occurred_at=runner_event.occurred_at,
                 )
@@ -1283,6 +1349,7 @@ class _AsyncAgent:
                 error_code=data.error_code.value,
                 message=data.message,
                 provider_request_id=data.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
             return None
@@ -1325,6 +1392,9 @@ class _AsyncAgent:
                     iteration_id=iteration_id,
                     finish_reason=finish_reason,
                     provider_request_id=data.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(
+                        state
+                    ),
                 ),
                 occurred_at=runner_event.occurred_at,
             )
@@ -1399,6 +1469,7 @@ class _AsyncAgent:
                 error_code=_ERROR_RUNNER_ABNORMAL_STOP,
                 message=_RUNNER_ABNORMAL_STOP_MESSAGE,
                 provider_request_id=None,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
 
@@ -1408,6 +1479,7 @@ class _AsyncAgent:
                 error_code=_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL,
                 message=_RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE,
                 provider_request_id=state.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
 
@@ -1417,6 +1489,9 @@ class _AsyncAgent:
                     error_code=_ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH,
                     message="runner completed tool calls with non-tool finish reason",
                     provider_request_id=state.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(
+                        state
+                    ),
                     recoverable=False,
                 )
             if not tool_calls_enabled:
@@ -1424,6 +1499,9 @@ class _AsyncAgent:
                     error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
                     message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
                     provider_request_id=state.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(
+                        state
+                    ),
                     recoverable=False,
                 )
             if len(state.tool_calls) == 0:
@@ -1431,6 +1509,9 @@ class _AsyncAgent:
                     error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
                     message="runner done with empty tool calls",
                     provider_request_id=state.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(
+                        state
+                    ),
                     recoverable=False,
                 )
             content = (
@@ -1453,6 +1534,7 @@ class _AsyncAgent:
                 content=content,
                 reasoning_content=reasoning,
                 provider_request_id=state.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 tool_calls=tuple(
                     sorted(
                         state.tool_calls,
@@ -1466,6 +1548,7 @@ class _AsyncAgent:
                 error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
                 message="runner requested tool calls without completed tool call data",
                 provider_request_id=state.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
 
@@ -1477,6 +1560,7 @@ class _AsyncAgent:
                 error_code=_ERROR_RUNNER_EMPTY_FINAL_CONTENT,
                 message=_RUNNER_EMPTY_FINAL_CONTENT_MESSAGE,
                 provider_request_id=state.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
         filtered = finish_reason is FinishReason.CONTENT_FILTER
@@ -1513,6 +1597,7 @@ class _AsyncAgent:
                     error_code=_ERROR_DUPLICATE_TOOL_CALL_ID,
                     message="duplicate tool_call_id in run",
                     provider_request_id=None,
+                    client_correlation_id=decision.client_correlation_id,
                     recoverable=False,
                 )
                 return
@@ -1587,11 +1672,15 @@ class _AsyncAgent:
             yield await self._make_cancelled_terminal_with_close()
             return
         if isinstance(batch_outcome, WaitTimedOut):
-            yield await self._make_tool_timeout_terminal_with_close()
+            yield await self._make_tool_timeout_terminal_with_close(
+                client_correlation_id=decision.client_correlation_id
+            )
             return
 
         bijection_failure = self._validate_batch_bijection(
-            calls=decision.tool_calls, outcome=batch_outcome.value
+            calls=decision.tool_calls,
+            outcome=batch_outcome.value,
+            client_correlation_id=decision.client_correlation_id,
         )
         if bijection_failure is not None:
             self._last_tool_batch_result = bijection_failure
@@ -1731,11 +1820,14 @@ class _AsyncAgent:
         *,
         calls: tuple[ToolCallRequest, ...],
         outcome: BatchToolExecutionOutcome,
+        client_correlation_id: str | None,
     ) -> RunFailedData | None:
         """校验批式 outcome 与输入 calls 的双射关系。
 
         :param calls: 输入工具调用元组。
         :param outcome: ToolExecutor 返回的批式 outcome。
+        :param client_correlation_id: 当前工具批次对应的逻辑 Runner 调用
+            客户端关联 id；无可用 Runner 调用时为 ``None``。
         :returns: 违反双射时返回 ``RUN_FAILED`` data，否则返回 ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -1747,6 +1839,7 @@ class _AsyncAgent:
                 error_code=_ERROR_TOOL_BATCH_OUTCOME_MISMATCH,
                 message=_TOOL_BATCH_OUTCOME_MISMATCH_MESSAGE,
                 provider_request_id=None,
+                client_correlation_id=client_correlation_id,
                 recoverable=False,
             )
         if set(record_ids) != input_ids:
@@ -1754,6 +1847,7 @@ class _AsyncAgent:
                 error_code=_ERROR_TOOL_BATCH_OUTCOME_MISMATCH,
                 message=_TOOL_BATCH_OUTCOME_MISMATCH_MESSAGE,
                 provider_request_id=None,
+                client_correlation_id=client_correlation_id,
                 recoverable=False,
             )
         return None
@@ -1983,6 +2077,9 @@ class _AsyncAgent:
                     error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
                     message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
                     provider_request_id=state.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(
+                        state
+                    ),
                     recoverable=False,
                 )
             )
@@ -1999,6 +2096,9 @@ class _AsyncAgent:
                         error_code=_ERROR_FORCE_ANSWER_EMPTY,
                         message=_FORCE_ANSWER_EMPTY_MESSAGE,
                         provider_request_id=None,
+                        client_correlation_id=_client_correlation_id_from_state(
+                            state
+                        ),
                         recoverable=False,
                     )
                 )
@@ -2041,9 +2141,13 @@ class _AsyncAgent:
             return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_failed(failure)
 
-    async def _make_tool_timeout_terminal_with_close(self) -> EngineEvent:
+    async def _make_tool_timeout_terminal_with_close(
+        self, *, client_correlation_id: str | None
+    ) -> EngineEvent:
         """关闭 Runner 后提交工具握手超时失败终态。
 
+        :param client_correlation_id: 产出当前工具批的逻辑 Runner 调用关联
+            id；无时为 ``None``。
         :returns: ``RUN_FAILED(tool_execution_timeout)`` terminal。
         :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
         """
@@ -2054,6 +2158,7 @@ class _AsyncAgent:
                 error_code=_ERROR_TOOL_EXECUTION_TIMEOUT,
                 message=_TOOL_EXECUTION_TIMEOUT_MESSAGE,
                 provider_request_id=None,
+                client_correlation_id=client_correlation_id,
                 recoverable=False,
             )
         )
@@ -2261,6 +2366,31 @@ class _AsyncAgent:
         return (
             f"{self._request.run_id}_iteration_"
             f"{iteration_index + _FIRST_ITERATION_ORDINAL}"
+        )
+
+    def _next_runner_request_identity(
+        self,
+        *,
+        iteration_id: str,
+        iteration_index: int,
+    ) -> RunnerRequestIdentity:
+        """构造下一次逻辑 Runner 调用的请求身份。
+
+        :param iteration_id: 当前 Engine iteration id。
+        :param iteration_index: 当前 Engine iteration 序号。
+        :returns: 带递增 ``runner_call_index`` 的请求身份。
+        :raises ValueError: 请求中的 run / attempt / execution 或 iteration
+            输入不满足请求身份契约时抛出。
+        """
+
+        self._runner_call_index += 1
+        return build_runner_request_identity(
+            run_id=self._request.run_id,
+            attempt_id=self._request.attempt_id,
+            execution_id=self._request.execution_id,
+            iteration_id=iteration_id,
+            iteration_index=iteration_index,
+            runner_call_index=self._runner_call_index,
         )
 
     def _batch_correlation_id(self, *, iteration_id: str) -> str:
@@ -2515,6 +2645,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             error_code=_ERROR_MISSING_TERMINAL,
             message=_MISSING_TERMINAL_MESSAGE,
             provider_request_id=None,
+            client_correlation_id=None,
             recoverable=False,
         )
 
@@ -2539,6 +2670,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             error_code=data.error_code,
             message=data.message,
             provider_request_id=data.provider_request_id,
+            client_correlation_id=data.client_correlation_id,
             recoverable=data.recoverable,
         )
     if terminal.type is EngineEventType.RUN_CANCELLED and isinstance(
@@ -2577,6 +2709,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
         error_code=_ERROR_MISSING_TERMINAL,
         message=_MISSING_TERMINAL_MESSAGE,
         provider_request_id=None,
+        client_correlation_id=None,
         recoverable=False,
     )
 

@@ -64,7 +64,8 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.contracts.tool_await import (
     ToolAwaitKind,
     ToolAwaitSnapshot,
@@ -189,6 +190,9 @@ class _ScriptedRunner:
     call_count: int = 0
     close_completed_at: datetime | None = None
     tools_seen: tuple[ToolSchema, ...] = ()
+    request_identities_seen: list[RunnerRequestIdentity | None] = field(
+        default_factory=list
+    )
     release_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def call(
@@ -196,18 +200,23 @@ class _ScriptedRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
 
         :param messages: Agent 消息。
         :param options: Runner 调用选项。
         :param tools: 暴露给模型的工具 schema。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises RuntimeError: 配置 ``raise_on_call`` 时抛出。
         """
 
+        del messages, options
         self.call_count += 1
         self.tools_seen = tuple(tools)
+        self.request_identities_seen.append(request_identity)
         return self._iter_events()
 
     def is_supports_tool_calling(self) -> bool:
@@ -284,16 +293,20 @@ class _PublicEntryDefaultRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回空 RunnerEvent 流。
 
         :param messages: Agent 消息。
         :param options: Runner 调用选项。
         :param tools: 暴露给模型的工具 schema。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: 空 RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
         """
 
+        del messages, options, tools, request_identity
         return self._iter_events()
 
     def is_supports_tool_calling(self) -> bool:
@@ -391,6 +404,7 @@ def _request(
             endpoint="https://example.test/v1/chat/completions",
             api_key_ref="TEST_KEY",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,
@@ -413,6 +427,8 @@ def _request(
         tool_schemas=tool_schemas,
         tool_executor=_NoopToolExecutor(),
         cancellation_token=actual_token,
+        attempt_id="attempt_phase2",
+        execution_id="execution_phase2",
     )
 
 
@@ -512,6 +528,27 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert {event.session_id for event in events} == {"session_phase2"}
     assert {event.run_id for event in events} == {"run_phase2"}
     assert runner.close_count == 1
+    assert len(runner.request_identities_seen) == 1
+    request_identity = runner.request_identities_seen[0]
+    assert request_identity is not None
+    assert request_identity.run_id == "run_phase2"
+    assert request_identity.attempt_id == "attempt_phase2"
+    assert request_identity.execution_id == "execution_phase2"
+    assert request_identity.iteration_id == "run_phase2_iteration_1"
+    assert request_identity.iteration_index == 0
+    assert request_identity.runner_call_index == 1
+    assert request_identity.client_correlation_id.startswith("dayu-")
+    iteration_completed = [
+        event
+        for event in events
+        if event.type is EngineEventType.ITERATION_COMPLETED
+    ]
+    assert len(iteration_completed) == 1
+    assert isinstance(iteration_completed[0].data, IterationCompletedData)
+    assert (
+        iteration_completed[0].data.client_correlation_id
+        == request_identity.client_correlation_id
+    )
     _assert_single_terminal_at_end(events)
 
 
@@ -1516,10 +1553,11 @@ async def test_run_agent_messages_builds_default_runner_and_closes_on_stream_clo
 async def test_run_agent_and_wait_preserves_provider_request_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``RUN_FAILED`` 携带 provider_request_id 时，必须透传到 ``EngineRunOutcomeFailed``。"""
+    """``RUN_FAILED`` 请求身份字段必须透传到 ``EngineRunOutcomeFailed``。"""
 
     request = _request()
     expected_provider_request_id = "req_provider_xyz"
+    expected_client_correlation_id = "dayu-test-client-correlation"
 
     async def fake_messages(
         request: AgentRunRequest,
@@ -1540,6 +1578,7 @@ async def test_run_agent_and_wait_preserves_provider_request_id(
                 error_code="provider_http_error",
                 message="provider failed",
                 provider_request_id=expected_provider_request_id,
+                client_correlation_id=expected_client_correlation_id,
                 recoverable=False,
             ),
             metadata=None,
@@ -1550,6 +1589,7 @@ async def test_run_agent_and_wait_preserves_provider_request_id(
 
     assert isinstance(result, EngineRunOutcomeFailed)
     assert result.provider_request_id == expected_provider_request_id
+    assert result.client_correlation_id == expected_client_correlation_id
     assert result.error_code == "provider_http_error"
 
 

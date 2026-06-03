@@ -15,7 +15,7 @@ from multiprocessing import Process
 from pathlib import Path
 
 from dayu.engine.contracts.agent_policy import AgentPolicy
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.admission import (
     CloseoutAttemptTerminalInput,
     HostAdmissionService,
@@ -529,6 +529,7 @@ def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
             endpoint="https://example.invalid",
             api_key_ref="secret:multiprocess",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,

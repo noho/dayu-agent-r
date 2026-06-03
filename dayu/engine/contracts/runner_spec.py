@@ -69,6 +69,26 @@ class GeminiThinkingLevel(StrEnum):
     HIGH = "high"
 
 
+class ClientCorrelationPolicy(StrEnum):
+    """客户端关联 id 的 provider 协议 outbound 映射策略。
+
+    本枚举的成员值表示 provider-protocol-specific outbound mapping
+    policies，用于声明 Runner 是否以及如何把本地
+    ``RunnerRequestIdentity.client_correlation_id`` 映射到请求协议字段。
+    它们不是 provider-name branches；Host / Agent 不得按 provider 字符串
+    分支治理行为。
+
+    成员：
+
+    - ``DISABLED``：不发送客户端关联 id。
+    - ``OPENAI_X_CLIENT_REQUEST_ID``：OpenAI-compatible 协议下发送
+      ``X-Client-Request-Id``。
+    """
+
+    DISABLED = "disabled"
+    OPENAI_X_CLIENT_REQUEST_ID = "openai_x_client_request_id"
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAIReasoningExtension:
     """OpenAI 推理强度扩展。
@@ -218,6 +238,13 @@ ProviderRequestExtension: TypeAlias = (
 )
 """provider 请求扩展封闭联合。"""
 
+OPENAI_CLIENT_REQUEST_ID_HEADER_NAME: str = "X-Client-Request-Id"
+"""OpenAI-compatible 客户端关联 id header 名称。"""
+
+_OPENAI_CLIENT_REQUEST_ID_HEADER_NAME_LOWER: str = (
+    OPENAI_CLIENT_REQUEST_ID_HEADER_NAME.lower()
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RunnerSpec:
@@ -233,6 +260,8 @@ class RunnerSpec:
     :param api_key_ref: API key 引用名（不直接落 key 明文）；``None`` 表示
         本地或免鉴权 provider 不需要 API key header。
     :param headers: 附加头映射。
+    :param client_correlation_policy: 客户端关联 id 的 provider 协议 outbound
+        映射策略。
     :param supports_tool_calling: 该 Runner 是否支持工具调用。
     :param supports_streaming: 该 Runner 是否支持流式输出。
     :param supports_stream_usage: 该 Runner 在流式协议下是否支持
@@ -256,6 +285,7 @@ class RunnerSpec:
     endpoint: str
     api_key_ref: str | None
     headers: Mapping[str, str]
+    client_correlation_policy: ClientCorrelationPolicy
     supports_tool_calling: bool
     supports_streaming: bool
     supports_stream_usage: bool
@@ -274,6 +304,8 @@ class RunnerSpec:
           必须同时启用。
         - 两者都必须为正数（> 0）。
         - 心跳不得大于 timeout。
+        - OpenAI-compatible 客户端关联策略启用时，静态 headers 不得包含
+          ``X-Client-Request-Id``。
 
         :raises ValueError: 当字段语义不一致时抛出。
         """
@@ -315,6 +347,30 @@ class RunnerSpec:
                 "stream_idle_timeout_seconds; got "
                 f"heartbeat={heartbeat!r}, timeout={timeout!r}"
             )
+        if (
+            self.client_correlation_policy
+            is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+            and _has_openai_client_request_id_header(self.headers)
+        ):
+            raise ValueError(
+                "RunnerSpec.headers must not include X-Client-Request-Id "
+                "when client_correlation_policy is "
+                "OPENAI_X_CLIENT_REQUEST_ID"
+            )
+
+
+def _has_openai_client_request_id_header(headers: Mapping[str, str]) -> bool:
+    """判断静态 headers 是否包含 OpenAI-compatible client request id。
+
+    :param headers: RunnerSpec 静态 header 映射。
+    :returns: 存在大小写不敏感匹配的 header 时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for name in headers:
+        if name.lower() == _OPENAI_CLIENT_REQUEST_ID_HEADER_NAME_LOWER:
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +393,7 @@ __all__ = [
     "OpenAIReasoningEffort",
     "DeepSeekReasoningEffort",
     "GeminiThinkingLevel",
+    "ClientCorrelationPolicy",
     "OpenAIReasoningExtension",
     "AnthropicThinkingExtension",
     "DeepSeekThinkingExtension",
@@ -344,6 +401,7 @@ __all__ = [
     "GeminiThinkingExtension",
     "QwenThinkingExtension",
     "ProviderRequestExtension",
+    "OPENAI_CLIENT_REQUEST_ID_HEADER_NAME",
     "RunnerSpec",
     "RunnerCallOptions",
 ]

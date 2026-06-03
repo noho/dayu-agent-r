@@ -8,12 +8,33 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TypedDict, Unpack
 
 from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
     ProviderRequestExtension,
     RunnerCallOptions,
     RunnerSpec,
 )
+
+
+class _RunnerSpecChanges(TypedDict, total=False):
+    """``replace_spec`` 支持的 RunnerSpec 字段覆写集合。"""
+
+    provider: str
+    model: str
+    endpoint: str
+    api_key_ref: str | None
+    headers: dict[str, str]
+    client_correlation_policy: ClientCorrelationPolicy
+    supports_tool_calling: bool
+    supports_streaming: bool
+    supports_stream_usage: bool
+    default_timeout_seconds: float
+    max_retries: int
+    provider_request: ProviderRequestExtension | None
+    stream_idle_timeout_seconds: float | None
+    stream_idle_heartbeat_seconds: float | None
 
 
 def make_spec(
@@ -23,6 +44,9 @@ def make_spec(
     endpoint: str = "https://example.test/v1/chat/completions",
     api_key_ref: str = "TEST_KEY",
     headers: dict[str, str] | None = None,
+    client_correlation_policy: ClientCorrelationPolicy = (
+        ClientCorrelationPolicy.DISABLED
+    ),
     supports_tool_calling: bool = True,
     supports_streaming: bool = True,
     supports_stream_usage: bool = False,
@@ -41,6 +65,7 @@ def make_spec(
         endpoint=endpoint,
         api_key_ref=api_key_ref,
         headers=headers_value,
+        client_correlation_policy=client_correlation_policy,
         supports_tool_calling=supports_tool_calling,
         supports_streaming=supports_streaming,
         supports_stream_usage=supports_stream_usage,
@@ -76,7 +101,7 @@ def make_options(
     )
 
 
-def replace_spec(spec: RunnerSpec, **changes: object) -> RunnerSpec:
+def replace_spec(spec: RunnerSpec, **changes: Unpack[_RunnerSpecChanges]) -> RunnerSpec:
     """``dataclasses.replace`` 的薄封装，便于逐字段覆写。
 
     :param spec: 原 spec。

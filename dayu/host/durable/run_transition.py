@@ -356,6 +356,7 @@ class TerminalCloseoutInput:
     :param error_code: 失败错误码；仅失败路径使用。
     :param message: 失败消息；仅失败路径使用。
     :param provider_request_id: provider request id；无时为 ``None``。
+    :param client_correlation_id: 本地客户端关联 id；无时为 ``None``。
     :param recoverable: 失败是否可恢复；仅失败路径使用。
     :param unsupported_later_owner: unsupported 路径后续 owner；无时为 ``None``。
     :param worker_lifecycle_signal: worker lifecycle signal；仅 lost 路径使用。
@@ -383,6 +384,7 @@ class TerminalCloseoutInput:
     error_code: str | None = None
     message: str | None = None
     provider_request_id: str | None = None
+    client_correlation_id: str | None = None
     recoverable: bool | None = None
     unsupported_later_owner: str | None = None
     worker_lifecycle_signal: str | None = None
@@ -406,6 +408,7 @@ class ContextRecoveryCloseInput:
     :param engine_event_ref: 触发 recovery 的 Engine event ref。
     :param provider_request_id: provider request id；无则为 ``None``。
     :param message: 诊断消息。
+    :param client_correlation_id: 本地客户端关联 id；无时为 ``None``。
     """
 
     run_id: str
@@ -419,6 +422,7 @@ class ContextRecoveryCloseInput:
     engine_event_ref: str
     provider_request_id: str | None
     message: str
+    client_correlation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3130,6 +3134,7 @@ def _context_recovery_attempt_failed_event_request(
             "error_code": request.reason,
             "message": request.message,
             "provider_request_id": request.provider_request_id,
+            "client_correlation_id": request.client_correlation_id,
             "recoverable": True,
             "unsupported_later_owner": None,
             "worker_kind": None
@@ -3183,6 +3188,7 @@ def _run_recovering_event_request(
             "attempt_failed_event_id": attempt_failed_event_id,
             "engine_event_ref": request.engine_event_ref,
             "provider_request_id": request.provider_request_id,
+            "client_correlation_id": request.client_correlation_id,
         },
         payload_ref=None,
         payload_digest=None,
@@ -4185,6 +4191,7 @@ def _attempt_terminal_payload(
         payload["error_code"] = request.error_code
         payload["message"] = request.message
         payload["provider_request_id"] = request.provider_request_id
+        payload["client_correlation_id"] = request.client_correlation_id
         payload["recoverable"] = request.recoverable
         if request.unsupported_later_owner is not None:
             payload["unsupported_later_owner"] = request.unsupported_later_owner
@@ -4237,6 +4244,7 @@ def _run_terminal_payload(
         payload["error_code"] = request.error_code
         payload["message"] = request.message
         payload["provider_request_id"] = request.provider_request_id
+        payload["client_correlation_id"] = request.client_correlation_id
         payload["recoverable"] = request.recoverable
         if request.unsupported_later_owner is not None:
             payload["unsupported_later_owner"] = request.unsupported_later_owner
@@ -5303,6 +5311,9 @@ def _validate_context_recovery_close_input(
     _require_optional_non_empty_text(
         request.provider_request_id, field_name="provider_request_id"
     )
+    _require_optional_non_empty_text(
+        request.client_correlation_id, field_name="client_correlation_id"
+    )
     _require_non_empty_text(request.message, field_name="message")
 
 
@@ -5656,6 +5667,9 @@ def _validate_terminal_input(request: TerminalCloseoutInput) -> None:
     _require_optional_non_empty_text(request.message, field_name="message")
     _require_optional_non_empty_text(
         request.provider_request_id, field_name="provider_request_id"
+    )
+    _require_optional_non_empty_text(
+        request.client_correlation_id, field_name="client_correlation_id"
     )
     _require_optional_non_empty_text(
         request.unsupported_later_owner, field_name="unsupported_later_owner"

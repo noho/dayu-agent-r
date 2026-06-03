@@ -14,7 +14,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.admission import (
     AdmissionClock,
     AdmissionIdFactory,
@@ -1424,6 +1424,7 @@ def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
             endpoint="https://example.invalid",
             api_key_ref="secret:admission-baseline",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,

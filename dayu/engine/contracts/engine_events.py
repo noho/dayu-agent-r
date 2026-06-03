@@ -262,12 +262,15 @@ class ContextCompactionRequestedData:
     :param reason: 压缩触发原因（中性字符串）。
     :param provider_request_id: 触发压缩请求的 provider response request
         id；非 provider response 触发时为 ``None``。
+    :param client_correlation_id: 触发压缩请求的逻辑 Runner 调用客户端关联
+        id；非 Runner 调用触发时为 ``None``。
     """
 
     iteration_id: str
     budget_state: ContextBudgetSnapshot | None
     reason: str
     provider_request_id: str | None
+    client_correlation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +302,8 @@ class ProviderProtocolErrorData:
         provider 原始报错载荷。
     :param partial_tool_calls: provider stream 失败前已解析但未完成的
         tool call 有界摘要；不包含 raw argument payload。
+    :param client_correlation_id: 触发协议错误的逻辑 Runner 调用客户端关联
+        id；非 Runner 调用触发时为 ``None``。
     """
 
     iteration_id: str
@@ -307,6 +312,7 @@ class ProviderProtocolErrorData:
     provider_request_id: str | None
     raw_payload: JsonValue | None
     partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+    client_correlation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,11 +323,13 @@ class IterationCompletedData:
     :param finish_reason: 完成原因。
     :param provider_request_id: 本轮 Runner 调用最终采用的 provider
         response request id；未收到 provider response 时为 ``None``。
+    :param client_correlation_id: 本轮逻辑 Runner 调用的客户端关联 id。
     """
 
     iteration_id: str
     finish_reason: FinishReason
     provider_request_id: str | None
+    client_correlation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +403,8 @@ class RunFailedData:
     :param provider_request_id: 若失败直接源自 provider response 或
         provider protocol，则为对应 request id；非 provider 失败为
         ``None``。
+    :param client_correlation_id: 若失败关联到一次逻辑 Runner 调用，则为
+        对应该调用的本地客户端关联 id；非 Runner 调用失败为 ``None``。
     :param recoverable: 是否可恢复。
     """
 
@@ -402,6 +412,7 @@ class RunFailedData:
     message: str
     provider_request_id: str | None
     recoverable: bool
+    client_correlation_id: str | None = None
 
 
 EngineEventData: TypeAlias = (

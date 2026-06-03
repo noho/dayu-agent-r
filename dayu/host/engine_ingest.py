@@ -331,6 +331,7 @@ class _TerminalPlan:
     error_code: str | None
     message: str | None
     provider_request_id: str | None
+    client_correlation_id: str | None
     recoverable: bool | None
     unsupported_later_owner: str | None
     worker_lifecycle_signal: str | None
@@ -846,6 +847,7 @@ class EngineEventIngestor:
                         "error_code": event.data.error_code,
                         "message": event.data.message,
                         "provider_request_id": event.data.provider_request_id,
+                        "client_correlation_id": event.data.client_correlation_id,
                         "recoverable": True,
                         "unsupported_later_owner": _OWNER_PHASE10,
                     },
@@ -1018,6 +1020,7 @@ class EngineEventIngestor:
                 error_code=plan.error_code,
                 message=plan.message,
                 provider_request_id=plan.provider_request_id,
+                client_correlation_id=plan.client_correlation_id,
                 recoverable=plan.recoverable,
                 unsupported_later_owner=plan.unsupported_later_owner,
                 worker_lifecycle_signal=plan.worker_lifecycle_signal,
@@ -1382,6 +1385,7 @@ class EngineEventIngestor:
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                 engine_event_ref=_engine_event_ref(candidate),
                 provider_request_id=data.provider_request_id,
+                client_correlation_id=data.client_correlation_id,
                 message=data.reason,
             ),
         )
@@ -1481,20 +1485,23 @@ class EngineEventIngestor:
                 idempotency_key=None,
                 policy_decision=None,
                 reason={"decision": decision.value, "engine_reason": data.reason},
-                payload_json=build_context_compaction_requested_payload(
-                    trigger_source=ContextCompactionTriggerSource.REACTIVE,
-                    budget_reason=data.reason,
-                    budget_snapshot_ref=estimate.estimator_digest,
-                    input_snapshot_cursor=context.run.input_event_sequence,
-                    estimator_digest=estimate.estimator_digest,
-                    policy_ref=policy_ref,
-                    provider_request_id=data.provider_request_id,
-                    provider_error_ref=_engine_event_ref(candidate),
-                    attempt_id=context.attempt.attempt_id,
-                    execution_id=context.attempt.execution_id,
-                    frozen_material_list_digest=frozen_material_list_digest,
-                    frozen_material_refs=frozen_material_refs,
-                ),
+                payload_json={
+                    **build_context_compaction_requested_payload(
+                        trigger_source=ContextCompactionTriggerSource.REACTIVE,
+                        budget_reason=data.reason,
+                        budget_snapshot_ref=estimate.estimator_digest,
+                        input_snapshot_cursor=context.run.input_event_sequence,
+                        estimator_digest=estimate.estimator_digest,
+                        policy_ref=policy_ref,
+                        provider_request_id=data.provider_request_id,
+                        provider_error_ref=_engine_event_ref(candidate),
+                        attempt_id=context.attempt.attempt_id,
+                        execution_id=context.attempt.execution_id,
+                        frozen_material_list_digest=frozen_material_list_digest,
+                        frozen_material_refs=frozen_material_refs,
+                    ),
+                    "client_correlation_id": data.client_correlation_id,
+                },
                 payload_ref=None,
                 payload_digest=None,
             ),
@@ -2410,6 +2417,7 @@ class EngineEventIngestor:
             "error_code": data.error_code,
             "message": data.message,
             "provider_request_id": data.provider_request_id,
+            "client_correlation_id": data.client_correlation_id,
             "raw_payload_ref": (
                 raw_descriptor.payload_ref if raw_descriptor is not None else None
             ),
@@ -3851,6 +3859,7 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
                 f"finish_reason={data.finish_reason.value}"
             ),
             provider_request_id=None,
+            client_correlation_id=None,
             recoverable=False,
             unsupported_later_owner=None,
         )
@@ -3872,6 +3881,7 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
         error_code=None,
         message=None,
         provider_request_id=None,
+        client_correlation_id=None,
         recoverable=None,
         unsupported_later_owner=None,
         worker_lifecycle_signal=None,
@@ -3902,6 +3912,7 @@ def _run_failed_plan(data: RunFailedData) -> _TerminalPlan:
             "error_code": data.error_code,
             "message": data.message,
             "provider_request_id": data.provider_request_id,
+            "client_correlation_id": data.client_correlation_id,
             "recoverable": data.recoverable,
         },
         finish_reason=None,
@@ -3910,6 +3921,7 @@ def _run_failed_plan(data: RunFailedData) -> _TerminalPlan:
         error_code=data.error_code,
         message=data.message,
         provider_request_id=data.provider_request_id,
+        client_correlation_id=data.client_correlation_id,
         recoverable=data.recoverable,
         unsupported_later_owner=unsupported_owner,
         worker_lifecycle_signal=None,
@@ -3931,6 +3943,7 @@ def _unsupported_recovery_plan(provider_request_id: str | None) -> _TerminalPlan
         error_code=_REASON_UNSUPPORTED_RECOVERY_POLICY,
         message="context compaction and recovery are unsupported in Phase 5",
         provider_request_id=provider_request_id,
+        client_correlation_id=None,
         recoverable=True,
         unsupported_later_owner=_OWNER_PHASE10,
     )
@@ -3947,6 +3960,7 @@ def _unsupported_waiting_plan() -> _TerminalPlan:
         error_code=_REASON_UNSUPPORTED_WAITING_PATH,
         message="waiting path is unsupported in Phase 5",
         provider_request_id=None,
+        client_correlation_id=None,
         recoverable=False,
         unsupported_later_owner=_OWNER_PHASE7,
     )
@@ -3967,6 +3981,7 @@ def _failed_lifecycle_plan(
         error_code=reason,
         message=reason,
         provider_request_id=None,
+        client_correlation_id=None,
         recoverable=False,
         unsupported_later_owner=None,
     )
@@ -4006,6 +4021,7 @@ def _lost_lifecycle_plan(
         error_code=None,
         message=None,
         provider_request_id=None,
+        client_correlation_id=None,
         recoverable=None,
         unsupported_later_owner=None,
         worker_lifecycle_signal=worker_lifecycle_signal,
@@ -4021,6 +4037,7 @@ def _failed_plan(
     error_code: str,
     message: str,
     provider_request_id: str | None,
+    client_correlation_id: str | None,
     recoverable: bool,
     unsupported_later_owner: str | None,
 ) -> _TerminalPlan:
@@ -4030,6 +4047,7 @@ def _failed_plan(
     :param error_code: error code。
     :param message: error message。
     :param provider_request_id: provider request id。
+    :param client_correlation_id: 本地客户端关联 id。
     :param recoverable: 是否可恢复。
     :param unsupported_later_owner: unsupported later owner。
     :returns: terminal plan。
@@ -4045,6 +4063,7 @@ def _failed_plan(
             "error_code": error_code,
             "message": message,
             "provider_request_id": provider_request_id,
+            "client_correlation_id": client_correlation_id,
             "recoverable": recoverable,
         },
         finish_reason=None,
@@ -4053,6 +4072,7 @@ def _failed_plan(
         error_code=error_code,
         message=message,
         provider_request_id=provider_request_id,
+        client_correlation_id=client_correlation_id,
         recoverable=recoverable,
         unsupported_later_owner=unsupported_later_owner,
         worker_lifecycle_signal=None,
@@ -4085,6 +4105,7 @@ def _replace_lifecycle_index(
         error_code=plan.error_code,
         message=plan.message,
         provider_request_id=plan.provider_request_id,
+        client_correlation_id=plan.client_correlation_id,
         recoverable=plan.recoverable,
         unsupported_later_owner=plan.unsupported_later_owner,
         worker_lifecycle_signal=None,
@@ -4196,6 +4217,7 @@ def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
         common["iteration_id"] = data.iteration_id
         common["finish_reason"] = data.finish_reason.value
         common["provider_request_id"] = data.provider_request_id
+        common["client_correlation_id"] = data.client_correlation_id
     return common
 
 
@@ -4234,6 +4256,7 @@ def _context_compaction_payload(
         "budget_state_present": data.budget_state is not None,
         "reason": data.reason,
         "provider_request_id": data.provider_request_id,
+        "client_correlation_id": data.client_correlation_id,
         "unsupported_later_owner": _OWNER_PHASE10,
     }
 

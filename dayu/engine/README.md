@@ -120,13 +120,22 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 `AsyncRunner` 当前定义三个方法：
 
-- `call(messages, options, tools)`：发起一次 LLM 调用，返回 `RunnerEvent` 异步流。
+- `call(messages, options, tools, *, request_identity)`：发起一次 LLM 调用，返回 `RunnerEvent` 异步流。
 - `is_supports_tool_calling()`：返回 Runner 是否支持工具调用。
 - `close()`：关闭 Runner 并释放底层连接。
 
-`RunnerSpec` 描述 Runner 规约，字段包括 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、默认 timeout、最大重试次数、provider 请求扩展和 SSE idle 配置。`api_key_ref=None` 表示本地或免鉴权 provider 不需要 API key header。默认 timeout 必须为正数，最大重试次数必须为非负整数。
+`request_identity` 是本次逻辑 Runner 调用的 `RunnerRequestIdentity | None`。普通 Agent run 会在每次 Runner 调用前构造非空 `RunnerRequestIdentity`；直接 Runner 调用、直接 Engine 调用或非普通 Attempt 路径可以显式传入 `None`。`RunnerRequestIdentity` 包含 `run_id`、可选且成对出现的 `attempt_id` / `execution_id`、`iteration_id`、`iteration_index`、`runner_call_index` 和 `client_correlation_id`。`client_correlation_id` 是 `dayu-` 加完整 64 位 lowercase SHA-256 hex 的稳定 ASCII id，用于本地诊断关联和 provider adapter 的显式 per-call 映射，不表达 Host 生命周期治理，也不是 provider end-user 字段。
+
+`RunnerSpec` 描述 Runner 规约，字段包括 provider、model、endpoint、api key 引用、headers、`client_correlation_policy`、tool calling / streaming 能力、默认 timeout、最大重试次数、provider 请求扩展和 SSE idle 配置。`api_key_ref=None` 表示本地或免鉴权 provider 不需要 API key header。默认 timeout 必须为正数，最大重试次数必须为非负整数。
 
 `RunnerCallOptions` 描述单次调用参数，字段包括 `temperature`、`max_tokens`、`top_p`、`stream`。
+
+`ClientCorrelationPolicy` 是客户端关联 id 的 provider 协议 outbound 映射策略。当前成员包括：
+
+- `DISABLED`：不发送客户端关联 id。
+- `OPENAI_X_CLIENT_REQUEST_ID`：OpenAI-compatible 协议下把 `RunnerRequestIdentity.client_correlation_id` 映射为 `X-Client-Request-Id`。
+
+OpenAI-compatible Runner 只有在 `RunnerSpec.client_correlation_policy == OPENAI_X_CLIENT_REQUEST_ID` 且 `request_identity` 非空时才发送 `X-Client-Request-Id`；policy 关闭或 identity 缺失时不发送。policy 开启时，静态 `RunnerSpec.headers` 不得包含大小写不敏感的 `X-Client-Request-Id`，否则 Runner fail fast，避免静态 header 伪装成 per-call identity。transport retry 复用同一次逻辑 Runner call 的 `client_correlation_id`；多次逻辑 Runner call 由 Agent 递增 `runner_call_index` 并派生不同 id。
 
 `RunnerSpec.provider_request` 是 `ProviderRequestExtension | None`，当前封闭联合成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。显式调用参数只进入 `RunnerCallOptions`，不放进 provider 扩展。
 
@@ -171,12 +180,14 @@ Engine 消费的消息类型来自 `AgentMessage` 封闭联合，当前包括：
 
 Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专属契约位于 `dayu.engine.contracts`；工具、JSON 值、取消 token 等共享契约位于 `dayu.contracts`。
 
-- `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、非空 `messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`。
+- `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、非空 `messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`、可选且成对出现的 `attempt_id` / `execution_id`。
 - `AgentPolicy`：Agent loop 策略。形状包含 iteration 预算、续写预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。
-- `RunnerSpec`：Runner 规约。形状包含 provider、model、endpoint、可为空的 api key 引用、headers、tool calling / streaming 能力、stream usage 能力、默认 timeout、重试次数、provider 请求扩展、SSE idle timeout 与 heartbeat。
+- `RunnerSpec`：Runner 规约。形状包含 provider、model、endpoint、可为空的 api key 引用、headers、`client_correlation_policy`、tool calling / streaming 能力、stream usage 能力、默认 timeout、重试次数、provider 请求扩展、SSE idle timeout 与 heartbeat。
 - `RunnerCallOptions`：单次 Runner 调用参数。形状包含 `temperature`、`max_tokens`、`top_p`、`stream`。
 - `ProviderRequestExtension`：provider 私有请求扩展的封闭联合。当前成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。
-- `AsyncRunner`：Engine 调用 LLM provider 的协议。形状包含 `call(messages, options, tools)`、`is_supports_tool_calling()`、`close()`。
+- `RunnerRequestIdentity`：单次逻辑 Runner 调用的请求身份。形状包含 `run_id`、可选且成对出现的 `attempt_id` / `execution_id`、`iteration_id`、`iteration_index`、`runner_call_index` 与派生的 `client_correlation_id`。
+- `ClientCorrelationPolicy`：客户端关联 id 的 provider 协议 outbound 映射策略。当前支持 `DISABLED` 与 `OPENAI_X_CLIENT_REQUEST_ID`。
+- `AsyncRunner`：Engine 调用 LLM provider 的协议。形状包含 `call(messages, options, tools, *, request_identity)`、`is_supports_tool_calling()`、`close()`。
 - `RunnerEvent`：Runner 到 Agent 的协议归一事件。形状包含 `type`、`data`、`occurred_at`；不包含 `session_id` 或 `run_id`。
 - `EngineEvent`：Engine 对调用方暴露的事件。形状包含 `occurred_at`、`session_id`、`run_id`、`type`、`data`、`metadata`。
 - `EngineEventData`：Engine 事件 data 封闭联合。每个 `EngineEventType` 对应一个明确 data dataclass。
@@ -191,6 +202,7 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 - `cancellation_token`：Engine 可观察的取消入口。形状是 `CancellationToken`，包含 `is_cancelled()`、`cancel_reason()`、`requested_at()`。
 - `RunnerHTTPErrorCode`：Runner HTTP / 网络 / 超时错误枚举。成员包括 `rate_limit_exceeded`、`server_error`、`client_error`、`network_error`、`timeout`、`context_length_exceeded`、`unknown_http_status`。
 - `provider_request_id`：provider response 关联标识。形状是 `str | None`，出现在 `RunnerHTTPErrorData`、`RunnerProtocolErrorData`、`RunnerDoneData`、`IterationCompletedData`、`ProviderProtocolErrorData`、`ContextCompactionRequestedData` 与 `RunFailedData`。
+- `client_correlation_id`：本地逻辑 Runner 调用关联标识。形状是 `str | None`，出现在 `RunnerRequestIdentity`，并随 `IterationCompletedData`、`ProviderProtocolErrorData`、`ContextCompactionRequestedData`、`RunFailedData` 和 `EngineRunOutcomeFailed` 透传到调用方。
 - `raw_payload`：Runner / Provider 诊断事件上的可选诊断 JSON。该字段是有界、脱敏、摘要化的诊断载荷，不保证保留 provider 原始 payload；核心错误事实仍通过 `message`、`error_code`、`provider_request_id` 等强类型字段表达。
 
 ## 架构
@@ -237,7 +249,8 @@ run_agent_messages(request)
       -> emit EngineEvent.iteration_started
       -> run ordinary iterations within agent_policy.max_iterations
       -> compute effective tools from disable_tools / AgentPolicy / Runner capability
-      -> AsyncRunner.call(messages, request.runner_options, effective_tools)
+      -> build RunnerRequestIdentity for this logical Runner call
+      -> AsyncRunner.call(messages, request.runner_options, effective_tools, request_identity=identity)
           -> RunnerEvent stream
               -> content_delta / reasoning_delta
               -> tool_call_delta

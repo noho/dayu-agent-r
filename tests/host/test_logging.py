@@ -13,7 +13,7 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEventType
 from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AuthorizationClaim,
     EnsureSessionRequest,
@@ -291,6 +291,7 @@ def _agent_run_request(snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
             endpoint="https://example.invalid",
             api_key_ref="api-key-ref",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,

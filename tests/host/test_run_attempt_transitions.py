@@ -45,12 +45,14 @@ from dayu.host.durable.run_transition import (
     CancelQueuedRunInput,
     CreateQueuedRunInput,
     CreateRunningRunInput,
+    ContextRecoveryCloseInput,
     PromoteQueuedRunInput,
     StartupOrphanCloseInput,
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
+    close_attempt_for_context_recovery_in_transaction,
     close_startup_orphan_attempt_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
@@ -405,6 +407,66 @@ def test_terminal_closeout_appends_concrete_terminal_events(
         assert _EVENT_TYPE_ATTEMPT_SUCCEEDED in event_types
         assert _EVENT_TYPE_RUN_SUCCEEDED in event_types
         assert "RUN_TERMINAL" not in event_types
+
+
+def test_failed_terminal_closeout_payload_includes_client_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """FAILED terminal payload 在 provider request 边界暴露 client correlation。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def closeout(transaction: HostTransaction) -> tuple[JsonValue, JsonValue]:
+            """执行 failed terminal closeout 并读取 payload。
+
+            :param transaction: Host transaction。
+            :returns: Attempt 与 Run terminal payload。
+            """
+
+            result = terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id="event-attempt-failed-provider",
+                    run_terminal_event_id="event-run-failed-provider",
+                    attempt_terminal_status=AttemptStatus.FAILED,
+                    run_terminal_status=RunStatus.FAILED,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="provider_error",
+                    terminal_summary_ref="summary-ref",
+                    terminal_summary_digest=(
+                        "sha256:"
+                        "0123456789abcdef0123456789abcdef"
+                        "0123456789abcdef0123456789abcdef"
+                    ),
+                    provider_request_id="req-terminal",
+                    client_correlation_id="client-terminal",
+                    error_code="provider_error",
+                    message="provider failed",
+                    recoverable=False,
+                ),
+            )
+            assert result.status == StateMutationStatus.UPDATED
+            attempt_payload = _event_payload(
+                transaction, event_id="event-attempt-failed-provider"
+            )
+            run_payload = _event_payload(
+                transaction, event_id="event-run-failed-provider"
+            )
+            return (
+                attempt_payload["client_correlation_id"],
+                run_payload["client_correlation_id"],
+            )
+
+        assert store.transaction_runner.run_write(closeout) == (
+            "client-terminal",
+            "client-terminal",
+        )
 
 
 def test_terminal_closeout_replay_absorbs_same_terminal_status_without_new_events(
@@ -1987,6 +2049,79 @@ def test_rollback_prevents_partial_event_and_state_persistence(
         assert store.transaction_runner.run_write(verify) == (0, 0)
 
 
+def test_context_recovery_close_payload_includes_client_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """context recovery closeout payload 保留本地客户端关联 id。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[dict[str, JsonValue], dict[str, JsonValue]]:
+            """执行 context recovery closeout 并读取 payload。
+
+            :param transaction: Host transaction。
+            :returns: ATTEMPT_FAILED 与 RUN_RECOVERING payload。
+            """
+
+            result = close_attempt_for_context_recovery_in_transaction(
+                transaction,
+                EventLogStore(),
+                _context_recovery_input(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    client_correlation_id="client-recovery",
+                ),
+            )
+            assert result.status == StateMutationStatus.UPDATED
+            return (
+                _event_payload(
+                    transaction,
+                    event_id="event-context-recovery-attempt-failed",
+                ),
+                _event_payload(
+                    transaction,
+                    event_id="event-context-recovery-run-recovering",
+                ),
+            )
+
+        attempt_payload, run_payload = store.transaction_runner.run_write(operation)
+        assert attempt_payload["client_correlation_id"] == "client-recovery"
+        assert run_payload["client_correlation_id"] == "client-recovery"
+
+
+def test_context_recovery_close_rejects_empty_client_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """context recovery closeout 拒绝空白客户端关联 id。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> None:
+            """执行非法 context recovery closeout。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostDurableError: client_correlation_id 空白时抛出。
+            """
+
+            close_attempt_for_context_recovery_in_transaction(
+                transaction,
+                EventLogStore(),
+                _context_recovery_input(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    client_correlation_id=" ",
+                ),
+            )
+
+        with pytest.raises(HostDurableError, match="client_correlation_id"):
+            store.transaction_runner.run_write(operation)
+
+
 def test_startup_orphan_closeout_marks_attempt_lost_then_run_recovering(
     tmp_path: Path,
 ) -> None:
@@ -2507,6 +2642,36 @@ def _cancel_active_input(
         reason="user_cancel",
         mode=CancelMode.GRACEFUL,
         call_context_digest=_CALL_CONTEXT_DIGEST,
+    )
+
+
+def _context_recovery_input(
+    *,
+    run_id: str,
+    attempt_id: str,
+    client_correlation_id: str | None,
+) -> ContextRecoveryCloseInput:
+    """构造 context recovery closeout 输入。
+
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param client_correlation_id: 本地客户端关联 id；无时为 ``None``。
+    :returns: ContextRecoveryCloseInput。
+    """
+
+    return ContextRecoveryCloseInput(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        attempt_failed_event_id="event-context-recovery-attempt-failed",
+        run_recovering_event_id="event-context-recovery-run-recovering",
+        occurred_at=_NOW,
+        actor="context_governance",
+        source="pytest",
+        reason="context_overflow",
+        engine_event_ref="engine-event-context-overflow",
+        provider_request_id="provider-recovery",
+        message="context compaction required",
+        client_correlation_id=client_correlation_id,
     )
 
 
