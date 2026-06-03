@@ -392,43 +392,40 @@ class InMemoryAttemptDuplicateGovernance:
 
         duplicate_key = duplicate_governance_key(request)
         async with self._state.condition:
-            accepted_entry = self._state.entries_by_key.get(duplicate_key)
-            if accepted_entry is not None:
-                return self._decision_for_accepted_entry(
-                    request=request,
-                    duplicate_key=duplicate_key,
-                    accepted_entry=accepted_entry,
-                )
-            in_flight = self._state.in_flight_by_key.get(duplicate_key)
-            if in_flight is None:
-                self._state.in_flight_by_key[duplicate_key] = _InFlightDuplicateRecord(
-                    duplicate_key=duplicate_key,
-                    state=_InFlightDuplicateState.OWNER_RUNNING,
-                )
-                return self._allow_decision(request, duplicate_key, prior_refs=())
-            while in_flight.state is _InFlightDuplicateState.OWNER_RUNNING:
-                await self._state.condition.wait()
-            if in_flight.state is _InFlightDuplicateState.ACCEPTED:
-                if in_flight.accepted_entry is None:
-                    raise RuntimeError("accepted duplicate in-flight entry is missing")
-                return self._decision_for_accepted_entry(
-                    request=request,
-                    duplicate_key=duplicate_key,
-                    accepted_entry=in_flight.accepted_entry,
-                )
-            if in_flight.durable_missing_reason is None:
-                raise RuntimeError("durable-missing duplicate reason is missing")
-            return DuplicateDecision(
-                kind=DuplicateDecisionKind.DURABLE_MISSING,
-                duplicate_key=duplicate_key,
-                prior_event_refs=(),
-                prior_outcome=None,
-                scope=request.scope,
-                reason_code="duplicate_prior_accept_missing",
-                message=self._policy.messages.prior_accept_missing,
-                diagnostic_message=self._policy.messages.prior_accept_missing,
-                durable_missing_reason=in_flight.durable_missing_reason,
-            )
+            while True:
+                accepted_entry = self._state.entries_by_key.get(duplicate_key)
+                if accepted_entry is not None:
+                    return self._decision_for_accepted_entry(
+                        request=request,
+                        duplicate_key=duplicate_key,
+                        accepted_entry=accepted_entry,
+                    )
+                in_flight = self._state.in_flight_by_key.get(duplicate_key)
+                if in_flight is None:
+                    self._state.in_flight_by_key[duplicate_key] = (
+                        _InFlightDuplicateRecord(
+                            duplicate_key=duplicate_key,
+                            state=_InFlightDuplicateState.OWNER_RUNNING,
+                        )
+                    )
+                    return self._allow_decision(request, duplicate_key, prior_refs=())
+                while in_flight.state is _InFlightDuplicateState.OWNER_RUNNING:
+                    await self._state.condition.wait()
+                if in_flight.state is _InFlightDuplicateState.ACCEPTED:
+                    if in_flight.accepted_entry is None:
+                        raise RuntimeError(
+                            "accepted duplicate in-flight entry is missing"
+                        )
+                    return self._decision_for_accepted_entry(
+                        request=request,
+                        duplicate_key=duplicate_key,
+                        accepted_entry=in_flight.accepted_entry,
+                    )
+                if in_flight.durable_missing_reason is None:
+                    raise RuntimeError("durable-missing duplicate reason is missing")
+                # durable-missing 只说明上一任 owner 没有可复用 fact；等待者需要
+                # 回到循环重新竞争 owner，而不是把旧失败永久传播给所有等待者。
+                continue
 
     async def record_accepted(
         self,

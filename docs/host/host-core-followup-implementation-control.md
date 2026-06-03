@@ -117,25 +117,31 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | WU-ENGINE-01 draft PR gate passed; RR-ENGINE-01-01 closed by PR follow-up |
-| active work unit | WU-ENGINE-01 |
-| default next work unit | WU-LAYER-01 |
-| accepted plan commit | 10b0eaa |
-| plan artifact | docs/host/wu-engine-01-runner-diagnostic-payload-audit-plan.md |
-| plan review artifacts | docs/reviews/wu-engine-01-plan-review-mimo-20260602.md; docs/reviews/wu-engine-01-plan-review-ds-20260602.md; docs/reviews/wu-engine-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-plan-rereview-ds-20260602.md |
-| accepted slice commits | Slice 1: dba6513; Slice 2: 3857e23; Slice 3: c7308f7 |
-| Slice 1 status | accepted; target tests 35 passed; pyright 0 errors |
-| Slice 2 status | accepted; target tests 67 passed; pyright 0 errors |
-| current slice | aggregate deepreview closeout |
-| implementation artifact | docs/reviews/wu-engine-01-slice3-validation-codex-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-codex-20260602.md |
-| code review artifacts | docs/reviews/wu-engine-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-engine-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-deepreview-ds-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-mimo-20260602.md; docs/reviews/wu-engine-01-aggregate-fix-rereview-ds-20260602.md |
-| accepted aggregate deepreview commit | cb190ee |
-| draft PR | https://github.com/noho/dayu-agent-r/pull/109 |
-| PR review artifacts | docs/reviews/wu-engine-01-draft-pr-review-handoff-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-mimo-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-ds-20260602.md; docs/reviews/wu-engine-01-draft-pr-review-controller-adjudication-20260602.md |
-| accepted PR review commit | ee29e2c |
-| PR follow-up artifacts | docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-codex-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-mimo-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-review-ds-20260602.md; docs/reviews/wu-engine-01-pr-followup-test-helper-cleanup-controller-adjudication-20260602.md |
-| validation | WU-ENGINE-01 target tests 97 passed; pyright 0 errors |
-| next entry point | WU-LAYER-01 discussion / code inspection |
+| implementation status | draft PR gate passed; PR review artifacts pushed |
+| active work unit | WU-LAYER-02 |
+| default next work unit | WU-LAYER-02 |
+| accepted plan commit | WU-LAYER-01: 278e5be; WU-LAYER-02: 76ecdb8 |
+| plan artifact | WU-LAYER-01: docs/host/wu-layer-01-durable-row-primitive-cleanup-plan.md; WU-LAYER-02: docs/host/wu-layer-02-shared-runtime-helper-consolidation-plan.md |
+| plan review artifacts | WU-LAYER-01: docs/reviews/wu-layer-01-plan-review-mimo-20260602.md; docs/reviews/wu-layer-01-plan-review-ds-20260602.md; docs/reviews/wu-layer-01-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-01-plan-rereview-ds-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-plan-review-mimo-20260602.md; docs/reviews/wu-layer-02-plan-review-ds-20260602.md; docs/reviews/wu-layer-02-plan-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-plan-rereview-mimo-20260602.md; docs/reviews/wu-layer-02-plan-rereview-ds-20260602.md |
+| accepted slice commits | WU-LAYER-01: Slice 1 02396e5; Slice 2 ff64f0b; Slice 3 b4fc923; Slice 4 2397e72; WU-LAYER-02: Slice 1 7d1a9de; Slice 2 b6c88cd; Slice 3 1a8d254 |
+| WU-LAYER-01 Slice 1 status | accepted; target tests 33 passed; pyright 0 errors |
+| WU-LAYER-01 Slice 2 status | accepted; target tests 115 passed; pyright 0 errors |
+| WU-LAYER-01 Slice 3 status | accepted; target tests 47 passed; pyright 0 errors |
+| WU-LAYER-01 Slice 4 status | accepted; aggregate tests 136 passed; pyright 0 errors |
+| WU-LAYER-02 Slice 1 status | accepted; target tests 47 passed; pyright 0 errors |
+| WU-LAYER-02 Slice 2 status | accepted; target tests 125 passed; pyright 0 errors |
+| WU-LAYER-02 Slice 3 status | accepted; target tests plus regression 168 passed; pyright 0 errors |
+| current slice | none |
+| aggregate deepreview artifacts | docs/reviews/wu-layer-01-aggregate-deepreview-mimo-20260602.md; docs/reviews/wu-layer-01-aggregate-deepreview-ds-20260602.md; docs/reviews/wu-layer-01-aggregate-deepreview-controller-adjudication-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-aggregate-review-mimo-20260602.md; docs/reviews/wu-layer-02-aggregate-review-ds-20260602.md; docs/reviews/wu-layer-02-aggregate-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-aggregate-fix-llm-compaction-report-20260602.md; docs/reviews/wu-layer-02-aggregate-fix-llm-compaction-rereview-mimo-20260602.md; docs/reviews/wu-layer-02-aggregate-fix-llm-compaction-rereview-ds-20260602.md |
+| implementation artifact | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-schema-definition-validation-codex-20260602.md; docs/reviews/wu-layer-01-slice2-terminal-shape-rules-codex-20260602.md; docs/reviews/wu-layer-01-slice3-row-decode-error-boundary-codex-20260602.md; docs/reviews/wu-layer-01-slice4-integration-verification-codex-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-implementation-report-20260602.md; docs/reviews/wu-layer-02-slice2-implementation-report-20260602.md; docs/reviews/wu-layer-02-slice2-blocker-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice3-implementation-report-20260602.md |
+| code review artifacts | WU-LAYER-01: docs/reviews/wu-layer-01-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice3-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-mimo-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-ds-20260602.md; docs/reviews/wu-layer-01-slice4-code-review-controller-adjudication-20260602.md; WU-LAYER-02: docs/reviews/wu-layer-02-slice1-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice1-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice2-code-review-controller-adjudication-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-mimo-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-ds-20260602.md; docs/reviews/wu-layer-02-slice3-code-review-controller-adjudication-20260602.md |
+| accepted aggregate deepreview commit | WU-LAYER-01: 351eb53; WU-LAYER-02: 4921d73 |
+| draft PR | https://github.com/noho/dayu-agent-r/pull/110 |
+| PR review artifacts | docs/reviews/pr-110-review-mimo-20260602.md; docs/reviews/pr-110-review-ds-20260602.md; docs/reviews/pr-110-review-controller-adjudication-20260602.md |
+| accepted PR review commit | c997c4c |
+| PR follow-up artifacts | GitHub checks: none reported by `gh pr checks 110 --repo noho/dayu-agent-r` |
+| validation | WU-LAYER-02 Slice 1: target tests 47 passed; pyright 0 errors; WU-LAYER-02 Slice 2: target tests plus import boundary 125 passed; pyright 0 errors; WU-LAYER-02 Slice 3: target tests plus regression 168 passed; pyright 0 errors; WU-LAYER-02 aggregate final: cross-slice tests 469 passed; pyright 0 errors |
+| next entry point | draft-PR-pass complete |
 | design source | docs/host/design.md |
 | blocking open questions | none |
 
@@ -178,15 +184,16 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| RR-STRESS-01 | WU-STRESS-01 aggregate deepreview | 测试边界 | deferred-with-owner | WU-STRESS residual risk / future hardening if needed | 当前 work unit 不扩展为 fuzz / soak；若未来需要更高规格覆盖，单独开 hardening work unit | 当前 stress suite 是可重复、确定性、有限预算 production hardening suite，验收信号未要求不可控 fuzz 或长时 soak。 |
-| RR-STRESS-02 | WU-STRESS-01 aggregate deepreview | 测试工具限制 | deferred-with-owner | pytest-timeout limitation accepted by WU-STRESS-01 | 保留 pytest-timeout 作为外层兜底；若 event loop 全局卡死，允许 timeout 先于内部 summary 终止 | 内部摘要覆盖可恢复失败；全局卡死时测试框架强杀是预期兜底，不改变 Host 语义。 |
-| RR-DUR-02 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | WAL checkpoint connection / db_path 一致性校验 | deferred-with-owner | future Host maintenance hardening | 若后续把 checkpoint primitive 接入 production maintenance caller，先增加 connection 与 db_path 一致性校验 | 当前 primitive 是内部 diagnostic-only/test entry，未接入 hot path 或 public API，现有调用方传入同一 store 的 connection/path pair。 |
-| RR-DUR-03 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | schema validation 批量缺失对象诊断 | deferred-with-owner | WU-LAYER-01 schema invariant hardening | 后续 schema invariant hardening 可把 fail-fast 单对象错误升级为批量缺失对象报告 | 当前 fail-closed 行为满足 WU-DUR 验收信号；批量诊断属于运维可读性增强。 |
-| RR-DUR-05 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | index definition / DDL text invariant validation | deferred-with-owner | WU-LAYER-01 schema invariant hardening | 后续如需抵御同名但定义错误的 index，再扩展 schema invariant validation | WU-DUR 当前只要求 required table/index existence fail-closed；full DDL text/index definition validation 已由 plan 明确 defer。 |
-| RR-LIFE-01 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | worker-started-but-not-accepted deterministic close window / close cancellation boundary | deferred-with-owner | future scheduler lifecycle hardening if needed | 若后续 close() refactor 改变 cleanup 顺序、增加非幂等步骤，或需要覆盖 worker-started-but-not-accepted precise window，再补 deterministic instrumentation/test | 当前 Slice B 已覆盖 lane-wait pre-worker 与 active-worker close 两侧稳定窗口，并证明 close cancellation retry 可在 lane close 边界补完 cleanup；精确 worker-started-but-not-accepted 窗口未稳定构造，按 plan deferred。 |
-| RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | deferred-with-owner | future EventLog terminal schema/type work unit | 未来新增或重命名 terminal EventLog type 时，同步检查 `tests/host/test_dispatch_scheduler.py` 的 scheduler close terminal fact assertion list，或改成 close 前后 EventLog set 不变断言 | 当前生产 close 不写任何 EventLog；现有测试已覆盖 cancel / failure / lost terminal fact 不由 scheduler close 写入。 |
-| RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | deferred-with-owner | WU-LAYER-02 shared helper consolidation | 后续 shared helper / Host internal constant cleanup 时，把 `not_applicable` 与其它 fallback action 常量收敛到同一 owner | aggregate deepreview 确认三处私有常量值一致且不影响 correctness；当前 work unit 不做无关重构。 |
-| RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | awaiting fanout 更宽并发治理 | deferred-with-owner | future WU-TOOL awaiting hardening if concrete evidence appears | 当前 Slice 1 只治理 duplicate in-flight owner/waiter；如后续 review 或生产路径核对发现 awaiting fanout 具体失败证据，再单独进入 hardening work unit | Slice 1 re-review 未发现 duplicate state 实现中存在该失败；该项不是 WU-TOOL-01 accepted plan 的当前验收边界。 |
+| RR-STRESS-01 | WU-STRESS-01 aggregate deepreview | 测试边界 | transferred-to-issue | GitHub Issue #38: Host SQLite multiprocess stress high-spec slow-disk Docker run | 当前总控 residual finding reject；高强度慢盘 / Docker stress 已由 Issue #38 独立跟踪 | 当前 stress suite 是可重复、确定性、有限预算 production hardening suite；更高规格慢盘 / Docker stress 已有独立 issue owner，不作为本文档 residual risk 继续追踪。 |
+| RR-STRESS-02 | WU-STRESS-01 aggregate deepreview | 测试工具限制 | closed | WU-STRESS-01 pytest-timeout behavior accepted | 当前总控 residual finding reject；pytest-timeout 强杀会导致 pytest 失败，不会被误判为测试通过 | 内部摘要覆盖可恢复失败；全局卡死时 pytest-timeout 作为外层兜底会让测试失败并阻断验证通过，因此不是当前 residual risk。 |
+| RR-DUR-02 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | WAL checkpoint connection / db_path 一致性校验 | closed | WU-DUR-01/WU-DUR-02 follow-up | 已在 checkpoint primitive 入口校验 connection 的 main database 与传入 db_path 同源，并补充错配拒绝测试 | 当前 primitive 仍是内部 diagnostic-only/test entry，未接入 hot path 或 public API；错配 connection/path pair 会 fail closed，不再返回误导性 WAL 诊断。 |
+| RR-DUR-03 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | schema validation 批量缺失对象诊断 | closed | WU-LAYER-01 schema invariant hardening follow-up | 已将 required table / index existence validation 收口为批量缺失对象诊断，并补充多个对象缺失时的 opener fail-closed 测试 | 当前 schema validation 仍不执行 DDL、不迁移、不修复；缺失 required objects 会一次性列出 table / index 缺口并结构化失败。 |
+| RR-DUR-05 | WU-DUR-01 + WU-DUR-02 aggregate deepreview | index definition / DDL text invariant validation | closed | WU-LAYER-01 schema invariant hardening | WU-LAYER-01 已实现 required table / index definition validation，并覆盖同名错误 index / table definition fail-closed 测试 | 当前 schema validation 从 `HOST_DURABLE_DDL` 同源生成 expected SQLite catalog SQL，只比较 required table / index；同名但定义错误的 table / index 会结构化失败且不 repair。 |
+| RR-LIFE-01 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | worker-started-but-not-accepted deterministic close window / close cancellation boundary | closed | WU-LIFE-01/WU-LIFE-02 follow-up | 已补 scheduler close residual active handle / registry cleanup 兜底，并新增 active task 尚未进入 event consume body 的确定性测试 | close 不再依赖 worker event consume task 的 `finally` 才能关闭 active handle；worker accepted 后、consumer task 尚未启动的本地资源窗口会被 scheduler close 自身收口，且不写 scheduler-close-created terminal fact。 |
+| RR-LIFE-02 | WU-LIFE-01 + WU-LIFE-02 aggregate deepreview | scheduler close terminal event type test list co-maintenance | closed | WU-LIFE-01/WU-LIFE-02 follow-up | 已移除 scheduler close 测试里的手写 terminal event type 清单，改为从当前 Attempt / Run terminal transition 映射生成终态事件集合，并断言 close 后未新增 terminal facts | 当前测试回到 WU-LIFE-02 边界：scheduler close 不得自行追加 cancel / failed / lost / succeeded terminal facts，但不禁止未来合理的 diagnostic / projection_signal EventLog。 |
+| RR-CTX-SLICED-01 | WU-CTX-02 + WU-CTX-03 Slice D code review | fallback action 私有常量重复 | closed | WU-CTX fallback constant follow-up | 已将 proactive / reactive caller 共享的 `not_applicable` fallback action 收口到 `dayu.host.context_fallback.FALLBACK_ACTION_NOT_APPLICABLE`，删除 dispatch / engine ingest 私有重复常量 | `context_events.py` 仍保留 payload schema validator 的 allowed-value 定义，避免让 schema helper 反向依赖 fallback helper；当前生产 caller 不再重复维护默认 fallback action。 |
+| RR-LAYER-02-01 | WU-LAYER-02 aggregate review / PR review | `llm_compaction._safe_outcome_text` 截断形状与 runtime truncate 语义不同 | closed | WU-LAYER-02 Host compactor diagnostic follow-up | 已将 `_safe_outcome_text` 收口到 `dayu.runtime.diagnostic_text.truncate_diagnostic_text`，并更新测试为总长不超过 `max_chars` 的 runtime 语义 | 这是显式接受的小型可见行为变更：compactor outcome 摘要超限时从“前 240 字符 + `...`”改为“总长 240，含 `...`”；不改变脱敏、状态机、EventLog 或 compaction decision。 |
+| RR-TOOL-01 | WU-TOOL-01 Slice 1 code review | duplicate durable-missing waiter handoff / awaiting fanout 更宽并发治理 | transferred-to-issue | GitHub Issue #111: Host ToolRuntime awaiting fanout governance hardening | durable-missing 后 waiter 接棒执行已在当前 PR 修复；awaiting fanout 不直接实现，后续 issue 中设计 single wait owner / follower / resume shared fact / cancel 与 late result 收口规则 | 当前 duplicate in-flight owner/waiter 已覆盖 completed accepted result 复用，且 owner 未产生可复用 accepted fact 时，等待者会重新竞争 owner：只允许一个 waiter 真实执行并产生新 accepted fact，其它 waiter 继续等待后复用；awaiting owner 返回 `ToolAwaitingOutcome` 时，不能简单让 waiter 原样返回同一 awaiting outcome，否则会撞到 Host 当前单 wait owner / single awaiting record ingest 约束。AgentMiMo / AgentDS review 与 final re-review PASS，artifacts: `docs/reviews/rr-tool-01-durable-missing-handoff-review-mimo-20260602.md`, `docs/reviews/rr-tool-01-durable-missing-handoff-review-ds-20260602.md`, `docs/reviews/rr-tool-01-durable-missing-handoff-final-rereview-mimo-20260602.md`, `docs/reviews/rr-tool-01-durable-missing-handoff-final-rereview-ds-20260602.md`。 |
 | RR-ENGINE-01-01 | WU-ENGINE-01 aggregate deepreview / PR follow-up | 测试 helper 维护性 | closed | WU-ENGINE-01 PR follow-up | 已提取 `tests/engine/runners/openai/_diagnostic_helpers.py`，三个测试文件统一导入 `leaf_strings` / `serialized_size` | Controller verification: affected tests 48 passed; WU-ENGINE-01 target tests 97 passed; target pyright 0 errors; full pyright 0 errors。MiMo/DS follow-up review PASS。 |
 
 ## 当前 Work Units
@@ -204,8 +211,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-TOOL-01 | Duplicate governance scope | duplicate governance 从 run-scope 改为 attempt-scope | 已完成：draft-PR-pass |
 | WU-TOOL-02 | Accept candidate cleanup | ToolRuntime accept candidate 结构拆分 | draft-PR-pass |
 | WU-ENGINE-01 | Runner diagnostic payload audit | provider state 降级为 diagnostic payload audit | draft-PR-pass |
-| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 未开始 |
-| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 未开始 |
+| WU-LAYER-01 | Durable row primitive cleanup | 显式 SQL / typed row / schema invariant 收口 | 本轮已完成：local-pass |
+| WU-LAYER-02 | Shared helper consolidation | 层中立 validation / redaction / JSON helper 小清理 | 本轮已完成：local-pass |
 | WU-RUNTIME-01 | Runtime file lock wrapper contraction | 收缩 `RuntimeFileLock`，只保留必要异常边界 / parent directory / audit 文件互斥职责 | 已完成 |
 | WU-RUNTIME-02 | Runtime lane clock and cancellation simplification | 保留多进程 named semaphore 抽象，修正跨进程 TTL 时间真源和无限等待控制流 | 已完成 |
 

@@ -42,10 +42,12 @@ from dayu.host import (
 from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import create_host_command_handle
 from dayu.host._execution_config_projection import (
+    effective_execution_snapshot_from_json,
     required_json_mapping as _required_json_mapping,
 )
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventLogRow, EventLogStore
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -232,6 +234,66 @@ async def test_field_level_partial_merge_uses_baseline_for_omitted_fields(
     assert request.agent_policy.max_iterations == 2
     assert request.messages[0].role == AgentMessageRole.SYSTEM
     assert request.messages[0].content == "system slice3"
+
+
+def test_effective_execution_snapshot_rejects_corrupted_json_with_durable_error() -> None:
+    """损坏的 durable execution config JSON 统一抛 HostDurableError。"""
+
+    with pytest.raises(HostDurableError, match="runner_spec"):
+        effective_execution_snapshot_from_json(
+            {
+                "policy_snapshot_ref": "policy:snapshot",
+                "config": {
+                    "runner_spec": "corrupted",
+                    "runner_options": {"stream": False},
+                    "agent_policy": {},
+                },
+            }
+        )
+
+
+def test_effective_execution_snapshot_rejects_unknown_provider_request_with_durable_error() -> None:
+    """冻结 execution config 中的未知 provider request kind 按 durable 损坏处理。"""
+
+    with pytest.raises(HostDurableError, match="provider_request"):
+        effective_execution_snapshot_from_json(
+            {
+                "policy_snapshot_ref": "policy:snapshot",
+                "config": {
+                    "runner_spec": {
+                        "provider": "openai",
+                        "model": "model",
+                        "endpoint": "http://localhost",
+                        "api_key_ref": None,
+                        "headers": {},
+                        "supports_tool_calling": False,
+                        "supports_streaming": False,
+                        "supports_stream_usage": False,
+                        "default_timeout_seconds": 1.0,
+                        "max_retries": 0,
+                        "provider_request": {"kind": "unknown-extension"},
+                        "stream_idle_timeout_seconds": None,
+                        "stream_idle_heartbeat_seconds": None,
+                    },
+                    "runner_options": {
+                        "temperature": None,
+                        "max_tokens": None,
+                        "top_p": None,
+                        "stream": False,
+                    },
+                    "agent_policy": {
+                        "max_iterations": 1,
+                        "continuation_max_attempts": 0,
+                        "allow_tool_calls": False,
+                        "tool_execution_timeout_seconds": 1.0,
+                        "fallback_mode": "raise_error",
+                        "fallback_prompt": "fallback",
+                        "continuation_prompt": "continue",
+                        "max_consecutive_failed_tool_batches": 1,
+                    },
+                },
+            }
+        )
 
 
 @pytest.mark.asyncio

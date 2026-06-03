@@ -1979,14 +1979,22 @@ def terminal_closeout_in_transaction(
     _validate_terminal_input(request)
     run = read_run_by_id(transaction, request.run_id)
     attempt = read_attempt_by_id(transaction, request.attempt_id)
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, request.attempt_id
+    )
+    replay_result = _terminal_closeout_replay_result(
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+        request=request,
+    )
+    if replay_result is not None:
+        return replay_result
     invalid = _invalid_terminal_precondition(run, attempt, request.attempt_id)
     if invalid is not None:
         return invalid
     if run is None or attempt is None:
         raise HostDurableError("terminal precondition narrowing failed")
-    dispatch_record = read_dispatch_record_by_attempt_id(
-        transaction, request.attempt_id
-    )
 
     attempt_event = event_log_store.append_event(
         transaction,
@@ -4682,6 +4690,40 @@ def _invalid_terminal_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=None,
+        )
+    return None
+
+
+def _terminal_closeout_replay_result(
+    *,
+    run: RunRow | None,
+    attempt: AttemptRow | None,
+    dispatch_record: DispatchRecordRow | None,
+    request: TerminalCloseoutInput,
+) -> RunTransitionResult | None:
+    """识别同种 terminal closeout replay 并在写事件前幂等吸收。
+
+    :param run: 最新 Run row。
+    :param attempt: 最新 Attempt row。
+    :param dispatch_record: 最新 dispatch record row；缺失时为 ``None``。
+    :param request: terminal closeout 输入。
+    :returns: 同种终态 replay 时返回 ``UPDATED`` transition，否则返回
+        ``None``。
+    """
+
+    if run is None or attempt is None:
+        return None
+    if (
+        run.current_attempt_id == request.attempt_id
+        and attempt.run_id == run.run_id
+        and run.status is request.run_terminal_status
+        and attempt.status is request.attempt_terminal_status
+    ):
+        return RunTransitionResult(
+            status=StateMutationStatus.UPDATED,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
         )
     return None
 

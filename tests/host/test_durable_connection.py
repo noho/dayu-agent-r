@@ -178,6 +178,29 @@ def test_wal_checkpoint_passive_result_fields_are_observable(
             connection.close()
 
 
+def test_wal_checkpoint_rejects_mismatched_connection_and_db_path(
+    tmp_path: Path,
+) -> None:
+    """WAL checkpoint 必须拒绝 connection 与 db_path 不同源的调用。"""
+
+    first_options = _options(tmp_path / "first")
+    second_options = _options(tmp_path / "second")
+    with open_host_durable_store(first_options) as first_store:
+        with open_host_durable_store(second_options):
+            connection = first_store.connect()
+            try:
+                with pytest.raises(
+                    HostDurableError,
+                    match="Host durable WAL checkpoint connection does not match db_path",
+                ):
+                    run_host_wal_checkpoint(
+                        connection,
+                        db_path=second_options.db_path,
+                    )
+            finally:
+                connection.close()
+
+
 def test_wal_checkpoint_closed_connection_failure_is_structured(
     tmp_path: Path,
 ) -> None:
@@ -190,7 +213,7 @@ def test_wal_checkpoint_closed_connection_failure_is_structured(
 
         with pytest.raises(
             HostDurableError,
-            match="Host durable WAL checkpoint failed",
+            match="Host durable WAL checkpoint failed to inspect connection database",
         ):
             run_host_wal_checkpoint(connection, db_path=options.db_path)
 

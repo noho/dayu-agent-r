@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import assert_never, cast
 
 import pytest
@@ -100,7 +100,7 @@ def _make_awaiting() -> ToolAwaitingOutcome:
         ),
         snapshot=ToolAwaitSnapshot(
             snapshot_id="s",
-            captured_at=datetime(2026, 1, 1),
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
         ),
     )
 
@@ -144,7 +144,7 @@ def test_tool_await_snapshot_rejects_empty_snapshot_id() -> None:
         with pytest.raises(ValueError, match="snapshot_id"):
             ToolAwaitSnapshot(
                 snapshot_id=snapshot_id,
-                captured_at=datetime(2026, 1, 1),
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
             )
 
 

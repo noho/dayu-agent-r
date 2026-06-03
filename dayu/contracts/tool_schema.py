@@ -55,10 +55,16 @@ class ToolParametersSchema:
         """校验工具参数 schema 的最小结构一致性。
 
         :returns: ``None``。
-        :raises ValueError: ``required`` 中字段不属于 ``properties`` 时抛出。
+        :raises ValueError: ``properties`` 字段名为空白，或 ``required``
+            中字段不属于 ``properties`` 时抛出。
         """
 
         property_names = set(self.properties.keys())
+        for property_name in property_names:
+            if property_name.strip() == "":
+                raise ValueError(
+                    "ToolParametersSchema.properties keys must be non-empty"
+                )
         for field_name in self.required:
             if field_name not in property_names:
                 raise ValueError(
@@ -186,7 +192,7 @@ class ToolTruncateSpec:
             return
         if self.strategy is None:
             raise ValueError("enabled ToolTruncateSpec requires strategy")
-        expected_limit_key = _TRUNCATE_LIMIT_KEYS_BY_STRATEGY[self.strategy]
+        expected_limit_key = truncate_limit_key_for_strategy(self.strategy)
         if not set(self.limits.keys()).issubset({expected_limit_key}):
             raise ValueError(
                 "enabled ToolTruncateSpec limits must match truncation strategy"
@@ -206,11 +212,15 @@ def truncate_limit_key_for_strategy(strategy: ToolTruncationStrategy) -> str:
     :param strategy: 截断策略。
     :returns: 该策略在 ``ToolTruncateSpec.limits`` 中使用的 limit key。
     :raises TypeError: ``strategy`` 不是 ``ToolTruncationStrategy`` 时抛出。
+    :raises ValueError: 枚举成员缺少 limit key 映射时抛出。
     """
 
     if not isinstance(strategy, ToolTruncationStrategy):
         raise TypeError("strategy must be ToolTruncationStrategy")
-    return _TRUNCATE_LIMIT_KEYS_BY_STRATEGY[strategy]
+    limit_key = _TRUNCATE_LIMIT_KEYS_BY_STRATEGY.get(strategy)
+    if limit_key is None:
+        raise ValueError("unknown ToolTruncationStrategy limit key mapping")
+    return limit_key
 
 
 __all__ = [

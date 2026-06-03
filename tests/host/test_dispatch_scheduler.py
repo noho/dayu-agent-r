@@ -87,6 +87,11 @@ from dayu.host.dispatch import (
     _safe_close_worker_handle,
     _safe_release_lane_token,
 )
+from dayu.host.engine_ingest import (
+    EngineIngestResult,
+    EngineEventIngestor,
+    LocalEngineEnvelope,
+)
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     MemoryRepairReason,
@@ -118,6 +123,8 @@ from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
     CreateAcceptedRunInput,
     CreateRunningRunInput,
+    _attempt_terminal_event_type,
+    _run_terminal_event_type,
     cancel_predispatch_starting_in_transaction,
     create_accepted_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
@@ -168,14 +175,18 @@ _SOFT_HARD_THRESHOLD_TOKENS = 80
 _SOFT_SAFETY_MARGIN_RATIO = 0.5
 _REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS = 2.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
-_SCHEDULER_CLOSE_TERMINAL_EVENT_TYPES = (
-    "CANCEL_REQUESTED",
-    "ATTEMPT_CANCELLED",
-    "RUN_CANCELLED",
-    "ATTEMPT_FAILED",
-    "RUN_FAILED",
-    "ATTEMPT_LOST",
-    "RUN_LOST",
+_EVENT_LOG_TEST_READ_LIMIT = 200
+_ATTEMPT_TERMINAL_STATUSES = (
+    AttemptStatus.SUCCEEDED,
+    AttemptStatus.FAILED,
+    AttemptStatus.CANCELLED,
+    AttemptStatus.LOST,
+)
+_RUN_TERMINAL_STATUSES = (
+    RunStatus.SUCCEEDED,
+    RunStatus.FAILED,
+    RunStatus.CANCELLED,
+    RunStatus.LOST,
 )
 _T = TypeVar("_T")
 
@@ -231,6 +242,14 @@ _SCHEDULER_CLOSE_LIFECYCLE_MATRIX = (
         expected_close_action="cancel drain path or receive lane close cancellation",
         expected_durable_mutation="no worker_startup_timeout terminal fact",
         expected_resource_cleanup="drain task done and lane controller closed",
+        coverage_classification="new",
+    ),
+    _SchedulerCloseLifecycleCase(
+        scenario_id="worker-accepted-before-consumer-start-close",
+        window="worker accepted and active task registered before event consume body starts",
+        expected_close_action="cancel active token and close residual active handle",
+        expected_durable_mutation="no scheduler-close-created terminal canonical fact",
+        expected_resource_cleanup="handle close once, registry clear, active task done",
         coverage_classification="new",
     ),
     _SchedulerCloseLifecycleCase(
@@ -749,6 +768,17 @@ class _CloseOnceBlockedLaneClose:
             self.started.set()
             await self.release.wait()
         await self._original_close(reason)
+
+
+async def _unstarted_active_consumer_probe(started: asyncio.Event) -> None:
+    """模拟尚未进入 worker event consume body 的 active task。
+
+    :param started: 若 task body 被调度执行则置位的事件。
+    :returns: ``None``。
+    """
+
+    started.set()
+    await asyncio.sleep(1)
 
 
 class _FlakyLocalWorkerIdHandle(_FakeHandle):
@@ -1554,6 +1584,42 @@ class _RetryExhaustedDrainLoopScheduler(HostDispatchScheduler):
         raise HostTransactionRetryExhaustedError("drain retry exhausted", attempts=3)
 
 
+class _CloseWorkerLostFailingIngestor:
+    """测试用 close_worker_lost 失败 ingestor。"""
+
+    def close_worker_lost(
+        self,
+        envelope: LocalEngineEnvelope,
+        *,
+        observed_at: datetime,
+        worker_lifecycle_signal: str,
+        stream_error_code: str,
+        last_observed_worker_event_index: int,
+        last_accepted_event_id: str | None,
+    ) -> EngineIngestResult:
+        """模拟 lost closeout 写入失败。
+
+        :param envelope: worker envelope。
+        :param observed_at: Host 观察时间。
+        :param worker_lifecycle_signal: worker lifecycle signal。
+        :param stream_error_code: 原始异常类型名。
+        :param last_observed_worker_event_index: 最后观测到的 worker event index。
+        :param last_accepted_event_id: 最后已接受 EventLog id。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出 closeout 失败。
+        """
+
+        del (
+            envelope,
+            observed_at,
+            worker_lifecycle_signal,
+            stream_error_code,
+            last_observed_worker_event_index,
+            last_accepted_event_id,
+        )
+        raise RuntimeError("close worker lost failed")
+
+
 class _FailingCloseWorkerHandle:
     """关闭时抛错的 worker handle fake。"""
 
@@ -1631,6 +1697,7 @@ def test_scheduler_close_lifecycle_matrix_covers_slice_b_windows() -> None:
         "dispatch-queue-non-empty-close",
         "promotion-queue-non-empty-close",
         "lane-wait-pre-worker-close",
+        "worker-accepted-before-consumer-start-close",
         "close-cancelled-mid-cleanup-retry",
     }
     actual_ids = {item.scenario_id for item in _SCHEDULER_CLOSE_LIFECYCLE_MATRIX}
@@ -1729,7 +1796,12 @@ async def test_dispatch_lag_repair_rebuild_retry_does_not_fail_run(
     builder = _LagRepairRunInputBuilder()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
 
         def _noop_catch_up(record: PendingDispatchRecord) -> None:
             """跳过 dispatch 预构建 catch-up，让 builder 暴露 lag repair。
@@ -1848,7 +1920,12 @@ async def test_persistent_memory_lag_repair_failure_closes_starting_run(
     builder = _PersistentLagRepairRunInputBuilder()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
 
         def _noop_catch_up(record: PendingDispatchRecord) -> None:
             """跳过 catch-up 以触发 builder lag repair 分支。
@@ -2026,6 +2103,111 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
         await scheduler.close()
 
     assert any("dispatch drain loop durable retry exhausted" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """drain loop retry exhausted 关闭前尽力收口队列剩余 dispatch。"""
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        lane_controller = await LaneController.open(
+            [
+                LaneConfig(
+                    name=_LANE_NAME,
+                    capacity=1,
+                    default_timeout_seconds=0.1,
+                    claim_ttl_seconds=1.0,
+                    heartbeat_interval_seconds=0.1,
+                )
+            ],
+            coordinator=SQLiteLaneCoordinatorConfig(db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3"),
+        )
+        scheduler = _RetryExhaustedDrainLoopScheduler(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            local_execution=HostLocalExecutionOptions(
+                lane_db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3",
+                lane_name=_LANE_NAME,
+                lane_capacity=1,
+                lane_default_timeout_seconds=0.1,
+                lane_claim_ttl_seconds=1.0,
+                lane_heartbeat_interval_seconds=0.1,
+                worker_startup_timeout_seconds=1.0,
+                dispatch_poll_interval_seconds=0.01,
+                runner_spec=_runner_spec(),
+                runner_options=RunnerCallOptions(temperature=None, max_tokens=None, top_p=None, stream=False),
+                agent_policy=_agent_policy(False),
+                worker_factory=_FakeWorkerFactory(),
+            ),
+            lane_controller=lane_controller,
+            host_handle_id="host-drain-loop-queue-closeout",
+        )
+        scheduler._queue.put_nowait(_pending_dispatch(seeded))
+        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
+        await asyncio.sleep(0.03)
+        await scheduler.close()
+
+        run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
+        assert scheduler._queue.qsize() == 0
+        assert run.status is RunStatus.FAILED
+        assert attempt.status is AttemptStatus.FAILED
+        assert dispatch_record.status is DispatchRecordStatus.CANCELLED
+
+    assert "dispatch.drain_loop.queue_closeout" in caplog.text
+    assert "closeout_count=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_close_worker_lost_failure_logs_context_without_raising(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """lost closeout 自身失败时记录结构化上下文且不传播异常。"""
+
+    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+        try:
+            token = _HostCancellationToken()
+            envelope = LocalEngineEnvelope(
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                dispatch_record_id=seeded.dispatch_record_id,
+                worker_kind=WorkerKind.LOCAL,
+                execution_target="target-dispatch",
+                local_worker_id="worker-lost-closeout-fails",
+                cancellation_token=token,
+            )
+            closed = scheduler._safe_close_worker_lost(
+                ingestor=cast(
+                    EngineEventIngestor,
+                    _CloseWorkerLostFailingIngestor(),
+                ),
+                envelope=envelope,
+                record=_pending_dispatch(seeded),
+                local_worker_id="worker-lost-closeout-fails",
+                worker_lifecycle_signal="ingest_exception",
+                stream_error_code="RuntimeError",
+                last_observed_worker_event_index=3,
+                last_accepted_event_id=None,
+                original_error=RuntimeError("original ingest failure"),
+            )
+            assert closed is False
+        finally:
+            await scheduler.close()
+
+    assert "dispatch.worker_events.close_worker_lost_failed" in caplog.text
+    assert "run_id=run-dispatch" in caplog.text
+    assert "closeout_error_type=RuntimeError" in caplog.text
+    assert "original_error_type=RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2763,6 +2945,72 @@ async def test_scheduler_close_lets_active_task_own_handle_close(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_close_cleans_active_handle_when_consumer_task_never_started(
+    tmp_path: Path,
+) -> None:
+    """close 必须清理尚未进入 events consume body 的 active handle。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: close 后仍残留 active handle、registry entry 或未关闭
+        worker handle 时抛出。
+    """
+
+    handle = _ControlledBlockingHandle()
+    registry = ActiveWorkerRegistry()
+    cancellation_token = _HostCancellationToken()
+    started = asyncio.Event()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            active_registry=registry,
+        )
+        heartbeat_task = scheduler._heartbeat_task
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            scheduler._heartbeat_task = None
+        registry.register(
+            run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            handle=handle,
+            cancellation_token=cancellation_token,
+        )
+        active_task = asyncio.create_task(_unstarted_active_consumer_probe(started))
+        scheduler._active_handles.add(handle)
+        scheduler._active_tasks.add(active_task)
+        active_task.add_done_callback(scheduler._active_tasks.discard)
+
+        await scheduler.close()
+
+        assert not started.is_set()
+        assert cancellation_token.is_cancelled()
+        assert cancellation_token.cancel_reason() == "scheduler_close"
+        assert handle.cancel_count == 1
+        assert handle.close_count == 1
+        assert not scheduler._active_tasks
+        assert not scheduler._active_handles
+        assert (
+            registry.cancel(
+                ActiveCancelMessage(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    reason="after_scheduler_close",
+                )
+            )
+            is False
+        )
+
+
+@pytest.mark.asyncio
 async def test_scheduler_close_during_active_events_releases_all_resources(
     tmp_path: Path,
 ) -> None:
@@ -2846,6 +3094,7 @@ async def test_scheduler_close_with_non_empty_dispatch_queue_does_not_drain_or_w
         scheduler = await _open_scheduler(tmp_path, store, factory)
 
         scheduler.wake_dispatch(_pending_dispatch(seeded))
+        event_log_cursor = _event_log_cursor(store.transaction_runner)
         await scheduler.close()
 
         run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
@@ -2855,7 +3104,10 @@ async def test_scheduler_close_with_non_empty_dispatch_queue_does_not_drain_or_w
         assert attempt.status is AttemptStatus.STARTING
         assert dispatch_record.status is DispatchRecordStatus.PENDING
         assert dispatch_record.worker_accept_event_id is None
-        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
+        _assert_scheduler_close_did_not_append_terminal_facts(
+            store.transaction_runner,
+            after_cursor=event_log_cursor,
+        )
         with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
             scheduler.wake_dispatch(_pending_dispatch(seeded))
         with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
@@ -2889,6 +3141,7 @@ async def test_scheduler_close_during_lane_wait_skips_worker_startup_timeout_ter
         assert run.status is RunStatus.RUNNING
         assert attempt.status is AttemptStatus.STARTING
         assert dispatch_record.status is DispatchRecordStatus.WAITING_FOR_LANE
+        event_log_cursor = _event_log_cursor(store.transaction_runner)
 
         await scheduler.close()
         monkeypatch.setattr(scheduler._lane_controller, "acquire", original_acquire)
@@ -2901,7 +3154,10 @@ async def test_scheduler_close_during_lane_wait_skips_worker_startup_timeout_ter
         assert attempt.status is AttemptStatus.STARTING
         assert dispatch_record.status is DispatchRecordStatus.WAITING_FOR_LANE
         assert dispatch_record.cancelled_event_id is None
-        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
+        _assert_scheduler_close_did_not_append_terminal_facts(
+            store.transaction_runner,
+            after_cursor=event_log_cursor,
+        )
         with pytest.raises(RuntimeLaneClosedError):
             await scheduler._lane_controller.acquire(_LANE_NAME, timeout_seconds=0)
 
@@ -2934,6 +3190,7 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
         await handle.events_started.wait()
         blocked_close = _CloseOnceBlockedLaneClose(scheduler._lane_controller.close)
         monkeypatch.setattr(scheduler._lane_controller, "close", blocked_close)
+        event_log_cursor = _event_log_cursor(store.transaction_runner)
 
         close_task = asyncio.create_task(scheduler.close())
         await blocked_close.started.wait()
@@ -2963,7 +3220,10 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
             )
             is False
         )
-        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
+        _assert_scheduler_close_did_not_append_terminal_facts(
+            store.transaction_runner,
+            after_cursor=event_log_cursor,
+        )
         with pytest.raises(RuntimeLaneClosedError):
             await scheduler._lane_controller.acquire(_LANE_NAME, timeout_seconds=0)
 
@@ -3419,12 +3679,16 @@ async def test_scheduler_close_cancels_tracked_promotion_task(
         promotion_task = scheduler._promotion_drain_task
         assert promotion_task is not None
         scheduler._promotion_queue.put_nowait("session-promotion-pending")
+        event_log_cursor = _event_log_cursor(store.transaction_runner)
 
         await scheduler.close()
 
         assert promotion_task.done() is True
         assert scheduler._promotion_queue.qsize() == 1
-        _assert_no_scheduler_close_terminal_events(store.transaction_runner)
+        _assert_scheduler_close_did_not_append_terminal_facts(
+            store.transaction_runner,
+            after_cursor=event_log_cursor,
+        )
 
 
 @pytest.mark.asyncio
@@ -4918,8 +5182,32 @@ def _event_types_for_run(transaction_runner: HostTransactionRunner, run_id: str)
     """
 
     def _operation(transaction: HostTransaction) -> tuple[str, ...]:
-        rows = EventLogStore().read_events_after(transaction, 0, limit=200)
+        rows = EventLogStore().read_events_after(
+            transaction,
+            0,
+            limit=_EVENT_LOG_TEST_READ_LIMIT,
+        )
         return tuple(row.event_type for row in rows if row.run_id == run_id)
+
+    return transaction_runner.run_read(_operation)
+
+
+def _event_log_cursor(transaction_runner: HostTransactionRunner) -> int:
+    """读取测试库中当前 EventLog 最大游标。
+
+    :param transaction_runner: transaction runner。
+    :returns: 当前最大 ``event_sequence``；没有事件时返回 ``0``。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        rows = EventLogStore().read_events_after(
+            transaction,
+            0,
+            limit=_EVENT_LOG_TEST_READ_LIMIT,
+        )
+        if not rows:
+            return 0
+        return max(row.event_sequence for row in rows)
 
     return transaction_runner.run_read(_operation)
 
@@ -4934,22 +5222,87 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
 
     def _operation(transaction: HostTransaction) -> int:
         return sum(
-            1 for row in EventLogStore().read_events_after(transaction, 0, limit=200) if row.event_type == event_type
+            1
+            for row in EventLogStore().read_events_after(
+                transaction,
+                0,
+                limit=_EVENT_LOG_TEST_READ_LIMIT,
+            )
+            if row.event_type == event_type
         )
 
     return transaction_runner.run_read(_operation)
 
 
-def _assert_no_scheduler_close_terminal_events(transaction_runner: HostTransactionRunner) -> None:
-    """断言 scheduler close 未创建 terminal canonical facts。
+def _event_log_types_after_cursor(
+    transaction_runner: HostTransactionRunner,
+    after_cursor: int,
+) -> tuple[str, ...]:
+    """读取指定游标之后新增的 EventLog type。
 
     :param transaction_runner: transaction runner。
-    :returns: ``None``。
-    :raises AssertionError: 存在 close 不应写入的 terminal fact 时抛出。
+    :param after_cursor: 只读取该 EventLog cursor 之后的事件。
+    :returns: 新增 EventLog type 序列。
     """
 
-    for event_type in _SCHEDULER_CLOSE_TERMINAL_EVENT_TYPES:
-        assert _event_count(transaction_runner, event_type) == 0
+    def _operation(transaction: HostTransaction) -> tuple[str, ...]:
+        rows = EventLogStore().read_events_after(
+            transaction,
+            after_cursor,
+            limit=_EVENT_LOG_TEST_READ_LIMIT,
+        )
+        return tuple(row.event_type for row in rows)
+
+    return transaction_runner.run_read(_operation)
+
+
+def _scheduler_close_terminal_event_types() -> frozenset[str]:
+    """读取 close 不得自行追加的当前 terminal EventLog type 集合。
+
+    :returns: Attempt / Run 终态映射对应的 EventLog type 集合。
+    """
+
+    return frozenset(
+        (
+            *(_attempt_terminal_event_type(status) for status in _ATTEMPT_TERMINAL_STATUSES),
+            *(_run_terminal_event_type(status) for status in _RUN_TERMINAL_STATUSES),
+        )
+    )
+
+
+def _terminal_event_log_types_after_cursor(
+    transaction_runner: HostTransactionRunner,
+    after_cursor: int,
+) -> tuple[str, ...]:
+    """读取指定游标之后新增的 terminal EventLog type。
+
+    :param transaction_runner: transaction runner。
+    :param after_cursor: 只读取该 EventLog cursor 之后的事件。
+    :returns: 新增 terminal EventLog type 序列。
+    """
+
+    terminal_event_types = _scheduler_close_terminal_event_types()
+    return tuple(
+        event_type
+        for event_type in _event_log_types_after_cursor(transaction_runner, after_cursor)
+        if event_type in terminal_event_types
+    )
+
+
+def _assert_scheduler_close_did_not_append_terminal_facts(
+    transaction_runner: HostTransactionRunner,
+    *,
+    after_cursor: int,
+) -> None:
+    """断言 scheduler close 未追加 terminal canonical facts。
+
+    :param transaction_runner: transaction runner。
+    :param after_cursor: close 前记录的 EventLog cursor。
+    :returns: ``None``。
+    :raises AssertionError: close 后出现新增 terminal EventLog row 时抛出。
+    """
+
+    assert _terminal_event_log_types_after_cursor(transaction_runner, after_cursor) == ()
 
 
 async def _wait_for_event_count(
@@ -4984,7 +5337,11 @@ def _latest_event_for_run(transaction_runner: HostTransactionRunner, run_id: str
     """
 
     def _operation(transaction: HostTransaction) -> EventLogRow:
-        rows = EventLogStore().read_events_after(transaction, 0, limit=200)
+        rows = EventLogStore().read_events_after(
+            transaction,
+            0,
+            limit=_EVENT_LOG_TEST_READ_LIMIT,
+        )
         for row in reversed(rows):
             if row.run_id == run_id and row.event_type == event_type:
                 return row

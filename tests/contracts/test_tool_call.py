@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Final, cast
 
 import pytest
@@ -24,7 +24,7 @@ from dayu.contracts.tool_call import (
     ToolCallProviderState,
     ToolCallRequest,
 )
-from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSnapshot, ToolAwaitSpec
 
 
 class _StaticCancellationToken:
@@ -191,6 +191,13 @@ def test_gemini_tool_call_state_field_set() -> None:
     assert fields == {"thought_signature"}
 
 
+def test_gemini_tool_call_state_rejects_blank_signature() -> None:
+    """Gemini thought signature 为空白时必须在构造期拒绝。"""
+
+    with pytest.raises(ValueError, match="thought_signature"):
+        GeminiToolCallState(thought_signature=" \n")
+
+
 def test_provider_state_union_currently_only_gemini() -> None:
     """:data:`ToolCallProviderState` 当前仅含 Gemini 一个成员。
 
@@ -210,6 +217,34 @@ def test_tool_await_spec_requires_enum_await_kind() -> None:
             deadline=None,
             resume_token="resume",
         )
+
+
+def test_tool_await_datetimes_must_be_timezone_aware() -> None:
+    """ToolAwaitSpec / ToolAwaitSnapshot 的时间字段必须带时区。"""
+
+    with pytest.raises(ValueError, match="deadline"):
+        ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=datetime(2026, 6, 1, 12, 0, 0),
+            resume_token="resume",
+        )
+    with pytest.raises(ValueError, match="captured_at"):
+        ToolAwaitSnapshot(
+            snapshot_id="snapshot-1",
+            captured_at=datetime(2026, 6, 1, 12, 0, 0),
+        )
+
+    spec = ToolAwaitSpec(
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+        deadline=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+        resume_token="resume",
+    )
+    snapshot = ToolAwaitSnapshot(
+        snapshot_id="snapshot-1",
+        captured_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+    )
+    assert spec.deadline is not None
+    assert snapshot.captured_at.tzinfo is UTC
 
 
 def _make_valid_context(

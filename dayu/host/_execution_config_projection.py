@@ -29,6 +29,7 @@ from dayu.engine.contracts.runner_spec import (
     RunnerSpec,
 )
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.errors import HostDurableError
 
 _POLICY_SNAPSHOT_REF_PREFIX = "policy:"
 
@@ -95,26 +96,31 @@ def effective_execution_snapshot_from_json(
 
     :param value: ``effective_execution_config`` JSON。
     :returns: 还原后的 execution snapshot 字段。
-    :raises RuntimeError: JSON shape 非法时抛出。
+    :raises HostDurableError: JSON shape 或字段语义非法时抛出。
     """
 
-    root = required_json_mapping(value, field_name="effective_execution_config")
-    policy_snapshot_ref = required_json_text(root, field_name="policy_snapshot_ref")
-    config = required_json_mapping(root.get("config"), field_name="config")
-    return EffectiveExecutionSnapshot(
-        runner_spec=runner_spec_from_json(
-            required_json_mapping(config.get("runner_spec"), field_name="runner_spec")
-        ),
-        runner_options=runner_options_from_json(
-            required_json_mapping(
-                config.get("runner_options"), field_name="runner_options"
-            )
-        ),
-        agent_policy=agent_policy_from_json(
-            required_json_mapping(config.get("agent_policy"), field_name="agent_policy")
-        ),
-        policy_snapshot_ref=policy_snapshot_ref,
-    )
+    try:
+        root = required_json_mapping(value, field_name="effective_execution_config")
+        policy_snapshot_ref = required_json_text(root, field_name="policy_snapshot_ref")
+        config = required_json_mapping(root.get("config"), field_name="config")
+        return EffectiveExecutionSnapshot(
+            runner_spec=runner_spec_from_json(
+                required_json_mapping(config.get("runner_spec"), field_name="runner_spec")
+            ),
+            runner_options=runner_options_from_json(
+                required_json_mapping(
+                    config.get("runner_options"), field_name="runner_options"
+                )
+            ),
+            agent_policy=agent_policy_from_json(
+                required_json_mapping(config.get("agent_policy"), field_name="agent_policy")
+            ),
+            policy_snapshot_ref=policy_snapshot_ref,
+        )
+    except HostDurableError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError("effective_execution_config is invalid") from exc
 
 
 def optional_runner_spec_json(runner_spec: RunnerSpec | None) -> JsonValue:
@@ -160,7 +166,7 @@ def runner_spec_from_json(value: Mapping[str, JsonValue]) -> RunnerSpec:
 
     :param value: RunnerSpec JSON mapping。
     :returns: RunnerSpec。
-    :raises RuntimeError: JSON shape 或字段类型非法时抛出。
+    :raises HostDurableError: JSON shape 或字段类型非法时抛出。
     :raises ValueError: provider 枚举值或 RunnerSpec 字段语义非法时抛出。
     """
 
@@ -253,7 +259,7 @@ def provider_request_from_json(value: JsonValue) -> ProviderRequestExtension | N
 
     :param value: provider extension JSON。
     :returns: provider extension 或 ``None``。
-    :raises RuntimeError: kind 未知或字段非法时抛出。
+    :raises HostDurableError: kind 未知或字段非法时抛出。
     :raises ValueError: provider 枚举值或 extension 字段组合非法时抛出。
     """
 
@@ -296,7 +302,7 @@ def provider_request_from_json(value: JsonValue) -> ProviderRequestExtension | N
             enable_thinking=required_json_bool(root, field_name="enable_thinking"),
             thinking_budget=optional_json_int(root, field_name="thinking_budget"),
         )
-    raise RuntimeError(f"unknown provider_request kind: {kind}")
+    raise HostDurableError(f"unknown provider_request kind: {kind}")
 
 
 def optional_runner_options_json(
@@ -335,7 +341,7 @@ def runner_options_from_json(value: Mapping[str, JsonValue]) -> RunnerCallOption
 
     :param value: RunnerCallOptions JSON mapping。
     :returns: RunnerCallOptions。
-    :raises RuntimeError: JSON shape 或字段类型非法时抛出。
+    :raises HostDurableError: JSON shape 或字段类型非法时抛出。
     """
 
     return RunnerCallOptions(
@@ -388,7 +394,7 @@ def agent_policy_from_json(value: Mapping[str, JsonValue]) -> AgentPolicy:
 
     :param value: AgentPolicy JSON mapping。
     :returns: AgentPolicy。
-    :raises RuntimeError: JSON shape 或字段类型非法时抛出。
+    :raises HostDurableError: JSON shape 或字段类型非法时抛出。
     :raises ValueError: fallback mode 枚举值或 AgentPolicy 字段语义非法时抛出。
     """
 
@@ -422,11 +428,11 @@ def required_json_mapping(
     :param value: JSON 值。
     :param field_name: 字段名。
     :returns: JSON mapping。
-    :raises RuntimeError: 值不是 mapping 时抛出。
+    :raises HostDurableError: 值不是 mapping 时抛出。
     """
 
     if not isinstance(value, Mapping):
-        raise RuntimeError(f"{field_name} must be JSON object")
+        raise HostDurableError(f"{field_name} must be JSON object")
     return cast(Mapping[str, JsonValue], value)
 
 
@@ -436,12 +442,12 @@ def required_json_text(value: Mapping[str, JsonValue], *, field_name: str) -> st
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: 文本值。
-    :raises RuntimeError: 字段缺失、非字符串或为空时抛出。
+    :raises HostDurableError: 字段缺失、非字符串或为空时抛出。
     """
 
     item = value.get(field_name)
     if not isinstance(item, str) or item.strip() == "":
-        raise RuntimeError(f"{field_name} must be non-empty text")
+        raise HostDurableError(f"{field_name} must be non-empty text")
     return item
 
 
@@ -453,7 +459,7 @@ def optional_json_text(
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: 文本值或 ``None``。
-    :raises RuntimeError: 字段非字符串或为空时抛出。
+    :raises HostDurableError: 字段非字符串或为空时抛出。
     """
 
     item = value.get(field_name)
@@ -461,7 +467,7 @@ def optional_json_text(
         return None
     if isinstance(item, str) and item.strip() != "":
         return item
-    raise RuntimeError(f"{field_name} must be non-empty text")
+    raise HostDurableError(f"{field_name} must be non-empty text")
 
 
 def required_json_bool(value: Mapping[str, JsonValue], *, field_name: str) -> bool:
@@ -470,12 +476,12 @@ def required_json_bool(value: Mapping[str, JsonValue], *, field_name: str) -> bo
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: bool 值。
-    :raises RuntimeError: 字段不是 bool 时抛出。
+    :raises HostDurableError: 字段不是 bool 时抛出。
     """
 
     item = value.get(field_name)
     if not isinstance(item, bool):
-        raise RuntimeError(f"{field_name} must be bool")
+        raise HostDurableError(f"{field_name} must be bool")
     return item
 
 
@@ -487,14 +493,14 @@ def optional_json_bool(
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: bool 值或 ``None``。
-    :raises RuntimeError: 字段不是 bool 时抛出。
+    :raises HostDurableError: 字段不是 bool 时抛出。
     """
 
     item = value.get(field_name)
     if item is None:
         return None
     if not isinstance(item, bool):
-        raise RuntimeError(f"{field_name} must be bool")
+        raise HostDurableError(f"{field_name} must be bool")
     return item
 
 
@@ -504,12 +510,12 @@ def required_json_int(value: Mapping[str, JsonValue], *, field_name: str) -> int
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: int 值。
-    :raises RuntimeError: 字段不是严格 int 时抛出。
+    :raises HostDurableError: 字段不是严格 int 时抛出。
     """
 
     item = value.get(field_name)
     if isinstance(item, bool) or not isinstance(item, int):
-        raise RuntimeError(f"{field_name} must be int")
+        raise HostDurableError(f"{field_name} must be int")
     return item
 
 
@@ -521,14 +527,14 @@ def optional_json_int(
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: int 值或 ``None``。
-    :raises RuntimeError: 字段不是严格 int 时抛出。
+    :raises HostDurableError: 字段不是严格 int 时抛出。
     """
 
     item = value.get(field_name)
     if item is None:
         return None
     if isinstance(item, bool) or not isinstance(item, int):
-        raise RuntimeError(f"{field_name} must be int")
+        raise HostDurableError(f"{field_name} must be int")
     return item
 
 
@@ -538,12 +544,12 @@ def required_json_float(value: Mapping[str, JsonValue], *, field_name: str) -> f
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: float 值。
-    :raises RuntimeError: 字段不是数值时抛出。
+    :raises HostDurableError: 字段不是数值时抛出。
     """
 
     item = value.get(field_name)
     if isinstance(item, bool) or not isinstance(item, int | float):
-        raise RuntimeError(f"{field_name} must be number")
+        raise HostDurableError(f"{field_name} must be number")
     return float(item)
 
 
@@ -555,14 +561,14 @@ def optional_json_float(
     :param value: JSON mapping。
     :param field_name: 字段名。
     :returns: float 值或 ``None``。
-    :raises RuntimeError: 字段不是数值时抛出。
+    :raises HostDurableError: 字段不是数值时抛出。
     """
 
     item = value.get(field_name)
     if item is None:
         return None
     if isinstance(item, bool) or not isinstance(item, int | float):
-        raise RuntimeError(f"{field_name} must be number")
+        raise HostDurableError(f"{field_name} must be number")
     return float(item)
 
 
@@ -571,13 +577,13 @@ def _headers_from_json(value: JsonValue) -> Mapping[str, str]:
 
     :param value: headers JSON。
     :returns: 字符串 header 映射。
-    :raises RuntimeError: 字段非法时抛出。
+    :raises HostDurableError: 字段非法时抛出。
     """
 
     root = required_json_mapping(value, field_name="headers")
     result: dict[str, str] = {}
     for key, item in root.items():
         if not isinstance(item, str):
-            raise RuntimeError("RunnerSpec.headers values must be text")
+            raise HostDurableError("RunnerSpec.headers values must be text")
         result[key] = item
     return result

@@ -30,6 +30,10 @@ from dayu.host.compaction import (
 )
 from dayu.host.context_governance import check_compaction_candidate
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.runtime.diagnostic_text import (
+    redact_sensitive_diagnostic_values,
+    truncate_diagnostic_text,
+)
 
 _FAILURE_PROPOSAL_FAILED = "proposal_failed"
 _FAILURE_QUALITY_CHECK_REJECTED = "quality_check_rejected"
@@ -44,8 +48,6 @@ _DIAGNOSTIC_SUFFIX_HARD_THRESHOLD = "hard_threshold"
 _MAX_SAFE_EXCEPTION_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
-_BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
-_ASSIGNMENT_SECRET_PATTERN = re.compile(r"(?i)((?:api[_-]?key|authorization|token|secret)\s*[:=]\s*)[^,\s}\]]+")
 _ERROR_CODE_PATTERN = re.compile(r"\berror_code=([A-Za-z0-9_-]+)")
 _LOGGER = logging.getLogger(__name__)
 _MERGED_CANDIDATE_PREFIX = "merged:"
@@ -743,12 +745,15 @@ def _safe_exception_message(exc: Exception | None) -> str:
     message = str(exc)
     if message.strip() == "":
         return exc.__class__.__name__
-    redacted = _BEARER_SECRET_PATTERN.sub(f"Bearer {_REDACTED_SECRET}", message)
-    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(rf"\1{_REDACTED_SECRET}", redacted)
-    if len(redacted) <= _MAX_SAFE_EXCEPTION_MESSAGE_CHARS:
-        return redacted
-    body_length = _MAX_SAFE_EXCEPTION_MESSAGE_CHARS - len(_TRUNCATED_SUFFIX)
-    return redacted[:body_length] + _TRUNCATED_SUFFIX
+    redacted = redact_sensitive_diagnostic_values(
+        message,
+        redaction_marker=_REDACTED_SECRET,
+    )
+    return truncate_diagnostic_text(
+        redacted,
+        max_chars=_MAX_SAFE_EXCEPTION_MESSAGE_CHARS,
+        truncated_suffix=_TRUNCATED_SUFFIX,
+    )
 
 
 __all__ = [

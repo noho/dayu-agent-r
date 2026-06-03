@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import ceil, floor
+import unicodedata
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._public_validation import (
@@ -33,12 +34,14 @@ from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 
 DEFAULT_INPUT_SOFT_THRESHOLD_RATIO = DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO
 DEFAULT_ESTIMATOR_CHARS_PER_TOKEN = 3
+DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN = 1
 DEFAULT_ESTIMATOR_JSON_BYTES_PER_TOKEN = 3
 DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS = 12
 DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS = 16
 USAGE_OBSERVATION_STATUS_OBSERVED = "observed"
 USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE = "estimate_unavailable"
 _MIN_SOFT_THRESHOLD_TOKENS = 1
+_CJK_EAST_ASIAN_WIDTH_VALUES = frozenset(("W", "F"))
 
 
 class ContextBudgetDecision(StrEnum):
@@ -465,6 +468,27 @@ def decide_context_budget(estimate: BudgetEstimate) -> ContextBudgetDecision:
     return ContextBudgetDecision.ALLOW_DISPATCH
 
 
+def estimate_budget_text_tokens(text: str) -> int:
+    """按 Host 统一保守策略估算文本 token 数。
+
+    该估算器对宽字符 / 全角字符按每字符一个 token 计算，对其它字符保留
+    既有三字符约一个 token 的近似语义，避免中文、日文、韩文财报文本被
+    ``chars / 3`` 严重低估。
+
+    :param text: 待估算文本。
+    :returns: 保守 token 估算；空文本返回 ``0``。
+    :raises TypeError: ``text`` 不是字符串时抛出。
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    cjk_chars = sum(1 for char in text if _is_cjk_token_char(char))
+    non_cjk_chars = len(text) - cjk_chars
+    non_cjk_tokens = ceil(non_cjk_chars / DEFAULT_ESTIMATOR_CHARS_PER_TOKEN)
+    cjk_tokens = ceil(cjk_chars / DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN)
+    return cjk_tokens + non_cjk_tokens
+
+
 def _soft_threshold_tokens(policy: ContextBudgetPolicy) -> int:
     """计算 soft threshold。
 
@@ -516,7 +540,18 @@ def _estimate_text_tokens(text: str) -> int:
     :returns: 保守 token 估算。
     """
 
-    return ceil(len(text) / DEFAULT_ESTIMATOR_CHARS_PER_TOKEN)
+    return estimate_budget_text_tokens(text)
+
+
+def _is_cjk_token_char(char: str) -> bool:
+    """判断字符是否应按 CJK / 全角保守 token 估算。
+
+    :param char: 单个字符。
+    :returns: East Asian Width 为 wide 或 fullwidth 时返回 ``True``。
+    :raises: 无主动抛出。
+    """
+
+    return unicodedata.east_asian_width(char) in _CJK_EAST_ASIAN_WIDTH_VALUES
 
 
 def _estimate_json_tokens(value: JsonValue) -> int:
@@ -580,6 +615,7 @@ def _estimator_digest(
                 DEFAULT_INPUT_SOFT_THRESHOLD_RATIO
             ),
             "chars_per_token": DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
+            "cjk_chars_per_token": DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN,
             "json_bytes_per_token": DEFAULT_ESTIMATOR_JSON_BYTES_PER_TOKEN,
             "message_overhead_tokens": DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
             "tool_schema_overhead_tokens": (
@@ -694,6 +730,7 @@ __all__ = [
     "BudgetTextFragment",
     "ContextBudgetDecision",
     "ContextBudgetOverageReason",
+    "DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN",
     "DEFAULT_ESTIMATOR_CHARS_PER_TOKEN",
     "DEFAULT_ESTIMATOR_JSON_BYTES_PER_TOKEN",
     "DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS",
@@ -705,5 +742,6 @@ __all__ = [
     "USAGE_OBSERVATION_STATUS_OBSERVED",
     "build_usage_observation_diagnostic",
     "decide_context_budget",
+    "estimate_budget_text_tokens",
     "estimate_context_budget",
 ]

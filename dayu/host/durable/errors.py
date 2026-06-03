@@ -35,6 +35,33 @@ class HostSchemaMismatchError(HostDurableError):
     """Host durable store schema version 与当前代码不匹配。"""
 
 
+class HostRowDecodeError(HostDurableError):
+    """Host durable row decode 失败。
+
+    :param message: 面向诊断的中文错误消息。
+    :param row_name: 发生 decode 失败的 durable row 名称。
+    :param field_name: 发生 decode 失败的字段名；row 级形状错误时为 ``None``。
+    :raises TypeError: ``Exception`` 初始化失败时由父类抛出。
+    """
+
+    row_name: str
+    field_name: str | None
+
+    def __init__(self, message: str, *, row_name: str, field_name: str | None) -> None:
+        """初始化 Host durable row decode 错误。
+
+        :param message: 面向诊断的中文错误消息。
+        :param row_name: 发生 decode 失败的 durable row 名称。
+        :param field_name: 发生 decode 失败的字段名；row 级形状错误时为 ``None``。
+        :returns: ``None``。
+        :raises TypeError: ``Exception`` 初始化失败时由父类抛出。
+        """
+
+        self.row_name = row_name
+        self.field_name = field_name
+        super().__init__(message)
+
+
 class HostTransactionBusyError(HostDurableError):
     """SQLite write transaction 遇到 busy 或 locked。"""
 

@@ -42,6 +42,21 @@ def test_require_json_object_rejects_non_string_keys() -> None:
         )
 
 
+def test_manifest_model_missing_required_field_fails_fast(tmp_path: Path) -> None:
+    """scene_prepare 缺字段由字段级 required 校验独立 fail-fast。"""
+
+    _write_json(
+        tmp_path / "manifests" / "missing_model_field.json",
+        _manifest("missing_model_field", model={}),
+    )
+
+    with pytest.raises(
+        ScenePrepareError,
+        match="missing_model_field.json.model.default_model_id is required",
+    ):
+        prepare_scene(_request(tmp_path, "missing_model_field"))
+
+
 def _write_json(path: Path, value: JsonValue) -> None:
     """写入 JSON fixture。
 

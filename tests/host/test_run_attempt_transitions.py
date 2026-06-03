@@ -35,9 +35,9 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.errors import HostDurableError, HostRowDecodeError
 from dayu.host.durable.liveness import HostInstanceStatus
-from dayu.host.durable.schema import TABLE_HOST_RUNS
+from dayu.host.durable.schema import TABLE_HOST_ATTEMPTS, TABLE_HOST_RUNS
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CancelActiveAttemptInput,
@@ -75,6 +75,7 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    terminal_attempt_row,
     terminal_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
@@ -404,6 +405,78 @@ def test_terminal_closeout_appends_concrete_terminal_events(
         assert _EVENT_TYPE_ATTEMPT_SUCCEEDED in event_types
         assert _EVENT_TYPE_RUN_SUCCEEDED in event_types
         assert "RUN_TERMINAL" not in event_types
+
+
+def test_terminal_closeout_replay_absorbs_same_terminal_status_without_new_events(
+    tmp_path: Path,
+) -> None:
+    """同种 terminal closeout replay 不追加新 terminal event。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def closeout(transaction: HostTransaction) -> tuple[str, tuple[str, ...]]:
+            """执行 terminal closeout。
+
+            :param transaction: Host transaction。
+            :returns: transition 状态与 event type 序列。
+            """
+
+            result = terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id="event-attempt-failed-original",
+                    run_terminal_event_id="event-run-failed-original",
+                    attempt_terminal_status=AttemptStatus.FAILED,
+                    run_terminal_status=RunStatus.FAILED,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="phase3_internal_closeout",
+                    terminal_summary_ref=None,
+                    terminal_summary_digest=None,
+                ),
+            )
+            return result.status.value, _event_types(transaction)
+
+        def replay(transaction: HostTransaction) -> tuple[str, tuple[str, ...]]:
+            """用不同 event id 重放同种 terminal closeout。
+
+            :param transaction: Host transaction。
+            :returns: transition 状态与 event type 序列。
+            """
+
+            result = terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id="event-attempt-failed-replay",
+                    run_terminal_event_id="event-run-failed-replay",
+                    attempt_terminal_status=AttemptStatus.FAILED,
+                    run_terminal_status=RunStatus.FAILED,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="phase3_internal_closeout",
+                    terminal_summary_ref=None,
+                    terminal_summary_digest=None,
+                ),
+            )
+            return result.status.value, _event_types(transaction)
+
+        first_status, first_event_types = store.transaction_runner.run_write(closeout)
+        replay_status, replay_event_types = store.transaction_runner.run_write(replay)
+
+        assert first_status == StateMutationStatus.UPDATED.value
+        assert replay_status == StateMutationStatus.UPDATED.value
+        assert first_event_types == replay_event_types
+        assert replay_event_types.count("ATTEMPT_FAILED") == 1
+        assert replay_event_types.count("RUN_FAILED") == 1
 
 
 @pytest.mark.parametrize(
@@ -1213,18 +1286,20 @@ def test_terminal_run_row_reports_cas_lost_for_deferred_active_statuses(
 
 
 @pytest.mark.parametrize(
-    "terminal_status",
+    ("terminal_status", "expected_mutation_status"),
     (
-        RunStatus.SUCCEEDED,
-        RunStatus.FAILED,
-        RunStatus.CANCELLED,
-        RunStatus.LOST,
+        (RunStatus.SUCCEEDED, StateMutationStatus.CAS_LOST),
+        (RunStatus.FAILED, StateMutationStatus.UPDATED),
+        (RunStatus.CANCELLED, StateMutationStatus.CAS_LOST),
+        (RunStatus.LOST, StateMutationStatus.CAS_LOST),
     ),
 )
-def test_terminal_run_row_reports_cas_lost_for_latest_terminal_status(
-    tmp_path: Path, terminal_status: RunStatus
+def test_terminal_run_row_absorbs_only_same_terminal_ref_replay(
+    tmp_path: Path,
+    terminal_status: RunStatus,
+    expected_mutation_status: StateMutationStatus,
 ) -> None:
-    """terminal Run CAS 看到最新 Run 已终态时归类为 CAS_LOST。"""
+    """terminal Run CAS 只吸收同终态且同 terminal event ref 的 replay。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
@@ -1272,8 +1347,238 @@ def test_terminal_run_row_reports_cas_lost_for_latest_terminal_status(
             return result.status.value, result.row.status.value
 
         assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.CAS_LOST.value,
+            expected_mutation_status.value,
             terminal_status.value,
+        )
+
+
+def test_terminal_run_row_rejects_same_terminal_status_with_different_ref(
+    tmp_path: Path,
+) -> None:
+    """同种终态但 terminal event ref 不同仍不可幂等吸收。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+            """构造 failed 终态后用不同 terminal ref 重放。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与最新 terminal event id。
+            """
+
+            existing_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-terminal-existing-failed",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "existing"},
+                ),
+            ).row
+            replay_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-terminal-replay-failed",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "replay"},
+                ),
+            ).row
+            transaction.execute(
+                "UPDATE host_runs "
+                "SET status = ?, terminal_event_id = ?, "
+                "terminal_event_sequence = ?, terminal_at = ? "
+                "WHERE run_id = ?",
+                (
+                    RunStatus.FAILED.value,
+                    existing_event.event_id,
+                    existing_event.event_sequence,
+                    "2026-05-14T01:02:10Z",
+                    seeded.run_id,
+                ),
+            )
+            result = terminal_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id=seeded.attempt_id,
+                terminal_status=RunStatus.FAILED,
+                terminal_event_id=replay_event.event_id,
+                terminal_event_sequence=replay_event.event_sequence,
+                terminal_at="2026-05-14T01:02:11Z",
+            )
+            assert result.row is not None
+            return result.status.value, result.row.terminal_event_id
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            "event-terminal-existing-failed",
+        )
+
+
+def test_terminal_run_row_reports_cas_lost_when_terminal_refs_already_set(
+    tmp_path: Path,
+) -> None:
+    """terminal Run CAS 看到 terminal refs 已写入时归类为 CAS_LOST。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+            """模拟损坏 running row 已有 terminal refs 后执行 terminal Run CAS。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与最新 terminal event id。
+            """
+
+            existing_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-terminal-existing-ref",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "existing-terminal-ref"},
+                ),
+            ).row
+            transaction.execute("PRAGMA ignore_check_constraints = ON")
+            try:
+                transaction.execute(
+                    "UPDATE host_runs "
+                    "SET terminal_event_id = ?, terminal_event_sequence = ?, terminal_at = ? "
+                    "WHERE run_id = ?",
+                    (
+                        existing_event.event_id,
+                        existing_event.event_sequence,
+                        "2026-05-14T01:02:10Z",
+                        seeded.run_id,
+                    ),
+                )
+            finally:
+                transaction.execute("PRAGMA ignore_check_constraints = OFF")
+            new_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-terminal-new-ref",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "new-terminal-ref"},
+                ),
+            ).row
+            try:
+                terminal_run_row(
+                    transaction,
+                    run_id=seeded.run_id,
+                    current_attempt_id=seeded.attempt_id,
+                    terminal_status=RunStatus.FAILED,
+                    terminal_event_id=new_event.event_id,
+                    terminal_event_sequence=new_event.event_sequence,
+                    terminal_at="2026-05-14T01:02:11Z",
+                )
+            except HostRowDecodeError:
+                row = transaction.fetchone(
+                    f"SELECT terminal_event_id FROM {TABLE_HOST_RUNS} WHERE run_id = ?",
+                    (seeded.run_id,),
+                )
+                if row is None:
+                    raise HostDurableError("run row missing after terminal CAS")
+                terminal_event_id = row.get("terminal_event_id")
+                if terminal_event_id is not None and not isinstance(
+                    terminal_event_id, str
+                ):
+                    raise HostDurableError("terminal_event_id must be text")
+                return StateMutationStatus.CAS_LOST.value, terminal_event_id
+            raise AssertionError("terminal_run_row should reject corrupted terminal refs")
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            "event-terminal-existing-ref",
+        )
+
+
+def test_terminal_attempt_row_reports_cas_lost_when_terminal_refs_already_set(
+    tmp_path: Path,
+) -> None:
+    """terminal Attempt CAS 看到 terminal refs 已写入时不得覆盖。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+            """模拟损坏 active attempt 已有 terminal refs 后执行 terminal CAS。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与最新 terminal event id。
+            """
+
+            existing_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-attempt-existing-ref",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="ATTEMPT_FAILED",
+                    payload={"reason": "existing-terminal-ref"},
+                ),
+            ).row
+            transaction.execute("PRAGMA ignore_check_constraints = ON")
+            try:
+                transaction.execute(
+                    "UPDATE host_attempts "
+                    "SET terminal_event_id = ?, terminal_event_sequence = ?, terminal_at = ? "
+                    "WHERE attempt_id = ?",
+                    (
+                        existing_event.event_id,
+                        existing_event.event_sequence,
+                        "2026-05-14T01:02:10Z",
+                        seeded.attempt_id,
+                    ),
+                )
+            finally:
+                transaction.execute("PRAGMA ignore_check_constraints = OFF")
+            new_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-attempt-new-ref",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="ATTEMPT_FAILED",
+                    payload={"reason": "new-terminal-ref"},
+                ),
+            ).row
+            try:
+                terminal_attempt_row(
+                    transaction,
+                    attempt_id=seeded.attempt_id,
+                    terminal_status=AttemptStatus.FAILED,
+                    terminal_event_id=new_event.event_id,
+                    terminal_event_sequence=new_event.event_sequence,
+                    terminal_at="2026-05-14T01:02:11Z",
+                )
+            except HostRowDecodeError:
+                row = transaction.fetchone(
+                    f"SELECT terminal_event_id FROM {TABLE_HOST_ATTEMPTS} "
+                    "WHERE attempt_id = ?",
+                    (seeded.attempt_id,),
+                )
+                if row is None:
+                    raise HostDurableError("attempt row missing after terminal CAS")
+                terminal_event_id = row.get("terminal_event_id")
+                if terminal_event_id is not None and not isinstance(
+                    terminal_event_id, str
+                ):
+                    raise HostDurableError("terminal_event_id must be text")
+                return StateMutationStatus.CAS_LOST.value, terminal_event_id
+            raise AssertionError(
+                "terminal_attempt_row should reject corrupted terminal refs"
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            "event-attempt-existing-ref",
         )
 
 
@@ -1494,16 +1799,22 @@ def test_cancel_queued_terminal_run_returns_invalid_state(
 def test_cancel_queued_run_row_requires_empty_terminal_refs(
     tmp_path: Path,
 ) -> None:
-    """queued Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。"""
+    """queued Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: CAS 覆盖 corrupted row 或错误边界不符合预期时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
 
-        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+        def operation(transaction: HostTransaction) -> None:
             """构造带 terminal refs 的 queued 行并尝试 cancel。
 
             :param transaction: Host transaction。
-            :returns: mutation 状态与保留的 terminal event id。
+            :returns: ``None``。
+            :raises HostRowDecodeError: CAS 拒绝 corrupted row 后读取 row 时抛出。
             """
 
             input_event = _append_user_input(
@@ -1549,35 +1860,37 @@ def test_cancel_queued_run_row_requires_empty_terminal_refs(
                 ),
             )
             transaction.execute("PRAGMA ignore_check_constraints = OFF")
-            result = cancel_queued_run_row(
+            cancel_queued_run_row(
                 transaction,
                 run_id="run-queued-guard",
                 terminal_event_id="event-cancel-queued-guard",
                 terminal_event_sequence=terminal_event.event_sequence + 1,
                 terminal_at="2026-05-14T01:02:10Z",
             )
-            assert result.row is not None
-            return result.status.value, result.row.terminal_event_id
 
-        assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.INVALID_STATE.value,
-            "event-terminal-queued-guard",
-        )
+        with pytest.raises(HostRowDecodeError, match="non-terminal Run terminal refs"):
+            store.transaction_runner.run_write(operation)
 
 
 def test_cancel_running_run_row_requires_empty_terminal_refs(
     tmp_path: Path,
 ) -> None:
-    """running Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。"""
+    """running Run 行若已有 terminal refs，底层 cancel CAS 不得覆盖。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: CAS 覆盖 corrupted row 或错误边界不符合预期时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
-        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+        def operation(transaction: HostTransaction) -> None:
             """构造带 terminal refs 的 running 行并尝试 cancel。
 
             :param transaction: Host transaction。
-            :returns: mutation 状态与保留的 terminal event id。
+            :returns: ``None``。
+            :raises HostRowDecodeError: CAS 拒绝 corrupted row 后读取 row 时抛出。
             """
 
             terminal_event = EventLogStore().append_event(
@@ -1607,7 +1920,7 @@ def test_cancel_running_run_row_requires_empty_terminal_refs(
                 ),
             )
             transaction.execute("PRAGMA ignore_check_constraints = OFF")
-            result = cancel_running_run_row(
+            cancel_running_run_row(
                 transaction,
                 run_id=seeded.run_id,
                 current_attempt_id=seeded.attempt_id,
@@ -1615,13 +1928,9 @@ def test_cancel_running_run_row_requires_empty_terminal_refs(
                 terminal_event_sequence=terminal_event.event_sequence + 1,
                 terminal_at="2026-05-14T01:02:10Z",
             )
-            assert result.row is not None
-            return result.status.value, result.row.terminal_event_id
 
-        assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.CAS_LOST.value,
-            "event-terminal-running-guard",
-        )
+        with pytest.raises(HostRowDecodeError, match="non-terminal Run terminal refs"):
+            store.transaction_runner.run_write(operation)
 
 
 def test_rollback_prevents_partial_event_and_state_persistence(

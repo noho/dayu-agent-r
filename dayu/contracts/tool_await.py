@@ -50,11 +50,17 @@ class ToolAwaitSpec:
 
         :returns: ``None``。
         :raises TypeError: ``await_kind`` 类型非法时抛出。
-        :raises ValueError: ``resume_token`` 为空或超过长度上限时抛出。
+        :raises ValueError: ``deadline`` 不是 timezone-aware datetime、
+            ``resume_token`` 为空或超过长度上限时抛出。
         """
 
         if not isinstance(self.await_kind, ToolAwaitKind):
             raise TypeError("ToolAwaitSpec.await_kind must be ToolAwaitKind")
+        if self.deadline is not None:
+            _require_timezone_aware_datetime(
+                self.deadline,
+                field_name="ToolAwaitSpec.deadline",
+            )
         if self.resume_token.strip() == "":
             raise ValueError("ToolAwaitSpec.resume_token must not be empty")
         if len(self.resume_token) > _MAX_RESUME_TOKEN_LENGTH:
@@ -80,11 +86,29 @@ class ToolAwaitSnapshot:
         """校验等待快照引用。
 
         :returns: ``None``。
-        :raises ValueError: ``snapshot_id`` 为空时抛出。
+        :raises ValueError: ``snapshot_id`` 为空或 ``captured_at`` 不是
+            timezone-aware datetime 时抛出。
         """
 
         if self.snapshot_id.strip() == "":
             raise ValueError("ToolAwaitSnapshot.snapshot_id must not be empty")
+        _require_timezone_aware_datetime(
+            self.captured_at,
+            field_name="ToolAwaitSnapshot.captured_at",
+        )
+
+
+def _require_timezone_aware_datetime(value: datetime, *, field_name: str) -> None:
+    """校验 datetime 带有可用时区信息。
+
+    :param value: 待校验 datetime。
+    :param field_name: 错误消息中的字段名。
+    :returns: ``None``。
+    :raises ValueError: ``value`` 是 naive datetime 时抛出。
+    """
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
 
 
 __all__ = ["ToolAwaitKind", "ToolAwaitSpec", "ToolAwaitSnapshot"]

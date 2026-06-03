@@ -62,21 +62,25 @@ from dayu.host.compaction import (
     PreservationEvidence,
 )
 from dayu.host.context_budget import (
-    DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
+    estimate_budget_text_tokens,
 )
 from dayu.host.opaque_ref import validate_host_neutral_opaque_ref_text
+from dayu.runtime.diagnostic_text import (
+    redact_sensitive_diagnostic_values,
+    truncate_diagnostic_text,
+)
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _MIN_PROPOSAL_LENGTH = 1
 _MAX_SAFE_OUTCOME_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
-_BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
-_ASSIGNMENT_SECRET_PATTERN = re.compile(r"(?i)((?:api[_-]?key|authorization|secret|token)\s*[:=]\s*)[^,\s}\]]+")
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"
+_UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
+_UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
 _COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON = "compactor_proposal_timeout"
 _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
@@ -344,11 +348,12 @@ def _safe_outcome_text(text: str) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
-    redacted = _BEARER_SECRET_PATTERN.sub(f"Bearer {_REDACTED_SECRET}", text)
-    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(rf"\1{_REDACTED_SECRET}", redacted)
-    if len(redacted) <= _MAX_SAFE_OUTCOME_MESSAGE_CHARS:
-        return redacted
-    return redacted[:_MAX_SAFE_OUTCOME_MESSAGE_CHARS] + _TRUNCATED_SUFFIX
+    redacted = redact_sensitive_diagnostic_values(text, redaction_marker=_REDACTED_SECRET)
+    return truncate_diagnostic_text(
+        redacted,
+        max_chars=_MAX_SAFE_OUTCOME_MESSAGE_CHARS,
+        truncated_suffix=_TRUNCATED_SUFFIX,
+    )
 
 
 def _user_prompt(request: CompactionRequest, template: str) -> str:
@@ -377,11 +382,16 @@ def _compaction_request_prompt_block(request: CompactionRequest) -> str:
     :returns: compaction request prompt 数据块。
     """
 
-    return json.dumps(
+    material_json = json.dumps(
         request.llm_material_json(),
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
+    )
+    return (
+        f"{_UNTRUSTED_COMPACTION_MATERIAL_BEGIN}\n"
+        f"{material_json}\n"
+        f"{_UNTRUSTED_COMPACTION_MATERIAL_END}"
     )
 
 
@@ -1388,7 +1398,7 @@ def _estimate_text_tokens(text: str) -> int:
     :returns: 至少为 1 的 token 估算。
     """
 
-    return max(1, ceil(len(text) / DEFAULT_ESTIMATOR_CHARS_PER_TOKEN))
+    return max(1, estimate_budget_text_tokens(text))
 
 
 __all__ = ["LLMCompactionProposalError", "LLMContextCompactor"]

@@ -683,10 +683,20 @@ def test_reject_conflicts_and_attach_active_returns_accepted_active(
         assert attached.attempt is None
         assert attached.dispatch_record is None
         assert attached.attached_active is True
+        replay = service.start_run(
+            _start_request(
+                session_id=session_id,
+                client_request_id="start-attach",
+                queue_policy="attach_active",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert replay.run.run_id == active.run.run_id
+        assert replay.idempotent_replay is True
         assert _event_count(store.transaction_runner) == before_events
         assert active.run.status == RunStatus.ACCEPTED
         assert _count_rows(store.transaction_runner, "idempotency_records") == (
-            before_idempotency
+            before_idempotency + 1
         )
 
 

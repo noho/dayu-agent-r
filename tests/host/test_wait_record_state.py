@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 
 from dayu.host.api import AttemptStatus, RunStatus, SessionStatus, WaitAdapterKey
 from dayu.host.durable.connection import open_host_durable_store
-from dayu.host.durable.errors import HostDurableError, HostUniqueConstraintError
+from dayu.host.durable.errors import HostDurableError, HostRowDecodeError, HostUniqueConstraintError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -42,7 +43,7 @@ from dayu.host.durable.state import (
     serialize_wait_resume_policy,
     wait_record_row_from_host_row,
 )
-from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
 _TIMESTAMP = "2026-05-16T00:00:00.000000Z"
 _EVENT_DIGEST = "0" * 64
@@ -577,6 +578,132 @@ def test_wait_record_ddl_rejects_orphan_snapshot_digest(
             store.transaction_runner.run_write(operation)
 
 
+def test_wait_record_ddl_rejects_waiting_terminal_at(
+    tmp_path: Path,
+) -> None:
+    """WaitRecord DDL CHECK 拒绝 waiting row 携带 terminal_at。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入合法 waiting wait 后补入 terminal_at。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET terminal_at = ? WHERE wait_id = ?",
+                (_TIMESTAMP, "wait-1"),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_wait_record_ddl_rejects_terminal_missing_terminal_at(
+    tmp_path: Path,
+) -> None:
+    """WaitRecord DDL CHECK 拒绝 terminal row 缺少 terminal_at。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入合法 waiting wait 后尝试改为缺 terminal_at 的 resolved。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET status = ?,
+                    resolve_idempotency_key = ?,
+                    resolve_semantic_digest = ?
+                WHERE wait_id = ?
+                """,
+                (
+                    serialize_wait_record_status(WaitRecordStatus.RESOLVED),
+                    "resolve-1",
+                    _RESOLVE_DIGEST,
+                    "wait-1",
+                ),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
+def test_wait_record_python_validation_rejects_terminal_at_shape(
+    tmp_path: Path,
+) -> None:
+    """WaitRecord Python insert validation 与 DDL terminal_at 形状一致。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Python validation 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def waiting_with_terminal_at(transaction: HostTransaction) -> None:
+            """尝试插入携带 terminal_at 的 waiting wait。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(
+                transaction,
+                replace(_wait_row(transaction), terminal_at=_TIMESTAMP),
+            )
+
+        def terminal_without_terminal_at(transaction: HostTransaction) -> None:
+            """尝试插入缺少 terminal_at 的 resolved wait。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _seed_run(transaction, run_id="run-2")
+            insert_wait_record(
+                transaction,
+                replace(
+                    _wait_row(
+                        transaction,
+                        wait_id="wait-2",
+                        run_id="run-2",
+                        status=WaitRecordStatus.RESOLVED,
+                    ),
+                    terminal_at=None,
+                ),
+            )
+
+        with pytest.raises(HostDurableError, match="waiting wait record terminal_at"):
+            store.transaction_runner.run_write(waiting_with_terminal_at)
+        with pytest.raises(HostDurableError, match="terminal wait record requires terminal_at"):
+            store.transaction_runner.run_write(terminal_without_terminal_at)
+
+
 def test_wait_record_cas_helpers_update_waiting_only(tmp_path: Path) -> None:
     """CAS helper 只更新 waiting wait，并区分 updated/not_found/invalid_state。"""
 
@@ -633,6 +760,55 @@ def test_wait_record_cas_helpers_update_waiting_only(tmp_path: Path) -> None:
         )
 
 
+def test_wait_record_terminal_cas_rejects_corrupted_waiting_terminal_at(
+    tmp_path: Path,
+) -> None:
+    """terminal CAS 拒绝测试专用 corrupted waiting + terminal_at row。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: terminal CAS 未拒绝 corrupted row 时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """绕过 CHECK 构造 corrupted wait row 并执行 terminal CAS。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostRowDecodeError: corrupted wait row 被读取时抛出。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute("PRAGMA ignore_check_constraints=ON")
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET terminal_at = ? WHERE wait_id = ?",
+                (_TIMESTAMP, "wait-1"),
+            )
+            transaction.execute("PRAGMA ignore_check_constraints=OFF")
+            mark_wait_record_resolved_row(
+                transaction,
+                wait_id="wait-1",
+                resolve_idempotency_key="resolve-1",
+                resolve_semantic_digest=_RESOLVE_DIGEST,
+                updated_event_id="event-wait-updated-wait-1",
+                updated_event_sequence=4,
+                updated_at=_TIMESTAMP,
+                terminal_at=_TIMESTAMP,
+            )
+
+        with pytest.raises(HostRowDecodeError, match="waiting wait record terminal_at") as error_info:
+            store.transaction_runner.run_write(operation)
+        _assert_host_row_decode_error(
+            error_info.value,
+            row_name=TABLE_HOST_WAIT_RECORDS,
+            field_name=None,
+        )
+
+
 def test_cancel_active_wait_records_for_run_updates_waiting_rows(
     tmp_path: Path,
 ) -> None:
@@ -668,70 +844,172 @@ def test_cancel_active_wait_records_for_run_updates_waiting_rows(
 
 
 def test_wait_record_row_from_host_row_rejects_invalid_status() -> None:
-    """row codec 拒绝不属于 WaitRecordStatus 的状态文本。"""
+    """row codec 拒绝不属于 WaitRecordStatus 的状态文本。
 
-    row = HostRow(
-        columns=(
-            "wait_id",
-            "session_id",
-            "run_id",
-            "attempt_id",
-            "execution_id",
-            "tool_call_id",
-            "tool_name",
-            "adapter_key",
-            "await_kind",
-            "resume_policy",
-            "resume_token",
-            "snapshot_ref",
-            "snapshot_captured_at",
-            "snapshot_digest",
-            "external_job_id",
-            "accept_idempotency_key",
-            "resolve_idempotency_key",
-            "resolve_semantic_digest",
-            "deadline_at",
-            "expires_at",
-            "status",
-            "created_event_id",
-            "created_event_sequence",
-            "updated_event_id",
-            "updated_event_sequence",
-            "created_at",
-            "updated_at",
-            "terminal_at",
-        ),
-        values=(
-            "wait-1",
-            "session-1",
-            "run-1",
-            "attempt-1",
-            "execution-1",
-            "tool-call-1",
-            "tool",
-            "manual",
-            "external_job",
-            "manual",
-            "resume-token",
-            None,
-            None,
-            None,
-            None,
-            "accept-1",
-            None,
-            None,
-            None,
-            None,
-            "pending",
-            "event-created",
-            1,
-            "event-updated",
-            2,
-            _TIMESTAMP,
-            _TIMESTAMP,
-            None,
-        ),
+    :returns: ``None``。
+    :raises AssertionError: 未抛出 ``HostRowDecodeError`` 或错误属性不符合预期时抛出。
+    """
+
+    with pytest.raises(HostRowDecodeError, match="WaitRecordStatus") as error_info:
+        wait_record_row_from_host_row(_wait_record_host_row(status="pending"))
+
+    _assert_host_row_decode_error(
+        error_info.value,
+        row_name=TABLE_HOST_WAIT_RECORDS,
+        field_name="status",
     )
 
-    with pytest.raises(HostDurableError, match="WaitRecordStatus"):
-        wait_record_row_from_host_row(row)
+
+def test_wait_record_row_decode_missing_terminal_at_column_raises_row_decode_error() -> None:
+    """WaitRecord row decode 缺少 terminal_at 列时抛出稳定 row decode 错误。
+
+    :returns: ``None``。
+    :raises AssertionError: 未抛出 ``HostRowDecodeError`` 或错误属性不符合预期时抛出。
+    """
+
+    with pytest.raises(HostRowDecodeError) as error_info:
+        wait_record_row_from_host_row(_wait_record_host_row(include_terminal_at_column=False))
+
+    _assert_host_row_decode_error(
+        error_info.value,
+        row_name=TABLE_HOST_WAIT_RECORDS,
+        field_name="terminal_at",
+    )
+
+
+def test_wait_record_row_decode_terminal_at_shape_raises_row_decode_error() -> None:
+    """WaitRecord row decode 拒绝 waiting/terminal 与 terminal_at 形状不一致。
+
+    :returns: ``None``。
+    :raises AssertionError: 未抛出 ``HostRowDecodeError`` 或错误属性不符合预期时抛出。
+    """
+
+    with pytest.raises(HostRowDecodeError, match="waiting wait record terminal_at") as waiting_error:
+        wait_record_row_from_host_row(
+            _wait_record_host_row(
+                status=serialize_wait_record_status(WaitRecordStatus.WAITING),
+                terminal_at=_TIMESTAMP,
+            )
+        )
+    with pytest.raises(HostRowDecodeError, match="terminal wait record requires terminal_at") as terminal_error:
+        wait_record_row_from_host_row(
+            _wait_record_host_row(
+                status=serialize_wait_record_status(WaitRecordStatus.RESOLVED),
+                terminal_at=None,
+            )
+        )
+
+    _assert_host_row_decode_error(
+        waiting_error.value,
+        row_name=TABLE_HOST_WAIT_RECORDS,
+        field_name=None,
+    )
+    _assert_host_row_decode_error(
+        terminal_error.value,
+        row_name=TABLE_HOST_WAIT_RECORDS,
+        field_name=None,
+    )
+
+
+def _assert_host_row_decode_error(
+    error: HostDurableError,
+    *,
+    row_name: str,
+    field_name: str | None,
+) -> None:
+    """断言错误保持 durable row decode 边界属性。
+
+    :param error: 捕获到的 durable 错误。
+    :param row_name: 期望的 row 名称。
+    :param field_name: 期望的字段名；row 级形状错误时为 ``None``。
+    :returns: ``None``。
+    :raises AssertionError: 错误类型、属性或消息不符合预期时抛出。
+    """
+
+    assert isinstance(error, HostDurableError)
+    assert isinstance(error, HostRowDecodeError)
+    assert error.row_name == row_name
+    assert error.field_name == field_name
+    assert row_name in str(error)
+    if field_name is not None:
+        assert field_name in str(error)
+
+
+def _wait_record_host_row(
+    *,
+    status: str = "waiting",
+    terminal_at: str | None = None,
+    include_terminal_at_column: bool = True,
+) -> HostRow:
+    """构造 WaitRecord row codec 测试用 HostRow。
+
+    :param status: status 列文本。
+    :param terminal_at: terminal timestamp。
+    :param include_terminal_at_column: 是否包含 terminal_at 列。
+    :returns: ``HostRow``。
+    :raises AssertionError: 本 helper 不主动触发断言。
+    """
+
+    columns: tuple[str, ...] = (
+        "wait_id",
+        "session_id",
+        "run_id",
+        "attempt_id",
+        "execution_id",
+        "tool_call_id",
+        "tool_name",
+        "adapter_key",
+        "await_kind",
+        "resume_policy",
+        "resume_token",
+        "snapshot_ref",
+        "snapshot_captured_at",
+        "snapshot_digest",
+        "external_job_id",
+        "accept_idempotency_key",
+        "resolve_idempotency_key",
+        "resolve_semantic_digest",
+        "deadline_at",
+        "expires_at",
+        "status",
+        "created_event_id",
+        "created_event_sequence",
+        "updated_event_id",
+        "updated_event_sequence",
+        "created_at",
+        "updated_at",
+        "terminal_at",
+    )
+    values: tuple[SQLiteScalar, ...] = (
+        "wait-1",
+        "session-1",
+        "run-1",
+        "attempt-1",
+        "execution-1",
+        "tool-call-1",
+        "tool",
+        "manual",
+        "external_job",
+        "manual",
+        "resume-token",
+        None,
+        None,
+        None,
+        None,
+        "accept-1",
+        None,
+        None,
+        None,
+        None,
+        status,
+        "event-created",
+        1,
+        "event-updated",
+        2,
+        _TIMESTAMP,
+        _TIMESTAMP,
+        terminal_at,
+    )
+    if include_terminal_at_column:
+        return HostRow(columns=columns, values=values)
+    return HostRow(columns=columns[:-1], values=values[:-1])

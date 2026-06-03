@@ -238,6 +238,7 @@ class HostTransactionRunner:
         self._sqlite_policy = sqlite_policy
         self._payload_inline_threshold_bytes = payload_inline_threshold_bytes
         self._active_transaction_count = 0
+        self._connection_unusable = False
 
     @property
     def has_active_transaction(self) -> bool:
@@ -272,6 +273,7 @@ class HostTransactionRunner:
         max_attempts = self._sqlite_policy.write_busy_retry_count + 1
         delay_seconds = self._sqlite_policy.write_retry_initial_delay_seconds
         while True:
+            self._raise_if_connection_unusable()
             attempt += 1
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -287,7 +289,10 @@ class HostTransactionRunner:
                 finally:
                     self._active_transaction_count -= 1
             except sqlite3.Error as exc:
-                _rollback(self._connection)
+                if not self._rollback_if_needed_or_mark_unusable():
+                    raise HostDurableError(
+                        "Host durable transaction rollback failed; connection is unusable"
+                    ) from exc
                 durable_error = _classify_sqlite_error(exc)
                 if _is_busy_or_locked(exc):
                     if attempt >= max_attempts:
@@ -302,11 +307,17 @@ class HostTransactionRunner:
                     )
                     continue
                 raise durable_error from exc
-            except HostDurableError:
-                _rollback(self._connection)
+            except HostDurableError as exc:
+                if not self._rollback_if_needed_or_mark_unusable():
+                    raise HostDurableError(
+                        "Host durable transaction rollback failed; connection is unusable"
+                    ) from exc
                 raise
-            except Exception:
-                _rollback(self._connection)
+            except Exception as exc:
+                if not self._rollback_if_needed_or_mark_unusable():
+                    raise HostDurableError(
+                        "Host durable transaction rollback failed; connection is unusable"
+                    ) from exc
                 raise
             _run_after_commit(after_commit)
             return result
@@ -325,6 +336,7 @@ class HostTransactionRunner:
         max_attempts = self._sqlite_policy.write_busy_retry_count + 1
         delay_seconds = self._sqlite_policy.write_retry_initial_delay_seconds
         while True:
+            self._raise_if_connection_unusable()
             attempt += 1
             try:
                 self._connection.execute("BEGIN")
@@ -340,7 +352,10 @@ class HostTransactionRunner:
                 finally:
                     self._active_transaction_count -= 1
             except sqlite3.Error as exc:
-                _rollback(self._connection)
+                if not self._rollback_if_needed_or_mark_unusable():
+                    raise HostDurableError(
+                        "Host durable transaction rollback failed; connection is unusable"
+                    ) from exc
                 if _is_busy_or_locked(exc):
                     if attempt >= max_attempts:
                         raise HostTransactionRetryExhaustedError(
@@ -354,13 +369,50 @@ class HostTransactionRunner:
                     )
                     continue
                 raise _classify_sqlite_error(exc) from exc
-            except HostDurableError:
-                _rollback(self._connection)
+            except HostDurableError as exc:
+                if not self._rollback_if_needed_or_mark_unusable():
+                    raise HostDurableError(
+                        "Host durable transaction rollback failed; connection is unusable"
+                    ) from exc
                 raise
-            except Exception:
-                _rollback(self._connection)
+            except Exception as exc:
+                if not self._rollback_if_needed_or_mark_unusable():
+                    raise HostDurableError(
+                        "Host durable transaction rollback failed; connection is unusable"
+                    ) from exc
                 raise
             return result
+
+    def _raise_if_connection_unusable(self) -> None:
+        """拒绝继续复用已知不可收口的 SQLite connection。
+
+        :returns: ``None``。
+        :raises HostDurableError: 连接已因 rollback 失败被标记为不可用时抛出。
+        """
+
+        if self._connection_unusable:
+            raise HostDurableError(
+                "Host durable transaction runner connection is unusable"
+            )
+
+    def _rollback_if_needed_or_mark_unusable(self) -> bool:
+        """在仍处于 transaction 时执行 rollback。
+
+        :returns: rollback 成功时返回 ``True``，失败时返回 ``False``。
+        """
+
+        if not self._connection.in_transaction:
+            return True
+        if _rollback(self._connection):
+            return True
+        self._connection_unusable = True
+        try:
+            self._connection.close()
+        except sqlite3.Error:
+            _LOGGER.warning(
+                "Host durable transaction rollback failed and connection close failed"
+            )
+        return False
 
 
 def configure_connection_pragmas(connection: sqlite3.Connection, sqlite_policy: HostSQLiteStoragePolicy) -> None:
@@ -487,14 +539,15 @@ def _sqlite_error_code(error: sqlite3.Error) -> int | None:
     return None
 
 
-def _rollback(connection: sqlite3.Connection) -> None:
+def _rollback(connection: sqlite3.Connection) -> bool:
     """尽力回滚当前 SQLite transaction。
 
     :param connection: SQLite connection。
-    :returns: ``None``。
+    :returns: rollback 成功时返回 ``True``，失败时返回 ``False``。
     """
 
     try:
         connection.execute("ROLLBACK")
     except sqlite3.Error:
-        return
+        return False
+    return True

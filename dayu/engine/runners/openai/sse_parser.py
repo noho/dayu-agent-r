@@ -74,8 +74,12 @@ _INVALID_JSON_CODE: str = "sse_invalid_json"
 _PAYLOAD_NOT_OBJECT_CODE: str = "sse_payload_not_object"
 _INVALID_UTF8_CODE: str = "invalid_utf8"
 _TRUNCATED_UTF8_TAIL_CODE: str = "truncated_utf8_tail"
+_LINE_TOO_LONG_CODE: str = "sse_line_too_long"
+_DATA_LINES_TOO_MANY_CODE: str = "sse_data_lines_too_many"
 _MISSING_CHOICES_AND_USAGE_REASON: str = "missing_choices_and_usage"
 _NO_VALID_CHOICE_OBJECT_REASON: str = "no_valid_choice_object"
+_MAX_SSE_LINE_CHARS: int = 1024 * 1024
+_MAX_SSE_DATA_LINES: int = 256
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "stop": FinishReason.STOP,
     "length": FinishReason.LENGTH,
@@ -187,12 +191,26 @@ class SSEParser:
                     yield event
                 return
             self._line_carry += text
+            if len(self._line_carry) > _MAX_SSE_LINE_CHARS and "\n" not in self._line_carry:
+                async for event in self._handle_buffer_limit_exceeded(
+                    error_code=_LINE_TOO_LONG_CODE,
+                    message="SSE line exceeded maximum buffered length",
+                ):
+                    yield event
+                return
             while True:
                 newline_index = self._line_carry.find("\n")
                 if newline_index == -1:
                     break
                 line = self._line_carry[:newline_index]
                 self._line_carry = self._line_carry[newline_index + 1 :]
+                if len(line) > _MAX_SSE_LINE_CHARS:
+                    async for event in self._handle_buffer_limit_exceeded(
+                        error_code=_LINE_TOO_LONG_CODE,
+                        message="SSE line exceeded maximum length",
+                    ):
+                        yield event
+                    return
                 async for event in self._consume_line(line):
                     yield event
                 if self._terminated:
@@ -208,6 +226,13 @@ class SSEParser:
         if tail:
             self._line_carry += tail
         if self._line_carry:
+            if len(self._line_carry) > _MAX_SSE_LINE_CHARS:
+                async for event in self._handle_buffer_limit_exceeded(
+                    error_code=_LINE_TOO_LONG_CODE,
+                    message="SSE trailing line exceeded maximum length",
+                ):
+                    yield event
+                return
             async for event in self._consume_line(self._line_carry):
                 yield event
             self._line_carry = ""
@@ -262,6 +287,34 @@ class SSEParser:
             )
         )
 
+    async def _handle_buffer_limit_exceeded(
+        self, *, error_code: str, message: str
+    ) -> AsyncIterator[RunnerEvent]:
+        """缓冲边界超限时产出协议错误并收口。
+
+        :param error_code: 协议错误码。
+        :param message: 协议错误说明。
+        :returns: 协议错误与 Done(ERROR) 事件。
+        """
+
+        _LOGGER.warning("sse.protocol_error code=%s", error_code)
+        yield _make_event(
+            RunnerProtocolErrorData(
+                error_code=error_code,
+                message=message,
+                provider_request_id=self._provider_request_id,
+                raw_payload=None,
+                partial_tool_calls=self._aggregator.partial_summaries(),
+            )
+        )
+        self._terminated = True
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=self._provider_request_id,
+            )
+        )
+
     async def _consume_line(self, line: str) -> AsyncIterator[RunnerEvent]:
         """处理一条 SSE 行。"""
 
@@ -273,6 +326,13 @@ class SSEParser:
             return
         if stripped.startswith(_DATA_PREFIX):
             payload = stripped[len(_DATA_PREFIX) :].lstrip(" ")
+            if len(self._data_lines) >= _MAX_SSE_DATA_LINES:
+                async for event in self._handle_buffer_limit_exceeded(
+                    error_code=_DATA_LINES_TOO_MANY_CODE,
+                    message="SSE event exceeded maximum data line count",
+                ):
+                    yield event
+                return
             self._data_lines.append(payload)
             return
         # 其它字段（``event:`` / ``id:`` / 注释 ``:`` 等）忽略。

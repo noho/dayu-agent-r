@@ -1232,6 +1232,7 @@ async def _read_next_terminal_for_run(
             HostEventKind.SUCCEEDED,
             HostEventKind.FAILED,
             HostEventKind.CANCELLED,
+            HostEventKind.LOST,
         ):
             return event
     raise AssertionError("watch iterator ended before terminal event")

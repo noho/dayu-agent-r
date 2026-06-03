@@ -6,6 +6,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timezone, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -40,6 +41,7 @@ from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import (
     HostTransaction,
     HostTransactionRunner,
+    SQLParameters,
     _is_busy_or_locked,
 )
 
@@ -49,6 +51,53 @@ _TEST_EVENT_TYPE = "TEST_EVENT"
 _TEST_ACTOR = "durable-test"
 _TEST_SOURCE = "durable-test"
 _COUNT_COLUMN = "event_count"
+
+
+class _NoopCursor:
+    """fake connection execute 成功时返回的占位 cursor。"""
+
+
+class _CommitRollbackFailingConnection:
+    """模拟 COMMIT 与 ROLLBACK 均失败的 SQLite connection。"""
+
+    def __init__(self) -> None:
+        """初始化 fake connection 状态。
+
+        :returns: ``None``。
+        """
+
+        self.in_transaction = False
+        self.closed = False
+        self.statements: list[str] = []
+
+    def execute(self, sql: str, parameters: SQLParameters = ()) -> sqlite3.Cursor:
+        """记录 SQL 并模拟 commit / rollback 失败。
+
+        :param sql: SQL statement。
+        :param parameters: SQLite 参数；本 fake 不使用。
+        :returns: 占位 cursor。
+        :raises sqlite3.OperationalError: COMMIT 或 ROLLBACK 时抛出。
+        """
+
+        del parameters
+        statement = sql.strip().upper()
+        self.statements.append(statement)
+        if statement.startswith("BEGIN"):
+            self.in_transaction = True
+            return cast(sqlite3.Cursor, _NoopCursor())
+        if statement == "COMMIT":
+            raise sqlite3.OperationalError("commit failed")
+        if statement == "ROLLBACK":
+            raise sqlite3.OperationalError("rollback failed")
+        return cast(sqlite3.Cursor, _NoopCursor())
+
+    def close(self) -> None:
+        """记录 connection 已被 runner 关闭。
+
+        :returns: ``None``。
+        """
+
+        self.closed = True
 
 
 def _options(
@@ -764,6 +813,41 @@ def test_runner_can_be_constructed_with_independent_connection(
             assert _count_rows(connection, "notes") == 1
         finally:
             connection.close()
+
+
+def test_commit_failure_with_rollback_failure_marks_runner_unusable(
+    tmp_path: Path,
+) -> None:
+    """COMMIT 与 ROLLBACK 均失败时 runner 不得继续复用脏连接。"""
+
+    options = _options(tmp_path)
+    connection = _CommitRollbackFailingConnection()
+    runner = HostTransactionRunner(
+        cast(sqlite3.Connection, connection),
+        options.sqlite_policy,
+        payload_inline_threshold_bytes=(
+            options.payload_policy.payload_inline_threshold_bytes
+        ),
+    )
+
+    def operation(transaction: HostTransaction) -> str:
+        """返回固定结果，让失败点落在 COMMIT。
+
+        :param transaction: Host transaction。
+        :returns: 固定结果。
+        """
+
+        del transaction
+        return "done"
+
+    with pytest.raises(HostDurableError, match="rollback failed"):
+        runner.run_write(operation)
+    assert connection.closed is True
+    assert connection.statements == ["BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"]
+
+    with pytest.raises(HostDurableError, match="connection is unusable"):
+        runner.run_write(operation)
+    assert connection.statements == ["BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"]
 
 
 def test_store_close_rejects_active_transaction(tmp_path: Path) -> None:

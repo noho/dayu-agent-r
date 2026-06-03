@@ -94,6 +94,7 @@ from dayu.host.context_budget import (
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
     FALLBACK_ACTION_FAIL_CLOSED,
+    FALLBACK_ACTION_NOT_APPLICABLE,
     FALLBACK_POLICY_DECISION_RECENT_WINDOW,
     FALLBACK_POLICY_DECISION_SELECTION_FAILED,
     build_recent_window_fallback_selection,
@@ -227,7 +228,6 @@ _REASON_CONTEXT_COMPACTION_REQUIRED = "context_compaction_required"
 _REASON_CONTEXT_COMPACTION_RECOVERY_FAILED = "context_compaction_recovery_failed"
 _RECOVERY_FAILURE_POLICY_DECISION = "reactive_compact_failed"
 _REACTIVE_PRECONDITION_OPERATION_PREFIX = "reactive_precondition"
-_FALLBACK_ACTION_NOT_APPLICABLE = "not_applicable"
 _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
@@ -1777,7 +1777,7 @@ class EngineEventIngestor:
         fallback_input_window: Mapping[str, JsonValue] | None = None,
         fallback_input_digest: str | None = None,
         fallback_budget_result: Mapping[str, JsonValue] | None = None,
-        fallback_action: str = _FALLBACK_ACTION_NOT_APPLICABLE,
+        fallback_action: str = FALLBACK_ACTION_NOT_APPLICABLE,
     ) -> EventLogRow:
         """追加 reactive ``CONTEXT_COMPACTION_FAILED`` fact。
 

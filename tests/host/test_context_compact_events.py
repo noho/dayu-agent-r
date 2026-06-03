@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.api import HostEventKind
+from dayu.host.api import HostEventKind, HostTerminalStatus
 from dayu.host.compaction import (
     CompactInputRange,
     CompactQualityIssue,
@@ -574,6 +574,29 @@ def test_attempt_rejected_projects_to_progress_host_event(tmp_path: Path) -> Non
         assert store.transaction_runner.run_read(_operation) is HostEventKind.PROGRESS
 
 
+def test_run_lost_projects_to_lost_host_event(tmp_path: Path) -> None:
+    """RUN_LOST canonical fact 投影为 public lost terminal HostEvent。"""
+
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def _operation(
+            transaction: HostTransaction,
+        ) -> tuple[HostEventKind, HostTerminalStatus | None]:
+            """执行 HostEvent 投影。
+
+            :param transaction: 当前 Host read transaction。
+            :returns: public HostEvent kind 与 terminal status。
+            """
+
+            host_event = _host_event_from_row(transaction, _run_lost_row())
+            return host_event.kind, host_event.terminal_status
+
+        assert store.transaction_runner.run_read(_operation) == (
+            HostEventKind.LOST,
+            HostTerminalStatus.LOST,
+        )
+
+
 def _valid_failed_payload_with_fallback(fallback_action: str) -> Mapping[str, JsonValue]:
     """构造带完整 fallback 诊断字段的 failed payload。
 
@@ -650,6 +673,37 @@ def _attempt_rejected_row() -> EventLogRow:
         policy_decision_json=None,
         reason_json=None,
         payload_json="{}",
+        payload_ref=None,
+        payload_digest=None,
+        appended_at=timestamp,
+    )
+
+
+def _run_lost_row() -> EventLogRow:
+    """构造 RUN_LOST EventLog row。
+
+    :returns: RUN_LOST EventLog row。
+    """
+
+    timestamp = format_utc_timestamp(datetime.now(UTC))
+    return EventLogRow(
+        event_sequence=2,
+        event_id="event-run-lost-test",
+        event_body_digest=_DIGEST_B,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-1",
+        run_id="run-1",
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        event_type="RUN_LOST",
+        occurred_at=timestamp,
+        actor="test",
+        source="pytest",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json='{"message":"worker lost"}',
         payload_ref=None,
         payload_digest=None,
         appended_at=timestamp,

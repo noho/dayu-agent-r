@@ -59,6 +59,16 @@ async def _readany_raises_runtime_error_on_cancel() -> bytes:
     return b""
 
 
+async def _readany_raises_runtime_error_immediately() -> bytes:
+    """模拟 ``readany`` 已完成但携带未消费异常。
+
+    :returns: 不会返回。
+    :raises RuntimeError: 始终抛出，用于验证 done task 异常消费。
+    """
+
+    raise RuntimeError("read failed before cleanup")
+
+
 @pytest.mark.asyncio
 async def test_attempt_start_diagnostic_logged(
     caplog: pytest.LogCaptureFixture,
@@ -167,6 +177,24 @@ async def test_cancel_pending_readany_exception_logs_warning(
 
     assert "runner.pending_readany_cancel_failed" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_readany_consumes_done_task_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """readany task 已完成且带异常时也必须消费异常。"""
+
+    task = asyncio.create_task(_readany_raises_runtime_error_immediately())
+    await asyncio.sleep(0)
+    assert task.done()
+
+    with caplog.at_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.runner"
+    ):
+        await AsyncOpenAIRunner._cancel_pending_readany(task)
+
+    assert "runner.pending_readany_cancel_failed" not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -559,6 +559,7 @@ async def _read_next_terminal(iterator: AsyncIterator[HostEvent]) -> HostEvent:
             HostEventKind.SUCCEEDED,
             HostEventKind.FAILED,
             HostEventKind.CANCELLED,
+            HostEventKind.LOST,
         }:
             return event
 

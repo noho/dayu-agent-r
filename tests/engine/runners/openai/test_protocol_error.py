@@ -122,6 +122,48 @@ async def test_sse_invalid_json_emits_protocol_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sse_line_buffer_limit_emits_protocol_error() -> None:
+    """SSE 单行缓冲超过上限时必须协议错误收口。"""
+
+    events = await parse_sse(
+        [b"data: " + (b"x" * (1024 * 1024 + 1))],
+        provider_request_id="req_sse_line_limit",
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_line_too_long"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
+async def test_sse_data_line_count_limit_emits_protocol_error() -> None:
+    """单个 SSE event 的 data 行数超过上限时必须协议错误收口。"""
+
+    events = await parse_sse(
+        [b"".join(b"data: {}\n" for _index in range(257))],
+        provider_request_id="req_sse_data_line_limit",
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_data_lines_too_many"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
 async def test_sse_provider_error_object_emits_protocol_error() -> None:
     """SSE 200 流内 provider error object 必须失败收口。"""
 

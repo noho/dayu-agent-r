@@ -677,7 +677,7 @@ def _parse_manifest(*, raw: JsonObject, manifest_path: Path, relative_manifest_p
     :raises ScenePrepareError: 任一字段缺失或非法时抛出。
     """
 
-    _require_exact_fields(raw, allowed=_ALLOWED_MANIFEST_FIELDS, context=relative_manifest_path)
+    _require_no_unknown_fields(raw, allowed=_ALLOWED_MANIFEST_FIELDS, context=relative_manifest_path)
     schema_version = _require_int_field(raw, field_name="schema_version", context=relative_manifest_path)
     if schema_version != _SCHEMA_VERSION:
         raise ScenePrepareError(f"{relative_manifest_path}.schema_version must be 1")
@@ -746,7 +746,7 @@ def _parse_model_hints(value: JsonValue | None, *, context: str) -> SceneModelHi
     if value is None:
         return None
     record = _require_json_object(value, context=f"{context}.model")
-    _require_exact_fields(
+    _require_no_unknown_fields(
         record,
         allowed=_ALLOWED_MODEL_FIELDS,
         context=f"{context}.model",
@@ -777,7 +777,7 @@ def _parse_agent_policy_override(value: JsonValue | None, *, context: str) -> Sc
     if value is None:
         return None
     record = _require_json_object(value, context=f"{context}.agent_policy")
-    _require_exact_fields(
+    _require_no_unknown_fields(
         record,
         allowed=_ALLOWED_AGENT_POLICY_FIELDS,
         context=f"{context}.agent_policy",
@@ -837,7 +837,7 @@ def _parse_tool_selection(value: JsonValue | None, *, context: str) -> SceneTool
     if value is None:
         return None
     record = _require_json_object(value, context=f"{context}.tool_selection")
-    _require_exact_fields(
+    _require_no_unknown_fields(
         record,
         allowed=_ALLOWED_TOOL_SELECTION_FIELDS,
         context=f"{context}.tool_selection",
@@ -881,7 +881,7 @@ def _parse_defaults(record: JsonObject, *, context: str) -> _SceneDefaults:
     :raises ScenePrepareError: 缺失或非法 policy 时抛出。
     """
 
-    _require_exact_fields(
+    _require_no_unknown_fields(
         record,
         allowed=_ALLOWED_DEFAULTS_FIELDS,
         context=f"{context}.defaults",
@@ -908,7 +908,7 @@ def _parse_fragments(values: Sequence[JsonValue], *, context: str) -> tuple[_Man
     fragments: list[_ManifestFragment] = []
     for index, value in enumerate(values):
         record = _require_json_object(value, context=f"{context}.fragments[{index}]")
-        _require_exact_fields(
+        _require_no_unknown_fields(
             record,
             allowed=_ALLOWED_FRAGMENT_FIELDS,
             context=f"{context}.fragments[{index}]",
@@ -950,7 +950,7 @@ def _parse_context_slots(values: Sequence[JsonValue], *, context: str) -> tuple[
     seen: set[str] = set()
     for index, value in enumerate(values):
         record = _require_json_object(value, context=f"{context}.context_slots[{index}]")
-        _require_exact_fields(
+        _require_no_unknown_fields(
             record,
             allowed=_ALLOWED_CONTEXT_SLOT_FIELDS,
             context=f"{context}.context_slots[{index}]",
@@ -1225,7 +1225,7 @@ def _tool_catalog_json(catalog: SceneToolCatalog) -> JsonValue:
     return tools
 
 
-def _require_exact_fields(record: JsonObject, *, allowed: frozenset[str], context: str) -> None:
+def _require_no_unknown_fields(record: JsonObject, *, allowed: frozenset[str], context: str) -> None:
     """校验 JSON object 只包含允许字段。
 
     :param record: JSON object。

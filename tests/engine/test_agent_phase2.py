@@ -850,6 +850,7 @@ def test_exception_diagnostic_message_preserves_normal_token_and_header_words(
         "provider rejected Bearer sk-secret-value",
         "provider rejected API key sk-secret-value",
         "provider rejected api_key=sk-secret-value",
+        "provider rejected api-key:sk-secret-value",
         "provider rejected apikey=sk-secret-value",
         "provider rejected authorization=sk-secret-value",
         "provider rejected password=sk-secret-value",
@@ -868,6 +869,133 @@ def test_exception_diagnostic_message_redacts_sensitive_value_patterns(
 
     assert message == "RuntimeError: exception message redacted"
     assert "sk-secret-value" not in message
+
+
+@pytest.mark.parametrize(
+    "raw_message",
+    (
+        "provider rejected api_key=;",
+        "provider rejected token=;",
+    ),
+)
+def test_exception_diagnostic_message_redacts_semicolon_value_start(
+    raw_message: str,
+) -> None:
+    """异常诊断保留分号 value start 的整条脱敏语义。
+
+    :param raw_message: 以分号作为敏感 value 起点的异常消息。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    message = agent_module._exception_diagnostic_message(
+        RuntimeError(raw_message)
+    )
+
+    assert message == "RuntimeError: exception message redacted"
+
+
+@pytest.mark.parametrize(
+    "raw_message",
+    (
+        "provider rejected api_key=}",
+        "provider rejected api_key=]",
+        "provider rejected token=}",
+        "provider rejected token=]",
+        "provider rejected Bearer }",
+        "provider rejected Bearer ]",
+    ),
+)
+def test_exception_diagnostic_message_preserves_closing_punctuation_start(
+    raw_message: str,
+) -> None:
+    """异常诊断不把右括号类 value start 误判为敏感值。
+
+    :param raw_message: 以右括号类标点作为 value 起点的异常消息。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    message = agent_module._exception_diagnostic_message(
+        RuntimeError(raw_message)
+    )
+
+    assert message == f"RuntimeError: {raw_message}"
+
+
+@pytest.mark.parametrize("raw_message", ("", "   ", "\t\n"))
+def test_safe_log_message_redacts_blank_or_whitespace(raw_message: str) -> None:
+    """日志安全摘要对空白消息使用固定脱敏文本。
+
+    :param raw_message: 空字符串或空白字符串。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    assert (
+        agent_module._safe_log_message(raw_message)
+        == "exception message redacted"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_message",
+    (
+        "provider rejected Bearer sk-secret-value",
+        "provider rejected api-key:sk-secret-value",
+        "provider rejected token=sk-secret-value",
+        "provider rejected api_key=;",
+    ),
+)
+def test_safe_log_message_redacts_sensitive_message_whole(
+    raw_message: str,
+) -> None:
+    """日志安全摘要命中敏感值时必须整条替换。
+
+    :param raw_message: 携带敏感值的原始日志消息。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    message = agent_module._safe_log_message(raw_message)
+
+    assert message == "exception message redacted"
+    assert "sk-secret-value" not in message
+
+
+def test_safe_log_message_truncates_ordinary_long_message() -> None:
+    """日志安全摘要对普通长消息使用 Engine suffix 截断。
+
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    message = agent_module._safe_log_message("x" * 500)
+
+    assert message.endswith("... [truncated]")
+    assert len(message) == agent_module._EXCEPTION_MESSAGE_MAX_LENGTH
+
+
+@pytest.mark.parametrize(
+    "raw_message",
+    (
+        "JWT token has expired",
+        "Content-Type header is invalid",
+        "provider rejected token=}",
+        "provider rejected Bearer ]",
+    ),
+)
+def test_safe_log_message_preserves_false_positive_guards(
+    raw_message: str,
+) -> None:
+    """日志安全摘要保留非敏感普通诊断文本。
+
+    :param raw_message: 不应被识别为敏感值的日志消息。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    assert agent_module._safe_log_message(raw_message) == raw_message
 
 
 @pytest.mark.asyncio
@@ -1257,6 +1385,7 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
     with pytest.raises(RuntimeError):
         async for _event_item in agent.run_messages():
             pass
+    assert runner.close_count == 0
     runner.release_event.set()
     await task
 

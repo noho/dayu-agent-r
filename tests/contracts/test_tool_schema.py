@@ -6,10 +6,12 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts import tool_schema as tool_schema_module
 from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolTruncateSpec,
     ToolTruncationStrategy,
+    truncate_limit_key_for_strategy,
 )
 
 
@@ -21,6 +23,18 @@ def test_tool_parameters_schema_requires_fields_inside_properties() -> None:
             type="object",
             properties={"known": {"type": "string"}},
             required=("missing",),
+            additional_properties=False,
+        )
+
+
+def test_tool_parameters_schema_rejects_blank_property_key() -> None:
+    """properties 字段名为空白时必须在构造期拒绝。"""
+
+    with pytest.raises(ValueError, match="properties keys"):
+        ToolParametersSchema(
+            type="object",
+            properties={" ": {"type": "string"}},
+            required=(),
             additional_properties=False,
         )
 
@@ -38,6 +52,39 @@ def test_enabled_truncate_spec_requires_enum_strategy_and_matching_limit() -> No
     )
 
     assert spec.strategy is ToolTruncationStrategy.TEXT_CHARS
+
+
+def test_truncate_limit_key_mapping_covers_all_strategies() -> None:
+    """所有截断策略都必须有稳定 limit key 映射。"""
+
+    assert {
+        strategy: truncate_limit_key_for_strategy(strategy)
+        for strategy in ToolTruncationStrategy
+    } == {
+        ToolTruncationStrategy.TEXT_CHARS: "max_chars",
+        ToolTruncationStrategy.TEXT_LINES: "max_lines",
+        ToolTruncationStrategy.LIST_ITEMS: "max_items",
+        ToolTruncationStrategy.BINARY_BYTES: "max_bytes",
+    }
+
+
+def test_truncate_limit_key_rejects_missing_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """枚举成员缺少 limit key 映射时抛 ValueError 而不是 KeyError。"""
+
+    monkeypatch.setattr(
+        tool_schema_module,
+        "_TRUNCATE_LIMIT_KEYS_BY_STRATEGY",
+        {
+            ToolTruncationStrategy.TEXT_LINES: "max_lines",
+            ToolTruncationStrategy.LIST_ITEMS: "max_items",
+            ToolTruncationStrategy.BINARY_BYTES: "max_bytes",
+        },
+    )
+
+    with pytest.raises(ValueError, match="limit key mapping"):
+        truncate_limit_key_for_strategy(ToolTruncationStrategy.TEXT_CHARS)
 
 
 def test_enabled_truncate_spec_allows_empty_limits_for_runtime_policy_fill() -> None:

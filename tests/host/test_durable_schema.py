@@ -23,6 +23,7 @@ from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
     INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
+    INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
     INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN,
     INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE,
     INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE,
@@ -56,6 +57,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_PROJECTION_FAILURES,
     TABLE_HOST_PURGE_TOMBSTONES,
     TABLE_HOST_RUN_RESULTS,
+    TABLE_HOST_RUNS,
     TABLE_HOST_SESSIONS,
     TABLE_HOST_SESSION_TIMELINE_ITEMS,
     TABLE_HOST_TOOL_TRACE_HOT,
@@ -80,6 +82,12 @@ _CREATE_TABLE_NAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 """从 Host durable DDL 中抽取 table 名称的测试正则。"""
+
+_SQLITE_OBJECT_TYPE_INDEX = "index"
+"""SQLite catalog 中 index object type 名称。"""
+
+_SQLITE_OBJECT_TYPE_TABLE = "table"
+"""SQLite catalog 中 table object type 名称。"""
 
 
 def _ddl_table_names(statements: tuple[str, ...]) -> frozenset[str]:
@@ -168,6 +176,93 @@ def _index_exists(connection: sqlite3.Connection, index_name: str) -> bool:
         (index_name,),
     ).fetchone()
     return row is not None
+
+
+def _schema_sql(connection: sqlite3.Connection, object_type: str, object_name: str) -> str:
+    """读取 SQLite catalog 中指定 object 的 SQL 定义。
+
+    :param connection: SQLite connection。
+    :param object_type: SQLite object type。
+    :param object_name: SQLite object name。
+    :returns: SQLite catalog SQL。
+    :raises AssertionError: 指定 object 不存在或 catalog SQL 为空时抛出。
+    """
+
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+        (object_type, object_name),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is not None
+    return str(row[0])
+
+
+def _schema_sql_from_db_path(db_path: Path, object_type: str, object_name: str) -> str:
+    """从 SQLite DB 文件读取指定 object 的 SQL 定义。
+
+    :param db_path: SQLite DB 文件路径。
+    :param object_type: SQLite object type。
+    :param object_name: SQLite object name。
+    :returns: SQLite catalog SQL。
+    :raises AssertionError: 指定 object 不存在或 catalog SQL 为空时抛出。
+    :raises sqlite3.Error: 打开 DB 或读取 catalog 失败时由 SQLite 抛出。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        return _schema_sql(connection, object_type, object_name)
+    finally:
+        connection.close()
+
+
+def _mutate_schema_sql(
+    db_path: Path,
+    *,
+    object_type: str,
+    object_name: str,
+    mutated_sql: str,
+) -> None:
+    """直接篡改 SQLite catalog 中指定 object 的 SQL 定义。
+
+    :param db_path: SQLite DB 文件路径。
+    :param object_type: SQLite object type。
+    :param object_name: SQLite object name。
+    :param mutated_sql: 写入 ``sqlite_master.sql`` 的变异 SQL。
+    :returns: ``None``。
+    :raises sqlite3.Error: 打开 DB 或更新 catalog 失败时由 SQLite 抛出。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql = ? WHERE type = ? AND name = ?",
+            (mutated_sql, object_type, object_name),
+        )
+        connection.execute("PRAGMA writable_schema=OFF")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _replace_index_with_wrong_definition(db_path: Path, index_name: str) -> None:
+    """用同名但定义错误的 index 替换 required index。
+
+    :param db_path: SQLite DB 文件路径。
+    :param index_name: 目标 index 名称。
+    :returns: ``None``。
+    :raises sqlite3.Error: 打开 DB 或执行 DDL 失败时由 SQLite 抛出。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(f"DROP INDEX {index_name}")
+        connection.execute(
+            f"CREATE INDEX {index_name} ON {TABLE_HOST_RUNS}(session_id)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _drop_table(db_path: Path, table_name: str) -> None:
@@ -394,9 +489,12 @@ def test_current_schema_missing_table_opener_raises_without_repair(
 
     with pytest.raises(
         HostSchemaMismatchError,
-        match=f"missing required table: {TABLE_EVENT_LOG}",
-    ):
+        match="missing required objects",
+    ) as exc_info:
         open_host_durable_store(options)
+    error_message = str(exc_info.value)
+    assert f"tables: {TABLE_EVENT_LOG}" in error_message
+    assert INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE in error_message
 
     verify_connection = sqlite3.connect(options.db_path)
     try:
@@ -433,6 +531,119 @@ def test_current_schema_missing_index_opener_raises_without_repair(
         verify_connection.close()
 
 
+def test_current_schema_multiple_missing_objects_are_reported_together(
+    tmp_path: Path,
+) -> None:
+    """current user_version 多个对象缺失时 schema validation 必须批量诊断。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 诊断未同时列出缺失 table 与 index 时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options):
+        pass
+    _drop_table(options.db_path, TABLE_HOST_MEMORY_DIAGNOSTICS)
+    _drop_index(options.db_path, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
+
+    with pytest.raises(
+        HostSchemaMismatchError,
+        match="missing required objects",
+    ) as exc_info:
+        open_host_durable_store(options)
+
+    error_message = str(exc_info.value)
+    assert f"tables: {TABLE_HOST_MEMORY_DIAGNOSTICS}" in error_message
+    assert (
+        f"indexes: {INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON}, "
+        f"{INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE}"
+    ) in error_message
+
+
+def test_current_schema_wrong_index_definition_opener_raises_without_repair(
+    tmp_path: Path,
+) -> None:
+    """current user_version 下同名 required index 定义错误时 opener fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: opener 未抛错或静默修复错误 index 定义时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options):
+        pass
+    _replace_index_with_wrong_definition(
+        options.db_path,
+        INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
+    )
+
+    with pytest.raises(
+        HostSchemaMismatchError,
+        match=(
+            "definition mismatch: "
+            f"{_SQLITE_OBJECT_TYPE_INDEX} {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}"
+        ),
+    ):
+        open_host_durable_store(options)
+
+    verify_connection = sqlite3.connect(options.db_path)
+    try:
+        wrong_sql = _schema_sql(
+            verify_connection,
+            _SQLITE_OBJECT_TYPE_INDEX,
+            INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
+        )
+        assert "CREATE INDEX" in wrong_sql
+        assert "WHERE status IN" not in wrong_sql
+    finally:
+        verify_connection.close()
+
+
+def test_current_schema_mutated_table_definition_opener_raises_without_repair(
+    tmp_path: Path,
+) -> None:
+    """current user_version 下同名 table catalog SQL 变异时 opener fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: opener 未抛错或静默修复错误 table 定义时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options):
+        pass
+    original_sql = _schema_sql_from_db_path(
+        options.db_path,
+        _SQLITE_OBJECT_TYPE_TABLE,
+        TABLE_HOST_RUNS,
+    )
+    mutated_sql = original_sql.replace("execution_target TEXT NOT NULL", "execution_target TEXT NULL", 1)
+    assert mutated_sql != original_sql
+    _mutate_schema_sql(
+        options.db_path,
+        object_type=_SQLITE_OBJECT_TYPE_TABLE,
+        object_name=TABLE_HOST_RUNS,
+        mutated_sql=mutated_sql,
+    )
+
+    with pytest.raises(
+        HostSchemaMismatchError,
+        match=f"definition mismatch: {_SQLITE_OBJECT_TYPE_TABLE} {TABLE_HOST_RUNS}",
+    ):
+        open_host_durable_store(options)
+
+    verify_connection = sqlite3.connect(options.db_path)
+    try:
+        assert (
+            _schema_sql(verify_connection, _SQLITE_OBJECT_TYPE_TABLE, TABLE_HOST_RUNS)
+            == mutated_sql
+        )
+    finally:
+        verify_connection.close()
+
+
 def test_secondary_connection_missing_table_raises_without_repair(
     tmp_path: Path,
 ) -> None:
@@ -448,9 +659,12 @@ def test_secondary_connection_missing_table_raises_without_repair(
         _drop_table(options.db_path, TABLE_HOST_MEMORY_DIAGNOSTICS)
         with pytest.raises(
             HostSchemaMismatchError,
-            match=f"missing required table: {TABLE_HOST_MEMORY_DIAGNOSTICS}",
-        ):
+            match="missing required objects",
+        ) as exc_info:
             store.connect()
+        error_message = str(exc_info.value)
+        assert f"tables: {TABLE_HOST_MEMORY_DIAGNOSTICS}" in error_message
+        assert f"indexes: {INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON}" in error_message
 
     verify_connection = sqlite3.connect(options.db_path)
     try:
@@ -485,6 +699,44 @@ def test_secondary_connection_missing_index_raises_without_repair(
         verify_connection.close()
 
 
+def test_secondary_connection_definition_mismatch_raises_without_repair(
+    tmp_path: Path,
+) -> None:
+    """store.connect secondary path 遇到 definition mismatch 时只校验不修复。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: secondary path 未抛错或静默修复错误定义时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _replace_index_with_wrong_definition(
+            options.db_path,
+            INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
+        )
+        with pytest.raises(
+            HostSchemaMismatchError,
+            match=(
+                "definition mismatch: "
+                f"{_SQLITE_OBJECT_TYPE_INDEX} {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}"
+            ),
+        ):
+            store.connect()
+
+    verify_connection = sqlite3.connect(options.db_path)
+    try:
+        wrong_sql = _schema_sql(
+            verify_connection,
+            _SQLITE_OBJECT_TYPE_INDEX,
+            INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
+        )
+        assert "CREATE INDEX" in wrong_sql
+        assert "WHERE status IN" not in wrong_sql
+    finally:
+        verify_connection.close()
+
+
 def test_host_durable_indexes_match_create_index_ddl() -> None:
     """HOST_DURABLE_INDEXES 与 HOST_DURABLE_DDL 中的 index DDL 保持同源。
 
@@ -508,6 +760,71 @@ def test_host_durable_tables_match_create_table_ddl() -> None:
     """
 
     assert _ddl_table_names(HOST_DURABLE_DDL) == set(HOST_DURABLE_TABLES)
+
+
+def test_fresh_bootstrapped_schema_matches_generated_expected_sql(
+    tmp_path: Path,
+) -> None:
+    """fresh bootstrap 后 catalog SQL 与当前 DDL 生成的 expected SQL 一致。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: fresh DB schema definition validation false positive 时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            durable_schema.validate_host_durable_schema(connection)
+            assert (
+                durable_schema._read_schema_sql_by_name(connection)
+                == durable_schema._expected_schema_sql_by_name()
+            )
+        finally:
+            connection.close()
+
+
+def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
+    """schema SQL 归一化只处理首尾空白和连续空白。
+
+    :returns: ``None``。
+    :raises AssertionError: 大小写、quote、clause 或标点变化被错误归一化时抛出。
+    """
+
+    base_sql = 'CREATE TABLE "host_runs" (run_id TEXT, status TEXT)'
+    normalized_base = durable_schema._normalize_schema_sql(base_sql)
+
+    assert (
+        durable_schema._normalize_schema_sql(
+            '\n\tCREATE   TABLE   "host_runs"   (run_id   TEXT,   status   TEXT)  '
+        )
+        == normalized_base
+    )
+    assert (
+        durable_schema._normalize_schema_sql(
+            'create TABLE "host_runs" (run_id TEXT, status TEXT)'
+        )
+        != normalized_base
+    )
+    assert (
+        durable_schema._normalize_schema_sql(
+            "CREATE TABLE host_runs (run_id TEXT, status TEXT)"
+        )
+        != normalized_base
+    )
+    assert (
+        durable_schema._normalize_schema_sql(
+            'CREATE TABLE "host_runs" (run_id TEXT, status TEXT) WITHOUT ROWID'
+        )
+        != normalized_base
+    )
+    assert (
+        durable_schema._normalize_schema_sql(
+            'CREATE TABLE "host_runs"(run_id TEXT, status TEXT)'
+        )
+        != normalized_base
+    )
 
 
 def test_host_schema_version_is_active_run_check_version() -> None:

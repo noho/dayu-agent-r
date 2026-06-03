@@ -72,6 +72,71 @@ def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
     assert "asyncio.run" not in source
 
 
+@pytest.mark.parametrize(
+    ("raw_message", "secret_value"),
+    (
+        ("provider failed Authorization: Bearer bearer-secret tail", "bearer-secret"),
+        ("provider failed api_key=api-key-secret tail", "api-key-secret"),
+        ("provider failed token=token-secret tail", "token-secret"),
+        ("provider failed secret=secret-value tail", "secret-value"),
+        ("provider failed authorization=authorization-secret tail", "authorization-secret"),
+        ("provider failed password=password-secret tail", "password-secret"),
+        ("provider failed api key spaced-secret tail", "spaced-secret"),
+        ("provider failed apikey=apikey-secret tail", "apikey-secret"),
+        ("provider failed api-key:colon-secret tail", "colon-secret"),
+        ("provider failed api-key: spaced-colon-secret tail", "spaced-colon-secret"),
+    ),
+)
+def test_safe_outcome_text_redacts_sensitive_diagnostic_values(
+    raw_message: str,
+    secret_value: str,
+) -> None:
+    """_safe_outcome_text 脱敏 runner outcome 中的敏感值。
+
+    :param raw_message: 包含敏感值写法的原始 outcome 文本。
+    :param secret_value: 不允许出现在脱敏结果中的明文值。
+    :returns: ``None``。
+    :raises AssertionError: 敏感值泄漏或非敏感上下文丢失时抛出。
+    """
+
+    safe_message = llm_compaction_module._safe_outcome_text(raw_message)
+
+    assert secret_value not in safe_message
+    assert "<redacted>" in safe_message
+    assert "provider failed" in safe_message
+    assert "tail" in safe_message
+
+
+def test_safe_outcome_text_does_not_redact_plain_token_diagnostic() -> None:
+    """_safe_outcome_text 不误脱敏普通 token 诊断句。
+
+    :returns: ``None``。
+    :raises AssertionError: 普通诊断文本被误改写时抛出。
+    """
+
+    message = "JWT token has expired"
+
+    assert llm_compaction_module._safe_outcome_text(message) == message
+
+
+def test_safe_outcome_text_uses_runtime_truncation_shape() -> None:
+    """_safe_outcome_text 使用 runtime diagnostic 截断语义。
+
+    outcome 摘要超限时，返回总长必须不超过 ``_MAX_SAFE_OUTCOME_MESSAGE_CHARS``，
+    截断后缀也计入最大长度。
+
+    :returns: ``None``。
+    :raises AssertionError: 截断正文长度或后缀形状变化时抛出。
+    """
+
+    message = "x" * 241
+
+    safe_message = llm_compaction_module._safe_outcome_text(message)
+
+    assert safe_message == ("x" * 237) + "..."
+    assert len(safe_message) == 240
+
+
 def _llm_compactor(
     *,
     runner_spec: RunnerSpec,
@@ -171,6 +236,8 @@ async def test_prompt_renders_material_pack_without_ledger_dump(
     user_message = seen[0].messages[1]
     prompt = user_message.content
     assert prompt is not None
+    assert "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN" in prompt
+    assert "UNTRUSTED_COMPACTION_MATERIAL_JSON_END" in prompt
     assert '"stable_input":' in prompt
     assert '"history_input":' in prompt
     assert '"evidence_input":' in prompt
@@ -192,6 +259,13 @@ async def test_prompt_renders_material_pack_without_ledger_dump(
     assert "outcome_digest" not in prompt
     assert "canonical_source_refs" not in prompt
     assert "Revenue grew 12% year over year." in prompt
+
+
+def test_llm_compaction_text_estimator_uses_cjk_conservative_budget() -> None:
+    """LLM compaction 文本估算复用 Host CJK 保守估算语义。"""
+
+    assert llm_compaction_module._estimate_text_tokens("abcdef") == 2
+    assert llm_compaction_module._estimate_text_tokens("收入增长明显") == 6
 
 
 @pytest.mark.asyncio
