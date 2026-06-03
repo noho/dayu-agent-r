@@ -140,18 +140,18 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | not-started |
-| active work unit | none selected |
-| default next work unit | WU-ENG-01 |
-| next entry point | discussion：确认默认下一条、对应 GitHub Issue 状态和依赖是否满足；随后进入 plan / implementation / review |
+| gate | ready-to-open-draft-PR |
+| implementation status | completed |
+| active work unit | WU-ENG-01 |
+| default next work unit | WU-ENG-02 |
+| next entry point | draft PR gate：push 当前分支并创建 draft PR；PR 创建后记录 PR URL |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | none |
-| implementation commits | none |
-| review artifacts | none |
+| implementation commits | a2304db |
+| review artifacts | discussion / code / provider API evidence recorded inline in WU-ENG-01 |
 | aggregate review artifacts | none |
-| draft PR status | not-started |
-| blocking open questions | none；如果用户不接受默认顺序，需要先指定 active work unit |
+| draft PR status | ready-to-create |
+| blocking open questions | none |
 
 状态约定：
 
@@ -241,25 +241,26 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 ### 状态
 
-GitHub Issue #10 当前仍为 OPEN。代码核对显示 `ToolCallProviderState` 已经是强类型 provider-specific 通道，当前成员为 `GeminiToolCallState`；但 OpenAI-compatible payload 仍保留 Phase 3 过渡行为：`AssistantMessage.reasoning_content is not None` 时无条件写回 outbound `reasoning_content`。因此 #10 尚未完全关闭，仍需要进入 Engine design / plan gate。
+GitHub Issue #10 当前仍为 OPEN，但 discussion / 代码 / provider API 文档核对后裁决：原先把 `AssistantMessage.reasoning_content is not None` 时写回 outbound `reasoning_content` 视为“无条件写回 bug”的动机被高估。MiMo、DeepSeek、Qwen 等 thinking + tool-call provider 要求把上一轮 assistant 的 `reasoning_content` 原样带回；Gemini 要求把 `thought_signature` 原样带回。因此当前 work unit 不进入 payload behavior change，先收敛为 issue 记录、docstring / 测试说明修正与 provider roundtrip 证据固化。
 
 ### 设计与代码核对
 
 - `docs/host/design.md` 仅涉及 Host 如何暴露 thinking / tool events，不拥有 provider-specific reasoning roundtrip 策略。
 - `docs/engine/design.md` 已定义 `ToolCallProviderState` 是封闭 provider-specific 联合，当前成员为 `GeminiToolCallState`，用于 Gemini `thought_signature` roundtrip。
-- `docs/engine/migration-plan.md` 明确把 Phase 3 的无条件 `reasoning_content` 写回标为过渡实现，要求后续改为 provider-specific 非无脑写回策略。
+- `docs/engine/migration-plan.md` 曾把 Phase 3 的 `reasoning_content` 写回标为过渡实现；本次核对后裁决为：不能在没有 provider API / 真实 smoke 证据证明当前 payload 错误时改动 request / response 行为。
 - `dayu/contracts/tool_call.py` 已实现 `GeminiToolCallState` 与 `ToolCallProviderState` 强类型通道。
-- `dayu/engine/runners/openai/payload.py` 仍在 assistant message serialization 中无条件保留非空 `reasoning_content`。
-- `tests/engine/runners/openai/test_payload_assistant_reasoning_content_preserved.py` 仍把“非空 reasoning_content 必须写回”作为当前测试期望。
+- `dayu/engine/runners/openai/payload.py` 在 assistant message serialization 中保留非空 `reasoning_content`，该字段来自 provider response / Engine 历史回放，不由 Host 或 payload builder 凭空生成。
+- `tests/engine/runners/openai/test_payload_assistant_reasoning_content_preserved.py` 应从“OLD 兼容保留性”改写为“thinking tool-call roundtrip provider requirement”测试说明。
+- Provider API 证据：MiMo / DeepSeek thinking mode 在多轮 tool-call 场景要求 assistant `reasoning_content` 原样回传；Qwen thinking tool-call 文档要求发送 tool results 时包含 assistant `reasoning_content`；Gemini thinking / function calling 要求回传 thought signature。
 
 ### 目标
 
-- 将 Phase 3 的过渡性 `reasoning_content` 无条件写回改为 provider-specific policy。
-- 为每个需要 reasoning / thinking roundtrip 的 provider 明确证据来源：API 文档、真实 smoke 或可复现 provider 行为。
-- 明确哪些 provider 不需要写回 `reasoning_content`，并确保不会被写入多余字段。
-- 若 provider 需要 roundtrip state，优先通过 `ToolCallProviderState` 封闭联合扩展，或通过 provider adapter 的显式请求投影表达。
+- 不改变当前已能运行的 provider request / response payload；只有 API 文档、真实 smoke 或可复现 provider 行为证明当前 payload 错误时，才允许 provider-specific payload 调整。
+- 固化 reasoning / thinking roundtrip 证据：MiMo / DeepSeek / Qwen 的 `reasoning_content` 与 Gemini 的 `thought_signature` 是 provider 协议的一部分，不是 Host 治理字段。
+- 修正文档和测试描述，避免把正确的 provider roundtrip 行为继续写成“OLD 过渡兼容”或“待删除的无条件写回”。
+- 若未来 provider 需要新增 roundtrip state，仍优先通过 `ToolCallProviderState` 封闭联合扩展，或通过 provider adapter 的显式请求投影表达。
 - 保持 Runner / Agent / ToolExecutor 边界：Runner 只做 provider payload 投影，不重新执行工具，不依赖 `ToolExecutor`。
-- 更新 Engine design、payload builder、tests 和相关 README / config docs，使过渡行为不再被写成长期稳定契约。
+- 更新 payload builder docstring、tests 和相关 Engine README，使当前稳定行为按 provider API contract 表述。
 
 ### 非目标
 
@@ -272,10 +273,10 @@ GitHub Issue #10 当前仍为 OPEN。代码核对显示 `ToolCallProviderState` 
 ### 验收信号
 
 - 每个 provider 的 reasoning roundtrip 策略有明确证据来源。
-- 不需要 reasoning roundtrip 的 provider 不会被写入多余 `reasoning_content` 字段。
-- 需要 reasoning roundtrip 的 provider 能在多轮 tool calling 中保持协议不断链。
+- 当前已能运行的 MiMo / DeepSeek / Qwen / Gemini request / response 行为不被改变。
+- MiMo / DeepSeek / Qwen 的 `reasoning_content` roundtrip 与 Gemini 的 `thought_signature` roundtrip 在 docstring / tests 中被明确为 provider API requirement。
 - `ToolCallProviderState` 仍是封闭强类型联合；新增成员时所有 parser / serializer match 分支穷尽。
-- 相关 tests 从“非空 reasoning_content 必须无条件写回”改为 provider-specific policy 测试。
+- 相关 tests 从“OLD 兼容保留性”改为 thinking tool-call roundtrip requirement 测试。
 - pyright 不新增或扩散类型错误。
 
 ## WU-ENG-02 Provider Request Identity And Vendor Debugging Correlation

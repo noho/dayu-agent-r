@@ -14,7 +14,9 @@
   capability 门控：仅当 ``stream=True`` 且 ``supports_stream_usage=True``
   时写入；其它情形不写。
 - :class:`AssistantMessage.reasoning_content is not None` 时 outbound
-  message 必须保留 ``reasoning_content`` 键，与 OLD 真源一致。
+  message 保留 ``reasoning_content`` 键。该字段是 provider response /
+  Engine 历史回放事实；MiMo、DeepSeek、Qwen 等 thinking + tool-call
+  provider 要求在后续请求中原样回传，payload builder 不凭空生成。
 - :class:`AssistantToolCall.provider_state == GeminiToolCallState(s)` 时
   outbound tool call 写入 ``extra_content = {"google":
   {"thought_signature": s}}``，保留 ``google`` namespace。

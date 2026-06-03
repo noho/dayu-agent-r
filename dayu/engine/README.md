@@ -130,6 +130,8 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 `RunnerSpec.provider_request` 是 `ProviderRequestExtension | None`，当前封闭联合成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。显式调用参数只进入 `RunnerCallOptions`，不放进 provider 扩展。
 
+OpenAI-compatible Runner 会保留已存在于 `AssistantMessage` 的 `reasoning_content`，并在 `AssistantToolCall.provider_state` 为 `GeminiToolCallState` 时回写 `extra_content.google.thought_signature`。这些字段是 provider response / Engine 历史回放事实，用于满足 thinking + tool-call provider 的 roundtrip 协议；Engine 对 Host 仍暴露统一的 `RunnerEvent` / `EngineEvent` 契约。
+
 `dayu.engine.provider_extensions.provider_request_extension_from_json(value)` 是配置 DSL 到 `ProviderRequestExtension` 的 Engine 边界 helper。它支持 `openai_reasoning`、`anthropic_thinking`、`deepseek_thinking`、`mimo_thinking`、`gemini_thinking`、`qwen_thinking` 六类 DSL；未知 `type`、未知字段、非法枚举值或契约拒绝的字段组合都会以 `ProviderExtensionConfigError` fail closed。该 helper 不在包根 re-export，调用方应显式从子模块导入。
 
 OpenAI-compatible Runner 会在内部执行 streaming capability：当 `RunnerCallOptions.stream=True` 但 `RunnerSpec.supports_streaming=False` 时，本次请求降级为 `stream=False`，且不写 `stream_options`。`RunnerSpec.supports_stream_usage` 只门控流式请求中是否写入 `stream_options.include_usage=True`；为 `False` 时不写该字段。`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 SSE 字节空闲检测配置：heartbeat 只能在 timeout 已启用时设置，二者必须为正数，且 heartbeat 不能大于 timeout。

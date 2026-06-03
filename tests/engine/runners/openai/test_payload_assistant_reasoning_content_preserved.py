@@ -1,4 +1,4 @@
-"""``AssistantMessage.reasoning_content`` outbound 序列化保留性测试。"""
+"""``AssistantMessage.reasoning_content`` provider roundtrip 测试。"""
 
 from __future__ import annotations
 
@@ -9,13 +9,24 @@ from dayu.engine.contracts.messages import (
     AssistantToolCall,
     UserMessage,
 )
+from dayu.engine.contracts.runner_spec import (
+    DeepSeekThinkingExtension,
+    MimoThinkingExtension,
+    ProviderRequestExtension,
+    QwenThinkingExtension,
+)
 from dayu.engine.runners.openai.payload import build_request_payload
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 
 
-def test_reasoning_content_present_when_not_none() -> None:
-    """``reasoning_content`` 非空时 outbound 必须保留同名键。"""
+def test_reasoning_content_roundtrips_when_present() -> None:
+    """``reasoning_content`` 非空时 outbound 必须原样保留。
+
+    MiMo、DeepSeek、Qwen 等 thinking + tool-call provider 要求把上一轮
+    assistant ``reasoning_content`` 随历史消息送回；payload builder 只保留
+    已存在的 Engine 消息事实，不自行生成该字段。
+    """
 
     msg = AssistantMessage(
         role=AgentMessageRole.ASSISTANT,
@@ -32,6 +43,32 @@ def test_reasoning_content_present_when_not_none() -> None:
     messages = payload.get("messages")
     assert messages is not None
     assert messages[0].get("reasoning_content") == "some thinking"
+
+
+def test_reasoning_content_roundtrips_for_thinking_tool_call_providers() -> None:
+    """thinking tool-call provider 的 ``reasoning_content`` 必须可回传。"""
+
+    provider_requests: tuple[ProviderRequestExtension, ...] = (
+        MimoThinkingExtension(enabled=True),
+        DeepSeekThinkingExtension(enabled=True),
+        QwenThinkingExtension(enable_thinking=True),
+    )
+    msg = AssistantMessage(
+        role=AgentMessageRole.ASSISTANT,
+        content="hello",
+        reasoning_content="provider thinking",
+        tool_calls=(),
+    )
+    for provider_request in provider_requests:
+        payload = build_request_payload(
+            messages=[msg],
+            options=make_options(stream=False),
+            tools=[],
+            spec=make_spec(provider_request=provider_request),
+        )
+        messages = payload.get("messages")
+        assert messages is not None
+        assert messages[0].get("reasoning_content") == "provider thinking"
 
 
 def test_reasoning_content_absent_when_none() -> None:
