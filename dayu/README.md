@@ -9,7 +9,7 @@
 
 ## 设计意图
 
-Dayu 是生产级买方财报分析 Agent，核心范式是“宿主强约束下的 LLM in the loop”。LLM 参与分析与生成，但 Session / Run / Attempt 生命周期、取消、恢复、工具治理、事件事实和投影治理由 Host 掌控。
+Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。LLM 参与分析与生成，但 Session / Run / Attempt 生命周期、取消、恢复、工具治理、事件事实和投影治理由 Host 掌控。
 
 系统优先保证以下性质：
 

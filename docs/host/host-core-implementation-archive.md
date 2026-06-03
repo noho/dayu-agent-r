@@ -16,7 +16,7 @@
 
 Host 设计与实施必须始终服务于以下目标：
 
-- 生产级买方财报分析 Agent。
+- 生产级通用 Agent，具备买方财报分析能力。
 - 范式是“宿主强约束下的 LLM in the loop”。
 - 支持单机多客户端 / 多进程。
 - 支持本地 Engine 和远程 Engine 并列执行。
@@ -1765,7 +1765,7 @@ Plan 必须额外收口的 readiness review checklist：
   PASS (361 passed)；`pyright dayu tests` PASS (0 errors)；`git diff --check` PASS。当前 gate 回到 draft-PR-pass。
 
 目标：
-- 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
+- 从生产级通用 Agent 的会话治理目标与买方财报分析能力的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
   跨 compaction 稳定复用，不依赖 assistant final answer、episode summary 或 raw turns 侥幸保留。
 - 明确 pinned_state、evidence_backed_facts、derived analysis state 与 interaction continuity 的职责边界。
 - 让 memory 最低语义能通过旧项目 `conversation_memory_test.md` 中测试 prompt 反推的验收：主体 / 口径不漂移、最近追问
@@ -1862,7 +1862,7 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/host/design.md`。
 
 目标：
-- 以买方财报分析 Agent 的第一性原理重新设计 Conversation Memory，使 memory / compaction I/O 边界回到可解释、可审计、
+- 以生产级通用 Agent 的会话治理目标与买方财报分析能力的第一性原理重新设计 Conversation Memory，使 memory / compaction I/O 边界回到可解释、可审计、
   可长期稳定的结构，而不是在 P12.5 既有实现上继续局部补丁。
 - 继承旧 `dayu-agent` Conversation Memory 已验证的稳定骨架：`pinned_state` materialized current state、recent raw turns
   floor、older prefix compaction、独立 compaction JSON payload、bounded episode rendering，以及避免 current user / raw turn /

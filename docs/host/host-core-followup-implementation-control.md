@@ -12,7 +12,7 @@
 
 Host follow-up 实施必须始终服务于以下目标：
 
-- 生产级买方财报分析 Agent。
+- 生产级通用 Agent，具备买方财报分析能力。
 - 范式是“宿主强约束下的 LLM in the loop”。
 - Host 对 Agent / Runner 的生命周期、取消、恢复、等待、上下文治理、审计与 durable truth 保持强约束。
 - 严格遵守 `UI -> Service -> Host -> Engine` 分层边界，禁止反向依赖和跨层泄漏实现细节。
@@ -378,7 +378,7 @@ Compact 是 Host 核心组件，因此不允许无解释失败、半成功提交
 ### 目标
 
 - 建立 compact failure 策略矩阵，列出触发来源、失败类型、retry / repair 策略、是否允许 deterministic fallback、最终 EventLog、Run 终态、用户可见结果和测试入口。
-- 明确 compact failure 何时 retry、何时 partial materialize、何时 fail closed、何时只记录 diagnostic。
+- 明确 compact failure 何时 whole-candidate repair retry、何时 fail closed、何时只记录 diagnostic；不得 partial materialize rejected compact candidate。
 - 补齐 proactive / reactive compact failure E2E。
 - 将默认 `max_compaction_attempts_per_operation` 提升到 5 次，并对齐 execution profile 默认值与 Host policy code fallback 默认值。
 - 默认 compact 模型使用低延迟 flash-tier 模型；高规格模型只能由 profile 显式选择。
@@ -389,7 +389,7 @@ Compact 是 Host 核心组件，因此不允许无解释失败、半成功提交
 
 ### 非目标
 
-- 不改变 fact-candidate-only 的裁决，除非先形成新的设计裁决。
+- 不改变 fact-candidate-only 的 fail-closed 裁决，除非先形成新的设计裁决。
 - 不吞掉 compactor 失败。
 - 不承诺 LLM compactor 永不失败。
 - 不让 deterministic fallback 生成 evidence-backed facts 或替代 accepted evidence。
@@ -398,7 +398,7 @@ Compact 是 Host 核心组件，因此不允许无解释失败、半成功提交
 ### 验收信号
 
 - 每类 compact failure 都有用户可见或 diagnostic 结果。
-- 默认 compact retry budget 为 5 次 semantic proposal / repair attempts；测试覆盖首轮失败、repair 成功、repair 耗尽与 fallback 收口。
+- 默认 compact retry budget 为 5 次 semantic proposal / whole-candidate repair attempts；测试覆盖首轮失败、whole-candidate repair 成功、repair 耗尽与 fallback 收口。
 - packaged 默认 compact model 与 scene / execution profile 配置一致；默认路径使用 flash-tier 模型，高规格模型只能由 profile 显式选择。
 - post-compact budget estimate 失败不会产生 silent overflow。
 - proactive / reactive / semantic repair / post-compact overflow 的组合矩阵标注已有测试、新增测试或明确非目标。

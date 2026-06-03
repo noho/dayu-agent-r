@@ -1,7 +1,7 @@
 # 大愚 Agent — 用户手册
 
 `大愚 Agent` 是每个投资者的助理分析师。  
-- `大愚 Agent` 是一个面向买方财报分析场景的 Agent 系统，但它不是简单的功能组合，`大愚 Agent` 让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有置信度，让投资结论、投资报告可审计、可追踪。  
+- `大愚 Agent` 是一个生产级通用 Agent 系统，具备买方财报分析能力；它不是简单的功能组合，`大愚 Agent` 让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有置信度，让投资结论、投资报告可审计、可追踪。
 - `大愚 Agent` 的 Host 层提供 Session / Run / Attempt / EventLog、admission、dispatch、tool governance、memory / context governance 与 recovery 治理能力。
 
 当前你可以用它完成四类工作：

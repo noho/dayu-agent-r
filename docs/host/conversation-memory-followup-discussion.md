@@ -1,452 +1,446 @@
 # Conversation Memory 讨论稿
 
-本文档用于记录 Conversation Memory 后续讨论，不是实施计划。任何进入实施的内容都必须回到对应 design gate 与实施总控 work unit。
+本文档只记录 Conversation Memory 已确认的设计共识。未在本文确认的内容，不作为 #81 的设计依据。
 
 ## 当前共识
 
 Conversation Memory 不应该成为新的事实真源。Host 的 durable EventLog、payload descriptor 与 artifact 才是可恢复、可审计的真源；Conversation Memory 是从这些真源投影出的、受预算约束的 read model。
 
-因此，“全量召回”不应理解为把所有历史都塞进 prompt，也不应理解为把 memory snapshot 做成无限大。更合理的方向是：
+因此，“全量召回”不应理解为把所有历史都塞进 prompt，也不应理解为把 memory snapshot 做成无限大。设计约束是：
 
 - EventLog / artifact 保留全量原始痕迹和 canonical facts。
 - Memory snapshot 只保留当前 Run 最常用、最稳定、最需要直接注入上下文的 bounded working set。
-- 需要全量或长尾历史时，通过检索 / 回查能力从 EventLog、payload descriptor、artifact 或后续索引中按需召回。
-- 不同用户 prompt 应只召回与当前问题相关的 memory，避免无关原文稀释模型注意力。
+- 第一阶段不根据用户 prompt 做相关性召回，不引入 memory intent parser、semantic search、vector recall 或 LLM reranker。
+- 第一阶段不提供全量或长尾历史召回；全量材料只保留在 EventLog、payload descriptor、artifact 和 audit 路径中。
 
-## 讨论边界
+## 配置化运行参数边界
 
-本文档包含若干面向目标架构的讨论判断，不等同于当前实施建议。特别是 Prompt Understanding / Memory Intent Parsing、LLM schema parser、跨 session 用户画像、回答锚点和前瞻意图等内容，都需要后续 design gate 单独裁决；本文只记录问题空间和可能方向。
+Conversation Memory 与 Context Governance 的运行参数必须来自配置文件进入 typed policy，再由 Host construction / composition root 显式注入；不得硬编码在生产代码、prompt 模板、compactor schema 或测试 fixture 中作为唯一来源。
+
+第一阶段仍使用两个配置归属作为唯一候选 owner：
+
+- `context_budget_policy`：承载 context budget / governance 相关运行参数。
+- `memory_projection_policy`：承载 Conversation Memory read model / projection / prompt assembly 相关运行参数。
+
+字段级 owner、字段名、默认值来源、派生公式、测试入口与迁移顺序由 WU-CM-01 plan 裁决。讨论稿只固定原则：selected recent window、protected recent floor、per-semantic bounded working set、compact attempt / fallback budget、projection lag / repair threshold 等运行参数不得硬编码；必须从配置文件进入 typed policy，再由 Host construction / composition root 注入运行时。
+
+同一个运行语义只能有一个 policy owner。若某个值同时影响 budget governance 与 memory projection，WU-CM-01 plan 必须明确 owner，并由 owner 的 typed policy 派生给另一侧使用；不得在 `context_budget_policy` 与 `memory_projection_policy` 中复制出会漂移的双份真源。
+
+## LLM-facing Compact I/O 硬边界
+
+一次 compact 是一次 LLM 调用。LLM 是无状态、会犯错、会走捷径、上下文有限、偏好模式匹配的推理器；因此 compact I/O 必须把 Host internal control/provenance 与 LLM-readable material 严格分离。
+
+本节指北星：
+
+- 不得暴露与当前任务无关的内部实现细节。
+- 不得把系统状态伪装成业务事实。
+- 不得返回会诱导模型依赖脆弱实现约定的字段或隐式规则，例如位置语义、临时缩写、magic string、仅当前版本成立的默认约定。
+
+Host internal terms 不得作为模型阅读材料，也不得要求模型返回：
+
+- EventLog event id、event sequence、payload / artifact ref、digest、durable evidence id。
+- compact cursor、compact boundary、policy name、recent floor、budget diagnostic、fallback diagnostic、`already_represented`、stable / delta / material block 内部状态。
+- `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` 的 raw payload、compact artifact JSON、projection checkpoint、scheduler / Attempt / recovery 内部治理细节。
+- 任何只在当前实现版本成立的默认约定、magic string、临时缩写、位置语义或隐式排序语义。
+
+LLM-readable compact material 只能包含与当前 compact 任务有关、用户或业务可理解的材料：
+
+- 用户输入文本、助手最终回答文本、用户可见的 Run 状态连续性。
+- 可读 tool name、tool query、tool response / source text。
+- Host 为本次 compact 生成的 prompt-local opaque labels。
+
+prompt-local label 是本次 LLM 调用内的 opaque citation handle，只用于让模型把 claim / anchor / summary / intent 绑定到它刚读过的材料。第一阶段允许使用短 deterministic handle，例如 `C1` / `H1` / `E1` / `S1` / `E1.1`，以节省 token 并降低 LLM 引用成本；“opaque”约束的是语义，不要求随机长 id。label 不得携带位置、时间、重要性、优先级、durable identity 或实现状态语义；模型不得根据 `E1` / `E2` / `M1` 等顺序、前缀、chunk 后缀或名字推断事实含义。Host 内部维护 prompt-local label 到 durable provenance refs 的映射。prompt、schema、validator 和测试可以验证 label 能映射回 provenance，但不得依赖 label 名称或 ordinal 推断业务语义。
+
+LLM compact output 只能返回业务语义字段和 prompt-local labels。Host 负责把 labels 映射回 durable refs、校验 provenance、长度、枚举、source boundary 和 quality gate。模型不得返回 durable refs、event ids、digests、artifact refs、policy decisions 或任何 Host 内部状态字段。
+
+## Prompt-independent compact / delta 边界
+
+第一阶段 Conversation Memory 不走 prompt-conditioned recall 路线。也就是说，Host 不在每轮根据用户 prompt 动态判断“哪些历史相关”，不做 semantic search / vector recall，不用 LLM parser 判断 memory intent，也不让用户一句话动态拉取任意历史。
+
+设计统一采用 material boundary + policy-conditioned deterministic assembly：
+
+```text
+memory_material =
+  latest_accepted_compacted_view
+  + post_compact_delta_material
+
+rendered_context =
+  assemble(
+    memory_material,
+    current_input_anchor,
+    selected_recent_window_policy,
+    protected_recent_floor_policy
+  )
+```
+
+其中：
+
+- `latest_accepted_compacted_view`：Host 内部已接受的 compact projection，用于代表 compact 覆盖范围内的旧历史；没有 accepted compact 时为空。给 LLM 的只能是 Host 从它投影出的业务语义视图，不是 raw compact artifact JSON、EventLog payload 或内部字段全集。
+- `post_compact_delta_material`：最近一次 accepted compact 之后新产生、尚未被 compact 覆盖的 canonical EventLog material；没有 accepted compact 时从 session 起点开始。它是 Host 内部材料边界，不是全部进入 prompt 的 view。
+- `current_input_anchor`：当前 Run 的用户输入保护锚点。它不是 memory 语义类，而是 Host 的 compact / fallback / prompt assembly 边界字段；给模型的仍只是当前用户输入文本。当前用户说“继续刚才失败的任务”或“恢复刚才那个”属于 `current_input_anchor`，不是 Trace Memory。
+- `selected_recent_window_policy`：Host 从 material 中选择 bounded recent window 的确定性策略，不得暴露给模型。
+- `protected_recent_floor_policy`：Host 在 selected recent window 内执行的保底规则，用来为短链路 continuity 保留最近若干 turn / item，避免“刚才”“继续”“第二点”等局部承接因 deterministic bound 或 compact 边界消失。它不是独立 memory，也不是第三份 view，不得暴露给模型。
+
+`before compact` 不需要作为独立阶段建模。它只是 `latest_accepted_compacted_view` 为空、`post_compact_delta_material` 从 session 起点开始时的普通情况：
+
+```text
+before_compact_memory_material =
+  empty_latest_accepted_compacted_view
+  + session_start_delta_material
+
+before_compact_rendered_context =
+  assemble(
+    before_compact_memory_material,
+    current_input_anchor,
+    selected_recent_window_policy,
+    protected_recent_floor_policy
+  )
+```
+
+也就是说，Conversation Memory 不维护 before compact / after compact 两套语义。统一模型始终是：
+
+- accepted compacted material：没有 compact 时为空；有 compact 时为 latest accepted compact projection。
+- delta material：没有 compact 时从 session 起点开始；有 compact 时从 latest compact cursor 之后开始。第一阶段不会把完整 delta 全量渲染给模型，而是按 deterministic recent-window policy 选择 bounded window。
+- prompt assembly policy：负责 recent-window 选择、protected recent floor、去重、排序和 deterministic bounded selection；`protected_recent_floor_policy` 不产生新 memory，只约束 material 选择。第一阶段不做 token-estimator-driven runtime trimming。
+
+第一阶段渲染原则固定为：
+
+```text
+if no accepted compacted view:
+  memory_context =
+    selected_recent_window
+  current_input = final user message
+
+if compact failed and recent-window fallback is allowed:
+  memory_context =
+    fallback_selected_recent_window
+  current_input = final user message
+
+if accepted compacted view exists:
+  memory_context =
+    session_summary_memory
+    evidence_fact_memory
+    answer_anchor_memory
+    forward_intent_memory
+    trace_memory.reference_continuity_items
+    selected_recent_window_after_compact_boundary
+  current_input = final user message
+```
+
+其中 `selected_recent_window` 可以包含近期 user turn、assistant final answer、tool query / response 或 accepted evidence material，但这些只作为 recent context / material 被渲染；它们不会在 compact 前自动生成 Answer Anchor、Session Summary、Forward Intent 或 `evidence_backed_facts`。
+
+Prompt Assembly 的 section 顺序是固定 contract，不根据当前 prompt 做 recall、parser、reranker 或动态重排。Session Summary 只提供会话框架，不能替代 Evidence / Fact Memory；当 summary 与 fact 同时出现时，事实 claim 以 `evidence_backed_facts` 为准。Answer Anchor Memory 与 Forward Intent Memory 在 compact 后按 bounded policy 渲染非空 section，不由当前 prompt 触发。Reference Continuity Item 归属 Trace Memory，只服务局部指代解析，并放在 selected recent window 之前；selected recent window 是最接近 current input 的历史上下文。
+
+compact failure fallback 场景下的 `selected_recent_window` 更准确地说是 deterministic fallback selected view。fallback 的原则与 compact 前一致：只渲染 deterministic fallback selected view 与当前输入，不提交新的 `CONTEXT_COMPACTED`，不写 compact artifact，不 materialize memory snapshot，不生成新的高阶语义。失败的 compact proposal 本身绝不能进入 memory。
+
+第一阶段不根据 token estimator 在 runtime 做逐 section 裁剪。各 section 必须在 projection / assembly 前通过配置化的 item cap、char cap、selected recent window floor-cap 等确定性上限形成 bounded working set；provider context length failure 由 Host context governance 的 reactive / fallback compact 收口。确定性上限可以迁移当前 `memory_projection_policy` 的思路，但不能继承旧 semantic field 名称或旧 `stable layer` / `history pool` / `pinned_state` / `working_assumptions` 语义。
+
+需要 floor 的 section 只固定两类：
+
+- `selected_recent_window_turn_floor`：必须存在，用于保障短链路连续性与刚发生的用户可见上下文。
+- `evidence_fact_floor`：必须存在，用于保障已经 accepted 的关键 `evidence_backed_facts` 不被普通 recent material 挤出。
+
+其它 section 默认只有 cap，没有 floor：`session_summary_memory`、`answer_anchor_memory`、`forward_intent_memory` 与 `trace_memory.reference_continuity_items` 都允许为空；`reference_continuity_item_floor = 0` 可以显式进入配置，避免实施时把 Reference Continuity Item 误做成必须保留的独立层。
+
+多次 compact 采用 rolling compacted view 模型。第二次及后续 compact 必须输入上一轮 accepted compacted view，但不能重新展开上一轮 compact 已覆盖的 raw history：
+
+```text
+next_compact_input =
+  previous_accepted_compacted_view
+  + selected_post_compact_recent_window
+  + current_input_anchor
+
+next_compact_output =
+  next_accepted_compacted_view
+```
+
+这里的 `previous_accepted_compacted_view` 是 Host 已接受并可由 memory projection / compact artifact 解释的语义视图；再次给 LLM 时必须先投影成业务可读材料，不能暴露上一次 LLM raw JSON、raw compact artifact、EventLog payload、repair 前 candidate、失败 proposal 或中间 transient artifact。已被 accepted compact output 代表的旧 raw turns / old tool results 不应在下一次 compact 中重新展开；否则会导致 context window overflow、重复抽取、事实 / anchor / summary 重复生成，以及 compact boundary 不可审计。
+
+下一次 compact 需要做的是 roll-forward / merge：用上一轮 accepted compacted view 代表旧历史，再吸收 post-compact selected recent window。输出的新 compacted view 代表旧 compacted view 与新 delta material 的合并结果，而不是无限追加 summary-of-summary。
+
+`current_input_anchor` 只参与本次 compact / fallback / prompt assembly。它用于标记当前用户问题，定义 compact 不能吞掉的边界；普通 Run 最终仍以最后一条 user message 渲染当前输入。当前输入只有到下一轮成为历史时，才可能作为 selected recent window 中的 previous user turn 进入 Trace Memory。
+
+每次 accepted compact 都会 renew 当前 compacted view：
+
+```text
+compact_1 -> accepted_compacted_view_1
+compact_2 input uses accepted_compacted_view_1 -> accepted_compacted_view_2
+compact_3 input uses accepted_compacted_view_2 -> accepted_compacted_view_3
+```
+
+因此，第三次 compact 的 `previous_accepted_compacted_view` 是第二次生成并被 Host 接受的 `accepted_compacted_view_2`。旧的 `accepted_compacted_view_1` 保留在 EventLog / artifact / audit 中用于追溯和重建，但不作为当前 prompt 或下一次 compact 的默认输入继续叠加。默认输入始终只使用 latest accepted compacted view，避免旧 summary、facts、anchors 或 forward intent 重复出现。
+
+在没有 accepted compact output 之前，高阶结构化语义不应被凭空生成。第一阶段 compact 前只有两类 session-scoped semantic memory 可以非空：
+
+- Trace Memory：来自 selected recent window 中的 `USER_INPUT_ACCEPTED`、`RUN_SUCCEEDED.final_answer` 等明确连续性事件。
+- Evidence / Fact Memory：来自 selected recent window 中的 tool query / response / accepted evidence material；如果没有 accepted compact output 或其它非 compact producer，`evidence_backed_facts` 仍为空。
+
+以下三类在 compact 前必须为空：
+
+- Answer Anchor Memory：compact 前不对 final answer 做规则化、deterministic outline parser 或 LLM parser。
+- Session Summary Memory：summary 是 accepted compact / rollup 的产物。
+- Forward Intent Memory：compact 前不对 prompt / final answer 做 intent parser，也不生成 hidden plan。
+
+这个公式不是：
+
+```text
+visible_memory = retrieve(prompt, all_history)
+```
+
+而是：
+
+```text
+rendered_context = assemble(policy, cursor, compact_boundary, material_delta)
+```
+
+因此，五个 session-scoped 语义模型都按 accepted compacted material / delta material / prompt assembly policy 建模：
+
+1. **accepted compacted material**：已经进入 accepted compact output 的结构化结果。它不改写历史 EventLog，只提供可审计的 projection / rollup；没有 compact 时为空。
+2. **delta material**：latest compact cursor 之后的 bounded canonical events；没有 compact 时就是 session 起点以来的 eligible events。它是未 compact 覆盖的材料集合，不等于 prompt view。
+3. **prompt assembly policy**：从 accepted compacted material 与 delta material 中做 selected recent-window 选择、protected recent floor 保底、去重、排序和 deterministic bounded selection。
+
+这个 compact / delta 边界会反过来约束 #80 的评测：empty compacted view、non-empty compacted view、post-compact delta、compact boundary、protected recent floor、deterministic bounded projection 与 provider context length fallback 都应有可断言场景。核心目标是可测试、可复现、可审计，而不是追求第一阶段的 prompt-level 相关性最优。
+
+## 评测约束
+
+Conversation Memory 的设计正确性由 GitHub Issue #80 的评测标准反向约束。#81 负责决定 memory 怎么设计，#80 负责定义什么行为证明这个设计成立。
+
+#80 从四层观察 Conversation Memory：
+
+- Memory Truth / Store：EventLog、accepted evidence、artifact refs、profile source refs 是否完整。
+- Memory Projection：session memory snapshot、answer anchors、session summary、forward intent、profile view 是否按规则生成、更新、淘汰并保留 source refs。
+- Prompt Assembly：RunInputBuilder 是否只注入 policy 允许的 bounded memory，是否保留 floor，是否避免无关历史污染 prompt，是否在 compact 后仍带上关键事实、锚点和任务状态。
+- Agent Outcome：最终回答是否使用正确事实、当前偏好和正确锚点，是否拒答无证据问题，是否避免不必要重复工具调用，是否引用或解释来源。
+
+WU-CM-01 进入 plan 前必须把 #80 维度映射为 current scope satisfied、deferred-with-owner 或 explicit non-goal。该映射不是要求 WU-CM-01 直接落地完整 #80 eval benchmark，而是防止 plan 把 User Profile、deep historical recall、full eval harness 或 smoke 覆盖范围混在一起。
+
+第一阶段映射如下：
+
+| #80 评测维度 / 能力 | WU-CM-01 scope | Owner / 验证入口 |
+| --- | --- | --- |
+| Trace continuity | current scope satisfied by WU-CM-01 | WU-CM-01 unit tests + 现有 `utils/` Host public smoke 初步验收 |
+| Evidence-backed fact recall | current scope satisfied by WU-CM-01 | compact / projection / RunInputBuilder tests + 现有 `utils/` Host public smoke 初步验收 |
+| Session Summary Memory | current scope satisfied by WU-CM-01 | accepted `CONTEXT_COMPACTED`、snapshot projection、prompt assembly tests |
+| Answer Anchor Memory | current scope satisfied by WU-CM-01 | compact candidate / accept barrier / projection / prompt assembly tests |
+| Forward Intent Memory | current scope satisfied by WU-CM-01 | compact candidate / accept barrier / projection / prompt assembly tests |
+| Prompt assembly bounded behavior | current scope satisfied by WU-CM-01 | RunInputBuilder、selected recent window、protected floor、deterministic bound policy tests |
+| Compact boundary / fallback behavior | current scope satisfied by WU-CM-01 | compact operation、fallback、不生成高阶语义、diagnostic tests |
+| Agent outcome under finance scenarios | current scope smoke-only initial acceptance | 现有 `utils/` Host public smoke 必须通过；完整 benchmark deferred to WU-CM-10 / GitHub Issue #80 |
+| User Profile Memory / dynamic profile | deferred-with-owner | WU-CM-11 / GitHub Issue #115；不进入 session Conversation Memory |
+| Deep historical recall / semantic search | deferred-with-owner；WU-CM-01 explicit non-goal | GitHub Issue #39；research gate 后再设计 recall / retrieval |
+| Full eval benchmark harness | deferred-with-owner | WU-CM-10 / GitHub Issue #80；当前不新增 issue，若 #80 后续需要拆 implementation child，再由 WU-CM-10 裁决 |
+
+现有 `utils/` smoke 是 WU-CM-01 的初步验收标准，不等价于完整通过 #80。#80 的完整 eval harness 在 post-#81 memory semantic contract 稳定后，由 WU-CM-10 / GitHub Issue #80 继续推进。
 
 ## 第一阶段策略
 
-第一阶段不默认引入 prompt-conditioned recall，也不默认引入 LLM parser。为了控制延迟、复杂度和测试成本，Trace Memory 与 Evidence / Fact Memory 先采用 recency + floor 策略：
+第一阶段不引入 prompt-conditioned recall，也不引入 LLM parser。Trace Memory 与 Evidence / Fact Memory 采用 policy-conditioned selected recent window 与 protected recent floor。各 section 在 projection / assembly 前已按 deterministic item cap / char cap / floor-cap bounded；第一阶段不做 token-estimator-driven runtime trimming。provider context length failure 由 Host context governance 的 reactive / fallback compact 收口。
 
-- Trace Memory：保留最近 N 轮原始痕迹，最少保留 M 轮。
-- Evidence / Fact Memory：保留最近 N 条 accepted evidence / evidence-backed facts，最少保留 M 条。
-
-这表示第一阶段主要解决近因记忆：
+第一阶段只解决近因连续性：
 
 - “刚才说什么”
 - “第二点展开”
 - “继续”
 - 最近工具结果和最近财报事实连续性
 
-预算紧张时，优先丢弃更旧的 trace / evidence / fact item，但必须保留对应 memory 类型的 minimum floor。超出 N 的历史仍可留在 EventLog / artifact / durable store 中，后续可通过 recall / retrieval 设计重新接入，但第一阶段不默认注入 prompt。
+深历史语义检索、跨 session 用户画像归纳、长期偏好演化不属于 #81 第一阶段。
 
-该策略的优点是低延迟、可测试、接近现有实现，且不会引入每轮 LLM parser 的额外成本和不稳定性。它的明确边界是：不能解决深历史语义检索、跨 session 用户画像归纳、长期偏好演化等问题；这些应留到后续相关性 recall / index / profile 设计中讨论。
+## Compact 失败、重试与 Fallback
 
-## 核心设计原则
-
-Conversation Memory 的默认目标不是“多带历史”，而是“少带但带对”。每一轮 prompt 应该尽量干净，只包含当前问题需要的连续性、事实证据、回答锚点、会话状态、用户画像和前瞻意图。
-
-这意味着：
-
-- 召回必须与当前 prompt 相关，不能按时间粗暴灌入大量历史。
-- 原始历史可以全量保存，但进入模型前必须经过选择、压缩、排序和预算控制。
-- 稳定事实优先于原文长片段；原文长片段只在需要引用、核验或重新推理时召回。
-- 上一轮 `final_answer` / `assistant_conclusion` 是重要的对话承接材料；当用户问“第二点”“刚才那个”“继续说”时，应通过相关性召回进入 prompt。
-- 如果上一轮回答有清晰结构，例如“三个主要风险”，应优先召回结构化回答锚点，而不是整段 `assistant_conclusion`。
-- 用户画像和前瞻意图只能辅助理解当前问题，不能压过用户本轮明确输入。
-- prompt cleanliness 是验收目标：memory 注入越多，越需要证明它确实相关。
-
-### 语义类型与预算层分离
-
-当前实现中的 `stable layer`、`history pool`、`recent raw turns floor` 更像是 prompt assembly 阶段的预算策略，而不是 Conversation Memory 的顶层语义模型。
-
-第一性原理上，LLM memory 要解决的不是“保存更多历史”，而是回答这些问题：
-
-1. 当前问题需要哪些事实。
-2. 当前问题在延续哪段对话。
-3. 用户是谁、偏好什么。
-4. 之前已经形成了什么结构化结论。
-5. 下一步任务状态是什么。
-6. 每条信息从哪里来，可信度如何，能否撤销。
-
-更好的设计应把两件事分开：
-
-- Memory semantic types：原始痕迹、原子事实、用户画像、会话摘要、回答锚点、前瞻意图。
-- Prompt budget / assembly policy：在当前 prompt 下，从这些语义类型中召回哪些 item，以什么顺序、格式和预算注入模型。
-
-这意味着：
-
-- `stable layer` / `history pool` 不应决定 memory 的概念边界；它们只决定 prompt 里如何取舍。
-- `pinned_state` 应进一步拆分语义：`current_goal` / `open_questions` 更接近任务状态或前瞻意图，`user_constraints` 可能是 session constraint，不应都塞进同一个概念桶。
-- `evidence_backed_facts` 是核心 stable fact 类型，但仍需要 accepted evidence recall / index 支撑回查和重新推理。
-- `working_assumptions` 容易被误读成弱事实，后续应考虑改成 hypotheses / candidate claims，并强制带 source、status 和置信度。
-- `conversation_continuity` 可以继续作为 prompt assembly 的连续性集合，但内部应允许 raw turns、assistant conclusion、minimum preserve、answer anchors 等不同语义 item 被独立召回。
-- `recent_raw_turns_floor` 只应是预算保底策略，不应承担 memory 分类职责。
-
-目标架构可以理解为：
+Compact failure handling 采用 whole-candidate repair retry、Host accept barrier 与 deterministic recent-window fallback：
 
 ```text
-Memory Truth / Store
-  -> EventLog / artifacts / accepted evidence
-  -> durable user profile store
-  -> session memory projection
-
-Semantic Memory Indexes
-  -> Trace Recall Index
-  -> Evidence / Fact Index
-  -> User Profile Memory
-  -> Session Summary Memory
-  -> Answer Anchor Memory
-  -> Forward Intent Memory
-
-Prompt Assembly
-  -> 根据当前 prompt 做相关性召回
-  -> 按预算、优先级、source refs 和结构化格式注入模型
+CompactionRequest
+-> LLMContextCompactor 生成一次 strict JSON proposal
+-> JSON parse / required keys / schema-value mapping
+-> Host quality check / provenance check / proactive budget gate
+-> accepted: write compact artifact + append CONTEXT_COMPACTED
+-> rejected: append CONTEXT_COMPACTION_ATTEMPT_REJECTED diagnostic
+-> if attempt budget remains: retry whole candidate proposal
+-> if attempt budget exhausted: append CONTEXT_COMPACTION_FAILED
+-> if recent-window fallback passes context governance: dispatch fallback attempt
+-> otherwise fail closed
 ```
 
-换句话说，`stable layer` / `history pool` 不应该是顶层心智模型。它们应降级为 Prompt Assembly 的预算结果。
+确定约束：
 
-### 当前实现取舍
+- LLM compactor 是单次 proposal 生成器，不拥有 durable 写入，也不在内部做 semantic repair loop。
+- runner timeout、非 final outcome、`finish_reason=length`、空文本、非 JSON、top-level 非 object、缺必填 key、字段类型 / 值非法，都会作为 proposal failure 收口。
+- `proposal_failed`、`quality_check_rejected`、`hard_threshold_after_compact` 都在 Host operation 层按 attempt budget 做 whole-candidate repair retry；取消请求在下一次 attempt 前 fail closed。
+- repair attempt 可以接收 Host-neutral 的失败类别 / validation issue 摘要，但每次必须重新产出完整 candidate；不得要求 LLM 返回 repair patch，不得由 Host 合并旧 proposal 的 valid fields 与新 patch。
+- rejected attempt 不是 memory。Host 只记录 `CONTEXT_COMPACTION_ATTEMPT_REJECTED` 诊断；失败 candidate 的“好字段”不被部分采用。
+- 不做 partial materialize。只有整体 candidate 通过 JSON/schema/value mapping、provenance、quality check 与必要预算闸门后，才允许写 compact artifact 和 `CONTEXT_COMPACTED`。
+- 多 pass reactive compact 先分别通过 pass 级 proposal 与 quality gate，再由 Host deterministic merge 成单个 candidate，并对 merged candidate 再做全量 quality check。
+- `CONTEXT_COMPACTION_FAILED` 是 Host governance diagnostic event，承载 attempt count、retry / repair budget 是否耗尽、diagnostic refs、fallback policy decision、fallback input window、fallback digest、fallback budget result 和 fallback action；它不是业务事实，不得进入 Evidence / Fact Memory，也不得作为 LLM-readable compact material。
+- recent-window fallback 只选择 current input anchor 与 policy-bounded selected recent window，并在 selected recent window 内应用 protected recent floor；不得渲染 `stable / already represented` 等内部状态。若 fallback selected view 仍无法通过 Host context governance，则 fail closed。
+- fallback dispatch 不是 compact 成功：不提交 `CONTEXT_COMPACTED`，不写 compact artifact，不 materialize memory snapshot，不生成 Session Summary / Answer Anchor / Forward Intent / `evidence_backed_facts`。
+- RunInputBuilder 只消费当前 Run started 前、`fallback_action=dispatch`、且 current input ref 匹配的 active fallback view；渲染结果仍是 selected recent window 与当前输入。
 
-现有实现不是错，但抽象层次混了。短期不用推倒，应在现有 Conversation Memory 上加一层语义模型：先引入 Answer Anchor 和 recall 思路，再逐步把 `stable layer` / `history pool` 重命名或下沉为预算策略。
+## 六类语义模型
 
-| 当前项 | 取舍 | 调整方向 |
-| --- | --- | --- |
-| `pinned_state` | 部分保留 | 拆开。`current_goal` / `open_questions` 更像任务状态或前瞻意图，`user_constraints` 可能是 session constraint，不应都塞进 `pinned_state`。 |
-| `evidence_backed_facts` | 保留 | 这是核心 stable fact 类型，但还缺 accepted evidence recall / index。 |
-| `working_assumptions` | 谨慎保留或改名 | 当前语义危险，容易被误读成弱事实。更好的方向是 hypotheses / candidate claims，并强制带 status / source / confidence。 |
-| `open_questions` | 保留但换位置 | 更像 forward intent / task state，不是 stable fact。 |
-| `conversation_continuity` | 保留 | 但它应成为 prompt assembly 的连续性集合，内部包含 raw turns、assistant conclusion、minimum preserve、answer anchors 等独立语义 item 的召回结果，而不是一个粗池子。 |
-| `recent_raw_turns_floor` | 保留为策略 | 它是预算保底策略，不是 memory 分类。 |
-| `episode summaries` | 保留 | 对应 Session Summary Memory。 |
-| `assistant_conclusion` | 保留但降级 | 作为原始痕迹 / 连续性兜底，不如 Answer Anchor 精确。 |
+Conversation Memory 按语义用途划分为六类。#81 第一阶段只实施 session-scoped 的五类；User Profile Memory 是唯一跨 session 语义类，已拆到 GitHub Issue #115。
 
-### Prompt Understanding / Memory Intent Parsing
+### vNext schema / producer / projection / prompt assembly 边界
 
-讨论判断：一个正常 Agent 面对的用户输入大多是自然表达，不能把规则解析作为主方案。规则只适合辅助和兜底，例如识别“第二点”“最新”“来源”“TSLA Q3”等明显结构。
+WU-CM-01 的新设计只从六类语义模型出发定义 vNext schema、producer、projection 与 prompt assembly，不从当前旧字段反推新语义。旧字段只作为删除 / 迁移清单处理，不作为设计输入，也不得形成兼容 wrapper。
 
-阶段性裁决：第一阶段不默认执行本节描述的 parser 路径，避免拉长每轮对话延迟。本节仅作为后续相关性 recall / profile / forward intent 设计的讨论材料。
-
-更合理的目标方向是：
+因此，第一阶段应定义新的 session-scoped snapshot / compact projection shape：
 
 ```text
-自然语言 prompt
--> typed memory-intent parser
--> deterministic validation
--> recall / write gate
--> memory retrieval / candidate update
--> prompt assembly
+ConversationMemorySnapshotVNext
+  trace_memory
+  evidence_fact_memory
+  session_summary_memory
+  answer_anchor_memory
+  forward_intent_memory
+  diagnostics
 ```
 
-typed memory-intent parser 可以由 LLM、专门小模型或混合 pipeline 实现，但它只能提出计划，不能直接读写 memory。Host / Service 仍必须通过确定性逻辑做 schema 校验、枚举校验、置信度处理、时间歧义判断、source refs 检查和是否需要用户确认的裁决。
+`UserProfileMemory` 不进入 session snapshot；它是 GitHub Issue #115 / WU-CM-11 的 durable cross-session profile 边界。
 
-示例：
+当前讨论稿不拍死 `ConversationMemorySnapshotVNext` 的最终字段名、JSON schema、dataclass / TypedDict / Pydantic 形态或 validator 细节，但必须明确：vNext compact I/O contract 与 snapshot typed schema 是进入 WU-CM-01 plan 前的 high blocker，不能留给 implementation 自行发挥。讨论稿升级为 Host design 真源时，必须正式定义：
 
-```json
-{
-  "intent": "memory_query",
-  "query_kind": "profile_pattern",
-  "target_memory": ["user_profile", "trace"],
-  "natural_query": "我做大决策有什么习惯",
-  "time_scope": "all_relevant",
-  "needs_aggregation": true,
-  "needs_evidence": true
-}
-```
+- LLM-readable compact input material：每类 semantic memory 暴露给 compactor 的业务可读材料、prompt-local opaque label 规则和禁止暴露的 Host internal provenance。
+- compact output JSON schema：每类 compact candidate 的 required / optional fields、allowed enum、source label 引用方式、长度上限、空值语义与多次 compact roll-forward 语义。
+- Host internal provenance mapping：prompt-local labels 如何映射到 durable EventLog / accepted evidence / assistant final answer / user-visible run state refs，且该 mapping 不作为模型阅读材料。
+- accept barrier：JSON parse、schema-value mapping、source boundary、provenance、quality gate、whole-candidate repair retry、fail closed 与 fallback 的判定顺序。
+- accepted projection / snapshot schema：通过 accept barrier 的 compact candidate 如何物化为 `ConversationMemorySnapshotVNext` typed view，哪些字段只存在于 diagnostics，哪些字段允许进入 RunInputBuilder。
+- producer mapping：compact 前、compact 成功后、post-compact delta、fallback 与后续明确非 prompt-conditioned producer 分别能生成哪些 semantic memory。
+- prompt assembly view：RunInputBuilder 消费 snapshot typed fields 的 section 顺序、bounded selection、floor / cap 与 current input 边界。
+- tests：invalid / missing / stale source label、schema invalid、provenance mismatch、partial candidate invalid、fallback 不生成高阶语义、post-compact delta 可见与 compact roll-forward 的可断言用例。
 
-```json
-{
-  "intent": "memory_write_candidate",
-  "write_kind": "future_event",
-  "target_memory": ["forward_intent"],
-  "content": "8月有一场重要的面试",
-  "time_expression": "8月",
-  "time_resolution": "ambiguous",
-  "needs_confirmation": true
-}
-```
+因此，这个 blocker 的裁决是：现在只在讨论稿固定设计责任和最低契约，不在讨论稿中提前锁死完整 schema；但该 blocker 必须在讨论稿升级为 `docs/host/design.md` 时关闭。WU-CM-01 只能消费设计真源，不能直接消费本讨论稿作为 implementation contract。
 
-这不是当前实施建议，也不表示第一版必须引入 LLM parser。当前可实施方案仍需要在 design gate 中基于复杂度、可靠性、测试成本和分层边界单独裁决。
+旧 `pinned_state`、`working_assumptions`、`conversation_continuity`、`stable layer`、`history pool` 与 `recent raw turns floor` 不再作为顶层 semantic model：
 
-### Compact Repair 策略
+- `working_assumptions` 已被 WU-CM-02 裁决为 rejected / closed；旧字段删除或迁移必须由 WU-CM-01 schema / projection slice 明确覆盖。
+- `pinned_state` 不能作为 god bag 保留；其中仍有价值的 session-scoped 任务状态只能按新语义进入 Forward Intent Memory 或明确删除。
+- `conversation_continuity` 不能作为粗池子保留；连续性材料必须按 Trace Memory、Session Summary Memory 或 Answer Anchor Memory 边界表达。旧 Minimum Preserve 裁决为 Trace Memory 下的 `reference_continuity_items`，不是独立 memory layer。
+- `stable layer`、`history pool` 与 `recent raw turns floor` 只能作为 prompt assembly / deterministic bounded selection policy 结果或配置字段讨论，不能继续充当 memory category。
 
-讨论判断：`CONTEXT_COMPACTED` 是一次 LLM 交互返回的结构化 JSON，但其中不同字段有不同 accept barrier。某些字段可能合法，另一些字段可能因 evidence ref 不存在、claim 过长、minimum preserve source refs 非法等原因不通过校验。
+每个 session-scoped 语义必须在 WU-CM-01 design / plan 中写清：
 
-更好的方向不是直接 partial materialize，而是在写入 `CONTEXT_COMPACTED` 前先 repair：
+- producer：哪些 canonical EventLog event、accepted compact output 或明确非 prompt-conditioned producer 能生成它。
+- projection schema：snapshot / compact artifact 中的 typed view 字段、source refs、长度 / 枚举 / 去重 / 淘汰规则。
+- accept barrier：LLM candidate 需要通过哪些 Host schema、provenance、source boundary、quality 与 budget gate。
+- prompt assembly：RunInputBuilder 渲染位置、deterministic bounded selection owner、排序、去重、fallback 行为，以及 compact 前 / compact 后 / compact failure fallback 的差异。
+- tests：compact 前为空或 selected recent window 行为、compact 后生成、post-compact delta 可见、fallback 不生成高阶语义、invalid candidate 不物化。
 
-```text
-compact proposal
--> Host validation 收集所有 invalid fields
--> 一次 repair LLM 交互修复所有坏字段
--> Host 用 repair patch 替换上一次 proposal 中的坏字段
--> Host 对 merged candidate 做全量校验
--> 通过后 append CONTEXT_COMPACTED
-```
+### 1. Trace Memory
 
-关键约束：
+Trace Memory 负责对话连续性，不负责事实证明。
 
-- 多个字段坏掉时，也应合并成一次 repair LLM 交互，而不是每个字段单独交互。
-- repair 只修坏字段，不应让 LLM 重写已通过校验的字段，避免 good fields 漂移。
-- 合并由 Host 代码完成；LLM 只返回 repair patch，不能决定最终接受状态。
-- merged candidate 必须重新做全量校验，只有整体合法才写入 EventLog。
-- repair 发生在 `CONTEXT_COMPACTED` 写入前；已提交 EventLog 不做原地修改。
+数据来源：
 
-阶段性裁决：该策略纳入 GitHub Issue #81 的 Conversation Memory 整体优化。`WU-CM-03` 不再单独裁决 partial materialize / fail closed；后续实现应优先讨论 compact repair，只有 repair 耗尽仍失败时，再裁决是否 partial materialize 或 fail closed。
+- `USER_INPUT_ACCEPTED` 中的用户输入。
+- `RUN_SUCCEEDED.final_answer` 中的助手最终回答。
+- 历史中用户可见的 Run 失败、取消、等待或恢复状态；当前用户说“继续 / 恢复”的文本本身属于 `current_input_anchor`，不属于 Trace Memory。
 
-### Answer Anchor 与 Minimum Preserve 分界
+投影规则：
 
-讨论判断：上一轮 assistant final answer 中形成的结构化回答轮廓，优先由 Answer Anchor 解决；minimum preserve 不应承担 answer outline 的主职责。
+- compact 前，Trace Memory 只来自 selected recent window。
+- compact 时，Trace material 作为连续性材料进入 compactor。
+- compact 后，Trace Memory 由 accepted compacted trace projection、post-compact delta material 与 protected recent floor 共同表达。
+- Trace Memory 不包含内部 Attempt retry、compact retry、projection repair、scheduler 治理细节或 fallback diagnostics；只有已经成为用户可见对话上下文的 Run 状态才可进入 Trace material。
+- 第一阶段不解析 tool response，不把 accepted evidence 归入 Trace Memory。
+- Reference Continuity Item 是 Trace Memory 下的受限 item type，用于保存 compact 后仍需解析代词、序号、“刚才那个”等局部承接的最小上下文。它是旧 Minimum Preserve 的新名称；不是独立语义层，不是 fact、summary、answer anchor 或 forward intent。
 
-例如：
+落地边界：
 
-```text
-用户：分析这家公司三个主要风险。
-助手 final_answer：
-1. 毛利率下行压力
-2. 需求放缓风险
-3. 现金流压力
+- producer：raw delta 来自 user input / assistant final answer / 用户可见 Run 状态；compacted trace projection 只能来自 accepted `CONTEXT_COMPACTED`。
+- projection schema：`trace_memory` 保存 bounded continuity items，可包含 `reference_continuity_items`；不保存工具事实证明、不保存内部治理 event。`reference_continuity_items` 只能保留理解局部指代所需的最小文本、source refs 与 reason，不能保留整段长输入。
+- prompt assembly：compact 前与 fallback 只渲染 selected recent window + current input；compact 后渲染 accepted trace projection + selected post-compact recent window + current input。
 
-下一轮用户：第二个风险展开说说。
-```
+### 2. Evidence / Fact Memory
 
-这个场景本质是“上一轮回答结构的指代解析”，更适合召回 Answer Anchor：
+Evidence / Fact Memory 负责工具证据与基于证据的 claim。这里的 fact 是 Host-accepted claim，不是 Host 对现实世界 truth 的证明。
 
-```text
-anchor 2 = 需求放缓风险
-source = RUN_SUCCEEDED.final_answer
-```
+数据来源：
 
-minimum preserve 仍然有价值，但职责不同：它用于保留长用户输入、compact material 或其它非 answer-outline 内容中的最小指代上下文。例如用户粘贴长文并要求提炼因素后，下一轮问“第二个因素”，而这个有序结构不一定来自 assistant final answer。
+- `TOOL_CALL_REQUESTED` 先进入 EventLog，再交给 LLM / tool loop。
+- `TOOL_RESULT_ACCEPTED` 通过 Host accept barrier 后保存 accepted evidence envelope、payload / artifact refs 与 digest。
+- LLM-facing evidence material 只包含可读 tool、query、response、source text 与 prompt-local opaque label。
+- event id、payload / artifact ref、digest、durable evidence id 只存在于 Host internal provenance map，不得作为模型阅读材料，也不得要求模型返回。
+
+投影规则：
+
+- compact 前，Evidence / Fact Memory 是 selected recent window 中的可读 tool query / response / evidence material。
+- compact 时，compactor 读取 selected recent window 中的 tool query / response material，提出 `evidence_backed_fact` candidates。
+- `evidence_backed_facts` 必须引用本次 compact material 中的 prompt-local opaque evidence label；该 label 必须由 Host provenance map 映射到 accepted `TOOL_RESULT_ACCEPTED` material。
+- compact 后，只有通过 Host accept barrier 的 `evidence_backed_fact_candidates` 才能物化为 `evidence_backed_facts`。
+- compact failure fallback 只保留 selected recent window 中仍被选中的 tool query / response material，不生成 `evidence_backed_facts`。
+- accepted evidence 存在但 compactor 没有产出合法 fact candidate 时，Host 只记录 diagnostic，不合成 fallback fact。
+
+落地边界：
+
+- producer：accepted evidence envelope 来自 `TOOL_RESULT_ACCEPTED`；`evidence_backed_facts` 只来自 accepted `CONTEXT_COMPACTED` 中通过 Host accept barrier 的 fact candidates，或后续明确设计的非 compact producer。
+- projection schema：`evidence_fact_memory` 至少区分 readable recent evidence material 与 accepted evidence-backed fact view；fact view 必须绑定 Host internal provenance map，但模型只看到业务可读 claim 与来源说明，不看到 durable refs。
+- prompt assembly：compact 前 / fallback 渲染 selected recent window 中的 readable tool query / response；compact 后渲染 accepted evidence-backed facts 加 selected post-compact recent evidence material。
+
+### 3. User Profile Memory
+
+User Profile Memory 是唯一跨 session 语义类，不混进 session Conversation Memory。#81 只固定边界：User Profile 的 durable store、profile update、撤销、删除、导出、隐私与跨 session profile projection 均由 GitHub Issue #115 承接。
+
+### 4. Session Summary Memory
+
+Session Summary Memory 负责当前 session 的 compact / rollup，服务长对话连续性，不替代事实。
+
+投影规则：
+
+- compact 前，Session Summary Memory 为空。
+- compact 成功后，accepted `CONTEXT_COMPACTED` 产生 session summary。
+- summary 不能替代 `evidence_backed_facts`。
+- 多次 compact 使用 rolling compacted view；latest accepted compacted view 是下一次 compact 的 previous accepted view。
+
+落地边界：
+
+- producer：只来自 accepted `CONTEXT_COMPACTED`。
+- projection schema：`session_summary_memory` 保存当前 session 的 rolling summary view、source boundary 与必要 source labels / refs 映射；不得保存 raw compact artifact JSON 或 failed proposal。
+- accept barrier：summary 不能声称未由 source material 支撑的业务事实，不能替代 evidence-backed facts，不能覆盖 current input anchor。
+- prompt assembly：compact 前与 fallback 为空；compact 后作为 compacted view 的 summary section 渲染，并与 evidence-backed facts、answer anchors、forward intents 分区。
+
+### 5. Answer Anchor Memory
+
+Answer Anchor Memory 保存上一轮或历史回答中可被用户后续指代的结构化轮廓，例如“三个风险”的第 1 / 2 / 3 点，用于支持“第二点展开”“刚才第三个风险”等追问。
 
 边界规则：
 
-- Answer Anchor：优先解决 final answer 中“第 N 点 / 那个结论 / 刚才第三个风险”等回答结构指代。
-- Minimum Preserve：保留长输入或 compact material 中理解代词、序号、局部承接所需的最小 continuity item。
-- Evidence / Fact Memory：负责财报事实和证据引用；Answer Anchor 与 minimum preserve 都不能自动升级为 evidence-backed fact。
+- compact 前，Answer Anchor Memory 为空。
+- 第一阶段不对 final answer 做规则化、deterministic outline parser 或 LLM parser。
+- Answer Anchor 只能来自 accepted compact output，或明确设计的非 prompt-conditioned producer。
+- Answer Anchor 必须引用本次 compact material 中的 prompt-local opaque source label；Host 内部再把 label 映射到 assistant final answer / assistant conclusion 的 durable source refs。
+- Answer Anchor 只服务对话指代和局部展开，不能自动升级为 `evidence_backed_fact`。
+- Reference Continuity Item 只保留长输入或 compact material 中理解代词、序号、局部承接所需的最小 continuity item；它归属 Trace Memory，不承担 final-answer outline 指代职责。
 
-阶段性裁决：`WU-CM-04` 纳入 GitHub Issue #81 的 Conversation Memory 整体优化与后续 Fins integration 边界。#81 正确实现 Answer Anchor 后，minimum preserve 不再需要承担 final-answer outline 指代职责；它只保留 continuity / navigation 边界。
+落地边界：
 
-## 代码核对
+- producer：只来自 accepted `CONTEXT_COMPACTED`，或后续明确设计的非 prompt-conditioned producer；第一阶段不在 compact 前对 final answer 做 outline parser。
+- projection schema：`answer_anchor_memory` 保存 bounded anchor items、anchor label / title、children / ordinal-safe display text、source refs 映射与淘汰规则；不得依赖 prompt-local label 名字的顺序语义。
+- accept barrier：anchor 必须绑定本次 compact material 中的 assistant final answer / conclusion source label；不能绑定 tool evidence 后冒充 fact。
+- prompt assembly：compact 前与 fallback 为空；compact 后按 bounded policy 渲染非空 anchor section，不根据当前 prompt 动态召回或触发。
 
-- `USER_INPUT_ACCEPTED` 是用户输入进入 Host 的 canonical fact；memory 当前会将其投影为 raw user turn。
-- `RUN_SUCCEEDED.payload.final_answer` 会投影为 `assistant_conclusion`，用于对话连续性，但不是 `evidence_backed_fact`。
-- `TOOL_RESULT_ACCEPTED` 当前只表示 accepted evidence envelope；memory 不会直接从 raw tool result 合成 stable fact。
-- `CONTEXT_COMPACTED` 的 accepted candidates 才会物化 episode summary、minimum preserve、pinned state patch 和 `evidence_backed_facts`。
-- 当前已有 session-level 会话摘要、minimum preserve、pinned state 的 current goal / constraints / open questions，但没有跨 session 用户画像。
-- 当前没有独立的“前瞻意图”层；`current_goal` 和 `open_questions` 只能覆盖一部分短期目标与未解问题。
+### 6. Forward Intent Memory
 
-## Benchmark 借鉴
+Forward Intent Memory 保存待澄清问题、未完成任务、下一步任务状态等前瞻意图。它不是真实世界事实，也不直接驱动工具执行，只辅助下一轮 prompt 构造或澄清问题。
 
-### LongMemEval
+边界规则：
 
-LongMemEval 评测长期交互记忆的五类能力：信息抽取、多 session 推理、时间推理、知识更新和拒答。它还把长期记忆系统拆成 indexing、retrieval、reading 三阶段，并强调 session / round decomposition、fact-augmented key、time-aware query expansion 和 structured reading。
+- compact 前，Forward Intent Memory 为空。
+- 第一阶段不对 prompt / final answer 做 intent parser，也不生成 hidden plan。
+- Forward Intent 只能来自 accepted compact output，或明确设计的非 prompt-conditioned producer。
+- Forward Intent 必须引用本次 compact material 中的 prompt-local opaque source label；Host 内部再校验 source refs、长度和允许类型。
 
-对 Dayu 的启发：
+落地边界：
 
-- Memory 不能靠“把历史全塞进长上下文”解决；需要 EventLog / artifact 的索引、相关召回和结构化阅读。
-- 原始痕迹 recall 应优先按 turn / event / evidence span 粒度切分，而不是整 session 粗召回。
-- index key 不应只来自原文，还应包含 extracted facts、公司、指标、期间、source locator、event_sequence 等增强 key。
-- 召回必须带时间信息，支持“最新”“之前”“修改后”“当时为什么”这类时间推理。
-- retrieved memory 进入 prompt 时要结构化，避免一坨聊天记录稀释模型注意力。
-- 评测必须包含无证据 / 不可回答问题，确保系统会拒答，而不是用 memory 幻觉补洞。
-
-### PersonaMem
-
-PersonaMem 评测个性化记忆和动态用户画像，关注模型能否识别用户当前偏好、偏好演化、变化原因，并在新场景中给出符合用户当前状态的回答。它的任务类型包括召回用户事实、识别最新偏好、追踪偏好演化、回忆偏好变化原因、给出偏好对齐建议、泛化到新场景。
-
-对 Dayu 的启发：
-
-- 用户画像不能是静态 key-value 表；它必须有 source refs、observed_at / valid_from、supersedes、confidence、撤销和用户可见解释。
-- 最新偏好与历史偏好必须同时可解释；系统既要知道当前采用哪个，也要能解释为什么旧偏好被覆盖。
-- 画像更新不能只依赖压缩后的 LLM-generated facts；相关原始交互仍应可召回，避免过早压缩丢失变化原因。
-- personalization recall 应按当前 prompt 选择相关画像，不应把用户全部画像都塞进 prompt。
-- 新场景泛化是高阶能力：用户画像只能辅助生成，不应压过本轮明确输入或财报证据。
-
-### 对 DayuMemoryEval 的启发
-
-后续可以建立项目内 memory eval，用来覆盖以下能力：
-
-- 财报事实召回：从 accepted evidence / evidence-backed facts 找回指标、期间、来源。
-- 多 session 推理：跨多个 session 合成公司、指标或用户关注点的变化。
-- 时间更新：处理“最新指引”“之前说法”“后来修正”的问题。
-- 拒答：当 EventLog / evidence / profile 中没有足够依据时明确拒答或要求补充。
-- 动态画像：用户偏好从“先看现金流风险”改为“先看毛利率”后，下一轮按最新偏好组织回答。
-- 回答锚点：用户问“第二点展开”时召回上一轮 answer anchors，而不是整段 final answer。
-
-## 目标六类语义模型
-
-更好的 Conversation Memory 不应以 `stable layer` / `history pool` 作为顶层分类，而应以语义用途划分为六类：
-
-- Trace Memory：原始痕迹。EventLog / artifact 全量保存，prompt 里只按需召回。包括 user input、final answer、tool result、失败、取消、恢复轨迹。
-- Evidence / Fact Memory：原子事实。分为 accepted evidence 和 evidence-backed facts 两层；事实必须绑定 evidence refs。
-- User Profile Memory：用户画像。跨 session，使用独立 durable store，不混进 session Conversation Memory。
-- Session Summary Memory：会话摘要。当前 session 的 compact / rollup，服务连续性，不替代事实。
-- Answer Anchor Memory：回答锚点。保存上一轮或历史回答的结构化轮廓，例如“三个风险”的 1 / 2 / 3 点，解决“第二点展开”问题。
-- Forward Intent Memory：前瞻意图。保存下一步任务状态、待澄清问题、可能需要召回的方向；不能自动驱动工具执行，只辅助 prompt 构造。
-
-### 1. 原始痕迹
-
-含义：
-
-- 用户原始输入、助手最终回答、工具调用结果、等待恢复结果、取消 / 失败 / 修复轨迹等原始历史。
-- 这些内容主要存在于 EventLog、payload descriptor 和 artifact 中。
-
-当前现状：
-
-- memory 只把部分原始痕迹投影进 conversation continuity。
-- raw user turn 来自 `USER_INPUT_ACCEPTED`。
-- assistant conclusion 来自上一轮 `RUN_SUCCEEDED.final_answer`。
-- 工具 raw result 不直接作为普通 memory 文本长期注入。
-
-待讨论问题：
-
-- “全量召回”应该做成 EventLog / artifact 检索能力，而不是扩大 raw turn pool。
-- 需要定义哪些历史可被普通 Run 检索，哪些只能供 compactor / audit / debug 使用。
-- 需要定义召回结果进入 prompt 前的预算、脱敏、排序和 source refs。
-
-初步倾向：
-
-- 保持 EventLog 是全量真源。
-- Conversation Memory 只保留 bounded continuity。
-- 新增独立 retrieval / recall 入口，用于按 session、run、event type、semantic query 或 evidence ref 回查原始痕迹。
-- recall 入口必须接收当前 prompt / query context，返回相关片段而不是时间线全量 dump。
-- `final_answer` 不需要并入 raw user turn 类型；它应保留为 `assistant_conclusion`，但成为高优先级 recall 候选。
-
-### 2. 原子事实
-
-含义：
-
-- 对财报分析真正有用的稳定事实，例如“某公司某季度收入是多少”“该事实来自哪份财报哪段证据”。
-- 原子事实必须可追溯到 accepted evidence，不能来自 assistant final answer 或 episode summary 的自由文本。
-
-当前现状：
-
-- `TOOL_RESULT_ACCEPTED` 保存 accepted evidence envelope。
-- `evidence_backed_facts` 当前只从 accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 物化。
-- 如果 accepted evidence 存在但 compactor 没有产出合法 fact candidate，Host 只记录 diagnostic，不合成 fallback fact。
-
-待讨论问题：
-
-- “全量召回原子事实”应召回 accepted evidence，还是召回已经抽取过的 `evidence_backed_facts`。
-- 是否需要一个 evidence index，让普通 Run 或 compactor 能按财报 subject / metric / period / source locator 找回 accepted evidence。
-- 是否需要把 fact extraction 从 compaction 中拆出一条更直接的 evidence-to-fact path。
-
-初步倾向：
-
-- accepted evidence 是原子事实的上游证据，不等同于已验证 fact。
-- `evidence_backed_facts` 仍必须绑定 evidence refs。
-- 如果要“全量”，应优先建立 accepted evidence recall，再决定是否新增专门 fact extraction work unit。
-
-### 3. 用户画像
-
-含义：
-
-- 跨 session 的用户偏好、角色、常用分析风格、约束、风险偏好、语言习惯、常看的公司 / 行业等。
-
-当前现状：
-
-- 当前 Conversation Memory 是 session-level。
-- `pinned_state.current_goal`、`user_constraints`、`open_questions` 仍属于 session memory，不是跨 session 用户画像。
-- 代码中没有 durable user profile / identity memory。
-
-关于实现边界：
-
-- 用户画像抽取 / 更新可以由 scene、专门 extractor、retrieval pipeline 或其它实现承载。
-- 讨论稿不预设必须使用某个 markdown prompt、某个 scene 或某条固定 pipeline。
-- 真正的用户画像数据应有 durable profile store、canonical update event、projection、隐私删除 / 重置策略和用户可见解释。
-
-待讨论问题：
-
-- 用户画像是按本地 workspace、账号、客户组织，还是更细粒度 subject 分区。
-- 哪些画像字段允许自动学习，哪些必须用户显式确认。
-- 画像如何过期、撤销、覆盖、导出和删除。
-
-初步倾向：
-
-- 新建跨 session User Memory / Identity Profile 设计，不混入 session Conversation Memory。
-- profile extraction / update 的技术实现后置到 design gate 决策。
-
-### 4. 会话摘要
-
-含义：
-
-- 对当前 session 已发生内容的压缩总结，用于跨长对话保持连续性。
-
-当前现状：
-
-- 已有 `CONTEXT_COMPACTED` 产生 episode summary。
-- memory 会将 accepted episode summary 作为 conversation continuity 的一部分。
-- summary 不能替代 `evidence_backed_facts`。
-
-待讨论问题：
-
-- 会话摘要是否只服务当前 session，还是能作为跨 session user profile 的候选输入。
-- 摘要里如果包含事实性陈述，是否必须显式引用已有 evidence-backed fact 或 accepted evidence。
-- 多次 compact 后 summary 的 roll-up、可读性与 source refs 怎么保持。
-
-初步倾向：
-
-- session summary 继续留在 Conversation Memory。
-- 跨 session 画像只能消费经过明确 profile update gate 的摘要候选。
-
-### 5. 回答锚点
-
-含义：
-
-- 上一轮或历史回答中可被用户后续指代的结构化节点。
-- 例如用户问“分析这家公司三个主要风险”，模型回答了三点；这三点应形成有序锚点，支持后续“第二点展开说说”“刚才第三个风险呢”这类追问。
-
-当前现状：
-
-- 当前已有 `assistant_conclusion`，但它是整段 final answer 的 continuity item。
-- 当前没有专门的 answer outline / answer anchor 分类。
-
-和前瞻意图的区别：
-
-- 前瞻意图表达“下一步可能要做什么 / 需要准备什么”。
-- 回答锚点表达“刚才回答中有哪些可被再次指代的结构”。
-- “三个主要风险”这个任务本身可以生成前瞻意图候选，例如后续可能追问某一项；但模型回答出的三点更适合进入回答锚点。
-
-待讨论问题：
-
-- 回答锚点由 deterministic parser、LLM extractor，还是 final answer 结构化输出直接产生。
-- 回答锚点是否只保存 label / order / short text / source final answer ref，还是也保存 evidence refs。
-- 回答锚点如何过期、覆盖，以及如何避免被误当作财报事实。
-
-初步倾向：
-
-- 新增 session-level answer anchors / answer outline memory 分类。
-- 它只服务对话指代和局部展开，不自动成为 `evidence_backed_fact`。
-- 如果某个锚点本身绑定了 accepted evidence refs，后续可用于解释和召回证据；但分析结论仍不能仅凭 final answer 升级为 stable fact。
-
-### 6. 前瞻意图
-
-含义：
-
-- 系统对用户下一步可能需要什么的结构化判断，例如待跟进问题、计划中的分析路径、未完成任务、下一步建议。
-
-当前现状：
-
-- `pinned_state.current_goal` 和 `open_questions` 能表达部分当前目标与未解问题。
-- 但它们不是完整的 forward intent，不表达“下一步应该主动准备什么 / 召回什么 / 问什么”。
-
-待讨论问题：
-
-- 前瞻意图是 Host memory 的一部分，还是 Service / Agent planning 的 projection。
-- 前瞻意图能否由 LLM 自动写入，还是必须通过 Host accept barrier。
-- 前瞻意图如何避免变成不可审计的隐形计划或 self-fulfilling prompt bias。
-
-初步倾向：
-
-- 前瞻意图可以作为 bounded、可解释、可撤销的 planning memory。
-- 它不应成为事实真源，也不应直接驱动工具执行；只能影响下一轮上下文构造或澄清问题。
+- producer：只来自 accepted `CONTEXT_COMPACTED`，或后续明确设计的非 prompt-conditioned producer；第一阶段不根据当前 prompt 生成 hidden plan。
+- projection schema：`forward_intent_memory` 保存 bounded intent items，例如 open question、pending clarification、pending user-visible task state、next-step note；每项必须有 allowed type、status、source refs 与过期 / supersession 规则。
+- accept barrier：Forward Intent 不能被当作工具执行计划或事实证明，不能覆盖本轮用户输入，也不能自动触发工具。
+- prompt assembly：compact 前与 fallback 为空；compact 后作为 bounded task-state / clarification section 渲染，帮助下一轮回答或澄清，但执行权仍属于 Host / Agent 正常 tool loop。
 
 ## 关键边界
 
-- 原始痕迹全量存在于 EventLog / descriptor / artifact，不等于全量进入 prompt。
-- accepted evidence 是事实证据，不等于已抽取的 stable fact。
-- assistant final answer、回答锚点、用户输入、episode summary、minimum preserve、用户画像、前瞻意图都不能自动升级成 `evidence_backed_fact`。
-- 跨 session 用户画像必须有独立 durable 边界，不能伪装成 session memory 字段。
-- 任何可自动学习的长期信息都需要来源、置信度、更新时间、撤销路径和用户可见解释。
-
-## 可能拆出的后续 Work Units
-
-- EventLog / artifact recall：为原始痕迹建立可控召回入口。
-- Accepted evidence recall / index：为财报证据建立可查询索引。
-- Evidence-to-fact extraction：评估是否从 compaction 中拆出独立 fact extraction path。
-- Answer anchors / outline memory：设计回答锚点的生产者、source refs、预算、过期和召回规则。
-- Cross-session identity profile：设计 durable 用户画像、profile update event 和抽取 / 更新边界。
-- Forward intent memory：设计前瞻意图的生产者、accept barrier、预算和渲染规则。
+- 原始痕迹全量存在于 EventLog、descriptor 和 artifact，不等于全量进入 prompt。
+- accepted evidence 是证据，不等于已抽取的 `evidence_backed_fact`。
+- assistant final answer、回答锚点、用户输入、episode summary、reference continuity item、用户画像、前瞻意图都不能自动升级成 `evidence_backed_fact`。
+- 跨 session 用户画像必须有独立 durable 边界，不能伪装成 session memory 字段；该边界由 GitHub Issue #115 跟踪。
+- 任何可自动学习的长期信息都必须有来源、置信度、更新时间、撤销路径和用户可见解释。

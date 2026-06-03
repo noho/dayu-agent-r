@@ -12,7 +12,7 @@
 
 Product entrypoint 实施必须始终服务于以下目标：
 
-- 生产级买方财报分析 Agent。
+- 生产级通用 Agent，具备买方财报分析能力。
 - 范式是“宿主强约束下的 LLM in the loop”。
 - 严格遵守 `UI -> Service -> Host -> Engine` 分层边界。
 - CLI / Web / GUI 入口只能通过 Service assembly 与 Host public API 触达 Host。

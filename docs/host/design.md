@@ -4,7 +4,7 @@
 
 ## 1. 设计目标
 
-Host 的设计目标是支撑生产级买方财报分析 Agent。系统范式是“宿主强约束下的 LLM in the loop”：
+Host 的设计目标是支撑生产级通用 Agent，具备买方财报分析能力。系统范式是“宿主强约束下的 LLM in the loop”：
 
 - Host 是 Session / Run / Attempt / EventLog / admission / cancel / resume / retry / steer / replay / memory / tool governance 的治理真源。
 - Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run 生命周期，不持久化 Host 状态，不恢复旧 Agent / Runner。
@@ -2512,7 +2512,7 @@ RunInputBuilder 不创建独立 RunInputBuildTrace 子系统；上下文构造�
 
 ## 24. Conversation Memory
 
-Conversation Memory 从买方财报分析 Agent 的会话不变量出发：
+Conversation Memory 从生产级通用 Agent 的会话治理目标，以及买方财报分析能力的工作台不变量出发：
 
 - 目标稳定。
 - 工具结果即事实。
@@ -2690,7 +2690,7 @@ Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace�
 - hard threshold 由 policy provider 显式给出或按 `input_budget_tokens` 扣除 policy 定义的最小保护余量后计算。proactive path 在 dispatch 前使用估算输入决定是否禁止 dispatch；proactive compact operation 的 bounded repair attempts 全部耗尽后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。reactive path 不把 compact 后估算值当作能否重新 dispatch 的真源；它接受 quality 通过的 compact 结果，随后用真实 recovery dispatch / Engine overflow 闭环判断是否还需要下一次 reactive compact。
 - 每个 Run 的 proactive trigger 第一版最多启动一个 compaction operation；reactive trigger 每次 Engine overflow 最多启动一个 operation，但同一 Run 可在 `max_reactive_compactions_per_run` 上限内多次 reactive compact，默认上限为 2。一个 operation 内可以包含 Host-owned bounded semantic repair attempts，但不得启动无界 compact loop。
 - `max_compaction_attempts_per_operation` 由 Host context budget policy 显式给出，含第一次 proposal attempt、reactive material
-  block pass proposal 与后续 semantic repair attempts，必须为正整数。它控制一次 Host compaction operation 内所有外部 LLM proposal
+  block pass proposal 与后续 whole-candidate semantic repair attempts，必须为正整数。它控制一次 Host compaction operation 内所有外部 LLM proposal
   调用总数；默认 packaged policy 为 5 次。代码 fallback 默认值与 execution profile 默认值必须保持一致，避免同一 Host 在不同装配路径下出现不同 compact retry 语义。该字段不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
 - 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
 
@@ -2717,7 +2717,7 @@ Compactor 与 retry / repair 的 owner 边界固定为：
 
 - Runner/provider 层负责低层 transport retry：network、timeout、HTTP 429、HTTP 5xx、stream idle timeout 等由 Engine Runner 按 `RunnerSpec.max_retries`、`Retry-After` 与退避策略在一次 compactor proposal 调用内处理。该层 retry 不拥有 Host governance，不 append EventLog，不 emit HostEvent，只通过 RunnerEvent / log / attempt summary 进入 Host diagnostic。
 - `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest`、Service 从 `compactor_baseline.scene_id` 指向的 scene 装配后传入的 system prompt / `AgentPolicy`、Service 从 `compactor_baseline.user_prompt_template_path` 指向的 prompt asset 读取后传入的 user prompt template，以及 Host lifecycle cancellation token 映射为一次 structured JSON LLM proposal，并返回 episode summary、pinned state patch、evidence-backed fact candidates、minimum preserve item candidates、preservation / diagnostic candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection，也不得自行构造不可取消 token。Host 只把 request 渲染为 typed data block 并替换 user template 中的 compaction request 占位符，不从 config 读取 prompt asset。
-- Host Context Governance 拥有 semantic repair / retry：非 final answer、空 summary、解析失败、candidate shape 非法、缺 preservation evidence、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
+- Host Context Governance 拥有 semantic repair / retry：非 final answer、空 summary、解析失败、candidate shape 非法、缺 preservation evidence、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 是 whole-candidate re-proposal：可以向 LLM 提供 Host-neutral 的失败类别 / validation issue 摘要，但每次必须重新产出完整 candidate；Host 不要求 LLM 返回 repair patch，不合并旧 proposal 的 valid fields 与新 patch，也不 partial materialize rejected candidate。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
 - stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。proactive compaction 在 worker 启动前没有 active worker token，必须使用 durable Run 状态观察 token；reactive compaction 必须复用 Engine envelope 中的 run-local cancellation token。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
 
@@ -2738,7 +2738,7 @@ CONTEXT_COMPACTION_REQUESTED(operation_id, trigger_source, budget snapshot, inpu
   -> attempt 1: LLM proposal outside write transaction
   -> Host quality / budget gate
   -> optional CONTEXT_COMPACTION_ATTEMPT_REJECTED(attempt_no, category, diagnostic refs)
-  -> optional bounded repair attempt N
+  -> optional bounded whole-candidate repair attempt N
   -> CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
 ```
 

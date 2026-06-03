@@ -12,7 +12,7 @@
 
 维护性治理必须始终服务于以下目标：
 
-- 保持生产级买方财报分析 Agent 的行为稳定。
+- 保持生产级通用 Agent 的行为稳定，并保留买方财报分析能力。
 - 保持“宿主强约束下的 LLM in the loop”架构不变。
 - 严格遵守 `UI -> Service -> Host -> Engine` 分层边界，禁止反向依赖和跨层泄漏实现细节。
 - 拆分 God Function / God Object 时，只沿真实职责边界切分，不制造胶水 seam、兼容 wrapper、god config bag 或无语义 owner 的 helper。
