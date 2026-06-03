@@ -47,6 +47,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
 )
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.runners.openai.cancellation_helpers import _RunnerInterrupted
 from dayu.engine.runners.openai.diagnostic_payload import (
@@ -245,15 +246,20 @@ class AsyncOpenAIRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None = None,
     ) -> AsyncIterator[RunnerEvent]:
         """发起一次 LLM 调用并返回 :class:`RunnerEvent` 异步流。
 
         :param messages: 消息序列。
         :param options: 单次调用参数。
         :param tools: 工具 schema 序列。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份；本 slice
+            仅接收契约，OpenAI header 映射由后续 policy slice 实现。
         :returns: :class:`RunnerEvent` 异步迭代器。
         """
 
+        del request_identity
         return self._call_impl(messages, options, tools)
 
     def is_supports_tool_calling(self) -> bool:

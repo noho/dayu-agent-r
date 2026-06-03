@@ -53,6 +53,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
     RunnerToolCallsCompletedData,
 )
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import (
     DeepSeekThinkingExtension,
     GeminiThinkingExtension,
@@ -550,17 +551,20 @@ class _ScriptedToolRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
 
         :param messages: 当前 Agent messages。
         :param options: Runner call options。
         :param tools: 当前暴露的 tool schemas。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         :raises Exception: 不主动抛出异常。
         """
 
-        del options, tools
+        del options, tools, request_identity
         self._factory.messages_seen.append(tuple(messages))
         self._call_count += 1
         if self._call_count == 1:
@@ -607,17 +611,20 @@ class _AwaitingToolRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回等待型工具调用脚本。
 
         :param messages: 当前 Agent messages。
         :param options: Runner call options。
         :param tools: 当前暴露的 tool schemas。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         :raises Exception: 不主动抛出异常。
         """
 
-        del messages, options, tools
+        del messages, options, tools, request_identity
         return self._iter_events(_tool_script(_awaiting_tool_call()))
 
     def is_supports_tool_calling(self) -> bool:

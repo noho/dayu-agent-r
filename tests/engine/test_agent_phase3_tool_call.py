@@ -68,6 +68,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
 )
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.runners.openai.non_stream_parser import parse_non_stream_response
 from dayu.contracts.tool_await import (
@@ -172,24 +173,32 @@ class _ScriptedRunner:
     token_to_cancel_on_close: _Token | None = None
     tools_seen: list[tuple[ToolSchema, ...]] = field(default_factory=list)
     messages_seen: list[tuple[AgentMessage, ...]] = field(default_factory=list)
+    request_identities_seen: list[RunnerRequestIdentity | None] = field(
+        default_factory=list
+    )
 
     def call(
         self,
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
 
         :param messages: Agent 消息。
         :param options: Runner 调用参数。
         :param tools: 本轮工具 schema。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
         """
 
+        del options
         self.messages_seen.append(tuple(messages))
         self.tools_seen.append(tuple(tools))
+        self.request_identities_seen.append(request_identity)
         script_index = self.call_count
         self.call_count += 1
         if script_index in self.raise_on_call_indices:
@@ -279,16 +288,20 @@ class _StateClearingRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回会破坏迭代状态不变量的 RunnerEvent 流。
 
         :param messages: Agent 消息。
         :param options: Runner 调用参数。
         :param tools: 本轮工具 schema。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
         """
 
+        del messages, options, tools, request_identity
         self.call_count += 1
         return self._iter_events()
 
@@ -328,6 +341,7 @@ class _RecordingToolExecutor:
     """记录批式请求并返回预设 outcome 的 fake ToolExecutor。"""
 
     outcomes: Mapping[str, ToolExecutionOutcome]
+    records_override: tuple[BatchToolExecutionRecord, ...] | None = None
     token_to_cancel: _Token | None = None
     raise_for_call_id: str | None = None
     raise_cancelled_for_call_id: str | None = None
@@ -339,7 +353,8 @@ class _RecordingToolExecutor:
         """执行 fake 批式工具调用。
 
         :param request: 批式工具执行请求。
-        :returns: 与输入 ``calls`` 一一对应的批式 outcome。
+        :returns: 配置 ``records_override`` 时返回该覆盖记录，否则返回与
+            输入 ``calls`` 一一对应的批式 outcome。
         :raises RuntimeError: 配置 ``raise_for_call_id`` 且某 call 命中时抛出。
         :raises asyncio.CancelledError: 配置 ``raise_cancelled_for_call_id``
             且某 call 命中时抛出。
@@ -359,6 +374,8 @@ class _RecordingToolExecutor:
             raise asyncio.CancelledError()
         if self.token_to_cancel is not None:
             self.token_to_cancel.trigger()
+        if self.records_override is not None:
+            return BatchToolExecutionOutcome(records=self.records_override)
         records = tuple(
             BatchToolExecutionRecord(
                 tool_call_id=call.tool_call_id,
@@ -653,6 +670,8 @@ def _request(
             outcomes={"tc_1": _success(5)}
         ),
         cancellation_token=token or _Token(),
+        attempt_id="attempt_phase3",
+        execution_id="execution_phase3",
     )
 
 
@@ -955,6 +974,29 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
     assert second_messages[-2].reasoning_content == "reason"
     assert json.loads(second_messages[-1].content) == {"sum": 5}
     assert runner.tools_seen[0] == (_schema(),)
+    assert [
+        identity.runner_call_index
+        for identity in runner.request_identities_seen
+        if identity is not None
+    ] == [1, 2]
+    assert all(
+        identity is not None
+        and identity.attempt_id == "attempt_phase3"
+        and identity.execution_id == "execution_phase3"
+        for identity in runner.request_identities_seen
+    )
+    iteration_completed = [
+        event
+        for event in events
+        if event.type is EngineEventType.ITERATION_COMPLETED
+    ]
+    assert len(iteration_completed) == 2
+    for event, identity in zip(
+        iteration_completed, runner.request_identities_seen, strict=True
+    ):
+        assert isinstance(event.data, IterationCompletedData)
+        assert identity is not None
+        assert event.data.client_correlation_id == identity.client_correlation_id
     assert runner.close_count == 1
 
 
@@ -1014,6 +1056,13 @@ async def test_oversized_tool_message_is_passed_to_force_answer_runner_call() ->
     assert "x" * _OVERSIZED_INLINE_CONTENT_LENGTH in second_messages[-2].content
     assert isinstance(second_messages[-1], UserMessage)
     assert runner.call_count == 2
+    assert [
+        identity.runner_call_index
+        for identity in runner.request_identities_seen
+        if identity is not None
+    ] == [1, 2]
+    assert runner.request_identities_seen[1] is not None
+    assert runner.request_identities_seen[1].iteration_id == "run_phase3_iteration_2"
     assert runner.close_count == 1
     assert len(executor.requests) == 1
 
@@ -1342,6 +1391,15 @@ async def test_tool_calls_finish_reason_mismatch_keeps_provider_request_id() -> 
     assert terminal.data.error_code == "runner_tool_calls_finish_reason_mismatch"
     assert iteration_completed.data.provider_request_id == "req_mismatch"
     assert terminal.data.provider_request_id == "req_mismatch"
+    assert runner.request_identities_seen[0] is not None
+    assert (
+        iteration_completed.data.client_correlation_id
+        == runner.request_identities_seen[0].client_correlation_id
+    )
+    assert (
+        terminal.data.client_correlation_id
+        == runner.request_identities_seen[0].client_correlation_id
+    )
 
 
 @pytest.mark.asyncio
@@ -1624,6 +1682,32 @@ async def test_duplicate_and_executor_exception_paths(
     )
     assert _failed_data(duplicate_events).error_code == "duplicate_tool_call_id"
     assert len(duplicate_executor.requests) == 0
+
+    mismatched_record = BatchToolExecutionRecord(
+        tool_call_id="tc_other",
+        outcome=_success(1),
+    )
+    mismatch_runner = _ScriptedRunner(
+        scripts=(_tool_script(_tool_call("tc_1")),)
+    )
+    mismatch_events = await _collect(
+        _AsyncAgent(
+            request=_request(
+                executor=_RecordingToolExecutor(
+                    outcomes={"tc_1": _success(1)},
+                    records_override=(mismatched_record,),
+                )
+            ),
+            runner=mismatch_runner,
+        )
+    )
+    mismatch_failed = _failed_data(mismatch_events)
+    assert mismatch_failed.error_code == "tool_batch_outcome_mismatch"
+    assert mismatch_runner.request_identities_seen[0] is not None
+    assert (
+        mismatch_failed.client_correlation_id
+        == mismatch_runner.request_identities_seen[0].client_correlation_id
+    )
 
     exploding_executor = _RecordingToolExecutor(
         outcomes={"tc_1": _success(1)},
@@ -1931,6 +2015,25 @@ async def test_length_continuation_appends_prompt_and_joins_content() -> None:
     assert runner.messages_seen[1][-2].content == "partial "
     assert isinstance(runner.messages_seen[1][-1], UserMessage)
     assert runner.messages_seen[1][-1].content == "请从截断处继续。"
+    assert [
+        identity.runner_call_index
+        for identity in runner.request_identities_seen
+        if identity is not None
+    ] == [1, 2]
+    assert runner.request_identities_seen[1] is not None
+    assert runner.request_identities_seen[1].iteration_id == "run_phase3_iteration_2"
+    iteration_completed = [
+        event
+        for event in events
+        if event.type is EngineEventType.ITERATION_COMPLETED
+    ]
+    assert len(iteration_completed) == 2
+    for event, identity in zip(
+        iteration_completed, runner.request_identities_seen, strict=True
+    ):
+        assert isinstance(event.data, IterationCompletedData)
+        assert identity is not None
+        assert event.data.client_correlation_id == identity.client_correlation_id
 
 
 @pytest.mark.asyncio

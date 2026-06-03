@@ -76,13 +76,48 @@ def test_agent_run_request_accepts_non_empty_messages() -> None:
     assert len(request.messages) == 1
 
 
+def test_agent_run_request_requires_attempt_execution_pair() -> None:
+    """AgentRunRequest 的 attempt / execution identity 必须成对出现。"""
+
+    message = UserMessage(role=AgentMessageRole.USER, content="hello")
+    with pytest.raises(ValueError, match="attempt_id"):
+        _request(
+            messages=(message,),
+            attempt_id="attempt-contract",
+            execution_id=None,
+        )
+    with pytest.raises(ValueError, match="attempt_id"):
+        _request(
+            messages=(message,),
+            attempt_id=None,
+            execution_id="execution-contract",
+        )
+
+
+def test_agent_run_request_accepts_attempt_execution_pair() -> None:
+    """AgentRunRequest 接受成对的 attempt / execution identity。"""
+
+    request = _request(
+        messages=(UserMessage(role=AgentMessageRole.USER, content="hello"),),
+        attempt_id="attempt-contract",
+        execution_id="execution-contract",
+    )
+
+    assert request.attempt_id == "attempt-contract"
+    assert request.execution_id == "execution-contract"
+
+
 def _request(
     *,
     messages: tuple[UserMessage, ...],
+    attempt_id: str | None = None,
+    execution_id: str | None = None,
 ) -> AgentRunRequest:
     """构造 AgentRunRequest。
 
     :param messages: 请求消息。
+    :param attempt_id: Host attempt id。
+    :param execution_id: Host execution id。
     :returns: AgentRunRequest。
     """
 
@@ -119,4 +154,6 @@ def _request(
         tool_schemas=(),
         tool_executor=_NoopToolExecutor(),
         cancellation_token=_Token(),
+        attempt_id=attempt_id,
+        execution_id=execution_id,
     )

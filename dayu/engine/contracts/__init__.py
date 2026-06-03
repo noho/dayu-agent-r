@@ -61,6 +61,10 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner import AsyncRunner
+from dayu.engine.contracts.runner_identity import (
+    RunnerRequestIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AssistantToolCallBatchSnapshot,
@@ -152,6 +156,7 @@ __all__ = [
     "RunnerHTTPErrorCode",
     "RunnerHTTPErrorData",
     "RunnerProtocolErrorData",
+    "RunnerRequestIdentity",
     "RunnerReasoningDeltaData",
     "RunnerSpec",
     "RunnerToolCallDeltaData",
@@ -169,4 +174,5 @@ __all__ = [
     "ToolResultAcceptedData",
     "UsageReportedData",
     "UserMessage",
+    "build_runner_request_identity",
 ]

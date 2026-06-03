@@ -141,14 +141,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | implementation |
-| implementation status | plan-accepted |
+| implementation status | slice-1-accepted |
 | active work unit | WU-ENG-02 |
 | default next work unit | WU-CM-01 |
-| next entry point | implementation gate |
+| next entry point | Slice 2 implementation gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | docs/host/wu-eng-02-provider-request-identity-plan.md |
-| implementation commits | accepted plan commit 59f66b7; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
-| review artifacts | docs/reviews/wu-eng-02-plan-review-mimo.md; docs/reviews/wu-eng-02-plan-review-ds.md; docs/reviews/wu-eng-02-plan-fix-codex.md; docs/reviews/wu-eng-02-plan-rereview-mimo.md; docs/reviews/wu-eng-02-plan-rereview-ds.md; plan accepted with no blocking open questions |
+| implementation commits | accepted plan commit 59f66b7; Slice 1 accepted commit PENDING_SLICE1_COMMIT_HASH; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
+| review artifacts | docs/reviews/wu-eng-02-plan-review-mimo.md; docs/reviews/wu-eng-02-plan-review-ds.md; docs/reviews/wu-eng-02-plan-fix-codex.md; docs/reviews/wu-eng-02-plan-rereview-mimo.md; docs/reviews/wu-eng-02-plan-rereview-ds.md; docs/reviews/wu-eng-02-slice1-implementation-codex.md; docs/reviews/wu-eng-02-slice1-code-review-mimo.md; docs/reviews/wu-eng-02-slice1-code-review-ds.md; docs/reviews/wu-eng-02-slice1-fix-codex.md; docs/reviews/wu-eng-02-slice1-rereview-mimo.md; docs/reviews/wu-eng-02-slice1-rereview-ds.md; Slice 1 accepted with residual risks assigned |
 | aggregate review artifacts | none |
 | draft PR status | none for active work unit; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |
@@ -196,7 +196,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| none | - | - | closed | - | - | 当前没有未分配 residual risk 或遗留问题。 |
+| WU-ENG-02-S1-R1 | WU-ENG-02 Slice 1 re-review | 测试 / 诊断一致性 | deferred-with-owner | WU-ENG-02 Slice 3 / aggregate review | Host ingest / Tool Trace 诊断链路落地时裁决工具超时类 `RunFailedData` 是否需要携带 current call correlation；若需要，补 Engine path 与 Host ingest 测试 | `_ERROR_TOOL_EXECUTION_TIMEOUT` 路径目前仍未携带 `client_correlation_id`；review 裁决为 Low，不阻塞 Slice 1。 |
+| WU-ENG-02-S1-R2 | WU-ENG-02 Slice 1 re-review | 测试覆盖 | deferred-with-owner | WU-ENG-02 Slice 4 final validation | 文档/最终验证 slice 检查 force-answer EngineEvent 级 correlation 断言是否仍需要补齐；若后续实现未覆盖，则在 final validation 中补测试或记录关闭依据 | force-answer 测试已验证 runner identity / call index，未显式断言 emitted EngineEvent `client_correlation_id`；review 裁决为 Low，不阻塞 Slice 1。 |
 
 ## 当前 Work Units
 
@@ -285,7 +286,17 @@ completed。PR 113 已 merge，merge commit 为 `bc50e26c45296171487272ff5fc2293
 
 GitHub Issue #63 与 #64 当前仍为 OPEN，必须作为同一个 Engine request identity / provider debugging correlation work unit 统一考虑。两条 issue 的真实目标不是引入用户治理字段，而是：当 `tool trace analyze` 发现 provider/model 行为疑似 bug 时，分析报告里必须能给出 provider 厂商可定位的 request id，并能回链到本地 `run_id` / iteration / attempt / tool trace。
 
-Plan gate 已完成，artifact 为 `docs/host/wu-eng-02-provider-request-identity-plan.md`，无 blocking open questions。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings` 且无 blocking open questions。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-plan-fix-codex.md`，8 条 accepted findings 均标记已修复。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无新增 blocking issue。当前 plan 已接受，accepted plan commit 为 `59f66b7`，下一步进入 implementation gate。
+Plan gate 已完成，artifact 为 `docs/host/wu-eng-02-provider-request-identity-plan.md`，无 blocking open questions。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings` 且无 blocking open questions。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-plan-fix-codex.md`，8 条 accepted findings 均标记已修复。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无新增 blocking issue。当前 plan 已接受，accepted plan commit 为 `59f66b7`。Implementation Slice 1（Engine contract and Agent identity）已由 AgentCodex 实施，artifact 为 `docs/reviews/wu-eng-02-slice1-implementation-codex.md`；验证结果为 127 个受影响 Engine tests passed，pyright 0 errors。Slice 1 code review gate 已完成，AgentMiMo 裁决 `pass`，AgentDS 裁决 `pass-with-findings`，均无 blocking open questions。当前进入 Slice 1 fix gate。
+
+Slice 1 code review findings 裁决：
+
+- accepted：EngineEvent / Agent outcome 中的 `client_correlation_id` 值缺少直接断言；应在现有 Engine Agent 测试中补齐关键 emitted event 的 correlation id 断言。
+- accepted：`_validate_batch_bijection` 生成的 `RunFailedData` 未携带当前 tool batch 的 `client_correlation_id`，与同一路径 duplicate 检查不一致；应传入并写入该字段。
+- rejected-with-reason：`RunnerRequestIdentity.__post_init__` 与 builder 重复校验属于防御性冗余，直接构造路径需要保留，不要求修改。
+- rejected-with-reason：canonical part 编码方案已由类型前缀与长度前缀证明无歧义，不要求修改。
+- deferred-with-owner：OpenAI header policy、Host projection / ingest、Tool Trace、README sync 按 accepted plan 进入 Slice 2 / Slice 3 / Slice 4。
+
+Slice 1 fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice1-fix-codex.md`。两个 accepted findings 均标记已修复；验证结果为 127 个受影响 Engine tests passed，pyright 0 errors。Slice 1 re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无 blocking open questions。Slice 1 accepted commit 为 `PENDING_SLICE1_COMMIT_HASH`。当前进入 Slice 2 implementation gate。
 
 Plan review findings 裁决：
 

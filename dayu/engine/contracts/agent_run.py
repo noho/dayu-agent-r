@@ -75,6 +75,10 @@ class AgentRunRequest:
         提供；EngineWorker 替 Host 在选定执行环境中代持并提供该 protocol
         handle。
     :param cancellation_token: 取消观察 token（由 Host 注入）。
+    :param attempt_id: Host attempt id；直接 Engine 或非 attempt 路径为
+        ``None``。
+    :param execution_id: Host execution id；直接 Engine 或非 attempt 路径为
+        ``None``。
     """
 
     run_id: str
@@ -87,16 +91,24 @@ class AgentRunRequest:
     tool_schemas: tuple[ToolSchema, ...]
     tool_executor: ToolExecutor
     cancellation_token: CancellationToken
+    attempt_id: str | None = None
+    execution_id: str | None = None
 
     def __post_init__(self) -> None:
         """校验 Agent run 请求的入口不变量。
 
         :returns: ``None``。
-        :raises ValueError: ``messages`` 为空时抛出。
+        :raises ValueError: ``messages`` 为空，或 ``attempt_id`` /
+            ``execution_id`` 未成对出现时抛出。
         """
 
         if len(self.messages) == 0:
             raise ValueError("AgentRunRequest.messages must be non-empty")
+        if (self.attempt_id is None) != (self.execution_id is None):
+            raise ValueError(
+                "AgentRunRequest.attempt_id and execution_id must both be "
+                "None or both be non-None"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +142,8 @@ class EngineRunOutcomeFailed:
     :param provider_request_id: 若失败直接源自 provider response 或
         provider protocol，则为对应 request id；非 provider 失败为
         ``None``。
+    :param client_correlation_id: 若失败关联到一次逻辑 Runner 调用，则为
+        对应该调用的本地客户端关联 id；非 Runner 调用失败为 ``None``。
     :param recoverable: 是否可恢复。
     """
 
@@ -139,6 +153,7 @@ class EngineRunOutcomeFailed:
     message: str
     provider_request_id: str | None
     recoverable: bool
+    client_correlation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

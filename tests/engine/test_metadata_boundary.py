@@ -46,6 +46,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerProtocolErrorData,
     RunnerUsageRecordedData,
 )
+from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
@@ -122,16 +123,20 @@ class _MetadataBoundaryRunner:
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
 
         :param messages: Agent 消息。
         :param options: Runner 调用选项。
         :param tools: 暴露给模型的工具 schema。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
         """
 
+        del messages, options, tools, request_identity
         return self._iter_events()
 
     def is_supports_tool_calling(self) -> bool:
@@ -215,6 +220,8 @@ def _metadata_boundary_request() -> AgentRunRequest:
         tool_schemas=(),
         tool_executor=_MetadataBoundaryToolExecutor(),
         cancellation_token=token,
+        attempt_id="attempt_metadata_boundary",
+        execution_id="execution_metadata_boundary",
     )
 
 
@@ -289,6 +296,7 @@ def test_provider_protocol_error_engine_data_has_explicit_fields() -> None:
     fields = _field_names(ProviderProtocolErrorData)
     assert {
         "iteration_id",
+        "client_correlation_id",
         "error_code",
         "message",
         "partial_tool_calls",
