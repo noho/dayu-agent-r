@@ -147,7 +147,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | draft PR gate：push 当前分支并创建 draft PR；PR 创建后记录 PR URL |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | none |
-| implementation commits | a2304db |
+| implementation commits | 70a5a4e |
 | review artifacts | discussion / code / provider API evidence recorded inline in WU-ENG-01 |
 | aggregate review artifacts | none |
 | draft PR status | ready-to-create |
