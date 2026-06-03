@@ -140,17 +140,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft PR gate |
-| implementation status | completed |
-| active work unit | WU-ENG-01 |
-| default next work unit | WU-ENG-02 |
-| next entry point | PR review / draft-PR-pass gate |
+| gate | implementation |
+| implementation status | plan-accepted |
+| active work unit | WU-ENG-02 |
+| default next work unit | WU-CM-01 |
+| next entry point | implementation gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
-| plan artifacts | none |
-| implementation commits | 70a5a4e |
-| review artifacts | discussion / code / provider API evidence recorded inline in WU-ENG-01 |
+| plan artifacts | docs/host/wu-eng-02-provider-request-identity-plan.md |
+| implementation commits | accepted plan commit 74dd0b2; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
+| review artifacts | docs/reviews/wu-eng-02-plan-review-mimo.md; docs/reviews/wu-eng-02-plan-review-ds.md; docs/reviews/wu-eng-02-plan-fix-codex.md; docs/reviews/wu-eng-02-plan-rereview-mimo.md; docs/reviews/wu-eng-02-plan-rereview-ds.md; plan accepted with no blocking open questions |
 | aggregate review artifacts | none |
-| draft PR status | draft-created: https://github.com/noho/dayu-agent-r/pull/113 |
+| draft PR status | none for active work unit; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |
 
 状态约定：
@@ -202,7 +202,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | Work Unit | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|
-| WU-ENG-01 | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | Engine provider-specific reasoning roundtrip；仍有效，优先于依赖真实 provider tool-calling 的后续工作 |
+| WU-ENG-01 | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | completed；PR 113 已 merge，稳定结论是 provider reasoning roundtrip 为协议要求，不进入 payload behavior change |
 | WU-ENG-02 | Provider request identity and vendor debugging correlation | GitHub Issue #63 / #64 | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；必须统一实现 typed request identity，避免 provider 硬编码 |
 | WU-CM-01 | Conversation Memory overall optimization | GitHub Issue #81 | #81 umbrella 的正式 implementation entry point |
 | WU-CM-02 | working_assumptions 生产者语义 | GitHub Issue #81 | 已纳入 Conversation Memory 整体优化，不单独实施 |
@@ -241,7 +241,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 ### 状态
 
-GitHub Issue #10 当前仍为 OPEN，但 discussion / 代码 / provider API 文档核对后裁决：原先把 `AssistantMessage.reasoning_content is not None` 时写回 outbound `reasoning_content` 视为“无条件写回 bug”的动机被高估。MiMo、DeepSeek、Qwen 等 thinking + tool-call provider 要求把上一轮 assistant 的 `reasoning_content` 原样带回；Gemini 要求把 `thought_signature` 原样带回。因此当前 work unit 不进入 payload behavior change，先收敛为 issue 记录、docstring / 测试说明修正与 provider roundtrip 证据固化。
+completed。PR 113 已 merge，merge commit 为 `bc50e26c45296171487272ff5fc2293db67a9246`。GitHub Issue #10 当前仍为 OPEN，但 discussion / 代码 / provider API 文档核对后裁决：原先把 `AssistantMessage.reasoning_content is not None` 时写回 outbound `reasoning_content` 视为“无条件写回 bug”的动机被高估。MiMo、DeepSeek、Qwen 等 thinking + tool-call provider 要求把上一轮 assistant 的 `reasoning_content` 原样带回；Gemini 要求把 `thought_signature` 原样带回。因此当前 work unit 不进入 payload behavior change，已收敛为 issue 记录、docstring / 测试说明修正与 provider roundtrip 证据固化。
 
 ### 设计与代码核对
 
@@ -284,6 +284,19 @@ GitHub Issue #10 当前仍为 OPEN，但 discussion / 代码 / provider API 文�
 ### 状态
 
 GitHub Issue #63 与 #64 当前仍为 OPEN，必须作为同一个 Engine request identity / provider debugging correlation work unit 统一考虑。两条 issue 的真实目标不是引入用户治理字段，而是：当 `tool trace analyze` 发现 provider/model 行为疑似 bug 时，分析报告里必须能给出 provider 厂商可定位的 request id，并能回链到本地 `run_id` / iteration / attempt / tool trace。
+
+Plan gate 已完成，artifact 为 `docs/host/wu-eng-02-provider-request-identity-plan.md`，无 blocking open questions。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings` 且无 blocking open questions。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-plan-fix-codex.md`，8 条 accepted findings 均标记已修复。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无新增 blocking issue。当前 plan 已接受，accepted plan commit 为 `74dd0b2`，下一步进入 implementation gate。
+
+Plan review findings 裁决：
+
+- accepted：force-answer / continuation / fallback 等所有 logical Runner call 都必须递增 `runner_call_index`，并补计划测试要求。
+- accepted：`request_identity: RunnerRequestIdentity | None` 只允许 direct Runner / compactor 等非普通 Agent path 显式传 `None`；普通 Agent -> Runner call path 必须传 non-None identity，计划完成信号需改写。
+- accepted：`AsyncRunner.call` 只新增 keyword-only `request_identity`，保留 `messages/options/tools` 位置参数以最小化变更。
+- accepted：计划需避免 `_AsyncAgent` 重复散落 correlation 取值逻辑，优先模块级 helper 或 iteration state。
+- accepted：`EngineRunOutcomeFailed` 应明确归类为 `AgentRunResult` outcome，不是 EngineEvent data class。
+- accepted：`client_correlation_id` digest 长度需明确为完整 SHA-256 hex，即 `dayu-` + 64 hex。
+- accepted：`ClientCorrelationPolicy` docstring 需说明 enum 是 provider-protocol-specific outbound mapping policy，不是 provider 名称分支。
+- rejected-with-reason：`iteration_id` 与 `run_id` digest input 冗余不要求修改；冗余不影响正确性，且保留 `run_id` 作为本地根关联更贴合 issue-63 / issue-64。
 
 ### 设计与代码核对
 
