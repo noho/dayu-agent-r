@@ -147,7 +147,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | implementation gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | docs/host/wu-eng-02-provider-request-identity-plan.md |
-| implementation commits | accepted plan commit 74dd0b2; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
+| implementation commits | accepted plan commit 59f66b7; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
 | review artifacts | docs/reviews/wu-eng-02-plan-review-mimo.md; docs/reviews/wu-eng-02-plan-review-ds.md; docs/reviews/wu-eng-02-plan-fix-codex.md; docs/reviews/wu-eng-02-plan-rereview-mimo.md; docs/reviews/wu-eng-02-plan-rereview-ds.md; plan accepted with no blocking open questions |
 | aggregate review artifacts | none |
 | draft PR status | none for active work unit; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
@@ -285,7 +285,7 @@ completed。PR 113 已 merge，merge commit 为 `bc50e26c45296171487272ff5fc2293
 
 GitHub Issue #63 与 #64 当前仍为 OPEN，必须作为同一个 Engine request identity / provider debugging correlation work unit 统一考虑。两条 issue 的真实目标不是引入用户治理字段，而是：当 `tool trace analyze` 发现 provider/model 行为疑似 bug 时，分析报告里必须能给出 provider 厂商可定位的 request id，并能回链到本地 `run_id` / iteration / attempt / tool trace。
 
-Plan gate 已完成，artifact 为 `docs/host/wu-eng-02-provider-request-identity-plan.md`，无 blocking open questions。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings` 且无 blocking open questions。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-plan-fix-codex.md`，8 条 accepted findings 均标记已修复。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无新增 blocking issue。当前 plan 已接受，accepted plan commit 为 `74dd0b2`，下一步进入 implementation gate。
+Plan gate 已完成，artifact 为 `docs/host/wu-eng-02-provider-request-identity-plan.md`，无 blocking open questions。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings` 且无 blocking open questions。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-plan-fix-codex.md`，8 条 accepted findings 均标记已修复。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无新增 blocking issue。当前 plan 已接受，accepted plan commit 为 `59f66b7`，下一步进入 implementation gate。
 
 Plan review findings 裁决：
 
