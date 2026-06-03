@@ -265,6 +265,8 @@ def _agent_request(
     return AgentRunRequest(
         run_id=f"{_COMPACTOR_RUN_ID_PREFIX}-{request.run_id}-{uuid4().hex}",
         session_id=request.session_id,
+        attempt_id=request.attempt_id,
+        execution_id=request.execution_id,
         messages=(
             SystemMessage(role=AgentMessageRole.SYSTEM, content=system_prompt),
             UserMessage(

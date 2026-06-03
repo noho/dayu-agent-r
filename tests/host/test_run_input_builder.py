@@ -516,6 +516,8 @@ def test_replay_no_tool_request_keeps_tools_disabled(tmp_path: Path) -> None:
         )
         request = builder.build(_attempt_snapshot(seeded))
 
+        assert request.attempt_id == seeded.attempt_id
+        assert request.execution_id == seeded.execution_id
         assert request.disable_tools is True
         assert request.tool_schemas == ()
         assert request.agent_policy.allow_tool_calls is False

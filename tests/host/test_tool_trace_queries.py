@@ -143,6 +143,7 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
             event_type="RUN_FAILED",
             payload={
                 "provider_request_id": "req-terminal",
+                "client_correlation_id": "client-terminal",
                 "engine_event_ref": "event-engine-terminal",
                 "terminal_summary_ref": "summary-ref",
                 "terminal_summary_digest": "sha256:summary",
@@ -189,6 +190,10 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
         ]
         assert [row.event_id for row in by_provider.rows] == ["event-3"]
         assert by_provider.rows[0].provider_request_id == "req-terminal"
+        assert (
+            by_provider.rows[0].trace_summary["client_correlation_id"]
+            == "client-terminal"
+        )
         assert [row.event_id for row in by_diagnostic.rows] == ["event-2"]
 
 
@@ -204,6 +209,7 @@ def test_provider_request_id_terminal_diagnostic_query(
             event_type="RUN_FAILED",
             payload={
                 "provider_request_id": "req-terminal",
+                "client_correlation_id": "client-terminal",
                 "engine_event_ref": "event-engine-terminal",
                 "error_code": "provider_error",
                 "message": "provider failed",
@@ -218,6 +224,7 @@ def test_provider_request_id_terminal_diagnostic_query(
             event_class=EventClass.DIAGNOSTIC,
             payload={
                 "provider_request_id": "req-terminal",
+                "client_correlation_id": "client-protocol",
                 "raw_payload_ref": "raw-ref",
                 "raw_payload_digest": "sha256:raw",
                 "error_code": "invalid_stream",
@@ -238,5 +245,13 @@ def test_provider_request_id_terminal_diagnostic_query(
         assert (
             page.rows[0].trace_summary["engine_event_ref"]
             == "event-engine-terminal"
+        )
+        assert (
+            page.rows[0].trace_summary["client_correlation_id"]
+            == "client-terminal"
+        )
+        assert (
+            page.rows[1].trace_summary["client_correlation_id"]
+            == "client-protocol"
         )
         assert page.rows[1].diagnostic_ref == "raw-ref"

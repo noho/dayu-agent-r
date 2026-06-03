@@ -407,6 +407,66 @@ def test_terminal_closeout_appends_concrete_terminal_events(
         assert "RUN_TERMINAL" not in event_types
 
 
+def test_failed_terminal_closeout_payload_includes_client_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """FAILED terminal payload 在 provider request 边界暴露 client correlation。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def closeout(transaction: HostTransaction) -> tuple[JsonValue, JsonValue]:
+            """执行 failed terminal closeout 并读取 payload。
+
+            :param transaction: Host transaction。
+            :returns: Attempt 与 Run terminal payload。
+            """
+
+            result = terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id="event-attempt-failed-provider",
+                    run_terminal_event_id="event-run-failed-provider",
+                    attempt_terminal_status=AttemptStatus.FAILED,
+                    run_terminal_status=RunStatus.FAILED,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="provider_error",
+                    terminal_summary_ref="summary-ref",
+                    terminal_summary_digest=(
+                        "sha256:"
+                        "0123456789abcdef0123456789abcdef"
+                        "0123456789abcdef0123456789abcdef"
+                    ),
+                    provider_request_id="req-terminal",
+                    client_correlation_id="client-terminal",
+                    error_code="provider_error",
+                    message="provider failed",
+                    recoverable=False,
+                ),
+            )
+            assert result.status == StateMutationStatus.UPDATED
+            attempt_payload = _event_payload(
+                transaction, event_id="event-attempt-failed-provider"
+            )
+            run_payload = _event_payload(
+                transaction, event_id="event-run-failed-provider"
+            )
+            return (
+                attempt_payload["client_correlation_id"],
+                run_payload["client_correlation_id"],
+            )
+
+        assert store.transaction_runner.run_write(closeout) == (
+            "client-terminal",
+            "client-terminal",
+        )
+
+
 def test_terminal_closeout_replay_absorbs_same_terminal_status_without_new_events(
     tmp_path: Path,
 ) -> None:
