@@ -12,23 +12,37 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TypeAlias
 
 import pytest
 
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
+    ClientCorrelationPolicy,
     DeepSeekReasoningEffort,
     DeepSeekThinkingExtension,
     GeminiThinkingExtension,
     GeminiThinkingLevel,
     OpenAIReasoningEffort,
     OpenAIReasoningExtension,
+    ProviderRequestExtension,
     QwenThinkingExtension,
     RunnerSpec,
 )
 
+_BaseSpecKwargValue: TypeAlias = (
+    str
+    | bool
+    | float
+    | int
+    | dict[str, str]
+    | ProviderRequestExtension
+    | ClientCorrelationPolicy
+    | None
+)
 
-def _base_spec_kwargs() -> dict[str, object]:
+
+def _base_spec_kwargs() -> dict[str, _BaseSpecKwargValue]:
     """构造一份基础合法的 RunnerSpec 关键字参数。"""
 
     return {
@@ -37,6 +51,7 @@ def _base_spec_kwargs() -> dict[str, object]:
         "endpoint": "https://example.com",
         "api_key_ref": "key",
         "headers": {},
+        "client_correlation_policy": ClientCorrelationPolicy.DISABLED,
         "supports_tool_calling": False,
         "supports_streaming": True,
         "supports_stream_usage": False,
@@ -74,6 +89,15 @@ def test_gemini_thinking_level_values() -> None:
         "low",
         "medium",
         "high",
+    }
+
+
+def test_client_correlation_policy_values() -> None:
+    """客户端关联策略只表达 provider 协议 outbound 映射。"""
+
+    assert {m.value for m in ClientCorrelationPolicy} == {
+        "disabled",
+        "openai_x_client_request_id",
     }
 
 
@@ -160,6 +184,7 @@ def test_runner_spec_field_set_includes_supports_stream_usage() -> None:
         "endpoint",
         "api_key_ref",
         "headers",
+        "client_correlation_policy",
         "supports_tool_calling",
         "supports_streaming",
         "supports_stream_usage",
@@ -180,6 +205,7 @@ def test_runner_spec_supports_stream_usage_true_construction() -> None:
         endpoint="https://example.com",
         api_key_ref="key",
         headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=True,
         supports_streaming=True,
         supports_stream_usage=True,
@@ -202,6 +228,7 @@ def test_runner_spec_supports_stream_usage_false_construction() -> None:
         endpoint="https://example.com",
         api_key_ref="key",
         headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
@@ -221,6 +248,7 @@ def test_runner_spec_allows_none_api_key_ref_for_local_provider() -> None:
         endpoint="http://localhost:11434/v1/chat/completions",
         api_key_ref=None,
         headers={"Content-Type": "application/json"},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=True,
         supports_streaming=True,
         supports_stream_usage=True,

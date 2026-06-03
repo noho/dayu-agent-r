@@ -69,6 +69,26 @@ class GeminiThinkingLevel(StrEnum):
     HIGH = "high"
 
 
+class ClientCorrelationPolicy(StrEnum):
+    """客户端关联 id 的 provider 协议 outbound 映射策略。
+
+    本枚举的成员值表示 provider-protocol-specific outbound mapping
+    policies，用于声明 Runner 是否以及如何把本地
+    ``RunnerRequestIdentity.client_correlation_id`` 映射到请求协议字段。
+    它们不是 provider-name branches；Host / Agent 不得按 provider 字符串
+    分支治理行为。
+
+    成员：
+
+    - ``DISABLED``：不发送客户端关联 id。
+    - ``OPENAI_X_CLIENT_REQUEST_ID``：OpenAI-compatible 协议下发送
+      ``X-Client-Request-Id``。
+    """
+
+    DISABLED = "disabled"
+    OPENAI_X_CLIENT_REQUEST_ID = "openai_x_client_request_id"
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAIReasoningExtension:
     """OpenAI 推理强度扩展。
@@ -233,6 +253,8 @@ class RunnerSpec:
     :param api_key_ref: API key 引用名（不直接落 key 明文）；``None`` 表示
         本地或免鉴权 provider 不需要 API key header。
     :param headers: 附加头映射。
+    :param client_correlation_policy: 客户端关联 id 的 provider 协议 outbound
+        映射策略。
     :param supports_tool_calling: 该 Runner 是否支持工具调用。
     :param supports_streaming: 该 Runner 是否支持流式输出。
     :param supports_stream_usage: 该 Runner 在流式协议下是否支持
@@ -256,6 +278,7 @@ class RunnerSpec:
     endpoint: str
     api_key_ref: str | None
     headers: Mapping[str, str]
+    client_correlation_policy: ClientCorrelationPolicy
     supports_tool_calling: bool
     supports_streaming: bool
     supports_stream_usage: bool
@@ -337,6 +360,7 @@ __all__ = [
     "OpenAIReasoningEffort",
     "DeepSeekReasoningEffort",
     "GeminiThinkingLevel",
+    "ClientCorrelationPolicy",
     "OpenAIReasoningExtension",
     "AnthropicThinkingExtension",
     "DeepSeekThinkingExtension",

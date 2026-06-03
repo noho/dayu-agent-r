@@ -140,15 +140,15 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | slice-1-accepted |
+| gate | accepted slice commit |
+| implementation status | slice-2-accepted-pending-commit |
 | active work unit | WU-ENG-02 |
 | default next work unit | WU-CM-01 |
-| next entry point | Slice 2 implementation gate |
+| next entry point | Slice 2 accepted slice commit |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | docs/host/wu-eng-02-provider-request-identity-plan.md |
 | implementation commits | accepted plan commit 59f66b7; Slice 1 accepted commit c4826e0; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
-| review artifacts | docs/reviews/wu-eng-02-plan-review-mimo.md; docs/reviews/wu-eng-02-plan-review-ds.md; docs/reviews/wu-eng-02-plan-fix-codex.md; docs/reviews/wu-eng-02-plan-rereview-mimo.md; docs/reviews/wu-eng-02-plan-rereview-ds.md; docs/reviews/wu-eng-02-slice1-implementation-codex.md; docs/reviews/wu-eng-02-slice1-code-review-mimo.md; docs/reviews/wu-eng-02-slice1-code-review-ds.md; docs/reviews/wu-eng-02-slice1-fix-codex.md; docs/reviews/wu-eng-02-slice1-rereview-mimo.md; docs/reviews/wu-eng-02-slice1-rereview-ds.md; Slice 1 accepted with residual risks assigned |
+| review artifacts | docs/reviews/wu-eng-02-plan-review-mimo.md; docs/reviews/wu-eng-02-plan-review-ds.md; docs/reviews/wu-eng-02-plan-fix-codex.md; docs/reviews/wu-eng-02-plan-rereview-mimo.md; docs/reviews/wu-eng-02-plan-rereview-ds.md; docs/reviews/wu-eng-02-slice1-implementation-codex.md; docs/reviews/wu-eng-02-slice1-code-review-mimo.md; docs/reviews/wu-eng-02-slice1-code-review-ds.md; docs/reviews/wu-eng-02-slice1-fix-codex.md; docs/reviews/wu-eng-02-slice1-rereview-mimo.md; docs/reviews/wu-eng-02-slice1-rereview-ds.md; docs/reviews/wu-eng-02-slice2-implementation-codex.md; docs/reviews/wu-eng-02-slice2-code-review-mimo.md; docs/reviews/wu-eng-02-slice2-code-review-ds.md; docs/reviews/wu-eng-02-slice2-fix-codex.md; docs/reviews/wu-eng-02-slice2-rereview-mimo.md; docs/reviews/wu-eng-02-slice2-rereview-ds.md |
 | aggregate review artifacts | none |
 | draft PR status | none for active work unit; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |
@@ -198,6 +198,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|---|---|---|---|---|
 | WU-ENG-02-S1-R1 | WU-ENG-02 Slice 1 re-review | 测试 / 诊断一致性 | deferred-with-owner | WU-ENG-02 Slice 3 / aggregate review | Host ingest / Tool Trace 诊断链路落地时裁决工具超时类 `RunFailedData` 是否需要携带 current call correlation；若需要，补 Engine path 与 Host ingest 测试 | `_ERROR_TOOL_EXECUTION_TIMEOUT` 路径目前仍未携带 `client_correlation_id`；review 裁决为 Low，不阻塞 Slice 1。 |
 | WU-ENG-02-S1-R2 | WU-ENG-02 Slice 1 re-review | 测试覆盖 | deferred-with-owner | WU-ENG-02 Slice 4 final validation | 文档/最终验证 slice 检查 force-answer EngineEvent 级 correlation 断言是否仍需要补齐；若后续实现未覆盖，则在 final validation 中补测试或记录关闭依据 | force-answer 测试已验证 runner identity / call index，未显式断言 emitted EngineEvent `client_correlation_id`；review 裁决为 Low，不阻塞 Slice 1。 |
+| WU-ENG-02-S2-R1 | WU-ENG-02 Slice 2 code review | 配置 / 集成决策 | deferred-with-owner | WU-ENG-02 Slice 3 / Slice 4 | Host projection 和最终验证阶段确认 production assembly 默认 `DISABLED` 是否仍符合当前 WU 验收；若需要启用 OpenAI-compatible correlation，必须通过显式 config/profile 决策进入实现 | Slice 2 只实现 RunnerSpec policy 和 OpenAI runner header mapping；生产装配仍显式 `DISABLED`，避免未经配置决策开启 outbound header。 |
+| WU-ENG-02-S2-R2 | WU-ENG-02 Slice 2 code review | 错误收口 | deferred-with-owner | WU-ENG-02 Slice 3 / aggregate review | 后续 Host projection / ingest review 中裁决静态 `x-client-request-id` 冲突的 `ValueError` 是否需要 Agent/Host 结构化失败收口；若当前 fail-fast 足够，则记录关闭依据 | 当前实现按 plan 在 HTTP post 前 fail-fast，review 裁决为 Low，不阻塞 Slice 2。 |
 
 ## 当前 Work Units
 
@@ -296,7 +298,14 @@ Slice 1 code review findings 裁决：
 - rejected-with-reason：canonical part 编码方案已由类型前缀与长度前缀证明无歧义，不要求修改。
 - deferred-with-owner：OpenAI header policy、Host projection / ingest、Tool Trace、README sync 按 accepted plan 进入 Slice 2 / Slice 3 / Slice 4。
 
-Slice 1 fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice1-fix-codex.md`。两个 accepted findings 均标记已修复；验证结果为 127 个受影响 Engine tests passed，pyright 0 errors。Slice 1 re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无 blocking open questions。Slice 1 accepted commit 为 `c4826e0`。当前进入 Slice 2 implementation gate。
+Slice 1 fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice1-fix-codex.md`。两个 accepted findings 均标记已修复；验证结果为 127 个受影响 Engine tests passed，pyright 0 errors。Slice 1 re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条未修复 / 部分修复，无 blocking open questions。Slice 1 accepted commit 为 `c4826e0`。Slice 2 implementation gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice2-implementation-codex.md`；验证结果为 61 个受影响 tests passed，pyright 0 errors。Slice 2 code review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，无 blocking open questions。Slice 2 fix gate 已完成，artifact 为 `docs/reviews/wu-eng-02-slice2-fix-codex.md`；已补充 `ClientCorrelationPolicy.DISABLED` 且 `request_identity=None` 时不发送 `X-Client-Request-Id` 的直接测试；验证结果为 40 个受影响 tests passed，pyright 0 errors。Slice 2 re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，0 条 blocking findings；本地复验 `pytest tests/engine/runners/openai/test_request_identity.py tests/engine/contracts/test_runner_spec.py tests/engine/runners/openai/test_streaming_capability_and_content_type.py tests/engine/runners/openai/test_http_error_event.py tests/host/test_effective_execution_config.py` 结果为 62 passed，pyright 0 errors。当前进入 Slice 2 accepted slice commit gate。
+
+Slice 2 code review findings 裁决：
+
+- accepted：补充 `ClientCorrelationPolicy.DISABLED` 且 `request_identity=None` 时不发送 `X-Client-Request-Id` 的直接测试。
+- rejected-with-reason：`_has_client_request_id_header` 的 `:raises Exception: 不主动抛出异常。` 符合本仓库中文 docstring 异常说明风格，不要求修改。
+- rejected-with-reason：`_build_request_headers` 的不可达 `ValueError` 是枚举扩展时的 fail-fast 防御分支，保留。
+- deferred-with-owner：production assembly 默认 `DISABLED`、静态 header 冲突 `ValueError` 是否需上层结构化收口，交由 Slice 3 / aggregate review 裁决。
 
 Plan review findings 裁决：
 

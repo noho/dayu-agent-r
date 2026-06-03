@@ -32,7 +32,7 @@ from dayu.engine.contracts.messages import (
     SystemMessage,
     UserMessage,
 )
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host._event_payload import (
     payload_object as _payload_object,
     required_payload_text as _required_payload_text,
@@ -3126,6 +3126,7 @@ def _policy_snapshot(*, allow_tool_calls: bool = False) -> PolicySnapshot:
             endpoint="https://example.invalid/v1",
             api_key_ref="test-key",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,

@@ -17,7 +17,7 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
     AuthorizationClaim,
@@ -1003,6 +1003,7 @@ def _policy_snapshot() -> PolicySnapshot:
             endpoint="https://example.invalid/v1",
             api_key_ref="test-key",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,

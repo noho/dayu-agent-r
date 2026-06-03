@@ -65,7 +65,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.contracts.tool_await import (
     ToolAwaitKind,
     ToolAwaitSnapshot,
@@ -404,6 +404,7 @@ def _request(
             endpoint="https://example.test/v1/chat/completions",
             api_key_ref="TEST_KEY",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,

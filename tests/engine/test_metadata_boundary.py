@@ -47,7 +47,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _RUNNER_DEFAULT_TIMEOUT_SECONDS: float = 30.0
@@ -198,6 +198,7 @@ def _metadata_boundary_request() -> AgentRunRequest:
             endpoint="https://example.test/v1/chat/completions",
             api_key_ref="TEST_KEY",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,

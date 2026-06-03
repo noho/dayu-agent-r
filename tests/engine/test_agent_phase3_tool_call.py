@@ -69,7 +69,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.engine.runners.openai.non_stream_parser import parse_non_stream_response
 from dayu.contracts.tool_await import (
     ToolAwaitKind,
@@ -642,6 +642,7 @@ def _request(
             endpoint="https://example.test/v1/chat/completions",
             api_key_ref="TEST_KEY",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,

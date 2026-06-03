@@ -42,7 +42,7 @@ from dayu.host import (
     submit_followup,
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.api import (
     HostInput,
     HostCommandHandleOptions,
@@ -136,6 +136,7 @@ def _local_execution_options(tmp_path: Path) -> HostLocalExecutionOptions:
             endpoint="https://example.invalid",
             api_key_ref="secret:test",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,

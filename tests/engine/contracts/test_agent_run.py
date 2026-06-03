@@ -12,7 +12,7 @@ from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 
 
 class _Token(CancellationToken):
@@ -132,6 +132,7 @@ def _request(
             endpoint="https://example.test/v1/chat/completions",
             api_key_ref="TEST_KEY",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,

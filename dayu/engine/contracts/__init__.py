@@ -87,6 +87,7 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
+    ClientCorrelationPolicy,
     DeepSeekReasoningEffort,
     DeepSeekThinkingExtension,
     GeminiThinkingLevel,
@@ -114,6 +115,7 @@ __all__ = [
     "AssistantToolCallBatchSnapshot",
     "AsyncRunner",
     "AwaitingToolExecutionRecord",
+    "ClientCorrelationPolicy",
     "ContentCompleteData",
     "ContentDeltaData",
     "ContextBudgetSnapshot",

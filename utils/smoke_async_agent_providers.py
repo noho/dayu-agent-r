@@ -41,6 +41,7 @@ from dayu.engine import (
     UserMessage,
     run_agent_messages,
 )
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
 from dayu.runtime.log import LogLevel, configure
 
 _PROMPT: str = "用一句话回答：2+2 等于几？"
@@ -271,6 +272,7 @@ def build_request(
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=False,
         supports_streaming=True,
         supports_stream_usage=case.supports_stream_usage,

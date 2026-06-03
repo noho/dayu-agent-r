@@ -77,7 +77,7 @@ from dayu.host.tool_runtime import ToolFactKind
 from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.engine.contracts.agent_policy import AgentPolicy
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 
 
 class _DataclassParams(Protocol):
@@ -282,6 +282,7 @@ def _runner_spec() -> RunnerSpec:
         endpoint="https://example.invalid",
         api_key_ref="secret:test",
         headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,

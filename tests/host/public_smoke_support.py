@@ -55,6 +55,7 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
     DeepSeekThinkingExtension,
     GeminiThinkingExtension,
     MimoThinkingExtension,
@@ -812,6 +813,7 @@ def runner_spec_for_case(case: ProviderSmokeCase, api_key: str) -> RunnerSpec:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=False,
         supports_streaming=True,
         supports_stream_usage=case.supports_stream_usage,
@@ -907,6 +909,7 @@ def deterministic_runner_spec(model: str = "slice6-test-model") -> RunnerSpec:
         endpoint="https://example.invalid",
         api_key_ref="secret:test",
         headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=True,
         supports_streaming=False,
         supports_stream_usage=False,

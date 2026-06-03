@@ -16,6 +16,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
+    ClientCorrelationPolicy,
     DeepSeekReasoningEffort,
     DeepSeekThinkingExtension,
     GeminiThinkingExtension,
@@ -150,6 +151,9 @@ def runner_spec_json(runner_spec: RunnerSpec) -> JsonValue:
         "endpoint": runner_spec.endpoint,
         "api_key_ref": runner_spec.api_key_ref,
         "headers": dict(sorted(runner_spec.headers.items())),
+        "client_correlation_policy": (
+            runner_spec.client_correlation_policy.value
+        ),
         "supports_tool_calling": runner_spec.supports_tool_calling,
         "supports_streaming": runner_spec.supports_streaming,
         "supports_stream_usage": runner_spec.supports_stream_usage,
@@ -176,6 +180,9 @@ def runner_spec_from_json(value: Mapping[str, JsonValue]) -> RunnerSpec:
         endpoint=required_json_text(value, field_name="endpoint"),
         api_key_ref=optional_json_text(value, field_name="api_key_ref"),
         headers=_headers_from_json(value.get("headers")),
+        client_correlation_policy=ClientCorrelationPolicy(
+            required_json_text(value, field_name="client_correlation_policy")
+        ),
         supports_tool_calling=required_json_bool(
             value, field_name="supports_tool_calling"
         ),

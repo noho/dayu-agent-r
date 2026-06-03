@@ -24,7 +24,7 @@ from dayu.engine.contracts.agent_run import (
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
     CompactMaterialPack,
     CompactMaterialBlockKind,
@@ -1188,6 +1188,7 @@ def _runner_spec(max_retries: int = 0, default_timeout_seconds: float = 1.0) -> 
         endpoint="https://example.invalid",
         api_key_ref="secret:test",
         headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,

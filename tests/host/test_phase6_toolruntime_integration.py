@@ -43,7 +43,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.api import EnsureSessionRequest, AttemptStatus, RunStatus
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.durable.codec import sha256_digest_json
@@ -596,6 +596,7 @@ def _policy_snapshot() -> PolicySnapshot:
             endpoint="https://example.test/v1/chat/completions",
             api_key_ref="TEST_KEY",
             headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,
