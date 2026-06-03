@@ -140,17 +140,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | ready-to-open-draft-PR |
+| gate | draft PR gate |
 | implementation status | completed |
 | active work unit | WU-ENG-01 |
 | default next work unit | WU-ENG-02 |
-| next entry point | draft PR gate：push 当前分支并创建 draft PR；PR 创建后记录 PR URL |
+| next entry point | PR review / draft-PR-pass gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | none |
 | implementation commits | 70a5a4e |
 | review artifacts | discussion / code / provider API evidence recorded inline in WU-ENG-01 |
 | aggregate review artifacts | none |
-| draft PR status | ready-to-create |
+| draft PR status | draft-created: https://github.com/noho/dayu-agent-r/pull/113 |
 | blocking open questions | none |
 
 状态约定：
