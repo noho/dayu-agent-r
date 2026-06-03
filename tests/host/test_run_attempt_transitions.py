@@ -37,7 +37,7 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.errors import HostDurableError, HostRowDecodeError
 from dayu.host.durable.liveness import HostInstanceStatus
-from dayu.host.durable.schema import TABLE_HOST_RUNS
+from dayu.host.durable.schema import TABLE_HOST_ATTEMPTS, TABLE_HOST_RUNS
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CancelActiveAttemptInput,
@@ -75,6 +75,7 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    terminal_attempt_row,
     terminal_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
@@ -1495,6 +1496,89 @@ def test_terminal_run_row_reports_cas_lost_when_terminal_refs_already_set(
         assert store.transaction_runner.run_write(operation) == (
             StateMutationStatus.CAS_LOST.value,
             "event-terminal-existing-ref",
+        )
+
+
+def test_terminal_attempt_row_reports_cas_lost_when_terminal_refs_already_set(
+    tmp_path: Path,
+) -> None:
+    """terminal Attempt CAS 看到 terminal refs 已写入时不得覆盖。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str | None]:
+            """模拟损坏 active attempt 已有 terminal refs 后执行 terminal CAS。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与最新 terminal event id。
+            """
+
+            existing_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-attempt-existing-ref",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="ATTEMPT_FAILED",
+                    payload={"reason": "existing-terminal-ref"},
+                ),
+            ).row
+            transaction.execute("PRAGMA ignore_check_constraints = ON")
+            try:
+                transaction.execute(
+                    "UPDATE host_attempts "
+                    "SET terminal_event_id = ?, terminal_event_sequence = ?, terminal_at = ? "
+                    "WHERE attempt_id = ?",
+                    (
+                        existing_event.event_id,
+                        existing_event.event_sequence,
+                        "2026-05-14T01:02:10Z",
+                        seeded.attempt_id,
+                    ),
+                )
+            finally:
+                transaction.execute("PRAGMA ignore_check_constraints = OFF")
+            new_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-attempt-new-ref",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="ATTEMPT_FAILED",
+                    payload={"reason": "new-terminal-ref"},
+                ),
+            ).row
+            try:
+                terminal_attempt_row(
+                    transaction,
+                    attempt_id=seeded.attempt_id,
+                    terminal_status=AttemptStatus.FAILED,
+                    terminal_event_id=new_event.event_id,
+                    terminal_event_sequence=new_event.event_sequence,
+                    terminal_at="2026-05-14T01:02:11Z",
+                )
+            except HostRowDecodeError:
+                row = transaction.fetchone(
+                    f"SELECT terminal_event_id FROM {TABLE_HOST_ATTEMPTS} "
+                    "WHERE attempt_id = ?",
+                    (seeded.attempt_id,),
+                )
+                if row is None:
+                    raise HostDurableError("attempt row missing after terminal CAS")
+                terminal_event_id = row.get("terminal_event_id")
+                if terminal_event_id is not None and not isinstance(
+                    terminal_event_id, str
+                ):
+                    raise HostDurableError("terminal_event_id must be text")
+                return StateMutationStatus.CAS_LOST.value, terminal_event_id
+            raise AssertionError(
+                "terminal_attempt_row should reject corrupted terminal refs"
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            "event-attempt-existing-ref",
         )
 
 

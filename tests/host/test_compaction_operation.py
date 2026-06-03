@@ -748,6 +748,28 @@ async def test_reactive_multi_pass_merges_distinct_summary_and_patch() -> None:
     )
 
 
+def test_tuple_patch_replace_drops_prior_clear_evidence() -> None:
+    """CLEAR 后的 REPLACE tuple patch 不继承 CLEAR pass evidence refs。"""
+
+    merged = compaction_operation._merge_tuple_field_patch(
+        (
+            PinnedStringTupleFieldPatch(
+                operation=PinnedPatchOperation.CLEAR,
+                evidence_refs=("clear-evidence",),
+            ),
+            PinnedStringTupleFieldPatch(
+                operation=PinnedPatchOperation.REPLACE,
+                value=("question from replace pass",),
+                evidence_refs=("replace-evidence",),
+            ),
+        )
+    )
+
+    assert merged.operation is PinnedPatchOperation.REPLACE
+    assert merged.value == ("question from replace pass",)
+    assert merged.evidence_refs == ("replace-evidence",)
+
+
 @pytest.mark.asyncio
 async def test_multi_pass_merge_quality_reject_records_rejected_attempt(
     monkeypatch: pytest.MonkeyPatch,

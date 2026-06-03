@@ -33,7 +33,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
+from dayu.engine.runners.openai.runner import AsyncOpenAIRunner, _is_sse_response
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
@@ -241,40 +241,21 @@ async def test_supports_streaming_false_downgrades_payload_to_non_stream() -> No
     await runner.close()
 
 
-@pytest.mark.asyncio
-async def test_stream_true_unknown_content_type_falls_back_to_sse() -> None:
-    """stream=True 且未知 Content-Type 时按 SSE 尝试，而不是走 JSON。"""
+def test_stream_true_unknown_content_type_is_not_sse() -> None:
+    """stream=True 但非 SSE Content-Type 不再按 SSE 解析。"""
 
-    runner = AsyncOpenAIRunner(
-        spec=make_spec(supports_streaming=True),
-        cancellation_token=FakeCancellationToken(),
+    assert _is_sse_response(content_type="text/plain", stream=True) is False
+    assert (
+        _is_sse_response(content_type="application/octet-stream", stream=True)
+        is False
     )
-    session = FakeSession()
-    session.enqueue_response(
-        FakeResponseSpec(
-            status=200,
-            headers={"Content-Type": "text/plain", "x-request-id": "req_sse"},
-            body_chunks=[
-                b'data: {"choices":[{"delta":{"content":"hi"},'
-                b'"finish_reason":"stop"}]}\n\n',
-                b"data: [DONE]\n\n",
-            ],
+    assert (
+        _is_sse_response(
+            content_type="Text/Event-Stream; charset=utf-8",
+            stream=True,
         )
+        is True
     )
-    _install_session(runner, session)
-
-    events = await _collect(runner)
-
-    assert [event.type for event in events] == [
-        RunnerEventType.RUNNER_CONTENT_DELTA,
-        RunnerEventType.RUNNER_CONTENT_COMPLETED,
-        RunnerEventType.RUNNER_DONE,
-    ]
-    assert isinstance(events[1].data, RunnerContentCompletedData)
-    assert events[1].data.content == "hi"
-    assert isinstance(events[2].data, RunnerDoneData)
-    assert events[2].data.provider_request_id == "req_sse"
-    await runner.close()
 
 
 @pytest.mark.asyncio

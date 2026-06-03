@@ -134,6 +134,8 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 OpenAI-compatible Runner 会在内部执行 streaming capability：当 `RunnerCallOptions.stream=True` 但 `RunnerSpec.supports_streaming=False` 时，本次请求降级为 `stream=False`，且不写 `stream_options`。`RunnerSpec.supports_stream_usage` 只门控流式请求中是否写入 `stream_options.include_usage=True`；为 `False` 时不写该字段。`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 SSE 字节空闲检测配置：heartbeat 只能在 timeout 已启用时设置，二者必须为正数，且 heartbeat 不能大于 timeout。
 
+OpenAI-compatible Runner 对 HTTP 200 响应按 `Content-Type` 分流：只有 `text/event-stream` media type 按 SSE 解析；缺失 `Content-Type` 时保留流式请求的 SSE fallback 并记录诊断；`application/json`、`text/plain`、`application/octet-stream` 等非 SSE media type 不进入 SSE parser。
+
 Engine / Runner 的可观测日志遵循 `dayu/README.md` 的级别语义。Agent 在 `VERBOSE` 记录 run、iteration、tool loop、fallback / continuation 与 terminal 骨架；OpenAI-compatible Runner 在 `VERBOSE` 记录单次 provider call start / done / cancelled 摘要，在 `DEBUG` 记录 HTTP attempt、response status、finish reason、usage、SSE heartbeat 与协议细节，在 `WARN` 记录 provider retry、协议差异和可恢复传输异常。Engine / Runner 日志不输出完整 prompt、provider headers、API key、完整工具结果或大段响应。
 
 ### 消息与工具接口

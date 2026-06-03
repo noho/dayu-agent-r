@@ -43,6 +43,18 @@ class GeminiToolCallState:
 
     thought_signature: str
 
+    def __post_init__(self) -> None:
+        """校验 Gemini tool call 续航状态。
+
+        :returns: ``None``。
+        :raises ValueError: ``thought_signature`` 为空或纯空白时抛出。
+        """
+
+        if self.thought_signature.strip() == "":
+            raise ValueError(
+                "GeminiToolCallState.thought_signature must be non-empty"
+            )
+
 
 ToolCallProviderState: TypeAlias = GeminiToolCallState
 """tool call 续航状态封闭联合。

@@ -84,7 +84,6 @@ from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _SSE_CONTENT_TYPE_FRAGMENT: str = "text/event-stream"
-_JSON_CONTENT_TYPE_FRAGMENT: str = "json"
 _PROVIDER_REQUEST_ID_HEADER_NAMES: tuple[str, ...] = ("x-request-id",)
 # HTTP error body 只用于诊断与 JSON 错误对象解析，必须显式有界读取。
 _HTTP_ERROR_BODY_MAX_BYTES: int = 65_536
@@ -126,7 +125,7 @@ def _extract_provider_request_id(headers: Iterable[tuple[str, str]]) -> str | No
 def _is_sse_response(*, content_type: str, stream: bool) -> bool:
     """判断 HTTP 200 response 是否应按 SSE 解析。
 
-    :param content_type: 小写后的 ``Content-Type``。
+    :param content_type: HTTP response 的 ``Content-Type``。
     :param stream: 本次 effective options 是否请求流式。
     :returns: 应按 SSE parser 尝试时返回 ``True``。
     :raises Exception: 不主动抛出异常。
@@ -136,9 +135,8 @@ def _is_sse_response(*, content_type: str, stream: bool) -> bool:
         return False
     if content_type.strip() == "":
         return True
-    if _SSE_CONTENT_TYPE_FRAGMENT in content_type:
-        return True
-    return _JSON_CONTENT_TYPE_FRAGMENT not in content_type
+    media_type = content_type.split(";", maxsplit=1)[0].strip().lower()
+    return media_type == _SSE_CONTENT_TYPE_FRAGMENT
 
 
 async def await_or_cancel(
@@ -867,6 +865,10 @@ class AsyncOpenAIRunner:
         """
 
         if pending.done():
+            try:
+                pending.exception()
+            except asyncio.CancelledError:
+                pass
             return
         pending.cancel()
         try:

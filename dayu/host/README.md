@@ -298,6 +298,7 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
   - schema 按当前 fresh version 起库，版本不匹配时要求重建 durable DB；主连接与 secondary durable connections 都会执行当前 schema validation，校验 schema version、required object 存在性与 required object 定义一致性，缺失 required objects 时批量诊断。
   - SQLite 连接启用 WAL 与 auto-checkpoint。
   - transaction runner 的 read transaction 使用 SQLite snapshot 语义，新的短读事务读取最新 committed truth。
+  - transaction runner 在已进入 transaction 后若 rollback 失败，会把当前 connection 标记为不可用并拒绝后续复用。
   - 内部 WAL checkpoint primitive 只服务显式 diagnostic / test entry，不属于 public maintenance API，也不作为 EventLog 或状态正确性的前置条件；调用时会校验 connection 的 main database 与传入 DB path 同源。
   - store close 会拒绝活跃 transaction，避免 SQLite 隐式 rollback 未提交写入。
 - dispatch scheduler、ToolRuntime factory、projection runner、memory repair runner。

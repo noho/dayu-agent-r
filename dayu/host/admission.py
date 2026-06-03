@@ -1016,6 +1016,17 @@ class _StartRunOperation:
             )
         if self.policy == AdmissionPolicy.ATTACH_ACTIVE:
             if active.status == RunStatus.ACCEPTED:
+                self.idempotency_store.record_idempotent_result(
+                    transaction,
+                    scope,
+                    semantic_digest,
+                    IdempotencyResultRef(
+                        result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                        result_ref=active.run_id,
+                        created_event_id=None,
+                        created_event_sequence=None,
+                    ),
+                )
                 return RunAdmissionResult(
                     run=active,
                     attempt=None,

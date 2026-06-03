@@ -3798,6 +3798,7 @@ def terminal_attempt_row(
           terminal_at = ?
         WHERE attempt_id = ?
           AND status IN (?, ?)
+{_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
             serialize_attempt_status(terminal_status),
