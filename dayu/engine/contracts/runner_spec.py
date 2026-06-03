@@ -238,6 +238,13 @@ ProviderRequestExtension: TypeAlias = (
 )
 """provider 请求扩展封闭联合。"""
 
+OPENAI_CLIENT_REQUEST_ID_HEADER_NAME: str = "X-Client-Request-Id"
+"""OpenAI-compatible 客户端关联 id header 名称。"""
+
+_OPENAI_CLIENT_REQUEST_ID_HEADER_NAME_LOWER: str = (
+    OPENAI_CLIENT_REQUEST_ID_HEADER_NAME.lower()
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RunnerSpec:
@@ -297,6 +304,8 @@ class RunnerSpec:
           必须同时启用。
         - 两者都必须为正数（> 0）。
         - 心跳不得大于 timeout。
+        - OpenAI-compatible 客户端关联策略启用时，静态 headers 不得包含
+          ``X-Client-Request-Id``。
 
         :raises ValueError: 当字段语义不一致时抛出。
         """
@@ -338,6 +347,30 @@ class RunnerSpec:
                 "stream_idle_timeout_seconds; got "
                 f"heartbeat={heartbeat!r}, timeout={timeout!r}"
             )
+        if (
+            self.client_correlation_policy
+            is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+            and _has_openai_client_request_id_header(self.headers)
+        ):
+            raise ValueError(
+                "RunnerSpec.headers must not include X-Client-Request-Id "
+                "when client_correlation_policy is "
+                "OPENAI_X_CLIENT_REQUEST_ID"
+            )
+
+
+def _has_openai_client_request_id_header(headers: Mapping[str, str]) -> bool:
+    """判断静态 headers 是否包含 OpenAI-compatible client request id。
+
+    :param headers: RunnerSpec 静态 header 映射。
+    :returns: 存在大小写不敏感匹配的 header 时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for name in headers:
+        if name.lower() == _OPENAI_CLIENT_REQUEST_ID_HEADER_NAME_LOWER:
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +401,7 @@ __all__ = [
     "GeminiThinkingExtension",
     "QwenThinkingExtension",
     "ProviderRequestExtension",
+    "OPENAI_CLIENT_REQUEST_ID_HEADER_NAME",
     "RunnerSpec",
     "RunnerCallOptions",
 ]

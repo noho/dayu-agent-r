@@ -189,21 +189,14 @@ async def test_policy_enabled_without_identity_does_not_send_header() -> None:
     assert "X-Client-Request-Id" not in session.calls[0][2]
 
 
-@pytest.mark.asyncio
-async def test_policy_enabled_rejects_static_case_insensitive_header() -> None:
-    """policy 开启时拒绝静态 headers 里已有的客户端关联 header。"""
-
-    runner = _runner(
-        policy=ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID,
-        headers={"x-client-request-id": "static-value"},
-    )
-    session = FakeSession()
-    _enqueue_http_error(session)
-    _install_session(runner, session)
+def test_policy_enabled_rejects_static_case_insensitive_header() -> None:
+    """policy 开启时 RunnerSpec 边界拒绝静态客户端关联 header。"""
 
     with pytest.raises(ValueError, match="X-Client-Request-Id"):
-        await _collect(runner, request_identity=_identity())
-    assert session.calls == []
+        _runner(
+            policy=ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID,
+            headers={"x-client-request-id": "static-value"},
+        )
 
 
 @pytest.mark.asyncio

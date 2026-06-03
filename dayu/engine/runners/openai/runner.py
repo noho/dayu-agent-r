@@ -51,6 +51,7 @@ from dayu.engine.contracts.runner_events import (
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
+    OPENAI_CLIENT_REQUEST_ID_HEADER_NAME,
     RunnerCallOptions,
     RunnerSpec,
 )
@@ -91,8 +92,6 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _SSE_CONTENT_TYPE_FRAGMENT: str = "text/event-stream"
 _PROVIDER_REQUEST_ID_HEADER_NAMES: tuple[str, ...] = ("x-request-id",)
-_CLIENT_REQUEST_ID_HEADER_NAME: str = "X-Client-Request-Id"
-_CLIENT_REQUEST_ID_HEADER_NAME_LOWER: str = _CLIENT_REQUEST_ID_HEADER_NAME.lower()
 # HTTP error body 只用于诊断与 JSON 错误对象解析，必须显式有界读取。
 _HTTP_ERROR_BODY_MAX_BYTES: int = 65_536
 
@@ -154,17 +153,15 @@ def _build_request_headers(
 ) -> dict[str, str]:
     """构造 OpenAI-compatible HTTP 请求头。
 
-    请求头由默认 ``Content-Type``、静态 ``RunnerSpec.headers`` 与显式策略
-    允许的 ``X-Client-Request-Id`` 组成。静态 headers 中若已包含大小写
-    不敏感的 ``X-Client-Request-Id``，会在 policy 开启时失败，避免静态
-    配置伪装成 per-call identity。
+    请求头由默认 ``Content-Type``、静态 ``RunnerSpec.headers`` 与
+    ``RunnerSpec`` 显式策略允许的 ``X-Client-Request-Id`` 组成。静态
+    header 冲突由 ``RunnerSpec`` construction-time validation 统一拒绝。
 
     :param spec: Runner 规约。
     :param request_identity: 本次逻辑 Runner 调用的请求身份；为 ``None`` 时
         不发送客户端关联 id。
     :returns: HTTP 请求头映射。
-    :raises ValueError: policy 开启且静态 headers 已包含
-        ``X-Client-Request-Id`` 时抛出。
+    :raises ValueError: policy 值不受当前 adapter 支持时抛出。
     """
 
     headers: dict[str, str] = {
@@ -177,14 +174,8 @@ def _build_request_headers(
         spec.client_correlation_policy
         is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
     ):
-        if _has_client_request_id_header(spec.headers):
-            raise ValueError(
-                "RunnerSpec.headers must not include X-Client-Request-Id "
-                "when client_correlation_policy is "
-                "OPENAI_X_CLIENT_REQUEST_ID"
-            )
         if request_identity is not None:
-            headers[_CLIENT_REQUEST_ID_HEADER_NAME] = (
+            headers[OPENAI_CLIENT_REQUEST_ID_HEADER_NAME] = (
                 request_identity.client_correlation_id
             )
         return headers
@@ -192,21 +183,6 @@ def _build_request_headers(
         "unsupported client_correlation_policy: "
         f"{spec.client_correlation_policy.value}"
     )
-
-
-def _has_client_request_id_header(headers: Mapping[str, str]) -> bool:
-    """判断 headers 是否已含 ``X-Client-Request-Id``。
-
-    :param headers: 待检查的 header 映射。
-    :returns: 已包含大小写不敏感的客户端 request id header 时返回
-        ``True``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    for name, _value in headers.items():
-        if name.lower() == _CLIENT_REQUEST_ID_HEADER_NAME_LOWER:
-            return True
-    return False
 
 
 async def await_or_cancel(

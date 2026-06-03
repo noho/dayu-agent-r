@@ -239,6 +239,30 @@ def test_runner_spec_supports_stream_usage_false_construction() -> None:
     assert spec.supports_stream_usage is False
 
 
+def test_runner_spec_rejects_static_openai_client_request_id_conflict() -> None:
+    """policy 开启时 RunnerSpec 边界拒绝静态客户端关联 header。"""
+
+    kwargs = _base_spec_kwargs()
+    kwargs["client_correlation_policy"] = (
+        ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    )
+    kwargs["headers"] = {"x-client-request-id": "static"}
+
+    with pytest.raises(ValueError, match="X-Client-Request-Id"):
+        RunnerSpec(**kwargs)  # type: ignore[arg-type]
+
+
+def test_runner_spec_allows_static_openai_client_request_id_when_policy_disabled() -> None:
+    """policy 关闭时静态 header 不与 per-call identity 发生语义冲突。"""
+
+    kwargs = _base_spec_kwargs()
+    kwargs["headers"] = {"X-Client-Request-Id": "static"}
+
+    spec = RunnerSpec(**kwargs)  # type: ignore[arg-type]
+
+    assert spec.headers["X-Client-Request-Id"] == "static"
+
+
 def test_runner_spec_allows_none_api_key_ref_for_local_provider() -> None:
     """本地或免鉴权 provider 可用 ``None`` 表达不需要 API key。"""
 

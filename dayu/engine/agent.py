@@ -1672,7 +1672,9 @@ class _AsyncAgent:
             yield await self._make_cancelled_terminal_with_close()
             return
         if isinstance(batch_outcome, WaitTimedOut):
-            yield await self._make_tool_timeout_terminal_with_close()
+            yield await self._make_tool_timeout_terminal_with_close(
+                client_correlation_id=decision.client_correlation_id
+            )
             return
 
         bijection_failure = self._validate_batch_bijection(
@@ -2139,9 +2141,13 @@ class _AsyncAgent:
             return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_failed(failure)
 
-    async def _make_tool_timeout_terminal_with_close(self) -> EngineEvent:
+    async def _make_tool_timeout_terminal_with_close(
+        self, *, client_correlation_id: str | None
+    ) -> EngineEvent:
         """关闭 Runner 后提交工具握手超时失败终态。
 
+        :param client_correlation_id: 产出当前工具批的逻辑 Runner 调用关联
+            id；无时为 ``None``。
         :returns: ``RUN_FAILED(tool_execution_timeout)`` terminal。
         :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
         """
@@ -2152,6 +2158,7 @@ class _AsyncAgent:
                 error_code=_ERROR_TOOL_EXECUTION_TIMEOUT,
                 message=_TOOL_EXECUTION_TIMEOUT_MESSAGE,
                 provider_request_id=None,
+                client_correlation_id=client_correlation_id,
                 recoverable=False,
             )
         )

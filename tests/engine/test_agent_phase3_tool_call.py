@@ -1797,6 +1797,10 @@ async def test_tool_execution_timeout_fails_run_without_tool_result() -> None:
     failed = _failed_data(events)
     assert failed.error_code == "tool_execution_timeout"
     assert failed.recoverable is False
+    assert runner.request_identities_seen[0] is not None
+    assert failed.client_correlation_id == (
+        runner.request_identities_seen[0].client_correlation_id
+    )
     assert executor.cancelled is True
     assert len(executor.requests) == 1
     assert (
@@ -1831,6 +1835,10 @@ async def test_tool_execution_timeout_wins_over_cleanup_cancel() -> None:
     failed = _failed_data(events)
     assert failed.error_code == "tool_execution_timeout"
     assert failed.recoverable is False
+    assert runner.request_identities_seen[0] is not None
+    assert failed.client_correlation_id == (
+        runner.request_identities_seen[0].client_correlation_id
+    )
     assert executor.cancelled is True
     assert token.is_cancelled()
     assert _terminal(events).type is EngineEventType.RUN_FAILED
@@ -1861,6 +1869,10 @@ async def test_tool_execution_timeout_wins_over_runner_close_cancel() -> None:
     failed = _failed_data(events)
     assert failed.error_code == "tool_execution_timeout"
     assert failed.recoverable is False
+    assert runner.request_identities_seen[0] is not None
+    assert failed.client_correlation_id == (
+        runner.request_identities_seen[0].client_correlation_id
+    )
     assert executor.cancelled is True
     assert token.is_cancelled()
     assert runner.close_count == 1
@@ -1910,39 +1922,50 @@ async def test_max_iterations_force_answer_and_raise_error() -> None:
 async def test_force_answer_empty_and_tool_call_are_fail_closed() -> None:
     """force-answer 空内容或继续 tool call 都不能伪装成 final。"""
 
+    empty_runner = _ScriptedRunner(
+        scripts=(_tool_script(_tool_call("tc_1")), _final_script(""))
+    )
     empty_events = await _collect(
         _AsyncAgent(
             request=_request(
                 executor=_RecordingToolExecutor(outcomes={"tc_1": _success(5)}),
                 max_iterations=1,
             ),
-            runner=_ScriptedRunner(
-                scripts=(_tool_script(_tool_call("tc_1")), _final_script(""))
+            runner=empty_runner,
+        )
+    )
+    empty_failure = _failed_data(empty_events)
+    assert empty_failure.error_code == "force_answer_empty"
+    assert empty_runner.request_identities_seen[1] is not None
+    assert empty_failure.client_correlation_id == (
+        empty_runner.request_identities_seen[1].client_correlation_id
+    )
+
+    tool_call_runner = _ScriptedRunner(
+        scripts=(
+            _tool_script(_tool_call("tc_1")),
+            _tool_script(
+                _tool_call("tc_2"),
+                provider_request_id="req_force_tool",
             ),
         )
     )
-    assert _failed_data(empty_events).error_code == "force_answer_empty"
-
     tool_call_events = await _collect(
         _AsyncAgent(
             request=_request(
                 executor=_RecordingToolExecutor(outcomes={"tc_1": _success(5)}),
                 max_iterations=1,
             ),
-            runner=_ScriptedRunner(
-                scripts=(
-                    _tool_script(_tool_call("tc_1")),
-                    _tool_script(
-                        _tool_call("tc_2"),
-                        provider_request_id="req_force_tool",
-                    ),
-                )
-            ),
+            runner=tool_call_runner,
         )
     )
     force_tool_failure = _failed_data(tool_call_events)
     assert force_tool_failure.error_code == "tool_call_not_enabled"
     assert force_tool_failure.provider_request_id == "req_force_tool"
+    assert tool_call_runner.request_identities_seen[1] is not None
+    assert force_tool_failure.client_correlation_id == (
+        tool_call_runner.request_identities_seen[1].client_correlation_id
+    )
 
 
 @pytest.mark.asyncio
