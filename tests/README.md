@@ -77,7 +77,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 ### `tests/runtime/`
 
-运行时基础设施测试，覆盖 `dayu.runtime` 的层中立边界、取消 helper、diagnostic 文本 helper 与日志装配：
+运行时基础设施测试，覆盖 `dayu.runtime` 的层中立边界、取消 helper、diagnostic 文本 helper、digest helper 与日志装配：
 
 - import boundary：阻止 runtime 反向依赖 Engine、Host、Service、UI、Fins 或引入运行期 HTTP 客户端，并显式确认
   `config_loader.py`、`location.py`、`scene_prepare.py`、`tools_discovery.py`、`assembly.py` 与 `tool_truncation.py` 被边界扫描覆盖。
@@ -89,6 +89,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
   FIFO、公平性或 Host dispatch 集成。
 - filelock：覆盖同步 file lock wrapper 的 parent directory 创建策略、禁用创建时的结构化错误、context manager 正常与异常路径 release、release 幂等、non-blocking timeout 包装，以及第三方 `filelock` import 只能出现在 `dayu.runtime.filelock` 的边界。
 - diagnostic text：覆盖层中立 diagnostic 文本中的 Bearer / API key / authorization / password / secret / token 敏感值检测、局部 value 脱敏、marker 字面替换、有界截断、空字符串 no-op、普通 token/header 诊断不误判，以及先脱敏再截断不泄漏原值。
+- digest：覆盖层中立 UTF-8 文本 digest 的稳定 `sha256:<hex>` 输出形态。
 - logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 - config loader：覆盖 `models.json`、`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json` 的 typed view 加载、workspace 同 id 整条替换、合法单继承链、missing / self / circular / multi / invalid `extends` 错误路径、catalog record 内重复 id 字段 fail fast、execution profile 上下文窗口分档校验、工具重复治理 decision allowlist、旧 execution profile 字段与旧 runner hint `max_tokens` fail fast、host runtime lane 引用校验和旧配置文件不读取。
 - runtime location：覆盖 `workspace/config` 存在与不存在时的 `config_overlay_dir`，workspace prompt assets 优先级，以及包内 prompt / manifest 默认资产缺失时 fail fast。
@@ -115,7 +116,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
   并显式确认公共 source ref 契约模块被边界扫描覆盖。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入公共契约源码。
 - ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配、工具等待时间字段时区边界、工具参数 schema key 边界和截断策略 limit key 映射穷尽性。
-- tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine，默认拒绝调用方直接构造空 `ToolBundle`，并覆盖框架 no-tool 路径使用的类型真实空 bundle。
+- tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine，校验展示名非空，默认拒绝调用方直接构造空 `ToolBundle`，并覆盖框架 no-tool 路径使用的类型真实空 bundle。
 
 ### `tests/host/`
 

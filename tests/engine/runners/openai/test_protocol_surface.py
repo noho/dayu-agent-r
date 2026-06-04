@@ -28,8 +28,18 @@ def test_call_signature_no_kwargs() -> None:
         p.kind is not inspect.Parameter.VAR_KEYWORD
         for p in sig.parameters.values()
     ), f"call() must not accept **kwargs: {sig}"
-    expected_names = {"self", "messages", "options", "tools"}
-    assert set(sig.parameters.keys()) == expected_names
+    assert tuple(sig.parameters.keys()) == (
+        "self",
+        "messages",
+        "options",
+        "tools",
+        "request_identity",
+    )
+    assert (
+        sig.parameters["request_identity"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert sig.parameters["request_identity"].default is None
 
 
 def test_is_supports_tool_calling_returns_spec_value() -> None:

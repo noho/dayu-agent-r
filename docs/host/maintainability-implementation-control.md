@@ -133,7 +133,7 @@ git push -u github <branch>
 | default next work unit | WU-MAINT-00 |
 | next entry point | 等 issue-backed backlog 全部实施完毕后，先刷新代码指标与 review finding，再讨论 WU-MAINT-00 |
 | design source | `docs/host/design.md`、`docs/engine/design.md`，按触及层级核对 |
-| source review artifact | `docs/reviews/repo-review-20260531-165918.md` |
+| source review artifact | `docs/reviews/repo-review-20260531-165918.md`; `docs/reviews/repo-review-20260604-220925.md`; `docs/reviews/repo-review-20260604-220415.md`; `docs/reviews/repo-review-20260604-controller-adjudication.md` |
 | related GitHub Issue | #33 |
 | plan artifacts | none |
 | implementation commits | none |
@@ -167,7 +167,7 @@ git push -u github <branch>
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| RR-MAINT-01 | repo review 20260531 | module scale risk | deferred-with-owner | 本文档 WU-MAINT-06 | WU-MAINT-06 重新评估 | `dayu/host/durable/run_transition.py`、`dayu/host/tool_runtime.py`、`dayu/host/durable/state.py`、`dayu/host/admission.py` 行数极高，先不在 issue backlog 前处理。 |
+| RR-MAINT-01 | repo review 20260531; repo review 20260604 | module scale risk | deferred-with-owner | 本文档 WU-MAINT-06 | WU-MAINT-06 重新评估 | `dayu/host/durable/run_transition.py`、`dayu/host/tool_runtime.py`、`dayu/host/durable/state.py`、`dayu/host/admission.py`、`dayu/host/engine_ingest.py`、`dayu/host/dispatch.py`、`dayu/runtime/config_loader.py`、`dayu/runtime/scene_prepare.py`、`dayu/service/host_assembly.py` 等模块规模极高；20260604 full repo review 已再次确认该风险。先不在 WU-CM-01 PR closeout 中处理。 |
 | RR-MAINT-02 | GitHub Issue #33 | God Object risk | deferred-with-owner | 本文档 WU-MAINT-03 / WU-MAINT-04 | issue backlog 完成后刷新代码事实 | `LocalRunHarness` 已不存在，但当前 Host dispatch / ingest orchestration 大对象仍需后续治理。 |
 | RR-MAINT-03 | `docs/reviews/repo-review-20260531-223418.md` | God Object risk | deferred-with-owner | 本文档 WU-MAINT-07 | WU-MAINT-00 刷新后确认拆分边界 | `_AsyncAgent` 约 1900 行且承担 Runner 迭代、工具批量执行、fallback、取消观察、延续逻辑、事件分发和终态决策；不并入当前 audit 修复批次，进入 Engine maintainability work unit。 |
 
@@ -330,7 +330,7 @@ git push -u github <branch>
 
 ### 目标
 
-- 评估 `dayu/host/durable/run_transition.py`、`dayu/host/tool_runtime.py`、`dayu/host/durable/state.py`、`dayu/host/admission.py` 等超大模块的真实内聚边界。
+- 评估 `dayu/host/durable/run_transition.py`、`dayu/host/tool_runtime.py`、`dayu/host/durable/state.py`、`dayu/host/admission.py`、`dayu/host/engine_ingest.py`、`dayu/host/dispatch.py`、`dayu/runtime/config_loader.py`、`dayu/runtime/scene_prepare.py`、`dayu/service/host_assembly.py` 等超大模块的真实内聚边界。
 - 判断是否需要拆分为多个语义 owner 模块，或只通过前面 work units 的类 / 函数拆分降低风险。
 - 若需要拆模块，给出独立 code-generation-ready plan。
 

@@ -22,7 +22,9 @@ from dayu.host.durable.schema import (
     HOST_DURABLE_INDEXES,
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
+    INDEX_EVENT_LOG_SESSION_SEQUENCE,
     INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
+    INDEX_HOST_INSTANCES_STATUS_HEARTBEAT,
     INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
     INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN,
     INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE,
@@ -827,10 +829,47 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
     )
 
 
-def test_host_schema_version_is_active_run_check_version() -> None:
-    """当前 committed Host schema version 是 active Run CHECK fresh schema 15。"""
+def test_host_schema_version_is_query_index_version() -> None:
+    """当前 committed Host schema version 是 durable query index fresh schema 16。"""
 
-    assert HOST_SCHEMA_VERSION == 15
+    assert HOST_SCHEMA_VERSION == 16
+
+
+def test_foundation_query_indexes_are_created(tmp_path: Path) -> None:
+    """fresh schema 创建 host liveness 与 session EventLog 查询索引。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            host_instance_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_INSTANCES})"
+            ).fetchall()
+            event_log_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_EVENT_LOG})"
+            ).fetchall()
+            assert INDEX_HOST_INSTANCES_STATUS_HEARTBEAT in {
+                str(row[1]) for row in host_instance_indexes
+            }
+            assert INDEX_EVENT_LOG_SESSION_SEQUENCE in {
+                str(row[1]) for row in event_log_indexes
+            }
+            host_instance_columns = connection.execute(
+                f"PRAGMA index_info({INDEX_HOST_INSTANCES_STATUS_HEARTBEAT})"
+            ).fetchall()
+            event_log_columns = connection.execute(
+                f"PRAGMA index_info({INDEX_EVENT_LOG_SESSION_SEQUENCE})"
+            ).fetchall()
+            assert tuple(str(row[2]) for row in host_instance_columns) == (
+                "status",
+                "heartbeat_at",
+            )
+            assert tuple(str(row[2]) for row in event_log_columns) == (
+                "session_id",
+                "event_sequence",
+            )
+        finally:
+            connection.close()
 
 
 def test_purge_tombstone_table_has_no_session_or_event_log_fk(

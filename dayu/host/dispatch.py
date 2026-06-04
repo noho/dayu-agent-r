@@ -2025,28 +2025,32 @@ class HostDispatchScheduler:
             len(self._active_tasks),
             len(self._active_handles),
         )
-        heartbeat_task = self._heartbeat_task
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            await _suppress_task_cancel(heartbeat_task)
-        task = self._drain_task
-        if task is not None:
-            task.cancel()
-            await _suppress_task_cancel(task)
-        promotion_task = self._promotion_drain_task
-        if promotion_task is not None:
-            promotion_task.cancel()
-            await _suppress_task_cancel(promotion_task)
-        self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
-        for active_task in tuple(self._active_tasks):
-            active_task.cancel()
-            await _suppress_task_cancel(active_task)
-        for active_handle in tuple(self._active_handles):
-            await _safe_close_worker_handle(active_handle)
-            self._active_handles.discard(active_handle)
-        self._active_registry.clear()
-        await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
-        self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
+        try:
+            heartbeat_task = self._heartbeat_task
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await _suppress_task_cancel(heartbeat_task)
+            task = self._drain_task
+            if task is not None:
+                task.cancel()
+                await _suppress_task_cancel(task)
+            promotion_task = self._promotion_drain_task
+            if promotion_task is not None:
+                promotion_task.cancel()
+                await _suppress_task_cancel(promotion_task)
+            self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
+            for active_task in tuple(self._active_tasks):
+                active_task.cancel()
+                await _suppress_task_cancel(active_task)
+            for active_handle in tuple(self._active_handles):
+                await _safe_close_worker_handle(active_handle)
+                self._active_handles.discard(active_handle)
+            self._active_registry.clear()
+            await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
+            self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
+        except Exception:
+            self._close_cleanup_done = True
+            raise
         self._close_cleanup_done = True
         _LOGGER.info(
             "dispatch.scheduler.close_done host_handle_id=%s",
@@ -2321,7 +2325,6 @@ class HostDispatchScheduler:
             if dispatching_row is None:
                 await _safe_release_lane_token(token)
                 return "skipped"
-            await asyncio.sleep(0)
             if not self._dispatch_record_still_pre_accept(dispatching_row):
                 await _safe_release_lane_token(token)
                 return "skipped"

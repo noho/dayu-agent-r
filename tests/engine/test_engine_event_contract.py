@@ -162,11 +162,13 @@ def test_provider_request_id_fields_are_locked() -> None:
         "iteration_id",
         "finish_reason",
         "provider_request_id",
+        "client_correlation_id",
     }
     assert {f.name for f in dataclasses.fields(RunFailedData)} == {
         "error_code",
         "message",
         "provider_request_id",
+        "client_correlation_id",
         "recoverable",
     }
     assert {
@@ -176,6 +178,7 @@ def test_provider_request_id_fields_are_locked() -> None:
         "budget_state",
         "reason",
         "provider_request_id",
+        "client_correlation_id",
     }
 
 

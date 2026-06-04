@@ -51,7 +51,7 @@ def test_classify_exception_timeout_async() -> None:
 
 
 def test_classify_exception_server_timeout() -> None:
-    """``aiohttp.ServerTimeoutError`` → ``TIMEOUT``。"""
+    """``aiohttp.ServerTimeoutError`` 经 asyncio timeout 分支归为 ``TIMEOUT``。"""
 
     assert (
         classify_exception(aiohttp.ServerTimeoutError())

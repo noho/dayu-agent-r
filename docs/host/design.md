@@ -1006,15 +1006,15 @@ Phase 4 public function behavior matrix：
 | `get_run` | 完整实现 | 从 durable Run / Attempt truth 构造 snapshot。 |
 | internal `stream_run_events` / run-scoped EventLog 补读 | 完整实现 EventLog-backed read path | 全局 EventLog cursor 是唯一 cursor truth；Phase 4 不引入 projection truth；P10.5 后该路径降为内部 diagnostic / detail contract。 |
 | `cancel_run` queued / pre-dispatch `STARTING` | 完整实现 | 覆盖 Phase 1-3 已有可闭环路径：`QUEUED` 与 dispatch record 尚未进入 dispatching 的 Attempt `STARTING`。 |
-| `cancel_session_runs` queued / pre-dispatch `STARTING` | 子集实现并追踪后续完善 | Phase 4 只批量覆盖上述 `cancel_run` 可闭环子集；dispatching / active worker、`WAITING`、`RECOVERING` cancel deferred。 |
+| `cancel_session_runs` queued / pre-dispatch `STARTING` / `WAITING` / `RECOVERING` | 完整覆盖当前可闭环状态 | 批量取消所有当前可闭环 non-terminal Run；active worker 物理传播、外部 job physical cancel / abandon 与 recovery dispatch 中取消继续由对应后续 owner 强化。 |
 | `submit_followup(steer)` | stable unsupported / deferred | Phase 4 只冻结 envelope、validation、error/detail contract；public facade 返回 `unsupported_operation`。完整 Attempt switching 由后续 steer / dispatch / wait owner 落地。 |
 | `retry_run` | stable unsupported / deferred | Phase 4 冻结 request / idempotency / error envelope；执行语义由后续 retry owner 落地。 |
 | `replay_run` | stable unsupported / deferred | Phase 4 冻结 request / idempotency / error envelope；执行语义由后续 replay owner 落地。 |
 | `resolve_wait` | stable unsupported / deferred | Phase 7 owns wait record、tool result accept 与 resume Attempt。 |
 | `purge_session` | stable unsupported / deferred | Phase 15 owns destructive cleanup 与 purge tombstone persistence。 |
 | active dispatch cancel | stable unsupported / deferred | Phase 5 owns dispatching / active WorkerProxy cancel propagation。 |
-| wait cancel | stable unsupported / deferred | Phase 7 owns `WAITING` closeout 与 external job best-effort cancel / abandon。 |
-| recovery cancel | stable unsupported / deferred | Phase 11 owns `RECOVERING` dispatch / recovery scan cancellation。 |
+| wait external job physical cancel | stable unsupported / deferred | 当前已实现 `WAITING -> CANCELLED` 逻辑收口；Phase 7 继续拥有外部 job best-effort cancel / abandon 强化。 |
+| recovery dispatch cancel | stable unsupported / deferred | 当前已实现未派发 `RECOVERING -> CANCELLED`；Phase 11 继续拥有 recovery dispatch / recovery scan cancellation 强化。 |
 
 所有会 append EventLog `canonical_fact` 或影响 audit 的 mutating request 都必须携带结构化 `HostCallContext` 或等价 request envelope。Host 不负责认证，但必须记录上层已经解析的 actor / principal、source / client、request id、权限声明和 operation context。required fields 不能塞进无结构 metadata。
 
@@ -1178,8 +1178,8 @@ Run 接口语义：
 - 内部 `stream_run_events` / run-scoped EventLog 补读：从全局 `event_sequence` cursor 补读目标 Run 的事件。它是 Host 内部 diagnostic / detail / debug / drill-down helper，只服务内部测试、排查某次 retry / replay source run 或运维诊断；不得和 `watch_session_events` 并列成为 Service-facing 聊天入口。若未来要公开给 Run detail 页面，必须先定义 public diagnostic event DTO，不得直接暴露内部 `HostEventView`。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
 - `purge_session`：清理已关闭且全部 Run 终态的 Session，按 `(session_id, client_request_id)` 幂等；删除可恢复事实与 projection，只保留最小 purge tombstone / audit record。
-- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-worker `STARTING` Run 可直接 `CANCELLED`，包括 `pending`、`waiting_for_lane` 以及 WorkerProxy accepted 前的 `dispatching`。active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；`WAITING` 与 `RECOVERING` cancel 分别由 Phase 7 / Phase 11 落地。
-- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有未终态 Run，不影响其它 Session。Phase 4 只实现 queued / pre-dispatch `STARTING` 子集，完整 pre-worker `dispatching` / active worker、`WAITING`、`RECOVERING` cancel 必须由 Phase 5 / 7 / 11 补齐。
+- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-worker `STARTING` Run 可直接 `CANCELLED`，包括 `pending`、`waiting_for_lane` 以及 WorkerProxy accepted 前的 `dispatching`；`WAITING` Run 通过取消 wait record 直接 `CANCELLED`；未派发的 `RECOVERING` Run 直接 `CANCELLED`。active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；外部 job physical cancel / abandon 与 recovery dispatch cancellation 分别由 Phase 7 / Phase 11 强化。
+- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有当前可闭环未终态 Run，不影响其它 Session。queued / pre-dispatch `STARTING`、`WAITING` 与未派发 `RECOVERING` 会直接收口；active worker 物理传播、外部 job physical cancel / abandon 与 recovery dispatch cancellation 继续由 Phase 5 / 7 / 11 强化。
 - `submit_followup`：接受同一 Session 的普通 prompt 或控制输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。Phase 4 只冻结 steer envelope、validation 与 error/detail contract，public facade 对 steer 返回 `unsupported_operation`；完整 Attempt switching 后续落地。
 - `retry_run`：公开 Host control API，由调用方主动发起；函数式语义为 `retry(run)`。它在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay_run`：公开 Host control API，由调用方主动发起；函数式语义为 `replay(run)`。它只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
@@ -2413,7 +2413,7 @@ client requests cancel
 
 `cancel_session_runs(host, session_id, request)` 是 session-scope cancel command，用于客户端退出、supervisor shutdown 或用户明确停止该 Session 下全部未完成工作。它不是 `close_session`，不关闭新输入入口；不是 `purge_session`，不删除事实；也不表达“客户端拥有的所有 Session”。
 
-Phase 4 只实现 `cancel_session_runs` 的 Phase 1-3 可闭环子集：`QUEUED` Run 与 pre-dispatch Attempt `STARTING`。dispatch record 已进入 `dispatching`、Attempt 已 `RUNNING`、`WAITING`、`RECOVERING`、active worker propagation、wait record cancel 与 recovery dispatch cancel 都是 stable deferred 行为；Phase 5 / Phase 7 / Phase 11 必须分别补齐，不能把 Phase 4 子集解释为最终语义。
+当前 `cancel_session_runs` 实现覆盖所有当前可闭环 non-terminal Run：`QUEUED`、pre-dispatch Attempt `STARTING`、`WAITING` 与未派发的 `RECOVERING`。active worker propagation、外部 job physical cancel / abandon 与 recovery dispatch cancellation 仍是后续强化行为；Phase 5 / Phase 7 / Phase 11 必须分别补齐，不能把当前逻辑收口解释为外部执行环境已经物理停止。
 
 `cancel_session_runs` 语义：
 
@@ -2424,8 +2424,8 @@ Phase 4 只实现 `cancel_session_runs` 的 Phase 1-3 可闭环子集：`QUEUED`
 - accepted / queued Run 直接 `CANCELLED`，不创建 Attempt。
 - Attempt `STARTING` 且尚未 dispatch / 正在 `waiting_for_lane` 时直接取消，不通知 EngineWorker。
 - 已 dispatch / active running Attempt 走普通 `cancel_run` 传播到 WorkerProxy；Phase 5 owns 该路径。
-- `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort；Phase 7 owns 该路径。
-- `RECOVERING` Run 的取消由 Phase 11 recovery owner 接入。
+- `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort，Phase 7 继续拥有该强化路径。
+- `RECOVERING` Run 在新 recovery dispatch 尚未提交前直接取消；已进入 recovery dispatch 的取消强化由 Phase 11 recovery owner 接入。
 - terminal 已抢先提交时 terminal 优先，`cancel_session_runs` 返回当前终态，不改写 terminal。
 - 返回 `SessionSnapshot`，包含 cancel 后的 session / run summary。
 

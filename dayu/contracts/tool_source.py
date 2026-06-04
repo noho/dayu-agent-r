@@ -11,6 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from dayu.contracts._validation import (
+    require_non_empty_text as _require_non_empty_text,
+    require_optional_non_empty_text as _require_optional_non_empty_text,
+)
+
 
 class ToolBundleSourceKind(StrEnum):
     """业务工具 bundle 来源类别。
@@ -58,32 +63,5 @@ class ToolBundleSourceRef:
             self.content_digest,
             field_name="ToolBundleSourceRef.content_digest",
         )
-
-
-def _require_non_empty_text(value: str, *, field_name: str) -> None:
-    """校验字符串存在非空白内容。
-
-    :param value: 待校验字符串。
-    :param field_name: 错误消息中的字段名。
-    :returns: 无返回值。
-    :raises ValueError: 字符串为空或只包含空白时抛出。
-    """
-
-    if not value.strip():
-        raise ValueError(f"{field_name} must be non-empty")
-
-
-def _require_optional_non_empty_text(value: str | None, *, field_name: str) -> None:
-    """校验可选字符串在存在时包含非空白内容。
-
-    :param value: 待校验字符串；``None`` 表示未提供。
-    :param field_name: 错误消息中的字段名。
-    :returns: 无返回值。
-    :raises ValueError: 字符串存在但为空或只包含空白时抛出。
-    """
-
-    if value is not None:
-        _require_non_empty_text(value, field_name=field_name)
-
 
 __all__ = ["ToolBundleSourceKind", "ToolBundleSourceRef"]

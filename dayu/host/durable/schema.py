@@ -31,7 +31,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 15
+HOST_SCHEMA_VERSION = 16
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -81,6 +81,8 @@ INDEX_HOST_OUTBOX_TERMINAL_ITEMS_SESSION_SEQUENCE = "host_outbox_terminal_items_
 INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE = "host_outbox_terminal_items_state_sequence"
 INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN = "host_outbox_terminal_items_run"
 INDEX_HOST_PURGE_TOMBSTONES_SESSION = "host_purge_tombstones_session"
+INDEX_HOST_INSTANCES_STATUS_HEARTBEAT = "host_instances_status_heartbeat"
+INDEX_EVENT_LOG_SESSION_SEQUENCE = "event_log_session_sequence"
 
 FOUNDATION_TABLES: tuple[str, ...] = (
     TABLE_EVENT_LOG,
@@ -167,6 +169,8 @@ HOST_DURABLE_INDEXES: tuple[str, ...] = (
     INDEX_HOST_OUTBOX_TERMINAL_ITEMS_STATE_SEQUENCE,
     INDEX_HOST_OUTBOX_TERMINAL_ITEMS_RUN,
     INDEX_HOST_PURGE_TOMBSTONES_SESSION,
+    INDEX_HOST_INSTANCES_STATUS_HEARTBEAT,
+    INDEX_EVENT_LOG_SESSION_SEQUENCE,
 )
 """当前 Host durable schema 必须存在的 index 名称集合。"""
 
@@ -290,6 +294,11 @@ ON {TABLE_EVENT_LOG}(run_id, event_type, event_sequence)
 WHERE run_id IS NOT NULL
 """
 
+_EVENT_LOG_SESSION_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_EVENT_LOG_SESSION_SEQUENCE}
+ON {TABLE_EVENT_LOG}(session_id, event_sequence)
+"""
+
 _IDEMPOTENCY_RECORDS_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_IDEMPOTENCY_RECORDS} (
   scope_kind TEXT NOT NULL,
@@ -327,6 +336,11 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_INSTANCES} (
     status IN ('running', 'stopping', 'stopped', 'crashed_suspected')
   )
 )
+"""
+
+_HOST_INSTANCES_STATUS_HEARTBEAT_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_INSTANCES_STATUS_HEARTBEAT}
+ON {TABLE_HOST_INSTANCES}(status, heartbeat_at)
 """
 
 _HOST_SESSIONS_DDL = f"""
@@ -1158,7 +1172,11 @@ FOUNDATION_DDL: tuple[str, ...] = (
 )
 """按外键依赖顺序排列的 Phase 2 foundation DDL。"""
 
-FOUNDATION_INDEX_DDL: tuple[str, ...] = (_EVENT_LOG_RUN_TYPE_SEQUENCE_INDEX_DDL,)
+FOUNDATION_INDEX_DDL: tuple[str, ...] = (
+    _EVENT_LOG_RUN_TYPE_SEQUENCE_INDEX_DDL,
+    _EVENT_LOG_SESSION_SEQUENCE_INDEX_DDL,
+    _HOST_INSTANCES_STATUS_HEARTBEAT_INDEX_DDL,
+)
 """Phase 2 foundation table index DDL。"""
 
 PHASE3_STATE_DDL: tuple[str, ...] = (

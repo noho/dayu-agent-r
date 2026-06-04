@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -256,6 +257,9 @@ def test_single_scene_assembly_outputs_stable_refs_and_digest(tmp_path: Path) ->
     )
     assert result.system_prompt == ("你是Dayu Corp财报分析员。\n\n分析Dayu Corp在2026年的收入。")
     assert tuple(ref.fragment_id for ref in result.fragment_refs) == ("base", "detail")
+    assert result.fragment_refs[0].content_digest == "sha256:" + hashlib.sha256(
+        "你是{{company}}财报分析员。".encode("utf-8")
+    ).hexdigest()
     assert tuple(ref.relative_path for ref in result.fragment_refs) == (
         "base.md",
         "detail.md",

@@ -36,6 +36,17 @@ def canonical_json_digest(value: JsonValue) -> str:
     return _CONTENT_DIGEST_PREFIX + hashlib.sha256(payload).hexdigest()
 
 
+def text_digest(value: str) -> str:
+    """对 UTF-8 文本计算 SHA-256 摘要。
+
+    :param value: 待摘要的文本。
+    :returns: ``sha256:<hex>`` 形式的稳定摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _CONTENT_DIGEST_PREFIX + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def normalize_json_value(value: JsonValue) -> JsonValue:
     """把 ``JsonValue`` 递归转换为 stdlib ``json`` 可稳定处理的结构。
 

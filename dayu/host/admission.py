@@ -765,8 +765,8 @@ class HostAdmissionService:
     ) -> SessionCancelResult:
         """接受 session-scope cancel 请求。
 
-        本方法取消 queued、pre-dispatch ``STARTING`` 与 active worker Run；
-        ``WAITING`` 与 ``RECOVERING`` 由后续 phase 负责。
+        本方法取消 queued、pre-dispatch ``STARTING``、active worker、
+        ``WAITING`` 与 ``RECOVERING`` Run；存在其它非终态状态时 fail closed。
 
         :param session_id: 目标 Session id。
         :param request: cancel session runs 请求。

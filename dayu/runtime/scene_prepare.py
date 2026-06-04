@@ -9,7 +9,6 @@ checkpoint 语义。
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -20,7 +19,7 @@ from pathlib import Path
 from typing import Final, TypeAlias, TypeVar, cast
 
 from dayu.contracts import JsonValue, ToolBundle
-from dayu.runtime._digest import canonical_json_digest
+from dayu.runtime._digest import canonical_json_digest, text_digest
 from dayu.runtime._agent_policy_constants import (
     AGENT_FALLBACK_MODE_FORCE_ANSWER,
     AGENT_FALLBACK_MODE_RAISE_ERROR,
@@ -29,7 +28,6 @@ from dayu.runtime._agent_policy_constants import (
 
 _SCHEMA_VERSION: Final[int] = 1
 _SCENE_FILE_SUFFIX: Final[str] = ".json"
-_DIGEST_PREFIX: Final[str] = "sha256:"
 _MISSING_FRAGMENT_POLICY_FAIL_CLOSED: Final[str] = "fail_closed"
 _STRING_VALUE_TYPE: Final[str] = "string"
 _SCENE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
@@ -482,7 +480,7 @@ class ScenePrepare:
                 relative_path=fragment.relative_path,
                 order=fragment.order,
                 required=fragment.required,
-                content_digest=_text_digest(content),
+                content_digest=text_digest(content),
             )
             for fragment, content in fragment_contents
         )
@@ -1138,7 +1136,7 @@ def _build_source_refs(
                 source_kind=SceneSourceKind.FRAGMENT,
                 source_id=fragment.relative_path,
                 version_ref=None,
-                content_digest=_text_digest(content),
+                content_digest=text_digest(content),
             )
         )
     refs.append(
@@ -1287,16 +1285,6 @@ def _sorted_text_mapping_json(values: Mapping[str, str]) -> JsonValue:
             raise ScenePrepareError(f"context slot value must be string: {key}")
         result[key] = value
     return result
-
-
-def _text_digest(value: str) -> str:
-    """计算文本 SHA-256 摘要。
-
-    :param value: 文本内容。
-    :returns: ``sha256:<hex>`` 摘要。
-    """
-
-    return _DIGEST_PREFIX + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _resolve_contained_path(*, root: Path, relative_path: str, context: str) -> Path:

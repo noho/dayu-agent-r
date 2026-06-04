@@ -794,6 +794,30 @@ class _CloseOnceBlockedLaneClose:
         await self._original_close(reason)
 
 
+class _FailingLaneClose:
+    """始终抛出 close 异常的 lane close 替身。"""
+
+    def __init__(self) -> None:
+        """初始化调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+
+    async def __call__(self, reason: str | None = None) -> None:
+        """模拟 lane close 失败。
+
+        :param reason: close 原因。
+        :returns: 不会正常返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        del reason
+        self.calls += 1
+        raise RuntimeError("lane close failed")
+
+
 async def _unstarted_active_consumer_probe(started: asyncio.Event) -> None:
     """模拟尚未进入 worker event consume body 的 active task。
 
@@ -3352,6 +3376,32 @@ async def test_scheduler_close_cancelled_mid_cleanup_can_retry_and_finish(
         )
         with pytest.raises(RuntimeLaneClosedError):
             await scheduler._lane_controller.acquire(_LANE_NAME, timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_close_marks_cleanup_done_when_cleanup_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close cleanup 抛普通异常时标记完成且透传原异常。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        failing_close = _FailingLaneClose()
+        monkeypatch.setattr(scheduler._lane_controller, "close", failing_close)
+
+        with pytest.raises(RuntimeError, match="lane close failed"):
+            await scheduler.close()
+
+        assert scheduler._closed is True
+        assert scheduler._close_cleanup_done is True
+        assert failing_close.calls == 1
 
 
 @pytest.mark.asyncio
