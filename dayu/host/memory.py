@@ -81,7 +81,6 @@ _PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
 _PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
 _PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
 _PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
-_PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_ORDINAL = "ordinal"
 _PAYLOAD_FIELD_ANSWER_SOURCE_LABELS = "answer_source_labels"
 _PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
@@ -193,6 +192,7 @@ class MemoryRepairReason(StrEnum):
     SNAPSHOT_MISSING = "snapshot_missing"
     SNAPSHOT_DAMAGED = "snapshot_damaged"
     SNAPSHOT_LAG_OVER_THRESHOLD = "snapshot_lag_over_threshold"
+    INLINE_DELTA_REPAIR_VIEW_MISSING = "inline_delta_repair_view_missing"
     SNAPSHOT_AHEAD_OF_REQUIRED = "snapshot_ahead_of_required"
 
 

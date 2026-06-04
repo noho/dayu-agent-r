@@ -1068,6 +1068,43 @@ class _PersistentLagRepairRunInputBuilder:
         )
 
 
+class _InlineRepairViewMissingRunInputBuilder:
+    """build 时抛出 inline repair view 缺失 repair。"""
+
+    def __init__(self) -> None:
+        """初始化调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+
+    def build(self, snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
+        """构造测试 Engine request，模拟 compact inline repair view 缺失。
+
+        :param snapshot: dispatch snapshot。
+        :returns: 不会返回。
+        :raises MemoryProjectionRepairRequired: 始终抛出 view 缺失 repair。
+        """
+
+        self.calls += 1
+        policy = default_memory_projection_policy()
+        raise MemoryProjectionRepairRequired(
+            MemoryRepairRequest(
+                session_id=snapshot.session_id,
+                reason=MemoryRepairReason.INLINE_DELTA_REPAIR_VIEW_MISSING,
+                required_event_sequence=20,
+                observed_cursor=MemorySnapshotCursor(
+                    consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                    checkpoint_event_sequence=18,
+                    checkpoint_event_id="event-18",
+                    session_id=snapshot.session_id,
+                ),
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+
 class _SnapshotEventHandle(_FakeHandle):
     """按 dispatch snapshot 生成单个 EngineEvent 的 handle。"""
 
@@ -1872,6 +1909,71 @@ async def test_dispatch_lag_repair_rebuild_retry_does_not_fail_run(
             assert factory.created == 1
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
             assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_repair_view_missing_does_not_rebuild_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """inline repair view 缺失不得触发大滞后 rebuild retry。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
+    builder = _InlineRepairViewMissingRunInputBuilder()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
+
+        def _noop_catch_up(record: PendingDispatchRecord) -> None:
+            """跳过 dispatch 预构建 catch-up，让 builder 暴露 repair reason。
+
+            :param record: pending dispatch 摘要。
+            :returns: ``None``。
+            """
+
+            del record
+
+        def _fake_builder_for_dispatch(
+            *,
+            snapshot: AttemptDispatchSnapshot,
+            policy_snapshot: PolicySnapshot,
+            selected_business_tool_names: frozenset[str] | None,
+        ) -> _InlineRepairViewMissingRunInputBuilder:
+            """返回会抛 view 缺失 repair 的测试 builder。
+
+            :param snapshot: dispatch snapshot。
+            :param policy_snapshot: 冻结 policy snapshot。
+            :param selected_business_tool_names: 冻结业务工具名。
+            :returns: 测试 builder。
+            """
+
+            del snapshot, policy_snapshot, selected_business_tool_names
+            return builder
+
+        monkeypatch.setattr(
+            scheduler,
+            "_catch_up_memory_projection_before_worker",
+            _noop_catch_up,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_input_builder_for_dispatch",
+            _fake_builder_for_dispatch,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            assert result.timed_out == 1
+            assert builder.calls == 1
+            assert factory.created == 0
+            assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
         finally:
             await scheduler.close()
 

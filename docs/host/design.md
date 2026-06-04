@@ -2754,6 +2754,7 @@ ConversationMemorySnapshotVNext
   diagnostics: MemoryProjectionDiagnostics
 
 TraceMemoryView
+  selected_recent_window: list[SelectedRecentWindowItem]
   reference_continuity_items: list[ReferenceContinuityItem]
 
 EvidenceFactMemoryView
@@ -2786,7 +2787,7 @@ Snapshot 与 projection checkpoint 必须在同一 durable store transaction 提
 
 ### 24.5 五类 Session Semantic Memory
 
-Trace Memory 负责对话连续性，不负责事实证明。数据来源包括 `USER_INPUT_ACCEPTED`、`RUN_SUCCEEDED.final_answer` 和用户可见 Run 状态。Reference continuity item 是 Trace Memory 下的受限 item type，用于保存 compact 后仍需解析代词、序号、“刚才那个”等局部承接的最小上下文；它不是独立 memory layer，不是 fact、summary、answer anchor 或 forward intent。
+Trace Memory 负责对话连续性，不负责事实证明。数据来源包括 `USER_INPUT_ACCEPTED`、`RUN_SUCCEEDED.final_answer` 和用户可见 Run 状态。TraceMemoryView 当前字段为 selected recent window 与 reference continuity items；reference continuity item 用于保存 compact 后仍需解析代词、序号、“刚才那个”等局部承接的最小上下文，不是 fact、summary、answer anchor 或 forward intent。
 
 Evidence / Fact Memory 负责工具证据与基于证据的 claim。`TOOL_RESULT_ACCEPTED` 通过 Host accept barrier 后保存 accepted evidence envelope、payload / artifact refs 与 digest；LLM-facing evidence material 只包含可读 tool、query、response、source text 与 prompt-local opaque label。`evidence_backed_facts` 只来自 accepted `CONTEXT_COMPACTED` 中通过 Host accept barrier 的 fact candidates，或后续明确设计的非 compact producer。这里的 fact 表示 Host-accepted claim 绑定到 accepted evidence，不表示 Host 证明现实世界 truth。
 

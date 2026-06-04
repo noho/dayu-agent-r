@@ -89,6 +89,31 @@ dayu/config/
 - `tool_duplicate_governance_policy`：配置 attempt-scoped 重复工具调用治理，包含默认 duplicate decision、按工具名覆盖的 decision、require-justification 参数名映射，以及治理消息文本。
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
 
+`memory_projection_policy` 当前字段为：
+
+| 字段 | 含义 |
+|---|---|
+| `context_window_size` | effective model context window，由 execution profile 显式配置并装配到 Host policy。 |
+| `selected_recent_window_item_cap` | selected recent window 的 item 上限。 |
+| `selected_recent_window_char_cap` | selected recent window 的字符上限。 |
+| `selected_recent_window_turn_floor` | selected recent window 必须保留的近轮下限。 |
+| `fallback_selected_recent_window_item_cap` | fallback selected recent window 的 item 上限，必须覆盖近轮 floor 且不超过普通 selected recent window 上限。 |
+| `fallback_selected_recent_window_char_cap` | fallback selected recent window 的字符上限，不得超过普通 selected recent window 字符上限。 |
+| `evidence_fact_item_cap` | evidence-backed fact 的 item 上限。 |
+| `evidence_fact_char_cap` | evidence-backed fact 的字符上限。 |
+| `evidence_fact_floor` | evidence-backed fact 的保底数量。 |
+| `session_summary_char_cap` | session summary 的字符上限。 |
+| `answer_anchor_item_cap` | answer anchor 的 item 上限。 |
+| `answer_anchor_char_cap` | answer anchor 的字符上限。 |
+| `forward_intent_item_cap` | forward intent 的 item 上限。 |
+| `forward_intent_char_cap` | forward intent 的字符上限。 |
+| `reference_continuity_item_cap` | reference continuity item 上限。 |
+| `reference_continuity_char_cap` | reference continuity 字符上限。 |
+| `reference_continuity_item_floor` | reference continuity item 保底数量，包内默认可为 `0`。 |
+| `max_lag_events_for_inline_delta` | 允许 inline delta repair 覆盖的 snapshot lag 事件数。 |
+| `max_delta_repair_events` | 单次 delta repair 可读取的最大事件数。 |
+| `policy_ref` | memory projection policy 的稳定配置引用。 |
+
 `tool_duplicate_governance_policy.default_duplicate_decision` 与 `decisions_by_tool_name` 只允许 `allow`、`reuse`、`hint`、`require_justification`、`hard_stop`。`messages` 是 duplicate governance 返回给模型和诊断的文本，workspace overlay 可以按 profile 覆盖；这些文本不是 scene prompt asset，不放在 `prompts/` 目录。默认 messages 只使用模型可执行、人工可读的外部语义，不要求模型理解 Host、ToolRuntime、Attempt 等内部实现概念。
 
 包内默认 `default_duplicate_decision` 为 `hint`：同一推理步骤内重复请求相同工具证据时，默认返回行为提示，让模型优先使用上一次工具结果，只有在主体、期间、指标或证据范围不同的情况下才重新调用工具。

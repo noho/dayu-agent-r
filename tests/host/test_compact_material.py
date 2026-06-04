@@ -29,16 +29,21 @@ from dayu.host.compaction import (
 )
 from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.memory import (
+    AnswerAnchor,
+    AnswerAnchorChild,
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
     EvidenceFactMemoryView,
+    ForwardIntent,
     ForwardIntentMemoryView,
     MemoryEvidenceBackedFactKind,
     EvidenceBackedFactView,
     MemoryIncludedReason,
+    MemoryRepairReason,
     MemoryProjectionPolicy,
     MemoryProducerKind,
     MemoryProvenanceRef,
+    ReferenceContinuityItem,
     MemorySizeUnits,
     MemorySnapshotCursor,
     AnswerAnchorMemoryView,
@@ -419,14 +424,12 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
     )
 
 
-def test_conversation_compact_input_vnext_previous_view_only_has_fact_blocks() -> None:
-    """vNext previous view 只从旧 stable input 接收 evidence-backed fact block。"""
+def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> None:
+    """vNext previous view 必须映射五类 stable memory blocks。"""
 
-    snapshot = _snapshot_with_goal_and_fact(
-        snapshot_id="snapshot-fact-only",
+    snapshot = _snapshot_with_stable_blocks(
+        snapshot_id="snapshot-stable-blocks",
         checkpoint_event_sequence=2,
-        current_goal="do not copy this goal into previous view",
-        claim_text="Revenue increased year over year",
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.PROACTIVE,
@@ -448,6 +451,7 @@ def test_conversation_compact_input_vnext_previous_view_only_has_fact_blocks() -
 
     previous_view = vnext_input.previous_compacted_view
     assert previous_view is not None
+    assert previous_view.session_summary == "summary text"
     assert tuple(
         item.claim_text
         for item in previous_view.evidence_backed_facts
@@ -455,10 +459,54 @@ def test_conversation_compact_input_vnext_previous_view_only_has_fact_blocks() -
         "fact=claim_text=Revenue increased year over year; "
         "evidence_refs=evidence:accepted; evidence_kind=derived_from_evidence",
     )
-    assert previous_view.session_summary is None
-    assert previous_view.answer_anchors == ()
-    assert previous_view.forward_intents == ()
-    assert previous_view.reference_continuity_items == ()
+    assert tuple(
+        item.anchor_title for item in previous_view.answer_anchors
+    ) == ("answer title",)
+    assert tuple(
+        item.anchor_items[0].display_text
+        for item in previous_view.answer_anchors
+    ) == ("answer title",)
+    assert tuple(item.text for item in previous_view.forward_intents) == (
+        "follow up",
+    )
+    assert tuple(item.intent_type.value for item in previous_view.forward_intents) == (
+        "next_step_note",
+    )
+    assert tuple(item.status.value for item in previous_view.forward_intents) == (
+        "open",
+    )
+    assert tuple(item.text for item in previous_view.reference_continuity_items) == (
+        "second factor",
+    )
+    assert tuple(
+        item.reason.value for item in previous_view.reference_continuity_items
+    ) == ("local_reference",)
+
+
+def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> None:
+    """vNext trace material 必须包含用户可见 Run 状态。"""
+
+    pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="current input",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-state",
+                text="run is waiting for user confirmation",
+                kind=CompactMaterialBlockKind.USER_VISIBLE_RUN_STATE,
+            ),
+        ),
+        evidence_materials=(),
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    assert tuple(item.text for item in vnext_input.trace_material) == (
+        "run is waiting for user confirmation",
+    )
+    assert tuple(item.trace_kind.value for item in vnext_input.trace_material) == (
+        "user_visible_run_state",
+    )
 
 
 def test_conversation_compact_input_vnext_current_anchor_not_citable() -> None:
@@ -517,6 +565,26 @@ def test_snapshot_cursor_lag_requires_catchup_or_inline_delta() -> None:
     assert exc_info.value.repair_request.reason.value == "snapshot_lag_over_threshold"
     assert result.snapshot.cursor.checkpoint_event_sequence == 4
     assert result.inline_delta_repair_view is not None
+
+
+def test_snapshot_cursor_missing_inline_delta_view_has_accurate_reason() -> None:
+    """小滞后但缺少 inline repair view 时不得伪装成大滞后。"""
+
+    lagged = _empty_snapshot("snapshot-lagged", checkpoint_event_sequence=2)
+
+    with pytest.raises(CompactMemorySnapshotRepairRequired) as exc_info:
+        check_compact_memory_snapshot_cursor(
+            session_id=_SESSION_ID,
+            required_event_sequence=4,
+            policy=_policy(max_lag_events_for_inline_delta=2),
+            snapshot=lagged,
+            inline_delta_repair_view=None,
+        )
+
+    assert (
+        exc_info.value.repair_request.reason
+        is MemoryRepairReason.INLINE_DELTA_REPAIR_VIEW_MISSING
+    )
 
 
 def test_snapshot_cursor_inline_delta_uses_inline_lag_threshold_only() -> None:
@@ -894,6 +962,85 @@ def _snapshot_with_goal_and_fact(
             ),
             ),
             recent_evidence_items=(),
+        ),
+        snapshot_digest="pending",
+    )
+    return replace(
+        snapshot_without_digest,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def _snapshot_with_stable_blocks(
+    *, snapshot_id: str, checkpoint_event_sequence: int
+) -> ConversationMemorySnapshotVNext:
+    """构造包含五类 stable memory block 的 snapshot。
+
+    :param snapshot_id: snapshot id。
+    :param checkpoint_event_sequence: cursor sequence。
+    :returns: ConversationMemorySnapshotVNext。
+    """
+
+    base = _snapshot_with_goal_and_fact(
+        snapshot_id=snapshot_id,
+        checkpoint_event_sequence=checkpoint_event_sequence,
+        current_goal="unused",
+        claim_text="Revenue increased year over year",
+    )
+    snapshot_without_digest = replace(
+        base,
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text="summary text",
+            source_refs=("event:summary",),
+            event_id="event-summary",
+            event_sequence=checkpoint_event_sequence,
+            size_units=MemorySizeUnits(12),
+        ),
+        answer_anchor_memory=AnswerAnchorMemoryView(
+            anchors=(
+                AnswerAnchor(
+                    item_id="memory-item:answer-anchor",
+                    anchor_title="answer title",
+                    anchor_items=(
+                        AnswerAnchorChild(
+                            display_text="first point",
+                            ordinal=1,
+                        ),
+                    ),
+                    source_refs=("event:answer",),
+                    event_id="event-answer",
+                    event_sequence=checkpoint_event_sequence,
+                    size_units=MemorySizeUnits(12),
+                ),
+            )
+        ),
+        forward_intent_memory=ForwardIntentMemoryView(
+            intents=(
+                ForwardIntent(
+                    item_id="memory-item:forward-intent",
+                    intent_type="next_step_note",
+                    text="follow up",
+                    status="open",
+                    source_refs=("event:intent",),
+                    event_id="event-intent",
+                    event_sequence=checkpoint_event_sequence,
+                    size_units=MemorySizeUnits(9),
+                ),
+            )
+        ),
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(),
+            reference_continuity_items=(
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity",
+                    text="second factor",
+                    reason="local_reference",
+                    source_refs=("event:reference",),
+                    event_id="event-reference",
+                    event_sequence=checkpoint_event_sequence,
+                    size_units=MemorySizeUnits(13),
+                ),
+            ),
         ),
         snapshot_digest="pending",
     )
