@@ -238,9 +238,11 @@ allowed files/modules：
 - `dayu/host/context_events.py`，仅当 projection event reader 需要 vNext payload type
 - `dayu/host/compact_material.py`，仅限 previous compacted view、selected recent window、ordinary material 与 vNext snapshot 消费
 - `dayu/host/compaction.py`，仅限 `CompactMaterialPack`、`CompactMaterialBlockKind`、material JSON / LLM JSON 与 vNext material section contract 迁移
+- `dayu/host/context_governance.py`，仅限 compact quality checker 对 vNext `CompactMaterialPack` sections 与删除旧 `CompactMaterialBlockKind` 后的读取迁移；不得保留旧 block kind alias 或 material field wrapper
 - `dayu/host/run_input.py`
 - `dayu/host/context_fallback.py`
 - `dayu/host/dispatch.py`，仅限 memory snapshot precondition、projection catch-up、fallback view 与 RunInputBuilder 参数迁移
+- `dayu/host/engine_ingest.py`，仅限 reactive compaction pending request 的 recent-window floor 字段迁移，从旧 `recent_raw_turns_floor` 改为 vNext `selected_recent_window_turn_floor` 或本 slice 明确的新字段；不得恢复旧字段 alias
 - `dayu/service/host_assembly.py`，仅限把 runtime config memory projection policy 映射为 vNext `MemoryProjectionPolicy`
 - `dayu/runtime/config_loader.py`，仅限 `execution_profiles.json.memory_projection_policy` typed config schema / validation 迁移
 - `dayu/config/execution_profiles.json`，仅限 packaged `memory_projection_policy` 字段迁移为 vNext 清单
@@ -256,6 +258,7 @@ allowed files/modules：
 - `tests/host/test_run_input_builder.py`
 - `tests/host/test_dispatch_scheduler.py`
 - `tests/host/test_recovery_dispatch.py`
+- `tests/host/test_engine_ingest_mapping.py`，仅限 reactive compaction pending policy field 迁移
 - `tests/host/test_admission_queue.py`，仅限旧 snapshot / policy helper 迁移
 - `tests/host/test_toolruntime_accept_barrier.py`，仅限旧 snapshot / policy helper 迁移
 - `tests/host/test_resolve_wait_command.py`，仅限旧 snapshot / policy helper 迁移
@@ -289,6 +292,8 @@ allowed files/modules：
 - accepted compacted view：渲染五类 memory section + selected recent window after compact boundary + current input。
 - compact failed fallback：只渲染 fallback selected recent window 和 current input，不渲染 accepted compacted view、高阶 memory section、失败 proposal、fallback diagnostic 或 Host internal state。
 - dispatch memory precondition 只能检查 vNext snapshot cursor、lag、diagnostics 与 vNext evidence/fact memory；不得读取旧 `snapshot.evidence_backed_facts` 顶层字段。
+- reactive compaction pending request 的 recent-window floor 只能读取 vNext policy 字段；若 implementation 删除旧 `recent_raw_turns_floor`，`engine_ingest.py` 必须在同 slice 同步迁移，不得通过旧 policy alias 维持编译。
+- compact quality checker 必须读取 vNext `CompactMaterialPack` sections；删除旧 `CompactMaterialBlockKind.OPEN_QUESTION` / `WORKING_ASSUMPTION` 后，`context_governance.py` 不得通过旧 block kind alias、旧 `stable_input` / `history_input` field wrapper 或 compatibility facade 继续读取旧 material shape。
 - 第一阶段不做 runtime token estimator 逐 section 裁剪；section 在 projection / assembly 前由 cap / floor bounded。
 - memory snapshot lag 仍触发 catch-up / rebuild / repair path；不得把 Run 推入 `RECOVERING`。
 - `CompactMaterialPack` 顶层字段迁移规则如下，旧字段不得保留 alias、wrapper 或 compatibility facade：
@@ -340,7 +345,7 @@ allowed files/modules：
 source .venv/bin/activate
 pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py tests/host/test_projection_checkpoint.py tests/host/test_durable_concurrency_matrix.py tests/host/test_memory_repair.py -q
 pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py -q
-pytest tests/host/test_compact_material.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py -q
+pytest tests/host/test_compact_material.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py -q
 pytest tests/host/test_admission_queue.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py -q
 pytest tests/service/test_host_assembly.py tests/runtime/test_config_loader.py -q
 pytest tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
@@ -372,6 +377,8 @@ python -m pyright dayu/ tests/ utils/
 - final messages 能从 vNext durable facts、snapshot、post-compact delta 和 current input 重建。
 - empty compacted view、non-empty compacted view、post-compact delta、compact boundary、fallback no high-order memory 均由 RunInputBuilder tests 覆盖。
 - fallback 路径只有 bounded recent window 和 current input，且不会写 `CONTEXT_COMPACTED`、compact artifact 或 memory snapshot。
+- reactive compaction pending request policy field 已迁移到 vNext selected recent-window floor，并由 `tests/host/test_engine_ingest_mapping.py` 覆盖；测试不得依赖旧 `recent_raw_turns_floor` alias。
+- context governance / compact material contract 没有独立 `tests/host/test_context_governance.py` 必跑文件；vNext compact quality checker 与 material section contract 的直接断言由 `tests/host/test_compaction_contract.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_llm_compaction.py` 覆盖。
 - Runtime config loader 与 Service assembly 只接受 / 映射 vNext `MemoryProjectionPolicy` 字段；旧 config field fail fast。
 - pyright 全量通过，且 `run_input.py`、`compact_material.py`、`dispatch.py`、`service/host_assembly.py`、`runtime/config_loader.py` 与受影响 tests 不再引用旧 snapshot / policy fields。
 
@@ -450,7 +457,7 @@ Implementation gate 可以按 slice 修改：
 - `dayu/host/compact_material.py`
 - `dayu/host/llm_compaction.py`
 - `dayu/host/dispatch.py`
-- `dayu/host/engine_ingest.py`，仅限 WU-CM-01 Slice B reactive accepted compaction event / artifact closeout；非 closeout 旧 import / annotation 可按仍使用情况保留
+- `dayu/host/engine_ingest.py`，仅限 WU-CM-01 Slice B reactive accepted compaction event / artifact closeout，或 WU-CM-01 Slice C reactive compaction pending request recent-window floor 字段迁移；非 closeout 旧 import / annotation 可按仍使用情况保留
 - `dayu/host/durable/memory.py`
 - `dayu/host/context_events.py`
 - `dayu/host/compaction_operation.py`
@@ -488,14 +495,14 @@ Implementation gate 可以按 slice 修改：
 - `pytest tests/host/test_context_compact_events.py -q`
 - `pytest tests/host/test_compact_material.py -q`
 - `pytest tests/host/test_llm_compaction.py -q`
-- `pytest tests/host/test_context_governance.py -q`，若该文件不存在则以 `tests/host/test_compaction_contract.py` 和 `tests/host/test_compaction_operation.py` 覆盖 quality checker。
+- context governance / compact material contract 没有独立 `tests/host/test_context_governance.py` 必跑文件；以 `tests/host/test_compaction_contract.py`、`tests/host/test_compaction_operation.py` 和 `tests/host/test_llm_compaction.py` 覆盖 quality checker 与 vNext material section contract。
 
 operation / dispatch / recovery：
 
 - `pytest tests/host/test_compaction_operation.py -q`
 - `pytest tests/host/test_dispatch_scheduler.py -q`
 - `pytest tests/host/test_recovery_dispatch.py -q`
-- `pytest tests/host/test_engine_ingest_mapping.py -q`，Slice B 仅覆盖 reactive compaction closeout / fake compactor vNext 迁移。
+- `pytest tests/host/test_engine_ingest_mapping.py -q`，Slice B 覆盖 reactive compaction closeout / fake compactor vNext 迁移；Slice C 仅覆盖 reactive compaction pending policy field 迁移。
 - `pytest tests/host/test_run_input_builder.py -q`
 - `pytest tests/host/test_context_budget.py -q`
 - `pytest tests/host/test_context_policy.py -q`
