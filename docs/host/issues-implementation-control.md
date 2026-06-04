@@ -141,14 +141,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | implementation |
-| implementation status | implementation-ready |
+| implementation status | slice-a-ready |
 | active work unit | WU-CM-01 |
 | default next work unit | WU-CM-01 |
-| next entry point | WU-CM-01 implementation gate |
+| next entry point | WU-CM-01 Slice A implementation gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | docs/host/wu-cm-01-conversation-memory-plan.md |
 | implementation commits | WU-CM-01 accepted plan commit 14d28009; WU-ENG-02 merged via PR 114 as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
-| review artifacts | docs/reviews/wu-cm-01-plan-review-mimo.md; docs/reviews/wu-cm-01-plan-review-ds.md; docs/reviews/wu-cm-01-plan-review-controller-adjudication.md; docs/reviews/wu-cm-01-plan-fix-codex.md; docs/reviews/wu-cm-01-plan-rereview-mimo.md; docs/reviews/wu-cm-01-plan-rereview-ds.md; docs/reviews/wu-cm-01-plan-rereview-controller-adjudication.md |
+| review artifacts | docs/reviews/wu-cm-01-plan-review-mimo.md; docs/reviews/wu-cm-01-plan-review-ds.md; docs/reviews/wu-cm-01-plan-review-controller-adjudication.md; docs/reviews/wu-cm-01-plan-fix-codex.md; docs/reviews/wu-cm-01-plan-rereview-mimo.md; docs/reviews/wu-cm-01-plan-rereview-ds.md; docs/reviews/wu-cm-01-plan-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-implementation-codex.md; docs/reviews/wu-cm-01-plan-reslice-fix-codex.md; docs/reviews/wu-cm-01-plan-reslice-rereview-mimo.md; docs/reviews/wu-cm-01-plan-reslice-rereview-ds.md; docs/reviews/wu-cm-01-plan-reslice-rereview-controller-adjudication.md |
 | aggregate review artifacts | WU-CM-01 pending |
 | draft PR status | WU-ENG-02 PR 114 merged at 2026-06-03 09:33:38 UTC as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |
@@ -372,7 +372,7 @@ GitHub Issue #80 是 Conversation Memory 的评测标准真源。#80 的具体 e
 
 WU-CM-01 的实施设计真源为 `docs/host/design.md` 的 `24. Conversation Memory` 与 `25. Context Governance`。plan、implementation、review、fix 与 re-review 不得从讨论稿、旧代码或 GitHub Issue body 重新解释 compact I/O、memory snapshot、prompt assembly、compact repair / fallback 或 context governance 边界；若发现第 24 / 25 章仍不足以生成 code-generation-ready plan，必须先回到 Host 设计真源修正，再更新本文档。
 
-Plan gate 已完成，artifact 为 `docs/host/wu-cm-01-conversation-memory-plan.md`。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings`；Controller 接受 6 组 plan fix findings，裁决 artifact 为 `docs/reviews/wu-cm-01-plan-review-controller-adjudication.md`。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-cm-01-plan-fix-codex.md`；accepted fix scope 是补齐 issue-80 评测维度映射、旧 continuity / compact candidate / material section / quality checker 迁移规则，以及 slice 可编译性验证边界。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，Controller 裁决 artifact 为 `docs/reviews/wu-cm-01-plan-rereview-controller-adjudication.md`。Accepted plan commit 为 `14d28009`。当前 gate 为 implementation。
+Plan gate 已完成，artifact 为 `docs/host/wu-cm-01-conversation-memory-plan.md`。Plan review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass-with-findings`；Controller 接受 6 组 plan fix findings，裁决 artifact 为 `docs/reviews/wu-cm-01-plan-review-controller-adjudication.md`。Plan fix gate 已完成，artifact 为 `docs/reviews/wu-cm-01-plan-fix-codex.md`；accepted fix scope 是补齐 issue-80 评测维度映射、旧 continuity / compact candidate / material section / quality checker 迁移规则，以及 slice 可编译性验证边界。Plan re-review gate 已完成，AgentMiMo 与 AgentDS 均裁决 `pass`，Controller 裁决 artifact 为 `docs/reviews/wu-cm-01-plan-rereview-controller-adjudication.md`。Accepted plan commit 为 `14d28009`。Implementation gate 预检由 AgentCodex 停止，artifact 为 `docs/reviews/wu-cm-01-implementation-codex.md`；直接证据显示当前 plan 的概念域 Slice 1-5 不是可编译闭环，若直接实施会违反 pyright 硬约束。Plan reslice fix gate 已完成，artifact 为 `docs/reviews/wu-cm-01-plan-reslice-fix-codex.md`。Plan reslice re-review gate 已完成，AgentMiMo 裁决 `pass`，AgentDS 裁决 `pass-with-findings`，Controller 裁决 artifact 为 `docs/reviews/wu-cm-01-plan-reslice-rereview-controller-adjudication.md`。当前 gate 为 Slice A implementation。
 
 ### 目标
 
