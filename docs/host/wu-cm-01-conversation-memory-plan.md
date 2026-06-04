@@ -43,20 +43,20 @@
 
 | 评测维度 / 可断言场景 | 状态 | Slice | 测试入口 / 验证入口 | 说明 |
 |---|---|---:|---|---|
-| empty compacted view | current scope covered | D, E | `tests/host/test_run_input_builder.py`、`tests/host/test_public_open_host_multiturn_smoke.py` | 无 accepted compact 时只渲染 selected recent window 与 current input。 |
-| non-empty compacted view | current scope covered | C, D | `tests/host/test_memory_projection.py`、`tests/host/test_run_input_builder.py` | accepted compact output 物化为五类 memory section 后进入 RunInputBuilder。 |
-| post-compact delta | current scope covered | A, C, D | `tests/host/test_compact_material.py`、`tests/host/test_run_input_builder.py` | latest compact cursor 之后的新 material 继续按 bounded recent window 注入。 |
-| compact boundary | current scope covered | A, B, C, D | `tests/host/test_compact_material.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_run_input_builder.py` | previous compacted view、post-compact delta 与 current input anchor 边界可审计。 |
-| protected recent floor | current scope covered | A, C, D | `tests/host/test_compact_material.py`、`tests/host/test_run_input_builder.py` | policy 提供 floor / cap，保证“刚才”“第二点”等短链路承接。 |
+| empty compacted view | current scope covered | C, D | `tests/host/test_run_input_builder.py`、`tests/host/test_public_open_host_multiturn_smoke.py` | 无 accepted compact 时只渲染 selected recent window 与 current input。 |
+| non-empty compacted view | current scope covered | C | `tests/host/test_memory_projection.py`、`tests/host/test_run_input_builder.py` | accepted compact output 物化为五类 memory section 后进入 RunInputBuilder。 |
+| post-compact delta | current scope covered | A, C | `tests/host/test_compact_material.py`、`tests/host/test_run_input_builder.py` | latest compact cursor 之后的新 material 继续按 bounded recent window 注入。 |
+| compact boundary | current scope covered | A, B, C | `tests/host/test_compact_material.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_run_input_builder.py` | previous compacted view、post-compact delta 与 current input anchor 边界可审计。 |
+| protected recent floor | current scope covered | A, C | `tests/host/test_compact_material.py`、`tests/host/test_run_input_builder.py` | policy 提供 floor / cap，保证“刚才”“第二点”等短链路承接。 |
 | deterministic bounded projection | current scope covered | C | `tests/host/test_memory_projection.py`、`tests/host/test_durable_schema.py` | snapshot 是 EventLog read model，policy digest、cursor 与 item cap 可断言。 |
-| provider context length fallback | current scope covered | B, D | `tests/host/test_dispatch_scheduler.py`、`tests/host/test_recovery_dispatch.py`、`tests/host/test_run_input_builder.py` | proactive / reactive fallback 只构造 deterministic recent-window input，不物化 high-order memory。 |
+| provider context length fallback | current scope covered | B, C | `tests/host/test_dispatch_scheduler.py`、`tests/host/test_recovery_dispatch.py`、`tests/host/test_run_input_builder.py` | proactive / reactive fallback 只构造 deterministic recent-window input，不物化 high-order memory。 |
 | invalid / missing / stale source label | current scope covered | A, B | `tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_compaction_operation.py` | parser 与 accept barrier fail closed；current input anchor label 不可引用。 |
 | schema invalid | current scope covered | A, B | `tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_context_compact_events.py` | strict JSON 与 event payload validator 只接受 vNext schema。 |
 | provenance mismatch | current scope covered | A, B | `tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_compaction_operation.py` | prompt-local label 必须映射回 Host internal provenance，且不能跨 section 使用。 |
 | partial candidate invalid | current scope covered | B | `tests/host/test_compaction_operation.py`、`tests/host/test_context_compact_events.py` | 任一 candidate invalid 时 whole-candidate repair；不得 partial materialize。 |
-| fallback 不生成高阶语义 | current scope covered | B, C, D | `tests/host/test_memory_projection.py`、`tests/host/test_dispatch_scheduler.py`、`tests/host/test_run_input_builder.py` | fallback 不写 `CONTEXT_COMPACTED`、不写 compact artifact、不生成 summary / fact / anchor / intent / reference continuity。 |
-| compact roll-forward | current scope covered | B, C, D, E | `tests/host/test_memory_projection.py`、`tests/host/test_compact_material.py`、`tests/host/test_public_compact_smoke.py` | 第二次及后续 compact 使用 latest accepted compacted view，不重新展开已覆盖旧 raw history。 |
-| 完整 Conversation Memory eval benchmark | deferred-with-owner | E | GitHub Issue #80 / WU-CM-10 | WU-CM-01 提供可断言入口和 smoke，不实现完整 offline benchmark、指标聚合或 eval runner。 |
+| fallback 不生成高阶语义 | current scope covered | B, C | `tests/host/test_memory_projection.py`、`tests/host/test_dispatch_scheduler.py`、`tests/host/test_run_input_builder.py` | fallback 不写 `CONTEXT_COMPACTED`、不写 compact artifact、不生成 summary / fact / anchor / intent / reference continuity。 |
+| compact roll-forward | current scope covered | B, C, D | `tests/host/test_memory_projection.py`、`tests/host/test_compact_material.py`、`tests/host/test_public_compact_smoke.py` | 第二次及后续 compact 使用 latest accepted compacted view，不重新展开已覆盖旧 raw history。 |
+| 完整 Conversation Memory eval benchmark | deferred-with-owner | D | GitHub Issue #80 / WU-CM-10 | WU-CM-01 提供可断言入口和 smoke，不实现完整 offline benchmark、指标聚合或 eval runner。 |
 | cross-session User Profile / dynamic profile eval | deferred-with-owner | - | GitHub Issue #115 / WU-CM-11；GitHub Issue #80 | WU-CM-01 只固定 User Profile 不进入 session Conversation Memory snapshot。 |
 | deep historical recall / semantic search eval | deferred-with-owner | - | GitHub Issue #39；GitHub Issue #80 | 第一阶段不做 prompt-conditioned recall、vector recall、LLM reranker 或 recall tool。 |
 | LongMemEval / PersonaMem 原始任务集适配 | explicit non-goal | - | 无 | Dayu eval 以财报分析、证据链、answer anchor、context governance 为真源，不直接绑定外部通用聊天任务集。 |
@@ -73,7 +73,9 @@
 - `dayu/host/context_governance.py` 的 quality checker 仍围绕 pinned patch、minimum preserve、open questions retained 和 preservation evidence 运行，缺少 vNext source-label section allowlist、answer anchor、forward intent、reference continuity item 校验。
 - `dayu/host/compact_material.py` 的 `_stable_blocks_from_snapshot()` 从 snapshot 构造 goals、facts、questions_assumptions 三类 stable blocks，并渲染 `working_assumption=`；这与第 24.6 章固定 prompt assembly section 不一致。
 - `dayu/host/run_input.py` 的 memory render header 仍是 `Memory user goals and constraints`、`Memory confirmed subjects and methodology`、`Memory evidence-backed facts`、`Memory open questions and working assumptions`、`Memory minimum preserve continuity`、`Memory episode summaries`。
-- `tests/host/test_memory_projection.py`、`tests/host/test_compaction_contract.py`、`tests/host/test_compact_material.py`、`tests/host/test_run_input_builder.py`、`tests/README.md` 仍断言旧 `working_assumptions`、stable layer、history pool、minimum preserve 等语义，需要随实现边界迁移。
+- `dayu/host/dispatch.py` 的 dispatch memory precondition 路径仍读取旧 `snapshot.evidence_backed_facts`。
+- `dayu/service/host_assembly.py` 与 `dayu/runtime/config_loader.py` 仍按旧 `MemoryProjectionPolicy(max_evidence_backed_facts, max_working_assumptions, ...)` shape 装配和校验 policy。
+- `tests/host/test_memory_projection.py`、`tests/host/test_compaction_contract.py`、`tests/host/test_compact_material.py`、`tests/host/test_run_input_builder.py`、`tests/service/test_host_assembly.py`、`tests/runtime/test_config_loader.py`、`tests/host/test_admission_queue.py`、`tests/host/test_toolruntime_accept_barrier.py`、`tests/host/test_resolve_wait_command.py`、`tests/README.md` 仍构造或断言旧 `ConversationMemorySnapshot` / `MemoryProjectionPolicy` shape，需要随实现边界迁移。
 
 ## Implementation Slices
 
@@ -88,6 +90,8 @@ WU-CM-01 的 implementation slices 必须是可编译、可验证、pyright-clea
 - 如果某个 slice 发现 vNext contract 需要改变，停止当前 slice，回到 design source / plan 修正；禁止在实现中发明局部兼容分支。
 
 这些 slice 不再按“类型、持久化、parser、operation、prompt”概念域单独拆分，而按每条可运行路径闭合。目标是让任一 accepted slice commit 都能被 review、pytest 与 pyright 独立验证。
+
+Slice C blocker 裁决后，本 plan 选择扩大 Slice C 为 pyright-clean vertical slice，而不是拆成“先引 vNext memory contract、后迁移 consumer”的双轨方案。原因是旧 `ConversationMemorySnapshot` / `MemoryProjectionPolicy` 已经同时被 memory durable/projection、compact material、RunInputBuilder、dispatch precondition、Service assembly、Runtime config loader 与测试消费；如果只在局部引入 vNext contract 而不迁移直接 consumers，后续 slice 仍会长时间保留旧生产 shape，容易诱导 compatibility wrapper、旧字段 alias 或旧 snapshot -> vNext bridge helper。扩大 Slice C 后，旧 snapshot/policy 的删除、所有直接 consumer 迁移、配置 schema 迁移和测试更新在同一个 pyright-clean commit 内闭合。
 
 ### Slice A - Compact Contract Closure
 
@@ -181,15 +185,15 @@ allowed files/modules：
 - retry budget 耗尽只写最终 `CONTEXT_COMPACTION_FAILED`；不得写 `CONTEXT_COMPACTED`，不得让 memory projection 消费 rejected candidate。
 - fallback 不是 compact success：不写 compact artifact，不 materialize memory snapshot，不生成 summary / fact / anchor / intent / reference continuity；proactive fallback 不让 Run 进入 `RECOVERING`，reactive fallback 使用新 Attempt / execution id 且不得写 `RUN_LOST`。
 - proactive closeout 只验证 operation 编排、accepted / failed event payload、artifact descriptor 与 fallback 行为；不得要求 accepted compacted event 已被 subsequent RunInputBuilder 消费。
-- Slice B 可以调整 `test_multi_turn_proactive_compact_feeds_subsequent_run_input`，使其只断言 proactive operation / event closeout；subsequent RunInputBuilder consumption、memory section 渲染和 compacted view 被后续 Run 消费的断言归 Slice D。
+- Slice B 可以调整 `test_multi_turn_proactive_compact_feeds_subsequent_run_input`，使其只断言 proactive operation / event closeout；subsequent RunInputBuilder consumption、memory section 渲染和 compacted view 被后续 Run 消费的断言归 Slice C。
 - reactive accepted closeout 在 `engine_ingest.py` 内只允许把 accepted vNext operation result 写成 vNext compact artifact 与 `CONTEXT_COMPACTED` payload，并保持同一 reactive recovery attempt / execution closeout 语义；不得借此新增 memory projection、memory durable write、old candidate adapter 或 RunInputBuilder consumption。
 - reactive `engine_ingest.py` 不得继续使用旧 `CompactArtifactWriteRequest` 写 vNext artifact；vNext artifact JSON / payload ref / descriptor metadata helper 应抽到 allowed shared module，优先 `dayu/host/compact_payload.py`，并由 `dispatch.py` 与 `engine_ingest.py` 复用。
-- subsequent run input、memory projection、durable snapshot materialization、post-compact delta 和 RunInputBuilder 对 vNext payload 的消费断言属于 Slice C / D。Slice B 测试不得通过旧 payload compatibility fields、projection shim、old candidate adapter 或额外 payload 字段让这些断言提前通过。
+- subsequent run input、memory projection、durable snapshot materialization、post-compact delta 和 RunInputBuilder 对 vNext payload 的消费断言属于 Slice C。Slice B 测试不得通过旧 payload compatibility fields、projection shim、old candidate adapter 或额外 payload 字段让这些断言提前通过。
 
 旧路径保留 / 删除边界：
 
 - 一旦 operation 切换到 vNext，必须删除或迁移 operation path 中旧 `pinned_state_patch_candidate`、`minimum_preserve_item_candidates`、`preserved_*`、`preservation_evidence`、旧 candidate merge 与旧 payload validator；不得保留旧字段作为事件兼容入口。
-- 尚未切换的 memory snapshot / durable item / RunInputBuilder 旧字段可原样存在到 Slice C / D；Slice B 不得新增 payload wrapper 或 projection shim 来把 vNext compact event 写回旧 memory shape。
+- 尚未切换的 memory snapshot / durable item / RunInputBuilder 旧字段可原样存在到 Slice C；Slice B 不得新增 payload wrapper 或 projection shim 来把 vNext compact event 写回旧 memory shape。
 - fallback recent-window view 只能影响本次 dispatch 输入选择；不得写 memory snapshot 或旧 compact artifact。
 - Slice B 不得新增旧 candidate 到 vNext / vNext 到旧 candidate 的 adapter，不得在 `CONTEXT_COMPACTED` payload 中保留 `evidence_backed_fact_candidates`、`pinned_state_patch_candidate`、`minimum_preserve_item_candidates`、`preserved_*` 或其它旧字段来喂给未迁移 projection / RunInputBuilder。
 - `engine_ingest.py` 内非 reactive closeout 路径仍使用的旧 import / annotation 可原样保留；本 slice 的清理只限 reactive closeout 迁移后已经 unused 的 import / annotation，不得修改非 closeout 函数的类型签名或实现。
@@ -218,12 +222,12 @@ python -m pyright dayu/ tests/ utils/
 
 residual risks：
 
-- vNext compact event 已提交但 memory durable/projection 尚未消费；分类为 covered by later approved slice，owner 是 Slice C。
-- ordinary prompt assembly 与 public smoke 尚未完成；分类为 covered by later approved slice，owner 是 Slice D / E。
+- vNext compact event 已提交但 memory durable/projection、RunInputBuilder 和 config assembly 尚未消费；分类为 covered by later approved slice，owner 是 Slice C。
+- public smoke 与 README 尚未完成；分类为 covered by later approved slice，owner 是 Slice D。
 
-### Slice C - Memory Durable And Projection Closure
+### Slice C - Memory Contract, Projection, Assembly And Config Closure
 
-目标：把 `ConversationMemorySnapshot`、durable memory rows、projection catch-up / rebuild 和 memory tests 同步迁移到 vNext，使 accepted vNext compact event 能 materialize 五类 session memory，fallback / rejected compact 不生成高阶 memory。
+目标：把 `ConversationMemorySnapshot`、`MemoryProjectionPolicy`、durable memory rows、projection catch-up / rebuild、compact material previous view、RunInputBuilder prompt assembly、dispatch memory precondition、Service assembly、Runtime config loader 与直接 consumer tests 同步迁移到 vNext。此 slice 必须形成 pyright-clean vertical closure：accepted vNext compact event 能 materialize 五类 session memory，ordinary Run input 能消费 vNext snapshot，fallback / rejected compact 不生成高阶 memory，config/service 装配不再生产旧 policy shape。
 
 allowed files/modules：
 
@@ -232,102 +236,116 @@ allowed files/modules：
 - `dayu/host/memory_repair.py`
 - `dayu/host/compact_payload.py`，仅当 projection payload reader 需要 vNext typed helper
 - `dayu/host/context_events.py`，仅当 projection event reader 需要 vNext payload type
+- `dayu/host/compact_material.py`，仅限 previous compacted view、selected recent window、ordinary material 与 vNext snapshot 消费
+- `dayu/host/run_input.py`
+- `dayu/host/context_fallback.py`
+- `dayu/host/dispatch.py`，仅限 memory snapshot precondition、projection catch-up、fallback view 与 RunInputBuilder 参数迁移
+- `dayu/service/host_assembly.py`，仅限把 runtime config memory projection policy 映射为 vNext `MemoryProjectionPolicy`
+- `dayu/runtime/config_loader.py`，仅限 `execution_profiles.json.memory_projection_policy` typed config schema / validation 迁移
+- `dayu/config/execution_profiles.json`，仅限 packaged `memory_projection_policy` 字段迁移为 vNext 清单
 - `tests/host/test_memory_projection.py`
 - `tests/host/test_durable_schema.py`
 - `tests/host/test_projection_checkpoint.py`
 - `tests/host/test_durable_concurrency_matrix.py`
-- `tests/host/test_memory_repair.py`，若该文件存在或 repair request / snapshot cursor 类型变化
-
-实现边界：
-
-- 新增 / 替换 `ConversationMemorySnapshotVNext`，字段为 `trace_memory`、`evidence_fact_memory`、`session_summary_memory`、`answer_anchor_memory`、`forward_intent_memory`、`diagnostics`。
-- 引入五类 view / item dataclass：`ReferenceContinuityItem`、`EvidenceBackedFact`、`RecentEvidenceReadableItem`、`SessionSummaryMemoryView`、`AnswerAnchor`、`ForwardIntent`。
-- `MemoryProjectionPolicy` 改为 per-semantic bounded policy：summary char cap、evidence fact cap / floor、answer anchor cap、forward intent cap、reference continuity cap / floor、selected recent window cap / floor、inline delta repair limits；policy digest 不含 `max_working_assumptions`、`history_pool_*`、`stable_layer_*`。
-- 按 schema 约束以全新 schema 起库处理；snapshot JSON 只写 vNext fields，旧 JSON key `pinned_state`、`working_assumptions`、`conversation_continuity` 必须 fail closed。
-- hot table `item_kind` 若需要变化，直接迁移为 vNext item kind：`reference_continuity_item`、`evidence_backed_fact`、`recent_evidence_item`、`session_summary`、`answer_anchor`、`forward_intent`。
-- compact 前 projection 只能形成 selected recent window 可读材料，不自动生成 session summary、answer anchor、forward intent 或 evidence-backed facts。
-- accepted `CONTEXT_COMPACTED` 后，projection 从 accepted vNext payload / artifact materialize 五类 memory；invalid / rejected / failed compaction event 不进入 memory projection。
-- accepted evidence 存在但无合法 fact candidate 时只记录 diagnostic，不合成 fallback fact；assistant final answer、用户输入、summary、anchor、reference continuity、User Profile、Forward Intent 都不能升级成 evidence-backed fact。
-- snapshot 与 projection checkpoint 必须同一 durable transaction 提交；checkpoint 不得先于 snapshot。
-
-旧路径保留 / 删除边界：
-
-- 一旦 `memory.py` 和 `durable/memory.py` 切换到 vNext，必须同步迁移其所有 production consumers 和 tests；不得保留 `WorkingAssumptionView`、`PinnedStateView`、`ConversationContinuityKind`、`ConversationContinuityItem`、`ConversationContinuityView` 作为 snapshot 顶层语义或 durable item kind。
-- 全新 schema 删除旧 durable item kind：`raw_user_turn`、`raw_assistant_turn`、`assistant_conclusion`、`episode_summary`、`minimum_preserve_item`、`working_assumption`、`pinned_state`。旧库 row 不做兼容读取；旧语义只在新实现的数据生产规则中迁移到 vNext memory section。
-- `RAW_USER_TURN`、`RAW_ASSISTANT_TURN`、`ASSISTANT_CONCLUSION` 迁移为 Trace Memory selected recent window material，不作为独立 snapshot item 持久化；`EPISODE_SUMMARY` 只能由 accepted `session_summary` roll-forward view 承接；`MINIMUM_PRESERVE_ITEM` 只以 `ReferenceContinuityItem` 形态保留局部承接语义。
-- `MemoryProjectionDiagnostics` 不保留 pinned / working assumption / minimum preserve 专属 reason；可保留或重命名的 reason 只能表达 snapshot missing / damaged / lag、unsupported event、budget limit、inline delta repair、fact candidate invalid / superseded、reference continuity covered 等 vNext 语义。
-
-不得引入：
-
-- 旧库兼容读取、旧字段 fallback codec、旧 item kind alias、compatibility wrapper / facade / re-export。
-- 通过旧 snapshot shape 反向生成 vNext section 的 bridge helper。
-
-测试命令：
-
-```bash
-source .venv/bin/activate
-pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py tests/host/test_projection_checkpoint.py tests/host/test_durable_concurrency_matrix.py -q
-pytest tests/host/test_memory_repair.py -q
-python -m pyright dayu/ tests/ utils/
-```
-
-若 `tests/host/test_memory_repair.py` 不存在，则在 implementation report 中说明，并以 `tests/host/test_memory_projection.py` 中 repair / rebuild cases 覆盖。
-
-退出信号：
-
-- durable store 读写 vNext snapshot 和 vNext items，旧 snapshot key fail closed。
-- projection consumer 能从 EventLog 重建同一 snapshot digest，并断言 checkpoint atomicity。
-- fallback、rejected compact、failed compact 不 materialize summary / fact / anchor / intent / reference continuity。
-- pyright 全量通过，且 memory production consumers 不再引用旧 snapshot fields。
-
-residual risks：
-
-- RunInputBuilder prompt assembly 尚未渲染 vNext snapshot；分类为 covered by later approved slice，owner 是 Slice D。
-- public smoke / README 尚未完成；分类为 covered by later approved slice，owner 是 Slice E。
-
-### Slice D - Prompt And Fallback Closure
-
-目标：把普通 Agent request messages、fallback input view、dispatch 接线和 RunInputBuilder tests 同步迁移到 vNext snapshot / post-compact delta / current input 固定顺序，保证 fallback 只渲染 bounded recent window 与 current input。
-
-allowed files/modules：
-
-- `dayu/host/run_input.py`
-- `dayu/host/compact_material.py`，仅限共享 ordinary material / selected recent window helper
-- `dayu/host/context_fallback.py`
-- `dayu/host/dispatch.py`，仅限调用 RunInputBuilder 所需的 memory / fallback view 参数
+- `tests/host/test_memory_repair.py`
+- `tests/host/test_compact_material.py`
 - `tests/host/test_run_input_builder.py`
 - `tests/host/test_dispatch_scheduler.py`
 - `tests/host/test_recovery_dispatch.py`
+- `tests/host/test_admission_queue.py`，仅限旧 snapshot / policy helper 迁移
+- `tests/host/test_toolruntime_accept_barrier.py`，仅限旧 snapshot / policy helper 迁移
+- `tests/host/test_resolve_wait_command.py`，仅限旧 snapshot / policy helper 迁移
+- `tests/host/test_public_contracts.py`，仅当 public options policy assertions 受 vNext field rename 影响
+- `tests/service/test_host_assembly.py`
+- `tests/runtime/test_config_loader.py`
 - `tests/host/test_public_compact_smoke.py`
 - `tests/host/test_public_open_host_multiturn_smoke.py`
 - `tests/host/test_public_tool_wiring_smoke.py`，仅当 accepted evidence material prompt 行为变化
 
 实现边界：
 
+- 新增 / 替换 `ConversationMemorySnapshotVNext`，字段为 `trace_memory`、`evidence_fact_memory`、`session_summary_memory`、`answer_anchor_memory`、`forward_intent_memory`、`diagnostics`。
+- 引入五类 view / item dataclass：`ReferenceContinuityItem`、`EvidenceBackedFact`、`RecentEvidenceReadableItem`、`SessionSummaryMemoryView`、`AnswerAnchor`、`ForwardIntent`。
+- `MemoryProjectionPolicy` 改为 per-semantic bounded policy：`context_window_size`、selected recent window item / char cap、selected recent window turn floor、fallback selected recent window item / char cap、evidence fact item / char cap / floor、session summary char cap、answer anchor item / char cap、forward intent item / char cap、reference continuity item / char cap / floor、inline delta repair limits 与 `policy_ref`；policy digest 不含 `max_working_assumptions`、`history_pool_*`、`stable_layer_*`。
+- vNext `memory_projection_policy` JSON 字段清单必须直接对齐 design source 第 3 章：`context_window_size`、`selected_recent_window_item_cap`、`selected_recent_window_char_cap`、`selected_recent_window_turn_floor`、`fallback_selected_recent_window_item_cap`、`fallback_selected_recent_window_char_cap`、`evidence_fact_item_cap`、`evidence_fact_char_cap`、`evidence_fact_floor`、`session_summary_char_cap`、`answer_anchor_item_cap`、`answer_anchor_char_cap`、`forward_intent_item_cap`、`forward_intent_char_cap`、`reference_continuity_item_cap`、`reference_continuity_char_cap`、`reference_continuity_item_floor`、`max_lag_events_for_inline_delta`、`max_delta_repair_events`、`policy_ref`。
+- `dayu/runtime/config_loader.py` 的 typed config view 必须按上述完整字段集合读取 `memory_projection_policy`，不接受旧 `max_evidence_backed_facts`、`max_working_assumptions`、`recent_raw_turns_floor`、`history_pool_*`、`stable_layer_*` 字段。
+- packaged config 真源 `dayu/config/execution_profiles.json` 必须在 Slice C implementation 中同步迁移为上述 vNext 字段；`tests/runtime` 与 `tests/service` 中构造 execution profile / memory projection policy 的 config fixtures 必须同步迁移。旧 config 字段必须由 schema validation fail fast，不得提供 alias、默认补齐或旧字段 wrapper。
+- `dayu/service/host_assembly.py` 只做 config typed view 到 Host `MemoryProjectionPolicy` 的显式字段映射；不得根据 model window 或 profile id 隐式选择 policy，不得用 raw dict patch、profile lookup 或 extra payload 兜底。
+- 按 schema 约束以全新 schema 起库处理；snapshot JSON 只写 vNext fields，旧 JSON key `pinned_state`、`working_assumptions`、`conversation_continuity` 必须 fail closed。
+- hot table `item_kind` 若需要变化，直接迁移为 vNext item kind：`reference_continuity_item`、`evidence_backed_fact`、`recent_evidence_item`、`session_summary`、`answer_anchor`、`forward_intent`。
+- compact 前 projection 只能形成 selected recent window 可读材料，不自动生成 session summary、answer anchor、forward intent 或 evidence-backed facts。
+- accepted `CONTEXT_COMPACTED` 后，projection 从 accepted vNext payload / artifact materialize 五类 memory；invalid / rejected / failed compaction event 不进入 memory projection。
+- accepted evidence 存在但无合法 fact candidate 时只记录 diagnostic，不合成 fallback fact；assistant final answer、用户输入、summary、anchor、reference continuity、User Profile、Forward Intent 都不能升级成 evidence-backed fact。
+- snapshot 与 projection checkpoint 必须同一 durable transaction 提交；checkpoint 不得先于 snapshot。
+- compact material previous compacted view 从 vNext snapshot 渲染为 `previous_compacted_view`，不得从旧 stable blocks、`pinned_state`、`working_assumptions` 或旧 continuity item 反推。
 - `MemorySnapshotView` 改为 vNext readable section view，记录 snapshot cursor、policy digest、diagnostics、represented evidence refs。
 - prompt assembly 固定顺序：system / scene、Session Summary、Evidence / Fact、Answer Anchor、Forward Intent、Trace reference continuity、selected recent window、current input、replay / retry / steer / resume guidance、tool schema / policy。
 - no accepted compacted view：只渲染 selected recent window 和 current input。
 - accepted compacted view：渲染五类 memory section + selected recent window after compact boundary + current input。
 - compact failed fallback：只渲染 fallback selected recent window 和 current input，不渲染 accepted compacted view、高阶 memory section、失败 proposal、fallback diagnostic 或 Host internal state。
+- dispatch memory precondition 只能检查 vNext snapshot cursor、lag、diagnostics 与 vNext evidence/fact memory；不得读取旧 `snapshot.evidence_backed_facts` 顶层字段。
 - 第一阶段不做 runtime token estimator 逐 section 裁剪；section 在 projection / assembly 前由 cap / floor bounded。
 - memory snapshot lag 仍触发 catch-up / rebuild / repair path；不得把 Run 推入 `RECOVERING`。
+- `CompactMaterialPack` 顶层字段迁移规则如下，旧字段不得保留 alias、wrapper 或 compatibility facade：
+
+| 旧字段 | vNext 字段 / section | 迁移语义 |
+|---|---|---|
+| `stable_input` | 删除旧顶层字段；按内容重建为 `previous_compacted_view`，必要时由 vNext snapshot 的 `trace_memory` / `answer_anchor_memory` / `forward_intent_memory` 支撑对应 material | 不复制旧 stable block。accepted session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items 只从 vNext snapshot / accepted compact output 进入 `previous_compacted_view`；旧 pinned / working assumption / open question stable blocks 删除。 |
+| `history_input` | `trace_material` 或 `answer_material` | user turn、用户可见状态和局部指代材料进入 `trace_material`；assistant final answer / conclusion 可引用材料进入 `answer_material`；current user input 不在此字段保留，必须进入 `current_input_anchor`。 |
+| `evidence_input` | `evidence_material` | accepted tool evidence 的 LLM-readable material 进入 `evidence_material`；不把 evidence-backed fact 当作 evidence material 反向展开。 |
+| `current_input_anchor` | `current_input_anchor` | vNext 保留同名 typed field，但只能作为 readable not citable anchor；不得通过旧字段 alias 或 wrapper 接入。 |
+
+- 旧 `CompactMaterialBlockKind` 全量枚举迁移 / 删除规则如下，implementation 不得保留旧 enum alias：
+
+| 旧 enum | vNext section 或删除语义 |
+|---|---|
+| `PINNED_STATE` | 删除；不进入 vNext material section。 |
+| `EVIDENCE_BACKED_FACT` | 只可由 vNext snapshot / accepted compact output 进入 `previous_compacted_view.evidence_backed_facts`；不得作为 `evidence_material` 重放。 |
+| `WORKING_ASSUMPTION` | 删除；不进入 vNext material section。若未来需要前瞻语义，只能由 accepted vNext `forward_intents` 重新生产。 |
+| `OPEN_QUESTION` | 删除；不保留旧 block。未完成问题只能由 accepted vNext `forward_intents` 承接。 |
+| `RAW_USER_TURN` | `trace_material`；若是当前输入，必须改由 `current_input_anchor` 承接。 |
+| `RAW_ASSISTANT_TURN` | assistant final answer / conclusion 进入 `answer_material`；仅用于局部对话连续性的可见 assistant turn 进入 `trace_material`。 |
+| `EPISODE_SUMMARY` | 删除旧 block；只能由 accepted vNext `session_summary` 进入 `previous_compacted_view.session_summary`。 |
+| `ACCEPTED_TOOL_EVIDENCE` | `evidence_material`。 |
+| `CURRENT_INPUT_ANCHOR` | `current_input_anchor`，readable not citable。 |
 
 旧路径保留 / 删除边界：
 
+- 一旦 `memory.py` 和 `durable/memory.py` 切换到 vNext，必须同步迁移所有直接 production consumers 和 tests；不得保留 `WorkingAssumptionView`、`PinnedStateView`、`ConversationContinuityKind`、`ConversationContinuityItem`、`ConversationContinuityView` 作为 snapshot 顶层语义、durable item kind、test helper 或 public assertion。
+- 全新 schema 删除旧 durable item kind：`raw_user_turn`、`raw_assistant_turn`、`assistant_conclusion`、`episode_summary`、`minimum_preserve_item`、`working_assumption`、`pinned_state`。旧库 row 不做兼容读取；旧语义只在新实现的数据生产规则中迁移到 vNext memory section。
+- durable/schema 边界必须有 fail-fast / fail-closed 断言：旧 snapshot key 存在时 snapshot codec / repair path 不得兼容读取；旧 durable item kind row 存在时 projection rebuild 不得静默跳过或物化为 vNext item；应给出明确 schema / projection error，并保证 checkpoint 不前进、snapshot 不部分提交。
+- `RAW_USER_TURN`、`RAW_ASSISTANT_TURN`、`ASSISTANT_CONCLUSION` 迁移为 Trace Memory selected recent window material，不作为独立 snapshot item 持久化；`EPISODE_SUMMARY` 只能由 accepted `session_summary` roll-forward view 承接；`MINIMUM_PRESERVE_ITEM` 只以 `ReferenceContinuityItem` 形态保留局部承接语义。
+- `MemoryProjectionDiagnostics` 不保留 pinned / working assumption / minimum preserve 专属 reason；可保留或重命名的 reason 只能表达 snapshot missing / damaged / lag、unsupported event、budget limit、inline delta repair、fact candidate invalid / superseded、reference continuity covered 等 vNext 语义。
 - 一旦 RunInputBuilder 切换到 vNext，必须删除旧 stable block headers：`Memory user goals and constraints`、`Memory confirmed subjects and methodology`、`Memory open questions and working assumptions`、`Memory minimum preserve continuity`、`Memory episode summaries`。
-- 不得在 RunInputBuilder 中保留旧 `goals` / `facts` / `questions_assumptions` renderer wrapper；旧字段不应通过 prompt adapter 或 extra payload 进入 final messages。
-- 未涉及的 public API、scheduler、Engine / Service / UI 边界保持不变。
+- 不得在 RunInputBuilder 或 compact material 中保留旧 `goals` / `facts` / `questions_assumptions` renderer wrapper；旧字段不应通过 prompt adapter、config alias 或 extra payload 进入 final messages。
+- Service / Runtime 迁移是旧 policy shape 的直接 consumer closure，不改变 `UI -> Service -> Host -> Engine` 分层，不允许 `dayu.runtime` import Host / Service / Engine / UI / Fins。
+- 未涉及的 public command、Host handle method、Engine / UI / Fins 边界保持不变。
 
 不得引入：
 
+- 旧库兼容读取、旧字段 fallback codec、旧 item kind alias、compatibility wrapper / facade / re-export。
+- 旧 `MemoryProjectionPolicy` 字段 alias、旧 config field alias、旧 snapshot -> vNext 或 vNext -> 旧 snapshot bridge helper。
 - provider-specific tokenizer adapter、runtime 逐 section 裁剪、recall / search / vector / reranker / recall tool。
 - 失败 Attempt provider payload 的复用路径或 fallback materialization 到 memory snapshot 的桥接路径。
+- 通过 `hasattr` / `getattr`、无类型 dict、`Any`、lazy import 或 extra payload 跨越旧 / 新 contract。
 
 测试命令：
 
 ```bash
 source .venv/bin/activate
-pytest tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
+pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py tests/host/test_projection_checkpoint.py tests/host/test_durable_concurrency_matrix.py tests/host/test_memory_repair.py -q
+pytest tests/host/test_compact_material.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py -q
+pytest tests/host/test_admission_queue.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py -q
+pytest tests/service/test_host_assembly.py tests/runtime/test_config_loader.py -q
+pytest tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
+python -m pyright dayu/ tests/ utils/
+```
+
+如果 public options policy assertions 受字段迁移影响，同 slice 追加：
+
+```bash
+source .venv/bin/activate
+pytest tests/host/test_public_contracts.py -q
 python -m pyright dayu/ tests/ utils/
 ```
 
@@ -341,16 +359,22 @@ python -m pyright dayu/ tests/ utils/
 
 退出信号：
 
+- durable store 读写 vNext snapshot 和 vNext items，旧 snapshot key fail closed。
+- 旧 snapshot key / 旧 durable item kind row 均有 fail-fast / fail-closed 测试；旧库 row 不被兼容读取，不被静默物化为 vNext item，失败时 checkpoint 不前进。
+- projection consumer 能从 EventLog 重建同一 snapshot digest，并断言 checkpoint atomicity。
+- fallback、rejected compact、failed compact 不 materialize summary / fact / anchor / intent / reference continuity。
 - final messages 能从 vNext durable facts、snapshot、post-compact delta 和 current input 重建。
 - empty compacted view、non-empty compacted view、post-compact delta、compact boundary、fallback no high-order memory 均由 RunInputBuilder tests 覆盖。
 - fallback 路径只有 bounded recent window 和 current input，且不会写 `CONTEXT_COMPACTED`、compact artifact 或 memory snapshot。
-- pyright 全量通过，且 prompt production path 不再引用旧 stable memory block shape。
+- Runtime config loader 与 Service assembly 只接受 / 映射 vNext `MemoryProjectionPolicy` 字段；旧 config field fail fast。
+- pyright 全量通过，且 `run_input.py`、`compact_material.py`、`dispatch.py`、`service/host_assembly.py`、`runtime/config_loader.py` 与受影响 tests 不再引用旧 snapshot / policy fields。
 
 residual risks：
 
-- public smoke 脚本、README 同步和最终 issue-80 映射复核尚未完成；分类为 covered by later approved slice，owner 是 Slice E。
+- Slice C 范围大于原计划，implementation / review 复杂度上升；接受理由是旧 snapshot/policy consumer graph 已跨 Host prompt、dispatch、Service assembly 与 Runtime config，只有同 slice 迁移才能避免 pyright blocker 和兼容桥。
+- README 同步、utils smoke 脚本最终核对和 issue-80 映射复核尚未完成；分类为 covered by later approved slice，owner 是 Slice D。
 
-### Slice E - Public Smoke And Docs Closure
+### Slice D - Public Smoke And Docs Closure
 
 目标：完成 Host public path smoke、README 同步、旧术语清理和 residual risk owner 标注，不扩大到完整 eval benchmark。
 
@@ -428,7 +452,12 @@ Implementation gate 可以按 slice 修改：
 - `dayu/host/memory_repair.py`
 - `dayu/host/compaction_evidence.py`
 - `dayu/host/compact_payload.py`
+- `dayu/service/host_assembly.py`，仅限 WU-CM-01 Slice C memory projection policy assembly 迁移
+- `dayu/runtime/config_loader.py`，仅限 WU-CM-01 Slice C memory projection policy config schema / validation 迁移
+- `dayu/config/execution_profiles.json`，仅限 WU-CM-01 Slice C packaged memory projection policy 字段迁移
 - `tests/host/*` 中与 memory、compact、context governance、RunInputBuilder、public smoke 直接相关的测试文件
+- `tests/service/test_host_assembly.py`，仅限 WU-CM-01 Slice C memory projection policy assembly 迁移
+- `tests/runtime/test_config_loader.py`，仅限 WU-CM-01 Slice C memory projection policy config schema / validation 迁移
 - `utils/smoke_host_public_conversation_memory.py`
 - `utils/smoke_host_public_conversation_memory_scenarios.py`
 - `utils/smoke_host_public_multiturn.py`
@@ -438,7 +467,8 @@ Implementation gate 可以按 slice 修改：
 
 禁止修改或新增：
 
-- `dayu.service`、`dayu.ui`、`dayu.fins`、`dayu.engine`，除非后续 gate 发现设计真源必须先变更并经用户确认。
+- `dayu.service` 除 `dayu/service/host_assembly.py` 的 Slice C policy assembly 迁移外、`dayu.ui`、`dayu.fins`、`dayu.engine`，除非后续 gate 发现设计真源必须先变更并经用户确认。
+- `dayu.runtime` 除 `dayu/runtime/config_loader.py` 的 Slice C config schema / validation 迁移外，不得新增 Host / Service / Engine / UI / Fins 依赖或业务语义。
 - recall / search / vector / reranker / recall tool 相关实现。
 - User Profile durable store 或跨 session profile contract。
 - 为旧字段保留的 compatibility wrapper、facade、re-export 或旧库兼容读取。
@@ -463,11 +493,13 @@ operation / dispatch / recovery：
 - `pytest tests/host/test_run_input_builder.py -q`
 - `pytest tests/host/test_context_budget.py -q`
 - `pytest tests/host/test_context_policy.py -q`
+- `pytest tests/host/test_admission_queue.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py -q`，Slice C 仅覆盖旧 snapshot / policy helper 迁移。
 
 durable / schema：
 
 - `pytest tests/host/test_durable_schema.py tests/host/test_projection_checkpoint.py tests/host/test_durable_concurrency_matrix.py -q`
-- `pytest tests/host/test_memory_repair.py -q`，若文件不存在则以 `tests/host/test_memory_projection.py` 中 repair / rebuild cases 覆盖。
+- `pytest tests/host/test_memory_repair.py -q`
+- `pytest tests/service/test_host_assembly.py tests/runtime/test_config_loader.py -q`，Slice C 覆盖 vNext memory projection policy 装配与配置校验。
 
 public smoke / integration：
 
@@ -487,6 +519,7 @@ README / guard：
 ```bash
 source .venv/bin/activate
 pytest tests/host/test_memory_projection.py tests/host/test_compaction_contract.py tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_context_compact_events.py tests/host/test_compaction_operation.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
+pytest tests/host/test_admission_queue.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/service/test_host_assembly.py tests/runtime/test_config_loader.py -q
 python utils/smoke_host_public_conversation_memory.py
 python utils/smoke_host_public_conversation_memory_scenarios.py
 python utils/smoke_host_public_multiturn.py
