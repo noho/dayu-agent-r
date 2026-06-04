@@ -91,7 +91,7 @@ WU-CM-01 的 implementation slices 必须是可编译、可验证、pyright-clea
 
 这些 slice 不再按“类型、持久化、parser、operation、prompt”概念域单独拆分，而按每条可运行路径闭合。目标是让任一 accepted slice commit 都能被 review、pytest 与 pyright 独立验证。
 
-Slice C blocker 裁决后，本 plan 选择扩大 Slice C 为 pyright-clean vertical slice，而不是拆成“先引 vNext memory contract、后迁移 consumer”的双轨方案。原因是旧 `ConversationMemorySnapshot` / `MemoryProjectionPolicy` 已经同时被 memory durable/projection、compact material、RunInputBuilder、dispatch precondition、Service assembly、Runtime config loader 与测试消费；如果只在局部引入 vNext contract 而不迁移直接 consumers，后续 slice 仍会长时间保留旧生产 shape，容易诱导 compatibility wrapper、旧字段 alias 或旧 snapshot -> vNext bridge helper。扩大 Slice C 后，旧 snapshot/policy 的删除、所有直接 consumer 迁移、配置 schema 迁移和测试更新在同一个 pyright-clean commit 内闭合。
+Slice C compact contract blocker 裁决后，本 plan 不再继续扩大当前 Slice C。直接代码证据显示旧 production compact contract 仍未闭合：`CompactionCandidate`、旧 `CompactMaterialPack.stable_input/history_input/evidence_input`、旧 `CompactMaterialBlockKind` 和 `LLMContextCompactor.compact()` 的旧 parser 返回值仍是生产 direct owner。若在 memory snapshot / durable / RunInputBuilder / config-service 的 Slice C 中继续删除旧 snapshot / policy，会把 compact parser、quality gate、operation payload 与 tests 一并拉入，导致 Slice C 变成跨 Slice A/B/C 的大迁移，并诱导旧 field alias、旧 wrapper 或 snapshot bridge。当前 plan 因此新增 `Pre-Slice C - Compact Contract Closure` 作为立即前置 slice；只有该 closure pyright-clean 后，后续 Slice C 才进入 memory durable/projection、RunInputBuilder、dispatch precondition 与 config-service 迁移。
 
 ### Slice A - Compact Contract Closure
 
@@ -225,9 +225,92 @@ residual risks：
 - vNext compact event 已提交但 memory durable/projection、RunInputBuilder 和 config assembly 尚未消费；分类为 covered by later approved slice，owner 是 Slice C。
 - public smoke 与 README 尚未完成；分类为 covered by later approved slice，owner 是 Slice D。
 
+### Pre-Slice C - Compact Contract Closure
+
+目标：在进入 memory snapshot closure 前，先把当前 production compact contract 真正收口为 vNext。此 slice 只关闭 compactor material、LLM parser、quality checker、operation accept/reject/fail、compact event payload 与相关 tests 的旧 contract 残留；不迁移 durable memory snapshot、memory projection、RunInputBuilder vNext section、Service assembly 或 Runtime config schema。
+
+动机判断：latest blocker 成立且严重性评估正确。`docs/host/design.md` 第 24.3 / 25 章要求 compactor 输入固定为 `ConversationCompactInputVNext`、输出固定为 `ConversationCompactOutputVNext`，Context Governance 只接受 vNext candidate 并写 compact-related canonical facts；当前代码仍保留旧 `CompactionCandidate`、旧 material pack 顶层字段、旧 block kind 与旧 `llm_compaction` parser，这会让 Slice C 删除旧 memory snapshot / policy 后无法 pyright-clean。该问题不是测试 fixture 过期，而是 production owner contract 未闭合。
+
+allowed files/modules：
+
+- `dayu/host/compaction.py`
+- `dayu/host/llm_compaction.py`
+- `dayu/host/context_governance.py`
+- `dayu/host/compact_material.py`
+- `dayu/host/compaction_evidence.py`，仅限 compact evidence material section label / vNext material contract 迁移
+- `dayu/host/compaction_operation.py`
+- `dayu/host/context_events.py`，仅当 `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` payload reader / writer 需要同步 vNext closeout
+- `dayu/host/compact_payload.py`，仅当 compact artifact JSON、payload ref 或 descriptor helper 需要作为 vNext payload 真源
+- `dayu/host/dispatch.py`，仅当 proactive compact event closeout / artifact write 仍被旧 contract 绑定
+- `dayu/host/engine_ingest.py`，仅当 reactive compact event closeout / artifact write 仍被旧 contract 绑定
+- `tests/host/test_compaction_contract.py`
+- `tests/host/test_llm_compaction.py`
+- `tests/host/test_compaction_operation.py`
+- `tests/host/test_compact_material.py`
+- `tests/host/test_compact_artifact_store.py`，仅限 artifact store 的 vNext candidate / quality check / material JSON 迁移
+- `tests/host/fake_compaction.py`，仅当 fake compactor 或 material JSON 行为仍依赖旧 fields
+- `tests/host/test_public_compact_smoke.py`，仅当 public compact smoke 直接断言 material JSON 的旧 `stable_input` / `history_input` / `evidence_input`
+
+实现边界：
+
+- `ContextCompactor` 的生产 protocol、`LLMContextCompactor.compact()` 与 operation 调用路径必须收敛到 `ConversationCompactOutputVNext`。若实现阶段临时保留 `compact_request_vnext()`，只能作为未导出的内部拆分 helper，并必须由 public production `compact()` 调用；slice closeout 时不得形成 `compact()` 旧 contract 与 `compact_request_vnext()` vNext contract 并存的双 public method。
+- `run_compaction_operation()` 的 `compactor` 参数类型必须是返回 vNext output 的 `ContextCompactor` protocol；不得继续以旧 `CompactionCandidate` compactor annotation、overload 或 adapter 维持编译。
+- `llm_compaction.py` 的 strict JSON parser 只接受 `ConversationCompactOutputVNext` schema：`schema_version`、`session_summary`、`evidence_backed_facts`、`answer_anchors`、`forward_intents`、`reference_continuity_items`、`diagnostics`。缺旧字段不失败，出现旧 `episode_summary_candidate`、`pinned_state_patch_candidate`、`minimum_preserve_item_candidates`、`preserved_*`、`preservation_evidence` 等字段必须 fail closed。
+- `CompactMaterialPack` 的 production LLM JSON 与 canonical JSON 顶层字段迁移为 `previous_compacted_view`、`trace_material`、`evidence_material`、`answer_material`、`current_input_anchor`、`instruction`；不得保留 `stable_input`、`history_input`、`evidence_input` alias / wrapper / facade。
+- `CompactMaterialBlockKind` production enum 必须删除旧 `PINNED_STATE`、`WORKING_ASSUMPTION`、`OPEN_QUESTION`、`EPISODE_SUMMARY` 等旧 compact mental model；vNext material section 与 prompt-local label provenance 必须直接表达 design 24.3 的 section allowlist。
+- `compact_material.py` 可以继续从旧 memory snapshot 读取尚未迁移的材料以维持当前 production 可编译，但只能把它投影为 vNext material sections；不得新增旧 snapshot -> vNext memory bridge，也不得让旧 pinned / working assumption 字段作为 vNext stable section 保留。
+- `compaction_evidence.py` 如仍生产 compact evidence material，必须同步使用 vNext material section label，不得继续依赖旧 `CompactMaterialBlockKind` 或旧 material JSON field。
+- `context_governance.py` 的 production accept barrier 必须使用 `check_conversation_compact_output_vnext()` 或等价 vNext checker；旧 `check_compaction_candidate()`、旧 pinned patch / minimum preserve / preservation evidence quality issue 不得继续作为 production closeout 入口。
+- `compaction_operation.py` 的 attempt result、repair retry、candidate digest、quality issue、accepted / rejected / failed closeout 必须统一使用 vNext candidate。repair 仍是 whole-candidate re-proposal，不合并旧 proposal 的 valid fields，不 partial materialize rejected candidate。
+- `context_events.py` / `compact_payload.py` 如被触碰，只能把 compact payload / artifact helper 收敛到 vNext candidate JSON、prompt-local label mapping refs、source boundary refs、quality result、budget after compact 与 projection signal；旧 compact payload constants、旧 field allowlist、旧 payload reader / writer helper 必须同步清理，不得保留旧 payload fields 给后续 memory projection 兼容读取。
+- `dispatch.py` / `engine_ingest.py` 仅在 proactive / reactive compact closeout 仍受旧 contract 影响时同步迁移；修改必须停在 compact event / artifact closeout，不得引入 memory durable write、RunInputBuilder vNext rendering 或 config-service policy 迁移。
+- `tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_compact_material.py`、`tests/host/test_compact_artifact_store.py` 必须从旧 candidate / quality check / material JSON 断言迁移到 vNext contract。fake compactor 只有在 fake public smoke 或 operation fixtures 仍构造旧 candidate 时同步迁移；public compact smoke 只有在其直接断言 material JSON 或 fake public compact output 的旧 shape 时追加。
+
+禁止项：
+
+- 禁止旧 `CompactionCandidate`、`EpisodeSummaryCandidate`、`PinnedStatePatchCandidate`、`MinimumPreserveItemCandidate`、`PreservationEvidence`、`PinnedPatchOperation`、`MinimumPreserveReason` 的 production wrapper、facade、re-export 或 compatibility adapter。
+- 禁止旧 material fields：`stable_input`、`history_input`、`evidence_input` 的 field alias、JSON alias、payload alias、test helper alias。
+- 禁止旧 `CompactMaterialBlockKind` enum alias 或从旧 block kind 到 vNext section 的运行时兼容桥。
+- 禁止旧 snapshot bridge：不得在此 slice 新增 `ConversationMemorySnapshot` -> `ConversationMemorySnapshotVNext`、旧 pinned / working assumptions -> vNext memory view、vNext -> 旧 snapshot 的 helper。
+- 禁止混入 Slice C 内容：不得迁移 `dayu/host/memory.py`、`dayu/host/durable/memory.py`、`dayu/host/run_input.py` 的 memory section rendering、`dayu/service/host_assembly.py`、`dayu/runtime/config_loader.py`、`dayu/config/execution_profiles.json` 或 memory durable schema。
+- 禁止通过 `hasattr` / `getattr`、无类型 dict、`Any`、lazy import、extra payload 或 raw JSON patch 绕过 typed boundary。
+
+测试命令：
+
+```bash
+source .venv/bin/activate
+pytest tests/host/test_compaction_contract.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py tests/host/test_compact_material.py tests/host/test_compact_artifact_store.py -q
+python -m pyright dayu/ tests/ utils/
+```
+
+如果 fake public smoke 或 operation fixtures 因 vNext candidate 迁移而需要修改 `tests/host/fake_compaction.py`，同 slice 追加受影响 smoke / operation 测试；如果 public compact smoke 直接断言 material JSON 或 fake public compact output 的旧 shape，同 slice 追加：
+
+```bash
+source .venv/bin/activate
+pytest tests/host/test_public_compact_smoke.py -q
+python -m pyright dayu/ tests/ utils/
+```
+
+退出信号：
+
+- 旧 candidate / type / helper 在 production closeout files 中不得再有 class definition、public export 或 production reference；production closeout files 包括 `dayu/host/compaction.py`、`dayu/host/llm_compaction.py`、`dayu/host/context_governance.py`、`dayu/host/compaction_operation.py`、`dayu/host/context_events.py`、`dayu/host/compact_payload.py`、`dayu/host/compact_material.py`、`dayu/host/compaction_evidence.py`。历史 docs、review artifact、implementation report 可命中旧 symbol。若 implementation 因未切换后续非 production path 而保留任何旧 symbol，必须是私有、不可导出、非 production path，并在 implementation report 中给出直接代码证据和 owner。
+- `CompactMaterialPack` JSON / LLM JSON 不再输出 `stable_input`、`history_input`、`evidence_input`；vNext material section、current input anchor not citable、unknown / stale / cross-section label 均有 fail-closed 测试。
+- `LLMContextCompactor.compact()` production parser 只返回 `ConversationCompactOutputVNext`；旧 candidate schema 输入 fail closed。
+- `context_governance.py` 的 production accept barrier 使用 vNext checker；operation accepted / rejected / repair exhausted / fallback closeout、whole-candidate repair 和 failed fallback 均使用 vNext candidate、vNext quality issue 与 vNext payload / artifact helper。
+- `context_events.py` 中旧 compact payload constants、旧 field allowlist 与旧 payload reader / writer helper 不再作为 production event contract 暴露。
+- 必须通过的 tests 明确包括：`tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_compact_material.py`、`tests/host/test_compact_artifact_store.py`。触发 fake/public smoke 条件时，必须追加对应 `tests/host/fake_compaction.py` consumer 测试和 `tests/host/test_public_compact_smoke.py`。
+- 受影响 tests 与全量 pyright 通过；未触碰 memory durable/projection、RunInputBuilder、config-service 的 Slice C 内容。
+
+residual risks：
+
+- `ConversationMemorySnapshot`、durable memory rows、memory projection、RunInputBuilder prompt assembly、dispatch memory precondition、Service assembly 与 Runtime config loader 尚未迁移；owner 是后续 Slice C。
+- 外部 `ContextCompactor` implementor 若存在，可能因 protocol 从旧 candidate 收敛到 vNext output 而需要同步迁移；当前 slice owner 必须通过 package exports / tests / pyright 识别仓库内 implementor，仓库外 implementor 风险作为 public contract breakage 在 implementation report 中列明。
+- public smoke 与 README 同步尚未完成；owner 是 Slice D。
+- 完整 Conversation Memory eval benchmark 仍 deferred-with-owner，owner 是 WU-CM-10 / GitHub Issue #80。
+
 ### Slice C - Memory Contract, Projection, Assembly And Config Closure
 
-目标：把 `ConversationMemorySnapshot`、`MemoryProjectionPolicy`、durable memory rows、projection catch-up / rebuild、compact material previous view、RunInputBuilder prompt assembly、dispatch memory precondition、Service assembly、Runtime config loader 与直接 consumer tests 同步迁移到 vNext。此 slice 必须形成 pyright-clean vertical closure：accepted vNext compact event 能 materialize 五类 session memory，ordinary Run input 能消费 vNext snapshot，fallback / rejected compact 不生成高阶 memory，config/service 装配不再生产旧 policy shape。
+目标：在 `Pre-Slice C - Compact Contract Closure` 已完成并 pyright-clean 的前提下，把 `ConversationMemorySnapshot`、`MemoryProjectionPolicy`、durable memory rows、projection catch-up / rebuild、compact material previous view、RunInputBuilder prompt assembly、dispatch memory precondition、Service assembly、Runtime config loader 与直接 consumer tests 同步迁移到 vNext。此 slice 不再承担 LLM parser、旧 `CompactionCandidate`、旧 `CompactMaterialPack` production closeout 或 compact event payload closure；它只消费已闭合的 vNext compact event / artifact，形成 memory snapshot / projection / prompt assembly / config-service 的 pyright-clean vertical closure。
 
 allowed files/modules：
 
@@ -237,8 +320,6 @@ allowed files/modules：
 - `dayu/host/compact_payload.py`，仅当 projection payload reader 需要 vNext typed helper
 - `dayu/host/context_events.py`，仅当 projection event reader 需要 vNext payload type
 - `dayu/host/compact_material.py`，仅限 previous compacted view、selected recent window、ordinary material 与 vNext snapshot 消费
-- `dayu/host/compaction.py`，仅限 `CompactMaterialPack`、`CompactMaterialBlockKind`、material JSON / LLM JSON 与 vNext material section contract 迁移
-- `dayu/host/context_governance.py`，仅限 compact quality checker 对 vNext `CompactMaterialPack` sections 与删除旧 `CompactMaterialBlockKind` 后的读取迁移；不得保留旧 block kind alias 或 material field wrapper
 - `dayu/host/run_input.py`
 - `dayu/host/context_fallback.py`
 - `dayu/host/dispatch.py`，仅限 memory snapshot precondition、projection catch-up、fallback view 与 RunInputBuilder 参数迁移
@@ -252,9 +333,6 @@ allowed files/modules：
 - `tests/host/test_durable_concurrency_matrix.py`
 - `tests/host/test_memory_repair.py`
 - `tests/host/test_compact_material.py`
-- `tests/host/test_llm_compaction.py`
-- `tests/host/test_compaction_contract.py`
-- `tests/host/test_compaction_operation.py`
 - `tests/host/test_run_input_builder.py`
 - `tests/host/test_dispatch_scheduler.py`
 - `tests/host/test_recovery_dispatch.py`
@@ -265,10 +343,9 @@ allowed files/modules：
 - `tests/host/test_public_contracts.py`，仅当 public options policy assertions 受 vNext field rename 影响
 - `tests/service/test_host_assembly.py`
 - `tests/runtime/test_config_loader.py`
-- `tests/host/test_public_compact_smoke.py`
+- `tests/host/test_public_compact_smoke.py`，仅当 accepted compact 后 memory projection / prompt 行为变化
 - `tests/host/test_public_open_host_multiturn_smoke.py`
 - `tests/host/test_public_tool_wiring_smoke.py`，仅当 accepted evidence material prompt 行为变化
-- `tests/host/fake_compaction.py`，仅限 public smoke / compaction tests 的 material JSON 字段迁移；不得改变生产 compactor 行为
 
 实现边界：
 
@@ -293,31 +370,9 @@ allowed files/modules：
 - compact failed fallback：只渲染 fallback selected recent window 和 current input，不渲染 accepted compacted view、高阶 memory section、失败 proposal、fallback diagnostic 或 Host internal state。
 - dispatch memory precondition 只能检查 vNext snapshot cursor、lag、diagnostics 与 vNext evidence/fact memory；不得读取旧 `snapshot.evidence_backed_facts` 顶层字段。
 - reactive compaction pending request 的 recent-window floor 只能读取 vNext policy 字段；若 implementation 删除旧 `recent_raw_turns_floor`，`engine_ingest.py` 必须在同 slice 同步迁移，不得通过旧 policy alias 维持编译。
-- compact quality checker 必须读取 vNext `CompactMaterialPack` sections；删除旧 `CompactMaterialBlockKind.OPEN_QUESTION` / `WORKING_ASSUMPTION` 后，`context_governance.py` 不得通过旧 block kind alias、旧 `stable_input` / `history_input` field wrapper 或 compatibility facade 继续读取旧 material shape。
+- `Pre-Slice C - Compact Contract Closure` 已保证 production compact material 顶层字段、LLM parser、quality checker、operation payload 和 event closeout 是 vNext；Slice C 只能消费该 vNext contract，不得重新引入旧 `stable_input` / `history_input` / `evidence_input`、旧 block kind alias 或旧 candidate adapter。
 - 第一阶段不做 runtime token estimator 逐 section 裁剪；section 在 projection / assembly 前由 cap / floor bounded。
 - memory snapshot lag 仍触发 catch-up / rebuild / repair path；不得把 Run 推入 `RECOVERING`。
-- `CompactMaterialPack` 顶层字段迁移规则如下，旧字段不得保留 alias、wrapper 或 compatibility facade：
-
-| 旧字段 | vNext 字段 / section | 迁移语义 |
-|---|---|---|
-| `stable_input` | 删除旧顶层字段；按内容重建为 `previous_compacted_view`，必要时由 vNext snapshot 的 `trace_memory` / `answer_anchor_memory` / `forward_intent_memory` 支撑对应 material | 不复制旧 stable block。accepted session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items 只从 vNext snapshot / accepted compact output 进入 `previous_compacted_view`；旧 pinned / working assumption / open question stable blocks 删除。 |
-| `history_input` | `trace_material` 或 `answer_material` | user turn、用户可见状态和局部指代材料进入 `trace_material`；assistant final answer / conclusion 可引用材料进入 `answer_material`；current user input 不在此字段保留，必须进入 `current_input_anchor`。 |
-| `evidence_input` | `evidence_material` | accepted tool evidence 的 LLM-readable material 进入 `evidence_material`；不把 evidence-backed fact 当作 evidence material 反向展开。 |
-| `current_input_anchor` | `current_input_anchor` | vNext 保留同名 typed field，但只能作为 readable not citable anchor；不得通过旧字段 alias 或 wrapper 接入。 |
-
-- 旧 `CompactMaterialBlockKind` 全量枚举迁移 / 删除规则如下，implementation 不得保留旧 enum alias：
-
-| 旧 enum | vNext section 或删除语义 |
-|---|---|
-| `PINNED_STATE` | 删除；不进入 vNext material section。 |
-| `EVIDENCE_BACKED_FACT` | 只可由 vNext snapshot / accepted compact output 进入 `previous_compacted_view.evidence_backed_facts`；不得作为 `evidence_material` 重放。 |
-| `WORKING_ASSUMPTION` | 删除；不进入 vNext material section。若未来需要前瞻语义，只能由 accepted vNext `forward_intents` 重新生产。 |
-| `OPEN_QUESTION` | 删除；不保留旧 block。未完成问题只能由 accepted vNext `forward_intents` 承接。 |
-| `RAW_USER_TURN` | `trace_material`；若是当前输入，必须改由 `current_input_anchor` 承接。 |
-| `RAW_ASSISTANT_TURN` | assistant final answer / conclusion 进入 `answer_material`；仅用于局部对话连续性的可见 assistant turn 进入 `trace_material`。 |
-| `EPISODE_SUMMARY` | 删除旧 block；只能由 accepted vNext `session_summary` 进入 `previous_compacted_view.session_summary`。 |
-| `ACCEPTED_TOOL_EVIDENCE` | `evidence_material`。 |
-| `CURRENT_INPUT_ANCHOR` | `current_input_anchor`，readable not citable。 |
 
 旧路径保留 / 删除边界：
 
@@ -344,7 +399,6 @@ allowed files/modules：
 ```bash
 source .venv/bin/activate
 pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py tests/host/test_projection_checkpoint.py tests/host/test_durable_concurrency_matrix.py tests/host/test_memory_repair.py -q
-pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py -q
 pytest tests/host/test_compact_material.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py -q
 pytest tests/host/test_admission_queue.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py -q
 pytest tests/service/test_host_assembly.py tests/runtime/test_config_loader.py -q
@@ -378,13 +432,13 @@ python -m pyright dayu/ tests/ utils/
 - empty compacted view、non-empty compacted view、post-compact delta、compact boundary、fallback no high-order memory 均由 RunInputBuilder tests 覆盖。
 - fallback 路径只有 bounded recent window 和 current input，且不会写 `CONTEXT_COMPACTED`、compact artifact 或 memory snapshot。
 - reactive compaction pending request policy field 已迁移到 vNext selected recent-window floor，并由 `tests/host/test_engine_ingest_mapping.py` 覆盖；测试不得依赖旧 `recent_raw_turns_floor` alias。
-- context governance / compact material contract 没有独立 `tests/host/test_context_governance.py` 必跑文件；vNext compact quality checker 与 material section contract 的直接断言由 `tests/host/test_compaction_contract.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_llm_compaction.py` 覆盖。
+- compact contract closure 不在 Slice C 重测为主验收；若 Slice C 修改 `compact_material.py` 的 snapshot 消费，必须只补充 previous compacted view / selected recent window 相关断言，不重新打开 LLM parser 或 operation closeout scope。
 - Runtime config loader 与 Service assembly 只接受 / 映射 vNext `MemoryProjectionPolicy` 字段；旧 config field fail fast。
 - pyright 全量通过，且 `run_input.py`、`compact_material.py`、`dispatch.py`、`service/host_assembly.py`、`runtime/config_loader.py` 与受影响 tests 不再引用旧 snapshot / policy fields。
 
 residual risks：
 
-- Slice C 范围大于原计划，implementation / review 复杂度上升；接受理由是旧 snapshot/policy consumer graph 已跨 Host prompt、dispatch、Service assembly 与 Runtime config，只有同 slice 迁移才能避免 pyright blocker 和兼容桥。
+- Slice C 仍是 memory durable/projection、prompt assembly 与 config-service 的较大 vertical closure；接受理由是旧 snapshot/policy consumer graph 已跨 Host prompt、dispatch、Service assembly 与 Runtime config，拆得更细会重新诱导旧 field alias 或旧 snapshot bridge。compact parser / operation closure 已由 `Pre-Slice C` 承接，不再算入本 slice。
 - README 同步、utils smoke 脚本最终核对和 issue-80 映射复核尚未完成；分类为 covered by later approved slice，owner 是 Slice D。
 
 ### Slice D - Public Smoke And Docs Closure
@@ -494,6 +548,7 @@ Implementation gate 可以按 slice 修改：
 - `pytest tests/host/test_compaction_contract.py -q`
 - `pytest tests/host/test_context_compact_events.py -q`
 - `pytest tests/host/test_compact_material.py -q`
+- `pytest tests/host/test_compact_artifact_store.py -q`
 - `pytest tests/host/test_llm_compaction.py -q`
 - context governance / compact material contract 没有独立 `tests/host/test_context_governance.py` 必跑文件；以 `tests/host/test_compaction_contract.py`、`tests/host/test_compaction_operation.py` 和 `tests/host/test_llm_compaction.py` 覆盖 quality checker 与 vNext material section contract。
 
@@ -531,7 +586,7 @@ README / guard：
 
 ```bash
 source .venv/bin/activate
-pytest tests/host/test_memory_projection.py tests/host/test_compaction_contract.py tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_context_compact_events.py tests/host/test_compaction_operation.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
+pytest tests/host/test_memory_projection.py tests/host/test_compaction_contract.py tests/host/test_compact_material.py tests/host/test_compact_artifact_store.py tests/host/test_llm_compaction.py tests/host/test_context_compact_events.py tests/host/test_compaction_operation.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
 pytest tests/host/test_admission_queue.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/service/test_host_assembly.py tests/runtime/test_config_loader.py -q
 python utils/smoke_host_public_conversation_memory.py
 python utils/smoke_host_public_conversation_memory_scenarios.py
