@@ -97,6 +97,8 @@ from utils.smoke_host_public_diagnostics import (
 )
 
 _PACKAGE_CONFIG_ROOT: Final[pathlib.Path] = _PROJECT_ROOT / "dayu" / "config"
+_DEFAULT_WORKSPACE_PARENT: Final[pathlib.Path] = _PROJECT_ROOT / "workspace" / "tmp"
+_DEFAULT_WORKSPACE_PREFIX: Final[str] = "host-public-conversation-memory-scenarios-smoke"
 _DEFAULT_SCENE_ID: Final[str] = "smoke_host_public_conversation_memory_scenarios"
 _DEFAULT_SLOT_KEY_PREFIX: Final[str] = "manual-smoke-conversation-memory-scenarios"
 _DEFAULT_LOG_LEVEL: Final[str] = "INFO"
@@ -134,7 +136,7 @@ _FINAL_PREVIEW_CHARS: Final[int] = 600
 _TERMINAL_TIMEOUT_SECONDS: Final[float] = 600.0
 _COMPACT_PRESSURE_TARGET_EXTRA_TOKENS: Final[int] = 16_384
 _COMPACT_PRESSURE_HARD_MARGIN_TOKENS: Final[int] = 24_576
-_COMPACT_PRESSURE_RESERVE_TOKENS: Final[int] = 8_192
+_COMPACT_PRESSURE_RESERVE_TOKENS: Final[int] = 160_000
 _COMPACT_PRESSURE_MIN_PROMPT_TOKENS: Final[int] = 1_024
 _COMPACT_PRESSURE_LARGE_WINDOW_TOKENS: Final[int] = 1_000_000
 _PRESSURE_LINE_CHARS: Final[int] = 120
@@ -1083,7 +1085,14 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     parser = argparse.ArgumentParser(
         description="Host public 财报对话记忆场景 smoke。"
     )
-    parser.add_argument("--workspace-root", default=str(_PROJECT_ROOT))
+    parser.add_argument(
+        "--workspace-root",
+        default=None,
+        help=(
+            "workspace / project root；默认使用 workspace/tmp 下的 fresh smoke "
+            "workspace，避免历史 durable DB schema 污染。"
+        ),
+    )
     parser.add_argument("--scene-id", default=_DEFAULT_SCENE_ID)
     parser.add_argument("--execution-profile-id", default=None)
     parser.add_argument("--host-runtime-id", default=None)
@@ -1112,7 +1121,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         default=PressureMode.AUTO.value,
     )
     namespace = parser.parse_args(tuple(argv))
-    workspace_root_text: str = namespace.workspace_root
+    workspace_root_text: str | None = namespace.workspace_root
     scene_id: str = namespace.scene_id
     execution_profile_id: str | None = namespace.execution_profile_id
     host_runtime_id: str | None = namespace.host_runtime_id
@@ -1125,7 +1134,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     long_rounds: int = namespace.long_rounds
     pressure_mode_text: str = namespace.pressure_mode
     return SmokeArgs(
-        workspace_root=pathlib.Path(workspace_root_text).resolve(),
+        workspace_root=_resolve_workspace_root(workspace_root_text),
         scene_id=scene_id,
         execution_profile_id=execution_profile_id,
         host_runtime_id=host_runtime_id,
@@ -1138,6 +1147,23 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         long_rounds=long_rounds,
         pressure_mode=PressureMode(pressure_mode_text),
     )
+
+
+def _resolve_workspace_root(workspace_root_text: str | None) -> pathlib.Path:
+    """解析 smoke workspace root。
+
+    :param workspace_root_text: CLI 显式传入的 workspace root；为 ``None`` 时
+        生成 fresh smoke workspace root。
+    :returns: 归一化后的 workspace root。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if workspace_root_text is not None:
+        return pathlib.Path(workspace_root_text).resolve()
+    return (
+        _DEFAULT_WORKSPACE_PARENT
+        / f"{_DEFAULT_WORKSPACE_PREFIX}-{uuid4().hex[:12]}"
+    ).resolve()
 
 
 def select_round_specs(args: SmokeArgs) -> tuple[RoundSpec, ...]:

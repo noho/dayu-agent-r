@@ -96,6 +96,8 @@ from utils.smoke_host_public_diagnostics import (
 )
 
 _PACKAGE_CONFIG_ROOT: Final[pathlib.Path] = _PROJECT_ROOT / "dayu" / "config"
+_DEFAULT_WORKSPACE_PARENT: Final[pathlib.Path] = _PROJECT_ROOT / "workspace" / "tmp"
+_DEFAULT_WORKSPACE_PREFIX: Final[str] = "host-public-conversation-memory-smoke"
 _DEFAULT_SCENE_ID: Final[str] = "smoke_host_public_conversation_memory"
 _DEFAULT_SLOT_KEY_PREFIX: Final[str] = "manual-smoke-conversation-memory"
 _TOOL_NAME: Final[str] = "get_mock_finance_facts"
@@ -317,8 +319,11 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     )
     parser.add_argument(
         "--workspace-root",
-        default=str(_PROJECT_ROOT),
-        help="workspace / project root；默认当前脚本所在项目根目录。",
+        default=None,
+        help=(
+            "workspace / project root；默认使用 workspace/tmp 下的 fresh smoke "
+            "workspace，避免历史 durable DB schema 污染。"
+        ),
     )
     parser.add_argument(
         "--scene-id",
@@ -362,7 +367,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         help="输出中标记保留 workspace；脚本不会删除 Host/runtime artifacts。",
     )
     namespace = parser.parse_args(list(argv))
-    workspace_root_text: str = namespace.workspace_root
+    workspace_root_text: str | None = namespace.workspace_root
     scene_id: str = namespace.scene_id
     execution_profile_id: str | None = namespace.execution_profile_id
     host_runtime_id: str | None = namespace.host_runtime_id
@@ -372,7 +377,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     reuse_session: bool = namespace.reuse_session
     keep_workspace: bool = namespace.keep_workspace
     return SmokeArgs(
-        workspace_root=pathlib.Path(workspace_root_text).resolve(),
+        workspace_root=_resolve_workspace_root(workspace_root_text),
         scene_id=scene_id,
         execution_profile_id=execution_profile_id,
         host_runtime_id=host_runtime_id,
@@ -382,6 +387,23 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         reuse_session=reuse_session,
         keep_workspace=keep_workspace,
     )
+
+
+def _resolve_workspace_root(workspace_root_text: str | None) -> pathlib.Path:
+    """解析 smoke workspace root。
+
+    :param workspace_root_text: CLI 显式传入的 workspace root；为 ``None`` 时
+        生成 fresh smoke workspace root。
+    :returns: 归一化后的 workspace root。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if workspace_root_text is not None:
+        return pathlib.Path(workspace_root_text).resolve()
+    return (
+        _DEFAULT_WORKSPACE_PARENT
+        / f"{_DEFAULT_WORKSPACE_PREFIX}-{uuid4().hex[:12]}"
+    ).resolve()
 
 
 async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
