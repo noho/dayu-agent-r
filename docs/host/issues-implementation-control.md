@@ -370,14 +370,16 @@ GitHub Issue #81 当前是 Conversation Memory 整体优化 umbrella issue。Iss
 
 GitHub Issue #80 是 Conversation Memory 的评测标准真源。#80 的具体 eval 实现可以等待 #81 完成或形成稳定 post-#81 memory contract 后推进，但 #80 定义的评测维度会反过来约束 WU-CM-01 / #81 的设计：任何 WU-CM-01 design / plan 都必须说明 #80 的评测维度哪些由当前 scope 满足、哪些 deferred-with-owner、哪些是 explicit non-goal。若某个 #81 方案让 #80 的核心评测维度不可测试、不可审计或不可实现，必须先回到设计讨论修正。
 
+WU-CM-01 的实施设计真源为 `docs/host/design.md` 的 `24. Conversation Memory` 与 `25. Context Governance`。plan、implementation、review、fix 与 re-review 不得从讨论稿、旧代码或 GitHub Issue body 重新解释 compact I/O、memory snapshot、prompt assembly、compact repair / fallback 或 context governance 边界；若发现第 24 / 25 章仍不足以生成 code-generation-ready plan，必须先回到 Host 设计真源修正，再更新本文档。
+
 ### 目标
 
-- 将 Conversation Memory 的语义类型与 prompt budget / assembly policy 分离，避免继续把 `stable layer`、`history pool`、`recent raw turns floor` 这类预算策略当作顶层 memory 心智模型。
-- 固定 Memory Truth / Store、Semantic Memory Indexes、Prompt Assembly 三层边界：EventLog / artifacts / accepted evidence 保持真源地位，memory snapshot 保持 bounded read model，不成为新的事实真源。
+- 将 Conversation Memory 的语义类型与 prompt assembly / deterministic bounded selection policy 分离，避免继续把 `stable layer`、`history pool`、`recent raw turns floor` 这类预算策略当作顶层 memory 心智模型。
+- 固定 Memory Truth / Store、Conversation Memory Projection、Prompt Assembly 与 Context Governance 边界：EventLog / artifacts / accepted evidence 保持真源地位，memory snapshot 保持 bounded read model，不成为新的事实真源，Context Governance 只负责编排 compact / fallback / budget governance，不直接写 memory projection。
 - 裁决并实现 #81 scope 内优先级最高的语义 memory 能力，例如 Trace Memory、Evidence / Fact Memory、Session Summary Memory、Answer Anchor Memory 与 Forward Intent Memory；User Profile Memory 只在 #81 固定“不混入 session Conversation Memory”的边界，跨 session durable profile 设计与实施交给 WU-CM-11 / GitHub Issue #115。
 - 将 WU-CM-02、WU-CM-03、WU-CM-04 等已并入 #81 的问题纳入统一 semantic model 裁决，不再对旧 memory shape 做局部补丁。
 - 为 compact repair 固定策略：采用 whole-candidate repair retry；一次 repair attempt 可以向 LLM 提供多个 Host-neutral invalid reasons / validation issues，但必须重新产出完整 candidate。Host 不要求 LLM 返回 repair patch，不合并旧 proposal 的 valid fields 与新 patch；只有完整 candidate 通过 JSON/schema/value mapping、provenance、quality check 与必要预算闸门后，才可写 `CONTEXT_COMPACTED`。
-- 对 trace / tool-output refs + recall tool 方向先做 research gate；不得在没有借鉴成熟 Agent / Memory 系统约束前自行发明 production recall 机制。
+- 明确第一阶段不做 prompt-conditioned recall、semantic search、vector recall、LLM reranker 或 recall tool；deep historical recall / semantic search 由 GitHub Issue #39 承接。
 - 以 GitHub Issue #80 的分层评测标准约束语义设计，确保 Memory Truth / Store、Memory Projection、Prompt Assembly 与 Agent Outcome 都保留可审计、可断言的验证入口。
 - 产出 code-generation-ready plan，明确 slices、allowed files / modules、schema / contract 变更、测试矩阵、migration strategy 和 residual risk owner。
 
@@ -388,7 +390,7 @@ GitHub Issue #80 是 Conversation Memory 的评测标准真源。#80 的具体 e
 - 不让 assistant final answer、summary、answer anchor、user claim 或 user profile 自动升级为 evidence-backed facts。
 - 不让 memory snapshot 替代 EventLog / artifacts / accepted evidence。
 - 不在 WU-CM-01 内实现跨 session User Profile Memory；durable profile store、profile update event、privacy / reset / deletion、supersession、confidence、confirmation policy 和用户可见解释由 WU-CM-11 / GitHub Issue #115 独立跟踪。
-- 不在 research gate 前实现任意 ref probing / recall tool。
+- 不在 WU-CM-01 内实现 prompt-conditioned recall、semantic search、vector recall、LLM reranker 或 recall tool；deep historical recall / semantic search 由 GitHub Issue #39 承接。
 - 不在 #81 内直接落地完整 #80 eval benchmark；#80 的实现等待稳定 post-#81 memory contract，但其评测标准立即约束 #81 设计。
 - 不为旧 `pinned_state` / `working_assumptions` 结构保留兼容 wrapper 或局部止血。
 
@@ -396,12 +398,12 @@ GitHub Issue #80 是 Conversation Memory 的评测标准真源。#80 的具体 e
 
 - #81 被拆成 code-generation-ready phase plan 和可 review 的 implementation slices。
 - #81 的 design / plan 明确映射 #80 评测维度：每个维度必须标记为 current scope satisfied、deferred-with-owner 或 explicit non-goal。
-- 设计真源明确 semantic memory categories 与 prompt assembly / budget policy 的边界。
+- 设计真源明确 semantic memory categories 与 prompt assembly / deterministic bounded selection policy 的边界。
 - User Profile Memory 在 #81 中被标记为 deferred-with-owner，并指向 WU-CM-11 / GitHub Issue #115；session Conversation Memory 不伪装、内嵌或兼容实现跨 session profile。
-- tests 能区分 trace continuity、evidence-backed facts、session summary、answer anchors、forward intent、profile boundary 和 prompt assembly budget behavior。
+- tests 能区分 trace continuity、evidence-backed facts、session summary、answer anchors、forward intent、profile boundary 和 prompt assembly bounded behavior。
 - compact repair 测试覆盖多个 invalid reasons 触发一次 whole-candidate repair retry、rejected candidate 不被部分采用、完整 candidate 重新通过全量 revalidation、repair exhausted fail closed。
 - 现有 `utils/` 下的 Host public smoke 必须通过，作为 WU-CM-01 的初步验收标准；至少覆盖 `utils/smoke_host_public_conversation_memory.py`、`utils/smoke_host_public_conversation_memory_scenarios.py` 与 `utils/smoke_host_public_multiturn.py`，后续若 smoke 脚本新增、拆分或改名，WU-CM-01 plan 必须同步列出实际验证命令。
-- trace / tool-output refs + recall tool 若进入后续 scope，必须先有 research artifact 和明确 design constraints。
+- deep historical recall / semantic search / recall tool 若进入后续 scope，必须由 GitHub Issue #39 先形成 research artifact 和明确 design constraints。
 - WU-CM-02、WU-CM-03、WU-CM-04、WU-CM-05、WU-CM-06、WU-CM-08、WU-CM-11 的后续状态被更新为 closed、deferred-with-owner 或 transferred-to-issue。
 
 ## WU-CM-02 Working Assumptions Producer Semantics
