@@ -4,7 +4,7 @@
 
 - Gate: WU-CM-01 Slice C policy contract plan fix re-review
 - Verdict: pass
-- Accepted plan fix commit: pending
+- Accepted plan fix commit: 49990e97
 - Next gate: WU-CM-01 Slice C implementation
 
 Controller 接受本轮 policy contract plan fix。两路 review 均为 pass；DS F7 / F8 经 fix gate 后由 MiMo 与 DS re-review 确认关闭，无新增 blocking finding。
