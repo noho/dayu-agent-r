@@ -84,7 +84,7 @@ dayu/config/
 - `run_baseline`：普通 Run 默认 `model_id` 与 `runner_option_hint_id`。
 - `compactor_baseline`：compactor 默认 `model_id`、`scene_id`、`runner_option_hint_id`、`user_prompt_template_path` 与 `artifact_root`。
 - `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
-- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`，其中 `max_evidence_backed_facts` 限制 stable evidence-backed facts 的数量。
+- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 per-section cap / floor 配置，包含 selected recent window、fallback selected recent window、evidence fact、session summary、answer anchor、forward intent、reference continuity、inline delta repair limits 与 `policy_ref`；`context_window_size` 由 profile 显式配置并由 Service 一对一装配。
 - `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
 - `tool_duplicate_governance_policy`：配置 attempt-scoped 重复工具调用治理，包含默认 duplicate decision、按工具名覆盖的 decision、require-justification 参数名映射，以及治理消息文本。
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。

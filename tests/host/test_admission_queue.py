@@ -1040,7 +1040,9 @@ def test_start_run_concrete_memory_catchup_projects_user_input(
 
         assert result.run.status == RunStatus.ACCEPTED
         assert snapshot is not None
-        assert snapshot.snapshot.pinned_state.current_goal == "start input"
+        assert tuple(
+            item.text for item in snapshot.snapshot.trace_memory.selected_recent_window
+        ) == ("start input",)
 
 
 def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(

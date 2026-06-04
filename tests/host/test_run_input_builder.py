@@ -119,13 +119,14 @@ from dayu.host.run_input import (
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
-    ConversationContinuityItem,
-    ConversationContinuityKind,
-    ConversationContinuityView,
-    ConversationMemorySnapshot,
-    HostNeutralRefKind,
+    AnswerAnchor,
+    AnswerAnchorChild,
+    AnswerAnchorMemoryView,
+    ConversationMemorySnapshotVNext,
+    EvidenceFactMemoryView,
+    ForwardIntent,
+    ForwardIntentMemoryView,
     MemoryClaimStatus,
-    MemoryContinuityPreserveReason,
     MemoryDiagnosticReason,
     MemoryEvidenceBackedFactKind,
     MemoryIncludedReason,
@@ -136,10 +137,12 @@ from dayu.host.memory import (
     MemoryRepairReason,
     MemorySizeUnits,
     MemorySnapshotCursor,
-    OpaqueMemoryRef,
-    PinnedStateView,
     EvidenceBackedFactView,
-    WorkingAssumptionView,
+    ReferenceContinuityItem,
+    SelectedRecentWindowItem,
+    SelectedRecentWindowRole,
+    SessionSummaryMemoryView,
+    TraceMemoryView,
     build_conversation_memory_snapshot_from_events,
     calculate_memory_snapshot_digest,
     digest_memory_projection_policy,
@@ -571,29 +574,23 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
         contents = tuple(_message_content(message) for message in request.messages)
 
         assert contents[0] == _expected_system_content()
-        assert contents[1].startswith("Memory user goals and constraints:")
-        assert contents[2].startswith("Memory evidence-backed facts:")
+        assert contents[1].startswith("Session Summary Memory:")
+        assert "summary=compare revenue quality; use reported currency" in contents[1]
+        assert contents[2].startswith("Evidence / Fact Memory:")
         assert "claim_text=Revenue increased year over year" in contents[2]
         assert "evidence_refs=evidence:memory-tool" in contents[2]
-        assert "evidence_kind=observed_value" in contents[2]
+        assert "evidence_kind=derived_from_evidence" in contents[2]
         assert "extraction_operation_ref=event:event-memory-episode" in contents[2]
         assert "event_id=event-memory-episode" in contents[2]
         assert "event_sequence=5" in contents[2]
         assert "digest_ref=" not in contents[2]
         assert "fact_summary=" not in contents[2]
-        assert contents[3].startswith("Memory confirmed subjects and methodology:")
-        assert contents[4].startswith("Memory open questions and working assumptions:")
-        assert contents[5] == "recent raw user"
-        assert contents[6] == "recent assistant conclusion"
-        assert contents[7].startswith("Memory minimum preserve continuity:")
-        assert "label=factor-2" in contents[7]
-        assert "text=second factor: margin mix" in contents[7]
-        assert "source_refs=event-memory-raw-user" in contents[7]
-        assert (
-            "preserve_reason=needed_for_ordered_item_reference"
-            in contents[7]
-        )
-        assert contents[8].startswith("Memory episode summaries:")
+        assert contents[3].startswith("Answer Anchor Memory:")
+        assert contents[4].startswith("Forward Intent Memory:")
+        assert contents[5].startswith("Trace Memory reference continuity:")
+        assert "text=second factor: margin mix" in contents[5]
+        assert contents[6] == "recent raw user"
+        assert contents[7] == "recent assistant conclusion"
         assert contents[-1] == "current prompt"
         assert all("inline delta" not in content for content in contents)
         assert all(
@@ -602,10 +599,10 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
         )
 
 
-def test_memory_provider_applies_stable_layer_budget(tmp_path: Path) -> None:
-    """stable layer 超预算时跳过 stable blocks 并保留 continuity 与当前 prompt。"""
+def test_memory_provider_renders_vnext_fact_section_from_snapshot(tmp_path: Path) -> None:
+    """RunInputBuilder 渲染持久化 vNext fact section。"""
 
-    policy = _memory_policy(stable_layer_size_units=24)
+    policy = _memory_policy(evidence_fact_char_cap=24)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         _append_rich_memory_source_events(store.transaction_runner, session_id)
@@ -627,25 +624,21 @@ def test_memory_provider_applies_stable_layer_budget(tmp_path: Path) -> None:
         ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
         contents = tuple(_message_content(message) for message in request.messages)
 
-        assert all(
-            not content.startswith("Memory evidence-backed facts:")
-            for content in contents
-        )
+        assert any(content.startswith("Evidence / Fact Memory:") for content in contents)
         assert "recent raw user" in contents
         assert contents[-1] == "current prompt"
-        assert any(
-            diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
-            and diagnostic.item_id == "stable:evidence_backed_facts"
+        assert all(
+            diagnostic.reason is not MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
             for diagnostic in memory_view.diagnostics
         )
 
 
-def test_stable_budget_prioritizes_evidence_backed_facts_over_subjects(
+def test_vnext_fact_section_does_not_depend_on_old_subject_blocks(
     tmp_path: Path,
 ) -> None:
-    """stable 预算紧张时 confirmed subjects 不能饿死 evidence-backed facts。"""
+    """vNext fact section 不依赖旧 subject blocks。"""
 
-    policy = _memory_policy(stable_layer_size_units=512)
+    policy = _memory_policy(evidence_fact_char_cap=512)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         _append_rich_memory_source_events(store.transaction_runner, session_id)
@@ -668,16 +661,15 @@ def test_stable_budget_prioritizes_evidence_backed_facts_over_subjects(
         contents = tuple(_message_content(message) for message in request.messages)
 
         assert any(
-            content.startswith("Memory evidence-backed facts:")
+            content.startswith("Evidence / Fact Memory:")
             for content in contents
         )
         assert all(
             not content.startswith("Memory confirmed subjects and methodology:")
             for content in contents
         )
-        assert any(
-            diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
-            and diagnostic.item_id == "stable:subjects"
+        assert all(
+            diagnostic.reason is not MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
             for diagnostic in memory_view.diagnostics
         )
 
@@ -791,7 +783,7 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
         material_blocks=blocks,
         current_input_ref="event-current",
         input_cursor=5,
-        recent_raw_turns_floor=1,
+        selected_recent_window_turn_floor=1,
         trigger_source=ContextCompactionTriggerSource.PROACTIVE,
     )
     second = build_recent_window_fallback_selection(
@@ -801,7 +793,7 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
         material_blocks=blocks,
         current_input_ref="event-current",
         input_cursor=5,
-        recent_raw_turns_floor=1,
+        selected_recent_window_turn_floor=1,
         trigger_source=ContextCompactionTriggerSource.PROACTIVE,
     )
     budget = estimate_recent_window_fallback_budget(
@@ -999,12 +991,12 @@ def test_inline_delta_filters_current_user_input(tmp_path: Path) -> None:
         assert _message_occurrences(contents, "current prompt") == 1
 
 
-def test_inline_delta_applies_stable_layer_budget(tmp_path: Path) -> None:
-    """inline delta 修复后的 stable blocks 仍受 stable layer budget 约束。"""
+def test_inline_delta_includes_vnext_memory_sections(tmp_path: Path) -> None:
+    """inline delta 修复后包含 vNext memory sections。"""
 
     policy = _memory_policy(
         max_lag_events_for_inline_delta=16,
-        stable_layer_size_units=24,
+        evidence_fact_char_cap=24,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -1032,11 +1024,6 @@ def test_inline_delta_applies_stable_layer_budget(tmp_path: Path) -> None:
 
         assert any(
             diagnostic.reason is MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED
-            for diagnostic in memory_view.diagnostics
-        )
-        assert any(
-            diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
-            and diagnostic.item_id == "stable:evidence_backed_facts"
             for diagnostic in memory_view.diagnostics
         )
 
@@ -1135,7 +1122,7 @@ def test_small_memory_lag_repairs_inline_without_checkpoint_advance(
             for diagnostic in memory_view.diagnostics
         )
         assert "current prompt" in contents[-1]
-        assert any("current_goal=prior memory prompt" in content for content in contents)
+        assert any("prior memory prompt" in content for content in contents)
 
 
 def test_over_threshold_memory_lag_raises_repair_required(
@@ -1282,10 +1269,10 @@ def test_run_input_memory_messages_include_context_compacted_projection(
         request = _build_request_with_memory(store, seeded, policy)
         contents = tuple(_message_content(message) for message in request.messages)
 
-        assert any("current_goal=compact pinned goal" in content for content in contents)
-        assert any("confirmed_subject=subject:issuer-a" in content for content in contents)
-        assert any("open_question=compact open question" in content for content in contents)
-        assert any("episode_summary=episode navigation only" in content for content in contents)
+        assert any("summary=episode navigation only" in content for content in contents)
+        assert any("compact pinned goal" in content for content in contents)
+        assert any("compact open question" in content for content in contents)
+        assert any("second factor: margin mix" in content for content in contents)
         assert contents[-1] == "current prompt"
 
 
@@ -1316,7 +1303,7 @@ def test_gross_margin_followup_uses_post_compaction_evidence_backed_facts(
         fact_blocks = tuple(
             content
             for content in contents
-            if content.startswith("Memory evidence-backed facts:")
+            if content.startswith("Evidence / Fact Memory:")
         )
 
         assert len(fact_blocks) == 1
@@ -1356,7 +1343,7 @@ def test_run_input_builder_renders_claim_text_and_evidence_refs_not_digest_only(
         fact_blocks = tuple(
             _message_content(message)
             for message in request.messages
-            if _message_content(message).startswith("Memory evidence-backed facts:")
+            if _message_content(message).startswith("Evidence / Fact Memory:")
         )
 
         assert len(fact_blocks) == 1
@@ -1401,7 +1388,7 @@ def test_no_compaction_recent_raw_turns_continuity_still_works(
         assert "上轮问题：收入增长来自哪里？" in contents
         assert "上轮回答：收入增长主要来自订阅业务。" in contents
         assert all(
-            not content.startswith("Memory evidence-backed facts:")
+            not content.startswith("Evidence / Fact Memory:")
             for content in contents
         )
         assert contents[-1] == "继续说明这个增长因素"
@@ -1423,10 +1410,10 @@ def test_compact_artifact_preserved_fact_refs_reads_canonical_evidence_key() -> 
     )
 
 
-def test_minimum_preserve_resolves_second_factor_without_full_long_input(
+def test_reference_continuity_resolves_second_factor_without_full_long_input(
     tmp_path: Path,
 ) -> None:
-    """长输入 compact 后只靠 minimum preserve 解析“第二个因素”。"""
+    """长输入 compact 后只靠 reference continuity 解析“第二个因素”。"""
 
     policy = _memory_policy()
     long_input = (
@@ -1444,7 +1431,7 @@ def test_minimum_preserve_resolves_second_factor_without_full_long_input(
             event_id="event-long-input",
             text=long_input,
         )
-        compact_event = _append_minimum_preserve_compact_marker(
+        compact_event = _append_reference_continuity_compact_marker(
             store.transaction_runner,
             session_id=session_id,
         )
@@ -1454,7 +1441,7 @@ def test_minimum_preserve_resolves_second_factor_without_full_long_input(
             payload=_user_input_payload("第二个因素具体影响是什么？"),
         )
         cursor = _required_memory_cursor(store.transaction_runner, seeded)
-        snapshot = _minimum_preserve_only_snapshot(
+        snapshot = _reference_continuity_only_snapshot(
             session_id=session_id,
             policy=policy,
             cursor=cursor,
@@ -1469,13 +1456,12 @@ def test_minimum_preserve_resolves_second_factor_without_full_long_input(
         preserve_blocks = tuple(
             content
             for content in contents
-            if content.startswith("Memory minimum preserve continuity:")
+            if content.startswith("Trace Memory reference continuity:")
         )
 
         assert len(preserve_blocks) == 1
-        assert "label=第二个因素" in preserve_blocks[0]
         assert f"text={preserve_text}" in preserve_blocks[0]
-        assert "source_refs=event-long-input" in preserve_blocks[0]
+        assert "reason=needed_for_ordered_item_reference" in preserve_blocks[0]
         assert all(long_input not in content for content in contents)
         assert contents[-1] == "第二个因素具体影响是什么？"
 
@@ -1638,34 +1624,38 @@ def test_current_facts_reject_stale_snapshot_identity(
 def _memory_policy(
     *,
     max_lag_events_for_inline_delta: int = 4,
-    history_pool_size_units: int = 4096,
-    stable_layer_size_units: int = 2048,
+    selected_recent_window_char_cap: int = 4096,
+    evidence_fact_char_cap: int = 2048,
 ) -> MemoryProjectionPolicy:
     """构造 RunInputBuilder memory provider 测试 policy。
 
     :param max_lag_events_for_inline_delta: inline repair 最大滞后事件数。
-    :param history_pool_size_units: history pool 尺寸。
-    :param stable_layer_size_units: stable layer 尺寸。
+    :param selected_recent_window_char_cap: selected recent window 字符上限。
+    :param evidence_fact_char_cap: evidence fact 字符上限。
     :returns: memory projection policy。
     """
 
     return MemoryProjectionPolicy(
         context_window_size=8192,
-        max_pinned_items=8,
-        max_evidence_backed_facts=16,
-        max_working_assumptions=8,
-        recent_raw_turns_floor=2,
-        raw_turn_context_ratio=0.125,
-        raw_turn_size_floor=1024,
-        raw_turn_size_cap=1024,
-        history_pool_context_ratio=0.5,
-        history_pool_size_floor=history_pool_size_units,
-        history_pool_size_cap=history_pool_size_units,
-        stable_layer_context_ratio=0.25,
-        stable_layer_size_floor=stable_layer_size_units,
-        stable_layer_size_cap=stable_layer_size_units,
+        selected_recent_window_item_cap=8,
+        selected_recent_window_char_cap=selected_recent_window_char_cap,
+        selected_recent_window_turn_floor=2,
+        fallback_selected_recent_window_item_cap=4,
+        fallback_selected_recent_window_char_cap=1024,
+        evidence_fact_item_cap=16,
+        evidence_fact_char_cap=evidence_fact_char_cap,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=8,
+        answer_anchor_char_cap=2048,
+        forward_intent_item_cap=8,
+        forward_intent_char_cap=2048,
+        reference_continuity_item_cap=8,
+        reference_continuity_char_cap=2048,
+        reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=max_lag_events_for_inline_delta,
         max_delta_repair_events=16,
+        policy_ref="run-input-builder-test",
     )
 
 
@@ -1768,8 +1758,8 @@ def _rich_memory_snapshot(
     session_id: str,
     policy: MemoryProjectionPolicy,
     cursor: MemorySnapshotCursor,
-) -> ConversationMemorySnapshot:
-    """构造覆盖所有 memory message 分组的 snapshot。
+) -> ConversationMemorySnapshotVNext:
+    """构造覆盖 vNext memory message 分组的 snapshot。
 
     :param session_id: Session id。
     :param policy: memory projection policy。
@@ -1778,160 +1768,135 @@ def _rich_memory_snapshot(
     """
 
     policy_digest = digest_memory_projection_policy(policy)
-    snapshot_without_digest = ConversationMemorySnapshot(
+    snapshot_without_digest = ConversationMemorySnapshotVNext(
+        schema_version="conversation_memory_snapshot_v1",
         snapshot_id=f"memory-snapshot-test-{session_id}",
         session_id=session_id,
         cursor=cursor,
         policy_digest=policy_digest,
-        pinned_state=PinnedStateView(
-            current_goal="compare revenue quality",
-            confirmed_subjects=(
-                OpaqueMemoryRef(
-                    ref_kind=HostNeutralRefKind.SUBJECT,
-                    ref_id="subject:alpha",
-                    digest=_DIGEST_A,
-                ),
-            ),
-            user_constraints=("use reported currency",),
-            open_questions=("what changed in margin?",),
-        ),
-        evidence_backed_facts=(
-            EvidenceBackedFactView(
-                item_id="memory-item:evidence-backed:test",
-                claim_text="Revenue increased year over year",
-                evidence_kind=MemoryEvidenceBackedFactKind.OBSERVED_VALUE,
-                evidence_refs=("evidence:memory-tool",),
-                attributes={},
-                provenance=MemoryProvenanceRef(
-                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
-                    producer_name="conversation_memory",
-                    event_id="event-memory-episode",
-                    event_sequence=5,
-                    run_id="run-memory",
-                    attempt_id=None,
-                    execution_id=None,
-                    tool_result_ref="event-memory-tool",
-                    payload_ref="compact-artifact:test",
-                    digest_ref=_DIGEST_A,
-                    source_refs=(),
-                ),
-                extraction_operation_ref="event:event-memory-episode",
-                compact_artifact_ref="compact-artifact:test",
-                candidate_id="fact-memory-revenue",
-                included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
-                excluded_reason=None,
-                size_units=MemorySizeUnits(31),
-            ),
-        ),
-        working_assumptions=(
-            WorkingAssumptionView(
-                item_id="memory-item:assumption:test",
-                assumption_summary="margin mix may have shifted",
-                claim_status=MemoryClaimStatus.ASSUMPTION,
-                producer_kind=MemoryProducerKind.USER,
-                event_id="event-memory-assumption",
-                event_sequence=2,
-                run_id="run-memory",
-                subject_refs=(),
-                included_reason=MemoryIncludedReason.WORKING_ASSUMPTION,
-                excluded_reason=None,
-                size_units=MemorySizeUnits(27),
-            ),
-        ),
-        conversation_continuity=ConversationContinuityView(
-            items=(
-                ConversationContinuityItem(
-                    item_id="memory-item:raw-user:test",
-                    item_kind=ConversationContinuityKind.RAW_USER_TURN,
-                    producer_kind=MemoryProducerKind.USER,
-                    claim_status=MemoryClaimStatus.ASSUMPTION,
+        latest_compaction_event_ref="event-memory-episode",
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(
+                SelectedRecentWindowItem(
+                    item_id="memory-item:selected-user:test",
+                    role=SelectedRecentWindowRole.USER,
+                    text="recent raw user",
                     event_id="event-memory-raw-user",
                     event_sequence=3,
                     run_id="run-memory",
-                    summary_text="recent raw user",
-                    label=None,
-                    source_refs=(),
-                    preserve_reason=None,
-                    payload_ref=None,
-                    payload_digest=None,
-                    included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+                    source_refs=("event-memory-raw-user",),
+                    included_reason=MemoryIncludedReason.SELECTED_RECENT_WINDOW,
                     excluded_reason=None,
                     size_units=MemorySizeUnits(15),
                 ),
-                ConversationContinuityItem(
-                    item_id="memory-item:assistant:test",
-                    item_kind=ConversationContinuityKind.ASSISTANT_CONCLUSION,
-                    producer_kind=MemoryProducerKind.ASSISTANT,
-                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                SelectedRecentWindowItem(
+                    item_id="memory-item:selected-assistant:test",
+                    role=SelectedRecentWindowRole.ASSISTANT,
+                    text="recent assistant conclusion",
                     event_id="event-memory-assistant",
                     event_sequence=4,
                     run_id="run-memory",
-                    summary_text="recent assistant conclusion",
-                    label=None,
-                    source_refs=(),
-                    preserve_reason=None,
-                    payload_ref=None,
-                    payload_digest=None,
-                    included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+                    source_refs=("event-memory-assistant",),
+                    included_reason=MemoryIncludedReason.SELECTED_RECENT_WINDOW,
                     excluded_reason=None,
                     size_units=MemorySizeUnits(27),
                 ),
-                ConversationContinuityItem(
-                    item_id="memory-item:minimum-preserve:test",
-                    item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
-                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
-                    claim_status=MemoryClaimStatus.ASSUMPTION,
+            ),
+            reference_continuity_items=(
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity:test",
+                    text="second factor: margin mix",
+                    reason="needed_for_ordered_item_reference",
+                    source_refs=("event-memory-raw-user",),
                     event_id="event-memory-episode",
                     event_sequence=5,
-                    run_id="run-memory",
-                    summary_text="second factor: margin mix",
-                    label="factor-2",
-                    source_refs=("event-memory-raw-user",),
-                    preserve_reason=(
-                        MemoryContinuityPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
-                    ),
-                    payload_ref=None,
-                    payload_digest=None,
-                    included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
-                    excluded_reason=None,
                     size_units=MemorySizeUnits(25),
                 ),
-                ConversationContinuityItem(
-                    item_id="memory-item:episode:test",
-                    item_kind=ConversationContinuityKind.EPISODE_SUMMARY,
-                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
-                    claim_status=MemoryClaimStatus.ASSUMPTION,
+            ),
+        ),
+        evidence_fact_memory=EvidenceFactMemoryView(
+            evidence_backed_facts=(_memory_fact_view(),),
+            recent_evidence_items=(),
+        ),
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text="compare revenue quality; use reported currency",
+            source_refs=("event-memory-episode",),
+            event_id="event-memory-episode",
+            event_sequence=5,
+            size_units=MemorySizeUnits(46),
+        ),
+        answer_anchor_memory=AnswerAnchorMemoryView(
+            anchors=(
+                AnswerAnchor(
+                    item_id="memory-item:answer-anchor:test",
+                    anchor_title="Revenue quality",
+                    anchor_items=(
+                        AnswerAnchorChild(
+                            display_text="Use reported currency.",
+                            ordinal=1,
+                        ),
+                    ),
+                    source_refs=("event-memory-episode",),
                     event_id="event-memory-episode",
                     event_sequence=5,
-                    run_id=None,
-                    summary_text="episode navigation only",
-                    label=None,
-                    source_refs=(),
-                    preserve_reason=None,
-                    payload_ref=None,
-                    payload_digest=None,
-                    included_reason=MemoryIncludedReason.EPISODE_SUMMARY,
-                    excluded_reason=None,
+                    size_units=MemorySizeUnits(42),
+                ),
+            ),
+        ),
+        forward_intent_memory=ForwardIntentMemoryView(
+            intents=(
+                ForwardIntent(
+                    item_id="memory-item:forward-intent:test",
+                    intent_type="follow_up",
+                    text="what changed in margin?",
+                    status="open",
+                    source_refs=("event-memory-episode",),
+                    event_id="event-memory-episode",
+                    event_sequence=5,
                     size_units=MemorySizeUnits(23),
                 ),
-            )
+            ),
         ),
         diagnostics=(),
         built_at="2026-05-15T01:02:03.000000Z",
         snapshot_digest="pending",
     )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
+    return replace(
+        snapshot_without_digest,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def _memory_fact_view() -> EvidenceBackedFactView:
+    """构造测试用 evidence-backed fact。
+
+    :returns: evidence-backed fact view。
+    """
+
+    return EvidenceBackedFactView(
+        item_id="memory-item:evidence-backed:test",
+        claim_text="Revenue increased year over year",
+        evidence_kind=MemoryEvidenceBackedFactKind.DERIVED_FROM_EVIDENCE,
+        evidence_refs=("evidence:memory-tool",),
+        provenance=MemoryProvenanceRef(
+            producer_kind=MemoryProducerKind.HOST_PROJECTION,
+            producer_name="conversation_memory",
+            event_id="event-memory-episode",
+            event_sequence=5,
+            run_id="run-memory",
+            attempt_id=None,
+            execution_id=None,
+            tool_result_ref="event-memory-tool",
+            payload_ref="compact-artifact:test",
+            digest_ref=_DIGEST_A,
+            source_refs=(),
+        ),
+        extraction_operation_ref="event:event-memory-episode",
+        compact_artifact_ref="compact-artifact:test",
+        candidate_id="fact-memory-revenue",
+        included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
+        excluded_reason=None,
+        size_units=MemorySizeUnits(31),
     )
 
 
@@ -1939,8 +1904,8 @@ def _stable_budget_pressure_snapshot(
     session_id: str,
     policy: MemoryProjectionPolicy,
     cursor: MemorySnapshotCursor,
-) -> ConversationMemorySnapshot:
-    """构造 subjects 大于预算但 fact 可独立放入的 snapshot。
+) -> ConversationMemorySnapshotVNext:
+    """构造 vNext fact pressure snapshot。
 
     :param session_id: Session id。
     :param policy: memory projection policy。
@@ -1948,28 +1913,7 @@ def _stable_budget_pressure_snapshot(
     :returns: memory snapshot。
     """
 
-    snapshot = _rich_memory_snapshot(session_id, policy, cursor)
-    subjects = tuple(
-        OpaqueMemoryRef(
-            ref_kind=HostNeutralRefKind.SUBJECT,
-            ref_id=f"subject:budget-pressure-{index}",
-            digest=_DIGEST_A,
-        )
-        for index in range(12)
-    )
-    pinned_state = replace(
-        snapshot.pinned_state,
-        current_goal=None,
-        confirmed_subjects=subjects,
-        user_constraints=(),
-        open_questions=(),
-    )
-    updated = replace(
-        snapshot,
-        pinned_state=pinned_state,
-        working_assumptions=(),
-    )
-    return replace(updated, snapshot_digest=calculate_memory_snapshot_digest(updated))
+    return _rich_memory_snapshot(session_id, policy, cursor)
 
 
 def _current_input_memory_snapshot(
@@ -1979,7 +1923,7 @@ def _current_input_memory_snapshot(
     cursor: MemorySnapshotCursor,
     current_input: EventLogRow,
     current_prompt: str,
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造包含当前用户输入的测试 memory snapshot。
 
     :param session_id: Session id。
@@ -1991,61 +1935,54 @@ def _current_input_memory_snapshot(
     """
 
     policy_digest = digest_memory_projection_policy(policy)
-    snapshot_without_digest = ConversationMemorySnapshot(
+    snapshot_without_digest = ConversationMemorySnapshotVNext(
+        schema_version="conversation_memory_snapshot_v1",
         snapshot_id=f"memory-snapshot-current-{session_id}",
         session_id=session_id,
         cursor=cursor,
         policy_digest=policy_digest,
-        pinned_state=PinnedStateView(
-            current_goal=current_prompt,
-            confirmed_subjects=(),
-            user_constraints=(current_prompt,),
-            open_questions=(),
-        ),
-        evidence_backed_facts=(),
-        working_assumptions=(),
-        conversation_continuity=ConversationContinuityView(
-            items=(
-                ConversationContinuityItem(
-                    item_id="memory-item:raw-user:current",
-                    item_kind=ConversationContinuityKind.RAW_USER_TURN,
-                    producer_kind=MemoryProducerKind.USER,
-                    claim_status=MemoryClaimStatus.ASSUMPTION,
+        latest_compaction_event_ref=None,
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(
+                SelectedRecentWindowItem(
+                    item_id="memory-item:selected-current",
+                    role=SelectedRecentWindowRole.USER,
+                    text=current_prompt,
                     event_id=current_input.event_id,
                     event_sequence=current_input.event_sequence,
                     run_id=current_input.run_id,
-                    summary_text=current_prompt,
-                    label=None,
-                    source_refs=(),
-                    preserve_reason=None,
-                    payload_ref=None,
-                    payload_digest=None,
-                    included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+                    source_refs=(current_input.event_id,),
+                    included_reason=MemoryIncludedReason.SELECTED_RECENT_WINDOW,
                     excluded_reason=None,
                     size_units=MemorySizeUnits(len(current_prompt)),
                 ),
-            )
+            ),
+            reference_continuity_items=(),
         ),
+        evidence_fact_memory=EvidenceFactMemoryView(
+            evidence_backed_facts=(),
+            recent_evidence_items=(),
+        ),
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text=None,
+            source_refs=(),
+            event_id=None,
+            event_sequence=None,
+            size_units=MemorySizeUnits(0),
+        ),
+        answer_anchor_memory=AnswerAnchorMemoryView(anchors=()),
+        forward_intent_memory=ForwardIntentMemoryView(intents=()),
         diagnostics=(),
         built_at="2026-05-15T01:02:03.000000Z",
         snapshot_digest="pending",
     )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
+    return replace(
+        snapshot_without_digest,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )
 
 
-def _minimum_preserve_only_snapshot(
+def _reference_continuity_only_snapshot(
     *,
     session_id: str,
     policy: MemoryProjectionPolicy,
@@ -2053,78 +1990,66 @@ def _minimum_preserve_only_snapshot(
     source_event: EventLogRow,
     producer_event: EventLogRow,
     preserve_text: str,
-) -> ConversationMemorySnapshot:
-    """构造只保留 minimum preserve item 的 memory snapshot。
+) -> ConversationMemorySnapshotVNext:
+    """构造只保留 reference continuity item 的 memory snapshot。
 
     :param session_id: Session id。
     :param policy: memory projection policy。
     :param cursor: snapshot cursor。
     :param source_event: compact 前长输入 source event。
-    :param producer_event: 生成 minimum preserve item 的 compact event。
-    :param preserve_text: minimum preserve item 文本。
+    :param producer_event: 生成 reference continuity item 的 compact event。
+    :param preserve_text: reference continuity item 文本。
     :returns: memory snapshot。
     """
 
     policy_digest = digest_memory_projection_policy(policy)
-    snapshot_without_digest = ConversationMemorySnapshot(
-        snapshot_id=f"memory-snapshot-minimum-preserve-{session_id}",
+    snapshot_without_digest = ConversationMemorySnapshotVNext(
+        schema_version="conversation_memory_snapshot_v1",
+        snapshot_id=f"memory-snapshot-reference-continuity-{session_id}",
         session_id=session_id,
         cursor=cursor,
         policy_digest=policy_digest,
-        pinned_state=PinnedStateView(
-            current_goal=None,
-            confirmed_subjects=(),
-            user_constraints=(),
-            open_questions=(),
-        ),
-        evidence_backed_facts=(),
-        working_assumptions=(),
-        conversation_continuity=ConversationContinuityView(
-            items=(
-                ConversationContinuityItem(
-                    item_id="memory-item:minimum-preserve:second-factor",
-                    item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
-                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
-                    claim_status=MemoryClaimStatus.ASSUMPTION,
+        latest_compaction_event_ref=producer_event.event_id,
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(),
+            reference_continuity_items=(
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity:second-factor",
+                    text=preserve_text,
+                    reason="needed_for_ordered_item_reference",
+                    source_refs=(source_event.event_id,),
                     event_id=producer_event.event_id,
                     event_sequence=producer_event.event_sequence,
-                    run_id=producer_event.run_id,
-                    summary_text=preserve_text,
-                    label="第二个因素",
-                    source_refs=(source_event.event_id,),
-                    preserve_reason=(
-                        MemoryContinuityPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
-                    ),
-                    payload_ref=None,
-                    payload_digest=None,
-                    included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
-                    excluded_reason=None,
                     size_units=MemorySizeUnits(len(preserve_text)),
                 ),
-            )
+            ),
         ),
+        evidence_fact_memory=EvidenceFactMemoryView(
+            evidence_backed_facts=(),
+            recent_evidence_items=(),
+        ),
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text=None,
+            source_refs=(),
+            event_id=None,
+            event_sequence=None,
+            size_units=MemorySizeUnits(0),
+        ),
+        answer_anchor_memory=AnswerAnchorMemoryView(anchors=()),
+        forward_intent_memory=ForwardIntentMemoryView(intents=()),
         diagnostics=(),
         built_at="2026-05-15T01:02:03.000000Z",
         snapshot_digest="pending",
     )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
+    return replace(
+        snapshot_without_digest,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )
 
 
 def _write_memory_snapshot(
     transaction_runner: HostTransactionRunner,
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> None:
     """写入 memory snapshot 与 projection checkpoint。
 
@@ -2313,10 +2238,10 @@ def _append_compacted_gross_margin_facts(
     transaction_runner.run_write(operation)
 
 
-def _append_minimum_preserve_compact_marker(
+def _append_reference_continuity_compact_marker(
     transaction_runner: HostTransactionRunner, *, session_id: str
 ) -> EventLogRow:
-    """追加 minimum preserve snapshot 的 compact producer event。
+    """追加 reference continuity snapshot 的 compact producer event。
 
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
@@ -2339,10 +2264,10 @@ def _append_minimum_preserve_compact_marker(
                 run_id="run-long-input",
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
-                    summary_text="long input compacted to minimum preserve",
+                    summary_text="long input compacted to reference continuity",
                     pinned_patch={"candidate_id": "patch-second-factor"},
                     fact_candidates=[],
-                    minimum_preserve_items=[
+                    reference_continuity_items=[
                         {
                             "item_id": "preserve-second-factor",
                             "label": "第二个因素",
@@ -3577,14 +3502,14 @@ def _compact_payload(
     summary_text: str,
     pinned_patch: dict[str, JsonValue],
     fact_candidates: list[JsonValue] | None = None,
-    minimum_preserve_items: list[JsonValue] | None = None,
+    reference_continuity_items: list[JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     """构造测试用 CONTEXT_COMPACTED payload。
 
     :param summary_text: episode summary 文本。
     :param pinned_patch: pinned patch candidate。
     :param fact_candidates: 可选 evidence-backed fact candidates。
-    :param minimum_preserve_items: 可选 minimum preserve item candidates。
+    :param reference_continuity_items: 可选 reference continuity candidates。
     :returns: compacted payload。
     """
 
@@ -3592,86 +3517,79 @@ def _compact_payload(
     if fact_candidates is None:
         resolved_fact_candidates = [
             {
-                "candidate_id": "fact-memory-revenue",
                 "claim_text": "Revenue increased year over year",
-                "evidence_kind": "observed_value",
-                "evidence_refs": ["evidence:memory-tool"],
-                "attributes": {},
+                "evidence_labels": ["evidence:memory-tool"],
             }
         ]
     else:
-        resolved_fact_candidates = fact_candidates
-    resolved_minimum_preserve_items: list[JsonValue]
-    if minimum_preserve_items is None:
-        resolved_minimum_preserve_items = [
+        resolved_fact_candidates = [
             {
-                "item_id": "preserve-factor-2",
-                "label": "factor-2",
+                "claim_text": str(candidate["claim_text"]),
+                "evidence_labels": ["evidence:memory-tool"],
+            }
+            for candidate in fact_candidates
+            if isinstance(candidate, dict) and "claim_text" in candidate
+        ]
+    resolved_reference_continuity_items: list[JsonValue]
+    if reference_continuity_items is None:
+        resolved_reference_continuity_items = [
+            {
                 "text": "second factor: margin mix",
-                "source_refs": ["event-memory-raw-user"],
-                "preserve_reason": "needed_for_ordered_item_reference",
+                "reason": "needed_for_ordered_item_reference",
+                "source_labels": ["event-memory-raw-user"],
             }
         ]
     else:
-        resolved_minimum_preserve_items = minimum_preserve_items
-
-    episode_summary: dict[str, JsonValue] = {
-        "candidate_id": "summary-memory",
-        "summary_text": summary_text,
-        "episode_title": "episode",
-        "goal": "compact goal",
-        "completed_actions": [],
-        "confirmed_fact_refs": [],
-        "confirmed_fact_summaries": [],
-        "user_constraints": [],
-        "open_questions": ["compact open question"],
-        "next_step": None,
-        "tool_finding_refs": [],
-        "source_event_refs": ["event-memory-raw-user"],
-        "evidence_refs": ["evidence-1"],
-        "proposed_evidence_backed_fact_refs": [],
-    }
-    preservation_evidence: list[JsonValue] = [
-        {
-            "evidence_id": "evidence-1",
-            "material_source_refs": ["event-memory-raw-user"],
-            "canonical_evidence_refs": ["evidence:memory-tool"],
-            "evidence_backed_fact_refs": [],
-            "memory_snapshot_cursor": None,
-            "compact_input_range": None,
-        }
-    ]
-    preserved_fact_refs: dict[str, JsonValue] = {
-        "canonical_evidence_refs": ["evidence:memory-tool"],
-        "evidence_backed_fact_refs": [],
-    }
-    quality_check_result: dict[str, JsonValue] = {
-        "accepted": True,
-        "rejection_reasons": [],
-        "current_user_input_retained": True,
-        "canonical_evidence_refs_retained": True,
-        "evidence_backed_fact_candidates_accepted": True,
-        "minimum_preserve_items_accepted": True,
-        "evidence_anchors_retained": True,
-        "open_questions_retained": True,
-        "retained_canonical_evidence_refs": ["evidence:memory-tool"],
-        "dropped_ranges": [],
-        "summarized_ranges": [],
-    }
+        resolved_reference_continuity_items = [
+            {
+                "text": str(candidate["text"]),
+                "reason": "needed_for_ordered_item_reference",
+                "source_labels": ["event-long-input"],
+            }
+            for candidate in reference_continuity_items
+            if isinstance(candidate, dict) and "text" in candidate
+        ]
+    anchor_text = "compact pinned goal"
+    if isinstance(pinned_patch.get("current_goal"), dict):
+        current_goal = pinned_patch["current_goal"]
+        if isinstance(current_goal, dict) and isinstance(current_goal.get("value"), str):
+            anchor_text = current_goal["value"]
+    forward_text = "compact open question"
+    if isinstance(pinned_patch.get("open_questions"), dict):
+        open_questions = pinned_patch["open_questions"]
+        if isinstance(open_questions, dict):
+            values = open_questions.get("value")
+            if isinstance(values, list) and values and isinstance(values[0], str):
+                forward_text = values[0]
     payload: dict[str, JsonValue] = {
+        "accepted_candidate": {
+            "schema_version": "conversation_compact_output_v1",
+            "session_summary": {
+                "summary_text": summary_text,
+                "source_labels": ["event-memory-raw-user"],
+            },
+            "evidence_backed_facts": resolved_fact_candidates,
+            "answer_anchors": [
+                {
+                    "anchor_title": "Compacted answer anchor",
+                    "anchor_items": [{"display_text": anchor_text, "ordinal": 1}],
+                    "answer_source_labels": ["event-memory-episode"],
+                }
+            ],
+            "forward_intents": [
+                {
+                    "intent_type": "open_question",
+                    "text": forward_text,
+                    "status": "open",
+                    "source_labels": ["event-memory-episode"],
+                }
+            ],
+            "reference_continuity_items": resolved_reference_continuity_items,
+            "diagnostics": [],
+        },
+        "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
         "compact_artifact_ref": "compact-artifact:test",
         "compact_artifact_digest": _DIGEST_A,
-        "episode_summary_candidate": episode_summary,
-        "pinned_state_patch_candidate": pinned_patch,
-        "evidence_backed_fact_candidates": resolved_fact_candidates,
-        "minimum_preserve_item_candidates": resolved_minimum_preserve_items,
-        "preservation_evidence": preservation_evidence,
-        "preserved_fact_refs": preserved_fact_refs,
-        "dropped_ranges": [],
-        "summarized_ranges": [],
-        "evidence_anchors_retained": True,
-        "quality_check_result": quality_check_result,
-        "budget_after_compact": 128,
     }
     return payload
 

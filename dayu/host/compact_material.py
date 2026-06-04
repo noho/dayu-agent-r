@@ -37,7 +37,7 @@ from dayu.host.compaction import (
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.memory import (
-    ConversationMemorySnapshot,
+    ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
     MemoryProjectionPolicy,
     MemoryRepairReason,
@@ -321,7 +321,7 @@ class InlineDeltaRepairMaterialView:
     :param diagnostics: inline repair 诊断。
     """
 
-    snapshot: ConversationMemorySnapshot
+    snapshot: ConversationMemorySnapshotVNext
     diagnostics: tuple[MemoryDiagnostic, ...]
 
 
@@ -343,7 +343,7 @@ class SnapshotCursorCheckResult:
     """
 
     kind: SnapshotCursorCheckKind
-    snapshot: ConversationMemorySnapshot
+    snapshot: ConversationMemorySnapshotVNext
     inline_delta_repair_view: InlineDeltaRepairMaterialView | None
     requests_run_recovery: bool = False
 
@@ -574,7 +574,7 @@ def select_compact_segment(
     memory_snapshot_cursor: int | None,
     policy_digest: str,
     material_blocks: tuple[RunInputMaterialBlock, ...],
-    recent_raw_turns_floor: int = 0,
+    selected_recent_window_turn_floor: int = 0,
     max_selected_size_units: int | None = None,
 ) -> CompactSegmentSelection:
     """按确定性规则选择 compact segment。
@@ -584,7 +584,7 @@ def select_compact_segment(
     :param memory_snapshot_cursor: memory snapshot cursor。
     :param policy_digest: context / memory policy digest。
     :param material_blocks: ordinary input 或 frozen overflow material list。
-    :param recent_raw_turns_floor: 需要保护的 recent raw turn 数量。
+    :param selected_recent_window_turn_floor: 需要保护的 selected recent-window turn 数量。
     :param max_selected_size_units: 可选 selected segment 尺寸上限。
     :returns: CompactSegmentSelection。
     :raises TypeError: 参数类型非法时抛出。
@@ -597,10 +597,13 @@ def select_compact_segment(
         memory_snapshot_cursor=memory_snapshot_cursor,
         policy_digest=policy_digest,
         material_blocks=material_blocks,
-        recent_raw_turns_floor=recent_raw_turns_floor,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
         max_selected_size_units=max_selected_size_units,
     )
-    protected_recent_ids = _protected_recent_raw_block_ids(material_blocks, recent_raw_turns_floor)
+    protected_recent_ids = _protected_recent_raw_block_ids(
+        material_blocks,
+        selected_recent_window_turn_floor,
+    )
     selected: list[str] = []
     excluded_reasons: dict[str, str] = {}
     selected_units = 0
@@ -658,7 +661,7 @@ def build_compact_material_pack(
     *,
     selected_segment: CompactSegmentSelection,
     material_blocks: tuple[RunInputMaterialBlock, ...],
-    memory_snapshot: ConversationMemorySnapshot | None,
+    memory_snapshot: ConversationMemorySnapshotVNext | None,
     inline_delta_repair_view: InlineDeltaRepairMaterialView | None,
     current_input_ref: str,
     current_input_text: str,
@@ -751,7 +754,7 @@ def check_compact_memory_snapshot_cursor(
     session_id: str,
     required_event_sequence: int,
     policy: MemoryProjectionPolicy,
-    snapshot: ConversationMemorySnapshot | None,
+    snapshot: ConversationMemorySnapshotVNext | None,
     inline_delta_repair_view: InlineDeltaRepairMaterialView | None = None,
 ) -> SnapshotCursorCheckResult:
     """校验 compact material build 前的 memory snapshot cursor。
@@ -1130,7 +1133,7 @@ def _validate_selection_inputs(
     memory_snapshot_cursor: int | None,
     policy_digest: str,
     material_blocks: tuple[RunInputMaterialBlock, ...],
-    recent_raw_turns_floor: int,
+    selected_recent_window_turn_floor: int,
     max_selected_size_units: int | None,
 ) -> None:
     """校验 segment selection 输入。
@@ -1140,7 +1143,7 @@ def _validate_selection_inputs(
     :param memory_snapshot_cursor: memory snapshot cursor。
     :param policy_digest: policy digest。
     :param material_blocks: material blocks。
-    :param recent_raw_turns_floor: protected raw turn floor。
+    :param selected_recent_window_turn_floor: protected selected recent-window turn floor。
     :param max_selected_size_units: 可选选择预算。
     :returns: ``None``。
     :raises TypeError: 参数类型非法时抛出。
@@ -1155,8 +1158,8 @@ def _validate_selection_inputs(
         raise ValueError("memory_snapshot_cursor must be non-negative")
     _require_non_empty_text(policy_digest, "policy_digest")
     _require_material_block_tuple(material_blocks, "material_blocks")
-    if recent_raw_turns_floor < 0:
-        raise ValueError("recent_raw_turns_floor must be non-negative")
+    if selected_recent_window_turn_floor < 0:
+        raise ValueError("selected_recent_window_turn_floor must be non-negative")
     if max_selected_size_units is not None and max_selected_size_units < 0:
         raise ValueError("max_selected_size_units must be non-negative")
 
@@ -1202,17 +1205,17 @@ def _block_event_sequence(block: RunInputMaterialBlock, memory_snapshot_cursor: 
 
 
 def _protected_recent_raw_block_ids(
-    blocks: tuple[RunInputMaterialBlock, ...], recent_raw_turns_floor: int
+    blocks: tuple[RunInputMaterialBlock, ...], selected_recent_window_turn_floor: int
 ) -> frozenset[str]:
     """计算 protected recent raw floor 对应 block ids。
 
     :param blocks: material blocks。
-    :param recent_raw_turns_floor: recent raw turn 保底数量。
+    :param selected_recent_window_turn_floor: selected recent-window turn 保底数量。
     :returns: protected block id 集合。
     """
 
     explicit = [block.block_id for block in blocks if block.protected_recent_raw_turn and _is_raw_turn_block(block)]
-    if recent_raw_turns_floor == 0:
+    if selected_recent_window_turn_floor == 0:
         return frozenset(explicit)
     raw_blocks = sorted(
         (block for block in blocks if _is_raw_turn_block(block)),
@@ -1223,7 +1226,9 @@ def _protected_recent_raw_block_ids(
         ),
         reverse=True,
     )
-    protected = [block.block_id for block in raw_blocks[:recent_raw_turns_floor]]
+    protected = [
+        block.block_id for block in raw_blocks[:selected_recent_window_turn_floor]
+    ]
     protected.extend(explicit)
     return frozenset(protected)
 
@@ -1305,9 +1310,9 @@ def _ordered_reason_mapping(values: dict[str, str]) -> dict[str, str]:
 
 
 def _effective_snapshot(
-    memory_snapshot: ConversationMemorySnapshot | None,
+    memory_snapshot: ConversationMemorySnapshotVNext | None,
     inline_delta_repair_view: InlineDeltaRepairMaterialView | None,
-) -> ConversationMemorySnapshot | None:
+) -> ConversationMemorySnapshotVNext | None:
     """选取 material pack stable input 使用的 snapshot。
 
     :param memory_snapshot: ready memory snapshot。
@@ -1390,7 +1395,7 @@ def _is_current_input_history_duplicate(block: RunInputMaterialBlock, current_an
 
 
 def _previous_blocks_from_snapshot(
-    snapshot: ConversationMemorySnapshot | None,
+    snapshot: ConversationMemorySnapshotVNext | None,
 ) -> tuple[CompactMaterialBlock, ...]:
     """从 memory snapshot 构造 previous compacted view blocks。
 
@@ -1401,14 +1406,14 @@ def _previous_blocks_from_snapshot(
     if snapshot is None:
         return ()
     blocks: list[RunInputMaterialBlock] = []
-    goals_text = _snapshot_goal_text(snapshot)
-    if goals_text is not None:
+    summary_text = _snapshot_summary_text(snapshot)
+    if summary_text is not None:
         blocks.append(
             run_input_material_block(
-                block_id=_STABLE_GOALS_BLOCK_ID,
+                block_id="previous:session_summary",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.SESSION_SUMMARY,
-                text=goals_text,
+                text=summary_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
                 event_sub_index=0,
@@ -1427,52 +1432,70 @@ def _previous_blocks_from_snapshot(
                 event_sub_index=1,
             )
         )
-    assumptions_text = _snapshot_assumptions_text(snapshot)
-    if assumptions_text is not None:
+    anchors_text = _snapshot_answer_anchors_text(snapshot)
+    if anchors_text is not None:
         blocks.append(
             run_input_material_block(
-                block_id=_STABLE_ASSUMPTIONS_BLOCK_ID,
+                block_id="previous:answer_anchors",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
-                kind=CompactMaterialBlockKind.FORWARD_INTENT,
-                text=assumptions_text,
+                kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
+                text=anchors_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
                 event_sub_index=2,
             )
         )
+    intents_text = _snapshot_forward_intents_text(snapshot)
+    if intents_text is not None:
+        blocks.append(
+            run_input_material_block(
+                block_id="previous:forward_intents",
+                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                kind=CompactMaterialBlockKind.FORWARD_INTENT,
+                text=intents_text,
+                canonical_source_refs=(snapshot.snapshot_id,),
+                event_sequence=None,
+                event_sub_index=3,
+            )
+        )
+    reference_text = _snapshot_reference_continuity_text(snapshot)
+    if reference_text is not None:
+        blocks.append(
+            run_input_material_block(
+                block_id="previous:reference_continuity",
+                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+                text=reference_text,
+                canonical_source_refs=(snapshot.snapshot_id,),
+                event_sequence=None,
+                event_sub_index=4,
+            )
+        )
     return _pack_previous_blocks(tuple(blocks))
 
 
-def _snapshot_goal_text(snapshot: ConversationMemorySnapshot) -> str | None:
-    """构造 pinned goal / subject stable 文本。
+def _snapshot_summary_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
+    """构造 previous session summary 文本。
 
     :param snapshot: memory snapshot。
-    :returns: stable 文本；无内容时返回 ``None``。
+    :returns: summary 文本；无内容时返回 ``None``。
     """
 
-    lines: list[str] = []
-    if snapshot.pinned_state.current_goal is not None:
-        lines.append(f"current_goal={snapshot.pinned_state.current_goal}")
-    for constraint in snapshot.pinned_state.user_constraints:
-        lines.append(f"user_constraint={constraint}")
-    for subject in snapshot.pinned_state.confirmed_subjects:
-        lines.append(f"confirmed_subject={subject.ref_kind.value}:{subject.ref_id}")
-    if not lines:
-        return None
-    return "\n".join(lines)
+    return snapshot.session_summary_memory.summary_text
 
 
-def _snapshot_facts_text(snapshot: ConversationMemorySnapshot) -> str | None:
+def _snapshot_facts_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
     """构造 evidence-backed facts stable 文本。
 
     :param snapshot: memory snapshot。
     :returns: stable 文本；无内容时返回 ``None``。
     """
 
-    if not snapshot.evidence_backed_facts:
+    facts = snapshot.evidence_fact_memory.evidence_backed_facts
+    if not facts:
         return None
     lines: list[str] = []
-    for fact in snapshot.evidence_backed_facts:
+    for fact in facts:
         lines.append(
             "fact="
             f"claim_text={fact.claim_text}; "
@@ -1482,20 +1505,48 @@ def _snapshot_facts_text(snapshot: ConversationMemorySnapshot) -> str | None:
     return "\n".join(lines)
 
 
-def _snapshot_assumptions_text(snapshot: ConversationMemorySnapshot) -> str | None:
-    """构造 open questions / assumptions stable 文本。
+def _snapshot_answer_anchors_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
+    """构造 previous answer anchors 文本。
 
     :param snapshot: memory snapshot。
-    :returns: stable 文本；无内容时返回 ``None``。
+    :returns: answer anchor 文本；无内容时返回 ``None``。
     """
 
-    lines: list[str] = []
-    for question in snapshot.pinned_state.open_questions:
-        lines.append(f"open_question={question}")
-    for assumption in snapshot.working_assumptions:
-        lines.append(f"working_assumption={assumption.assumption_summary}")
-    if not lines:
+    if not snapshot.answer_anchor_memory.anchors:
         return None
+    lines: list[str] = []
+    for anchor in snapshot.answer_anchor_memory.anchors:
+        lines.append(f"answer_anchor={anchor.anchor_title}")
+    return "\n".join(lines)
+
+
+def _snapshot_forward_intents_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
+    """构造 previous forward intents 文本。
+
+    :param snapshot: memory snapshot。
+    :returns: forward intent 文本；无内容时返回 ``None``。
+    """
+
+    if not snapshot.forward_intent_memory.intents:
+        return None
+    lines: list[str] = []
+    for intent in snapshot.forward_intent_memory.intents:
+        lines.append(f"forward_intent={intent.intent_type}; status={intent.status}; text={intent.text}")
+    return "\n".join(lines)
+
+
+def _snapshot_reference_continuity_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
+    """构造 previous reference continuity 文本。
+
+    :param snapshot: memory snapshot。
+    :returns: reference continuity 文本；无内容时返回 ``None``。
+    """
+
+    if not snapshot.trace_memory.reference_continuity_items:
+        return None
+    lines: list[str] = []
+    for item in snapshot.trace_memory.reference_continuity_items:
+        lines.append(f"reference_continuity={item.reason}; text={item.text}")
     return "\n".join(lines)
 
 
@@ -1729,7 +1780,7 @@ def _raise_on_duplicate_section_owner(entries: tuple[PromptLocalProvenanceEntry,
 
 
 def _validate_snapshot_session(
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     *,
     session_id: str,
     required_event_sequence: int,

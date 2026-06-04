@@ -37,18 +37,19 @@ from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.context_events import CONTEXT_COMPACTED
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
-    ConversationContinuityItem,
-    ConversationContinuityKind,
-    ConversationMemorySnapshot,
+    AnswerAnchor,
+    ConversationMemorySnapshotVNext,
+    ForwardIntent,
     MemoryClaimStatus,
     MemoryDiagnostic,
     MemoryExcludedReason,
     MemoryIncludedReason,
     MemoryProjectionEvent,
-    MemoryProducerKind,
     MemoryProjectionPolicy,
+    MemoryProducerKind,
+    ReferenceContinuityItem,
+    SelectedRecentWindowItem,
     EvidenceBackedFactView,
-    WorkingAssumptionView,
     calculate_memory_snapshot_digest,
     conversation_memory_snapshot_from_json_value,
     conversation_memory_snapshot_to_json_value,
@@ -77,7 +78,11 @@ from dayu.host.durable.event_log import EventClass
 _ZERO_CURSOR_SEQUENCE = 0
 _ITEM_KIND_EVIDENCE_BACKED_FACT = "evidence_backed_fact"
 _ITEM_KIND_OLD_VERIFIED_FACT = "verified_fact"
-_ITEM_KIND_WORKING_ASSUMPTION = "working_assumption"
+_ITEM_KIND_SELECTED_RECENT_WINDOW = "selected_recent_window"
+_ITEM_KIND_REFERENCE_CONTINUITY = "reference_continuity"
+_ITEM_KIND_ANSWER_ANCHOR = "answer_anchor"
+_ITEM_KIND_FORWARD_INTENT = "forward_intent"
+_ITEM_KIND_SESSION_SUMMARY = "session_summary"
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
@@ -280,7 +285,7 @@ class MemorySnapshotRow:
     :param updated_at: row 最近更新时间。
     """
 
-    snapshot: ConversationMemorySnapshot
+    snapshot: ConversationMemorySnapshotVNext
     updated_at: str
 
 
@@ -411,7 +416,7 @@ def read_latest_memory_snapshot_at_or_before(
 
 def write_memory_snapshot(
     transaction: HostTransaction,
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     *,
     updated_at: str,
 ) -> MemorySnapshotRow:
@@ -480,7 +485,7 @@ def write_memory_snapshot(
 
 def write_memory_snapshot_with_checkpoint(
     transaction: HostTransaction,
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     *,
     now: str,
 ) -> MemorySnapshotRow:
@@ -632,7 +637,7 @@ def read_memory_diagnostic(
 
 
 def _replace_memory_items(
-    transaction: HostTransaction, snapshot: ConversationMemorySnapshot
+    transaction: HostTransaction, snapshot: ConversationMemorySnapshotVNext
 ) -> None:
     """替换 snapshot 对应的 item rows。
 
@@ -645,17 +650,23 @@ def _replace_memory_items(
         f"DELETE FROM {TABLE_HOST_MEMORY_ITEMS} WHERE snapshot_id = ?",
         (snapshot.snapshot_id,),
     )
-    for item in snapshot.evidence_backed_facts:
+    for item in snapshot.trace_memory.selected_recent_window:
+        _insert_selected_recent_window_item(transaction, snapshot, item)
+    for item in snapshot.evidence_fact_memory.evidence_backed_facts:
         _insert_evidence_backed_fact_item(transaction, snapshot, item)
-    for item in snapshot.working_assumptions:
-        _insert_working_assumption_item(transaction, snapshot, item)
-    for item in snapshot.conversation_continuity.items:
-        _insert_continuity_item(transaction, snapshot, item)
+    if snapshot.session_summary_memory.summary_text is not None:
+        _insert_session_summary_item(transaction, snapshot)
+    for item in snapshot.answer_anchor_memory.anchors:
+        _insert_answer_anchor_item(transaction, snapshot, item)
+    for item in snapshot.forward_intent_memory.intents:
+        _insert_forward_intent_item(transaction, snapshot, item)
+    for item in snapshot.trace_memory.reference_continuity_items:
+        _insert_reference_continuity_item(transaction, snapshot, item)
 
 
 def _replace_snapshot_diagnostics(
     transaction: HostTransaction,
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     *,
     recorded_at: str,
 ) -> None:
@@ -683,7 +694,7 @@ def _replace_snapshot_diagnostics(
 
 def _insert_evidence_backed_fact_item(
     transaction: HostTransaction,
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     item: EvidenceBackedFactView,
 ) -> None:
     """插入 evidence-backed fact item row。
@@ -728,16 +739,16 @@ def _payload_digest_for_evidence_backed_fact(item: EvidenceBackedFactView) -> st
     return item.provenance.digest_ref
 
 
-def _insert_working_assumption_item(
+def _insert_selected_recent_window_item(
     transaction: HostTransaction,
-    snapshot: ConversationMemorySnapshot,
-    item: WorkingAssumptionView,
+    snapshot: ConversationMemorySnapshotVNext,
+    item: SelectedRecentWindowItem,
 ) -> None:
-    """插入 working assumption item row。
+    """插入 selected recent window item row。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param snapshot: typed memory snapshot。
-    :param item: working assumption item。
+    :param item: selected recent window item。
     :returns: ``None``。
     """
 
@@ -745,30 +756,75 @@ def _insert_working_assumption_item(
         transaction,
         snapshot=snapshot,
         item_id=item.item_id,
-        item_kind=_ITEM_KIND_WORKING_ASSUMPTION,
-        claim_status=item.claim_status,
+        item_kind=_ITEM_KIND_SELECTED_RECENT_WINDOW,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
         event_id=item.event_id,
         event_sequence=item.event_sequence,
-        producer_kind=item.producer_kind,
-        producer_name=item.producer_kind.value,
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        producer_name=MemoryProducerKind.HOST_PROJECTION.value,
         payload_ref=None,
         payload_digest=None,
-        item_json=canonical_json_dumps(_working_assumption_item_json_value(item)),
+        item_json=canonical_json_dumps(_selected_recent_item_json_value(item)),
         included_reason=item.included_reason,
         excluded_reason=item.excluded_reason,
     )
 
 
-def _insert_continuity_item(
+def _insert_session_summary_item(
     transaction: HostTransaction,
-    snapshot: ConversationMemorySnapshot,
-    item: ConversationContinuityItem,
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> None:
-    """插入 continuity item row。
+    """插入 session summary item row。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param snapshot: typed memory snapshot。
-    :param item: continuity item。
+    :returns: ``None``。
+    :raises HostDurableError: summary 字段不完整时抛出。
+    """
+
+    summary = snapshot.session_summary_memory
+    if (
+        summary.summary_text is None
+        or summary.event_id is None
+        or summary.event_sequence is None
+    ):
+        raise HostDurableError("session summary memory item is incomplete")
+    item_id = f"{snapshot.snapshot_id}:session_summary"
+    _insert_item(
+        transaction,
+        snapshot=snapshot,
+        item_id=item_id,
+        item_kind=_ITEM_KIND_SESSION_SUMMARY,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        event_id=summary.event_id,
+        event_sequence=summary.event_sequence,
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        producer_name=MemoryProducerKind.HOST_PROJECTION.value,
+        payload_ref=None,
+        payload_digest=None,
+        item_json=canonical_json_dumps(
+            {
+                "item_id": item_id,
+                "size_units": summary.size_units.units,
+                "source_refs": list(summary.source_refs),
+                "summary_text": summary.summary_text,
+            }
+        ),
+        included_reason=MemoryIncludedReason.SESSION_SUMMARY,
+        excluded_reason=None,
+    )
+
+
+def _insert_answer_anchor_item(
+    transaction: HostTransaction,
+    snapshot: ConversationMemorySnapshotVNext,
+    item: AnswerAnchor,
+) -> None:
+    """插入 answer anchor item row。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param snapshot: typed memory snapshot。
+    :param item: answer anchor item。
     :returns: ``None``。
     """
 
@@ -776,24 +832,86 @@ def _insert_continuity_item(
         transaction,
         snapshot=snapshot,
         item_id=item.item_id,
-        item_kind=item.item_kind.value,
-        claim_status=item.claim_status,
+        item_kind=_ITEM_KIND_ANSWER_ANCHOR,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
         event_id=item.event_id,
         event_sequence=item.event_sequence,
-        producer_kind=item.producer_kind,
-        producer_name=item.producer_kind.value,
-        payload_ref=item.payload_ref,
-        payload_digest=item.payload_digest,
-        item_json=canonical_json_dumps(_continuity_item_json_value(item)),
-        included_reason=item.included_reason,
-        excluded_reason=item.excluded_reason,
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        producer_name=MemoryProducerKind.HOST_PROJECTION.value,
+        payload_ref=None,
+        payload_digest=None,
+        item_json=canonical_json_dumps(_answer_anchor_item_json_value(item)),
+        included_reason=MemoryIncludedReason.ANSWER_ANCHOR,
+        excluded_reason=None,
+    )
+
+
+def _insert_forward_intent_item(
+    transaction: HostTransaction,
+    snapshot: ConversationMemorySnapshotVNext,
+    item: ForwardIntent,
+) -> None:
+    """插入 forward intent item row。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param snapshot: typed memory snapshot。
+    :param item: forward intent item。
+    :returns: ``None``。
+    """
+
+    _insert_item(
+        transaction,
+        snapshot=snapshot,
+        item_id=item.item_id,
+        item_kind=_ITEM_KIND_FORWARD_INTENT,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        event_id=item.event_id,
+        event_sequence=item.event_sequence,
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        producer_name=MemoryProducerKind.HOST_PROJECTION.value,
+        payload_ref=None,
+        payload_digest=None,
+        item_json=canonical_json_dumps(_forward_intent_item_json_value(item)),
+        included_reason=MemoryIncludedReason.FORWARD_INTENT,
+        excluded_reason=None,
+    )
+
+
+def _insert_reference_continuity_item(
+    transaction: HostTransaction,
+    snapshot: ConversationMemorySnapshotVNext,
+    item: ReferenceContinuityItem,
+) -> None:
+    """插入 reference continuity item row。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param snapshot: typed memory snapshot。
+    :param item: reference continuity item。
+    :returns: ``None``。
+    """
+
+    _insert_item(
+        transaction,
+        snapshot=snapshot,
+        item_id=item.item_id,
+        item_kind=_ITEM_KIND_REFERENCE_CONTINUITY,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        event_id=item.event_id,
+        event_sequence=item.event_sequence,
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        producer_name=MemoryProducerKind.HOST_PROJECTION.value,
+        payload_ref=None,
+        payload_digest=None,
+        item_json=canonical_json_dumps(_reference_continuity_item_json_value(item)),
+        included_reason=MemoryIncludedReason.REFERENCE_CONTINUITY,
+        excluded_reason=None,
     )
 
 
 def _insert_item(
     transaction: HostTransaction,
     *,
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     item_id: str,
     item_kind: str,
     claim_status: MemoryClaimStatus,
@@ -951,8 +1069,11 @@ def _validate_snapshot_item_kinds(
 
     allowed_kinds = {
         _ITEM_KIND_EVIDENCE_BACKED_FACT,
-        _ITEM_KIND_WORKING_ASSUMPTION,
-        *(kind.value for kind in ConversationContinuityKind),
+        _ITEM_KIND_SELECTED_RECENT_WINDOW,
+        _ITEM_KIND_REFERENCE_CONTINUITY,
+        _ITEM_KIND_ANSWER_ANCHOR,
+        _ITEM_KIND_FORWARD_INTENT,
+        _ITEM_KIND_SESSION_SUMMARY,
     }
     rows = transaction.fetchall(
         f"""
@@ -995,7 +1116,7 @@ def _diagnostic_row_from_host_row(row: HostRow) -> MemoryDiagnosticRow:
     )
 
 
-def _snapshot_from_json_text(value: str) -> ConversationMemorySnapshot:
+def _snapshot_from_json_text(value: str) -> ConversationMemorySnapshotVNext:
     """从 JSON 文本恢复 snapshot。
 
     :param value: snapshot JSON 文本。
@@ -1025,7 +1146,7 @@ def _diagnostic_from_json_text(value: str) -> MemoryDiagnostic:
         raise HostDurableError("memory diagnostic JSON is invalid") from exc
 
 
-def _validate_snapshot_digest(snapshot: ConversationMemorySnapshot) -> None:
+def _validate_snapshot_digest(snapshot: ConversationMemorySnapshotVNext) -> None:
     """校验 snapshot digest 与 canonical content 匹配。
 
     :param snapshot: typed memory snapshot。
@@ -1053,35 +1174,68 @@ def _evidence_backed_fact_item_json_value(item: EvidenceBackedFactView) -> JsonV
     }
 
 
-def _working_assumption_item_json_value(item: WorkingAssumptionView) -> JsonValue:
-    """生成 working assumption item table JSON。
+def _selected_recent_item_json_value(item: SelectedRecentWindowItem) -> JsonValue:
+    """生成 selected recent window item table JSON。
 
-    :param item: working assumption item。
+    :param item: selected recent window item。
     :returns: JSON 值。
     """
 
     return {
-        "assumption_summary": item.assumption_summary,
+        "event_sequence": item.event_sequence,
         "item_id": item.item_id,
+        "role": item.role.value,
         "size_units": item.size_units.units,
+        "source_refs": list(item.source_refs),
+        "text": item.text,
     }
 
 
-def _continuity_item_json_value(item: ConversationContinuityItem) -> JsonValue:
-    """生成 continuity item table JSON。
+def _answer_anchor_item_json_value(item: AnswerAnchor) -> JsonValue:
+    """生成 answer anchor item table JSON。
 
-    :param item: continuity item。
+    :param item: answer anchor item。
+    :returns: JSON 值。
+    """
+
+    return {
+        "anchor_title": item.anchor_title,
+        "item_id": item.item_id,
+        "size_units": item.size_units.units,
+        "source_refs": list(item.source_refs),
+    }
+
+
+def _forward_intent_item_json_value(item: ForwardIntent) -> JsonValue:
+    """生成 forward intent item table JSON。
+
+    :param item: forward intent item。
+    :returns: JSON 值。
+    """
+
+    return {
+        "intent_type": item.intent_type,
+        "item_id": item.item_id,
+        "size_units": item.size_units.units,
+        "source_refs": list(item.source_refs),
+        "status": item.status,
+        "text": item.text,
+    }
+
+
+def _reference_continuity_item_json_value(
+    item: ReferenceContinuityItem,
+) -> JsonValue:
+    """生成 reference continuity item table JSON。
+
+    :param item: reference continuity item。
     :returns: JSON 值。
     """
 
     return {
         "item_id": item.item_id,
-        "item_kind": item.item_kind.value,
-        "label": item.label,
-        "preserve_reason": (
-            None if item.preserve_reason is None else item.preserve_reason.value
-        ),
+        "reason": item.reason,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
-        "summary_text": item.summary_text,
+        "text": item.text,
     }

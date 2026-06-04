@@ -810,12 +810,11 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_ITEMS} (
     item_kind TEXT NOT NULL CHECK (
     item_kind IN (
       'evidence_backed_fact',
-      'working_assumption',
-      'raw_user_turn',
-      'raw_assistant_turn',
-      'assistant_conclusion',
-      'episode_summary',
-      'minimum_preserve_item'
+      'selected_recent_window',
+      'reference_continuity',
+      'answer_anchor',
+      'forward_intent',
+      'session_summary'
     )
   ),
   claim_status TEXT NOT NULL CHECK (
@@ -860,6 +859,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
   reason TEXT NOT NULL CHECK (
     reason IN (
       'evidence_backed_fact_candidate_invalid',
+      'accepted_evidence_without_fact_candidate',
       'inline_delta_repair_included',
       'snapshot_missing',
       'snapshot_damaged',
@@ -867,8 +867,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
       'snapshot_lag_over_threshold',
       'budget_limit_reached',
       'empty_event_log_snapshot',
-      'evidence_backed_fact_superseded',
-      'minimum_preserve_item_covered'
+      'evidence_backed_fact_superseded'
     )
   ),
   event_sequence INTEGER NULL CHECK (

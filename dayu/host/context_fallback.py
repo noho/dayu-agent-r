@@ -45,6 +45,7 @@ _FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
 _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
 _FIELD_SELECTED_BLOCK_IDS = "selected_block_ids"
 _FIELD_CURRENT_INPUT_REF = "current_input_ref"
+_FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR = "selected_recent_window_turn_floor"
 
 
 class RecentWindowFallbackAction(StrEnum):
@@ -120,7 +121,7 @@ class RecentWindowFallbackSelection:
     :param dropped_blocks: 未进入 fallback view 的 blocks。
     :param current_input_ref: 当前输入 canonical ref。
     :param source_refs: selected blocks 的 canonical source refs。
-    :param recent_raw_turns_floor: recent raw turn floor。
+    :param selected_recent_window_turn_floor: selected recent window turn floor。
     :param trigger_source: compact trigger source。
     :param policy_ref: context budget policy ref。
     :param input_cursor: material input cursor。
@@ -131,7 +132,7 @@ class RecentWindowFallbackSelection:
     dropped_blocks: tuple[RunInputMaterialBlock, ...]
     current_input_ref: str
     source_refs: tuple[str, ...]
-    recent_raw_turns_floor: int
+    selected_recent_window_turn_floor: int
     trigger_source: ContextCompactionTriggerSource
     policy_ref: str
     input_cursor: int
@@ -149,8 +150,8 @@ class RecentWindowFallbackSelection:
         _require_block_tuple(self.dropped_blocks, "dropped_blocks")
         _require_non_empty_text(self.current_input_ref, "current_input_ref")
         _require_text_tuple(self.source_refs, "source_refs")
-        if self.recent_raw_turns_floor < 0:
-            raise ValueError("recent_raw_turns_floor must be non-negative")
+        if self.selected_recent_window_turn_floor < 0:
+            raise ValueError("selected_recent_window_turn_floor must be non-negative")
         if not isinstance(self.trigger_source, ContextCompactionTriggerSource):
             raise TypeError("trigger_source must be ContextCompactionTriggerSource")
         _require_non_empty_text(self.policy_ref, "policy_ref")
@@ -197,7 +198,7 @@ class RecentWindowFallbackSelection:
             "dropped_block_ids": list(self.dropped_block_ids),
             _FIELD_CURRENT_INPUT_REF: self.current_input_ref,
             "source_refs": list(self.source_refs),
-            "recent_raw_turns_floor": self.recent_raw_turns_floor,
+            _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR: self.selected_recent_window_turn_floor,
             "trigger_source": self.trigger_source.value,
             "policy_ref": self.policy_ref,
             "input_cursor": self.input_cursor,
@@ -337,7 +338,7 @@ def build_recent_window_fallback_selection(
     material_blocks: tuple[RunInputMaterialBlock, ...],
     current_input_ref: str,
     input_cursor: int,
-    recent_raw_turns_floor: int,
+    selected_recent_window_turn_floor: int,
     trigger_source: ContextCompactionTriggerSource,
 ) -> RecentWindowFallbackSelection:
     """按 deterministic recent-window policy 选择 fallback input view。
@@ -353,17 +354,19 @@ def build_recent_window_fallback_selection(
     :param material_blocks: ordinary material blocks。
     :param current_input_ref: 当前输入 event id。
     :param input_cursor: material input cursor。
-    :param recent_raw_turns_floor: recent raw turn floor。
+    :param selected_recent_window_turn_floor: selected recent window turn floor。
     :param trigger_source: compact trigger source。
     :returns: fallback selection。
     :raises ValueError: 缺少 current input anchor 或 floor 非法时抛出。
     """
 
-    if recent_raw_turns_floor < 0:
-        raise ValueError("recent_raw_turns_floor must be non-negative")
+    if selected_recent_window_turn_floor < 0:
+        raise ValueError("selected_recent_window_turn_floor must be non-negative")
     current = _current_input_block(material_blocks, current_input_ref=current_input_ref)
     raw_blocks = _reverse_chronological_raw_blocks(material_blocks)
-    floor_ids = frozenset(block.block_id for block in raw_blocks[:recent_raw_turns_floor])
+    floor_ids = frozenset(
+        block.block_id for block in raw_blocks[:selected_recent_window_turn_floor]
+    )
     selected_ids = _required_block_ids(
         material_blocks,
         current_block_id=current.block_id,
@@ -403,7 +406,7 @@ def build_recent_window_fallback_selection(
         dropped_blocks=dropped_blocks,
         current_input_ref=current_input_ref,
         source_refs=_selected_source_refs(selected_blocks),
-        recent_raw_turns_floor=recent_raw_turns_floor,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
         trigger_source=trigger_source,
         policy_ref=policy.policy_ref,
         input_cursor=input_cursor,
@@ -478,7 +481,7 @@ def build_selection_failure_window_payload(
         "dropped_block_ids": [],
         _FIELD_CURRENT_INPUT_REF: current_input_ref,
         "source_refs": [current_input_ref],
-        "recent_raw_turns_floor": 0,
+        _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR: 0,
         "trigger_source": trigger_source.value,
         "policy_ref": policy_ref,
         "input_cursor": input_cursor,

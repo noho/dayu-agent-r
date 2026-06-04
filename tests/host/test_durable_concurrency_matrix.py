@@ -54,7 +54,7 @@ from dayu.host.durable.projection import (
 from dayu.host.durable.schema import TABLE_IDEMPOTENCY_RECORDS
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 from dayu.host.memory import (
-    ConversationMemorySnapshot,
+    ConversationMemorySnapshotVNext,
     MemoryProjectionPolicy,
     MemorySnapshotCursor,
     build_empty_conversation_memory_snapshot,
@@ -309,7 +309,7 @@ class _WriteMemorySnapshotWithCheckpointOperation:
     :param snapshot: 待写入 snapshot。
     """
 
-    def __init__(self, snapshot: ConversationMemorySnapshot) -> None:
+    def __init__(self, snapshot: ConversationMemorySnapshotVNext) -> None:
         """初始化 operation。
 
         :param snapshot: 待写入 snapshot。
@@ -743,7 +743,7 @@ def _stale_projection_checkpoint(
 
 def _memory_snapshot_for_event(
     *, snapshot_id: str, event_sequence: int, event_id: str
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造覆盖指定 EventLog cursor 的空 memory snapshot。
 
     :param snapshot_id: snapshot id。
@@ -755,21 +755,25 @@ def _memory_snapshot_for_event(
 
     policy = MemoryProjectionPolicy(
         context_window_size=8192,
-        max_pinned_items=8,
-        max_evidence_backed_facts=16,
-        max_working_assumptions=8,
-        recent_raw_turns_floor=2,
-        raw_turn_context_ratio=0.125,
-        raw_turn_size_floor=1024,
-        raw_turn_size_cap=1024,
-        history_pool_context_ratio=0.5,
-        history_pool_size_floor=4096,
-        history_pool_size_cap=4096,
-        stable_layer_context_ratio=0.25,
-        stable_layer_size_floor=2048,
-        stable_layer_size_cap=2048,
+        selected_recent_window_item_cap=8,
+        selected_recent_window_char_cap=2048,
+        selected_recent_window_turn_floor=2,
+        fallback_selected_recent_window_item_cap=4,
+        fallback_selected_recent_window_char_cap=1024,
+        evidence_fact_item_cap=16,
+        evidence_fact_char_cap=4096,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=4,
+        answer_anchor_char_cap=1024,
+        forward_intent_item_cap=4,
+        forward_intent_char_cap=1024,
+        reference_continuity_item_cap=4,
+        reference_continuity_char_cap=1024,
+        reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
+        policy_ref="durable-concurrency-test",
     )
     base = build_empty_conversation_memory_snapshot(
         snapshot_id=snapshot_id,

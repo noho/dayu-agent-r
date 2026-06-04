@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from dayu.host.compact_material import (
@@ -28,8 +30,9 @@ from dayu.host.compaction import (
 from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
-    ConversationContinuityView,
-    ConversationMemorySnapshot,
+    ConversationMemorySnapshotVNext,
+    EvidenceFactMemoryView,
+    ForwardIntentMemoryView,
     MemoryEvidenceBackedFactKind,
     EvidenceBackedFactView,
     MemoryIncludedReason,
@@ -38,7 +41,9 @@ from dayu.host.memory import (
     MemoryProvenanceRef,
     MemorySizeUnits,
     MemorySnapshotCursor,
-    PinnedStateView,
+    AnswerAnchorMemoryView,
+    SessionSummaryMemoryView,
+    TraceMemoryView,
     calculate_memory_snapshot_digest,
     digest_memory_projection_policy,
 )
@@ -91,7 +96,7 @@ def test_proactive_segment_excludes_current_anchor_and_recent_raw_floor() -> Non
         memory_snapshot_cursor=3,
         policy_digest=_POLICY_DIGEST,
         material_blocks=blocks,
-        recent_raw_turns_floor=1,
+        selected_recent_window_turn_floor=1,
     )
 
     assert selection.selected_block_ids == ("history-old",)
@@ -156,8 +161,8 @@ def test_already_represented_blocks_are_not_reexpanded() -> None:
     )
 
 
-def test_material_pack_one_to_one_section_mapping_rejects_duplicate_content() -> None:
-    """同一 canonical source ref set + digest 不能进入两个 LLM-facing section。"""
+def test_vnext_snapshot_does_not_bridge_old_goal_into_previous_view() -> None:
+    """vNext snapshot 不把旧 goal bridge 成 previous compacted view block。"""
 
     snapshot = _snapshot_with_goal(
         snapshot_id="snapshot-duplicate",
@@ -180,10 +185,63 @@ def test_material_pack_one_to_one_section_mapping_rejects_duplicate_content() ->
         material_blocks=(duplicate,),
     )
 
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(duplicate,),
+        memory_snapshot=snapshot,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+
+    assert tuple(block.text for block in pack.trace_material) == (
+        "current_goal=same goal",
+    )
+    assert pack.current_input_anchor.anchor_text == "current input"
+
+
+def test_duplicate_section_owner_raises_for_vnext_previous_and_trace_material() -> None:
+    """同一 canonical content 进入两个 LLM-facing section 时必须抛错。"""
+
+    snapshot_without_digest = replace(
+        _empty_snapshot(
+            "snapshot-duplicate-owner",
+            checkpoint_event_sequence=2,
+        ),
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text="duplicate readable content",
+            source_refs=("event:summary",),
+            event_id="event-summary",
+            event_sequence=2,
+            size_units=MemorySizeUnits(26),
+        ),
+        snapshot_digest="pending",
+    )
+    snapshot = replace(
+        snapshot_without_digest,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+    duplicate_trace_block = run_input_material_block(
+        block_id="history-duplicate-owner",
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
+        text="duplicate readable content",
+        canonical_source_refs=("snapshot-duplicate-owner",),
+        event_sequence=1,
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=2,
+        memory_snapshot_cursor=2,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(duplicate_trace_block,),
+        selected_recent_window_turn_floor=0,
+    )
+
     with pytest.raises(DuplicateMaterialSectionOwnerError):
         build_compact_material_pack(
             selected_segment=selection,
-            material_blocks=(duplicate,),
+            material_blocks=(duplicate_trace_block,),
             memory_snapshot=snapshot,
             inline_delta_repair_view=None,
             current_input_ref="event-current",
@@ -395,7 +453,7 @@ def test_conversation_compact_input_vnext_previous_view_only_has_fact_blocks() -
         for item in previous_view.evidence_backed_facts
     ) == (
         "fact=claim_text=Revenue increased year over year; "
-        "evidence_refs=evidence:accepted; evidence_kind=observed_value",
+        "evidence_refs=evidence:accepted; evidence_kind=derived_from_evidence",
     )
     assert previous_view.session_summary is None
     assert previous_view.answer_anchors == ()
@@ -687,32 +745,36 @@ def _policy(
 
     return MemoryProjectionPolicy(
         context_window_size=8192,
-        max_pinned_items=8,
-        max_evidence_backed_facts=16,
-        max_working_assumptions=8,
-        recent_raw_turns_floor=2,
-        raw_turn_context_ratio=0.125,
-        raw_turn_size_floor=256,
-        raw_turn_size_cap=1024,
-        history_pool_context_ratio=0.5,
-        history_pool_size_floor=1024,
-        history_pool_size_cap=4096,
-        stable_layer_context_ratio=0.25,
-        stable_layer_size_floor=512,
-        stable_layer_size_cap=2048,
+        selected_recent_window_item_cap=8,
+        selected_recent_window_char_cap=2048,
+        selected_recent_window_turn_floor=2,
+        fallback_selected_recent_window_item_cap=4,
+        fallback_selected_recent_window_char_cap=1024,
+        evidence_fact_item_cap=16,
+        evidence_fact_char_cap=4096,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=4,
+        answer_anchor_char_cap=1024,
+        forward_intent_item_cap=4,
+        forward_intent_char_cap=1024,
+        reference_continuity_item_cap=4,
+        reference_continuity_char_cap=1024,
+        reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=max_lag_events_for_inline_delta,
         max_delta_repair_events=max_delta_repair_events,
+        policy_ref="compact-material-test",
     )
 
 
 def _empty_snapshot(
     snapshot_id: str, *, checkpoint_event_sequence: int
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造空 memory snapshot。
 
     :param snapshot_id: snapshot id。
     :param checkpoint_event_sequence: cursor sequence。
-    :returns: ConversationMemorySnapshot。
+    :returns: ConversationMemorySnapshotVNext。
     """
 
     cursor = MemorySnapshotCursor(
@@ -725,87 +787,59 @@ def _empty_snapshot(
         ),
         session_id=_SESSION_ID,
     )
-    snapshot_without_digest = ConversationMemorySnapshot(
+    snapshot_without_digest = ConversationMemorySnapshotVNext(
+        schema_version="conversation_memory_snapshot_v1",
         snapshot_id=snapshot_id,
         session_id=_SESSION_ID,
         cursor=cursor,
         policy_digest=digest_memory_projection_policy(
             _policy(max_lag_events_for_inline_delta=16)
         ),
-        pinned_state=PinnedStateView(
-            current_goal=None,
-            confirmed_subjects=(),
-            user_constraints=(),
-            open_questions=(),
+        latest_compaction_event_ref=None,
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(),
+            reference_continuity_items=(),
         ),
-        evidence_backed_facts=(),
-        working_assumptions=(),
-        conversation_continuity=ConversationContinuityView(items=()),
+        evidence_fact_memory=EvidenceFactMemoryView(
+            evidence_backed_facts=(),
+            recent_evidence_items=(),
+        ),
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text=None,
+            source_refs=(),
+            event_id=None,
+            event_sequence=None,
+            size_units=MemorySizeUnits(0),
+        ),
+        answer_anchor_memory=AnswerAnchorMemoryView(anchors=()),
+        forward_intent_memory=ForwardIntentMemoryView(intents=()),
         diagnostics=(),
         built_at=_NOW,
         snapshot_digest="pending",
     )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
+    return replace(
+        snapshot_without_digest,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )
 
 
 def _snapshot_with_goal(
     *, snapshot_id: str, checkpoint_event_sequence: int, current_goal: str
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造带 stable goal 的 memory snapshot。
 
     :param snapshot_id: snapshot id。
     :param checkpoint_event_sequence: cursor sequence。
     :param current_goal: current goal。
-    :returns: ConversationMemorySnapshot。
+    :returns: ConversationMemorySnapshotVNext。
     """
 
     base = _empty_snapshot(
         snapshot_id,
         checkpoint_event_sequence=checkpoint_event_sequence,
     )
-    snapshot_without_digest = ConversationMemorySnapshot(
-        snapshot_id=base.snapshot_id,
-        session_id=base.session_id,
-        cursor=base.cursor,
-        policy_digest=base.policy_digest,
-        pinned_state=PinnedStateView(
-            current_goal=current_goal,
-            confirmed_subjects=(),
-            user_constraints=(),
-            open_questions=(),
-        ),
-        evidence_backed_facts=(),
-        working_assumptions=(),
-        conversation_continuity=ConversationContinuityView(items=()),
-        diagnostics=(),
-        built_at=base.built_at,
-        snapshot_digest="pending",
-    )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
-        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
-    )
+    del current_goal
+    return base
 
 
 def _snapshot_with_goal_and_fact(
@@ -814,14 +848,14 @@ def _snapshot_with_goal_and_fact(
     checkpoint_event_sequence: int,
     current_goal: str,
     claim_text: str,
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造同时包含非 fact stable block 与 evidence fact 的 snapshot。
 
     :param snapshot_id: snapshot id。
     :param checkpoint_event_sequence: cursor sequence。
     :param current_goal: current goal。
     :param claim_text: evidence-backed fact claim text。
-    :returns: ConversationMemorySnapshot。
+    :returns: ConversationMemorySnapshotVNext。
     """
 
     base = _snapshot_with_goal(
@@ -829,19 +863,15 @@ def _snapshot_with_goal_and_fact(
         checkpoint_event_sequence=checkpoint_event_sequence,
         current_goal=current_goal,
     )
-    snapshot_without_digest = ConversationMemorySnapshot(
-        snapshot_id=base.snapshot_id,
-        session_id=base.session_id,
-        cursor=base.cursor,
-        policy_digest=base.policy_digest,
-        pinned_state=base.pinned_state,
-        evidence_backed_facts=(
+    snapshot_without_digest = replace(
+        base,
+        evidence_fact_memory=EvidenceFactMemoryView(
+            evidence_backed_facts=(
             EvidenceBackedFactView(
                 item_id="memory-item:fact-test",
                 claim_text=claim_text,
-                evidence_kind=MemoryEvidenceBackedFactKind.OBSERVED_VALUE,
+                evidence_kind=MemoryEvidenceBackedFactKind.DERIVED_FROM_EVIDENCE,
                 evidence_refs=("evidence:accepted",),
-                attributes={},
                 provenance=MemoryProvenanceRef(
                     producer_kind=MemoryProducerKind.HOST_PROJECTION,
                     producer_name="conversation_memory",
@@ -862,23 +892,12 @@ def _snapshot_with_goal_and_fact(
                 excluded_reason=None,
                 size_units=MemorySizeUnits(units=7),
             ),
+            ),
+            recent_evidence_items=(),
         ),
-        working_assumptions=base.working_assumptions,
-        conversation_continuity=base.conversation_continuity,
-        diagnostics=base.diagnostics,
-        built_at=base.built_at,
         snapshot_digest="pending",
     )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
+    return replace(
+        snapshot_without_digest,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )

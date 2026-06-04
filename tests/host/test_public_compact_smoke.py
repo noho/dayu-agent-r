@@ -140,7 +140,7 @@ async def test_no_compaction_recent_raw_turns_continuity(
     second_request = factory.requests[1]
     joined = _joined_message_content(second_request.messages)
     assert "第一轮原始问题：请记住营收增长来自价格因素。" in joined
-    assert "Memory episode summaries:" not in joined
+    assert "Session Summary Memory:" not in joined
 
 
 @pytest.mark.asyncio
@@ -215,7 +215,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert "event-tool-result" not in material_text
     assert len(factory.requests) >= 3
     joined = _joined_message_content(factory.requests[-1].messages)
-    assert "Memory evidence-backed facts:" in joined
+    assert "Evidence / Fact Memory:" in joined
     assert _LONG_CHAPTER_MARKER in joined
 
     # helper-level 补充：fake proposal 只使用 prompt-local E label，不读取 canonical refs。
@@ -245,10 +245,10 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
 
 
 @pytest.mark.asyncio
-async def test_long_user_input_second_factor_survives_minimum_preserve(
+async def test_long_user_input_second_factor_survives_reference_continuity(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """长输入 compact 后，下一轮仍可通过 minimum preserve 看到第二个因素。
+    """长输入 compact 后，下一轮仍可通过 vNext continuity 看到第二个因素。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -296,7 +296,6 @@ async def test_long_user_input_second_factor_survives_minimum_preserve(
     assert len(fake_compactor.prompt_lengths) >= 1
     joined = _joined_message_content(factory.requests[1].messages)
     assert _SECOND_FACTOR_MARKER in joined
-    assert "Memory episode summaries:" in joined
 
 
 @pytest.mark.asyncio

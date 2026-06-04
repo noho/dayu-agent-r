@@ -1848,8 +1848,8 @@ class HostDispatchScheduler:
             material_blocks=material_blocks,
             current_input_ref=run.input_event_id,
             input_cursor=run.input_event_sequence,
-            recent_raw_turns_floor=(
-                self._local_execution.memory_projection_policy.recent_raw_turns_floor
+            selected_recent_window_turn_floor=(
+                self._local_execution.memory_projection_policy.selected_recent_window_turn_floor
             ),
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
         )
@@ -3667,7 +3667,7 @@ def _proactive_represented_evidence_refs(
         max_checkpoint_event_sequence=run.input_event_sequence,
     )
     if snapshot_row is not None:
-        for fact in snapshot_row.snapshot.evidence_backed_facts:
+        for fact in snapshot_row.snapshot.evidence_fact_memory.evidence_backed_facts:
             refs.extend(fact.evidence_refs)
     compacted = _latest_session_compacted_event_before_input(transaction, event_log_store, run=run)
     if compacted is not None:

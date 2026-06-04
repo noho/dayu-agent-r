@@ -88,18 +88,17 @@ from dayu.host.terminal_summary_payload import (
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
-    ConversationContinuityItem,
-    ConversationContinuityKind,
-    ConversationMemorySnapshot,
+    ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
     MemoryProjectionEvent,
     MemoryProjectionPolicy,
     MemoryRepairReason,
     MemoryRepairRequest,
     MemorySnapshotCursor,
-    OpaqueMemoryRef,
     EvidenceBackedFactView,
-    WorkingAssumptionView,
+    ReferenceContinuityItem,
+    SelectedRecentWindowItem,
+    SelectedRecentWindowRole,
     build_inline_delta_repair_diagnostic,
     build_memory_budget_diagnostic,
     digest_memory_projection_policy,
@@ -136,16 +135,11 @@ _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _COMPACT_SUMMARY_MAX_CHARS = 1200
-_MEMORY_USER_GOALS_HEADER = "Memory user goals and constraints:"
-_MEMORY_CONFIRMED_SUBJECTS_HEADER = (
-    "Memory confirmed subjects and methodology:"
-)
-_MEMORY_EVIDENCE_BACKED_FACTS_HEADER = "Memory evidence-backed facts:"
-_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER = (
-    "Memory open questions and working assumptions:"
-)
-_MEMORY_MINIMUM_PRESERVE_HEADER = "Memory minimum preserve continuity:"
-_MEMORY_EPISODE_SUMMARIES_HEADER = "Memory episode summaries:"
+_MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
+_MEMORY_EVIDENCE_FACT_HEADER = "Evidence / Fact Memory:"
+_MEMORY_ANSWER_ANCHOR_HEADER = "Answer Anchor Memory:"
+_MEMORY_FORWARD_INTENT_HEADER = "Forward Intent Memory:"
+_MEMORY_REFERENCE_CONTINUITY_HEADER = "Trace Memory reference continuity:"
 _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT = 8
 _MEMORY_EVENT_TYPES = frozenset(
     (
@@ -844,7 +838,7 @@ class DurableMemorySnapshotProvider:
         *,
         session_id: str,
         required_event_sequence: int,
-    ) -> ConversationMemorySnapshot:
+    ) -> ConversationMemorySnapshotVNext:
         """读取 latest snapshot，缺失或损坏时转成 repair-required。
 
         :param transaction: Host durable transaction。
@@ -884,7 +878,7 @@ class DurableMemorySnapshotProvider:
         self,
         transaction: HostTransaction,
         *,
-        memory_snapshot: ConversationMemorySnapshot,
+        memory_snapshot: ConversationMemorySnapshotVNext,
         required_event_sequence: int,
     ) -> None:
         """校验 snapshot cursor 指向真实 EventLog row。
@@ -923,10 +917,10 @@ class DurableMemorySnapshotProvider:
         self,
         transaction: HostTransaction,
         *,
-        snapshot: ConversationMemorySnapshot,
+        snapshot: ConversationMemorySnapshotVNext,
         required_event_sequence: int,
         lag_events: int,
-    ) -> ConversationMemorySnapshot:
+    ) -> ConversationMemorySnapshotVNext:
         """用 EventLog delta 临时修复小滞后 snapshot。
 
         :param transaction: Host durable transaction。
@@ -1929,7 +1923,7 @@ def _required_memory_event_sequence(current_facts: CurrentRunFacts) -> int:
 
 
 def _memory_snapshot_view(
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     current_facts: CurrentRunFacts,
     policy: MemoryProjectionPolicy,
 ) -> MemorySnapshotView:
@@ -1957,11 +1951,11 @@ def _memory_snapshot_view(
 
 
 def _memory_messages(
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     render_scope: _CurrentMemoryRenderScope,
     policy: MemoryProjectionPolicy,
 ) -> _RenderedMemoryMessages:
-    """按稳定优先级渲染 memory messages。
+    """按设计固定顺序渲染 vNext memory messages。
 
     :param snapshot: memory snapshot。
     :param render_scope: 当前 Run memory 渲染排除范围。
@@ -1969,159 +1963,59 @@ def _memory_messages(
     :returns: memory provider messages 与 transient diagnostics。
     """
 
+    del policy
     messages: list[AgentMessage] = []
-    stable = _bounded_stable_memory_messages(
-        blocks=_memory_stable_blocks(snapshot, render_scope),
-        snapshot=snapshot,
-        policy=policy,
+    summary = _memory_session_summary_message(snapshot)
+    if summary is not None:
+        messages.append(summary)
+    facts = _memory_evidence_fact_message(
+        snapshot.evidence_fact_memory.evidence_backed_facts
     )
-    messages.extend(stable.messages)
+    if facts is not None:
+        messages.append(facts)
+    anchors = _memory_answer_anchor_message(snapshot)
+    if anchors is not None:
+        messages.append(anchors)
+    intents = _memory_forward_intent_message(snapshot)
+    if intents is not None:
+        messages.append(intents)
+    reference = _memory_reference_continuity_message(
+        snapshot.trace_memory.reference_continuity_items
+    )
+    if reference is not None:
+        messages.append(reference)
     messages.extend(
-        _memory_raw_turn_messages(
-            snapshot.conversation_continuity.items, render_scope
+        _memory_selected_recent_window_messages(
+            snapshot.trace_memory.selected_recent_window,
+            render_scope,
         )
     )
-    minimum_preserve = _memory_minimum_preserve_message(
-        snapshot.conversation_continuity.items, render_scope
-    )
-    if minimum_preserve is not None:
-        messages.append(minimum_preserve)
-    episode = _memory_episode_summary_message(
-        snapshot.conversation_continuity.items, render_scope
-    )
-    if episode is not None:
-        messages.append(episode)
     return _RenderedMemoryMessages(
         messages=tuple(messages),
-        diagnostics=stable.diagnostics,
+        diagnostics=(),
     )
 
 
-def _memory_stable_blocks(
-    snapshot: ConversationMemorySnapshot, render_scope: _CurrentMemoryRenderScope
-) -> tuple[_MemoryStableBlock, ...]:
-    """按固定优先级构造 stable memory blocks。
-
-    :param snapshot: memory snapshot。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: stable memory blocks。
-    """
-
-    blocks: list[_MemoryStableBlock] = []
-    goals = _memory_goal_and_constraint_message(snapshot, render_scope)
-    if goals is not None:
-        blocks.append(_MemoryStableBlock(block_id="stable:goals", message=goals))
-    facts = _memory_evidence_backed_fact_message(snapshot.evidence_backed_facts)
-    if facts is not None:
-        blocks.append(
-            _MemoryStableBlock(
-                block_id="stable:evidence_backed_facts",
-                message=facts,
-            )
-        )
-    subjects = _memory_subject_message(snapshot)
-    if subjects is not None:
-        blocks.append(_MemoryStableBlock(block_id="stable:subjects", message=subjects))
-    assumptions = _memory_question_and_assumption_message(snapshot)
-    if assumptions is not None:
-        blocks.append(
-            _MemoryStableBlock(
-                block_id="stable:questions_assumptions",
-                message=assumptions,
-            )
-        )
-    return tuple(blocks)
-
-
-def _bounded_stable_memory_messages(
-    *,
-    blocks: tuple[_MemoryStableBlock, ...],
-    snapshot: ConversationMemorySnapshot,
-    policy: MemoryProjectionPolicy,
-) -> _RenderedMemoryMessages:
-    """按 ``stable_layer_size_units`` 限制 stable memory blocks。
-
-    :param blocks: 按 P9 优先级排序的 stable blocks。
-    :param snapshot: memory snapshot。
-    :param policy: memory projection policy。
-    :returns: 被保留的 stable messages 与 budget diagnostics。
-    """
-
-    kept: list[AgentMessage] = []
-    diagnostics: list[MemoryDiagnostic] = []
-    budget_used = 0
-    for block in blocks:
-        block_units = estimate_memory_size_units(block.message.content).units
-        if budget_used + block_units <= policy.stable_layer_size_units:
-            kept.append(block.message)
-            budget_used += block_units
-            continue
-        diagnostics.append(
-            build_memory_budget_diagnostic(
-                event_sequence=snapshot.cursor.checkpoint_event_sequence,
-                item_id=block.block_id,
-                policy_digest=snapshot.policy_digest,
-                message="stable memory block skipped by stable layer budget",
-            )
-        )
-    return _RenderedMemoryMessages(
-        messages=tuple(kept),
-        diagnostics=tuple(diagnostics),
-    )
-
-
-def _memory_goal_and_constraint_message(
-    snapshot: ConversationMemorySnapshot, render_scope: _CurrentMemoryRenderScope
+def _memory_session_summary_message(
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> SystemMessage | None:
-    """渲染用户目标与约束 memory block。
+    """渲染 Session Summary Memory section。
 
     :param snapshot: memory snapshot。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: system message；无内容时返回 ``None``。
+    :returns: system message；无 summary 时返回 ``None``。
     """
 
-    lines: list[str] = [_MEMORY_USER_GOALS_HEADER]
-    if (
-        snapshot.pinned_state.current_goal is not None
-        and snapshot.pinned_state.current_goal != render_scope.user_prompt
-    ):
-        lines.append(f"current_goal={snapshot.pinned_state.current_goal}")
-    for constraint in snapshot.pinned_state.user_constraints:
-        if constraint == render_scope.user_prompt:
-            continue
-        lines.append(f"user_constraint={constraint}")
-    if len(lines) == 1:
+    summary = snapshot.session_summary_memory
+    if summary.summary_text is None:
         return None
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
+    lines = [_MEMORY_SESSION_SUMMARY_HEADER, f"summary={summary.summary_text}"]
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
-def _memory_subject_message(
-    snapshot: ConversationMemorySnapshot,
-) -> SystemMessage | None:
-    """渲染已确认主体和口径 memory block。
-
-    :param snapshot: memory snapshot。
-    :returns: system message；无内容时返回 ``None``。
-    """
-
-    if not snapshot.pinned_state.confirmed_subjects:
-        return None
-    lines = [_MEMORY_CONFIRMED_SUBJECTS_HEADER]
-    for ref in snapshot.pinned_state.confirmed_subjects:
-        lines.append(f"confirmed_subject={_opaque_ref_text(ref)}")
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
-
-
-def _memory_evidence_backed_fact_message(
+def _memory_evidence_fact_message(
     facts: tuple[EvidenceBackedFactView, ...],
 ) -> SystemMessage | None:
-    """渲染 evidence-backed facts memory block。
+    """渲染 Evidence / Fact Memory section。
 
     :param facts: evidence-backed fact 元组。
     :returns: system message；无内容时返回 ``None``。
@@ -2129,7 +2023,7 @@ def _memory_evidence_backed_fact_message(
 
     if not facts:
         return None
-    lines = [_MEMORY_EVIDENCE_BACKED_FACTS_HEADER]
+    lines = [_MEMORY_EVIDENCE_FACT_HEADER]
     for fact in facts:
         lines.append(
             "fact="
@@ -2146,174 +2040,99 @@ def _memory_evidence_backed_fact_message(
     )
 
 
-def _memory_question_and_assumption_message(
-    snapshot: ConversationMemorySnapshot,
+def _memory_answer_anchor_message(
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> SystemMessage | None:
-    """渲染 open questions / working assumptions memory block。
+    """渲染 Answer Anchor Memory section。
 
     :param snapshot: memory snapshot。
     :returns: system message；无内容时返回 ``None``。
     """
 
-    lines: list[str] = [_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER]
-    for question in snapshot.pinned_state.open_questions:
-        lines.append(f"open_question={question}")
-    for assumption in snapshot.working_assumptions:
-        lines.append(
-            "working_assumption="
-            f"{assumption.assumption_summary}; "
-            f"event_id={assumption.event_id}; "
-            f"event_sequence={assumption.event_sequence}"
-        )
-    if len(lines) == 1:
+    anchors = snapshot.answer_anchor_memory.anchors
+    if not anchors:
         return None
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
+    lines = [_MEMORY_ANSWER_ANCHOR_HEADER]
+    for anchor in anchors:
+        child_text = "; ".join(
+            (
+                child.display_text
+                if child.ordinal is None
+                else f"{child.ordinal}. {child.display_text}"
+            )
+            for child in anchor.anchor_items
+        )
+        lines.append(f"answer_anchor=title={anchor.anchor_title}; items={child_text}")
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
-def _memory_raw_turn_messages(
-    items: tuple[ConversationContinuityItem, ...],
+def _memory_forward_intent_message(
+    snapshot: ConversationMemorySnapshotVNext,
+) -> SystemMessage | None:
+    """渲染 Forward Intent Memory section。
+
+    :param snapshot: memory snapshot。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    intents = snapshot.forward_intent_memory.intents
+    if not intents:
+        return None
+    lines = [_MEMORY_FORWARD_INTENT_HEADER]
+    for intent in intents:
+        lines.append(
+            "forward_intent="
+            f"type={intent.intent_type}; status={intent.status}; text={intent.text}"
+        )
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
+
+
+def _memory_reference_continuity_message(
+    items: tuple[ReferenceContinuityItem, ...],
+) -> SystemMessage | None:
+    """渲染 Trace Memory reference continuity section。
+
+    :param items: reference continuity items。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    if not items:
+        return None
+    lines = [_MEMORY_REFERENCE_CONTINUITY_HEADER]
+    for item in items:
+        lines.append(f"reference_continuity=reason={item.reason}; text={item.text}")
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
+
+
+def _memory_selected_recent_window_messages(
+    items: tuple[SelectedRecentWindowItem, ...],
     render_scope: _CurrentMemoryRenderScope,
 ) -> tuple[AgentMessage, ...]:
-    """渲染 recent raw turns continuity messages。
+    """渲染 selected recent window messages。
 
-    :param items: continuity items。
+    :param items: selected recent window items。
     :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: raw turn messages。
+    :returns: Engine messages。
     """
 
     messages: list[AgentMessage] = []
     for item in items:
-        if item.item_kind not in (
-            ConversationContinuityKind.RAW_USER_TURN,
-            ConversationContinuityKind.RAW_ASSISTANT_TURN,
-            ConversationContinuityKind.ASSISTANT_CONCLUSION,
-        ):
+        if item.event_id == render_scope.user_input_event_id:
             continue
-        if _is_current_run_user_input_memory_item(item, render_scope):
-            continue
-        content = _continuity_item_text(item)
-        if item.item_kind is ConversationContinuityKind.RAW_USER_TURN:
-            messages.append(
-                UserMessage(role=AgentMessageRole.USER, content=content)
-            )
-        else:
+        if item.role is SelectedRecentWindowRole.USER:
+            messages.append(UserMessage(role=AgentMessageRole.USER, content=item.text))
+        elif item.role is SelectedRecentWindowRole.ASSISTANT:
             messages.append(
                 AssistantMessage(
                     role=AgentMessageRole.ASSISTANT,
-                    content=content,
+                    content=item.text,
                     reasoning_content=None,
                     tool_calls=(),
                 )
             )
+        else:
+            messages.append(SystemMessage(role=AgentMessageRole.SYSTEM, content=item.text))
     return tuple(messages)
-
-
-def _memory_minimum_preserve_message(
-    items: tuple[ConversationContinuityItem, ...],
-    render_scope: _CurrentMemoryRenderScope,
-) -> SystemMessage | None:
-    """渲染 minimum preserve continuity block。
-
-    :param items: continuity items。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: system message；无 minimum preserve item 时返回 ``None``。
-    """
-
-    preserve_items = tuple(
-        item
-        for item in items
-        if item.item_kind is ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
-        and not _is_current_run_user_input_memory_item(item, render_scope)
-    )
-    if not preserve_items:
-        return None
-    lines = [_MEMORY_MINIMUM_PRESERVE_HEADER]
-    for item in preserve_items:
-        lines.append(
-            "continuity_item="
-            f"label={item.label}; "
-            f"text={_continuity_item_text(item)}; "
-            f"source_refs={','.join(item.source_refs)}; "
-            f"preserve_reason={_preserve_reason_text(item)}"
-        )
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
-
-
-def _memory_episode_summary_message(
-    items: tuple[ConversationContinuityItem, ...],
-    render_scope: _CurrentMemoryRenderScope,
-) -> SystemMessage | None:
-    """渲染 episode summaries memory block。
-
-    :param items: continuity items。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: system message；无 episode summary 时返回 ``None``。
-    """
-
-    episode_items = tuple(
-        item
-        for item in items
-        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
-        and not _is_current_run_user_input_memory_item(item, render_scope)
-    )
-    if not episode_items:
-        return None
-    lines = [_MEMORY_EPISODE_SUMMARIES_HEADER]
-    for item in episode_items:
-        lines.append(f"episode_summary={_continuity_item_text(item)}")
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
-
-
-def _continuity_item_text(item: ConversationContinuityItem) -> str:
-    """读取 continuity item 可渲染文本。
-
-    :param item: continuity item。
-    :returns: 可进入 Engine message 的文本。
-    """
-
-    if item.summary_text is not None:
-        return item.summary_text
-    if item.payload_ref is not None and item.payload_digest is not None:
-        return f"payload_ref={item.payload_ref}; payload_digest={item.payload_digest}"
-    return f"event_ref={item.event_id}"
-
-
-def _preserve_reason_text(item: ConversationContinuityItem) -> str:
-    """读取 minimum preserve reason 的可渲染文本。
-
-    :param item: continuity item。
-    :returns: preserve reason 文本。
-    """
-
-    if item.preserve_reason is None:
-        return "unspecified"
-    return item.preserve_reason.value
-
-
-def _is_current_run_user_input_memory_item(
-    item: ConversationContinuityItem, render_scope: _CurrentMemoryRenderScope
-) -> bool:
-    """判断 continuity item 是否是当前 Run 的用户输入。
-
-    :param item: continuity item。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: 属于当前 ``USER_INPUT_ACCEPTED`` raw turn 时返回 ``True``。
-    """
-
-    if item.item_kind is not ConversationContinuityKind.RAW_USER_TURN:
-        return False
-    if item.event_id == render_scope.user_input_event_id:
-        return True
-    return False
 
 
 def build_run_input_material_blocks(
@@ -2544,11 +2363,15 @@ def _memory_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
     """
 
     content = _run_input_message_content(message)
-    if content.startswith(_MEMORY_EVIDENCE_BACKED_FACTS_HEADER):
+    if content.startswith(_MEMORY_EVIDENCE_FACT_HEADER):
         return CompactMaterialBlockKind.EVIDENCE_BACKED_FACT
-    if content.startswith(_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER):
+    if content.startswith(_MEMORY_FORWARD_INTENT_HEADER):
         return CompactMaterialBlockKind.FORWARD_INTENT
-    if content.startswith(_MEMORY_EPISODE_SUMMARIES_HEADER):
+    if content.startswith(_MEMORY_ANSWER_ANCHOR_HEADER):
+        return CompactMaterialBlockKind.ANSWER_ANCHOR
+    if content.startswith(_MEMORY_REFERENCE_CONTINUITY_HEADER):
+        return CompactMaterialBlockKind.REFERENCE_CONTINUITY
+    if content.startswith(_MEMORY_SESSION_SUMMARY_HEADER):
         return CompactMaterialBlockKind.SESSION_SUMMARY
     if isinstance(message, UserMessage):
         return CompactMaterialBlockKind.USER_INPUT
@@ -2584,7 +2407,7 @@ def _memory_material_source_ref(memory: MemorySnapshotView) -> str:
 
 
 def _memory_represented_evidence_refs(
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> tuple[str, ...]:
     """返回 stable memory facts 已表示的 accepted evidence refs。
 
@@ -2593,7 +2416,7 @@ def _memory_represented_evidence_refs(
     """
 
     refs: list[str] = []
-    for fact in snapshot.evidence_backed_facts:
+    for fact in snapshot.evidence_fact_memory.evidence_backed_facts:
         refs.extend(fact.evidence_refs)
     return tuple(dict.fromkeys(refs))
 
@@ -2630,18 +2453,6 @@ def _represented_evidence_refs(
             )
         )
     )
-
-
-def _opaque_ref_text(ref: OpaqueMemoryRef) -> str:
-    """渲染 Host 中立 opaque ref。
-
-    :param ref: opaque memory ref。
-    :returns: 稳定文本。
-    """
-
-    if ref.digest is None:
-        return f"{ref.ref_kind.value}:{ref.ref_id}"
-    return f"{ref.ref_kind.value}:{ref.ref_id}; digest={ref.digest}"
 
 
 def _memory_cursor_ref(cursor: MemorySnapshotCursor) -> str:

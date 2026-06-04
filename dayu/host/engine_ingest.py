@@ -411,7 +411,7 @@ class _ReactiveCompactPending:
     :param estimate: reactive compact 前估算。
     :param decision: reactive compact 前预算决策。
     :param policy: reactive context budget policy。
-    :param recent_raw_turns_floor: fallback recent raw turn floor。
+    :param selected_recent_window_turn_floor: fallback selected recent-window turn floor。
     """
 
     result_prefix: EngineIngestResult
@@ -425,7 +425,7 @@ class _ReactiveCompactPending:
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
     policy: ContextBudgetPolicy
-    recent_raw_turns_floor: int
+    selected_recent_window_turn_floor: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1276,8 +1276,8 @@ class EngineEventIngestor:
             estimate=estimate,
             decision=decision,
             policy=policy,
-            recent_raw_turns_floor=(
-                self._memory_projection_policy.recent_raw_turns_floor
+            selected_recent_window_turn_floor=(
+                self._memory_projection_policy.selected_recent_window_turn_floor
             ),
         )
 
@@ -3305,7 +3305,7 @@ def _reactive_fallback_decision(
             material_blocks=pending.frozen_material_blocks,
             current_input_ref=pending.context.run.input_event_id,
             input_cursor=pending.expected_input_event_sequence,
-            recent_raw_turns_floor=pending.recent_raw_turns_floor,
+            selected_recent_window_turn_floor=pending.selected_recent_window_turn_floor,
             trigger_source=ContextCompactionTriggerSource.REACTIVE,
         )
         budget = estimate_recent_window_fallback_budget(
