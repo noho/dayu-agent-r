@@ -12,17 +12,27 @@ from enum import StrEnum
 from typing import NoReturn
 
 from dayu.host.compaction import (
+    AnswerReadableItemVNext,
+    CompactInstructionVNext,
     CompactEvidenceBlock,
     CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialPack,
     CompactMaterialSection,
+    CompactReadableViewVNext,
+    ConversationCompactInputVNext,
+    CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT,
+    CurrentInputAnchorVNext,
+    EvidenceReadableItemVNext,
     CompactSegmentSelection,
     CompactSegmentTrigger,
     CurrentInputAnchor,
     PromptLocalEvidenceMap,
     PromptLocalMaterialLabel,
     PromptLocalProvenanceEntry,
+    ReadableFactItemVNext,
+    TraceReadableItemVNext,
+    TraceReadableKindVNext,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.evidence import OpaqueEvidenceRef
@@ -272,6 +282,36 @@ def selected_material_source_refs(
         if block.block_id in selected:
             refs.extend(block.canonical_source_refs)
     return tuple(dict.fromkeys(refs))
+
+
+def conversation_compact_input_vnext_from_material_pack(
+    material_pack: CompactMaterialPack,
+) -> ConversationCompactInputVNext:
+    """从现有 compact material pack 构造 vNext LLM-readable input。
+
+    Slice A 只在 request/material/parser/accept barrier 局部闭环内建立 vNext
+    contract，因此该 helper 不把 vNext output 桥接回旧 candidate，也不改变
+    production operation 的旧 material 入口。
+
+    :param material_pack: 旧 production path 仍在使用的 material pack。
+    :returns: vNext compactor input。
+    :raises TypeError: material pack 类型非法时抛出。
+    """
+
+    if not isinstance(material_pack, CompactMaterialPack):
+        raise TypeError("material_pack must be CompactMaterialPack")
+    return ConversationCompactInputVNext(
+        schema_version=CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT,
+        previous_compacted_view=_previous_compacted_view_vnext(material_pack.stable_input),
+        trace_material=_trace_material_vnext(material_pack.history_input),
+        evidence_material=_evidence_material_vnext(material_pack.evidence_input),
+        answer_material=_answer_material_vnext(material_pack.history_input),
+        current_input_anchor=CurrentInputAnchorVNext(
+            anchor_label=material_pack.current_input_anchor.anchor_label,
+            text=material_pack.current_input_anchor.anchor_text,
+        ),
+        instruction=CompactInstructionVNext(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1726,6 +1766,100 @@ def _require_material_block_tuple(value: tuple[RunInputMaterialBlock, ...], fiel
             raise TypeError(f"{field_name} items must be RunInputMaterialBlock")
 
 
+def _trace_material_vnext(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[TraceReadableItemVNext, ...]:
+    """把旧 history input 中的 raw user turn 映射为 vNext trace material。
+
+    :param blocks: 旧 history material blocks。
+    :returns: vNext trace material tuple。
+    """
+
+    items: list[TraceReadableItemVNext] = []
+    for block in blocks:
+        if block.kind is CompactMaterialBlockKind.RAW_USER_TURN:
+            items.append(
+                TraceReadableItemVNext(
+                    source_label=block.block_label,
+                    trace_kind=TraceReadableKindVNext.USER_INPUT,
+                    text=block.text,
+                )
+            )
+    return tuple(items)
+
+
+def _answer_material_vnext(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[AnswerReadableItemVNext, ...]:
+    """把旧 history input 中的 raw assistant turn 映射为 vNext answer material。
+
+    :param blocks: 旧 history material blocks。
+    :returns: vNext answer material tuple。
+    """
+
+    items: list[AnswerReadableItemVNext] = []
+    for block in blocks:
+        if block.kind is CompactMaterialBlockKind.RAW_ASSISTANT_TURN:
+            items.append(AnswerReadableItemVNext(source_label=block.block_label, answer_text=block.text))
+    return tuple(items)
+
+
+def _evidence_material_vnext(blocks: tuple[CompactEvidenceBlock, ...]) -> tuple[EvidenceReadableItemVNext, ...]:
+    """把旧 evidence input 映射为 vNext evidence material。
+
+    :param blocks: 旧 accepted evidence material blocks。
+    :returns: vNext evidence material tuple。
+    """
+
+    items: list[EvidenceReadableItemVNext] = []
+    for block in blocks:
+        items.append(
+            EvidenceReadableItemVNext(
+                source_label=block.evidence_label,
+                tool_name=block.readable_tool_name,
+                query_text=block.readable_query_text,
+                response_text=block.raw_result_text,
+                source_note=block.readable_source_text,
+            )
+        )
+    return tuple(items)
+
+
+def _previous_compacted_fact_material_vnext(
+    blocks: tuple[CompactMaterialBlock, ...],
+) -> tuple[ReadableFactItemVNext, ...]:
+    """把旧 stable evidence-backed fact block 映射为 vNext 可读 fact。
+
+    当前 Slice A 的 public helper 暂不接入 previous_compacted_view；保留该
+    映射规则作为局部闭环测试入口，避免把 pinned / assumption 旧概念带入
+    vNext。
+
+    :param blocks: 旧 stable material blocks。
+    :returns: vNext readable fact tuple。
+    """
+
+    items: list[ReadableFactItemVNext] = []
+    for block in blocks:
+        if block.kind is CompactMaterialBlockKind.EVIDENCE_BACKED_FACT:
+            items.append(ReadableFactItemVNext(source_label=block.block_label, claim_text=block.text))
+    return tuple(items)
+
+
+def _previous_compacted_view_vnext(blocks: tuple[CompactMaterialBlock, ...]) -> CompactReadableViewVNext | None:
+    """把旧 stable input 中可承接的 fact 映射为 vNext previous view。
+
+    :param blocks: 旧 stable material blocks。
+    :returns: vNext previous compacted view；无可迁移内容时返回 ``None``。
+    """
+
+    facts = _previous_compacted_fact_material_vnext(blocks)
+    if len(facts) == 0:
+        return None
+    return CompactReadableViewVNext(
+        session_summary=None,
+        evidence_backed_facts=facts,
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity_items=(),
+    )
+
+
 def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
     """校验字符串 tuple。
 
@@ -1820,6 +1954,7 @@ __all__ = [
     "build_initial_material_pack",
     "build_compact_material_pack",
     "check_compact_memory_snapshot_cursor",
+    "conversation_compact_input_vnext_from_material_pack",
     "current_input_anchor_label",
     "evidence_chunk_label",
     "initial_segment_selection",

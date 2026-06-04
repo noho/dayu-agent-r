@@ -11,20 +11,32 @@ from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     build_initial_material_pack,
+    conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
 from dayu.host.compaction import (
+    AnswerAnchorCandidateVNext,
+    AnswerAnchorChildVNext,
     CompactInputRange,
     CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialPack,
     CompactMaterialSection,
     CompactQualityCheckResult,
+    CompactQualityIssueVNext,
     CompactQualityIssue,
     CompactSegmentTrigger,
     CompactionRequest,
+    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    ConversationCompactInputVNext,
+    ConversationCompactOutputVNext,
     EvidenceBackedFactCandidate,
     EvidenceBackedFactKind,
+    EvidenceBackedFactCandidateVNext,
+    FactEvidenceKindVNext,
+    ForwardIntentCandidateVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
     MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
     MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
     MinimumPreserveItemCandidate,
@@ -33,9 +45,12 @@ from dayu.host.compaction import (
     PinnedStringTupleFieldPatch,
     PinnedTextFieldPatch,
     PromptLocalProvenanceEntry,
+    ReferenceContinuityCandidateVNext,
+    ReferenceContinuityReasonVNext,
+    SessionSummaryCandidateVNext,
 )
 from dayu.host.context_budget import BudgetEstimate
-from dayu.host.context_governance import check_compaction_candidate
+from dayu.host.context_governance import check_compaction_candidate, check_conversation_compact_output_vnext
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
@@ -43,7 +58,7 @@ from dayu.host.evidence import (
     AcceptedEvidenceToolQuery,
 )
 from tests.host.fake_cancellation import StubCancellationToken
-from tests.host.fake_compaction import FakeContextCompactor
+from tests.host.fake_compaction import FakeContextCompactor, FakeConversationCompactorVNext
 
 
 @pytest.mark.asyncio
@@ -99,6 +114,107 @@ async def test_fact_candidates_can_reference_evidence_materials() -> None:
         "Canonical evidence material: canonical evidence raw content accepted-1",
         "Canonical evidence material: canonical evidence raw content accepted-2",
     )
+
+
+def test_conversation_compact_output_vnext_round_trips_json() -> None:
+    """vNext output dataclass 可构造并进行 JSON round-trip。"""
+
+    candidate = _vnext_candidate()
+    restored = ConversationCompactOutputVNext(
+        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text="Session stayed focused on annual report analysis.",
+            source_labels=("H1", "E1"),
+        ),
+        evidence_backed_facts=(
+            EvidenceBackedFactCandidateVNext(
+                claim_text="Accepted evidence supports revenue growth.",
+                evidence_labels=("E1",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+                source_labels=("E1",),
+            ),
+        ),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="Prior answer",
+                anchor_items=(AnswerAnchorChildVNext(display_text="上一轮回答摘要", ordinal=1),),
+                answer_source_labels=("H1",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="Continue the annual report analysis.",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("H1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="The follow-up refers to the prior assistant answer.",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("H1",),
+            ),
+        ),
+        diagnostics=(),
+    )
+
+    assert restored.to_json() == candidate.to_json()
+    assert restored.digest() == candidate.digest()
+
+
+def test_check_conversation_compact_output_vnext_accepts_valid_candidate() -> None:
+    """vNext accept barrier 接受 section labels 合法的 candidate。"""
+
+    result = check_conversation_compact_output_vnext(_vnext_input(), _vnext_candidate())
+
+    assert result.accepted is True
+    assert result.rejection_reasons == ()
+
+
+@pytest.mark.asyncio
+async def test_fake_conversation_compactor_vnext_produces_typed_candidate() -> None:
+    """Fake vNext compactor 产生 deterministic typed candidate。"""
+
+    request = _vnext_input()
+    candidate = await FakeConversationCompactorVNext().compact_vnext(request, StubCancellationToken())
+    result = check_conversation_compact_output_vnext(request, candidate)
+
+    assert result.accepted is True
+    assert len(candidate.evidence_backed_facts) == 2
+    assert candidate.answer_anchors[0].answer_source_labels == ("H1",)
+    assert candidate.forward_intents[0].source_labels == ("H1",)
+    assert candidate.reference_continuity_items[0].source_labels == ("H1",)
+
+
+@pytest.mark.parametrize(
+    ("fact_evidence_labels", "issue"),
+    (
+        (
+            ("E99",),
+            CompactQualityIssueVNext.STALE_SOURCE_LABEL,
+        ),
+        (
+            ("H1",),
+            CompactQualityIssueVNext.CROSS_SECTION_LABEL,
+        ),
+        (
+            ("C1",),
+            CompactQualityIssueVNext.CURRENT_INPUT_ANCHOR_CITED,
+        ),
+    ),
+)
+def test_check_conversation_compact_output_vnext_rejects_label_contract_violations(
+    fact_evidence_labels: tuple[str, ...],
+    issue: CompactQualityIssueVNext,
+) -> None:
+    """vNext accept barrier 对 stale、跨 section 与 current anchor fail closed。"""
+
+    candidate = _vnext_candidate(fact_evidence_labels=fact_evidence_labels)
+    result = check_conversation_compact_output_vnext(_vnext_input(), candidate)
+
+    assert result.accepted is False
+    assert issue in result.rejection_reasons
 
 
 @pytest.mark.asyncio
@@ -837,6 +953,65 @@ def _material_pack_with_open_question() -> CompactMaterialPack:
         material_pack,
         stable_input=(block, *material_pack.stable_input),
         provenance_map=provenance_map,
+    )
+
+
+def _vnext_input() -> ConversationCompactInputVNext:
+    """构造 vNext compact input。
+
+    :returns: vNext compact input。
+    """
+
+    return conversation_compact_input_vnext_from_material_pack(_request().material_pack)
+
+
+def _vnext_candidate(
+    *,
+    fact_evidence_labels: tuple[str, ...] = ("E1",),
+) -> ConversationCompactOutputVNext:
+    """构造 vNext compact output candidate。
+
+    :param fact_evidence_labels: fact candidate evidence labels。
+    :returns: vNext compact output。
+    """
+
+    return ConversationCompactOutputVNext(
+        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text="Session stayed focused on annual report analysis.",
+            source_labels=("H1", "E1"),
+        ),
+        evidence_backed_facts=(
+            EvidenceBackedFactCandidateVNext(
+                claim_text="Accepted evidence supports revenue growth.",
+                evidence_labels=fact_evidence_labels,
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+                source_labels=fact_evidence_labels,
+            ),
+        ),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="Prior answer",
+                anchor_items=(AnswerAnchorChildVNext(display_text="上一轮回答摘要", ordinal=1),),
+                answer_source_labels=("H1",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="Continue the annual report analysis.",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("H1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="The follow-up refers to the prior assistant answer.",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("H1",),
+            ),
+        ),
+        diagnostics=(),
     )
 
 

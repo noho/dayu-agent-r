@@ -10,10 +10,12 @@ from dataclasses import replace
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     build_initial_material_pack,
+    conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
 from dayu.engine.contracts.agent_run import (
@@ -30,6 +32,7 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactSegmentTrigger,
     CompactionRequest,
+    ConversationCompactInputVNext,
     MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
     MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
 )
@@ -48,6 +51,7 @@ import dayu.host.llm_compaction as llm_compaction_module
 from dayu.host.llm_compaction import (
     LLMCompactionProposalError,
     LLMContextCompactor,
+    parse_conversation_compact_output_vnext,
 )
 from tests.host.fake_cancellation import StubCancellationToken
 
@@ -985,6 +989,168 @@ async def test_llm_context_compactor_projects_proactive_identity_none(
     assert len(calls) == 1
     assert calls[0].attempt_id is None
     assert calls[0].execution_id is None
+
+
+def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None:
+    """vNext parser 接受 design 24.3 candidate schema 并保留字段。"""
+
+    candidate = parse_conversation_compact_output_vnext(
+        _vnext_input(),
+        _proposal_vnext_json(),
+    )
+
+    assert candidate.schema_version == "conversation_compact_output_v1"
+    assert candidate.session_summary is not None
+    assert candidate.session_summary.summary_text == "Session stayed focused on revenue analysis."
+    assert candidate.evidence_backed_facts[0].evidence_labels == ("E1",)
+    assert candidate.answer_anchors[0].answer_source_labels == ("H1",)
+    assert candidate.forward_intents[0].source_labels == ("H1",)
+    assert candidate.reference_continuity_items[0].source_labels == ("H1",)
+    assert candidate.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    ("case_name", "match"),
+    (
+        ("unknown", "unknown source label"),
+        ("stale", "stale source label"),
+        ("cross_section", "cross-section label"),
+        ("missing_label", "must be non-empty"),
+        ("empty_text", "must be non-empty"),
+        ("illegal_enum", "is not a valid"),
+        ("current_anchor", "current input anchor"),
+    ),
+)
+def test_parse_conversation_compact_output_vnext_fails_closed(
+    case_name: str,
+    match: str,
+) -> None:
+    """vNext parser 对非法 label、空文本与非法 enum fail closed。"""
+
+    with pytest.raises(LLMCompactionProposalError, match=match):
+        parse_conversation_compact_output_vnext(_vnext_input(), _invalid_proposal_vnext_json(case_name))
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_compact_vnext_uses_vnext_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """compact_vnext 渲染 vNext input 并返回 vNext output，不走旧 candidate parser。"""
+
+    calls: list[AgentRunRequest] = []
+
+    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """记录 Engine request 并返回合法 vNext proposal。
+
+        :param request: compactor 构造的 Engine request。
+        :returns: final answer outcome。
+        """
+
+        calls.append(request)
+        return _final(_proposal_vnext_json())
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
+    candidate = await _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    ).compact_vnext(_vnext_input(), StubCancellationToken())
+
+    assert len(calls) == 1
+    prompt = calls[0].messages[1].content
+    assert prompt is not None
+    assert '"schema_version": "conversation_compact_input_v1"' in prompt
+    assert '"evidence_material"' in prompt
+    assert '"stable_input"' not in prompt
+    assert candidate.evidence_backed_facts[0].claim_text == "Revenue grew 12% year over year."
+
+
+def _vnext_input() -> ConversationCompactInputVNext:
+    """构造 vNext compact input。
+
+    :returns: vNext compact input。
+    """
+
+    return conversation_compact_input_vnext_from_material_pack(_request().material_pack)
+
+
+def _proposal_vnext_json(
+    *,
+    claim_text: str = "Revenue grew 12% year over year.",
+    fact_evidence_labels: tuple[str, ...] = ("E1",),
+    fact_evidence_kind: str = "accepted_evidence_material",
+) -> str:
+    """构造 vNext LLM strict JSON proposal。
+
+    :param claim_text: fact claim 文本。
+    :param fact_evidence_labels: fact evidence labels。
+    :param fact_evidence_kind: fact evidence kind。
+    :returns: JSON 文本。
+    """
+
+    proposal: dict[str, JsonValue] = {
+        "schema_version": "conversation_compact_output_v1",
+        "session_summary": {
+            "summary_text": "Session stayed focused on revenue analysis.",
+            "source_labels": ["H1", "E1"],
+        },
+        "evidence_backed_facts": [
+            {
+                "claim_text": claim_text,
+                "evidence_labels": list(fact_evidence_labels),
+                "evidence_kind": fact_evidence_kind,
+                "source_labels": list(fact_evidence_labels),
+            }
+        ],
+        "answer_anchors": [
+            {
+                "anchor_title": "Prior answer",
+                "anchor_items": [{"display_text": "previous assistant turn", "ordinal": 1}],
+                "answer_source_labels": ["H1"],
+            }
+        ],
+        "forward_intents": [
+            {
+                "intent_type": "next_step_note",
+                "text": "Continue the analysis.",
+                "status": "open",
+                "source_labels": ["H1"],
+            }
+        ],
+        "reference_continuity_items": [
+            {
+                "text": "The follow-up refers to the previous answer.",
+                "reason": "local_reference",
+                "source_labels": ["H1"],
+            }
+        ],
+        "diagnostics": [],
+    }
+    return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+
+
+def _invalid_proposal_vnext_json(case_name: str) -> str:
+    """按 case 名构造非法 vNext proposal。
+
+    :param case_name: 非法场景名。
+    :returns: JSON 文本。
+    :raises ValueError: case 名未知时抛出。
+    """
+
+    if case_name == "unknown":
+        return _proposal_vnext_json(fact_evidence_labels=("missing-label",))
+    if case_name == "stale":
+        return _proposal_vnext_json(fact_evidence_labels=("E99",))
+    if case_name == "cross_section":
+        return _proposal_vnext_json(fact_evidence_labels=("H1",))
+    if case_name == "missing_label":
+        return _proposal_vnext_json(fact_evidence_labels=())
+    if case_name == "empty_text":
+        return _proposal_vnext_json(claim_text="")
+    if case_name == "illegal_enum":
+        return _proposal_vnext_json(fact_evidence_kind="observed_value")
+    if case_name == "current_anchor":
+        return _proposal_vnext_json(fact_evidence_labels=("C1",))
+    raise ValueError(f"unknown invalid vNext proposal case: {case_name}")
 
 
 def _fake_run_factory(

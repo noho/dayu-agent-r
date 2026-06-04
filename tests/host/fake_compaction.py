@@ -14,14 +14,27 @@ from typing import cast
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
+    AnswerAnchorCandidateVNext,
+    AnswerAnchorChildVNext,
     CompactInputRange,
     CompactMaterialSection,
     CompactionCandidate,
     CompactionRequest,
+    ConversationCompactInputVNext,
+    ConversationCompactOutputVNext,
+    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     ContextCompactor,
+    EvidenceBackedFactCandidateVNext,
+    FactEvidenceKindVNext,
+    ForwardIntentCandidateVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
     PinnedPatchOperation,
     PinnedStringTupleFieldPatch,
     PinnedTextFieldPatch,
+    ReferenceContinuityCandidateVNext,
+    ReferenceContinuityReasonVNext,
+    SessionSummaryCandidateVNext,
 )
 from dayu.host.llm_compaction import _candidate_from_final_answer
 
@@ -62,6 +75,154 @@ class FakeContextCompactor(ContextCompactor):
         )
         candidate = _candidate_from_final_answer(request, proposal_json)
         return _fake_candidate_ids(request, candidate)
+
+
+class FakeConversationCompactorVNext:
+    """测试专用 deterministic vNext context compactor。"""
+
+    async def compact_vnext(
+        self,
+        request: ConversationCompactInputVNext,
+        cancellation_token: CancellationToken,
+    ) -> ConversationCompactOutputVNext:
+        """生成 deterministic vNext compact output。
+
+        :param request: vNext compactor input。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: deterministic vNext compact output。
+        :raises TypeError: request 类型非法时抛出。
+        :raises RuntimeError: token 已取消时抛出。
+        """
+
+        if not isinstance(request, ConversationCompactInputVNext):
+            raise TypeError("request must be ConversationCompactInputVNext")
+        if cancellation_token.is_cancelled():
+            raise RuntimeError("compaction cancelled")
+        return ConversationCompactOutputVNext(
+            schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+            session_summary=_fake_session_summary_vnext(request),
+            evidence_backed_facts=_fake_fact_candidates_vnext(request),
+            answer_anchors=_fake_answer_anchors_vnext(request),
+            forward_intents=_fake_forward_intents_vnext(request),
+            reference_continuity_items=_fake_reference_items_vnext(request),
+            diagnostics=(),
+        )
+
+
+def _fake_session_summary_vnext(request: ConversationCompactInputVNext) -> SessionSummaryCandidateVNext | None:
+    """构造 fake vNext session summary。
+
+    :param request: vNext compactor input。
+    :returns: session summary；无可引用 material 时返回 ``None``。
+    """
+
+    labels = _summary_labels_vnext(request)
+    if len(labels) == 0:
+        return None
+    return SessionSummaryCandidateVNext(
+        summary_text=f"Deterministic compact summary for {request.current_input_anchor.text}",
+        source_labels=labels,
+    )
+
+
+def _fake_fact_candidates_vnext(
+    request: ConversationCompactInputVNext,
+) -> tuple[EvidenceBackedFactCandidateVNext, ...]:
+    """构造 fake vNext fact candidates。
+
+    :param request: vNext compactor input。
+    :returns: fact candidate tuple。
+    """
+
+    candidates: list[EvidenceBackedFactCandidateVNext] = []
+    for item in request.evidence_material:
+        candidates.append(
+            EvidenceBackedFactCandidateVNext(
+                claim_text=f"Canonical evidence material: {item.response_text}",
+                evidence_labels=(item.source_label,),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+                source_labels=(item.source_label,),
+            )
+        )
+    return tuple(candidates)
+
+
+def _fake_answer_anchors_vnext(
+    request: ConversationCompactInputVNext,
+) -> tuple[AnswerAnchorCandidateVNext, ...]:
+    """构造 fake vNext answer anchors。
+
+    :param request: vNext compactor input。
+    :returns: answer anchor tuple。
+    """
+
+    anchors: list[AnswerAnchorCandidateVNext] = []
+    for item in request.answer_material:
+        anchors.append(
+            AnswerAnchorCandidateVNext(
+                anchor_title="Previous answer",
+                anchor_items=(AnswerAnchorChildVNext(display_text=item.answer_text),),
+                answer_source_labels=(item.source_label,),
+            )
+        )
+    return tuple(anchors)
+
+
+def _fake_forward_intents_vnext(
+    request: ConversationCompactInputVNext,
+) -> tuple[ForwardIntentCandidateVNext, ...]:
+    """构造 fake vNext forward intents。
+
+    :param request: vNext compactor input。
+    :returns: forward intent tuple。
+    """
+
+    labels = _summary_labels_vnext(request)
+    if len(labels) == 0:
+        return ()
+    return (
+        ForwardIntentCandidateVNext(
+            intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+            text="Continue current user-visible analysis.",
+            status=ForwardIntentStatusVNext.OPEN,
+            source_labels=(labels[0],),
+        ),
+    )
+
+
+def _fake_reference_items_vnext(
+    request: ConversationCompactInputVNext,
+) -> tuple[ReferenceContinuityCandidateVNext, ...]:
+    """构造 fake vNext reference continuity items。
+
+    :param request: vNext compactor input。
+    :returns: reference continuity tuple。
+    """
+
+    labels = _summary_labels_vnext(request)
+    if len(labels) == 0:
+        return ()
+    return (
+        ReferenceContinuityCandidateVNext(
+            text="Keep the nearest prior context for local references.",
+            reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+            source_labels=(labels[0],),
+        ),
+    )
+
+
+def _summary_labels_vnext(request: ConversationCompactInputVNext) -> tuple[str, ...]:
+    """返回 fake vNext 可用于 summary / continuity 的 labels。
+
+    :param request: vNext compactor input。
+    :returns: prompt-local labels。
+    """
+
+    labels: list[str] = []
+    labels.extend(item.source_label for item in request.trace_material)
+    labels.extend(item.source_label for item in request.answer_material)
+    labels.extend(item.source_label for item in request.evidence_material)
+    return tuple(dict.fromkeys(labels))
 
 
 def fake_compaction_proposal_from_material_json(
