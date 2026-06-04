@@ -152,7 +152,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
-    :raises AssertionError: public material 缺 evidence_input 或后续 request 未复用 fact 时抛出。
+    :raises AssertionError: public material 缺 evidence_material 或后续 request 未复用 fact 时抛出。
     """
 
     fake_compactor = FakeCompactorRunAgent()
@@ -205,9 +205,9 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert third_terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.material_jsons) >= 1
     material_json = _first_material_json_with_evidence(fake_compactor.material_jsons)
-    evidence_input = material_json["evidence_material"]
-    assert isinstance(evidence_input, list)
-    assert len(evidence_input) >= 1
+    evidence_material = material_json["evidence_material"]
+    assert isinstance(evidence_material, list)
+    assert len(evidence_material) >= 1
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
     assert _LONG_CHAPTER_MARKER in material_text
     assert "result_preview" not in material_text
@@ -675,19 +675,19 @@ def _material_json_text_from_prompt(prompt: str) -> str:
 def _first_material_json_with_evidence(
     values: list[Mapping[str, JsonValue]],
 ) -> Mapping[str, JsonValue]:
-    """返回首个包含 evidence_input 的 compactor material JSON。
+    """返回首个包含 evidence_material 的 compactor material JSON。
 
     :param values: fake compactor 记录的 material JSON 列表。
-    :returns: 首个包含 evidence_input 项的 material JSON。
-    :raises AssertionError: 所有 public compactor material 都缺 evidence_input 时抛出。
+    :returns: 首个包含 evidence_material 项的 material JSON。
+    :raises AssertionError: 所有 public compactor material 都缺 evidence_material 时抛出。
     """
 
     for value in values:
-        evidence_input = value["evidence_material"]
-        assert isinstance(evidence_input, list)
-        if len(evidence_input) > 0:
+        evidence_material = value["evidence_material"]
+        assert isinstance(evidence_material, list)
+        if len(evidence_material) > 0:
             return value
-    raise AssertionError("public compactor material evidence_input is empty")
+    raise AssertionError("public compactor material evidence_material is empty")
 
 
 def _compactor_user_prompt(request: AgentRunRequest) -> str:

@@ -113,7 +113,8 @@ from dayu.host.run_input import (
     PolicySnapshot,
     ToolExecutionMode,
     MemorySnapshotView,
-    _preserved_fact_refs_summary,
+    _accepted_evidence_mapping_refs,
+    _vnext_compact_candidate_summary,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -1394,19 +1395,35 @@ def test_no_compaction_recent_raw_turns_continuity_still_works(
         assert contents[-1] == "继续说明这个增长因素"
 
 
-def test_compact_artifact_preserved_fact_refs_reads_canonical_evidence_key() -> None:
-    """compact artifact message 从 canonical evidence refs 字段读取 refs。"""
+def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
+    """compact artifact reader 只读取 vNext accepted evidence mapping refs。"""
 
     payload: dict[str, JsonValue] = {
-        "preserved_fact_refs": {
-            "canonical_evidence_refs": ["evidence:memory-tool"],
-            "evidence_backed_fact_refs": ["fact:memory-revenue"],
-        }
+        "accepted_candidate": {
+            "schema_version": "conversation_compact_output_v1",
+            "session_summary": {
+                "summary_text": "用户关注收入与毛利率。",
+                "source_labels": ["T1"],
+            },
+            "evidence_backed_facts": [
+                {"claim_text": "收入增长", "evidence_labels": ["E1"]}
+            ],
+            "answer_anchors": [],
+            "forward_intents": [],
+            "reference_continuity_items": [],
+            "diagnostics": [],
+        },
+        "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
     }
 
-    assert _preserved_fact_refs_summary(payload) == (
-        "canonical_evidence_refs=evidence:memory-tool; "
-        "evidence_backed_fact_refs=fact:memory-revenue"
+    assert _accepted_evidence_mapping_refs(payload) == ("evidence:memory-tool",)
+    assert _vnext_compact_candidate_summary(payload, max_summary_chars=1200) == (
+        "schema_version=conversation_compact_output_v1 | "
+        "session_summary=用户关注收入与毛利率。 | "
+        "evidence_backed_facts=1 | "
+        "answer_anchors=0 | "
+        "forward_intents=0 | "
+        "reference_continuity_items=0"
     )
 
 
@@ -3506,7 +3523,7 @@ def _compact_payload(
 ) -> dict[str, JsonValue]:
     """构造测试用 CONTEXT_COMPACTED payload。
 
-    :param summary_text: episode summary 文本。
+    :param summary_text: session summary 文本。
     :param pinned_patch: pinned patch candidate。
     :param fact_candidates: 可选 evidence-backed fact candidates。
     :param reference_continuity_items: 可选 reference continuity candidates。

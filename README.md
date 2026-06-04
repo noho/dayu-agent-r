@@ -32,7 +32,7 @@
   - 普通文件（非财报文件）信息提取还需要优化。
   - 优化 Fins 里的港股/A股/美股财报信息提取。
   - Anthropic 原生 API 支持。
-  - Durable memory / Retrieval layer（ Memory只实现了working memory 和 episode summary ）。
+  - Durable memory / Retrieval layer（Memory 已落地五类 session memory：Trace、Evidence / Fact、Session Summary、Answer Anchor、Forward Intent）。
   - FMP 工具尚未实现。
   - 更多LLM 工具。
 

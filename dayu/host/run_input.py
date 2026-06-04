@@ -125,14 +125,15 @@ _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
-_PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
-_PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
-_PAYLOAD_FIELD_GOAL = "goal"
-_PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
-_PAYLOAD_FIELD_USER_CONSTRAINTS = "user_constraints"
-_PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
-_PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
-_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
+_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
+_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
+_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
+_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
+_PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
+_PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
+_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _COMPACT_SUMMARY_MAX_CHARS = 1200
 _MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
@@ -1224,7 +1225,7 @@ class DurableCompactArtifactProvider:
     """基于 EventLog 读取 accepted compact artifact 的 provider。
 
     :param transaction_runner: Host durable transaction runner。
-    :param max_summary_chars: episode summary 渲染字符上限。
+    :param max_summary_chars: compact candidate 摘要渲染字符上限。
     """
 
     def __init__(
@@ -1236,7 +1237,7 @@ class DurableCompactArtifactProvider:
         """初始化 provider。
 
         :param transaction_runner: Host durable transaction runner。
-        :param max_summary_chars: episode summary 渲染字符上限。
+        :param max_summary_chars: compact candidate 摘要渲染字符上限。
         :returns: ``None``。
         :raises ValueError: 上限非正数时抛出。
         """
@@ -1304,7 +1305,7 @@ class DurableCompactArtifactProvider:
             messages=(message,),
             compact_artifact_ref=artifact_ref,
             compact_artifact_digest=artifact_digest,
-            represented_evidence_refs=_preserved_canonical_evidence_refs(payload),
+            represented_evidence_refs=_accepted_evidence_mapping_refs(payload),
         )
 
 
@@ -2264,64 +2265,6 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
 
 
-def _optional_text_list_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
-    """从 JSON mapping 中读取可选文本列表字段。
-
-    :param payload: JSON payload 映射。
-    :param field_name: 待读取字段名。
-    :returns: 去除空字符串后的文本 tuple；字段缺失或非法时返回空 tuple。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        return ()
-    result: list[str] = []
-    for item in value:
-        if isinstance(item, str) and item.strip() != "":
-            result.append(item)
-    return tuple(result)
-
-
-def _preserved_canonical_evidence_refs(
-    payload: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """读取尚未迁移的 RunInput compact prompt preserved evidence refs。
-
-    :param payload: ``CONTEXT_COMPACTED`` payload。
-    :returns: canonical evidence refs；vNext payload 返回空 tuple。
-    """
-
-    preserved = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
-    if not isinstance(preserved, Mapping):
-        return ()
-    return _optional_text_list_field(preserved, _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS)
-
-
-def _preserved_fact_refs_summary(payload: Mapping[str, JsonValue]) -> str:
-    """渲染尚未迁移的 RunInput compact prompt preserved fact refs 摘要。
-
-    :param payload: ``CONTEXT_COMPACTED`` payload。
-    :returns: preserved fact refs 摘要；vNext payload 返回空字符串。
-    """
-
-    preserved = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
-    if not isinstance(preserved, Mapping):
-        return ""
-    canonical_evidence_refs = _optional_text_list_field(
-        preserved, _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS
-    )
-    evidence_backed_fact_refs = _optional_text_list_field(
-        preserved, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS
-    )
-    parts = [
-        f"canonical_evidence_refs={','.join(canonical_evidence_refs)}",
-        f"evidence_backed_fact_refs={','.join(evidence_backed_fact_refs)}",
-    ]
-    return "; ".join(parts)
-
-
 def _run_input_message_content(message: AgentMessage) -> str:
     """读取 AgentMessage 文本内容。
 
@@ -2678,55 +2621,156 @@ def _compact_artifact_message_content(
     artifact_digest = _required_text_field(
         payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
     )
-    summary = _optional_summary_text_from_compacted_payload(
+    accepted_evidence_mapping_refs = _accepted_evidence_mapping_refs(payload)
+    candidate_summary = _vnext_compact_candidate_summary(
         payload, max_summary_chars=max_summary_chars
     )
-    preserved_fact_refs = _preserved_fact_refs_summary(payload)
     lines = [
-        "Accepted compact artifact is available for this run.",
+        "Accepted vNext compact artifact is available for this run.",
         f"compact_artifact_ref={artifact_ref}",
         f"compact_artifact_digest={artifact_digest}",
         f"compacted_event_id={compacted_event.event_id}",
         f"compacted_event_sequence={compacted_event.event_sequence}",
-        f"preserved_fact_refs={preserved_fact_refs}",
+        (
+            "accepted_evidence_mapping_refs="
+            f"{','.join(accepted_evidence_mapping_refs)}"
+        ),
+        f"accepted_candidate={candidate_summary}",
     ]
-    if summary is not None:
-        lines.append(f"episode_summary={summary}")
     return "\n".join(lines)
 
 
-def _optional_summary_text_from_compacted_payload(
-    payload: Mapping[str, JsonValue], *, max_summary_chars: int
-) -> str | None:
-    """从 compacted payload 提取 bounded episode summary。
+def _accepted_evidence_mapping_refs(
+    payload: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    """读取 vNext compact payload 中已接受 evidence mapping refs。
 
-    :param payload: compacted payload。
-    :param max_summary_chars: 最大字符数。
-    :returns: summary 文本；不存在时为 ``None``。
+    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
+    :returns: accepted evidence mapping refs。
+    :raises HostDurableError: 字段缺失或包含非文本元素时抛出。
     """
 
-    value = payload.get(_PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE)
-    if not isinstance(value, Mapping):
-        return None
-    candidate_id = _optional_mapping_text(value, _PAYLOAD_FIELD_CANDIDATE_ID)
-    goal = _optional_mapping_text(value, _PAYLOAD_FIELD_GOAL)
-    constraints = _optional_text_list_field(value, _PAYLOAD_FIELD_USER_CONSTRAINTS)
-    questions = _optional_text_list_field(value, _PAYLOAD_FIELD_OPEN_QUESTIONS)
-    parts = []
-    if candidate_id is not None:
-        parts.append(f"candidate_id={candidate_id}")
-    if goal is not None:
-        parts.append(f"goal={goal}")
-    if len(constraints) > 0:
-        parts.append("user_constraints=" + "; ".join(constraints))
-    if len(questions) > 0:
-        parts.append("open_questions=" + "; ".join(questions))
-    if len(parts) == 0:
-        return None
+    return _required_text_list_field(
+        payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS
+    )
+
+
+def _vnext_compact_candidate_summary(
+    payload: Mapping[str, JsonValue], *, max_summary_chars: int
+) -> str:
+    """从 vNext accepted candidate 渲染 bounded compact 摘要。
+
+    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
+    :param max_summary_chars: 最大字符数。
+    :returns: accepted candidate 摘要。
+    :raises HostDurableError: accepted candidate 结构损坏时抛出。
+    """
+
+    candidate = _required_mapping_field(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
+    schema_version = _required_text_field(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
+    facts = _required_mapping_list_field(
+        candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS
+    )
+    anchors = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
+    intents = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
+    references = _required_mapping_list_field(
+        candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS
+    )
+    parts = [f"schema_version={schema_version}"]
+    session_summary = _optional_session_summary_text(candidate)
+    if session_summary is not None:
+        parts.append(f"session_summary={session_summary}")
+    parts.extend(
+        (
+            f"evidence_backed_facts={len(facts)}",
+            f"answer_anchors={len(anchors)}",
+            f"forward_intents={len(intents)}",
+            f"reference_continuity_items={len(references)}",
+        )
+    )
     text = " | ".join(parts)
     if len(text) <= max_summary_chars:
         return text
     return text[:max_summary_chars]
+
+
+def _optional_session_summary_text(
+    candidate: Mapping[str, JsonValue],
+) -> str | None:
+    """读取 vNext accepted candidate 的可选 session summary 文本。
+
+    :param candidate: ``accepted_candidate`` JSON object。
+    :returns: summary text；无 summary 时返回 ``None``。
+    :raises HostDurableError: summary 字段存在但结构损坏时抛出。
+    """
+
+    value = candidate.get(_PAYLOAD_FIELD_SESSION_SUMMARY)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError("accepted_candidate.session_summary must be object")
+    return _required_text_field(value, _PAYLOAD_FIELD_SUMMARY_TEXT)
+
+
+def _required_mapping_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> Mapping[str, JsonValue]:
+    """读取必填 JSON object 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: JSON object。
+    :raises HostDurableError: 字段缺失或非 object 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"payload field {field_name} must be object")
+    return value
+
+
+def _required_mapping_list_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取必填 JSON object list 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: JSON object tuple。
+    :raises HostDurableError: 字段缺失、非 list 或元素非 object 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        raise HostDurableError(f"payload field {field_name} must be list")
+    items: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError(f"payload field {field_name} item must be object")
+        items.append(item)
+    return tuple(items)
+
+
+def _required_text_list_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """读取必填文本 list 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 文本 tuple。
+    :raises HostDurableError: 字段缺失、非 list 或元素非文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        raise HostDurableError(f"payload field {field_name} must be list")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item.strip() == "":
+            raise HostDurableError(f"payload field {field_name} item must be text")
+        result.append(item)
+    return tuple(result)
 
 
 def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:
