@@ -160,11 +160,13 @@ allowed files/modules：
 - `dayu/host/context_events.py`
 - `dayu/host/compact_payload.py`
 - `dayu/host/dispatch.py`，仅限 proactive / reactive compaction operation 编排
+- `dayu/host/engine_ingest.py`，仅限 reactive accepted compaction event / artifact closeout；不得修改 Engine event ingest 的其它状态机、projection catch-up、RunInputBuilder 调用或旧 payload 兼容路径
 - `dayu/host/context_fallback.py`，仅限 compaction failure 后 recent-window fallback view
 - `tests/host/test_compaction_operation.py`
 - `tests/host/test_context_compact_events.py`
 - `tests/host/test_dispatch_scheduler.py`
 - `tests/host/test_recovery_dispatch.py`
+- `tests/host/test_engine_ingest_mapping.py`，仅限 reactive compaction closeout / fake compactor vNext 迁移
 - `tests/host/_context_compaction_assertions.py`
 - `tests/host/fake_compaction.py`
 
@@ -178,12 +180,19 @@ allowed files/modules：
 - repair attempt 必须 whole-candidate re-proposal；Host 可提供多个 Host-neutral invalid reasons，但不得要求 patch，不合并旧 proposal valid fields。
 - retry budget 耗尽只写最终 `CONTEXT_COMPACTION_FAILED`；不得写 `CONTEXT_COMPACTED`，不得让 memory projection 消费 rejected candidate。
 - fallback 不是 compact success：不写 compact artifact，不 materialize memory snapshot，不生成 summary / fact / anchor / intent / reference continuity；proactive fallback 不让 Run 进入 `RECOVERING`，reactive fallback 使用新 Attempt / execution id 且不得写 `RUN_LOST`。
+- proactive closeout 只验证 operation 编排、accepted / failed event payload、artifact descriptor 与 fallback 行为；不得要求 accepted compacted event 已被 subsequent RunInputBuilder 消费。
+- Slice B 可以调整 `test_multi_turn_proactive_compact_feeds_subsequent_run_input`，使其只断言 proactive operation / event closeout；subsequent RunInputBuilder consumption、memory section 渲染和 compacted view 被后续 Run 消费的断言归 Slice D。
+- reactive accepted closeout 在 `engine_ingest.py` 内只允许把 accepted vNext operation result 写成 vNext compact artifact 与 `CONTEXT_COMPACTED` payload，并保持同一 reactive recovery attempt / execution closeout 语义；不得借此新增 memory projection、memory durable write、old candidate adapter 或 RunInputBuilder consumption。
+- reactive `engine_ingest.py` 不得继续使用旧 `CompactArtifactWriteRequest` 写 vNext artifact；vNext artifact JSON / payload ref / descriptor metadata helper 应抽到 allowed shared module，优先 `dayu/host/compact_payload.py`，并由 `dispatch.py` 与 `engine_ingest.py` 复用。
+- subsequent run input、memory projection、durable snapshot materialization、post-compact delta 和 RunInputBuilder 对 vNext payload 的消费断言属于 Slice C / D。Slice B 测试不得通过旧 payload compatibility fields、projection shim、old candidate adapter 或额外 payload 字段让这些断言提前通过。
 
 旧路径保留 / 删除边界：
 
 - 一旦 operation 切换到 vNext，必须删除或迁移 operation path 中旧 `pinned_state_patch_candidate`、`minimum_preserve_item_candidates`、`preserved_*`、`preservation_evidence`、旧 candidate merge 与旧 payload validator；不得保留旧字段作为事件兼容入口。
 - 尚未切换的 memory snapshot / durable item / RunInputBuilder 旧字段可原样存在到 Slice C / D；Slice B 不得新增 payload wrapper 或 projection shim 来把 vNext compact event 写回旧 memory shape。
 - fallback recent-window view 只能影响本次 dispatch 输入选择；不得写 memory snapshot 或旧 compact artifact。
+- Slice B 不得新增旧 candidate 到 vNext / vNext 到旧 candidate 的 adapter，不得在 `CONTEXT_COMPACTED` payload 中保留 `evidence_backed_fact_candidates`、`pinned_state_patch_candidate`、`minimum_preserve_item_candidates`、`preserved_*` 或其它旧字段来喂给未迁移 projection / RunInputBuilder。
+- `engine_ingest.py` 内非 reactive closeout 路径仍使用的旧 import / annotation 可原样保留；本 slice 的清理只限 reactive closeout 迁移后已经 unused 的 import / annotation，不得修改非 closeout 函数的类型签名或实现。
 
 不得引入：
 
@@ -194,7 +203,7 @@ allowed files/modules：
 
 ```bash
 source .venv/bin/activate
-pytest tests/host/test_compaction_contract.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py tests/host/test_context_compact_events.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py -q
+pytest tests/host/test_compaction_contract.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py tests/host/test_context_compact_events.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py -q
 python -m pyright dayu/ tests/ utils/
 ```
 
@@ -203,6 +212,8 @@ python -m pyright dayu/ tests/ utils/
 - accepted compact、attempt rejected、repair exhausted 与 fallback failure event 都使用 vNext payload 并通过 validator。
 - fact-only invalid 与 non-fact invalid 都触发同一 fail closed / whole-candidate repair 策略，不 partial materialize。
 - operation-level attempt number、candidate digest、quality issues 与 budget accounting 有测试断言。
+- proactive accepted / failed closeout 与 reactive accepted / failed / fallback closeout 都能形成 vNext event / artifact / state transition 闭环；测试断言停在 operation/event closeout，不断言 subsequent run input 已消费 compacted view。
+- `tests/host/test_engine_ingest_mapping.py` 的 reactive compaction closeout / fake compactor 已迁移到 vNext candidate，不再依赖旧 `CompactionCandidate` 或旧 compact artifact write request。
 - pyright 全量通过，且 operation production consumers 不再引用旧 compact candidate 字段。
 
 residual risks：
@@ -409,6 +420,7 @@ Implementation gate 可以按 slice 修改：
 - `dayu/host/compact_material.py`
 - `dayu/host/llm_compaction.py`
 - `dayu/host/dispatch.py`
+- `dayu/host/engine_ingest.py`，仅限 WU-CM-01 Slice B reactive accepted compaction event / artifact closeout；非 closeout 旧 import / annotation 可按仍使用情况保留
 - `dayu/host/durable/memory.py`
 - `dayu/host/context_events.py`
 - `dayu/host/compaction_operation.py`
@@ -447,6 +459,7 @@ operation / dispatch / recovery：
 - `pytest tests/host/test_compaction_operation.py -q`
 - `pytest tests/host/test_dispatch_scheduler.py -q`
 - `pytest tests/host/test_recovery_dispatch.py -q`
+- `pytest tests/host/test_engine_ingest_mapping.py -q`，Slice B 仅覆盖 reactive compaction closeout / fake compactor vNext 迁移。
 - `pytest tests/host/test_run_input_builder.py -q`
 - `pytest tests/host/test_context_budget.py -q`
 - `pytest tests/host/test_context_policy.py -q`
@@ -473,7 +486,7 @@ README / guard：
 
 ```bash
 source .venv/bin/activate
-pytest tests/host/test_memory_projection.py tests/host/test_compaction_contract.py tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_context_compact_events.py tests/host/test_compaction_operation.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
+pytest tests/host/test_memory_projection.py tests/host/test_compaction_contract.py tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_context_compact_events.py tests/host/test_compaction_operation.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_compact_smoke.py -q
 python utils/smoke_host_public_conversation_memory.py
 python utils/smoke_host_public_conversation_memory_scenarios.py
 python utils/smoke_host_public_multiturn.py
