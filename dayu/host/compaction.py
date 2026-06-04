@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -2802,6 +2802,31 @@ class ContextCompactor(Protocol):
         :param request: Host 构造的 compaction 请求。
         :param cancellation_token: Host 注入的真实取消 token。
         :returns: compaction candidate。
+        :raises RuntimeError: compactor 后端失败时可抛出运行时错误。
+        """
+
+        ...
+
+
+@runtime_checkable
+class ContextCompactorVNext(Protocol):
+    """vNext context compactor typed port。
+
+    真实实现可以是 LLM scene adapter；Host operation 只能接受 vNext compact
+    output，并且必须由 vNext quality checker 通过后才可写 compact artifact /
+    canonical event。
+    """
+
+    async def compact_request_vnext(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+    ) -> ConversationCompactOutputVNext:
+        """生成 vNext compaction candidate。
+
+        :param request: Host 构造的 compaction 请求。
+        :param cancellation_token: Host 注入的真实取消 token。
+        :returns: vNext compaction output candidate。
         :raises RuntimeError: compactor 后端失败时可抛出运行时错误。
         """
 

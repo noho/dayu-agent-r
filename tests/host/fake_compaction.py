@@ -13,6 +13,7 @@ from typing import cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compaction import (
     AnswerAnchorCandidateVNext,
     AnswerAnchorChildVNext,
@@ -75,6 +76,46 @@ class FakeContextCompactor(ContextCompactor):
         )
         candidate = _candidate_from_final_answer(request, proposal_json)
         return _fake_candidate_ids(request, candidate)
+
+    async def compact_vnext(
+        self,
+        request: ConversationCompactInputVNext,
+        cancellation_token: CancellationToken,
+    ) -> ConversationCompactOutputVNext:
+        """生成 deterministic vNext compaction candidate。
+
+        :param request: Host 构造的 vNext compactor input。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: deterministic vNext compact output。
+        :raises TypeError: ``request`` 类型非法时抛出。
+        :raises RuntimeError: token 已取消时抛出。
+        """
+
+        return await FakeConversationCompactorVNext().compact_vnext(
+            request,
+            cancellation_token,
+        )
+
+    async def compact_request_vnext(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+    ) -> ConversationCompactOutputVNext:
+        """生成 operation-level deterministic vNext compaction candidate。
+
+        :param request: Host 构造的 compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: deterministic vNext compact output。
+        :raises TypeError: ``request`` 类型非法时抛出。
+        :raises RuntimeError: token 已取消时抛出。
+        """
+
+        if not isinstance(request, CompactionRequest):
+            raise TypeError("request must be CompactionRequest")
+        compact_input = conversation_compact_input_vnext_from_material_pack(
+            request.material_pack
+        )
+        return await self.compact_vnext(compact_input, cancellation_token)
 
 
 class FakeConversationCompactorVNext:

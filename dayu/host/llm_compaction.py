@@ -41,6 +41,7 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.compact_material import validate_material_label
+from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compaction import (
     AnswerAnchorCandidateVNext,
     AnswerAnchorChildVNext,
@@ -306,6 +307,28 @@ class LLMContextCompactor(ContextCompactor):
         if outcome.finish_reason is FinishReason.LENGTH:
             raise LLMCompactionProposalError("compactor proposal was truncated finish_reason=length")
         return parse_conversation_compact_output_vnext(request, outcome.content)
+
+    async def compact_request_vnext(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+    ) -> ConversationCompactOutputVNext:
+        """执行一次 operation-level vNext LLM compaction proposal。
+
+        :param request: Host 构造的 immutable compaction request。
+        :param cancellation_token: Host run lifecycle 注入的真实取消 token。
+        :returns: vNext compact output candidate。
+        :raises TypeError: request 类型非法时抛出。
+        :raises LLMCompactionProposalError: LLM 没有返回可用 structured proposal 时抛出。
+        :raises Exception: Engine runner / provider 调用失败时透传。
+        """
+
+        if not isinstance(request, CompactionRequest):
+            raise TypeError("request must be CompactionRequest")
+        compact_input = conversation_compact_input_vnext_from_material_pack(
+            request.material_pack
+        )
+        return await self.compact_vnext(compact_input, cancellation_token)
 
 
 def _agent_request(

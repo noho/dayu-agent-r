@@ -20,11 +20,12 @@ from dayu.host.compact_material import (
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactSegmentTrigger,
-    CompactQualityCheckResult,
-    CompactQualityIssue,
+    CompactQualityCheckResultVNext,
+    CompactQualityIssueVNext,
     CompactionCandidate,
     CompactionRequest,
-    ContextCompactor,
+    ConversationCompactInputVNext,
+    ConversationCompactOutputVNext,
     EpisodeSummaryCandidate,
     PinnedPatchOperation,
     PinnedStatePatchCandidate,
@@ -77,7 +78,7 @@ _DEFAULT_SENSITIVE_EXCEPTION_MESSAGE = (
 )
 
 
-class _FailOnceCompactor(ContextCompactor):
+class _FailOnceCompactor(FakeContextCompactor):
     """首次 proposal 失败，第二次返回 fake candidate。"""
 
     def __init__(self) -> None:
@@ -89,7 +90,9 @@ class _FailOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """执行可重试 proposal。
 
         :param request: compaction request。
@@ -101,13 +104,15 @@ class _FailOnceCompactor(ContextCompactor):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("proposal failed once")
-        return await self._fake.compact(request, cancellation_token)
+        return await self._fake.compact_request_vnext(request, cancellation_token)
 
 
-class _AlwaysFailingCompactor(ContextCompactor):
+class _AlwaysFailingCompactor(FakeContextCompactor):
     """始终 proposal 失败的 compactor。"""
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """模拟 proposal failure。
 
         :param request: compaction request。
@@ -121,7 +126,7 @@ class _AlwaysFailingCompactor(ContextCompactor):
         raise RuntimeError("proposal failed")
 
 
-class _SensitiveFailingCompactor(ContextCompactor):
+class _SensitiveFailingCompactor(FakeContextCompactor):
     """始终抛出带敏感字段的 proposal 异常。"""
 
     def __init__(self, exception_message: str = _DEFAULT_SENSITIVE_EXCEPTION_MESSAGE) -> None:
@@ -134,7 +139,9 @@ class _SensitiveFailingCompactor(ContextCompactor):
 
         self._exception_message = exception_message
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """模拟 provider 错误消息携带 secret。
 
         :param request: compaction request。
@@ -148,10 +155,12 @@ class _SensitiveFailingCompactor(ContextCompactor):
         raise RuntimeError(self._exception_message)
 
 
-class _EmptyMessageFailingCompactor(ContextCompactor):
+class _EmptyMessageFailingCompactor(FakeContextCompactor):
     """始终抛出空消息 proposal 异常。"""
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """模拟 provider 抛出空消息异常。
 
         :param request: compaction request。
@@ -165,7 +174,7 @@ class _EmptyMessageFailingCompactor(ContextCompactor):
         raise RuntimeError()
 
 
-class _CancelAfterFailureCompactor(ContextCompactor):
+class _CancelAfterFailureCompactor(FakeContextCompactor):
     """首次失败后请求取消的 compactor。"""
 
     def __init__(self, token: StubCancellationToken) -> None:
@@ -178,7 +187,9 @@ class _CancelAfterFailureCompactor(ContextCompactor):
         self.calls = 0
         self._token = token
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """首次 proposal 失败并在重试前请求取消。
 
         :param request: compaction request。
@@ -194,7 +205,7 @@ class _CancelAfterFailureCompactor(ContextCompactor):
         raise RuntimeError("proposal failed before cancellation")
 
 
-class _QualityRejectOnceCompactor(ContextCompactor):
+class _QualityRejectOnceCompactor(FakeContextCompactor):
     """首次返回 quality reject candidate，第二次返回 accepted candidate。"""
 
     def __init__(self) -> None:
@@ -206,7 +217,9 @@ class _QualityRejectOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """返回可修复 quality rejection 后的成功 candidate。
 
         :param request: compaction request。
@@ -215,13 +228,20 @@ class _QualityRejectOnceCompactor(ContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
         if self.calls == 1:
-            return replace(candidate, retained_current_user_input_ref="wrong-input")
+            assert candidate.session_summary is not None
+            return replace(
+                candidate,
+                session_summary=replace(
+                    candidate.session_summary,
+                    source_labels=("C1",),
+                ),
+            )
         return candidate
 
 
-class _HardThresholdOnceCompactor(ContextCompactor):
+class _HardThresholdOnceCompactor(FakeContextCompactor):
     """首次 compact 后仍越过 hard threshold，第二次返回 accepted candidate。"""
 
     def __init__(self) -> None:
@@ -233,7 +253,9 @@ class _HardThresholdOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """返回 hard-threshold rejection 后的成功 candidate。
 
         :param request: compaction request。
@@ -242,16 +264,20 @@ class _HardThresholdOnceCompactor(ContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
         if self.calls == 1:
+            assert candidate.session_summary is not None
             return replace(
                 candidate,
-                budget_after_compact=(request.budget_before_compact.hard_threshold_tokens),
+                session_summary=replace(
+                    candidate.session_summary,
+                    summary_text="x" * 2000,
+                ),
             )
         return candidate
 
 
-class _RecordingCompactor(ContextCompactor):
+class _RecordingCompactor(FakeContextCompactor):
     """记录 multi-pass request 并返回 fake candidate。"""
 
     def __init__(self) -> None:
@@ -263,7 +289,9 @@ class _RecordingCompactor(ContextCompactor):
         self.requests: list[CompactionRequest] = []
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """记录 request 并返回 fake candidate。
 
         :param request: compaction request。
@@ -272,11 +300,11 @@ class _RecordingCompactor(ContextCompactor):
         """
 
         self.requests.append(request)
-        return await self._fake.compact(request, cancellation_token)
+        return await self._fake.compact_request_vnext(request, cancellation_token)
 
 
-class _NoPreservedFactPassCompactor(ContextCompactor):
-    """返回不声明 preserved fact refs 的 multi-pass compactor。"""
+class _DistinctFactPassCompactor(FakeContextCompactor):
+    """每个 pass 返回不同 evidence fact tuple 的 deterministic compactor。"""
 
     def __init__(self) -> None:
         """初始化 fake compactor 与调用计数。
@@ -287,8 +315,10 @@ class _NoPreservedFactPassCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
-        """返回已通过质量闸门但未声明 preserved fact refs 的候选。
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
+        """返回带 pass 差异的 accepted vNext fact tuple。
 
         :param request: compaction request。
         :param cancellation_token: Host 注入的取消 token。
@@ -296,15 +326,21 @@ class _NoPreservedFactPassCompactor(ContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
+        assert len(candidate.evidence_backed_facts) > 0
+        first_fact = candidate.evidence_backed_facts[0]
         return replace(
             candidate,
-            candidate_id=f"no-preserved-fact-pass:{self.calls}",
-            preserved_evidence_backed_fact_refs=(),
+            evidence_backed_facts=(
+                replace(
+                    first_fact,
+                    claim_text=f"whole vNext fact tuple from pass {self.calls}",
+                ),
+            ),
         )
 
 
-class _SecondPassFailingCompactor(ContextCompactor):
+class _SecondPassFailingCompactor(FakeContextCompactor):
     """第一 pass 成功，第二 pass proposal 失败。"""
 
     def __init__(self) -> None:
@@ -316,7 +352,9 @@ class _SecondPassFailingCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """第二次调用抛出 proposal failure。
 
         :param request: compaction request。
@@ -328,10 +366,10 @@ class _SecondPassFailingCompactor(ContextCompactor):
         self.calls += 1
         if self.calls == 2:
             raise RuntimeError("second pass failed")
-        return await self._fake.compact(request, cancellation_token)
+        return await self._fake.compact_request_vnext(request, cancellation_token)
 
 
-class _DistinctPassCompactor(ContextCompactor):
+class _DistinctPassCompactor(FakeContextCompactor):
     """每个 pass 返回不同 summary / patch 的 deterministic compactor。"""
 
     def __init__(self) -> None:
@@ -343,7 +381,9 @@ class _DistinctPassCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest, cancellation_token: CancellationToken) -> CompactionCandidate:
+    async def compact_request_vnext(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> ConversationCompactOutputVNext:
         """返回带 pass 差异的 accepted candidate。
 
         :param request: compaction request。
@@ -352,56 +392,14 @@ class _DistinctPassCompactor(ContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
-        evidence = PreservationEvidence(
-            evidence_id=f"pass-evidence:{self.calls}",
-            material_source_refs=request.material_source_refs,
-            canonical_evidence_refs=request.canonical_evidence_refs,
-            memory_snapshot_cursor=request.memory_snapshot_cursor,
-            compact_input_range=None,
-        )
-        evidence_refs = (evidence.evidence_id,)
+        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
+        assert candidate.session_summary is not None
         return replace(
             candidate,
-            candidate_id=f"pass-candidate:{self.calls}",
-            episode_summary_candidate=EpisodeSummaryCandidate(
-                candidate_id=f"pass-summary:{self.calls}",
-                episode_title=f"Pass {self.calls} summary",
-                goal=f"goal from pass {self.calls}",
-                completed_actions=(f"action from pass {self.calls}",),
-                confirmed_fact_refs=request.evidence_backed_fact_refs,
-                confirmed_fact_summaries=(f"fact summary {self.calls}",),
-                user_constraints=(f"constraint from pass {self.calls}",),
-                open_questions=(f"question from pass {self.calls}",),
-                next_step=f"next step from pass {self.calls}",
-                tool_finding_refs=request.canonical_evidence_refs,
-                source_event_refs=request.material_source_refs,
-                evidence_refs=evidence_refs,
+            session_summary=replace(
+                candidate.session_summary,
+                summary_text=f"whole vNext candidate from pass {self.calls}",
             ),
-            pinned_state_patch_candidate=PinnedStatePatchCandidate(
-                candidate_id=f"pass-patch:{self.calls}",
-                current_goal=PinnedTextFieldPatch(
-                    operation=PinnedPatchOperation.REPLACE,
-                    value=f"current goal from pass {self.calls}",
-                    evidence_refs=evidence_refs,
-                ),
-                confirmed_subjects=PinnedStringTupleFieldPatch(
-                    operation=PinnedPatchOperation.REPLACE,
-                    value=(f"subject from pass {self.calls}",),
-                    evidence_refs=evidence_refs,
-                ),
-                user_constraints=PinnedStringTupleFieldPatch(
-                    operation=PinnedPatchOperation.REPLACE,
-                    value=(f"constraint from pass {self.calls}",),
-                    evidence_refs=evidence_refs,
-                ),
-                open_questions=PinnedStringTupleFieldPatch(
-                    operation=PinnedPatchOperation.REPLACE,
-                    value=(f"question from pass {self.calls}",),
-                    evidence_refs=evidence_refs,
-                ),
-            ),
-            preservation_evidence=(evidence,),
         )
 
 
@@ -654,7 +652,7 @@ async def test_exception_diagnostic_suffix_uses_exception_type_for_empty_message
 
 @pytest.mark.asyncio
 async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> None:
-    """reactive multi-pass 全部成功后只返回一个 merged accepted candidate。"""
+    """reactive multi-pass 全部成功后只返回一个完整 vNext candidate。"""
 
     request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
     compactor = _RecordingCompactor()
@@ -669,17 +667,16 @@ async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> 
 
     assert len(compactor.requests) == 2
     assert result.accepted_candidate is not None
-    assert result.accepted_candidate.candidate_id.startswith("merged:")
-    assert result.accepted_candidate.preserved_material_source_refs == (request.material_source_refs)
+    assert result.accepted_candidate.schema_version == "conversation_compact_output_v1"
     assert result.failure_reason is None
 
 
 @pytest.mark.asyncio
-async def test_reactive_multi_pass_merges_only_candidate_preserved_refs() -> None:
-    """multi-pass merge 只声明各 pass candidate 实际 preserved refs。"""
+async def test_reactive_multi_pass_uses_last_whole_vnext_fact_tuple() -> None:
+    """reactive multi-pass 接受最后一次完整 vNext fact tuple。"""
 
     request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
-    compactor = _NoPreservedFactPassCompactor()
+    compactor = _DistinctFactPassCompactor()
 
     result = await run_compaction_operation(
         request=request,
@@ -690,14 +687,16 @@ async def test_reactive_multi_pass_merges_only_candidate_preserved_refs() -> Non
     )
 
     assert result.accepted_candidate is not None
-    assert result.accepted_candidate.preserved_canonical_evidence_refs == (request.canonical_evidence_refs)
-    assert result.accepted_candidate.preserved_evidence_backed_fact_refs == ()
+    assert len(result.accepted_candidate.evidence_backed_facts) == 1
+    assert result.accepted_candidate.evidence_backed_facts[0].claim_text == (
+        "whole vNext fact tuple from pass 2"
+    )
     assert result.failure_reason is None
 
 
 @pytest.mark.asyncio
-async def test_reactive_multi_pass_merges_distinct_summary_and_patch() -> None:
-    """reactive multi-pass merge 不丢弃前序 pass 的 summary / tuple patch。"""
+async def test_reactive_multi_pass_uses_last_whole_vnext_candidate() -> None:
+    """reactive multi-pass 不合并旧字段，只接受最后一个 whole candidate。"""
 
     request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
     compactor = _DistinctPassCompactor()
@@ -711,113 +710,49 @@ async def test_reactive_multi_pass_merges_distinct_summary_and_patch() -> None:
     )
 
     assert result.accepted_candidate is not None
-    summary = result.accepted_candidate.episode_summary_candidate
-    assert summary.goal == "goal from pass 1\n\ngoal from pass 2"
-    assert summary.completed_actions == (
-        "action from pass 1",
-        "action from pass 2",
+    assert result.accepted_candidate.session_summary is not None
+    assert result.accepted_candidate.session_summary.summary_text == (
+        "whole vNext candidate from pass 2"
     )
-    assert summary.user_constraints == (
-        "constraint from pass 1",
-        "constraint from pass 2",
-    )
-    assert summary.open_questions == (
-        "question from pass 1",
-        "question from pass 2",
-    )
-    assert summary.next_step == "next step from pass 1\n\nnext step from pass 2"
-    assert summary.evidence_refs == ("pass-evidence:1", "pass-evidence:2")
-    patch = result.accepted_candidate.pinned_state_patch_candidate
-    assert patch.current_goal.value == "current goal from pass 2"
-    assert patch.current_goal.evidence_refs == ("pass-evidence:2",)
-    assert patch.confirmed_subjects.value == (
-        "subject from pass 1",
-        "subject from pass 2",
-    )
-    assert patch.user_constraints.value == (
-        "constraint from pass 1",
-        "constraint from pass 2",
-    )
-    assert patch.open_questions.value == (
-        "question from pass 1",
-        "question from pass 2",
-    )
-    assert patch.open_questions.evidence_refs == (
-        "pass-evidence:1",
-        "pass-evidence:2",
-    )
-
-
-def test_tuple_patch_replace_drops_prior_clear_evidence() -> None:
-    """CLEAR 后的 REPLACE tuple patch 不继承 CLEAR pass evidence refs。"""
-
-    merged = compaction_operation._merge_tuple_field_patch(
-        (
-            PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.CLEAR,
-                evidence_refs=("clear-evidence",),
-            ),
-            PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("question from replace pass",),
-                evidence_refs=("replace-evidence",),
-            ),
-        )
-    )
-
-    assert merged.operation is PinnedPatchOperation.REPLACE
-    assert merged.value == ("question from replace pass",)
-    assert merged.evidence_refs == ("replace-evidence",)
 
 
 @pytest.mark.asyncio
-async def test_multi_pass_merge_quality_reject_records_rejected_attempt(
+async def test_vnext_quality_reject_records_rejected_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """merge-level quality reject 必须写入 rejected_attempts 供诊断。"""
+    """vNext quality reject 必须写入 rejected_attempts 供诊断。"""
 
     checks = 0
 
-    def fake_check(request: CompactionRequest, candidate: CompactionCandidate) -> CompactQualityCheckResult:
-        """前两个 pass 放行，merge 后拒绝。
+    def fake_check_vnext(
+        request: ConversationCompactInputVNext,
+        candidate: ConversationCompactOutputVNext,
+    ) -> CompactQualityCheckResultVNext:
+        """首次拒绝，第二次放行。
 
-        :param request: compaction request。
-        :param candidate: compaction candidate。
-        :returns: quality check fake result。
+        :param request: vNext compaction input。
+        :param candidate: vNext compaction output。
+        :returns: vNext quality check fake result。
         """
 
         nonlocal checks
         del request, candidate
         checks += 1
-        if checks < 3:
-            return CompactQualityCheckResult(
+        if checks == 1:
+            return CompactQualityCheckResultVNext(
+                accepted=False,
+                rejection_reasons=(CompactQualityIssueVNext.UNKNOWN_SOURCE_LABEL,),
+            )
+        return CompactQualityCheckResultVNext(
                 accepted=True,
                 rejection_reasons=(),
-                current_user_input_retained=True,
-                canonical_evidence_refs_retained=True,
-                evidence_backed_fact_candidates_accepted=True,
-                minimum_preserve_items_accepted=True,
-                evidence_anchors_retained=True,
-                open_questions_retained=True,
-                retained_canonical_evidence_refs=(),
-                dropped_ranges=(),
-                summarized_ranges=(),
-            )
-        return CompactQualityCheckResult(
-            accepted=False,
-            rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
-            current_user_input_retained=False,
-            canonical_evidence_refs_retained=True,
-            evidence_backed_fact_candidates_accepted=True,
-            minimum_preserve_items_accepted=True,
-            evidence_anchors_retained=True,
-            open_questions_retained=True,
-            retained_canonical_evidence_refs=(),
-            dropped_ranges=(),
-            summarized_ranges=(),
         )
 
-    monkeypatch.setattr(compaction_operation, "check_compaction_candidate", fake_check)
+    monkeypatch.setattr(
+        compaction_operation,
+        "check_conversation_compact_output_vnext",
+        fake_check_vnext,
+    )
     request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
 
     result = await run_compaction_operation(
@@ -825,14 +760,13 @@ async def test_multi_pass_merge_quality_reject_records_rejected_attempt(
         compactor=_RecordingCompactor(),
         max_attempts=2,
         cancellation_token=StubCancellationToken(),
-        pass_queue=(request, request),
     )
 
-    assert result.accepted_candidate is None
-    assert result.failure_reason == "quality_check_rejected"
+    assert result.accepted_candidate is not None
+    assert result.failure_reason is None
     assert len(result.rejected_attempts) == 1
     assert result.rejected_attempts[0].failure_category == "quality_check_rejected"
-    assert result.rejected_attempts[0].repairable is False
+    assert result.rejected_attempts[0].repairable is True
 
 
 @pytest.mark.asyncio
@@ -1599,7 +1533,7 @@ def _request(
             estimated_input_tokens=100,
             input_budget_tokens=200,
             soft_threshold_tokens=120,
-            hard_threshold_tokens=140,
+            hard_threshold_tokens=400,
             safety_margin_tokens=20,
             estimator_digest=_DIGEST,
             overage_reason=None,

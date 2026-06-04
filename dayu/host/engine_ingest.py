@@ -55,7 +55,16 @@ from dayu.host.admission import (
     PendingDispatchRecord,
 )
 from dayu.host.api import AttemptStatus, RunStatus
-from dayu.host.compact_artifact import CompactArtifactStore, CompactArtifactWriteRequest
+from dayu.host.compact_payload import (
+    COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
+    COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+    accepted_evidence_mapping_refs_for_candidate,
+    compact_artifact_descriptor_metadata_vnext,
+    compact_artifact_json_vnext,
+    compact_artifact_payload_ref,
+    prompt_local_label_mapping_refs,
+    source_boundary_refs,
+)
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
     build_compact_material_pack,
@@ -64,14 +73,14 @@ from dayu.host.compact_material import (
     selected_material_source_refs,
 )
 from dayu.host.compaction import (
-    CompactQualityCheckResult,
+    CompactQualityCheckResultVNext,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactSegmentSelection,
     CompactSegmentTrigger,
-    CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
+    ConversationCompactOutputVNext,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
@@ -118,6 +127,7 @@ from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
 )
 from dayu.host.durable.codec import (
+    canonical_json_dumps,
     format_utc_timestamp,
     parse_utc_timestamp,
     sha256_digest_json,
@@ -1668,8 +1678,15 @@ class EngineEventIngestor:
                 context=latest,
                 request=request,
                 decision=pending.decision,
+                operation_id=pending.operation_id,
+                accepted_attempt_number=len(operation_result.rejected_attempts) + 1,
                 candidate=operation_result.accepted_candidate,
                 quality=operation_result.quality_result,
+                budget_after_compact=(
+                    operation_result.budget_after_attempted_compact
+                    if operation_result.budget_after_attempted_compact is not None
+                    else pending.estimate.estimated_input_tokens
+                ),
             )
             return _ReactiveRecoveryAccepted(
                 result=EngineIngestResult(
@@ -1700,8 +1717,11 @@ class EngineEventIngestor:
         context: _ValidatedCandidate,
         request: CompactionRequest,
         decision: ContextBudgetDecision,
-        candidate: CompactionCandidate,
-        quality: CompactQualityCheckResult,
+        operation_id: str,
+        accepted_attempt_number: int,
+        candidate: ConversationCompactOutputVNext,
+        quality: CompactQualityCheckResultVNext,
+        budget_after_compact: int,
     ) -> EventLogRow:
         """写入 reactive accepted compact artifact 与 fact。
 
@@ -1709,31 +1729,48 @@ class EngineEventIngestor:
         :param context: 已校验 candidate 上下文。
         :param request: Host compaction request。
         :param decision: compact 前预算决策。
-        :param candidate: accepted compaction candidate。
-        :param quality: accepted quality result。
+        :param operation_id: reactive compaction request event id。
+        :param accepted_attempt_number: accepted operation attempt number。
+        :param candidate: accepted vNext compaction candidate。
+        :param quality: accepted vNext quality result。
+        :param budget_after_compact: Host 估算的 compact 后预算。
         :returns: ``CONTEXT_COMPACTED`` row。
         """
 
         if self._compact_artifact_root is None:
             raise RuntimeError("compact artifact root is missing")
-        artifact = CompactArtifactStore(
-            LocalArtifactStore(
-                self._compact_artifact_root,
-                create_artifact_root=self._compact_artifact_create_parent_dirs,
-            )
-        ).write_compact_artifact(
+        policy_digest = sha256_digest_json(
+            {
+                "policy_ref": self._context_budget_policy.policy_ref
+                if self._context_budget_policy is not None
+                else _NO_CONTEXT_BUDGET_POLICY_REF
+            }
+        )
+        artifact_ref = LocalArtifactStore(
+            self._compact_artifact_root,
+            create_artifact_root=self._compact_artifact_create_parent_dirs,
+        ).write_artifact_bytes(
+            canonical_json_dumps(
+                compact_artifact_json_vnext(
+                    request=request,
+                    candidate=candidate,
+                    quality=quality,
+                    policy_digest=policy_digest,
+                    budget_after_compact=budget_after_compact,
+                )
+            ).encode("utf-8")
+        )
+        payload_ref = compact_artifact_payload_ref(artifact_ref.artifact_digest)
+        descriptor = self._payload_store.write_payload_descriptor_for_artifact(
             transaction,
-            CompactArtifactWriteRequest(
-                compaction_request=request,
-                accepted_candidate=candidate,
-                quality_result=quality,
-                policy_digest=sha256_digest_json(
-                    {
-                        "policy_ref": self._context_budget_policy.policy_ref
-                        if self._context_budget_policy is not None
-                        else "none"
-                    }
-                ),
+            payload_ref,
+            artifact_ref,
+            COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
+            compact_artifact_descriptor_metadata_vnext(
+                request=request,
+                candidate=candidate,
+                artifact_digest=artifact_ref.artifact_digest,
+                policy_digest=policy_digest,
             ),
         )
         return self._event_log_store.append_event(
@@ -1759,10 +1796,17 @@ class EngineEventIngestor:
                 policy_decision=None,
                 reason={"decision": decision.value},
                 payload_json=build_context_compacted_payload(
-                    compact_artifact_ref=artifact.payload_descriptor.payload_ref,
-                    compact_artifact_digest=artifact.artifact_ref.artifact_digest,
+                    operation_id=operation_id,
+                    accepted_attempt_number=accepted_attempt_number,
+                    compact_artifact_ref=descriptor.payload_ref,
+                    compact_artifact_digest=artifact_ref.artifact_digest,
                     accepted_candidate=candidate,
                     quality_check_result=quality,
+                    budget_after_compact=budget_after_compact,
+                    prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
+                    source_boundary_refs=source_boundary_refs(request),
+                    accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
+                    projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
                 ),
                 payload_ref=None,
                 payload_digest=None,
