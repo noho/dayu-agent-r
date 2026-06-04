@@ -237,6 +237,7 @@ allowed files/modules：
 - `dayu/host/compact_payload.py`，仅当 projection payload reader 需要 vNext typed helper
 - `dayu/host/context_events.py`，仅当 projection event reader 需要 vNext payload type
 - `dayu/host/compact_material.py`，仅限 previous compacted view、selected recent window、ordinary material 与 vNext snapshot 消费
+- `dayu/host/compaction.py`，仅限 `CompactMaterialPack`、`CompactMaterialBlockKind`、material JSON / LLM JSON 与 vNext material section contract 迁移
 - `dayu/host/run_input.py`
 - `dayu/host/context_fallback.py`
 - `dayu/host/dispatch.py`，仅限 memory snapshot precondition、projection catch-up、fallback view 与 RunInputBuilder 参数迁移
@@ -249,6 +250,9 @@ allowed files/modules：
 - `tests/host/test_durable_concurrency_matrix.py`
 - `tests/host/test_memory_repair.py`
 - `tests/host/test_compact_material.py`
+- `tests/host/test_llm_compaction.py`
+- `tests/host/test_compaction_contract.py`
+- `tests/host/test_compaction_operation.py`
 - `tests/host/test_run_input_builder.py`
 - `tests/host/test_dispatch_scheduler.py`
 - `tests/host/test_recovery_dispatch.py`
@@ -261,6 +265,7 @@ allowed files/modules：
 - `tests/host/test_public_compact_smoke.py`
 - `tests/host/test_public_open_host_multiturn_smoke.py`
 - `tests/host/test_public_tool_wiring_smoke.py`，仅当 accepted evidence material prompt 行为变化
+- `tests/host/fake_compaction.py`，仅限 public smoke / compaction tests 的 material JSON 字段迁移；不得改变生产 compactor 行为
 
 实现边界：
 
@@ -334,6 +339,7 @@ allowed files/modules：
 ```bash
 source .venv/bin/activate
 pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py tests/host/test_projection_checkpoint.py tests/host/test_durable_concurrency_matrix.py tests/host/test_memory_repair.py -q
+pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py -q
 pytest tests/host/test_compact_material.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_recovery_dispatch.py -q
 pytest tests/host/test_admission_queue.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py -q
 pytest tests/service/test_host_assembly.py tests/runtime/test_config_loader.py -q
