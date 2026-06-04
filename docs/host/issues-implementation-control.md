@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | fix |
-| implementation status | compact-contract-closure-plan-blocker-fix-rereview-failed |
+| gate | implementation |
+| implementation status | compact-contract-closure-plan-blocker-followup-fix-accepted |
 | active work unit | WU-CM-01 |
 | default next work unit | WU-CM-01 |
-| next entry point | WU-CM-01 compact contract closure plan blocker follow-up fix gate |
+| next entry point | WU-CM-01 compact contract closure implementation gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | docs/host/wu-cm-01-conversation-memory-plan.md |
 | implementation commits | WU-CM-01 accepted plan commit 14d28009; WU-CM-01 plan reslice accepted commit a92416ec; WU-CM-01 compact contract closure accepted plan commit daa01004; WU-CM-01 Slice A accepted commit f060853d; WU-CM-01 Slice B accepted commit 74fbb5e6; WU-ENG-02 merged via PR 114 as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
@@ -161,6 +161,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | compact contract closure implementation blocker artifacts | docs/reviews/wu-cm-01-compact-contract-closure-implementation-codex.md; docs/reviews/wu-cm-01-compact-contract-closure-blocker-controller-adjudication.md |
 | compact contract closure plan blocker fix artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-codex.md |
 | compact contract closure plan blocker fix re-review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-rereview-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-rereview-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-rereview-controller-adjudication.md |
+| compact contract closure plan blocker follow-up fix artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-codex.md |
+| compact contract closure plan blocker follow-up fix re-review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-rereview-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-rereview-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-rereview-controller-adjudication.md |
 | aggregate review artifacts | WU-CM-01 pending |
 | draft PR status | WU-ENG-02 PR 114 merged at 2026-06-03 09:33:38 UTC as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |

@@ -244,6 +244,8 @@ allowed files/modules：
 - `dayu/host/compact_artifact.py`，必须纳入；artifact store 测试属于本 gate，production artifact writer 必须与 vNext compact output / quality result 同步迁移
 - `dayu/host/dispatch.py`，仅当 proactive compact event closeout / artifact write 仍被旧 contract 绑定
 - `dayu/host/engine_ingest.py`，仅当 reactive compact event closeout / artifact write 仍被旧 contract 绑定
+- `dayu/host/open_host.py`，仅限 `LLMContextCompactor` construction 与单一 public `ContextCompactor.compact()` vNext contract 的类型对齐；不得修改 `open_host()` public lifecycle、scheduler wiring、runtime behavior 或 Service assembly 语义
+- `dayu/host/api.py`，仅限 `HostLocalExecutionOptions.context_compactor` typed option 与单一 public `ContextCompactor.compact()` vNext contract 的类型对齐；不得新增 / 修改 public option 字段、配置服务入口、Service assembly、UI 入口或 OpenHost 行为
 - `dayu/host/memory.py`，仅限断开对旧 compact public symbols 的直接 import / annotation / construction 依赖，使 `dayu/host/compaction.py` 能删除旧 compact symbols；不得迁移 memory snapshot shape、durable item kind、projection algorithm、policy schema 或 repair path
 - `dayu/host/run_input.py`，仅限断开对旧 compact material public enum / section 的直接 import / annotation / construction 依赖，使旧 compact material symbols 能删除；不得迁移 RunInputBuilder 的 vNext memory section 渲染、prompt assembly 顺序或 fallback 语义
 - `tests/host/test_compaction_contract.py`
@@ -253,6 +255,8 @@ allowed files/modules：
 - `tests/host/test_compact_artifact_store.py`，仅限 artifact store 的 vNext candidate / quality check / material JSON 迁移
 - `tests/host/test_memory_projection.py`，仅限 `memory.py` 旧 compact symbol dependency severance 所需 fixture / assertion 迁移；不得迁移 vNext snapshot durable behavior
 - `tests/host/test_run_input_builder.py`，仅限 `run_input.py` 旧 compact material symbol dependency severance 所需 fixture / assertion 迁移；不得把 full vNext memory prompt assembly 提前纳入本 gate
+- `tests/host/test_public_open_host_options.py`，仅当 `dayu/host/api.py` typed option 或 `dayu/host/open_host.py` compactor construction 类型对齐需要测试断言同步；不得新增 OpenHost 行为重构断言
+- `tests/host/test_open_host_runtime.py`，仅当 `LLMContextCompactor` construction 参数或 typed option 注入路径因单一 public `compact()` contract 对齐而变更；不得扩大到 scheduler、lifecycle 或 public runtime 行为重构
 - `tests/host/test_package_exports.py`，仅当 compact public exports 变化
 - `tests/host/fake_compaction.py`，仅当 fake compactor 或 material JSON 行为仍依赖旧 fields
 - `tests/host/test_public_compact_smoke.py`，仅当 public compact smoke 直接断言 material JSON 的旧 `stable_input` / `history_input` / `evidence_input`
@@ -271,9 +275,11 @@ allowed files/modules：
 - `context_events.py` / `compact_payload.py` 如被触碰，只能把 compact payload / artifact helper 收敛到 vNext candidate JSON、prompt-local label mapping refs、source boundary refs、quality result、budget after compact 与 projection signal；旧 compact payload constants、旧 field allowlist、旧 payload reader / writer helper 必须同步清理，不得保留旧 payload fields 给后续 memory projection 兼容读取。
 - `compact_artifact.py` 是本 gate 的 compact artifact owner，必须把 `CompactArtifactWriteRequest`、artifact canonical JSON 与 descriptor metadata 从旧 `CompactionCandidate` / 旧 `CompactQualityCheckResult` 迁移为 vNext output / vNext quality result；不得把 vNext output 先转换成旧 candidate 再写 artifact。
 - `dispatch.py` / `engine_ingest.py` 仅在 proactive / reactive compact closeout 仍受旧 contract 影响时同步迁移；修改必须停在 compact event / artifact closeout，不得引入 memory durable write、RunInputBuilder vNext rendering 或 config-service policy 迁移。
+- `open_host.py` / `api.py` 只允许为 `ContextCompactor` / `LLMContextCompactor` construction、typed option 和单一 public `compact()` vNext contract 做类型对齐；不得混入 `dayu/service/host_assembly.py`、`dayu/runtime/config_loader.py`、`dayu/config/execution_profiles.json`、`dayu.ui` 或 OpenHost lifecycle / scheduler / public behavior 重构。
 - `memory.py` 在本 slice 只承担旧 compact public symbol 删除的最小 owner：若当前旧 memory projection 仍需表达局部承接原因或历史 item shape，必须改为 memory-owned typed shape 或直接消费 vNext compact payload 的后续 Slice C 输入边界；不得继续从 `dayu.host.compaction` import `MinimumPreserveItemCandidate`、`MinimumPreserveReason` 或其它旧 compact candidate 类型。
-- `run_input.py` 在本 slice 只承担旧 compact material public symbol 删除的最小 owner：当前仍需构造 selected recent window / current input material 时，必须使用 vNext material section typed API 或本模块私有分类 helper；不得继续引用旧 `CompactMaterialBlockKind.PINNED_STATE`、`WORKING_ASSUMPTION`、`OPEN_QUESTION`、`EPISODE_SUMMARY` 等旧 mental model。
+- `run_input.py` 在本 slice 只承担旧 compact material public symbol 删除的最小 owner：删除旧 `CompactMaterialBlockKind` enum members 前，必须先把本模块对 `PINNED_STATE`、`WORKING_ASSUMPTION`、`OPEN_QUESTION`、`EPISODE_SUMMARY` 等旧 members 的引用替换为 vNext section 分类 helper 或本模块私有分类；当前仍需构造 selected recent window / current input material 时，必须使用 vNext material section typed API 或本模块私有分类 helper。不得提前迁移 full vNext memory prompt assembly、固定 prompt section 顺序或 fallback prompt 语义。
 - `ContextCompactor` 同 gate owner 清单：production protocol owner 是 `dayu/host/compaction.py`；仓库内 production implementor 是 `dayu/host/llm_compaction.py::LLMContextCompactor`；production construction owner 是 `dayu/host/open_host.py`；typed option owner 是 `dayu/host/api.py`；production operation callers 是 `dayu/host/dispatch.py`、`dayu/host/engine_ingest.py` 与 `dayu/host/compaction_operation.py`；test implementor / caller owner 是 `tests/host/fake_compaction.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_dispatch_scheduler.py`、`tests/host/test_engine_ingest_mapping.py` 和 direct contract/parser tests。Implementation 必须让仓库内 production owner 统一到单一 `compact()` vNext method，不得保留 `compact()` 旧 contract 与 `compact_request_vnext()` / `compact_vnext()` 双 public method。
+- `EvidenceBackedFactCandidate` 的符号处置必须在 implementation closeout 中单独说明：若当前定义与 design 24.3 vNext schema 完全一致，可以保留为 vNext shape；若不一致，必须重建或迁移到 vNext shape。禁止旧定义与 vNext 定义并存，禁止 alias、compatibility re-export 或旧 candidate wrapper。
 - `tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_compact_material.py`、`tests/host/test_compact_artifact_store.py` 必须从旧 candidate / quality check / material JSON 断言迁移到 vNext contract。fake compactor 只有在 fake public smoke 或 operation fixtures 仍构造旧 candidate 时同步迁移；public compact smoke 只有在其直接断言 material JSON 或 fake public compact output 的旧 shape 时追加。
 
 禁止项：
@@ -294,6 +300,14 @@ pytest tests/host/test_memory_projection.py tests/host/test_run_input_builder.py
 python -m pyright dayu/ tests/ utils/
 ```
 
+如果 `dayu/host/api.py` typed option 或 `dayu/host/open_host.py` compactor construction 因单一 public `compact()` contract 需要测试同步，同 slice 追加：
+
+```bash
+source .venv/bin/activate
+pytest tests/host/test_public_open_host_options.py tests/host/test_open_host_runtime.py -q
+python -m pyright dayu/ tests/ utils/
+```
+
 如果 fake public smoke 或 operation fixtures 因 vNext candidate 迁移而需要修改 `tests/host/fake_compaction.py`，同 slice 追加受影响 smoke / operation 测试；如果 public compact smoke 直接断言 material JSON 或 fake public compact output 的旧 shape，同 slice 追加：
 
 ```bash
@@ -306,12 +320,14 @@ python -m pyright dayu/ tests/ utils/
 
 - 旧 candidate / type / helper 在 production closeout files 中不得再有 class definition、public export 或 production reference；production closeout files 包括 `dayu/host/compaction.py`、`dayu/host/llm_compaction.py`、`dayu/host/context_governance.py`、`dayu/host/compaction_operation.py`、`dayu/host/context_events.py`、`dayu/host/compact_payload.py`、`dayu/host/compact_artifact.py`、`dayu/host/compact_material.py`、`dayu/host/compaction_evidence.py`。历史 docs、review artifact、implementation report 可命中旧 symbol。若 implementation 因未切换后续非 production path 而保留任何旧 symbol，必须是私有、不可导出、非 production path，并在 implementation report 中给出直接代码证据和 owner。
 - `dayu/host/memory.py` 与 `dayu/host/run_input.py` 不再从 `dayu.host.compaction` 导入或引用旧 compact public symbols；若二者仍保留旧 memory / prompt 行为到 Slice C，保留内容必须由本模块自己的 typed shape 表达，且不得被导出为 compact compatibility contract。
+- `dayu/host/open_host.py` 与 `dayu/host/api.py` 如被修改，修改仅限 compactor construction / typed option / single public compact contract 类型对齐；不得出现 Service assembly、config-service、UI 或 OpenHost lifecycle / scheduler / public behavior 重构。
 - `ContextCompactor` 仓库内 production implementor / caller 全部收敛到单一 public `compact()` vNext contract；`compact_request_vnext()` / `compact_vnext()` 不得作为 public protocol / production method 保留。测试 helper 可有私有辅助方法，但不得作为旧 / 新双 contract 的兼容入口。
+- implementation closeout 已单独说明 `EvidenceBackedFactCandidate` 的处置策略，且代码中不存在旧定义与 vNext 定义并存、alias、compatibility re-export 或旧 candidate wrapper。
 - `CompactMaterialPack` JSON / LLM JSON 不再输出 `stable_input`、`history_input`、`evidence_input`；vNext material section、current input anchor not citable、unknown / stale / cross-section label 均有 fail-closed 测试。
 - `LLMContextCompactor.compact()` production parser 只返回 `ConversationCompactOutputVNext`；旧 candidate schema 输入 fail closed。
 - `context_governance.py` 的 production accept barrier 使用 vNext checker；operation accepted / rejected / repair exhausted / fallback closeout、whole-candidate repair 和 failed fallback 均使用 vNext candidate、vNext quality issue 与 vNext payload / artifact helper。
 - `context_events.py` 中旧 compact payload constants、旧 field allowlist 与旧 payload reader / writer helper 不再作为 production event contract 暴露。
-- 必须通过的 tests 明确包括：`tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_compact_material.py`、`tests/host/test_compact_artifact_store.py`、`tests/host/test_memory_projection.py`、`tests/host/test_run_input_builder.py`。public exports 变化时必须追加 `tests/host/test_package_exports.py`；触发 fake/public smoke 条件时，必须追加对应 `tests/host/fake_compaction.py` consumer 测试和 `tests/host/test_public_compact_smoke.py`。
+- 必须通过的 tests 明确包括：`tests/host/test_compaction_contract.py`、`tests/host/test_llm_compaction.py`、`tests/host/test_compaction_operation.py`、`tests/host/test_compact_material.py`、`tests/host/test_compact_artifact_store.py`、`tests/host/test_memory_projection.py`、`tests/host/test_run_input_builder.py`。public exports 变化时必须追加 `tests/host/test_package_exports.py`；`api.py` / `open_host.py` typed option 或 construction 测试断言同步时必须追加 `tests/host/test_public_open_host_options.py` 与 `tests/host/test_open_host_runtime.py`；触发 fake/public smoke 条件时，必须追加对应 `tests/host/fake_compaction.py` consumer 测试和 `tests/host/test_public_compact_smoke.py`。
 - 受影响 tests 与全量 pyright 通过；未触碰 memory durable/projection、RunInputBuilder、config-service 的 Slice C 内容。
 
 residual risks：
@@ -533,6 +549,8 @@ Implementation gate 可以按 slice 修改：
 - `dayu/host/compaction_evidence.py`
 - `dayu/host/compact_payload.py`
 - `dayu/host/compact_artifact.py`，仅限 Pre-Slice C compact artifact writer vNext 迁移；后续 Slice C 不得重新打开 artifact writer 旧 candidate 兼容读取
+- `dayu/host/open_host.py`，仅限 Pre-Slice C `LLMContextCompactor` construction 与 single public `ContextCompactor.compact()` vNext contract 类型对齐；不得修改 OpenHost lifecycle、scheduler wiring、runtime behavior、Service assembly 或 UI 语义
+- `dayu/host/api.py`，仅限 Pre-Slice C `HostLocalExecutionOptions.context_compactor` typed option 与 single public `ContextCompactor.compact()` vNext contract 类型对齐；不得新增 / 修改 public option 字段、配置服务入口、Service assembly、UI 入口或 OpenHost 行为
 - `dayu/service/host_assembly.py`，仅限 WU-CM-01 Slice C memory projection policy assembly 迁移
 - `dayu/runtime/config_loader.py`，仅限 WU-CM-01 Slice C memory projection policy config schema / validation 迁移
 - `dayu/config/execution_profiles.json`，仅限 WU-CM-01 Slice C packaged memory projection policy 字段迁移
