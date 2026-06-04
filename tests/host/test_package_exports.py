@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dayu.host as host
 import dayu.host.api as api
+import dayu.host.context_fallback as context_fallback
+import dayu.host.memory as memory
 import dayu.host.read_api as read_api
 
 
@@ -203,6 +205,105 @@ INTERNAL_PURGE_DURABLE_EXPORTS: frozenset[str] = frozenset(
     }
 )
 
+EXPECTED_MEMORY_MODULE_EXPORTS: frozenset[str] = frozenset(
+    {
+        "CONVERSATION_MEMORY_CONSUMER_ID",
+        "CONVERSATION_MEMORY_SNAPSHOT_SCHEMA_VERSION",
+        "DEFAULT_ANSWER_ANCHOR_CHAR_CAP",
+        "DEFAULT_ANSWER_ANCHOR_ITEM_CAP",
+        "DEFAULT_EVIDENCE_FACT_CHAR_CAP",
+        "DEFAULT_EVIDENCE_FACT_FLOOR",
+        "DEFAULT_EVIDENCE_FACT_ITEM_CAP",
+        "DEFAULT_FALLBACK_SELECTED_RECENT_WINDOW_CHAR_CAP",
+        "DEFAULT_FALLBACK_SELECTED_RECENT_WINDOW_ITEM_CAP",
+        "DEFAULT_FORWARD_INTENT_CHAR_CAP",
+        "DEFAULT_FORWARD_INTENT_ITEM_CAP",
+        "DEFAULT_MEMORY_CONTEXT_WINDOW_SIZE",
+        "DEFAULT_MEMORY_MAX_DELTA_REPAIR_EVENTS",
+        "DEFAULT_MEMORY_MAX_LAG_EVENTS_FOR_INLINE_DELTA",
+        "DEFAULT_MEMORY_POLICY_REF",
+        "DEFAULT_REFERENCE_CONTINUITY_CHAR_CAP",
+        "DEFAULT_REFERENCE_CONTINUITY_ITEM_CAP",
+        "DEFAULT_REFERENCE_CONTINUITY_ITEM_FLOOR",
+        "DEFAULT_SELECTED_RECENT_WINDOW_CHAR_CAP",
+        "DEFAULT_SELECTED_RECENT_WINDOW_ITEM_CAP",
+        "DEFAULT_SELECTED_RECENT_WINDOW_TURN_FLOOR",
+        "DEFAULT_SESSION_SUMMARY_CHAR_CAP",
+        "AnswerAnchor",
+        "AnswerAnchorChild",
+        "AnswerAnchorMemoryView",
+        "ConversationMemorySnapshotVNext",
+        "EvidenceBackedFactView",
+        "EvidenceFactMemoryView",
+        "ForwardIntent",
+        "ForwardIntentMemoryView",
+        "HostEventRef",
+        "HostNeutralRefKind",
+        "HostPayloadRef",
+        "MemoryClaimStatus",
+        "MemoryDiagnostic",
+        "MemoryDiagnosticReason",
+        "MemoryDigestRef",
+        "MemoryEvidenceBackedFactKind",
+        "MemoryExcludedReason",
+        "MemoryIncludedReason",
+        "MemoryPolicyDigest",
+        "MemoryProducerKind",
+        "MemoryProjectionEvent",
+        "MemoryProjectionPolicy",
+        "MemoryProvenanceRef",
+        "MemoryRepairReason",
+        "MemoryRepairRequest",
+        "MemorySizeUnits",
+        "MemorySnapshotCursor",
+        "OpaqueMemoryRef",
+        "ReferenceContinuityItem",
+        "SelectedRecentWindowItem",
+        "SelectedRecentWindowRole",
+        "SessionSummaryMemoryView",
+        "TraceMemoryView",
+        "build_conversation_memory_snapshot_from_events",
+        "build_empty_conversation_memory_snapshot",
+        "build_inline_delta_repair_diagnostic",
+        "build_memory_budget_diagnostic",
+        "calculate_memory_snapshot_digest",
+        "conversation_memory_snapshot_from_json_value",
+        "conversation_memory_snapshot_to_json_value",
+        "default_memory_projection_policy",
+        "digest_memory_projection_policy",
+        "estimate_memory_size_units",
+        "memory_diagnostic_from_json_value",
+        "memory_diagnostic_to_json_value",
+        "memory_projection_policy_to_json_value",
+        "memory_snapshot_with_cursor_and_diagnostics",
+        "project_conversation_memory_event",
+        "stable_memory_snapshot_id",
+    }
+)
+
+EXPECTED_CONTEXT_FALLBACK_MODULE_EXPORTS: frozenset[str] = frozenset(
+    {
+        "FALLBACK_ACTION_DISPATCH",
+        "FALLBACK_ACTION_FAIL_CLOSED",
+        "FALLBACK_ACTION_NOT_APPLICABLE",
+        "FALLBACK_BUDGET_STATUS_OVER_BUDGET",
+        "FALLBACK_BUDGET_STATUS_SELECTION_FAILED",
+        "FALLBACK_BUDGET_STATUS_WITHIN_BUDGET",
+        "FALLBACK_POLICY_DECISION_RECENT_WINDOW",
+        "FALLBACK_POLICY_DECISION_SELECTION_FAILED",
+        "ActiveRecentWindowFallback",
+        "EventLogContextFallbackProvider",
+        "RecentWindowFallbackAction",
+        "RecentWindowFallbackBudgetResult",
+        "RecentWindowFallbackSelection",
+        "build_recent_window_fallback_selection",
+        "build_selection_failure_budget_payload",
+        "build_selection_failure_window_payload",
+        "estimate_recent_window_fallback_budget",
+        "fallback_window_digest",
+    }
+)
+
 
 def test_host_all_matches_current_public_contracts() -> None:
     """``dayu.host.__all__`` 匹配当前 public contract。"""
@@ -211,6 +312,23 @@ def test_host_all_matches_current_public_contracts() -> None:
     assert actual == EXPECTED_HOST_EXPORTS, (
         f"missing={EXPECTED_HOST_EXPORTS - actual}; extra={actual - EXPECTED_HOST_EXPORTS}"
     )
+
+
+def test_memory_module_all_matches_typed_contract_boundary() -> None:
+    """``dayu.host.memory.__all__`` 只导出稳定 typed contracts。"""
+
+    actual = frozenset(memory.__all__)
+    assert actual == EXPECTED_MEMORY_MODULE_EXPORTS
+    assert "_MemoryItemWithId" not in actual
+    assert not any(name.startswith("_") for name in actual)
+
+
+def test_context_fallback_module_all_matches_helper_boundary() -> None:
+    """``dayu.host.context_fallback.__all__`` 只导出 fallback contract。"""
+
+    actual = frozenset(context_fallback.__all__)
+    assert actual == EXPECTED_CONTEXT_FALLBACK_MODULE_EXPORTS
+    assert not any(name.startswith("_") for name in actual)
 
 
 def test_host_root_does_not_export_internal_services() -> None:

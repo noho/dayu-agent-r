@@ -746,3 +746,25 @@ def _require_non_empty_text(value: str, field_name: str) -> None:
 
     if value.strip() == "":
         raise ValueError(f"{field_name} must be non-empty")
+
+
+__all__ = [
+    "FALLBACK_ACTION_DISPATCH",
+    "FALLBACK_ACTION_FAIL_CLOSED",
+    "FALLBACK_ACTION_NOT_APPLICABLE",
+    "FALLBACK_BUDGET_STATUS_OVER_BUDGET",
+    "FALLBACK_BUDGET_STATUS_SELECTION_FAILED",
+    "FALLBACK_BUDGET_STATUS_WITHIN_BUDGET",
+    "FALLBACK_POLICY_DECISION_RECENT_WINDOW",
+    "FALLBACK_POLICY_DECISION_SELECTION_FAILED",
+    "ActiveRecentWindowFallback",
+    "EventLogContextFallbackProvider",
+    "RecentWindowFallbackAction",
+    "RecentWindowFallbackBudgetResult",
+    "RecentWindowFallbackSelection",
+    "build_recent_window_fallback_selection",
+    "build_selection_failure_budget_payload",
+    "build_selection_failure_window_payload",
+    "estimate_recent_window_fallback_budget",
+    "fallback_window_digest",
+]

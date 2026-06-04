@@ -31,6 +31,7 @@ from dayu.host.compaction_evidence import (
     collect_selected_compaction_request_evidence_inputs,
 )
 from dayu.host.compaction_operation import run_compaction_operation
+from dayu.host.context_events import build_context_compaction_attempt_rejected_payload
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
@@ -432,8 +433,36 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
     assert compactor.calls == 2
     assert result.accepted_candidate is not None
     assert len(result.rejected_attempts) == 1
-    assert result.rejected_attempts[0].failure_category == "quality_check_rejected"
-    assert result.rejected_attempts[0].repairable is True
+    rejected = result.rejected_attempts[0]
+    assert isinstance(
+        rejected.failure_category,
+        compaction_operation.CompactionFailureCategory,
+    )
+    assert isinstance(
+        rejected.next_policy_decision,
+        compaction_operation.CompactionNextPolicyDecision,
+    )
+    assert (
+        rejected.failure_category
+        is compaction_operation.CompactionFailureCategory.QUALITY_CHECK_REJECTED
+    )
+    assert (
+        rejected.next_policy_decision
+        is compaction_operation.CompactionNextPolicyDecision.RETRY_SEMANTIC_REPAIR
+    )
+    assert rejected.repairable is True
+    payload = build_context_compaction_attempt_rejected_payload(
+        operation_id="operation-quality-rejected",
+        attempt_number=rejected.attempt_number,
+        failure_category=rejected.failure_category.value,
+        repairable=rejected.repairable,
+        runner_attempt_summary_refs=rejected.runner_attempt_summary_refs,
+        diagnostic_refs=rejected.diagnostic_refs,
+        next_policy_decision=rejected.next_policy_decision.value,
+        budget_after_attempted_compact=rejected.budget_after_attempted_compact,
+    )
+    assert payload["failure_category"] == "quality_check_rejected"
+    assert payload["next_policy_decision"] == "retry_semantic_repair"
     assert result.failure_reason is None
 
 
@@ -452,7 +481,14 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
     assert compactor.calls == 2
     assert result.accepted_candidate is not None
     assert len(result.rejected_attempts) == 1
-    assert result.rejected_attempts[0].failure_category == "hard_threshold_after_compact"
+    assert isinstance(
+        result.rejected_attempts[0].failure_category,
+        compaction_operation.CompactionFailureCategory,
+    )
+    assert (
+        result.rejected_attempts[0].failure_category
+        is compaction_operation.CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
+    )
     assert result.rejected_attempts[0].repairable is True
     assert result.failure_reason is None
 
@@ -520,7 +556,14 @@ async def test_run_compaction_operation_stops_before_retry_when_cancelled() -> N
     assert result.failure_reason == "cancellation_requested"
     assert len(result.rejected_attempts) == 2
     assert result.rejected_attempts[1].attempt_number == 2
-    assert result.rejected_attempts[1].failure_category == "cancellation_requested"
+    assert isinstance(
+        result.rejected_attempts[1].failure_category,
+        compaction_operation.CompactionFailureCategory,
+    )
+    assert (
+        result.rejected_attempts[1].failure_category
+        is compaction_operation.CompactionFailureCategory.CANCELLATION_REQUESTED
+    )
     assert result.rejected_attempts[1].repairable is False
     assert "test_cancelled" in result.rejected_attempts[1].diagnostic_refs[0]
 
@@ -758,7 +801,14 @@ async def test_vnext_quality_reject_records_rejected_attempt(
     assert result.accepted_candidate is not None
     assert result.failure_reason is None
     assert len(result.rejected_attempts) == 1
-    assert result.rejected_attempts[0].failure_category == "quality_check_rejected"
+    assert isinstance(
+        result.rejected_attempts[0].failure_category,
+        compaction_operation.CompactionFailureCategory,
+    )
+    assert (
+        result.rejected_attempts[0].failure_category
+        is compaction_operation.CompactionFailureCategory.QUALITY_CHECK_REJECTED
+    )
     assert result.rejected_attempts[0].repairable is True
 
 

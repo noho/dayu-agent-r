@@ -1,8 +1,8 @@
 """Host compact material pack 与 prompt-local label helper。
 
-本模块是 Phase 12.6 Slice 1 的 material/label owner。它只构造 Host
-internal material pack，不读取业务工具、不写 EventLog、不向 Engine 暴露
-Host provenance。
+本模块是 Host compact material/label owner。它只构造 Host internal
+material pack，不读取业务工具、不写 EventLog、不向 Engine 暴露 Host
+provenance。
 """
 
 from __future__ import annotations
@@ -61,12 +61,12 @@ _ANSWER_PREFIX = "A"
 _LABEL_CHUNK_SEPARATOR = "."
 _FIRST_ORDINAL = 1
 _CURRENT_ANCHOR_ORDINAL = 1
-_INITIAL_POLICY_DIGEST = "slice1-initial-policy"
-_INITIAL_REASON_CURRENT = "slice1_current_anchor"
-_INITIAL_REASON_TRACE = "slice1_trace_material"
-_INITIAL_REASON_EVIDENCE = "slice1_evidence_material"
-_INITIAL_REASON_PREVIOUS = "slice1_previous_compacted_view"
-_INITIAL_REASON_ANSWER = "slice1_answer_material"
+_INITIAL_POLICY_DIGEST = "initial-compact-material-policy"
+_INITIAL_REASON_CURRENT = "initial_current_anchor"
+_INITIAL_REASON_TRACE = "initial_trace_material"
+_INITIAL_REASON_EVIDENCE = "initial_evidence_material"
+_INITIAL_REASON_PREVIOUS = "initial_previous_compacted_view"
+_INITIAL_REASON_ANSWER = "initial_answer_material"
 CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS = 1200
 """Current input anchor 允许直接暴露给 LLM 的最大字符数。"""
 
@@ -363,7 +363,7 @@ class SnapshotCursorCheckResult:
 
 @dataclass(frozen=True, slots=True)
 class InitialHistoryMaterial:
-    """Slice 1 初始 history material。
+    """初始 trace material。
 
     :param canonical_source_ref: canonical source ref。
     :param text: 有界可读文本。
@@ -377,7 +377,7 @@ class InitialHistoryMaterial:
 
 @dataclass(frozen=True, slots=True)
 class InitialEvidenceMaterial:
-    """Slice 1 初始 evidence material。
+    """初始 evidence material。
 
     :param canonical_source_ref: canonical source ref。
     :param accepted_evidence_id: canonical accepted evidence id。
@@ -450,7 +450,7 @@ def evidence_chunk_label(evidence_ordinal: int, chunk_ordinal: int) -> PromptLoc
 
 
 def current_input_anchor_label() -> PromptLocalMaterialLabel:
-    """返回 Slice 1 current input anchor label。
+    """返回 current input anchor label。
 
     :returns: ``C1``。
     """
@@ -863,7 +863,7 @@ def build_initial_material_pack(
     history_materials: tuple[InitialHistoryMaterial, ...],
     evidence_materials: tuple[InitialEvidenceMaterial, ...],
 ) -> CompactMaterialPack:
-    """构造 Slice 1 初始 compact material pack。
+    """构造初始 compact material pack。
 
     :param current_input_ref: 当前输入 canonical source ref。
     :param current_input_text: 当前输入有界文本。
@@ -908,7 +908,7 @@ def initial_segment_selection(
     input_cursor: int,
     material_pack: CompactMaterialPack,
 ) -> CompactSegmentSelection:
-    """构造 Slice 1 初始 segment selection。
+    """构造初始 segment selection。
 
     :param trigger_source: compact trigger。
     :param input_cursor: 当前输入 cursor。
@@ -1097,7 +1097,7 @@ def _evidence_provenance(
 
 
 def _initial_reason_codes(pack: CompactMaterialPack) -> tuple[str, ...]:
-    """构造 Slice 1 初始 reason codes。
+    """构造初始 material reason codes。
 
     :param pack: material pack。
     :returns: reason code tuple。

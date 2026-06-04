@@ -144,6 +144,16 @@ def test_vnext_quality_checker_rejects_cross_section_label() -> None:
     assert CompactQualityIssueVNext.CROSS_SECTION_LABEL in result.rejection_reasons
 
 
+def test_vnext_candidate_schema_rejects_missing_required_source_label() -> None:
+    """vNext candidate typed 边界拒绝必需 source label 缺失。"""
+
+    with pytest.raises(ValueError, match="source_labels must be non-empty"):
+        SessionSummaryCandidateVNext(
+            summary_text="缺失 source label 的摘要",
+            source_labels=(),
+        )
+
+
 def test_vnext_quality_result_requires_reason_for_rejection() -> None:
     """vNext quality result 拒绝态必须给出拒绝原因。"""
 
@@ -183,6 +193,22 @@ def test_vnext_candidate_digest_is_canonical() -> None:
 
     assert candidate.digest().startswith("sha256:")
     assert payload["schema_version"] == CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
+
+
+def test_initial_segment_selection_diagnostics_do_not_expose_slice_name() -> None:
+    """初始 material 诊断值不泄漏历史 implementation slice 名称。"""
+
+    selection = initial_segment_selection(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        material_pack=_request().material_pack,
+    )
+
+    diagnostic_values = (
+        selection.policy_digest,
+        *selection.deterministic_reason_codes,
+    )
+    assert not any("slice1" in value for value in diagnostic_values)
 
 
 def _compact_input() -> ConversationCompactInputVNext:

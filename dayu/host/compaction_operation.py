@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
@@ -29,13 +30,6 @@ from dayu.runtime.diagnostic_text import (
     truncate_diagnostic_text,
 )
 
-_FAILURE_PROPOSAL_FAILED = "proposal_failed"
-_FAILURE_QUALITY_CHECK_REJECTED = "quality_check_rejected"
-_FAILURE_HARD_THRESHOLD_AFTER_COMPACT = "hard_threshold_after_compact"
-_FAILURE_MAX_ATTEMPTS_EXHAUSTED = "max_compaction_attempts_exhausted"
-_FAILURE_CANCELLATION_REQUESTED = "cancellation_requested"
-_NEXT_DECISION_RETRY_REPAIR = "retry_semantic_repair"
-_NEXT_DECISION_FAIL_COMPACTION = "fail_compaction"
 _DIAGNOSTIC_SUFFIX_UNKNOWN = "unknown"
 _DIAGNOSTIC_SUFFIX_CANCELLED = "cancelled"
 _DIAGNOSTIC_SUFFIX_HARD_THRESHOLD = "hard_threshold"
@@ -45,6 +39,34 @@ _REDACTED_SECRET = "<redacted>"
 _ERROR_CODE_PATTERN = re.compile(r"\berror_code=([A-Za-z0-9_-]+)")
 _LOGGER = logging.getLogger(__name__)
 _POST_COMPACT_BASE_MESSAGE_COUNT = 2
+
+
+class CompactionFailureCategory(StrEnum):
+    """compaction attempt 拒绝原因分类。"""
+
+    PROPOSAL_FAILED = "proposal_failed"
+    QUALITY_CHECK_REJECTED = "quality_check_rejected"
+    HARD_THRESHOLD_AFTER_COMPACT = "hard_threshold_after_compact"
+    MAX_ATTEMPTS_EXHAUSTED = "max_compaction_attempts_exhausted"
+    CANCELLATION_REQUESTED = "cancellation_requested"
+
+
+class CompactionNextPolicyDecision(StrEnum):
+    """compaction attempt 拒绝后的下一步策略决策。"""
+
+    RETRY_SEMANTIC_REPAIR = "retry_semantic_repair"
+    FAIL_COMPACTION = "fail_compaction"
+
+
+_FAILURE_PROPOSAL_FAILED = CompactionFailureCategory.PROPOSAL_FAILED
+_FAILURE_QUALITY_CHECK_REJECTED = CompactionFailureCategory.QUALITY_CHECK_REJECTED
+_FAILURE_HARD_THRESHOLD_AFTER_COMPACT = (
+    CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
+)
+_FAILURE_MAX_ATTEMPTS_EXHAUSTED = CompactionFailureCategory.MAX_ATTEMPTS_EXHAUSTED
+_FAILURE_CANCELLATION_REQUESTED = CompactionFailureCategory.CANCELLATION_REQUESTED
+_NEXT_DECISION_RETRY_REPAIR = CompactionNextPolicyDecision.RETRY_SEMANTIC_REPAIR
+_NEXT_DECISION_FAIL_COMPACTION = CompactionNextPolicyDecision.FAIL_COMPACTION
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,11 +83,11 @@ class CompactionAttemptRejected:
     """
 
     attempt_number: int
-    failure_category: str
+    failure_category: CompactionFailureCategory
     repairable: bool
     runner_attempt_summary_refs: tuple[str, ...]
     diagnostic_refs: tuple[str, ...]
-    next_policy_decision: str
+    next_policy_decision: CompactionNextPolicyDecision
     budget_after_attempted_compact: int | None
 
 
@@ -138,7 +160,7 @@ async def run_compaction_operation(
                     accepted_candidate=None,
                     quality_result=None,
                     rejected_attempts=tuple(rejected),
-                    failure_reason=_FAILURE_CANCELLATION_REQUESTED,
+                    failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
                     budget_after_attempted_compact=last_budget,
                 )
             repairable = attempt_number < max_attempts
@@ -173,7 +195,7 @@ async def run_compaction_operation(
                         accepted_candidate=None,
                         quality_result=None,
                         rejected_attempts=tuple(rejected),
-                        failure_reason=_FAILURE_PROPOSAL_FAILED,
+                        failure_reason=_FAILURE_PROPOSAL_FAILED.value,
                         budget_after_attempted_compact=None,
                     )
                 attempt_number += 1
@@ -201,7 +223,7 @@ async def run_compaction_operation(
                         accepted_candidate=None,
                         quality_result=None,
                         rejected_attempts=tuple(rejected),
-                        failure_reason=_FAILURE_QUALITY_CHECK_REJECTED,
+                        failure_reason=_FAILURE_QUALITY_CHECK_REJECTED.value,
                         budget_after_attempted_compact=last_budget,
                     )
                 attempt_number += 1
@@ -229,7 +251,7 @@ async def run_compaction_operation(
                         accepted_candidate=None,
                         quality_result=None,
                         rejected_attempts=tuple(rejected),
-                        failure_reason=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
+                        failure_reason=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT.value,
                         budget_after_attempted_compact=last_budget,
                     )
                 attempt_number += 1
@@ -243,7 +265,7 @@ async def run_compaction_operation(
                 accepted_candidate=None,
                 quality_result=None,
                 rejected_attempts=tuple(rejected),
-                failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED,
+                failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
                 budget_after_attempted_compact=last_budget,
             )
     if accepted_candidate is None or accepted_quality is None:
@@ -251,7 +273,7 @@ async def run_compaction_operation(
             accepted_candidate=None,
             quality_result=None,
             rejected_attempts=tuple(rejected),
-            failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED,
+            failure_reason=_FAILURE_MAX_ATTEMPTS_EXHAUSTED.value,
             budget_after_attempted_compact=last_budget,
         )
     return CompactionOperationResult(
@@ -377,9 +399,9 @@ def _attempt_rejected(
     *,
     request: CompactionRequest,
     attempt_number: int,
-    failure_category: str,
+    failure_category: CompactionFailureCategory,
     repairable: bool,
-    next_policy_decision: str,
+    next_policy_decision: CompactionNextPolicyDecision,
     budget_after_attempted_compact: int | None,
     diagnostic_suffix: str,
 ) -> CompactionAttemptRejected:
@@ -401,7 +423,9 @@ def _attempt_rejected(
         failure_category=failure_category,
         repairable=repairable,
         runner_attempt_summary_refs=(f"runner-attempt:{request.run_id}:{attempt_number}",),
-        diagnostic_refs=(f"diagnostic:{failure_category}:{operation_ref}:{diagnostic_suffix}",),
+        diagnostic_refs=(
+            f"diagnostic:{failure_category.value}:{operation_ref}:{diagnostic_suffix}",
+        ),
         next_policy_decision=next_policy_decision,
         budget_after_attempted_compact=budget_after_attempted_compact,
     )
@@ -473,12 +497,12 @@ def _log_rejected_attempt(
         request.run_id,
         request.trigger_source.value,
         rejected.attempt_number,
-        rejected.failure_category,
+        rejected.failure_category.value,
         rejected.repairable,
         _exception_error_code(exception),
         _safe_exception_message(exception),
         ",".join(rejected.diagnostic_refs),
-        rejected.next_policy_decision,
+        rejected.next_policy_decision.value,
         rejected.budget_after_attempted_compact,
     )
     if rejected.repairable:
@@ -529,6 +553,8 @@ def _safe_exception_message(exc: Exception | None) -> str:
 
 __all__ = [
     "CompactionAttemptRejected",
+    "CompactionFailureCategory",
+    "CompactionNextPolicyDecision",
     "CompactionOperationResult",
     "run_compaction_operation",
 ]

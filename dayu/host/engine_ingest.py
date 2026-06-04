@@ -1935,17 +1935,17 @@ class EngineEventIngestor:
                 client_request_id=None,
                 idempotency_key=None,
                 policy_decision=None,
-                reason={"failure_category": rejected.failure_category},
+                reason={"failure_category": rejected.failure_category.value},
                 payload_json=build_context_compaction_attempt_rejected_payload(
                     operation_id=operation_id,
                     attempt_number=rejected.attempt_number,
-                    failure_category=rejected.failure_category,
+                    failure_category=rejected.failure_category.value,
                     repairable=rejected.repairable,
                     runner_attempt_summary_refs=(
                         rejected.runner_attempt_summary_refs
                     ),
                     diagnostic_refs=rejected.diagnostic_refs,
-                    next_policy_decision=rejected.next_policy_decision,
+                    next_policy_decision=rejected.next_policy_decision.value,
                     budget_after_attempted_compact=(
                         rejected.budget_after_attempted_compact
                     ),
