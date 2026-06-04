@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | draft-pr-pass |
+| gate | final closeout |
+| implementation status | final-closeout-pass |
 | active work unit | WU-CM-01 |
-| default next work unit | WU-CM-01 |
-| next entry point | WU-CM-01 final closeout gate |
+| default next work unit | WU-TOOLS-01 |
+| next entry point | User / maintainer review and merge PR 116 when ready; after merge enter WU-TOOLS-01 discussion gate |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | docs/host/wu-cm-01-conversation-memory-plan.md |
 | implementation commits | WU-CM-01 accepted plan commit 14d28009; WU-CM-01 plan reslice accepted commit a92416ec; WU-CM-01 compact contract closure accepted plan commit daa01004; WU-CM-01 compact contract closure blocker follow-up accepted commit ff6c225a; WU-CM-01 compact contract closure accepted slice commit b2b57c18; WU-CM-01 Slice C policy contract plan fix accepted commit 49990e97; WU-CM-01 Slice C accepted commit 29c86355; WU-CM-01 Slice D accepted commit 30a426b4; WU-CM-01 aggregate deepreview accepted commit 2248a395; WU-CM-01 accepted PR review commit f2db943f; WU-CM-01 deferred risk cleanup accepted commit 30759116d00d0ca58308e74b9f61a0ecc5b6ad9a; WU-CM-01 Slice A accepted commit f060853d; WU-CM-01 Slice B accepted commit 74fbb5e6; WU-ENG-02 merged via PR 114 as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
@@ -179,7 +179,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | compact contract closure fix re-review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-fix-rereview-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-fix-rereview-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-fix-rereview-controller-adjudication.md |
 | aggregate review artifacts | docs/reviews/wu-cm-01-aggregate-deepreview-mimo.md; docs/reviews/wu-cm-01-aggregate-deepreview-ds.md; docs/reviews/wu-cm-01-aggregate-deepreview-controller-adjudication.md; docs/reviews/wu-cm-01-aggregate-deepreview-fix-codex.md; docs/reviews/wu-cm-01-aggregate-rereview-mimo.md; docs/reviews/wu-cm-01-aggregate-rereview-ds.md; docs/reviews/wu-cm-01-aggregate-rereview-controller-adjudication.md |
 | PR review artifacts | docs/reviews/wu-cm-01-pr-review-mimo.md; docs/reviews/wu-cm-01-pr-review-ds.md; docs/reviews/wu-cm-01-pr-review-controller-adjudication.md; docs/reviews/wu-cm-01-pr-review-fix-codex.md; docs/reviews/wu-cm-01-pr-rereview-mimo.md; docs/reviews/wu-cm-01-pr-rereview-ds.md; docs/reviews/wu-cm-01-pr-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-pr-deferred-risk-controller-adjudication.md; docs/host/wu-cm-01-deferred-risk-cleanup-plan.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-implementation-codex.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-review-mimo.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-review-ds.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-rereview-mimo.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-rereview-ds.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-controller-adjudication.md |
-| draft PR status | WU-CM-01 draft PR 116 open at https://github.com/noho/dayu-agent-r/pull/116; deferred risk cleanup accepted commit 30759116d00d0ca58308e74b9f61a0ecc5b6ad9a ready for follow-up push; WU-ENG-02 PR 114 merged at 2026-06-03 09:33:38 UTC as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
+| draft PR status | WU-CM-01 draft PR 116 open at https://github.com/noho/dayu-agent-r/pull/116; branch `phaseflow/wu-cm-01` pushed through control-doc bookkeeping commit a63351d62da313b233ff18825c6e59f1f2ce0ef7 before final closeout record; GitHub reported no checks on branch `phaseflow/wu-cm-01`; WU-ENG-02 PR 114 merged at 2026-06-03 09:33:38 UTC as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |
 
 状态约定：
@@ -228,10 +228,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
 | WU-ENG-02-S3-R1 | WU-ENG-02 Slice 3 code review | analyzer 需求边界 | deferred-with-owner | WU-OBS-00 / GitHub Issue #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要 `client_correlation_id` 与 `provider_request_id`，若需要先扩展 Engine `UsageReportedData` / Runner usage event contract，再补 Host payload / Tool Trace tests | PR 114 residual review 裁决保留 defer：usage 是 post-call observation / analyzer signal，不是 provider debugging terminal 主链路；`UsageReportedData` 当前无 correlation fields，且 usage event 发生时 provider request id 不总是可用，不能在 residual fix gate 单独定死 analyzer 关联语义。已在 issue-70 留痕：https://github.com/noho/dayu-agent-r/issues/70#issuecomment-4610820571 |
-| WU-CM-01-PR-D1 | WU-CM-01 PR review | public surface hardening | closed | WU-CM-01 deferred risk cleanup | 已为 `dayu/host/memory.py` 与 `dayu/host/context_fallback.py` 增加模块级 `__all__`，并补模块级导出白名单测试；未修改 `dayu.host.__all__`。 | `docs/reviews/wu-cm-01-deferred-risk-cleanup-controller-adjudication.md`；D1 closed。 |
-| WU-CM-01-PR-D2 | WU-CM-01 PR review | typed cleanup | closed | WU-CM-01 deferred risk cleanup | 已将 `CompactionAttemptRejected.failure_category` 与 `next_policy_decision` 从自由 `str` 收紧为 `StrEnum`；EventLog payload 继续输出既有字符串值。 | `docs/reviews/wu-cm-01-deferred-risk-cleanup-controller-adjudication.md`；D2 closed。 |
-| WU-CM-01-PR-D4 | WU-CM-01 PR review | diagnostic naming cleanup | closed | WU-CM-01 deferred risk cleanup | 已清理 module-private `slice1` diagnostic / selection 常量命名与相关 docstring；未扩展为真实 policy digest 派生设计。 | `docs/reviews/wu-cm-01-deferred-risk-cleanup-controller-adjudication.md`；D4 closed。 |
-| WU-CM-01-PR-D5 | WU-CM-01 PR review | evaluation / test hardening | closed | WU-CM-01 deferred risk cleanup / GitHub Issue #80 后续 evaluation | 已补当前代码边界测试：缺失 source label typed/schema 边界、真实 durable repair integration、memory catch-up 与 snapshot write 同事务场景；未重复已有 large chunk / fallback / CAS rollback 覆盖。 | `docs/reviews/wu-cm-01-deferred-risk-cleanup-controller-adjudication.md`；D5 closed for current cleanup，长期 evaluation 仍归 issue-80。 |
 
 ## 当前 Work Units
 
