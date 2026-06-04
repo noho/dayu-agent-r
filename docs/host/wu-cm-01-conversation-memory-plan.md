@@ -93,6 +93,8 @@ WU-CM-01 的 implementation slices 必须是可编译、可验证、pyright-clea
 
 Slice C compact contract blocker 裁决后，本 plan 不再继续扩大当前 Slice C。直接代码证据显示旧 production compact contract 仍未闭合：`CompactionCandidate`、旧 `CompactMaterialPack.stable_input/history_input/evidence_input`、旧 `CompactMaterialBlockKind` 和 `LLMContextCompactor.compact()` 的旧 parser 返回值仍是生产 direct owner。若在 memory snapshot / durable / RunInputBuilder / config-service 的 Slice C 中继续删除旧 snapshot / policy，会把 compact parser、quality gate、operation payload 与 tests 一并拉入，导致 Slice C 变成跨 Slice A/B/C 的大迁移，并诱导旧 field alias、旧 wrapper 或 snapshot bridge。当前 plan 因此新增 `Pre-Slice C - Compact Contract Closure` 作为立即前置 slice；只有该 closure pyright-clean 后，后续 Slice C 才进入 memory durable/projection、RunInputBuilder、dispatch precondition 与 config-service 迁移。
 
+Slice C policy contract blocker 裁决后，本 plan 明确后续 Slice C implementation prompt 必须以 `docs/host/design.md` 的 `memory_projection_policy` 字段清单为唯一真源。上一轮 implementation retry 使用的 `selected_recent_window_floor_turns`、`max_memory_items_per_category`、`max_text_chars_per_memory_item`、`projection_max_repair_attempts`、`projection_max_rebuild_rows`、`projection_max_catchup_rows` 属于与设计真源不一致的 generic policy shape，不得作为 production dataclass 字段、config JSON key、typed config view 字段、Service assembly 参数、test fixture 或 README 术语。后续实现不得通过 alias、compatibility wrapper、默认补齐、extra payload 或双字段读取同时容纳这两套 shape；如果实现者认为设计真源字段应改变，必须停止 Slice C implementation，回到 design source gate，而不是在代码中局部发明契约。
+
 ### Slice A - Compact Contract Closure
 
 目标：先在 compactor request / material / parser / accept barrier 的局部闭环内建立 vNext compact I/O，旧 production operation 暂不切换。此 slice 只允许新增未接线或局部接线的 vNext compact contract，并用 contract tests 验证；不得删除仍被旧 operation、memory projection 或 RunInputBuilder 使用的旧 production contract。
@@ -357,10 +359,11 @@ allowed files/modules：
 - `dayu/host/run_input.py`
 - `dayu/host/context_fallback.py`
 - `dayu/host/dispatch.py`，仅限 memory snapshot precondition、projection catch-up、fallback view 与 RunInputBuilder 参数迁移
-- `dayu/host/engine_ingest.py`，仅限 reactive compaction pending request 的 recent-window floor 字段迁移，从旧 `recent_raw_turns_floor` 改为 vNext `selected_recent_window_turn_floor` 或本 slice 明确的新字段；不得恢复旧字段 alias
+- `dayu/host/engine_ingest.py`，仅限 reactive compaction pending request 的 recent-window floor 字段迁移，从旧 `recent_raw_turns_floor` 改为 vNext `selected_recent_window_turn_floor`；不得恢复旧字段 alias，不得改用 `selected_recent_window_floor_turns`
 - `dayu/service/host_assembly.py`，仅限把 runtime config memory projection policy 映射为 vNext `MemoryProjectionPolicy`
 - `dayu/runtime/config_loader.py`，仅限 `execution_profiles.json.memory_projection_policy` typed config schema / validation 迁移
 - `dayu/config/execution_profiles.json`，仅限 packaged `memory_projection_policy` 字段迁移为 vNext 清单
+- `dayu/config/README.md`，仅当本 slice 修改 `dayu/config/execution_profiles.json.memory_projection_policy` 字段时，同 slice 检查并按配置说明手册职责同步配置示例、字段名与旧术语清理；不得把 AGENTS.md 触发的配置说明同步只推迟到 Slice D
 - `tests/host/test_memory_projection.py`
 - `tests/host/test_durable_schema.py`
 - `tests/host/test_projection_checkpoint.py`
@@ -387,8 +390,10 @@ allowed files/modules：
 - 引入五类 view / item dataclass：`ReferenceContinuityItem`、`EvidenceBackedFact`、`RecentEvidenceReadableItem`、`SessionSummaryMemoryView`、`AnswerAnchor`、`ForwardIntent`。
 - `MemoryProjectionPolicy` 改为 per-semantic bounded policy：`context_window_size`、selected recent window item / char cap、selected recent window turn floor、fallback selected recent window item / char cap、evidence fact item / char cap / floor、session summary char cap、answer anchor item / char cap、forward intent item / char cap、reference continuity item / char cap / floor、inline delta repair limits 与 `policy_ref`；policy digest 不含 `max_working_assumptions`、`history_pool_*`、`stable_layer_*`。
 - vNext `memory_projection_policy` JSON 字段清单必须直接对齐 design source 第 3 章：`context_window_size`、`selected_recent_window_item_cap`、`selected_recent_window_char_cap`、`selected_recent_window_turn_floor`、`fallback_selected_recent_window_item_cap`、`fallback_selected_recent_window_char_cap`、`evidence_fact_item_cap`、`evidence_fact_char_cap`、`evidence_fact_floor`、`session_summary_char_cap`、`answer_anchor_item_cap`、`answer_anchor_char_cap`、`forward_intent_item_cap`、`forward_intent_char_cap`、`reference_continuity_item_cap`、`reference_continuity_char_cap`、`reference_continuity_item_floor`、`max_lag_events_for_inline_delta`、`max_delta_repair_events`、`policy_ref`。
+- `MemoryProjectionPolicy` production dataclass 字段清单、`execution_profiles.json.memory_projection_policy` JSON key 清单、`dayu/runtime/config_loader.py` typed config view 字段清单、`dayu/service/host_assembly.py` 显式映射参数和测试 fixture 必须使用上一条完全相同的字段集合。字段名必须是 `selected_recent_window_turn_floor`，不是 `selected_recent_window_floor_turns`；budget 必须是 per-section item / char cap / floor，不得退化为 `max_memory_items_per_category` 或 `max_text_chars_per_memory_item`。
 - `dayu/runtime/config_loader.py` 的 typed config view 必须按上述完整字段集合读取 `memory_projection_policy`，不接受旧 `max_evidence_backed_facts`、`max_working_assumptions`、`recent_raw_turns_floor`、`history_pool_*`、`stable_layer_*` 字段。
 - packaged config 真源 `dayu/config/execution_profiles.json` 必须在 Slice C implementation 中同步迁移为上述 vNext 字段；`tests/runtime` 与 `tests/service` 中构造 execution profile / memory projection policy 的 config fixtures 必须同步迁移。旧 config 字段必须由 schema validation fail fast，不得提供 alias、默认补齐或旧字段 wrapper。
+- 若 Slice C implementation 修改 `dayu/config/execution_profiles.json.memory_projection_policy` 字段，同 slice 必须检查 `dayu/config/README.md` 是否仍描述旧字段、旧路径或旧术语；属于配置说明手册职责的示例、覆盖关系或常改项必须同步更新。不允许把该 README 同步作为 Slice D 才处理的事项。
 - `dayu/service/host_assembly.py` 只做 config typed view 到 Host `MemoryProjectionPolicy` 的显式字段映射；不得根据 model window 或 profile id 隐式选择 policy，不得用 raw dict patch、profile lookup 或 extra payload 兜底。
 - 按 schema 约束以全新 schema 起库处理；snapshot JSON 只写 vNext fields，旧 JSON key `pinned_state`、`working_assumptions`、`conversation_continuity` 必须 fail closed。
 - hot table `item_kind` 若需要变化，直接迁移为 vNext item kind：`reference_continuity_item`、`evidence_backed_fact`、`recent_evidence_item`、`session_summary`、`answer_anchor`、`forward_intent`。
@@ -407,6 +412,17 @@ allowed files/modules：
 - `Pre-Slice C - Compact Contract Closure` 已保证 production compact material 顶层字段、LLM parser、quality checker、operation payload 和 event closeout 是 vNext；Slice C 只能消费该 vNext contract，不得重新引入旧 `stable_input` / `history_input` / `evidence_input`、旧 block kind alias 或旧 candidate adapter。
 - 第一阶段不做 runtime token estimator 逐 section 裁剪；section 在 projection / assembly 前由 cap / floor bounded。
 - memory snapshot lag 仍触发 catch-up / rebuild / repair path；不得把 Run 推入 `RECOVERING`。
+
+direct consumer closure list：
+
+- Host public policy owner：`dayu/host/memory.py` 必须定义唯一 vNext `MemoryProjectionPolicy` 字段集合，并删除旧 policy digest / codec 中的旧字段。
+- Durable / projection owner：`dayu/host/durable/memory.py`、`dayu/host/memory_repair.py` 与 projection checkpoint tests 必须同步迁移 vNext snapshot / item kind / fail-closed 行为。
+- Compact material consumer：`dayu/host/compact_material.py` 只消费 vNext snapshot 与 vNext compact event / artifact，生成 `previous_compacted_view`、selected recent window 与 current input material。
+- RunInputBuilder consumer：`dayu/host/run_input.py` 只渲染 vNext memory section 与 bounded recent window，不保留旧 stable block headers 或旧 renderer wrapper。
+- Dispatch / ingest consumer：`dayu/host/dispatch.py` 与 `dayu/host/engine_ingest.py` 只读取 vNext snapshot cursor / lag / diagnostics / evidence fact memory 与 `selected_recent_window_turn_floor`。
+- Runtime config consumer：`dayu/runtime/config_loader.py` 只接受 design-source `memory_projection_policy` JSON key，旧 key 和 retry prompt generic key 均 fail fast。
+- Service assembly consumer：`dayu/service/host_assembly.py` 只做 typed config view 到 Host policy dataclass 的显式一对一映射。
+- Test consumer：`tests/host/test_memory_projection.py`、`tests/host/test_durable_schema.py`、`tests/host/test_projection_checkpoint.py`、`tests/host/test_durable_concurrency_matrix.py`、`tests/host/test_memory_repair.py`、`tests/host/test_compact_material.py`、`tests/host/test_run_input_builder.py`、`tests/host/test_dispatch_scheduler.py`、`tests/host/test_recovery_dispatch.py`、`tests/host/test_engine_ingest_mapping.py`、`tests/host/test_admission_queue.py`、`tests/host/test_toolruntime_accept_barrier.py`、`tests/host/test_resolve_wait_command.py`、`tests/service/test_host_assembly.py` 与 `tests/runtime/test_config_loader.py` 必须随 production consumer 同步迁移，不得保留旧 policy / snapshot helper。
 
 旧路径保留 / 删除边界：
 
@@ -485,6 +501,7 @@ allowed files/modules：
 - `utils/smoke_host_public_conversation_memory_scenarios.py`
 - `utils/smoke_host_public_multiturn.py`
 - `dayu/host/README.md`
+- `dayu/config/README.md`，仅限 re-check Slice C 后是否仍残留旧 memory policy 字段、旧术语或与当前配置入口不一致的说明
 - `tests/README.md`
 - `README.md`，仅当 smoke 命令或 public workflow 发生变化
 - 相关 `tests/host/*` smoke / support 文件
@@ -494,6 +511,7 @@ allowed files/modules：
 - smoke 必须走 Host public path，不绕过 public API、scheduler、context governance 或 memory projection。
 - 复核本 plan 的 `Issue-80 / Design 24.7 Evaluation Mapping` 小节与最终实现一致；若 implementation 发现某个 current scope covered 项无法满足，必须回到 plan / design 修正，不得只在 implementation report 中降级。
 - README 只写当前代码已落地事实，不写路线图；Host README 记录 vNext Conversation Memory / Context Governance 稳定边界，tests README 记录新增 / 迁移后的测试事实和命令。
+- `dayu/config/README.md` 的字段级配置说明同步由修改 `dayu/config/execution_profiles.json.memory_projection_policy` 的 Slice C 同 slice 完成；Slice D 只做残留旧 memory policy 术语和配置入口一致性的 re-check。
 - 根目录 `README.md` 只在项目级使用方式、配置入口、CLI、trace/render 入口或 smoke 命令变化时更新。
 
 旧路径保留 / 删除边界：
@@ -637,6 +655,7 @@ python -m pyright dayu/ tests/ utils/
 ## README / Doc Sync Triggers
 
 - 修改 `dayu/host/`：必须检查并按职责更新 `dayu/host/README.md`。只写已落地的 Host Conversation Memory / Context Governance 契约、执行路径、状态边界和扩展点，不写未来 eval 或 recall 能力。
+- 修改 `dayu/config/execution_profiles.json.memory_projection_policy`：必须同 slice 检查并按职责更新 `dayu/config/README.md`。只同步当前默认配置、workspace/config 覆盖关系、常改项与最小示例中的真实字段；不得把配置说明同步只推迟到 Slice D。
 - 修改 `tests/`：必须检查并按职责更新 `tests/README.md`。只同步当前测试分层、运行命令和维护规则。
 - 修改 `utils/smoke_host_public_*`：如果用户手册中的 smoke 命令或 public workflow 发生变化，再更新根目录 `README.md`；若只是脚本内部断言迁移，不更新根 README。
 - 不更新 `dayu/README.md`，除非 implementation 实际改变 `UI -> Service -> Host -> Engine` 分层关系或装配边界。
