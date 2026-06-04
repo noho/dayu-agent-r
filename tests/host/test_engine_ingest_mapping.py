@@ -168,7 +168,7 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         self._transaction_runner = transaction_runner
         self.calls = 0
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """执行 vNext compact 并验证当前不在外层 write transaction 内。
@@ -183,7 +183,7 @@ class _TransactionReadableCompactor(FakeContextCompactor):
             lambda transaction: read_run_by_id(transaction, request.run_id)
         )
         assert row is not None
-        return await super().compact_request_vnext(request, cancellation_token)
+        return await super().compact(request, cancellation_token)
 
 
 class _InputSequenceAdvancingCompactor(FakeContextCompactor):
@@ -199,7 +199,7 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
         self._transaction_runner = transaction_runner
         self.calls = 0
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """推进 durable input sequence 后返回旧 snapshot 的 vNext candidate。
@@ -211,13 +211,13 @@ class _InputSequenceAdvancingCompactor(FakeContextCompactor):
 
         self.calls += 1
         _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
-        return await super().compact_request_vnext(request, cancellation_token)
+        return await super().compact(request, cancellation_token)
 
 
 class _RaisingCompactor(FakeContextCompactor):
     """测试用失败 compactor。"""
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """抛出 vNext proposal 失败。

@@ -205,7 +205,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert third_terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.material_jsons) >= 1
     material_json = _first_material_json_with_evidence(fake_compactor.material_jsons)
-    evidence_input = material_json["evidence_input"]
+    evidence_input = material_json["evidence_material"]
     assert isinstance(evidence_input, list)
     assert len(evidence_input) >= 1
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
@@ -230,7 +230,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
         ),
         field_name="fake proposal",
     )
-    fact_candidates = proposal["evidence_backed_fact_candidates"]
+    fact_candidates = proposal["evidence_backed_facts"]
     assert isinstance(fact_candidates, list)
     assert len(fact_candidates) == 1
     fact = _required_mapping(fact_candidates[0], field_name="fact")
@@ -296,7 +296,7 @@ async def test_long_user_input_second_factor_survives_minimum_preserve(
     assert len(fake_compactor.prompt_lengths) >= 1
     joined = _joined_message_content(factory.requests[1].messages)
     assert _SECOND_FACTOR_MARKER in joined
-    assert "Memory minimum preserve continuity:" in joined
+    assert "Memory episode summaries:" in joined
 
 
 @pytest.mark.asyncio
@@ -684,7 +684,7 @@ def _first_material_json_with_evidence(
     """
 
     for value in values:
-        evidence_input = value["evidence_input"]
+        evidence_input = value["evidence_material"]
         assert isinstance(evidence_input, list)
         if len(evidence_input) > 0:
             return value
@@ -713,9 +713,9 @@ def _llm_material_with_long_tool_evidence() -> Mapping[str, JsonValue]:
     """
 
     return {
-        "stable_input": [],
-        "history_input": [],
-        "evidence_input": [
+        "previous_compacted_view": [],
+        "trace_material": [],
+        "evidence_material": [
             {
                 "label": "E1",
                 "kind": "accepted_tool_evidence",

@@ -91,8 +91,6 @@ from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransact
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    EvidenceBackedFactKind,
-    MinimumPreserveReason,
 )
 from dayu.host.compact_material import RunInputMaterialBlock, run_input_material_block
 from dayu.host.context_fallback import (
@@ -104,7 +102,6 @@ from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
     context_budget_policy_from_threshold_tokens,
 )
-from dayu.host.compact_payload import preserved_fact_refs_summary
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
     CurrentRunFacts,
@@ -116,6 +113,7 @@ from dayu.host.run_input import (
     PolicySnapshot,
     ToolExecutionMode,
     MemorySnapshotView,
+    _preserved_fact_refs_summary,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -127,7 +125,9 @@ from dayu.host.memory import (
     ConversationMemorySnapshot,
     HostNeutralRefKind,
     MemoryClaimStatus,
+    MemoryContinuityPreserveReason,
     MemoryDiagnosticReason,
+    MemoryEvidenceBackedFactKind,
     MemoryIncludedReason,
     MemoryProducerKind,
     MemoryProjectionEvent,
@@ -748,29 +748,29 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
     blocks = (
         _material_block(
             "stable:goals",
-            CompactMaterialSection.STABLE_INPUT,
-            CompactMaterialBlockKind.PINNED_STATE,
+            CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+            CompactMaterialBlockKind.SESSION_SUMMARY,
             "stable goal",
             event_sequence=None,
         ),
         _material_block(
             "history:old",
-            CompactMaterialSection.HISTORY_INPUT,
-            CompactMaterialBlockKind.RAW_USER_TURN,
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
             "older raw turn",
             event_sequence=1,
         ),
         _material_block(
             "history:blocked",
-            CompactMaterialSection.HISTORY_INPUT,
-            CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             "x" * 180,
             event_sequence=3,
         ),
         _material_block(
             "history:recent",
-            CompactMaterialSection.HISTORY_INPUT,
-            CompactMaterialBlockKind.RAW_USER_TURN,
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
             "recent raw turn",
             event_sequence=4,
         ),
@@ -845,8 +845,8 @@ def test_recent_window_fallback_estimate_covers_normal_empty_stable_and_over_bud
         selection_blocks=(
             _material_block(
                 "stable:goals",
-                CompactMaterialSection.STABLE_INPUT,
-                CompactMaterialBlockKind.PINNED_STATE,
+                CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                CompactMaterialBlockKind.SESSION_SUMMARY,
                 "stable goal",
                 event_sequence=None,
             ),
@@ -1417,7 +1417,7 @@ def test_compact_artifact_preserved_fact_refs_reads_canonical_evidence_key() -> 
         }
     }
 
-    assert preserved_fact_refs_summary(payload) == (
+    assert _preserved_fact_refs_summary(payload) == (
         "canonical_evidence_refs=evidence:memory-tool; "
         "evidence_backed_fact_refs=fact:memory-revenue"
     )
@@ -1799,7 +1799,7 @@ def _rich_memory_snapshot(
             EvidenceBackedFactView(
                 item_id="memory-item:evidence-backed:test",
                 claim_text="Revenue increased year over year",
-                evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+                evidence_kind=MemoryEvidenceBackedFactKind.OBSERVED_VALUE,
                 evidence_refs=("evidence:memory-tool",),
                 attributes={},
                 provenance=MemoryProvenanceRef(
@@ -1888,7 +1888,7 @@ def _rich_memory_snapshot(
                     label="factor-2",
                     source_refs=("event-memory-raw-user",),
                     preserve_reason=(
-                        MinimumPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
+                        MemoryContinuityPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
                     ),
                     payload_ref=None,
                     payload_digest=None,
@@ -2093,7 +2093,7 @@ def _minimum_preserve_only_snapshot(
                     label="第二个因素",
                     source_refs=(source_event.event_id,),
                     preserve_reason=(
-                        MinimumPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
+                        MemoryContinuityPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
                     ),
                     payload_ref=None,
                     payload_digest=None,

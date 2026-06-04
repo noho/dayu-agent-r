@@ -13,16 +13,8 @@ from enum import StrEnum
 from typing import Protocol, TypeAlias, TypeVar
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.compaction import (
-    EvidenceBackedFactCandidate,
-    EvidenceBackedFactKind,
-    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
-    MinimumPreserveItemCandidate,
-    MinimumPreserveReason,
-)
 from dayu.host.context_events import (
     CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED,
-    validate_context_compacted_payload,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.terminal_summary_payload import (
@@ -47,6 +39,12 @@ _MemoryItemT = TypeVar("_MemoryItemT", bound="_MemoryItemWithId")
 _MIN_SEQUENCE = 0
 _MIN_POSITIVE_LIMIT = 1
 _EMPTY_SIZE_UNITS = 0
+MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS = 2000
+"""Memory-owned evidence-backed fact claim_text 字符数上限。"""
+
+MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS = 1200
+"""Memory-owned continuity text 字符数上限。"""
+
 CONVERSATION_MEMORY_CONSUMER_ID = "host.memory.session.v1"
 """Conversation memory projection consumer 稳定 id。"""
 
@@ -109,6 +107,19 @@ _PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
 _PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
 _PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
 _PAYLOAD_FIELD_EVIDENCE_REFS = "evidence_refs"
+_PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
+_PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
+_PAYLOAD_FIELD_QUALITY_CHECK_RESULT = "quality_check_result"
+_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
+_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
+_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
+_PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
+_PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
+_PAYLOAD_FIELD_REASON = "reason"
+_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
 _PAYLOAD_FIELD_ATTRIBUTES = "attributes"
 _PAYLOAD_FIELD_ITEM_ID = "item_id"
 _PAYLOAD_FIELD_LABEL = "label"
@@ -120,6 +131,23 @@ _EVENT_REF_PREFIX = "event:"
 _SNAPSHOT_ID_DIGEST_PREFIX = "memory-snapshot-"
 _ITEM_ID_PREFIX = "memory-item"
 _DIAGNOSTIC_ID_PREFIX = "memory-diagnostic"
+
+
+class MemoryEvidenceBackedFactKind(StrEnum):
+    """Memory projection 使用的 evidence-backed fact 类型。"""
+
+    OBSERVED_VALUE = "observed_value"
+    QUOTED_STATEMENT = "quoted_statement"
+    TABLE_VALUE = "table_value"
+    DERIVED_FROM_EVIDENCE = "derived_from_evidence"
+
+
+class MemoryContinuityPreserveReason(StrEnum):
+    """Memory projection 使用的局部连续性保留原因。"""
+
+    NEEDED_FOR_RECENT_REFERENCE = "needed_for_recent_reference"
+    NEEDED_FOR_ORDERED_ITEM_REFERENCE = "needed_for_ordered_item_reference"
+    NEEDED_FOR_LOCAL_FOLLOWUP = "needed_for_local_followup"
 
 
 class _MemoryItemWithId(Protocol):
@@ -407,7 +435,7 @@ class EvidenceBackedFactView:
 
     item_id: str
     claim_text: str
-    evidence_kind: EvidenceBackedFactKind
+    evidence_kind: MemoryEvidenceBackedFactKind
     evidence_refs: tuple[str, ...]
     attributes: Mapping[str, JsonValue]
     provenance: MemoryProvenanceRef
@@ -429,8 +457,8 @@ class EvidenceBackedFactView:
         _require_non_empty(self.claim_text, "claim_text")
         if len(self.claim_text) > MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS:
             raise ValueError("claim_text exceeds maximum length")
-        if not isinstance(self.evidence_kind, EvidenceBackedFactKind):
-            raise ValueError("evidence_kind must be EvidenceBackedFactKind")
+        if not isinstance(self.evidence_kind, MemoryEvidenceBackedFactKind):
+            raise ValueError("evidence_kind must be MemoryEvidenceBackedFactKind")
         if len(self.evidence_refs) == 0:
             raise ValueError("evidence_refs must be non-empty")
         _require_non_empty_items(self.evidence_refs, "evidence_refs")
@@ -527,7 +555,7 @@ class ConversationContinuityItem:
     summary_text: str | None
     label: str | None
     source_refs: tuple[str, ...]
-    preserve_reason: MinimumPreserveReason | None
+    preserve_reason: MemoryContinuityPreserveReason | None
     payload_ref: HostPayloadRef | None
     payload_digest: str | None
     included_reason: MemoryIncludedReason | None
@@ -555,9 +583,9 @@ class ConversationContinuityItem:
         _require_non_empty_items(self.source_refs, "source_refs")
         if (
             self.preserve_reason is not None
-            and not isinstance(self.preserve_reason, MinimumPreserveReason)
+            and not isinstance(self.preserve_reason, MemoryContinuityPreserveReason)
         ):
-            raise ValueError("preserve_reason must be MinimumPreserveReason")
+            raise ValueError("preserve_reason must be MemoryContinuityPreserveReason")
         _require_optional_non_empty(self.payload_ref, "payload_ref")
         _require_optional_non_empty(self.payload_digest, "payload_digest")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -1411,13 +1439,30 @@ def _validate_compacted_payload_for_memory_projection(
     """
 
     try:
-        validate_context_compacted_payload(event.payload)
+        _validate_memory_projection_compacted_payload(event, validate_facts=True)
         return (), True
     except ValueError as exc:
         patched_payload = dict(event.payload)
         patched_payload[_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES] = []
+        patched_event = MemoryProjectionEvent(
+            event_sequence=event.event_sequence,
+            event_id=event.event_id,
+            event_class=event.event_class,
+            event_type=event.event_type,
+            occurred_at=event.occurred_at,
+            session_id=event.session_id,
+            run_id=event.run_id,
+            attempt_id=event.attempt_id,
+            execution_id=event.execution_id,
+            payload_ref=event.payload_ref,
+            payload_digest=event.payload_digest,
+            payload=patched_payload,
+        )
         try:
-            validate_context_compacted_payload(patched_payload)
+            _validate_memory_projection_compacted_payload(
+                patched_event,
+                validate_facts=False,
+            )
         except ValueError as non_fact_exc:
             raise non_fact_exc from exc
         item_id = _item_id(event, "evidence_backed_fact_candidates")
@@ -1444,6 +1489,170 @@ def _validate_compacted_payload_for_memory_projection(
             ),
             False,
         )
+
+
+def _validate_memory_projection_compacted_payload(
+    event: MemoryProjectionEvent, *, validate_facts: bool
+) -> None:
+    """校验 memory projection 自有 compacted payload shape。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :param validate_facts: 是否校验并物化 fact candidates。
+    :returns: ``None``。
+    :raises ValueError: payload shape 非法时抛出。
+    """
+
+    payload = event.payload
+    if _is_vnext_compacted_payload(payload):
+        _validate_memory_projection_vnext_compacted_payload(payload)
+        return
+    _required_payload_mapping(payload, _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE)
+    _required_payload_mapping(payload, _PAYLOAD_FIELD_PINNED_STATE_PATCH_CANDIDATE)
+    _validate_memory_projection_minimum_preserve_candidates(payload)
+    _validate_memory_projection_quality_result(payload)
+    _validate_memory_projection_preserved_refs(payload)
+    if validate_facts:
+        _validate_memory_projection_fact_candidates(event)
+
+
+def _is_vnext_compacted_payload(payload: Mapping[str, JsonValue]) -> bool:
+    """判断 payload 是否为 vNext compacted event payload。
+
+    :param payload: CONTEXT_COMPACTED payload。
+    :returns: 包含 accepted_candidate 字段时返回 ``True``。
+    """
+
+    return _PAYLOAD_FIELD_ACCEPTED_CANDIDATE in payload
+
+
+def _validate_memory_projection_vnext_compacted_payload(
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """校验 memory projection 可消费的 vNext compacted payload shape。
+
+    :param payload: CONTEXT_COMPACTED payload。
+    :returns: ``None``。
+    :raises ValueError: vNext payload shape 非法时抛出。
+    """
+
+    candidate = _required_payload_mapping(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
+    if _required_str(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION) != "conversation_compact_output_v1":
+        raise ValueError("accepted candidate schema_version is invalid")
+    summary = _required_value(candidate, _PAYLOAD_FIELD_SESSION_SUMMARY)
+    if summary is not None:
+        summary_mapping = _as_mapping(summary, _PAYLOAD_FIELD_SESSION_SUMMARY)
+        _required_str(summary_mapping, _PAYLOAD_FIELD_SUMMARY_TEXT)
+        _required_text_tuple(summary_mapping, _PAYLOAD_FIELD_SOURCE_LABELS)
+    for fact in _required_mapping_list(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS):
+        _required_str(fact, _PAYLOAD_FIELD_CLAIM_TEXT)
+        _required_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
+    for item in _required_mapping_list(
+        candidate,
+        _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS,
+    ):
+        _required_str(item, _PAYLOAD_FIELD_TEXT)
+        _required_str(item, _PAYLOAD_FIELD_REASON)
+        _required_text_tuple(item, _PAYLOAD_FIELD_SOURCE_LABELS)
+    _required_text_tuple(payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
+
+
+def _vnext_session_summary_mapping(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取 vNext accepted candidate 的 session summary。
+
+    :param payload: CONTEXT_COMPACTED payload。
+    :returns: session summary mapping；candidate 未提供 summary 时返回 ``None``。
+    :raises ValueError: vNext candidate 或 summary 结构非法时抛出。
+    """
+
+    candidate = _required_payload_mapping(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
+    summary = _required_value(candidate, _PAYLOAD_FIELD_SESSION_SUMMARY)
+    if summary is None:
+        return None
+    return _as_mapping(summary, _PAYLOAD_FIELD_SESSION_SUMMARY)
+
+
+def _validate_memory_projection_quality_result(
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """校验 memory projection compact quality result 基本 shape。
+
+    :param payload: CONTEXT_COMPACTED payload。
+    :returns: ``None``。
+    :raises ValueError: quality result 缺失或未 accepted 时抛出。
+    """
+
+    quality = _required_payload_mapping(payload, _PAYLOAD_FIELD_QUALITY_CHECK_RESULT)
+    accepted = _required_value(quality, "accepted")
+    if accepted is not True:
+        raise ValueError("compact quality result must be accepted")
+
+
+def _validate_memory_projection_minimum_preserve_candidates(
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """校验 memory projection minimum preserve candidates。
+
+    :param payload: CONTEXT_COMPACTED payload。
+    :returns: ``None``。
+    :raises ValueError: candidate 字段非法时抛出。
+    """
+
+    for candidate in _required_mapping_list(
+        payload,
+        _PAYLOAD_FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES,
+    ):
+        text = _required_str(candidate, _PAYLOAD_FIELD_TEXT)
+        if len(text) > MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS:
+            raise ValueError("minimum preserve text exceeds maximum length")
+        MemoryContinuityPreserveReason(
+            _required_str(candidate, _PAYLOAD_FIELD_PRESERVE_REASON)
+        )
+
+
+def _validate_memory_projection_preserved_refs(
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """校验 memory projection compact preserved refs 基本 shape。
+
+    :param payload: CONTEXT_COMPACTED payload。
+    :returns: ``None``。
+    :raises ValueError: preserved refs 缺失或结构非法时抛出。
+    """
+
+    preserved = _required_payload_mapping(payload, _PAYLOAD_FIELD_PRESERVED_FACT_REFS)
+    _required_text_tuple(preserved, _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS)
+    _required_text_tuple(preserved, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS)
+
+
+def _validate_memory_projection_fact_candidates(event: MemoryProjectionEvent) -> None:
+    """校验 memory projection compact fact candidates。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :returns: ``None``。
+    :raises ValueError: fact candidate 非法时抛出。
+    """
+
+    retained_refs = set(_memory_projection_retained_evidence_refs(event.payload))
+    for fact in _evidence_backed_facts_from_compacted_event(event):
+        for evidence_ref in fact.evidence_refs:
+            if evidence_ref not in retained_refs:
+                raise ValueError("evidence ref is not retained by compact payload")
+
+
+def _memory_projection_retained_evidence_refs(
+    payload: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    """读取 memory projection compact payload 中保留的 evidence refs。
+
+    :param payload: CONTEXT_COMPACTED payload。
+    :returns: canonical evidence refs。
+    :raises ValueError: preserved refs 结构非法时抛出。
+    """
+
+    preserved = _required_payload_mapping(payload, _PAYLOAD_FIELD_PRESERVED_FACT_REFS)
+    return _required_text_tuple(preserved, _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS)
 
 
 def _evidence_backed_facts_from_compacted_event(
@@ -1474,46 +1683,98 @@ def _evidence_backed_facts_from_compacted_event(
         event.payload,
         _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF,
     )
+    if _is_vnext_compacted_payload(event.payload):
+        return _vnext_evidence_backed_facts_from_compacted_event(
+            event,
+            provenance=provenance,
+            compact_artifact_ref=compact_artifact_ref,
+        )
     facts: list[EvidenceBackedFactView] = []
     for candidate in _required_mapping_list(
         event.payload,
         _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES,
     ):
-        fact_candidate = EvidenceBackedFactCandidate(
-            candidate_id=_required_str(candidate, _PAYLOAD_FIELD_CANDIDATE_ID),
-            claim_text=_required_str(candidate, _PAYLOAD_FIELD_CLAIM_TEXT),
-            evidence_kind=EvidenceBackedFactKind(
-                _required_str(candidate, _PAYLOAD_FIELD_EVIDENCE_KIND)
-            ),
-            evidence_refs=tuple(
-                _as_str(item, _PAYLOAD_FIELD_EVIDENCE_REFS)
-                for item in _required_list(
-                    candidate,
-                    _PAYLOAD_FIELD_EVIDENCE_REFS,
-                )
-            ),
-            attributes=_as_mapping(
-                _required_value(candidate, _PAYLOAD_FIELD_ATTRIBUTES),
-                _PAYLOAD_FIELD_ATTRIBUTES,
-            ),
+        candidate_id = _required_str(candidate, _PAYLOAD_FIELD_CANDIDATE_ID)
+        claim_text = _required_str(candidate, _PAYLOAD_FIELD_CLAIM_TEXT)
+        evidence_kind = MemoryEvidenceBackedFactKind(
+            _required_str(candidate, _PAYLOAD_FIELD_EVIDENCE_KIND)
+        )
+        evidence_refs = tuple(
+            _as_str(item, _PAYLOAD_FIELD_EVIDENCE_REFS)
+            for item in _required_list(
+                candidate,
+                _PAYLOAD_FIELD_EVIDENCE_REFS,
+            )
+        )
+        attributes = _as_mapping(
+            _required_value(candidate, _PAYLOAD_FIELD_ATTRIBUTES),
+            _PAYLOAD_FIELD_ATTRIBUTES,
         )
         facts.append(
             EvidenceBackedFactView(
                 item_id=_item_id(
                     event,
-                    f"evidence_backed_fact:{fact_candidate.candidate_id}",
+                    f"evidence_backed_fact:{candidate_id}",
                 ),
-                claim_text=fact_candidate.claim_text,
-                evidence_kind=fact_candidate.evidence_kind,
-                evidence_refs=fact_candidate.evidence_refs,
-                attributes=fact_candidate.attributes,
+                claim_text=claim_text,
+                evidence_kind=evidence_kind,
+                evidence_refs=evidence_refs,
+                attributes=attributes,
                 provenance=provenance,
                 extraction_operation_ref=f"{_EVENT_REF_PREFIX}{event.event_id}",
                 compact_artifact_ref=compact_artifact_ref,
-                candidate_id=fact_candidate.candidate_id,
+                candidate_id=candidate_id,
                 included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
                 excluded_reason=None,
-                size_units=estimate_memory_size_units(fact_candidate.claim_text),
+                size_units=estimate_memory_size_units(claim_text),
+            )
+        )
+    return tuple(facts)
+
+
+def _vnext_evidence_backed_facts_from_compacted_event(
+    event: MemoryProjectionEvent,
+    *,
+    provenance: MemoryProvenanceRef,
+    compact_artifact_ref: str | None,
+) -> tuple[EvidenceBackedFactView, ...]:
+    """从 vNext compacted payload 物化 evidence-backed facts。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :param provenance: 当前 compact event provenance。
+    :param compact_artifact_ref: 可选 compact artifact ref。
+    :returns: evidence-backed facts。
+    :raises ValueError: vNext fact candidate 结构非法时抛出。
+    """
+
+    candidate = _required_payload_mapping(event.payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
+    evidence_refs = _required_text_tuple(
+        event.payload,
+        _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
+    )
+    facts: list[EvidenceBackedFactView] = []
+    for index, fact in enumerate(
+        _required_mapping_list(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
+    ):
+        claim_text = _required_str(fact, _PAYLOAD_FIELD_CLAIM_TEXT)
+        candidate_id = f"vnext-fact-{index + 1}"
+        facts.append(
+            EvidenceBackedFactView(
+                item_id=_item_id(
+                    event,
+                    f"evidence_backed_fact:{candidate_id}",
+                ),
+                claim_text=claim_text,
+                evidence_kind=MemoryEvidenceBackedFactKind.DERIVED_FROM_EVIDENCE,
+                evidence_refs=evidence_refs,
+                attributes={},
+                provenance=provenance,
+                extraction_operation_ref=f"{_EVENT_REF_PREFIX}{event.event_id}",
+                compact_artifact_ref=compact_artifact_ref,
+                candidate_id=candidate_id,
+                included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
+                excluded_reason=None,
+                size_units=estimate_memory_size_units(claim_text),
             )
         )
     return tuple(facts)
@@ -1580,7 +1841,7 @@ def _evidence_backed_fact_duplicate_index(
 
 def _evidence_backed_fact_dedupe_key(
     fact: EvidenceBackedFactView,
-) -> tuple[str, tuple[str, ...], EvidenceBackedFactKind]:
+) -> tuple[str, tuple[str, ...], MemoryEvidenceBackedFactKind]:
     """生成 evidence-backed fact 去重 key。
 
     :param fact: evidence-backed fact。
@@ -1652,25 +1913,28 @@ def _minimum_preserve_items_from_compacted_event(
     :raises ValueError: candidate JSON 结构非法时抛出。
     """
 
+    if _is_vnext_compacted_payload(event.payload):
+        return _vnext_reference_continuity_items_from_compacted_event(
+            event,
+            policy=policy,
+        )
     items: list[ConversationContinuityItem] = []
     for candidate in _required_mapping_list(
         event.payload,
         _PAYLOAD_FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES,
     ):
-        preserve_candidate = MinimumPreserveItemCandidate(
-            item_id=_required_str(candidate, _PAYLOAD_FIELD_ITEM_ID),
-            label=_required_str(candidate, _PAYLOAD_FIELD_LABEL),
-            text=_required_str(candidate, _PAYLOAD_FIELD_TEXT),
-            source_refs=tuple(
-                _as_str(item, _PAYLOAD_FIELD_SOURCE_REFS)
-                for item in _required_list(candidate, _PAYLOAD_FIELD_SOURCE_REFS)
-            ),
-            preserve_reason=MinimumPreserveReason(
-                _required_str(candidate, _PAYLOAD_FIELD_PRESERVE_REASON)
-            ),
+        item_id = _required_str(candidate, _PAYLOAD_FIELD_ITEM_ID)
+        label = _required_str(candidate, _PAYLOAD_FIELD_LABEL)
+        candidate_text = _required_str(candidate, _PAYLOAD_FIELD_TEXT)
+        source_refs = tuple(
+            _as_str(item, _PAYLOAD_FIELD_SOURCE_REFS)
+            for item in _required_list(candidate, _PAYLOAD_FIELD_SOURCE_REFS)
+        )
+        preserve_reason = MemoryContinuityPreserveReason(
+            _required_str(candidate, _PAYLOAD_FIELD_PRESERVE_REASON)
         )
         text = _bounded_patch_text(
-            preserve_candidate.text,
+            candidate_text,
             event=event,
             policy=policy,
         )
@@ -1678,7 +1942,7 @@ def _minimum_preserve_items_from_compacted_event(
             ConversationContinuityItem(
                 item_id=_item_id(
                     event,
-                    f"minimum_preserve_item:{preserve_candidate.item_id}",
+                    f"minimum_preserve_item:{item_id}",
                 ),
                 item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
                 producer_kind=MemoryProducerKind.HOST_PROJECTION,
@@ -1687,9 +1951,53 @@ def _minimum_preserve_items_from_compacted_event(
                 event_sequence=event.event_sequence,
                 run_id=event.run_id,
                 summary_text=text,
-                label=preserve_candidate.label,
-                source_refs=preserve_candidate.source_refs,
-                preserve_reason=preserve_candidate.preserve_reason,
+                label=label,
+                source_refs=source_refs,
+                preserve_reason=preserve_reason,
+                payload_ref=None,
+                payload_digest=None,
+                included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
+                excluded_reason=None,
+                size_units=estimate_memory_size_units(text),
+            )
+        )
+    return tuple(items)
+
+
+def _vnext_reference_continuity_items_from_compacted_event(
+    event: MemoryProjectionEvent, *, policy: MemoryProjectionPolicy
+) -> tuple[ConversationContinuityItem, ...]:
+    """从 vNext compacted payload 物化 reference continuity items。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :param policy: memory projection policy。
+    :returns: continuity items。
+    :raises ValueError: vNext reference item 结构非法时抛出。
+    """
+
+    candidate = _required_payload_mapping(event.payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
+    items: list[ConversationContinuityItem] = []
+    for index, item in enumerate(
+        _required_mapping_list(candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS)
+    ):
+        text = _bounded_patch_text(
+            _required_str(item, _PAYLOAD_FIELD_TEXT),
+            event=event,
+            policy=policy,
+        )
+        items.append(
+            ConversationContinuityItem(
+                item_id=_item_id(event, f"vnext_reference_continuity:{index + 1}"),
+                item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
+                producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                claim_status=MemoryClaimStatus.ASSUMPTION,
+                event_id=event.event_id,
+                event_sequence=event.event_sequence,
+                run_id=event.run_id,
+                summary_text=text,
+                label="reference_continuity",
+                source_refs=_required_text_tuple(item, _PAYLOAD_FIELD_SOURCE_LABELS),
+                preserve_reason=MemoryContinuityPreserveReason.NEEDED_FOR_LOCAL_FOLLOWUP,
                 payload_ref=None,
                 payload_digest=None,
                 included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
@@ -1842,6 +2150,11 @@ def _compact_episode_summary_source_refs(
     :returns: 去重后的 source refs。
     """
 
+    if _is_vnext_compacted_payload(event.payload):
+        summary = _vnext_session_summary_mapping(event.payload)
+        if summary is None:
+            return ()
+        return _required_text_tuple(summary, _PAYLOAD_FIELD_SOURCE_LABELS)
     summary = _required_payload_mapping(
         event.payload,
         _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
@@ -1868,6 +2181,8 @@ def _apply_pinned_state_patch_candidate(
     :raises ValueError: patch JSON 结构或 confirmed subjects ref 非法时抛出。
     """
 
+    if _is_vnext_compacted_payload(event.payload):
+        return pinned_state
     patch = _required_payload_mapping(
         event.payload,
         _PAYLOAD_FIELD_PINNED_STATE_PATCH_CANDIDATE,
@@ -2168,6 +2483,8 @@ def _validate_compact_summary_fact_refs(
     :raises ValueError: summary 引用了未知 fact ref 时抛出。
     """
 
+    if _is_vnext_compacted_payload(event.payload):
+        return
     summary = _required_payload_mapping(
         event.payload,
         _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
@@ -2873,6 +3190,15 @@ def _compact_episode_summary_text(event: MemoryProjectionEvent) -> str:
     :returns: episode summary 文本。
     """
 
+    if _is_vnext_compacted_payload(event.payload):
+        summary = _vnext_session_summary_mapping(event.payload)
+        if summary is not None:
+            return _required_str(summary, _PAYLOAD_FIELD_SUMMARY_TEXT)
+        return _ref_summary_text(
+            payload_ref=event.payload_ref,
+            payload_digest=event.payload_digest,
+            fallback_event_id=event.event_id,
+        )
     summary = _required_payload_mapping(
         event.payload,
         _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
@@ -3470,7 +3796,7 @@ def _evidence_backed_fact_from_json_value(value: JsonValue) -> EvidenceBackedFac
     return EvidenceBackedFactView(
         item_id=_required_str(mapping, "item_id"),
         claim_text=_required_str(mapping, "claim_text"),
-        evidence_kind=EvidenceBackedFactKind(_required_str(mapping, "evidence_kind")),
+        evidence_kind=MemoryEvidenceBackedFactKind(_required_str(mapping, "evidence_kind")),
         evidence_refs=tuple(
             _as_str(item, "evidence_refs item")
             for item in _required_list(mapping, "evidence_refs")
@@ -3739,7 +4065,7 @@ def _optional_excluded_reason(
 
 def _optional_minimum_preserve_reason(
     mapping: Mapping[str, JsonValue], field_name: str
-) -> MinimumPreserveReason | None:
+) -> MemoryContinuityPreserveReason | None:
     """读取 optional minimum preserve reason。
 
     :param mapping: JSON mapping。
@@ -3750,7 +4076,7 @@ def _optional_minimum_preserve_reason(
     value = _optional_str(mapping, field_name)
     if value is None:
         return None
-    return MinimumPreserveReason(value)
+    return MemoryContinuityPreserveReason(value)
 
 
 def _enum_value_or_none(value: StrEnum | None) -> str | None:
@@ -4035,6 +4361,20 @@ def _required_list(
     if isinstance(value, list):
         return value
     raise ValueError(f"{field_name} must be list")
+
+
+def _required_text_tuple(
+    mapping: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """读取必填字符串数组字段。
+
+    :param mapping: JSON mapping。
+    :param field_name: 字段名。
+    :returns: 字符串 tuple。
+    :raises ValueError: 字段缺失、非数组或元素非字符串时抛出。
+    """
+
+    return tuple(_as_str(item, field_name) for item in _required_list(mapping, field_name))
 
 
 def _required_mapping_list(

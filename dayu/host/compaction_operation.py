@@ -18,7 +18,6 @@ from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
     CompactionRequest,
     ContextCompactor,
-    ContextCompactorVNext,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
 )
@@ -148,7 +147,7 @@ async def run_compaction_operation(
                 compact_input = conversation_compact_input_vnext_from_material_pack(
                     pass_request.material_pack
                 )
-                candidate = await _compact_vnext(
+                candidate = await _compact_candidate(
                     compactor,
                     pass_request,
                     cancellation_token,
@@ -180,7 +179,7 @@ async def run_compaction_operation(
                 attempt_number += 1
                 continue
             quality = check_conversation_compact_output_vnext(compact_input, candidate)
-            last_budget = _budget_after_compact_vnext(pass_request, compact_input, candidate)
+            last_budget = _budget_after_compact_candidate(pass_request, compact_input, candidate)
             if not quality.accepted:
                 rejected_attempt = _attempt_rejected(
                     request=pass_request,
@@ -306,7 +305,7 @@ def _requires_budget_acceptance(request: CompactionRequest) -> bool:
     return request.trigger_source is ContextCompactionTriggerSource.PROACTIVE
 
 
-async def _compact_vnext(
+async def _compact_candidate(
     compactor: ContextCompactor,
     request: CompactionRequest,
     cancellation_token: CancellationToken,
@@ -320,12 +319,10 @@ async def _compact_vnext(
     :raises TypeError: compactor 不支持 vNext capability 时抛出。
     """
 
-    if not isinstance(compactor, ContextCompactorVNext):
-        raise TypeError("context compactor must support compact_request_vnext")
-    return await compactor.compact_request_vnext(request, cancellation_token)
+    return await compactor.compact(request, cancellation_token)
 
 
-def _budget_after_compact_vnext(
+def _budget_after_compact_candidate(
     request: CompactionRequest,
     compact_input: ConversationCompactInputVNext,
     candidate: ConversationCompactOutputVNext,

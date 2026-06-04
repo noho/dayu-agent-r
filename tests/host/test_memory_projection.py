@@ -39,12 +39,6 @@ from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
 )
-from dayu.host.compaction import (
-    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
-    MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
-    EvidenceBackedFactKind,
-    MinimumPreserveReason,
-)
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_HOST_MEMORY_ITEMS,
@@ -58,10 +52,14 @@ from dayu.host.memory import (
     ConversationContinuityView,
     ConversationMemorySnapshot,
     HostNeutralRefKind,
+    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
+    MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+    MemoryContinuityPreserveReason,
     MemoryClaimStatus,
     MemoryDiagnostic,
     MemoryDiagnosticReason,
     MemoryExcludedReason,
+    MemoryEvidenceBackedFactKind,
     MemoryIncludedReason,
     MemoryProjectionEvent,
     MemoryProducerKind,
@@ -445,7 +443,7 @@ def _fact_candidate(
     return {
         "candidate_id": candidate_id,
         "claim_text": claim_text,
-        "evidence_kind": EvidenceBackedFactKind.OBSERVED_VALUE.value,
+        "evidence_kind": MemoryEvidenceBackedFactKind.OBSERVED_VALUE.value,
         "evidence_refs": list(evidence_refs),
         "attributes": {"source": "test"},
     }
@@ -472,7 +470,7 @@ def _minimum_preserve_item(
         "label": label,
         "text": text,
         "source_refs": list(source_refs),
-        "preserve_reason": MinimumPreserveReason.NEEDED_FOR_LOCAL_FOLLOWUP.value,
+        "preserve_reason": MemoryContinuityPreserveReason.NEEDED_FOR_LOCAL_FOLLOWUP.value,
     }
 
 
@@ -958,7 +956,7 @@ def test_typed_contracts_reject_invalid_ids_cursor_and_evidence_fact() -> None:
         EvidenceBackedFactView(
             item_id="fact-1",
             claim_text="summary",
-            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_kind=MemoryEvidenceBackedFactKind.OBSERVED_VALUE,
             evidence_refs=(),
             attributes={},
             provenance=_tool_provenance(),
@@ -973,7 +971,7 @@ def test_typed_contracts_reject_invalid_ids_cursor_and_evidence_fact() -> None:
         EvidenceBackedFactView(
             item_id="fact-1",
             claim_text="summary",
-            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_kind=MemoryEvidenceBackedFactKind.OBSERVED_VALUE,
             evidence_refs=("evidence-1",),
             attributes={},
             provenance=_user_provenance(),
@@ -988,7 +986,7 @@ def test_typed_contracts_reject_invalid_ids_cursor_and_evidence_fact() -> None:
         EvidenceBackedFactView(
             item_id="fact-1",
             claim_text="x" * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1),
-            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_kind=MemoryEvidenceBackedFactKind.OBSERVED_VALUE,
             evidence_refs=("evidence-1",),
             attributes={},
             provenance=_tool_provenance(),
@@ -1745,7 +1743,7 @@ def test_context_compacted_fact_candidates_materialize_evidence_backed_facts() -
     fact = snapshot.evidence_backed_facts[0]
     assert fact.claim_text == "Revenue increased based on canonical evidence."
     assert fact.evidence_refs == ("evidence-1",)
-    assert fact.evidence_kind is EvidenceBackedFactKind.OBSERVED_VALUE
+    assert fact.evidence_kind is MemoryEvidenceBackedFactKind.OBSERVED_VALUE
     assert fact.provenance.event_id == "event-compact-fact"
     assert fact.provenance.event_sequence == 1
     assert fact.provenance.producer_kind is MemoryProducerKind.HOST_PROJECTION
@@ -2348,7 +2346,7 @@ def test_minimum_preserve_candidates_create_continuity_items_only() -> None:
     assert preserve_items[0].source_refs == ("event-input",)
     assert (
         preserve_items[0].preserve_reason
-        is MinimumPreserveReason.NEEDED_FOR_LOCAL_FOLLOWUP
+        is MemoryContinuityPreserveReason.NEEDED_FOR_LOCAL_FOLLOWUP
     )
 
 
@@ -2448,7 +2446,7 @@ def test_context_compacted_pinned_patch_updates_clears_and_preserves() -> None:
 def test_context_compacted_rejects_free_form_confirmed_subject_patch() -> None:
     """confirmed_subjects patch 只能使用 Host-neutral opaque refs。"""
 
-    with pytest.raises(ValueError, match="opaque ref text requires kind prefix"):
+    with pytest.raises(ValueError, match="confirmed subject ref must include Host-neutral kind"):
         _build_snapshot(
             (
                 _memory_event(

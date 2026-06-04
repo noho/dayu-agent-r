@@ -1,16 +1,29 @@
-"""Host-owned LLM context compactor tests。"""
+"""Host-owned LLM vNext context compactor tests。"""
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
-from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from collections.abc import Mapping
+from pathlib import Path
+from typing import cast
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import (
+    AgentRunRequest,
+    AgentRunResult,
+    EngineRunOutcomeFailed,
+    EngineRunOutcomeFinalAnswer,
+)
+from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
@@ -18,35 +31,17 @@ from dayu.host.compact_material import (
     conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
-from dayu.engine.contracts.agent_run import (
-    AgentRunRequest,
-    AgentRunResult,
-    EngineRunOutcomeFailed,
-    EngineRunOutcomeFinalAnswer,
-)
-from dayu.engine.contracts.agent_policy import AgentPolicy
-from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
-    CompactMaterialPack,
     CompactMaterialBlockKind,
     CompactSegmentTrigger,
     CompactionRequest,
     ConversationCompactInputVNext,
-    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
-    MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+    ConversationCompactOutputVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
 )
-from dayu.host.context_budget import (
-    BudgetEstimate,
-    DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
-    DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
-)
+from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.evidence import (
-    AcceptedEvidenceEnvelope,
-    AcceptedEvidenceResultRef,
-    AcceptedEvidenceToolQuery,
-)
 import dayu.host.llm_compaction as llm_compaction_module
 from dayu.host.llm_compaction import (
     LLMCompactionProposalError,
@@ -54,8 +49,8 @@ from dayu.host.llm_compaction import (
     parse_conversation_compact_output_vnext,
 )
 from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_compaction import fake_compaction_proposal_from_material_json
 
-_DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _TEST_SYSTEM_PROMPT = "test compactor system prompt"
 _TEST_USER_PROMPT_TEMPLATE = "test compactor user prompt\n\n<<compaction_request>>\n\nreturn strict json"
 _TEST_AGENT_POLICY = AgentPolicy(
@@ -64,6 +59,7 @@ _TEST_AGENT_POLICY = AgentPolicy(
     allow_tool_calls=False,
     tool_execution_timeout_seconds=1.0,
 )
+_PROMPT_TEMPLATE_PATH = Path("dayu/config/prompts/scenes/conversation_compaction_user.md")
 
 
 def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
@@ -99,8 +95,6 @@ def test_safe_outcome_text_redacts_sensitive_diagnostic_values(
 
     :param raw_message: 包含敏感值写法的原始 outcome 文本。
     :param secret_value: 不允许出现在脱敏结果中的明文值。
-    :returns: ``None``。
-    :raises AssertionError: 敏感值泄漏或非敏感上下文丢失时抛出。
     """
 
     safe_message = llm_compaction_module._safe_outcome_text(raw_message)
@@ -112,54 +106,11 @@ def test_safe_outcome_text_redacts_sensitive_diagnostic_values(
 
 
 def test_safe_outcome_text_does_not_redact_plain_token_diagnostic() -> None:
-    """_safe_outcome_text 不误脱敏普通 token 诊断句。
-
-    :returns: ``None``。
-    :raises AssertionError: 普通诊断文本被误改写时抛出。
-    """
+    """_safe_outcome_text 不误脱敏普通 token 诊断句。"""
 
     message = "JWT token has expired"
 
     assert llm_compaction_module._safe_outcome_text(message) == message
-
-
-def test_safe_outcome_text_uses_runtime_truncation_shape() -> None:
-    """_safe_outcome_text 使用 runtime diagnostic 截断语义。
-
-    outcome 摘要超限时，返回总长必须不超过 ``_MAX_SAFE_OUTCOME_MESSAGE_CHARS``，
-    截断后缀也计入最大长度。
-
-    :returns: ``None``。
-    :raises AssertionError: 截断正文长度或后缀形状变化时抛出。
-    """
-
-    message = "x" * 241
-
-    safe_message = llm_compaction_module._safe_outcome_text(message)
-
-    assert safe_message == ("x" * 237) + "..."
-    assert len(safe_message) == 240
-
-
-def _llm_compactor(
-    *,
-    runner_spec: RunnerSpec,
-    runner_options: RunnerCallOptions,
-) -> LLMContextCompactor:
-    """构造测试用 LLM compactor。
-
-    :param runner_spec: compactor runner spec。
-    :param runner_options: compactor runner options。
-    :returns: 测试 compactor。
-    """
-
-    return LLMContextCompactor(
-        runner_spec=runner_spec,
-        runner_options=runner_options,
-        agent_policy=_TEST_AGENT_POLICY,
-        system_prompt=_TEST_SYSTEM_PROMPT,
-        user_prompt_template=_TEST_USER_PROMPT_TEMPLATE,
-    )
 
 
 def test_llm_context_compactor_requires_scene_prompt_template() -> None:
@@ -183,1060 +134,224 @@ def test_llm_context_compactor_requires_scene_prompt_template() -> None:
         )
 
 
-@pytest.mark.asyncio
-async def test_llm_context_compactor_builds_tool_disabled_request(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """LLM compactor 构造禁用工具的 Engine public request。"""
+def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None:
+    """vNext parser 接受设计 schema 并返回 ConversationCompactOutputVNext。"""
 
-    seen: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        seen.append(request)
-        return _final(_proposal_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-    runner_spec = _runner_spec(max_retries=3)
-    runner_options = _runner_options()
-    cancellation_token = StubCancellationToken()
-
-    await _llm_compactor(
-        runner_spec=runner_spec,
-        runner_options=runner_options,
-    ).compact(_request(), cancellation_token)
-
-    assert len(seen) == 1
-    assert seen[0].runner_spec is runner_spec
-    assert seen[0].runner_options is runner_options
-    assert seen[0].agent_policy is _TEST_AGENT_POLICY
-    assert seen[0].cancellation_token is cancellation_token
-    assert seen[0].messages[0].content == _TEST_SYSTEM_PROMPT
-    assert seen[0].messages[1].content is not None
-    assert seen[0].messages[1].content.startswith("test compactor user prompt")
-    assert seen[0].disable_tools is True
-    assert seen[0].tool_schemas == ()
-
-
-@pytest.mark.asyncio
-async def test_prompt_renders_material_pack_without_ledger_dump(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Prompt 只渲染四个 material pack section 且不倾倒账本字段。"""
-
-    seen: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        seen.append(request)
-        return _final(_proposal_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-
-    await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact(_request(), StubCancellationToken())
-
-    assert len(seen) == 1
-    user_message = seen[0].messages[1]
-    prompt = user_message.content
-    assert prompt is not None
-    assert "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN" in prompt
-    assert "UNTRUSTED_COMPACTION_MATERIAL_JSON_END" in prompt
-    assert '"stable_input":' in prompt
-    assert '"history_input":' in prompt
-    assert '"evidence_input":' in prompt
-    assert '"current_input_anchor":' in prompt
-    assert "material_pack:" not in prompt
-    assert "trigger_source:" not in prompt
-    assert '"label": "E1"' in prompt
-    assert '"tool_name": "fins.search"' in prompt
-    assert "accepted_evidence_envelopes:" not in prompt
-    assert "compact_raw_context:" not in prompt
-    assert "input_event_refs:" not in prompt
-    assert "payload_digest" not in prompt
-    assert "payload_ref" not in prompt
-    assert "payload:accepted-1" not in prompt
-    assert "event-tool-result-1" not in prompt
-    assert "event-tool-call-1" not in prompt
-    assert "memory_snapshot_cursor" not in prompt
-    assert "policy_snapshot" not in prompt
-    assert "outcome_digest" not in prompt
-    assert "canonical_source_refs" not in prompt
-    assert "Revenue grew 12% year over year." in prompt
-
-
-def test_llm_compaction_text_estimator_uses_cjk_conservative_budget() -> None:
-    """LLM compaction 文本估算复用 Host CJK 保守估算语义。"""
-
-    assert llm_compaction_module._estimate_text_tokens("abcdef") == 2
-    assert llm_compaction_module._estimate_text_tokens("收入增长明显") == 6
-
-
-@pytest.mark.asyncio
-async def test_prompt_does_not_render_accepted_evidence_envelope_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Prompt 不暴露 accepted evidence envelope 的内部 metadata。"""
-
-    seen: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        seen.append(request)
-        return _final(_proposal_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-
-    await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact(_request(), StubCancellationToken())
-
-    assert len(seen) == 1
-    prompt = seen[0].messages[1].content
-    assert prompt is not None
-    envelope = _accepted_evidence_envelope()
-    assert envelope.producer_event_ref not in prompt
-    assert envelope.tool_call_id not in prompt
-    assert envelope.tool_query.normalized_arguments_digest not in prompt
-    assert envelope.tool_query.semantic_input_digest not in prompt
-    payload_ref = envelope.result_ref.payload_ref
-    payload_digest = envelope.result_ref.payload_digest
-    outcome_digest = envelope.result_ref.outcome_digest
-    assert payload_ref is not None
-    assert payload_digest is not None
-    assert outcome_digest is not None
-    assert payload_ref not in prompt
-    assert payload_digest not in prompt
-    assert outcome_digest not in prompt
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_prompt_keeps_long_raw_evidence_content(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """长 raw evidence 内容的末尾仍进入 compactor prompt。"""
-
-    long_prefix = "A" * 1300
-    tail_marker = "MD&A section says backlog conversion improved in Q4."
-    raw_content = f"{long_prefix}{tail_marker}"
-    seen: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        seen.append(request)
-        return _final(_proposal_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-
-    await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact(_request(raw_tool_content=raw_content), StubCancellationToken())
-
-    assert len(seen) == 1
-    prompt = seen[0].messages[1].content
-    assert prompt is not None
-    assert tail_marker in prompt
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_prompt_marks_raw_evidence_with_evidence_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """raw evidence 内容旁边只标注 prompt-local evidence label。"""
-
-    seen: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        seen.append(request)
-        return _final(_proposal_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-
-    await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact(_request(), StubCancellationToken())
-
-    assert len(seen) == 1
-    prompt = seen[0].messages[1].content
-    assert prompt is not None
-    material_index = prompt.index('"evidence_input"')
-    evidence_ref_index = prompt.index('"label": "E1"', material_index)
-    raw_content_index = prompt.index(
-        "Revenue grew 12% year over year.",
-        material_index,
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
     )
-    assert material_index < evidence_ref_index < raw_content_index
-
-
-@pytest.mark.asyncio
-async def test_parser_maps_prompt_local_evidence_label_to_canonical_ref(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Parser 先把 prompt-local evidence label 映射为 canonical ref。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json())),
-    )
-
-    candidate = await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact(_request(), StubCancellationToken())
-
-    assert candidate.episode_summary_candidate.goal == "keep the current user request"
-    assert candidate.pinned_state_patch_candidate.current_goal.value == ("keep the current user request")
-    assert len(candidate.evidence_backed_fact_candidates) == 1
-    assert candidate.evidence_backed_fact_candidates[0].claim_text == ("Canonical evidence shows revenue growth.")
-    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == ("evidence:accepted-1",)
-    assert candidate.episode_summary_candidate.tool_finding_refs == ("evidence:accepted-1",)
-    assert len(candidate.minimum_preserve_item_candidates) == 1
-    assert candidate.minimum_preserve_item_candidates[0].text == (
-        "Current user asked to keep the financial analysis context."
-    )
-    assert candidate.retained_current_user_input_ref == "input-1"
-    assert candidate.preserved_material_source_refs == ("input-1", "input-2")
-    assert candidate.preserved_canonical_evidence_refs == ("evidence:accepted-1",)
-    assert candidate.preserved_evidence_backed_fact_refs == ("fact-1",)
-    assert candidate.budget_after_compact > 8
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_budget_counts_preserved_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """compact 后预算必须覆盖 summary 以外的保留上下文与 framing 开销。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json())),
-    )
-
-    candidate = await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact(_request(), StubCancellationToken())
-
-    assert candidate.budget_after_compact >= (
-        80 + DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS + DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS
-    )
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_budget_counts_structured_output_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """预算估算必须随 fact 与 minimum preserve 文本增长。"""
-
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(
-                _proposal_json(
-                    claim_text="short fact",
-                    minimum_preserve_text="short preserve",
-                )
-            )
+    candidate = parse_conversation_compact_output_vnext(
+        compact_input,
+        fake_compaction_proposal_from_material_json(
+            cast(Mapping[str, JsonValue], compact_input.to_json())
         ),
     )
-    short_candidate = await compactor.compact(_request(), StubCancellationToken())
 
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(
-                _proposal_json(
-                    claim_text="material fact " * 120,
-                    minimum_preserve_text="continuity item " * 70,
-                )
-            )
-        ),
+    assert isinstance(candidate, ConversationCompactOutputVNext)
+    assert candidate.evidence_backed_facts[0].evidence_labels == ("E1",)
+    assert candidate.answer_anchors[0].answer_source_labels == ("A1",)
+
+
+def test_prompt_forward_intent_enum_values_match_parser_vnext() -> None:
+    """prompt forward intent enum 示例值必须能被 vNext parser enum 接受。"""
+
+    intent_type_values = _prompt_schema_pipe_values("intent_type")
+    status_values = _prompt_schema_pipe_values("status")
+
+    parsed_intent_types = tuple(
+        ForwardIntentTypeVNext(value) for value in intent_type_values
     )
-    long_candidate = await compactor.compact(_request(), StubCancellationToken())
-
-    assert long_candidate.episode_summary_candidate.goal == (short_candidate.episode_summary_candidate.goal)
-    assert long_candidate.budget_after_compact > short_candidate.budget_after_compact
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_empty_plain_text_or_non_final_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """空、纯文本 final answer 或非 final outcome 不会被映射为 candidate。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final("   ")),
+    parsed_statuses = tuple(
+        ForwardIntentStatusVNext(value) for value in status_values
     )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-    with pytest.raises(LLMCompactionProposalError, match="proposal is empty"):
-        await compactor.compact(_request(), StubCancellationToken())
 
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final("plain text summary")),
-    )
-    with pytest.raises(LLMCompactionProposalError, match="not valid JSON"):
-        await compactor.compact(_request(), StubCancellationToken())
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            EngineRunOutcomeFailed(
-                session_id="session-1",
-                run_id="run-1",
-                error_code="failed",
-                message="failed",
-                provider_request_id=None,
-                recoverable=False,
-            )
-        ),
-    )
-    with pytest.raises(LLMCompactionProposalError, match="runner failed"):
-        await compactor.compact(_request(), StubCancellationToken())
+    assert len(parsed_intent_types) == len(intent_type_values)
+    assert len(parsed_statuses) == len(status_values)
 
 
-@pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_malformed_and_schema_invalid_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """坏 JSON 与 schema-invalid JSON 必须拒绝。"""
+def test_parse_conversation_compact_output_vnext_fails_closed_for_old_schema() -> None:
+    """vNext parser 对旧 candidate schema fail closed。"""
 
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
     )
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final('{"episode_summary_candidate": ')),
-    )
-    with pytest.raises(LLMCompactionProposalError, match="not valid JSON"):
-        await compactor.compact(_request(), StubCancellationToken())
+    old_schema = {
+        "candidate_id": "old-candidate",
+        "episode_summary_candidate": {"summary_text": "old"},
+        "pinned_state_patch_candidate": {"current_goal": {"operation": "replace"}},
+    }
 
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(json.dumps({"episode_summary_candidate": {}}, sort_keys=True))),
-    )
     with pytest.raises(LLMCompactionProposalError, match="missing required key"):
-        await compactor.compact(_request(), StubCancellationToken())
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(old_schema, sort_keys=True),
+        )
 
 
-@pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_overlong_structured_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """claim_text 与 minimum preserve text 上限复用 shared constants。"""
+def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() -> None:
+    """vNext parser 禁止 LLM candidate 引用 current input anchor。"""
 
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
     )
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json(claim_text="x" * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1)))),
-    )
-    with pytest.raises(LLMCompactionProposalError, match="claim_text"):
-        await compactor.compact(_request(), StubCancellationToken())
+    proposal = _proposal_json(compact_input)
+    proposal["session_summary"] = {
+        "summary_text": "bad citation",
+        "source_labels": ["C1"],
+    }
 
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            _final(_proposal_json(minimum_preserve_text="x" * (MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS + 1)))
-        ),
-    )
-    with pytest.raises(
-        LLMCompactionProposalError,
-        match="MinimumPreserveItemCandidate.text",
-    ):
-        await compactor.compact(_request(), StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_non_canonical_evidence_refs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """fact candidate evidence_refs 只能引用 request.canonical_evidence_refs。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json(fact_evidence_refs=("evidence:not-accepted",)))),
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    with pytest.raises(LLMCompactionProposalError, match="unknown label"):
-        await compactor.compact(_request(), StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_parser_rejects_unknown_or_cross_section_labels(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Parser 对未知 label 与跨 section label fail closed。"""
-
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json(preserved_material_labels=("C1", "missing-label")))),
-    )
-    with pytest.raises(LLMCompactionProposalError, match="unknown label"):
-        await compactor.compact(_request(), StubCancellationToken())
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json(fact_evidence_refs=("H1",)))),
-    )
-    with pytest.raises(LLMCompactionProposalError, match="section mismatch"):
-        await compactor.compact(_request(), StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_parser_accepts_parent_label_for_chunked_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Chunked evidence 允许用父标签引用同一个 canonical evidence。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json())),
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    candidate = await compactor.compact(
-        _request(raw_tool_content="large evidence " * 500),
-        StubCancellationToken(),
-    )
-
-    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == ("evidence:accepted-1",)
-    assert candidate.preserved_canonical_evidence_refs == ("evidence:accepted-1",)
-
-
-@pytest.mark.asyncio
-async def test_parser_rejects_free_form_confirmed_subject_patch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """confirmed_subjects patch 不接受没有 Host-neutral kind 的自由文本。"""
-
-    proposal = json.loads(_proposal_json())
-    pinned_patch = proposal["pinned_state_patch_candidate"]
-    assert isinstance(pinned_patch, dict)
-    confirmed_subjects = pinned_patch["confirmed_subjects"]
-    assert isinstance(confirmed_subjects, dict)
-    confirmed_subjects["value"] = ["DAYU_MEMORY_ALPHA"]
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(json.dumps(proposal))),
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    with pytest.raises(
-        LLMCompactionProposalError,
-        match="opaque ref text requires kind prefix",
-    ):
-        await compactor.compact(_request(), StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_fact_candidate_without_evidence_label_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fact candidate 缺少 evidence label 时 parser 必须拒绝。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json(fact_evidence_refs=()))),
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    with pytest.raises(LLMCompactionProposalError, match="evidence label"):
-        await compactor.compact(_request(), StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_minimum_preserve_source_refs_must_be_material_labels(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Minimum preserve source refs 必须是当前 material pack labels。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json(minimum_preserve_source_labels=("payload:accepted-1",)))),
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    with pytest.raises(LLMCompactionProposalError, match="unknown label"):
-        await compactor.compact(_request(), StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_empty_canonical_source_refs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """prompt-local label 映射为空 canonical source refs 时返回明确 schema 错误。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json(preserved_material_labels=("C1",)))),
-    )
-    request = _request()
-    material_pack = request.material_pack
-    provenance_map = dict(material_pack.provenance_map)
-    provenance_map["H1"] = replace(
-        provenance_map["H1"],
-        canonical_source_refs=(),
-    )
-    invalid_pack = CompactMaterialPack(
-        stable_input=material_pack.stable_input,
-        history_input=material_pack.history_input,
-        evidence_input=material_pack.evidence_input,
-        current_input_anchor=material_pack.current_input_anchor,
-        provenance_map=provenance_map,
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    with pytest.raises(
-        LLMCompactionProposalError,
-        match="has no canonical source refs",
-    ):
-        await compactor.compact(
-            replace(request, material_pack=invalid_pack),
-            StubCancellationToken(),
+    with pytest.raises(LLMCompactionProposalError, match="current input anchor"):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
         )
 
 
 @pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_truncated_final_output(
+async def test_llm_context_compactor_compact_uses_vnext_material(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """compactor final answer 若被 length 截断，必须作为脏 proposal 拒绝。"""
+    """LLMContextCompactor.compact 渲染 vNext input 并返回 vNext output。"""
 
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final("partial summary", finish_reason=FinishReason.LENGTH)),
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
+    calls: list[AgentRunRequest] = []
 
-    with pytest.raises(LLMCompactionProposalError, match="truncated"):
-        await compactor.compact(_request(), StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_applies_runner_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """compactor timeout 必须转为稳定 proposal error 并写入取消 token。"""
-
-    async def _hanging_run(request: AgentRunRequest) -> AgentRunResult:
-        """模拟不返回的 Engine public runner。
+    async def fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """返回 deterministic vNext final answer。
 
         :param request: Engine run request。
-        :returns: 不会正常返回。
-        :raises TimeoutError: 外层 ``asyncio.wait_for`` 超时时取消本协程。
+        :returns: Engine final answer。
         """
 
-        del request
-        await asyncio.sleep(10.0)
-        return _final("unreachable")
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _hanging_run)
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(default_timeout_seconds=0.01),
-        runner_options=_runner_options(),
-    )
-    cancellation_token = StubCancellationToken()
-
-    with pytest.raises(LLMCompactionProposalError, match="proposal timed out"):
-        await compactor.compact(_request(), cancellation_token)
-
-    assert cancellation_token.is_cancelled() is True
-    assert cancellation_token.cancel_reason() == "compactor_proposal_timeout"
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """runner failed outcome 的错误摘要不泄漏敏感字段。
-
-    :param monkeypatch: pytest monkeypatch fixture。
-    :returns: ``None``。
-    :raises AssertionError: 错误摘要缺少诊断或泄漏敏感字段时抛出。
-    """
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(
-            EngineRunOutcomeFailed(
-                session_id="session-1",
-                run_id="run-1",
-                error_code="api_key=error-secret",
-                message=(
-                    "http 503 Authorization: Bearer deepsecret "
-                    "api_key=plainsecret token=tokensecret "
-                    "secret=secretvalue transient unavailable"
-                ),
-                provider_request_id="provider-request-1",
-                recoverable=True,
+        calls.append(request)
+        compact_input = conversation_compact_input_vnext_from_material_pack(
+            _request().material_pack
+        )
+        return _final(
+            fake_compaction_proposal_from_material_json(
+                cast(Mapping[str, JsonValue], compact_input.to_json())
             )
-        ),
-    )
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
+        )
 
-    with pytest.raises(LLMCompactionProposalError) as exc_info:
-        await compactor.compact(_request(), StubCancellationToken())
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
 
-    message = str(exc_info.value)
-    assert "error_code=unknown_error" in message
-    assert "recoverable=True" in message
-    assert "503" in message
-    assert "transient unavailable" in message
-    assert "error-secret" not in message
-    assert "deepsecret" not in message
-    assert "plainsecret" not in message
-    assert "tokensecret" not in message
-    assert "secretvalue" not in message
-    assert "provider-request-1" not in message
+    candidate = await _llm_compactor().compact(_request(), StubCancellationToken())
 
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """candidate evidence 与 pinned patch ref 由 Host-owned mapper 生成。"""
-
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json())),
-    )
-
-    candidate = await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact(_request(), StubCancellationToken())
-
-    evidence = candidate.preservation_evidence[0]
-    assert evidence.material_source_refs == (
-        "input-1",
-        "input-2",
-    )
-    assert evidence.canonical_evidence_refs == ("evidence:accepted-1",)
-    assert candidate.episode_summary_candidate.evidence_refs == (evidence.evidence_id,)
-    assert candidate.pinned_state_patch_candidate.current_goal.evidence_refs == (evidence.evidence_id,)
-
-
-@pytest.mark.asyncio
-async def test_range_endpoint_label_with_multiple_refs_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Range endpoint label 映射多个 canonical refs 时必须 fail closed。"""
-
-    request = _request()
-    material_pack = _material_pack_with_history_refs(("input-2", "input-2b"))
-    request = replace(request, material_pack=material_pack)
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json())),
-    )
-
-    with pytest.raises(LLMCompactionProposalError, match="exactly one"):
-        await _llm_compactor(
-            runner_spec=_runner_spec(),
-            runner_options=_runner_options(),
-        ).compact(request, StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_range_endpoint_label_without_ref_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Range endpoint label 没有 canonical ref 时必须 fail closed。"""
-
-    request = _request()
-    material_pack = _material_pack_with_history_refs(())
-    request = replace(request, material_pack=material_pack)
-    monkeypatch.setattr(
-        "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final(_proposal_json())),
-    )
-
-    with pytest.raises(LLMCompactionProposalError, match="no canonical source refs"):
-        await _llm_compactor(
-            runner_spec=_runner_spec(),
-            runner_options=_runner_options(),
-        ).compact(request, StubCancellationToken())
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_uses_runner_retry_policy_without_owning_semantic_repair(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """compactor 透传 RunnerSpec.max_retries，runner failure 不在内部 repair loop。"""
-
-    calls: list[AgentRunRequest] = []
-
-    async def _raising_run(request: AgentRunRequest) -> AgentRunResult:
-        calls.append(request)
-        raise RuntimeError("runner failed")
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _raising_run)
-    runner_spec = _runner_spec(max_retries=5)
-    compactor = _llm_compactor(
-        runner_spec=runner_spec,
-        runner_options=_runner_options(),
-    )
-
-    with pytest.raises(RuntimeError, match="runner failed"):
-        await compactor.compact(_request(), StubCancellationToken())
-
+    assert isinstance(candidate, ConversationCompactOutputVNext)
     assert len(calls) == 1
-    assert calls[0].runner_spec.max_retries == 5
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_projects_reactive_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """reactive compaction request 透传 Attempt / execution identity。"""
-
-    calls: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        """记录 Engine request 并返回合法 proposal。
-
-        :param request: compactor 构造的 Engine request。
-        :returns: final answer outcome。
-        """
-
-        calls.append(request)
-        return _final(_proposal_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    await compactor.compact(
-        _request(attempt_id="attempt-reactive", execution_id="execution-reactive"),
-        StubCancellationToken(),
-    )
-
-    assert len(calls) == 1
-    assert calls[0].attempt_id == "attempt-reactive"
-    assert calls[0].execution_id == "execution-reactive"
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_projects_proactive_identity_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """proactive compaction request 保持 Attempt / execution identity 为空。"""
-
-    calls: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        """记录 Engine request 并返回合法 proposal。
-
-        :param request: compactor 构造的 Engine request。
-        :returns: final answer outcome。
-        """
-
-        calls.append(request)
-        return _final(_proposal_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-    compactor = _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    )
-
-    await compactor.compact(_request(), StubCancellationToken())
-
-    assert len(calls) == 1
-    assert calls[0].attempt_id is None
-    assert calls[0].execution_id is None
-
-
-def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None:
-    """vNext parser 接受 design 24.3 candidate schema 并保留字段。"""
-
-    candidate = parse_conversation_compact_output_vnext(
-        _vnext_input(),
-        _proposal_vnext_json(),
-    )
-
-    assert candidate.schema_version == "conversation_compact_output_v1"
-    assert candidate.session_summary is not None
-    assert candidate.session_summary.summary_text == "Session stayed focused on revenue analysis."
-    assert candidate.evidence_backed_facts[0].evidence_labels == ("E1",)
-    assert candidate.answer_anchors[0].answer_source_labels == ("H1",)
-    assert candidate.forward_intents[0].source_labels == ("H1",)
-    assert candidate.reference_continuity_items[0].source_labels == ("H1",)
-    assert candidate.diagnostics == ()
-
-
-@pytest.mark.parametrize(
-    ("case_name", "match"),
-    (
-        ("unknown", "unknown source label"),
-        ("stale", "stale source label"),
-        ("cross_section", "cross-section label"),
-        ("missing_label", "must be non-empty"),
-        ("empty_text", "must be non-empty"),
-        ("illegal_enum", "is not a valid"),
-        ("current_anchor", "current input anchor"),
-    ),
-)
-def test_parse_conversation_compact_output_vnext_fails_closed(
-    case_name: str,
-    match: str,
-) -> None:
-    """vNext parser 对非法 label、空文本与非法 enum fail closed。"""
-
-    with pytest.raises(LLMCompactionProposalError, match=match):
-        parse_conversation_compact_output_vnext(_vnext_input(), _invalid_proposal_vnext_json(case_name))
-
-
-@pytest.mark.asyncio
-async def test_llm_context_compactor_compact_vnext_uses_vnext_material(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """compact_vnext 渲染 vNext input 并返回 vNext output，不走旧 candidate parser。"""
-
-    calls: list[AgentRunRequest] = []
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
-        """记录 Engine request 并返回合法 vNext proposal。
-
-        :param request: compactor 构造的 Engine request。
-        :returns: final answer outcome。
-        """
-
-        calls.append(request)
-        return _final(_proposal_vnext_json())
-
-    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
-    candidate = await _llm_compactor(
-        runner_spec=_runner_spec(),
-        runner_options=_runner_options(),
-    ).compact_vnext(_vnext_input(), StubCancellationToken())
-
-    assert len(calls) == 1
-    prompt = calls[0].messages[1].content
-    assert prompt is not None
-    assert '"schema_version": "conversation_compact_input_v1"' in prompt
+    request = calls[0]
+    assert request.disable_tools is True
+    assert request.tool_schemas == ()
+    prompt = request.messages[1].content
+    assert isinstance(prompt, str)
+    assert '"previous_compacted_view"' in prompt
+    assert '"trace_material"' in prompt
     assert '"evidence_material"' in prompt
+    assert '"answer_material"' in prompt
     assert '"stable_input"' not in prompt
-    assert candidate.evidence_backed_facts[0].claim_text == "Revenue grew 12% year over year."
+    assert '"history_input"' not in prompt
+    assert '"candidate_id"' not in prompt
 
 
-def _vnext_input() -> ConversationCompactInputVNext:
-    """构造 vNext compact input。
+@pytest.mark.asyncio
+async def test_llm_context_compactor_rejects_non_final_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLMContextCompactor.compact 拒绝非 final answer outcome。"""
 
-    :returns: vNext compact input。
-    """
+    async def fake_run(request: AgentRunRequest) -> AgentRunResult:
+        """返回失败 outcome。
 
-    return conversation_compact_input_vnext_from_material_pack(_request().material_pack)
+        :param request: Engine run request。
+        :returns: Engine failed outcome。
+        """
 
-
-def _proposal_vnext_json(
-    *,
-    claim_text: str = "Revenue grew 12% year over year.",
-    fact_evidence_labels: tuple[str, ...] = ("E1",),
-    fact_evidence_kind: str = "accepted_evidence_material",
-) -> str:
-    """构造 vNext LLM strict JSON proposal。
-
-    :param claim_text: fact claim 文本。
-    :param fact_evidence_labels: fact evidence labels。
-    :param fact_evidence_kind: fact evidence kind。
-    :returns: JSON 文本。
-    """
-
-    proposal: dict[str, JsonValue] = {
-        "schema_version": "conversation_compact_output_v1",
-        "session_summary": {
-            "summary_text": "Session stayed focused on revenue analysis.",
-            "source_labels": ["H1", "E1"],
-        },
-        "evidence_backed_facts": [
-            {
-                "claim_text": claim_text,
-                "evidence_labels": list(fact_evidence_labels),
-                "evidence_kind": fact_evidence_kind,
-                "source_labels": list(fact_evidence_labels),
-            }
-        ],
-        "answer_anchors": [
-            {
-                "anchor_title": "Prior answer",
-                "anchor_items": [{"display_text": "previous assistant turn", "ordinal": 1}],
-                "answer_source_labels": ["H1"],
-            }
-        ],
-        "forward_intents": [
-            {
-                "intent_type": "next_step_note",
-                "text": "Continue the analysis.",
-                "status": "open",
-                "source_labels": ["H1"],
-            }
-        ],
-        "reference_continuity_items": [
-            {
-                "text": "The follow-up refers to the previous answer.",
-                "reason": "local_reference",
-                "source_labels": ["H1"],
-            }
-        ],
-        "diagnostics": [],
-    }
-    return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
-
-
-def _invalid_proposal_vnext_json(case_name: str) -> str:
-    """按 case 名构造非法 vNext proposal。
-
-    :param case_name: 非法场景名。
-    :returns: JSON 文本。
-    :raises ValueError: case 名未知时抛出。
-    """
-
-    if case_name == "unknown":
-        return _proposal_vnext_json(fact_evidence_labels=("missing-label",))
-    if case_name == "stale":
-        return _proposal_vnext_json(fact_evidence_labels=("E99",))
-    if case_name == "cross_section":
-        return _proposal_vnext_json(fact_evidence_labels=("H1",))
-    if case_name == "missing_label":
-        return _proposal_vnext_json(fact_evidence_labels=())
-    if case_name == "empty_text":
-        return _proposal_vnext_json(claim_text="")
-    if case_name == "illegal_enum":
-        return _proposal_vnext_json(fact_evidence_kind="observed_value")
-    if case_name == "current_anchor":
-        return _proposal_vnext_json(fact_evidence_labels=("C1",))
-    raise ValueError(f"unknown invalid vNext proposal case: {case_name}")
-
-
-def _fake_run_factory(
-    outcome: AgentRunResult,
-) -> Callable[[AgentRunRequest], Awaitable[AgentRunResult]]:
-    """构造 async run_agent_and_wait 替身。
-
-    :param outcome: 固定 Engine outcome。
-    :returns: async fake runner。
-    """
-
-    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
         del request
-        return outcome
+        return EngineRunOutcomeFailed(
+            session_id="session-1",
+            run_id="run-1",
+            error_code="provider_error",
+            message="provider failed api_key=secret",
+            provider_request_id=None,
+            client_correlation_id=None,
+            recoverable=False,
+        )
 
-    return _fake_run
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
+
+    with pytest.raises(LLMCompactionProposalError, match="<redacted>"):
+        await _llm_compactor().compact(_request(), StubCancellationToken())
 
 
-def _request(
-    *,
-    raw_tool_content: str = "Revenue grew 12% year over year.",
-    attempt_id: str | None = None,
-    execution_id: str | None = None,
-) -> CompactionRequest:
-    """构造 compaction request。
+def _proposal_json(compact_input: ConversationCompactInputVNext) -> dict[str, JsonValue]:
+    """构造可变 vNext proposal JSON。
 
-    :param raw_tool_content: accepted 工具结果 raw 内容。
-    :param attempt_id: reactive compaction 对应 Attempt id。
-    :param execution_id: reactive compaction 对应 execution id。
-    :returns: CompactionRequest。
+    :param compact_input: vNext compact input。
+    :returns: vNext proposal dict。
+    :raises TypeError: fake proposal 不是 JSON object 时抛出。
     """
 
-    trigger_source = (
-        ContextCompactionTriggerSource.REACTIVE
-        if attempt_id is not None
-        else ContextCompactionTriggerSource.PROACTIVE
+    raw = fake_compaction_proposal_from_material_json(
+        cast(Mapping[str, JsonValue], compact_input.to_json())
     )
-    segment_trigger = (
-        CompactSegmentTrigger.REACTIVE
-        if attempt_id is not None
-        else CompactSegmentTrigger.PROACTIVE
-    )
-    return CompactionRequest(
-        trigger_source=trigger_source,
-        session_id="session-1",
-        run_id="run-1",
-        attempt_id=attempt_id,
-        execution_id=execution_id,
-        memory_snapshot_cursor=7,
-        material_pack=_material_pack(raw_tool_content),
-        segment_selection=initial_segment_selection(
-            trigger_source=segment_trigger,
-            input_cursor=2,
-            material_pack=_material_pack(raw_tool_content),
-        ),
-        evidence_backed_fact_refs=("fact-1",),
-        recent_raw_turn_refs=("input-1",),
-        older_raw_turn_refs=("input-2",),
-        existing_episode_summary_refs=("summary-1",),
-        budget_before_compact=BudgetEstimate(
-            estimated_input_tokens=100,
-            input_budget_tokens=200,
-            soft_threshold_tokens=120,
-            hard_threshold_tokens=80,
-            safety_margin_tokens=20,
-            estimator_digest=_DIGEST,
-            overage_reason=None,
-        ),
-    )
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise TypeError("proposal must be object")
+    return cast(dict[str, JsonValue], parsed)
 
 
-def _material_pack(raw_tool_content: str) -> CompactMaterialPack:
-    """构造测试 material pack。
+def _prompt_schema_pipe_values(field_name: str) -> tuple[str, ...]:
+    """读取 prompt schema 示例中以竖线分隔的字段候选值。
 
-    :param raw_tool_content: raw evidence 文本。
-    :returns: material pack。
+    :param field_name: JSON schema 示例字段名。
+    :returns: 字段候选值元组。
+    :raises AssertionError: 模板中缺少字段或字段值为空时抛出。
     """
 
-    return build_initial_material_pack(
-        current_input_ref="input-1",
-        current_input_text="current user text",
+    field_prefix = f'"{field_name}": "'
+    for line in _PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(field_prefix):
+            raw_values = stripped.removeprefix(field_prefix).split('"', 1)[0]
+            values = tuple(value for value in raw_values.split("|") if value != "")
+            assert len(values) > 0
+            return values
+    raise AssertionError(f"missing prompt schema field: {field_name}")
+
+
+def _llm_compactor() -> LLMContextCompactor:
+    """构造测试用 LLM compactor。
+
+    :returns: 测试 compactor。
+    """
+
+    return LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+        agent_policy=_TEST_AGENT_POLICY,
+        system_prompt=_TEST_SYSTEM_PROMPT,
+        user_prompt_template=_TEST_USER_PROMPT_TEMPLATE,
+    )
+
+
+def _request() -> CompactionRequest:
+    """构造标准 compaction request。
+
+    :returns: compaction request。
+    """
+
+    material_pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="分析公司现金流",
         history_materials=(
             InitialHistoryMaterial(
-                canonical_source_ref="input-2",
-                text="previous assistant turn",
-                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+                canonical_source_ref="event-user-old",
+                text="上一轮用户问题",
+                kind=CompactMaterialBlockKind.USER_INPUT,
+            ),
+            InitialHistoryMaterial(
+                canonical_source_ref="event-answer-old",
+                text="上一轮助手答案",
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             ),
         ),
         evidence_materials=(
@@ -1246,158 +361,39 @@ def _material_pack(raw_tool_content: str) -> CompactMaterialPack:
                 tool_result_event_ref="event-tool-result-1",
                 tool_call_event_ref="event-tool-call-1",
                 readable_tool_name="fins.search",
-                readable_query_text="accepted tool query",
-                raw_result_text=raw_tool_content,
-                readable_source_text="accepted tool evidence",
-                payload_refs=("payload:accepted-1",),
+                readable_query_text="cash flow",
+                raw_result_text="经营现金流同比增长",
+                readable_source_text="2025 年年报现金流量表",
+                payload_refs=("payload:evidence-1",),
             ),
         ),
     )
-
-
-def _material_pack_with_history_refs(
-    canonical_source_refs: tuple[str, ...],
-) -> CompactMaterialPack:
-    """构造替换 H1 provenance refs 的 material pack。
-
-    :param canonical_source_refs: H1 对应 canonical source refs。
-    :returns: compact material pack。
-    """
-
-    pack = _material_pack("Revenue grew 12% year over year.")
-    provenance = dict(pack.provenance_map)
-    history_entry = provenance["H1"]
-    provenance["H1"] = replace(
-        history_entry,
-        canonical_source_refs=canonical_source_refs,
-        source_event_refs=canonical_source_refs,
-    )
-    return replace(pack, provenance_map=provenance)
-
-
-def _proposal_json(
-    *,
-    claim_text: str = "Canonical evidence shows revenue growth.",
-    minimum_preserve_text: str = ("Current user asked to keep the financial analysis context."),
-    fact_evidence_refs: tuple[str, ...] = ("E1",),
-    minimum_preserve_source_labels: tuple[str, ...] = ("C1",),
-    preserved_material_labels: tuple[str, ...] = ("C1", "H1"),
-    preservation_material_labels: tuple[str, ...] = ("C1", "H1"),
-    preservation_evidence_labels: tuple[str, ...] = ("E1",),
-) -> str:
-    """构造 LLM structured JSON proposal。
-
-    :param claim_text: fact candidate claim_text。
-    :param minimum_preserve_text: minimum preserve item text。
-    :param fact_evidence_refs: fact candidate evidence refs。
-    :param minimum_preserve_source_labels: minimum preserve source labels。
-    :param preserved_material_labels: preserved material labels。
-    :param preservation_material_labels: preservation evidence material labels。
-    :param preservation_evidence_labels: preservation evidence labels。
-    :returns: JSON 文本。
-    """
-
-    return json.dumps(
-        {
-            "episode_summary_candidate": {
-                "episode_title": "Context compact summary",
-                "goal": "keep the current user request",
-                "completed_actions": ["reviewed current financial context"],
-                "confirmed_fact_refs": ["fact-1"],
-                "confirmed_fact_summaries": ["fact-1 remains relevant"],
-                "user_constraints": ["keep-current-input:input-1"],
-                "open_questions": ["continue-current-run"],
-                "next_step": "continue with the current user input",
-                "tool_finding_labels": ["E1"],
-            },
-            "pinned_state_patch_candidate": {
-                "current_goal": {
-                    "operation": "replace",
-                    "value": "keep the current user request",
-                },
-                "confirmed_subjects": {
-                    "operation": "replace",
-                    "value": ["subject:fact-1"],
-                },
-                "user_constraints": {
-                    "operation": "replace",
-                    "value": ["keep-current-input:input-1"],
-                },
-                "open_questions": {
-                    "operation": "replace",
-                    "value": ["continue-current-run"],
-                },
-            },
-            "evidence_backed_fact_candidates": [
-                {
-                    "candidate_id": "fact-candidate-1",
-                    "claim_text": claim_text,
-                    "evidence_kind": "observed_value",
-                    "evidence_labels": list(fact_evidence_refs),
-                    "attributes": {},
-                }
-            ],
-            "minimum_preserve_item_candidates": [
-                {
-                    "item_id": "preserve-current-input",
-                    "label": "current input",
-                    "text": minimum_preserve_text,
-                    "source_labels": list(minimum_preserve_source_labels),
-                    "preserve_reason": "needed_for_recent_reference",
-                }
-            ],
-            "preservation_evidence": [
-                {
-                    "material_labels": list(preservation_material_labels),
-                    "evidence_labels": list(preservation_evidence_labels),
-                    "compact_range": {
-                        "range_ref": "range-older-raw-turns",
-                        "start_material_label": "H1",
-                        "end_material_label": "H1",
-                    },
-                }
-            ],
-            "retained_current_input_label": "C1",
-            "preserved_material_labels": list(preserved_material_labels),
-            "preserved_evidence_labels": ["E1"],
-            "preserved_evidence_backed_fact_refs": ["fact-1"],
-            "dropped_ranges": [],
-            "summarized_ranges": [
-                {
-                    "range_ref": "range-older-raw-turns",
-                    "start_material_label": "H1",
-                    "end_material_label": "H1",
-                }
-            ],
-        },
-        sort_keys=True,
-    )
-
-
-def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
-    """构造测试用 canonical evidence envelope。
-
-    :returns: canonical evidence envelope。
-    """
-
-    return AcceptedEvidenceEnvelope(
-        evidence_id="evidence:accepted-1",
-        producer_event_ref="event-tool-result-1",
-        tool_name="fins.search",
-        tool_call_id="tool-call-1",
-        tool_query=AcceptedEvidenceToolQuery(
-            tool_call_requested_event_ref="event-tool-call-1",
-            normalized_arguments_digest=_DIGEST,
-            semantic_input_digest=_DIGEST,
+    return CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        session_id="session-llm",
+        run_id="run-llm",
+        attempt_id=None,
+        execution_id=None,
+        memory_snapshot_cursor=None,
+        material_pack=material_pack,
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=3,
+            material_pack=material_pack,
         ),
-        result_ref=AcceptedEvidenceResultRef(
-            payload_ref="payload:1",
-            payload_digest=_DIGEST,
-            outcome_digest=_DIGEST,
-            truncation_applied=False,
+        evidence_backed_fact_refs=(),
+        recent_raw_turn_refs=("event-current",),
+        older_raw_turn_refs=("event-user-old", "event-answer-old"),
+        existing_episode_summary_refs=(),
+        budget_before_compact=BudgetEstimate(
+            estimated_input_tokens=900,
+            input_budget_tokens=4096,
+            soft_threshold_tokens=3200,
+            hard_threshold_tokens=3900,
+            safety_margin_tokens=200,
+            estimator_digest="estimate-digest",
+            overage_reason=None,
         ),
-        source_refs=(),
-        locator_refs=(),
     )
 
 
@@ -1419,11 +415,9 @@ def _final(content: str, *, finish_reason: FinishReason = FinishReason.STOP) -> 
     )
 
 
-def _runner_spec(max_retries: int = 0, default_timeout_seconds: float = 1.0) -> RunnerSpec:
+def _runner_spec() -> RunnerSpec:
     """构造 RunnerSpec。
 
-    :param max_retries: runner retry 上限。
-    :param default_timeout_seconds: runner 单次默认超时秒数。
     :returns: RunnerSpec。
     """
 
@@ -1437,8 +431,8 @@ def _runner_spec(max_retries: int = 0, default_timeout_seconds: float = 1.0) -> 
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
-        default_timeout_seconds=default_timeout_seconds,
-        max_retries=max_retries,
+        default_timeout_seconds=1.0,
+        max_retries=0,
         provider_request=None,
     )
 

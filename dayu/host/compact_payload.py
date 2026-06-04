@@ -25,74 +25,7 @@ _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
 _FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
 _FIELD_EVIDENCE_LABELS = "evidence_labels"
-_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
-_FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
-_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _SHA256_PREFIX = "sha256:"
-
-
-def optional_text_list_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
-    """从 JSON mapping 中读取可选文本列表字段。
-
-    :param payload: JSON payload 映射。
-    :param field_name: 待读取字段名。
-    :returns: 去除空字符串后的文本 tuple；字段缺失或非法时返回空 tuple。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        return ()
-    result: list[str] = []
-    for item in value:
-        if isinstance(item, str) and item.strip() != "":
-            result.append(item)
-    return tuple(result)
-
-
-def preserved_canonical_evidence_refs(
-    payload: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """读取旧 compact payload 中 preserved canonical evidence refs。
-
-    该 helper 仅保留到 RunInputBuilder 所属 Slice D 切换前避免导入断裂；
-    vNext operation / dispatch 不调用该函数。字段缺失或非法时 fail closed。
-
-    :param payload: ``CONTEXT_COMPACTED`` payload。
-    :returns: canonical evidence refs；vNext payload 返回空 tuple。
-    """
-
-    preserved = payload.get(_FIELD_PRESERVED_FACT_REFS)
-    if not isinstance(preserved, Mapping):
-        return ()
-    return optional_text_list_field(preserved, _FIELD_CANONICAL_EVIDENCE_REFS)
-
-
-def preserved_fact_refs_summary(payload: Mapping[str, JsonValue]) -> str:
-    """渲染旧 compact payload 中 preserved fact refs 的稳定摘要。
-
-    该 helper 仅服务尚未迁移的 RunInputBuilder artifact message；vNext payload
-    不含旧字段时返回空字符串。
-
-    :param payload: ``CONTEXT_COMPACTED`` payload。
-    :returns: preserved fact refs 摘要；vNext payload 返回空字符串。
-    """
-
-    preserved = payload.get(_FIELD_PRESERVED_FACT_REFS)
-    if not isinstance(preserved, Mapping):
-        return ""
-    canonical_evidence_refs = optional_text_list_field(
-        preserved, _FIELD_CANONICAL_EVIDENCE_REFS
-    )
-    evidence_backed_fact_refs = optional_text_list_field(
-        preserved, _FIELD_EVIDENCE_BACKED_FACT_REFS
-    )
-    parts = [
-        f"canonical_evidence_refs={','.join(canonical_evidence_refs)}",
-        f"evidence_backed_fact_refs={','.join(evidence_backed_fact_refs)}",
-    ]
-    return "; ".join(parts)
 
 
 def accepted_evidence_mapping_refs(

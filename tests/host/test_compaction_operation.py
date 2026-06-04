@@ -22,16 +22,9 @@ from dayu.host.compaction import (
     CompactSegmentTrigger,
     CompactQualityCheckResultVNext,
     CompactQualityIssueVNext,
-    CompactionCandidate,
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
-    EpisodeSummaryCandidate,
-    PinnedPatchOperation,
-    PinnedStatePatchCandidate,
-    PinnedStringTupleFieldPatch,
-    PinnedTextFieldPatch,
-    PreservationEvidence,
 )
 from dayu.host.compaction_evidence import (
     SelectedEvidenceBlockRef,
@@ -90,7 +83,7 @@ class _FailOnceCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """执行可重试 proposal。
@@ -104,13 +97,13 @@ class _FailOnceCompactor(FakeContextCompactor):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("proposal failed once")
-        return await self._fake.compact_request_vnext(request, cancellation_token)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _AlwaysFailingCompactor(FakeContextCompactor):
     """始终 proposal 失败的 compactor。"""
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """模拟 proposal failure。
@@ -139,7 +132,7 @@ class _SensitiveFailingCompactor(FakeContextCompactor):
 
         self._exception_message = exception_message
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """模拟 provider 错误消息携带 secret。
@@ -158,7 +151,7 @@ class _SensitiveFailingCompactor(FakeContextCompactor):
 class _EmptyMessageFailingCompactor(FakeContextCompactor):
     """始终抛出空消息 proposal 异常。"""
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """模拟 provider 抛出空消息异常。
@@ -187,7 +180,7 @@ class _CancelAfterFailureCompactor(FakeContextCompactor):
         self.calls = 0
         self._token = token
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """首次 proposal 失败并在重试前请求取消。
@@ -217,7 +210,7 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """返回可修复 quality rejection 后的成功 candidate。
@@ -228,7 +221,7 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
+        candidate = await self._fake.compact(request, cancellation_token)
         if self.calls == 1:
             assert candidate.session_summary is not None
             return replace(
@@ -253,7 +246,7 @@ class _HardThresholdOnceCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """返回 hard-threshold rejection 后的成功 candidate。
@@ -264,7 +257,7 @@ class _HardThresholdOnceCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
+        candidate = await self._fake.compact(request, cancellation_token)
         if self.calls == 1:
             assert candidate.session_summary is not None
             return replace(
@@ -289,7 +282,7 @@ class _RecordingCompactor(FakeContextCompactor):
         self.requests: list[CompactionRequest] = []
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """记录 request 并返回 fake candidate。
@@ -300,7 +293,7 @@ class _RecordingCompactor(FakeContextCompactor):
         """
 
         self.requests.append(request)
-        return await self._fake.compact_request_vnext(request, cancellation_token)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _DistinctFactPassCompactor(FakeContextCompactor):
@@ -315,7 +308,7 @@ class _DistinctFactPassCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """返回带 pass 差异的 accepted vNext fact tuple。
@@ -326,7 +319,7 @@ class _DistinctFactPassCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
+        candidate = await self._fake.compact(request, cancellation_token)
         assert len(candidate.evidence_backed_facts) > 0
         first_fact = candidate.evidence_backed_facts[0]
         return replace(
@@ -352,7 +345,7 @@ class _SecondPassFailingCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """第二次调用抛出 proposal failure。
@@ -366,7 +359,7 @@ class _SecondPassFailingCompactor(FakeContextCompactor):
         self.calls += 1
         if self.calls == 2:
             raise RuntimeError("second pass failed")
-        return await self._fake.compact_request_vnext(request, cancellation_token)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _DistinctPassCompactor(FakeContextCompactor):
@@ -381,7 +374,7 @@ class _DistinctPassCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """返回带 pass 差异的 accepted candidate。
@@ -392,7 +385,7 @@ class _DistinctPassCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
+        candidate = await self._fake.compact(request, cancellation_token)
         assert candidate.session_summary is not None
         return replace(
             candidate,
@@ -1260,28 +1253,16 @@ def test_compaction_request_evidence_inputs_reject_envelope_producer_mismatch(
     ("payload", "message"),
     (
         (
-            {"evidence_backed_fact_candidates": "not-list"},
-            "evidence_backed_fact_candidates must be list",
+            {"accepted_candidate": "not-object"},
+            "accepted_candidate must be object",
         ),
         (
-            {"evidence_backed_fact_candidates": ["not-object"]},
-            "evidence_backed_fact_candidate must be object",
+            {"accepted_candidate": {"evidence_backed_facts": "not-list"}},
+            "evidence_backed_facts must be list",
         ),
         (
-            {"evidence_backed_fact_candidates": [{"candidate_id": ""}]},
-            "candidate_id is invalid",
-        ),
-        (
-            {"preserved_fact_refs": "not-object"},
-            "preserved_fact_refs is invalid",
-        ),
-        (
-            {"preserved_fact_refs": {"evidence_backed_fact_refs": "not-list"}},
-            "evidence_backed_fact_refs must be list",
-        ),
-        (
-            {"preserved_fact_refs": {"evidence_backed_fact_refs": [""]}},
-            "evidence_backed_fact_refs item is invalid",
+            {"accepted_candidate": {"evidence_backed_facts": ["not-object"]}},
+            "evidence_backed_facts\\[0\\] must be object",
         ),
     ),
 )
@@ -1458,7 +1439,7 @@ def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
         assert store.transaction_runner.run_read(read_history_material) == (
             (
                 event_id,
-                CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+                CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
                 "本轮回答中的稳定结论摘要",
             ),
         )
@@ -1480,13 +1461,12 @@ def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
             session_id=session_id,
             event_type="CONTEXT_COMPACTED",
             payload={
-                "preserved_fact_refs": {
-                    "evidence_backed_fact_refs": (["memory-item:evidence_backed_fact:existing:event-old"])
+                "accepted_candidate": {
+                    "evidence_backed_facts": [
+                        {"claim_text": "fact one"},
+                        {"claim_text": "fact two"},
+                    ],
                 },
-                "evidence_backed_fact_candidates": [
-                    {"candidate_id": "fact-new"},
-                    {"candidate_id": "fact-new"},
-                ],
             },
         )
 
@@ -1496,8 +1476,8 @@ def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
             session_id=session_id,
             event_id=compacted_event_id,
         ) == (
-            "memory-item:evidence_backed_fact:existing:event-old",
-            f"memory-item:evidence_backed_fact:fact-new:{compacted_event_id}",
+            f"memory-item:evidence_backed_fact:vnext-fact-1:{compacted_event_id}",
+            f"memory-item:evidence_backed_fact:vnext-fact-2:{compacted_event_id}",
         )
 
 
@@ -1554,7 +1534,7 @@ def _material_pack():
             InitialHistoryMaterial(
                 canonical_source_ref="input-2",
                 text="previous assistant turn",
-                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             ),
         ),
         evidence_materials=(

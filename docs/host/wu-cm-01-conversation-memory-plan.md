@@ -261,6 +261,11 @@ allowed files/modules：
 - `tests/host/fake_compaction.py`，仅当 fake compactor 或 material JSON 行为仍依赖旧 fields
 - `tests/host/test_public_compact_smoke.py`，仅当 public compact smoke 直接断言 material JSON 的旧 `stable_input` / `history_input` / `evidence_input`
 
+necessary dependency fallout：
+
+- `dayu/config/prompts/scenes/conversation_compaction.md` 与 `dayu/config/prompts/scenes/conversation_compaction_user.md` 是 Pre-Slice C compact contract closure 的必要 prompt asset fallout；允许范围只限 vNext prompt schema、vNext material field name 与 parser enum member replacement，不扩大到 config-service、scene assembly 或 runtime prompt loading behavior。
+- `dayu/host/context_fallback.py` 是 Pre-Slice C 删除旧 compact material enum member 后的必要 dependency fallout；允许范围只限 fallback recent-window view 对 vNext material section / enum member 的类型对齐，不扩大 fallback 行为、config-service 或 memory durable/projection 语义。
+
 实现边界：
 
 - `ContextCompactor` 的生产 protocol、`LLMContextCompactor.compact()` 与 operation 调用路径必须收敛到 `ConversationCompactOutputVNext`。若实现阶段临时保留 `compact_request_vnext()`，只能作为未导出的内部拆分 helper，并必须由 public production `compact()` 调用；slice closeout 时不得形成 `compact()` 旧 contract 与 `compact_request_vnext()` vNext contract 并存的双 public method。

@@ -47,11 +47,6 @@ from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
     EventLogContextFallbackProvider,
 )
-from dayu.host.compact_payload import (
-    optional_text_list_field,
-    preserved_canonical_evidence_refs,
-    preserved_fact_refs_summary,
-)
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
     run_input_material_block,
@@ -136,6 +131,9 @@ _PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
 _PAYLOAD_FIELD_GOAL = "goal"
 _PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
 _PAYLOAD_FIELD_USER_CONSTRAINTS = "user_constraints"
+_PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
+_PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _COMPACT_SUMMARY_MAX_CHARS = 1200
 _MEMORY_USER_GOALS_HEADER = "Memory user goals and constraints:"
@@ -1208,7 +1206,7 @@ def build_accepted_tool_evidence_material_blocks(
                     f"{material.tool_result_event_ref}:"
                     f"{material.accepted_evidence_id}"
                 ),
-                section=CompactMaterialSection.EVIDENCE_INPUT,
+                section=CompactMaterialSection.EVIDENCE_MATERIAL,
                 kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
                 text=material.raw_result_text,
                 canonical_source_refs=(material.canonical_source_ref,),
@@ -1312,7 +1310,7 @@ class DurableCompactArtifactProvider:
             messages=(message,),
             compact_artifact_ref=artifact_ref,
             compact_artifact_digest=artifact_digest,
-            represented_evidence_refs=preserved_canonical_evidence_refs(payload),
+            represented_evidence_refs=_preserved_canonical_evidence_refs(payload),
         )
 
 
@@ -2356,8 +2354,8 @@ def build_run_input_material_blocks(
         blocks.append(
             run_input_material_block(
                 block_id=f"compact:{index}",
-                section=CompactMaterialSection.HISTORY_INPUT,
-                kind=CompactMaterialBlockKind.EPISODE_SUMMARY,
+                section=CompactMaterialSection.TRACE_MATERIAL,
+                kind=CompactMaterialBlockKind.SESSION_SUMMARY,
                 text=_run_input_message_content(message),
                 canonical_source_refs=(compact_source_ref,),
                 event_sequence=None,
@@ -2369,7 +2367,7 @@ def build_run_input_material_blocks(
         blocks.append(
             run_input_material_block(
                 block_id=f"continuity:{index}",
-                section=CompactMaterialSection.HISTORY_INPUT,
+                section=CompactMaterialSection.TRACE_MATERIAL,
                 kind=_history_material_kind(message),
                 text=_run_input_message_content(message),
                 canonical_source_refs=(f"message:continuity:{index}",),
@@ -2435,9 +2433,9 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
     :returns: Agent message。
     """
 
-    if block.kind is CompactMaterialBlockKind.RAW_USER_TURN:
+    if block.kind is CompactMaterialBlockKind.USER_INPUT:
         return UserMessage(role=AgentMessageRole.USER, content=block.text)
-    if block.kind is CompactMaterialBlockKind.RAW_ASSISTANT_TURN:
+    if block.kind is CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER:
         return AssistantMessage(
             role=AgentMessageRole.ASSISTANT,
             content=block.text,
@@ -2445,6 +2443,64 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
             tool_calls=(),
         )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
+
+
+def _optional_text_list_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """从 JSON mapping 中读取可选文本列表字段。
+
+    :param payload: JSON payload 映射。
+    :param field_name: 待读取字段名。
+    :returns: 去除空字符串后的文本 tuple；字段缺失或非法时返回空 tuple。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        return ()
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip() != "":
+            result.append(item)
+    return tuple(result)
+
+
+def _preserved_canonical_evidence_refs(
+    payload: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    """读取尚未迁移的 RunInput compact prompt preserved evidence refs。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: canonical evidence refs；vNext payload 返回空 tuple。
+    """
+
+    preserved = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
+    if not isinstance(preserved, Mapping):
+        return ()
+    return _optional_text_list_field(preserved, _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS)
+
+
+def _preserved_fact_refs_summary(payload: Mapping[str, JsonValue]) -> str:
+    """渲染尚未迁移的 RunInput compact prompt preserved fact refs 摘要。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: preserved fact refs 摘要；vNext payload 返回空字符串。
+    """
+
+    preserved = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
+    if not isinstance(preserved, Mapping):
+        return ""
+    canonical_evidence_refs = _optional_text_list_field(
+        preserved, _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS
+    )
+    evidence_backed_fact_refs = _optional_text_list_field(
+        preserved, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS
+    )
+    parts = [
+        f"canonical_evidence_refs={','.join(canonical_evidence_refs)}",
+        f"evidence_backed_fact_refs={','.join(evidence_backed_fact_refs)}",
+    ]
+    return "; ".join(parts)
 
 
 def _run_input_message_content(message: AgentMessage) -> str:
@@ -2474,8 +2530,10 @@ def _material_section_for_message(message: AgentMessage) -> CompactMaterialSecti
     """
 
     if isinstance(message, SystemMessage):
-        return CompactMaterialSection.STABLE_INPUT
-    return CompactMaterialSection.HISTORY_INPUT
+        return CompactMaterialSection.PREVIOUS_COMPACTED_VIEW
+    if isinstance(message, AssistantMessage):
+        return CompactMaterialSection.ANSWER_MATERIAL
+    return CompactMaterialSection.TRACE_MATERIAL
 
 
 def _memory_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
@@ -2489,14 +2547,14 @@ def _memory_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
     if content.startswith(_MEMORY_EVIDENCE_BACKED_FACTS_HEADER):
         return CompactMaterialBlockKind.EVIDENCE_BACKED_FACT
     if content.startswith(_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER):
-        return CompactMaterialBlockKind.WORKING_ASSUMPTION
+        return CompactMaterialBlockKind.FORWARD_INTENT
     if content.startswith(_MEMORY_EPISODE_SUMMARIES_HEADER):
-        return CompactMaterialBlockKind.EPISODE_SUMMARY
+        return CompactMaterialBlockKind.SESSION_SUMMARY
     if isinstance(message, UserMessage):
-        return CompactMaterialBlockKind.RAW_USER_TURN
+        return CompactMaterialBlockKind.USER_INPUT
     if isinstance(message, AssistantMessage):
-        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
-    return CompactMaterialBlockKind.PINNED_STATE
+        return CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER
+    return CompactMaterialBlockKind.SESSION_SUMMARY
 
 
 def _history_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
@@ -2507,10 +2565,10 @@ def _history_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
     """
 
     if isinstance(message, UserMessage):
-        return CompactMaterialBlockKind.RAW_USER_TURN
+        return CompactMaterialBlockKind.USER_INPUT
     if isinstance(message, AssistantMessage):
-        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
-    return CompactMaterialBlockKind.EPISODE_SUMMARY
+        return CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER
+    return CompactMaterialBlockKind.SESSION_SUMMARY
 
 
 def _memory_material_source_ref(memory: MemorySnapshotView) -> str:
@@ -2812,7 +2870,7 @@ def _compact_artifact_message_content(
     summary = _optional_summary_text_from_compacted_payload(
         payload, max_summary_chars=max_summary_chars
     )
-    preserved_fact_refs = preserved_fact_refs_summary(payload)
+    preserved_fact_refs = _preserved_fact_refs_summary(payload)
     lines = [
         "Accepted compact artifact is available for this run.",
         f"compact_artifact_ref={artifact_ref}",
@@ -2841,8 +2899,8 @@ def _optional_summary_text_from_compacted_payload(
         return None
     candidate_id = _optional_mapping_text(value, _PAYLOAD_FIELD_CANDIDATE_ID)
     goal = _optional_mapping_text(value, _PAYLOAD_FIELD_GOAL)
-    constraints = optional_text_list_field(value, _PAYLOAD_FIELD_USER_CONSTRAINTS)
-    questions = optional_text_list_field(value, _PAYLOAD_FIELD_OPEN_QUESTIONS)
+    constraints = _optional_text_list_field(value, _PAYLOAD_FIELD_USER_CONSTRAINTS)
+    questions = _optional_text_list_field(value, _PAYLOAD_FIELD_OPEN_QUESTIONS)
     parts = []
     if candidate_id is not None:
         parts.append(f"candidate_id={candidate_id}")

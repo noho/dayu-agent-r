@@ -30,7 +30,7 @@ from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationContinuityView,
     ConversationMemorySnapshot,
-    EvidenceBackedFactKind,
+    MemoryEvidenceBackedFactKind,
     EvidenceBackedFactView,
     MemoryIncludedReason,
     MemoryProjectionPolicy,
@@ -166,8 +166,8 @@ def test_material_pack_one_to_one_section_mapping_rejects_duplicate_content() ->
     )
     duplicate = run_input_material_block(
         block_id="history-duplicate",
-        section=CompactMaterialSection.HISTORY_INPUT,
-        kind=CompactMaterialBlockKind.RAW_USER_TURN,
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
         text="current_goal=same goal",
         canonical_source_refs=("snapshot-duplicate",),
         event_sequence=1,
@@ -196,8 +196,8 @@ def test_current_input_anchor_does_not_duplicate_history_raw_turn() -> None:
 
     current_history = run_input_material_block(
         block_id="history-current",
-        section=CompactMaterialSection.HISTORY_INPUT,
-        kind=CompactMaterialBlockKind.RAW_USER_TURN,
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
         text="current input",
         canonical_source_refs=("event-current",),
         event_sequence=5,
@@ -221,7 +221,7 @@ def test_current_input_anchor_does_not_duplicate_history_raw_turn() -> None:
     )
 
     assert pack.current_input_anchor.anchor_text == "current input"
-    assert tuple(block.text for block in pack.history_input) == ("old input",)
+    assert tuple(block.text for block in pack.trace_material) == ("old input",)
 
 
 def test_conversation_compact_input_vnext_maps_material_without_citable_current_anchor() -> None:
@@ -234,12 +234,12 @@ def test_conversation_compact_input_vnext_maps_material_without_citable_current_
             InitialHistoryMaterial(
                 canonical_source_ref="event-user-old",
                 text="old input",
-                kind=CompactMaterialBlockKind.RAW_USER_TURN,
+                kind=CompactMaterialBlockKind.USER_INPUT,
             ),
             InitialHistoryMaterial(
                 canonical_source_ref="event-answer-old",
                 text="old answer",
-                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             ),
         ),
         evidence_materials=(
@@ -262,8 +262,8 @@ def test_conversation_compact_input_vnext_maps_material_without_citable_current_
 
     assert vnext_input.current_input_anchor.anchor_label == "C1"
     assert "C1" not in vnext_input.citable_source_labels
-    assert tuple(item.source_label for item in vnext_input.trace_material) == ("H1",)
-    assert tuple(item.source_label for item in vnext_input.answer_material) == ("H2",)
+    assert tuple(item.source_label for item in vnext_input.trace_material) == ("T1",)
+    assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
     assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
     assert isinstance(vnext_json, dict)
     assert "trace_material" in vnext_json
@@ -282,12 +282,12 @@ def test_conversation_compact_input_vnext_maps_user_turn_to_trace() -> None:
             InitialHistoryMaterial(
                 canonical_source_ref="event-user-old",
                 text="old user input",
-                kind=CompactMaterialBlockKind.RAW_USER_TURN,
+                kind=CompactMaterialBlockKind.USER_INPUT,
             ),
             InitialHistoryMaterial(
                 canonical_source_ref="event-answer-old",
                 text="old assistant answer",
-                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             ),
         ),
         evidence_materials=(),
@@ -296,7 +296,7 @@ def test_conversation_compact_input_vnext_maps_user_turn_to_trace() -> None:
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
     assert tuple(item.text for item in vnext_input.trace_material) == ("old user input",)
-    assert tuple(item.source_label for item in vnext_input.trace_material) == ("H1",)
+    assert tuple(item.source_label for item in vnext_input.trace_material) == ("T1",)
 
 
 def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> None:
@@ -309,12 +309,12 @@ def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> Non
             InitialHistoryMaterial(
                 canonical_source_ref="event-user-old",
                 text="old user input",
-                kind=CompactMaterialBlockKind.RAW_USER_TURN,
+                kind=CompactMaterialBlockKind.USER_INPUT,
             ),
             InitialHistoryMaterial(
                 canonical_source_ref="event-answer-old",
                 text="old assistant answer",
-                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             ),
         ),
         evidence_materials=(),
@@ -325,7 +325,7 @@ def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> Non
     assert tuple(item.answer_text for item in vnext_input.answer_material) == (
         "old assistant answer",
     )
-    assert tuple(item.source_label for item in vnext_input.answer_material) == ("H2",)
+    assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
 
 
 def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -> None:
@@ -413,7 +413,7 @@ def test_conversation_compact_input_vnext_current_anchor_not_citable() -> None:
             InitialHistoryMaterial(
                 canonical_source_ref="event-user-old",
                 text="old user input",
-                kind=CompactMaterialBlockKind.RAW_USER_TURN,
+                kind=CompactMaterialBlockKind.USER_INPUT,
             ),
         ),
         evidence_materials=(),
@@ -574,7 +574,7 @@ def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
     evidence_map = prompt_local_evidence_map(pack)
 
     assert pack.evidence_labels == ("E1.1", "E1.2")
-    assert tuple(block.raw_result_text for block in pack.evidence_input) == (
+    assert tuple(block.raw_result_text for block in pack.evidence_material) == (
         "A" * EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
         "A" * 7,
     )
@@ -604,8 +604,8 @@ def _history_block(
 
     return run_input_material_block(
         block_id=block_id,
-        section=CompactMaterialSection.HISTORY_INPUT,
-        kind=CompactMaterialBlockKind.RAW_USER_TURN,
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
@@ -635,7 +635,7 @@ def _evidence_block(
 
     return run_input_material_block(
         block_id=block_id,
-        section=CompactMaterialSection.EVIDENCE_INPUT,
+        section=CompactMaterialSection.EVIDENCE_MATERIAL,
         kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
@@ -839,7 +839,7 @@ def _snapshot_with_goal_and_fact(
             EvidenceBackedFactView(
                 item_id="memory-item:fact-test",
                 claim_text=claim_text,
-                evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+                evidence_kind=MemoryEvidenceBackedFactKind.OBSERVED_VALUE,
                 evidence_refs=("evidence:accepted",),
                 attributes={},
                 provenance=MemoryProvenanceRef(

@@ -553,7 +553,7 @@ def _required_block_ids(
     selected: set[str] = {current_block_id}
     selected.update(floor_ids)
     for block in blocks:
-        if block.section is CompactMaterialSection.STABLE_INPUT or block.already_represented:
+        if block.section is CompactMaterialSection.PREVIOUS_COMPACTED_VIEW or block.already_represented:
             selected.add(block.block_id)
     return frozenset(selected)
 
@@ -624,8 +624,8 @@ def _is_raw_turn_block(block: RunInputMaterialBlock) -> bool:
     """
 
     return block.kind in (
-        CompactMaterialBlockKind.RAW_USER_TURN,
-        CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+        CompactMaterialBlockKind.USER_INPUT,
+        CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
     )
 
 

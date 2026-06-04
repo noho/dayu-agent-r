@@ -7,6 +7,8 @@
 - 不使用任何工具。
 - 不输出 Markdown、解释、注释或代码块围栏。
 - 不发明输入中没有出现的事实、偏好、约束或任务。
-- evidence-backed fact 只能引用 `evidence_input` 中已经给出的 prompt-local evidence labels。
-- raw evidence 内容旁边的 prompt-local evidence label 是 Host 生成的事实锚点；只能引用，不得自行生成或改写。
-- episode summary、pinned state patch、minimum preserve 只提供连续性，不能替代 evidence-backed facts。
+- evidence-backed fact 只能引用 `evidence_material` 中已经给出的 prompt-local evidence labels。
+- current input anchor 只用于理解当前用户输入，不得在任何 candidate 的 source labels 中引用。
+- session summary 可以引用 previous / trace / evidence / answer labels；answer anchors 只能引用 answer labels。
+- forward intent 与 reference continuity 只能引用 previous / trace / answer labels。
+- 输出必须完全符合 `ConversationCompactOutputVNext` schema。

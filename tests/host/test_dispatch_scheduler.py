@@ -414,7 +414,7 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """执行 compact 并验证当前不在外层 write transaction 内。
@@ -427,7 +427,7 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         self.calls += 1
         row = self._transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, request.run_id))
         assert row is not None
-        return await self._fake.compact_request_vnext(request, cancellation_token)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _StaleMutatingCompactor(FakeContextCompactor):
@@ -443,7 +443,7 @@ class _StaleMutatingCompactor(FakeContextCompactor):
         self._transaction_runner = transaction_runner
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """先把源 Run 失败收口，再返回 candidate。
@@ -473,13 +473,13 @@ class _StaleMutatingCompactor(FakeContextCompactor):
             )
 
         self._transaction_runner.run_write(_operation)
-        return await self._fake.compact_request_vnext(request, cancellation_token)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _RaisingCompactor(FakeContextCompactor):
     """测试用始终失败 compactor。"""
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """模拟 proposal failure。
@@ -507,7 +507,7 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """构造一次可修复 quality rejection。
@@ -518,7 +518,7 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         """
 
         self.calls += 1
-        candidate = await self._fake.compact_request_vnext(request, cancellation_token)
+        candidate = await self._fake.compact(request, cancellation_token)
         if self.calls == 1:
             return replace(
                 candidate,
@@ -545,7 +545,7 @@ class _RequestCapturingCompactor(FakeContextCompactor):
         self.requests: list[CompactionRequest] = []
         self._fake = FakeContextCompactor()
 
-    async def compact_request_vnext(
+    async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
     ) -> ConversationCompactOutputVNext:
         """记录 request 并返回 fake candidate。
@@ -556,7 +556,7 @@ class _RequestCapturingCompactor(FakeContextCompactor):
         """
 
         self.requests.append(request)
-        return await self._fake.compact_request_vnext(request, cancellation_token)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _CloseFailingHandle(_FakeHandle):
@@ -4273,8 +4273,11 @@ async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
         factory = _RepeatedReactiveOverflowWorkerFactory()
-        policy = _soft_compact_policy(max_reactive_compactions_per_run=2)
-        expected_attempt_count = 2
+        max_reactive_compactions_per_run = 2
+        policy = _soft_compact_policy(
+            max_reactive_compactions_per_run=max_reactive_compactions_per_run
+        )
+        expected_attempt_count = max_reactive_compactions_per_run + 1
         scheduler = await _open_scheduler(
             tmp_path,
             store,
@@ -4289,7 +4292,7 @@ async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
 
             await _wait_for_event_count(
                 store.transaction_runner,
-                CONTEXT_COMPACTED,
+                CONTEXT_COMPACTION_FAILED,
                 expected_count=1,
             )
 
@@ -4300,20 +4303,30 @@ async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
                 seeded.run_id,
             )
 
-            assert run.status in (
-                RunStatus.RECOVERING,
-                RunStatus.RUNNING,
-                RunStatus.FAILED,
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
             )
-            assert factory.created >= 1
-            assert len(factory.accepted_snapshots) >= 1
+            payload = _event_payload(failed)
+
+            assert run.status == RunStatus.FAILED
+            assert factory.created == expected_attempt_count
+            assert len(factory.accepted_snapshots) == expected_attempt_count
             assert actual_attempt_count == expected_attempt_count
-            assert actual_attempt_count <= expected_attempt_count
             assert event_types.count(CONTEXT_COMPACTION_REQUESTED) == (
-                1
+                max_reactive_compactions_per_run
             )
             assert event_types.count(CONTEXT_COMPACTED) == (
-                1
+                max_reactive_compactions_per_run
+            )
+            assert event_types.count(CONTEXT_COMPACTION_FAILED) == 1
+            assert payload["failure_reason"] == "reactive_compact_limit_reached"
+            assert_failed_payload_no_fallback(
+                payload,
+                expected_operation_id=None,
+                expected_attempt_count=0,
+                expected_retry_repair_budget_exhausted=False,
             )
             assert event_types.count("RUN_LOST") == 0
         finally:
