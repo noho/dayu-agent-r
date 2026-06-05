@@ -9,8 +9,21 @@ from pathlib import Path
 import pytest
 
 import dayu.host.compaction_operation as compaction_operation
+import dayu.host.dispatch as dispatch
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_executor import ToolExecutor
+from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import runner_role_sequence_digest
+from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
@@ -31,6 +44,10 @@ from dayu.host.compaction_evidence import (
     collect_selected_compaction_request_evidence_inputs,
 )
 from dayu.host.compaction_operation import run_compaction_operation
+from dayu.host.compaction_operation import (
+    CompactorProposalManifestReference,
+    CompactorProposalRunInput,
+)
 from dayu.host.context_events import build_context_compaction_attempt_rejected_payload
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
@@ -58,6 +75,7 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.codec import sha256_digest_json
 from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
@@ -397,6 +415,222 @@ class _DistinctPassCompactor(FakeContextCompactor):
         )
 
 
+class _RejectingToolExecutor(ToolExecutor):
+    """测试用禁用工具 executor。"""
+
+    async def execute(
+        self,
+        request: BatchToolExecutionRequest,
+    ) -> BatchToolExecutionOutcome:
+        """返回空工具执行结果。
+
+        :param request: Engine 工具执行请求。
+        :returns: 空 outcome。
+        """
+
+        del request
+        return BatchToolExecutionOutcome(records=())
+
+
+class _RecordingProposalManifestRecorder:
+    """记录 proposal manifest recorder 调用。"""
+
+    def __init__(self, events: list[str]) -> None:
+        """初始化调用记录。
+
+        :param events: 共享顺序记录列表。
+        :returns: ``None``。
+        """
+
+        self.events = events
+        self.references: list[CompactorProposalManifestReference] = []
+
+    def record_compactor_proposal_manifest(
+        self,
+        *,
+        request: CompactionRequest,
+        prepared_input: CompactorProposalRunInput,
+        compaction_operation_id: str,
+        compaction_attempt_number: int,
+    ) -> CompactorProposalManifestReference:
+        """记录 proposal manifest 并返回 deterministic ref。
+
+        :param request: Host compaction request。
+        :param prepared_input: prepared proposal input。
+        :param compaction_operation_id: operation id。
+        :param compaction_attempt_number: attempt 序号。
+        :returns: fake manifest reference。
+        """
+
+        self.events.append("record")
+        reference = CompactorProposalManifestReference(
+            manifest_event_id=f"event-manifest-{compaction_attempt_number}",
+            manifest_payload_ref=(
+                f"runner-call-manifest:{compaction_operation_id}:"
+                f"{compaction_attempt_number}"
+            ),
+            manifest_digest=prepared_input.role_sequence_digest,
+            compactor_input_projection_ref=(
+                f"compactor-input-projection:{request.run_id}:"
+                f"{compaction_attempt_number}"
+            ),
+            compactor_input_projection_digest=(
+                prepared_input.compactor_input_projection_digest
+            ),
+        )
+        self.references.append(reference)
+        return reference
+
+
+class _PreparedManifestCompactor(FakeContextCompactor):
+    """支持 prepared proposal manifest 的测试 compactor。"""
+
+    def __init__(self, events: list[str], *, fail_run: bool = False) -> None:
+        """初始化 fake compactor。
+
+        :param events: 共享顺序记录列表。
+        :param fail_run: run 阶段是否抛出 proposal failure。
+        :returns: ``None``。
+        """
+
+        self.events = events
+        self.fail_run = fail_run
+        self._fake = FakeContextCompactor()
+
+    def prepare_compactor_proposal_run_input(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        compaction_operation_id: str | None,
+        compaction_attempt_number: int,
+    ) -> CompactorProposalRunInput:
+        """构造测试用 prepared proposal input。
+
+        :param request: Host compaction request。
+        :param cancellation_token: Host cancellation token。
+        :param compaction_operation_id: operation id。
+        :param compaction_attempt_number: attempt 序号。
+        :returns: prepared proposal input。
+        """
+
+        del cancellation_token
+        self.events.append("prepare")
+        compact_input = compaction_operation.conversation_compact_input_vnext_from_material_pack(
+            request.material_pack
+        )
+        agent_request = _proposal_agent_request(
+            request,
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+        )
+        roles = tuple(message.role.value for message in agent_request.messages)
+        projection = {
+            "projection_kind": "compactor_input_projection",
+            "compaction_request_digest": request.digest(),
+        }
+        return CompactorProposalRunInput(
+            compact_input=compact_input,
+            agent_request=agent_request,
+            compaction_request_digest=request.digest(),
+            compactor_engine_run_id=agent_request.run_id,
+            message_count=len(agent_request.messages),
+            role_sequence_digest=runner_role_sequence_digest(roles),
+            system_prompt_asset_digest=_DIGEST,
+            user_prompt_template_digest=_DIGEST,
+            user_prompt_digest=sha256_digest_json({"user_prompt": "user"}),
+            compactor_input_projection=projection,
+            compactor_input_projection_digest=sha256_digest_json(projection),
+        )
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """执行 prepared proposal。
+
+        :param prepared_input: prepared proposal input。
+        :returns: fake candidate。
+        :raises RuntimeError: ``fail_run`` 为真时抛出。
+        """
+
+        self.events.append("run")
+        if self.fail_run:
+            raise RuntimeError("prepared proposal failed")
+        return await self._fake.compact(
+            _request(),
+            prepared_input.agent_request.cancellation_token,
+        )
+
+
+def _proposal_agent_request(
+    request: CompactionRequest,
+    *,
+    compaction_operation_id: str | None,
+    compaction_attempt_number: int,
+) -> AgentRunRequest:
+    """构造测试用 compactor AgentRunRequest。
+
+    :param request: compaction request。
+    :param compaction_operation_id: operation id。
+    :param compaction_attempt_number: attempt 序号。
+    :returns: AgentRunRequest。
+    """
+
+    return AgentRunRequest(
+        run_id=(
+            f"compactor-run:{request.run_id}:"
+            f"{compaction_operation_id}:{compaction_attempt_number}"
+        ),
+        session_id="context-compactor:test",
+        attempt_id=None,
+        execution_id=None,
+        messages=(
+            SystemMessage(role=AgentMessageRole.SYSTEM, content="system"),
+            UserMessage(role=AgentMessageRole.USER, content="user"),
+        ),
+        disable_tools=True,
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
+        tool_schemas=(),
+        tool_executor=_RejectingToolExecutor(),
+        cancellation_token=StubCancellationToken(),
+    )
+
+
+def _runner_spec() -> RunnerSpec:
+    """构造测试 RunnerSpec。
+
+    :returns: RunnerSpec。
+    """
+
+    return RunnerSpec(
+        provider="test",
+        model="test-model",
+        endpoint="https://example.invalid",
+        api_key_ref="secret:test",
+        headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
+        supports_tool_calling=False,
+        supports_streaming=False,
+        supports_stream_usage=False,
+        default_timeout_seconds=1.0,
+        max_retries=0,
+        provider_request=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_compaction_operation_retries_async_proposal_failure() -> None:
     """operation await async compactor，并保留 proposal failure 后 retry 行为。"""
@@ -416,6 +650,93 @@ async def test_run_compaction_operation_retries_async_proposal_failure() -> None
     assert len(result.rejected_attempts) == 1
     assert result.rejected_attempts[0].repairable is True
     assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_records_prepared_proposal_manifest_before_call() -> None:
+    """prepared compactor 在 proposal call 前记录 manifest 并传出 accepted ref。"""
+
+    events: list[str] = []
+    recorder = _RecordingProposalManifestRecorder(events)
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_PreparedManifestCompactor(events),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+        compaction_operation_id="operation-prepared-accepted",
+        proposal_manifest_recorder=recorder,
+    )
+
+    assert events == ["prepare", "record", "run"]
+    assert result.accepted_candidate is not None
+    assert result.accepted_proposal_manifest_ref == (
+        "runner-call-manifest:operation-prepared-accepted:1"
+    )
+    assert result.accepted_proposal_manifest_digest == (
+        recorder.references[0].manifest_digest
+    )
+    assert len(result.rejected_attempts) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest_ref() -> None:
+    """proposal failure attempt 通过 rejected summary 暴露 proposal manifest。"""
+
+    events: list[str] = []
+    recorder = _RecordingProposalManifestRecorder(events)
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_PreparedManifestCompactor(events, fail_run=True),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+        compaction_operation_id="operation-prepared-failed",
+        proposal_manifest_recorder=recorder,
+    )
+
+    assert events == ["prepare", "record", "run"]
+    assert result.accepted_candidate is None
+    assert len(result.rejected_attempts) == 1
+    rejected = result.rejected_attempts[0]
+    assert rejected.proposal_manifest_ref == (
+        "runner-call-manifest:operation-prepared-failed:1"
+    )
+    assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
+
+
+def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> None:
+    """accepted compaction 缺 proposal manifest ref/digest 时 fail-closed。"""
+
+    missing_ref = compaction_operation.CompactionOperationResult(
+        accepted_candidate=None,
+        quality_result=None,
+        rejected_attempts=(),
+        failure_reason=None,
+        budget_after_attempted_compact=10,
+        accepted_proposal_manifest_ref=None,
+        accepted_proposal_manifest_digest=_DIGEST,
+    )
+    missing_digest = compaction_operation.CompactionOperationResult(
+        accepted_candidate=None,
+        quality_result=None,
+        rejected_attempts=(),
+        failure_reason=None,
+        budget_after_attempted_compact=10,
+        accepted_proposal_manifest_ref="runner-call-manifest:test",
+        accepted_proposal_manifest_digest=None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="accepted compaction is missing proposal manifest ref",
+    ):
+        dispatch._required_compactor_manifest_ref(missing_ref)
+    with pytest.raises(
+        RuntimeError,
+        match="accepted compaction is missing proposal manifest digest",
+    ):
+        dispatch._required_compactor_manifest_digest(missing_digest)
 
 
 @pytest.mark.asyncio

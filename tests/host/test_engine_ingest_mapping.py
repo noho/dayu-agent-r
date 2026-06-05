@@ -14,10 +14,15 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import ToolCallRequest
+from dayu.contracts.tool_executor import ToolExecutor
+from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     ContentDeltaData,
@@ -43,6 +48,12 @@ from dayu.engine.contracts.engine_events import (
     runner_role_sequence_digest,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AssistantToolCallBatchSnapshot,
@@ -71,11 +82,15 @@ from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
     COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
 )
+from dayu.host.compact_material import (
+    conversation_compact_input_vnext_from_material_pack,
+)
 from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactionRequest,
     ConversationCompactOutputVNext,
 )
+from dayu.host.compaction_operation import CompactorProposalRunInput
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     context_budget_policy_from_threshold_tokens,
@@ -233,6 +248,106 @@ class _RaisingCompactor(FakeContextCompactor):
 
         del cancellation_token
         raise RuntimeError(f"proposal failed for {request.run_id}")
+
+
+class _RejectingToolExecutor(ToolExecutor):
+    """测试用工具执行器，prepared compactor 路径不会实际调用。"""
+
+    async def execute(
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
+        """拒绝意外工具执行。
+
+        :param request: 批式工具执行请求。
+        :returns: 不会返回。
+        :raises AssertionError: 一旦被调用即抛出。
+        """
+
+        del request
+        raise AssertionError("prepared compactor test must not execute tools")
+
+
+class _PreparedManifestReactiveCompactor(FakeContextCompactor):
+    """支持 prepared proposal manifest 的 reactive 测试 compactor。"""
+
+    def __init__(self, *, fail_run: bool = False) -> None:
+        """初始化 prepared compactor。
+
+        :param fail_run: 是否在 prepared proposal 执行阶段抛错。
+        :returns: ``None``。
+        """
+
+        self.fail_run = fail_run
+        self.calls = 0
+        self._prepared_request: CompactionRequest | None = None
+
+    def prepare_compactor_proposal_run_input(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        compaction_operation_id: str | None,
+        compaction_attempt_number: int,
+    ) -> CompactorProposalRunInput:
+        """构造测试用 prepared compactor proposal input。
+
+        :param request: Host compaction request。
+        :param cancellation_token: Host cancellation token。
+        :param compaction_operation_id: operation id。
+        :param compaction_attempt_number: operation 内 attempt 序号。
+        :returns: prepared proposal input。
+        """
+
+        del cancellation_token
+        self._prepared_request = request
+        compact_input = conversation_compact_input_vnext_from_material_pack(
+            request.material_pack
+        )
+        agent_request = _proposal_agent_request(
+            request,
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+        )
+        projection = {
+            "projection_kind": "reactive_compactor_input_projection",
+            "compaction_request_digest": request.digest(),
+        }
+        roles = tuple(message.role.value for message in agent_request.messages)
+        return CompactorProposalRunInput(
+            compact_input=compact_input,
+            agent_request=agent_request,
+            compaction_request_digest=request.digest(),
+            compactor_engine_run_id=agent_request.run_id,
+            message_count=len(agent_request.messages),
+            role_sequence_digest=runner_role_sequence_digest(roles),
+            system_prompt_asset_digest=_CALL_CONTEXT_DIGEST,
+            user_prompt_template_digest=_CALL_CONTEXT_DIGEST,
+            user_prompt_digest=sha256_digest_json({"user_prompt": "reactive"}),
+            compactor_input_projection=projection,
+            compactor_input_projection_digest=sha256_digest_json(projection),
+        )
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """执行 prepared proposal。
+
+        :param prepared_input: prepared proposal input。
+        :returns: fake compact candidate。
+        :raises RuntimeError: ``fail_run`` 为真时抛出。
+        """
+
+        self.calls += 1
+        if self.fail_run:
+            raise RuntimeError("prepared reactive proposal failed")
+        request = self._prepared_request
+        if request is None:
+            raise AssertionError("prepared request is missing")
+        return await super().compact(
+            request,
+            prepared_input.agent_request.cancellation_token,
+        )
 
 
 class _WakeupSpy:
@@ -507,6 +622,38 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
 
 
 @pytest.mark.asyncio
+async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
+    tmp_path: Path,
+) -> None:
+    """reactive accepted compact payload 携带 prepared proposal manifest 引用。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=_PreparedManifestReactiveCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=40))
+
+        compacted_rows = tuple(
+            event for event in result.events if event.event_type == CONTEXT_COMPACTED
+        )
+        assert len(compacted_rows) == 1
+        compacted_payload = _payload(compacted_rows[0])
+        assert isinstance(
+            compacted_payload["accepted_proposal_manifest_ref"], str
+        )
+        assert compacted_payload["accepted_proposal_manifest_ref"].startswith(
+            "runner-call-manifest:"
+        )
+        assert isinstance(
+            compacted_payload["accepted_proposal_manifest_digest"], str
+        )
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 1
+
+
+@pytest.mark.asyncio
 async def test_reactive_freezes_overflow_material_list_before_compaction(
     tmp_path: Path,
 ) -> None:
@@ -625,6 +772,42 @@ async def test_reactive_compaction_attempt_rejected_uses_request_event_operation
         assert result.events[0].event_type == CONTEXT_COMPACTION_REQUESTED
         assert rejected_payload["operation_id"] == result.events[0].event_id
         assert requested_payload["estimator_digest"] != rejected_payload["operation_id"]
+
+
+@pytest.mark.asyncio
+async def test_reactive_prepared_rejected_attempt_records_proposal_manifest(
+    tmp_path: Path,
+) -> None:
+    """reactive rejected attempt payload 携带 prepared proposal manifest 引用。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=context_budget_policy_from_threshold_tokens(
+                context_window_size=100,
+                soft_threshold_tokens=45,
+                hard_threshold_tokens=80,
+                max_compaction_attempts_per_operation=1,
+                policy_ref=_REACTIVE_POLICY_REF,
+            ),
+            context_compactor=_PreparedManifestReactiveCompactor(fail_run=True),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=39))
+
+        rejected_rows = tuple(
+            event
+            for event in result.events
+            if event.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
+        )
+        assert len(rejected_rows) == 1
+        rejected_payload = _payload(rejected_rows[0])
+        assert isinstance(rejected_payload["proposal_manifest_ref"], str)
+        assert rejected_payload["proposal_manifest_ref"].startswith(
+            "runner-call-manifest:"
+        )
+        assert isinstance(rejected_payload["proposal_manifest_digest"], str)
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 1
 
 
 def test_context_compaction_requested_stale_identity_is_rejected(
@@ -2502,6 +2685,74 @@ def _context_compaction_candidate(
             provider_request_id="req-overflow",
         ),
         event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+    )
+
+
+def _proposal_agent_request(
+    request: CompactionRequest,
+    *,
+    compaction_operation_id: str | None,
+    compaction_attempt_number: int,
+) -> AgentRunRequest:
+    """构造测试用 compactor proposal AgentRunRequest。
+
+    :param request: compaction request。
+    :param compaction_operation_id: operation id。
+    :param compaction_attempt_number: operation 内 attempt 序号。
+    :returns: AgentRunRequest。
+    """
+
+    return AgentRunRequest(
+        run_id=(
+            f"compactor-run:{request.run_id}:"
+            f"{compaction_operation_id}:{compaction_attempt_number}"
+        ),
+        session_id="context-compactor:test",
+        attempt_id=None,
+        execution_id=None,
+        messages=(
+            SystemMessage(role=AgentMessageRole.SYSTEM, content="system"),
+            UserMessage(role=AgentMessageRole.USER, content="reactive user"),
+        ),
+        disable_tools=True,
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
+        tool_schemas=(),
+        tool_executor=_RejectingToolExecutor(),
+        cancellation_token=StubCancellationToken(),
+    )
+
+
+def _runner_spec() -> RunnerSpec:
+    """构造测试 RunnerSpec。
+
+    :returns: RunnerSpec。
+    """
+
+    return RunnerSpec(
+        provider="test",
+        model="test-model",
+        endpoint="https://example.invalid",
+        api_key_ref="secret:test",
+        headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
+        supports_tool_calling=False,
+        supports_streaming=False,
+        supports_stream_usage=False,
+        default_timeout_seconds=1.0,
+        max_retries=0,
+        provider_request=None,
     )
 
 

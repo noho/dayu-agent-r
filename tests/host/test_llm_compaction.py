@@ -12,6 +12,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
@@ -132,6 +133,35 @@ def test_llm_context_compactor_requires_scene_prompt_template() -> None:
             system_prompt=_TEST_SYSTEM_PROMPT,
             user_prompt_template="missing placeholder",
         )
+
+
+def test_llm_context_compactor_prepares_same_source_runner_input() -> None:
+    """prepared proposal input 与真实 Engine request messages 同源。"""
+
+    prepared = _llm_compactor().prepare_compactor_proposal_run_input(
+        _request(),
+        StubCancellationToken(),
+        compaction_operation_id="event-context-compact-requested-test",
+        compaction_attempt_number=2,
+    )
+    request = prepared.agent_request
+    roles = tuple(message.role.value for message in request.messages)
+
+    assert prepared.compactor_engine_run_id == request.run_id
+    assert prepared.message_count == len(request.messages) == 2
+    assert prepared.role_sequence_digest == runner_role_sequence_digest(roles)
+    assert roles == ("system", "user")
+    assert prepared.compaction_request_digest == _request().digest()
+    assert prepared.compactor_input_projection_digest == llm_compaction_module.sha256_digest_json(
+        prepared.compactor_input_projection
+    )
+    projection_text = json.dumps(
+        prepared.compactor_input_projection,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    assert _TEST_SYSTEM_PROMPT not in projection_text
+    assert _TEST_USER_PROMPT_TEMPLATE not in projection_text
 
 
 def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None:

@@ -85,6 +85,7 @@ from dayu.host.compaction import (
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
     CompactionOperationResult,
+    DurableCompactorProposalManifestRecorder,
     run_compaction_operation,
 )
 from dayu.host.context_budget import (
@@ -1586,6 +1587,10 @@ class EngineEventIngestor:
                     pending.context.candidate.envelope.cancellation_token
                 ),
                 pass_queue=pass_queue,
+                compaction_operation_id=pending.operation_id,
+                proposal_manifest_recorder=(
+                    self._compactor_proposal_manifest_recorder()
+                ),
             )
 
         def _operation(
@@ -1721,6 +1726,12 @@ class EngineEventIngestor:
                     if operation_result.budget_after_attempted_compact is not None
                     else pending.estimate.estimated_input_tokens
                 ),
+                accepted_proposal_manifest_ref=(
+                    operation_result.accepted_proposal_manifest_ref
+                ),
+                accepted_proposal_manifest_digest=(
+                    operation_result.accepted_proposal_manifest_digest
+                ),
             )
             return _ReactiveRecoveryAccepted(
                 result=EngineIngestResult(
@@ -1744,6 +1755,26 @@ class EngineEventIngestor:
 
         return self._transaction_runner.run_write(_operation)
 
+    def _compactor_proposal_manifest_recorder(
+        self,
+    ) -> DurableCompactorProposalManifestRecorder:
+        """构造 reactive compactor proposal durable manifest recorder。
+
+        :returns: durable manifest recorder。
+        :raises RuntimeError: compact artifact root 缺失时抛出。
+        """
+
+        artifact_root = self._compact_artifact_root
+        if artifact_root is None:
+            raise RuntimeError("compact artifact root is missing")
+        return DurableCompactorProposalManifestRecorder(
+            transaction_runner=self._transaction_runner,
+            event_log_store=self._event_log_store,
+            artifact_root=artifact_root,
+            create_artifact_root=self._compact_artifact_create_parent_dirs,
+            event_source=_EVENT_SOURCE,
+        )
+
     def _append_reactive_compacted_event(
         self,
         transaction: HostTransaction,
@@ -1756,6 +1787,8 @@ class EngineEventIngestor:
         candidate: ConversationCompactOutputVNext,
         quality: CompactQualityCheckResultVNext,
         budget_after_compact: int,
+        accepted_proposal_manifest_ref: str | None,
+        accepted_proposal_manifest_digest: str | None,
     ) -> EventLogRow:
         """写入 reactive accepted compact artifact 与 fact。
 
@@ -1768,6 +1801,8 @@ class EngineEventIngestor:
         :param candidate: accepted vNext compaction candidate。
         :param quality: accepted vNext quality result。
         :param budget_after_compact: Host 估算的 compact 后预算。
+        :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
+        :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
         :returns: ``CONTEXT_COMPACTED`` row。
         """
 
@@ -1841,6 +1876,10 @@ class EngineEventIngestor:
                     source_boundary_refs=source_boundary_refs(request),
                     accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
                     projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+                    accepted_proposal_manifest_ref=accepted_proposal_manifest_ref,
+                    accepted_proposal_manifest_digest=(
+                        accepted_proposal_manifest_digest
+                    ),
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1983,6 +2022,8 @@ class EngineEventIngestor:
                     budget_after_attempted_compact=(
                         rejected.budget_after_attempted_compact
                     ),
+                    proposal_manifest_ref=rejected.proposal_manifest_ref,
+                    proposal_manifest_digest=rejected.proposal_manifest_digest,
                 ),
                 payload_ref=None,
                 payload_digest=None,

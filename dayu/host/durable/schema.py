@@ -233,6 +233,9 @@ RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE = (
 )
 """RUNNER_CALL_INPUT_ASSEMBLED manifest body media type。"""
 
+COMPACTOR_INPUT_PROJECTION_DESCRIPTOR_KIND = "compactor_input_projection"
+"""compactor proposal input projection payload descriptor kind。"""
+
 _SQLITE_PAYLOADS_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_SQLITE_PAYLOADS} (
   payload_id TEXT PRIMARY KEY,

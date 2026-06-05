@@ -40,6 +40,7 @@ from dayu.host import (
 )
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
+from dayu.host.durable.schema import RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.scene_prepare import (
     ScenePrepareRequest,
@@ -397,6 +398,14 @@ async def test_proactive_compact_duplicate_prompt_does_not_exceed_compactor_wind
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.prompt_lengths) == 1
     assert fake_compactor.prompt_lengths[0] <= _FAKE_COMPACTOR_MAX_PROMPT_CHARS
+    manifest = _runner_call_manifest_for_run(
+        _compact_artifact_files(tmp_path / "compact-artifacts"),
+        followup.accepted_run_id,
+    )
+    assert manifest["runner_call_kind"] == "compactor_proposal"
+    assert manifest["message_count"] == 2
+    manifest_text = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+    assert _DUPLICATE_PROMPT_SENTENCE * 20 not in manifest_text
 
 
 @pytest.mark.asyncio
@@ -987,6 +996,29 @@ def _compact_artifact_for_run(
         if candidate.get(_CANDIDATE_ID_FIELD) == expected_candidate_id:
             return artifact
     raise AssertionError(f"compact artifact for run {run_id} was not found")
+
+
+def _runner_call_manifest_for_run(
+    paths: tuple[pathlib.Path, ...], run_id: str
+) -> Mapping[str, JsonValue]:
+    """从 artifact 文件集合中找出指定 Run 的 runner-call manifest。
+
+    :param paths: 候选 artifact 文件路径。
+    :param run_id: Host Run id。
+    :returns: runner-call manifest JSON object。
+    :raises AssertionError: 没有找到匹配 manifest 时抛出。
+    """
+
+    for path in paths:
+        artifact = _required_mapping(_read_json(path), field_name=str(path))
+        if artifact.get("schema_version") != RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION:
+            continue
+        if artifact.get("host_run_id") != run_id:
+            continue
+        if artifact.get("runner_call_kind") != "compactor_proposal":
+            continue
+        return artifact
+    raise AssertionError(f"runner-call manifest for run {run_id} was not found")
 
 
 def _read_json(path: pathlib.Path) -> JsonValue:

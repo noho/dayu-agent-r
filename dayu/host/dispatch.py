@@ -15,6 +15,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
@@ -25,6 +26,7 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
     RunCancelledData,
+    runner_role_sequence_digest,
 )
 from dayu.host.admission import (
     PendingDispatchRecord,
@@ -154,6 +156,7 @@ from dayu.host.compaction import (
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
     CompactionOperationResult,
+    DurableCompactorProposalManifestRecorder,
     run_compaction_operation,
 )
 from dayu.host.context_budget import (
@@ -1177,6 +1180,10 @@ class HostDispatchScheduler:
                 expected_status=pending.expected_status,
                 expected_input_event_sequence=pending.expected_input_event_sequence,
             ),
+            compaction_operation_id=pending.operation_id,
+            proposal_manifest_recorder=(
+                self._compactor_proposal_manifest_recorder()
+            ),
         )
 
         def _operation(transaction: HostTransaction) -> _ProactiveCompactionExecutionResult:
@@ -1254,6 +1261,12 @@ class HostDispatchScheduler:
                     if result.budget_after_attempted_compact is not None
                     else pending.estimate.estimated_input_tokens
                 ),
+                accepted_proposal_manifest_ref=(
+                    _required_compactor_manifest_ref(result)
+                ),
+                accepted_proposal_manifest_digest=(
+                    _required_compactor_manifest_digest(result)
+                ),
             )
             return _ProactiveCompactionExecutionResult(
                 compacted_event_sequence=compacted_sequence,
@@ -1261,6 +1274,28 @@ class HostDispatchScheduler:
             )
 
         return self._transaction_runner.run_write(_operation)
+
+    def _compactor_proposal_manifest_recorder(
+        self,
+    ) -> DurableCompactorProposalManifestRecorder:
+        """构造 compactor proposal durable manifest recorder。
+
+        :returns: durable manifest recorder。
+        :raises RuntimeError: compact artifact root 缺失时抛出。
+        """
+
+        artifact_root = self._local_execution.compact_artifact_root
+        if artifact_root is None:
+            raise RuntimeError("compact artifact root is missing")
+        return DurableCompactorProposalManifestRecorder(
+            transaction_runner=self._transaction_runner,
+            event_log_store=self._event_log_store,
+            artifact_root=artifact_root,
+            create_artifact_root=(
+                self._local_execution.compact_artifact_create_parent_dirs
+            ),
+            event_source=_EVENT_SOURCE,
+        )
 
     def _start_governed_after_compact(self, accepted: _GovernanceCompactAccepted) -> PendingDispatchRecord | None:
         """compact catch-up 后启动同一个未启动 Run。
@@ -1543,6 +1578,8 @@ class HostDispatchScheduler:
         operation_id: str,
         accepted_attempt_number: int,
         budget_after_compact: int,
+        accepted_proposal_manifest_ref: str,
+        accepted_proposal_manifest_digest: str,
     ) -> int:
         """写入 accepted compact artifact 与 ``CONTEXT_COMPACTED`` fact。
 
@@ -1556,6 +1593,8 @@ class HostDispatchScheduler:
         :param operation_id: requested event id。
         :param accepted_attempt_number: accepted operation attempt number。
         :param budget_after_compact: Host 估算的 compact 后预算。
+        :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
+        :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
         :returns: ``CONTEXT_COMPACTED`` event sequence。
         """
 
@@ -1627,6 +1666,8 @@ class HostDispatchScheduler:
                     source_boundary_refs=source_boundary_refs(request),
                     accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
                     projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+                    accepted_proposal_manifest_ref=accepted_proposal_manifest_ref,
+                    accepted_proposal_manifest_digest=accepted_proposal_manifest_digest,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1973,6 +2014,8 @@ class HostDispatchScheduler:
                     diagnostic_refs=rejected.diagnostic_refs,
                     next_policy_decision=rejected.next_policy_decision.value,
                     budget_after_attempted_compact=(rejected.budget_after_attempted_compact),
+                    proposal_manifest_ref=rejected.proposal_manifest_ref,
+                    proposal_manifest_digest=rejected.proposal_manifest_digest,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -3686,6 +3729,34 @@ def _accepted_attempt_number(result: CompactionOperationResult) -> int:
     """
 
     return len(result.rejected_attempts) + 1
+
+
+def _required_compactor_manifest_ref(result: CompactionOperationResult) -> str:
+    """读取 accepted proposal manifest ref。
+
+    :param result: compaction operation result。
+    :returns: accepted proposal manifest ref。
+    :raises RuntimeError: accepted result 缺少 manifest ref 时抛出。
+    """
+
+    value = result.accepted_proposal_manifest_ref
+    if value is None or value.strip() == "":
+        raise RuntimeError("accepted compaction is missing proposal manifest ref")
+    return value
+
+
+def _required_compactor_manifest_digest(result: CompactionOperationResult) -> str:
+    """读取 accepted proposal manifest digest。
+
+    :param result: compaction operation result。
+    :returns: accepted proposal manifest digest。
+    :raises RuntimeError: accepted result 缺少 manifest digest 时抛出。
+    """
+
+    value = result.accepted_proposal_manifest_digest
+    if value is None or value.strip() == "":
+        raise RuntimeError("accepted compaction is missing proposal manifest digest")
+    return value
 
 
 def _latest_session_compacted_event_before_input(
