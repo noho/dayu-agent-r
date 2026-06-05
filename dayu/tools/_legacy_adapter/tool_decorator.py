@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import ParamSpec, cast
+from typing import ParamSpec, Protocol, cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_schema import (
@@ -22,6 +22,10 @@ from .registry_collector import LegacySyncToolCallable, LegacyToolDeclarationCol
 from .tool_contracts import DupCallSpec, normalize_truncate_spec
 
 P = ParamSpec("P")
+
+
+class _DecoratedToolReturn(Protocol):
+    """被 legacy decorator 接受但不在声明阶段检查的工具返回值标记。"""
 
 
 def build_tool_schema(
@@ -90,7 +94,7 @@ def tool(
     execution_context_param_name: str | None = None,
     display_name: str | None = None,
     summary_params: Sequence[str] | None = None,
-) -> Callable[[Callable[P, JsonValue]], LegacySyncToolCallable]:
+) -> Callable[[Callable[P, _DecoratedToolReturn]], LegacySyncToolCallable]:
     """声明一个 OLD 风格同步工具。
 
     :param registry: OLD 注册函数传入的 collector；本装饰器只把它用于保持
@@ -126,7 +130,7 @@ def tool(
     normalized_file_path_params = _normalize_text_sequence(file_path_params)
     normalized_tags = _normalize_text_sequence(tags)
 
-    def wrap(func: Callable[P, JsonValue]) -> LegacySyncToolCallable:
+    def wrap(func: Callable[P, _DecoratedToolReturn]) -> LegacySyncToolCallable:
         """把声明 metadata 挂到函数对象。
 
         :param func: 被装饰的同步工具函数。

@@ -8,7 +8,7 @@
       "enabled": false,
       "allow_empty": true,
       "config": {
-        "workspace_root": "workspace/fins",
+        "workspace_root": null,
         "include_read_tools": true,
         "include_ingestion_tools": false,
         "limits": {}

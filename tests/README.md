@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Documents、Tools、Host、Runtime、Service 与 Engine 测试：
+运行当前契约、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/documents tests/tools tests/host tests/runtime tests/service tests/engine -q
+pytest tests/contracts tests/documents tests/fins tests/tools tests/host tests/runtime tests/service tests/engine -q
 ```
 
 运行类型检查：
@@ -37,6 +37,7 @@ pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 ```bash
 pytest tests/contracts -q
 pytest tests/documents -q
+pytest tests/fins -q
 pytest tests/tools -q
 pytest tests/host -q
 pytest tests/host/test_tooling_options.py tests/host/test_package_exports.py tests/host/test_import_boundary.py -q
@@ -135,6 +136,12 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 - doc tools provider：覆盖 `dayu.tools.doc_provider` 通过当前 `ToolsDiscovery` 暴露五个 Doc tools、启用但缺少 `allowed_paths` 时 fail closed、显式路径白名单拒绝、路径参数进入迁移函数前投影为绝对路径、路径验证失败不进入迁移函数体、`file_path_params` metadata 收集与使用、collector 记录的 `register_allowed_paths` 不作为可信安全源、current outcome 投影、Markdown / Docling JSON 章节列表 / 搜索 / 章节读取、current `ToolTruncateSpec` 暴露，以及 current ToolRuntime accept barrier 集成。
 
 `tests/tools/fixtures/documents/` 存放工具 provider 测试使用的确定性文档 fixture。当前包含 Markdown 与 Docling JSON 样本，测试应复制到临时目录后通过 provider 白名单访问，不直接把 fixture 根作为隐式生产路径。
+
+### `tests/fins/`
+
+财报仓储与 Fins read tools provider 测试，覆盖 `dayu.fins.storage` 文件系统仓储协议实现、确定性财报 fixture 的 list/read、`dayu.fins.tools.provider` 通过当前 `ToolsDiscovery` 暴露带 `fins` tag 的 read tools、`include_read_tools=false` 返回空工具集且不解析 workspace root、`list_documents` 与 `search_document` 通过当前 ToolRuntime accept path 执行、数组 / 标量参数投影、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露、ingestion tools fail-closed，以及基于 AST import 解析的 Fins / Engine / runtime import boundary。
+
+Fins fixture 由测试通过仓储 public API 写入临时 workspace，不依赖隐式 cwd、环境变量或手工拼生产路径。
 
 ### `tests/host/`
 
