@@ -7,7 +7,7 @@
 - PR: https://github.com/noho/dayu-agent-r/pull/118
 - PR state at closeout: open draft
 - Branch: `phaseflow/wu-dur-obs-cm-closeout`
-- PR head at closeout: `c57b7471feeb3ffb68afaf1cd3ac003e4464f1f6`
+- PR head checked before final closeout bookkeeping: `c57b7471feeb3ffb68afaf1cd3ac003e4464f1f6`
 - Verdict: local gates complete; PR review passed; draft-PR-pass reached; final closeout record created.
 
 ## 已完成
@@ -26,6 +26,7 @@
   - AgentDS: `docs/reviews/wu-dur-obs-cm-closeout-pr-review-ds.md`
   - Controller adjudication: `docs/reviews/wu-dur-obs-cm-closeout-pr-review-controller-adjudication.md`
 - Accepted PR review bookkeeping commit: `c57b7471feeb3ffb68afaf1cd3ac003e4464f1f6`.
+- Final closeout bookkeeping is recorded in the PR branch after that accepted PR review commit.
 
 ## Final Validation
 
@@ -46,7 +47,7 @@ source .venv/bin/activate && pyright
 # 0 errors, 0 warnings, 0 informations
 ```
 
-GitHub state checked after accepted PR review commit:
+GitHub state checked before creating this final closeout record:
 
 - `gh pr view 118 --json number,url,state,isDraft,headRefName,headRefOid,baseRefName,title,mergeStateStatus,reviewDecision`
   - PR 118 open draft
