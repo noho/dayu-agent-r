@@ -595,7 +595,7 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
             "status": "limited_signal",
             "reason": "missing_projection_artifact",
             "missing_atom_kind": None,
-            "missing_ref_kind": "runner_call_projection_artifact",
+            "missing_ref_kind": "artifact_ref",
             "missing_ref": None,
             "observed_count": 3,
             "expected_count": None,
@@ -604,6 +604,121 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
             "consumer_boundary": "tool_trace_query",
         }
         assert cold_lines[0]["trace_summary"] == row.trace_summary
+
+
+def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """非 complete runner-call signal 缺少 typed diagnostic 时 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input-missing-diagnostic",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 2,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "manifest_payload_ref": "payload-runner-call-manifest-missing",
+                "manifest_digest": sha256_digest_json(
+                    {"manifest": "runner-call-missing-diagnostic"}
+                ),
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "limited_signal",
+                "message_count": 1,
+                "role_sequence_digest": sha256_digest_json({"roles": ["user"]}),
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "missing-diagnostic"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": None,
+            },
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
+        )
+
+        with pytest.raises(HostDurableError, match="runner-call diagnostic"):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(event),
+                )
+            )
+
+
+def test_tool_trace_projects_mismatch_runner_call_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 复制 runner-call mismatch diagnostic 的 count / digest 证据。"""
+
+    cold_path = tmp_path / "trace" / "runner-call-mismatch.jsonl"
+    observed_digest = sha256_digest_json({"roles": ["system", "user", "tool"]})
+    expected_digest = sha256_digest_json({"roles": ["system", "user"]})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input-mismatch",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 3,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "iteration_id": "iteration-3",
+                "manifest_payload_ref": "payload-runner-call-manifest-mismatch",
+                "manifest_digest": sha256_digest_json(
+                    {"manifest": "runner-call-mismatch"}
+                ),
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "mismatch",
+                "message_count": 3,
+                "role_sequence_digest": observed_digest,
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "mismatch"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": {
+                    "status": "mismatch",
+                    "reason": "role_sequence_digest_mismatch",
+                    "missing_atom_kind": None,
+                    "missing_ref_kind": None,
+                    "missing_ref": None,
+                    "observed_count": 3,
+                    "expected_count": 2,
+                    "observed_digest": observed_digest,
+                    "expected_digest": expected_digest,
+                    "consumer_boundary": "host.engine_ingest",
+                },
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+
+        assert row is not None
+        assert row.trace_summary["diagnostic"] == {
+            "status": "mismatch",
+            "reason": "role_sequence_digest_mismatch",
+            "missing_atom_kind": None,
+            "missing_ref_kind": None,
+            "missing_ref": None,
+            "observed_count": 3,
+            "expected_count": 2,
+            "observed_digest": observed_digest,
+            "expected_digest": expected_digest,
+            "consumer_boundary": "tool_trace_query",
+        }
 
 
 def test_tool_trace_projection_includes_client_correlation_id(

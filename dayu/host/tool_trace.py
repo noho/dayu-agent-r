@@ -23,6 +23,11 @@ from dayu.host.durable.codec import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, read_event_by_id
 from dayu.host.durable.tool_trace import (
+    RunnerCallReconstructionConsumerBoundary,
+    RunnerCallReconstructionDiagnosticReason,
+    RunnerCallReconstructionMissingAtomKind,
+    RunnerCallReconstructionMissingRefKind,
+    RunnerCallReconstructionStatus,
     ToolTraceHotRow,
     ToolTraceHotRowWriteStatus,
     insert_tool_trace_hot_row_if_absent,
@@ -117,6 +122,24 @@ _FIELD_ROLE_SEQUENCE_DIGEST = "role_sequence_digest"
 _FIELD_INPUT_PROJECTION_DIGEST = "input_projection_digest"
 _FIELD_PROJECTOR_METADATA_SUMMARY = "projector_metadata_summary"
 _FIELD_VALIDATION_STATUS = "validation_status"
+_FIELD_DIAGNOSTIC = "diagnostic"
+_FIELD_REASON = "reason"
+_FIELD_MISSING_ATOM_KIND = "missing_atom_kind"
+_FIELD_MISSING_REF_KIND = "missing_ref_kind"
+_FIELD_MISSING_REF = "missing_ref"
+_FIELD_OBSERVED_COUNT = "observed_count"
+_FIELD_EXPECTED_COUNT = "expected_count"
+_FIELD_OBSERVED_DIGEST = "observed_digest"
+_FIELD_EXPECTED_DIGEST = "expected_digest"
+_FIELD_CONSUMER_BOUNDARY = "consumer_boundary"
+_FIELD_PROJECTOR_METADATA_ID = "projector_metadata_id"
+_FIELD_PROJECTOR_ID = "projector_id"
+_FIELD_PROJECTOR_SCHEMA_VERSION = "projector_schema_version"
+_FIELD_PROJECTOR_DIGEST = "projector_digest"
+_FIELD_PURPOSE = "purpose"
+_PRODUCER_MISSING_REF_KIND_RUNNER_CALL_PROJECTION_ARTIFACT = (
+    "runner_call_projection_artifact"
+)
 _OPERATION_CONTEXT_REF_FIELDS: tuple[str, ...] = (
     "operation_name",
     "operation_kind",
@@ -586,10 +609,10 @@ def _runner_call_trace_summary(event: ProjectionEventView) -> Mapping[str, JsonV
         _FIELD_INPUT_PROJECTION_DIGEST: _optional_text(
             payload, _FIELD_INPUT_PROJECTION_DIGEST
         ),
-        _FIELD_PROJECTOR_METADATA_SUMMARY: _json_value_or_none(
-            payload, _FIELD_PROJECTOR_METADATA_SUMMARY
+        _FIELD_PROJECTOR_METADATA_SUMMARY: list(
+            _runner_call_projector_metadata_summary(payload)
         ),
-        "diagnostic": _runner_call_diagnostic(payload),
+        _FIELD_DIAGNOSTIC: _runner_call_diagnostic(payload),
     }
 
 
@@ -603,35 +626,184 @@ def _runner_call_diagnostic(
     :raises HostDurableError: 非 complete signal 缺少 typed diagnostic 时抛出。
     """
 
-    status = _optional_text(payload, _FIELD_VALIDATION_STATUS)
-    diagnostic = payload.get("diagnostic")
-    if status == "complete":
+    status = _runner_call_status(
+        _required_text(payload, _FIELD_VALIDATION_STATUS),
+        field_name=_FIELD_VALIDATION_STATUS,
+    )
+    diagnostic = payload.get(_FIELD_DIAGNOSTIC)
+    if status is RunnerCallReconstructionStatus.COMPLETE:
         return {
-            "status": status,
-            "reason": None,
-            "missing_atom_kind": None,
-            "missing_ref_kind": None,
-            "missing_ref": None,
-            "observed_count": None,
-            "expected_count": None,
-            "observed_digest": None,
-            "expected_digest": None,
-            "consumer_boundary": "tool_trace_query",
+            "status": status.value,
+            _FIELD_REASON: None,
+            _FIELD_MISSING_ATOM_KIND: None,
+            _FIELD_MISSING_REF_KIND: None,
+            _FIELD_MISSING_REF: None,
+            _FIELD_OBSERVED_COUNT: None,
+            _FIELD_EXPECTED_COUNT: None,
+            _FIELD_OBSERVED_DIGEST: None,
+            _FIELD_EXPECTED_DIGEST: None,
+            _FIELD_CONSUMER_BOUNDARY: (
+                RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY.value
+            ),
         }
     if not isinstance(diagnostic, Mapping):
         raise HostDurableError("runner-call diagnostic must be object")
+    diagnostic_mapping = cast(Mapping[str, JsonValue], diagnostic)
+    diagnostic_status = _runner_call_status(
+        _required_text(diagnostic_mapping, "status"),
+        field_name="diagnostic.status",
+    )
+    if diagnostic_status is not status:
+        raise HostDurableError("runner-call diagnostic status mismatch")
+    reason = _runner_call_reason(
+        _required_text(diagnostic_mapping, _FIELD_REASON),
+        field_name="diagnostic.reason",
+    )
     return {
-        "status": _required_text(diagnostic, "status"),
-        "reason": _optional_text(diagnostic, "reason"),
-        "missing_atom_kind": _optional_text(diagnostic, "missing_atom_kind"),
-        "missing_ref_kind": _optional_text(diagnostic, "missing_ref_kind"),
-        "missing_ref": _optional_text(diagnostic, "missing_ref"),
-        "observed_count": _optional_int(diagnostic, "observed_count"),
-        "expected_count": _optional_int(diagnostic, "expected_count"),
-        "observed_digest": _optional_text(diagnostic, "observed_digest"),
-        "expected_digest": _optional_text(diagnostic, "expected_digest"),
-        "consumer_boundary": "tool_trace_query",
+        "status": diagnostic_status.value,
+        _FIELD_REASON: reason.value,
+        _FIELD_MISSING_ATOM_KIND: _optional_runner_call_missing_atom_kind(
+            diagnostic_mapping, _FIELD_MISSING_ATOM_KIND
+        ),
+        _FIELD_MISSING_REF_KIND: _optional_runner_call_missing_ref_kind(
+            diagnostic_mapping, _FIELD_MISSING_REF_KIND
+        ),
+        _FIELD_MISSING_REF: _optional_text(diagnostic_mapping, _FIELD_MISSING_REF),
+        _FIELD_OBSERVED_COUNT: _optional_int(
+            diagnostic_mapping, _FIELD_OBSERVED_COUNT
+        ),
+        _FIELD_EXPECTED_COUNT: _optional_int(
+            diagnostic_mapping, _FIELD_EXPECTED_COUNT
+        ),
+        _FIELD_OBSERVED_DIGEST: _optional_text(
+            diagnostic_mapping, _FIELD_OBSERVED_DIGEST
+        ),
+        _FIELD_EXPECTED_DIGEST: _optional_text(
+            diagnostic_mapping, _FIELD_EXPECTED_DIGEST
+        ),
+        _FIELD_CONSUMER_BOUNDARY: (
+            RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY.value
+        ),
     }
+
+
+def _runner_call_projector_metadata_summary(
+    payload: Mapping[str, JsonValue],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取并裁剪 runner-call projector metadata summary。
+
+    :param payload: RUNNER_CALL_INPUT_ASSEMBLED hot payload。
+    :returns: 只含 projector metadata 摘要字段的 JSON object 元组。
+    :raises HostDurableError: projector metadata summary 类型非法时抛出。
+    """
+
+    value = payload.get(_FIELD_PROJECTOR_METADATA_SUMMARY)
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise HostDurableError(
+            "runner-call projector_metadata_summary must be JSON array"
+        )
+    items: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError("runner-call projector metadata item must be object")
+        item_mapping = cast(Mapping[str, JsonValue], item)
+        items.append(
+            {
+                _FIELD_PROJECTOR_METADATA_ID: _required_text(
+                    item_mapping, _FIELD_PROJECTOR_METADATA_ID
+                ),
+                _FIELD_PROJECTOR_ID: _required_text(
+                    item_mapping, _FIELD_PROJECTOR_ID
+                ),
+                _FIELD_PROJECTOR_SCHEMA_VERSION: _required_text(
+                    item_mapping, _FIELD_PROJECTOR_SCHEMA_VERSION
+                ),
+                _FIELD_PROJECTOR_DIGEST: _required_text(
+                    item_mapping, _FIELD_PROJECTOR_DIGEST
+                ),
+                _FIELD_PURPOSE: _required_text(item_mapping, _FIELD_PURPOSE),
+            }
+        )
+    return tuple(items)
+
+
+def _runner_call_status(
+    value: str, *, field_name: str
+) -> RunnerCallReconstructionStatus:
+    """校验 runner-call reconstruction status。
+
+    :param value: status 文本。
+    :param field_name: 错误消息字段名。
+    :returns: status enum。
+    :raises HostDurableError: status 不在封闭枚举内时抛出。
+    """
+
+    try:
+        return RunnerCallReconstructionStatus(value)
+    except ValueError as exc:
+        raise HostDurableError(f"runner-call {field_name} is unsupported") from exc
+
+
+def _runner_call_reason(
+    value: str, *, field_name: str
+) -> RunnerCallReconstructionDiagnosticReason:
+    """校验 runner-call reconstruction diagnostic reason。
+
+    :param value: reason 文本。
+    :param field_name: 错误消息字段名。
+    :returns: reason enum。
+    :raises HostDurableError: reason 不在封闭枚举内时抛出。
+    """
+
+    try:
+        return RunnerCallReconstructionDiagnosticReason(value)
+    except ValueError as exc:
+        raise HostDurableError(f"runner-call {field_name} is unsupported") from exc
+
+
+def _optional_runner_call_missing_atom_kind(
+    diagnostic: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """读取并校验 optional runner-call missing atom kind。
+
+    :param diagnostic: diagnostic JSON object。
+    :param field_name: 字段名。
+    :returns: missing atom kind 文本或 ``None``。
+    :raises HostDurableError: 字段值不在封闭枚举内时抛出。
+    """
+
+    value = _optional_text(diagnostic, field_name)
+    if value is None:
+        return None
+    try:
+        return RunnerCallReconstructionMissingAtomKind(value).value
+    except ValueError as exc:
+        raise HostDurableError(f"runner-call diagnostic.{field_name} is unsupported") from exc
+
+
+def _optional_runner_call_missing_ref_kind(
+    diagnostic: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """读取并校验 optional runner-call missing ref kind。
+
+    :param diagnostic: diagnostic JSON object。
+    :param field_name: 字段名。
+    :returns: missing ref kind 文本或 ``None``。
+    :raises HostDurableError: 字段值不在封闭枚举内时抛出。
+    """
+
+    value = _optional_text(diagnostic, field_name)
+    if value is None:
+        return None
+    # Engine ingest 的 projection artifact producer 标签在 Tool Trace 查询边界收敛为通用 artifact ref kind。
+    if value == _PRODUCER_MISSING_REF_KIND_RUNNER_CALL_PROJECTION_ARTIFACT:
+        return RunnerCallReconstructionMissingRefKind.ARTIFACT_REF.value
+    try:
+        return RunnerCallReconstructionMissingRefKind(value).value
+    except ValueError as exc:
+        raise HostDurableError(f"runner-call diagnostic.{field_name} is unsupported") from exc
 
 
 def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
