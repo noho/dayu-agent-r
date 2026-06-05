@@ -1658,6 +1658,9 @@ def test_tool_call_requested_and_result_accepted_are_preview(
         assert first.events[0].event_class == EventClass.PREVIEW
         assert first.events[0].event_type == "TOOL_CALL_REQUESTED"
         assert _payload(first.events[0])["argument_key_count"] == 1
+        assert _payload(first.events[0])["normalized_arguments_digest"] == (
+            sha256_digest_json({"arguments": {"ticker": "MSFT"}})
+        )
         assert second.events[0].event_class == EventClass.PREVIEW
         assert second.events[0].event_type == "TOOL_RESULT_ACCEPTED"
         assert _payload(second.events[0])["outcome_kind"] == "completed"

@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -37,6 +38,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
     TABLE_HOST_TOOL_TRACE_HOT,
+    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
 )
 from dayu.host.durable.tool_trace import read_tool_trace_hot_row
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -396,6 +398,67 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             "kind": "attempt",
             "attempt_id": "attempt-trace",
         }
+
+
+def test_tool_trace_does_not_inline_large_tool_call_arguments(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 投影 TOOL_CALL_REQUESTED 时不展开大参数 descriptor。"""
+
+    cold_path = tmp_path / "trace" / "cold.jsonl"
+    large_arguments: Mapping[str, JsonValue] = {
+        "ticker": "MSFT",
+        "query": "x" * 1024,
+    }
+    arguments_json: Mapping[str, JsonValue] = {"arguments": large_arguments}
+    arguments_digest = sha256_digest_json(arguments_json)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-tool-call-arguments-large",
+                    payload_id="sqlite-payload-tool-call-arguments-large",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json=arguments_json,
+                    media_type="application/json",
+                    metadata={
+                        "descriptor_kind": TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+                    },
+                    expected_digest=arguments_digest,
+                ),
+            )
+        )
+        _append_tool_event(
+            store.transaction_runner,
+            event_id="event-requested-large-arguments",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": "tool-call-large-arguments",
+                "tool_name": "lookup_filing",
+                "tool_schema_digest": "sha256:schema",
+                "tool_identity_digest": "sha256:identity",
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_json_size_bytes": 2048,
+                "arguments_storage_kind": "payload_descriptor",
+                "arguments_inline_json": None,
+                "arguments_payload_ref": "payload-tool-call-arguments-large",
+                "arguments_payload_digest": arguments_digest,
+                "semantic_input_digest": "sha256:semantic",
+                "semantic_query_storage_kind": "absent",
+                "semantic_query_text": None,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": None,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        cold_lines = _json_lines(cold_path)
+
+        assert len(cold_lines) == 1
+        line_text = json.dumps(cold_lines[0], sort_keys=True)
+        assert arguments_digest in line_text
+        assert "x" * 128 not in line_text
 
 
 def test_tool_trace_projection_includes_client_correlation_id(

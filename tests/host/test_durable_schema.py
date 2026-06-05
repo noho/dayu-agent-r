@@ -67,6 +67,8 @@ from dayu.host.durable.schema import (
     INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL,
     INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB,
     INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN,
+    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+    TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
     TABLE_IDEMPOTENCY_RECORDS,
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
@@ -833,6 +835,16 @@ def test_host_schema_version_is_query_index_version() -> None:
     """当前 committed Host schema version 是 durable query index fresh schema 16。"""
 
     assert HOST_SCHEMA_VERSION == 16
+
+
+def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
+    """TOOL_CALL_REQUESTED request atom descriptor kind 使用稳定文本。"""
+
+    assert TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND == "tool_call_arguments_json"
+    assert (
+        TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND
+        == "tool_call_semantic_query_text"
+    )
 
 
 def test_foundation_query_indexes_are_created(tmp_path: Path) -> None:

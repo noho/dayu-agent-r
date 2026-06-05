@@ -232,6 +232,7 @@ ToolRuntime 的稳定语义：
 - no-tool replay 或显式禁用工具路径输出空 schema、no-tool executor 和禁止工具调用的 Agent policy。
 - 工具结果、工具失败、工具取消、工具等待、治理拒绝、重复调用复用与截断结果必须经过 Host accept barrier。
 - accept barrier 校验 run / attempt / execution identity、schema digest、payload descriptor、幂等与 stale execution，接受后写入 canonical tool result facts。
+- `TOOL_CALL_REQUESTED` canonical fact 是工具调用 intent 与 accepted arguments 的同源 durable atom：ToolRuntime 使用与 `normalized_arguments_digest` 相同的 canonical arguments JSON preimage 校验 digest，小参数在 EventLog hot payload 中 bounded inline，大参数写 SQLite payload descriptor，descriptor kind 为 `tool_call_arguments_json`。可读 semantic query 是独立可选 atom，缺失合法；长文本写 descriptor kind `tool_call_semantic_query_text`。
 - side-effect 或付费工具必须具备工具级幂等依据；缺失时不调用实际 callable。
 - duplicate governance 是 attempt-local in-memory 治理能力，只治理当前 ToolRuntime Attempt 内同工具同参数的重复调用和 in-flight owner / waiter 串行化；owner 未产生可复用 accepted fact 时，等待者中只允许一个接棒成为新 owner，其它等待者继续等待新 owner；新 Attempt、worker restart 或 Host restart 不继承旧内存索引，也不从 EventLog 重建 duplicate ledger。
 - duplicate governance 的默认动作、按工具覆盖动作、模型可见治理文案与 justification 参数名由 `HostToolingOptions.duplicate_governance_policy` 在 Host construction 阶段以 typed `DuplicateGovernancePolicy` 配置；ToolRuntime 执行路径不读取 raw config、profile id 或 extra payload。
@@ -288,7 +289,7 @@ accepted compact closeout 写入 vNext compact artifact 和 `CONTEXT_COMPACTED` 
 
 ## Payload 与 Terminal Continuity
 
-Host payload descriptor 用于把较大或需要引用的 payload 从 EventLog inline JSON 中分离出来。当前 helper 支持按 EventLog payload ref 解析 SQLite payload descriptor，并校验 descriptor、digest 与 JSON object 形状。ToolRuntime accept barrier 是工具结果冷热分离的 owner；工具实现只返回语义 outcome，不负责判断 EventLog inline threshold。
+Host payload descriptor 用于把较大或需要引用的 payload 从 EventLog inline JSON 中分离出来。当前 helper 支持按 EventLog payload ref 或 tool-call request atom ref 解析 SQLite payload descriptor，并校验 descriptor kind、digest 与 JSON object 形状。ToolRuntime accept barrier 是工具结果与工具请求参数冷热分离的 owner；工具实现只返回语义 outcome，不负责判断 EventLog inline threshold。
 
 terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory projection 可以从 terminal summary 或 `RUN_SUCCEEDED` payload 中按策略提取 assistant summary，形成后继输入 continuity。该 helper 只读取受控字段，不从 UI 临时文本、provider raw payload 或未持久化上下文恢复回答。
 

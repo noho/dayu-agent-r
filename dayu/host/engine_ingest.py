@@ -4244,6 +4244,9 @@ def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
         common["tool_name"] = data.name
         common["index_in_iteration"] = data.index_in_iteration
         common["argument_key_count"] = len(data.arguments)
+        common["normalized_arguments_digest"] = sha256_digest_json(
+            {"arguments": data.arguments}
+        )
         common["provider_state_present"] = data.provider_state is not None
     elif isinstance(data, ToolResultAcceptedData):
         common["iteration_id"] = data.iteration_id

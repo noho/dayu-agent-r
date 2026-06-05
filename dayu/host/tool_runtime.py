@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import secrets
 import time
 from collections.abc import Mapping
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -81,6 +82,15 @@ from dayu.host.durable.payload import (
     PayloadStore,
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
+)
+from dayu.host.durable.schema import (
+    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
+    TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -176,6 +186,12 @@ _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 _TOOL_RESULT_PAYLOAD_REF_PREFIX = "payload-tool-result"
 _TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-tool-result"
+_TOOL_CALL_ARGUMENTS_PAYLOAD_REF_PREFIX = "payload-tool-call-arguments"
+_TOOL_CALL_ARGUMENTS_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-tool-call-arguments"
+_TOOL_CALL_SEMANTIC_QUERY_PAYLOAD_REF_PREFIX = "payload-tool-call-semantic-query"
+_TOOL_CALL_SEMANTIC_QUERY_SQLITE_PAYLOAD_ID_PREFIX = (
+    "sqlite-payload-tool-call-semantic-query"
+)
 _TOOL_ACCEPT_EVENT_ACTOR = "host.tool_runtime"
 _TOOL_ACCEPT_EVENT_SOURCE = "host.tool_runtime.accept"
 _MIN_ACCEPT_RETRY_ATTEMPTS = 1
@@ -412,9 +428,13 @@ class ToolAcceptCall:
     :param iteration_id: Engine iteration id。
     :param tool_call_id: tool call id。
     :param tool_name: 工具名。
+    :param accepted_arguments: 已被 Host accept 的 canonical 工具参数；仅构造
+        fake ack 且不写 accepted fact 的低层测试可省略。
     :param tool_schema_digest: 工具 schema digest。
     :param tool_identity_digest: 工具身份 digest。
     :param normalized_arguments_digest: 规范化参数 digest。
+    :param semantic_query_text: 可选业务可读 semantic query；缺失时为
+        ``None``。
     :returns: 构造完成的工具调用值对象。
     :raises ValueError: 文本字段为空或 digest 非法时抛出。
     """
@@ -425,6 +445,8 @@ class ToolAcceptCall:
     tool_schema_digest: str
     tool_identity_digest: str
     normalized_arguments_digest: str
+    accepted_arguments: Mapping[str, JsonValue] | None = None
+    semantic_query_text: str | None = None
 
     def __post_init__(self) -> None:
         """校验工具调用内部字段。
@@ -1793,7 +1815,11 @@ class DefaultHostToolFactAcceptPort:
         event_plan = _tool_accept_event_plan(candidate)
         requested = self._event_log_store.append_event(
             transaction,
-            _tool_call_requested_event_request(candidate, event_plan.requested_id),
+            _tool_call_requested_event_request(
+                transaction,
+                candidate,
+                event_plan.requested_id,
+            ),
         ).row
         governed = _append_tool_call_governed_if_needed(
             self._event_log_store,
@@ -3058,6 +3084,22 @@ class _ToolResultPayloadPlan:
     payload_ref: HostPayloadRef | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ToolCallRequestPayloadPlan:
+    """``TOOL_CALL_REQUESTED`` 的 accepted 参数与可读 query 写入计划。
+
+    :param payload: 写入 EventLog 的 bounded canonical payload。
+    :param arguments_payload_ref: 大参数 payload descriptor 引用；inline 时为
+        ``None``。
+    :param semantic_query_payload_ref: 长 semantic query payload descriptor
+        引用；缺失或 inline 时为 ``None``。
+    """
+
+    payload: Mapping[str, JsonValue]
+    arguments_payload_ref: HostPayloadRef | None
+    semantic_query_payload_ref: HostPayloadRef | None
+
+
 def _log_tool_fact_accept_result(
     candidate: ToolFactAcceptCandidate, result: ToolFactAcceptResult
 ) -> None:
@@ -3250,38 +3292,206 @@ def _tool_accept_event_plan(candidate: ToolFactAcceptCandidate) -> _ToolAcceptEv
 
 
 def _tool_call_requested_event_request(
-    candidate: ToolFactAcceptCandidate, event_id: str
+    transaction: HostTransaction,
+    candidate: ToolFactAcceptCandidate,
+    event_id: str,
 ) -> EventLogAppendRequest:
     """构造 ``TOOL_CALL_REQUESTED`` append request。
 
+    :param transaction: 当前 Host transaction。
     :param candidate: 工具事实候选。
     :param event_id: 稳定事件 id。
     :returns: EventLog append request。
     """
 
+    payload_plan = _tool_call_request_payload_plan(
+        transaction=transaction,
+        candidate=candidate,
+        requested_event_id=event_id,
+    )
     return _tool_event_request(
         candidate,
         event_id=event_id,
         event_type=_EVENT_TYPE_TOOL_CALL_REQUESTED,
         policy_decision=None,
         reason=None,
-        payload={
-            "session_id": candidate.identity.session_id,
-            "run_id": candidate.identity.run_id,
-            "attempt_id": candidate.identity.attempt_id,
-            "execution_id": candidate.identity.execution_id,
-            "iteration_id": candidate.call.iteration_id,
-            "tool_call_id": candidate.call.tool_call_id,
-            "tool_name": candidate.call.tool_name,
-            "tool_schema_digest": candidate.call.tool_schema_digest,
-            "tool_identity_digest": candidate.call.tool_identity_digest,
-            "normalized_arguments_digest": (
-                candidate.call.normalized_arguments_digest
+        payload=payload_plan.payload,
+    )
+
+
+def _tool_call_request_payload_plan(
+    *,
+    transaction: HostTransaction,
+    candidate: ToolFactAcceptCandidate,
+    requested_event_id: str,
+) -> _ToolCallRequestPayloadPlan:
+    """为 ``TOOL_CALL_REQUESTED`` 准备 accepted request atom payload。
+
+    :param transaction: 当前 Host transaction。
+    :param candidate: 工具事实候选。
+    :param requested_event_id: 即将写入的 ``TOOL_CALL_REQUESTED`` event id。
+    :returns: EventLog bounded payload 与可选 payload descriptor 引用。
+    """
+
+    accepted_arguments = _required_accepted_arguments(candidate.call)
+    arguments_json = _accepted_arguments_json(accepted_arguments)
+    arguments_payload_digest = _accepted_arguments_digest(
+        accepted_arguments
+    )
+    if arguments_payload_digest != candidate.call.normalized_arguments_digest:
+        raise HostPayloadReferenceError(
+            "tool call accepted arguments digest mismatch"
+        )
+    arguments_size_bytes = _payload_size_bytes(arguments_json)
+    arguments_ref: HostPayloadRef | None = None
+    arguments_inline_json: JsonValue = None
+    arguments_storage_kind = TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON
+    if arguments_size_bytes <= transaction.payload_inline_threshold_bytes:
+        arguments_inline_json = arguments_json
+    else:
+        descriptor = PayloadStore().write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref=_tool_call_arguments_payload_ref(requested_event_id),
+                payload_id=_tool_call_arguments_sqlite_payload_id(
+                    requested_event_id
+                ),
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json=arguments_json,
+                media_type="application/json",
+                metadata={
+                    "descriptor_kind": TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+                    "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
+                    "event_id": requested_event_id,
+                    "tool_name": candidate.call.tool_name,
+                    "tool_call_id": candidate.call.tool_call_id,
+                },
+                expected_digest=arguments_payload_digest,
             ),
-            "tool_fact_kind": candidate.tool_fact_kind.value,
-            "accept_idempotency_key": candidate.idempotency.accept_idempotency_key,
-            "semantic_input_digest": candidate.idempotency.semantic_input_digest,
-        },
+        )
+        arguments_ref = HostPayloadRef(
+            payload_ref=descriptor.payload_ref,
+            payload_digest=descriptor.payload_digest,
+        )
+        arguments_storage_kind = TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR
+
+    semantic_query_plan = _semantic_query_payload_plan(
+        transaction=transaction,
+        candidate=candidate,
+        requested_event_id=requested_event_id,
+    )
+    payload: dict[str, JsonValue] = {
+        "session_id": candidate.identity.session_id,
+        "run_id": candidate.identity.run_id,
+        "attempt_id": candidate.identity.attempt_id,
+        "execution_id": candidate.identity.execution_id,
+        "iteration_id": candidate.call.iteration_id,
+        "tool_call_id": candidate.call.tool_call_id,
+        "tool_name": candidate.call.tool_name,
+        "tool_schema_digest": candidate.call.tool_schema_digest,
+        "tool_identity_digest": candidate.call.tool_identity_digest,
+        "normalized_arguments_digest": candidate.call.normalized_arguments_digest,
+        "arguments_json_size_bytes": arguments_size_bytes,
+        "arguments_storage_kind": arguments_storage_kind,
+        "arguments_inline_json": arguments_inline_json,
+        "arguments_payload_ref": (
+            arguments_ref.payload_ref if arguments_ref is not None else None
+        ),
+        "arguments_payload_digest": arguments_payload_digest,
+        "tool_fact_kind": candidate.tool_fact_kind.value,
+        "accept_idempotency_key": candidate.idempotency.accept_idempotency_key,
+        "semantic_input_digest": candidate.idempotency.semantic_input_digest,
+        "semantic_query_storage_kind": semantic_query_plan.storage_kind,
+        "semantic_query_text": semantic_query_plan.inline_text,
+        "semantic_query_payload_ref": (
+            semantic_query_plan.payload_ref.payload_ref
+            if semantic_query_plan.payload_ref is not None
+            else None
+        ),
+        "semantic_query_digest": semantic_query_plan.digest,
+    }
+    return _ToolCallRequestPayloadPlan(
+        payload=payload,
+        arguments_payload_ref=arguments_ref,
+        semantic_query_payload_ref=semantic_query_plan.payload_ref,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticQueryPayloadPlan:
+    """semantic query 的冷热 payload 写入计划。
+
+    :param storage_kind: semantic query 存储形态。
+    :param inline_text: inline 文本；缺失或 descriptor 时为 ``None``。
+    :param payload_ref: descriptor 引用；缺失或 inline 时为 ``None``。
+    :param digest: query 文本 digest；缺失时为 ``None``。
+    """
+
+    storage_kind: str
+    inline_text: str | None
+    payload_ref: HostPayloadRef | None
+    digest: str | None
+
+
+def _semantic_query_payload_plan(
+    *,
+    transaction: HostTransaction,
+    candidate: ToolFactAcceptCandidate,
+    requested_event_id: str,
+) -> _SemanticQueryPayloadPlan:
+    """为可选 semantic query 准备冷热 payload。
+
+    :param transaction: 当前 Host transaction。
+    :param candidate: 工具事实候选。
+    :param requested_event_id: 即将写入的 ``TOOL_CALL_REQUESTED`` event id。
+    :returns: semantic query payload 计划。
+    """
+
+    query_text = candidate.call.semantic_query_text
+    if query_text is None:
+        return _SemanticQueryPayloadPlan(
+            storage_kind=TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
+            inline_text=None,
+            payload_ref=None,
+            digest=None,
+        )
+    query_json = _semantic_query_json(query_text)
+    query_digest = _semantic_query_digest(query_text)
+    if _payload_size_bytes(query_json) <= transaction.payload_inline_threshold_bytes:
+        return _SemanticQueryPayloadPlan(
+            storage_kind=TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+            inline_text=query_text,
+            payload_ref=None,
+            digest=query_digest,
+        )
+    descriptor = PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=_tool_call_semantic_query_payload_ref(requested_event_id),
+            payload_id=_tool_call_semantic_query_sqlite_payload_id(
+                requested_event_id
+            ),
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=query_json,
+            media_type="text/plain; charset=utf-8",
+            metadata={
+                "descriptor_kind": TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
+                "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
+                "event_id": requested_event_id,
+                "tool_name": candidate.call.tool_name,
+                "tool_call_id": candidate.call.tool_call_id,
+            },
+            expected_digest=query_digest,
+        ),
+    )
+    return _SemanticQueryPayloadPlan(
+        storage_kind=TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
+        inline_text=None,
+        payload_ref=HostPayloadRef(
+            payload_ref=descriptor.payload_ref,
+            payload_digest=descriptor.payload_digest,
+        ),
+        digest=descriptor.payload_digest,
     )
 
 
@@ -3623,6 +3833,66 @@ def _tool_result_sqlite_payload_id(result_event_id: str) -> str:
     """
 
     return f"{_TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX}-{result_event_id}"
+
+
+def _tool_call_arguments_payload_ref(requested_event_id: str) -> str:
+    """派生工具调用 accepted arguments payload ref。
+
+    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
+    :returns: 稳定 payload descriptor ref。
+    """
+
+    return f"{_TOOL_CALL_ARGUMENTS_PAYLOAD_REF_PREFIX}-{requested_event_id}"
+
+
+def _tool_call_arguments_sqlite_payload_id(requested_event_id: str) -> str:
+    """派生工具调用 accepted arguments SQLite payload id。
+
+    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
+    :returns: 稳定 SQLite payload id。
+    """
+
+    return f"{_TOOL_CALL_ARGUMENTS_SQLITE_PAYLOAD_ID_PREFIX}-{requested_event_id}"
+
+
+def _tool_call_semantic_query_payload_ref(requested_event_id: str) -> str:
+    """派生工具调用 semantic query payload ref。
+
+    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
+    :returns: 稳定 payload descriptor ref。
+    """
+
+    return f"{_TOOL_CALL_SEMANTIC_QUERY_PAYLOAD_REF_PREFIX}-{requested_event_id}"
+
+
+def _tool_call_semantic_query_sqlite_payload_id(requested_event_id: str) -> str:
+    """派生工具调用 semantic query SQLite payload id。
+
+    :param requested_event_id: ``TOOL_CALL_REQUESTED`` event id。
+    :returns: 稳定 SQLite payload id。
+    """
+
+    return f"{_TOOL_CALL_SEMANTIC_QUERY_SQLITE_PAYLOAD_ID_PREFIX}-{requested_event_id}"
+
+
+def _semantic_query_json(query_text: str) -> Mapping[str, JsonValue]:
+    """构造 semantic query descriptor 的 canonical JSON preimage。
+
+    :param query_text: 业务可读 semantic query 文本。
+    :returns: canonical JSON object。
+    """
+
+    return {"semantic_query_text": query_text}
+
+
+def _semantic_query_digest(query_text: str) -> str:
+    """计算 semantic query 文本 digest。
+
+    :param query_text: 业务可读 semantic query 文本。
+    :returns: Host canonical sha256 digest。
+    """
+
+    return sha256_digest_json(_semantic_query_json(query_text))
 
 
 def _accepted_evidence_envelope(
@@ -4038,6 +4308,20 @@ def _validate_tool_accept_call(call: ToolAcceptCall) -> None:
         call.normalized_arguments_digest,
         field_name="normalized_arguments_digest",
     )
+    if call.accepted_arguments is not None:
+        _validate_json_mapping(
+            call.accepted_arguments, field_name="accepted_arguments"
+        )
+        expected_arguments_digest = _accepted_arguments_digest(
+            call.accepted_arguments
+        )
+        if call.normalized_arguments_digest != expected_arguments_digest:
+            raise ValueError(
+                "normalized_arguments_digest must match accepted canonical arguments"
+            )
+    _require_optional_non_empty_text(
+        call.semantic_query_text, field_name="semantic_query_text"
+    )
 
 
 def _validate_tool_accept_result(result: ToolAcceptResult) -> None:
@@ -4394,6 +4678,50 @@ def _require_optional_non_empty_text(
 
     if value is not None and value.strip() == "":
         raise ValueError(f"{field_name} must be non-empty when provided")
+
+
+def _validate_json_mapping(
+    value: Mapping[str, JsonValue], *, field_name: str
+) -> None:
+    """递归校验 JSON object 参数映射。
+
+    :param value: 待校验 JSON object。
+    :param field_name: 错误消息中的字段名。
+    :returns: ``None``。
+    :raises ValueError: key 为空或嵌套值不是 JSON 兼容结构时抛出。
+    """
+
+    for key, nested_value in value.items():
+        if not isinstance(key, str) or key.strip() == "":
+            raise ValueError(f"{field_name} keys must be non-empty")
+        _validate_json_value(nested_value, field_name=f"{field_name}.{key}")
+
+
+def _validate_json_value(value: JsonValue, *, field_name: str) -> None:
+    """递归校验 JSON 值边界。
+
+    :param value: 待校验 JSON 值。
+    :param field_name: 错误消息中的字段名。
+    :returns: ``None``。
+    :raises ValueError: 值不是 JSON 兼容结构时抛出。
+    """
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must be finite JSON number")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, field_name=f"{field_name}[{index}]")
+        return
+    if isinstance(value, Mapping):
+        _validate_json_mapping(
+            cast(Mapping[str, JsonValue], value), field_name=field_name
+        )
+        return
+    raise ValueError(f"{field_name} must be JSON-compatible")
 
 
 def _require_sha256_digest(value: str | None, *, field_name: str) -> None:
@@ -4861,7 +5189,44 @@ def _normalized_arguments_digest(call: ToolCallRequest) -> str:
     :returns: Host canonical sha256 digest。
     """
 
-    return sha256_digest_json({"arguments": call.arguments})
+    return _accepted_arguments_digest(call.arguments)
+
+
+def _accepted_arguments_json(
+    arguments: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    """构造 accepted arguments 的 canonical JSON preimage。
+
+    :param arguments: 已接受的工具参数映射。
+    :returns: 与 ``normalized_arguments_digest`` 同源的 canonical JSON object。
+    """
+
+    return {"arguments": dict(arguments)}
+
+
+def _accepted_arguments_digest(arguments: Mapping[str, JsonValue]) -> str:
+    """计算 accepted canonical arguments JSON digest。
+
+    :param arguments: 已接受的工具参数映射。
+    :returns: 与 ``normalized_arguments_digest`` 同源的 sha256 digest。
+    """
+
+    return sha256_digest_json(_accepted_arguments_json(arguments))
+
+
+def _required_accepted_arguments(
+    call: ToolAcceptCall,
+) -> Mapping[str, JsonValue]:
+    """读取写入 accepted fact 必需的工具参数。
+
+    :param call: 工具 accept call 子结构。
+    :returns: accepted arguments 映射。
+    :raises HostPayloadReferenceError: 参数 atom 缺失时抛出。
+    """
+
+    if call.accepted_arguments is None:
+        raise HostPayloadReferenceError("tool call accepted arguments are missing")
+    return call.accepted_arguments
 
 
 def _tool_idempotency_key(
@@ -5077,6 +5442,7 @@ def _tool_fact_accept_candidate(
             tool_schema_digest=schema_digest,
             tool_identity_digest=identity_digest,
             normalized_arguments_digest=normalized_arguments_digest,
+            accepted_arguments=call.arguments,
         ),
         tool_fact_kind=tool_fact_kind,
         result=ToolAcceptResult(
@@ -5180,6 +5546,7 @@ def _tool_fact_reuse_accept_candidate(
             tool_schema_digest=schema_digest,
             tool_identity_digest=identity_digest,
             normalized_arguments_digest=normalized_arguments_digest,
+            accepted_arguments=call.arguments,
         ),
         tool_fact_kind=ToolFactKind.REUSE,
         result=None,
