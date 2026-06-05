@@ -32,6 +32,7 @@ from dayu.engine.contracts.messages import (
     SystemMessage,
     UserMessage,
 )
+from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host._event_payload import (
     payload_object as _payload_object,
@@ -47,7 +48,7 @@ from dayu.host.api import (
     OperationContext,
     RunStatus,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
@@ -66,6 +67,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.payload import (
     PayloadStore,
     SQLitePayloadFormat,
@@ -103,6 +105,7 @@ from dayu.host.context_policy import (
     context_budget_policy_from_threshold_tokens,
 )
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
     CurrentRunFacts,
     DurableCurrentRunFactProvider,
@@ -346,6 +349,57 @@ def test_build_is_deterministic_for_same_eventlog_and_policy(
         assert tuple(_message_content(message) for message in first.messages) == tuple(
             _message_content(message) for message in second.messages
         )
+        assert len(
+            _events_by_type(
+                store.transaction_runner,
+                event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            )
+        ) == 1
+
+
+def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
+    tmp_path: Path,
+) -> None:
+    """大输入只进入 request message，不完整内联到 runner-call manifest。"""
+
+    large_prompt = "read filing " + ("x" * 20000)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload(large_prompt),
+        )
+
+        request = _build_request(store, seeded)
+        manifest_events = _events_by_type(
+            store.transaction_runner,
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+        )
+        manifest_event = manifest_events[0]
+        hot_payload = _payload_object(manifest_event)
+        manifest = store.transaction_runner.run_read(
+            lambda transaction: event_payload_object(
+                transaction,
+                manifest_event,
+                payload_label="runner-call manifest",
+            )
+        )
+        manifest_text = canonical_json_dumps(manifest)
+        hot_text = canonical_json_dumps(hot_payload)
+
+        assert len(manifest_events) == 1
+        assert hot_payload["message_count"] == len(request.messages)
+        assert hot_payload["role_sequence_digest"] == runner_role_sequence_digest(
+            tuple(message.role.value for message in request.messages)
+        )
+        assert manifest_event.payload_ref == hot_payload["manifest_payload_ref"]
+        assert manifest_event.payload_digest == hot_payload["manifest_digest"]
+        assert manifest["message_count"] == len(request.messages)
+        assert len(manifest_text) < 5000
+        assert "x" * 128 not in hot_text
+        assert "x" * 128 not in manifest_text
+        assert large_prompt == _message_content(request.messages[-1])
 
 
 def test_session_continuity_does_not_emit_unbudgeted_historical_raw_turns(
@@ -439,8 +493,8 @@ def test_continuity_skips_unsuccessful_prior_runs(tmp_path: Path) -> None:
         assert contents == (_expected_system_content(), "current question")
 
 
-def test_noop_providers_do_not_create_durable_rows(tmp_path: Path) -> None:
-    """noop memory / compact / tool schema provider 不创建 durable rows。"""
+def test_noop_providers_only_create_runner_call_manifest_rows(tmp_path: Path) -> None:
+    """noop providers 只额外创建 runner-call manifest durable rows。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -453,7 +507,8 @@ def test_noop_providers_do_not_create_durable_rows(tmp_path: Path) -> None:
 
         _build_request(store, seeded)
 
-        assert _table_counts(store.transaction_runner) == before
+        after = _table_counts(store.transaction_runner)
+        assert after == (before[0] + 1, before[1] + 1, before[2] + 1)
 
 
 def test_no_tool_request_fields_are_disabled(tmp_path: Path) -> None:
@@ -2322,6 +2377,45 @@ def _read_event_by_id(
         row = EventLogStore().read_event_by_id(transaction, event_id)
         assert row is not None
         return row
+
+    return transaction_runner.run_read(operation)
+
+
+def _events_by_type(
+    transaction_runner: HostTransactionRunner, *, event_type: str
+) -> tuple[EventLogRow, ...]:
+    """读取指定 event type 的 EventLog rows。
+
+    :param transaction_runner: Host transaction runner。
+    :param event_type: event type。
+    :returns: 按 event_sequence 排序的 EventLog rows。
+    """
+
+    def operation(transaction: HostTransaction) -> tuple[EventLogRow, ...]:
+        """读取指定事件类型。
+
+        :param transaction: Host transaction。
+        :returns: EventLog rows。
+        """
+
+        rows = transaction.fetchall(
+            f"""
+            SELECT event_id
+            FROM {TABLE_EVENT_LOG}
+            WHERE event_type = ?
+            ORDER BY event_sequence
+            """,
+            (event_type,),
+        )
+        events: list[EventLogRow] = []
+        store = EventLogStore()
+        for row in rows:
+            event_id = row.get("event_id")
+            assert isinstance(event_id, str)
+            event = store.read_event_by_id(transaction, event_id)
+            assert event is not None
+            events.append(event)
+        return tuple(events)
 
     return transaction_runner.run_read(operation)
 

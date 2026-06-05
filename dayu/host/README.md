@@ -199,6 +199,8 @@ worker startup timeout、worker accept failure、worker stream crash 和未知 t
 
 RunInputBuilder 构造 ordinary Engine `AgentRunRequest` 时，会把当前 `AttemptDispatchSnapshot.attempt_id` 与 `execution_id` 投影到 Engine request。Engine 用这些字段和 run / iteration / logical Runner call 序号生成 `RunnerRequestIdentity.client_correlation_id`；Host 仍是 Attempt / execution 生命周期真源，Engine 不拥有 Host 状态机。
 
+RunInputBuilder 在 ordinary runner input 装配完成时写入 `RUNNER_CALL_INPUT_ASSEMBLED` canonical fact，并通过 `runner_call_input_manifest` payload descriptor 保存 lightweight manifest。manifest 记录 Host-owned `runner_call_index`、manifest ref / digest、source refs、message summaries、role sequence digest、input projection digest 和 projector metadata；它不内联完整 message text、prompt、compact material、memory snapshot、provider raw request / response 或未类型化 payload bag。Engine ingest 会把 `iteration_started` 中 Engine-owned `message_count` / `role_sequence_digest` 与对应 manifest signal 做诊断校验；Engine-internal continuation 缺少完整 Host source / projector material 时，Host 写入 canonical limited-signal manifest，并在 diagnostic 中保留 observed count / digest 与受限原因。
+
 ## EventLog 与 HostEvent
 
 EventLog 是 append-only ledger。`canonical_fact` 子集是恢复、memory、tool governance、terminal summary 和状态索引的事实来源；非 canonical 的展示事件、`diagnostic` 与 `projection_signal` 只能服务展示、诊断或投影追平。
@@ -274,7 +276,7 @@ Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservat
 
 Runner usage 进入 Host 后只写 `USAGE_REPORTED` projection signal，并附带 Session / Run / Attempt / execution、policy ref、estimator digest、估算输入 token 与 observation digest 等诊断字段。usage 是 post-call observation，只用于后续估算校准、diagnostic 和后续治理参考；缺少 policy、input event 或估算失败时 projection 仍提交为 `estimate_unavailable`，不改变当前 Run / Attempt 状态，也不回改当前 dispatch decision。
 
-Tool Trace 是 EventLog 的派生投影。当前 hot row 仍只把 `provider_request_id` 作为查询列；`client_correlation_id` 进入 `trace_summary_json`，cold JSONL 的 `trace_summary` 也保留同名字段。因此同一条 trace 可以同时呈现 provider-native request id、本地 client correlation id、Run / Attempt / execution、Engine event ref 与工具相关诊断 refs。Tool Trace projection 遇到 payload 中非文本 `client_correlation_id` 会按 durable payload 字段校验失败。
+Tool Trace 是 EventLog 的派生投影。当前 hot row 仍只把 `provider_request_id` 作为查询列；`client_correlation_id` 进入 `trace_summary_json`，cold JSONL 的 `trace_summary` 也保留同名字段。因此同一条 trace 可以同时呈现 provider-native request id、本地 client correlation id、Run / Attempt / execution、Engine event ref 与工具相关诊断 refs。Tool Trace 还会复制 `RUNNER_CALL_INPUT_ASSEMBLED` 的 read-model signal，包括 manifest ref / digest、message count、role sequence digest、input projection digest、projector metadata summary 和 typed diagnostic；Tool Trace 不是真源，也不展开 manifest body。Tool Trace projection 遇到 payload 中非文本 `client_correlation_id` 会按 durable payload 字段校验失败。
 
 当前已实现两类 compaction 路径：
 

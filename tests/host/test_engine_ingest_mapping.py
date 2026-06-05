@@ -28,6 +28,7 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
@@ -39,6 +40,7 @@ from dayu.engine.contracts.engine_events import (
     ToolCallsBatchReadyData,
     ToolResultAcceptedData,
     UsageReportedData,
+    runner_role_sequence_digest,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.tool_records import (
@@ -122,6 +124,7 @@ from dayu.host.durable.state import (
     steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.payload_resolution import event_payload_object
 from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
 from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
@@ -1954,6 +1957,10 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
                 iteration_id="iter-wrong",
                 iteration_index=0,
                 message_count=1,
+                role_sequence_digest=runner_role_sequence_digest(("user",)),
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
             ),
         ),
     ),
@@ -2004,6 +2011,87 @@ def test_preview_event_accepts_matching_type_and_data(tmp_path: Path) -> None:
         assert result.status == EngineIngestStatus.ACCEPTED
         assert result.events[0].event_class == EventClass.PREVIEW
         assert _payload(result.events[0])["delta"] == "hello"
+
+
+def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
+    tmp_path: Path,
+) -> None:
+    """tool-loop continuation iteration 会写 canonical limited manifest signal。"""
+
+    role_digest = runner_role_sequence_digest(
+        ("system", "user", "assistant", "tool")
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=21,
+            data=IterationStartedData(
+                iteration_id="iter-continuation",
+                iteration_index=1,
+                message_count=4,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert [event.event_type for event in result.events] == [
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            "ITERATION_STARTED",
+        ]
+        manifest_event = result.events[0]
+        preview_event = result.events[1]
+        manifest_hot = _payload(manifest_event)
+        manifest_body = store.transaction_runner.run_read(
+            lambda transaction: event_payload_object(
+                transaction,
+                manifest_event,
+                payload_label="runner-call manifest",
+            )
+        )
+        preview_payload = _payload(preview_event)
+        validation = preview_payload["runner_call_manifest_validation"]
+        assert isinstance(validation, Mapping)
+
+        assert manifest_event.event_class == EventClass.CANONICAL_FACT
+        assert manifest_hot["runner_call_index"] == 0
+        assert manifest_hot["runner_call_kind"] == "tool_result_continuation"
+        assert manifest_hot["runner_call_trigger_reason"] == "tool_results_available"
+        assert manifest_hot["iteration_id"] == "iter-continuation"
+        assert manifest_hot["message_count"] == 4
+        assert manifest_hot["role_sequence_digest"] == role_digest
+        assert manifest_hot["validation_status"] == "limited_signal"
+        assert manifest_hot["diagnostic"] == {
+            "status": "limited_signal",
+            "reason": "missing_projection_artifact",
+            "missing_atom_kind": None,
+            "missing_ref_kind": "runner_call_projection_artifact",
+            "missing_ref": None,
+            "observed_count": 4,
+            "expected_count": None,
+            "observed_digest": role_digest,
+            "expected_digest": None,
+            "consumer_boundary": "host.engine_ingest",
+        }
+        assert manifest_body["manifest_id"] == (
+            f"runner-call-manifest:{manifest_event.event_id}"
+        )
+        assert manifest_body["message_entries"] == []
+        assert manifest_body["message_count"] == 4
+        assert manifest_event.payload_ref == manifest_hot["manifest_payload_ref"]
+        assert manifest_event.payload_digest == manifest_hot["manifest_digest"]
+        assert validation["status"] == "limited_signal"
+        assert validation["reason"] == "missing_projection_artifact"
+        assert validation["observed_count"] == 4
+        assert validation["observed_digest"] == role_digest
 
 
 def test_iteration_completed_preview_includes_client_correlation_id(

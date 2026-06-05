@@ -461,6 +461,151 @@ def test_tool_trace_does_not_inline_large_tool_call_arguments(
         assert "x" * 128 not in line_text
 
 
+def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None:
+    """Tool Trace 只复制 runner-call manifest refs/digests 与摘要 signal。"""
+
+    cold_path = tmp_path / "trace" / "runner-call.jsonl"
+    manifest_digest = sha256_digest_json({"manifest": "runner-call"})
+    role_digest = sha256_digest_json({"roles": ["system", "user"]})
+    projection_digest = sha256_digest_json({"projection": "summary"})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 0,
+                "runner_call_kind": "initial_user_dispatch",
+                "runner_call_trigger_reason": "initial_user_input",
+                "iteration_id": "iteration-1",
+                "manifest_payload_ref": "payload-runner-call-manifest",
+                "manifest_digest": manifest_digest,
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "complete",
+                "message_count": 2,
+                "role_sequence_digest": role_digest,
+                "input_projection_digest": projection_digest,
+                "projector_metadata_summary": [
+                    {
+                        "projector_metadata_id": "projector:0:system",
+                        "projector_id": "run_input_system_context",
+                        "projector_schema_version": "run_input_projector.v1",
+                        "projector_digest": sha256_digest_json(
+                            {"projector": "system"}
+                        ),
+                        "purpose": "ordinary_run_input",
+                    }
+                ],
+                "diagnostic": None,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.result_digest == manifest_digest
+        assert row.trace_summary["runner_call_index"] == 0
+        assert row.trace_summary["manifest_ref"] == "payload-runner-call-manifest"
+        assert row.trace_summary["manifest_digest"] == manifest_digest
+        assert row.trace_summary["message_count"] == 2
+        assert row.trace_summary["role_sequence_digest"] == role_digest
+        assert row.trace_summary["input_projection_digest"] == projection_digest
+        assert row.trace_summary["diagnostic"] == {
+            "status": "complete",
+            "reason": None,
+            "missing_atom_kind": None,
+            "missing_ref_kind": None,
+            "missing_ref": None,
+            "observed_count": None,
+            "expected_count": None,
+            "observed_digest": None,
+            "expected_digest": None,
+            "consumer_boundary": "tool_trace_query",
+        }
+        assert cold_lines[0]["trace_summary"] == row.trace_summary
+
+
+def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 从 canonical payload 复制 non-complete typed diagnostic。"""
+
+    cold_path = tmp_path / "trace" / "runner-call-limited.jsonl"
+    manifest_digest = sha256_digest_json({"manifest": "runner-call-limited"})
+    role_digest = sha256_digest_json({"roles": ["system", "user", "tool"]})
+    projection_digest = sha256_digest_json({"projection": "limited"})
+    diagnostic = {
+        "status": "limited_signal",
+        "reason": "missing_projection_artifact",
+        "missing_atom_kind": None,
+        "missing_ref_kind": "runner_call_projection_artifact",
+        "missing_ref": None,
+        "observed_count": 3,
+        "expected_count": None,
+        "observed_digest": role_digest,
+        "expected_digest": None,
+        "consumer_boundary": "host.engine_ingest",
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input-limited",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 1,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "iteration_id": "iteration-2",
+                "manifest_payload_ref": "payload-runner-call-manifest-limited",
+                "manifest_digest": manifest_digest,
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "limited_signal",
+                "message_count": 3,
+                "role_sequence_digest": role_digest,
+                "input_projection_digest": projection_digest,
+                "projector_metadata_summary": [],
+                "diagnostic": diagnostic,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.trace_summary["runner_call_index"] == 1
+        assert row.trace_summary["manifest_ref"] == (
+            "payload-runner-call-manifest-limited"
+        )
+        assert row.trace_summary["diagnostic"] == {
+            "status": "limited_signal",
+            "reason": "missing_projection_artifact",
+            "missing_atom_kind": None,
+            "missing_ref_kind": "runner_call_projection_artifact",
+            "missing_ref": None,
+            "observed_count": 3,
+            "expected_count": None,
+            "observed_digest": role_digest,
+            "expected_digest": None,
+            "consumer_boundary": "tool_trace_query",
+        }
+        assert cold_lines[0]["trace_summary"] == row.trace_summary
+
+
 def test_tool_trace_projection_includes_client_correlation_id(
     tmp_path: Path,
 ) -> None:

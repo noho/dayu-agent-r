@@ -66,6 +66,7 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     ReasoningDeltaData,
     RunCancelledData,
@@ -80,6 +81,7 @@ from dayu.engine.contracts.engine_events import (
     ToolCallsBatchReadyData,
     ToolResultAcceptedData,
     UsageReportedData,
+    runner_role_sequence_digest,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -241,6 +243,16 @@ def _safe_log_message(message: str) -> str:
         max_chars=_EXCEPTION_MESSAGE_MAX_LENGTH,
         truncated_suffix=_EXCEPTION_MESSAGE_TRUNCATED_SUFFIX,
     )
+
+
+def _message_role_values(messages: Sequence[AgentMessage]) -> tuple[str, ...]:
+    """返回实际 runner 输入消息的 role 文本序列。
+
+    :param messages: 即将传给 Runner 的消息序列。
+    :returns: 按实际顺序排列的 role wire value 元组。
+    """
+
+    return tuple(message.role.value for message in messages)
 
 
 def _fallback_error_message(error_code: str) -> str:
@@ -1107,6 +1119,12 @@ class _AsyncAgent:
                 iteration_id=iteration_id,
                 iteration_index=iteration_index,
                 message_count=len(messages),
+                role_sequence_digest=runner_role_sequence_digest(
+                    _message_role_values(messages)
+                ),
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
             ),
             occurred_at=_utc_now(),
         )

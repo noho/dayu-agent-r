@@ -10,6 +10,7 @@ Agent 在内部把 :class:`RunnerEvent` 提升为 :class:`EngineEvent`，并补�
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +29,9 @@ from dayu.contracts.tool_call import ToolCallProviderState
 
 RUN_SUSPENDED_REASON_TOOL_AWAITING: str = "tool_awaiting"
 """工具进入长事务等待导致 run 挂起的中性原因码。"""
+
+RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION: str = "runner_input_roles.v1"
+"""Engine 观测 runner 输入 role 序列时使用的序列化 schema 版本。"""
 
 
 class EngineEventType(StrEnum):
@@ -60,11 +64,16 @@ class IterationStartedData:
     :param iteration_id: 当前迭代 id。
     :param iteration_index: 迭代序号（从 0 起）。
     :param message_count: 进入本轮 LLM 调用的消息数量。
+    :param role_sequence_digest: 按实际 messages role 顺序计算的 digest。
+    :param runner_input_serializer_schema_version: role digest 序列化 schema
+        版本。
     """
 
     iteration_id: str
     iteration_index: int
     message_count: int
+    role_sequence_digest: str
+    runner_input_serializer_schema_version: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,7 +480,22 @@ TERMINAL_ENGINE_EVENT_TYPES: frozenset[EngineEventType] = frozenset(
 """会导致 Engine run 终止的事件类型集合。"""
 
 
+def runner_role_sequence_digest(roles: tuple[str, ...]) -> str:
+    """计算 runner 输入消息 role 序列 digest。
+
+    Digest 只来自 Engine 能直接观测的实际 messages role 顺序，不包含 Host
+    lifecycle、manifest ref、source ref、message 正文或 provider raw dict。
+
+    :param roles: 按实际 runner input 顺序排列的 role 文本。
+    :returns: ``sha256:`` 前缀的 role 序列 digest。
+    """
+
+    preimage = "\n".join(roles).encode("utf-8")
+    return f"sha256:{hashlib.sha256(preimage).hexdigest()}"
+
+
 __all__ = [
+    "RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION",
     "RUN_SUSPENDED_REASON_TOOL_AWAITING",
     "EngineEventType",
     "IterationStartedData",
@@ -497,4 +521,5 @@ __all__ = [
     "EngineEventData",
     "EngineEvent",
     "TERMINAL_ENGINE_EVENT_TYPES",
+    "runner_role_sequence_digest",
 ]

@@ -58,6 +58,7 @@ _EVENT_TYPE_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = (
     "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
 )
+_EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
@@ -106,6 +107,16 @@ _FIELD_OPERATION_CONTEXT_DIGEST = "operation_context_digest"
 _FIELD_TRACE_SUMMARY = "trace_summary"
 _FIELD_SOURCE_PAYLOAD_REF = "source_payload_ref"
 _FIELD_SOURCE_PAYLOAD_DIGEST = "source_payload_digest"
+_FIELD_RUNNER_CALL_INDEX = "runner_call_index"
+_FIELD_RUNNER_CALL_KIND = "runner_call_kind"
+_FIELD_RUNNER_CALL_TRIGGER_REASON = "runner_call_trigger_reason"
+_FIELD_MANIFEST_PAYLOAD_REF = "manifest_payload_ref"
+_FIELD_MANIFEST_DIGEST = "manifest_digest"
+_FIELD_MESSAGE_COUNT = "message_count"
+_FIELD_ROLE_SEQUENCE_DIGEST = "role_sequence_digest"
+_FIELD_INPUT_PROJECTION_DIGEST = "input_projection_digest"
+_FIELD_PROJECTOR_METADATA_SUMMARY = "projector_metadata_summary"
+_FIELD_VALIDATION_STATUS = "validation_status"
 _OPERATION_CONTEXT_REF_FIELDS: tuple[str, ...] = (
     "operation_name",
     "operation_kind",
@@ -126,6 +137,7 @@ _CANONICAL_EVENT_TYPES: tuple[str, ...] = (
     _EVENT_TYPE_CONTEXT_COMPACTED,
     _EVENT_TYPE_CONTEXT_COMPACTION_FAILED,
     _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
     _EVENT_TYPE_RUN_SUCCEEDED,
     _EVENT_TYPE_RUN_FAILED,
     _EVENT_TYPE_RUN_CANCELLED,
@@ -448,6 +460,8 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
     :raises HostDurableError: 已命名字段存在但类型非法时抛出。
     """
 
+    if event.event_type == _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED:
+        return _extract_runner_call_trace(event)
     payload = event.payload
     diagnostic_refs = _diagnostic_refs(payload)
     provider_request_id = _optional_text(payload, _FIELD_PROVIDER_REQUEST_ID)
@@ -513,6 +527,111 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
         payload_digest=payload_digest,
         trace_summary=summary,
     )
+
+
+def _extract_runner_call_trace(event: ProjectionEventView) -> _ToolTraceExtract:
+    """从 RUNNER_CALL_INPUT_ASSEMBLED payload 抽取 runner-call trace signal。
+
+    :param event: typed projection event view。
+    :returns: Tool Trace extract。
+    :raises HostDurableError: runner-call signal 字段类型非法时抛出。
+    """
+
+    payload = event.payload
+    manifest_ref = _optional_text(payload, _FIELD_MANIFEST_PAYLOAD_REF)
+    manifest_digest = _optional_text(payload, _FIELD_MANIFEST_DIGEST)
+    diagnostic_refs = tuple(
+        ref for ref in (manifest_ref, manifest_digest) if ref is not None
+    )
+    summary = _runner_call_trace_summary(event)
+    return _ToolTraceExtract(
+        tool_call_id=None,
+        tool_name=None,
+        provider_request_id=None,
+        client_correlation_id=None,
+        diagnostic_ref=manifest_ref,
+        diagnostic_refs=diagnostic_refs,
+        normalized_arguments_digest=None,
+        semantic_input_digest=None,
+        result_digest=manifest_digest,
+        payload_ref=manifest_ref,
+        payload_digest=manifest_digest,
+        trace_summary=summary,
+    )
+
+
+def _runner_call_trace_summary(event: ProjectionEventView) -> Mapping[str, JsonValue]:
+    """构造 Tool Trace runner-call signal summary。
+
+    :param event: typed projection event view。
+    :returns: runner-call signal summary。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    payload = event.payload
+    return {
+        "event_type": event.event_type,
+        _FIELD_RUNNER_CALL_INDEX: _optional_int(payload, _FIELD_RUNNER_CALL_INDEX),
+        _FIELD_RUNNER_CALL_KIND: _optional_text(payload, _FIELD_RUNNER_CALL_KIND),
+        _FIELD_RUNNER_CALL_TRIGGER_REASON: _optional_text(
+            payload, _FIELD_RUNNER_CALL_TRIGGER_REASON
+        ),
+        "iteration_id": _optional_text(payload, "iteration_id"),
+        "manifest_ref": _optional_text(payload, _FIELD_MANIFEST_PAYLOAD_REF),
+        _FIELD_MANIFEST_DIGEST: _optional_text(payload, _FIELD_MANIFEST_DIGEST),
+        _FIELD_MESSAGE_COUNT: _optional_int(payload, _FIELD_MESSAGE_COUNT),
+        _FIELD_ROLE_SEQUENCE_DIGEST: _optional_text(
+            payload, _FIELD_ROLE_SEQUENCE_DIGEST
+        ),
+        _FIELD_INPUT_PROJECTION_DIGEST: _optional_text(
+            payload, _FIELD_INPUT_PROJECTION_DIGEST
+        ),
+        _FIELD_PROJECTOR_METADATA_SUMMARY: _json_value_or_none(
+            payload, _FIELD_PROJECTOR_METADATA_SUMMARY
+        ),
+        "diagnostic": _runner_call_diagnostic(payload),
+    }
+
+
+def _runner_call_diagnostic(
+    payload: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    """从 runner-call canonical payload 读取 typed diagnostic。
+
+    :param payload: RUNNER_CALL_INPUT_ASSEMBLED hot payload。
+    :returns: Tool Trace consumer boundary 下的 diagnostic summary。
+    :raises HostDurableError: 非 complete signal 缺少 typed diagnostic 时抛出。
+    """
+
+    status = _optional_text(payload, _FIELD_VALIDATION_STATUS)
+    diagnostic = payload.get("diagnostic")
+    if status == "complete":
+        return {
+            "status": status,
+            "reason": None,
+            "missing_atom_kind": None,
+            "missing_ref_kind": None,
+            "missing_ref": None,
+            "observed_count": None,
+            "expected_count": None,
+            "observed_digest": None,
+            "expected_digest": None,
+            "consumer_boundary": "tool_trace_query",
+        }
+    if not isinstance(diagnostic, Mapping):
+        raise HostDurableError("runner-call diagnostic must be object")
+    return {
+        "status": _required_text(diagnostic, "status"),
+        "reason": _optional_text(diagnostic, "reason"),
+        "missing_atom_kind": _optional_text(diagnostic, "missing_atom_kind"),
+        "missing_ref_kind": _optional_text(diagnostic, "missing_ref_kind"),
+        "missing_ref": _optional_text(diagnostic, "missing_ref"),
+        "observed_count": _optional_int(diagnostic, "observed_count"),
+        "expected_count": _optional_int(diagnostic, "expected_count"),
+        "observed_digest": _optional_text(diagnostic, "observed_digest"),
+        "expected_digest": _optional_text(diagnostic, "expected_digest"),
+        "consumer_boundary": "tool_trace_query",
+    }
 
 
 def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
@@ -921,6 +1040,40 @@ def _optional_text(payload: Mapping[str, JsonValue], field_name: str) -> str | N
     if isinstance(value, str) and value.strip() != "":
         return value
     raise HostDurableError(f"tool trace payload field {field_name} must be text")
+
+
+def _required_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取 payload 中的必填非空文本。
+
+    :param payload: projection event payload。
+    :param field_name: 字段名。
+    :returns: 文本值。
+    :raises HostDurableError: 字段缺失或不是非空文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"tool trace payload field {field_name} must be text")
+
+
+def _optional_int(payload: Mapping[str, JsonValue], field_name: str) -> int | None:
+    """读取 payload 中的可选非负整数。
+
+    :param payload: projection event payload。
+    :param field_name: 字段名。
+    :returns: 整数值或 ``None``。
+    :raises HostDurableError: 字段存在但不是非负整数时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HostDurableError(
+            f"tool trace payload field {field_name} must be non-negative integer"
+        )
+    return value
 
 
 def _json_value_or_none(payload: Mapping[str, JsonValue], field_name: str) -> JsonValue:

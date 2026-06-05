@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import NoReturn, Protocol
 
@@ -24,6 +25,10 @@ from dayu.contracts.tool_outcome import (
     ToolCancelledOutcome,
 )
 from dayu.contracts.tool_schema import ToolSchema
+from dayu.engine.contracts.engine_events import (
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+    runner_role_sequence_digest,
+)
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.messages import (
@@ -31,6 +36,7 @@ from dayu.engine.contracts.messages import (
     AgentMessageRole,
     AssistantMessage,
     SystemMessage,
+    ToolMessage,
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
@@ -61,13 +67,26 @@ from dayu.host.compaction import (
 )
 from dayu.host.durable.event_log import (
     EventClass,
+    EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
     read_event_by_id,
 )
 from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
-from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.payload import (
+    PayloadDescriptor,
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+)
+from dayu.host.durable.schema import (
+    RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
+    RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
+    RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+    TABLE_EVENT_LOG,
+)
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -113,6 +132,7 @@ _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_SYSTEM_PROMPT = "system_prompt"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
@@ -142,6 +162,30 @@ _MEMORY_ANSWER_ANCHOR_HEADER = "Answer Anchor Memory:"
 _MEMORY_FORWARD_INTENT_HEADER = "Forward Intent Memory:"
 _MEMORY_REFERENCE_CONTINUITY_HEADER = "Trace Memory reference continuity:"
 _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT = 8
+_RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX = "payload-runner-call-input-manifest"
+_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
+    "sqlite-payload-runner-call-input-manifest"
+)
+_RUNNER_CALL_EVENT_ID_PREFIX = "event-runner-call-input-assembled"
+_RUNNER_CALL_EVENT_ACTOR = "host.run_input"
+_RUNNER_CALL_EVENT_SOURCE = "host.run_input.builder"
+_RUNNER_CALL_KIND_INITIAL_USER_DISPATCH = "initial_user_dispatch"
+_RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH = "followup_user_dispatch"
+_RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH = "post_compaction_dispatch"
+_RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT = "initial_user_input"
+_RUNNER_CALL_TRIGGER_FOLLOWUP_USER_INPUT = "followup_user_input"
+_RUNNER_CALL_TRIGGER_HOST_RESUME = "host_resume"
+_RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
+_RUNNER_CALL_VALIDATION_COMPLETE = "complete"
+_PROJECTOR_ID_SYSTEM_CONTEXT = "run_input_system_context"
+_PROJECTOR_ID_USER_INPUT = "user_input_message"
+_PROJECTOR_ID_ASSISTANT_HISTORY = "assistant_history_message"
+_PROJECTOR_ID_TOOL_RESULT = "tool_result_message"
+_PROJECTOR_ID_MEMORY = "compact_memory_material"
+_PROJECTOR_ID_RECENT_WINDOW = "recent_window_material"
+_PROJECTOR_PURPOSE_ORDINARY = "ordinary_run_input"
+_PROJECTOR_PURPOSE_POST_COMPACTION = "post_compaction_input"
+_PROJECTOR_SCHEMA_VERSION = "run_input_projector.v1"
 _MEMORY_EVENT_TYPES = frozenset(
     (
         _EVENT_TYPE_USER_INPUT_ACCEPTED,
@@ -544,6 +588,165 @@ class PolicySnapshotProvider(Protocol):
         :returns: policy snapshot。
         """
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerCallManifestRecordInput:
+    """记录 runner-call input assembly manifest 所需输入。
+
+    :param attempt_snapshot: Attempt dispatch snapshot。
+    :param current_facts: 当前 Run durable facts。
+    :param policy_snapshot: policy snapshot。
+    :param memory: memory snapshot provider view。
+    :param compact: compact artifact provider view。
+    :param continuity: session continuity provider view。
+    :param tool_snapshot: tool schema snapshot provider view。
+    :param messages: 实际传给 Engine / Runner 的 messages。
+    :param fallback: 当前生效的 recent-window fallback；未生效时为 ``None``。
+    """
+
+    attempt_snapshot: AttemptDispatchSnapshot
+    current_facts: CurrentRunFacts
+    policy_snapshot: PolicySnapshot
+    memory: MemorySnapshotView
+    compact: CompactArtifactView
+    continuity: SessionContinuityView
+    tool_snapshot: ToolSchemaSnapshot
+    messages: tuple[AgentMessage, ...]
+    fallback: ActiveRecentWindowFallback | None
+
+
+class RunnerCallManifestRecorder(Protocol):
+    """runner-call input assembly manifest 记录器协议。"""
+
+    def record_runner_call_manifest(
+        self, record_input: RunnerCallManifestRecordInput
+    ) -> None:
+        """记录一次 logical runner call input assembly manifest。
+
+        :param record_input: manifest 构造输入。
+        :returns: ``None``。
+        :raises HostDurableError: manifest 无法写入或校验失败时抛出。
+        """
+        ...
+
+
+class NoopRunnerCallManifestRecorder:
+    """不写入 manifest 的测试 recorder。"""
+
+    def record_runner_call_manifest(
+        self, record_input: RunnerCallManifestRecordInput
+    ) -> None:
+        """忽略 manifest 记录请求。
+
+        :param record_input: manifest 构造输入。
+        :returns: ``None``。
+        """
+
+        del record_input
+
+
+class DurableRunnerCallManifestRecorder:
+    """将 runner-call input assembly manifest 写入 Host EventLog。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 durable manifest recorder。
+
+        :param transaction_runner: Host durable transaction runner。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self._event_log_store = EventLogStore()
+        self._payload_store = PayloadStore()
+
+    def record_runner_call_manifest(
+        self, record_input: RunnerCallManifestRecordInput
+    ) -> None:
+        """记录一次 logical runner call input assembly manifest。
+
+        :param record_input: manifest 构造输入。
+        :returns: ``None``。
+        :raises HostDurableError: manifest 无法写入或校验失败时抛出。
+        """
+
+        self._transaction_runner.run_write(
+            lambda transaction: self._record_in_transaction(
+                transaction,
+                record_input,
+            )
+        )
+
+    def _record_in_transaction(
+        self,
+        transaction: HostTransaction,
+        record_input: RunnerCallManifestRecordInput,
+    ) -> None:
+        """在单个 transaction 内写入 manifest descriptor 与 canonical event。
+
+        :param transaction: 当前 Host transaction。
+        :param record_input: manifest 构造输入。
+        :returns: ``None``。
+        :raises HostDurableError: manifest 无法写入或校验失败时抛出。
+        """
+
+        existing = _find_existing_runner_call_manifest_event(
+            transaction,
+            run_id=record_input.current_facts.run.run_id,
+            attempt_id=record_input.current_facts.attempt.attempt_id,
+            execution_id=record_input.current_facts.attempt.execution_id,
+        )
+        if existing is not None:
+            return
+        runner_call_index = _next_runner_call_index(
+            transaction, run_id=record_input.current_facts.run.run_id
+        )
+        event_id = _runner_call_manifest_event_id(
+            record_input.current_facts.run.run_id,
+            record_input.current_facts.attempt.attempt_id,
+            record_input.current_facts.attempt.execution_id,
+            runner_call_index,
+        )
+        manifest = _runner_call_manifest_body(
+            record_input,
+            runner_call_index=runner_call_index,
+            manifest_id=_runner_call_manifest_id(event_id),
+        )
+        manifest_digest = sha256_digest_json(manifest)
+        descriptor = _write_runner_call_manifest_payload(
+            transaction,
+            self._payload_store,
+            event_id=event_id,
+            manifest=manifest,
+            manifest_digest=manifest_digest,
+        )
+        hot_payload = _runner_call_manifest_hot_payload(
+            manifest=manifest,
+            manifest_payload_ref=descriptor.payload_ref,
+            manifest_digest=manifest_digest,
+        )
+        self._event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=record_input.current_facts.run.session_id,
+                run_id=record_input.current_facts.run.run_id,
+                attempt_id=record_input.current_facts.attempt.attempt_id,
+                execution_id=record_input.current_facts.attempt.execution_id,
+                event_type=_EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                occurred_at=datetime.now(UTC),
+                actor=_RUNNER_CALL_EVENT_ACTOR,
+                source=_RUNNER_CALL_EVENT_SOURCE,
+                client_request_id=record_input.current_facts.run.client_request_id,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=hot_payload,
+                payload_ref=descriptor.payload_ref,
+                payload_digest=descriptor.payload_digest,
+            ),
+        )
 
 
 class DurableCurrentRunFactProvider:
@@ -1553,6 +1756,7 @@ class RunInputBuilder:
         scene_parameter_provider: SceneParameterProvider,
         policy_snapshot_provider: PolicySnapshotProvider,
         tool_execution_mode: ToolExecutionMode,
+        runner_call_manifest_recorder: RunnerCallManifestRecorder | None = None,
     ) -> None:
         """初始化 RunInputBuilder。
 
@@ -1568,6 +1772,8 @@ class RunInputBuilder:
         :param scene_parameter_provider: Scene parameter provider。
         :param policy_snapshot_provider: Policy snapshot provider。
         :param tool_execution_mode: 显式工具执行模式。
+        :param runner_call_manifest_recorder: runner-call manifest 记录器；
+            ``None`` 表示 no-op。
         :returns: ``None``。
         """
 
@@ -1584,6 +1790,11 @@ class RunInputBuilder:
         self._scene_parameter_provider = scene_parameter_provider
         self._policy_snapshot_provider = policy_snapshot_provider
         self._tool_execution_mode = tool_execution_mode
+        self._runner_call_manifest_recorder = (
+            NoopRunnerCallManifestRecorder()
+            if runner_call_manifest_recorder is None
+            else runner_call_manifest_recorder
+        )
 
     def build(self, attempt_snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
         """构造 AgentRunRequest。
@@ -1666,6 +1877,19 @@ class RunInputBuilder:
                 role=AgentMessageRole.USER,
                 content=current_facts.user_prompt,
             ),
+        )
+        self._runner_call_manifest_recorder.record_runner_call_manifest(
+            RunnerCallManifestRecordInput(
+                attempt_snapshot=attempt_snapshot,
+                current_facts=current_facts,
+                policy_snapshot=policy_snapshot,
+                memory=memory,
+                compact=compact,
+                continuity=continuity,
+                tool_snapshot=tool_snapshot,
+                messages=messages,
+                fallback=fallback,
+            )
         )
         return AgentRunRequest(
             run_id=attempt_snapshot.run_id,
@@ -1774,6 +1998,9 @@ def create_no_tool_run_input_builder(
         scene_parameter_provider=DefaultSceneParameterProvider(),
         policy_snapshot_provider=StaticPolicySnapshotProvider(policy_snapshot),
         tool_execution_mode=tool_execution_mode,
+        runner_call_manifest_recorder=DurableRunnerCallManifestRecorder(
+            transaction_runner
+        ),
     )
 
 
@@ -1828,6 +2055,9 @@ def create_tool_enabled_run_input_builder(
         scene_parameter_provider=DefaultSceneParameterProvider(),
         policy_snapshot_provider=StaticPolicySnapshotProvider(policy_snapshot),
         tool_execution_mode=ToolExecutionMode.TOOL_ENABLED,
+        runner_call_manifest_recorder=DurableRunnerCallManifestRecorder(
+            transaction_runner
+        ),
     )
 
 
@@ -3098,6 +3328,803 @@ def _validate_tool_enabled_snapshot(
         raise HostDurableError(
             "RunInputBuilder tool executor must come from same ToolRuntimeHandle"
         )
+
+
+def _find_existing_runner_call_manifest_event(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+) -> EventLogRow | None:
+    """查找同一 attempt/execution 已写入的 runner-call manifest event。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: 当前 Run id。
+    :param attempt_id: 当前 Attempt id。
+    :param execution_id: 当前 execution id。
+    :returns: 已存在的 manifest event；不存在时返回 ``None``。
+    :raises HostDurableError: 既有 event hot payload 非法时抛出。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND event_type = ?
+        ORDER BY event_sequence ASC
+        """,
+        (run_id, _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED),
+    )
+    event_log_store = EventLogStore()
+    for row in rows:
+        event_id = row.get("event_id")
+        if not isinstance(event_id, str):
+            raise HostDurableError("runner-call manifest event_id is invalid")
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError("runner-call manifest event row is missing")
+        payload = _payload_object(event)
+        if (
+            payload.get("attempt_id") == attempt_id
+            and payload.get("execution_id") == execution_id
+        ):
+            return event
+    return None
+
+
+def _next_runner_call_index(transaction: HostTransaction, *, run_id: str) -> int:
+    """返回当前 Run 下下一个 Host-owned runner_call_index。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: 当前 Run id。
+    :returns: 从 0 起的下一个 runner call index。
+    :raises HostDurableError: SQLite 返回值非法时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT count(*) AS n
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND event_type = ?
+        """,
+        (run_id, _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED),
+    )
+    if row is None:
+        raise HostDurableError("runner-call manifest count query returned no row")
+    value = row.get("n")
+    if not isinstance(value, int) or value < 0:
+        raise HostDurableError("runner-call manifest count is invalid")
+    return value
+
+
+def _runner_call_manifest_event_id(
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    runner_call_index: int,
+) -> str:
+    """派生 runner-call manifest canonical event id。
+
+    :param run_id: 当前 Run id。
+    :param attempt_id: 当前 Attempt id。
+    :param execution_id: 当前 execution id。
+    :param runner_call_index: Host-owned runner call index。
+    :returns: 稳定 event id。
+    """
+
+    digest = sha256_digest_json(
+        {
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "execution_id": execution_id,
+            "runner_call_index": runner_call_index,
+        }
+    )
+    return f"{_RUNNER_CALL_EVENT_ID_PREFIX}-{digest.removeprefix('sha256:')}"
+
+
+def _runner_call_manifest_id(event_id: str) -> str:
+    """派生 runner-call manifest logical id。
+
+    :param event_id: manifest canonical event id。
+    :returns: manifest id。
+    """
+
+    return f"runner-call-manifest:{event_id}"
+
+
+def _runner_call_manifest_body(
+    record_input: RunnerCallManifestRecordInput,
+    *,
+    runner_call_index: int,
+    manifest_id: str,
+) -> Mapping[str, JsonValue]:
+    """构造 runner-call input assembly manifest body。
+
+    :param record_input: manifest 构造输入。
+    :param runner_call_index: Host-owned runner call index。
+    :param manifest_id: manifest logical id。
+    :returns: manifest canonical JSON object。
+    """
+
+    roles = _message_role_values(record_input.messages)
+    message_entries = _runner_call_message_entries(record_input)
+    projector_metadata = _runner_call_projector_metadata(record_input)
+    source_cursor_refs = _source_cursor_refs(record_input)
+    input_projection_digest = _input_projection_digest(
+        message_entries=message_entries,
+        projector_metadata=projector_metadata,
+        source_cursor_refs=source_cursor_refs,
+    )
+    runner_call_kind, trigger_reason = _runner_call_kind_and_trigger(record_input)
+    return {
+        "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+        "manifest_id": manifest_id,
+        "session_id": record_input.current_facts.run.session_id,
+        "host_run_id": record_input.current_facts.run.run_id,
+        "attempt_id": record_input.current_facts.attempt.attempt_id,
+        "execution_id": record_input.current_facts.attempt.execution_id,
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": runner_call_kind,
+        "runner_call_trigger_reason": trigger_reason,
+        "iteration_id": None,
+        "iteration_index": None,
+        "message_count": len(record_input.messages),
+        "role_sequence_digest": runner_role_sequence_digest(roles),
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
+        "input_projection_digest": input_projection_digest,
+        "message_entries": list(message_entries),
+        "source_cursor_refs": list(source_cursor_refs),
+        "tool_schema_snapshot_refs": list(_tool_schema_snapshot_refs(record_input)),
+        "memory_snapshot_cursor_ref": _memory_snapshot_cursor_ref(
+            record_input.memory
+        ),
+        "compact_artifact_refs": list(_compact_artifact_refs(record_input.compact)),
+        "context_fallback_decision_ref": _context_fallback_decision_ref(
+            record_input.fallback
+        ),
+        "projector_metadata": list(projector_metadata),
+        "compactor_identity": None,
+        "diagnostic": None,
+    }
+
+
+def _write_runner_call_manifest_payload(
+    transaction: HostTransaction,
+    payload_store: PayloadStore,
+    *,
+    event_id: str,
+    manifest: Mapping[str, JsonValue],
+    manifest_digest: str,
+) -> PayloadDescriptor:
+    """写入 runner-call manifest payload descriptor。
+
+    :param transaction: 当前 Host transaction。
+    :param payload_store: payload store primitive。
+    :param event_id: manifest canonical event id。
+    :param manifest: manifest body。
+    :param manifest_digest: manifest body digest。
+    :returns: payload descriptor。
+    :raises HostDurableError: descriptor 缺失或 digest 不一致时抛出。
+    """
+
+    payload_ref = _runner_call_manifest_payload_ref(event_id)
+    existing = payload_store.read_payload_descriptor(transaction, payload_ref)
+    if existing is not None:
+        if existing.payload_digest != manifest_digest:
+            raise HostDurableError("runner-call manifest payload digest mismatch")
+        return existing
+    return payload_store.write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=_runner_call_manifest_sqlite_payload_id(event_id),
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=manifest,
+            media_type=RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
+            metadata={
+                "descriptor_kind": RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
+                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                "event_id": event_id,
+            },
+            expected_digest=manifest_digest,
+        ),
+    )
+
+
+def _runner_call_manifest_hot_payload(
+    *,
+    manifest: Mapping[str, JsonValue],
+    manifest_payload_ref: str,
+    manifest_digest: str,
+) -> Mapping[str, JsonValue]:
+    """构造 RUNNER_CALL_INPUT_ASSEMBLED hot payload。
+
+    :param manifest: manifest body。
+    :param manifest_payload_ref: manifest payload descriptor ref。
+    :param manifest_digest: manifest body digest。
+    :returns: EventLog hot payload。
+    :raises HostDurableError: manifest identity 字段类型非法时抛出。
+    """
+
+    return {
+        "session_id": _manifest_text(manifest, "session_id"),
+        "host_run_id": _manifest_text(manifest, "host_run_id"),
+        "attempt_id": _manifest_optional_text(manifest, "attempt_id"),
+        "execution_id": _manifest_optional_text(manifest, "execution_id"),
+        "runner_call_index": _manifest_int(manifest, "runner_call_index"),
+        "runner_call_kind": _manifest_text(manifest, "runner_call_kind"),
+        "runner_call_trigger_reason": _manifest_text(
+            manifest, "runner_call_trigger_reason"
+        ),
+        "iteration_id": _manifest_optional_text(manifest, "iteration_id"),
+        "iteration_index": manifest.get("iteration_index"),
+        "manifest_payload_ref": manifest_payload_ref,
+        "manifest_digest": manifest_digest,
+        "manifest_schema_version": _manifest_text(manifest, "schema_version"),
+        "validation_status": _RUNNER_CALL_VALIDATION_COMPLETE,
+        "message_count": _manifest_int(manifest, "message_count"),
+        "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
+        "input_projection_digest": _manifest_text(
+            manifest, "input_projection_digest"
+        ),
+        "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
+        "diagnostic": None,
+    }
+
+
+def _runner_call_manifest_payload_ref(event_id: str) -> str:
+    """派生 runner-call manifest payload descriptor ref。
+
+    :param event_id: manifest canonical event id。
+    :returns: payload descriptor ref。
+    """
+
+    return f"{_RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX}-{event_id}"
+
+
+def _runner_call_manifest_sqlite_payload_id(event_id: str) -> str:
+    """派生 runner-call manifest SQLite payload id。
+
+    :param event_id: manifest canonical event id。
+    :returns: SQLite payload id。
+    """
+
+    return f"{_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX}-{event_id}"
+
+
+def _runner_call_message_entries(
+    record_input: RunnerCallManifestRecordInput,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """构造 manifest message entries。
+
+    :param record_input: manifest 构造输入。
+    :returns: message entry 元组。
+    """
+
+    return tuple(
+        _runner_call_message_entry(record_input, index=index, message=message)
+        for index, message in enumerate(record_input.messages)
+    )
+
+
+def _runner_call_message_entry(
+    record_input: RunnerCallManifestRecordInput,
+    *,
+    index: int,
+    message: AgentMessage,
+) -> Mapping[str, JsonValue]:
+    """构造单条 manifest message entry。
+
+    :param record_input: manifest 构造输入。
+    :param index: message 顺序。
+    :param message: 实际 runner input message。
+    :returns: message entry JSON object。
+    """
+
+    return {
+        "index": index,
+        "role": message.role.value,
+        "content_digest": _message_content_digest(message),
+        "content_size_bytes": _message_content_size_bytes(message),
+        "source_refs": list(
+            _message_source_refs(record_input, index=index, message=message)
+        ),
+        "projection_artifact_ref": None,
+        "projection_artifact_digest": None,
+        "projector_metadata_id": _projector_metadata_id_for_message(
+            record_input, index=index, message=message
+        ),
+        "provider_tool_calls_digest": _assistant_tool_calls_digest(message),
+        "reasoning_content_digest": _assistant_reasoning_content_digest(message),
+    }
+
+
+def _runner_call_projector_metadata(
+    record_input: RunnerCallManifestRecordInput,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """构造 manifest projector metadata。
+
+    :param record_input: manifest 构造输入。
+    :returns: projector metadata 元组。
+    """
+
+    metadata_by_id: dict[str, Mapping[str, JsonValue]] = {}
+    for index, message in enumerate(record_input.messages):
+        metadata_id = _projector_metadata_id_for_message(
+            record_input, index=index, message=message
+        )
+        if metadata_id in metadata_by_id:
+            continue
+        metadata_by_id[metadata_id] = _projector_metadata(
+            metadata_id=metadata_id,
+            projector_id=_projector_id_for_message(record_input, index, message),
+            purpose=_projector_purpose(record_input),
+            source_contract_refs=_message_source_refs(
+                record_input, index=index, message=message
+            ),
+        )
+    return tuple(metadata_by_id.values())
+
+
+def _projector_metadata(
+    *,
+    metadata_id: str,
+    projector_id: str,
+    purpose: str,
+    source_contract_refs: tuple[str, ...],
+) -> Mapping[str, JsonValue]:
+    """构造单条 projector metadata。
+
+    :param metadata_id: projector metadata id。
+    :param projector_id: projector 语义 id。
+    :param purpose: projector 目的。
+    :param source_contract_refs: source contract refs。
+    :returns: projector metadata JSON object。
+    """
+
+    return {
+        "projector_metadata_id": metadata_id,
+        "projector_id": projector_id,
+        "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
+        "projector_digest": sha256_digest_json(
+            {
+                "projector_id": projector_id,
+                "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
+                "purpose": purpose,
+                "source_contract_refs": list(source_contract_refs),
+            }
+        ),
+        "purpose": purpose,
+        "source_contract_refs": list(source_contract_refs),
+    }
+
+
+def _projector_metadata_summary(
+    manifest: Mapping[str, JsonValue]
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """从 manifest body 复制 Tool Trace 可缓存的 projector metadata summary。
+
+    :param manifest: manifest body。
+    :returns: projector metadata summary 元组。
+    :raises HostDurableError: manifest projector metadata 结构非法时抛出。
+    """
+
+    value = manifest.get("projector_metadata")
+    if not isinstance(value, list):
+        raise HostDurableError("runner-call manifest projector_metadata is invalid")
+    summaries: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError("runner-call projector metadata must be object")
+        summaries.append(
+            {
+                "projector_metadata_id": _manifest_text(
+                    item, "projector_metadata_id"
+                ),
+                "projector_id": _manifest_text(item, "projector_id"),
+                "projector_schema_version": _manifest_text(
+                    item, "projector_schema_version"
+                ),
+                "projector_digest": _manifest_text(item, "projector_digest"),
+                "purpose": _manifest_text(item, "purpose"),
+            }
+        )
+    return tuple(summaries)
+
+
+def _projector_metadata_id_for_message(
+    record_input: RunnerCallManifestRecordInput,
+    *,
+    index: int,
+    message: AgentMessage,
+) -> str:
+    """返回 message 对应的 projector metadata id。
+
+    :param record_input: manifest 构造输入。
+    :param index: message 顺序。
+    :param message: 实际 runner input message。
+    :returns: projector metadata id。
+    """
+
+    del record_input
+    return f"projector:{index}:{message.role.value}"
+
+
+def _projector_id_for_message(
+    record_input: RunnerCallManifestRecordInput,
+    index: int,
+    message: AgentMessage,
+) -> str:
+    """返回 message 对应的 projector id。
+
+    :param record_input: manifest 构造输入。
+    :param index: message 顺序。
+    :param message: 实际 runner input message。
+    :returns: projector id。
+    """
+
+    if record_input.fallback is not None and index < len(record_input.messages) - 1:
+        return _PROJECTOR_ID_RECENT_WINDOW
+    if index == len(record_input.messages) - 1 and isinstance(message, UserMessage):
+        return _PROJECTOR_ID_USER_INPUT
+    if isinstance(message, AssistantMessage):
+        return _PROJECTOR_ID_ASSISTANT_HISTORY
+    if isinstance(message, ToolMessage):
+        return _PROJECTOR_ID_TOOL_RESULT
+    if _message_content_text(message).startswith(_MEMORY_SESSION_SUMMARY_HEADER):
+        return _PROJECTOR_ID_MEMORY
+    return _PROJECTOR_ID_SYSTEM_CONTEXT
+
+
+def _projector_purpose(record_input: RunnerCallManifestRecordInput) -> str:
+    """返回当前 manifest 的 projector purpose。
+
+    :param record_input: manifest 构造输入。
+    :returns: projector purpose。
+    """
+
+    if record_input.fallback is not None:
+        return _PROJECTOR_PURPOSE_POST_COMPACTION
+    return _PROJECTOR_PURPOSE_ORDINARY
+
+
+def _message_role_values(messages: tuple[AgentMessage, ...]) -> tuple[str, ...]:
+    """返回 messages 的 role wire value 序列。
+
+    :param messages: 实际 runner input messages。
+    :returns: role 文本元组。
+    """
+
+    return tuple(message.role.value for message in messages)
+
+
+def _message_content_digest(message: AgentMessage) -> str:
+    """计算单条 message rendered content digest。
+
+    :param message: 实际 runner input message。
+    :returns: ``sha256:`` digest。
+    """
+
+    return sha256_digest_json(_message_content_digest_preimage(message))
+
+
+def _message_content_digest_preimage(message: AgentMessage) -> Mapping[str, JsonValue]:
+    """构造 message content digest preimage。
+
+    :param message: 实际 runner input message。
+    :returns: digest preimage JSON object。
+    """
+
+    if isinstance(message, AssistantMessage):
+        return {
+            "serializer_schema_version": RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+            "role": message.role.value,
+            "content": message.content,
+            "reasoning_content_digest": _assistant_reasoning_content_digest(message),
+            "tool_calls_digest": _assistant_tool_calls_digest(message),
+        }
+    return {
+        "serializer_schema_version": RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+        "role": message.role.value,
+        "content": _message_content_text(message),
+    }
+
+
+def _message_content_size_bytes(message: AgentMessage) -> int:
+    """计算 message content 的 UTF-8 字节数。
+
+    :param message: 实际 runner input message。
+    :returns: content 字节数。
+    """
+
+    return len(_message_content_text(message).encode("utf-8"))
+
+
+def _message_content_text(message: AgentMessage) -> str:
+    """读取 message 文本内容。
+
+    :param message: 实际 runner input message。
+    :returns: message 文本；assistant content 缺失时返回空串。
+    """
+
+    if isinstance(message, SystemMessage):
+        return message.content
+    if isinstance(message, UserMessage):
+        return message.content
+    if isinstance(message, ToolMessage):
+        return message.content
+    if isinstance(message, AssistantMessage) and message.content is not None:
+        return message.content
+    return ""
+
+
+def _assistant_tool_calls_digest(message: AgentMessage) -> str | None:
+    """计算 assistant typed tool calls digest。
+
+    :param message: 实际 runner input message。
+    :returns: tool calls digest；非 assistant 或无 tool calls 时返回 ``None``。
+    """
+
+    if not isinstance(message, AssistantMessage) or len(message.tool_calls) == 0:
+        return None
+    return sha256_digest_json(
+        {
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": dict(call.arguments),
+                }
+                for call in message.tool_calls
+            ]
+        }
+    )
+
+
+def _assistant_reasoning_content_digest(message: AgentMessage) -> str | None:
+    """计算 assistant reasoning content digest。
+
+    :param message: 实际 runner input message。
+    :returns: reasoning content digest；缺失时返回 ``None``。
+    """
+
+    if not isinstance(message, AssistantMessage):
+        return None
+    if message.reasoning_content is None:
+        return None
+    return sha256_digest_json({"reasoning_content": message.reasoning_content})
+
+
+def _message_source_refs(
+    record_input: RunnerCallManifestRecordInput,
+    *,
+    index: int,
+    message: AgentMessage,
+) -> tuple[str, ...]:
+    """返回 message 的 durable source refs。
+
+    :param record_input: manifest 构造输入。
+    :param index: message 顺序。
+    :param message: 实际 runner input message。
+    :returns: source refs 元组。
+    """
+
+    if index == len(record_input.messages) - 1 and isinstance(message, UserMessage):
+        return (record_input.current_facts.user_input_event.event_id,)
+    refs: list[str] = [
+        record_input.current_facts.run_accepted_event.event_id,
+        record_input.current_facts.run_started_event.event_id,
+        record_input.policy_snapshot.policy_snapshot_ref,
+    ]
+    if record_input.memory.memory_snapshot_cursor is not None:
+        refs.append(f"memory:{record_input.memory.memory_snapshot_cursor}")
+    if record_input.compact.compact_artifact_ref is not None:
+        refs.append(f"compact:{record_input.compact.compact_artifact_ref}")
+    if record_input.fallback is not None:
+        refs.append(f"context_fallback:{record_input.fallback.fallback_input_digest}")
+    return tuple(dict.fromkeys(refs))
+
+
+def _source_cursor_refs(
+    record_input: RunnerCallManifestRecordInput,
+) -> tuple[str, ...]:
+    """返回 manifest source cursor refs。
+
+    :param record_input: manifest 构造输入。
+    :returns: source cursor refs 元组。
+    """
+
+    refs = [
+        f"event:{record_input.current_facts.user_input_event.event_id}",
+        f"event:{record_input.current_facts.run_started_event.event_id}",
+    ]
+    if record_input.memory.memory_snapshot_cursor is not None:
+        refs.append(f"memory:{record_input.memory.memory_snapshot_cursor}")
+    if record_input.compact.compact_artifact_ref is not None:
+        refs.append(f"compact:{record_input.compact.compact_artifact_ref}")
+    return tuple(dict.fromkeys(refs))
+
+
+def _tool_schema_snapshot_refs(
+    record_input: RunnerCallManifestRecordInput,
+) -> tuple[str, ...]:
+    """返回工具 schema snapshot refs。
+
+    :param record_input: manifest 构造输入。
+    :returns: 工具 schema refs；无工具时为空。
+    """
+
+    if len(record_input.tool_snapshot.tool_schemas) == 0:
+        return ()
+    return (
+        "tool_schema_snapshot:"
+        + sha256_digest_json(
+            {
+                "tool_schema_count": len(record_input.tool_snapshot.tool_schemas),
+                "disable_tools": record_input.tool_snapshot.disable_tools,
+            }
+        ),
+    )
+
+
+def _memory_snapshot_cursor_ref(memory: MemorySnapshotView) -> str | None:
+    """返回 manifest memory snapshot cursor ref。
+
+    :param memory: memory view。
+    :returns: cursor ref；缺失时返回 ``None``。
+    """
+
+    if memory.memory_snapshot_cursor is None:
+        return None
+    return f"memory:{memory.memory_snapshot_cursor}"
+
+
+def _compact_artifact_refs(compact: CompactArtifactView) -> tuple[str, ...]:
+    """返回 manifest compact artifact refs。
+
+    :param compact: compact artifact view。
+    :returns: compact artifact refs 元组。
+    """
+
+    refs: list[str] = []
+    if compact.compact_artifact_ref is not None:
+        refs.append(f"compact:{compact.compact_artifact_ref}")
+    if compact.compact_artifact_digest is not None:
+        refs.append(f"compact_digest:{compact.compact_artifact_digest}")
+    return tuple(refs)
+
+
+def _context_fallback_decision_ref(
+    fallback: ActiveRecentWindowFallback | None,
+) -> str | None:
+    """返回 context fallback decision ref。
+
+    :param fallback: active fallback view。
+    :returns: fallback ref；未生效时返回 ``None``。
+    """
+
+    if fallback is None:
+        return None
+    return f"context_fallback:{fallback.fallback_input_digest}"
+
+
+def _input_projection_digest(
+    *,
+    message_entries: tuple[Mapping[str, JsonValue], ...],
+    projector_metadata: tuple[Mapping[str, JsonValue], ...],
+    source_cursor_refs: tuple[str, ...],
+) -> str:
+    """计算 manifest input projection digest。
+
+    :param message_entries: message entry 摘要。
+    :param projector_metadata: projector metadata 摘要。
+    :param source_cursor_refs: source cursor refs。
+    :returns: input projection digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "message_entries": [
+                {
+                    "index": entry["index"],
+                    "role": entry["role"],
+                    "content_digest": entry["content_digest"],
+                    "source_refs": entry["source_refs"],
+                    "projector_metadata_id": entry["projector_metadata_id"],
+                }
+                for entry in message_entries
+            ],
+            "projector_metadata": list(projector_metadata),
+            "source_cursor_refs": list(source_cursor_refs),
+        }
+    )
+
+
+def _runner_call_kind_and_trigger(
+    record_input: RunnerCallManifestRecordInput,
+) -> tuple[str, str]:
+    """返回 runner call kind 与 trigger reason。
+
+    :param record_input: manifest 构造输入。
+    :returns: ``(runner_call_kind, runner_call_trigger_reason)``。
+    """
+
+    start_payload = _payload_object(record_input.current_facts.run_started_event)
+    start_reason = start_payload.get(_PAYLOAD_FIELD_START_REASON)
+    if start_reason == "recovery" or record_input.fallback is not None:
+        return (
+            _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
+            _RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED,
+        )
+    if start_reason == "resume":
+        return (
+            _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
+            _RUNNER_CALL_TRIGGER_HOST_RESUME,
+        )
+    if len(record_input.continuity.messages) > 0:
+        return (
+            _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
+            _RUNNER_CALL_TRIGGER_FOLLOWUP_USER_INPUT,
+        )
+    return (
+        _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH,
+        _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT,
+    )
+
+
+def _manifest_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取 manifest 中的必填文本字段。
+
+    :param payload: manifest JSON object。
+    :param field_name: 字段名。
+    :returns: 文本值。
+    :raises HostDurableError: 字段缺失或类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"runner-call manifest {field_name} must be text")
+    return value
+
+
+def _manifest_optional_text(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """读取 manifest 中的可选文本字段。
+
+    :param payload: manifest JSON object。
+    :param field_name: 字段名。
+    :returns: 文本值或 ``None``。
+    :raises HostDurableError: 字段类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"runner-call manifest {field_name} must be text")
+    return value
+
+
+def _manifest_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
+    """读取 manifest 中的必填非负整数字段。
+
+    :param payload: manifest JSON object。
+    :param field_name: 字段名。
+    :returns: 整数值。
+    :raises HostDurableError: 字段缺失或类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HostDurableError(f"runner-call manifest {field_name} must be int")
+    return value
 
 
 def _tools_scene_line(tool_execution_mode: ToolExecutionMode) -> str:

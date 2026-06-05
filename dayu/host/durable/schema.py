@@ -222,6 +222,17 @@ TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT = "inline_text"
 TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR = "payload_descriptor"
 """TOOL_CALL_REQUESTED readable semantic query 以 payload descriptor 存储。"""
 
+RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND = "runner_call_input_manifest"
+"""RUNNER_CALL_INPUT_ASSEMBLED manifest body payload descriptor kind。"""
+
+RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION = "runner_call_input_manifest.v1"
+"""RUNNER_CALL_INPUT_ASSEMBLED manifest body schema version。"""
+
+RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE = (
+    "application/vnd.dayu.runner-call-manifest+json"
+)
+"""RUNNER_CALL_INPUT_ASSEMBLED manifest body media type。"""
+
 _SQLITE_PAYLOADS_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_SQLITE_PAYLOADS} (
   payload_id TEXT PRIMARY KEY,

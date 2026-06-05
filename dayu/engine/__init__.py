@@ -115,6 +115,10 @@ from dayu.engine.contracts import (
     UsageReportedData,
     UserMessage,
 )
+from dayu.engine.contracts.engine_events import (
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+    runner_role_sequence_digest,
+)
 from dayu.engine.agent import run_agent_and_wait, run_agent_messages
 
 __all__ = [
@@ -165,6 +169,7 @@ __all__ = [
     "ProviderRequestExtension",
     "QwenThinkingExtension",
     "ReasoningDeltaData",
+    "RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION",
     "RUN_SUSPENDED_REASON_TOOL_AWAITING",
     "RunCancelledData",
     "RunFailedData",
@@ -217,4 +222,5 @@ __all__ = [
     "ToolResultSuccess",
     "ToolSchema",
     "UserMessage",
+    "runner_role_sequence_digest",
 ]
