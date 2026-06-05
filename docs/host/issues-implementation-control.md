@@ -232,47 +232,47 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ## 当前 Work Units
 
-| Work Unit | 主题 | Owner / Destination | 当前定位 |
-|---|---|---|---|
-| WU-ENG-01 | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | completed；PR 113 已 merge，稳定结论是 provider reasoning roundtrip 为协议要求，不进入 payload behavior change |
-| WU-ENG-02 | Provider request identity and vendor debugging correlation | GitHub Issue #63 closed；#64 current shared scope completed, native adapter-specific scope remains open | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；typed request identity 与 OpenAI-compatible correlation scope 已完成，#64 保留 native Anthropic / Claude Code gateway adapter-specific 后续语义 |
-| WU-CM-01 | Conversation Memory overall optimization | GitHub Issue #81 | #81 umbrella 的正式 implementation entry point |
-| WU-CM-01-F01 | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | WU-CM-01 收尾 follow-up；修正 Host public smoke 中无法有效验证 Conversation Memory / Host 设计的偏差；当前已知项是 Runner-call messages 收敛为一个 `system` role message，并审计同组 4 个 Host public smoke 是否存在相同偏差 |
-| WU-CM-01-F02 | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | WU-CM-01 收尾 follow-up；改善 compact evidence material 的 `query_text`，避免只向 compactor 暴露 `tool_call_id` 而缺少 tool name / arguments / semantic query |
-| WU-CM-02 | working_assumptions 生产者语义 | GitHub Issue #81 / WU-CM-01 | 已裁决；reject 旧 `working_assumptions` 独立语义，不单独实施，删除 / 迁移旧字段由 WU-CM-01 schema / projection slice 承接 |
-| WU-CM-03 | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
-| WU-CM-04 | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
-| WU-TOOLS-01 | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98 | 单一 work unit，先迁移 shared document foundations，再按 Doc tools、Fins、Web tools slice 实施 |
-| WU-PROJ-01 | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
-| WU-DUR-P01 | EventLog runner-call reconstruction atoms | GitHub Issue #117 | WU-OBS-P00 / WU-OBS-00 前置；补齐 EventLog / payload 原子字段，使历史 Runner 调用 LLM-facing messages 可由 durable truth 与版本化 projector 重建 |
-| WU-OBS-P00 | Runner call input reconstruction signals | GitHub Issue #70 / #117 | WU-OBS-00 前置；Tool Trace analyzer 的 runner-call messages dump 信号契约，消费 WU-DUR-P01 补齐的 durable atoms |
-| WU-OBS-P01 | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
-| WU-OBS-P02 | Tool Trace tool latency signals | GitHub Issue #30 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 tool latency stable signal |
-| WU-OBS-P03 | Tool Trace structured failure metadata | GitHub Issue #31 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 failure signature / repair hint stable signal |
-| WU-OBS-P04 | Provider protocol partial tool-call trace signals | GitHub Issue #35 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 provider protocol error partial tool-call stable trace signal |
-| WU-OBS-00 | Tool Trace analyzer | GitHub Issue #70 | trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
-| WU-OBS-00A | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
-| WU-OBS-01 | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
-| WU-AUDIT-01 | Audit Ledger viewer and integrity report | GitHub Issue #72 | read-only audit JSONL ledger viewer；审计责任链 / 完整性校验，不做 Tool Trace root-cause analyzer |
-| WU-AUDIT-02 | External audit delivery contract with local validation adapters | GitHub Issue #75 | async external audit delivery 语义；无真实外部系统时先用 Noop / FileMirror adapter 验证 contract |
-| WU-RET-00 | Host storage lifecycle retention policy | GitHub Issue #43 | retention umbrella；purge 已完成，剩余 payload / descriptor / DB / workspace-level cleanup |
-| WU-RET-01 | Tool Trace cold JSONL storage governance | GitHub Issue #36 | Tool Trace cold JSONL rotation / retention / compaction / size reporting；不作为 #70 前置 |
-| WU-RET-02 | Audit JSONL storage governance | GitHub Issue #96 | Audit JSONL rotation / retention / compaction / size reporting；保留 purge tombstone 可验证关联 |
-| WU-STRESS-SQLITE-01 | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
-| WU-LIFE-03 | Active cancel watchdog | GitHub Issue #91 / #87 umbrella | Host lifecycle watchdog target |
-| WU-GOV-01 | Host governance terminal taxonomy | GitHub Issue #88 | 引入 `REJECTED` |
-| WU-CTX-01 | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
-| WU-WAIT-01 | Callback endpoint / auth / replay | GitHub Issue #89 | wait callback adapter |
-| WU-WAIT-02 | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | production poller loop |
-| WU-WAIT-03 | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
-| WU-WAIT-04 | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
-| WU-CM-05 | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | deferred behind #81 |
-| WU-CM-06 | Terminal summary text policy convergence | GitHub Issue #94 / #81 child | deferred behind #81 |
-| WU-CM-07 | Evidence validation and pinned state cleanup | obsolete / #81 semantic model | 过期失效，不独立推进 |
-| WU-CM-08 | Compaction material readability and smoke maintenance | GitHub Issue #95 / #81 child | #81 子任务，测试可维护性 cleanup |
-| WU-CM-09 | Durable memory snapshot corruption policy | GitHub Issue #41 | deferred behind #81；post-#81 durable memory hardening / operator repair policy |
-| WU-CM-10 | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
-| WU-CM-11 | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+| Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
+|---|---|---|---|---|
+| WU-ENG-01 | completed | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | completed；PR 113 已 merge，稳定结论是 provider reasoning roundtrip 为协议要求，不进入 payload behavior change |
+| WU-ENG-02 | completed-with-follow-up | Provider request identity and vendor debugging correlation | GitHub Issue #63 closed；#64 current shared scope completed, native adapter-specific scope remains open | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；typed request identity 与 OpenAI-compatible correlation scope 已完成，#64 保留 native Anthropic / Claude Code gateway adapter-specific 后续语义 |
+| WU-CM-01 | final-closeout-follow-up | Conversation Memory overall optimization | GitHub Issue #81 | #81 umbrella 的正式 implementation entry point |
+| WU-CM-01-F01 | next | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | WU-CM-01 收尾 follow-up；修正 Host public smoke 中无法有效验证 Conversation Memory / Host 设计的偏差；当前已知项是 Runner-call messages 收敛为一个 `system` role message，并审计同组 4 个 Host public smoke 是否存在相同偏差 |
+| WU-CM-01-F02 | pending-prerequisite | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | WU-CM-01 收尾 follow-up；改善 compact evidence material 的 `query_text`，避免只向 compactor 暴露 `tool_call_id` 而缺少 tool name / arguments / semantic query |
+| WU-CM-02 | closed | working_assumptions 生产者语义 | GitHub Issue #81 / WU-CM-01 | 已裁决；reject 旧 `working_assumptions` 独立语义，不单独实施，删除 / 迁移旧字段由 WU-CM-01 schema / projection slice 承接 |
+| WU-CM-03 | closed | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
+| WU-CM-04 | closed | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
+| WU-TOOLS-01 | pending | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98 | 单一 work unit，先迁移 shared document foundations，再按 Doc tools、Fins、Web tools slice 实施 |
+| WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
+| WU-DUR-P01 | pending | EventLog runner-call reconstruction atoms | GitHub Issue #117 | WU-OBS-P00 / WU-OBS-00 前置；补齐 EventLog / payload 原子字段，使历史 Runner 调用 LLM-facing messages 可由 durable truth 与版本化 projector 重建 |
+| WU-OBS-P00 | pending-prerequisite | Runner call input reconstruction signals | GitHub Issue #70 / #117 | WU-OBS-00 前置；Tool Trace analyzer 的 runner-call messages dump 信号契约，消费 WU-DUR-P01 补齐的 durable atoms |
+| WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
+| WU-OBS-P02 | pending | Tool Trace tool latency signals | GitHub Issue #30 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 tool latency stable signal |
+| WU-OBS-P03 | pending | Tool Trace structured failure metadata | GitHub Issue #31 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 failure signature / repair hint stable signal |
+| WU-OBS-P04 | pending | Provider protocol partial tool-call trace signals | GitHub Issue #35 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 provider protocol error partial tool-call stable trace signal |
+| WU-OBS-00 | pending-prerequisite | Tool Trace analyzer | GitHub Issue #70 | trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
+| WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
+| WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
+| WU-AUDIT-01 | pending | Audit Ledger viewer and integrity report | GitHub Issue #72 | read-only audit JSONL ledger viewer；审计责任链 / 完整性校验，不做 Tool Trace root-cause analyzer |
+| WU-AUDIT-02 | pending | External audit delivery contract with local validation adapters | GitHub Issue #75 | async external audit delivery 语义；无真实外部系统时先用 Noop / FileMirror adapter 验证 contract |
+| WU-RET-00 | in-progress-partial | Host storage lifecycle retention policy | GitHub Issue #43 | retention umbrella；purge 已完成，剩余 payload / descriptor / DB / workspace-level cleanup |
+| WU-RET-01 | pending | Tool Trace cold JSONL storage governance | GitHub Issue #36 | Tool Trace cold JSONL rotation / retention / compaction / size reporting；不作为 #70 前置 |
+| WU-RET-02 | pending | Audit JSONL storage governance | GitHub Issue #96 | Audit JSONL rotation / retention / compaction / size reporting；保留 purge tombstone 可验证关联 |
+| WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
+| WU-LIFE-03 | pending | Active cancel watchdog | GitHub Issue #91 / #87 umbrella | Host lifecycle watchdog target |
+| WU-GOV-01 | pending | Host governance terminal taxonomy | GitHub Issue #88 | 引入 `REJECTED` |
+| WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
+| WU-WAIT-01 | pending | Callback endpoint / auth / replay | GitHub Issue #89 | wait callback adapter |
+| WU-WAIT-02 | pending | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | production poller loop |
+| WU-WAIT-03 | pending | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
+| WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
+| WU-CM-05 | deferred | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | deferred behind #81 |
+| WU-CM-06 | deferred | Terminal summary text policy convergence | GitHub Issue #94 / #81 child | deferred behind #81 |
+| WU-CM-07 | obsolete | Evidence validation and pinned state cleanup | obsolete / #81 semantic model | 过期失效，不独立推进 |
+| WU-CM-08 | deferred | Compaction material readability and smoke maintenance | GitHub Issue #95 / #81 child | #81 子任务，测试可维护性 cleanup |
+| WU-CM-09 | deferred | Durable memory snapshot corruption policy | GitHub Issue #41 | deferred behind #81；post-#81 durable memory hardening / operator repair policy |
+| WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
+| WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
 ## WU-ENG-01 Provider State And Reasoning Content Roundtrip Policy
 
