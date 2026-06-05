@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final closeout |
-| implementation status | final-closeout-pass |
-| active work unit | WU-CM-01 |
-| default next work unit | WU-TOOLS-01 |
-| next entry point | User / maintainer review and merge PR 116 when ready; after merge enter WU-TOOLS-01 discussion gate |
+| gate | discussion-ready |
+| implementation status | WU-CM-01 final closeout follow-up queued |
+| active work unit | WU-CM-01-F01 |
+| default next work unit | WU-CM-01-F01 |
+| next entry point | Enter WU-CM-01-F01 discussion / plan gate for Host public conversation memory smoke correctness closeout |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
 | plan artifacts | docs/host/wu-cm-01-conversation-memory-plan.md |
 | implementation commits | WU-CM-01 accepted plan commit 14d28009; WU-CM-01 plan reslice accepted commit a92416ec; WU-CM-01 compact contract closure accepted plan commit daa01004; WU-CM-01 compact contract closure blocker follow-up accepted commit ff6c225a; WU-CM-01 compact contract closure accepted slice commit b2b57c18; WU-CM-01 Slice C policy contract plan fix accepted commit 49990e97; WU-CM-01 Slice C accepted commit 29c86355; WU-CM-01 Slice D accepted commit 30a426b4; WU-CM-01 aggregate deepreview accepted commit 2248a395; WU-CM-01 accepted PR review commit f2db943f; WU-CM-01 deferred risk cleanup accepted commit 30759116d00d0ca58308e74b9f61a0ecc5b6ad9a; WU-CM-01 Slice A accepted commit f060853d; WU-CM-01 Slice B accepted commit 74fbb5e6; WU-ENG-02 merged via PR 114 as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
@@ -181,6 +181,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | PR review artifacts | docs/reviews/wu-cm-01-pr-review-mimo.md; docs/reviews/wu-cm-01-pr-review-ds.md; docs/reviews/wu-cm-01-pr-review-controller-adjudication.md; docs/reviews/wu-cm-01-pr-review-fix-codex.md; docs/reviews/wu-cm-01-pr-rereview-mimo.md; docs/reviews/wu-cm-01-pr-rereview-ds.md; docs/reviews/wu-cm-01-pr-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-pr-deferred-risk-controller-adjudication.md; docs/host/wu-cm-01-deferred-risk-cleanup-plan.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-implementation-codex.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-review-mimo.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-review-ds.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-rereview-mimo.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-rereview-ds.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-controller-adjudication.md |
 | draft PR status | WU-CM-01 draft PR 116 open at https://github.com/noho/dayu-agent-r/pull/116; branch `phaseflow/wu-cm-01` pushed through control-doc bookkeeping commit a63351d62da313b233ff18825c6e59f1f2ce0ef7 before final closeout record; GitHub reported no checks on branch `phaseflow/wu-cm-01`; WU-ENG-02 PR 114 merged at 2026-06-03 09:33:38 UTC as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 PR 113 merged at 2026-06-03 05:14:07 UTC as bc50e26c45296171487272ff5fc2293db67a9246 |
 | blocking open questions | none |
+| current inspection note | 2026-06-05 Host public conversation memory smoke message dump review identified WU-CM-01-F01 follow-up scope: round1 system role convergence, round2 post-compact message-count observability, and compactor prompt LLM-facing semantic rewrite; WU-CM-01-F01 must audit the same correction items across all 4 Host public smoke entries (`conversation_memory`, `diagnostics`, `conversation_memory_scenarios`, `multiturn`); WU-CM-01-F02 / WU-DUR-P01 / WU-OBS-P00 remain separate dependent follow-ups |
 
 状态约定：
 
@@ -236,11 +237,15 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-ENG-01 | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | completed；PR 113 已 merge，稳定结论是 provider reasoning roundtrip 为协议要求，不进入 payload behavior change |
 | WU-ENG-02 | Provider request identity and vendor debugging correlation | GitHub Issue #63 closed；#64 current shared scope completed, native adapter-specific scope remains open | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；typed request identity 与 OpenAI-compatible correlation scope 已完成，#64 保留 native Anthropic / Claude Code gateway adapter-specific 后续语义 |
 | WU-CM-01 | Conversation Memory overall optimization | GitHub Issue #81 | #81 umbrella 的正式 implementation entry point |
+| WU-CM-01-F01 | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | WU-CM-01 收尾 follow-up；修正 Host public smoke 中无法有效验证 Conversation Memory / Host 设计的偏差；当前已知项是 Runner-call messages 收敛为一个 `system` role message，并审计同组 4 个 Host public smoke 是否存在相同偏差 |
+| WU-CM-01-F02 | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | WU-CM-01 收尾 follow-up；改善 compact evidence material 的 `query_text`，避免只向 compactor 暴露 `tool_call_id` 而缺少 tool name / arguments / semantic query |
 | WU-CM-02 | working_assumptions 生产者语义 | GitHub Issue #81 / WU-CM-01 | 已裁决；reject 旧 `working_assumptions` 独立语义，不单独实施，删除 / 迁移旧字段由 WU-CM-01 schema / projection slice 承接 |
 | WU-CM-03 | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
 | WU-CM-04 | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
 | WU-TOOLS-01 | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98 | 单一 work unit，先迁移 shared document foundations，再按 Doc tools、Fins、Web tools slice 实施 |
 | WU-PROJ-01 | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
+| WU-DUR-P01 | EventLog runner-call reconstruction atoms | GitHub Issue #117 | WU-OBS-P00 / WU-OBS-00 前置；补齐 EventLog / payload 原子字段，使历史 Runner 调用 LLM-facing messages 可由 durable truth 与版本化 projector 重建 |
+| WU-OBS-P00 | Runner call input reconstruction signals | GitHub Issue #70 / #117 | WU-OBS-00 前置；Tool Trace analyzer 的 runner-call messages dump 信号契约，消费 WU-DUR-P01 补齐的 durable atoms |
 | WU-OBS-P01 | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
 | WU-OBS-P02 | Tool Trace tool latency signals | GitHub Issue #30 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 tool latency stable signal |
 | WU-OBS-P03 | Tool Trace structured failure metadata | GitHub Issue #31 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 failure signature / repair hint stable signal |
@@ -435,7 +440,85 @@ Plan gate 已完成，artifact 为 `docs/host/wu-cm-01-conversation-memory-plan.
 - compact repair 测试覆盖多个 invalid reasons 触发一次 whole-candidate repair retry、rejected candidate 不被部分采用、完整 candidate 重新通过全量 revalidation、repair exhausted fail closed。
 - 现有 `utils/` 下的 Host public smoke 必须通过，作为 WU-CM-01 的初步验收标准；至少覆盖 `utils/smoke_host_public_conversation_memory.py`、`utils/smoke_host_public_conversation_memory_scenarios.py` 与 `utils/smoke_host_public_multiturn.py`，后续若 smoke 脚本新增、拆分或改名，WU-CM-01 plan 必须同步列出实际验证命令。
 - deep historical recall / semantic search / recall tool 若进入后续 scope，必须由 GitHub Issue #39 先形成 research artifact 和明确 design constraints。
-- WU-CM-02、WU-CM-03、WU-CM-04、WU-CM-05、WU-CM-06、WU-CM-08、WU-CM-11 的后续状态被更新为 closed、deferred-with-owner 或 transferred-to-issue。
+- WU-CM-01-F01、WU-CM-01-F02、WU-CM-02、WU-CM-03、WU-CM-04、WU-CM-05、WU-CM-06、WU-CM-08、WU-CM-11 的后续状态被更新为 closed、deferred-with-owner 或 transferred-to-issue。
+
+## WU-CM-01-F01 Conversation Memory Smoke Correctness Closeout
+
+### 状态
+
+GitHub Issue #81 / WU-CM-01 final closeout follow-up。Host public smoke 用于验证 Conversation Memory 与 Host 整体设计是否在 public path 上成立；如果 smoke 输入、断言或观测点本身偏离设计真源，就无法提供有效验收信号。本条作为 WU-CM-01 的 smoke correctness 收尾追踪项，不占用已有 WU-CM-05 编号。后续若继续发现这些 smoke 自身不符合设计验证目的的问题，统一在本条追踪，而不是散落到新的编号。
+
+### 当前已知修正项
+
+- 2026-06-05 Host public conversation memory smoke 的 round1 final Runner-call messages dump 显示当前有两条 `system` role message：一条为 scene / behavior prompt，一条为 Host execution context。协议层面这不是非法 messages，但 smoke 作为 public conversation memory 验收入口，应收敛到一个 `system` role message，降低 provider-compatible 路径的歧义。
+- 2026-06-05 round2 compact 后 Runner-call dump 发现观测闭环不一致：`workspace/tmp/smoke01.log` 中 round2 `runner_call_start` 记录 `message_count=9`，但从当前 durable DB + EventLog 重建 cursor=121 的 memory / compact 投影只能得到 7 条 messages。round2 是 Conversation Memory compact 后 public path 验收点；smoke / dump 必须能解释或直接验证这 2 条差异来自哪里，不能让 compact 后实际 LLM-facing input 只能靠日志计数间接判断。
+- 2026-06-05 round2 proactive compact compactor messages dump 暴露 compactor prompt 设计问题：`dayu/config/prompts/scenes/conversation_compaction.md` / `conversation_compaction_user.md` 中存在面向内部实现者的术语和无状态 LLM 不具备的上下文，例如 `Host-owned context compaction`、`ConversationCompactOutputVNext`、`prompt-local evidence labels`、`vNext 字段`。这会增加无状态、有限上下文、偏模式匹配的 LLM 的认知负担，降低 strict JSON compaction 稳定性。`utils/smoke_host_public_conversation_memory.py` 与 `utils/smoke_host_public_conversation_memory_scenarios.py` 需确认是否都装配该 compactor prompt；当前直接 `rg` 证据显示这些术语来自 `dayu/config/prompts/scenes/conversation_compaction*.md`，不是 smoke 脚本内联字符串。
+- 2026-06-05 scope review 确认本条不得只检查 `utils/smoke_host_public_conversation_memory.py`；同组 Host public smoke 入口 `utils/smoke_host_public_diagnostics.py`、`utils/smoke_host_public_conversation_memory_scenarios.py`、`utils/smoke_host_public_multiturn.py` 也必须检查是否存在相同修正项，包括多 `system` role message、compact 后 Runner-call message 观测闭环缺口、以及 LLM-facing prompt / evidence material 使用内部实现术语的问题。
+
+### 目标
+
+- 修正 `utils/` 下 Host public smoke 中无法有效验证 Conversation Memory / Host 设计的偏差；当前审计范围至少包括 `utils/smoke_host_public_conversation_memory.py`、`utils/smoke_host_public_diagnostics.py`、`utils/smoke_host_public_conversation_memory_scenarios.py`、`utils/smoke_host_public_multiturn.py`。
+- 对每个新增 smoke correctness 问题，先用设计真源与代码直接证据确认 smoke 错在输入构造、断言、观测点、fixture、projection expectation 还是生产实现偏离设计；只有确认是 smoke 偏差时才纳入本条修正。
+- 当前已知修正：修改 `utils/smoke_host_public_conversation_memory.py` 及必要的同组 smoke helper，使 smoke 构造的 round1 final Runner-call messages 只包含一个 `system` role message，并增加直接验收；同时审计另外三个 Host public smoke 是否经由相同 prompt assembly 路径产生多 `system` role message，若存在则一并修正并加验收。
+- 当前已知修正：补齐 round2 compact 后 RunInput / Runner-call message shape 的 smoke 验收信号，使日志记录的 `message_count`、durable 可重建 messages、memory snapshot / compact artifact 投影三者能对齐；若无法完整重建，smoke 必须输出明确 limited-signal 诊断。
+- 当前已知修正：审计 4 个 Host public smoke 的 compactor prompt 装配路径，并修正 `dayu/config/prompts/scenes/conversation_compaction*.md` 中面向内部实现的 prompt 表述；prompt 应以最低认知负担描述下一步动作、输入 JSON、输出 JSON、label 引用规则和禁止项，不要求 LLM 理解 Host 内部命名、Python 类型名或 vNext 历史迁移语义。
+- 保持 smoke 能验证真实 public Host path，不通过测试私有入口、伪造 durable atom 或绕过 Host / Engine contract 来获得通过。
+
+### 非目标
+
+- 不修改 production Conversation Memory、compact、RunInputBuilder、Engine runner 或 provider payload 行为。
+- 不把 production 实现偏离设计的问题伪装成 smoke 修改；若根因是生产代码，应回到对应 production work unit 或设计真源处理。
+- 不通过只改 smoke prompt、测试 fixture 或 dump 脚本来掩盖 `dayu/config/prompts` 真源 prompt 的问题；如果真实 compactor prompt 是根因，必须修 prompt asset 本身并让 smoke 覆盖真实装配路径。
+- 不把 smoke 可读性、输出格式美化或普通维护项纳入本条，除非它直接影响 smoke 对 Conversation Memory / Host 设计的验收能力。
+- 不补 EventLog runner-call reconstruction atoms；该工作由 WU-DUR-P01 / GitHub Issue #117 承接。
+- 不实现 Tool Trace analyzer 或 messages dump 工具；该工作由 WU-OBS-P00 / WU-OBS-00 承接。
+- 不引入新的 smoke 私有生产入口或测试专用 durable bridge。
+
+### 验收信号
+
+- 每个纳入本条的 smoke correctness 问题都有直接证据说明为什么 smoke 当前无法验证对应设计点，以及修正后验证的设计点是什么。
+- 当前已知项修正后，4 个 Host public smoke 入口通过，并能证明各自 final Runner-call messages 至多只有一个 `system` role message；若某个 smoke 不触发 Runner-call 或 compact，应明确记录它不适用该断言的直接原因。
+- 若当前已知项修正后 smoke 仍产生多条 `system` role message，必须 fail fast，而不是只在事后 dump 中发现。
+- round2 compact 后 `runner_call_start.message_count` 与 smoke / dump 可观测的 message items 数量一致；若不一致，smoke 失败或输出明确 limited-signal 诊断并指向缺失的投影来源。
+- compactor prompt dump 中不再出现要求 LLM 理解内部实现身份或 Python 类型名的表达，例如 `Host-owned context compaction`、`ConversationCompactOutputVNext`、`prompt-local evidence labels`、`vNext 字段`；对应规则必须改写成面向无状态 LLM 的直接任务说明、输入字段说明、输出 JSON 字段说明与引用 label 约束。
+- 4 个 Host public smoke 入口均完成 compactor prompt 装配路径审计；凡会触发 compact 的入口，都能证明它们使用的 compactor prompt 来自同一稳定 prompt asset，且该 prompt 通过上述可读性 / 可执行性检查。
+- smoke 修改后，相关 Host public smoke 入口通过；pyright 0 errors。
+
+## WU-CM-01-F02 Compact Evidence Query Readability Quality Closeout
+
+### 状态
+
+GitHub Issue #81 / WU-CM-01 final closeout follow-up，依赖 WU-DUR-P01 补齐 accepted tool call request durable atoms。本条处理 compact 输入质量问题，不处理 analyzer dump 可观测性本身；dump / trace 能否轻量重建仍由 WU-DUR-P01 / WU-OBS-P00 承接。
+
+### 设计与代码核对
+
+- 2026-06-05 round2 proactive compact messages dump 显示 `evidence_material[*].query_text` 退化为 `tool_call_id=call_5c4a39a2ea37464a82357cce`。本次 smoke 仍能 compact 成功，是因为 `response_text` 的 mock tool result 自解释且包含完整结构化 facts；但泛化场景下，compactor 会缺少“工具为什么被调用、调用参数是什么、该 evidence 对应哪个用户问题”的语义锚点。
+- 当前生产路径为 `build_accepted_tool_evidence_material_blocks` -> `collect_selected_compaction_request_evidence_inputs` -> `_readable_query_text(envelope)`；`_readable_query_text` 目前只返回 `tool_call_id={envelope.tool_call_id}`。
+- 根因与 WU-DUR-P01 同源：canonical `TOOL_CALL_REQUESTED` 当前没有可读取的 arguments / semantic query durable atom，因此 compact material projection 无法稳定生成 tool name + arguments / semantic query 的 LLM-readable query text。
+
+### 目标
+
+- 让 compact `evidence_material[*].query_text` 使用 durable tool call request atom 生成可读查询文本，至少包含 tool name 与稳定规范化 arguments；在工具提供 semantic query / readable input 时优先使用该语义文本。
+- 保持 query text 是 LLM-readable material，不包含 EventLog id、payload ref、digest、cursor、artifact descriptor 或其它 Host 内部账本细节。
+- 与 WU-DUR-P01 对齐：若 durable tool-call arguments / semantic query 尚未补齐，本条不得用 prompt 猜测、tool behavior 推断或当前代码 hardcode 伪造 query text。
+- 覆盖 accepted evidence chunking：同一 tool result 被切成 `E1.1`、`E1.2` 等 evidence chunks 时，各 chunk 的 query text 应保持同源、稳定、简洁，不因 chunk 数量重复注入大段参数文本。
+- 保持 compact quality owner 边界：本条只改善 compactor LLM-facing evidence material 的查询语义，不改变 accepted tool result truth、不改变 evidence-backed fact accept barrier、不改变 compact candidate schema。
+
+### 非目标
+
+- 不补 EventLog / payload durable atoms；该工作由 WU-DUR-P01 / GitHub Issue #117 承接。
+- 不实现 Tool Trace analyzer 或 dump 工具；该工作由 WU-OBS-P00 / WU-OBS-00 承接。
+- 不把 tool call request 原文、provider payload 或 Host 内部 refs 直接塞进 compact prompt。
+- 不把业务工具 schema 特例硬编码进 compact material projection；若工具需要更好的 semantic query，应通过 typed durable atom / projection contract 表达。
+- 不修改 compactor output schema 或 evidence-backed fact candidate 语义。
+
+### 验收信号
+
+- compact material 单元测试覆盖 accepted tool evidence query text：给定 durable tool call name + normalized arguments，`ConversationCompactInputVNext.evidence_material[*].query_text` 输出业务可读查询，而不是裸 `tool_call_id=...`。
+- Host public conversation memory smoke 或 focused compact smoke 覆盖 round2 proactive compact：dump 中 `evidence_material[*].query_text` 能看到 tool name / arguments 或 semantic query；若 durable atoms 缺失，smoke 必须输出明确 limited-signal 诊断，而不是静默退化。
+- query text 不包含 `event-`、`payload-`、`sha256:`、`compact-artifact:`、cursor、policy ref 等 Host 内部账本标识。
+- compact 后 accepted candidate 仍只引用 prompt-local labels，不引用 `C1` 或 Host internal refs。
+- 受影响 focused tests 通过；pyright 0 errors。
 
 ## WU-CM-02 Working Assumptions Producer Semantics
 
@@ -612,6 +695,121 @@ Plan gate 已完成，artifact 为 `docs/host/wu-cm-01-conversation-memory-plan.
 - dispatch 前 memory catch-up / rebuild 超预算或失败时有结构化 diagnostic，且不会改写 EventLog / Run / Attempt governance truth。
 - 测试覆盖 bounded catch-up、required cursor 已覆盖、lag / failure / rebuild 超预算不误触发 recovery，以及 Audit / Tool Trace / Outbox 不被改成 command-path blocking sink。
 
+## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
+
+### 状态
+
+GitHub Issue #117 当前为 OPEN。本条是 WU-OBS-P00 / WU-OBS-00 的 durable truth 前置 work unit，负责补齐 EventLog / payload / artifact 中用于还原历史 Runner 调用 LLM-facing messages 的原子字段。本条不把完整 provider request payload/messages 明文保存为新的 canonical fact；目标是让 provider request 作为派生视图，能由 durable atoms 与版本化 projector 稳定重建。
+
+上位架构原则以 `docs/host/design.md` 为准：EventLog 是 Host durable fact 真源；tool trace、audit、usage、timeline、outbox 与 memory snapshot 都是从 committed EventLog 投影出的 read model / diagnostic view，不能反向成为 EventLog、recovery、resume、memory 或 Run 状态迁移真源。
+
+重要约束：本条不得削弱 EventLog 原子性。补字段不是把 RunInput、provider request、messages dump、memory snapshot、compact material 或 analyzer bundle 一股脑塞进 EventLog；EventLog 仍只记录治理与恢复需要的 canonical facts、refs、digests、版本化 projector metadata 与最小必要原子。大体积 LLM-facing projection 必须走 payload descriptor / artifact ref，并保持可由 source refs / digests 校验。
+
+### 设计与代码核对
+
+- 2026-06-05 smoke 检查结论：当前 `USER_INPUT_ACCEPTED` 保存了 `system_prompt` / `user_prompt`，`TOOL_RESULT_ACCEPTED` 有完整 tool result payload，但 canonical `TOOL_CALL_REQUESTED` 只保存 `normalized_arguments_digest`，没有 tool call arguments 明文。GitHub Issue #117 已记录该 durable atom 缺口。
+- Engine `ToolCallRequestedData` 内部包含 `arguments`，但 Host ingest preview event 只落 `argument_key_count`、`tool_name`、`tool_call_id` 和 `provider_state_present`。
+- ToolRuntime accept barrier 写入的 canonical `TOOL_CALL_REQUESTED` 当前只包含 `tool_name`、`tool_call_id`、`tool_schema_digest`、`tool_identity_digest`、`normalized_arguments_digest`、`semantic_input_digest` 等摘要字段。
+- `payload_descriptors` 当前没有 tool-call-arguments payload；round1 第二次 Runner call dump 只能从用户 prompt / 当前代码 / smoke 工具行为推断 arguments，不能从 durable atoms 直接读取。
+- 2026-06-05 round2 proactive compact dump 显示 `evidence_material[*].query_text` 只能投影为 `tool_call_id=...`。直接代码证据是 `dayu/host/compaction_evidence.py::_readable_query_text(envelope)` 当前只返回 tool call id；根因是 durable truth 缺少可读取的 accepted tool call arguments / semantic query atom，导致 compact evidence material 无法稳定生成业务可读 query text。
+- Host execution context system message 当前可由字段重建，但缺少显式 scene-message projector version / schema id。
+- LLM-facing tool message content 当前依赖 Engine 投影代码；历史 dump 若不读当前代码，需要 durable projector version / schema digest 或等价 contract。
+- 2026-06-05 round2 compact 后 dump 暴露更大缺口：`smoke01.log` 中 `runner_call_start` 记录 `message_count=9`，但当前 durable DB + EventLog 重建 cursor=121 的 memory / compact 投影只能得到 7 条 messages。现有 EventLog 有 `CONTEXT_COMPACTED`、compact artifact、当前 user input、terminal summary refs 等原子，但缺少“本次 Runner call 使用了哪些 LLM-facing material / memory / compact / continuity blocks、按何种 projector 版本拼成几个 message”的 durable assembly manifest。
+- 2026-06-05 round2 proactive compact 内部 compactor call 也暴露同类缺口：Engine log 中 `context-compactor:vnext` run `context-compactor-vnext-10e0d9ae533d4673a430cedddac55b5d` 的 final proposal call `message_count=2`，当前可通过 EventLog / payload / compact artifact refs 与当前 compactor projector 代码重建 system+user messages，且重建 `compaction_request_digest=sha256:4013a39b85957a9463b8755976809fea47eb0ecc90ea38263ddb9ba4cb405abc` 与 artifact 一致；但 EventLog / compact artifact 没有保存 compactor runner-call input manifest、message role sequence digest 或 LLM-facing `ConversationCompactInputVNext` projection artifact ref，因此仍不能只靠轻量渲染完成历史 dump。
+- `host_memory_snapshots` 当前只保留 latest snapshot row；该 smoke 完成后 snapshot cursor 已推进到 269，无法直接读取 round2 dispatch 时 cursor=121 的 historical memory read model。虽然 memory 可由 EventLog 重建，但若缺少本次 RunInput 所用 snapshot/material cursor、projector id、block ids 与 role sequence digest，历史重放仍会退化为读当前代码推断。
+- 当前 Engine `ITERATION_STARTED` / verbose log 只给出 `message_count`，没有 message role sequence、message digests、source block refs、RunInput projector id 或 projection artifact ref。日志计数不能作为 durable truth，也不足以解释 9 与 7 的差异来源。
+
+### 目标
+
+- 实施前必须先把 EventLog 补字段的稳定 contract 写回 `docs/host/design.md`，包括新增 canonical atoms / refs / digests / projector metadata、payload descriptor / artifact ref 边界、schema 语义与不得削弱 EventLog 原子性的约束；implementation 只能按 design.md 的稳定设计落地。
+- 补齐 EventLog / payload / artifact 原子字段，使历史 Runner 调用的 LLM-facing messages 可由 durable truth 与版本化 projector 重建。
+- 将 accepted tool call arguments 作为可恢复、可校验的 durable atom 保存；可采用 canonical event payload 或 payload ref，但必须保留 digest/ref 链路。
+- 为 compact evidence query projection 提供 durable 输入：accepted tool call request 至少要能恢复 tool name、normalized arguments 与可选 semantic query / readable input，使 `evidence_material[*].query_text` 不必退化为裸 `tool_call_id`。
+- 明确 assistant tool_calls message 重建所需字段，包括 `content`、`reasoning_content`、`tool_calls`、provider state 边界与空值语义。
+- 为 scene / Host execution context message 与 LLM-facing tool result projection 记录稳定 projector id、schema version 或 digest。
+- 为每次 Runner call 记录 durable input assembly manifest：至少包含 `runner_call_index`、`iteration_id`、message_count、message role sequence digest、source block refs、source cursor、RunInput projector id/schema version/digest、tool schema snapshot refs、compact artifact refs、memory snapshot/material cursor refs、continuity refs 与 context fallback decision refs。
+- 覆盖 Host-owned compactor 内部 Runner call：compactor 不是 Host admission 产生的用户 Run，但它仍是 Engine Runner 调用，manifest / projection refs 必须能表达 compactor system prompt、user prompt template、`ConversationCompactInputVNext` projection artifact/ref、compaction request digest、accepted compact artifact ref 与 compactor projector id/schema version。
+- 区分 durable truth atoms 与派生 LLM-facing projection：EventLog 不保存完整 provider request 作为 canonical fact，但可以保存 derived projection artifact 的 ref/digest/producer projector metadata；artifact 内容必须能由 source refs/digests 校验，且不能反向成为 recovery / memory / Run 状态迁移真源。
+- 保持 manifest 原子化：manifest 只列出本次 Runner call 采用的 source atom / projection artifact / digest / projector version / role-sequence 等可校验索引，不内联完整 messages、长 prompt、完整 tool result、完整 memory snapshot 或 compact material。
+- 覆盖 compact 后 no-tool / empty-tool Runner call input，不只覆盖 tool call roundtrip；round2 这类 compact artifact + memory material + current large user prompt 场景必须能重建或明确报告 limited signal。
+- 为 WU-OBS-P00 / WU-OBS-00 提供可消费的 durable refs / metadata，使 analyzer 不依赖当前代码或 prompt 猜测来重建 Runner call input。
+
+### 非目标
+
+- 不把完整 provider request payload/messages 明文作为 EventLog canonical fact 重复保存。
+- 不把 EventLog 改成 messages dump store、provider request store、memory material store 或 analyzer bundle store。
+- 不让 Tool Trace、Audit、Outbox、timeline 或 memory snapshot 反向成为恢复、resume、memory 或 Run 状态迁移真源。
+- 不实现 Tool Trace analyzer、prompt-based diagnostics 或 operator bundle。
+- 不要求 EventLog inline 大体积 LLM-facing messages；大 payload 应通过 payload descriptor / artifact ref / digest 管理。
+- 不用 untyped extra payload 承载显式字段；新增字段必须是 typed canonical atom、typed ref / digest 或版本化 projector metadata。
+- 不改变 ToolRuntime accept / governance 语义，除非字段补齐需要同步更新同源 contract。
+- 不通过兼容 wrapper、旧字段 alias 或 extra payload 保留旧 schema。
+
+### 验收信号
+
+- 至少一个包含 tool call 的历史 Runner call，可只凭 EventLog + payload/artifact store + projector metadata 重建 LLM-facing messages。
+- 至少一个 compact 后 follow-up Runner call，可只凭 durable input assembly manifest + source payload/artifact refs 重建 LLM-facing messages，或在历史字段不足时输出明确 limited-signal 诊断；不得出现日志 `message_count` 与 dump item 数量无法解释的状态。
+- 至少一个 proactive compactor internal Runner call，可只凭 durable input assembly manifest + compactor projection artifact refs 轻量 dump 出 system/user messages，并能校验 `compaction_request_digest`、message_count 与 accepted compact artifact digest；不得要求 analyzer 重新执行 `_proactive_material_blocks` / `select_compact_segment` / `build_compact_material_pack` / compactor prompt rendering。
+- EventLog 新增字段保持原子化；测试或 review 必须能证明没有把完整 provider request/messages、完整 memory snapshot、完整 compact material 或 analyzer bundle 内联进 EventLog canonical payload。
+- accepted tool call arguments 可从 durable truth 读取，并能与 `normalized_arguments_digest` 校验一致。
+- compact evidence query text 可由 durable tool call request atoms 生成，并能校验其 source 与 accepted evidence / tool result 同源；不得只剩 `tool_call_id=...`，除非输出明确 limited-signal 诊断。
+- assistant tool_calls message 重建不依赖用户 prompt 文本推断。
+- tests 覆盖 tool call -> tool result -> 第二次 Runner call messages reconstruction，以及 compact -> memory/material -> follow-up Runner call messages reconstruction 两条 durable atom 路径。
+- Tool Trace / analyzer 相关字段仍只消费 refs / digest / metadata，不变成事实真源。
+
+## WU-OBS-P00 Runner Call Input Reconstruction Signals
+
+### 状态
+
+GitHub Issue #70 当前为 OPEN，GitHub Issue #117 为本条的 durable atom 前置 owner。本条是 WU-OBS-00 / GitHub Issue #70 的前置 signal-contract work unit：在 WU-DUR-P01 补齐 EventLog 原子字段后，定义 Tool Trace analyzer 如何通过 refs / digest / projector metadata 定位并重建某次 Runner 调用的 LLM-facing messages。
+
+上位架构原则以 `docs/host/design.md` 为准：Tool Trace / Audit 只能是 EventLog 的投影结果；它们可以服务分析、解释和 operator dump，但不能拥有或补造 Host durable truth，也不能成为恢复、resume、memory 或 Run 状态迁移依据。
+
+重要约束：WU-OBS-P00 只能消费 WU-DUR-P01 提供的原子 refs / digests / projection artifact refs；不得反向要求 EventLog 保存完整 dump，也不得把 Tool Trace 提升为事实真源。
+
+### 设计与代码核对
+
+- `docs/host/issues-implementation-control.md` 已明确 WU-OBS-00 是 Tool Trace analyzer，Tool Trace 是 committed EventLog 的派生 projection，不是 Host recovery、resume、memory 或 Run 状态迁移真源。
+- 当前 `tool-trace-cold.jsonl` 可投影 `TOOL_CALL_REQUESTED`、`TOOL_RESULT_ACCEPTED`、`USAGE_REPORTED`、`RUN_SUCCEEDED` 等 trace 行，但没有 system/user message、tool arguments 明文、assistant tool_calls content / reasoning_content，也没有 runner call message role index。
+- 当前 tool trace 有 tool result / terminal summary payload refs，但只靠 trace 文件本身不能展开 tool role message content 或 final summary。
+- WU-DUR-P01 解决 durable truth 缺口后，WU-OBS-P00 仍需裁决 trace projection schema：是否在 Tool Trace 中提供足够 refs / metadata，或新增 runner-call / run-input trace artifact。
+- 2026-06-05 round2 dump 显示 analyzer 若只读取当前 DB、EventLog 与当前代码，可能得到与真实运行日志 `message_count=9` 不一致的 7 条重建结果。WU-OBS-P00 必须把这种 mismatch 变成结构化诊断：指出缺少 runner-call input manifest、historical memory/material snapshot、projection artifact 或 role sequence digest，而不是静默输出看似完整的 messages dump。
+- 2026-06-05 round2 compact 内部 compactor dump 显示 analyzer 若要输出 `context-compactor:vnext` final proposal call messages，目前必须重跑 compactor input projector 与 prompt rendering；这不是轻量 renderer。WU-OBS-P00 必须让 analyzer 能把 Host-owned compactor Engine call 标识为 internal runner call，并通过 trace refs / projection artifact refs dump 或报告 limited-signal，而不是把它误判为普通 Host admitted Run。
+- 2026-06-05 round2 compact dump 还显示 `evidence_material[*].query_text` 退化为 `tool_call_id=...`。Analyzer 不负责修复 compact 质量，但必须能把该退化标记为 durable atoms / projection signal 不足，而不是把只有 tool_call_id 的 query_text 当作完整可读 query。
+
+### 目标
+
+- 定义 Tool Trace analyzer 所需的 runner-call input reconstruction signal contract。
+- 明确 trace 中应暴露的 refs / digest / projector metadata，例如 `runner_call_index`、`iteration_id`、message role index、tool call arguments payload ref、tool result projection ref、scene projector id。
+- 明确 analyzer 消费的 runner-call input artifact / manifest contract：message item count、role sequence、per-message source refs / digests、projection artifact ref、RunInput projector id、tool-result projector id、memory-material projector id、compact artifact projector id，以及 provider serializer id / schema version。
+- 将 compactor internal runner call 纳入同一 signal contract：trace / diagnostic artifact 必须能表达 parent Host run id、`context-compactor:vnext` run id、runner_call_index、compactor projector id/schema version、compaction request digest、`ConversationCompactInputVNext` projection artifact ref、accepted compact artifact ref，以及该调用不是 Host admitted user Run 的语义边界。
+- 保持信号来源同源：只能来自 EventLog canonical facts、payload descriptors、artifact refs 或 Host-owned projection metadata；不得从日志、prompt 文本或当前代码猜测补造。
+- analyzer 对 compact evidence material 应报告 query readability diagnostics：当 `query_text` 只能解析为裸 `tool_call_id` 且没有 tool name / normalized arguments / semantic query projection refs 时，输出 structured limited-signal，而不是静默通过。
+- 保持 trace signal 轻量化：Tool Trace 可保存 manifest ref / projection artifact ref / digest / role-sequence summary / mismatch diagnostic，但不内联长 prompt、完整 messages、完整 tool result 或完整 memory material。
+- 让 WU-OBS-00 analyzer 能输出某次 Runner 调用的 messages dump，或明确报告 limited signal / mismatch reason；特别要覆盖 compact 后 follow-up 的 memory/material/compact source gap。
+- 将 dump 复杂度限制为轻量 renderer：resolve refs、verify digests、expand payload/artifact、render Markdown / JSON。Analyzer 不得复刻 RunInputBuilder、Engine tool message injection、tool result projection 或 provider payload serializer。
+
+### 非目标
+
+- 不把 Tool Trace 变成事实真源。
+- 不在本条补 EventLog 原子字段；该工作由 WU-DUR-P01 / GitHub Issue #117 承接。
+- 不实现完整 Tool Trace analyzer report。
+- 不默认在 hot trace 中内联大 payload、敏感 provider raw payload 或完整 tool result。
+- 不要求 Tool Trace 自身保存所有 LLM-facing messages；可以保存 message projection artifact ref / manifest ref / digest，但必须让 analyzer 能定位并校验派生 artifact。
+- 不借 analyzer 需求反向污染 EventLog 原子事实；若需要完整 LLM-facing projection，使用派生 artifact，并用 refs / digests 连接到 EventLog atoms。
+- 不改变 ToolRuntime / Engine / Runner 执行语义。
+- 不在 analyzer 中用当前生产代码、prompt 文本或工具行为反推历史 messages；若 projector version 不受支持，必须报告 limited signal。
+
+### 验收信号
+
+- Tool Trace analyzer fixture 能从 trace refs 回链到 durable atoms，并生成 Runner call messages dump，或在字段缺失时输出明确 limited-signal 诊断。
+- trace projection tests 覆盖 tool-call roundtrip、compact 后 follow-up、proactive compactor internal runner call 的 runner_call_index / iteration / refs / projector metadata / message_count 对齐。
+- analyzer 不读取日志、不依赖 prompt 猜测、不把 Tool Trace 当作 truth。
+- analyzer 能检测 `runner_call_start.message_count`、manifest message_count、dump item 数量不一致，并输出缺失字段 / 缺失 projection artifact 的 structured mismatch diagnostic。
+- analyzer 能检测 compact evidence `query_text` 退化为 `tool_call_id` 的情况，并指向缺失的 tool-call arguments / semantic query durable atom 或 projection ref。
+- analyzer dump 路径只有轻量渲染逻辑；若仍需要重写复杂 prompt assembly / tool projection，视为本条未通过。
+- WU-OBS-00 plan 可以直接消费本条 signal contract。
+
 ## WU-OBS-P01 Tool Trace Context Budget Snapshot Signals
 
 ### 状态
@@ -760,7 +958,7 @@ GitHub Issue #35 当前为 OPEN。本条是 WU-OBS-00 / GitHub Issue #70 的前�
 
 ### 状态
 
-GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。本条依赖 WU-OBS-P01 / #29、WU-OBS-P02 / #30、WU-OBS-P03 / #31、WU-OBS-P04 / #35 先裁决或补齐 analyzer 所需的核心 trace signals，避免先做出一个只能覆盖 OLD / dayu-agent 受限子集的 analyzer。对 provider / model bug 报障场景，本条应消费 WU-ENG-02 / #63 已完成的 OpenAI-compatible provider debugging correlation signals；#64 的 native Anthropic / Claude Code gateway adapter-specific signals 若尚未实现，报告必须明确 limited signal。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
+GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug tooling 的基础 work unit：输入已经存在的 Tool Trace 文件或目录，输出结构化 Host / Engine / Tool 分层诊断报告。它不是 #71 的重复，而是 #71 的自然前置能力；#71 负责“先按 prompt / final answer 找到 run 并导出 bundle”，本条负责“对 trace / bundle 做诊断归因”。本条依赖 WU-OBS-P00 / #70 + #117、WU-OBS-P01 / #29、WU-OBS-P02 / #30、WU-OBS-P03 / #31、WU-OBS-P04 / #35 先裁决或补齐 analyzer 所需的核心 trace signals，避免先做出一个只能覆盖 OLD / dayu-agent 受限子集的 analyzer。对 provider / model bug 报障场景，本条应消费 WU-ENG-02 / #63 已完成的 OpenAI-compatible provider debugging correlation signals；#64 的 native Anthropic / Claude Code gateway adapter-specific signals 若尚未实现，报告必须明确 limited signal。GitHub Issue #34 是本条的 analyzer integrity / large payload diagnostics 子项，不单独实现平行 analyzer。
 
 ### 设计与代码核对
 
