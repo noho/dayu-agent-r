@@ -85,6 +85,7 @@ from dayu.host.compaction import (
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
     CompactionOperationResult,
+    DurableCompactorProposalManifestRecorder,
     run_compaction_operation,
 )
 from dayu.host.context_budget import (
@@ -158,6 +159,12 @@ from dayu.host.durable.run_transition import (
     start_recovery_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
+from dayu.host.durable.schema import (
+    RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
+    RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
+    RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+    TABLE_EVENT_LOG,
+)
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -217,6 +224,10 @@ _EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
+_EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
+_EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED = (
+    "RUNNER_CALL_INPUT_ITERATION_LINKED"
+)
 _EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
 _EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
 _REASON_FINAL_ANSWER = "final_answer"
@@ -236,6 +247,11 @@ _REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD = (
 )
 _REASON_CONTEXT_COMPACTION_REQUIRED = "context_compaction_required"
 _REASON_CONTEXT_COMPACTION_RECOVERY_FAILED = "context_compaction_recovery_failed"
+_REASON_AMBIGUOUS_RUNNER_CALL_MANIFEST = "ambiguous_runner_call_manifest"
+_REASON_RUNNER_CALL_ITERATION_LINK_CONFLICT = (
+    "runner_call_iteration_link_conflict"
+)
+_REASON_RUNNER_CALL_MANIFEST_MISMATCH = "runner_call_manifest_mismatch"
 _RECOVERY_FAILURE_POLICY_DECISION = "reactive_compact_failed"
 _REACTIVE_PRECONDITION_OPERATION_PREFIX = "reactive_precondition"
 _OWNER_PHASE7 = "phase7"
@@ -243,6 +259,35 @@ _OWNER_PHASE10 = "phase10"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
 _NO_CONTEXT_BUDGET_POLICY_REF = "none"
 _USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
+_RUNNER_CALL_MANIFEST_STATUS_COMPLETE = "complete"
+_RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL = "limited_signal"
+_RUNNER_CALL_MANIFEST_STATUS_MISMATCH = "mismatch"
+_RUNNER_CALL_MANIFEST_REASON_MISSING = "missing_runner_call_manifest"
+_RUNNER_CALL_MANIFEST_REASON_MISSING_PROJECTION = "missing_projection_artifact"
+_RUNNER_CALL_MANIFEST_REASON_MESSAGE_COUNT = "message_count_mismatch"
+_RUNNER_CALL_MANIFEST_REASON_ROLE_DIGEST = "role_sequence_digest_mismatch"
+_RUNNER_CALL_MANIFEST_REF_PREFIX = "payload-runner-call-input-manifest"
+_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
+    "sqlite-payload-runner-call-input-manifest"
+)
+_RUNNER_CALL_MANIFEST_ID_PREFIX = "runner-call-manifest"
+_RUNNER_CALL_KIND_INITIAL_USER_DISPATCH = "initial_user_dispatch"
+_RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH = "followup_user_dispatch"
+_RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH = "post_compaction_dispatch"
+_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION = "tool_result_continuation"
+_RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT = "initial_user_input"
+_RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE = "tool_results_available"
+_RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT = (
+    "runner_call_projection_artifact"
+)
+_RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION = "tool_continuation_input"
+_ORDINARY_RUNNER_CALL_KINDS = frozenset(
+    (
+        _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH,
+        _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
+        _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
+    )
+)
 
 
 class EngineIngestStatus(StrEnum):
@@ -323,6 +368,36 @@ class _ValidatedCandidate:
     run: RunRow
     attempt: AttemptRow
     dispatch_record: DispatchRecordRow
+
+
+@dataclass(frozen=True, slots=True)
+class _RunnerCallIterationResolution:
+    """runner-call manifest 与 Engine iteration 的 link resolution。
+
+    :param status: runner-call reconstruction validation status。
+    :param reason: 诊断 reason；成功时为 ``None``。
+    :param link_event_id: link canonical event id；未写入 link 时为 ``None``。
+    :param manifest_event_id: prepared 或 limited manifest event id。
+    :param manifest_payload_ref: manifest payload descriptor ref。
+    :param manifest_digest: manifest body digest。
+    :param expected_count: manifest 中的 message count。
+    :param expected_digest: manifest 中的 role sequence digest。
+    :param observed_count: Engine observed message count。
+    :param observed_digest: Engine observed role sequence digest。
+    :param continuation_limited_signal: 是否为 Engine-only continuation limited signal。
+    """
+
+    status: str
+    reason: str | None
+    link_event_id: str | None
+    manifest_event_id: str | None
+    manifest_payload_ref: str | None
+    manifest_digest: str | None
+    expected_count: int | None
+    expected_digest: str | None
+    observed_count: int
+    observed_digest: str
+    continuation_limited_signal: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -908,6 +983,12 @@ class EngineEventIngestor:
         ):
             row = self._append_projection_signal(transaction, context, event.data)
             return _single_event_result(row)
+        if event.type == EngineEventType.ITERATION_STARTED and isinstance(
+            event.data, IterationStartedData
+        ):
+            return self._append_iteration_started_events(
+                transaction, context, event.data
+            )
         if _is_preview_event(event):
             row = self._append_preview_event(transaction, context)
             return _single_event_result(row)
@@ -1552,6 +1633,10 @@ class EngineEventIngestor:
                     pending.context.candidate.envelope.cancellation_token
                 ),
                 pass_queue=pass_queue,
+                compaction_operation_id=pending.operation_id,
+                proposal_manifest_recorder=(
+                    self._compactor_proposal_manifest_recorder()
+                ),
             )
 
         def _operation(
@@ -1687,6 +1772,12 @@ class EngineEventIngestor:
                     if operation_result.budget_after_attempted_compact is not None
                     else pending.estimate.estimated_input_tokens
                 ),
+                accepted_proposal_manifest_ref=(
+                    operation_result.accepted_proposal_manifest_ref
+                ),
+                accepted_proposal_manifest_digest=(
+                    operation_result.accepted_proposal_manifest_digest
+                ),
             )
             return _ReactiveRecoveryAccepted(
                 result=EngineIngestResult(
@@ -1710,6 +1801,26 @@ class EngineEventIngestor:
 
         return self._transaction_runner.run_write(_operation)
 
+    def _compactor_proposal_manifest_recorder(
+        self,
+    ) -> DurableCompactorProposalManifestRecorder:
+        """构造 reactive compactor proposal durable manifest recorder。
+
+        :returns: durable manifest recorder。
+        :raises RuntimeError: compact artifact root 缺失时抛出。
+        """
+
+        artifact_root = self._compact_artifact_root
+        if artifact_root is None:
+            raise RuntimeError("compact artifact root is missing")
+        return DurableCompactorProposalManifestRecorder(
+            transaction_runner=self._transaction_runner,
+            event_log_store=self._event_log_store,
+            artifact_root=artifact_root,
+            create_artifact_root=self._compact_artifact_create_parent_dirs,
+            event_source=_EVENT_SOURCE,
+        )
+
     def _append_reactive_compacted_event(
         self,
         transaction: HostTransaction,
@@ -1722,6 +1833,8 @@ class EngineEventIngestor:
         candidate: ConversationCompactOutputVNext,
         quality: CompactQualityCheckResultVNext,
         budget_after_compact: int,
+        accepted_proposal_manifest_ref: str | None,
+        accepted_proposal_manifest_digest: str | None,
     ) -> EventLogRow:
         """写入 reactive accepted compact artifact 与 fact。
 
@@ -1734,6 +1847,8 @@ class EngineEventIngestor:
         :param candidate: accepted vNext compaction candidate。
         :param quality: accepted vNext quality result。
         :param budget_after_compact: Host 估算的 compact 后预算。
+        :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
+        :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
         :returns: ``CONTEXT_COMPACTED`` row。
         """
 
@@ -1807,6 +1922,10 @@ class EngineEventIngestor:
                     source_boundary_refs=source_boundary_refs(request),
                     accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
                     projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+                    accepted_proposal_manifest_ref=accepted_proposal_manifest_ref,
+                    accepted_proposal_manifest_digest=(
+                        accepted_proposal_manifest_digest
+                    ),
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1949,6 +2068,8 @@ class EngineEventIngestor:
                     budget_after_attempted_compact=(
                         rejected.budget_after_attempted_compact
                     ),
+                    proposal_manifest_ref=rejected.proposal_manifest_ref,
+                    proposal_manifest_digest=rejected.proposal_manifest_digest,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -2232,12 +2353,18 @@ class EngineEventIngestor:
         return result
 
     def _append_preview_event(
-        self, transaction: HostTransaction, context: _ValidatedCandidate
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedCandidate,
+        *,
+        payload: Mapping[str, JsonValue] | None = None,
     ) -> EventLogRow:
         """追加 preview Engine event。
 
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
+        :param payload: 已由专用路径构造的 preview payload；为 ``None`` 时
+            使用通用 preview payload builder。
         :returns: EventLog row。
         """
 
@@ -2250,8 +2377,244 @@ class EngineEventIngestor:
                 event_id=_event_id(candidate, EventClass.PREVIEW, event_type, 0),
                 event_class=EventClass.PREVIEW,
                 event_type=event_type,
-                payload=_preview_payload(context),
+                payload=(
+                    _preview_payload(transaction, context)
+                    if payload is None
+                    else payload
+                ),
                 reason=None,
+            ),
+        ).row
+
+    def _append_iteration_started_events(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedCandidate,
+        data: IterationStartedData,
+    ) -> EngineIngestResult:
+        """追加 iteration started 的 canonical manifest signal 与 preview。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :param data: Engine iteration started data。
+        :returns: 本次 ingest 结果。
+        """
+
+        rows: list[EventLogRow] = []
+        existing_link = _find_runner_call_iteration_link_event(
+            transaction,
+            run_id=context.run.run_id,
+            attempt_id=context.attempt.attempt_id,
+            execution_id=context.attempt.execution_id,
+            iteration_id=data.iteration_id,
+        )
+        if existing_link is not None:
+            if not _runner_call_iteration_link_matches(
+                existing_link,
+                data,
+            ):
+                return self._append_rejected_diagnostic(
+                    transaction,
+                    candidate=context.candidate,
+                    reason=_REASON_RUNNER_CALL_ITERATION_LINK_CONFLICT,
+                    stop_worker_stream=True,
+                    runner_call_iteration_link_event_id=existing_link.event_id,
+                )
+            resolution = _resolution_from_link_event(existing_link, data)
+            if resolution.status != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
+                return self._append_rejected_diagnostic(
+                    transaction,
+                    candidate=context.candidate,
+                    reason=_REASON_RUNNER_CALL_MANIFEST_MISMATCH,
+                    stop_worker_stream=True,
+                    runner_call_iteration_link_event_id=existing_link.event_id,
+                    runner_call_manifest_event_id=resolution.manifest_event_id,
+                    manifest_payload_ref=resolution.manifest_payload_ref,
+                    manifest_digest=resolution.manifest_digest,
+                )
+            preview = self._append_preview_event(
+                transaction,
+                context,
+                payload=_iteration_started_preview_payload(
+                    context, data, resolution
+                ),
+            )
+            return _event_rows_result((preview,))
+
+        candidates = _find_unlinked_prepared_runner_call_manifest_events(
+            transaction,
+            run_id=context.run.run_id,
+            attempt_id=context.attempt.attempt_id,
+            execution_id=context.attempt.execution_id,
+        )
+        if len(candidates) > 1:
+            return self._append_rejected_diagnostic(
+                transaction,
+                candidate=context.candidate,
+                reason=_REASON_AMBIGUOUS_RUNNER_CALL_MANIFEST,
+                stop_worker_stream=True,
+            )
+        if len(candidates) == 0:
+            if not _has_prior_iteration_observation(
+                transaction,
+                run_id=context.run.run_id,
+                attempt_id=context.attempt.attempt_id,
+                execution_id=context.attempt.execution_id,
+            ):
+                return self._append_rejected_diagnostic(
+                    transaction,
+                    candidate=context.candidate,
+                    reason=_RUNNER_CALL_MANIFEST_REASON_MISSING,
+                    stop_worker_stream=True,
+                )
+            manifest_event = self._append_limited_runner_call_manifest_event(
+                transaction,
+                context,
+                data,
+                runner_call_kind=_RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION,
+                runner_call_trigger_reason=_RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE,
+            )
+            rows.append(manifest_event)
+            resolution = _resolution_from_limited_manifest_event(
+                manifest_event,
+                data,
+            )
+            preview = self._append_preview_event(
+                transaction,
+                context,
+                payload=_iteration_started_preview_payload(
+                    context, data, resolution
+                ),
+            )
+            rows.append(preview)
+            return _event_rows_result(tuple(rows))
+
+        manifest_event = candidates[0]
+        link_event = self._append_runner_call_iteration_link_event(
+            transaction,
+            context,
+            data,
+            manifest_event=manifest_event,
+        )
+        resolution = _resolution_from_link_event(link_event, data)
+        if resolution.status == _RUNNER_CALL_MANIFEST_STATUS_MISMATCH:
+            return self._append_rejected_diagnostic(
+                transaction,
+                candidate=context.candidate,
+                reason=_REASON_RUNNER_CALL_MANIFEST_MISMATCH,
+                stop_worker_stream=True,
+                additional_events=(link_event,),
+                runner_call_iteration_link_event_id=link_event.event_id,
+                runner_call_manifest_event_id=manifest_event.event_id,
+                manifest_payload_ref=resolution.manifest_payload_ref,
+                manifest_digest=resolution.manifest_digest,
+            )
+        rows.append(link_event)
+        rows.append(
+            self._append_preview_event(
+                transaction,
+                context,
+                payload=_iteration_started_preview_payload(
+                    context, data, resolution
+                ),
+            )
+        )
+        return _event_rows_result(tuple(rows))
+
+    def _append_limited_runner_call_manifest_event(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedCandidate,
+        data: IterationStartedData,
+        *,
+        runner_call_kind: str | None = None,
+        runner_call_trigger_reason: str | None = None,
+    ) -> EventLogRow:
+        """为 Engine-only runner continuation 写入 limited-signal manifest。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :param data: Engine iteration started data。
+        :param runner_call_kind: Host 已判定的 runner call kind；为 ``None`` 时
+            按 Engine iteration signal 推导。
+        :param runner_call_trigger_reason: Host 已判定的 trigger reason；为
+            ``None`` 时按 Engine iteration signal 推导。
+        :returns: `RUNNER_CALL_INPUT_ASSEMBLED` canonical EventLog row。
+        :raises HostDurableError: payload descriptor 或 manifest 校验失败时抛出。
+        """
+
+        event_id = _event_id(
+            context.candidate,
+            EventClass.CANONICAL_FACT,
+            _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+            0,
+        )
+        manifest = _limited_runner_call_manifest_body(
+            context,
+            data,
+            runner_call_index=_next_runner_call_index(
+                transaction, context.run.run_id
+            ),
+            manifest_id=_runner_call_manifest_id(event_id),
+            runner_call_kind=runner_call_kind,
+            runner_call_trigger_reason=runner_call_trigger_reason,
+        )
+        manifest_digest = sha256_digest_json(manifest)
+        descriptor = _write_runner_call_manifest_payload(
+            transaction,
+            self._payload_store,
+            event_id=event_id,
+            manifest=manifest,
+            manifest_digest=manifest_digest,
+        )
+        return self._event_log_store.append_event(
+            transaction,
+            _runner_call_manifest_event_request(
+                context=context,
+                event_id=event_id,
+                manifest=manifest,
+                manifest_payload_ref=descriptor.payload_ref,
+                manifest_digest=manifest_digest,
+            ),
+        ).row
+
+    def _append_runner_call_iteration_link_event(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedCandidate,
+        data: IterationStartedData,
+        *,
+        manifest_event: EventLogRow,
+    ) -> EventLogRow:
+        """追加 prepared manifest 与 Engine iteration 的 link fact。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :param data: Engine iteration started data。
+        :param manifest_event: 被 link 的 prepared manifest event。
+        :returns: `RUNNER_CALL_INPUT_ITERATION_LINKED` EventLog row。
+        :raises HostDurableError: manifest hot payload 字段非法时抛出。
+        """
+
+        payload = _runner_call_iteration_link_payload(
+            manifest_event,
+            data,
+        )
+        candidate = context.candidate
+        return self._event_log_store.append_event(
+            transaction,
+            _event_request(
+                candidate=candidate,
+                event_id=_event_id(
+                    candidate,
+                    EventClass.CANONICAL_FACT,
+                    _EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED,
+                    0,
+                ),
+                event_class=EventClass.CANONICAL_FACT,
+                event_type=_EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED,
+                payload=payload,
+                reason={"runner_call_manifest_event_id": manifest_event.event_id},
             ),
         ).row
 
@@ -2533,6 +2896,11 @@ class EngineEventIngestor:
         candidate: EngineEventCandidate,
         reason: str,
         stop_worker_stream: bool = False,
+        additional_events: tuple[EventLogRow, ...] = (),
+        runner_call_iteration_link_event_id: str | None = None,
+        runner_call_manifest_event_id: str | None = None,
+        manifest_payload_ref: str | None = None,
+        manifest_digest: str | None = None,
     ) -> EngineIngestResult:
         """追加 rejected diagnostic。
 
@@ -2540,9 +2908,33 @@ class EngineEventIngestor:
         :param candidate: 被拒绝的 candidate。
         :param reason: 拒绝原因。
         :param stop_worker_stream: 是否要求 worker stream fail-closed 停止。
+        :param additional_events: 同一事务中已追加且需要随 result 返回的事件。
+        :param runner_call_iteration_link_event_id: 可选 runner-call link event id。
+        :param runner_call_manifest_event_id: 可选 runner-call manifest event id。
+        :param manifest_payload_ref: 可选 runner-call manifest payload ref。
+        :param manifest_digest: 可选 runner-call manifest digest。
         :returns: rejected ingest 结果。
         """
 
+        payload: dict[str, JsonValue] = {
+            "attempt_id": candidate.envelope.attempt_id,
+            "execution_id": candidate.envelope.execution_id,
+            "dispatch_record_id": candidate.envelope.dispatch_record_id,
+            "worker_event_index": candidate.worker_event_index,
+            "engine_event_type": candidate.engine_event.type.value,
+            "reason": reason,
+            "stop_worker_stream": stop_worker_stream,
+        }
+        if runner_call_iteration_link_event_id is not None:
+            payload["runner_call_iteration_link_event_id"] = (
+                runner_call_iteration_link_event_id
+            )
+        if runner_call_manifest_event_id is not None:
+            payload["runner_call_manifest_event_id"] = runner_call_manifest_event_id
+        if manifest_payload_ref is not None:
+            payload["manifest_payload_ref"] = manifest_payload_ref
+        if manifest_digest is not None:
+            payload["manifest_digest"] = manifest_digest
         row = self._event_log_store.append_event(
             transaction,
             _event_request(
@@ -2555,20 +2947,13 @@ class EngineEventIngestor:
                 ),
                 event_class=EventClass.DIAGNOSTIC,
                 event_type=_EVENT_TYPE_ENGINE_EVENT_REJECTED,
-                payload={
-                    "attempt_id": candidate.envelope.attempt_id,
-                    "execution_id": candidate.envelope.execution_id,
-                    "dispatch_record_id": candidate.envelope.dispatch_record_id,
-                    "worker_event_index": candidate.worker_event_index,
-                    "engine_event_type": candidate.engine_event.type.value,
-                    "reason": reason,
-                },
+                payload=payload,
                 reason={"reason": reason},
             ),
         ).row
         return EngineIngestResult(
             status=EngineIngestStatus.REJECTED,
-            events=(row,),
+            events=additional_events + (row,),
             terminal_closeout=False,
             promotion_triggered=False,
             reason=reason,
@@ -4199,9 +4584,12 @@ def _is_preview_event(event: EngineEvent) -> bool:
     )
 
 
-def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
+def _preview_payload(
+    transaction: HostTransaction, context: _ValidatedCandidate
+) -> Mapping[str, JsonValue]:
     """构造 preview payload。
 
+    :param transaction: 当前 Host transaction。
     :param context: 已校验 candidate 上下文。
     :returns: preview payload。
     """
@@ -4215,9 +4603,9 @@ def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
     }
     data = event.data
     if isinstance(data, IterationStartedData):
-        common["iteration_id"] = data.iteration_id
-        common["iteration_index"] = data.iteration_index
-        common["message_count"] = data.message_count
+        raise HostDurableError(
+            "iteration started preview requires runner-call link resolution"
+        )
     elif isinstance(data, ContentDeltaData):
         common["iteration_id"] = data.iteration_id
         common["delta"] = data.delta
@@ -4244,6 +4632,9 @@ def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
         common["tool_name"] = data.name
         common["index_in_iteration"] = data.index_in_iteration
         common["argument_key_count"] = len(data.arguments)
+        common["normalized_arguments_digest"] = sha256_digest_json(
+            {"arguments": data.arguments}
+        )
         common["provider_state_present"] = data.provider_state is not None
     elif isinstance(data, ToolResultAcceptedData):
         common["iteration_id"] = data.iteration_id
@@ -4263,6 +4654,1102 @@ def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
         common["provider_request_id"] = data.provider_request_id
         common["client_correlation_id"] = data.client_correlation_id
     return common
+
+
+def _limited_runner_call_manifest_body(
+    context: _ValidatedCandidate,
+    data: IterationStartedData,
+    *,
+    runner_call_index: int,
+    manifest_id: str,
+    runner_call_kind: str | None,
+    runner_call_trigger_reason: str | None,
+) -> Mapping[str, JsonValue]:
+    """构造 Engine continuation 的 limited-signal manifest body。
+
+    :param context: 已校验 candidate 上下文。
+    :param data: Engine iteration started data。
+    :param runner_call_index: Host-owned runner call index。
+    :param manifest_id: manifest logical id。
+    :param runner_call_kind: Host 已判定的 runner call kind；为 ``None`` 时
+        按 Engine iteration signal 推导。
+    :param runner_call_trigger_reason: Host 已判定的 trigger reason；为
+        ``None`` 时按 Engine iteration signal 推导。
+    :returns: limited-signal manifest body。
+    """
+
+    diagnostic = _runner_call_manifest_diagnostic(
+        status=_RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL,
+        reason=_RUNNER_CALL_MANIFEST_REASON_MISSING_PROJECTION,
+        missing_atom_kind=None,
+        missing_ref_kind=_RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT,
+        missing_ref=None,
+        observed_count=data.message_count,
+        expected_count=None,
+        observed_digest=data.role_sequence_digest,
+        expected_digest=None,
+        consumer_boundary=_EVENT_SOURCE,
+    )
+    return {
+        "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+        "manifest_id": manifest_id,
+        "session_id": context.run.session_id,
+        "host_run_id": context.run.run_id,
+        "attempt_id": context.attempt.attempt_id,
+        "execution_id": context.attempt.execution_id,
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": (
+            runner_call_kind
+            if runner_call_kind is not None
+            else _runner_call_kind_for_iteration(data)
+        ),
+        "runner_call_trigger_reason": (
+            runner_call_trigger_reason
+            if runner_call_trigger_reason is not None
+            else _runner_call_trigger_for_iteration(data)
+        ),
+        "iteration_id": data.iteration_id,
+        "iteration_index": data.iteration_index,
+        "message_count": data.message_count,
+        "role_sequence_digest": data.role_sequence_digest,
+        "runner_input_serializer_schema_version": (
+            data.runner_input_serializer_schema_version
+        ),
+        "input_projection_digest": sha256_digest_json(
+            {
+                "signal_kind": "engine_observed_limited_runner_input",
+                "iteration_id": data.iteration_id,
+                "iteration_index": data.iteration_index,
+                "message_count": data.message_count,
+                "role_sequence_digest": data.role_sequence_digest,
+                "diagnostic": diagnostic,
+            }
+        ),
+        "message_entries": [],
+        "source_cursor_refs": list(_limited_runner_call_source_refs(context)),
+        "tool_schema_snapshot_refs": [],
+        "memory_snapshot_cursor_ref": None,
+        "compact_artifact_refs": [],
+        "context_fallback_decision_ref": None,
+        "projector_metadata": [
+            _limited_runner_call_projector_metadata(context, data)
+        ],
+        "compactor_identity": None,
+        "diagnostic": diagnostic,
+    }
+
+
+def _runner_call_manifest_diagnostic(
+    *,
+    status: str,
+    reason: str | None,
+    missing_atom_kind: str | None,
+    missing_ref_kind: str | None,
+    missing_ref: str | None,
+    observed_count: int | None,
+    expected_count: int | None,
+    observed_digest: str | None,
+    expected_digest: str | None,
+    consumer_boundary: str,
+) -> Mapping[str, JsonValue]:
+    """构造 runner-call reconstruction diagnostic。
+
+    :param status: diagnostic status。
+    :param reason: diagnostic reason。
+    :param missing_atom_kind: 缺失 atom kind。
+    :param missing_ref_kind: 缺失 ref kind。
+    :param missing_ref: 缺失 ref。
+    :param observed_count: Engine 观察到的 message count。
+    :param expected_count: manifest 期望 message count。
+    :param observed_digest: Engine 观察到的 role digest。
+    :param expected_digest: manifest 期望 role digest。
+    :param consumer_boundary: 产生该诊断的 consumer boundary。
+    :returns: diagnostic JSON object。
+    """
+
+    return {
+        "status": status,
+        "reason": reason,
+        "missing_atom_kind": missing_atom_kind,
+        "missing_ref_kind": missing_ref_kind,
+        "missing_ref": missing_ref,
+        "observed_count": observed_count,
+        "expected_count": expected_count,
+        "observed_digest": observed_digest,
+        "expected_digest": expected_digest,
+        "consumer_boundary": consumer_boundary,
+    }
+
+
+def _limited_runner_call_source_refs(
+    context: _ValidatedCandidate,
+) -> tuple[str, ...]:
+    """返回 limited continuation manifest 可证明的 Host source refs。
+
+    :param context: 已校验 candidate 上下文。
+    :returns: 去重后的 source refs。
+    """
+
+    refs = [
+        f"event:{context.run.input_event_id}",
+        f"event:{context.run.accepted_event_id}",
+        f"event:{context.attempt.started_event_id}",
+    ]
+    if context.run.started_event_id is not None:
+        refs.append(f"event:{context.run.started_event_id}")
+    return tuple(dict.fromkeys(refs))
+
+
+def _limited_runner_call_projector_metadata(
+    context: _ValidatedCandidate, data: IterationStartedData
+) -> Mapping[str, JsonValue]:
+    """构造 limited continuation projector metadata。
+
+    :param context: 已校验 candidate 上下文。
+    :param data: Engine iteration started data。
+    :returns: projector metadata JSON object。
+    """
+
+    projector_id = "engine_observed_runner_input_signal"
+    projector_schema_version = "engine_observed_runner_input_signal.v1"
+    metadata_id = f"projector:{data.iteration_index}:engine-observed"
+    return {
+        "projector_metadata_id": metadata_id,
+        "projector_id": projector_id,
+        "projector_schema_version": projector_schema_version,
+        "projector_digest": sha256_digest_json(
+            {
+                "projector_id": projector_id,
+                "projector_schema_version": projector_schema_version,
+                "source_refs": list(_limited_runner_call_source_refs(context)),
+            }
+        ),
+        "purpose": _RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION,
+        "source_contract_refs": list(_limited_runner_call_source_refs(context)),
+    }
+
+
+def _runner_call_kind_for_iteration(data: IterationStartedData) -> str:
+    """返回 Engine iteration 对应的 runner call kind。
+
+    :param data: Engine iteration started data。
+    :returns: runner call kind。
+    """
+
+    if data.iteration_index > 0:
+        return _RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION
+    return _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH
+
+
+def _runner_call_trigger_for_iteration(data: IterationStartedData) -> str:
+    """返回 Engine iteration 对应的 runner call trigger reason。
+
+    :param data: Engine iteration started data。
+    :returns: runner call trigger reason。
+    """
+
+    if data.iteration_index > 0:
+        return _RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE
+    return _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT
+
+
+def _write_runner_call_manifest_payload(
+    transaction: HostTransaction,
+    payload_store: PayloadStore,
+    *,
+    event_id: str,
+    manifest: Mapping[str, JsonValue],
+    manifest_digest: str,
+) -> PayloadDescriptor:
+    """写入 runner-call manifest payload descriptor。
+
+    :param transaction: 当前 Host transaction。
+    :param payload_store: payload store primitive。
+    :param event_id: manifest canonical event id。
+    :param manifest: manifest body。
+    :param manifest_digest: manifest body digest。
+    :returns: payload descriptor。
+    :raises HostDurableError: descriptor digest 不一致时抛出。
+    """
+
+    payload_ref = _runner_call_manifest_payload_ref(event_id)
+    existing = payload_store.read_payload_descriptor(transaction, payload_ref)
+    if existing is not None:
+        if existing.payload_digest != manifest_digest:
+            raise HostDurableError("runner-call manifest payload digest mismatch")
+        return existing
+    return payload_store.write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=_runner_call_manifest_sqlite_payload_id(event_id),
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=manifest,
+            media_type=RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
+            metadata={
+                "descriptor_kind": RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
+                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                "event_id": event_id,
+            },
+            expected_digest=manifest_digest,
+        ),
+    )
+
+
+def _runner_call_manifest_event_request(
+    *,
+    context: _ValidatedCandidate,
+    event_id: str,
+    manifest: Mapping[str, JsonValue],
+    manifest_payload_ref: str,
+    manifest_digest: str,
+) -> EventLogAppendRequest:
+    """构造 RUNNER_CALL_INPUT_ASSEMBLED append request。
+
+    :param context: 已校验 candidate 上下文。
+    :param event_id: canonical event id。
+    :param manifest: manifest body。
+    :param manifest_payload_ref: manifest payload descriptor ref。
+    :param manifest_digest: manifest body digest。
+    :returns: EventLog append request。
+    """
+
+    hot_payload = _runner_call_manifest_hot_payload(
+        manifest=manifest,
+        manifest_payload_ref=manifest_payload_ref,
+        manifest_digest=manifest_digest,
+    )
+    candidate = context.candidate
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=candidate.envelope.session_id,
+        run_id=candidate.envelope.run_id,
+        attempt_id=candidate.envelope.attempt_id,
+        execution_id=candidate.envelope.execution_id,
+        event_type=_EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+        occurred_at=candidate.observed_at,
+        actor=_EVENT_ACTOR,
+        source=_EVENT_SOURCE,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason=None,
+        payload_json=hot_payload,
+        payload_ref=manifest_payload_ref,
+        payload_digest=manifest_digest,
+    )
+
+
+def _runner_call_manifest_hot_payload(
+    *,
+    manifest: Mapping[str, JsonValue],
+    manifest_payload_ref: str,
+    manifest_digest: str,
+) -> Mapping[str, JsonValue]:
+    """构造 RUNNER_CALL_INPUT_ASSEMBLED hot payload。
+
+    :param manifest: manifest body。
+    :param manifest_payload_ref: manifest payload descriptor ref。
+    :param manifest_digest: manifest body digest。
+    :returns: canonical event hot payload。
+    """
+
+    return {
+        "session_id": _manifest_text(manifest, "session_id"),
+        "host_run_id": _manifest_text(manifest, "host_run_id"),
+        "attempt_id": _manifest_optional_text(manifest, "attempt_id"),
+        "execution_id": _manifest_optional_text(manifest, "execution_id"),
+        "runner_call_index": _manifest_int(manifest, "runner_call_index"),
+        "runner_call_kind": _manifest_text(manifest, "runner_call_kind"),
+        "runner_call_trigger_reason": _manifest_text(
+            manifest, "runner_call_trigger_reason"
+        ),
+        "iteration_id": _manifest_optional_text(manifest, "iteration_id"),
+        "iteration_index": manifest.get("iteration_index"),
+        "manifest_payload_ref": manifest_payload_ref,
+        "manifest_digest": manifest_digest,
+        "manifest_schema_version": _manifest_text(manifest, "schema_version"),
+        "validation_status": _manifest_text(
+            _manifest_diagnostic(manifest), "status"
+        ),
+        "message_count": _manifest_int(manifest, "message_count"),
+        "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
+        "input_projection_digest": _manifest_text(
+            manifest, "input_projection_digest"
+        ),
+        "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
+        "diagnostic": _manifest_diagnostic(manifest),
+    }
+
+
+def _runner_call_manifest_payload_ref(event_id: str) -> str:
+    """派生 runner-call manifest payload descriptor ref。
+
+    :param event_id: manifest canonical event id。
+    :returns: payload descriptor ref。
+    """
+
+    return f"{_RUNNER_CALL_MANIFEST_REF_PREFIX}:{event_id}"
+
+
+def _runner_call_manifest_sqlite_payload_id(event_id: str) -> str:
+    """派生 runner-call manifest SQLite payload id。
+
+    :param event_id: manifest canonical event id。
+    :returns: SQLite payload id。
+    """
+
+    return f"{_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX}:{event_id}"
+
+
+def _runner_call_manifest_id(event_id: str) -> str:
+    """派生 runner-call manifest logical id。
+
+    :param event_id: manifest canonical event id。
+    :returns: manifest id。
+    """
+
+    return f"{_RUNNER_CALL_MANIFEST_ID_PREFIX}:{event_id}"
+
+
+def _next_runner_call_index(transaction: HostTransaction, run_id: str) -> int:
+    """返回当前 Run 的下一个 runner_call_index。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: Run id。
+    :returns: 下一个零基 runner call index。
+    :raises HostDurableError: 计数查询失败时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT COUNT(*) AS manifest_count
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND event_type = ?
+        """,
+        (run_id, _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED),
+    )
+    if row is None:
+        raise HostDurableError("runner-call manifest count query returned no row")
+    value = row.get("manifest_count")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HostDurableError("runner-call manifest count is invalid")
+    return value
+
+
+def _projector_metadata_summary(
+    manifest: Mapping[str, JsonValue]
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """从 manifest body 复制 projector metadata summary。
+
+    :param manifest: manifest body。
+    :returns: projector metadata summary。
+    :raises HostDurableError: projector metadata 字段非法时抛出。
+    """
+
+    value = manifest.get("projector_metadata")
+    if not isinstance(value, list):
+        raise HostDurableError("runner-call manifest projector_metadata is invalid")
+    summary: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError("runner-call projector metadata must be object")
+        summary.append(
+            {
+                "projector_metadata_id": _manifest_text(
+                    item, "projector_metadata_id"
+                ),
+                "projector_id": _manifest_text(item, "projector_id"),
+                "projector_schema_version": _manifest_text(
+                    item, "projector_schema_version"
+                ),
+                "projector_digest": _manifest_text(item, "projector_digest"),
+                "purpose": _manifest_text(item, "purpose"),
+            }
+        )
+    return tuple(summary)
+
+
+def _find_runner_call_iteration_link_event(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    iteration_id: str,
+) -> EventLogRow | None:
+    """查找当前 Engine iteration 已有的 runner-call link event。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :param iteration_id: Engine iteration id。
+    :returns: link event；不存在时返回 ``None``。
+    :raises HostDurableError: EventLog row 缺失或 payload 非法时抛出。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND attempt_id = ?
+          AND execution_id = ?
+          AND event_type = ?
+        ORDER BY event_sequence ASC
+        """,
+        (
+            run_id,
+            attempt_id,
+            execution_id,
+            _EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED,
+        ),
+    )
+    event_log_store = EventLogStore()
+    for row in rows:
+        event_id = row.get("event_id")
+        if not isinstance(event_id, str):
+            raise HostDurableError("runner-call link event id is invalid")
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError("runner-call link event row is missing")
+        payload = _payload_object(event)
+        if _optional_payload_text(payload, field_name="iteration_id") == iteration_id:
+            return event
+    return None
+
+
+def _find_unlinked_prepared_runner_call_manifest_events(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+) -> tuple[EventLogRow, ...]:
+    """查找当前 attempt/execution 尚未 link 的 ordinary prepared manifest。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :returns: unlinked prepared manifest events。
+    :raises HostDurableError: EventLog row 缺失或 payload 非法时抛出。
+    """
+
+    linked_manifest_event_ids = _linked_manifest_event_ids(
+        transaction,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+    )
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND attempt_id = ?
+          AND execution_id = ?
+          AND event_type = ?
+        ORDER BY event_sequence ASC
+        """,
+        (run_id, attempt_id, execution_id, _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED),
+    )
+    event_log_store = EventLogStore()
+    candidates: list[EventLogRow] = []
+    for row in rows:
+        event_id = row.get("event_id")
+        if not isinstance(event_id, str):
+            raise HostDurableError("runner-call manifest event id is invalid")
+        if event_id in linked_manifest_event_ids:
+            continue
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError("runner-call manifest event row is missing")
+        if _is_unlinked_prepared_ordinary_manifest(transaction, event):
+            candidates.append(event)
+    return tuple(candidates)
+
+
+def _linked_manifest_event_ids(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+) -> frozenset[str]:
+    """读取当前 attempt/execution 已被 link 的 manifest event ids。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :returns: manifest event id 集合。
+    :raises HostDurableError: link payload 非法时抛出。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND attempt_id = ?
+          AND execution_id = ?
+          AND event_type = ?
+        ORDER BY event_sequence ASC
+        """,
+        (
+            run_id,
+            attempt_id,
+            execution_id,
+            _EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED,
+        ),
+    )
+    event_log_store = EventLogStore()
+    linked: set[str] = set()
+    for row in rows:
+        event_id = row.get("event_id")
+        if not isinstance(event_id, str):
+            raise HostDurableError("runner-call link event id is invalid")
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError("runner-call link event row is missing")
+        payload = _payload_object(event)
+        linked.add(_manifest_text(payload, "manifest_event_id"))
+    return frozenset(linked)
+
+
+def _is_unlinked_prepared_ordinary_manifest(
+    transaction: HostTransaction,
+    event: EventLogRow,
+) -> bool:
+    """判断 manifest event 是否为 ordinary prepared input。
+
+    :param transaction: 当前 Host transaction。
+    :param event: `RUNNER_CALL_INPUT_ASSEMBLED` event。
+    :returns: 满足 ordinary prepared 条件时返回 ``True``。
+    :raises HostDurableError: payload 字段非法时抛出。
+    """
+
+    hot_payload = _payload_object(event)
+    if _optional_payload_text(hot_payload, field_name="validation_status") != (
+        _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
+    ):
+        return False
+    if _optional_payload_text(hot_payload, field_name="iteration_id") is not None:
+        return False
+    if hot_payload.get("iteration_index") is not None:
+        return False
+    runner_call_kind = _optional_payload_text(
+        hot_payload, field_name="runner_call_kind"
+    )
+    if runner_call_kind not in _ORDINARY_RUNNER_CALL_KINDS:
+        return False
+    manifest = event_payload_object(
+        transaction,
+        event,
+        payload_label="runner-call manifest",
+    )
+    if manifest.get("compactor_identity") is not None:
+        return False
+    return True
+
+
+def _has_prior_iteration_observation(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+) -> bool:
+    """判断当前 attempt/execution 是否已有 accepted iteration observation。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :returns: 存在 accepted link 或 accepted ITERATION_STARTED preview 时返回
+        ``True``。
+    :raises HostDurableError: SQLite 查询失败时由 transaction runner 转换。
+    """
+
+    link_rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND attempt_id = ?
+          AND execution_id = ?
+          AND event_type = ?
+        ORDER BY event_sequence ASC
+        """,
+        (
+            run_id,
+            attempt_id,
+            execution_id,
+            _EVENT_TYPE_RUNNER_CALL_INPUT_ITERATION_LINKED,
+        ),
+    )
+    event_log_store = EventLogStore()
+    for link_row in link_rows:
+        event_id = link_row.get("event_id")
+        if not isinstance(event_id, str):
+            raise HostDurableError("runner-call link event id is invalid")
+        event = event_log_store.read_event_by_id(transaction, event_id)
+        if event is None:
+            raise HostDurableError("runner-call link event row is missing")
+        payload = _payload_object(event)
+        if _manifest_text(payload, "validation_status") == (
+            _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
+        ):
+            return True
+
+    preview_row = transaction.fetchone(
+        f"""
+        SELECT 1 AS found
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND attempt_id = ?
+          AND execution_id = ?
+          AND event_type = ?
+          AND event_class = ?
+        LIMIT 1
+        """,
+        (
+            run_id,
+            attempt_id,
+            execution_id,
+            _host_event_type(EngineEventType.ITERATION_STARTED),
+            EventClass.PREVIEW.value,
+        ),
+    )
+    return preview_row is not None
+
+
+def _runner_call_iteration_link_payload(
+    manifest_event: EventLogRow,
+    data: IterationStartedData,
+) -> Mapping[str, JsonValue]:
+    """构造 runner-call iteration link hot payload。
+
+    :param manifest_event: 被 link 的 prepared manifest event。
+    :param data: Engine iteration started data。
+    :returns: link event hot payload。
+    :raises HostDurableError: manifest hot payload 字段非法时抛出。
+    """
+
+    manifest_payload = _payload_object(manifest_event)
+    expected_count = _optional_payload_int(
+        manifest_payload, field_name="message_count"
+    )
+    expected_digest = _optional_payload_text(
+        manifest_payload, field_name="role_sequence_digest"
+    )
+    status = _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
+    reason: str | None = None
+    if expected_count != data.message_count:
+        status = _RUNNER_CALL_MANIFEST_STATUS_MISMATCH
+        reason = _RUNNER_CALL_MANIFEST_REASON_MESSAGE_COUNT
+    elif expected_digest != data.role_sequence_digest:
+        status = _RUNNER_CALL_MANIFEST_STATUS_MISMATCH
+        reason = _RUNNER_CALL_MANIFEST_REASON_ROLE_DIGEST
+    diagnostic: Mapping[str, JsonValue] | None = None
+    if status != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
+        diagnostic = _runner_call_manifest_diagnostic(
+            status=status,
+            reason=reason,
+            missing_atom_kind=None,
+            missing_ref_kind=None,
+            missing_ref=None,
+            observed_count=data.message_count,
+            expected_count=expected_count,
+            observed_digest=data.role_sequence_digest,
+            expected_digest=expected_digest,
+            consumer_boundary=_EVENT_SOURCE,
+        )
+    return {
+        "session_id": _manifest_text(manifest_payload, "session_id"),
+        "host_run_id": _manifest_text(manifest_payload, "host_run_id"),
+        "attempt_id": _manifest_optional_text(manifest_payload, "attempt_id"),
+        "execution_id": _manifest_optional_text(manifest_payload, "execution_id"),
+        "manifest_event_id": manifest_event.event_id,
+        "manifest_payload_ref": _manifest_text(
+            manifest_payload, "manifest_payload_ref"
+        ),
+        "manifest_digest": _manifest_text(manifest_payload, "manifest_digest"),
+        "manifest_schema_version": _manifest_text(
+            manifest_payload, "manifest_schema_version"
+        ),
+        "runner_call_index": _manifest_int(
+            manifest_payload, "runner_call_index"
+        ),
+        "runner_call_kind": _manifest_text(
+            manifest_payload, "runner_call_kind"
+        ),
+        "runner_call_trigger_reason": _manifest_text(
+            manifest_payload, "runner_call_trigger_reason"
+        ),
+        "iteration_id": data.iteration_id,
+        "iteration_index": data.iteration_index,
+        "engine_message_count": data.message_count,
+        "engine_role_sequence_digest": data.role_sequence_digest,
+        "runner_input_serializer_schema_version": (
+            data.runner_input_serializer_schema_version
+        ),
+        "expected_message_count": expected_count,
+        "expected_role_sequence_digest": expected_digest,
+        "validation_status": status,
+        "diagnostic": diagnostic,
+    }
+
+
+def _runner_call_iteration_link_matches(
+    event: EventLogRow,
+    data: IterationStartedData,
+) -> bool:
+    """判断既有 link event 是否与当前 Engine observation 一致。
+
+    :param event: 既有 link event。
+    :param data: 当前 Engine iteration started data。
+    :returns: 完全一致时返回 ``True``。
+    :raises HostDurableError: link payload 字段非法时抛出。
+    """
+
+    payload = _payload_object(event)
+    return (
+        _optional_payload_text(payload, field_name="iteration_id")
+        == data.iteration_id
+        and _optional_payload_int(payload, field_name="iteration_index")
+        == data.iteration_index
+        and _optional_payload_int(payload, field_name="engine_message_count")
+        == data.message_count
+        and _optional_payload_text(
+            payload, field_name="engine_role_sequence_digest"
+        )
+        == data.role_sequence_digest
+        and _optional_payload_text(
+            payload, field_name="runner_input_serializer_schema_version"
+        )
+        == data.runner_input_serializer_schema_version
+    )
+
+
+def _resolution_from_link_event(
+    event: EventLogRow,
+    data: IterationStartedData,
+) -> _RunnerCallIterationResolution:
+    """从 link event 构造 preview validation resolution。
+
+    :param event: link event。
+    :param data: Engine iteration started data。
+    :returns: preview 使用的 resolution。
+    :raises HostDurableError: link payload 字段非法时抛出。
+    """
+
+    payload = _payload_object(event)
+    return _RunnerCallIterationResolution(
+        status=_manifest_text(payload, "validation_status"),
+        reason=_manifest_optional_text(_link_diagnostic(payload), "reason"),
+        link_event_id=event.event_id,
+        manifest_event_id=_manifest_text(payload, "manifest_event_id"),
+        manifest_payload_ref=_manifest_text(payload, "manifest_payload_ref"),
+        manifest_digest=_manifest_text(payload, "manifest_digest"),
+        expected_count=_manifest_optional_int(payload, "expected_message_count"),
+        expected_digest=_manifest_optional_text(
+            payload, "expected_role_sequence_digest"
+        ),
+        observed_count=data.message_count,
+        observed_digest=data.role_sequence_digest,
+        continuation_limited_signal=False,
+    )
+
+
+def _resolution_from_limited_manifest_event(
+    event: EventLogRow,
+    data: IterationStartedData,
+) -> _RunnerCallIterationResolution:
+    """从 limited-signal manifest event 构造 preview validation resolution。
+
+    :param event: limited-signal manifest event。
+    :param data: Engine iteration started data。
+    :returns: preview 使用的 resolution。
+    :raises HostDurableError: manifest hot payload 字段非法时抛出。
+    """
+
+    payload = _payload_object(event)
+    diagnostic = _runner_call_payload_diagnostic(
+        payload,
+        consumer_boundary="engine_ingest_preview",
+    )
+    return _RunnerCallIterationResolution(
+        status=_manifest_text(diagnostic, "status"),
+        reason=_manifest_optional_text(diagnostic, "reason"),
+        link_event_id=None,
+        manifest_event_id=event.event_id,
+        manifest_payload_ref=_manifest_text(payload, "manifest_payload_ref"),
+        manifest_digest=_manifest_text(payload, "manifest_digest"),
+        expected_count=_manifest_optional_int(diagnostic, "expected_count"),
+        expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
+        observed_count=data.message_count,
+        observed_digest=data.role_sequence_digest,
+        continuation_limited_signal=True,
+    )
+
+
+def _link_diagnostic(payload: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    """读取 link payload 中的 diagnostic object。
+
+    :param payload: link hot payload。
+    :returns: diagnostic object；complete 时返回 reason 为空的 synthetic object。
+    :raises HostDurableError: diagnostic 字段非法时抛出。
+    """
+
+    if _manifest_text(payload, "validation_status") == (
+        _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
+    ):
+        return {"reason": None}
+    value = payload.get("diagnostic")
+    if not isinstance(value, Mapping):
+        raise HostDurableError("runner-call link diagnostic must be object")
+    return value
+
+
+def _iteration_started_preview_payload(
+    context: _ValidatedCandidate,
+    data: IterationStartedData,
+    resolution: _RunnerCallIterationResolution,
+) -> Mapping[str, JsonValue]:
+    """构造带 link resolution 的 iteration started preview payload。
+
+    :param context: 已校验 candidate 上下文。
+    :param data: Engine iteration started data。
+    :param resolution: 当前 iteration 的 runner-call link resolution。
+    :returns: preview payload。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "attempt_id": context.attempt.attempt_id,
+        "execution_id": context.attempt.execution_id,
+        "worker_event_index": context.candidate.worker_event_index,
+        "engine_event_type": EngineEventType.ITERATION_STARTED.value,
+        "iteration_id": data.iteration_id,
+        "iteration_index": data.iteration_index,
+        "message_count": data.message_count,
+        "role_sequence_digest": data.role_sequence_digest,
+        "runner_input_serializer_schema_version": (
+            data.runner_input_serializer_schema_version
+        ),
+        "runner_call_manifest_validation": _runner_call_link_validation_summary(
+            resolution
+        ),
+    }
+    if resolution.link_event_id is not None:
+        payload["runner_call_iteration_link_event_id"] = resolution.link_event_id
+    if resolution.manifest_event_id is not None:
+        payload["runner_call_manifest_event_id"] = resolution.manifest_event_id
+    if resolution.manifest_payload_ref is not None:
+        payload["manifest_payload_ref"] = resolution.manifest_payload_ref
+    if resolution.manifest_digest is not None:
+        payload["manifest_digest"] = resolution.manifest_digest
+    return payload
+
+
+def _runner_call_link_validation_summary(
+    resolution: _RunnerCallIterationResolution,
+) -> Mapping[str, JsonValue]:
+    """构造 preview 中的 runner-call manifest validation summary。
+
+    :param resolution: 当前 iteration 的 link resolution。
+    :returns: validation summary。
+    """
+
+    return {
+        "status": resolution.status,
+        "reason": resolution.reason,
+        "runner_call_iteration_link_event_id": resolution.link_event_id,
+        "manifest_event_id": resolution.manifest_event_id,
+        "manifest_payload_ref": resolution.manifest_payload_ref,
+        "manifest_digest": resolution.manifest_digest,
+        "observed_count": resolution.observed_count,
+        "expected_count": resolution.expected_count,
+        "observed_digest": resolution.observed_digest,
+        "expected_digest": resolution.expected_digest,
+        "continuation_limited_signal": resolution.continuation_limited_signal,
+    }
+
+
+def _runner_call_payload_diagnostic(
+    payload: Mapping[str, JsonValue], *, consumer_boundary: str
+) -> Mapping[str, JsonValue]:
+    """从 RUNNER_CALL_INPUT_ASSEMBLED hot payload 读取 typed diagnostic。
+
+    :param payload: canonical hot payload。
+    :param consumer_boundary: 当前消费边界。
+    :returns: diagnostic summary。
+    :raises HostDurableError: 非 complete signal 缺少 typed diagnostic 时抛出。
+    """
+
+    status = _optional_payload_text(payload, field_name="validation_status")
+    diagnostic = payload.get("diagnostic")
+    if status == _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
+        return _runner_call_manifest_diagnostic(
+            status=_RUNNER_CALL_MANIFEST_STATUS_COMPLETE,
+            reason=None,
+            missing_atom_kind=None,
+            missing_ref_kind=None,
+            missing_ref=None,
+            observed_count=_optional_payload_int(
+                payload, field_name="message_count"
+            ),
+            expected_count=_optional_payload_int(
+                payload, field_name="message_count"
+            ),
+            observed_digest=_optional_payload_text(
+                payload, field_name="role_sequence_digest"
+            ),
+            expected_digest=_optional_payload_text(
+                payload, field_name="role_sequence_digest"
+            ),
+            consumer_boundary=consumer_boundary,
+        )
+    if not isinstance(diagnostic, Mapping):
+        raise HostDurableError("runner-call manifest diagnostic must be object")
+    return _runner_call_manifest_diagnostic(
+        status=_manifest_text(diagnostic, "status"),
+        reason=_manifest_optional_text(diagnostic, "reason"),
+        missing_atom_kind=_manifest_optional_text(diagnostic, "missing_atom_kind"),
+        missing_ref_kind=_manifest_optional_text(diagnostic, "missing_ref_kind"),
+        missing_ref=_manifest_optional_text(diagnostic, "missing_ref"),
+        observed_count=_manifest_optional_int(diagnostic, "observed_count"),
+        expected_count=_manifest_optional_int(diagnostic, "expected_count"),
+        observed_digest=_manifest_optional_text(diagnostic, "observed_digest"),
+        expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
+        consumer_boundary=consumer_boundary,
+    )
+
+
+def _optional_payload_int(
+    payload: Mapping[str, JsonValue], *, field_name: str
+) -> int | None:
+    """读取 payload 中的可选非负整数字段。
+
+    :param payload: payload 映射。
+    :param field_name: 字段名。
+    :returns: 整数值或 ``None``。
+    :raises HostDurableError: 字段存在但不是非负整数时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HostDurableError(f"payload field {field_name} must be non-negative int")
+    return value
+
+
+def _optional_payload_text(
+    payload: Mapping[str, JsonValue], *, field_name: str
+) -> str | None:
+    """读取 payload 中的可选非空文本字段。
+
+    :param payload: payload 映射。
+    :param field_name: 字段名。
+    :returns: 文本值或 ``None``。
+    :raises HostDurableError: 字段存在但不是非空文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"payload field {field_name} must be non-empty text")
+
+
+def _manifest_diagnostic(
+    manifest: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    """读取 manifest 中的 diagnostic object。
+
+    :param manifest: manifest body。
+    :returns: diagnostic object。
+    :raises HostDurableError: diagnostic 缺失或类型非法时抛出。
+    """
+
+    value = manifest.get("diagnostic")
+    if not isinstance(value, Mapping):
+        raise HostDurableError("runner-call manifest diagnostic must be object")
+    return value
+
+
+def _manifest_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取 manifest / diagnostic 中的必填文本字段。
+
+    :param payload: manifest 或 diagnostic JSON object。
+    :param field_name: 字段名。
+    :returns: 文本值。
+    :raises HostDurableError: 字段缺失或类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"runner-call manifest {field_name} must be text")
+    return value
+
+
+def _manifest_optional_text(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """读取 manifest / diagnostic 中的可选文本字段。
+
+    :param payload: manifest 或 diagnostic JSON object。
+    :param field_name: 字段名。
+    :returns: 文本值或 ``None``。
+    :raises HostDurableError: 字段类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"runner-call manifest {field_name} must be text")
+    return value
+
+
+def _manifest_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
+    """读取 manifest 中的必填非负整数字段。
+
+    :param payload: manifest JSON object。
+    :param field_name: 字段名。
+    :returns: 非负整数。
+    :raises HostDurableError: 字段缺失或类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HostDurableError(f"runner-call manifest {field_name} must be int")
+    return value
+
+
+def _manifest_optional_int(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> int | None:
+    """读取 manifest / diagnostic 中的可选非负整数字段。
+
+    :param payload: manifest 或 diagnostic JSON object。
+    :param field_name: 字段名。
+    :returns: 非负整数或 ``None``。
+    :raises HostDurableError: 字段类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HostDurableError(f"runner-call manifest {field_name} must be int")
+    return value
 
 
 def _accepted_tool_outcome_kind(data: ToolResultAcceptedData) -> str:
@@ -4374,6 +5861,22 @@ def _single_event_result(row: EventLogRow) -> EngineIngestResult:
     return EngineIngestResult(
         status=status,
         events=(row,),
+        terminal_closeout=False,
+        promotion_triggered=False,
+        reason=None,
+    )
+
+
+def _event_rows_result(rows: tuple[EventLogRow, ...]) -> EngineIngestResult:
+    """构造多事件接受结果。
+
+    :param rows: 本次 ingest 接受的 EventLog rows。
+    :returns: ingest result。
+    """
+
+    return EngineIngestResult(
+        status=EngineIngestStatus.ACCEPTED,
+        events=rows,
         terminal_closeout=False,
         promotion_triggered=False,
         reason=None,

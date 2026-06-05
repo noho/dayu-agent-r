@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -37,6 +38,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
     TABLE_HOST_TOOL_TRACE_HOT,
+    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
 )
 from dayu.host.durable.tool_trace import read_tool_trace_hot_row
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -395,6 +397,327 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         assert governed_summary["duplicate_scope"] == {
             "kind": "attempt",
             "attempt_id": "attempt-trace",
+        }
+
+
+def test_tool_trace_does_not_inline_large_tool_call_arguments(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 投影 TOOL_CALL_REQUESTED 时不展开大参数 descriptor。"""
+
+    cold_path = tmp_path / "trace" / "cold.jsonl"
+    large_arguments: Mapping[str, JsonValue] = {
+        "ticker": "MSFT",
+        "query": "x" * 1024,
+    }
+    arguments_json: Mapping[str, JsonValue] = {"arguments": large_arguments}
+    arguments_digest = sha256_digest_json(arguments_json)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-tool-call-arguments-large",
+                    payload_id="sqlite-payload-tool-call-arguments-large",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json=arguments_json,
+                    media_type="application/json",
+                    metadata={
+                        "descriptor_kind": TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+                    },
+                    expected_digest=arguments_digest,
+                ),
+            )
+        )
+        _append_tool_event(
+            store.transaction_runner,
+            event_id="event-requested-large-arguments",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": "tool-call-large-arguments",
+                "tool_name": "lookup_filing",
+                "tool_schema_digest": "sha256:schema",
+                "tool_identity_digest": "sha256:identity",
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_json_size_bytes": 2048,
+                "arguments_storage_kind": "payload_descriptor",
+                "arguments_inline_json": None,
+                "arguments_payload_ref": "payload-tool-call-arguments-large",
+                "arguments_payload_digest": arguments_digest,
+                "semantic_input_digest": "sha256:semantic",
+                "semantic_query_storage_kind": "absent",
+                "semantic_query_text": None,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": None,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        cold_lines = _json_lines(cold_path)
+
+        assert len(cold_lines) == 1
+        line_text = json.dumps(cold_lines[0], sort_keys=True)
+        assert arguments_digest in line_text
+        assert "x" * 128 not in line_text
+
+
+def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None:
+    """Tool Trace 只复制 runner-call manifest refs/digests 与摘要 signal。"""
+
+    cold_path = tmp_path / "trace" / "runner-call.jsonl"
+    manifest_digest = sha256_digest_json({"manifest": "runner-call"})
+    role_digest = sha256_digest_json({"roles": ["system", "user"]})
+    projection_digest = sha256_digest_json({"projection": "summary"})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 0,
+                "runner_call_kind": "initial_user_dispatch",
+                "runner_call_trigger_reason": "initial_user_input",
+                "iteration_id": "iteration-1",
+                "manifest_payload_ref": "payload-runner-call-manifest",
+                "manifest_digest": manifest_digest,
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "complete",
+                "message_count": 2,
+                "role_sequence_digest": role_digest,
+                "input_projection_digest": projection_digest,
+                "projector_metadata_summary": [
+                    {
+                        "projector_metadata_id": "projector:0:system",
+                        "projector_id": "run_input_system_context",
+                        "projector_schema_version": "run_input_projector.v1",
+                        "projector_digest": sha256_digest_json(
+                            {"projector": "system"}
+                        ),
+                        "purpose": "ordinary_run_input",
+                    }
+                ],
+                "diagnostic": None,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.result_digest == manifest_digest
+        assert row.trace_summary["runner_call_index"] == 0
+        assert row.trace_summary["manifest_ref"] == "payload-runner-call-manifest"
+        assert row.trace_summary["manifest_digest"] == manifest_digest
+        assert row.trace_summary["message_count"] == 2
+        assert row.trace_summary["role_sequence_digest"] == role_digest
+        assert row.trace_summary["input_projection_digest"] == projection_digest
+        assert row.trace_summary["diagnostic"] == {
+            "status": "complete",
+            "reason": None,
+            "missing_atom_kind": None,
+            "missing_ref_kind": None,
+            "missing_ref": None,
+            "observed_count": None,
+            "expected_count": None,
+            "observed_digest": None,
+            "expected_digest": None,
+            "consumer_boundary": "tool_trace_query",
+        }
+        assert cold_lines[0]["trace_summary"] == row.trace_summary
+
+
+def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 从 canonical payload 复制 non-complete typed diagnostic。"""
+
+    cold_path = tmp_path / "trace" / "runner-call-limited.jsonl"
+    manifest_digest = sha256_digest_json({"manifest": "runner-call-limited"})
+    role_digest = sha256_digest_json({"roles": ["system", "user", "tool"]})
+    projection_digest = sha256_digest_json({"projection": "limited"})
+    diagnostic = {
+        "status": "limited_signal",
+        "reason": "missing_projection_artifact",
+        "missing_atom_kind": None,
+        "missing_ref_kind": "runner_call_projection_artifact",
+        "missing_ref": None,
+        "observed_count": 3,
+        "expected_count": None,
+        "observed_digest": role_digest,
+        "expected_digest": None,
+        "consumer_boundary": "host.engine_ingest",
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input-limited",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 1,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "iteration_id": "iteration-2",
+                "manifest_payload_ref": "payload-runner-call-manifest-limited",
+                "manifest_digest": manifest_digest,
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "limited_signal",
+                "message_count": 3,
+                "role_sequence_digest": role_digest,
+                "input_projection_digest": projection_digest,
+                "projector_metadata_summary": [],
+                "diagnostic": diagnostic,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.trace_summary["runner_call_index"] == 1
+        assert row.trace_summary["manifest_ref"] == (
+            "payload-runner-call-manifest-limited"
+        )
+        assert row.trace_summary["diagnostic"] == {
+            "status": "limited_signal",
+            "reason": "missing_projection_artifact",
+            "missing_atom_kind": None,
+            "missing_ref_kind": "artifact_ref",
+            "missing_ref": None,
+            "observed_count": 3,
+            "expected_count": None,
+            "observed_digest": role_digest,
+            "expected_digest": None,
+            "consumer_boundary": "tool_trace_query",
+        }
+        assert cold_lines[0]["trace_summary"] == row.trace_summary
+
+
+def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """非 complete runner-call signal 缺少 typed diagnostic 时 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input-missing-diagnostic",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 2,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "manifest_payload_ref": "payload-runner-call-manifest-missing",
+                "manifest_digest": sha256_digest_json(
+                    {"manifest": "runner-call-missing-diagnostic"}
+                ),
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "limited_signal",
+                "message_count": 1,
+                "role_sequence_digest": sha256_digest_json({"roles": ["user"]}),
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "missing-diagnostic"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": None,
+            },
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
+        )
+
+        with pytest.raises(HostDurableError, match="runner-call diagnostic"):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(event),
+                )
+            )
+
+
+def test_tool_trace_projects_mismatch_runner_call_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 复制 runner-call mismatch diagnostic 的 count / digest 证据。"""
+
+    cold_path = tmp_path / "trace" / "runner-call-mismatch.jsonl"
+    observed_digest = sha256_digest_json({"roles": ["system", "user", "tool"]})
+    expected_digest = sha256_digest_json({"roles": ["system", "user"]})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-runner-call-input-mismatch",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "session_id": "session-1",
+                "host_run_id": "run-1",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+                "runner_call_index": 3,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "iteration_id": "iteration-3",
+                "manifest_payload_ref": "payload-runner-call-manifest-mismatch",
+                "manifest_digest": sha256_digest_json(
+                    {"manifest": "runner-call-mismatch"}
+                ),
+                "manifest_schema_version": "runner_call_input_manifest.v1",
+                "validation_status": "mismatch",
+                "message_count": 3,
+                "role_sequence_digest": observed_digest,
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "mismatch"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": {
+                    "status": "mismatch",
+                    "reason": "role_sequence_digest_mismatch",
+                    "missing_atom_kind": None,
+                    "missing_ref_kind": None,
+                    "missing_ref": None,
+                    "observed_count": 3,
+                    "expected_count": 2,
+                    "observed_digest": observed_digest,
+                    "expected_digest": expected_digest,
+                    "consumer_boundary": "host.engine_ingest",
+                },
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+
+        assert row is not None
+        assert row.trace_summary["diagnostic"] == {
+            "status": "mismatch",
+            "reason": "role_sequence_digest_mismatch",
+            "missing_atom_kind": None,
+            "missing_ref_kind": None,
+            "missing_ref": None,
+            "observed_count": 3,
+            "expected_count": 2,
+            "observed_digest": observed_digest,
+            "expected_digest": expected_digest,
+            "consumer_boundary": "tool_trace_query",
         }
 
 

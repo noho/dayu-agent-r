@@ -26,9 +26,10 @@ from dayu.engine.contracts.agent_run import (
     AgentRunResult,
     EngineRunOutcomeFinalAnswer,
 )
+from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.messages import AgentMessage, UserMessage
+from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import (
     CompactorRunnerBaseline,
@@ -40,6 +41,7 @@ from dayu.host import (
 )
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
+from dayu.host.durable.schema import RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.scene_prepare import (
     ScenePrepareRequest,
@@ -51,6 +53,7 @@ from tests.host.public_smoke_support import (
     FinalAnswerWorkerFactory,
     ToolCallingWorkerFactory,
     api_key_or_skip,
+    assert_at_most_one_system_message,
     deterministic_runner_spec,
     ensure_request,
     followup_request,
@@ -69,6 +72,9 @@ _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT = 7
 _SOFT_THRESHOLD_PROMPT_SENTENCE = "请保留标记 DAYU_COMPACT_OK，并继续等待下一步。"
 _COMPACTOR_PROVIDER_MAX_RETRIES = 1
 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
+_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "conversation_compact_output_v1"
+_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
+_INTERNAL_COMPACT_INPUT_TYPE_NAME = "ConversationCompactInputVNext"
 _COMPACT_ARTIFACT_KIND_FIELD = "artifact_kind"
 _COMPACT_ARTIFACT_KIND = "context_compaction"
 _ACCEPTED_CANDIDATE_FIELD = "accepted_candidate"
@@ -91,6 +97,77 @@ _PACKAGE_CONFIG_ROOT = (
     pathlib.Path(__file__).resolve().parents[2] / "dayu" / "config"
 )
 _COMPACTOR_PROFILE_ID = "standard-256k"
+_FORBIDDEN_COMPACTOR_PROMPT_TERMS = (
+    "Host-owned context compaction",
+    _INTERNAL_COMPACT_OUTPUT_TYPE_NAME,
+    _INTERNAL_COMPACT_INPUT_TYPE_NAME,
+    "vNext",
+    "migration",
+    "candidate_id",
+    "episode_summary_candidate",
+    "pinned_state_patch_candidate",
+    "minimum_preserve_item_candidates",
+    "preservation_evidence",
+    "stable_input",
+    "history_input",
+    "evidence_input",
+    "EventLog",
+    "payload ref",
+    "payload refs",
+    "payload_refs",
+    "digest",
+    "cursor",
+    "policy",
+)
+_FORBIDDEN_COMPACTOR_MATERIAL_TERMS = (
+    _INTERNAL_COMPACT_OUTPUT_TYPE_NAME,
+    _INTERNAL_COMPACT_INPUT_TYPE_NAME,
+    "ConversationCompactOutput",
+    "ConversationCompactInput",
+    "EventLog",
+    "payload ref",
+    "payload_refs",
+    "tool_call_id=",
+    "vNext",
+)
+
+
+def test_default_compactor_prompt_is_llm_facing_and_self_contained() -> None:
+    """默认 compactor prompt 不暴露内部实现术语，并自足说明输入输出。
+
+    :returns: ``None``。
+    :raises AssertionError: prompt 文本缺少必要语义或包含内部术语时抛出。
+    """
+
+    system_prompt, user_prompt_template, _ = _compactor_baseline_inputs()
+    prompt_text = f"{system_prompt}\n{user_prompt_template}"
+
+    for forbidden_term in _FORBIDDEN_COMPACTOR_PROMPT_TERMS:
+        assert forbidden_term not in prompt_text
+
+    assert "<<compaction_request>>" in user_prompt_template
+    assert "输入 JSON 说明" in user_prompt_template
+    assert "输出 JSON 字段" in user_prompt_template
+    assert "输出 JSON 最小示例" in user_prompt_template
+    assert "label 是本次请求内的引用标签" in user_prompt_template
+    assert "label 本身不是业务事实、财报事实或结论" in system_prompt
+    assert "唯一允许值为 `conversation_compact_output_v1`" in user_prompt_template
+    assert (
+        "必须为每个确实需要保留的 evidence label 产出至少一个 "
+        "evidence_backed_facts 条目；不得合成无证据事实。"
+        in user_prompt_template
+    )
+    assert "应为每个确实需要保留的 evidence label" not in user_prompt_template
+    for required_field in (
+        "schema_version",
+        "session_summary",
+        "evidence_backed_facts",
+        "answer_anchors",
+        "forward_intents",
+        "reference_continuity_items",
+        "diagnostics",
+    ):
+        assert required_field in user_prompt_template
 
 
 @pytest.mark.asyncio
@@ -138,6 +215,10 @@ async def test_no_compaction_recent_raw_turns_continuity(
 
     assert second_terminal.kind is HostEventKind.SUCCEEDED
     second_request = factory.requests[1]
+    for index, request in enumerate(factory.requests):
+        assert_at_most_one_system_message(
+            request.messages, label=f"no compact request {index}"
+        )
     joined = _joined_message_content(second_request.messages)
     assert "第一轮原始问题：请记住营收增长来自价格因素。" in joined
     assert "Session Summary Memory:" not in joined
@@ -205,6 +286,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert third_terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.material_jsons) >= 1
     material_json = _first_material_json_with_evidence(fake_compactor.material_jsons)
+    _assert_compactor_material_instruction_contract(material_json)
     evidence_material = material_json["evidence_material"]
     assert isinstance(evidence_material, list)
     assert len(evidence_material) >= 1
@@ -214,8 +296,12 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert "payload:" not in material_text
     assert "event-tool-result" not in material_text
     assert len(factory.requests) >= 3
+    for index, request in enumerate(factory.requests):
+        assert_at_most_one_system_message(
+            request.messages, label=f"tool evidence request {index}"
+        )
     joined = _joined_message_content(factory.requests[-1].messages)
-    assert "Evidence / Fact Memory:" in joined
+    assert "## Verified Evidence and Facts" in joined
     assert _LONG_CHAPTER_MARKER in joined
 
     # helper-level 补充：fake proposal 只使用 prompt-local E label，不读取 canonical refs。
@@ -294,6 +380,10 @@ async def test_long_user_input_second_factor_survives_reference_continuity(
 
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.prompt_lengths) >= 1
+    for index, request in enumerate(factory.requests):
+        assert_at_most_one_system_message(
+            request.messages, label=f"minimum preserve request {index}"
+        )
     joined = _joined_message_content(factory.requests[1].messages)
     assert _SECOND_FACTOR_MARKER in joined
 
@@ -349,6 +439,10 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
 
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.prompt_lengths) >= 2
+    for index, request in enumerate(factory.requests):
+        assert_at_most_one_system_message(
+            request.messages, label=f"multi compact request {index}"
+        )
     assert max(fake_compactor.prompt_lengths) <= _FAKE_COMPACTOR_MAX_PROMPT_CHARS
     assert len(_joined_message_content(factory.requests[-1].messages)) <= (
         _FAKE_PUBLIC_MEMORY_MAX_CHARS
@@ -397,6 +491,20 @@ async def test_proactive_compact_duplicate_prompt_does_not_exceed_compactor_wind
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.prompt_lengths) == 1
     assert fake_compactor.prompt_lengths[0] <= _FAKE_COMPACTOR_MAX_PROMPT_CHARS
+    manifest = _runner_call_manifest_for_run(
+        _compact_artifact_files(tmp_path / "compact-artifacts"),
+        followup.accepted_run_id,
+    )
+    assert manifest["runner_call_kind"] == "compactor_proposal"
+    assert manifest["runner_call_trigger_reason"] == (
+        "context_compaction_initial_proposal"
+    )
+    _assert_runner_call_manifest_messages(
+        manifest,
+        expected_roles=(AgentMessageRole.SYSTEM, AgentMessageRole.USER),
+    )
+    manifest_text = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+    assert _DUPLICATE_PROMPT_SENTENCE * 20 not in manifest_text
 
 
 @pytest.mark.asyncio
@@ -553,7 +661,11 @@ class FakeCompactorRunAgent:
         """
 
         del timeout_seconds
+        assert_at_most_one_system_message(
+            request.messages, label="fake compactor request"
+        )
         material_json = _material_json_from_compactor_request(request)
+        _assert_compactor_material_instruction_contract(material_json)
         user_prompt = _compactor_user_prompt(request)
         self.material_jsons.append(material_json)
         self.prompts.append(user_prompt)
@@ -654,6 +766,61 @@ def _material_json_from_compactor_request(
     parsed = cast(JsonValue, json.loads(_material_json_text_from_prompt(prompt)))
     assert isinstance(parsed, Mapping)
     return cast(Mapping[str, JsonValue], parsed)
+
+
+def _assert_compactor_material_instruction_contract(
+    material_json: Mapping[str, JsonValue],
+) -> None:
+    """校验 public compactor runtime material 的 instruction contract。
+
+    :param material_json: compactor request 中投影给 LLM 的 material JSON。
+    :returns: ``None``。
+    :raises AssertionError: instruction contract 暴露内部类型名或字面量错误时抛出。
+    """
+
+    instruction_value = material_json["instruction"]
+    assert isinstance(instruction_value, Mapping)
+    instruction = cast(Mapping[str, JsonValue], instruction_value)
+    assert (
+        instruction["output_schema_name"]
+        == _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER
+    )
+    material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
+    for forbidden_term in _FORBIDDEN_COMPACTOR_MATERIAL_TERMS:
+        assert forbidden_term not in material_text
+
+
+def _assert_runner_call_manifest_messages(
+    manifest: Mapping[str, JsonValue],
+    *,
+    expected_roles: tuple[AgentMessageRole, ...],
+) -> None:
+    """校验 runner-call manifest 的 message_count、dump item 与 role digest 同源。
+
+    :param manifest: runner-call input assembly manifest JSON。
+    :param expected_roles: 期望的 message role 序列。
+    :returns: ``None``。
+    :raises AssertionError: manifest 数量、条目或 digest 不一致时抛出。
+    """
+
+    message_count = manifest["message_count"]
+    assert isinstance(message_count, int)
+    assert message_count == len(expected_roles)
+    message_entries_value = manifest["message_entries"]
+    assert isinstance(message_entries_value, list)
+    assert len(message_entries_value) == message_count
+    observed_roles: list[str] = []
+    for index, entry_value in enumerate(message_entries_value):
+        entry = _required_mapping(entry_value, field_name=f"message_entries[{index}]")
+        assert entry["index"] == index
+        role = entry["role"]
+        assert isinstance(role, str)
+        observed_roles.append(role)
+    expected_role_values = tuple(role.value for role in expected_roles)
+    assert tuple(observed_roles) == expected_role_values
+    assert manifest["role_sequence_digest"] == runner_role_sequence_digest(
+        expected_role_values
+    )
 
 
 def _material_json_text_from_prompt(prompt: str) -> str:
@@ -987,6 +1154,29 @@ def _compact_artifact_for_run(
         if candidate.get(_CANDIDATE_ID_FIELD) == expected_candidate_id:
             return artifact
     raise AssertionError(f"compact artifact for run {run_id} was not found")
+
+
+def _runner_call_manifest_for_run(
+    paths: tuple[pathlib.Path, ...], run_id: str
+) -> Mapping[str, JsonValue]:
+    """从 artifact 文件集合中找出指定 Run 的 runner-call manifest。
+
+    :param paths: 候选 artifact 文件路径。
+    :param run_id: Host Run id。
+    :returns: runner-call manifest JSON object。
+    :raises AssertionError: 没有找到匹配 manifest 时抛出。
+    """
+
+    for path in paths:
+        artifact = _required_mapping(_read_json(path), field_name=str(path))
+        if artifact.get("schema_version") != RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION:
+            continue
+        if artifact.get("host_run_id") != run_id:
+            continue
+        if artifact.get("runner_call_kind") != "compactor_proposal":
+            continue
+        return artifact
+    raise AssertionError(f"runner-call manifest for run {run_id} was not found")
 
 
 def _read_json(path: pathlib.Path) -> JsonValue:

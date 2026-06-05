@@ -52,6 +52,8 @@ _FIELD_PROMPT_LOCAL_LABEL_MAPPING_REFS = "prompt_local_label_mapping_refs"
 _FIELD_SOURCE_BOUNDARY_REFS = "source_boundary_refs"
 _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _FIELD_PROJECTION_SIGNAL = "projection_signal"
+_FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF = "accepted_proposal_manifest_ref"
+_FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST = "accepted_proposal_manifest_digest"
 _FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
 _FIELD_PINNED_STATE_PATCH_CANDIDATE = "pinned_state_patch_candidate"
 _FIELD_PRESERVATION_EVIDENCE = "preservation_evidence"
@@ -76,6 +78,8 @@ _FIELD_ATTEMPT_COUNT = "attempt_count"
 _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED = "retry_repair_budget_exhausted"
 _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT = "budget_after_attempted_compact"
+_FIELD_PROPOSAL_MANIFEST_REF = "proposal_manifest_ref"
+_FIELD_PROPOSAL_MANIFEST_DIGEST = "proposal_manifest_digest"
 _FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
 _FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
 _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
@@ -259,6 +263,8 @@ def build_context_compacted_payload(
     source_boundary_refs: tuple[str, ...],
     accepted_evidence_mapping_refs: tuple[str, ...],
     projection_signal: str,
+    accepted_proposal_manifest_ref: str | None = None,
+    accepted_proposal_manifest_digest: str | None = None,
 ) -> Mapping[str, JsonValue]:
     """构造 ``CONTEXT_COMPACTED`` payload。
 
@@ -273,6 +279,8 @@ def build_context_compacted_payload(
     :param source_boundary_refs: source boundary refs。
     :param accepted_evidence_mapping_refs: accepted evidence mapping refs。
     :param projection_signal: memory projection signal。
+    :param accepted_proposal_manifest_ref: accepted proposal manifest ref。
+    :param accepted_proposal_manifest_digest: accepted proposal manifest digest。
     :returns: 可写入 EventLog 的 JSON payload。
     :raises TypeError: 输入类型非法时抛出。
     :raises ValueError: payload 结构非法时抛出。
@@ -299,6 +307,8 @@ def build_context_compacted_payload(
         _FIELD_QUALITY_CHECK_RESULT: quality_check_result.to_json(),
         _FIELD_BUDGET_AFTER_COMPACT: budget_after_compact,
         _FIELD_PROJECTION_SIGNAL: projection_signal,
+        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF: accepted_proposal_manifest_ref,
+        _FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST: accepted_proposal_manifest_digest,
     }
     validate_context_compacted_payload(payload)
     return payload
@@ -332,6 +342,11 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _validate_quality_check_result_vnext(payload)
     _required_non_negative_int(payload, _FIELD_BUDGET_AFTER_COMPACT)
     _required_text(payload, _FIELD_PROJECTION_SIGNAL)
+    _validate_optional_ref_digest_pair(
+        payload,
+        ref_field=_FIELD_ACCEPTED_PROPOSAL_MANIFEST_REF,
+        digest_field=_FIELD_ACCEPTED_PROPOSAL_MANIFEST_DIGEST,
+    )
 
 
 def build_context_compaction_failed_payload(
@@ -448,6 +463,29 @@ def _validate_failed_fallback_fields(
     _required_mapping(payload, _FIELD_FALLBACK_BUDGET_RESULT)
 
 
+def _validate_optional_ref_digest_pair(
+    payload: Mapping[str, JsonValue],
+    *,
+    ref_field: str,
+    digest_field: str,
+) -> None:
+    """校验可选 ref/digest 字段必须成对出现。
+
+    :param payload: 待校验 payload。
+    :param ref_field: ref 字段名。
+    :param digest_field: digest 字段名。
+    :returns: ``None``。
+    :raises ValueError: 只出现一侧或 digest 非法时抛出。
+    """
+
+    ref = _optional_text(payload, ref_field)
+    digest = _optional_text(payload, digest_field)
+    if (ref is None) != (digest is None):
+        raise ValueError(f"{ref_field} and {digest_field} must both be set or null")
+    if digest is not None and not is_sha256_digest(digest):
+        raise ValueError(f"{digest_field} must be sha256 digest")
+
+
 def _reject_old_compacted_fields(payload: Mapping[str, JsonValue]) -> None:
     """拒绝旧 ``CONTEXT_COMPACTED`` 字段。
 
@@ -521,6 +559,8 @@ def build_context_compaction_attempt_rejected_payload(
     diagnostic_refs: tuple[str, ...],
     next_policy_decision: str,
     budget_after_attempted_compact: int | None,
+    proposal_manifest_ref: str | None = None,
+    proposal_manifest_digest: str | None = None,
 ) -> Mapping[str, JsonValue]:
     """构造 ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` payload。
 
@@ -533,6 +573,10 @@ def build_context_compaction_attempt_rejected_payload(
     :param next_policy_decision: 下一步 Host policy decision。
     :param budget_after_attempted_compact: 本次 attempt 后预算；未知时为
         ``None``。
+    :param proposal_manifest_ref: 对应该 attempt 的 proposal manifest ref；
+        未发起 proposal call 时为 ``None``。
+    :param proposal_manifest_digest: 对应该 attempt 的 proposal manifest digest；
+        未发起 proposal call 时为 ``None``。
     :returns: 可写入 EventLog 的 JSON payload。
     :raises ValueError: payload 字段非法时抛出。
     """
@@ -548,6 +592,8 @@ def build_context_compaction_attempt_rejected_payload(
         _FIELD_DIAGNOSTIC_REFS: _string_list_json(diagnostic_refs),
         _FIELD_NEXT_POLICY_DECISION: next_policy_decision,
         _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: budget_after_attempted_compact,
+        _FIELD_PROPOSAL_MANIFEST_REF: proposal_manifest_ref,
+        _FIELD_PROPOSAL_MANIFEST_DIGEST: proposal_manifest_digest,
     }
     validate_context_compaction_attempt_rejected_payload(payload)
     return payload
@@ -576,6 +622,11 @@ def validate_context_compaction_attempt_rejected_payload(
         raise ValueError("diagnostic_refs must be non-empty")
     _required_text(payload, _FIELD_NEXT_POLICY_DECISION)
     _optional_non_negative_int(payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT)
+    _validate_optional_ref_digest_pair(
+        payload,
+        ref_field=_FIELD_PROPOSAL_MANIFEST_REF,
+        digest_field=_FIELD_PROPOSAL_MANIFEST_DIGEST,
+    )
 
 
 def _string_list_json(values: tuple[str, ...]) -> list[JsonValue]:

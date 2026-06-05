@@ -14,16 +14,21 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import EnsureSessionRequest, HostPayloadRef
 from dayu.host._event_payload import payload_object
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.artifact import LocalArtifactRef
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
 )
-from dayu.host.durable.payload import write_payload_descriptor_for_artifact
+from dayu.host.durable.payload import (
+    PayloadKind,
+    read_payload_descriptor,
+    write_payload_descriptor_for_artifact,
+)
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
@@ -50,6 +55,7 @@ from dayu.host.durable.state import (
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.evidence import accepted_evidence_envelope_from_json_value
 from dayu.host.payload_resolution import event_payload_object
+from dayu.host.payload_resolution import tool_call_request_atoms
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     default_memory_projection_policy,
@@ -218,6 +224,242 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.locator_refs == ()
         assert payload["raw_tool_outcome"] == candidate_result.raw_tool_outcome
         assert "result_preview" not in payload
+
+
+def test_tool_call_requested_carries_inline_arguments_atom(
+    tmp_path: Path,
+) -> None:
+    """小参数 TOOL_CALL_REQUESTED 内联 accepted arguments atom。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(seeded, tool_call_id="tool-call-args-inline")
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        payload = payload_object(requested)
+        atoms = store.transaction_runner.run_read(
+            lambda transaction: tool_call_request_atoms(transaction, requested)
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert payload["arguments_storage_kind"] == "inline_json"
+        assert payload["arguments_inline_json"] == {
+            "arguments": {"ticker": "MSFT"}
+        }
+        assert payload["arguments_payload_ref"] is None
+        assert payload["arguments_payload_digest"] == (
+            candidate.call.normalized_arguments_digest
+        )
+        assert payload["semantic_query_storage_kind"] == "absent"
+        assert atoms.arguments_json == {"arguments": {"ticker": "MSFT"}}
+        assert atoms.semantic_query_text is None
+
+
+def test_tool_call_requested_large_arguments_use_payload_descriptor(
+    tmp_path: Path,
+) -> None:
+    """大参数 TOOL_CALL_REQUESTED 使用 tool_call_arguments_json descriptor。"""
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        base = _completed_candidate(seeded, tool_call_id="tool-call-args-large")
+        large_arguments: Mapping[str, JsonValue] = {
+            "ticker": "MSFT",
+            "query": "x" * 8192,
+        }
+        candidate = replace(
+            base,
+            call=replace(
+                base.call,
+                accepted_arguments=large_arguments,
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": large_arguments}
+                ),
+            ),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        payload = payload_object(requested)
+        atoms = store.transaction_runner.run_read(
+            lambda transaction: tool_call_request_atoms(transaction, requested)
+        )
+        descriptor = store.transaction_runner.run_read(
+            lambda transaction: read_payload_descriptor(
+                transaction,
+                cast(str, payload["arguments_payload_ref"]),
+            )
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert payload["arguments_storage_kind"] == "payload_descriptor"
+        assert payload["arguments_inline_json"] is None
+        assert payload["arguments_payload_digest"] == (
+            candidate.call.normalized_arguments_digest
+        )
+        assert descriptor is not None
+        assert descriptor.payload_kind is PayloadKind.SQLITE_PAYLOAD
+        assert '"descriptor_kind":"tool_call_arguments_json"' in (
+            descriptor.metadata_json
+        )
+        assert atoms.arguments_json == {"arguments": large_arguments}
+        assert canonical_json_dumps(large_arguments) not in requested.payload_json
+
+
+def test_tool_call_request_atoms_reject_inline_arguments_payload_ref(
+    tmp_path: Path,
+) -> None:
+    """reader 拒绝 inline arguments 同时携带 payload ref 的畸形 atom。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(
+            seeded, tool_call_id="tool-call-args-inline-bad-ref"
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        malformed_payload = dict(payload_object(requested))
+        malformed_payload["arguments_payload_ref"] = "payload:unexpected-arguments"
+        malformed_requested = replace(
+            requested,
+            payload_json=canonical_json_dumps(malformed_payload),
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        with pytest.raises(HostDurableError, match="inline tool call arguments"):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(
+                    transaction, malformed_requested
+                )
+            )
+
+
+def test_tool_accept_call_rejects_arguments_digest_mismatch() -> None:
+    """ToolAcceptCall 拒绝 normalized digest 与 accepted arguments 不同源。"""
+
+    with pytest.raises(ValueError, match="accepted canonical arguments"):
+        ToolAcceptCall(
+            iteration_id="iteration-1",
+            tool_call_id="tool-call-args-mismatch",
+            tool_name="lookup",
+            tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
+            tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
+            normalized_arguments_digest=sha256_digest_json(
+                {"arguments": {"ticker": "MSFT"}}
+            ),
+            accepted_arguments={"ticker": "AAPL"},
+        )
+
+
+def test_tool_call_requested_semantic_query_inline_and_descriptor(
+    tmp_path: Path,
+) -> None:
+    """semantic query 缺失合法；存在时支持 inline 与 descriptor 两种形态。"""
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        inline_base = _completed_candidate(
+            seeded, tool_call_id="tool-call-query-inline"
+        )
+        descriptor_base = _completed_candidate(
+            seeded, tool_call_id="tool-call-query-descriptor"
+        )
+        inline_candidate = replace(
+            inline_base,
+            call=replace(inline_base.call, semantic_query_text="lookup MSFT filing"),
+        )
+        descriptor_query = "readable query " + ("x" * 8192)
+        descriptor_candidate = replace(
+            descriptor_base,
+            call=replace(
+                descriptor_base.call,
+                semantic_query_text=descriptor_query,
+            ),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        inline_result = accept_port.accept_tool_fact(inline_candidate)
+        descriptor_result = accept_port.accept_tool_fact(descriptor_candidate)
+        requested_events = _tool_requested_events(store.transaction_runner)
+        inline_atoms = store.transaction_runner.run_read(
+            lambda transaction: tool_call_request_atoms(
+                transaction, requested_events[0]
+            )
+        )
+        descriptor_payload = payload_object(requested_events[1])
+        descriptor_atoms = store.transaction_runner.run_read(
+            lambda transaction: tool_call_request_atoms(
+                transaction, requested_events[1]
+            )
+        )
+
+        assert isinstance(inline_result, ToolFactAcceptedAck)
+        assert isinstance(descriptor_result, ToolFactAcceptedAck)
+        assert inline_atoms.semantic_query_text == "lookup MSFT filing"
+        assert payload_object(requested_events[0])["semantic_query_storage_kind"] == (
+            "inline_text"
+        )
+        assert descriptor_payload["semantic_query_storage_kind"] == (
+            "payload_descriptor"
+        )
+        assert descriptor_payload["semantic_query_text"] is None
+        assert descriptor_atoms.semantic_query_text == descriptor_query
+        assert descriptor_query not in requested_events[1].payload_json
+
+
+def test_tool_call_request_atoms_reject_inline_semantic_query_payload_ref(
+    tmp_path: Path,
+) -> None:
+    """reader 拒绝 inline semantic query 同时携带 payload ref 的畸形 atom。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        base = _completed_candidate(
+            seeded, tool_call_id="tool-call-query-inline-bad-ref"
+        )
+        candidate = replace(
+            base,
+            call=replace(base.call, semantic_query_text="lookup MSFT filing"),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        malformed_payload = dict(payload_object(requested))
+        malformed_payload["semantic_query_payload_ref"] = (
+            "payload:unexpected-semantic-query"
+        )
+        malformed_requested = replace(
+            requested,
+            payload_json=canonical_json_dumps(malformed_payload),
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        with pytest.raises(HostDurableError, match="inline semantic query"):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(
+                    transaction, malformed_requested
+                )
+            )
 
 
 def test_tool_result_accepted_large_payload_uses_sqlite_payload_descriptor(
@@ -760,7 +1002,10 @@ def test_tool_accept_call_rejects_invalid_digest() -> None:
             tool_name="lookup",
             tool_schema_digest="not-a-sha256-digest",
             tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-            normalized_arguments_digest=sha256_digest_json({"ticker": "MSFT"}),
+            normalized_arguments_digest=sha256_digest_json(
+                {"arguments": {"ticker": "MSFT"}}
+            ),
+            accepted_arguments={"ticker": "MSFT"},
         )
 
 
@@ -1138,8 +1383,9 @@ def _fact_kind_candidate(
             tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
             tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
             normalized_arguments_digest=sha256_digest_json(
-                {"ticker": tool_call_id}
+                {"arguments": {"ticker": tool_call_id}}
             ),
+            accepted_arguments={"ticker": tool_call_id},
         ),
         tool_fact_kind=fact_kind,
         result=ToolAcceptResult(
@@ -1200,7 +1446,10 @@ def _candidate_call(tool_call_id: str, *, iteration_id: str) -> ToolAcceptCall:
         tool_name="lookup",
         tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
         tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-        normalized_arguments_digest=sha256_digest_json({"ticker": "MSFT"}),
+        normalized_arguments_digest=sha256_digest_json(
+            {"arguments": {"ticker": "MSFT"}}
+        ),
+        accepted_arguments={"ticker": "MSFT"},
     )
 
 
@@ -1359,4 +1608,20 @@ def _tool_result_events(
         row
         for row in _tool_events(transaction_runner)
         if row.event_type == "TOOL_RESULT_ACCEPTED"
+    )
+
+
+def _tool_requested_events(
+    transaction_runner: HostTransactionRunner,
+) -> tuple[EventLogRow, ...]:
+    """读取所有 ``TOOL_CALL_REQUESTED`` rows。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: 工具请求事件 rows。
+    """
+
+    return tuple(
+        row
+        for row in _tool_events(transaction_runner)
+        if row.event_type == "TOOL_CALL_REQUESTED"
     )

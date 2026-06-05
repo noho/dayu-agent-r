@@ -19,6 +19,7 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     ReasoningDeltaData,
     RunCancelledData,
     RunFailedData,
@@ -31,6 +32,7 @@ from dayu.engine.contracts.engine_events import (
     ToolCallsBatchReadyData,
     ToolResultAcceptedData,
     UsageReportedData,
+    runner_role_sequence_digest,
 )
 
 EVENT_TYPE_TO_DATA: dict[EngineEventType, type] = {
@@ -180,6 +182,23 @@ def test_provider_request_id_fields_are_locked() -> None:
         "provider_request_id",
         "client_correlation_id",
     }
+
+
+def test_iteration_started_runner_input_signal_fields_are_locked() -> None:
+    """iteration started 只携带 Engine 可观测 runner input signal。"""
+
+    assert {f.name for f in dataclasses.fields(IterationStartedData)} == {
+        "iteration_id",
+        "iteration_index",
+        "message_count",
+        "role_sequence_digest",
+        "runner_input_serializer_schema_version",
+    }
+    assert runner_role_sequence_digest(("system", "user")) == (
+        "sha256:"
+        "12217463eda5df10663547ab698e0aebc9e7d7620d3f2caea52f122a1abe8547"
+    )
+    assert RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION == "runner_input_roles.v1"
 
 
 def test_context_compaction_budget_state_accepts_unknown_and_snapshot() -> None:

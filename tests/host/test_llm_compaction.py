@@ -12,6 +12,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
@@ -60,6 +61,11 @@ _TEST_AGENT_POLICY = AgentPolicy(
     tool_execution_timeout_seconds=1.0,
 )
 _PROMPT_TEMPLATE_PATH = Path("dayu/config/prompts/scenes/conversation_compaction_user.md")
+_UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
+_UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
+_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "conversation_compact_output_v1"
+_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
+_INTERNAL_COMPACT_INPUT_TYPE_NAME = "ConversationCompactInputVNext"
 
 
 def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
@@ -132,6 +138,35 @@ def test_llm_context_compactor_requires_scene_prompt_template() -> None:
             system_prompt=_TEST_SYSTEM_PROMPT,
             user_prompt_template="missing placeholder",
         )
+
+
+def test_llm_context_compactor_prepares_same_source_runner_input() -> None:
+    """prepared proposal input 与真实 Engine request messages 同源。"""
+
+    prepared = _llm_compactor().prepare_compactor_proposal_run_input(
+        _request(),
+        StubCancellationToken(),
+        compaction_operation_id="event-context-compact-requested-test",
+        compaction_attempt_number=2,
+    )
+    request = prepared.agent_request
+    roles = tuple(message.role.value for message in request.messages)
+
+    assert prepared.compactor_engine_run_id == request.run_id
+    assert prepared.message_count == len(request.messages) == 2
+    assert prepared.role_sequence_digest == runner_role_sequence_digest(roles)
+    assert roles == ("system", "user")
+    assert prepared.compaction_request_digest == _request().digest()
+    assert prepared.compactor_input_projection_digest == llm_compaction_module.sha256_digest_json(
+        prepared.compactor_input_projection
+    )
+    projection_text = json.dumps(
+        prepared.compactor_input_projection,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    assert _TEST_SYSTEM_PROMPT not in projection_text
+    assert _TEST_USER_PROMPT_TEMPLATE not in projection_text
 
 
 def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None:
@@ -211,7 +246,12 @@ def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() 
 async def test_llm_context_compactor_compact_uses_vnext_material(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LLMContextCompactor.compact 渲染 vNext input 并返回 vNext output。"""
+    """LLMContextCompactor.compact 渲染 vNext input 并返回 vNext output。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: runner request 或渲染 material contract 不符合预期时抛出。
+    """
 
     calls: list[AgentRunRequest] = []
 
@@ -247,9 +287,18 @@ async def test_llm_context_compactor_compact_uses_vnext_material(
     assert '"trace_material"' in prompt
     assert '"evidence_material"' in prompt
     assert '"answer_material"' in prompt
+    assert f'"output_schema_name": "{_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER}"' in prompt
+    assert _INTERNAL_COMPACT_OUTPUT_TYPE_NAME not in prompt
+    assert _INTERNAL_COMPACT_INPUT_TYPE_NAME not in prompt
     assert '"stable_input"' not in prompt
     assert '"history_input"' not in prompt
     assert '"candidate_id"' not in prompt
+    material_json = _material_json_from_compactor_prompt(prompt)
+    instruction = _required_mapping(material_json["instruction"], field_name="instruction")
+    assert (
+        instruction["output_schema_name"]
+        == _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER
+    )
 
 
 @pytest.mark.asyncio
@@ -297,6 +346,48 @@ def _proposal_json(compact_input: ConversationCompactInputVNext) -> dict[str, Js
     if not isinstance(parsed, dict):
         raise TypeError("proposal must be object")
     return cast(dict[str, JsonValue], parsed)
+
+
+def _material_json_from_compactor_prompt(prompt: str) -> Mapping[str, JsonValue]:
+    """从 compactor user prompt 提取 LLM-facing material JSON。
+
+    :param prompt: compactor user prompt。
+    :returns: material JSON object。
+    :raises AssertionError: prompt 中 material JSON 不是 object 时抛出。
+    :raises json.JSONDecodeError: prompt 中 material JSON 非法时抛出。
+    """
+
+    parsed = cast(JsonValue, json.loads(_material_json_text_from_prompt(prompt)))
+    return _required_mapping(parsed, field_name="material_json")
+
+
+def _material_json_text_from_prompt(prompt: str) -> str:
+    """从 compactor user prompt 中读取 material JSON 文本。
+
+    :param prompt: compactor user prompt。
+    :returns: untrusted delimiter 中的 JSON 文本。
+    :raises AssertionError: prompt 缺少 material delimiter 时抛出。
+    """
+
+    begin_index = prompt.find(_UNTRUSTED_COMPACTION_MATERIAL_BEGIN)
+    end_index = prompt.find(_UNTRUSTED_COMPACTION_MATERIAL_END)
+    assert begin_index >= 0
+    assert end_index > begin_index
+    json_start = begin_index + len(_UNTRUSTED_COMPACTION_MATERIAL_BEGIN)
+    return prompt[json_start:end_index].strip()
+
+
+def _required_mapping(value: JsonValue, *, field_name: str) -> Mapping[str, JsonValue]:
+    """校验并返回 JSON object。
+
+    :param value: 待校验 JSON value。
+    :param field_name: 错误定位字段名。
+    :returns: JSON object。
+    :raises AssertionError: value 不是 JSON object 时抛出。
+    """
+
+    assert isinstance(value, Mapping), field_name
+    return cast(Mapping[str, JsonValue], value)
 
 
 def _prompt_schema_pipe_values(field_name: str) -> tuple[str, ...]:

@@ -9,8 +9,21 @@ from pathlib import Path
 import pytest
 
 import dayu.host.compaction_operation as compaction_operation
+import dayu.host.dispatch as dispatch
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_executor import ToolExecutor
+from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import runner_role_sequence_digest
+from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
@@ -31,6 +44,10 @@ from dayu.host.compaction_evidence import (
     collect_selected_compaction_request_evidence_inputs,
 )
 from dayu.host.compaction_operation import run_compaction_operation
+from dayu.host.compaction_operation import (
+    CompactorProposalManifestReference,
+    CompactorProposalRunInput,
+)
 from dayu.host.context_events import build_context_compaction_attempt_rejected_payload
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
@@ -51,6 +68,11 @@ from dayu.host.durable.payload import (
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
 )
+from dayu.host.durable.schema import (
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+)
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
     AcceptedEvidenceResultRef,
@@ -58,6 +80,7 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
@@ -397,6 +420,222 @@ class _DistinctPassCompactor(FakeContextCompactor):
         )
 
 
+class _RejectingToolExecutor(ToolExecutor):
+    """测试用禁用工具 executor。"""
+
+    async def execute(
+        self,
+        request: BatchToolExecutionRequest,
+    ) -> BatchToolExecutionOutcome:
+        """返回空工具执行结果。
+
+        :param request: Engine 工具执行请求。
+        :returns: 空 outcome。
+        """
+
+        del request
+        return BatchToolExecutionOutcome(records=())
+
+
+class _RecordingProposalManifestRecorder:
+    """记录 proposal manifest recorder 调用。"""
+
+    def __init__(self, events: list[str]) -> None:
+        """初始化调用记录。
+
+        :param events: 共享顺序记录列表。
+        :returns: ``None``。
+        """
+
+        self.events = events
+        self.references: list[CompactorProposalManifestReference] = []
+
+    def record_compactor_proposal_manifest(
+        self,
+        *,
+        request: CompactionRequest,
+        prepared_input: CompactorProposalRunInput,
+        compaction_operation_id: str,
+        compaction_attempt_number: int,
+    ) -> CompactorProposalManifestReference:
+        """记录 proposal manifest 并返回 deterministic ref。
+
+        :param request: Host compaction request。
+        :param prepared_input: prepared proposal input。
+        :param compaction_operation_id: operation id。
+        :param compaction_attempt_number: attempt 序号。
+        :returns: fake manifest reference。
+        """
+
+        self.events.append("record")
+        reference = CompactorProposalManifestReference(
+            manifest_event_id=f"event-manifest-{compaction_attempt_number}",
+            manifest_payload_ref=(
+                f"runner-call-manifest:{compaction_operation_id}:"
+                f"{compaction_attempt_number}"
+            ),
+            manifest_digest=prepared_input.role_sequence_digest,
+            compactor_input_projection_ref=(
+                f"compactor-input-projection:{request.run_id}:"
+                f"{compaction_attempt_number}"
+            ),
+            compactor_input_projection_digest=(
+                prepared_input.compactor_input_projection_digest
+            ),
+        )
+        self.references.append(reference)
+        return reference
+
+
+class _PreparedManifestCompactor(FakeContextCompactor):
+    """支持 prepared proposal manifest 的测试 compactor。"""
+
+    def __init__(self, events: list[str], *, fail_run: bool = False) -> None:
+        """初始化 fake compactor。
+
+        :param events: 共享顺序记录列表。
+        :param fail_run: run 阶段是否抛出 proposal failure。
+        :returns: ``None``。
+        """
+
+        self.events = events
+        self.fail_run = fail_run
+        self._fake = FakeContextCompactor()
+
+    def prepare_compactor_proposal_run_input(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        compaction_operation_id: str | None,
+        compaction_attempt_number: int,
+    ) -> CompactorProposalRunInput:
+        """构造测试用 prepared proposal input。
+
+        :param request: Host compaction request。
+        :param cancellation_token: Host cancellation token。
+        :param compaction_operation_id: operation id。
+        :param compaction_attempt_number: attempt 序号。
+        :returns: prepared proposal input。
+        """
+
+        del cancellation_token
+        self.events.append("prepare")
+        compact_input = compaction_operation.conversation_compact_input_vnext_from_material_pack(
+            request.material_pack
+        )
+        agent_request = _proposal_agent_request(
+            request,
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+        )
+        roles = tuple(message.role.value for message in agent_request.messages)
+        projection = {
+            "projection_kind": "compactor_input_projection",
+            "compaction_request_digest": request.digest(),
+        }
+        return CompactorProposalRunInput(
+            compact_input=compact_input,
+            agent_request=agent_request,
+            compaction_request_digest=request.digest(),
+            compactor_engine_run_id=agent_request.run_id,
+            message_count=len(agent_request.messages),
+            role_sequence_digest=runner_role_sequence_digest(roles),
+            system_prompt_asset_digest=_DIGEST,
+            user_prompt_template_digest=_DIGEST,
+            user_prompt_digest=sha256_digest_json({"user_prompt": "user"}),
+            compactor_input_projection=projection,
+            compactor_input_projection_digest=sha256_digest_json(projection),
+        )
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """执行 prepared proposal。
+
+        :param prepared_input: prepared proposal input。
+        :returns: fake candidate。
+        :raises RuntimeError: ``fail_run`` 为真时抛出。
+        """
+
+        self.events.append("run")
+        if self.fail_run:
+            raise RuntimeError("prepared proposal failed")
+        return await self._fake.compact(
+            _request(),
+            prepared_input.agent_request.cancellation_token,
+        )
+
+
+def _proposal_agent_request(
+    request: CompactionRequest,
+    *,
+    compaction_operation_id: str | None,
+    compaction_attempt_number: int,
+) -> AgentRunRequest:
+    """构造测试用 compactor AgentRunRequest。
+
+    :param request: compaction request。
+    :param compaction_operation_id: operation id。
+    :param compaction_attempt_number: attempt 序号。
+    :returns: AgentRunRequest。
+    """
+
+    return AgentRunRequest(
+        run_id=(
+            f"compactor-run:{request.run_id}:"
+            f"{compaction_operation_id}:{compaction_attempt_number}"
+        ),
+        session_id="context-compactor:test",
+        attempt_id=None,
+        execution_id=None,
+        messages=(
+            SystemMessage(role=AgentMessageRole.SYSTEM, content="system"),
+            UserMessage(role=AgentMessageRole.USER, content="user"),
+        ),
+        disable_tools=True,
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
+        tool_schemas=(),
+        tool_executor=_RejectingToolExecutor(),
+        cancellation_token=StubCancellationToken(),
+    )
+
+
+def _runner_spec() -> RunnerSpec:
+    """构造测试 RunnerSpec。
+
+    :returns: RunnerSpec。
+    """
+
+    return RunnerSpec(
+        provider="test",
+        model="test-model",
+        endpoint="https://example.invalid",
+        api_key_ref="secret:test",
+        headers={},
+        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
+        supports_tool_calling=False,
+        supports_streaming=False,
+        supports_stream_usage=False,
+        default_timeout_seconds=1.0,
+        max_retries=0,
+        provider_request=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_compaction_operation_retries_async_proposal_failure() -> None:
     """operation await async compactor，并保留 proposal failure 后 retry 行为。"""
@@ -416,6 +655,131 @@ async def test_run_compaction_operation_retries_async_proposal_failure() -> None
     assert len(result.rejected_attempts) == 1
     assert result.rejected_attempts[0].repairable is True
     assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_records_prepared_proposal_manifest_before_call() -> None:
+    """prepared compactor 在 proposal call 前记录 manifest 并传出 accepted ref。"""
+
+    events: list[str] = []
+    recorder = _RecordingProposalManifestRecorder(events)
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_PreparedManifestCompactor(events),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+        compaction_operation_id="operation-prepared-accepted",
+        proposal_manifest_recorder=recorder,
+    )
+
+    assert events == ["prepare", "record", "run"]
+    assert result.accepted_candidate is not None
+    assert result.accepted_proposal_manifest_ref == (
+        "runner-call-manifest:operation-prepared-accepted:1"
+    )
+    assert result.accepted_proposal_manifest_digest == (
+        recorder.references[0].manifest_digest
+    )
+    assert len(result.rejected_attempts) == 0
+
+
+def test_compactor_proposal_manifest_uses_initial_trigger_for_first_attempt() -> None:
+    """首次 compactor proposal manifest 使用专用 initial trigger reason。"""
+
+    request = _request()
+    compactor = _PreparedManifestCompactor([])
+    prepared_input = compactor.prepare_compactor_proposal_run_input(
+        request,
+        StubCancellationToken(),
+        compaction_operation_id="operation-trigger",
+        compaction_attempt_number=1,
+    )
+
+    first_manifest = compaction_operation._compactor_runner_call_manifest_body(
+        request=request,
+        prepared_input=prepared_input,
+        event_id="event-trigger-first",
+        compaction_operation_id="operation-trigger",
+        compaction_attempt_number=1,
+        compactor_input_projection_ref="payload-ref-trigger-first",
+    )
+    retry_manifest = compaction_operation._compactor_runner_call_manifest_body(
+        request=request,
+        prepared_input=prepared_input,
+        event_id="event-trigger-retry",
+        compaction_operation_id="operation-trigger",
+        compaction_attempt_number=2,
+        compactor_input_projection_ref="payload-ref-trigger-retry",
+    )
+
+    assert first_manifest["runner_call_kind"] == "compactor_proposal"
+    assert first_manifest["runner_call_trigger_reason"] == (
+        "context_compaction_initial_proposal"
+    )
+    assert retry_manifest["runner_call_trigger_reason"] == (
+        "context_compaction_retry_attempt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest_ref() -> None:
+    """proposal failure attempt 通过 rejected summary 暴露 proposal manifest。"""
+
+    events: list[str] = []
+    recorder = _RecordingProposalManifestRecorder(events)
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_PreparedManifestCompactor(events, fail_run=True),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+        compaction_operation_id="operation-prepared-failed",
+        proposal_manifest_recorder=recorder,
+    )
+
+    assert events == ["prepare", "record", "run"]
+    assert result.accepted_candidate is None
+    assert len(result.rejected_attempts) == 1
+    rejected = result.rejected_attempts[0]
+    assert rejected.proposal_manifest_ref == (
+        "runner-call-manifest:operation-prepared-failed:1"
+    )
+    assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
+
+
+def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> None:
+    """accepted compaction 缺 proposal manifest ref/digest 时 fail-closed。"""
+
+    missing_ref = compaction_operation.CompactionOperationResult(
+        accepted_candidate=None,
+        quality_result=None,
+        rejected_attempts=(),
+        failure_reason=None,
+        budget_after_attempted_compact=10,
+        accepted_proposal_manifest_ref=None,
+        accepted_proposal_manifest_digest=_DIGEST,
+    )
+    missing_digest = compaction_operation.CompactionOperationResult(
+        accepted_candidate=None,
+        quality_result=None,
+        rejected_attempts=(),
+        failure_reason=None,
+        budget_after_attempted_compact=10,
+        accepted_proposal_manifest_ref="runner-call-manifest:test",
+        accepted_proposal_manifest_digest=None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="accepted compaction is missing proposal manifest ref",
+    ):
+        dispatch._required_compactor_manifest_ref(missing_ref)
+    with pytest.raises(
+        RuntimeError,
+        match="accepted compaction is missing proposal manifest digest",
+    ):
+        dispatch._required_compactor_manifest_digest(missing_digest)
 
 
 @pytest.mark.asyncio
@@ -989,6 +1353,13 @@ def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
 
     session_id = "session-selected-descriptor"
     event_id = "event-tool-result-descriptor"
+    tool_call_event_id = "event-tool-call-descriptor"
+    tool_arguments: dict[str, JsonValue] = {
+        "company": "MSFT",
+        "filing": "10-K",
+        "section": "revenue note",
+    }
+    arguments_digest = _accepted_arguments_digest(tool_arguments)
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
 
@@ -999,10 +1370,21 @@ def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
             :returns: ``None``。
             """
 
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=tool_call_event_id,
+                session_id=session_id,
+                tool_call_id=f"tool-call:{event_id}",
+                arguments=tool_arguments,
+            )
             payload = {
                 "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
-                    _accepted_evidence_envelope_for_event_with_payload_ref(
+                    _accepted_evidence_envelope_for_tool_request(
                         event_id,
+                        tool_call_requested_event_ref=tool_call_event_id,
+                        tool_call_id=f"tool-call:{event_id}",
+                        normalized_arguments_digest=arguments_digest,
                         payload_ref="payload-selected-descriptor",
                         payload_digest=None,
                     )
@@ -1062,9 +1444,220 @@ def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
                 '"value":{"content":"raw content event-tool-result-descriptor",'
                 '"event_id":"event-tool-result-descriptor"}}}'
             ),
-            "tool_call_id=tool-call:event-tool-result-descriptor",
+            (
+                '工具参数: {"arguments":{"company":"MSFT","filing":"10-K",'
+                '"section":"revenue note"}}'
+            ),
             ("payload-selected-descriptor",),
         )
+
+
+def test_evidence_input_prefers_semantic_query_from_tool_request_atom(
+    tmp_path: Path,
+) -> None:
+    """Selected evidence query_text 优先使用 durable semantic query。"""
+
+    session_id = "session-selected-semantic-query"
+    event_id = "event-tool-result-semantic-query"
+    tool_call_event_id = "event-tool-call-semantic-query"
+    tool_arguments: dict[str, JsonValue] = {"ticker": "MSFT", "period": "FY2025"}
+    semantic_query = "读取 MSFT FY2025 年报中的收入分部说明"
+    arguments_digest = _accepted_arguments_digest(tool_arguments)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_rows(transaction: HostTransaction) -> None:
+            """写入 semantic query request atom 与 selected evidence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=tool_call_event_id,
+                session_id=session_id,
+                tool_call_id=f"tool-call:{event_id}",
+                arguments=tool_arguments,
+                semantic_query_text=semantic_query,
+            )
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_tool_request(
+                                    event_id,
+                                    tool_call_requested_event_ref=tool_call_event_id,
+                                    tool_call_id=f"tool-call:{event_id}",
+                                    normalized_arguments_digest=arguments_digest,
+                                )
+                            )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(event_id),
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_rows)
+
+        assert _collect_selected_query_text(
+            store,
+            event_log,
+            session_id=session_id,
+            event_id=event_id,
+        ) == semantic_query
+
+
+def test_evidence_input_missing_tool_request_atom_emits_limited_signal(
+    tmp_path: Path,
+) -> None:
+    """Selected evidence 缺 durable request atom 时 query_text 明确 limited-signal。"""
+
+    session_id = "session-selected-missing-tool-request"
+    event_id = "event-tool-result-missing-request"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_row(transaction: HostTransaction) -> None:
+            """写入缺少 request ref 的 selected evidence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_event(event_id)
+                            )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(event_id),
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_row)
+
+        query_text = _collect_selected_query_text(
+            store,
+            event_log,
+            session_id=session_id,
+            event_id=event_id,
+        )
+        assert query_text.startswith("状态=limited_signal；")
+        assert "已验收工具请求参数材料缺失" in query_text
+        assert "tool-call" not in query_text
+        assert event_id not in query_text
+
+
+def test_evidence_chunks_share_same_durable_query_text(
+    tmp_path: Path,
+) -> None:
+    """同一 durable request 被 chunk 后各 evidence chunk 复用同一 query_text。"""
+
+    session_id = "session-selected-query-chunk"
+    event_id = "event-tool-result-query-chunk"
+    tool_call_event_id = "event-tool-call-query-chunk"
+    tool_arguments: dict[str, JsonValue] = {"ticker": "MSFT", "chapter": "MD&A"}
+    arguments_digest = _accepted_arguments_digest(tool_arguments)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_rows(transaction: HostTransaction) -> None:
+            """写入会被 chunk 的 selected evidence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=tool_call_event_id,
+                session_id=session_id,
+                tool_call_id=f"tool-call:{event_id}",
+                arguments=tool_arguments,
+            )
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_tool_request(
+                                    event_id,
+                                    tool_call_requested_event_ref=tool_call_event_id,
+                                    tool_call_id=f"tool-call:{event_id}",
+                                    normalized_arguments_digest=arguments_digest,
+                                )
+                            )
+                        ),
+                        "raw_tool_outcome": {
+                            "kind": "completed",
+                            "result": {
+                                "ok": True,
+                                "value": {"content": "x" * 9000},
+                                "meta": None,
+                            },
+                        },
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_rows)
+
+        def read_query_texts(transaction: HostTransaction) -> tuple[tuple[str, str], ...]:
+            """读取 chunk labels 与 query_text。
+
+            :param transaction: Host transaction。
+            :returns: ``(label, query_text)`` tuple。
+            """
+
+            inputs = collect_selected_compaction_request_evidence_inputs(
+                transaction,
+                event_log,
+                session_id=session_id,
+                selected_evidence_block_refs=(
+                    SelectedEvidenceBlockRef(
+                        block_id="selected-evidence-chunk",
+                        tool_result_event_ref=event_id,
+                    ),
+                ),
+            )
+            pack = build_initial_material_pack(
+                current_input_ref="input-query-chunk",
+                current_input_text="current user text",
+                history_materials=(),
+                evidence_materials=inputs.evidence_materials,
+            )
+            return tuple(
+                (block.evidence_label, block.readable_query_text)
+                for block in pack.evidence_material
+            )
+
+        query_texts = store.transaction_runner.run_read(read_query_texts)
+        assert tuple(label for label, _query_text in query_texts) == (
+            "E1.1",
+            "E1.2",
+            "E1.3",
+        )
+        assert len({query_text for _label, query_text in query_texts}) == 1
+        assert query_texts[0][1] == '工具参数: {"arguments":{"chapter":"MD&A","ticker":"MSFT"}}'
 
 
 def test_missing_or_digest_mismatch_raw_evidence_fails_closed(
@@ -1695,6 +2288,125 @@ def _accepted_evidence_envelope_for_event_with_payload_ref(
     )
 
 
+def _accepted_evidence_envelope_for_tool_request(
+    event_id: str,
+    *,
+    tool_call_requested_event_ref: str,
+    tool_call_id: str,
+    normalized_arguments_digest: str,
+    payload_ref: str | None = None,
+    payload_digest: str | None = _DIGEST,
+) -> AcceptedEvidenceEnvelope:
+    """构造带 TOOL_CALL_REQUESTED ref 的 canonical evidence envelope。
+
+    :param event_id: TOOL_RESULT_ACCEPTED event id。
+    :param tool_call_requested_event_ref: 对应 TOOL_CALL_REQUESTED event id。
+    :param tool_call_id: 工具调用 id。
+    :param normalized_arguments_digest: 工具参数 canonical digest。
+    :param payload_ref: result payload descriptor ref。
+    :param payload_digest: result payload digest。
+    :returns: canonical evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{event_id}",
+        producer_event_ref=event_id,
+        tool_name="fins.search",
+        tool_call_id=tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=tool_call_requested_event_ref,
+            normalized_arguments_digest=normalized_arguments_digest,
+            semantic_input_digest=_DIGEST,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
+            outcome_digest=_DIGEST,
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+
+
+def _append_tool_call_requested_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    session_id: str,
+    tool_call_id: str,
+    arguments: dict[str, JsonValue],
+    semantic_query_text: str | None = None,
+) -> None:
+    """追加测试用 TOOL_CALL_REQUESTED durable request atom。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: TOOL_CALL_REQUESTED event id。
+    :param session_id: Session id。
+    :param tool_call_id: 工具调用 id。
+    :param arguments: accepted 工具参数。
+    :param semantic_query_text: 可选业务可读 semantic query。
+    :returns: ``None``。
+    """
+
+    arguments_json = _accepted_arguments_json(arguments)
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query_storage_kind = TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT
+    semantic_query_digest: str | None = None
+    if semantic_query_text is not None:
+        semantic_query_storage_kind = TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+        semantic_query_digest = sha256_digest_json(
+            {"semantic_query_text": semantic_query_text}
+        )
+    event_log.append_event(
+        transaction,
+        _event_request(
+            event_id=event_id,
+            session_id=session_id,
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": tool_call_id,
+                "tool_name": "fins.search",
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
+                "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+                "arguments_inline_json": arguments_json,
+                "arguments_payload_ref": None,
+                "arguments_payload_digest": arguments_digest,
+                "semantic_input_digest": _DIGEST,
+                "semantic_query_storage_kind": semantic_query_storage_kind,
+                "semantic_query_text": semantic_query_text,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": semantic_query_digest,
+            },
+        ),
+    )
+
+
+def _accepted_arguments_json(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """构造 accepted arguments canonical JSON preimage。
+
+    :param arguments: accepted 工具参数。
+    :returns: 与 ToolRuntime 一致的 arguments digest preimage。
+    """
+
+    return {"arguments": dict(arguments)}
+
+
+def _accepted_arguments_digest(arguments: dict[str, JsonValue]) -> str:
+    """计算 accepted arguments digest。
+
+    :param arguments: accepted 工具参数。
+    :returns: canonical arguments digest。
+    """
+
+    return sha256_digest_json(_accepted_arguments_json(arguments))
+
+
 def _raw_tool_outcome(event_id: str) -> JsonValue:
     """构造测试用 raw tool outcome。
 
@@ -1787,6 +2499,45 @@ def _collect_selected_evidence_ids(
             ),
         )
         return tuple(material.accepted_evidence_id for material in inputs.evidence_materials)
+
+    return store.transaction_runner.run_read(read_inputs)
+
+
+def _collect_selected_query_text(
+    store: HostDurableStore,
+    event_log: EventLogStore,
+    *,
+    session_id: str,
+    event_id: str,
+) -> str:
+    """读取 selected helper 输出的单条 readable query text。
+
+    :param store: Host durable store。
+    :param event_log: EventLog store。
+    :param session_id: Session id。
+    :param event_id: selected TOOL_RESULT_ACCEPTED event id。
+    :returns: readable query text。
+    """
+
+    def read_inputs(transaction: HostTransaction) -> str:
+        """在 transaction 内读取 query text。
+
+        :param transaction: Host transaction。
+        :returns: readable query text。
+        """
+
+        inputs = collect_selected_compaction_request_evidence_inputs(
+            transaction,
+            event_log,
+            session_id=session_id,
+            selected_evidence_block_refs=(
+                SelectedEvidenceBlockRef(
+                    block_id=f"selected:{event_id}",
+                    tool_result_event_ref=event_id,
+                ),
+            ),
+        )
+        return inputs.evidence_materials[0].readable_query_text
 
     return store.transaction_runner.run_read(read_inputs)
 

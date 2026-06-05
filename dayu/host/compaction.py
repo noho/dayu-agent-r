@@ -31,8 +31,8 @@ CONVERSATION_COMPACT_INPUT_SCHEMA_VERSION_VNEXT = "conversation_compact_input_v1
 CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT = "conversation_compact_output_v1"
 """vNext compact output schema version。"""
 
-CONVERSATION_COMPACT_OUTPUT_SCHEMA_NAME_VNEXT = "ConversationCompactOutputVNext"
-"""vNext compact instruction 要求的输出 schema 名称。"""
+CONVERSATION_COMPACT_OUTPUT_SCHEMA_NAME_VNEXT = CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
+"""vNext compact instruction 投影给 LLM 的输出 contract 标识。"""
 
 CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY = "roll_forward_session_memory"
 """vNext compact instruction 固定业务目标。"""
@@ -685,7 +685,7 @@ CURRENT_INPUT_ANCHOR_VNEXT_TEXT_MAX_CHARS = 1200
 class CompactInstructionVNext:
     """vNext compact instruction。
 
-    :param output_schema_name: 输出 schema 名称。
+    :param output_schema_name: 投影给 LLM 的输出 contract 标识，不是内部类型名。
     :param compact_goal: compact 业务目标。
     """
 

@@ -44,6 +44,7 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage
+from dayu.engine.contracts.messages import AgentMessageRole
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -172,6 +173,31 @@ _EXPLICIT_UNAVAILABLE_MARKERS: tuple[str, ...] = (
     "grpc_status=unavailable",
     "error code: 503",
 )
+
+
+def assert_at_most_one_system_message(
+    messages: Sequence[AgentMessage], *, label: str
+) -> None:
+    """断言 public smoke 观测到的 LLM messages 至多一条 system 且位于首位。
+
+    :param messages: public path 记录到的 Engine request 或 Runner call messages。
+    :param label: 断言失败时用于定位 smoke 场景的标签。
+    :returns: ``None``。
+    :raises AssertionError: system role message 超过一条时抛出。
+    """
+
+    system_count = sum(
+        1 for message in messages if message.role is AgentMessageRole.SYSTEM
+    )
+    roles = tuple(message.role.value for message in messages)
+    assert system_count <= 1, (
+        f"{label} expected at most one system message, "
+        f"got {system_count}; roles={roles}"
+    )
+    if system_count == 1:
+        assert messages[0].role is AgentMessageRole.SYSTEM, (
+            f"{label} expected the only system message at index 0; roles={roles}"
+        )
 
 
 @dataclass(frozen=True, slots=True)

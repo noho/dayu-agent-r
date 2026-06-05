@@ -40,6 +40,8 @@ from dayu.engine.contracts.engine_events import (
     EngineEventType,
     FinalAnswerData,
     IterationCompletedData,
+    IterationStartedData,
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunFailedData,
     RunSuspendedData,
@@ -48,6 +50,7 @@ from dayu.engine.contracts.engine_events import (
     ToolCallsBatchReadyData,
     ToolCallRequestedData,
     ToolResultAcceptedData,
+    runner_role_sequence_digest,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -688,6 +691,47 @@ async def _collect(agent: _AsyncAgent) -> list[EngineEvent]:
     async for event in agent.run_messages():
         events.append(event)
     return events
+
+
+@pytest.mark.asyncio
+async def test_iteration_started_carries_role_digest_from_actual_messages() -> None:
+    """iteration_started 的 role digest 来自实际传给 Runner 的 messages。"""
+
+    runner = _ScriptedRunner(
+        scripts=(
+            (
+                _event(
+                    RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                    RunnerContentCompletedData(
+                        content="done",
+                        reasoning_content=None,
+                        finish_reason=FinishReason.STOP,
+                    ),
+                ),
+                _event(
+                    RunnerEventType.RUNNER_DONE,
+                    RunnerDoneData(
+                        finish_reason=FinishReason.STOP,
+                        provider_request_id="req-role-digest",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+    started = events[0]
+
+    assert started.type is EngineEventType.ITERATION_STARTED
+    assert isinstance(started.data, IterationStartedData)
+    assert started.data.message_count == len(runner.messages_seen[0])
+    assert started.data.role_sequence_digest == runner_role_sequence_digest(
+        tuple(message.role.value for message in runner.messages_seen[0])
+    )
+    assert (
+        started.data.runner_input_serializer_schema_version
+        == RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+    )
 
 
 def _terminal(events: Sequence[EngineEvent]) -> EngineEvent:

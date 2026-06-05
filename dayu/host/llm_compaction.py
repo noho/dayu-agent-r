@@ -16,14 +16,13 @@ from collections.abc import Mapping
 from json import JSONDecodeError
 from math import ceil
 from typing import Protocol, cast, runtime_checkable
-from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
-from dayu.engine import run_agent_and_wait
+from dayu.engine import run_agent_and_wait, runner_role_sequence_digest
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
@@ -77,6 +76,8 @@ from dayu.host.context_budget import (
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
     estimate_budget_text_tokens,
 )
+from dayu.host.compaction_operation import CompactorProposalRunInput
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.runtime.diagnostic_text import (
     redact_sensitive_diagnostic_values,
     truncate_diagnostic_text,
@@ -99,6 +100,7 @@ _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
 )
 _POST_COMPACT_BASE_MESSAGE_COUNT = 2
 _POST_COMPACT_TOOL_SCHEMA_OVERHEAD_COUNT = 1
+_COMPACTOR_PROJECTION_SCHEMA_VERSION = "compactor_input_projection.v1"
 @runtime_checkable
 class _CancellationSignalToken(CancellationToken, Protocol):
     """Host 内部可写取消 token 协议。"""
@@ -207,32 +209,115 @@ class LLMContextCompactor(ContextCompactor):
         :raises Exception: Engine runner / provider 调用失败时透传。
         """
 
+        prepared_input = self.prepare_compactor_proposal_run_input(
+            request,
+            cancellation_token,
+            compaction_operation_id=None,
+            compaction_attempt_number=1,
+        )
+        return await self.run_prepared_compactor_proposal(prepared_input)
+
+    def prepare_compactor_proposal_run_input(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        compaction_operation_id: str | None,
+        compaction_attempt_number: int,
+    ) -> CompactorProposalRunInput:
+        """构造一次 compactor proposal 的真实 Engine runner call 输入。
+
+        :param request: Host 构造的 immutable compaction request。
+        :param cancellation_token: Host run lifecycle 注入的真实取消 token。
+        :param compaction_operation_id: Host compaction operation id；直接
+            ``compact`` 调用时为 ``None``。
+        :param compaction_attempt_number: operation 内 proposal attempt 序号。
+        :returns: 可执行且可写 manifest 的同源 proposal 输入。
+        :raises TypeError: request 类型非法时抛出。
+        :raises ValueError: attempt 序号非法时抛出。
+        """
+
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
+        if compaction_attempt_number <= 0:
+            raise ValueError("compaction_attempt_number must be positive")
         compact_input = conversation_compact_input_vnext_from_material_pack(
             request.material_pack
         )
+        compactor_engine_run_id = _compactor_engine_run_id(
+            request=request,
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+        )
+        agent_request = _agent_request_vnext(
+            compact_input,
+            self._runner_spec,
+            self._runner_options,
+            self._agent_policy,
+            self._system_prompt,
+            self._user_prompt_template,
+            cancellation_token,
+            compactor_engine_run_id=compactor_engine_run_id,
+        )
+        roles = tuple(message.role.value for message in agent_request.messages)
+        projection = _compactor_input_projection_json(
+            request=request,
+            compact_input=compact_input,
+        )
+        return CompactorProposalRunInput(
+            compact_input=compact_input,
+            agent_request=agent_request,
+            compaction_request_digest=request.digest(),
+            compactor_engine_run_id=compactor_engine_run_id,
+            message_count=len(agent_request.messages),
+            role_sequence_digest=runner_role_sequence_digest(roles),
+            system_prompt_asset_digest=sha256_digest_json(
+                {"compactor_system_prompt": self._system_prompt}
+            ),
+            user_prompt_template_digest=sha256_digest_json(
+                {"compactor_user_prompt_template": self._user_prompt_template}
+            ),
+            user_prompt_digest=sha256_digest_json(
+                {"compactor_user_prompt": agent_request.messages[1].content}
+            ),
+            compactor_input_projection=projection,
+            compactor_input_projection_digest=sha256_digest_json(projection),
+        )
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """执行已准备的 compactor proposal runner call。
+
+        :param prepared_input: 由 ``prepare_compactor_proposal_run_input``
+            返回的同源 proposal input。
+        :returns: vNext compact output candidate。
+        :raises TypeError: prepared_input 类型非法时抛出。
+        :raises LLMCompactionProposalError: LLM 没有返回可用 structured proposal 时抛出。
+        :raises Exception: Engine runner / provider 调用失败时透传。
+        """
+
+        if not isinstance(prepared_input, CompactorProposalRunInput):
+            raise TypeError("prepared_input must be CompactorProposalRunInput")
         try:
             outcome = await _run_agent_request(
-                _agent_request_vnext(
-                    compact_input,
-                    self._runner_spec,
-                    self._runner_options,
-                    self._agent_policy,
-                    self._system_prompt,
-                    self._user_prompt_template,
-                    cancellation_token,
-                ),
+                prepared_input.agent_request,
                 timeout_seconds=self._runner_spec.default_timeout_seconds,
             )
         except TimeoutError as exc:
-            _signal_timeout_cancellation(cancellation_token)
+            _signal_timeout_cancellation(
+                prepared_input.agent_request.cancellation_token
+            )
             raise LLMCompactionProposalError(_COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE) from exc
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
             raise LLMCompactionProposalError(_non_final_outcome_message(outcome))
         if outcome.finish_reason is FinishReason.LENGTH:
             raise LLMCompactionProposalError("compactor proposal was truncated finish_reason=length")
-        return parse_conversation_compact_output_vnext(compact_input, outcome.content)
+        return parse_conversation_compact_output_vnext(
+            prepared_input.compact_input,
+            outcome.content,
+        )
 
 
 
@@ -318,6 +403,8 @@ def _agent_request_vnext(
     system_prompt: str,
     user_prompt_template: str,
     cancellation_token: CancellationToken,
+    *,
+    compactor_engine_run_id: str,
 ) -> AgentRunRequest:
     """构造 vNext 禁用工具的 Engine public run request。
 
@@ -328,11 +415,12 @@ def _agent_request_vnext(
     :param system_prompt: compactor system prompt。
     :param user_prompt_template: compactor user prompt template。
     :param cancellation_token: Host cancellation token。
+    :param compactor_engine_run_id: Host 派生的 compactor Engine run id。
     :returns: Engine run request。
     """
 
     return AgentRunRequest(
-        run_id=f"{_COMPACTOR_RUN_ID_PREFIX}-vnext-{uuid4().hex}",
+        run_id=compactor_engine_run_id,
         session_id=f"{_COMPACTOR_RUN_ID_PREFIX}:vnext",
         attempt_id=None,
         execution_id=None,
@@ -350,6 +438,71 @@ def _agent_request_vnext(
         tool_schemas=(),
         tool_executor=_RejectingToolExecutor(),
         cancellation_token=cancellation_token,
+    )
+
+
+def _compactor_engine_run_id(
+    *,
+    request: CompactionRequest,
+    compaction_operation_id: str | None,
+    compaction_attempt_number: int,
+) -> str:
+    """派生 compactor internal Engine run id。
+
+    :param request: Host compaction request。
+    :param compaction_operation_id: Host compaction operation id；未知时为
+        ``None``。
+    :param compaction_attempt_number: operation 内 proposal attempt 序号。
+    :returns: deterministic compactor Engine run id。
+    """
+
+    digest = sha256_digest_json(
+        {
+            "compaction_operation_id": compaction_operation_id,
+            "compaction_request_digest": request.digest(),
+            "compaction_attempt_number": compaction_attempt_number,
+        }
+    )
+    return f"{_COMPACTOR_RUN_ID_PREFIX}-vnext-{digest.removeprefix('sha256:')}"
+
+
+def _compactor_input_projection_json(
+    *,
+    request: CompactionRequest,
+    compact_input: ConversationCompactInputVNext,
+) -> Mapping[str, JsonValue]:
+    """构造 compactor input projection artifact body。
+
+    :param request: Host compaction request。
+    :param compact_input: 已冻结的 vNext compactor input。
+    :returns: 可作为 artifact 写入的 projection JSON。
+    """
+
+    return {
+        "projection_kind": "compactor_input_projection",
+        "schema_version": _COMPACTOR_PROJECTION_SCHEMA_VERSION,
+        "compaction_request_digest": request.digest(),
+        "source_boundary_refs": list(_compactor_source_boundary_refs(request)),
+        "compact_input": compact_input.to_json(),
+    }
+
+
+def _compactor_source_boundary_refs(request: CompactionRequest) -> tuple[str, ...]:
+    """返回 compactor projection 的 source boundary refs。
+
+    :param request: Host compaction request。
+    :returns: 去重后的 source refs。
+    """
+
+    return tuple(
+        dict.fromkeys(
+            (
+                request.current_input_ref,
+                *request.material_source_refs,
+                *request.canonical_evidence_refs,
+                *request.evidence_backed_fact_refs,
+            )
+        )
     )
 
 

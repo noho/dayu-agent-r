@@ -114,6 +114,8 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 `TERMINAL_ENGINE_EVENT_TYPES` 是终态事件集合，当前包括 `final_answer`、`run_failed`、`run_cancelled`、`run_suspended`。
 
+`iteration_started` 的 `IterationStartedData` 会携带 Engine 对本次真实 Runner 输入的直接观察：`message_count`、由实际 `messages` 角色顺序计算的 `role_sequence_digest`，以及 `runner_input_serializer_schema_version`。这些字段只描述 Engine 可见输入形态，不包含 Host-owned runner call index、manifest ref、source refs、memory / compact / tool schema refs 或 provider raw request。
+
 ### Runner 接口
 
 `AsyncRunner` 是 Engine 调用 LLM provider 的协议接口。它只负责把 provider 协议归一成 `RunnerEvent` 流，不执行工具，也不直接依赖 `ToolExecutor`。

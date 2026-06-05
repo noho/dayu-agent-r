@@ -201,6 +201,41 @@ _HOST_ATTEMPT_TERMINAL_REFS_UNSET_CHECK_SQL = terminal_event_refs_unset_check_sq
 _HOST_WAIT_TERMINAL_AT_CHECK_SQL = wait_terminal_at_check_sql(status_column="status")
 """WaitRecord status 与 terminal_at 形状 CHECK 表达式。"""
 
+TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND = "tool_call_arguments_json"
+"""TOOL_CALL_REQUESTED accepted arguments payload descriptor kind。"""
+
+TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND = "tool_call_semantic_query_text"
+"""TOOL_CALL_REQUESTED readable semantic query payload descriptor kind。"""
+
+TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON = "inline_json"
+"""TOOL_CALL_REQUESTED accepted arguments 以内联 JSON 存储。"""
+
+TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR = "payload_descriptor"
+"""TOOL_CALL_REQUESTED accepted arguments 以 payload descriptor 存储。"""
+
+TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT = "absent"
+"""TOOL_CALL_REQUESTED readable semantic query 缺失。"""
+
+TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT = "inline_text"
+"""TOOL_CALL_REQUESTED readable semantic query 以内联文本存储。"""
+
+TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR = "payload_descriptor"
+"""TOOL_CALL_REQUESTED readable semantic query 以 payload descriptor 存储。"""
+
+RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND = "runner_call_input_manifest"
+"""RUNNER_CALL_INPUT_ASSEMBLED manifest body payload descriptor kind。"""
+
+RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION = "runner_call_input_manifest.v1"
+"""RUNNER_CALL_INPUT_ASSEMBLED manifest body schema version。"""
+
+RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE = (
+    "application/vnd.dayu.runner-call-manifest+json"
+)
+"""RUNNER_CALL_INPUT_ASSEMBLED manifest body media type。"""
+
+COMPACTOR_INPUT_PROJECTION_DESCRIPTOR_KIND = "compactor_input_projection"
+"""compactor proposal input projection payload descriptor kind。"""
+
 _SQLITE_PAYLOADS_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_SQLITE_PAYLOADS} (
   payload_id TEXT PRIMARY KEY,

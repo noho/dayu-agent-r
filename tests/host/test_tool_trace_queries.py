@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
@@ -18,9 +19,14 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.tool_trace import (
+    RunnerCallReconstructionConsumerBoundary,
+    RunnerCallReconstructionDiagnosticReason,
+    RunnerCallReconstructionMissingRefKind,
+    RunnerCallReconstructionStatus,
     find_tool_trace_by_diagnostic_ref,
     find_tool_trace_by_provider_request_id,
     find_tool_trace_by_tool_call_id,
+    read_runner_call_reconstruction_signals_by_run,
     read_tool_trace_by_run,
 )
 from dayu.host.durable.transaction import HostTransactionRunner
@@ -255,3 +261,148 @@ def test_provider_request_id_terminal_diagnostic_query(
             == "client-protocol"
         )
         assert page.rows[1].diagnostic_ref == "raw-ref"
+
+
+def test_runner_call_reconstruction_signal_query_classifies_statuses(
+    tmp_path: Path,
+) -> None:
+    """runner-call 查询 helper 返回 complete / limited_signal / mismatch typed signal。"""
+
+    manifest_digest = sha256_digest_json({"manifest": "runner-call"})
+    role_digest = sha256_digest_json({"roles": ["system", "user"]})
+    projection_digest = sha256_digest_json({"projection": "summary"})
+    observed_digest = sha256_digest_json({"roles": ["system", "user", "tool"]})
+    expected_digest = sha256_digest_json({"roles": ["system", "user"]})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-complete",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "runner_call_index": 0,
+                "runner_call_kind": "initial_user_dispatch",
+                "runner_call_trigger_reason": "initial_user_input",
+                "iteration_id": "iteration-1",
+                "manifest_payload_ref": "payload-runner-call-complete",
+                "manifest_digest": manifest_digest,
+                "validation_status": "complete",
+                "message_count": 2,
+                "role_sequence_digest": role_digest,
+                "input_projection_digest": projection_digest,
+                "projector_metadata_summary": [
+                    {
+                        "projector_metadata_id": "projector:0",
+                        "projector_id": "run_input_system_context",
+                        "projector_schema_version": "run_input_projector.v1",
+                        "projector_digest": sha256_digest_json(
+                            {"projector": "system"}
+                        ),
+                        "purpose": "ordinary_run_input",
+                    }
+                ],
+                "diagnostic": None,
+            },
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-limited",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "runner_call_index": 1,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "manifest_payload_ref": "payload-runner-call-limited",
+                "manifest_digest": sha256_digest_json({"manifest": "limited"}),
+                "validation_status": "limited_signal",
+                "message_count": 3,
+                "role_sequence_digest": observed_digest,
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "limited"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": {
+                    "status": "limited_signal",
+                    "reason": "missing_projection_artifact",
+                    "missing_atom_kind": None,
+                    "missing_ref_kind": "runner_call_projection_artifact",
+                    "missing_ref": None,
+                    "observed_count": 3,
+                    "expected_count": None,
+                    "observed_digest": observed_digest,
+                    "expected_digest": None,
+                    "consumer_boundary": "host.engine_ingest",
+                },
+            },
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-mismatch",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "runner_call_index": 2,
+                "runner_call_kind": "tool_result_continuation",
+                "runner_call_trigger_reason": "tool_results_available",
+                "manifest_payload_ref": "payload-runner-call-mismatch",
+                "manifest_digest": sha256_digest_json({"manifest": "mismatch"}),
+                "validation_status": "mismatch",
+                "message_count": 3,
+                "role_sequence_digest": observed_digest,
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "mismatch"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": {
+                    "status": "mismatch",
+                    "reason": "role_sequence_digest_mismatch",
+                    "missing_atom_kind": None,
+                    "missing_ref_kind": None,
+                    "missing_ref": None,
+                    "observed_count": 3,
+                    "expected_count": 2,
+                    "observed_digest": observed_digest,
+                    "expected_digest": expected_digest,
+                    "consumer_boundary": "host.engine_ingest",
+                },
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                transaction, "run-1", after_event_sequence=0, limit=10
+            )
+        )
+
+        assert [signal.event_id for signal in page.signals] == [
+            "event-runner-call-complete",
+            "event-runner-call-limited",
+            "event-runner-call-mismatch",
+        ]
+        assert page.has_more is False
+        complete = page.signals[0]
+        limited = page.signals[1]
+        mismatch = page.signals[2]
+        assert complete.diagnostic.status is RunnerCallReconstructionStatus.COMPLETE
+        assert complete.manifest_ref == "payload-runner-call-complete"
+        assert complete.message_count == 2
+        assert complete.projector_metadata_summary[0].projector_id == (
+            "run_input_system_context"
+        )
+        assert limited.diagnostic.status is (
+            RunnerCallReconstructionStatus.LIMITED_SIGNAL
+        )
+        assert limited.diagnostic.reason is (
+            RunnerCallReconstructionDiagnosticReason.MISSING_PROJECTION_ARTIFACT
+        )
+        assert limited.diagnostic.missing_ref_kind is (
+            RunnerCallReconstructionMissingRefKind.ARTIFACT_REF
+        )
+        assert limited.diagnostic.consumer_boundary is (
+            RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY
+        )
+        assert mismatch.diagnostic.status is RunnerCallReconstructionStatus.MISMATCH
+        assert mismatch.diagnostic.reason is (
+            RunnerCallReconstructionDiagnosticReason.ROLE_SEQUENCE_DIGEST_MISMATCH
+        )
+        assert mismatch.diagnostic.observed_digest == observed_digest
+        assert mismatch.diagnostic.expected_digest == expected_digest

@@ -26,6 +26,8 @@ from dayu.host.evidence import (
 )
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.payload_resolution import event_payload_object_for_result_ref
+from dayu.host.payload_resolution import tool_call_request_atoms
+from dayu.host.payload_resolution import ToolCallRequestAtoms
 from dayu.host.terminal_summary_payload import (
     PayloadSummaryTextPolicy,
     assistant_summary_from_payload,
@@ -42,6 +44,16 @@ _MEMORY_ITEM_EVIDENCE_BACKED_FACT_PREFIX = "memory-item:evidence_backed_fact"
 _PAYLOAD_REF_PREFIX = "payload"
 _LOCATOR_REF_SEPARATOR = ", "
 _READABLE_SOURCE_EMPTY = "accepted tool evidence"
+_READABLE_QUERY_TEXT_MAX_CHARS = 1200
+_READABLE_QUERY_TRUNCATED_MARKER = "\n[truncated_query_text]"
+_READABLE_ARGUMENTS_PREFIX = "工具参数: "
+_LIMITED_SIGNAL_STATUS = "limited_signal"
+_LIMITED_SIGNAL_FIELD_SEPARATOR = "；"
+_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS = "已验收工具请求参数材料缺失"
+_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS = "已验收工具请求参数材料不可验证"
+_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH = "工具请求与当前证据来源不一致"
+_LIMITED_SIGNAL_DETAIL_UNAVAILABLE = "无法从已验收工具请求恢复查询参数"
+_LIMITED_SIGNAL_DETAIL_UNSAFE = "无法安全展示查询参数"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +131,12 @@ def collect_selected_compaction_request_evidence_inputs(
         )
         envelopes = _accepted_evidence_envelope_from_event(transaction, row)
         evidence_materials.extend(
-            _tool_result_evidence_materials(transaction, row, envelopes)
+            _tool_result_evidence_materials(
+                transaction,
+                event_log_store,
+                row,
+                envelopes,
+            )
         )
     history_materials: list[InitialHistoryMaterial] = []
     for event_ref in selected_history_event_refs:
@@ -178,12 +195,14 @@ def _accepted_evidence_envelope_from_event(
 
 def _tool_result_evidence_materials(
     transaction: HostTransaction,
+    event_log_store: EventLogStore,
     row: EventLogRow,
     envelopes: tuple[AcceptedEvidenceEnvelope, ...],
 ) -> tuple[InitialEvidenceMaterial, ...]:
     """读取 ``TOOL_RESULT_ACCEPTED`` raw 工具结果 material。
 
     :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
     :param row: TOOL_RESULT_ACCEPTED EventLog row。
     :param envelopes: 该事件携带的 accepted evidence envelopes。
     :returns: evidence material tuple；无 envelope 时为空。
@@ -209,7 +228,12 @@ def _tool_result_evidence_materials(
                     envelope.tool_query.tool_call_requested_event_ref or row.event_id
                 ),
                 readable_tool_name=envelope.tool_name,
-                readable_query_text=_readable_query_text(envelope),
+                readable_query_text=_readable_query_text(
+                    transaction,
+                    event_log_store,
+                    row,
+                    envelope,
+                ),
                 raw_result_text=raw_text,
                 readable_source_text=_readable_source_text(envelope),
                 payload_refs=_payload_refs(row),
@@ -254,14 +278,109 @@ def _reject_result_preview(payload: Mapping[str, JsonValue]) -> None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed")
 
 
-def _readable_query_text(envelope: AcceptedEvidenceEnvelope) -> str:
-    """从 envelope metadata 构造可读 query 描述。
+def _readable_query_text(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    result_row: EventLogRow,
+    envelope: AcceptedEvidenceEnvelope,
+) -> str:
+    """从 durable request atom 构造可读 query 描述。
 
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param result_row: ``TOOL_RESULT_ACCEPTED`` EventLog row。
     :param envelope: accepted evidence envelope。
     :returns: 不含 result content 的可读 query metadata。
     """
 
-    return f"tool_call_id={envelope.tool_call_id}"
+    requested_ref = envelope.tool_query.tool_call_requested_event_ref
+    if requested_ref is None:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
+            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
+        )
+    request_row = event_log_store.read_event_by_id(transaction, requested_ref)
+    if request_row is None:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
+            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
+        )
+    if request_row.session_id != result_row.session_id:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
+            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
+        )
+    try:
+        atoms = tool_call_request_atoms(transaction, request_row)
+    except HostDurableError:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS,
+            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
+        )
+    if not _request_atoms_match_envelope(atoms, envelope):
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
+            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
+        )
+    if atoms.semantic_query_text is not None:
+        return _bounded_query_text(atoms.semantic_query_text)
+    return _bounded_query_text(
+        f"{_READABLE_ARGUMENTS_PREFIX}{canonical_json_dumps(atoms.arguments_json)}"
+    )
+
+
+def _request_atoms_match_envelope(
+    atoms: ToolCallRequestAtoms, envelope: AcceptedEvidenceEnvelope
+) -> bool:
+    """校验 request atoms 与 accepted evidence envelope 同源。
+
+    :param atoms: 从 ``TOOL_CALL_REQUESTED`` 读取的 durable request atoms。
+    :param envelope: accepted evidence envelope。
+    :returns: 工具调用 id、工具名和参数 digest 均一致时返回 ``True``。
+    """
+
+    return (
+        atoms.tool_call_id == envelope.tool_call_id
+        and atoms.tool_name == envelope.tool_name
+        and atoms.normalized_arguments_digest
+        == envelope.tool_query.normalized_arguments_digest
+    )
+
+
+def _bounded_query_text(text: str) -> str:
+    """把 query 文本规范化并截断到 compact material 字段预算内。
+
+    :param text: 原始 query 文本。
+    :returns: 有界、非空、可投影给 LLM 的 query 文本。
+    :raises ValueError: 规范化后为空时抛出。
+    """
+
+    normalized = " ".join(text.split())
+    if normalized == "":
+        raise ValueError("query text must be non-empty after normalization")
+    if len(normalized) <= _READABLE_QUERY_TEXT_MAX_CHARS:
+        return normalized
+    keep_chars = _READABLE_QUERY_TEXT_MAX_CHARS - len(_READABLE_QUERY_TRUNCATED_MARKER)
+    return f"{normalized[:keep_chars]}{_READABLE_QUERY_TRUNCATED_MARKER}"
+
+
+def _limited_signal_query_text(*, reason: str, detail: str) -> str:
+    """构造 LLM-facing limited-signal query 文本。
+
+    :param reason: 业务中性的不可用原因，不包含 Host refs / digests。
+    :param detail: 业务中性的影响说明，不包含 Host refs / digests。
+    :returns: 结构化 limited-signal query 文本。
+    """
+
+    return _bounded_query_text(
+        _LIMITED_SIGNAL_FIELD_SEPARATOR.join(
+            (
+                f"状态={_LIMITED_SIGNAL_STATUS}",
+                f"原因={reason}",
+                f"说明={detail}",
+            )
+        )
+    )
 
 
 def _readable_source_text(envelope: AcceptedEvidenceEnvelope) -> str:

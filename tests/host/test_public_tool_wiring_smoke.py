@@ -12,6 +12,7 @@ from dayu.host import HostEventKind, open_host
 from tests.host.public_smoke_support import (
     FinalAnswerWorkerFactory,
     ToolCallingWorkerFactory,
+    assert_at_most_one_system_message,
     deterministic_runner_spec,
     ensure_request,
     followup_request,
@@ -67,6 +68,10 @@ async def test_mock_tool_result_feeds_same_run_and_later_run_continuity(
     assert first_terminal.kind is HostEventKind.SUCCEEDED
     assert second_terminal.kind is HostEventKind.SUCCEEDED
     continuation_messages = factory.messages_seen[1]
+    for index, messages in enumerate(factory.messages_seen):
+        assert_at_most_one_system_message(
+            messages, label=f"tool wiring runner call {index}"
+        )
     assert isinstance(continuation_messages[-1], ToolMessage)
     assert "mock-tool-fact-enters-memory" in continuation_messages[-1].content
     second_run_initial_messages = factory.messages_seen[2]
@@ -127,5 +132,9 @@ async def test_tool_names_subset_and_empty_freeze(tmp_path: pathlib.Path) -> Non
     empty_names = tuple(
         schema.function.name for schema in factory.requests[1].tool_schemas
     )
+    for index, request in enumerate(factory.requests):
+        assert_at_most_one_system_message(
+            request.messages, label=f"tool selection request {index}"
+        )
     assert subset_names == ("lookup_mock_fact",)
     assert empty_names == ()

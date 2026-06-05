@@ -12,6 +12,7 @@ from dayu.engine.contracts.runner_spec import RunnerCallOptions
 from dayu.host import Host, HostEventKind, HostTerminalStatus, RunStatus, open_host
 from tests.host.public_smoke_support import (
     FinalAnswerWorkerFactory,
+    assert_at_most_one_system_message,
     deterministic_runner_spec,
     ensure_request,
     first_available_provider_case,
@@ -160,6 +161,10 @@ async def test_deterministic_two_turn_request_contains_prior_final_answer(
         content is not None and f"final:1:{first.accepted_run_id}" in content
         for content in second_contents
     )
+    for index, request in enumerate(factory.requests):
+        assert_at_most_one_system_message(
+            request.messages, label=f"two turn request {index}"
+        )
     assert second_contents[-1] == "second prompt"
 
 
@@ -262,6 +267,12 @@ async def test_submit_followup_field_level_execution_override_freezes_effective_
         continuation_max_attempts=0,
         allow_tool_calls=False,
         tool_execution_timeout_seconds=5.0,
+    )
+    assert_at_most_one_system_message(
+        first_request.messages, label="override request 0"
+    )
+    assert_at_most_one_system_message(
+        second_request.messages, label="override request 1"
     )
     assert second_request.runner_spec.model == "override-model"
     assert second_request.runner_options.max_tokens == 96
