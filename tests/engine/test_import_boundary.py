@@ -5,8 +5,8 @@
 - Phase 1 起 ``aiohttp`` 仅允许出现在 ``dayu/engine/runners/openai/``
   子树（OpenAI Runner 实现）；其它子树禁止。
 - Engine core 永久禁止：``requests`` / ``httpx`` / ``dayu.host`` /
-  ``dayu.service`` / ``dayu.ui`` / ``dayu.fins`` / ``dayu.engine.tools``
-  / ``dayu.engine.processors`` / 任何 ``*tool_trace*`` 模块。
+  ``dayu.service`` / ``dayu.ui`` / ``dayu.fins`` / ``dayu.documents`` /
+  ``dayu.engine.tools`` / ``dayu.engine.processors`` / 任何 ``*tool_trace*`` 模块。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ ENGINE_CORE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.service",
     "dayu.ui",
     "dayu.fins",
+    "dayu.documents",
     "dayu.engine.tools",
     "dayu.engine.processors",
 )

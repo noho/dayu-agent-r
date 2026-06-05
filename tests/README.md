@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Host、Runtime、Service 与 Engine 测试：
+运行当前契约、Documents、Host、Runtime、Service 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/host tests/runtime tests/service tests/engine -q
+pytest tests/contracts tests/documents tests/host tests/runtime tests/service tests/engine -q
 ```
 
 运行类型检查：
@@ -36,6 +36,7 @@ pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 
 ```bash
 pytest tests/contracts -q
+pytest tests/documents -q
 pytest tests/host -q
 pytest tests/host/test_tooling_options.py tests/host/test_package_exports.py tests/host/test_import_boundary.py -q
 pytest tests/host/test_durable_schema.py tests/host/test_event_log_store.py -q
@@ -117,6 +118,13 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入公共契约源码。
 - ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配、工具等待时间字段时区边界、工具参数 schema key 边界和截断策略 limit key 映射穷尽性。
 - tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine，校验展示名非空，默认拒绝调用方直接构造空 `ToolBundle`，并覆盖框架 no-tool 路径使用的类型真实空 bundle。
+
+### `tests/documents/`
+
+共享文档基础测试，覆盖 `dayu.documents` 的层中立边界与轻量处理器 fixture：
+
+- import boundary：阻止 `dayu.documents` 反向依赖 Engine、Host、Service、UI、Fins 或具体工具实现，并确认 Docling runtime 与 processors 子包被边界扫描覆盖。
+- processors：使用确定性 fixture 覆盖 Markdown、HTML 与 Docling JSON 处理器的章节提取、表格读取与搜索片段输出。
 
 ### `tests/host/`
 
