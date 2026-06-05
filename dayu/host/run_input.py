@@ -156,11 +156,60 @@ _PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
 _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _COMPACT_SUMMARY_MAX_CHARS = 1200
+_SYSTEM_ENVELOPE_SEPARATOR = "\n\n"
+_SYSTEM_ENVELOPE_HEADER_PREFIX = "## "
+_SYSTEM_SECTION_TASK_INSTRUCTIONS = "Task Instructions"
+_SYSTEM_SECTION_EXECUTION_GUIDANCE = "Execution Guidance"
+_SYSTEM_SECTION_CONVERSATION_SUMMARY = "Conversation Summary"
+_SYSTEM_SECTION_VERIFIED_EVIDENCE = "Verified Evidence and Facts"
+_SYSTEM_SECTION_PRIOR_ANSWER_ANCHORS = "Prior Answer Anchors"
+_SYSTEM_SECTION_OPEN_FOLLOWUP_CONTEXT = "Open Follow-up Context"
+_SYSTEM_SECTION_REFERENCE_CONTINUITY = "Reference Continuity"
+_SYSTEM_SECTION_RECENT_EVIDENCE = "Recent Evidence"
+_SYSTEM_SECTION_RESUME_GUIDANCE = "Resume Guidance"
+_SYSTEM_ENVELOPE_SECTION_ORDER = (
+    _SYSTEM_SECTION_TASK_INSTRUCTIONS,
+    _SYSTEM_SECTION_EXECUTION_GUIDANCE,
+    _SYSTEM_SECTION_CONVERSATION_SUMMARY,
+    _SYSTEM_SECTION_VERIFIED_EVIDENCE,
+    _SYSTEM_SECTION_PRIOR_ANSWER_ANCHORS,
+    _SYSTEM_SECTION_OPEN_FOLLOWUP_CONTEXT,
+    _SYSTEM_SECTION_REFERENCE_CONTINUITY,
+    _SYSTEM_SECTION_RECENT_EVIDENCE,
+    _SYSTEM_SECTION_RESUME_GUIDANCE,
+)
+_EXECUTION_GUIDANCE_PREFIX = "Execution guidance:"
+_ACCEPTED_COMPACTED_VIEW_PREFIX = "Accepted compacted conversation view:"
+_RECENT_EVIDENCE_PREFIX = "Recent evidence:"
+_ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
+_RESUME_GUIDANCE_PREFIX = "Resume guidance:"
 _MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
 _MEMORY_EVIDENCE_FACT_HEADER = "Evidence / Fact Memory:"
 _MEMORY_ANSWER_ANCHOR_HEADER = "Answer Anchor Memory:"
 _MEMORY_FORWARD_INTENT_HEADER = "Forward Intent Memory:"
 _MEMORY_REFERENCE_CONTINUITY_HEADER = "Trace Memory reference continuity:"
+_SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS = (
+    "policy_snapshot_ref=",
+    "tool_call_id=",
+    "tool_call_id",
+    "event_id=",
+    "event_sequence=",
+    "payload_ref=",
+    "artifact_ref=",
+    "compact_artifact_ref=",
+    "compact_artifact_digest=",
+    "manifest_payload_ref=",
+    "manifest_digest=",
+    "projection_artifact_ref=",
+    "projection_checkpoint",
+    "projector_metadata",
+    "attempt_id=",
+    "execution_id=",
+    "runner_call_index=",
+    "checkpoint_event_id",
+    "checkpoint_event_sequence",
+    "ConversationCompactOutputVNext",
+)
 _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT = 8
 _RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX = "payload-runner-call-input-manifest"
 _RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
@@ -1689,17 +1738,11 @@ class DefaultSceneParameterProvider:
         """
 
         del snapshot
-        execution_target = _execution_target_from_accepted_event(
-            current_facts.run_accepted_event,
-            fallback=current_facts.run.execution_target,
-        )
+        del current_facts, policy_snapshot
         content = "\n".join(
             (
-                "Host execution context:",
-                f"operation_kind={current_facts.operation_kind}",
-                f"execution_target={execution_target}",
-                f"queue_policy={current_facts.run.queue_policy}",
-                f"policy_snapshot_ref={policy_snapshot.policy_snapshot_ref}",
+                _EXECUTION_GUIDANCE_PREFIX,
+                "Use the available context and tools under the current run limits.",
                 _tools_scene_line(tool_execution_mode),
             )
         )
@@ -1864,7 +1907,7 @@ class RunInputBuilder:
             policy_snapshot,
             tool_executor,
         )
-        messages = (
+        candidate_messages = (
             *_system_prompt_message(current_facts.system_prompt),
             *self._scene_parameter_provider.build_scene_messages(
                 attempt_snapshot,
@@ -1878,6 +1921,7 @@ class RunInputBuilder:
                 content=current_facts.user_prompt,
             ),
         )
+        messages = _normalize_ordinary_run_messages(candidate_messages)
         self._runner_call_manifest_recorder.record_runner_call_manifest(
             RunnerCallManifestRecordInput(
                 attempt_snapshot=attempt_snapshot,
@@ -2255,15 +2299,11 @@ def _memory_evidence_fact_message(
     if not facts:
         return None
     lines = [_MEMORY_EVIDENCE_FACT_HEADER]
-    for fact in facts:
+    for index, fact in enumerate(facts, start=1):
         lines.append(
-            "fact="
+            f"Source F{index}: "
             f"claim_text={fact.claim_text}; "
-            f"evidence_refs={','.join(fact.evidence_refs)}; "
-            f"evidence_kind={fact.evidence_kind.value}; "
-            f"extraction_operation_ref={fact.extraction_operation_ref}; "
-            f"event_id={fact.provenance.event_id}; "
-            f"event_sequence={fact.provenance.event_sequence}"
+            f"evidence_kind={fact.evidence_kind.value}"
         )
     return SystemMessage(
         role=AgentMessageRole.SYSTEM,
@@ -2362,7 +2402,12 @@ def _memory_selected_recent_window_messages(
                 )
             )
         else:
-            messages.append(SystemMessage(role=AgentMessageRole.SYSTEM, content=item.text))
+            messages.append(
+                SystemMessage(
+                    role=AgentMessageRole.SYSTEM,
+                    content=_recent_evidence_content(item.text),
+                )
+            )
     return tuple(messages)
 
 
@@ -2439,6 +2484,230 @@ def build_run_input_material_blocks(
     return tuple(blocks)
 
 
+def _normalize_ordinary_run_messages(
+    messages: tuple[AgentMessage, ...],
+) -> tuple[AgentMessage, ...]:
+    """把 ordinary RunInput 候选 messages 归一为至多一条 system envelope。
+
+    :param messages: RunInputBuilder 已完成预算治理的候选 messages。
+    :returns: 归一化后的最终 Engine messages。
+    :raises HostDurableError: system material 为空、未知 message 类型或 envelope
+        含内部治理标识时抛出。
+    """
+
+    sections: dict[str, list[str]] = {
+        section: [] for section in _SYSTEM_ENVELOPE_SECTION_ORDER
+    }
+    non_system_messages: list[AgentMessage] = []
+    source_system_chars = 0
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            content = message.content.strip()
+            if content == "":
+                raise HostDurableError("ordinary system material must be non-empty")
+            source_system_chars += len(content)
+            section, body = _system_envelope_section_and_body(content)
+            sections[section].append(body)
+        elif isinstance(message, UserMessage):
+            non_system_messages.append(message)
+        elif isinstance(message, AssistantMessage):
+            non_system_messages.append(message)
+        elif isinstance(message, ToolMessage):
+            non_system_messages.append(message)
+        else:
+            _raise_unsupported_agent_message(message)
+    section_blocks = _non_empty_system_section_blocks(sections)
+    if not section_blocks:
+        return tuple(non_system_messages)
+    envelope_content = _render_system_envelope(section_blocks)
+    _validate_system_envelope_content(
+        envelope_content,
+        source_system_chars=source_system_chars,
+        section_blocks=section_blocks,
+    )
+    return (
+        SystemMessage(role=AgentMessageRole.SYSTEM, content=envelope_content),
+        *tuple(non_system_messages),
+    )
+
+
+def _system_envelope_section_and_body(content: str) -> tuple[str, str]:
+    """返回候选 system material 对应的 envelope section 与正文。
+
+    :param content: 单条候选 system message 内容。
+    :returns: ``(section title, body)``。
+    :raises HostDurableError: 正文为空时抛出。
+    """
+
+    if content.startswith(_EXECUTION_GUIDANCE_PREFIX):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_EXECUTION_GUIDANCE_PREFIX,
+            section=_SYSTEM_SECTION_EXECUTION_GUIDANCE,
+        )
+    if content.startswith(_MEMORY_SESSION_SUMMARY_HEADER):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_MEMORY_SESSION_SUMMARY_HEADER,
+            section=_SYSTEM_SECTION_CONVERSATION_SUMMARY,
+        )
+    if content.startswith(_ACCEPTED_COMPACTED_VIEW_PREFIX):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_ACCEPTED_COMPACTED_VIEW_PREFIX,
+            section=_SYSTEM_SECTION_CONVERSATION_SUMMARY,
+        )
+    if content.startswith(_MEMORY_EVIDENCE_FACT_HEADER):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_MEMORY_EVIDENCE_FACT_HEADER,
+            section=_SYSTEM_SECTION_VERIFIED_EVIDENCE,
+        )
+    if content.startswith(_MEMORY_ANSWER_ANCHOR_HEADER):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_MEMORY_ANSWER_ANCHOR_HEADER,
+            section=_SYSTEM_SECTION_PRIOR_ANSWER_ANCHORS,
+        )
+    if content.startswith(_MEMORY_FORWARD_INTENT_HEADER):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_MEMORY_FORWARD_INTENT_HEADER,
+            section=_SYSTEM_SECTION_OPEN_FOLLOWUP_CONTEXT,
+        )
+    if content.startswith(_MEMORY_REFERENCE_CONTINUITY_HEADER):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_MEMORY_REFERENCE_CONTINUITY_HEADER,
+            section=_SYSTEM_SECTION_REFERENCE_CONTINUITY,
+        )
+    if content.startswith(_RECENT_EVIDENCE_PREFIX):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_RECENT_EVIDENCE_PREFIX,
+            section=_SYSTEM_SECTION_RECENT_EVIDENCE,
+        )
+    if content.startswith(_ACCEPTED_TOOL_EVIDENCE_PREFIX):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_ACCEPTED_TOOL_EVIDENCE_PREFIX,
+            section=_SYSTEM_SECTION_RECENT_EVIDENCE,
+        )
+    if content.startswith(_RESUME_GUIDANCE_PREFIX):
+        return _stripped_prefixed_system_body(
+            content,
+            prefix=_RESUME_GUIDANCE_PREFIX,
+            section=_SYSTEM_SECTION_RESUME_GUIDANCE,
+        )
+    return (_SYSTEM_SECTION_TASK_INSTRUCTIONS, content)
+
+
+def _stripped_prefixed_system_body(
+    content: str, *, prefix: str, section: str
+) -> tuple[str, str]:
+    """移除候选 material 内部分类前缀并返回指定 section。
+
+    :param content: 候选 system message 内容。
+    :param prefix: 需要移除的固定前缀。
+    :param section: envelope section title。
+    :returns: ``(section, body)``。
+    :raises HostDurableError: 移除前缀后正文为空时抛出。
+    """
+
+    body = content.removeprefix(prefix).strip()
+    if body == "":
+        raise HostDurableError("ordinary system section body must be non-empty")
+    return (section, body)
+
+
+def _non_empty_system_section_blocks(
+    sections: Mapping[str, list[str]],
+) -> tuple[tuple[str, str, int], ...]:
+    """把 section item 映射转为固定顺序的非空 section blocks。
+
+    :param sections: section title 到正文 item 的映射。
+    :returns: 固定顺序的 ``(section title, body, item count)`` 元组。
+    """
+
+    blocks: list[tuple[str, str, int]] = []
+    for section in _SYSTEM_ENVELOPE_SECTION_ORDER:
+        items = tuple(item.strip() for item in sections[section] if item.strip() != "")
+        if not items:
+            continue
+        blocks.append((section, "\n".join(items), len(items)))
+    return tuple(blocks)
+
+
+def _render_system_envelope(section_blocks: tuple[tuple[str, str, int], ...]) -> str:
+    """按设计固定标题与分隔符渲染 system envelope。
+
+    :param section_blocks: 非空 section blocks。
+    :returns: system envelope content。
+    """
+
+    rendered_sections = tuple(
+        f"{_SYSTEM_ENVELOPE_HEADER_PREFIX}{section}\n{body}"
+        for section, body, _item_count in section_blocks
+    )
+    return _SYSTEM_ENVELOPE_SEPARATOR.join(rendered_sections)
+
+
+def _validate_system_envelope_content(
+    content: str,
+    *,
+    source_system_chars: int,
+    section_blocks: tuple[tuple[str, str, int], ...],
+) -> None:
+    """校验 system envelope 的 boundedness 与 LLM-facing 内部字段边界。
+
+    :param content: 合并后的 system envelope。
+    :param source_system_chars: 候选 system material 字符数总和。
+    :param section_blocks: 非空 section blocks。
+    :returns: ``None``。
+    :raises HostDurableError: envelope 膨胀异常或包含内部治理标识时抛出。
+    """
+
+    overhead = _system_envelope_overhead(section_blocks)
+    if len(content) > source_system_chars + overhead:
+        raise HostDurableError("ordinary system envelope exceeded deterministic overhead")
+    for fragment in _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS:
+        if fragment in content:
+            raise HostDurableError(
+                "ordinary system envelope exposes internal governance material"
+            )
+
+
+def _system_envelope_overhead(section_blocks: tuple[tuple[str, str, int], ...]) -> int:
+    """计算 envelope 固定 header 与 separator 开销。
+
+    :param section_blocks: 非空 section blocks。
+    :returns: 固定格式开销字符数。
+    """
+
+    if not section_blocks:
+        return 0
+    header_chars = sum(
+        len(_SYSTEM_ENVELOPE_HEADER_PREFIX) + len(section) + 1
+        for section, _body, _item_count in section_blocks
+    )
+    separator_chars = len(_SYSTEM_ENVELOPE_SEPARATOR) * (len(section_blocks) - 1)
+    item_separator_chars = sum(
+        item_count - 1 for _section, _body, item_count in section_blocks
+    )
+    return header_chars + separator_chars + item_separator_chars
+
+
+def _raise_unsupported_agent_message(message: NoReturn) -> NoReturn:
+    """对 AgentMessage 封闭联合做穷尽性防线。
+
+    :param message: 静态类型上不可达的 message。
+    :returns: 永不返回。
+    :raises HostDurableError: 始终抛出。
+    """
+
+    raise HostDurableError(f"unsupported AgentMessage type: {type(message).__name__}")
+
+
 def _fallback_context_messages(
     *,
     fallback: ActiveRecentWindowFallback,
@@ -2492,7 +2761,55 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
             reasoning_content=None,
             tool_calls=(),
         )
+    if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        return SystemMessage(
+            role=AgentMessageRole.SYSTEM,
+            content=_accepted_tool_evidence_content(block),
+        )
+    if block.kind is CompactMaterialBlockKind.EVIDENCE_BACKED_FACT:
+        return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
+    if block.section is CompactMaterialSection.EVIDENCE_MATERIAL:
+        return SystemMessage(
+            role=AgentMessageRole.SYSTEM,
+            content=_recent_evidence_content(block.text),
+        )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
+
+
+def _recent_evidence_content(text: str) -> str:
+    """构造 recent evidence 的 LLM-facing 有界正文。
+
+    :param text: 已由上游预算治理的 evidence 文本。
+    :returns: 带 recent evidence 前缀的 system material。
+    """
+
+    return f"{_RECENT_EVIDENCE_PREFIX}\n{text}"
+
+
+def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
+    """把 accepted tool evidence block 改写为业务可读 material。
+
+    :param block: accepted tool evidence material block。
+    :returns: 不含内部 ref / digest 的 evidence 文本。
+    :raises HostDurableError: 可读工具名缺失时抛出。
+    """
+
+    if block.readable_tool_name is None:
+        raise HostDurableError("accepted tool evidence requires readable tool name")
+    query_text = (
+        "The original tool query is not available in readable form."
+        if block.readable_query_text is None
+        else block.readable_query_text
+    )
+    lines = [
+        _ACCEPTED_TOOL_EVIDENCE_PREFIX,
+        f"tool_name={block.readable_tool_name}",
+        f"query={query_text}",
+    ]
+    if block.readable_source_text is not None:
+        lines.append(f"source={block.readable_source_text}")
+    lines.append(f"result={block.text}")
+    return "\n".join(lines)
 
 
 def _run_input_message_content(message: AgentMessage) -> str:
@@ -2847,25 +3164,13 @@ def _compact_artifact_message_content(
     :returns: message 内容。
     """
 
-    artifact_ref = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF)
-    artifact_digest = _required_text_field(
-        payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
-    )
-    accepted_evidence_mapping_refs = _accepted_evidence_mapping_refs(payload)
+    del compacted_event
     candidate_summary = _vnext_compact_candidate_summary(
         payload, max_summary_chars=max_summary_chars
     )
     lines = [
-        "Accepted vNext compact artifact is available for this run.",
-        f"compact_artifact_ref={artifact_ref}",
-        f"compact_artifact_digest={artifact_digest}",
-        f"compacted_event_id={compacted_event.event_id}",
-        f"compacted_event_sequence={compacted_event.event_sequence}",
-        (
-            "accepted_evidence_mapping_refs="
-            f"{','.join(accepted_evidence_mapping_refs)}"
-        ),
-        f"accepted_candidate={candidate_summary}",
+        _ACCEPTED_COMPACTED_VIEW_PREFIX,
+        candidate_summary,
     ]
     return "\n".join(lines)
 
@@ -2897,7 +3202,7 @@ def _vnext_compact_candidate_summary(
     """
 
     candidate = _required_mapping_field(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
-    schema_version = _required_text_field(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
+    _required_text_field(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
     facts = _required_mapping_list_field(
         candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS
     )
@@ -2906,7 +3211,7 @@ def _vnext_compact_candidate_summary(
     references = _required_mapping_list_field(
         candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS
     )
-    parts = [f"schema_version={schema_version}"]
+    parts: list[str] = []
     session_summary = _optional_session_summary_text(candidate)
     if session_summary is not None:
         parts.append(f"session_summary={session_summary}")
@@ -3164,19 +3469,22 @@ def _resume_wait_message_from_current_start(
         expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
     payload = _payload_object(tool_result_event)
+    result_text = json.dumps(
+        payload.get("result"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     content = "\n".join(
         (
-            "Accepted wait result fact:",
-            f"wait_id={_required_payload_text(payload, field_name='wait_id')}",
-            "tool_call_id="
-            f"{_required_payload_text(payload, field_name='tool_call_id')}",
+            _RESUME_GUIDANCE_PREFIX,
+            "A previous interrupted step has an accepted wait result.",
             f"tool_name={_required_payload_text(payload, field_name='tool_name')}",
             "resolution_kind="
             f"{_required_payload_text(payload, field_name='resolution_kind')}",
             "tool_fact_kind="
             f"{_required_payload_text(payload, field_name='tool_fact_kind')}",
-            "result="
-            f"{json.dumps(payload.get('result'), sort_keys=True, separators=(',', ':'))}",
+            f"result={result_text}",
         )
     )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=content)
@@ -4128,15 +4436,15 @@ def _manifest_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
 
 
 def _tools_scene_line(tool_execution_mode: ToolExecutionMode) -> str:
-    """返回 scene message 中的工具状态行。
+    """返回 scene message 中的工具可用性说明。
 
     :param tool_execution_mode: 显式工具执行模式。
-    :returns: 工具状态行。
+    :returns: 工具可用性说明。
     """
 
     if tool_execution_mode == ToolExecutionMode.TOOL_ENABLED:
-        return "tools=enabled"
-    return "tools=disabled"
+        return "Tools are available for this runner call."
+    return "Tools are disabled for this runner call."
 
 
 __all__ = [

@@ -116,7 +116,9 @@ from dayu.host.run_input import (
     PolicySnapshot,
     ToolExecutionMode,
     MemorySnapshotView,
+    _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
     _accepted_evidence_mapping_refs,
+    _normalize_ordinary_run_messages,
     _vnext_compact_candidate_summary,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
@@ -553,8 +555,10 @@ def test_tool_enabled_request_uses_toolruntime_handle(tmp_path: Path) -> None:
         assert request.agent_policy.allow_tool_calls is True
         assert request.tool_schemas == tool_runtime_handle.tool_schemas
         assert request.tool_executor is tool_runtime_handle.tool_executor
-        assert "tools=disabled" not in _message_content(request.messages[0])
-        assert "tools=enabled" in _message_content(request.messages[0])
+        assert "Tools are disabled" not in _message_content(request.messages[0])
+        assert "Tools are available for this runner call." in _message_content(
+            request.messages[0]
+        )
 
 
 def test_replay_no_tool_request_keeps_tools_disabled(tmp_path: Path) -> None:
@@ -581,7 +585,9 @@ def test_replay_no_tool_request_keeps_tools_disabled(tmp_path: Path) -> None:
         assert request.tool_schemas == ()
         assert request.agent_policy.allow_tool_calls is False
         assert isinstance(request.tool_executor, NoToolExecutor)
-        assert "tools=disabled" in _message_content(request.messages[0])
+        assert "Tools are disabled for this runner call." in _message_content(
+            request.messages[0]
+        )
 
 
 def test_no_tool_builder_rejects_tool_enabled_mode(tmp_path: Path) -> None:
@@ -602,6 +608,28 @@ def test_policy_snapshot_allows_tool_policy_for_tool_enabled() -> None:
     snapshot = _policy_snapshot(allow_tool_calls=True)
 
     assert snapshot.agent_policy.allow_tool_calls is True
+
+
+def test_system_envelope_boundedness_allows_multiple_items_in_same_section() -> None:
+    """system envelope 有界校验必须允许同一 section 内多条 material。"""
+
+    messages: tuple[AgentMessage, ...] = (
+        SystemMessage(role=AgentMessageRole.SYSTEM, content="first instruction"),
+        SystemMessage(role=AgentMessageRole.SYSTEM, content="second instruction"),
+        UserMessage(role=AgentMessageRole.USER, content="current prompt"),
+    )
+
+    normalized = _normalize_ordinary_run_messages(messages)
+    system_content = _single_system_content(normalized)
+
+    assert system_content == "\n".join(
+        (
+            "## Task Instructions",
+            "first instruction",
+            "second instruction",
+        )
+    )
+    assert _message_content(normalized[-1]) == "current prompt"
 
 
 def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
@@ -629,24 +657,25 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
         ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
         contents = tuple(_message_content(message) for message in request.messages)
 
-        assert contents[0] == _expected_system_content()
-        assert contents[1].startswith("Session Summary Memory:")
-        assert "summary=compare revenue quality; use reported currency" in contents[1]
-        assert contents[2].startswith("Evidence / Fact Memory:")
-        assert "claim_text=Revenue increased year over year" in contents[2]
-        assert "evidence_refs=evidence:memory-tool" in contents[2]
-        assert "evidence_kind=derived_from_evidence" in contents[2]
-        assert "extraction_operation_ref=event:event-memory-episode" in contents[2]
-        assert "event_id=event-memory-episode" in contents[2]
-        assert "event_sequence=5" in contents[2]
-        assert "digest_ref=" not in contents[2]
-        assert "fact_summary=" not in contents[2]
-        assert contents[3].startswith("Answer Anchor Memory:")
-        assert contents[4].startswith("Forward Intent Memory:")
-        assert contents[5].startswith("Trace Memory reference continuity:")
-        assert "text=second factor: margin mix" in contents[5]
-        assert contents[6] == "recent raw user"
-        assert contents[7] == "recent assistant conclusion"
+        system_content = _single_system_content(request.messages)
+        assert system_content.startswith(_expected_system_content())
+        assert "## Conversation Summary" in system_content
+        assert "summary=compare revenue quality; use reported currency" in system_content
+        assert "## Verified Evidence and Facts" in system_content
+        assert "claim_text=Revenue increased year over year" in system_content
+        assert "evidence_kind=derived_from_evidence" in system_content
+        assert "evidence_refs=" not in system_content
+        assert "extraction_operation_ref=" not in system_content
+        assert "event_id=" not in system_content
+        assert "event_sequence=" not in system_content
+        assert "digest_ref=" not in system_content
+        assert "fact_summary=" not in system_content
+        assert "## Prior Answer Anchors" in system_content
+        assert "## Open Follow-up Context" in system_content
+        assert "## Reference Continuity" in system_content
+        assert "text=second factor: margin mix" in system_content
+        assert contents[1] == "recent raw user"
+        assert contents[2] == "recent assistant conclusion"
         assert contents[-1] == "current prompt"
         assert all("inline delta" not in content for content in contents)
         assert all(
@@ -680,7 +709,9 @@ def test_memory_provider_renders_vnext_fact_section_from_snapshot(tmp_path: Path
         ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
         contents = tuple(_message_content(message) for message in request.messages)
 
-        assert any(content.startswith("Evidence / Fact Memory:") for content in contents)
+        assert "## Verified Evidence and Facts" in _single_system_content(
+            request.messages
+        )
         assert "recent raw user" in contents
         assert contents[-1] == "current prompt"
         assert all(
@@ -716,9 +747,8 @@ def test_vnext_fact_section_does_not_depend_on_old_subject_blocks(
         ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
         contents = tuple(_message_content(message) for message in request.messages)
 
-        assert any(
-            content.startswith("Evidence / Fact Memory:")
-            for content in contents
+        assert "## Verified Evidence and Facts" in _single_system_content(
+            request.messages
         )
         assert all(
             not content.startswith("Memory confirmed subjects and methodology:")
@@ -1356,16 +1386,12 @@ def test_gross_margin_followup_uses_post_compaction_evidence_backed_facts(
 
         request = _build_request_with_memory(store, seeded, policy)
         contents = tuple(_message_content(message) for message in request.messages)
-        fact_blocks = tuple(
-            content
-            for content in contents
-            if content.startswith("Evidence / Fact Memory:")
-        )
+        system_content = _single_system_content(request.messages)
 
-        assert len(fact_blocks) == 1
-        assert "claim_text=Revenue was 100." in fact_blocks[0]
-        assert "claim_text=Gross profit was 40." in fact_blocks[0]
-        assert "evidence_refs=evidence:memory-tool" in fact_blocks[0]
+        assert "## Verified Evidence and Facts" in system_content
+        assert "claim_text=Revenue was 100." in system_content
+        assert "claim_text=Gross profit was 40." in system_content
+        assert "evidence_refs=" not in system_content
         assert all(
             "older raw says revenue 100 and gross profit 40" not in content
             for content in contents
@@ -1376,7 +1402,7 @@ def test_gross_margin_followup_uses_post_compaction_evidence_backed_facts(
 def test_run_input_builder_renders_claim_text_and_evidence_refs_not_digest_only(
     tmp_path: Path,
 ) -> None:
-    """RunInputBuilder 渲染 stable facts 时必须包含 claim_text 与 evidence_refs。"""
+    """RunInputBuilder 渲染 stable facts 时包含 claim_text 且不暴露内部 ref。"""
 
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -1396,18 +1422,14 @@ def test_run_input_builder_renders_claim_text_and_evidence_refs_not_digest_only(
         )
 
         request = _build_request_with_memory(store, seeded, policy)
-        fact_blocks = tuple(
-            _message_content(message)
-            for message in request.messages
-            if _message_content(message).startswith("Evidence / Fact Memory:")
-        )
+        system_content = _single_system_content(request.messages)
 
-        assert len(fact_blocks) == 1
-        assert "claim_text=Revenue was 100." in fact_blocks[0]
-        assert "claim_text=Gross profit was 40." in fact_blocks[0]
-        assert "evidence_refs=evidence:memory-tool" in fact_blocks[0]
-        assert "digest_ref=" not in fact_blocks[0]
-        assert "fact_summary=" not in fact_blocks[0]
+        assert "## Verified Evidence and Facts" in system_content
+        assert "claim_text=Revenue was 100." in system_content
+        assert "claim_text=Gross profit was 40." in system_content
+        assert "evidence_refs=" not in system_content
+        assert "digest_ref=" not in system_content
+        assert "fact_summary=" not in system_content
 
 
 def test_no_compaction_recent_raw_turns_continuity_still_works(
@@ -1473,7 +1495,6 @@ def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
 
     assert _accepted_evidence_mapping_refs(payload) == ("evidence:memory-tool",)
     assert _vnext_compact_candidate_summary(payload, max_summary_chars=1200) == (
-        "schema_version=conversation_compact_output_v1 | "
         "session_summary=用户关注收入与毛利率。 | "
         "evidence_backed_facts=1 | "
         "answer_anchors=0 | "
@@ -1525,15 +1546,11 @@ def test_reference_continuity_resolves_second_factor_without_full_long_input(
 
         request = _build_request_with_memory(store, seeded, policy)
         contents = tuple(_message_content(message) for message in request.messages)
-        preserve_blocks = tuple(
-            content
-            for content in contents
-            if content.startswith("Trace Memory reference continuity:")
-        )
+        system_content = _single_system_content(request.messages)
 
-        assert len(preserve_blocks) == 1
-        assert f"text={preserve_text}" in preserve_blocks[0]
-        assert "reason=needed_for_ordered_item_reference" in preserve_blocks[0]
+        assert "## Reference Continuity" in system_content
+        assert f"text={preserve_text}" in system_content
+        assert "reason=needed_for_ordered_item_reference" in system_content
         assert all(long_input not in content for content in contents)
         assert contents[-1] == "第二个因素具体影响是什么？"
 
@@ -3729,14 +3746,40 @@ def _expected_system_content() -> str:
 
     return "\n".join(
         (
-            "Host execution context:",
-            "operation_kind=start_run",
-            "execution_target=local-default",
-            "queue_policy=queue",
-            f"policy_snapshot_ref={_POLICY_REF}",
-            "tools=disabled",
+            "## Execution Guidance",
+            "Use the available context and tools under the current run limits.",
+            "Tools are disabled for this runner call.",
         )
     )
+
+
+def _single_system_content(messages: tuple[AgentMessage, ...]) -> str:
+    """读取唯一 system envelope 内容并校验 one-system-message contract。
+
+    :param messages: RunInputBuilder 输出 messages。
+    :returns: 唯一 system message content。
+    :raises AssertionError: system message 数量或位置非法时抛出。
+    """
+
+    system_messages = tuple(
+        message for message in messages if isinstance(message, SystemMessage)
+    )
+    assert len(system_messages) == 1
+    assert messages[0] is system_messages[0]
+    _assert_system_content_has_no_internal_refs(system_messages[0].content)
+    return system_messages[0].content
+
+
+def _assert_system_content_has_no_internal_refs(content: str) -> None:
+    """断言 ordinary system envelope 不暴露内部治理标识。
+
+    :param content: system envelope 内容。
+    :returns: ``None``。
+    :raises AssertionError: 命中内部治理标识时抛出。
+    """
+
+    for fragment in _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS:
+        assert fragment not in content
 
 
 def _table_counts(
