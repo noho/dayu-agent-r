@@ -68,6 +68,11 @@ from dayu.host.durable.payload import (
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
 )
+from dayu.host.durable.schema import (
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+)
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
     AcceptedEvidenceResultRef,
@@ -75,7 +80,7 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.durable.transaction import HostTransaction
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
@@ -1310,6 +1315,13 @@ def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
 
     session_id = "session-selected-descriptor"
     event_id = "event-tool-result-descriptor"
+    tool_call_event_id = "event-tool-call-descriptor"
+    tool_arguments: dict[str, JsonValue] = {
+        "company": "MSFT",
+        "filing": "10-K",
+        "section": "revenue note",
+    }
+    arguments_digest = _accepted_arguments_digest(tool_arguments)
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
 
@@ -1320,10 +1332,21 @@ def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
             :returns: ``None``。
             """
 
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=tool_call_event_id,
+                session_id=session_id,
+                tool_call_id=f"tool-call:{event_id}",
+                arguments=tool_arguments,
+            )
             payload = {
                 "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
-                    _accepted_evidence_envelope_for_event_with_payload_ref(
+                    _accepted_evidence_envelope_for_tool_request(
                         event_id,
+                        tool_call_requested_event_ref=tool_call_event_id,
+                        tool_call_id=f"tool-call:{event_id}",
+                        normalized_arguments_digest=arguments_digest,
                         payload_ref="payload-selected-descriptor",
                         payload_digest=None,
                     )
@@ -1383,9 +1406,220 @@ def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
                 '"value":{"content":"raw content event-tool-result-descriptor",'
                 '"event_id":"event-tool-result-descriptor"}}}'
             ),
-            "tool_call_id=tool-call:event-tool-result-descriptor",
+            (
+                '工具参数: {"arguments":{"company":"MSFT","filing":"10-K",'
+                '"section":"revenue note"}}'
+            ),
             ("payload-selected-descriptor",),
         )
+
+
+def test_evidence_input_prefers_semantic_query_from_tool_request_atom(
+    tmp_path: Path,
+) -> None:
+    """Selected evidence query_text 优先使用 durable semantic query。"""
+
+    session_id = "session-selected-semantic-query"
+    event_id = "event-tool-result-semantic-query"
+    tool_call_event_id = "event-tool-call-semantic-query"
+    tool_arguments: dict[str, JsonValue] = {"ticker": "MSFT", "period": "FY2025"}
+    semantic_query = "读取 MSFT FY2025 年报中的收入分部说明"
+    arguments_digest = _accepted_arguments_digest(tool_arguments)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_rows(transaction: HostTransaction) -> None:
+            """写入 semantic query request atom 与 selected evidence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=tool_call_event_id,
+                session_id=session_id,
+                tool_call_id=f"tool-call:{event_id}",
+                arguments=tool_arguments,
+                semantic_query_text=semantic_query,
+            )
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_tool_request(
+                                    event_id,
+                                    tool_call_requested_event_ref=tool_call_event_id,
+                                    tool_call_id=f"tool-call:{event_id}",
+                                    normalized_arguments_digest=arguments_digest,
+                                )
+                            )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(event_id),
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_rows)
+
+        assert _collect_selected_query_text(
+            store,
+            event_log,
+            session_id=session_id,
+            event_id=event_id,
+        ) == semantic_query
+
+
+def test_evidence_input_missing_tool_request_atom_emits_limited_signal(
+    tmp_path: Path,
+) -> None:
+    """Selected evidence 缺 durable request atom 时 query_text 明确 limited-signal。"""
+
+    session_id = "session-selected-missing-tool-request"
+    event_id = "event-tool-result-missing-request"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_row(transaction: HostTransaction) -> None:
+            """写入缺少 request ref 的 selected evidence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_event(event_id)
+                            )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(event_id),
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_row)
+
+        query_text = _collect_selected_query_text(
+            store,
+            event_log,
+            session_id=session_id,
+            event_id=event_id,
+        )
+        assert query_text.startswith("状态=limited_signal；")
+        assert "已验收工具请求参数材料缺失" in query_text
+        assert "tool-call" not in query_text
+        assert event_id not in query_text
+
+
+def test_evidence_chunks_share_same_durable_query_text(
+    tmp_path: Path,
+) -> None:
+    """同一 durable request 被 chunk 后各 evidence chunk 复用同一 query_text。"""
+
+    session_id = "session-selected-query-chunk"
+    event_id = "event-tool-result-query-chunk"
+    tool_call_event_id = "event-tool-call-query-chunk"
+    tool_arguments: dict[str, JsonValue] = {"ticker": "MSFT", "chapter": "MD&A"}
+    arguments_digest = _accepted_arguments_digest(tool_arguments)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_rows(transaction: HostTransaction) -> None:
+            """写入会被 chunk 的 selected evidence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=tool_call_event_id,
+                session_id=session_id,
+                tool_call_id=f"tool-call:{event_id}",
+                arguments=tool_arguments,
+            )
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_tool_request(
+                                    event_id,
+                                    tool_call_requested_event_ref=tool_call_event_id,
+                                    tool_call_id=f"tool-call:{event_id}",
+                                    normalized_arguments_digest=arguments_digest,
+                                )
+                            )
+                        ),
+                        "raw_tool_outcome": {
+                            "kind": "completed",
+                            "result": {
+                                "ok": True,
+                                "value": {"content": "x" * 9000},
+                                "meta": None,
+                            },
+                        },
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_rows)
+
+        def read_query_texts(transaction: HostTransaction) -> tuple[tuple[str, str], ...]:
+            """读取 chunk labels 与 query_text。
+
+            :param transaction: Host transaction。
+            :returns: ``(label, query_text)`` tuple。
+            """
+
+            inputs = collect_selected_compaction_request_evidence_inputs(
+                transaction,
+                event_log,
+                session_id=session_id,
+                selected_evidence_block_refs=(
+                    SelectedEvidenceBlockRef(
+                        block_id="selected-evidence-chunk",
+                        tool_result_event_ref=event_id,
+                    ),
+                ),
+            )
+            pack = build_initial_material_pack(
+                current_input_ref="input-query-chunk",
+                current_input_text="current user text",
+                history_materials=(),
+                evidence_materials=inputs.evidence_materials,
+            )
+            return tuple(
+                (block.evidence_label, block.readable_query_text)
+                for block in pack.evidence_material
+            )
+
+        query_texts = store.transaction_runner.run_read(read_query_texts)
+        assert tuple(label for label, _query_text in query_texts) == (
+            "E1.1",
+            "E1.2",
+            "E1.3",
+        )
+        assert len({query_text for _label, query_text in query_texts}) == 1
+        assert query_texts[0][1] == '工具参数: {"arguments":{"chapter":"MD&A","ticker":"MSFT"}}'
 
 
 def test_missing_or_digest_mismatch_raw_evidence_fails_closed(
@@ -2016,6 +2250,125 @@ def _accepted_evidence_envelope_for_event_with_payload_ref(
     )
 
 
+def _accepted_evidence_envelope_for_tool_request(
+    event_id: str,
+    *,
+    tool_call_requested_event_ref: str,
+    tool_call_id: str,
+    normalized_arguments_digest: str,
+    payload_ref: str | None = None,
+    payload_digest: str | None = _DIGEST,
+) -> AcceptedEvidenceEnvelope:
+    """构造带 TOOL_CALL_REQUESTED ref 的 canonical evidence envelope。
+
+    :param event_id: TOOL_RESULT_ACCEPTED event id。
+    :param tool_call_requested_event_ref: 对应 TOOL_CALL_REQUESTED event id。
+    :param tool_call_id: 工具调用 id。
+    :param normalized_arguments_digest: 工具参数 canonical digest。
+    :param payload_ref: result payload descriptor ref。
+    :param payload_digest: result payload digest。
+    :returns: canonical evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{event_id}",
+        producer_event_ref=event_id,
+        tool_name="fins.search",
+        tool_call_id=tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=tool_call_requested_event_ref,
+            normalized_arguments_digest=normalized_arguments_digest,
+            semantic_input_digest=_DIGEST,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
+            outcome_digest=_DIGEST,
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+
+
+def _append_tool_call_requested_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    session_id: str,
+    tool_call_id: str,
+    arguments: dict[str, JsonValue],
+    semantic_query_text: str | None = None,
+) -> None:
+    """追加测试用 TOOL_CALL_REQUESTED durable request atom。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: TOOL_CALL_REQUESTED event id。
+    :param session_id: Session id。
+    :param tool_call_id: 工具调用 id。
+    :param arguments: accepted 工具参数。
+    :param semantic_query_text: 可选业务可读 semantic query。
+    :returns: ``None``。
+    """
+
+    arguments_json = _accepted_arguments_json(arguments)
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query_storage_kind = TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT
+    semantic_query_digest: str | None = None
+    if semantic_query_text is not None:
+        semantic_query_storage_kind = TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+        semantic_query_digest = sha256_digest_json(
+            {"semantic_query_text": semantic_query_text}
+        )
+    event_log.append_event(
+        transaction,
+        _event_request(
+            event_id=event_id,
+            session_id=session_id,
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": tool_call_id,
+                "tool_name": "fins.search",
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
+                "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+                "arguments_inline_json": arguments_json,
+                "arguments_payload_ref": None,
+                "arguments_payload_digest": arguments_digest,
+                "semantic_input_digest": _DIGEST,
+                "semantic_query_storage_kind": semantic_query_storage_kind,
+                "semantic_query_text": semantic_query_text,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": semantic_query_digest,
+            },
+        ),
+    )
+
+
+def _accepted_arguments_json(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """构造 accepted arguments canonical JSON preimage。
+
+    :param arguments: accepted 工具参数。
+    :returns: 与 ToolRuntime 一致的 arguments digest preimage。
+    """
+
+    return {"arguments": dict(arguments)}
+
+
+def _accepted_arguments_digest(arguments: dict[str, JsonValue]) -> str:
+    """计算 accepted arguments digest。
+
+    :param arguments: accepted 工具参数。
+    :returns: canonical arguments digest。
+    """
+
+    return sha256_digest_json(_accepted_arguments_json(arguments))
+
+
 def _raw_tool_outcome(event_id: str) -> JsonValue:
     """构造测试用 raw tool outcome。
 
@@ -2108,6 +2461,45 @@ def _collect_selected_evidence_ids(
             ),
         )
         return tuple(material.accepted_evidence_id for material in inputs.evidence_materials)
+
+    return store.transaction_runner.run_read(read_inputs)
+
+
+def _collect_selected_query_text(
+    store: HostDurableStore,
+    event_log: EventLogStore,
+    *,
+    session_id: str,
+    event_id: str,
+) -> str:
+    """读取 selected helper 输出的单条 readable query text。
+
+    :param store: Host durable store。
+    :param event_log: EventLog store。
+    :param session_id: Session id。
+    :param event_id: selected TOOL_RESULT_ACCEPTED event id。
+    :returns: readable query text。
+    """
+
+    def read_inputs(transaction: HostTransaction) -> str:
+        """在 transaction 内读取 query text。
+
+        :param transaction: Host transaction。
+        :returns: readable query text。
+        """
+
+        inputs = collect_selected_compaction_request_evidence_inputs(
+            transaction,
+            event_log,
+            session_id=session_id,
+            selected_evidence_block_refs=(
+                SelectedEvidenceBlockRef(
+                    block_id=f"selected:{event_id}",
+                    tool_result_event_ref=event_id,
+                ),
+            ),
+        )
+        return inputs.evidence_materials[0].readable_query_text
 
     return store.transaction_runner.run_read(read_inputs)
 
