@@ -70,6 +70,9 @@ _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT = 7
 _SOFT_THRESHOLD_PROMPT_SENTENCE = "请保留标记 DAYU_COMPACT_OK，并继续等待下一步。"
 _COMPACTOR_PROVIDER_MAX_RETRIES = 1
 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
+_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "conversation_compact_output_v1"
+_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
+_INTERNAL_COMPACT_INPUT_TYPE_NAME = "ConversationCompactInputVNext"
 _COMPACT_ARTIFACT_KIND_FIELD = "artifact_kind"
 _COMPACT_ARTIFACT_KIND = "context_compaction"
 _ACCEPTED_CANDIDATE_FIELD = "accepted_candidate"
@@ -94,8 +97,8 @@ _PACKAGE_CONFIG_ROOT = (
 _COMPACTOR_PROFILE_ID = "standard-256k"
 _FORBIDDEN_COMPACTOR_PROMPT_TERMS = (
     "Host-owned context compaction",
-    "ConversationCompactOutputVNext",
-    "ConversationCompactInputVNext",
+    _INTERNAL_COMPACT_OUTPUT_TYPE_NAME,
+    _INTERNAL_COMPACT_INPUT_TYPE_NAME,
     "vNext",
     "migration",
     "candidate_id",
@@ -266,6 +269,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert third_terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.material_jsons) >= 1
     material_json = _first_material_json_with_evidence(fake_compactor.material_jsons)
+    _assert_compactor_material_instruction_contract(material_json)
     evidence_material = material_json["evidence_material"]
     assert isinstance(evidence_material, list)
     assert len(evidence_material) >= 1
@@ -623,6 +627,7 @@ class FakeCompactorRunAgent:
 
         del timeout_seconds
         material_json = _material_json_from_compactor_request(request)
+        _assert_compactor_material_instruction_contract(material_json)
         user_prompt = _compactor_user_prompt(request)
         self.material_jsons.append(material_json)
         self.prompts.append(user_prompt)
@@ -723,6 +728,27 @@ def _material_json_from_compactor_request(
     parsed = cast(JsonValue, json.loads(_material_json_text_from_prompt(prompt)))
     assert isinstance(parsed, Mapping)
     return cast(Mapping[str, JsonValue], parsed)
+
+
+def _assert_compactor_material_instruction_contract(
+    material_json: Mapping[str, JsonValue],
+) -> None:
+    """校验 public compactor runtime material 的 instruction contract。
+
+    :param material_json: compactor request 中投影给 LLM 的 material JSON。
+    :returns: ``None``。
+    :raises AssertionError: instruction contract 暴露内部类型名或字面量错误时抛出。
+    """
+
+    instruction_value = material_json["instruction"]
+    assert isinstance(instruction_value, Mapping)
+    instruction = cast(Mapping[str, JsonValue], instruction_value)
+    assert (
+        instruction["output_schema_name"]
+        == _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER
+    )
+    material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
+    assert _INTERNAL_COMPACT_OUTPUT_TYPE_NAME not in material_text
 
 
 def _material_json_text_from_prompt(prompt: str) -> str:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
+
 import pytest
 
 import dayu.host.compaction as compaction_module
@@ -13,9 +16,11 @@ from dayu.host.compact_material import (
     initial_segment_selection,
 )
 from dayu.host.compaction import (
+    CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY,
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     AnswerAnchorCandidateVNext,
     AnswerAnchorChildVNext,
+    CompactInstructionVNext,
     CompactMaterialBlockKind,
     CompactQualityIssueVNext,
     CompactSegmentTrigger,
@@ -31,6 +36,9 @@ from dayu.host.context_governance import check_conversation_compact_output_vnext
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
+
+_LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "conversation_compact_output_v1"
+_INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
 
 
 @pytest.mark.asyncio
@@ -65,6 +73,43 @@ def test_material_pack_json_and_llm_json_use_vnext_fields_only() -> None:
         assert "stable_input" not in payload
         assert "history_input" not in payload
         assert "evidence_input" not in payload
+
+
+def test_compact_instruction_uses_llm_facing_output_contract_identifier() -> None:
+    """vNext instruction JSON 只投影 LLM-facing output contract 标识。
+
+    :returns: ``None``。
+    :raises AssertionError: instruction 字面量或 material 文本不符合 contract 时抛出。
+    """
+
+    compact_input = _compact_input()
+    payload = compact_input.to_json()
+
+    assert isinstance(payload, Mapping)
+    instruction = payload["instruction"]
+    assert isinstance(instruction, Mapping)
+    assert (
+        instruction["output_schema_name"]
+        == _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER
+        == CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
+    )
+    assert (
+        instruction["compact_goal"]
+        == CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY
+    )
+    material_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert _INTERNAL_COMPACT_OUTPUT_TYPE_NAME not in material_text
+
+
+def test_compact_instruction_rejects_internal_python_type_name() -> None:
+    """vNext instruction strict validation 拒绝内部 Python 输出类型名。
+
+    :returns: ``None``。
+    :raises AssertionError: 旧内部类型名未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="output_schema_name"):
+        CompactInstructionVNext(output_schema_name=_INTERNAL_COMPACT_OUTPUT_TYPE_NAME)
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,9 @@
 - `evidence_material`：JSON array。每个元素包含 `source_label`、`tool_name`、`query_text`、`response_text`、`source_note`。`query_text` 与 `source_note` 可以为 JSON string 或 null；`response_text` 是可用于生成事实的证据文本。
 - `answer_material`：JSON array。每个元素包含 `source_label`、`answer_text`，表示此前助手最终回答文本。
 - `current_input_anchor`：JSON object，包含 `anchor_label` 与 `text`。它帮助理解当前用户输入，但其 `anchor_label` 不允许出现在任何输出 label 列表中。
-- `instruction`：JSON object，包含 `output_schema_name` 与 `compact_goal`。它说明本次整理目标；不要把该字段内容当成财报事实。
+- `instruction`：JSON object，包含 `output_schema_name` 与 `compact_goal`。
+- `instruction.output_schema_name`：JSON string，唯一允许值为 `conversation_compact_output_v1`；它只是本次请求的输出格式标识，不是业务事实。
+- `instruction.compact_goal`：JSON string，唯一允许值为 `roll_forward_session_memory`；它只是本次整理目标，不是财报事实或用户结论。
 
 label 规则：
 - label 是本次请求内的引用标签，只能逐字复制输入里已有的 `source_label` 或 `anchor_label`；不要生成不存在的 label。
