@@ -172,6 +172,8 @@ provider 字段：
 
 `import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。`config` 缺省等价空对象；需要业务含义时由对应 provider 自行解析，例如文档路径白名单、财报 workspace root、Web 请求限制等。
 
+包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。启用 Doc tools 时必须在 `config.allowed_paths` 中显式配置可访问文件或目录根；provider 启用但白名单为空时会 fail closed，返回空工具集合，不注册可执行文档工具。Doc provider 的 `config.limits` 可覆盖 `list_files_max`、`get_sections_max`、`search_files_max_results`、`read_file_max_chars` 与 `read_file_section_max_chars`，未配置字段使用 provider 默认值。
+
 ## prompts 目录职责
 
 `workspace/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：

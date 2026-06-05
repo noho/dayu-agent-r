@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
@@ -206,30 +207,152 @@ def project_legacy_return(
     :raises Exception: 不主动抛出异常。
     """
 
-    if isinstance(raw_value, Mapping):
-        ok_value = raw_value.get("ok")
-        if ok_value is True and "value" in raw_value:
+    projected_value = _project_legacy_response(tool_name, raw_value)
+    if isinstance(projected_value, Mapping):
+        ok_value = projected_value.get("ok")
+        if ok_value is True and "value" in projected_value:
             return _completed_outcome(
                 tool_name=tool_name,
-                value=raw_value.get("value"),
+                value=projected_value.get("value"),
                 started_at=started_at,
                 finished_at=finished_at,
             )
         if ok_value is False:
             return _failed_outcome(
                 tool_name=tool_name,
-                error=_text_or_default(raw_value.get("error"), "execution_error"),
-                message=_text_or_default(raw_value.get("message"), "Tool execution failed."),
-                hint=_optional_text(raw_value.get("hint")),
+                error=_text_or_default(projected_value.get("error"), "execution_error"),
+                message=_text_or_default(
+                    projected_value.get("message"),
+                    "Tool execution failed.",
+                ),
+                hint=_optional_text(projected_value.get("hint")),
                 started_at=started_at,
                 finished_at=finished_at,
             )
     return _completed_outcome(
         tool_name=tool_name,
-        value=raw_value,
+        value=projected_value,
         started_at=started_at,
         finished_at=finished_at,
     )
+
+
+def _project_legacy_response(tool_name: str, raw_value: JsonValue) -> JsonValue:
+    """把迁移工具返回值中的可复用路径投影为后续工具可接收的路径。
+
+    :param tool_name: 工具名。
+    :param raw_value: 迁移函数原始 JSON 返回值。
+    :returns: 路径字段已按返回目录归一化的 JSON 值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if tool_name == "list_files":
+        return _project_list_files_response(raw_value)
+    if tool_name == "search_files":
+        return _project_search_files_response(raw_value)
+    return raw_value
+
+
+def _project_list_files_response(raw_value: JsonValue) -> JsonValue:
+    """投影 ``list_files`` 返回的 ``files[].path`` 字段。
+
+    :param raw_value: 迁移函数原始返回值。
+    :returns: 投影后的 JSON 值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not isinstance(raw_value, Mapping):
+        return raw_value
+    payload = cast(Mapping[str, JsonValue], raw_value)
+    directory = payload.get("directory")
+    files = payload.get("files")
+    if not isinstance(directory, str) or not isinstance(files, list):
+        return raw_value
+    projected_files: list[JsonValue] = []
+    for item in files:
+        if isinstance(item, Mapping):
+            projected_files.append(
+                _project_record_path(
+                    cast(Mapping[str, JsonValue], item),
+                    base_directory=directory,
+                    field_name="path",
+                )
+            )
+        else:
+            projected_files.append(item)
+    projected_payload: dict[str, JsonValue] = dict(payload)
+    projected_payload["files"] = projected_files
+    return projected_payload
+
+
+def _project_search_files_response(raw_value: JsonValue) -> JsonValue:
+    """投影 ``search_files`` 返回的 ``matches[].file`` 字段。
+
+    :param raw_value: 迁移函数原始返回值。
+    :returns: 投影后的 JSON 值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not isinstance(raw_value, Mapping):
+        return raw_value
+    payload = cast(Mapping[str, JsonValue], raw_value)
+    directory = payload.get("directory")
+    matches = payload.get("matches")
+    if not isinstance(directory, str) or not isinstance(matches, list):
+        return raw_value
+    projected_matches: list[JsonValue] = []
+    for item in matches:
+        if isinstance(item, Mapping):
+            projected_matches.append(
+                _project_record_path(
+                    cast(Mapping[str, JsonValue], item),
+                    base_directory=directory,
+                    field_name="file",
+                )
+            )
+        else:
+            projected_matches.append(item)
+    projected_payload: dict[str, JsonValue] = dict(payload)
+    projected_payload["matches"] = projected_matches
+    return projected_payload
+
+
+def _project_record_path(
+    record: Mapping[str, JsonValue],
+    *,
+    base_directory: str,
+    field_name: str,
+) -> Mapping[str, JsonValue]:
+    """把记录中的相对路径字段投影为基于目录的绝对路径。
+
+    :param record: 单条返回记录。
+    :param base_directory: 记录所属目录。
+    :param field_name: 需要投影的路径字段名。
+    :returns: 投影后的记录。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    path_value = record.get(field_name)
+    if not isinstance(path_value, str) or path_value.strip() == "":
+        return record
+    projected_record: dict[str, JsonValue] = dict(record)
+    projected_record[field_name] = _project_response_path(base_directory, path_value)
+    return projected_record
+
+
+def _project_response_path(base_directory: str, path_value: str) -> str:
+    """把工具返回路径归一化为绝对路径。
+
+    :param base_directory: 返回路径所属目录。
+    :param path_value: 原始返回路径。
+    :returns: 绝对路径字符串。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return str(path.resolve(strict=False))
+    return str((Path(base_directory) / path).expanduser().resolve(strict=False))
 
 
 def project_legacy_exception(

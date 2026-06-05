@@ -27,6 +27,9 @@ LegacyToolKeywordValue = JsonValue | BatchToolExecutionContext | None
 class LegacySyncToolCallable(Protocol):
     """迁移同步工具函数协议。"""
 
+    __tool_name__: str
+    __tool_schema__: ToolSchema
+
     def __call__(self, **keyword_arguments: LegacyToolKeywordValue) -> JsonValue:
         """执行同步工具函数。
 

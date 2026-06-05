@@ -91,18 +91,28 @@ class FileAccessError(LegacyAdapterError):
     """文件访问或路径权限错误。
 
     :param path: 相关路径。
-    :param details: 详细错误说明。
+    :param filename_or_details: 文件名或详细错误说明。
+    :param details: OLD 三参调用形状中的详细错误说明。
     """
 
-    def __init__(self, path: str, details: str) -> None:
+    def __init__(
+        self,
+        path: str,
+        filename_or_details: str,
+        details: str | None = None,
+    ) -> None:
         """初始化文件访问错误。
 
         :param path: 相关路径。
-        :param details: 详细错误说明。
+        :param filename_or_details: 二参调用时为详细错误说明；三参调用时为文件名。
+        :param details: 三参调用时的详细错误说明。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
-        self.path = path
-        self.details = details
-        super().__init__(f"{path}: {details}")
+        detail_text = filename_or_details if details is None else details
+        filename = "" if details is None else filename_or_details
+        display_path = path if filename == "" else f"{path}/{filename}"
+        self.path = display_path
+        self.details = detail_text
+        super().__init__(f"{display_path}: {detail_text}")
