@@ -131,21 +131,26 @@ def _execution_profile_record() -> dict[str, JsonValue]:
             "policy_ref": "test",
         },
         "memory_projection_policy": {
-            "max_pinned_items": 2,
-            "max_evidence_backed_facts": 3,
-            "max_working_assumptions": 4,
-            "recent_raw_turns_floor": 1,
-            "raw_turn_context_ratio": 0.1,
-            "raw_turn_size_floor": 10,
-            "raw_turn_size_cap": 100,
-            "history_pool_context_ratio": 0.2,
-            "history_pool_size_floor": 20,
-            "history_pool_size_cap": 200,
-            "stable_layer_context_ratio": 0.3,
-            "stable_layer_size_floor": 30,
-            "stable_layer_size_cap": 300,
+            "context_window_size": 262144,
+            "selected_recent_window_item_cap": 8,
+            "selected_recent_window_char_cap": 100,
+            "selected_recent_window_turn_floor": 1,
+            "fallback_selected_recent_window_item_cap": 4,
+            "fallback_selected_recent_window_char_cap": 50,
+            "evidence_fact_item_cap": 3,
+            "evidence_fact_char_cap": 300,
+            "evidence_fact_floor": 1,
+            "session_summary_char_cap": 400,
+            "answer_anchor_item_cap": 5,
+            "answer_anchor_char_cap": 500,
+            "forward_intent_item_cap": 6,
+            "forward_intent_char_cap": 600,
+            "reference_continuity_item_cap": 7,
+            "reference_continuity_char_cap": 700,
+            "reference_continuity_item_floor": 0,
             "max_lag_events_for_inline_delta": 5,
             "max_delta_repair_events": 6,
+            "policy_ref": "test-memory",
         },
         "tool_truncation_policy": {
             "enabled": True,
@@ -339,10 +344,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert standard_256k.compactor_baseline.user_prompt_template_path == (
         "scenes/conversation_compaction_user.md"
     )
-    assert (
-        standard_256k.memory_projection_policy.max_evidence_backed_facts
-        == 256
-    )
+    assert standard_256k.memory_projection_policy.evidence_fact_item_cap == 256
     assert (
         standard_256k.tool_duplicate_governance_policy.default_duplicate_decision
         == "hint"
@@ -633,16 +635,15 @@ def test_old_execution_profile_fields_fail_fast(tmp_path: Path) -> None:
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 
-def test_old_max_verified_facts_key_fails_fast(tmp_path: Path) -> None:
-    """旧 max_verified_facts 配置 key 必须作为未知字段失败。"""
+def test_old_memory_projection_policy_key_fails_fast(tmp_path: Path) -> None:
+    """旧 memory projection policy key 必须作为未知字段失败。"""
 
     package_root = tmp_path / "package"
     _minimal_package_config(package_root)
     profile = _execution_profile_record()
     memory_projection = profile["memory_projection_policy"]
     assert isinstance(memory_projection, dict)
-    max_facts = memory_projection.pop("max_evidence_backed_facts")
-    memory_projection["max_verified_facts"] = max_facts
+    memory_projection["max_evidence_backed_facts"] = 3
     _write_json(
         package_root / "execution_profiles.json",
         {

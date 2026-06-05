@@ -770,7 +770,7 @@ def test_host_local_execution_options_accept_valid_shape() -> None:
     assert options.runner_options.stream is False
     assert options.agent_policy.allow_tool_calls is False
     assert options.context_budget_policy is None
-    assert options.memory_projection_policy.max_evidence_backed_facts > 0
+    assert options.memory_projection_policy.evidence_fact_item_cap > 0
     assert options.memory_projection_catchup_batch_size > 0
 
     with_budget = replace(

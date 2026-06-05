@@ -12,7 +12,7 @@
 - HTTP ``500`` / ``502`` / ``503`` / ``504`` → :attr:`SERVER_ERROR`。
 - HTTP ``4xx`` 其它 → :attr:`CLIENT_ERROR`（不可重试）。
 - 其它 HTTP 状态（``1xx`` / ``3xx`` / 自定义）→ :attr:`UNKNOWN_HTTP_STATUS`。
-- :class:`asyncio.TimeoutError` / :class:`aiohttp.ServerTimeoutError`
+- :class:`asyncio.TimeoutError`（包含 aiohttp 的 server timeout 子类）
   → :attr:`TIMEOUT`。
 - :class:`aiohttp.ClientConnectionError` / :class:`aiohttp.ClientPayloadError`
   / 其它 :class:`aiohttp.ClientError` → :attr:`NETWORK_ERROR`。
@@ -77,8 +77,6 @@ def classify_exception(exc: BaseException) -> RunnerHTTPErrorCode:
     """
 
     if isinstance(exc, asyncio.TimeoutError):
-        return RunnerHTTPErrorCode.TIMEOUT
-    if isinstance(exc, aiohttp.ServerTimeoutError):
         return RunnerHTTPErrorCode.TIMEOUT
     if isinstance(exc, aiohttp.ClientConnectionError):
         return RunnerHTTPErrorCode.NETWORK_ERROR

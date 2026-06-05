@@ -236,38 +236,48 @@ class ContextBudgetConfig:
 class MemoryProjectionConfig:
     """Conversation memory projection 配置。
 
-    :param max_pinned_items: pinned state 最大条目数。
-    :param max_evidence_backed_facts: evidence-backed facts 最大条目数。
-    :param max_working_assumptions: working assumptions 最大条目数。
-    :param recent_raw_turns_floor: recent raw turns 保底条数。
-    :param raw_turn_context_ratio: 单条 raw turn 尺寸比例。
-    :param raw_turn_size_floor: 单条 raw turn 尺寸下限。
-    :param raw_turn_size_cap: 单条 raw turn 尺寸上限。
-    :param history_pool_context_ratio: history pool 尺寸比例。
-    :param history_pool_size_floor: history pool 尺寸下限。
-    :param history_pool_size_cap: history pool 尺寸上限。
-    :param stable_layer_context_ratio: stable layer 尺寸比例。
-    :param stable_layer_size_floor: stable layer 尺寸下限。
-    :param stable_layer_size_cap: stable layer 尺寸上限。
+    :param context_window_size: policy 上下文窗口。
+    :param selected_recent_window_item_cap: selected recent window item 上限。
+    :param selected_recent_window_char_cap: selected recent window 字符上限。
+    :param selected_recent_window_turn_floor: selected recent window 近轮保底。
+    :param fallback_selected_recent_window_item_cap: fallback selected recent window item 上限。
+    :param fallback_selected_recent_window_char_cap: fallback selected recent window 字符上限。
+    :param evidence_fact_item_cap: evidence-backed fact item 上限。
+    :param evidence_fact_char_cap: evidence-backed fact 字符上限。
+    :param evidence_fact_floor: evidence-backed fact 保底数量。
+    :param session_summary_char_cap: session summary 字符上限。
+    :param answer_anchor_item_cap: answer anchor item 上限。
+    :param answer_anchor_char_cap: answer anchor 字符上限。
+    :param forward_intent_item_cap: forward intent item 上限。
+    :param forward_intent_char_cap: forward intent 字符上限。
+    :param reference_continuity_item_cap: reference continuity item 上限。
+    :param reference_continuity_char_cap: reference continuity 字符上限。
+    :param reference_continuity_item_floor: reference continuity item 保底数量。
     :param max_lag_events_for_inline_delta: inline delta 最大滞后事件数。
     :param max_delta_repair_events: repair delta 最大事件数。
+    :param policy_ref: policy ref。
     """
 
-    max_pinned_items: int
-    max_evidence_backed_facts: int
-    max_working_assumptions: int
-    recent_raw_turns_floor: int
-    raw_turn_context_ratio: float
-    raw_turn_size_floor: int
-    raw_turn_size_cap: int
-    history_pool_context_ratio: float
-    history_pool_size_floor: int
-    history_pool_size_cap: int
-    stable_layer_context_ratio: float
-    stable_layer_size_floor: int
-    stable_layer_size_cap: int
+    context_window_size: int
+    selected_recent_window_item_cap: int
+    selected_recent_window_char_cap: int
+    selected_recent_window_turn_floor: int
+    fallback_selected_recent_window_item_cap: int
+    fallback_selected_recent_window_char_cap: int
+    evidence_fact_item_cap: int
+    evidence_fact_char_cap: int
+    evidence_fact_floor: int
+    session_summary_char_cap: int
+    answer_anchor_item_cap: int
+    answer_anchor_char_cap: int
+    forward_intent_item_cap: int
+    forward_intent_char_cap: int
+    reference_continuity_item_cap: int
+    reference_continuity_char_cap: int
+    reference_continuity_item_floor: int
     max_lag_events_for_inline_delta: int
     max_delta_repair_events: int
+    policy_ref: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1518,41 +1528,51 @@ def _parse_memory_projection(
         record,
         allowed=frozenset(
             {
-                "max_pinned_items",
-                "max_evidence_backed_facts",
-                "max_working_assumptions",
-                "recent_raw_turns_floor",
-                "raw_turn_context_ratio",
-                "raw_turn_size_floor",
-                "raw_turn_size_cap",
-                "history_pool_context_ratio",
-                "history_pool_size_floor",
-                "history_pool_size_cap",
-                "stable_layer_context_ratio",
-                "stable_layer_size_floor",
-                "stable_layer_size_cap",
+                "context_window_size",
+                "selected_recent_window_item_cap",
+                "selected_recent_window_char_cap",
+                "selected_recent_window_turn_floor",
+                "fallback_selected_recent_window_item_cap",
+                "fallback_selected_recent_window_char_cap",
+                "evidence_fact_item_cap",
+                "evidence_fact_char_cap",
+                "evidence_fact_floor",
+                "session_summary_char_cap",
+                "answer_anchor_item_cap",
+                "answer_anchor_char_cap",
+                "forward_intent_item_cap",
+                "forward_intent_char_cap",
+                "reference_continuity_item_cap",
+                "reference_continuity_char_cap",
+                "reference_continuity_item_floor",
                 "max_lag_events_for_inline_delta",
                 "max_delta_repair_events",
+                "policy_ref",
             }
         ),
         context=context,
     )
     return MemoryProjectionConfig(
-        max_pinned_items=_require_positive_int_field(record, field_name="max_pinned_items", context=context),
-        max_evidence_backed_facts=_require_positive_int_field(record, field_name="max_evidence_backed_facts", context=context),
-        max_working_assumptions=_require_positive_int_field(record, field_name="max_working_assumptions", context=context),
-        recent_raw_turns_floor=_require_non_negative_int_field(record, field_name="recent_raw_turns_floor", context=context),
-        raw_turn_context_ratio=_require_float_field(record, field_name="raw_turn_context_ratio", context=context),
-        raw_turn_size_floor=_require_positive_int_field(record, field_name="raw_turn_size_floor", context=context),
-        raw_turn_size_cap=_require_positive_int_field(record, field_name="raw_turn_size_cap", context=context),
-        history_pool_context_ratio=_require_float_field(record, field_name="history_pool_context_ratio", context=context),
-        history_pool_size_floor=_require_positive_int_field(record, field_name="history_pool_size_floor", context=context),
-        history_pool_size_cap=_require_positive_int_field(record, field_name="history_pool_size_cap", context=context),
-        stable_layer_context_ratio=_require_float_field(record, field_name="stable_layer_context_ratio", context=context),
-        stable_layer_size_floor=_require_positive_int_field(record, field_name="stable_layer_size_floor", context=context),
-        stable_layer_size_cap=_require_positive_int_field(record, field_name="stable_layer_size_cap", context=context),
+        context_window_size=_require_positive_int_field(record, field_name="context_window_size", context=context),
+        selected_recent_window_item_cap=_require_positive_int_field(record, field_name="selected_recent_window_item_cap", context=context),
+        selected_recent_window_char_cap=_require_positive_int_field(record, field_name="selected_recent_window_char_cap", context=context),
+        selected_recent_window_turn_floor=_require_non_negative_int_field(record, field_name="selected_recent_window_turn_floor", context=context),
+        fallback_selected_recent_window_item_cap=_require_positive_int_field(record, field_name="fallback_selected_recent_window_item_cap", context=context),
+        fallback_selected_recent_window_char_cap=_require_positive_int_field(record, field_name="fallback_selected_recent_window_char_cap", context=context),
+        evidence_fact_item_cap=_require_positive_int_field(record, field_name="evidence_fact_item_cap", context=context),
+        evidence_fact_char_cap=_require_positive_int_field(record, field_name="evidence_fact_char_cap", context=context),
+        evidence_fact_floor=_require_non_negative_int_field(record, field_name="evidence_fact_floor", context=context),
+        session_summary_char_cap=_require_positive_int_field(record, field_name="session_summary_char_cap", context=context),
+        answer_anchor_item_cap=_require_positive_int_field(record, field_name="answer_anchor_item_cap", context=context),
+        answer_anchor_char_cap=_require_positive_int_field(record, field_name="answer_anchor_char_cap", context=context),
+        forward_intent_item_cap=_require_positive_int_field(record, field_name="forward_intent_item_cap", context=context),
+        forward_intent_char_cap=_require_positive_int_field(record, field_name="forward_intent_char_cap", context=context),
+        reference_continuity_item_cap=_require_positive_int_field(record, field_name="reference_continuity_item_cap", context=context),
+        reference_continuity_char_cap=_require_positive_int_field(record, field_name="reference_continuity_char_cap", context=context),
+        reference_continuity_item_floor=_require_non_negative_int_field(record, field_name="reference_continuity_item_floor", context=context),
         max_lag_events_for_inline_delta=_require_non_negative_int_field(record, field_name="max_lag_events_for_inline_delta", context=context),
         max_delta_repair_events=_require_non_negative_int_field(record, field_name="max_delta_repair_events", context=context),
+        policy_ref=_require_str_field(record, field_name="policy_ref", context=context),
     )
 
 

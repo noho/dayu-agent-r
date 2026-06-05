@@ -38,7 +38,7 @@ from dayu.host.api import (
     RunStatus,
     SourceRunRelation,
 )
-from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -125,11 +125,17 @@ from dayu.host.memory_repair import (
     rebuild_conversation_memory_projection,
 )
 from dayu.host._event_payload import payload_object as _payload_object
-from dayu.host.compact_artifact import (
-    CompactArtifactStore,
-    CompactArtifactWriteRequest,
+from dayu.host.compact_payload import (
+    COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
+    COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+    accepted_evidence_mapping_refs,
+    accepted_evidence_mapping_refs_for_candidate,
+    compact_artifact_descriptor_metadata_vnext,
+    compact_artifact_json_vnext,
+    compact_artifact_payload_ref,
+    prompt_local_label_mapping_refs,
+    source_boundary_refs,
 )
-from dayu.host.compact_payload import preserved_canonical_evidence_refs
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
     build_compact_material_pack,
@@ -138,15 +144,16 @@ from dayu.host.compact_material import (
     selected_material_source_refs,
 )
 from dayu.host.compaction import (
-    CompactQualityCheckResult,
+    CompactQualityCheckResultVNext,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactSegmentTrigger,
-    CompactionCandidate,
     CompactionRequest,
+    ConversationCompactOutputVNext,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
+    CompactionOperationResult,
     run_compaction_operation,
 )
 from dayu.host.context_budget import (
@@ -183,6 +190,7 @@ from dayu.host.context_events import (
 )
 from dayu.host.context_policy import ContextBudgetPolicy, ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
     DefaultToolRuntimeFactory,
@@ -1239,6 +1247,13 @@ class HostDispatchScheduler:
                 request=pending.request,
                 candidate=result.accepted_candidate,
                 quality=result.quality_result,
+                operation_id=pending.operation_id,
+                accepted_attempt_number=_accepted_attempt_number(result),
+                budget_after_compact=(
+                    result.budget_after_attempted_compact
+                    if result.budget_after_attempted_compact is not None
+                    else pending.estimate.estimated_input_tokens
+                ),
             )
             return _ProactiveCompactionExecutionResult(
                 compacted_event_sequence=compacted_sequence,
@@ -1523,8 +1538,11 @@ class HostDispatchScheduler:
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
         request: CompactionRequest,
-        candidate: CompactionCandidate,
-        quality: CompactQualityCheckResult,
+        candidate: ConversationCompactOutputVNext,
+        quality: CompactQualityCheckResultVNext,
+        operation_id: str,
+        accepted_attempt_number: int,
+        budget_after_compact: int,
     ) -> int:
         """写入 accepted compact artifact 与 ``CONTEXT_COMPACTED`` fact。
 
@@ -1533,34 +1551,51 @@ class HostDispatchScheduler:
         :param estimate: compact 前预算估算。
         :param decision: 触发 compact 的预算决策。
         :param request: Host compaction request。
-        :param candidate: accepted compaction candidate。
-        :param quality: accepted quality check 结果。
+        :param candidate: accepted vNext compaction candidate。
+        :param quality: accepted vNext quality check 结果。
+        :param operation_id: requested event id。
+        :param accepted_attempt_number: accepted operation attempt number。
+        :param budget_after_compact: Host 估算的 compact 后预算。
         :returns: ``CONTEXT_COMPACTED`` event sequence。
         """
 
         artifact_root = self._local_execution.compact_artifact_root
         if artifact_root is None:
             raise RuntimeError("compact artifact root is missing")
-        artifact = CompactArtifactStore(
-            LocalArtifactStore(
-                artifact_root,
-                create_artifact_root=(self._local_execution.compact_artifact_create_parent_dirs),
-            )
-        ).write_compact_artifact(
+        policy_digest = sha256_digest_json(
+            {
+                "policy_ref": (
+                    self._local_execution.context_budget_policy.policy_ref
+                    if self._local_execution.context_budget_policy is not None
+                    else "none"
+                )
+            }
+        )
+        artifact_ref = LocalArtifactStore(
+            artifact_root,
+            create_artifact_root=(self._local_execution.compact_artifact_create_parent_dirs),
+        ).write_artifact_bytes(
+            canonical_json_dumps(
+                compact_artifact_json_vnext(
+                    request=request,
+                    candidate=candidate,
+                    quality=quality,
+                    policy_digest=policy_digest,
+                    budget_after_compact=budget_after_compact,
+                )
+            ).encode("utf-8")
+        )
+        payload_ref = compact_artifact_payload_ref(artifact_ref.artifact_digest)
+        descriptor = PayloadStore().write_payload_descriptor_for_artifact(
             transaction,
-            CompactArtifactWriteRequest(
-                compaction_request=request,
-                accepted_candidate=candidate,
-                quality_result=quality,
-                policy_digest=sha256_digest_json(
-                    {
-                        "policy_ref": (
-                            self._local_execution.context_budget_policy.policy_ref
-                            if self._local_execution.context_budget_policy is not None
-                            else "none"
-                        )
-                    }
-                ),
+            payload_ref,
+            artifact_ref,
+            COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
+            compact_artifact_descriptor_metadata_vnext(
+                request=request,
+                candidate=candidate,
+                artifact_digest=artifact_ref.artifact_digest,
+                policy_digest=policy_digest,
             ),
         )
         event = self._event_log_store.append_event(
@@ -1581,10 +1616,17 @@ class HostDispatchScheduler:
                 policy_decision=None,
                 reason={"decision": decision.value},
                 payload_json=build_context_compacted_payload(
-                    compact_artifact_ref=artifact.payload_descriptor.payload_ref,
-                    compact_artifact_digest=artifact.artifact_ref.artifact_digest,
+                    operation_id=operation_id,
+                    accepted_attempt_number=accepted_attempt_number,
+                    compact_artifact_ref=descriptor.payload_ref,
+                    compact_artifact_digest=artifact_ref.artifact_digest,
                     accepted_candidate=candidate,
                     quality_check_result=quality,
+                    budget_after_compact=budget_after_compact,
+                    prompt_local_label_mapping_refs=prompt_local_label_mapping_refs(request),
+                    source_boundary_refs=source_boundary_refs(request),
+                    accepted_evidence_mapping_refs=accepted_evidence_mapping_refs_for_candidate(request, candidate),
+                    projection_signal=COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -1806,8 +1848,8 @@ class HostDispatchScheduler:
             material_blocks=material_blocks,
             current_input_ref=run.input_event_id,
             input_cursor=run.input_event_sequence,
-            recent_raw_turns_floor=(
-                self._local_execution.memory_projection_policy.recent_raw_turns_floor
+            selected_recent_window_turn_floor=(
+                self._local_execution.memory_projection_policy.selected_recent_window_turn_floor
             ),
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
         )
@@ -1921,15 +1963,15 @@ class HostDispatchScheduler:
                 client_request_id=None,
                 idempotency_key=None,
                 policy_decision=None,
-                reason={"failure_category": rejected.failure_category},
+                reason={"failure_category": rejected.failure_category.value},
                 payload_json=build_context_compaction_attempt_rejected_payload(
                     operation_id=operation_id,
                     attempt_number=rejected.attempt_number,
-                    failure_category=rejected.failure_category,
+                    failure_category=rejected.failure_category.value,
                     repairable=rejected.repairable,
                     runner_attempt_summary_refs=(rejected.runner_attempt_summary_refs),
                     diagnostic_refs=rejected.diagnostic_refs,
-                    next_policy_decision=rejected.next_policy_decision,
+                    next_policy_decision=rejected.next_policy_decision.value,
                     budget_after_attempted_compact=(rejected.budget_after_attempted_compact),
                 ),
                 payload_ref=None,
@@ -1983,28 +2025,32 @@ class HostDispatchScheduler:
             len(self._active_tasks),
             len(self._active_handles),
         )
-        heartbeat_task = self._heartbeat_task
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            await _suppress_task_cancel(heartbeat_task)
-        task = self._drain_task
-        if task is not None:
-            task.cancel()
-            await _suppress_task_cancel(task)
-        promotion_task = self._promotion_drain_task
-        if promotion_task is not None:
-            promotion_task.cancel()
-            await _suppress_task_cancel(promotion_task)
-        self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
-        for active_task in tuple(self._active_tasks):
-            active_task.cancel()
-            await _suppress_task_cancel(active_task)
-        for active_handle in tuple(self._active_handles):
-            await _safe_close_worker_handle(active_handle)
-            self._active_handles.discard(active_handle)
-        self._active_registry.clear()
-        await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
-        self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
+        try:
+            heartbeat_task = self._heartbeat_task
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await _suppress_task_cancel(heartbeat_task)
+            task = self._drain_task
+            if task is not None:
+                task.cancel()
+                await _suppress_task_cancel(task)
+            promotion_task = self._promotion_drain_task
+            if promotion_task is not None:
+                promotion_task.cancel()
+                await _suppress_task_cancel(promotion_task)
+            self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
+            for active_task in tuple(self._active_tasks):
+                active_task.cancel()
+                await _suppress_task_cancel(active_task)
+            for active_handle in tuple(self._active_handles):
+                await _safe_close_worker_handle(active_handle)
+                self._active_handles.discard(active_handle)
+            self._active_registry.clear()
+            await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
+            self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
+        except Exception:
+            self._close_cleanup_done = True
+            raise
         self._close_cleanup_done = True
         _LOGGER.info(
             "dispatch.scheduler.close_done host_handle_id=%s",
@@ -2279,7 +2325,6 @@ class HostDispatchScheduler:
             if dispatching_row is None:
                 await _safe_release_lane_token(token)
                 return "skipped"
-            await asyncio.sleep(0)
             if not self._dispatch_record_still_pre_accept(dispatching_row):
                 await _safe_release_lane_token(token)
                 return "skipped"
@@ -3625,12 +3670,22 @@ def _proactive_represented_evidence_refs(
         max_checkpoint_event_sequence=run.input_event_sequence,
     )
     if snapshot_row is not None:
-        for fact in snapshot_row.snapshot.evidence_backed_facts:
+        for fact in snapshot_row.snapshot.evidence_fact_memory.evidence_backed_facts:
             refs.extend(fact.evidence_refs)
     compacted = _latest_session_compacted_event_before_input(transaction, event_log_store, run=run)
     if compacted is not None:
-        refs.extend(preserved_canonical_evidence_refs(_payload_object(compacted)))
+        refs.extend(accepted_evidence_mapping_refs(_payload_object(compacted)))
     return tuple(dict.fromkeys(refs))
+
+
+def _accepted_attempt_number(result: CompactionOperationResult) -> int:
+    """返回 accepted candidate 对应的 operation attempt number。
+
+    :param result: compaction operation result。
+    :returns: accepted attempt number。
+    """
+
+    return len(result.rejected_attempts) + 1
 
 
 def _latest_session_compacted_event_before_input(

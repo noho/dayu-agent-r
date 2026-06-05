@@ -1,7 +1,7 @@
 # 大愚 Agent — 用户手册
 
 `大愚 Agent` 是每个投资者的助理分析师。  
-- `大愚 Agent` 是一个面向买方财报分析场景的 Agent 系统，但它不是简单的功能组合，`大愚 Agent` 让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有置信度，让投资结论、投资报告可审计、可追踪。  
+- `大愚 Agent` 是一个生产级通用 Agent 系统，具备买方财报分析能力；它不是简单的功能组合，`大愚 Agent` 让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有置信度，让投资结论、投资报告可审计、可追踪。
 - `大愚 Agent` 的 Host 层提供 Session / Run / Attempt / EventLog、admission、dispatch、tool governance、memory / context governance 与 recovery 治理能力。
 
 当前你可以用它完成四类工作：
@@ -32,7 +32,7 @@
   - 普通文件（非财报文件）信息提取还需要优化。
   - 优化 Fins 里的港股/A股/美股财报信息提取。
   - Anthropic 原生 API 支持。
-  - Durable memory / Retrieval layer（ Memory只实现了working memory 和 episode summary ）。
+  - Durable memory / Retrieval layer（Memory 已落地五类 session memory：Trace、Evidence / Fact、Session Summary、Answer Anchor、Forward Intent）。
   - FMP 工具尚未实现。
   - 更多LLM 工具。
 
@@ -948,7 +948,7 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 
 ### 5.1 Host public 多轮闭环 smoke
 
-`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 runtime location resolver 解析 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。默认每次运行使用 fresh session slot；需要复用同一个 durable session 时显式加 `--reuse-session`。
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace，避免历史 durable DB schema 污染；需要复用已有 workspace 时显式传 `--workspace-root`。脚本使用 runtime location resolver 解析所选 workspace 的 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。默认每次运行使用 fresh session slot；需要在同一个 durable session 内复用时显式加 `--workspace-root` 和 `--reuse-session`。
 
 ```bash
 source .venv/bin/activate
@@ -982,7 +982,7 @@ python utils/smoke_host_public_multiturn.py --log-level DEBUG
 
 ### 5.2 Host public 财报对话记忆 smoke
 
-`utils/smoke_host_public_conversation_memory.py` 用于人工验证同一个 Host public session 中，mock 财报工具确认过的招商银行 2024H1 息差事实能在后续禁用工具的轮次中保持一致。脚本只使用 public Host handle，不读取 durable store、EventLog、memory 表或 compact payload 内容；mock tool 为 `get_mock_finance_facts`，不会调用真实 Fins 工具。
+`utils/smoke_host_public_conversation_memory.py` 用于人工验证同一个 Host public session 中，mock 财报工具确认过的招商银行 2024H1 息差事实能在后续禁用工具的轮次中保持一致。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace；显式传 `--workspace-root` 时才复用指定 workspace。脚本只使用 public Host handle，不读取 durable store、EventLog、memory 表或 compact payload 内容；mock tool 为 `get_mock_finance_facts`，不会调用真实 Fins 工具。
 
 ```bash
 source .venv/bin/activate
@@ -993,7 +993,7 @@ python utils/smoke_host_public_conversation_memory.py --log-level VERBOSE
 
 ### 5.3 Host public 财报对话记忆场景 smoke
 
-`utils/smoke_host_public_conversation_memory_scenarios.py` 用于人工验证同一个 Host public session 中，多组 mock 财报事实在干扰、上下文压力和长轮次下的 public answer continuity。脚本默认运行 `--suite core`；`--suite long` 需要显式指定，用于长轮次稳定性观察；`--suite all` 会同时运行 core 与 long 场景。
+`utils/smoke_host_public_conversation_memory_scenarios.py` 用于人工验证同一个 Host public session 中，多组 mock 财报事实在干扰、上下文压力和长轮次下的 public answer continuity。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace；显式传 `--workspace-root` 时才复用指定 workspace。脚本默认运行 `--suite core`；`--suite long` 需要显式指定，用于长轮次稳定性观察；`--suite all` 会同时运行 core 与 long 场景。
 
 ```bash
 source .venv/bin/activate

@@ -995,21 +995,29 @@ def _memory_projection_policy_from_config(
     policy = execution_profile.memory_projection_policy
     return MemoryProjectionPolicy(
         context_window_size=context_window_size,
-        max_pinned_items=policy.max_pinned_items,
-        max_evidence_backed_facts=policy.max_evidence_backed_facts,
-        max_working_assumptions=policy.max_working_assumptions,
-        recent_raw_turns_floor=policy.recent_raw_turns_floor,
-        raw_turn_context_ratio=policy.raw_turn_context_ratio,
-        raw_turn_size_floor=policy.raw_turn_size_floor,
-        raw_turn_size_cap=policy.raw_turn_size_cap,
-        history_pool_context_ratio=policy.history_pool_context_ratio,
-        history_pool_size_floor=policy.history_pool_size_floor,
-        history_pool_size_cap=policy.history_pool_size_cap,
-        stable_layer_context_ratio=policy.stable_layer_context_ratio,
-        stable_layer_size_floor=policy.stable_layer_size_floor,
-        stable_layer_size_cap=policy.stable_layer_size_cap,
+        selected_recent_window_item_cap=policy.selected_recent_window_item_cap,
+        selected_recent_window_char_cap=policy.selected_recent_window_char_cap,
+        selected_recent_window_turn_floor=policy.selected_recent_window_turn_floor,
+        fallback_selected_recent_window_item_cap=(
+            policy.fallback_selected_recent_window_item_cap
+        ),
+        fallback_selected_recent_window_char_cap=(
+            policy.fallback_selected_recent_window_char_cap
+        ),
+        evidence_fact_item_cap=policy.evidence_fact_item_cap,
+        evidence_fact_char_cap=policy.evidence_fact_char_cap,
+        evidence_fact_floor=policy.evidence_fact_floor,
+        session_summary_char_cap=policy.session_summary_char_cap,
+        answer_anchor_item_cap=policy.answer_anchor_item_cap,
+        answer_anchor_char_cap=policy.answer_anchor_char_cap,
+        forward_intent_item_cap=policy.forward_intent_item_cap,
+        forward_intent_char_cap=policy.forward_intent_char_cap,
+        reference_continuity_item_cap=policy.reference_continuity_item_cap,
+        reference_continuity_char_cap=policy.reference_continuity_char_cap,
+        reference_continuity_item_floor=policy.reference_continuity_item_floor,
         max_lag_events_for_inline_delta=policy.max_lag_events_for_inline_delta,
         max_delta_repair_events=policy.max_delta_repair_events,
+        policy_ref=policy.policy_ref,
     )
 
 

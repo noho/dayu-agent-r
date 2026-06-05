@@ -3,18 +3,46 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import ClassVar, TypeVar, cast
 
 import pytest
 
 import dayu.host.memory_repair as memory_repair
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogRow,
+    append_event,
+)
+from dayu.host.durable.memory import MemorySnapshotRow, read_latest_memory_snapshot
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.projection import (
+    ProjectionCheckpointRow,
+    read_projection_checkpoint,
+)
 from dayu.host.durable.transaction import (
     AfterCommitCallback,
     HostTransaction,
     HostTransactionRunner,
 )
-from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
-from dayu.host.projection import ProjectionConsumerId, ProjectionRunResult
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    MemoryProjectionPolicy,
+    default_memory_projection_policy,
+    digest_memory_projection_policy,
+)
+from dayu.host.projection import (
+    ProjectionConsumerId,
+    ProjectionRunResult,
+    ProjectionRunner as RealProjectionRunner,
+)
 
 T = TypeVar("T")
 
@@ -346,3 +374,175 @@ def test_catchup_port_delegates_to_catch_up_function(
     port.catch_up_projection()
 
     assert calls == [(4, "memory.port")]
+
+
+def test_catch_up_uses_real_durable_store_and_writes_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """catch-up 在真实 durable store 上写入 memory snapshot 与 checkpoint。"""
+
+    monkeypatch.setattr(memory_repair, "ProjectionRunner", RealProjectionRunner)
+    policy = _policy()
+    options = _options(tmp_path / "durable.sqlite3", tmp_path / "artifacts")
+    with open_host_durable_store(options) as store:
+        first_event = store.transaction_runner.run_write(
+            _AppendMemoryEventOperation(
+                event_id="event-memory-repair-1",
+                display_text="第一轮用户问题",
+            )
+        )
+        second_event = store.transaction_runner.run_write(
+            _AppendMemoryEventOperation(
+                event_id="event-memory-repair-2",
+                display_text="第二轮用户问题",
+            )
+        )
+
+        result = memory_repair.catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=2,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        )
+        snapshot_row = store.transaction_runner.run_read(
+            _ReadLatestMemorySnapshotOperation(policy)
+        )
+        checkpoint = store.transaction_runner.run_read(
+            _ReadMemoryCheckpointOperation()
+        )
+
+        assert first_event.event_sequence < second_event.event_sequence
+        assert result.reset_checkpoint is False
+        assert result.events_scanned == 2
+        assert result.events_matched == 2
+        assert result.events_applied == 2
+        assert result.failures == 0
+        assert result.finished_cursor == second_event.event_sequence
+        assert snapshot_row is not None
+        assert (
+            snapshot_row.snapshot.cursor.checkpoint_event_sequence
+            == second_event.event_sequence
+        )
+        assert tuple(
+            item.text
+            for item in snapshot_row.snapshot.trace_memory.selected_recent_window
+        ) == ("第一轮用户问题", "第二轮用户问题")
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == second_event.event_sequence
+        assert checkpoint.checkpoint_event_id == second_event.event_id
+
+
+class _AppendMemoryEventOperation:
+    """追加 USER_INPUT_ACCEPTED 事件的真实 durable operation。
+
+    :param event_id: EventLog event id。
+    :param display_text: memory projection 可读文本。
+    """
+
+    def __init__(self, *, event_id: str, display_text: str) -> None:
+        """初始化 append operation。
+
+        :param event_id: EventLog event id。
+        :param display_text: 用户可见文本。
+        :returns: ``None``。
+        """
+
+        self._event_id = event_id
+        self._display_text = display_text
+
+    def __call__(self, transaction: HostTransaction) -> EventLogRow:
+        """追加 canonical memory input event。
+
+        :param transaction: Host durable transaction。
+        :returns: 追加后的 EventLog row。
+        """
+
+        return append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=self._event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id="session-memory-repair",
+                run_id="run-memory-repair",
+                attempt_id=None,
+                execution_id=None,
+                event_type="USER_INPUT_ACCEPTED",
+                occurred_at=datetime(2026, 6, 1, tzinfo=UTC),
+                actor="host",
+                source="memory-repair-test",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={"display_text": self._display_text},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+
+
+class _ReadLatestMemorySnapshotOperation:
+    """读取真实 durable memory 最新 snapshot。
+
+    :param policy: memory projection policy。
+    """
+
+    def __init__(self, policy: MemoryProjectionPolicy) -> None:
+        """初始化读取 operation。
+
+        :param policy: memory projection policy。
+        :returns: ``None``。
+        """
+
+        self._policy = policy
+
+    def __call__(self, transaction: HostTransaction) -> MemorySnapshotRow | None:
+        """读取测试 session 的最新 memory snapshot row。
+
+        :param transaction: Host durable transaction。
+        :returns: snapshot row 或 ``None``。
+        """
+
+        return read_latest_memory_snapshot(
+            transaction,
+            session_id="session-memory-repair",
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy_digest=digest_memory_projection_policy(self._policy),
+        )
+
+
+class _ReadMemoryCheckpointOperation:
+    """读取 memory projection checkpoint 的 durable operation。"""
+
+    def __call__(self, transaction: HostTransaction) -> ProjectionCheckpointRow | None:
+        """读取 memory projection checkpoint。
+
+        :param transaction: Host durable transaction。
+        :returns: checkpoint row 或 ``None``。
+        """
+
+        return read_projection_checkpoint(
+            transaction,
+            CONVERSATION_MEMORY_CONSUMER_ID,
+        )
+
+
+def _options(db_path: Path, artifact_root: Path) -> HostDurableStoreOptions:
+    """构造真实 durable store options。
+
+    :param db_path: SQLite DB 路径。
+    :param artifact_root: artifact 根目录。
+    :returns: durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=db_path,
+        payload_policy=PayloadStoragePolicy(artifact_root=artifact_root),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=3.0,
+            write_busy_retry_count=80,
+            write_retry_initial_delay_seconds=0.002,
+            write_retry_backoff_multiplier=1.2,
+            write_retry_max_delay_seconds=0.03,
+        ),
+    )

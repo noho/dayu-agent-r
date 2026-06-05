@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from dayu.host.compact_material import (
     CompactMemorySnapshotRepairRequired,
     DuplicateMaterialSectionOwnerError,
     EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
+    InitialEvidenceMaterial,
+    InitialHistoryMaterial,
     InlineDeltaRepairMaterialView,
     RunInputMaterialBlock,
+    build_initial_material_pack,
     build_compact_material_pack,
     check_compact_memory_snapshot_cursor,
+    conversation_compact_input_vnext_from_material_pack,
     prompt_local_evidence_map,
     run_input_material_block,
     select_compact_segment,
@@ -23,12 +29,26 @@ from dayu.host.compaction import (
 )
 from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.memory import (
+    AnswerAnchor,
+    AnswerAnchorChild,
     CONVERSATION_MEMORY_CONSUMER_ID,
-    ConversationContinuityView,
-    ConversationMemorySnapshot,
+    ConversationMemorySnapshotVNext,
+    EvidenceFactMemoryView,
+    ForwardIntent,
+    ForwardIntentMemoryView,
+    MemoryEvidenceBackedFactKind,
+    EvidenceBackedFactView,
+    MemoryIncludedReason,
+    MemoryRepairReason,
     MemoryProjectionPolicy,
+    MemoryProducerKind,
+    MemoryProvenanceRef,
+    ReferenceContinuityItem,
+    MemorySizeUnits,
     MemorySnapshotCursor,
-    PinnedStateView,
+    AnswerAnchorMemoryView,
+    SessionSummaryMemoryView,
+    TraceMemoryView,
     calculate_memory_snapshot_digest,
     digest_memory_projection_policy,
 )
@@ -81,7 +101,7 @@ def test_proactive_segment_excludes_current_anchor_and_recent_raw_floor() -> Non
         memory_snapshot_cursor=3,
         policy_digest=_POLICY_DIGEST,
         material_blocks=blocks,
-        recent_raw_turns_floor=1,
+        selected_recent_window_turn_floor=1,
     )
 
     assert selection.selected_block_ids == ("history-old",)
@@ -146,8 +166,8 @@ def test_already_represented_blocks_are_not_reexpanded() -> None:
     )
 
 
-def test_material_pack_one_to_one_section_mapping_rejects_duplicate_content() -> None:
-    """同一 canonical source ref set + digest 不能进入两个 LLM-facing section。"""
+def test_vnext_snapshot_does_not_bridge_old_goal_into_previous_view() -> None:
+    """vNext snapshot 不把旧 goal bridge 成 previous compacted view block。"""
 
     snapshot = _snapshot_with_goal(
         snapshot_id="snapshot-duplicate",
@@ -156,8 +176,8 @@ def test_material_pack_one_to_one_section_mapping_rejects_duplicate_content() ->
     )
     duplicate = run_input_material_block(
         block_id="history-duplicate",
-        section=CompactMaterialSection.HISTORY_INPUT,
-        kind=CompactMaterialBlockKind.RAW_USER_TURN,
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
         text="current_goal=same goal",
         canonical_source_refs=("snapshot-duplicate",),
         event_sequence=1,
@@ -170,10 +190,63 @@ def test_material_pack_one_to_one_section_mapping_rejects_duplicate_content() ->
         material_blocks=(duplicate,),
     )
 
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(duplicate,),
+        memory_snapshot=snapshot,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+
+    assert tuple(block.text for block in pack.trace_material) == (
+        "current_goal=same goal",
+    )
+    assert pack.current_input_anchor.anchor_text == "current input"
+
+
+def test_duplicate_section_owner_raises_for_vnext_previous_and_trace_material() -> None:
+    """同一 canonical content 进入两个 LLM-facing section 时必须抛错。"""
+
+    snapshot_without_digest = replace(
+        _empty_snapshot(
+            "snapshot-duplicate-owner",
+            checkpoint_event_sequence=2,
+        ),
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text="duplicate readable content",
+            source_refs=("event:summary",),
+            event_id="event-summary",
+            event_sequence=2,
+            size_units=MemorySizeUnits(26),
+        ),
+        snapshot_digest="pending",
+    )
+    snapshot = replace(
+        snapshot_without_digest,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+    duplicate_trace_block = run_input_material_block(
+        block_id="history-duplicate-owner",
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
+        text="duplicate readable content",
+        canonical_source_refs=("snapshot-duplicate-owner",),
+        event_sequence=1,
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=2,
+        memory_snapshot_cursor=2,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(duplicate_trace_block,),
+        selected_recent_window_turn_floor=0,
+    )
+
     with pytest.raises(DuplicateMaterialSectionOwnerError):
         build_compact_material_pack(
             selected_segment=selection,
-            material_blocks=(duplicate,),
+            material_blocks=(duplicate_trace_block,),
             memory_snapshot=snapshot,
             inline_delta_repair_view=None,
             current_input_ref="event-current",
@@ -186,8 +259,8 @@ def test_current_input_anchor_does_not_duplicate_history_raw_turn() -> None:
 
     current_history = run_input_material_block(
         block_id="history-current",
-        section=CompactMaterialSection.HISTORY_INPUT,
-        kind=CompactMaterialBlockKind.RAW_USER_TURN,
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
         text="current input",
         canonical_source_refs=("event-current",),
         event_sequence=5,
@@ -211,7 +284,255 @@ def test_current_input_anchor_does_not_duplicate_history_raw_turn() -> None:
     )
 
     assert pack.current_input_anchor.anchor_text == "current input"
-    assert tuple(block.text for block in pack.history_input) == ("old input",)
+    assert tuple(block.text for block in pack.trace_material) == ("old input",)
+
+
+def test_conversation_compact_input_vnext_maps_material_without_citable_current_anchor() -> None:
+    """vNext material input 使用新顶层 section，current input readable but not citable。"""
+
+    pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="current input",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-user-old",
+                text="old input",
+                kind=CompactMaterialBlockKind.USER_INPUT,
+            ),
+            InitialHistoryMaterial(
+                canonical_source_ref="event-answer-old",
+                text="old answer",
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            ),
+        ),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted",
+                accepted_evidence_id="evidence:accepted",
+                tool_result_event_ref="event-tool-result",
+                tool_call_event_ref="event-tool-call",
+                readable_tool_name="fins.search",
+                readable_query_text="query",
+                raw_result_text="accepted evidence text",
+                readable_source_text="source note",
+                payload_refs=("payload:accepted",),
+            ),
+        ),
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    vnext_json = vnext_input.to_json()
+
+    assert vnext_input.current_input_anchor.anchor_label == "C1"
+    assert "C1" not in vnext_input.citable_source_labels
+    assert tuple(item.source_label for item in vnext_input.trace_material) == ("T1",)
+    assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
+    assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    assert isinstance(vnext_json, dict)
+    assert "trace_material" in vnext_json
+    assert "stable_input" not in vnext_json
+    assert "history_input" not in vnext_json
+    assert "evidence_input" not in vnext_json
+
+
+def test_conversation_compact_input_vnext_maps_user_turn_to_trace() -> None:
+    """vNext material 映射必须把 user turn 放入 trace_material。"""
+
+    pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="current input",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-user-old",
+                text="old user input",
+                kind=CompactMaterialBlockKind.USER_INPUT,
+            ),
+            InitialHistoryMaterial(
+                canonical_source_ref="event-answer-old",
+                text="old assistant answer",
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            ),
+        ),
+        evidence_materials=(),
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    assert tuple(item.text for item in vnext_input.trace_material) == ("old user input",)
+    assert tuple(item.source_label for item in vnext_input.trace_material) == ("T1",)
+
+
+def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> None:
+    """vNext material 映射必须把 assistant turn 放入 answer_material。"""
+
+    pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="current input",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-user-old",
+                text="old user input",
+                kind=CompactMaterialBlockKind.USER_INPUT,
+            ),
+            InitialHistoryMaterial(
+                canonical_source_ref="event-answer-old",
+                text="old assistant answer",
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            ),
+        ),
+        evidence_materials=(),
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    assert tuple(item.answer_text for item in vnext_input.answer_material) == (
+        "old assistant answer",
+    )
+    assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
+
+
+def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -> None:
+    """vNext material 映射必须把 accepted evidence 放入 evidence_material。"""
+
+    pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="current input",
+        history_materials=(),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted",
+                accepted_evidence_id="evidence:accepted",
+                tool_result_event_ref="event-tool-result",
+                tool_call_event_ref="event-tool-call",
+                readable_tool_name="fins.search",
+                readable_query_text="revenue query",
+                raw_result_text="accepted evidence text",
+                readable_source_text="source note",
+                payload_refs=("payload:accepted",),
+            ),
+        ),
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    assert tuple(item.response_text for item in vnext_input.evidence_material) == (
+        "accepted evidence text",
+    )
+    assert tuple(item.tool_name for item in vnext_input.evidence_material) == (
+        "fins.search",
+    )
+
+
+def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> None:
+    """vNext previous view 必须映射五类 stable memory blocks。"""
+
+    snapshot = _snapshot_with_stable_blocks(
+        snapshot_id="snapshot-stable-blocks",
+        checkpoint_event_sequence=2,
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=2,
+        memory_snapshot_cursor=2,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(),
+    )
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(),
+        memory_snapshot=snapshot,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    previous_view = vnext_input.previous_compacted_view
+    assert previous_view is not None
+    assert previous_view.session_summary == "summary text"
+    assert tuple(
+        item.claim_text
+        for item in previous_view.evidence_backed_facts
+    ) == (
+        "fact=claim_text=Revenue increased year over year; "
+        "evidence_refs=evidence:accepted; evidence_kind=derived_from_evidence",
+    )
+    assert tuple(
+        item.anchor_title for item in previous_view.answer_anchors
+    ) == ("answer title",)
+    assert tuple(
+        item.anchor_items[0].display_text
+        for item in previous_view.answer_anchors
+    ) == ("answer title",)
+    assert tuple(item.text for item in previous_view.forward_intents) == (
+        "follow up",
+    )
+    assert tuple(item.intent_type.value for item in previous_view.forward_intents) == (
+        "next_step_note",
+    )
+    assert tuple(item.status.value for item in previous_view.forward_intents) == (
+        "open",
+    )
+    assert tuple(item.text for item in previous_view.reference_continuity_items) == (
+        "second factor",
+    )
+    assert tuple(
+        item.reason.value for item in previous_view.reference_continuity_items
+    ) == ("local_reference",)
+
+
+def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> None:
+    """vNext trace material 必须包含用户可见 Run 状态。"""
+
+    pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="current input",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-state",
+                text="run is waiting for user confirmation",
+                kind=CompactMaterialBlockKind.USER_VISIBLE_RUN_STATE,
+            ),
+        ),
+        evidence_materials=(),
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    assert tuple(item.text for item in vnext_input.trace_material) == (
+        "run is waiting for user confirmation",
+    )
+    assert tuple(item.trace_kind.value for item in vnext_input.trace_material) == (
+        "user_visible_run_state",
+    )
+
+
+def test_conversation_compact_input_vnext_current_anchor_not_citable() -> None:
+    """vNext material 映射必须保持 current_input_anchor readable but not citable。"""
+
+    pack = build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="current input",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-user-old",
+                text="old user input",
+                kind=CompactMaterialBlockKind.USER_INPUT,
+            ),
+        ),
+        evidence_materials=(),
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    assert vnext_input.current_input_anchor.anchor_label == "C1"
+    assert vnext_input.current_input_anchor.text == "current input"
+    assert "C1" not in vnext_input.citable_source_labels
+    current_anchor_section = vnext_input.source_section("C1")
+    assert current_anchor_section is not None
+    assert current_anchor_section.value == "current_input_anchor"
 
 
 def test_snapshot_cursor_lag_requires_catchup_or_inline_delta() -> None:
@@ -244,6 +565,26 @@ def test_snapshot_cursor_lag_requires_catchup_or_inline_delta() -> None:
     assert exc_info.value.repair_request.reason.value == "snapshot_lag_over_threshold"
     assert result.snapshot.cursor.checkpoint_event_sequence == 4
     assert result.inline_delta_repair_view is not None
+
+
+def test_snapshot_cursor_missing_inline_delta_view_has_accurate_reason() -> None:
+    """小滞后但缺少 inline repair view 时不得伪装成大滞后。"""
+
+    lagged = _empty_snapshot("snapshot-lagged", checkpoint_event_sequence=2)
+
+    with pytest.raises(CompactMemorySnapshotRepairRequired) as exc_info:
+        check_compact_memory_snapshot_cursor(
+            session_id=_SESSION_ID,
+            required_event_sequence=4,
+            policy=_policy(max_lag_events_for_inline_delta=2),
+            snapshot=lagged,
+            inline_delta_repair_view=None,
+        )
+
+    assert (
+        exc_info.value.repair_request.reason
+        is MemoryRepairReason.INLINE_DELTA_REPAIR_VIEW_MISSING
+    )
 
 
 def test_snapshot_cursor_inline_delta_uses_inline_lag_threshold_only() -> None:
@@ -359,7 +700,7 @@ def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
     evidence_map = prompt_local_evidence_map(pack)
 
     assert pack.evidence_labels == ("E1.1", "E1.2")
-    assert tuple(block.raw_result_text for block in pack.evidence_input) == (
+    assert tuple(block.raw_result_text for block in pack.evidence_material) == (
         "A" * EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
         "A" * 7,
     )
@@ -389,8 +730,8 @@ def _history_block(
 
     return run_input_material_block(
         block_id=block_id,
-        section=CompactMaterialSection.HISTORY_INPUT,
-        kind=CompactMaterialBlockKind.RAW_USER_TURN,
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
@@ -420,7 +761,7 @@ def _evidence_block(
 
     return run_input_material_block(
         block_id=block_id,
-        section=CompactMaterialSection.EVIDENCE_INPUT,
+        section=CompactMaterialSection.EVIDENCE_MATERIAL,
         kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
@@ -472,32 +813,36 @@ def _policy(
 
     return MemoryProjectionPolicy(
         context_window_size=8192,
-        max_pinned_items=8,
-        max_evidence_backed_facts=16,
-        max_working_assumptions=8,
-        recent_raw_turns_floor=2,
-        raw_turn_context_ratio=0.125,
-        raw_turn_size_floor=256,
-        raw_turn_size_cap=1024,
-        history_pool_context_ratio=0.5,
-        history_pool_size_floor=1024,
-        history_pool_size_cap=4096,
-        stable_layer_context_ratio=0.25,
-        stable_layer_size_floor=512,
-        stable_layer_size_cap=2048,
+        selected_recent_window_item_cap=8,
+        selected_recent_window_char_cap=2048,
+        selected_recent_window_turn_floor=2,
+        fallback_selected_recent_window_item_cap=4,
+        fallback_selected_recent_window_char_cap=1024,
+        evidence_fact_item_cap=16,
+        evidence_fact_char_cap=4096,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=4,
+        answer_anchor_char_cap=1024,
+        forward_intent_item_cap=4,
+        forward_intent_char_cap=1024,
+        reference_continuity_item_cap=4,
+        reference_continuity_char_cap=1024,
+        reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=max_lag_events_for_inline_delta,
         max_delta_repair_events=max_delta_repair_events,
+        policy_ref="compact-material-test",
     )
 
 
 def _empty_snapshot(
     snapshot_id: str, *, checkpoint_event_sequence: int
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造空 memory snapshot。
 
     :param snapshot_id: snapshot id。
     :param checkpoint_event_sequence: cursor sequence。
-    :returns: ConversationMemorySnapshot。
+    :returns: ConversationMemorySnapshotVNext。
     """
 
     cursor = MemorySnapshotCursor(
@@ -510,84 +855,196 @@ def _empty_snapshot(
         ),
         session_id=_SESSION_ID,
     )
-    snapshot_without_digest = ConversationMemorySnapshot(
+    snapshot_without_digest = ConversationMemorySnapshotVNext(
+        schema_version="conversation_memory_snapshot_v1",
         snapshot_id=snapshot_id,
         session_id=_SESSION_ID,
         cursor=cursor,
         policy_digest=digest_memory_projection_policy(
             _policy(max_lag_events_for_inline_delta=16)
         ),
-        pinned_state=PinnedStateView(
-            current_goal=None,
-            confirmed_subjects=(),
-            user_constraints=(),
-            open_questions=(),
+        latest_compaction_event_ref=None,
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(),
+            reference_continuity_items=(),
         ),
-        evidence_backed_facts=(),
-        working_assumptions=(),
-        conversation_continuity=ConversationContinuityView(items=()),
+        evidence_fact_memory=EvidenceFactMemoryView(
+            evidence_backed_facts=(),
+            recent_evidence_items=(),
+        ),
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text=None,
+            source_refs=(),
+            event_id=None,
+            event_sequence=None,
+            size_units=MemorySizeUnits(0),
+        ),
+        answer_anchor_memory=AnswerAnchorMemoryView(anchors=()),
+        forward_intent_memory=ForwardIntentMemoryView(intents=()),
         diagnostics=(),
         built_at=_NOW,
         snapshot_digest="pending",
     )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
+    return replace(
+        snapshot_without_digest,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )
 
 
 def _snapshot_with_goal(
     *, snapshot_id: str, checkpoint_event_sequence: int, current_goal: str
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造带 stable goal 的 memory snapshot。
 
     :param snapshot_id: snapshot id。
     :param checkpoint_event_sequence: cursor sequence。
     :param current_goal: current goal。
-    :returns: ConversationMemorySnapshot。
+    :returns: ConversationMemorySnapshotVNext。
     """
 
     base = _empty_snapshot(
         snapshot_id,
         checkpoint_event_sequence=checkpoint_event_sequence,
     )
-    snapshot_without_digest = ConversationMemorySnapshot(
-        snapshot_id=base.snapshot_id,
-        session_id=base.session_id,
-        cursor=base.cursor,
-        policy_digest=base.policy_digest,
-        pinned_state=PinnedStateView(
-            current_goal=current_goal,
-            confirmed_subjects=(),
-            user_constraints=(),
-            open_questions=(),
+    del current_goal
+    return base
+
+
+def _snapshot_with_goal_and_fact(
+    *,
+    snapshot_id: str,
+    checkpoint_event_sequence: int,
+    current_goal: str,
+    claim_text: str,
+) -> ConversationMemorySnapshotVNext:
+    """构造同时包含非 fact stable block 与 evidence fact 的 snapshot。
+
+    :param snapshot_id: snapshot id。
+    :param checkpoint_event_sequence: cursor sequence。
+    :param current_goal: current goal。
+    :param claim_text: evidence-backed fact claim text。
+    :returns: ConversationMemorySnapshotVNext。
+    """
+
+    base = _snapshot_with_goal(
+        snapshot_id=snapshot_id,
+        checkpoint_event_sequence=checkpoint_event_sequence,
+        current_goal=current_goal,
+    )
+    snapshot_without_digest = replace(
+        base,
+        evidence_fact_memory=EvidenceFactMemoryView(
+            evidence_backed_facts=(
+            EvidenceBackedFactView(
+                item_id="memory-item:fact-test",
+                claim_text=claim_text,
+                evidence_kind=MemoryEvidenceBackedFactKind.DERIVED_FROM_EVIDENCE,
+                evidence_refs=("evidence:accepted",),
+                provenance=MemoryProvenanceRef(
+                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                    producer_name="conversation_memory",
+                    event_id="event-memory-compact",
+                    event_sequence=checkpoint_event_sequence,
+                    run_id="run-memory",
+                    attempt_id=None,
+                    execution_id=None,
+                    tool_result_ref="event-tool-result",
+                    payload_ref="compact-artifact:test",
+                    digest_ref="digest:fact-test",
+                    source_refs=(),
+                ),
+                extraction_operation_ref="event:event-memory-compact",
+                compact_artifact_ref="compact-artifact:test",
+                candidate_id="candidate:fact-test",
+                included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
+                excluded_reason=None,
+                size_units=MemorySizeUnits(units=7),
+            ),
+            ),
+            recent_evidence_items=(),
         ),
-        evidence_backed_facts=(),
-        working_assumptions=(),
-        conversation_continuity=ConversationContinuityView(items=()),
-        diagnostics=(),
-        built_at=base.built_at,
         snapshot_digest="pending",
     )
-    return ConversationMemorySnapshot(
-        snapshot_id=snapshot_without_digest.snapshot_id,
-        session_id=snapshot_without_digest.session_id,
-        cursor=snapshot_without_digest.cursor,
-        policy_digest=snapshot_without_digest.policy_digest,
-        pinned_state=snapshot_without_digest.pinned_state,
-        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
-        working_assumptions=snapshot_without_digest.working_assumptions,
-        conversation_continuity=snapshot_without_digest.conversation_continuity,
-        diagnostics=snapshot_without_digest.diagnostics,
-        built_at=snapshot_without_digest.built_at,
+    return replace(
+        snapshot_without_digest,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def _snapshot_with_stable_blocks(
+    *, snapshot_id: str, checkpoint_event_sequence: int
+) -> ConversationMemorySnapshotVNext:
+    """构造包含五类 stable memory block 的 snapshot。
+
+    :param snapshot_id: snapshot id。
+    :param checkpoint_event_sequence: cursor sequence。
+    :returns: ConversationMemorySnapshotVNext。
+    """
+
+    base = _snapshot_with_goal_and_fact(
+        snapshot_id=snapshot_id,
+        checkpoint_event_sequence=checkpoint_event_sequence,
+        current_goal="unused",
+        claim_text="Revenue increased year over year",
+    )
+    snapshot_without_digest = replace(
+        base,
+        session_summary_memory=SessionSummaryMemoryView(
+            summary_text="summary text",
+            source_refs=("event:summary",),
+            event_id="event-summary",
+            event_sequence=checkpoint_event_sequence,
+            size_units=MemorySizeUnits(12),
+        ),
+        answer_anchor_memory=AnswerAnchorMemoryView(
+            anchors=(
+                AnswerAnchor(
+                    item_id="memory-item:answer-anchor",
+                    anchor_title="answer title",
+                    anchor_items=(
+                        AnswerAnchorChild(
+                            display_text="first point",
+                            ordinal=1,
+                        ),
+                    ),
+                    source_refs=("event:answer",),
+                    event_id="event-answer",
+                    event_sequence=checkpoint_event_sequence,
+                    size_units=MemorySizeUnits(12),
+                ),
+            )
+        ),
+        forward_intent_memory=ForwardIntentMemoryView(
+            intents=(
+                ForwardIntent(
+                    item_id="memory-item:forward-intent",
+                    intent_type="next_step_note",
+                    text="follow up",
+                    status="open",
+                    source_refs=("event:intent",),
+                    event_id="event-intent",
+                    event_sequence=checkpoint_event_sequence,
+                    size_units=MemorySizeUnits(9),
+                ),
+            )
+        ),
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(),
+            reference_continuity_items=(
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity",
+                    text="second factor",
+                    reason="local_reference",
+                    source_refs=("event:reference",),
+                    event_id="event-reference",
+                    event_sequence=checkpoint_event_sequence,
+                    size_units=MemorySizeUnits(13),
+                ),
+            ),
+        ),
+        snapshot_digest="pending",
+    )
+    return replace(
+        snapshot_without_digest,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )

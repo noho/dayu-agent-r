@@ -84,10 +84,35 @@ dayu/config/
 - `run_baseline`：普通 Run 默认 `model_id` 与 `runner_option_hint_id`。
 - `compactor_baseline`：compactor 默认 `model_id`、`scene_id`、`runner_option_hint_id`、`user_prompt_template_path` 与 `artifact_root`。
 - `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
-- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`，其中 `max_evidence_backed_facts` 限制 stable evidence-backed facts 的数量。
+- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 per-section cap / floor 配置，包含 selected recent window、fallback selected recent window、evidence fact、session summary、answer anchor、forward intent、reference continuity、inline delta repair limits 与 `policy_ref`；`context_window_size` 由 profile 显式配置并由 Service 一对一装配。
 - `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
 - `tool_duplicate_governance_policy`：配置 attempt-scoped 重复工具调用治理，包含默认 duplicate decision、按工具名覆盖的 decision、require-justification 参数名映射，以及治理消息文本。
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
+
+`memory_projection_policy` 当前字段为：
+
+| 字段 | 含义 |
+|---|---|
+| `context_window_size` | effective model context window，由 execution profile 显式配置并装配到 Host policy。 |
+| `selected_recent_window_item_cap` | selected recent window 的 item 上限。 |
+| `selected_recent_window_char_cap` | selected recent window 的字符上限。 |
+| `selected_recent_window_turn_floor` | selected recent window 必须保留的近轮下限。 |
+| `fallback_selected_recent_window_item_cap` | fallback selected recent window 的 item 上限，必须覆盖近轮 floor 且不超过普通 selected recent window 上限。 |
+| `fallback_selected_recent_window_char_cap` | fallback selected recent window 的字符上限，不得超过普通 selected recent window 字符上限。 |
+| `evidence_fact_item_cap` | evidence-backed fact 的 item 上限。 |
+| `evidence_fact_char_cap` | evidence-backed fact 的字符上限。 |
+| `evidence_fact_floor` | evidence-backed fact 的保底数量。 |
+| `session_summary_char_cap` | session summary 的字符上限。 |
+| `answer_anchor_item_cap` | answer anchor 的 item 上限。 |
+| `answer_anchor_char_cap` | answer anchor 的字符上限。 |
+| `forward_intent_item_cap` | forward intent 的 item 上限。 |
+| `forward_intent_char_cap` | forward intent 的字符上限。 |
+| `reference_continuity_item_cap` | reference continuity item 上限。 |
+| `reference_continuity_char_cap` | reference continuity 字符上限。 |
+| `reference_continuity_item_floor` | reference continuity item 保底数量，包内默认可为 `0`。 |
+| `max_lag_events_for_inline_delta` | 允许 inline delta repair 覆盖的 snapshot lag 事件数。 |
+| `max_delta_repair_events` | 单次 delta repair 可读取的最大事件数。 |
+| `policy_ref` | memory projection policy 的稳定配置引用。 |
 
 `tool_duplicate_governance_policy.default_duplicate_decision` 与 `decisions_by_tool_name` 只允许 `allow`、`reuse`、`hint`、`require_justification`、`hard_stop`。`messages` 是 duplicate governance 返回给模型和诊断的文本，workspace overlay 可以按 profile 覆盖；这些文本不是 scene prompt asset，不放在 `prompts/` 目录。默认 messages 只使用模型可执行、人工可读的外部语义，不要求模型理解 Host、ToolRuntime、Attempt 等内部实现概念。
 

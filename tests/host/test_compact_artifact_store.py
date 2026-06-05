@@ -1,4 +1,4 @@
-"""Phase 10 Slice 2 compact artifact store 测试。"""
+"""vNext compact artifact store 测试。"""
 
 from __future__ import annotations
 
@@ -16,18 +16,19 @@ from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     build_initial_material_pack,
+    conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
 from dayu.host.compaction import (
-    CompactQualityIssue,
-    CompactQualityCheckResult,
     CompactMaterialBlockKind,
+    CompactQualityCheckResultVNext,
+    CompactQualityIssueVNext,
     CompactSegmentTrigger,
-    CompactionCandidate,
     CompactionRequest,
+    ConversationCompactOutputVNext,
 )
 from dayu.host.context_budget import BudgetEstimate
-from dayu.host.context_governance import check_compaction_candidate
+from dayu.host.context_governance import check_conversation_compact_output_vnext
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_bytes
@@ -41,13 +42,10 @@ from dayu.host.durable.options import (
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.transaction import HostTransaction
-from dayu.host.evidence import (
-    AcceptedEvidenceEnvelope,
-    AcceptedEvidenceResultRef,
-    AcceptedEvidenceToolQuery,
-)
 from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
+
+_POLICY_DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
 @pytest.mark.asyncio
@@ -90,6 +88,7 @@ async def test_compact_artifact_store_writes_deterministic_descriptor_with_diges
         assert artifact_digest == expected_digest
         metadata = json.loads(metadata_json)
         assert metadata["artifact_kind"] == "context_compaction"
+        assert metadata["schema_version"] == 3
         assert metadata["compaction_request_digest"] == (
             write_request.compaction_request.digest()
         )
@@ -99,13 +98,14 @@ async def test_compact_artifact_store_writes_deterministic_descriptor_with_diges
 
 
 @pytest.mark.asyncio
-async def test_compact_artifact_content_contains_required_canonical_fields() -> None:
-    """Artifact content 包含 Slice 2 要求字段。"""
+async def test_compact_artifact_content_contains_required_vnext_fields() -> None:
+    """Artifact content 包含 vNext canonical 字段且不输出旧 payload 字段。"""
 
     write_request = await _write_request()
     artifact_json = compact_artifact_json(write_request)
 
     assert isinstance(artifact_json, dict)
+    assert artifact_json["schema_version"] == 3
     assert artifact_json["compaction_request_digest"] == (
         write_request.compaction_request.digest()
     )
@@ -113,10 +113,12 @@ async def test_compact_artifact_content_contains_required_canonical_fields() -> 
         write_request.accepted_candidate.to_json()
     )
     assert artifact_json["quality_result"] == write_request.quality_result.to_json()
-    assert artifact_json["budget_after_compact"] == (
-        write_request.accepted_candidate.budget_after_compact
-    )
+    assert artifact_json["budget_after_compact"] == write_request.budget_after_compact
     assert artifact_json["policy_digest"] == write_request.policy_digest
+    assert artifact_json["accepted_evidence_mapping_refs"] == ["evidence:accepted-1"]
+    assert "preserved_fact_refs" not in artifact_json
+    assert "canonical_evidence_refs" not in artifact_json
+    assert "evidence_backed_fact_refs" not in artifact_json
 
 
 @pytest.mark.asyncio
@@ -166,36 +168,29 @@ async def test_compact_artifact_store_rejects_corrupted_expected_digest(
 
 @pytest.mark.asyncio
 async def test_compact_artifact_write_request_rejects_unaccepted_quality_result() -> None:
-    """Artifact 写入请求拒绝未通过 quality check 的候选。"""
+    """Artifact 写入请求拒绝未通过 vNext quality check 的候选。"""
 
     request, candidate, quality_result = await _candidate_bundle()
-    rejected_quality = CompactQualityCheckResult(
+    rejected_quality = CompactQualityCheckResultVNext(
         accepted=False,
-        rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
-        current_user_input_retained=False,
-        canonical_evidence_refs_retained=True,
-        evidence_backed_fact_candidates_accepted=True,
-        minimum_preserve_items_accepted=True,
-        evidence_anchors_retained=True,
-        open_questions_retained=True,
-        retained_canonical_evidence_refs=(),
-        dropped_ranges=(),
-        summarized_ranges=(),
+        rejection_reasons=(CompactQualityIssueVNext.UNKNOWN_SOURCE_LABEL,),
     )
     write_request = CompactArtifactWriteRequest(
         compaction_request=request,
         accepted_candidate=candidate,
         quality_result=quality_result,
-        policy_digest=sha256_digest_bytes(b"policy"),
+        policy_digest=_POLICY_DIGEST,
+        budget_after_compact=700,
     )
-    assert write_request.accepted_candidate.candidate_id == "fake-compact:run-1"
+    assert write_request.accepted_candidate.digest() == candidate.digest()
 
     with pytest.raises(ValueError, match="accepted quality result"):
         CompactArtifactWriteRequest(
             compaction_request=request,
             accepted_candidate=candidate,
             quality_result=rejected_quality,
-            policy_digest=sha256_digest_bytes(b"policy"),
+            policy_digest=_POLICY_DIGEST,
+            budget_after_compact=700,
         )
 
 
@@ -265,23 +260,27 @@ async def _write_request(
         compaction_request=request,
         accepted_candidate=candidate,
         quality_result=quality_result,
-        policy_digest=sha256_digest_bytes(b"policy"),
+        policy_digest=_POLICY_DIGEST,
+        budget_after_compact=700,
         payload_ref=payload_ref,
         expected_artifact_digest=expected_artifact_digest,
     )
 
 
 async def _candidate_bundle() -> tuple[
-    CompactionRequest, CompactionCandidate, CompactQualityCheckResult
+    CompactionRequest, ConversationCompactOutputVNext, CompactQualityCheckResultVNext
 ]:
-    """构造已通过 quality check 的 candidate bundle。
+    """构造已通过 vNext quality check 的 candidate bundle。
 
     :returns: request、candidate 与 quality result。
     """
 
     request = _request()
     candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
-    quality_result = check_compaction_candidate(request, candidate)
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        request.material_pack
+    )
+    quality_result = check_conversation_compact_output_vnext(compact_input, candidate)
     assert quality_result.accepted is True
     return request, candidate, quality_result
 
@@ -292,49 +291,14 @@ def _request() -> CompactionRequest:
     :returns: compaction request。
     """
 
-    return CompactionRequest(
-        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
-        session_id="session-1",
-        run_id="run-1",
-        attempt_id=None,
-        execution_id=None,
-        memory_snapshot_cursor=7,
-        material_pack=_material_pack(),
-        segment_selection=initial_segment_selection(
-            trigger_source=CompactSegmentTrigger.PROACTIVE,
-            input_cursor=2,
-            material_pack=_material_pack(),
-        ),
-        evidence_backed_fact_refs=("fact-existing-1",),
-        recent_raw_turn_refs=("event-current",),
-        older_raw_turn_refs=("event-old",),
-        existing_episode_summary_refs=("summary-prev",),
-        budget_before_compact=BudgetEstimate(
-            estimated_input_tokens=900,
-            input_budget_tokens=1000,
-            soft_threshold_tokens=800,
-            hard_threshold_tokens=950,
-            safety_margin_tokens=200,
-            estimator_digest="estimate-digest",
-            overage_reason=None,
-        ),
-    )
-
-
-def _material_pack():
-    """构造标准 material pack。
-
-    :returns: material pack。
-    """
-
-    return build_initial_material_pack(
+    material_pack = build_initial_material_pack(
         current_input_ref="event-current",
         current_input_text="分析 A 公司 2025 年年报",
         history_materials=(
             InitialHistoryMaterial(
                 canonical_source_ref="event-old",
                 text="上一轮回答摘要",
-                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+                kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             ),
         ),
         evidence_materials=(
@@ -349,52 +313,32 @@ def _material_pack():
                 readable_source_text="accepted tool evidence",
                 payload_refs=("payload:accepted-1",),
             ),
-            InitialEvidenceMaterial(
-                canonical_source_ref="evidence:accepted-2",
-                accepted_evidence_id="evidence:accepted-2",
-                tool_result_event_ref="event-tool-result-accepted-2",
-                tool_call_event_ref="event-tool-call-accepted-2",
-                readable_tool_name="fins.search",
-                readable_query_text="accepted tool query",
-                raw_result_text="canonical evidence raw content accepted-2",
-                readable_source_text="accepted tool evidence",
-                payload_refs=("payload:accepted-2",),
-            ),
         ),
     )
-
-
-def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
-    """构造 compact artifact 测试用 canonical evidence envelope。
-
-    :param suffix: evidence 与 producer ref 后缀。
-    :returns: canonical evidence envelope。
-    """
-
-    return AcceptedEvidenceEnvelope(
-        evidence_id=f"evidence:{suffix}",
-        producer_event_ref=f"event-tool-result-{suffix}",
-        tool_name="fins.search",
-        tool_call_id=f"tool-call-{suffix}",
-        tool_query=AcceptedEvidenceToolQuery(
-            tool_call_requested_event_ref=f"event-tool-call-{suffix}",
-            normalized_arguments_digest=(
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            semantic_input_digest=(
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ),
+    return CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        session_id="session-1",
+        run_id="run-1",
+        attempt_id=None,
+        execution_id=None,
+        memory_snapshot_cursor=7,
+        material_pack=material_pack,
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            material_pack=material_pack,
         ),
-        result_ref=AcceptedEvidenceResultRef(
-            payload_ref=f"payload:{suffix}",
-            payload_digest=(
-                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-            ),
-            outcome_digest=(
-                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-            ),
-            truncation_applied=False,
+        evidence_backed_fact_refs=("fact-existing-1",),
+        recent_raw_turn_refs=("event-current",),
+        older_raw_turn_refs=("event-old",),
+        existing_episode_summary_refs=("summary-prev",),
+        budget_before_compact=BudgetEstimate(
+            estimated_input_tokens=900,
+            input_budget_tokens=4096,
+            soft_threshold_tokens=3200,
+            hard_threshold_tokens=3900,
+            safety_margin_tokens=200,
+            estimator_digest="estimate-digest",
+            overage_reason=None,
         ),
-        source_refs=(),
-        locator_refs=(),
     )

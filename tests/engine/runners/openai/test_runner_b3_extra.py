@@ -78,7 +78,7 @@ async def test_sse_idle_aclose_does_not_leak_pending_task() -> None:
     iterator = cast(
         AsyncGenerator[RunnerEvent, None],
         runner._call_impl(  # type: ignore[attr-defined]
-            msgs, make_options(stream=True), []
+            msgs, make_options(stream=True), [], request_identity=None
         ),
     )
 

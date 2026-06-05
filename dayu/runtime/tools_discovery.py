@@ -21,6 +21,10 @@ from dayu.contracts import (
     ToolBundleSourceRef,
     ToolDefinition,
 )
+from dayu.contracts._validation import (
+    require_non_empty_text as _require_non_empty_text,
+    require_optional_non_empty_text as _require_optional_non_empty_text,
+)
 from dayu.runtime._digest import canonical_json_digest, normalize_json_value
 
 _IMPORT_PATH_SEPARATOR = ":"
@@ -585,32 +589,6 @@ def _require_provider_identity(provider_id: str) -> str:
     if not stripped:
         raise ToolsDiscoveryError("provider identity must be non-empty")
     return stripped
-
-
-def _require_non_empty_text(value: str, *, field_name: str) -> None:
-    """校验字符串存在非空白内容。
-
-    :param value: 待校验字符串。
-    :param field_name: 错误消息中的字段名。
-    :returns: 无返回值。
-    :raises ValueError: 字符串为空或只包含空白时抛出。
-    """
-
-    if not value.strip():
-        raise ValueError(f"{field_name} must be non-empty")
-
-
-def _require_optional_non_empty_text(value: str | None, *, field_name: str) -> None:
-    """校验可选字符串在存在时包含非空白内容。
-
-    :param value: 待校验字符串；``None`` 表示未提供。
-    :param field_name: 错误消息中的字段名。
-    :returns: 无返回值。
-    :raises ValueError: 字符串存在但为空或只包含空白时抛出。
-    """
-
-    if value is not None:
-        _require_non_empty_text(value, field_name=field_name)
 
 
 __all__ = [

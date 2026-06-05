@@ -140,7 +140,7 @@ async def test_no_compaction_recent_raw_turns_continuity(
     second_request = factory.requests[1]
     joined = _joined_message_content(second_request.messages)
     assert "第一轮原始问题：请记住营收增长来自价格因素。" in joined
-    assert "Memory episode summaries:" not in joined
+    assert "Session Summary Memory:" not in joined
 
 
 @pytest.mark.asyncio
@@ -152,7 +152,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
-    :raises AssertionError: public material 缺 evidence_input 或后续 request 未复用 fact 时抛出。
+    :raises AssertionError: public material 缺 evidence_material 或后续 request 未复用 fact 时抛出。
     """
 
     fake_compactor = FakeCompactorRunAgent()
@@ -205,9 +205,9 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert third_terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.material_jsons) >= 1
     material_json = _first_material_json_with_evidence(fake_compactor.material_jsons)
-    evidence_input = material_json["evidence_input"]
-    assert isinstance(evidence_input, list)
-    assert len(evidence_input) >= 1
+    evidence_material = material_json["evidence_material"]
+    assert isinstance(evidence_material, list)
+    assert len(evidence_material) >= 1
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
     assert _LONG_CHAPTER_MARKER in material_text
     assert "result_preview" not in material_text
@@ -215,7 +215,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert "event-tool-result" not in material_text
     assert len(factory.requests) >= 3
     joined = _joined_message_content(factory.requests[-1].messages)
-    assert "Memory evidence-backed facts:" in joined
+    assert "Evidence / Fact Memory:" in joined
     assert _LONG_CHAPTER_MARKER in joined
 
     # helper-level 补充：fake proposal 只使用 prompt-local E label，不读取 canonical refs。
@@ -230,7 +230,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
         ),
         field_name="fake proposal",
     )
-    fact_candidates = proposal["evidence_backed_fact_candidates"]
+    fact_candidates = proposal["evidence_backed_facts"]
     assert isinstance(fact_candidates, list)
     assert len(fact_candidates) == 1
     fact = _required_mapping(fact_candidates[0], field_name="fact")
@@ -245,10 +245,10 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
 
 
 @pytest.mark.asyncio
-async def test_long_user_input_second_factor_survives_minimum_preserve(
+async def test_long_user_input_second_factor_survives_reference_continuity(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """长输入 compact 后，下一轮仍可通过 minimum preserve 看到第二个因素。
+    """长输入 compact 后，下一轮仍可通过 vNext continuity 看到第二个因素。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
@@ -296,7 +296,6 @@ async def test_long_user_input_second_factor_survives_minimum_preserve(
     assert len(fake_compactor.prompt_lengths) >= 1
     joined = _joined_message_content(factory.requests[1].messages)
     assert _SECOND_FACTOR_MARKER in joined
-    assert "Memory minimum preserve continuity:" in joined
 
 
 @pytest.mark.asyncio
@@ -676,19 +675,19 @@ def _material_json_text_from_prompt(prompt: str) -> str:
 def _first_material_json_with_evidence(
     values: list[Mapping[str, JsonValue]],
 ) -> Mapping[str, JsonValue]:
-    """返回首个包含 evidence_input 的 compactor material JSON。
+    """返回首个包含 evidence_material 的 compactor material JSON。
 
     :param values: fake compactor 记录的 material JSON 列表。
-    :returns: 首个包含 evidence_input 项的 material JSON。
-    :raises AssertionError: 所有 public compactor material 都缺 evidence_input 时抛出。
+    :returns: 首个包含 evidence_material 项的 material JSON。
+    :raises AssertionError: 所有 public compactor material 都缺 evidence_material 时抛出。
     """
 
     for value in values:
-        evidence_input = value["evidence_input"]
-        assert isinstance(evidence_input, list)
-        if len(evidence_input) > 0:
+        evidence_material = value["evidence_material"]
+        assert isinstance(evidence_material, list)
+        if len(evidence_material) > 0:
             return value
-    raise AssertionError("public compactor material evidence_input is empty")
+    raise AssertionError("public compactor material evidence_material is empty")
 
 
 def _compactor_user_prompt(request: AgentRunRequest) -> str:
@@ -713,9 +712,9 @@ def _llm_material_with_long_tool_evidence() -> Mapping[str, JsonValue]:
     """
 
     return {
-        "stable_input": [],
-        "history_input": [],
-        "evidence_input": [
+        "previous_compacted_view": [],
+        "trace_material": [],
+        "evidence_material": [
             {
                 "label": "E1",
                 "kind": "accepted_tool_evidence",

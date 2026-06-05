@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+
 from dayu.engine.contracts.runner_events import RunnerHTTPErrorCode
 from dayu.engine.runners.openai._types import _RetryDecision
 from dayu.engine.runners.openai.error_classifier import is_retriable
@@ -30,14 +33,16 @@ _RATE_LIMIT_RETRY_AFTER_CAP_SECONDS: float = 120.0
 _RATE_LIMIT_FIRST_BACKOFF_SECONDS: float = 4.0
 
 
-def parse_retry_after(retry_after_header: str | None) -> float | None:
+def parse_retry_after(
+    retry_after_header: str | None, *, now: datetime | None = None
+) -> float | None:
     """解析 HTTP ``Retry-After`` 头。
 
     :param retry_after_header: 原始头字符串；为 ``None`` 表示未提供。
+    :param now: 计算 HTTP-date 剩余秒数时使用的 UTC 时间；为 ``None`` 时
+        使用当前 UTC 时间。
     :returns: 正数秒值；无效或负值返回 ``None``。
-
-    本函数仅处理「秒数」形态；HTTP-date 形态由调用方按需扩展，本
-    Phase 不实现。
+    :raises Exception: 不主动抛出异常。
     """
 
     if retry_after_header is None:
@@ -48,10 +53,36 @@ def parse_retry_after(retry_after_header: str | None) -> float | None:
     try:
         value = float(text)
     except ValueError:
-        return None
+        return _parse_retry_after_http_date(text, now=now)
     if value <= 0.0:
         return None
     return value
+
+
+def _parse_retry_after_http_date(
+    retry_after_header: str, *, now: datetime | None
+) -> float | None:
+    """解析 HTTP-date 形态的 ``Retry-After``。
+
+    :param retry_after_header: 去除首尾空白后的 header 文本。
+    :param now: 调用方指定的当前时间；为 ``None`` 时读取 UTC 当前时间。
+    :returns: 正数剩余秒数；无效或非未来时间返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    try:
+        retry_at = parsedate_to_datetime(retry_after_header)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    else:
+        retry_at = retry_at.astimezone(UTC)
+    base_now = datetime.now(UTC) if now is None else now.astimezone(UTC)
+    delay_seconds = (retry_at - base_now).total_seconds()
+    if delay_seconds <= 0.0:
+        return None
+    return delay_seconds
 
 
 def compute_retry_decision(

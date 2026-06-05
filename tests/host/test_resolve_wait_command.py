@@ -228,7 +228,7 @@ def test_resolve_wait_committed_tool_result_catches_up_memory_without_fact(
         tool_events = _events_by_type(
             _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
         )
-        assert memory_snapshot.snapshot.evidence_backed_facts == ()
+        assert memory_snapshot.snapshot.evidence_fact_memory.evidence_backed_facts == ()
         assert len(tool_events) > 0
         assert (
             memory_snapshot.snapshot.cursor.checkpoint_event_sequence

@@ -55,12 +55,15 @@ class ToolParametersSchema:
         """校验工具参数 schema 的最小结构一致性。
 
         :returns: ``None``。
+        :raises TypeError: ``properties`` 字段名不是字符串时抛出。
         :raises ValueError: ``properties`` 字段名为空白，或 ``required``
             中字段不属于 ``properties`` 时抛出。
         """
 
         property_names = set(self.properties.keys())
         for property_name in property_names:
+            if not isinstance(property_name, str):
+                raise TypeError("ToolParametersSchema.properties keys must be str")
             if property_name.strip() == "":
                 raise ValueError(
                     "ToolParametersSchema.properties keys must be non-empty"

@@ -167,7 +167,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.payload_inline_threshold_bytes == 2048
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
-    assert result.options.memory_projection_policy.max_evidence_backed_facts == 256
+    assert result.options.memory_projection_policy.evidence_fact_item_cap == 256
     context_budget_policy = result.options.context_budget_policy
     assert context_budget_policy is not None
     assert (
@@ -641,6 +641,66 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
     assert result.diagnostics.tool_truncation_policy.startswith("enabled=False")
 
 
+def test_memory_projection_context_window_uses_effective_model_window(
+    tmp_path: Path,
+) -> None:
+    """Memory projection context window 必须来自 effective model。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: helper 使用 profile policy 内的窗口字段时抛出。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    _write_execution_profile_overlay(tmp_path, truncation_enabled=True)
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = discover_service_tools(config)
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "service-assembly-test",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=config,
+            locations=locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    assert config.models.models[_MODEL_ID].context_window_tokens == 1048576
+    assert (
+        config.execution_profiles.execution_profiles[
+            "standard-256k"
+        ].memory_projection_policy.context_window_size
+        == 262144
+    )
+    assert result.options.memory_projection_policy.context_window_size == 1048576
+
+
 def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
     tmp_path: Path,
 ) -> None:
@@ -1002,21 +1062,26 @@ def _write_execution_profile_overlay(
                         "policy_ref": profile_id,
                     },
                     "memory_projection_policy": {
-                        "max_pinned_items": 32,
-                        "max_evidence_backed_facts": 256,
-                        "max_working_assumptions": 128,
-                        "recent_raw_turns_floor": 4,
-                        "raw_turn_context_ratio": 0.02,
-                        "raw_turn_size_floor": 1024,
-                        "raw_turn_size_cap": 8192,
-                        "history_pool_context_ratio": 0.18,
-                        "history_pool_size_floor": 8192,
-                        "history_pool_size_cap": 131072,
-                        "stable_layer_context_ratio": 0.12,
-                        "stable_layer_size_floor": 4096,
-                        "stable_layer_size_cap": 65536,
+                        "context_window_size": 262144,
+                        "selected_recent_window_item_cap": 32,
+                        "selected_recent_window_char_cap": 131072,
+                        "selected_recent_window_turn_floor": 4,
+                        "fallback_selected_recent_window_item_cap": 8,
+                        "fallback_selected_recent_window_char_cap": 32768,
+                        "evidence_fact_item_cap": 256,
+                        "evidence_fact_char_cap": 65536,
+                        "evidence_fact_floor": 1,
+                        "session_summary_char_cap": 4096,
+                        "answer_anchor_item_cap": 32,
+                        "answer_anchor_char_cap": 32768,
+                        "forward_intent_item_cap": 32,
+                        "forward_intent_char_cap": 32768,
+                        "reference_continuity_item_cap": 32,
+                        "reference_continuity_char_cap": 32768,
+                        "reference_continuity_item_floor": 0,
                         "max_lag_events_for_inline_delta": 32,
                         "max_delta_repair_events": 128,
+                        "policy_ref": profile_id,
                     },
                     "tool_truncation_policy": {
                         "enabled": truncation_enabled,

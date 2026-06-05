@@ -304,35 +304,23 @@ def test_display_change_changes_digest() -> None:
 
 
 def test_schema_mapping_with_non_string_key_is_rejected() -> None:
-    """schema 映射包含非字符串 key 时 discovery 必须快速失败。"""
+    """schema 映射包含非字符串 key 时应在 schema 契约边界快速失败。"""
 
     malformed_properties = cast(
         Mapping[str, JsonValue],
         {1: {"type": "string"}},
     )
-    definition = ToolDefinition(
-        name="lookup_filing",
-        schema=ToolSchema(
-            type="function",
-            function=ToolFunctionSchema(
-                name="lookup_filing",
-                description="Lookup filing",
-                parameters=ToolParametersSchema(
-                    type="object",
-                    properties=malformed_properties,
-                    required=(),
-                    additional_properties=False,
-                ),
-            ),
-        ),
-        callable=_noop_tool,
-        truncate=None,
-        display=None,
-        tags=(),
-    )
 
-    with pytest.raises(TypeError, match="JsonValue object key must be str"):
-        _discover_digest((definition,))
+    with pytest.raises(
+        TypeError,
+        match="ToolParametersSchema.properties keys must be str",
+    ):
+        ToolParametersSchema(
+            type="object",
+            properties=malformed_properties,
+            required=(),
+            additional_properties=False,
+        )
 
 
 def test_source_refs_preserve_kind_id_version_and_replace_digest() -> None:

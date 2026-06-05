@@ -11,20 +11,20 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import HostEventKind, HostTerminalStatus
 from dayu.host.compaction import (
-    CompactInputRange,
-    CompactQualityIssue,
-    CompactQualityCheckResult,
-    CompactionCandidate,
-    EpisodeSummaryCandidate,
-    EvidenceBackedFactCandidate,
-    EvidenceBackedFactKind,
-    MinimumPreserveItemCandidate,
-    MinimumPreserveReason,
-    PinnedPatchOperation,
-    PinnedStatePatchCandidate,
-    PinnedStringTupleFieldPatch,
-    PinnedTextFieldPatch,
-    PreservationEvidence,
+    AnswerAnchorCandidateVNext,
+    AnswerAnchorChildVNext,
+    CompactQualityCheckResultVNext,
+    CompactQualityIssueVNext,
+    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    ConversationCompactOutputVNext,
+    EvidenceBackedFactCandidateVNext,
+    FactEvidenceKindVNext,
+    ForwardIntentCandidateVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityCandidateVNext,
+    ReferenceContinuityReasonVNext,
+    SessionSummaryCandidateVNext,
 )
 from dayu.host.context_budget import ContextBudgetDecision
 from dayu.host.context_events import (
@@ -122,17 +122,14 @@ def test_reactive_requested_requires_attempt_and_execution() -> None:
 
 
 def test_compacted_payload_builder_emits_required_accepted_output() -> None:
-    """compacted builder 输出 accepted summary / pinned patch / evidence 字段。"""
+    """compacted builder 输出 accepted vNext candidate 与治理字段。"""
 
-    payload = build_context_compacted_payload(
-        compact_artifact_ref="compact-artifact:abc",
-        compact_artifact_digest=_DIGEST_B,
-        accepted_candidate=_candidate(),
-        quality_check_result=_quality_result(),
-    )
+    payload = _valid_compacted_payload()
 
     validate_context_compacted_payload(payload)
     assert payload["compact_artifact_ref"] == "compact-artifact:abc"
+    assert payload["accepted_attempt_number"] == 2
+    assert payload["accepted_candidate_digest"] == _candidate().digest()
     assert payload["budget_after_compact"] == 512
 
 
@@ -147,92 +144,72 @@ def test_compacted_payload_rejects_missing_artifact_digest_pair() -> None:
 
 
 def test_compacted_payload_rejects_summary_without_preservation_evidence() -> None:
-    """summary candidate 没有 preservation evidence 时不能成为 accepted output。"""
+    """vNext compacted payload 拒绝旧 episode summary 字段。"""
 
     payload = dict(_valid_compacted_payload())
-    summary = _payload_mapping(payload["episode_summary_candidate"])
-    summary["evidence_refs"] = []
-    payload["episode_summary_candidate"] = summary
+    payload["episode_summary_candidate"] = {}
 
-    with pytest.raises(ValueError, match="episode summary candidate requires"):
+    with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
         validate_context_compacted_payload(payload)
 
 
 def test_compacted_payload_rejects_summary_proposed_evidence_backed_fact_refs() -> None:
-    """accepted compact summary 不能提议新建 evidence-backed fact。"""
+    """vNext compacted payload 拒绝旧 proposed fact summary 字段入口。"""
 
     payload = dict(_valid_compacted_payload())
-    summary = _payload_mapping(payload["episode_summary_candidate"])
-    summary["proposed_evidence_backed_fact_refs"] = ["fake-fact"]
-    payload["episode_summary_candidate"] = summary
+    payload["episode_summary_candidate"] = {"proposed_evidence_backed_fact_refs": ["fake-fact"]}
 
-    with pytest.raises(ValueError, match="must not propose evidence-backed facts"):
+    with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
         validate_context_compacted_payload(payload)
 
 
 def test_compacted_payload_rejects_old_summary_proposed_verified_fact_refs() -> None:
-    """accepted compact summary 拒绝旧 proposed_verified_fact_refs key。"""
+    """vNext compacted payload 拒绝旧 proposed_verified_fact_refs key。"""
 
     payload = dict(_valid_compacted_payload())
-    summary = _payload_mapping(payload["episode_summary_candidate"])
-    summary["proposed_verified_fact_refs"] = ["fake-fact"]
-    payload["episode_summary_candidate"] = summary
+    payload["episode_summary_candidate"] = {"proposed_verified_fact_refs": ["fake-fact"]}
 
-    with pytest.raises(ValueError, match="old proposed verified fact refs"):
+    with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
         validate_context_compacted_payload(payload)
 
 
 def test_compacted_payload_rejects_patch_without_preservation_evidence() -> None:
-    """非 missing pinned patch 字段必须引用 preservation evidence。"""
+    """vNext compacted payload 拒绝旧 pinned patch 字段。"""
 
     payload = dict(_valid_compacted_payload())
-    patch = _payload_mapping(payload["pinned_state_patch_candidate"])
-    current_goal = _payload_mapping(patch["current_goal"])
-    current_goal["evidence_refs"] = []
-    patch["current_goal"] = current_goal
-    payload["pinned_state_patch_candidate"] = patch
+    payload["pinned_state_patch_candidate"] = {}
 
-    with pytest.raises(ValueError, match="pinned patch requires"):
+    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
         validate_context_compacted_payload(payload)
 
 
 def test_compacted_payload_rejects_replace_patch_without_value() -> None:
-    """replace patch 必须在 validator 层带合法 value。"""
+    """vNext compacted payload 拒绝旧 replace patch 字段。"""
 
     payload = dict(_valid_compacted_payload())
-    patch = _payload_mapping(payload["pinned_state_patch_candidate"])
-    current_goal = _payload_mapping(patch["current_goal"])
-    del current_goal["value"]
-    patch["current_goal"] = current_goal
-    payload["pinned_state_patch_candidate"] = patch
+    payload["pinned_state_patch_candidate"] = {"current_goal": {"operation": "replace"}}
 
-    with pytest.raises(ValueError, match="value must be non-empty text"):
+    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
         validate_context_compacted_payload(payload)
 
 
 def test_compacted_payload_rejects_direct_patch_field_without_tristate() -> None:
-    """pinned patch 必须使用字段级三态结构，不能用直写文本绕过 evidence。"""
+    """vNext compacted payload 拒绝旧 direct pinned patch 字段。"""
 
     payload = dict(_valid_compacted_payload())
-    patch = _payload_mapping(payload["pinned_state_patch_candidate"])
-    patch["current_goal"] = "direct goal"
-    payload["pinned_state_patch_candidate"] = patch
+    payload["pinned_state_patch_candidate"] = {"current_goal": "direct goal"}
 
-    with pytest.raises(ValueError, match="pinned patch field must be mapping"):
+    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
         validate_context_compacted_payload(payload)
 
 
 def test_compacted_payload_rejects_free_form_confirmed_subject() -> None:
-    """confirmed_subjects patch 不能接受自由业务字符串。"""
+    """vNext compacted payload 拒绝旧 confirmed_subjects patch 字段。"""
 
     payload = dict(_valid_compacted_payload())
-    patch = _payload_mapping(payload["pinned_state_patch_candidate"])
-    subjects = _payload_mapping(patch["confirmed_subjects"])
-    subjects["value"] = ["Apple Inc."]
-    patch["confirmed_subjects"] = subjects
-    payload["pinned_state_patch_candidate"] = patch
+    payload["pinned_state_patch_candidate"] = {"confirmed_subjects": {"value": ["Apple Inc."]}}
 
-    with pytest.raises(ValueError, match="opaque ref text requires kind prefix"):
+    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
         validate_context_compacted_payload(payload)
 
 
@@ -241,22 +218,20 @@ def test_compacted_payload_rejects_rejected_quality_result() -> None:
 
     with pytest.raises(ValueError, match="accepted quality result"):
         build_context_compacted_payload(
+            operation_id="event-context-compaction-requested-rejected",
+            accepted_attempt_number=1,
             compact_artifact_ref="compact-artifact:abc",
             compact_artifact_digest=_DIGEST_B,
             accepted_candidate=_candidate(),
-            quality_check_result=CompactQualityCheckResult(
+            quality_check_result=CompactQualityCheckResultVNext(
                 accepted=False,
-                rejection_reasons=(CompactQualityIssue.PRESERVATION_EVIDENCE_MISSING,),
-                current_user_input_retained=True,
-                canonical_evidence_refs_retained=True,
-                evidence_backed_fact_candidates_accepted=True,
-                minimum_preserve_items_accepted=True,
-                evidence_anchors_retained=True,
-                open_questions_retained=True,
-                retained_canonical_evidence_refs=("evidence:accepted-1",),
-                dropped_ranges=(),
-                summarized_ranges=(),
+                rejection_reasons=(CompactQualityIssueVNext.UNKNOWN_SOURCE_LABEL,),
             ),
+            budget_after_compact=512,
+            prompt_local_label_mapping_refs=("prompt-label:E1",),
+            source_boundary_refs=("event-user-1",),
+            accepted_evidence_mapping_refs=("evidence:accepted-1",),
+            projection_signal="conversation_memory_projection_catchup",
         )
 
 
@@ -733,98 +708,64 @@ def _valid_compacted_payload() -> dict[str, JsonValue]:
 
     return dict(
         build_context_compacted_payload(
+            operation_id="event-context-compaction-requested-accepted",
+            accepted_attempt_number=2,
             compact_artifact_ref="compact-artifact:abc",
             compact_artifact_digest=_DIGEST_B,
             accepted_candidate=_candidate(),
             quality_check_result=_quality_result(),
+            budget_after_compact=512,
+            prompt_local_label_mapping_refs=("prompt-label:E1", "prompt-label:A1"),
+            source_boundary_refs=("event-user-1", "evidence:accepted-1"),
+            accepted_evidence_mapping_refs=("evidence:accepted-1",),
+            projection_signal="conversation_memory_projection_catchup",
         )
     )
 
 
-def _candidate() -> CompactionCandidate:
-    """构造测试用 accepted compaction candidate。
+def _candidate() -> ConversationCompactOutputVNext:
+    """构造测试用 accepted vNext compaction candidate。
 
-    :returns: compaction candidate。
+    :returns: vNext compaction candidate。
     """
 
-    input_range = CompactInputRange(
-        range_ref="range:older",
-        start_input_ref="event-user-1",
-        end_input_ref="event-user-2",
-    )
-    return CompactionCandidate(
-        candidate_id="candidate-1",
-        episode_summary_candidate=EpisodeSummaryCandidate(
-            candidate_id="summary-1",
-            episode_title="Q1 review",
-            goal="分析收入",
-            completed_actions=("read filing",),
-            confirmed_fact_refs=("event-tool-1",),
-            confirmed_fact_summaries=("tool fact summary",),
-            user_constraints=("use fiscal year",),
-            open_questions=("check margin",),
-            next_step="compare quarters",
-            tool_finding_refs=("event-tool-1",),
-            source_event_refs=("event-user-1", "event-user-2"),
-            evidence_refs=("evidence-1",),
+    return ConversationCompactOutputVNext(
+        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text="Q1 review focused on revenue.",
+            source_labels=("E1", "A1"),
         ),
-        pinned_state_patch_candidate=PinnedStatePatchCandidate(
-            candidate_id="patch-1",
-            current_goal=PinnedTextFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value="分析收入",
-                evidence_refs=("evidence-1",),
-            ),
-            confirmed_subjects=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("subject:issuer-a",),
-                evidence_refs=("evidence-1",),
-            ),
-            user_constraints=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("use fiscal year",),
-                evidence_refs=("evidence-1",),
-            ),
-            open_questions=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("check margin",),
-                evidence_refs=("evidence-1",),
-            ),
-        ),
-        preservation_evidence=(
-            PreservationEvidence(
-                evidence_id="evidence-1",
-                material_source_refs=("event-user-1",),
-                canonical_evidence_refs=("evidence:accepted-1",),
-                memory_snapshot_cursor=3,
-                compact_input_range=input_range,
-            ),
-        ),
-        evidence_backed_fact_candidates=(
-            EvidenceBackedFactCandidate(
-                candidate_id="fact-candidate-1",
+        evidence_backed_facts=(
+            EvidenceBackedFactCandidateVNext(
                 claim_text="Revenue increased.",
-                evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
-                evidence_refs=("evidence:accepted-1",),
-                attributes={},
+                evidence_labels=("E1",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+                source_labels=("E1",),
             ),
         ),
-        minimum_preserve_item_candidates=(
-            MinimumPreserveItemCandidate(
-                item_id="preserve-1",
-                label="current input",
-                text="compare revenue",
-                source_refs=("event-user-2",),
-                preserve_reason=MinimumPreserveReason.NEEDED_FOR_RECENT_REFERENCE,
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="Revenue answer",
+                anchor_items=(AnswerAnchorChildVNext(display_text="Revenue increased."),),
+                answer_source_labels=("A1",),
             ),
         ),
-        retained_current_user_input_ref="event-user-2",
-        preserved_material_source_refs=("event-user-1", "event-user-2"),
-        preserved_canonical_evidence_refs=("evidence:accepted-1",),
-        preserved_evidence_backed_fact_refs=("fact-existing-1",),
-        dropped_ranges=(),
-        summarized_ranges=(input_range,),
-        budget_after_compact=512,
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="Compare quarters next.",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("A1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="Keep revenue comparison context.",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("A1",),
+            ),
+        ),
+        diagnostics=(),
     )
 
 
@@ -840,22 +781,13 @@ def _payload_mapping(value: JsonValue) -> dict[str, JsonValue]:
     return dict(value)
 
 
-def _quality_result() -> CompactQualityCheckResult:
-    """构造测试用 accepted quality result。
+def _quality_result() -> CompactQualityCheckResultVNext:
+    """构造测试用 accepted vNext quality result。
 
-    :returns: quality check result。
+    :returns: vNext quality check result。
     """
 
-    return CompactQualityCheckResult(
+    return CompactQualityCheckResultVNext(
         accepted=True,
         rejection_reasons=(),
-        current_user_input_retained=True,
-        canonical_evidence_refs_retained=True,
-        evidence_backed_fact_candidates_accepted=True,
-        minimum_preserve_items_accepted=True,
-        evidence_anchors_retained=True,
-        open_questions_retained=True,
-        retained_canonical_evidence_refs=("evidence:accepted-1",),
-        dropped_ranges=(),
-        summarized_ranges=(),
     )

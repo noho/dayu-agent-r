@@ -150,6 +150,8 @@ class AsyncRunner(Protocol):
         messages: Sequence[AgentMessage],
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None = None,
     ) -> AsyncIterator[RunnerEvent]: ...
 
     def is_supports_tool_calling(self) -> bool: ...

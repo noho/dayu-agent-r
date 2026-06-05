@@ -64,7 +64,16 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
 )
-from dayu.host.compaction import CompactionCandidate, CompactionRequest, ContextCompactor
+from dayu.host.compact_payload import (
+    COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
+    COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
+    COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
+)
+from dayu.host.compaction import (
+    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    CompactionRequest,
+    ConversationCompactOutputVNext,
+)
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     context_budget_policy_from_threshold_tokens,
@@ -86,6 +95,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CreateRunningRunInput,
@@ -145,7 +155,7 @@ class _SeededRun:
     dispatch_record_id: str
 
 
-class _TransactionReadableCompactor(ContextCompactor):
+class _TransactionReadableCompactor(FakeContextCompactor):
     """测试 compactor 调用期可开启独立读事务。"""
 
     def __init__(self, transaction_runner: HostTransactionRunner) -> None:
@@ -157,16 +167,15 @@ class _TransactionReadableCompactor(ContextCompactor):
 
         self._transaction_runner = transaction_runner
         self.calls = 0
-        self._fake = FakeContextCompactor()
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
-        """执行 compact 并验证当前不在外层 write transaction 内。
+    ) -> ConversationCompactOutputVNext:
+        """执行 vNext compact 并验证当前不在外层 write transaction 内。
 
         :param request: compaction request。
         :param cancellation_token: Host 注入的取消 token。
-        :returns: fake compaction candidate。
+        :returns: fake vNext compaction candidate。
         """
 
         self.calls += 1
@@ -174,10 +183,10 @@ class _TransactionReadableCompactor(ContextCompactor):
             lambda transaction: read_run_by_id(transaction, request.run_id)
         )
         assert row is not None
-        return await self._fake.compact(request, cancellation_token)
+        return await super().compact(request, cancellation_token)
 
 
-class _InputSequenceAdvancingCompactor(ContextCompactor):
+class _InputSequenceAdvancingCompactor(FakeContextCompactor):
     """测试 compactor，在 proposal 期间推进 Run input sequence。"""
 
     def __init__(self, transaction_runner: HostTransactionRunner) -> None:
@@ -188,31 +197,30 @@ class _InputSequenceAdvancingCompactor(ContextCompactor):
         """
 
         self._transaction_runner = transaction_runner
-        self._fake = FakeContextCompactor()
         self.calls = 0
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
-        """推进 durable input sequence 后返回旧 snapshot 的 fake candidate。
+    ) -> ConversationCompactOutputVNext:
+        """推进 durable input sequence 后返回旧 snapshot 的 vNext candidate。
 
         :param request: compaction request。
         :param cancellation_token: Host 注入的取消 token。
-        :returns: 基于旧 request 的 fake compaction candidate。
+        :returns: 基于旧 request 的 fake vNext compaction candidate。
         """
 
         self.calls += 1
         _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
-        return await self._fake.compact(request, cancellation_token)
+        return await super().compact(request, cancellation_token)
 
 
-class _RaisingCompactor(ContextCompactor):
+class _RaisingCompactor(FakeContextCompactor):
     """测试用失败 compactor。"""
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> CompactionCandidate:
-        """抛出 proposal 失败。
+    ) -> ConversationCompactOutputVNext:
+        """抛出 vNext proposal 失败。
 
         :param request: compaction request。
         :param cancellation_token: Host 注入的取消 token。
@@ -454,6 +462,39 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert requested_payload["frozen_material_refs"] == ["event-input-ingest"]
         assert isinstance(requested_payload["frozen_material_list_digest"], str)
         assert isinstance(requested_payload["estimator_digest"], str)
+        compacted_payload = _payload(result.events[3])
+        assert compacted_payload["operation_id"] == result.events[0].event_id
+        assert compacted_payload["accepted_attempt_number"] == 1
+        assert compacted_payload["projection_signal"] == (
+            COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP
+        )
+        accepted_candidate = compacted_payload["accepted_candidate"]
+        assert isinstance(accepted_candidate, Mapping)
+        assert accepted_candidate["schema_version"] == (
+            CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
+        )
+        assert "preserved_fact_refs" not in compacted_payload
+        artifact_ref = compacted_payload["compact_artifact_ref"]
+        assert isinstance(artifact_ref, str)
+        descriptor = store.transaction_runner.run_read(
+            lambda transaction: PayloadStore().read_payload_descriptor(
+                transaction, artifact_ref
+            )
+        )
+        assert descriptor is not None
+        assert descriptor.media_type == COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT
+        assert descriptor.payload_digest == compacted_payload["compact_artifact_digest"]
+        assert descriptor.artifact_relative_path is not None
+        artifact_path = tmp_path / "compact-artifacts" / descriptor.artifact_relative_path
+        artifact_raw = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert isinstance(artifact_raw, Mapping)
+        artifact_json = cast(Mapping[str, JsonValue], artifact_raw)
+        assert artifact_json["schema_version"] == (
+            COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT
+        )
+        assert artifact_json["accepted_candidate_digest"] == (
+            compacted_payload["accepted_candidate_digest"]
+        )
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.FAILED

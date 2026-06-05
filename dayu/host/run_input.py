@@ -47,11 +47,6 @@ from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
     EventLogContextFallbackProvider,
 )
-from dayu.host.compact_payload import (
-    optional_text_list_field,
-    preserved_canonical_evidence_refs,
-    preserved_fact_refs_summary,
-)
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
     run_input_material_block,
@@ -93,18 +88,17 @@ from dayu.host.terminal_summary_payload import (
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
-    ConversationContinuityItem,
-    ConversationContinuityKind,
-    ConversationMemorySnapshot,
+    ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
     MemoryProjectionEvent,
     MemoryProjectionPolicy,
     MemoryRepairReason,
     MemoryRepairRequest,
     MemorySnapshotCursor,
-    OpaqueMemoryRef,
     EvidenceBackedFactView,
-    WorkingAssumptionView,
+    ReferenceContinuityItem,
+    SelectedRecentWindowItem,
+    SelectedRecentWindowRole,
     build_inline_delta_repair_diagnostic,
     build_memory_budget_diagnostic,
     digest_memory_projection_policy,
@@ -131,23 +125,22 @@ _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
-_PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
-_PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
-_PAYLOAD_FIELD_GOAL = "goal"
-_PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
-_PAYLOAD_FIELD_USER_CONSTRAINTS = "user_constraints"
+_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
+_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
+_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
+_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
+_PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
+_PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
+_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _COMPACT_SUMMARY_MAX_CHARS = 1200
-_MEMORY_USER_GOALS_HEADER = "Memory user goals and constraints:"
-_MEMORY_CONFIRMED_SUBJECTS_HEADER = (
-    "Memory confirmed subjects and methodology:"
-)
-_MEMORY_EVIDENCE_BACKED_FACTS_HEADER = "Memory evidence-backed facts:"
-_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER = (
-    "Memory open questions and working assumptions:"
-)
-_MEMORY_MINIMUM_PRESERVE_HEADER = "Memory minimum preserve continuity:"
-_MEMORY_EPISODE_SUMMARIES_HEADER = "Memory episode summaries:"
+_MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
+_MEMORY_EVIDENCE_FACT_HEADER = "Evidence / Fact Memory:"
+_MEMORY_ANSWER_ANCHOR_HEADER = "Answer Anchor Memory:"
+_MEMORY_FORWARD_INTENT_HEADER = "Forward Intent Memory:"
+_MEMORY_REFERENCE_CONTINUITY_HEADER = "Trace Memory reference continuity:"
 _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT = 8
 _MEMORY_EVENT_TYPES = frozenset(
     (
@@ -846,7 +839,7 @@ class DurableMemorySnapshotProvider:
         *,
         session_id: str,
         required_event_sequence: int,
-    ) -> ConversationMemorySnapshot:
+    ) -> ConversationMemorySnapshotVNext:
         """读取 latest snapshot，缺失或损坏时转成 repair-required。
 
         :param transaction: Host durable transaction。
@@ -886,7 +879,7 @@ class DurableMemorySnapshotProvider:
         self,
         transaction: HostTransaction,
         *,
-        memory_snapshot: ConversationMemorySnapshot,
+        memory_snapshot: ConversationMemorySnapshotVNext,
         required_event_sequence: int,
     ) -> None:
         """校验 snapshot cursor 指向真实 EventLog row。
@@ -925,10 +918,10 @@ class DurableMemorySnapshotProvider:
         self,
         transaction: HostTransaction,
         *,
-        snapshot: ConversationMemorySnapshot,
+        snapshot: ConversationMemorySnapshotVNext,
         required_event_sequence: int,
         lag_events: int,
-    ) -> ConversationMemorySnapshot:
+    ) -> ConversationMemorySnapshotVNext:
         """用 EventLog delta 临时修复小滞后 snapshot。
 
         :param transaction: Host durable transaction。
@@ -1208,7 +1201,7 @@ def build_accepted_tool_evidence_material_blocks(
                     f"{material.tool_result_event_ref}:"
                     f"{material.accepted_evidence_id}"
                 ),
-                section=CompactMaterialSection.EVIDENCE_INPUT,
+                section=CompactMaterialSection.EVIDENCE_MATERIAL,
                 kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
                 text=material.raw_result_text,
                 canonical_source_refs=(material.canonical_source_ref,),
@@ -1232,7 +1225,7 @@ class DurableCompactArtifactProvider:
     """基于 EventLog 读取 accepted compact artifact 的 provider。
 
     :param transaction_runner: Host durable transaction runner。
-    :param max_summary_chars: episode summary 渲染字符上限。
+    :param max_summary_chars: compact candidate 摘要渲染字符上限。
     """
 
     def __init__(
@@ -1244,7 +1237,7 @@ class DurableCompactArtifactProvider:
         """初始化 provider。
 
         :param transaction_runner: Host durable transaction runner。
-        :param max_summary_chars: episode summary 渲染字符上限。
+        :param max_summary_chars: compact candidate 摘要渲染字符上限。
         :returns: ``None``。
         :raises ValueError: 上限非正数时抛出。
         """
@@ -1312,7 +1305,7 @@ class DurableCompactArtifactProvider:
             messages=(message,),
             compact_artifact_ref=artifact_ref,
             compact_artifact_digest=artifact_digest,
-            represented_evidence_refs=preserved_canonical_evidence_refs(payload),
+            represented_evidence_refs=_accepted_evidence_mapping_refs(payload),
         )
 
 
@@ -1931,7 +1924,7 @@ def _required_memory_event_sequence(current_facts: CurrentRunFacts) -> int:
 
 
 def _memory_snapshot_view(
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     current_facts: CurrentRunFacts,
     policy: MemoryProjectionPolicy,
 ) -> MemorySnapshotView:
@@ -1959,11 +1952,11 @@ def _memory_snapshot_view(
 
 
 def _memory_messages(
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
     render_scope: _CurrentMemoryRenderScope,
     policy: MemoryProjectionPolicy,
 ) -> _RenderedMemoryMessages:
-    """按稳定优先级渲染 memory messages。
+    """按设计固定顺序渲染 vNext memory messages。
 
     :param snapshot: memory snapshot。
     :param render_scope: 当前 Run memory 渲染排除范围。
@@ -1971,159 +1964,59 @@ def _memory_messages(
     :returns: memory provider messages 与 transient diagnostics。
     """
 
+    del policy
     messages: list[AgentMessage] = []
-    stable = _bounded_stable_memory_messages(
-        blocks=_memory_stable_blocks(snapshot, render_scope),
-        snapshot=snapshot,
-        policy=policy,
+    summary = _memory_session_summary_message(snapshot)
+    if summary is not None:
+        messages.append(summary)
+    facts = _memory_evidence_fact_message(
+        snapshot.evidence_fact_memory.evidence_backed_facts
     )
-    messages.extend(stable.messages)
+    if facts is not None:
+        messages.append(facts)
+    anchors = _memory_answer_anchor_message(snapshot)
+    if anchors is not None:
+        messages.append(anchors)
+    intents = _memory_forward_intent_message(snapshot)
+    if intents is not None:
+        messages.append(intents)
+    reference = _memory_reference_continuity_message(
+        snapshot.trace_memory.reference_continuity_items
+    )
+    if reference is not None:
+        messages.append(reference)
     messages.extend(
-        _memory_raw_turn_messages(
-            snapshot.conversation_continuity.items, render_scope
+        _memory_selected_recent_window_messages(
+            snapshot.trace_memory.selected_recent_window,
+            render_scope,
         )
     )
-    minimum_preserve = _memory_minimum_preserve_message(
-        snapshot.conversation_continuity.items, render_scope
-    )
-    if minimum_preserve is not None:
-        messages.append(minimum_preserve)
-    episode = _memory_episode_summary_message(
-        snapshot.conversation_continuity.items, render_scope
-    )
-    if episode is not None:
-        messages.append(episode)
     return _RenderedMemoryMessages(
         messages=tuple(messages),
-        diagnostics=stable.diagnostics,
+        diagnostics=(),
     )
 
 
-def _memory_stable_blocks(
-    snapshot: ConversationMemorySnapshot, render_scope: _CurrentMemoryRenderScope
-) -> tuple[_MemoryStableBlock, ...]:
-    """按固定优先级构造 stable memory blocks。
-
-    :param snapshot: memory snapshot。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: stable memory blocks。
-    """
-
-    blocks: list[_MemoryStableBlock] = []
-    goals = _memory_goal_and_constraint_message(snapshot, render_scope)
-    if goals is not None:
-        blocks.append(_MemoryStableBlock(block_id="stable:goals", message=goals))
-    facts = _memory_evidence_backed_fact_message(snapshot.evidence_backed_facts)
-    if facts is not None:
-        blocks.append(
-            _MemoryStableBlock(
-                block_id="stable:evidence_backed_facts",
-                message=facts,
-            )
-        )
-    subjects = _memory_subject_message(snapshot)
-    if subjects is not None:
-        blocks.append(_MemoryStableBlock(block_id="stable:subjects", message=subjects))
-    assumptions = _memory_question_and_assumption_message(snapshot)
-    if assumptions is not None:
-        blocks.append(
-            _MemoryStableBlock(
-                block_id="stable:questions_assumptions",
-                message=assumptions,
-            )
-        )
-    return tuple(blocks)
-
-
-def _bounded_stable_memory_messages(
-    *,
-    blocks: tuple[_MemoryStableBlock, ...],
-    snapshot: ConversationMemorySnapshot,
-    policy: MemoryProjectionPolicy,
-) -> _RenderedMemoryMessages:
-    """按 ``stable_layer_size_units`` 限制 stable memory blocks。
-
-    :param blocks: 按 P9 优先级排序的 stable blocks。
-    :param snapshot: memory snapshot。
-    :param policy: memory projection policy。
-    :returns: 被保留的 stable messages 与 budget diagnostics。
-    """
-
-    kept: list[AgentMessage] = []
-    diagnostics: list[MemoryDiagnostic] = []
-    budget_used = 0
-    for block in blocks:
-        block_units = estimate_memory_size_units(block.message.content).units
-        if budget_used + block_units <= policy.stable_layer_size_units:
-            kept.append(block.message)
-            budget_used += block_units
-            continue
-        diagnostics.append(
-            build_memory_budget_diagnostic(
-                event_sequence=snapshot.cursor.checkpoint_event_sequence,
-                item_id=block.block_id,
-                policy_digest=snapshot.policy_digest,
-                message="stable memory block skipped by stable layer budget",
-            )
-        )
-    return _RenderedMemoryMessages(
-        messages=tuple(kept),
-        diagnostics=tuple(diagnostics),
-    )
-
-
-def _memory_goal_and_constraint_message(
-    snapshot: ConversationMemorySnapshot, render_scope: _CurrentMemoryRenderScope
+def _memory_session_summary_message(
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> SystemMessage | None:
-    """渲染用户目标与约束 memory block。
+    """渲染 Session Summary Memory section。
 
     :param snapshot: memory snapshot。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: system message；无内容时返回 ``None``。
+    :returns: system message；无 summary 时返回 ``None``。
     """
 
-    lines: list[str] = [_MEMORY_USER_GOALS_HEADER]
-    if (
-        snapshot.pinned_state.current_goal is not None
-        and snapshot.pinned_state.current_goal != render_scope.user_prompt
-    ):
-        lines.append(f"current_goal={snapshot.pinned_state.current_goal}")
-    for constraint in snapshot.pinned_state.user_constraints:
-        if constraint == render_scope.user_prompt:
-            continue
-        lines.append(f"user_constraint={constraint}")
-    if len(lines) == 1:
+    summary = snapshot.session_summary_memory
+    if summary.summary_text is None:
         return None
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
+    lines = [_MEMORY_SESSION_SUMMARY_HEADER, f"summary={summary.summary_text}"]
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
-def _memory_subject_message(
-    snapshot: ConversationMemorySnapshot,
-) -> SystemMessage | None:
-    """渲染已确认主体和口径 memory block。
-
-    :param snapshot: memory snapshot。
-    :returns: system message；无内容时返回 ``None``。
-    """
-
-    if not snapshot.pinned_state.confirmed_subjects:
-        return None
-    lines = [_MEMORY_CONFIRMED_SUBJECTS_HEADER]
-    for ref in snapshot.pinned_state.confirmed_subjects:
-        lines.append(f"confirmed_subject={_opaque_ref_text(ref)}")
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
-
-
-def _memory_evidence_backed_fact_message(
+def _memory_evidence_fact_message(
     facts: tuple[EvidenceBackedFactView, ...],
 ) -> SystemMessage | None:
-    """渲染 evidence-backed facts memory block。
+    """渲染 Evidence / Fact Memory section。
 
     :param facts: evidence-backed fact 元组。
     :returns: system message；无内容时返回 ``None``。
@@ -2131,7 +2024,7 @@ def _memory_evidence_backed_fact_message(
 
     if not facts:
         return None
-    lines = [_MEMORY_EVIDENCE_BACKED_FACTS_HEADER]
+    lines = [_MEMORY_EVIDENCE_FACT_HEADER]
     for fact in facts:
         lines.append(
             "fact="
@@ -2148,174 +2041,99 @@ def _memory_evidence_backed_fact_message(
     )
 
 
-def _memory_question_and_assumption_message(
-    snapshot: ConversationMemorySnapshot,
+def _memory_answer_anchor_message(
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> SystemMessage | None:
-    """渲染 open questions / working assumptions memory block。
+    """渲染 Answer Anchor Memory section。
 
     :param snapshot: memory snapshot。
     :returns: system message；无内容时返回 ``None``。
     """
 
-    lines: list[str] = [_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER]
-    for question in snapshot.pinned_state.open_questions:
-        lines.append(f"open_question={question}")
-    for assumption in snapshot.working_assumptions:
-        lines.append(
-            "working_assumption="
-            f"{assumption.assumption_summary}; "
-            f"event_id={assumption.event_id}; "
-            f"event_sequence={assumption.event_sequence}"
-        )
-    if len(lines) == 1:
+    anchors = snapshot.answer_anchor_memory.anchors
+    if not anchors:
         return None
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
+    lines = [_MEMORY_ANSWER_ANCHOR_HEADER]
+    for anchor in anchors:
+        child_text = "; ".join(
+            (
+                child.display_text
+                if child.ordinal is None
+                else f"{child.ordinal}. {child.display_text}"
+            )
+            for child in anchor.anchor_items
+        )
+        lines.append(f"answer_anchor=title={anchor.anchor_title}; items={child_text}")
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
-def _memory_raw_turn_messages(
-    items: tuple[ConversationContinuityItem, ...],
+def _memory_forward_intent_message(
+    snapshot: ConversationMemorySnapshotVNext,
+) -> SystemMessage | None:
+    """渲染 Forward Intent Memory section。
+
+    :param snapshot: memory snapshot。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    intents = snapshot.forward_intent_memory.intents
+    if not intents:
+        return None
+    lines = [_MEMORY_FORWARD_INTENT_HEADER]
+    for intent in intents:
+        lines.append(
+            "forward_intent="
+            f"type={intent.intent_type}; status={intent.status}; text={intent.text}"
+        )
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
+
+
+def _memory_reference_continuity_message(
+    items: tuple[ReferenceContinuityItem, ...],
+) -> SystemMessage | None:
+    """渲染 Trace Memory reference continuity section。
+
+    :param items: reference continuity items。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    if not items:
+        return None
+    lines = [_MEMORY_REFERENCE_CONTINUITY_HEADER]
+    for item in items:
+        lines.append(f"reference_continuity=reason={item.reason}; text={item.text}")
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
+
+
+def _memory_selected_recent_window_messages(
+    items: tuple[SelectedRecentWindowItem, ...],
     render_scope: _CurrentMemoryRenderScope,
 ) -> tuple[AgentMessage, ...]:
-    """渲染 recent raw turns continuity messages。
+    """渲染 selected recent window messages。
 
-    :param items: continuity items。
+    :param items: selected recent window items。
     :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: raw turn messages。
+    :returns: Engine messages。
     """
 
     messages: list[AgentMessage] = []
     for item in items:
-        if item.item_kind not in (
-            ConversationContinuityKind.RAW_USER_TURN,
-            ConversationContinuityKind.RAW_ASSISTANT_TURN,
-            ConversationContinuityKind.ASSISTANT_CONCLUSION,
-        ):
+        if item.event_id == render_scope.user_input_event_id:
             continue
-        if _is_current_run_user_input_memory_item(item, render_scope):
-            continue
-        content = _continuity_item_text(item)
-        if item.item_kind is ConversationContinuityKind.RAW_USER_TURN:
-            messages.append(
-                UserMessage(role=AgentMessageRole.USER, content=content)
-            )
-        else:
+        if item.role is SelectedRecentWindowRole.USER:
+            messages.append(UserMessage(role=AgentMessageRole.USER, content=item.text))
+        elif item.role is SelectedRecentWindowRole.ASSISTANT:
             messages.append(
                 AssistantMessage(
                     role=AgentMessageRole.ASSISTANT,
-                    content=content,
+                    content=item.text,
                     reasoning_content=None,
                     tool_calls=(),
                 )
             )
+        else:
+            messages.append(SystemMessage(role=AgentMessageRole.SYSTEM, content=item.text))
     return tuple(messages)
-
-
-def _memory_minimum_preserve_message(
-    items: tuple[ConversationContinuityItem, ...],
-    render_scope: _CurrentMemoryRenderScope,
-) -> SystemMessage | None:
-    """渲染 minimum preserve continuity block。
-
-    :param items: continuity items。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: system message；无 minimum preserve item 时返回 ``None``。
-    """
-
-    preserve_items = tuple(
-        item
-        for item in items
-        if item.item_kind is ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
-        and not _is_current_run_user_input_memory_item(item, render_scope)
-    )
-    if not preserve_items:
-        return None
-    lines = [_MEMORY_MINIMUM_PRESERVE_HEADER]
-    for item in preserve_items:
-        lines.append(
-            "continuity_item="
-            f"label={item.label}; "
-            f"text={_continuity_item_text(item)}; "
-            f"source_refs={','.join(item.source_refs)}; "
-            f"preserve_reason={_preserve_reason_text(item)}"
-        )
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
-
-
-def _memory_episode_summary_message(
-    items: tuple[ConversationContinuityItem, ...],
-    render_scope: _CurrentMemoryRenderScope,
-) -> SystemMessage | None:
-    """渲染 episode summaries memory block。
-
-    :param items: continuity items。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: system message；无 episode summary 时返回 ``None``。
-    """
-
-    episode_items = tuple(
-        item
-        for item in items
-        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
-        and not _is_current_run_user_input_memory_item(item, render_scope)
-    )
-    if not episode_items:
-        return None
-    lines = [_MEMORY_EPISODE_SUMMARIES_HEADER]
-    for item in episode_items:
-        lines.append(f"episode_summary={_continuity_item_text(item)}")
-    return SystemMessage(
-        role=AgentMessageRole.SYSTEM,
-        content="\n".join(lines),
-    )
-
-
-def _continuity_item_text(item: ConversationContinuityItem) -> str:
-    """读取 continuity item 可渲染文本。
-
-    :param item: continuity item。
-    :returns: 可进入 Engine message 的文本。
-    """
-
-    if item.summary_text is not None:
-        return item.summary_text
-    if item.payload_ref is not None and item.payload_digest is not None:
-        return f"payload_ref={item.payload_ref}; payload_digest={item.payload_digest}"
-    return f"event_ref={item.event_id}"
-
-
-def _preserve_reason_text(item: ConversationContinuityItem) -> str:
-    """读取 minimum preserve reason 的可渲染文本。
-
-    :param item: continuity item。
-    :returns: preserve reason 文本。
-    """
-
-    if item.preserve_reason is None:
-        return "unspecified"
-    return item.preserve_reason.value
-
-
-def _is_current_run_user_input_memory_item(
-    item: ConversationContinuityItem, render_scope: _CurrentMemoryRenderScope
-) -> bool:
-    """判断 continuity item 是否是当前 Run 的用户输入。
-
-    :param item: continuity item。
-    :param render_scope: 当前 Run memory 渲染排除范围。
-    :returns: 属于当前 ``USER_INPUT_ACCEPTED`` raw turn 时返回 ``True``。
-    """
-
-    if item.item_kind is not ConversationContinuityKind.RAW_USER_TURN:
-        return False
-    if item.event_id == render_scope.user_input_event_id:
-        return True
-    return False
 
 
 def build_run_input_material_blocks(
@@ -2356,8 +2174,8 @@ def build_run_input_material_blocks(
         blocks.append(
             run_input_material_block(
                 block_id=f"compact:{index}",
-                section=CompactMaterialSection.HISTORY_INPUT,
-                kind=CompactMaterialBlockKind.EPISODE_SUMMARY,
+                section=CompactMaterialSection.TRACE_MATERIAL,
+                kind=CompactMaterialBlockKind.SESSION_SUMMARY,
                 text=_run_input_message_content(message),
                 canonical_source_refs=(compact_source_ref,),
                 event_sequence=None,
@@ -2369,7 +2187,7 @@ def build_run_input_material_blocks(
         blocks.append(
             run_input_material_block(
                 block_id=f"continuity:{index}",
-                section=CompactMaterialSection.HISTORY_INPUT,
+                section=CompactMaterialSection.TRACE_MATERIAL,
                 kind=_history_material_kind(message),
                 text=_run_input_message_content(message),
                 canonical_source_refs=(f"message:continuity:{index}",),
@@ -2435,9 +2253,9 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
     :returns: Agent message。
     """
 
-    if block.kind is CompactMaterialBlockKind.RAW_USER_TURN:
+    if block.kind is CompactMaterialBlockKind.USER_INPUT:
         return UserMessage(role=AgentMessageRole.USER, content=block.text)
-    if block.kind is CompactMaterialBlockKind.RAW_ASSISTANT_TURN:
+    if block.kind is CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER:
         return AssistantMessage(
             role=AgentMessageRole.ASSISTANT,
             content=block.text,
@@ -2474,8 +2292,10 @@ def _material_section_for_message(message: AgentMessage) -> CompactMaterialSecti
     """
 
     if isinstance(message, SystemMessage):
-        return CompactMaterialSection.STABLE_INPUT
-    return CompactMaterialSection.HISTORY_INPUT
+        return CompactMaterialSection.PREVIOUS_COMPACTED_VIEW
+    if isinstance(message, AssistantMessage):
+        return CompactMaterialSection.ANSWER_MATERIAL
+    return CompactMaterialSection.TRACE_MATERIAL
 
 
 def _memory_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
@@ -2486,17 +2306,21 @@ def _memory_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
     """
 
     content = _run_input_message_content(message)
-    if content.startswith(_MEMORY_EVIDENCE_BACKED_FACTS_HEADER):
+    if content.startswith(_MEMORY_EVIDENCE_FACT_HEADER):
         return CompactMaterialBlockKind.EVIDENCE_BACKED_FACT
-    if content.startswith(_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER):
-        return CompactMaterialBlockKind.WORKING_ASSUMPTION
-    if content.startswith(_MEMORY_EPISODE_SUMMARIES_HEADER):
-        return CompactMaterialBlockKind.EPISODE_SUMMARY
+    if content.startswith(_MEMORY_FORWARD_INTENT_HEADER):
+        return CompactMaterialBlockKind.FORWARD_INTENT
+    if content.startswith(_MEMORY_ANSWER_ANCHOR_HEADER):
+        return CompactMaterialBlockKind.ANSWER_ANCHOR
+    if content.startswith(_MEMORY_REFERENCE_CONTINUITY_HEADER):
+        return CompactMaterialBlockKind.REFERENCE_CONTINUITY
+    if content.startswith(_MEMORY_SESSION_SUMMARY_HEADER):
+        return CompactMaterialBlockKind.SESSION_SUMMARY
     if isinstance(message, UserMessage):
-        return CompactMaterialBlockKind.RAW_USER_TURN
+        return CompactMaterialBlockKind.USER_INPUT
     if isinstance(message, AssistantMessage):
-        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
-    return CompactMaterialBlockKind.PINNED_STATE
+        return CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER
+    return CompactMaterialBlockKind.SESSION_SUMMARY
 
 
 def _history_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
@@ -2507,10 +2331,10 @@ def _history_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
     """
 
     if isinstance(message, UserMessage):
-        return CompactMaterialBlockKind.RAW_USER_TURN
+        return CompactMaterialBlockKind.USER_INPUT
     if isinstance(message, AssistantMessage):
-        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
-    return CompactMaterialBlockKind.EPISODE_SUMMARY
+        return CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER
+    return CompactMaterialBlockKind.SESSION_SUMMARY
 
 
 def _memory_material_source_ref(memory: MemorySnapshotView) -> str:
@@ -2526,7 +2350,7 @@ def _memory_material_source_ref(memory: MemorySnapshotView) -> str:
 
 
 def _memory_represented_evidence_refs(
-    snapshot: ConversationMemorySnapshot,
+    snapshot: ConversationMemorySnapshotVNext,
 ) -> tuple[str, ...]:
     """返回 stable memory facts 已表示的 accepted evidence refs。
 
@@ -2535,7 +2359,7 @@ def _memory_represented_evidence_refs(
     """
 
     refs: list[str] = []
-    for fact in snapshot.evidence_backed_facts:
+    for fact in snapshot.evidence_fact_memory.evidence_backed_facts:
         refs.extend(fact.evidence_refs)
     return tuple(dict.fromkeys(refs))
 
@@ -2572,18 +2396,6 @@ def _represented_evidence_refs(
             )
         )
     )
-
-
-def _opaque_ref_text(ref: OpaqueMemoryRef) -> str:
-    """渲染 Host 中立 opaque ref。
-
-    :param ref: opaque memory ref。
-    :returns: 稳定文本。
-    """
-
-    if ref.digest is None:
-        return f"{ref.ref_kind.value}:{ref.ref_id}"
-    return f"{ref.ref_kind.value}:{ref.ref_id}; digest={ref.digest}"
 
 
 def _memory_cursor_ref(cursor: MemorySnapshotCursor) -> str:
@@ -2809,55 +2621,156 @@ def _compact_artifact_message_content(
     artifact_digest = _required_text_field(
         payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
     )
-    summary = _optional_summary_text_from_compacted_payload(
+    accepted_evidence_mapping_refs = _accepted_evidence_mapping_refs(payload)
+    candidate_summary = _vnext_compact_candidate_summary(
         payload, max_summary_chars=max_summary_chars
     )
-    preserved_fact_refs = preserved_fact_refs_summary(payload)
     lines = [
-        "Accepted compact artifact is available for this run.",
+        "Accepted vNext compact artifact is available for this run.",
         f"compact_artifact_ref={artifact_ref}",
         f"compact_artifact_digest={artifact_digest}",
         f"compacted_event_id={compacted_event.event_id}",
         f"compacted_event_sequence={compacted_event.event_sequence}",
-        f"preserved_fact_refs={preserved_fact_refs}",
+        (
+            "accepted_evidence_mapping_refs="
+            f"{','.join(accepted_evidence_mapping_refs)}"
+        ),
+        f"accepted_candidate={candidate_summary}",
     ]
-    if summary is not None:
-        lines.append(f"episode_summary={summary}")
     return "\n".join(lines)
 
 
-def _optional_summary_text_from_compacted_payload(
-    payload: Mapping[str, JsonValue], *, max_summary_chars: int
-) -> str | None:
-    """从 compacted payload 提取 bounded episode summary。
+def _accepted_evidence_mapping_refs(
+    payload: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    """读取 vNext compact payload 中已接受 evidence mapping refs。
 
-    :param payload: compacted payload。
-    :param max_summary_chars: 最大字符数。
-    :returns: summary 文本；不存在时为 ``None``。
+    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
+    :returns: accepted evidence mapping refs。
+    :raises HostDurableError: 字段缺失或包含非文本元素时抛出。
     """
 
-    value = payload.get(_PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE)
-    if not isinstance(value, Mapping):
-        return None
-    candidate_id = _optional_mapping_text(value, _PAYLOAD_FIELD_CANDIDATE_ID)
-    goal = _optional_mapping_text(value, _PAYLOAD_FIELD_GOAL)
-    constraints = optional_text_list_field(value, _PAYLOAD_FIELD_USER_CONSTRAINTS)
-    questions = optional_text_list_field(value, _PAYLOAD_FIELD_OPEN_QUESTIONS)
-    parts = []
-    if candidate_id is not None:
-        parts.append(f"candidate_id={candidate_id}")
-    if goal is not None:
-        parts.append(f"goal={goal}")
-    if len(constraints) > 0:
-        parts.append("user_constraints=" + "; ".join(constraints))
-    if len(questions) > 0:
-        parts.append("open_questions=" + "; ".join(questions))
-    if len(parts) == 0:
-        return None
+    return _required_text_list_field(
+        payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS
+    )
+
+
+def _vnext_compact_candidate_summary(
+    payload: Mapping[str, JsonValue], *, max_summary_chars: int
+) -> str:
+    """从 vNext accepted candidate 渲染 bounded compact 摘要。
+
+    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
+    :param max_summary_chars: 最大字符数。
+    :returns: accepted candidate 摘要。
+    :raises HostDurableError: accepted candidate 结构损坏时抛出。
+    """
+
+    candidate = _required_mapping_field(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
+    schema_version = _required_text_field(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
+    facts = _required_mapping_list_field(
+        candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS
+    )
+    anchors = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
+    intents = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
+    references = _required_mapping_list_field(
+        candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS
+    )
+    parts = [f"schema_version={schema_version}"]
+    session_summary = _optional_session_summary_text(candidate)
+    if session_summary is not None:
+        parts.append(f"session_summary={session_summary}")
+    parts.extend(
+        (
+            f"evidence_backed_facts={len(facts)}",
+            f"answer_anchors={len(anchors)}",
+            f"forward_intents={len(intents)}",
+            f"reference_continuity_items={len(references)}",
+        )
+    )
     text = " | ".join(parts)
     if len(text) <= max_summary_chars:
         return text
     return text[:max_summary_chars]
+
+
+def _optional_session_summary_text(
+    candidate: Mapping[str, JsonValue],
+) -> str | None:
+    """读取 vNext accepted candidate 的可选 session summary 文本。
+
+    :param candidate: ``accepted_candidate`` JSON object。
+    :returns: summary text；无 summary 时返回 ``None``。
+    :raises HostDurableError: summary 字段存在但结构损坏时抛出。
+    """
+
+    value = candidate.get(_PAYLOAD_FIELD_SESSION_SUMMARY)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError("accepted_candidate.session_summary must be object")
+    return _required_text_field(value, _PAYLOAD_FIELD_SUMMARY_TEXT)
+
+
+def _required_mapping_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> Mapping[str, JsonValue]:
+    """读取必填 JSON object 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: JSON object。
+    :raises HostDurableError: 字段缺失或非 object 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"payload field {field_name} must be object")
+    return value
+
+
+def _required_mapping_list_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取必填 JSON object list 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: JSON object tuple。
+    :raises HostDurableError: 字段缺失、非 list 或元素非 object 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        raise HostDurableError(f"payload field {field_name} must be list")
+    items: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError(f"payload field {field_name} item must be object")
+        items.append(item)
+    return tuple(items)
+
+
+def _required_text_list_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """读取必填文本 list 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 文本 tuple。
+    :raises HostDurableError: 字段缺失、非 list 或元素非文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        raise HostDurableError(f"payload field {field_name} must be list")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item.strip() == "":
+            raise HostDurableError(f"payload field {field_name} item must be text")
+        result.append(item)
+    return tuple(result)
 
 
 def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:

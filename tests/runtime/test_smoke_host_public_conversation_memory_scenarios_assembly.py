@@ -32,6 +32,7 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     SuiteMode,
     _build_byd_long_input,
     _compact_pressure_padding,
+    _compact_pressure_reserve_tokens,
     _estimate_chars_as_tokens,
     _ensure_request,
     _mock_pressure_blob,
@@ -276,7 +277,13 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     prompt_tokens = _estimate_chars_as_tokens(
         len(_compact_pressure_padding(assembly.options))
     )
-    pressure_tokens = prompt_tokens + _tool_pressure_estimated_tokens()
+    pressure_tokens = (
+        prompt_tokens
+        + _tool_pressure_estimated_tokens()
+        + _compact_pressure_reserve_tokens(
+            context_window_size=policy.context_window_size
+        )
+    )
     soft_threshold_tokens = _threshold_tokens(
         policy.context_window_size,
         policy.soft_threshold_context_ratio,

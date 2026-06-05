@@ -137,9 +137,11 @@ def test_cancel_session_runs_cancels_waiting_run(
         )
 
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        event_types = [event.event_type for event in _events(host._transaction_runner())]
         assert snapshot.active_run_id is None
         assert snapshot.queued_run_ids == ()
         assert wait_record.status is WaitRecordStatus.CANCELLED
+        assert "RUN_CANCELLED" in event_types
     finally:
         host.close()
 

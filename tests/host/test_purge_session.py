@@ -2232,7 +2232,7 @@ def _insert_memory_rows(transaction: HostTransaction, events: _TargetEvents) -> 
             "memory-item-1",
             "memory-snapshot-1",
             _SESSION_ID,
-            "raw_user_turn",
+            "selected_recent_window",
             "candidate",
             events.parent_input[0],
             events.parent_input[1],

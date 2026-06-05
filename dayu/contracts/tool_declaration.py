@@ -17,10 +17,11 @@ Host / ToolRuntime 的职责，公共契约层不提供默认执行器或 callab
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import InitVar, dataclass
 from typing import Protocol, runtime_checkable
 
+from dayu.contracts._validation import require_non_empty_text as _require_non_empty_text
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     ToolCallRequest,
@@ -72,6 +73,15 @@ class ToolDisplayInfo:
 
     name: str
 
+    def __post_init__(self) -> None:
+        """校验展示名称非空。
+
+        :returns: ``None``。
+        :raises ValueError: ``name`` 为空或只包含空白时抛出。
+        """
+
+        _require_non_empty_text(self.name, field_name="ToolDisplayInfo.name")
+
 
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
@@ -104,8 +114,7 @@ class ToolDefinition:
             ``schema.function.name`` 不一致时抛出。
         """
 
-        if self.name.strip() == "":
-            raise ValueError("ToolDefinition name must be non-empty")
+        _require_non_empty_text(self.name, field_name="ToolDefinition name")
         if self.name != self.schema.function.name:
             raise ValueError("ToolDefinition name must match schema.function.name")
 
@@ -223,7 +232,7 @@ def tool(
     truncate: ToolTruncateSpec | None = None,
     display_name: str | None = None,
     tags: Sequence[str] = (),
-) -> _ToolDecorator:
+) -> Callable[[ToolCallable], ToolDefinition]:
     """声明一个工具并返回装饰器。
 
     本装饰器用于在工具函数现场同源声明 :class:`ToolSchema`、Host

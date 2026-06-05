@@ -177,6 +177,17 @@ def test_tool_definition_rejects_empty_name() -> None:
         raise AssertionError("empty tool definition name was accepted")
 
 
+def test_tool_display_info_rejects_empty_name() -> None:
+    """工具展示名称不能为空。"""
+
+    try:
+        ToolDisplayInfo(name="  ")
+    except ValueError as exc:
+        assert str(exc) == "ToolDisplayInfo.name must be non-empty"
+    else:
+        raise AssertionError("empty tool display name was accepted")
+
+
 def test_tool_bundle_rejects_public_empty_definitions() -> None:
     """调用方默认不得直接构造空 ``ToolBundle``。"""
 

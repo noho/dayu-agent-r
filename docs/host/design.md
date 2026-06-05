@@ -4,7 +4,7 @@
 
 ## 1. 设计目标
 
-Host 的设计目标是支撑生产级买方财报分析 Agent。系统范式是“宿主强约束下的 LLM in the loop”：
+Host 的设计目标是支撑生产级通用 Agent，具备买方财报分析能力。系统范式是“宿主强约束下的 LLM in the loop”：
 
 - Host 是 Session / Run / Attempt / EventLog / admission / cancel / resume / retry / steer / replay / memory / tool governance 的治理真源。
 - Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run 生命周期，不持久化 Host 状态，不恢复旧 Agent / Runner。
@@ -50,7 +50,7 @@ Host 内部模块边界：
 - Attempt Dispatch：只消费已提交的 dispatch record / attempt snapshot，负责 LocalProxy / RemoteProxy 派发与 cancel 传播；不得生成治理事实。
 - EngineEvent Ingest：唯一负责把 Engine / Worker / ToolRuntime 回传事件验证、分类并转成 Host event。
 - RunInputBuilder：唯一负责通过 typed input provider protocols 聚合 EventLog、memory snapshot、compact artifact、tool schema snapshot 与场景约束，构造 `AgentRunRequest.messages`。
-- Conversation Memory：只消费 committed canonical EventLog facts，维护 session memory snapshot、stable layer 与 history pool；它是可重建 projection / read model，不是事实真源，不直接写 EventLog，也不由 Context Governance 直接写入。
+- Conversation Memory：只消费 committed canonical EventLog facts 与 accepted compact projection，维护 session memory snapshot 的五类会话语义视图；它是可重建 projection / read model，不是事实真源，不直接写 EventLog，也不由 Context Governance 直接写入。
 - Context Governance：唯一负责上下文预算、compact 编排与 compact 事件收口；它是治理 orchestrator，不直接写 memory、audit、trace 或其它 projection。
 - ToolRuntime / TruncationManager：唯一负责工具执行治理、截断、`fetch_more`、等待与重复调用治理；工具事实必须走 Host accept barrier。
 - Observer / Sink / Projection：只消费 committed EventLog events，维护派生视图和外部投递队列。
@@ -88,11 +88,11 @@ Config catalog 的 record id 由顶层 map key 提供，record 内不重复 `run
 
 execution profile 选择是 Service / composition root 的显式业务决策，不由 helper 根据 `models.context_window_tokens` 隐式切换。Service 可以根据业务场景、响应速度和 effective model 选择合适 profile；assembly helper 只做兼容性校验和诊断，例如 1M profile 搭配 256K 模型时 fail fast 或输出明确 diagnostic，256K profile 搭配 1M 模型时可允许但提示策略较保守。若需要机器可读约束，profile 可增加 `context_window_class` 或 `min_context_window_tokens` 一类字段；这些字段只用于校验，不用于自动选择。
 
-`context_budget_policy` 对齐 ratio-first Host public `ContextBudgetPolicy`，只表达治理策略，不表达模型能力或本次调用输出预算。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `ContextBudgetPolicy.context_window_size` 直接传入 typed policy。`ContextBudgetPolicy` 至少包含 `context_window_size`、`soft_threshold_context_ratio`、`hard_threshold_context_ratio`、`max_proactive_compactions_per_run`、`max_reactive_compactions_per_run`、`max_compaction_attempts_per_operation` 与 `policy_ref`；Host 内部根据 ratio 计算 soft / hard threshold tokens。旧的 `max_context_tokens`、`reserved_response_tokens`、`reserved_output_tokens`、`minimum_protection_tokens` 与 `compaction_trigger_tokens` 不作为 config/public policy 字段暴露。
+`context_budget_policy` 对齐 ratio-first Host public `ContextBudgetPolicy`，只表达治理策略，不表达模型能力或本次调用输出预算。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `ContextBudgetPolicy.context_window_size` 直接传入 typed policy。`ContextBudgetPolicy` 至少包含 `context_window_size`、`soft_threshold_context_ratio`、`hard_threshold_context_ratio`、`max_proactive_compactions_per_run`、`max_reactive_compactions_per_run`、`max_compaction_attempts_per_operation` 与 `policy_ref`；Host 内部根据 ratio 计算 soft / hard threshold tokens。绝对 token 阈值、输出预留和触发阈值不作为 config/public policy 字段暴露。
 
 usage 是 provider capability 驱动的治理观测信号，不是 scene / Service 业务风格参数。流式 OpenAI-compatible 请求在 `RunnerCallOptions.stream=True` 且 `RunnerSpec.supports_stream_usage=True` 时默认请求 `stream_options.include_usage=true`；非流式响应如果 provider 返回 `usage`，Engine 默认读取并上报。Config 不提供 `usage_enabled`、`collect_usage`、`include_usage` 这类 override，也不引入独立 `supports_usage` 字段。Engine 只负责如实上报 usage，不理解 Host budget；Host ingest 负责 durable 化 `usage_reported` 并保留 attempt / execution context、估算 digest、policy ref 等后续消费所需关联信息。Context Governance 可主动消费 usage，但 usage 是 post-call observation，只用于估算器校准、diagnostic 与后续 Run / 后续 compaction 治理参考；不得回头修改当前已经完成的 dispatch decision。usage 缺失、provider 不支持 usage 或 usage 字段格式异常都不得导致 Run 失败。
 
-`memory_projection_policy` 对齐 Host public `MemoryProjectionPolicy`，采用 ratio / floor / cap 自适应预算模型。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `MemoryProjectionPolicy.context_window_size` 直接传入 typed policy。policy 至少包含 `context_window_size`、`max_pinned_items`、`max_evidence_backed_facts`、`max_working_assumptions`、`recent_raw_turns_floor`、stable layer ratio/floor/cap、history pool ratio/floor/cap、raw turn ratio/floor/cap、`max_lag_events_for_inline_delta` 与 `max_delta_repair_events`。policy 存在即表示装配 stateful memory projection；不再使用 `enabled` 字段表达单轮 / 多轮语义。
+`memory_projection_policy` 对齐 Host public `MemoryProjectionPolicy`，采用按语义分区的 deterministic floor / cap 预算模型。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `MemoryProjectionPolicy.context_window_size` 直接传入 typed policy。policy 至少包含 `context_window_size`、`selected_recent_window_item_cap`、`selected_recent_window_char_cap`、`selected_recent_window_turn_floor`、`fallback_selected_recent_window_item_cap`、`fallback_selected_recent_window_char_cap`、`evidence_fact_item_cap`、`evidence_fact_char_cap`、`evidence_fact_floor`、`session_summary_char_cap`、`answer_anchor_item_cap`、`answer_anchor_char_cap`、`forward_intent_item_cap`、`forward_intent_char_cap`、`reference_continuity_item_cap`、`reference_continuity_char_cap`、`reference_continuity_item_floor`、`max_lag_events_for_inline_delta`、`max_delta_repair_events` 与 `policy_ref`。fallback selected recent window caps 必须不小于 `selected_recent_window_turn_floor` 所需材料，且不得大于普通 selected recent window caps；否则 fallback 会失去“更小、更保守恢复视图”的治理含义。同一个运行语义只能有一个 policy owner；若某个值同时影响 context governance 与 memory projection，必须由唯一 owner 派生给另一侧使用，不得复制成会漂移的双份真源。policy 存在即表示装配 stateful memory projection；不再使用 `enabled` 字段表达单轮 / 多轮语义。
 
 `tool_truncation_policy` 只配置默认治理参数，不配置 per-tool strategy / target。它至少包含 `enabled`、`default_cursor_ttl_seconds` 与 `default_limits`，其中 `default_limits` 覆盖 `text_chars.max_chars`、`text_lines.max_lines`、`list_items.max_items` 与 `binary_bytes.max_bytes`。工具声明负责提供 `ToolTruncateSpec.strategy`、`target_field` / `field_path` 与是否启用截断；如果工具声明启用截断但未提供 limit 或 ttl，Service / composition root 用 policy default 补齐成 effective truncate spec。`fetch_more` 名称由 `FrameworkToolName.FETCH_MORE` 固定，不作为配置项。
 
@@ -1006,15 +1006,15 @@ Phase 4 public function behavior matrix：
 | `get_run` | 完整实现 | 从 durable Run / Attempt truth 构造 snapshot。 |
 | internal `stream_run_events` / run-scoped EventLog 补读 | 完整实现 EventLog-backed read path | 全局 EventLog cursor 是唯一 cursor truth；Phase 4 不引入 projection truth；P10.5 后该路径降为内部 diagnostic / detail contract。 |
 | `cancel_run` queued / pre-dispatch `STARTING` | 完整实现 | 覆盖 Phase 1-3 已有可闭环路径：`QUEUED` 与 dispatch record 尚未进入 dispatching 的 Attempt `STARTING`。 |
-| `cancel_session_runs` queued / pre-dispatch `STARTING` | 子集实现并追踪后续完善 | Phase 4 只批量覆盖上述 `cancel_run` 可闭环子集；dispatching / active worker、`WAITING`、`RECOVERING` cancel deferred。 |
+| `cancel_session_runs` queued / pre-dispatch `STARTING` / `WAITING` / `RECOVERING` | 完整覆盖当前可闭环状态 | 批量取消所有当前可闭环 non-terminal Run；active worker 物理传播、外部 job physical cancel / abandon 与 recovery dispatch 中取消继续由对应后续 owner 强化。 |
 | `submit_followup(steer)` | stable unsupported / deferred | Phase 4 只冻结 envelope、validation、error/detail contract；public facade 返回 `unsupported_operation`。完整 Attempt switching 由后续 steer / dispatch / wait owner 落地。 |
 | `retry_run` | stable unsupported / deferred | Phase 4 冻结 request / idempotency / error envelope；执行语义由后续 retry owner 落地。 |
 | `replay_run` | stable unsupported / deferred | Phase 4 冻结 request / idempotency / error envelope；执行语义由后续 replay owner 落地。 |
 | `resolve_wait` | stable unsupported / deferred | Phase 7 owns wait record、tool result accept 与 resume Attempt。 |
 | `purge_session` | stable unsupported / deferred | Phase 15 owns destructive cleanup 与 purge tombstone persistence。 |
 | active dispatch cancel | stable unsupported / deferred | Phase 5 owns dispatching / active WorkerProxy cancel propagation。 |
-| wait cancel | stable unsupported / deferred | Phase 7 owns `WAITING` closeout 与 external job best-effort cancel / abandon。 |
-| recovery cancel | stable unsupported / deferred | Phase 11 owns `RECOVERING` dispatch / recovery scan cancellation。 |
+| wait external job physical cancel | stable unsupported / deferred | 当前已实现 `WAITING -> CANCELLED` 逻辑收口；Phase 7 继续拥有外部 job best-effort cancel / abandon 强化。 |
+| recovery dispatch cancel | stable unsupported / deferred | 当前已实现未派发 `RECOVERING -> CANCELLED`；Phase 11 继续拥有 recovery dispatch / recovery scan cancellation 强化。 |
 
 所有会 append EventLog `canonical_fact` 或影响 audit 的 mutating request 都必须携带结构化 `HostCallContext` 或等价 request envelope。Host 不负责认证，但必须记录上层已经解析的 actor / principal、source / client、request id、权限声明和 operation context。required fields 不能塞进无结构 metadata。
 
@@ -1178,8 +1178,8 @@ Run 接口语义：
 - 内部 `stream_run_events` / run-scoped EventLog 补读：从全局 `event_sequence` cursor 补读目标 Run 的事件。它是 Host 内部 diagnostic / detail / debug / drill-down helper，只服务内部测试、排查某次 retry / replay source run 或运维诊断；不得和 `watch_session_events` 并列成为 Service-facing 聊天入口。若未来要公开给 Run detail 页面，必须先定义 public diagnostic event DTO，不得直接暴露内部 `HostEventView`。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
 - `purge_session`：清理已关闭且全部 Run 终态的 Session，按 `(session_id, client_request_id)` 幂等；删除可恢复事实与 projection，只保留最小 purge tombstone / audit record。
-- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-worker `STARTING` Run 可直接 `CANCELLED`，包括 `pending`、`waiting_for_lane` 以及 WorkerProxy accepted 前的 `dispatching`。active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；`WAITING` 与 `RECOVERING` cancel 分别由 Phase 7 / Phase 11 落地。
-- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有未终态 Run，不影响其它 Session。Phase 4 只实现 queued / pre-dispatch `STARTING` 子集，完整 pre-worker `dispatching` / active worker、`WAITING`、`RECOVERING` cancel 必须由 Phase 5 / 7 / 11 补齐。
+- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-worker `STARTING` Run 可直接 `CANCELLED`，包括 `pending`、`waiting_for_lane` 以及 WorkerProxy accepted 前的 `dispatching`；`WAITING` Run 通过取消 wait record 直接 `CANCELLED`；未派发的 `RECOVERING` Run 直接 `CANCELLED`。active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；外部 job physical cancel / abandon 与 recovery dispatch cancellation 分别由 Phase 7 / Phase 11 强化。
+- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有当前可闭环未终态 Run，不影响其它 Session。queued / pre-dispatch `STARTING`、`WAITING` 与未派发 `RECOVERING` 会直接收口；active worker 物理传播、外部 job physical cancel / abandon 与 recovery dispatch cancellation 继续由 Phase 5 / 7 / 11 强化。
 - `submit_followup`：接受同一 Session 的普通 prompt 或控制输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。Phase 4 只冻结 steer envelope、validation 与 error/detail contract，public facade 对 steer 返回 `unsupported_operation`；完整 Attempt switching 后续落地。
 - `retry_run`：公开 Host control API，由调用方主动发起；函数式语义为 `retry(run)`。它在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay_run`：公开 Host control API，由调用方主动发起；函数式语义为 `replay(run)`。它只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
@@ -1519,7 +1519,7 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | resume 是 | audit 是 / tool trace 是 |
 | `GUIDANCE_INSERTED` | `session_id`、`run_id` | guidance text / source policy / reason | 不直接改 terminal；影响下一 Attempt messages | 插入 messages 时 resume 消费 | audit yes / Host event stream emit |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
-| `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / episode summary candidate / pinned state patch candidate / preserved fact refs / dropped reason / quality check / failure reason | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
+| `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / accepted candidate digest / prompt-local label mapping refs / source boundary refs / quality check / failure reason / fallback decision | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
 | `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
 
 canonical event 的 required fields 不能被塞进无结构 `metadata`；`metadata` 只能承载不参与状态机、幂等、恢复和审计主链的附加说明。
@@ -2413,7 +2413,7 @@ client requests cancel
 
 `cancel_session_runs(host, session_id, request)` 是 session-scope cancel command，用于客户端退出、supervisor shutdown 或用户明确停止该 Session 下全部未完成工作。它不是 `close_session`，不关闭新输入入口；不是 `purge_session`，不删除事实；也不表达“客户端拥有的所有 Session”。
 
-Phase 4 只实现 `cancel_session_runs` 的 Phase 1-3 可闭环子集：`QUEUED` Run 与 pre-dispatch Attempt `STARTING`。dispatch record 已进入 `dispatching`、Attempt 已 `RUNNING`、`WAITING`、`RECOVERING`、active worker propagation、wait record cancel 与 recovery dispatch cancel 都是 stable deferred 行为；Phase 5 / Phase 7 / Phase 11 必须分别补齐，不能把 Phase 4 子集解释为最终语义。
+当前 `cancel_session_runs` 实现覆盖所有当前可闭环 non-terminal Run：`QUEUED`、pre-dispatch Attempt `STARTING`、`WAITING` 与未派发的 `RECOVERING`。active worker propagation、外部 job physical cancel / abandon 与 recovery dispatch cancellation 仍是后续强化行为；Phase 5 / Phase 7 / Phase 11 必须分别补齐，不能把当前逻辑收口解释为外部执行环境已经物理停止。
 
 `cancel_session_runs` 语义：
 
@@ -2424,8 +2424,8 @@ Phase 4 只实现 `cancel_session_runs` 的 Phase 1-3 可闭环子集：`QUEUED`
 - accepted / queued Run 直接 `CANCELLED`，不创建 Attempt。
 - Attempt `STARTING` 且尚未 dispatch / 正在 `waiting_for_lane` 时直接取消，不通知 EngineWorker。
 - 已 dispatch / active running Attempt 走普通 `cancel_run` 传播到 WorkerProxy；Phase 5 owns 该路径。
-- `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort；Phase 7 owns 该路径。
-- `RECOVERING` Run 的取消由 Phase 11 recovery owner 接入。
+- `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort，Phase 7 继续拥有该强化路径。
+- `RECOVERING` Run 在新 recovery dispatch 尚未提交前直接取消；已进入 recovery dispatch 的取消强化由 Phase 11 recovery owner 接入。
 - terminal 已抢先提交时 terminal 优先，`cancel_session_runs` 返回当前终态，不改写 terminal。
 - 返回 `SessionSnapshot`，包含 cancel 后的 session / run summary。
 
@@ -2480,10 +2480,15 @@ Service / caller 可以提供 system messages 或场景装配参数，但不能�
 messages 构造顺序必须稳定：
 
 1. Host / Service 提供的 system 与场景约束。
-2. session memory stable layer：pinned state、evidence-backed facts、open questions、assumptions。
-3. 当前 `USER_INPUT_ACCEPTED` 与当前 Run 需要的 canonical facts，按 `event_sequence` 顺序投影为对模型有语义的 messages。
-4. replay / retry / steer / resume guidance。
-5. 当前 attempt 的工具 schema snapshot 与运行 policy。
+2. Session Summary Memory。
+3. Evidence / Fact Memory。
+4. Answer Anchor Memory。
+5. Forward Intent Memory。
+6. Trace Memory 中的 reference continuity items。
+7. selected recent window。
+8. 当前 `USER_INPUT_ACCEPTED` 对应的 current input。
+9. replay / retry / steer / resume guidance。
+10. 当前 attempt 的工具 schema snapshot 与运行 policy。
 
 同一 EventLog 在同一 policy 下必须构造出等价 messages；projection lag、preview delta 或 sink failure 不能改变 RunInputBuilder 输出。
 
@@ -2495,7 +2500,7 @@ RunInputBuilder 的输出必须能由输入 fact refs、memory snapshot cursor�
 - assistant final answer / assistant conclusion，作为对话连续性，不是 `evidence_backed_fact`。
 - accepted tool result、tool terminal result、evidence anchor / ref / digest。
 - tool awaiting resolved 后的 terminal / result fact。
-- Host memory block：pinned state、evidence-backed facts、open questions、assumptions。
+- Host memory block：session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items。
 - `GUIDANCE_INSERTED`，如果影响后续 iteration。
 - 必要的 cancel / resume / steer 说明，如果它影响当前继续目标。
 
@@ -2512,150 +2517,344 @@ RunInputBuilder 不创建独立 RunInputBuildTrace 子系统；上下文构造�
 
 ## 24. Conversation Memory
 
-Conversation Memory 从买方财报分析 Agent 的会话不变量出发：
+Conversation Memory 的目标是为生产级通用 Agent 提供可恢复、可审计、受预算约束的会话 read model，并在该通用能力之上支撑买方财报分析的跨轮事实、证据和追问连续性。它不是新的事实真源，也不是把历史全文塞回 prompt 的召回系统。
 
-- 目标稳定。
-- 工具结果即事实。
-- 追问连续性是刚需。
-- 跨轮一致性优先于上下文丰富度。
-- memory 克制。
-- 展示态与运行态分离。
+事实真源固定为 Host durable EventLog、payload descriptor 与 artifact。Conversation Memory 只从这些真源和 accepted compact projection 中投影出当前 Session 最常用、最稳定、最需要直接注入上下文的 bounded working set。第一阶段不根据当前用户 prompt 做相关性召回，不引入 memory intent parser、semantic search、vector recall 或 LLM reranker；深历史语义检索 deferred owner 为 GitHub Issue 39。
 
-Conversation Memory 不是聊天记录压缩器，而是财报分析工作台状态投影。它回答下一轮分析所需的稳定问题：
+Conversation Memory 的 session-scoped 语义模型固定为五类：
 
-- 现在分析谁。
-- 分析什么期间。
-- 按什么口径。
-- 哪些事实已由工具确认。
-- 哪些仍是假设或待验证线索。
-- 下一步需要验证什么。
+1. Trace Memory。
+2. Evidence / Fact Memory。
+3. Session Summary Memory。
+4. Answer Anchor Memory。
+5. Forward Intent Memory。
 
-结构：
+User Profile Memory 是唯一跨 session 语义类，不进入 session Conversation Memory snapshot；其 durable profile store、更新、撤销、删除、导出、隐私与跨 session projection deferred owner 为 GitHub Issue 115。
+
+### 24.1 Compact / Delta 边界
+
+第一阶段采用 material boundary 与 policy-conditioned deterministic assembly：
 
 ```text
-Conversation Memory
-  -> stable layer
-      -> pinned_state
-      -> evidence_backed_facts
-      -> working_assumptions
-      -> open_questions
-  -> history pool
-      -> conversation_continuity
-      -> recent raw turns floor
-      -> older raw turns
-      -> episode summaries
+memory_material =
+  latest_accepted_compacted_view
+  + post_compact_delta_material
+
+rendered_context =
+  assemble(
+    memory_material,
+    current_input_anchor,
+    selected_recent_window_policy,
+    protected_recent_floor_policy
+  )
 ```
 
-Conversation Memory 不包含独立的 `evidence anchors / tool facts / provenance` memory layer。accepted tool result 是
-`TOOL_RESULT_ACCEPTED` canonical fact；accepted evidence envelope、payload digest、artifact ref、source locator 与 EventLog
-refs 是 Host 内部 provenance / audit mapping。LLM-facing memory 只能看到可读 claim、可读 continuity 与短 evidence refs，不能把
-Host 内部账本字段作为主要语义输入。
+`latest_accepted_compacted_view` 是 Host 内部已接受的 compact projection，用于代表 compact 覆盖范围内的旧历史；没有 accepted compact 时为空。给 LLM 的只能是 Host 从它投影出的业务语义视图，不是 raw compact artifact JSON、EventLog payload 或内部字段全集。
 
-`pinned_state` 至少包含：
+`post_compact_delta_material` 是最近一次 accepted compact 之后新产生、尚未被 compact 覆盖的 canonical EventLog material；没有 accepted compact 时从 session 起点开始。它是 Host 内部材料边界，不等于全部进入 prompt 的 view。
 
-- `current_goal`
-- `confirmed_subjects`
-- `user_constraints`
-- `open_questions`
+`current_input_anchor` 是当前 Run 的用户输入保护锚点。它不是 memory 语义类，而是 compact、fallback 与 prompt assembly 的边界字段；给模型的仍只是当前用户输入文本。当前用户说“继续刚才失败的任务”或“恢复刚才那个”属于 current input，而不是 Trace Memory。
 
-`evidence_backed_facts` 只来自 accepted tool evidence。它不表示 Host 证明世界事实为真，而表示一个自包含 claim 绑定到了
-已接受 evidence，因此不是 assistant 幻想、episode summary 或 user claim。每条 `evidence_backed_fact` 至少包含
-`claim_text`、`evidence_kind`、`evidence_refs`、producer / extraction operation ref、`event_id` / `event_sequence` 与可选
-opaque attributes。`evidence_refs` 指向 accepted evidence envelope；第一版每个 accepted tool result 至少形成一个稳定
-`evidence_id`，多个 facts 可以引用同一个 `evidence_id`。更细粒度 item-level evidence id 可后续扩展，但不得要求 Host
-理解 URL、年报章节、chunk、span、row、cell 或其它 locator。
+`selected_recent_window_policy` 从 material 中确定性选择 bounded recent window；`protected_recent_floor_policy` 在 selected recent window 内保底最近若干 turn / item，用来保护“刚才”“继续”“第二点”等短链路承接。二者都是 Host policy，不暴露给模型。
 
-Accepted evidence envelope 至少记录 evidence id、producer event ref、tool name、tool query、
-payload ref / digest、outcome digest 与 opaque source / locator descriptor；不记录、派生或暴露有界结果预览字段。
-`evidence_id` 由 Host 在
-`TOOL_RESULT_ACCEPTED` accept barrier 通过时生成；LLM 不生成 canonical evidence id，tool provider 也不承担 memory fact
-生成职责。Accepted evidence envelope 是 provenance anchor，不是 evidence 内容的 lossy 容器；LLM extractor 生成
-`claim_text` 时必须读取 compact input 中原本进入会话上下文的 raw tool result / raw transcript，并引用 Host 标注到该 raw
-内容旁边的 `evidence_id`。Host 只校验 `evidence_refs` 指向已接受 evidence、`claim_text` 非空且
-长度受限、`evidence_kind` 属于允许枚举，以及 candidate 不把 assistant final answer、episode summary、user input 或
-working assumption 当作 evidence。Host 不校验 evidence 的业务形状，不解析 locator，不证明 excerpt 逐字覆盖 claim，也不理解
-metric / subject / period 的业务含义。
+before compact 不需要独立阶段建模。它只是 `latest_accepted_compacted_view` 为空、`post_compact_delta_material` 从 session 起点开始的普通情况：
 
-当 compact 输入中存在 accepted evidence，但 LLM extractor 无法形成可接受的 `evidence_backed_fact` candidate 时，Host 不得合成
-neutral fallback fact。正确行为是保留 accepted evidence envelope / artifact refs，记录 projection diagnostic、candidate reject
-reason 或 bounded repair 结果；episode summary 与 minimum preserve 仍可保留导航和连续性，但不能以 fallback fact 形式进入 stable facts。
+```text
+before_compact_memory_material =
+  empty_latest_accepted_compacted_view
+  + session_start_delta_material
 
-`working_assumptions` 承载用户说法、assistant 推断、早期弱信号和待验证候选。它们不能冒充 `evidence_backed_facts`；后续若被用于关键归因，
-必须由当前 Run 召回并验证对应工具事实后，才能形成 evidence-backed claim。
+before_compact_rendered_context =
+  assemble(
+    before_compact_memory_material,
+    current_input_anchor,
+    selected_recent_window_policy,
+    protected_recent_floor_policy
+  )
+```
 
-`conversation_continuity` 承载最近 raw turns、assistant conclusion、minimum preserve items 与 episode summaries，只服务追问连续性。episode summary
-只能做导航，不能替代 evidence anchor、source ref、chunk ref、fingerprint 或 claim status。
+多次 compact 使用 rolling compacted view。第二次及后续 compact 只输入上一轮 latest accepted compacted view、selected post-compact recent window 与 current input anchor；不得重新展开已被上一轮 accepted compact 覆盖的旧 raw history。旧 compact artifact 保留在 EventLog / artifact / audit 中用于追溯和重建，但不作为当前 prompt 或下一次 compact 的默认叠加输入。
 
-`minimum_preserve_items` 是 compact structured output 中的 bounded continuity item，用于保护当前或下一轮追问所需的最小指代解析上下文。
-例如用户粘贴长文本并要求提炼三个因素后，下一轮追问“第二个因素”时，minimum preserve 应保留有序 extracted items 中能解析
-“第二个因素”的 item，而不是保留整段长 user input。minimum preserve 不属于事实真源，不产生 `evidence_backed_fact`；它只进入
-conversation continuity / navigation。
+### 24.2 LLM-facing Compact I/O 硬边界
 
-long-session retention / consolidation 是 Conversation Memory 的基本语义，不是后续性能优化：
+一次 compact 是一次 LLM 调用。Compact I/O 必须严格分离 Host internal control / provenance 与 LLM-readable material。
 
-- `pinned_state` 对 RunInputBuilder 和 compactor 可见时必须是 materialized current state，不是 patch log。
-- `working_assumptions` 与 `open_questions` 是当前工作台状态，后续 compact 应合并、解决、过期或降级旧项，不能无限 append。
-- `episode summaries` 进入 history pool 后仍需 bounded rendering；较旧 summaries 应 roll up 或只保留 artifact / EventLog refs。
-- `evidence_backed_facts` 可以在 durable memory projection 中保存更多历史项，但 ordinary RunInputBuilder 与 compactor input 只能选择
-  与当前 pinned subject、current goal、用户问题、近期引用或 policy top-K / size budget 相关的 bounded working set。
-- 第一版 consolidation 由 memory projection policy 与 RunInputBuilder / compactor input bounded selection 执行，不要求 compactor 输出
-  独立 `memory_retention_candidate`。后续若引入 retention intent，也只能作为 compactor candidate 由 Host accept barrier 与
-  memory projection policy 消费，不能让 LLM 直接改写 memory truth。
-- `minimum_preserve_items` 与 conversation continuity 是短寿命导航层；如果已被 stable layer 或 episode summary 覆盖，应从可见
-  working set 中移除。
+LLM-readable compact input 只能包含与当前 compact 任务有关、用户或业务可理解的材料：
 
-RunInputBuilder 注入 memory 的顺序必须体现财报分析优先级：
+- 用户输入文本、助手最终回答文本、用户可见 Run 状态连续性。
+- 可读 tool name、tool query、tool response / source text。
+- Host 为本次 compact 生成的 prompt-local opaque labels。
+- 上一轮 accepted compacted view 的业务可读 projection。
 
-1. 用户目标与约束。
-2. 已确认主体和口径。
-3. evidence-backed facts。
-4. open questions / working assumptions。
-5. recent raw turns。
-6. episode summaries。
+不得作为模型阅读材料暴露，也不得要求模型返回：
 
-不变量：
+- EventLog event id、event sequence、payload / artifact ref、digest、durable evidence id。
+- compact cursor、compact boundary、policy name、budget diagnostic、fallback diagnostic、projection checkpoint、scheduler / Attempt / recovery 内部治理细节。
+- `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` raw payload、compact artifact JSON、repair 前 candidate、失败 proposal 或中间 transient artifact。
+- 任何只在当前实现版本成立的默认约定、magic string、临时缩写、位置语义或隐式排序语义。
 
-- `pinned_state` 与 evidence-backed stable facts 全量注入，不参与 history pool 竞争。
-- `pinned_state` 与 `evidence_backed_facts` 虽不参与 history pool 竞争，但必须有结构化尺寸上限、降级诊断和 trace 记录；不得无限扩大 memory
-  挤占财报材料、工具结果、章节上下文和当前问题的预算。
-- `final_answer` 是 assistant role 产出的最终回答，只能作为 raw turn / assistant conclusion 参与连续性。
-- `final_answer` 绝不能自动升级为 `evidence_backed_fact`。
-- `evidence_backed_fact` 只接受 accepted tool evidence refs。
-- 缺少可接受的 `evidence_backed_fact` candidate 时只能记录 diagnostic / repair outcome，不得生成 neutral fallback fact。
-- 用户输入进入 pinned state、约束或待验证候选，不直接成为 `evidence_backed_fact`。
-- memory projection 只消费 canonical facts。
-- preview / reasoning / display-only facts 不进入 memory。
-- LLM 产出的 pinned patch、episode summary 或 conclusion 默认只能成为 candidate / assumption / continuity view；它们不能直接写入
-  Host truth，也不能直接产生 `evidence_backed_fact`。proactive compaction 编排属于 Context Governance。
-- RunInputBuilder 渲染 `evidence_backed_facts` 时必须包含 `claim_text` 与 `evidence_refs`，不能只渲染 digest / ref。source /
-  locator 细节通过 evidence id 回查 accepted evidence envelope，不要求进入 memory block。
-- 第一版 `evidence_backed_facts` 采用 compaction-gated extraction：compact 前不阻塞普通 Run 做 extraction；短链路追问继续依赖
-  recent raw turns / older raw turns / 已有 memory。`TOOL_RESULT_ACCEPTED` 后记录 accepted evidence / artifact / refs，供后续
-  compact 使用，不要求同步 LLM extraction。
-- memory snapshot 是 read model，可重建、可修复，不是事实真源。
-- 第一版 memory snapshot 与 projection checkpoint 使用同一 SQLite durable store transaction 提交；checkpoint 不得先于 snapshot 落库。
-- 跨存储 atomic commit marker 不进入第一版默认实现，只作为后续 memory storage split 能力。
-- RunInputBuilder 消费 memory snapshot 时必须记录 snapshot cursor；后续 replay / audit 能解释当时看到的是哪一版 memory。
-- RunInputBuilder 消费 memory snapshot 前必须校验 snapshot cursor 覆盖本次构造 messages 所需的 EventLog cursor。projection lag 不能改变同一 EventLog + policy 下的 messages。
-- RunInputBuilder 的 trace / tool trace 必须记录 memory item included / excluded reason、snapshot cursor、policy digest、预算原因、
-  stale / conflict / missing-evidence reason。P9 不创建独立 RunInputBuildTrace 子系统。
-- recent raw turns floor 是下限保底，不是 history 上限；预算允许时可以注入更多 older raw turns。older raw turns 与 episode summaries
-  共享单一 history pool，超预算时先降级 episode summaries / older raw turns，最后才降级 recent raw turns。
-- `recent_raw_turns_floor` 保留现有命名，语义是最近 raw turns 的最低保留数量，用于代词指代、局部追问、刚发生的用户输入 /
-  assistant conclusion / tool result 展示等交互连续性。它不是 financial fact retention 机制，不保证完整 raw tool transcript
-  跨 compact 可见；compact 覆盖范围内的历史事实稳定性由 `evidence_backed_facts` 承担。
-- minimum preserve items 只保留指代解析所需的最小 extracted context，不保留整段长输入。Host 只校验 item text 非空且长度受限、
-  source refs 指向 compact input、item 数量受 policy 限制、preserve reason 属于允许枚举；Host 不解释 item 业务含义。
-- P9 只实现 session-level memory projection 与 provider 边界；长期 retrieval index、业务 signal ledger、signal-to-outcome
-  verification 与 public memory edit / reset / forget API 均不进入第一版。
+prompt-local label 是本次 LLM 调用内的 opaque citation handle，只用于让模型把 claim、anchor、summary 或 intent 绑定到它刚读过的材料。第一阶段允许使用短 deterministic handle，例如 `C1`、`H1`、`E1`、`S1`、`E1.1`。label 不得携带位置、时间、重要性、优先级、durable identity 或实现状态语义；模型不得根据顺序、前缀、chunk 后缀或名字推断事实含义。Host 内部维护 prompt-local label 到 durable provenance refs 的映射；prompt、schema、validator 和测试可以验证 label 能映射回 provenance，但不得依赖 label 名称或 ordinal 推断业务语义。
 
-memory snapshot 缺失或滞后的处理：
+LLM compact output 只能返回业务语义字段和 prompt-local labels。Host 负责把 labels 映射回 durable refs，校验 provenance、长度、枚举、source boundary 和 quality gate。模型不得返回 durable refs、event ids、digests、artifact refs、policy decisions 或任何 Host 内部状态字段。
 
-- snapshot cursor 滞后但 EventLog delta 在 policy 阈值内时，RunInputBuilder 可以从 EventLog canonical facts 重建所需 stable layer，并记录 diagnostic / trace。
-- snapshot 缺失、损坏或 lag 超过 policy 阈值时，Host 进入结构化 context governance / projection repair path；dispatch 前的
-  catch-up failure 或 lag 超阈值必须先尝试 memory projection rebuild / retry。这不是 Run crash recovery。
-- memory projection lag 不得触发 Run 状态迁移，不得把 Run 推入 `RECOVERING`。
-- 重建后的 snapshot checkpoint 不得先于 durable snapshot content 落库。
+### 24.3 vNext Compact I/O Contract
+
+`ConversationCompactInputVNext` 是 Host 渲染给 compactor 的唯一 user material data block，结构固定为：
+
+```text
+ConversationCompactInputVNext
+  schema_version: "conversation_compact_input_v1"
+  previous_compacted_view?: CompactReadableView
+  trace_material: list[TraceReadableItem]
+  evidence_material: list[EvidenceReadableItem]
+  answer_material: list[AnswerReadableItem]
+  current_input_anchor: CurrentInputAnchor
+  instruction: CompactInstruction
+```
+
+compact input 子类型固定为 LLM-readable schema，不携带 Host internal refs：
+
+```text
+PromptLocalLabel = str
+
+CompactReadableView
+  session_summary?: str
+  evidence_backed_facts: list[ReadableFactItem]
+  answer_anchors: list[ReadableAnswerAnchor]
+  forward_intents: list[ReadableForwardIntent]
+  reference_continuity_items: list[ReadableReferenceContinuityItem]
+
+ReadableFactItem
+  source_label: PromptLocalLabel
+  claim_text: str
+  source_note?: str
+
+ReadableAnswerAnchor
+  source_label: PromptLocalLabel
+  anchor_title: str
+  anchor_items: list[ReadableAnswerAnchorItem]
+
+ReadableAnswerAnchorItem
+  display_text: str
+  ordinal?: int
+
+ReadableForwardIntent
+  source_label: PromptLocalLabel
+  intent_type: "open_question" | "pending_clarification" | "pending_user_visible_task" | "next_step_note"
+  text: str
+  status: "open" | "blocked" | "superseded"
+
+ReadableReferenceContinuityItem
+  source_label: PromptLocalLabel
+  text: str
+  reason: "local_reference" | "ordinal_reference" | "ellipsis_recovery" | "recent_state"
+
+TraceReadableItem
+  source_label: PromptLocalLabel
+  trace_kind: "user_input" | "assistant_final_answer" | "user_visible_run_state"
+  text: str
+
+EvidenceReadableItem
+  source_label: PromptLocalLabel
+  tool_name: str
+  query_text?: str
+  response_text: str
+  source_note?: str
+
+AnswerReadableItem
+  source_label: PromptLocalLabel
+  answer_text: str
+
+CurrentInputAnchor
+  anchor_label: PromptLocalLabel
+  text: str
+
+CompactInstruction
+  output_schema_name: "ConversationCompactOutputVNext"
+  compact_goal: "roll_forward_session_memory"
+```
+
+所有 readable item 的 `source_label` 都是 prompt-local opaque label，只在本次 compact 调用内有效。`display_text`、`text`、`claim_text` 与 `answer_text` 是模型可读业务内容；这些字段不得承载 durable refs、digest、event sequence、policy name 或 compact boundary。`CompactInstruction` 只表达业务任务和目标输出 schema，不承载 Host budget policy、fallback decision、repair state 或内部 provenance map。
+
+`previous_compacted_view` 只包含上一轮 accepted compacted view 的业务可读 projection，包括 session summary、accepted evidence-backed facts、answer anchors、forward intents 与 reference continuity items；不得包含 raw compact artifact JSON。`trace_material` 只包含用户输入、助手最终回答和用户可见 Run 状态。`evidence_material` 只包含可读 tool、query、response / source text 与 prompt-local evidence label。`answer_material` 只包含可读 assistant final answer / conclusion 与 prompt-local answer label。`current_input_anchor` 只包含当前用户输入文本和 prompt-local anchor label；同一 current user payload 不得再作为 trace material 重复渲染。`instruction` 只表达本次 compact 的业务任务和输出 schema 要求，不承载 Host policy internals。
+
+`current_input_anchor` 是 readable but not citable：LLM 可以读取它来理解本次 compact 的边界，Host 也用它确保当前用户输入不会被 compact / fallback 吞掉；但 `current_input_anchor.anchor_label` 不属于任何 compact candidate 的 allowed source label set。Host accept barrier 必须拒绝任何在 `source_labels`、`evidence_labels`、`answer_source_labels`、diagnostic `source_labels` 或其它 candidate source 字段中引用 `current_input_anchor.anchor_label` 的输出。当前输入只有到下一轮成为历史时，才可能作为 trace material 进入后续 compact。
+
+`ConversationCompactOutputVNext` 是 compactor 必须返回的 strict JSON object：
+
+```text
+ConversationCompactOutputVNext
+  schema_version: "conversation_compact_output_v1"
+  session_summary: SessionSummaryCandidate | null
+  evidence_backed_facts: list[EvidenceBackedFactCandidate]
+  answer_anchors: list[AnswerAnchorCandidate]
+  forward_intents: list[ForwardIntentCandidate]
+  reference_continuity_items: list[ReferenceContinuityCandidate]
+  diagnostics: list[CompactCandidateDiagnostic]
+```
+
+`session_summary` 为 nullable；compact 后如果没有足够材料形成 summary，Host 可以接受空 summary，但不能让空 summary 掩盖其它必需 quality gate。`evidence_backed_facts`、`answer_anchors`、`forward_intents`、`reference_continuity_items` 必须是 list，允许为空。所有 candidate 均必须引用本次 input 中存在且允许被引用的 prompt-local source labels；未知 label、跨 section label、stale label、缺 source label 或引用 `current_input_anchor.anchor_label` 都是 candidate invalid。candidate 文本必须非空且受 policy char cap 限制；枚举字段只能使用 schema 定义值；空字符串不表达删除或清空语义。
+
+candidate schema：
+
+```text
+SessionSummaryCandidate
+  summary_text: str
+  source_labels: list[str]
+
+EvidenceBackedFactCandidate
+  claim_text: str
+  evidence_labels: list[str]
+  evidence_kind: "tool_result" | "tool_source_text" | "accepted_evidence_material"
+  source_labels?: list[str]
+
+AnswerAnchorCandidate
+  anchor_title: str
+  anchor_items: list[AnswerAnchorChild]
+  answer_source_labels: list[str]
+
+AnswerAnchorChild
+  display_text: str
+  ordinal?: int
+
+ForwardIntentCandidate
+  intent_type: "open_question" | "pending_clarification" | "pending_user_visible_task" | "next_step_note"
+  text: str
+  status: "open" | "blocked" | "superseded"
+  source_labels: list[str]
+
+ReferenceContinuityCandidate
+  text: str
+  reason: "local_reference" | "ordinal_reference" | "ellipsis_recovery" | "recent_state"
+  source_labels: list[str]
+
+CompactCandidateDiagnostic
+  code: str
+  text: str
+  source_labels?: list[str]
+```
+
+`EvidenceBackedFactCandidate` 只能引用 evidence material labels，不能引用 user input、assistant final answer、session summary、answer anchor 或 forward intent 后冒充工具事实。`AnswerAnchorCandidate` 只能引用 assistant final answer / conclusion labels。`ForwardIntentCandidate` 不能被当作工具执行计划或事实证明，也不能自动触发工具。`ReferenceContinuityCandidate` 只能保存理解局部指代所需的最小文本，不能保留整段长输入。
+
+### 24.4 Snapshot Typed Schema
+
+通过 Host accept barrier 的 compact output 物化为 `ConversationMemorySnapshotVNext` typed view。Snapshot 是 read model，可重建、可修复，不是事实真源。
+
+```text
+ConversationMemorySnapshotVNext
+  schema_version: "conversation_memory_snapshot_v1"
+  session_id: SessionId
+  source_event_cursor: EventSequence
+  latest_compaction_event_ref?: HostInternalRef
+  trace_memory: TraceMemoryView
+  evidence_fact_memory: EvidenceFactMemoryView
+  session_summary_memory: SessionSummaryMemoryView
+  answer_anchor_memory: AnswerAnchorMemoryView
+  forward_intent_memory: ForwardIntentMemoryView
+  diagnostics: MemoryProjectionDiagnostics
+
+TraceMemoryView
+  selected_recent_window: list[SelectedRecentWindowItem]
+  reference_continuity_items: list[ReferenceContinuityItem]
+
+EvidenceFactMemoryView
+  evidence_backed_facts: list[EvidenceBackedFact]
+  recent_evidence_items: list[RecentEvidenceReadableItem]
+
+SessionSummaryMemoryView
+  summary_text?: str
+  source_refs: list[HostInternalRef]
+
+AnswerAnchorMemoryView
+  anchors: list[AnswerAnchor]
+
+ForwardIntentMemoryView
+  intents: list[ForwardIntent]
+```
+
+`HostInternalRef` 是 Host 内部 typed provenance ref，不进入 LLM-readable prompt。Snapshot item 必须保存 internal source refs、source labels mapping digest、producer compact event ref、created cursor、last updated cursor、policy ref、item digest 与 bounded diagnostic。RunInputBuilder 渲染 snapshot 时只输出业务可读文本和必要的短来源说明，不输出 durable refs、digest 或 cursor。
+
+Projection 规则：
+
+- compact 前，Session Summary Memory、Answer Anchor Memory 与 Forward Intent Memory 为空。
+- compact 前，Trace Memory 与 Evidence / Fact Memory 只能从 selected recent window 中的 user / assistant / user-visible state / readable tool material 表达；它们不自动生成高阶结构化 item。
+- compact 成功后，accepted compact output 生成或更新五类 session memory；post-compact delta material 继续按 selected recent window 进入 prompt assembly。
+- compact failure fallback 不 materialize snapshot，不生成 Session Summary、Answer Anchor、Forward Intent、reference continuity item 或 `evidence_backed_facts`。
+- accepted evidence 存在但 compactor 没有产出合法 fact candidate 时，Host 只记录 diagnostic，不合成 fallback fact。
+- assistant final answer、用户输入、session summary、answer anchor、reference continuity item、User Profile、Forward Intent 都不能自动升级成 `evidence_backed_fact`。
+
+Snapshot 与 projection checkpoint 必须在同一 durable store transaction 提交；checkpoint 不得先于 snapshot 落库。RunInputBuilder 消费 snapshot 时必须记录 snapshot cursor；若 snapshot 缺失、损坏或 lag 超过 policy 阈值，Host 进入 projection catch-up / rebuild / retry path。这不是 Run crash recovery，不得触发 Run 状态迁移，也不得把 Run 推入 `RECOVERING`。
+
+### 24.5 五类 Session Semantic Memory
+
+Trace Memory 负责对话连续性，不负责事实证明。数据来源包括 `USER_INPUT_ACCEPTED`、`RUN_SUCCEEDED.final_answer` 和用户可见 Run 状态。TraceMemoryView 当前字段为 selected recent window 与 reference continuity items；reference continuity item 用于保存 compact 后仍需解析代词、序号、“刚才那个”等局部承接的最小上下文，不是 fact、summary、answer anchor 或 forward intent。
+
+Evidence / Fact Memory 负责工具证据与基于证据的 claim。`TOOL_RESULT_ACCEPTED` 通过 Host accept barrier 后保存 accepted evidence envelope、payload / artifact refs 与 digest；LLM-facing evidence material 只包含可读 tool、query、response、source text 与 prompt-local opaque label。`evidence_backed_facts` 只来自 accepted `CONTEXT_COMPACTED` 中通过 Host accept barrier 的 fact candidates，或后续明确设计的非 compact producer。这里的 fact 表示 Host-accepted claim 绑定到 accepted evidence，不表示 Host 证明现实世界 truth。
+
+Session Summary Memory 负责当前 session 的 compact / rollup，服务长对话连续性，不替代事实。它只来自 accepted `CONTEXT_COMPACTED`；多次 compact 使用 rolling compacted view，latest accepted compacted view 是下一次 compact 的 previous accepted view。
+
+Answer Anchor Memory 保存历史回答中可被用户后续指代的结构化轮廓，例如“三个风险”的第 1 / 2 / 3 点，用于支持“第二点展开”“刚才第三个风险”等追问。第一阶段不对 final answer 做 deterministic outline parser 或 LLM parser；Answer Anchor 只能来自 accepted compact output，或明确设计的非 prompt-conditioned producer。
+
+Forward Intent Memory 保存待澄清问题、未完成任务、下一步任务状态等前瞻意图。它不是真实世界事实，也不直接驱动工具执行，只辅助下一轮 prompt 构造或澄清问题。第一阶段不对 prompt / final answer 做 intent parser，也不生成 hidden plan；Forward Intent 只能来自 accepted compact output，或明确设计的非 prompt-conditioned producer。
+
+producer mapping 汇总如下；实现不得从旧字段或旧 renderer 反推新语义：
+
+| 语义 | compact 前 | compact 成功后 | post-compact delta | compact failure fallback |
+| --- | --- | --- | --- | --- |
+| Trace Memory | selected recent window 中的 user input、assistant final answer、用户可见 Run 状态 | accepted `reference_continuity_items` 与 trace projection | latest compact cursor 之后的 eligible user / assistant / user-visible state material 继续进入 selected recent window | 只渲染 fallback selected recent window，不物化 Trace snapshot item |
+| Evidence / Fact Memory | selected recent window 中的 readable tool query / response / source text | 通过 accept barrier 的 `evidence_backed_facts` | latest compact cursor 之后的 readable accepted evidence material 继续进入 selected recent window | 只渲染 fallback selected recent window 中仍被选中的 tool material，不生成 fact |
+| Session Summary Memory | 空 | accepted `session_summary` roll-forward view | 不由 delta 直接生成 summary | 空，不生成 summary |
+| Answer Anchor Memory | 空 | 通过 accept barrier 的 `answer_anchors` | 不对 final answer 做 compact 前 parser | 空，不生成 anchor |
+| Forward Intent Memory | 空 | 通过 accept barrier 的 `forward_intents` | 不对 prompt / final answer 做 intent parser | 空，不生成 intent |
+
+### 24.6 Prompt Assembly
+
+Prompt Assembly 的 section 顺序是固定 contract，不根据当前 prompt 做 recall、parser、reranker 或动态重排：
+
+1. Host / Service system messages 与场景约束。
+2. Session Summary Memory。
+3. Evidence / Fact Memory。
+4. Answer Anchor Memory。
+5. Forward Intent Memory。
+6. Trace Memory 的 reference continuity items。
+7. selected recent window。
+8. current input。
+9. replay / retry / steer / resume guidance。
+10. tool schema snapshot 与运行 policy。
+
+Session Summary 只提供会话框架，不能替代 Evidence / Fact Memory；当 summary 与 fact 同时出现时，事实 claim 以 `evidence_backed_facts` 为准。Answer Anchor Memory 与 Forward Intent Memory 在 compact 后按 bounded policy 渲染非空 section，不由当前 prompt 触发。Reference continuity items 只服务局部指代解析，并放在 selected recent window 之前；selected recent window 是最接近 current input 的历史上下文。
+
+渲染原则固定为：
+
+```text
+if no accepted compacted view:
+  memory_context =
+    selected_recent_window
+  current_input = final user message
+
+if compact failed and recent-window fallback is allowed:
+  memory_context =
+    fallback_selected_recent_window
+  current_input = final user message
+
+if accepted compacted view exists:
+  memory_context =
+    session_summary_memory
+    evidence_fact_memory
+    answer_anchor_memory
+    forward_intent_memory
+    trace_memory.reference_continuity_items
+    selected_recent_window_after_compact_boundary
+  current_input = final user message
+```
+
+第一阶段不根据 token estimator 在 runtime 做逐 section 裁剪。各 section 必须在 projection / assembly 前通过配置化 item cap、char cap、selected recent window cap、selected recent window floor 与 per-semantic bounded working set 形成确定性上限；provider context length failure 由 Context Governance 的 reactive compact / fallback 收口。需要 floor 的 section 只固定两类：`selected_recent_window_turn_floor` 与 `evidence_fact_floor`。其它 section 默认只有 cap，没有 floor；`reference_continuity_item_floor = 0` 可以显式进入配置。fallback selected recent window caps 必须不小于 selected recent window floor 所需材料，并且不大于普通 selected recent window caps。
+
+### 24.7 测试与评测边界
+
+Conversation Memory 的完整评测 deferred owner 为 GitHub Issue 80。当前设计要求 WU-CM-01 至少覆盖以下可断言场景：empty compacted view、non-empty compacted view、post-compact delta、compact boundary、protected recent floor、deterministic bounded projection、provider context length fallback、invalid / missing / stale source label、schema invalid、provenance mismatch、partial candidate invalid、fallback 不生成高阶语义、compact roll-forward。
+
+`utils/` Host public smoke 是 WU-CM-01 的初步验收标准，不等价于完整通过 GitHub Issue 80 的 benchmark。完整 eval harness 由 GitHub Issue 80 继续推进。
 
 ## 25. Context Governance
 
@@ -2664,72 +2863,50 @@ Context governance 是 Host 责任。Engine 不做 Host-side compact retry，也
 Host 负责：
 
 - provider-aware context budget policy。
-- RunInputBuilder 输入层预算分配。
-- compact 触发。
-- LLM episode summary compaction。
-- pinned_state patch。
-- evidence-backed fact candidate extraction。
-- compact 后保真检查。
-- compaction semantic repair / retry 编排。
-- failure closeout。
-- context overflow retry。
-- compact event。
-- compact event 与 projection 输入。
+- RunInputBuilder 输入层预算观测。
+- proactive / reactive compact 触发。
+- `ConversationCompactInputVNext` 构造。
+- `ConversationCompactOutputVNext` accept barrier。
+- compaction whole-candidate repair / retry 编排。
+- failure closeout 与 deterministic recent-window fallback。
+- context overflow recovery dispatch。
+- compact-related EventLog facts。
+- compact event 与 Conversation Memory projection 输入。
 
 Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace、audit projection 或 outbox。它只能 append / request append compact-related canonical facts 或 projection_signal，并通过 typed ports 调用 compactor、budget estimator、RunInputBuilder 和 policy view。memory、trace、audit 等 projection 只从已提交 EventLog 追平。
 
-第一版不实现 provider-specific token counting / provider tokenizer adapter。Context Governance 使用 conservative estimator、provider-aware configured limits 和 safety margin 做 proactive 判断；Engine context overflow event 只是 reactive fallback，不是主要 compaction trigger。provider-specific tokenizer adapter 是后续能力。
+第一版不实现 provider-specific token counting / provider tokenizer adapter。Context Governance 使用 conservative estimator、provider-aware configured limits 和 safety margin 做 proactive 判断；Engine context overflow event 是 reactive 收口信号。provider-specific tokenizer adapter 是后续精确能力。
 
-`context_window_size` 与 `reserved_output_tokens` 是 Host context policy 的显式 typed input，由 Service / composition root 在装配 Host policy provider 时传入。Host 不从 Engine 反查模型窗口，不从 per-run metadata 或 extra payload 中读取预算参数，也不把 provider overflow event 当作预算真源。pre-dispatch 判断必须先为输出预留 `reserved_output_tokens`，再用剩余输入预算、safety margin 与 conservative estimator 决定是否触发 proactive compact。Runner 返回的 usage 只能作为 post-call observation / diagnostics / policy calibration 输入，不能替代下一次 dispatch 前对当前 messages 的估算。
+`context_window_size` 是 Host context policy 的显式 typed input，由 Service / composition root 从 effective model config 读取并传入 typed policy。Host 不从 Engine 反查模型窗口，不从 per-run metadata 或 extra payload 中读取预算参数，也不把 provider overflow event 当作预算真源。Runner 返回的 usage 只能作为 post-call observation / diagnostics / policy calibration 输入，不能替代下一次 dispatch 前对当前 messages 的估算。
 
 第一版 policy 默认值与阈值语义：
 
-- `context_window_size` 与 `reserved_output_tokens` 必须为正整数，且 `reserved_output_tokens` 必须小于 `context_window_size`。
-- 输入预算先按 `input_budget_tokens = context_window_size - reserved_output_tokens` 计算；输出预留不参与输入层竞争。
-- 默认 safety margin 为 20%，即 proactive compact 的 soft threshold 为 `input_budget_tokens * 0.8`。超过 soft threshold 时，Host 应先尝试 compact，而不是直接 dispatch。
-- hard threshold 由 policy provider 显式给出或按 `input_budget_tokens` 扣除 policy 定义的最小保护余量后计算。proactive path 在 dispatch 前使用估算输入决定是否禁止 dispatch；proactive compact operation 的 bounded repair attempts 全部耗尽后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。reactive path 不把 compact 后估算值当作能否重新 dispatch 的真源；它接受 quality 通过的 compact 结果，随后用真实 recovery dispatch / Engine overflow 闭环判断是否还需要下一次 reactive compact。
+- `context_window_size` 必须为正整数。
+- `soft_threshold_context_ratio` 与 `hard_threshold_context_ratio` 必须大于 0 且小于等于 1，且 soft ratio 不得大于 hard ratio。
+- Host 内部按 ratio 计算 soft / hard threshold tokens。超过 soft threshold 时，Host 应先尝试 compact，而不是直接 dispatch。
+- proactive path 在 dispatch 前使用估算输入决定是否触发 compact 或禁止 dispatch；proactive compact operation 的 bounded repair attempts 全部耗尽后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。
+- reactive path 不把 compact 后估算值当作能否重新 dispatch 的真源；它接受 quality 通过的 compact 结果，随后用真实 recovery dispatch / Engine overflow 闭环判断是否还需要下一次 reactive compact。
 - 每个 Run 的 proactive trigger 第一版最多启动一个 compaction operation；reactive trigger 每次 Engine overflow 最多启动一个 operation，但同一 Run 可在 `max_reactive_compactions_per_run` 上限内多次 reactive compact，默认上限为 2。一个 operation 内可以包含 Host-owned bounded semantic repair attempts，但不得启动无界 compact loop。
 - `max_compaction_attempts_per_operation` 由 Host context budget policy 显式给出，含第一次 proposal attempt、reactive material
-  block pass proposal 与后续 semantic repair attempts，必须为正整数。它控制一次 Host compaction operation 内所有外部 LLM proposal
+  block pass proposal 与后续 whole-candidate semantic repair attempts，必须为正整数。它控制一次 Host compaction operation 内所有外部 LLM proposal
   调用总数；默认 packaged policy 为 5 次。代码 fallback 默认值与 execution profile 默认值必须保持一致，避免同一 Host 在不同装配路径下出现不同 compact retry 语义。该字段不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
 - 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
 
-Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 memory snapshot、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 compacted summary 替代 `evidence_backed_fact` 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。`WorkingAssumptionView` 的主动填充可以由 proactive compaction 或后续 retrieval owner 通过 canonical facts / projection policy 接入；P10 不得绕过 P9 memory projection 边界直接写入。
+Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 `ConversationMemorySnapshotVNext`、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 session summary 替代 `evidence_backed_fact` 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。
 
-P10 必须补齐 stable layer / history pool 的生成来源，而不是只做预算裁剪。第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出至少包含：
+第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出 `ConversationCompactOutputVNext` 结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出 schema、candidate 字段和 source label 规则以第 24 章的 vNext compact I/O contract 为准。
 
-- episode summary candidate：阶段标题、目标、已完成动作、confirmed fact refs / summaries、用户约束、open questions、next step、tool finding refs。
-- pinned state patch candidate：`current_goal`、`confirmed_subjects`、`user_constraints`、`open_questions` 的字段级 patch；每个字段必须有三态语义：未出现表示不修改，空值表示显式清空，非空值表示替换为候选值。
-- evidence-backed fact candidates：基于 compact 输入中的 raw tool result / raw transcript 生成 `claim_text`、
-  `evidence_kind`、`evidence_refs` 与可选 opaque attributes。Host 必须把 accepted evidence envelope 的 `evidence_id`
-  标注回对应 raw tool result 内容旁边，使 LLM 只负责引用 Host 已给出的 evidence id；不得让 LLM 从 tool query 自行生成 canonical
-  evidence id，也不得让 lossy preview 替代原始 evidence 内容。它们与 episode summary / pinned state patch 可由同一次 structured JSON
-  proposal 产生，正常 compact 路径不得因此固定增加第二次 LLM 调用。
-- minimum preserve item candidates：当前追问或下一轮短链路追问中，理解代词、序号、局部承接所需的最小 continuity items。每条至少
-  包含 item id、label、text、source refs 与 preserve reason；它们可与 episode summary / pinned state patch / evidence-backed fact
-  candidates 由同一次 structured JSON proposal 产生。
-- preservation evidence：每条 summary / patch candidate 对应的输入 event refs、tool fact refs、memory snapshot cursor 或 compact input range。
-- quality check result：是否保留 current user input、accepted tool fact refs、evidence anchors、open questions / assumptions refs，以及 dropped / summarized ranges。
-
-Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、episode summary candidate、pinned state patch candidate、evidence-backed fact candidates、minimum preserve item candidates、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。是否将 episode summary / pinned patch / evidence-backed fact candidates / minimum preserve item candidates materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
+Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、accepted attempt number、accepted candidate digest、prompt-local label mapping refs、source boundary refs、quality check result、budget after compact 与 projection signal。是否将 session summary、evidence-backed fact candidates、answer anchors、forward intents 或 reference continuity items materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
 
 Compactor 与 retry / repair 的 owner 边界固定为：
 
 - Runner/provider 层负责低层 transport retry：network、timeout、HTTP 429、HTTP 5xx、stream idle timeout 等由 Engine Runner 按 `RunnerSpec.max_retries`、`Retry-After` 与退避策略在一次 compactor proposal 调用内处理。该层 retry 不拥有 Host governance，不 append EventLog，不 emit HostEvent，只通过 RunnerEvent / log / attempt summary 进入 Host diagnostic。
-- `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest`、Service 从 `compactor_baseline.scene_id` 指向的 scene 装配后传入的 system prompt / `AgentPolicy`、Service 从 `compactor_baseline.user_prompt_template_path` 指向的 prompt asset 读取后传入的 user prompt template，以及 Host lifecycle cancellation token 映射为一次 structured JSON LLM proposal，并返回 episode summary、pinned state patch、evidence-backed fact candidates、minimum preserve item candidates、preservation / diagnostic candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection，也不得自行构造不可取消 token。Host 只把 request 渲染为 typed data block 并替换 user template 中的 compaction request 占位符，不从 config 读取 prompt asset。
-- Host Context Governance 拥有 semantic repair / retry：非 final answer、空 summary、解析失败、candidate shape 非法、缺 preservation evidence、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
+- `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest`、Service 从 `compactor_baseline.scene_id` 指向的 scene 装配后传入的 system prompt / `AgentPolicy`、Service 从 `compactor_baseline.user_prompt_template_path` 指向的 prompt asset 读取后传入的 user prompt template，以及 Host lifecycle cancellation token 映射为一次 strict JSON proposal，并返回 typed candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection，也不得自行构造不可取消 token。Host 只把 request 渲染为 typed data block 并替换 user template 中的 compaction request 占位符，不从 config 读取 prompt asset。
+- Host Context Governance 拥有 semantic repair / retry：runner timeout、非 final outcome、`finish_reason=length`、空文本、非 JSON、top-level 非 object、缺必填 key、字段类型 / 值非法、未知 source label、provenance mismatch、source boundary violation、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 是 whole-candidate re-proposal：可以向 LLM 提供 Host-neutral 的失败类别 / validation issue 摘要，但每次必须重新产出完整 candidate；Host 不要求 LLM 返回 repair patch，不合并旧 proposal 的 valid fields 与新 patch，也不 partial materialize rejected candidate。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
 - stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。proactive compaction 在 worker 启动前没有 active worker token，必须使用 durable Run 状态观察 token；reactive compaction 必须复用 Engine envelope 中的 run-local cancellation token。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
 
-LLM compaction repair 耗尽或 compactor 不可用时，Host 可以进入 deterministic recent-window fallback。该 fallback 不是
-compact 成功，不提交 `CONTEXT_COMPACTED`，不生成 episode summary、minimum preserve、pinned state patch 或
-`evidence_backed_fact`，也不写 memory projection。它只为本次 dispatch 构造类似首次 compact 前的 bounded RunInputBuilder
-输入视图：当前用户输入、最新 N 轮 raw turns、至少 M 轮 recent raw floor、已有 stable facts、answer anchors、open task
-state，以及必要 evidence / artifact / tool result refs。fallback 必须写 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic，
-并标明本次 dispatch 使用了 recent-window fallback；记录内容至少包含 compact failure reason、fallback policy
-decision、fallback input window / digest、重新估算后的 budget result 和 diagnostic refs。fallback 后必须重新估算预算；
-若该 bounded input view 仍超过 hard threshold，Host 不得 dispatch，必须按 failure policy 收口。fallback 读取已有
-facts / refs，但不得把 refs 或 raw turns 提升为新的 stable facts。
+LLM compaction repair 耗尽或 compactor 不可用时，Host 可以进入 deterministic recent-window fallback。该 fallback 不是 compact 成功，不提交 `CONTEXT_COMPACTED`，不写 compact artifact，不 materialize memory snapshot，不生成 Session Summary、Answer Anchor、Forward Intent、reference continuity item 或 `evidence_backed_fact`。fallback 只为本次 dispatch 渲染 policy-bounded selected recent window 与当前输入，并在 selected recent window 内应用 protected recent floor；不得渲染 accepted compacted view、高阶 memory section、失败 proposal、fallback diagnostic 或任何 Host 内部状态。fallback 必须写 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic，并标明本次 dispatch 使用了 recent-window fallback；记录内容至少包含 compact failure reason、fallback policy decision、fallback input window / digest、重新估算后的 budget result 和 diagnostic refs。fallback 后必须重新估算预算；若该 bounded input view 仍超过 hard threshold，Host 不得 dispatch，必须按 failure policy 收口。
 
 Compaction operation 的 durable 语义固定为：
 
@@ -2738,7 +2915,7 @@ CONTEXT_COMPACTION_REQUESTED(operation_id, trigger_source, budget snapshot, inpu
   -> attempt 1: LLM proposal outside write transaction
   -> Host quality / budget gate
   -> optional CONTEXT_COMPACTION_ATTEMPT_REJECTED(attempt_no, category, diagnostic refs)
-  -> optional bounded repair attempt N
+  -> optional bounded whole-candidate repair attempt N
   -> CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
 ```
 
@@ -2746,76 +2923,37 @@ CONTEXT_COMPACTION_REQUESTED(operation_id, trigger_source, budget snapshot, inpu
 
 HostEvent 暴露粒度必须比 EventLog 克制：`CONTEXT_COMPACTION_REQUESTED`、最终 `CONTEXT_COMPACTED`、最终 `CONTEXT_COMPACTION_FAILED` 应作为 Service-facing HostEvent 可观察；Host-level repair attempt rejected / retry scheduled 可以作为 typed diagnostic/progress HostEvent 暴露，但不得把每一次 Engine runner HTTP retry 变成 public HostEvent。低层 provider retry 只进入 runner log / aggregated diagnostics。
 
-stable layer / history pool 的来源按事实等级固定：
+Compaction request 的输入边界固定为 `ConversationCompactInputVNext`，而不是从 Session 起点重放 EventLog ledger。一次 compactor run 的 messages 只能由 compactor system prompt 和一个 user material data block 组成；data block 是 Host 对 latest accepted compacted view、post-compact delta material 与 current input anchor 的去重、分段、可读投影，不承载 Host 内部账本 dump。
 
-- `pinned_state.current_goal` 与 `pinned_state.user_constraints` 可由 `USER_INPUT_ACCEPTED` 的确定性投影初始化，也可由 P10 accepted pinned state patch candidate 后续修正。
-- `pinned_state.confirmed_subjects` 与 `pinned_state.open_questions` 主要来自 P10 accepted pinned state patch candidate、用户显式确认或后续 steer / goal-change owner；不得仅凭未校验 LLM 文本直接写入。`confirmed_subjects` 的 replace 值必须是 Host-neutral opaque ref 文本，例如 `subject:...`、`entity:...` 或 `topic:...`，不能接受自然语言、ticker、marker 或没有 kind 前缀的字符串。
-- `evidence_backed_facts` 只来自 accepted evidence refs。compact 前不阻塞普通 Run 做 extraction；compact 时复用同一次 structured JSON proposal 生成 `evidence_backed_fact_candidates`。本次 compact 覆盖范围内的历史 evidence-backed claims 在 compact 后通过 accepted `evidence_backed_facts` 进入 stable memory，不再依赖 compact 前 raw turns 或 episode summary 复原；compact 后新产生的 user input、assistant answer、tool result 继续作为新的 raw turns / accepted evidence 进入后续 memory pipeline。
-- P10 episode summary 中的 confirmed facts 只能引用或摘要已存在 facts / evidence refs，不能新建 `evidence_backed_fact`，也不能替代 `evidence_backed_fact`。
-- `conversation_continuity` 的 raw turns 来自 `USER_INPUT_ACCEPTED` 与 `RUN_SUCCEEDED`；episode summaries 与 minimum preserve items 来自 accepted compact output，并继续只作为 continuity / navigation，不替代 evidence anchors 或 `evidence_backed_facts`。
+compact material selection 必须满足：
 
-Compaction request 的输入边界固定为 compact material pack，而不是从 Session 起点重放 EventLog ledger。一次 compactor run 的
-messages 只能由 compactor system prompt 和一个 user material pack 组成；material pack 是 Host 对 memory / history /
-evidence / current input anchor 的去重、分段、可读投影，不承载 Host 内部账本 dump。
+- proactive path 的目标是压缩旧 prefix，为当前 Run dispatch 腾出预算；current input anchor 与 protected recent floor 必须保留。
+- reactive path 来自被冻结的 overflow ordinary input material list，优先压缩 older prefix；current input anchor 与 protected recent floor 必须保留到 recovery dispatch。
+- selection 按 material block 与 budget 压力裁剪，不按固定轮数裁剪；一轮中包含的长 tool result 可以单独形成 evidence material block 或 evidence-block 内部分段。
+- 给定 input cursor、snapshot cursor、policy 与 ordinary input material list，selection 必须确定性输出本次进入 compact input 的 block ids，供 tests、trace 与 audit 解释。
+- 已被 latest accepted compacted view 代表的旧 raw turns / old tool results 不应在下一次 compact 中重新展开。
 
-material pack 至少包含：
+material data block 的 section 映射必须一对一，不允许同一 canonical content 同时进入两个 LLM-facing section：
 
-- `stable_input`：bounded `pinned_state`、`evidence_backed_facts`、`working_assumptions` 与 `open_questions`。
-- `history_input`：compact segment 内的 recent raw turns、older raw turns、assistant terminal continuity、compact segment 新产生的
-  episode summaries，以及 policy 允许的 bounded recent episode summaries；超出 policy 上限或与本次 segment 无关的较旧 summaries
-  只保留 artifact / EventLog refs。
-- `evidence_input`：compact segment 内 accepted tool results 的 prompt-local evidence blocks，每个 block 包含可读 tool query、
-  raw result 或必要 raw transcript、可读 source / locator 和短 label，例如 `E1`。
-- `current_input_anchor`：当前输入的 ref、短文本 / 摘要 / digest 与 retention check 所需边界信息；它不能重复承载完整当前
-  user payload。
+- `previous_compacted_view` 只来自 latest accepted compacted view 的业务可读 projection。
+- `current_input_anchor` 来自当前 `USER_INPUT_ACCEPTED` 的 bounded anchor；同一 current user payload 不得再作为 trace material 渲染，且该 anchor label 不得被 compact candidate 作为 source 引用。
+- `trace_material` 渲染 user / assistant continuity 与用户可见 Run 状态；accepted tool result raw content 不在 trace section 中重复出现。
+- `evidence_material` 渲染 accepted tool evidence block。raw evidence 内容来自 `TOOL_RESULT_ACCEPTED` canonical fact 所引用且 digest 校验通过的 Host payload / raw result descriptor；accepted evidence envelope 只提供 Host 内部 provenance mapping，不作为 lossy result preview 或事实内容容器。
+- `answer_material` 渲染 assistant final answer / conclusion 的可读文本，用于 answer anchor candidate；它不得作为 evidence-backed fact 的 source。
 
-compact segment 是从 ordinary run input material list 或 reactive overflow material list 中选择的可压缩 material block 集合，
-不是 EventLog 全量 range。segment selection 必须满足：
+material data block build 启动前必须校验 memory snapshot cursor。若 snapshot cursor 不能覆盖构造 previous compacted view 与 compact material 所需的 EventLog cursor，Host 必须先执行 memory projection catch-up / rebuild 或在 policy 允许范围内做 inline delta repair；失败时按 compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
 
-- proactive path 的 segment 上界是当前待 dispatch ordinary input 中除 `current_input_anchor` 与 protected recent raw turns floor
-  之外的 history / evidence material；目标是压缩旧 prefix，为当前 Run dispatch 腾出预算。
-- proactive path 的 segment 下界从当前 ordinary input 中最旧、尚未被 accepted compact output 的 stable layer / episode summary
-  充分代表的 material block 开始；已 compact 且仅以 summary / stable facts 进入 ordinary input 的旧 range 不应重新展开。
-- reactive path 的 segment 来自被冻结的 overflow ordinary input material list，优先选择 older prefix；suffix 中的 current input
-  anchor 与 protected recent raw turns 必须保留到后续 pass 或 recovery dispatch。
-- segment selection 按 material block 与 token / budget 压力裁剪，不按固定轮数裁剪；一轮中包含的长 tool result 可以单独形成
-  evidence block 或 evidence-block 内部分段。
-- 给定 input cursor、memory snapshot cursor、policy 与 ordinary input material list，segment selection 必须确定性输出本次进入
-  `history_input` / `evidence_input` / `current_input_anchor` 的 block ids，供 tests、trace 与 audit 解释。
-
-material pack builder 的 section 映射必须是一对一分类，不允许同一 canonical content 同时进入两个 LLM-facing section：
-
-- `stable_input` 只来自 memory snapshot 的 bounded stable layer view，以及 policy 允许的 inline delta repair view。
-- `current_input_anchor` 来自当前 `USER_INPUT_ACCEPTED` 的 bounded anchor；同一 current user payload 不得再作为 `history_input`
-  raw turn 渲染。
-- `history_input` 渲染 user / assistant continuity 与 non-evidence raw turns；accepted tool result raw content 不在 history section
-  中重复出现。
-- `evidence_input` 渲染 accepted tool evidence block。raw evidence 内容来自 compact segment 内 `TOOL_RESULT_ACCEPTED` canonical fact
-  所引用且 digest 校验通过的 Host payload / raw result descriptor；accepted evidence envelope 只提供 evidence id、query /
-  provenance mapping 与 source locator metadata，不作为 lossy result preview 或事实内容容器。
-- `accepted_evidence_envelope`、payload ref、artifact ref、digest、event id、cursor 与 policy snapshot 只能作为 Host 内部映射、
-  trace、audit 或 validation 输入，不能代替 LLM-facing raw result / transcript。
-
-material pack build 启动前必须校验 memory snapshot cursor。若 snapshot cursor 不能覆盖构造 `stable_input` 和 compact segment 所需的
-EventLog cursor，Host 必须先执行 memory projection catch-up / rebuild 或在 policy 允许范围内做 inline delta repair；失败时按
-compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
-
-Host 必须同时维护 prompt-local label 到 canonical provenance 的内部映射，例如 `E1 -> TOOL_RESULT_ACCEPTED event ->
-TOOL_CALL_REQUESTED event -> payload / artifact / source locator refs`。该映射用于 accept barrier、audit 与 rebuild，不作为
-LLM 主要语义输入。compact material pack 不得包含 full EventLog range wrapper、裸 event id / payload ref / digest /
-cursor / policy / artifact descriptor 作为模型阅读主体，也不得重复渲染同一 current input、raw turn 或 raw tool result。
-当单条 accepted evidence 被 chunk 成 `E1.1`、`E1.2` 等子 label 时，Host proposal parser 可以把父 label `E1`
-解析为同一 canonical evidence 的 shorthand；该 shorthand 只允许用于 evidence section，仍必须拒绝未知 label 或跨 section label。
+Host 必须同时维护 prompt-local label 到 canonical provenance 的内部映射，例如 `E1 -> TOOL_RESULT_ACCEPTED event -> TOOL_CALL_REQUESTED event -> payload / artifact / source locator refs`。该映射用于 accept barrier、audit 与 rebuild，不作为 LLM 主要语义输入。compact material data block 不得包含 full EventLog range wrapper、裸 event id / payload ref / digest / cursor / policy / artifact descriptor 作为模型阅读主体，也不得重复渲染同一 current input、raw turn 或 raw tool result。当单条 accepted evidence 被 chunk 成 `E1.1`、`E1.2` 等子 label 时，Host proposal parser 可以把父 label `E1` 解析为同一 canonical evidence 的 shorthand；该 shorthand 只允许用于 evidence section，仍必须拒绝未知 label 或跨 section label。
 
 proactive compact 的安全条件是：compactor material tokens 必须与触发 compact 的 ordinary input material 属于同一去重视图，
 不得显著大于 ordinary run input material。Context Governance 必须按即将发送给 compactor 的真实 messages 估算 budget；若
-proactive material pack 仍超过 hard budget，优先判定为 segment selection 或 material pack builder 错误，并通过 bounded
+proactive material data block 仍超过 hard budget，优先判定为 segment selection 或 material data block builder 错误，并通过 bounded
 repair / failure policy 收口，不能盲打 provider。
 
 reactive compact 来自 provider context overflow，不能把已经 overflow 的 ordinary messages 原样一次性交给 compactor。Host 必须冻结
-overflowed ordinary input material list，优先压缩 older prefix，保留 recent raw turns 与 current input anchor；若完整 material
-list 仍超过 compactor budget，应按 compact material block 分段多 pass 压缩。分段单位是 turn block、evidence block、episode summary
-block、stable layer block 与 current input anchor，而不是固定轮数。若单个 evidence block 自身超过 compactor budget，必须在同一
+overflowed ordinary input material list，优先压缩 older prefix，保留 selected recent window 与 current input anchor；若完整 material
+list 仍超过 compactor budget，应按 compact material block 分段多 pass 压缩。分段单位是 trace block、evidence block、summary block、
+answer block 与 current input anchor，而不是固定轮数。若单个 evidence block 自身超过 compactor budget，必须在同一
 canonical evidence provenance 下做 evidence-block 内部分段。reactive path 不依赖估算证明成功，而是通过 bounded multi-pass compact
 与真实 recovery dispatch / provider overflow 闭环收敛，超过 `max_reactive_compactions_per_run` 后 fail closed。
 
@@ -2870,7 +3008,7 @@ reactive path 约束：
 - reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Host 可按 policy 尝试 deterministic recent-window fallback，并创建新的 recovery Attempt。fallback 仍超预算或 policy 不允许 fallback 时，Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
 - `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 operation id、trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor、retry / repair budget snapshot 和 reason。
 - `CONTEXT_COMPACTION_ATTEMPT_REJECTED` payload 至少记录 operation id、attempt number、failure category、whether repairable、runner attempt summary refs、quality / parse / budget diagnostic refs 和 next policy decision。
-- `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、episode summary candidate、pinned state patch candidate、evidence-backed fact candidates、minimum preserve item candidates、preserved fact refs、dropped / summarized ranges、accepted evidence refs / prompt-local label mapping refs、quality check result、budget after compact。
+- `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、accepted candidate digest、prompt-local label mapping refs、source boundary refs、accepted evidence mapping refs、quality check result、budget after compact 与 projection signal。
 - `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs；若 policy decision 采用 deterministic recent-window fallback，还必须记录 fallback input window / digest、fallback budget result，以及 fallback 后是 dispatch 还是 fail closed。
 
 compact 不变量：
@@ -2897,8 +3035,8 @@ provider tokenizer adapter 是 Host 预算治理的后续精确能力，不进�
 
 - Host 提供 evidence anchor、provenance、事实候选 / 验证标记等中立骨架。
 - 原始网页新闻、公告、研报摘录、财报 chunk、source metadata、业务 event type、company / product / business-line ref 由业务工具和财报领域仓储管理。
-- 早期 signal 进入 assumption / candidate，不因 summary 或 memory 收录变成 verified attribution。
-- 后续分析通过 query-time retrieval 召回 signal anchors / evidence chunks / prior assumptions。
+- 早期 signal 进入待验证 candidate，不因 summary 或 memory 收录变成 verified attribution。
+- 后续分析通过 query-time retrieval 召回 signal anchors、evidence chunks 与待验证 candidates。
 - 长期 summary 只能做导航；关键归因必须追到当前 run 已召回并验证过的工具事实。
 - 召回失败、证据不足、证据冲突、signal stale、预算未纳入 RunInput 时，tool trace / trace 必须能解释。
 

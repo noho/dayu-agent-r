@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from email.utils import format_datetime
 
 import pytest
 
@@ -47,9 +49,16 @@ def test_parse_retry_after_empty_returns_none() -> None:
 
 
 def test_parse_retry_after_invalid_returns_none() -> None:
-    """非法字符串返回 ``None``（不实现 HTTP-date 解析）。"""
+    """非法字符串与非未来 HTTP-date 返回 ``None``。"""
 
-    assert parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") is None
+    assert parse_retry_after("not-a-date") is None
+    assert (
+        parse_retry_after(
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            now=datetime(2026, 6, 4, tzinfo=UTC),
+        )
+        is None
+    )
 
 
 def test_parse_retry_after_negative_returns_none() -> None:
@@ -57,6 +66,15 @@ def test_parse_retry_after_negative_returns_none() -> None:
 
     assert parse_retry_after("-1") is None
     assert parse_retry_after("0") is None
+
+
+def test_parse_retry_after_http_date_uses_future_delay_seconds() -> None:
+    """HTTP-date 形态返回相对当前时间的正数秒值。"""
+
+    now = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+    retry_at = datetime(2026, 6, 4, 12, 0, 7, tzinfo=UTC)
+
+    assert parse_retry_after(format_datetime(retry_at), now=now) == 7.0
 
 
 def test_compute_retry_decision_uses_retry_after() -> None:

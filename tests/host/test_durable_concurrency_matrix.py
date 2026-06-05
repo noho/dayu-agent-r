@@ -54,7 +54,7 @@ from dayu.host.durable.projection import (
 from dayu.host.durable.schema import TABLE_IDEMPOTENCY_RECORDS
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 from dayu.host.memory import (
-    ConversationMemorySnapshot,
+    ConversationMemorySnapshotVNext,
     MemoryProjectionPolicy,
     MemorySnapshotCursor,
     build_empty_conversation_memory_snapshot,
@@ -309,7 +309,7 @@ class _WriteMemorySnapshotWithCheckpointOperation:
     :param snapshot: 待写入 snapshot。
     """
 
-    def __init__(self, snapshot: ConversationMemorySnapshot) -> None:
+    def __init__(self, snapshot: ConversationMemorySnapshotVNext) -> None:
         """初始化 operation。
 
         :param snapshot: 待写入 snapshot。
@@ -357,6 +357,37 @@ class _ReadMemorySnapshotExistsOperation:
         """
 
         return read_memory_snapshot(transaction, self._snapshot_id) is not None
+
+
+class _ReadMemorySnapshotOperation:
+    """读取指定 memory snapshot 的 transaction operation。
+
+    :param snapshot_id: snapshot id。
+    """
+
+    def __init__(self, snapshot_id: str) -> None:
+        """初始化 operation。
+
+        :param snapshot_id: snapshot id。
+        :returns: ``None``。
+        """
+
+        self._snapshot_id = snapshot_id
+
+    def __call__(
+        self, transaction: HostTransaction
+    ) -> ConversationMemorySnapshotVNext | None:
+        """读取 snapshot 内容。
+
+        :param transaction: Host durable transaction。
+        :returns: snapshot 存在时返回 typed snapshot，否则返回 ``None``。
+        :raises HostDurableError: snapshot row 损坏时抛出。
+        """
+
+        row = read_memory_snapshot(transaction, self._snapshot_id)
+        if row is None:
+            return None
+        return row.snapshot
 
 
 def test_idempotency_same_scope_key_same_digest_multiprocess_shares_winner(
@@ -510,6 +541,42 @@ def test_memory_snapshot_checkpoint_lost_cas_rolls_back_snapshot(
 
         assert "projection checkpoint advance lost CAS race" in error_message
         assert snapshot_exists is False
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == first_event.event_sequence
+        assert checkpoint.checkpoint_event_id == first_event.event_id
+
+
+def test_memory_snapshot_write_and_checkpoint_commit_together(
+    tmp_path: Path,
+) -> None:
+    """memory snapshot 写入与 checkpoint 推进在同一事务内同时可见。"""
+
+    options = _options(tmp_path / "durable.sqlite3", tmp_path / "artifacts")
+    snapshot_id = "snapshot-same-transaction"
+    with open_host_durable_store(options) as store:
+        first_event = store.transaction_runner.run_write(
+            _AppendEventOperation("event-memory-positive-1", "TYPE_A")
+        )
+        snapshot = _memory_snapshot_for_event(
+            snapshot_id=snapshot_id,
+            event_sequence=first_event.event_sequence,
+            event_id=first_event.event_id,
+        )
+
+        store.transaction_runner.run_write(
+            _WriteMemorySnapshotWithCheckpointOperation(snapshot)
+        )
+        written_snapshot = store.transaction_runner.run_read(
+            _ReadMemorySnapshotOperation(snapshot_id)
+        )
+        checkpoint = store.transaction_runner.run_read(_ReadCheckpointOperation())
+
+        assert written_snapshot is not None
+        assert (
+            written_snapshot.cursor.checkpoint_event_sequence
+            == first_event.event_sequence
+        )
+        assert written_snapshot.cursor.checkpoint_event_id == first_event.event_id
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == first_event.event_sequence
         assert checkpoint.checkpoint_event_id == first_event.event_id
@@ -743,7 +810,7 @@ def _stale_projection_checkpoint(
 
 def _memory_snapshot_for_event(
     *, snapshot_id: str, event_sequence: int, event_id: str
-) -> ConversationMemorySnapshot:
+) -> ConversationMemorySnapshotVNext:
     """构造覆盖指定 EventLog cursor 的空 memory snapshot。
 
     :param snapshot_id: snapshot id。
@@ -755,21 +822,25 @@ def _memory_snapshot_for_event(
 
     policy = MemoryProjectionPolicy(
         context_window_size=8192,
-        max_pinned_items=8,
-        max_evidence_backed_facts=16,
-        max_working_assumptions=8,
-        recent_raw_turns_floor=2,
-        raw_turn_context_ratio=0.125,
-        raw_turn_size_floor=1024,
-        raw_turn_size_cap=1024,
-        history_pool_context_ratio=0.5,
-        history_pool_size_floor=4096,
-        history_pool_size_cap=4096,
-        stable_layer_context_ratio=0.25,
-        stable_layer_size_floor=2048,
-        stable_layer_size_cap=2048,
+        selected_recent_window_item_cap=8,
+        selected_recent_window_char_cap=2048,
+        selected_recent_window_turn_floor=2,
+        fallback_selected_recent_window_item_cap=4,
+        fallback_selected_recent_window_char_cap=1024,
+        evidence_fact_item_cap=16,
+        evidence_fact_char_cap=4096,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=4,
+        answer_anchor_char_cap=1024,
+        forward_intent_item_cap=4,
+        forward_intent_char_cap=1024,
+        reference_continuity_item_cap=4,
+        reference_continuity_char_cap=1024,
+        reference_continuity_item_floor=0,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
+        policy_ref="durable-concurrency-test",
     )
     base = build_empty_conversation_memory_snapshot(
         snapshot_id=snapshot_id,

@@ -34,10 +34,8 @@ from dayu.host.terminal_summary_payload import (
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
-_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES = "evidence_backed_fact_candidates"
-_PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
-_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
-_PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
+_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
 _PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 _PAYLOAD_FIELD_RESULT_PREVIEW = "result_preview"
 _MEMORY_ITEM_EVIDENCE_BACKED_FACT_PREFIX = "memory-item:evidence_backed_fact"
@@ -307,7 +305,7 @@ def _assistant_history_materials(
         InitialHistoryMaterial(
             canonical_source_ref=row.event_id,
             text=summary,
-            kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
         ),
     )
 
@@ -328,36 +326,19 @@ def _evidence_backed_fact_refs_from_compacted_event(
         row,
         payload_label=CONTEXT_COMPACTED,
     )
+    candidate = _required_mapping(
+        payload,
+        _PAYLOAD_FIELD_ACCEPTED_CANDIDATE,
+        payload_label=CONTEXT_COMPACTED,
+    )
+    facts = _required_mapping_list(
+        candidate,
+        _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS,
+        payload_label=CONTEXT_COMPACTED,
+    )
     refs: list[str] = []
-    preserved = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
-    if preserved is not None:
-        if not isinstance(preserved, Mapping):
-            raise HostDurableError("CONTEXT_COMPACTED preserved_fact_refs is invalid")
-        refs.extend(
-            _required_text_list(
-                preserved,
-                _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS,
-                payload_label=CONTEXT_COMPACTED,
-            )
-        )
-    candidates = payload.get(_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES)
-    if candidates is None:
-        return tuple(refs)
-    if not isinstance(candidates, list):
-        raise HostDurableError(
-            "CONTEXT_COMPACTED evidence_backed_fact_candidates must be list"
-        )
-    for candidate in candidates:
-        if not isinstance(candidate, Mapping):
-            raise HostDurableError(
-                "CONTEXT_COMPACTED evidence_backed_fact_candidate must be object"
-            )
-        candidate_id = candidate.get(_PAYLOAD_FIELD_CANDIDATE_ID)
-        if not isinstance(candidate_id, str) or candidate_id.strip() == "":
-            raise HostDurableError(
-                "CONTEXT_COMPACTED evidence_backed_fact candidate_id is invalid"
-            )
-        refs.append(_derived_evidence_backed_fact_ref(row, candidate_id))
+    for index, _fact in enumerate(facts):
+        refs.append(_derived_evidence_backed_fact_ref(row, f"vnext-fact-{index + 1}"))
     return tuple(refs)
 
 
@@ -468,6 +449,49 @@ def _required_text_list(
             raise HostDurableError(f"{payload_label} {field_name} item is invalid")
         refs.append(item)
     return tuple(refs)
+
+
+def _required_mapping(
+    mapping: Mapping[str, JsonValue], field_name: str, *, payload_label: str
+) -> Mapping[str, JsonValue]:
+    """读取 JSON object 中的必填 object 字段。
+
+    :param mapping: JSON object。
+    :param field_name: 字段名。
+    :param payload_label: 错误消息中的 payload 名称。
+    :returns: JSON object。
+    :raises HostDurableError: 字段缺失或结构非法时抛出。
+    """
+
+    value = mapping.get(field_name)
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"{payload_label} {field_name} must be object")
+    return value
+
+
+def _required_mapping_list(
+    mapping: Mapping[str, JsonValue], field_name: str, *, payload_label: str
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取 JSON object 中的必填 object array 字段。
+
+    :param mapping: JSON object。
+    :param field_name: 字段名。
+    :param payload_label: 错误消息中的 payload 名称。
+    :returns: JSON object tuple。
+    :raises HostDurableError: 字段缺失或结构非法时抛出。
+    """
+
+    value = mapping.get(field_name)
+    if not isinstance(value, list):
+        raise HostDurableError(f"{payload_label} {field_name} must be list")
+    result: list[Mapping[str, JsonValue]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise HostDurableError(
+                f"{payload_label} {field_name}[{index}] must be object"
+            )
+        result.append(item)
+    return tuple(result)
 
 
 def _require_selected_evidence_block_refs(

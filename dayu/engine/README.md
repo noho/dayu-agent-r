@@ -298,7 +298,7 @@ run_agent_messages(request)
       -> if fallback_mode is FORCE_ANSWER
           -> observe cancellation_token before fallback Runner call
           -> append fallback_prompt to run-local messages
-          -> AsyncRunner.call(messages, request.runner_options, tools=())
+          -> AsyncRunner.call(messages, request.runner_options, tools=(), request_identity=identity)
           -> emit EngineEvent.final_answer if content accepted
           -> emit EngineEvent.run_failed if force-answer is empty or still requests tools
       -> if fallback_mode is RAISE_ERROR

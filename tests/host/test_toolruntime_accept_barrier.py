@@ -431,7 +431,7 @@ def test_tool_fact_accept_concrete_memory_catchup_does_not_project_fact(
         assert isinstance(result, ToolFactAcceptedAck)
         assert result.tool_result_event_ref is not None
         assert snapshot is not None
-        assert snapshot.snapshot.evidence_backed_facts == ()
+        assert snapshot.snapshot.evidence_fact_memory.evidence_backed_facts == ()
         assert snapshot.snapshot.cursor.checkpoint_event_id == (
             result.tool_result_event_ref.event_id
         )
