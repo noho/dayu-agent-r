@@ -1443,6 +1443,10 @@ canonical ingest 必须满足：
 - 超过 Host policy 阈值的大工具结果、财报 chunk、binary、长网页正文、provider raw response、完整 prompt / messages、trace 明细必须外移到 artifact / blob / tool trace / 领域仓储，并在 artifact durable 且 digest verified 后才 append EventLog `canonical_fact`。
 - 本地 `artifact_ref` 的最小写入顺序是：先写入 artifact root 下的临时文件，完成 flush / fsync 或等价 durable 写入，计算并校验 digest，再通过 atomic rename 发布到最终相对路径，最后在 SQLite transaction 中写 payload descriptor 与 EventLog row。EventLog 不得引用未 durable、未 digest verified 或位于 artifact root 外的临时路径。
 - SQLite transaction 无法原子覆盖外部文件系统写入；因此 artifact 发布必须先于 EventLog canonical append。若 SQLite transaction 后续失败，已发布但未被 descriptor 引用的 artifact 只能作为后续 cleanup / diagnostics 处理，不能被当作 accepted fact。
+- runner-call reconstruction 使用同一冷热分离规则。`RUNNER_CALL_INPUT_ASSEMBLED` 只在 canonical event hot payload 中保存 scope、runner-call identity、manifest descriptor ref、manifest digest、manifest schema version 与 validation status；manifest body 使用 payload descriptor kind `runner_call_input_manifest` 存储。manifest canonical JSON 字节数小于等于 `payload_inline_threshold_bytes` 时可以写 SQLite payload，超过阈值必须写 artifact root 并通过 payload descriptor 引用。
+- 完整 LLM-facing rendered messages 不是 EventLog hot payload。若 debug、analyzer 或 smoke 需要保存完整 rendered messages，只能写为 derived artifact kind `runner_call_projection_artifact`，由 runner-call manifest 中的 projection artifact ref / digest 指向；它不能成为 recovery、resume、memory projection、dispatch decision 或 Run / Attempt 状态迁移真源。
+- `TOOL_CALL_REQUESTED` 接受的工具参数也使用冷热分离规则。规范化 canonical arguments JSON 字节数小于等于 `payload_inline_threshold_bytes` 时可以作为 bounded inline JSON 进入 canonical payload；超过阈值必须写 payload descriptor kind `tool_call_arguments_json`。工具运行时若能提供业务可读 semantic query，短文本可 bounded inline，长文本必须写 payload descriptor kind `tool_call_semantic_query_text`；没有 semantic query 是合法但可诊断状态。
+- compactor LLM proposal 输入投影使用 payload descriptor / artifact kind `compactor_input_projection`。该投影只记录 compactor 输入 data block 的 durable ref / digest，不能替代 `CONTEXT_COMPACTED` 的 accepted compact truth。
 - `payload_digest`、normalized args digest、result digest 和 evidence digest 必须基于确定性序列化 / canonicalization 计算；同一语义 payload 不能因 JSON key 顺序或无关默认值产生不同 digest。
 - 会参与 resume、memory、audit、`fetch_more`、replay 的 payload / ref / descriptor 缺失或 digest 不匹配时，Host 不能把该 fact 当作 accepted fact 使用。
 - preview / diagnostic / display-only payload 可以降级丢失；其缺失只能影响展示、深度审计或 trace 细节，不能伪装成恢复必要事实。
@@ -1488,6 +1492,7 @@ TOOL_CALL_GOVERNED
 TOOL_RESULT_ACCEPTED
 TOOL_AWAITING
 GUIDANCE_INSERTED
+RUNNER_CALL_INPUT_ASSEMBLED
 CONTEXT_COMPACTION_REQUESTED
 CONTEXT_COMPACTED
 CONTEXT_COMPACTION_FAILED
@@ -1513,11 +1518,12 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `ATTEMPT_RUNNING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | worker accepted / dispatch accepted info | Attempt status=`RUNNING` | resume 不消费，除非用于诊断 | audit yes / Host event stream optional |
 | `ATTEMPT_SUCCEEDED` / `ATTEMPT_FAILED` / `ATTEMPT_CANCELLED` / `ATTEMPT_SUSPENDED` / `ATTEMPT_STEERED` / `ATTEMPT_LOST` | `session_id`、`run_id`、`attempt_id`、`execution_id` | terminal reason / error / wait_id | 关闭 Attempt | resume 按需消费 suspended / lost reason | audit yes / Host event stream emit |
 | `STEER_REQUESTED` / `CANCEL_REQUESTED` / `RESUME_REQUESTED` / `RETRY_REQUESTED` / `REPLAY_REQUESTED` | `session_id`、`run_id`、operation idempotency key | control input / reason / policy / source_run_id when retry or replay | 触发对应状态机；retry / replay 创建关联新 Run，不重开源 Run | 改变模型语义时进入 messages | audit yes / Host event stream emit |
-| `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / normalized args digest | 记录工具调用 intent | accepted into model history 时 resume 消费 | audit 是 / tool trace 是 |
+| `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / accepted arguments atom / normalized args digest / optional semantic query atom | 记录工具调用 intent | accepted into model history 时 resume 消费；compact evidence 可消费业务可读 tool name / query / bounded arguments projection | audit 是 / tool trace 是 |
 | `TOOL_CALL_GOVERNED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | policy decision / duplicate key / action | 不直接改 Run；可触发 guidance / hard stop | action 影响模型继续时进入 messages | audit 是 / tool trace 是 |
 | `TOOL_RESULT_ACCEPTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | result ref / digest / evidence anchors / status；wait terminal result 通过 wait-specific fields 表达来源与状态 | 记录工具事实；P1-P7 accepted waiting terminal result 不另建 `TOOL_TERMINAL_RESULT` canonical fact | resume 是 / memory 工具事实 | audit 是 / tool trace 是 |
 | `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | resume 是 | audit 是 / tool trace 是 |
 | `GUIDANCE_INSERTED` | `session_id`、`run_id` | guidance text / source policy / reason | 不直接改 terminal；影响下一 Attempt messages | 插入 messages 时 resume 消费 | audit yes / Host event stream emit |
+| `RUNNER_CALL_INPUT_ASSEMBLED` | `session_id`、`host_run_id`；有 Attempt 时必须带 `attempt_id`、`execution_id`；compactor proposal 必须可由 manifest 关联 parent run 与 compaction operation | runner_call_index / runner_call_kind / runner_call_trigger_reason / manifest_payload_ref / manifest_digest / manifest_schema_version / validation_status | 无 Run / Attempt 状态副作用；不参与 terminal decision、recovery scan、memory projection、dispatch decision 或 lifecycle transition | resume 不消费；reconstruction consumer 只能消费 refs / digests / projector metadata | audit optional / tool trace 是 |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
 | `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / accepted candidate digest / prompt-local label mapping refs / source boundary refs / quality check / failure reason / fallback decision | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
 | `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
@@ -1531,6 +1537,31 @@ control event 的 `run_id` 绑定规则：
 - `RETRY_REQUESTED` 与 `REPLAY_REQUESTED` 的 `run_id` 是源 Run；关联的新 Run 必须通过后续 `RUN_ACCEPTED` 的 `source_run_id` / `source_run_relation` 或等价 typed payload 表达。
 - `RESUME_REQUESTED` 的 `run_id` 是从 `WAITING` / `RECOVERING` 继续的同一 Run。
 - `CANCEL_REQUESTED` 的 `run_id` 是被取消的 Run。
+
+Runner-call reconstruction contract 使用以下 scalar aliases：`Digest` 表示对 contract 声明的 canonical bytes 计算出的 lowercase hex SHA-256；`HostInternalRef` 表示只供 Host / trace / smoke consumer 使用的 typed Host ref string 或 descriptor object，永远不进入 LLM-facing material；`JsonObject` 表示 JSON-compatible mapping，key 必须是 string，value 只能是 JSON scalar / list / object，不能是 provider object、binary blob、callable、Python `Any` 或无结构内部对象。
+
+`TOOL_CALL_REQUESTED` payload contract 固定为工具调用 intent 与 accepted arguments 的同源 durable atom。payload required fields 至少包括 `tool_call_id`、`tool_name`、`normalized_arguments_digest`、`arguments_json_size_bytes`、`arguments_storage_kind`、`arguments_payload_digest`、`semantic_input_digest`、`semantic_query_storage_kind`。`arguments_storage_kind` 只允许 `inline_json` 或 `payload_descriptor`：当 canonical arguments JSON 字节数小于等于 `payload_inline_threshold_bytes` 时必须使用 `inline_json` 并提供 `arguments_inline_json`；超过阈值时必须使用 `payload_descriptor` 并提供 `arguments_payload_ref`，descriptor kind 为 `tool_call_arguments_json`。`arguments_payload_digest` 必须等于 accepted canonical arguments JSON digest，并与 `normalized_arguments_digest` 使用同一 canonical normalization preimage 校验一致；digest 不一致时该工具调用 intent 不能作为 accepted fact 消费。
+
+可选 semantic query 是业务可读输入，不等同于 `semantic_input_digest` 的 preimage。`semantic_input_digest` 只表达幂等或语义归一 digest，可以没有可读文本；若工具/runtime 提供可读 query，`semantic_query_storage_kind` 可以是 `inline_text` 或 `payload_descriptor`，并必须提供 `semantic_query_digest`。长 query 使用 payload descriptor kind `tool_call_semantic_query_text`。缺少 semantic query 时 `semantic_query_storage_kind="absent"`，compact evidence projection 可以退回到 bounded arguments projection 或业务中性“工具参数不可读”说明，但不得把 `tool_call_id`、payload ref、digest、cursor 或 Host 内部账本字段渲染给 LLM。WU-CM-01-F02 的真实缺口是 query_text arguments / semantic query 的业务可读表达，不是 tool name 缺失。
+
+`ToolCallArgumentsAtom` 字段固定为：
+
+| field | type | required | semantics | validation rule |
+| --- | --- | ---: | --- | --- |
+| `tool_call_requested_event_ref` | `HostInternalRef` | yes | canonical `TOOL_CALL_REQUESTED` event that accepted the intent | resolves to same `tool_call_id` and `tool_name` |
+| `tool_call_id` | `str` | yes | provider/Engine tool call identity | can appear in internal trace, not compact query text |
+| `tool_name` | `str` | yes | business-readable tool identity | equals canonical payload tool name |
+| `normalized_arguments_digest` | `Digest` | yes | digest used for idempotency/tool intent validation | equals digest of normalized canonical arguments |
+| `arguments_json_size_bytes` | `int` | yes | canonical JSON byte size | non-negative |
+| `arguments_storage_kind` | `"inline_json" | "payload_descriptor"` | yes | storage form for accepted arguments | inline iff size `<= payload_inline_threshold_bytes`; descriptor otherwise |
+| `arguments_inline_json` | `JsonObject | null` | conditional | bounded accepted arguments when small | required for `inline_json`; forbidden for descriptor path |
+| `arguments_payload_ref` | `HostInternalRef | null` | conditional | descriptor ref for accepted arguments JSON | required for descriptor path; forbidden for inline path |
+| `arguments_payload_digest` | `Digest` | yes | digest of canonical accepted arguments JSON | durable args digest must equal `normalized_arguments_digest` |
+| `semantic_input_digest` | `Digest | null` | no | existing idempotency semantic digest | retained; not assumed to be readable query preimage |
+| `semantic_query_storage_kind` | `"absent" | "inline_text" | "payload_descriptor"` | yes | optional business-readable query supplied by typed tool/runtime contract | absent is valid and diagnosable |
+| `semantic_query_text` | `str | null` | conditional | bounded readable query text | required only for inline text |
+| `semantic_query_payload_ref` | `HostInternalRef | null` | conditional | descriptor ref for long readable semantic query | descriptor kind `tool_call_semantic_query_text`; required only for descriptor path |
+| `semantic_query_digest` | `Digest | null` | conditional | digest of semantic query text | required when semantic query exists |
 
 ### 13.4 EngineEvent 映射
 
@@ -1619,6 +1650,32 @@ Tool trace 是 EventLog 派生 projection，不是 Host durable truth。它必�
 - 热数据可以按 retention policy 淘汰或压缩；冷 JSONL 可以按 run / 日期 / workspace 分片归档。
 - EventLog 对 tool trace 只记录必要 event、ref 与 digest；不得把 JSONL 当作恢复、resume、memory 或 Run 状态迁移真源。
 - tool trace projection 损坏或缺失时，应能从 EventLog 与外移 payload ref 尽力重建热数据；冷 JSONL 丢失只能影响深度诊断和离线审计。
+
+Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only signal。它只能消费 `RUNNER_CALL_INPUT_ASSEMBLED` manifest refs / digests、`TOOL_CALL_REQUESTED` arguments / semantic query atoms、Projector metadata summary、Engine 可观察的 iteration/message count 以及 projection artifact refs；不得读取旧 provider request、EngineRunner 内存、当前 prompt builder 代码或重新运行 compact material selection 来猜测历史输入。Tool Trace hot projection 可以缓存以下 runner-call signal，但这些字段只是 projection copy，不是 recovery、memory、dispatch 或 Run 状态真源：
+
+| field | type | required | semantics | validation rule |
+| --- | --- | ---: | --- | --- |
+| `runner_call_index` | `int` | yes | Host call index for locating the manifest | must match manifest |
+| `runner_call_kind` | `RunnerCallKind` | yes | non-overlapping logical call kind | must match manifest |
+| `runner_call_trigger_reason` | `RunnerCallTriggerReason` | yes | why the call was assembled | must match manifest |
+| `iteration_id` | `str | null` | no | Engine iteration id when available | if present must match Engine event |
+| `manifest_ref` | `HostInternalRef | null` | no | ref to runner-call manifest descriptor/artifact | null only with diagnostic reason `missing_runner_call_manifest` |
+| `manifest_digest` | `Digest | null` | no | digest of manifest body canonical JSON | required when `manifest_ref` is present |
+| `message_count` | `int | null` | no | manifest/Engine message count summary | mismatch emits diagnostic |
+| `role_sequence_digest` | `Digest | null` | no | digest of roles in actual message order | mismatch emits diagnostic |
+| `input_projection_digest` | `Digest | null` | no | digest of manifest source summary | mismatch emits diagnostic |
+| `projector_metadata_summary` | `list[ProjectorMetadataSummary]` | no | projector ids/schema versions/digests needed by analyzer | unsupported version emits diagnostic |
+| `diagnostic` | `RunnerCallReconstructionDiagnostic | null` | no | typed limited/mismatch signal | required unless status is `complete` |
+
+`ProjectorMetadataSummary` 只复制 manifest 中的 `projector_metadata_id`、`projector_id`、`projector_schema_version`、`projector_digest` 与 `purpose`。它不得包含 Python module path、source code text、完整 prompt、完整 messages 或 Host 私有 ledger dump。
+
+`RunnerCallReconstructionDiagnostic` 是内部诊断 contract，状态只允许：
+
+- `complete`：所有必需 refs / digests / counts 校验通过。
+- `limited_signal`：缺少 durable atom 或 ref，导致无法完整重建，但没有发现矛盾。
+- `mismatch`：observed data 与 expected data 冲突。
+
+diagnostic 字段固定为 `status`、`reason`、`missing_atom_kind`、`missing_ref_kind`、`missing_ref`、`observed_count`、`expected_count`、`observed_digest`、`expected_digest`、`consumer_boundary`。`reason` 在非 `complete` 时必填，只允许 `missing_runner_call_manifest`、`missing_projection_artifact`、`missing_tool_call_arguments_atom`、`missing_semantic_query_atom`、`missing_compactor_manifest`、`missing_memory_snapshot_body`、`unsupported_projector_version`、`message_count_mismatch`、`role_sequence_digest_mismatch`、`input_projection_digest_mismatch`、`payload_digest_mismatch`、`unresolvable_ref`、`provider_specific_atom_deferred`。`missing_atom_kind` 只允许 `tool_call_arguments`、`semantic_query`、`runner_call_manifest`、`compactor_manifest`、`projection_artifact`、`memory_snapshot_body`。`missing_ref_kind` 只允许 `payload_ref`、`artifact_ref`、`event_ref`、`cursor_ref`。`consumer_boundary` 只允许 `tool_trace_query`、`analyzer_fixture`、`compact_evidence_projection`、`public_smoke`；compact LLM-facing text 只能得到业务中性的 unavailable wording，不能得到 refs、digests、event ids、cursors 或 diagnostic ledger details。
 
 约束：
 
@@ -2515,6 +2572,103 @@ RunInputBuilder 的输出必须能由输入 fact refs、memory snapshot cursor�
 
 RunInputBuilder 不创建独立 RunInputBuildTrace 子系统；上下文构造和证据纳入的观测统一进入 tool trace / trace 体系。
 
+### 23.1 Runner-call Input Assembly Manifest
+
+RunInputBuilder 每次完成 logical runner call input assembly 后，Host 必须写入 `RUNNER_CALL_INPUT_ASSEMBLED` canonical reconstruction event，并把完整 manifest body 存为 `runner_call_input_manifest` payload descriptor / artifact。该 event 的 hot payload 只记录 `session_id`、`host_run_id`、`attempt_id`、`execution_id`、`runner_call_index`、`runner_call_kind`、`runner_call_trigger_reason`、`manifest_payload_ref`、`manifest_digest`、`manifest_schema_version` 与 `validation_status`。`manifest_digest` 必须等于 manifest body canonical JSON digest；hot payload scope fields 必须与 manifest identity fields 一致。该 event 没有 Run / Attempt 状态副作用，不驱动 recovery、memory、lifecycle、terminal decision 或 dispatch decision。
+
+`RunnerCallInputAssemblyManifest` 是 durable reconstruction contract，不是 message dump。字段固定为：
+
+| field | type | required | semantics | validation rule |
+| --- | --- | ---: | --- | --- |
+| `schema_version` | `str` | yes | manifest contract version | equals design-approved current version |
+| `manifest_id` | `str` | yes | stable logical id for this manifest body | unique within payload/artifact namespace |
+| `session_id` | `str` | yes | parent Session scope | equals canonical event `session_id` |
+| `host_run_id` | `str` | yes | Host admitted user Run for ordinary calls; parent user Run for compactor calls | equals canonical event `host_run_id` |
+| `attempt_id` | `str | null` | conditional | Host Attempt that owns this runner call when one exists | required for ordinary dispatch after Attempt creation; null allowed for pre-dispatch proactive compact |
+| `execution_id` | `str | null` | conditional | Engine execution envelope id when call belongs to Engine execution | required for Engine-emitted ordinary/tool continuation calls |
+| `runner_call_index` | `int` | yes | Host-owned monotonic zero-based index per `host_run_id`; compactor operations use a separate zero-based index scoped by `compaction_operation_id` | first call is 0; each later call in the same scope increments by 1 |
+| `runner_call_kind` | `RunnerCallKind` | yes | non-overlapping business kind of the logical call | value must be in the closed enum below |
+| `runner_call_trigger_reason` | `RunnerCallTriggerReason` | yes | why this call was assembled now | value must be compatible with `runner_call_kind` |
+| `iteration_id` | `str | null` | conditional | Engine iteration id for calls observed by Engine | required when Engine emitted an iteration-started event |
+| `iteration_index` | `int | null` | conditional | Engine iteration index | non-negative when present |
+| `message_count` | `int` | yes | number of messages sent to runner/provider boundary | equals `message_entries` count and Engine `message_count` when present |
+| `role_sequence_digest` | `Digest` | yes | digest of message roles in order | computed from canonical UTF-8 string `role0\nrole1\n...` over allowed roles |
+| `input_projection_digest` | `Digest` | yes | digest of canonical manifest source summary, not full rendered messages | recompute from message entry content digests, source refs and projector metadata |
+| `message_entries` | `list[RunnerCallMessageEntry]` | yes | per-message lightweight provenance and digest | length equals `message_count`; indexes contiguous |
+| `source_cursor_refs` | `list[HostInternalRef]` | yes | EventLog cursor, memory cursor, compact boundary or equivalent source boundary | every ref must resolve or produce limited-signal diagnostic |
+| `tool_schema_snapshot_refs` | `list[HostInternalRef]` | no | tool schema snapshots visible to the call | required when tools are available |
+| `memory_snapshot_cursor_ref` | `HostInternalRef | null` | no | memory read model cursor used by RunInputBuilder | missing historical snapshot body leaves manifest valid and emits limited-signal for body reconstruction |
+| `compact_artifact_refs` | `list[HostInternalRef]` | no | accepted compact artifacts or fallback diagnostic artifacts used in input selection | refs must point to accepted compact or explicit fallback diagnostic |
+| `context_fallback_decision_ref` | `HostInternalRef | null` | no | recent-window fallback decision when compaction failed but dispatch continued | present only when fallback affected this input |
+| `projector_metadata` | `list[ProjectorMetadata]` | yes | stable producer metadata for each message/source projection | every message `projector_metadata_id` must resolve here |
+| `compactor_identity` | `CompactorRunnerCallIdentity | null` | conditional | parent/self identity for Host-owned compactor calls | required when `runner_call_kind == "compactor_proposal"` |
+| `diagnostic` | `RunnerCallReconstructionDiagnostic | null` | no | typed incomplete/mismatch signal | required when validation status is not `complete` |
+
+`RunnerCallMessageEntry` 字段固定为：
+
+| field | type | required | semantics | validation rule |
+| --- | --- | ---: | --- | --- |
+| `index` | `int` | yes | message order in actual runner call input | contiguous from 0 |
+| `role` | `"system" | "user" | "assistant" | "tool"` | yes | LLM role sent to runner | must match Engine/provider role vocabulary accepted by `AgentRunRequest` |
+| `content_digest` | `Digest` | yes | digest of rendered content for this message | computed from canonical text/parts serializer chosen by projector metadata |
+| `content_size_bytes` | `int` | yes | bounded observability for payload size | non-negative; used to test manifest stays bounded |
+| `source_refs` | `list[HostInternalRef]` | yes | canonical facts, payload descriptors, compact artifacts, memory cursors or tool result refs that explain the message | empty only for static system prompt with prompt asset digest in projector metadata |
+| `projection_artifact_ref` | `HostInternalRef | null` | no | optional derived rendered-message artifact for analyzer/debug | may be null; if present digest must match `projection_artifact_digest` |
+| `projection_artifact_digest` | `Digest | null` | no | digest of optional derived rendered-message artifact | required when artifact ref is present |
+| `projector_metadata_id` | `str` | yes | lookup id into manifest `projector_metadata` | must resolve to one projector metadata entry |
+| `provider_tool_calls_digest` | `Digest | null` | no | digest for assistant tool_calls/provider structured parts when present | absent unless provider contract exposes typed fields |
+| `reasoning_content_digest` | `Digest | null` | no | digest for provider reasoning content if typed Engine contract exposes it | absent unless provider contract exposes typed field |
+
+Provider-specific assistant `tool_calls` / `reasoning_content` 不得以 raw provider dict、untyped payload bag 或 Python object 进入 Host manifest。若 Engine provider contract 已有 typed 字段，manifest 只保存 digest；若当前 provider data 只有 raw provider state，则 runner-call reconstruction 对该 atom 输出 `provider_specific_atom_deferred` limited-signal，具体 typed provider atom 属于后续 Engine provider contract work。
+
+`ProjectorMetadata` 字段固定为：
+
+| field | type | required | semantics | validation rule |
+| --- | --- | ---: | --- | --- |
+| `projector_metadata_id` | `str` | yes | stable id referenced by message entries | unique within manifest |
+| `projector_id` | closed string enum | yes | semantic projector identity | must be one of design-approved ids |
+| `projector_schema_version` | `str` | yes | output contract version for the projector | unsupported consumer emits `unsupported_projector_version` |
+| `projector_digest` | `Digest` | yes | digest of prompt asset / config / projector contract that affects output shape | recompute from declared source refs where possible |
+| `purpose` | closed string enum | yes | why the projector contributes to LLM input | must be one of design-approved purposes |
+| `source_contract_refs` | `list[HostInternalRef]` | yes | design/prompt/tool schema/config refs that define projector input contract | every ref must resolve or produce diagnostic |
+
+第一版 `projector_id` 至少覆盖 `run_input_system_context`、`user_input_message`、`assistant_history_message`、`tool_result_message`、`compact_memory_material`、`recent_window_material`、`guidance_message`、`tool_schema_snapshot`、`compactor_system_prompt`、`compactor_user_prompt`。第一版 `purpose` 至少覆盖 `ordinary_run_input`、`tool_continuation_input`、`post_compaction_input`、`compactor_proposal_input`、`retry_replay_resume_input`、`forced_answer_input`、`length_continuation_input`。这些枚举是 Host / trace 内部 contract；LLM-facing compact material 或 prompt 不得暴露 projector id、schema version、digest 或 source contract refs。
+
+Closed `RunnerCallKind` enum：
+
+| value | meaning |
+| --- | --- |
+| `initial_user_dispatch` | ordinary Session 中第一个被 Host admitted user input 触发的 runner call |
+| `followup_user_dispatch` | 同一 Session 中后续 user input 触发的 ordinary runner call |
+| `tool_result_continuation` | tool results accepted 后继续同一 logical run 的 runner call |
+| `post_compaction_dispatch` | accepted compact 或 deterministic recent-window fallback 后的 ordinary/recovery dispatch |
+| `compactor_proposal` | Host-owned compactor proposal / repair attempt 的 runner call，不是 Host admitted user Run |
+
+Closed `RunnerCallTriggerReason` enum：
+
+| value | meaning |
+| --- | --- |
+| `initial_user_input` | initial user input dispatch |
+| `followup_user_input` | follow-up user input dispatch |
+| `tool_results_available` | accepted tool results make a continuation call possible |
+| `force_answer_after_tool_limit` | policy forces answer after tool limit or tool loop limit |
+| `finish_reason_length_continuation` | provider length finish requires continuation |
+| `host_retry` | Host retry operation |
+| `host_replay` | Host replay operation |
+| `host_resume` | Host resume operation |
+| `context_compaction_completed` | accepted compact or fallback permits next dispatch |
+| `context_compaction_repair_attempt` | compactor repair attempt after proposal rejection |
+| `context_compaction_retry_attempt` | compactor retry attempt after proposal execution failure |
+
+`runner_call_kind` 表达互不重叠的 logical call business kind；forced answer、length continuation、retry/replay/resume 只作为 trigger reason，不挤入 kind。该分类必须覆盖 ordinary initial / follow-up、tool result continuation、post compaction dispatch、compactor proposal、retry / replay / resume、forced answer 与 length continuation，且一个 runner call 只能有一个 kind。
+
+Manifest size-boundary 不变量：
+
+- manifest 不内联 full messages、完整 prompt、完整 compact material、完整 memory snapshot、provider raw request 或 provider raw response。
+- manifest 只保存 source refs、cursor refs、digests、message count、role sequence digest、content size、projector metadata 与可选 projection artifact refs。
+- 小体积 human-readable projection 只有在对应 contract 显式允许且不违反 LLM-facing boundary 时才可 bounded inline；默认完整 rendered messages 必须走 derived artifact。
+- Tool Trace、analyzer 与 public smoke 可以按 refs/digests/projector metadata 做 reconstruction 或输出 limited-signal，但不能把 missing projection artifact 解释成 EventLog fact 缺失。
+
 ## 24. Conversation Memory
 
 Conversation Memory 的目标是为生产级通用 Agent 提供可恢复、可审计、受预算约束的会话 read model，并在该通用能力之上支撑买方财报分析的跨轮事实、证据和追问连续性。它不是新的事实真源，也不是把历史全文塞回 prompt 的召回系统。
@@ -2596,6 +2750,10 @@ LLM-readable compact input 只能包含与当前 compact 任务有关、用户�
 prompt-local label 是本次 LLM 调用内的 opaque citation handle，只用于让模型把 claim、anchor、summary 或 intent 绑定到它刚读过的材料。第一阶段允许使用短 deterministic handle，例如 `C1`、`H1`、`E1`、`S1`、`E1.1`。label 不得携带位置、时间、重要性、优先级、durable identity 或实现状态语义；模型不得根据顺序、前缀、chunk 后缀或名字推断事实含义。Host 内部维护 prompt-local label 到 durable provenance refs 的映射；prompt、schema、validator 和测试可以验证 label 能映射回 provenance，但不得依赖 label 名称或 ordinal 推断业务语义。
 
 LLM compact output 只能返回业务语义字段和 prompt-local labels。Host 负责把 labels 映射回 durable refs，校验 provenance、长度、枚举、source boundary 和 quality gate。模型不得返回 durable refs、event ids、digests、artifact refs、policy decisions 或任何 Host 内部状态字段。
+
+compact material / prompt / query_text 的 LLM-facing 语义必须自解释。工具材料可以暴露业务可读 tool name、Host 改写后的业务可读 query text、bounded arguments projection 与工具响应/来源文本；不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、cursor、projection checkpoint、policy 名称、Attempt / execution ledger、Projector metadata 或 Host 内部账本字段。若工具只有 `semantic_input_digest` 而没有 durable semantic query text，Host 不得把 digest 当作 query 文本，也不得要求模型理解 digest；compact evidence projection 只能使用可读 arguments projection 或业务中性的 unavailable wording。若 accepted arguments atom 缺失，projection 必须产生 `missing_tool_call_arguments_atom` limited-signal，并避免向 LLM 展示内部诊断细节。
+
+F02 的稳定问题陈述固定为：`EvidenceReadableItem.tool_name` 已有业务可读位置；真实缺口是 `query_text` 缺少 durable arguments / semantic query 的业务可读表达。实现和测试不得把该问题降级成“tool name 缺失”，也不得用 `tool_call_id=...`、payload ref、digest 或 Host 内部 id 伪装成业务 query。
 
 ### 24.3 vNext Compact I/O Contract
 
@@ -2897,6 +3055,22 @@ Context Governance 与 Conversation Memory 的关系必须保持单向。Convers
 第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出 `ConversationCompactOutputVNext` 结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出 schema、candidate 字段和 source label 规则以第 24 章的 vNext compact I/O contract 为准。
 
 Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、accepted attempt number、accepted candidate digest、prompt-local label mapping refs、source boundary refs、quality check result、budget after compact 与 projection signal。是否将 session summary、evidence-backed fact candidates、answer anchors、forward intents 或 reference continuity items materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
+
+Host-owned compactor proposal call 必须写入 runner-call manifest，并在 manifest 中提供 `CompactorRunnerCallIdentity`。该 identity 只标识“哪个 parent user Run 的哪个 compaction operation 发起了哪次 compactor LLM proposal input”，不表示新的 Host admitted user Run。字段固定为：
+
+| field | type | required | semantics | validation rule |
+| --- | --- | ---: | --- | --- |
+| `parent_host_run_id` | `str` | yes | Host admitted user Run that triggered or is governed by compaction | must equal manifest `host_run_id` |
+| `parent_session_id` | `str` | yes | parent Session | must equal manifest `session_id` |
+| `compaction_operation_id` | `str` | yes | Host context governance operation id shared across proposal/repair attempts | required for every compactor call |
+| `compactor_engine_run_id` | `str` | yes | self Engine/runner id for compactor proposal call, e.g. `context-compactor:*` | must not be treated as Host admitted user Run id |
+| `compaction_attempt_number` | `int` | yes | proposal/repair attempt number within operation | positive and <= Host compaction policy max attempts |
+| `compaction_request_digest` | `Digest` | yes | digest of immutable compaction request | must match compactor input projection |
+| `compactor_input_projection_ref` | `HostInternalRef` | yes | artifact/descriptor for rendered compactor input data block | descriptor kind `compactor_input_projection` |
+| `accepted_context_compacted_event_ref` | `HostInternalRef | null` | no | accepted `CONTEXT_COMPACTED` event for successful attempt | present only for accepted attempt |
+| `rejected_attempt_diagnostic_ref` | `HostInternalRef | null` | no | diagnostic/progress ref for rejected/failed proposal attempt | present for rejected or failed attempts |
+
+`CompactorRunnerCallIdentity` 补充 `CONTEXT_COMPACTED`，不替代 compact truth。`CONTEXT_COMPACTED` 继续拥有 accepted compact artifact refs、accepted attempt number、candidate digest、prompt-local label mapping refs、source boundary refs、quality check 与 budget after compact。accepted compact event 可以引用 accepted proposal manifest；rejected attempts 可以通过 typed diagnostics 引用各自 manifest。任何 rejected proposal content、中间 transient artifact 或 compactor input projection 都不能进入 Conversation Memory，也不能成为 accepted compacted view。
 
 Compactor 与 retry / repair 的 owner 边界固定为：
 
