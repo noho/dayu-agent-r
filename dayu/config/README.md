@@ -168,8 +168,9 @@ provider 字段：
 | `source_id` | 来源标识 |
 | `enabled` | 是否启用 provider |
 | `allow_empty` | 是否允许 provider 返回空工具集合 |
+| `config` | provider 自身的层中立 JSON 配置；ConfigLoader 原样读取，不解释 Doc / Fins / Web 语义 |
 
-`import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。
+`import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。`config` 缺省等价空对象；需要业务含义时由对应 provider 自行解析，例如文档路径白名单、财报 workspace root、Web 请求限制等。
 
 ## prompts 目录职责
 

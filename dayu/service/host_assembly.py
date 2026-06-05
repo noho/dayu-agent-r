@@ -744,7 +744,7 @@ def _tool_discovery_specs(
                 location=location,
                 enabled=provider_config.enabled,
                 allow_empty=provider_config.allow_empty,
-                config={},
+                config=provider_config.config,
             )
         )
     return tuple(specs)

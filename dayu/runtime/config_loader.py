@@ -579,6 +579,7 @@ class ToolDiscoveryProviderConfig:
     :param source_id: 来源标识。
     :param enabled: 是否启用 provider。
     :param allow_empty: 是否允许 provider 返回空工具集合。
+    :param config: provider 自身的层中立 JSON 配置。
     """
 
     provider_id: str
@@ -588,6 +589,7 @@ class ToolDiscoveryProviderConfig:
     source_id: str
     enabled: bool
     allow_empty: bool
+    config: Mapping[str, JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2020,9 +2022,9 @@ def _parse_tool_discovery_provider(
 
     context = f"tool_discovery.providers.{record_id}"
     _require_no_forbidden_id_fields(record, context=context)
-    _require_exact_fields(
+    _require_required_and_optional_fields(
         record,
-        allowed=frozenset(
+        required=frozenset(
             {
                 "import_path",
                 "entry_point",
@@ -2032,6 +2034,7 @@ def _parse_tool_discovery_provider(
                 "allow_empty",
             }
         ),
+        optional=frozenset({"config"}),
         context=context,
     )
     import_path = _optional_str_field(
@@ -2064,7 +2067,54 @@ def _parse_tool_discovery_provider(
         source_id=_require_str_field(record, field_name="source_id", context=context),
         enabled=_require_bool_field(record, field_name="enabled", context=context),
         allow_empty=_require_bool_field(record, field_name="allow_empty", context=context),
+        config=_optional_mapping_field(record, field_name="config", context=context),
     )
+
+
+def _optional_mapping_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> JsonObject:
+    """读取可选 JSON object 字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 字段 JSON object；缺失或 ``null`` 时返回空 mapping。
+    :raises ConfigShapeError: 字段不是 JSON object 时抛出。
+    """
+
+    if field_name not in record or record[field_name] is None:
+        return {}
+    return _require_json_object(
+        record[field_name],
+        context=f"{context}.{field_name}",
+    )
+
+
+def _require_required_and_optional_fields(
+    record: JsonObject,
+    *,
+    required: frozenset[str],
+    optional: frozenset[str],
+    context: str,
+) -> None:
+    """校验必填字段存在并拒绝未知字段。
+
+    :param record: 待校验 JSON object。
+    :param required: 必填字段集合。
+    :param optional: 可选字段集合。
+    :param context: 错误消息上下文。
+    :returns: 无返回值。
+    :raises ConfigFieldError: 缺少必填字段或包含未知字段时抛出。
+    """
+
+    keys = frozenset(record.keys())
+    missing = required - keys
+    if missing:
+        raise ConfigFieldError(f"{context} missing required fields: {sorted(missing)}")
+    unknown = keys - required - optional
+    if unknown:
+        raise ConfigFieldError(f"{context} has unknown fields: {sorted(unknown)}")
 
 
 def _optional_entry_point(

@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Documents、Host、Runtime、Service 与 Engine 测试：
+运行当前契约、Documents、Tools、Host、Runtime、Service 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/documents tests/host tests/runtime tests/service tests/engine -q
+pytest tests/contracts tests/documents tests/tools tests/host tests/runtime tests/service tests/engine -q
 ```
 
 运行类型检查：
@@ -37,6 +37,7 @@ pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 ```bash
 pytest tests/contracts -q
 pytest tests/documents -q
+pytest tests/tools -q
 pytest tests/host -q
 pytest tests/host/test_tooling_options.py tests/host/test_package_exports.py tests/host/test_import_boundary.py -q
 pytest tests/host/test_durable_schema.py tests/host/test_event_log_store.py -q
@@ -125,6 +126,12 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 
 - import boundary：阻止 `dayu.documents` 反向依赖 Engine、Host、Service、UI、Fins 或具体工具实现，并确认 Docling runtime 与 processors 子包被边界扫描覆盖。
 - processors：使用确定性 fixture 覆盖 Markdown、HTML 与 Docling JSON 处理器的章节提取、表格读取与搜索片段输出。
+
+### `tests/tools/`
+
+业务工具与 provider 适配测试，当前覆盖 `dayu.tools._legacy_adapter` 的迁移边界：
+
+- legacy adapter：覆盖 OLD 风格同步 callable 到 current async `ToolCallable` 的适配、直接参数透传、需要投影 / 默认值 / 类型转换的参数校验、投影失败不进入迁移函数、显式路径策略校验、OLD ok/value envelope 解包、业务异常到 current failure outcome 的投影、reserved `fetch_more` 不作为业务工具输出、current `ToolTruncateSpec` 声明转换、默认 per-tool 串行执行，以及适配器不得导入 OLD registry / truncation / projection owner 的边界。
 
 ### `tests/host/`
 

@@ -6,7 +6,38 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools",
       "enabled": false,
-      "allow_empty": true
+      "allow_empty": true,
+      "config": {
+        "workspace_root": "workspace/fins",
+        "include_read_tools": true,
+        "include_ingestion_tools": false,
+        "limits": {}
+      }
+    },
+    "doc-tools": {
+      "import_path": "dayu.tools.doc_provider:discover_tools",
+      "entry_point": null,
+      "source_kind": "explicit_provider",
+      "source_id": "dayu.tools.doc_provider",
+      "enabled": false,
+      "allow_empty": true,
+      "config": {
+        "allowed_paths": [],
+        "limits": {}
+      }
+    },
+    "web-tools": {
+      "import_path": "dayu.tools.web:discover_tools",
+      "entry_point": null,
+      "source_kind": "explicit_provider",
+      "source_id": "dayu.tools.web",
+      "enabled": false,
+      "allow_empty": true,
+      "config": {
+        "request_timeout_seconds": 20.0,
+        "max_search_results": 8,
+        "allow_private_network_url": false
+      }
     }
   }
 }
