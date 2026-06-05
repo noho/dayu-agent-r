@@ -1493,6 +1493,7 @@ TOOL_RESULT_ACCEPTED
 TOOL_AWAITING
 GUIDANCE_INSERTED
 RUNNER_CALL_INPUT_ASSEMBLED
+RUNNER_CALL_INPUT_ITERATION_LINKED
 CONTEXT_COMPACTION_REQUESTED
 CONTEXT_COMPACTED
 CONTEXT_COMPACTION_FAILED
@@ -1502,6 +1503,14 @@ PROVIDER_PROTOCOL_ERROR
 Terminal event 使用具体终态 event，不使用模糊 `RUN_TERMINAL` / `ATTEMPT_TERMINAL` 作为唯一类型。
 
 模糊的“attempt event accepted”不作为第一版 canonical event。EngineEvent ingest 必须落到具体业务事实、preview / diagnostic，或被拒绝；不得用模糊“已接受某事件”掩盖事实类型。
+
+EngineEvent ingest 的命名 diagnostic event 至少包括：
+
+```text
+ENGINE_EVENT_REJECTED
+```
+
+`ENGINE_EVENT_REJECTED` 不是 Run / Attempt lifecycle fact，只记录 Host 拒绝某个 Engine event 的原因和是否要求停止当前 worker stream。它不得驱动 recovery、memory projection、dispatch decision、resume 或 Run / Attempt 状态迁移。
 
 ### 13.3 Canonical Event Contract Matrix
 
@@ -1524,9 +1533,11 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | resume 是 | audit 是 / tool trace 是 |
 | `GUIDANCE_INSERTED` | `session_id`、`run_id` | guidance text / source policy / reason | 不直接改 terminal；影响下一 Attempt messages | 插入 messages 时 resume 消费 | audit yes / Host event stream emit |
 | `RUNNER_CALL_INPUT_ASSEMBLED` | `session_id`、`host_run_id`；有 Attempt 时必须带 `attempt_id`、`execution_id`；compactor proposal 必须可由 manifest 关联 parent run 与 compaction operation | runner_call_index / runner_call_kind / runner_call_trigger_reason / manifest_payload_ref / manifest_digest / manifest_schema_version / validation_status | 无 Run / Attempt 状态副作用；不参与 terminal decision、recovery scan、memory projection、dispatch decision 或 lifecycle transition | resume 不消费；reconstruction consumer 只能消费 refs / digests / projector metadata | audit optional / tool trace 是 |
+| `RUNNER_CALL_INPUT_ITERATION_LINKED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id` | manifest_event_id / manifest_payload_ref / manifest_digest / manifest_schema_version / runner_call_index / runner_call_kind / runner_call_trigger_reason / iteration_id / iteration_index / engine_message_count / engine_role_sequence_digest / runner_input_serializer_schema_version / expected_message_count / expected_role_sequence_digest / validation_status / diagnostic | 无 Run / Attempt 状态副作用；只表达 prepared runner-call manifest 与 Engine `ITERATION_STARTED` observation 的追加式 link / validation fact | resume 不消费；reconstruction consumer 可用 refs / digests / observed-vs-expected summary 判断 Engine link 是否完成 | audit optional / tool trace optional |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
 | `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / accepted candidate digest / prompt-local label mapping refs / source boundary refs / quality check / failure reason / fallback decision | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
 | `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
+| `ENGINE_EVENT_REJECTED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id`、worker_event_index、engine_event_type | reason / stop_worker_stream / optional diagnostic_refs / optional runner-call link or manifest refs | 无 Run / Attempt 状态副作用；只表达 Host ingest fail-closed 或 unsupported event diagnostic；`stop_worker_stream` 是 worker stream 控制信号，不是 lifecycle transition | resume 不消费；memory 不消费 | audit yes / tool trace optional |
 
 canonical event 的 required fields 不能被塞进无结构 `metadata`；`metadata` 只能承载不参与状态机、幂等、恢复和审计主链的附加说明。
 
@@ -1653,6 +1664,8 @@ Tool trace 是 EventLog 派生 projection，不是 Host durable truth。它必�
 
 Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only signal。它只能消费 `RUNNER_CALL_INPUT_ASSEMBLED` manifest refs / digests、`TOOL_CALL_REQUESTED` arguments / semantic query atoms、Projector metadata summary、Engine 可观察的 iteration/message count 以及 projection artifact refs；不得读取旧 provider request、EngineRunner 内存、当前 prompt builder 代码或重新运行 compact material selection 来猜测历史输入。Tool Trace hot projection 可以缓存以下 runner-call signal，但这些字段只是 projection copy，不是 recovery、memory、dispatch 或 Run 状态真源：
 
+`RUNNER_CALL_INPUT_ASSEMBLED.validation_status="complete"` 只表示 prepared manifest 完整；`RUNNER_CALL_INPUT_ITERATION_LINKED.validation_status="complete"` 才表示该 prepared input 已通过 Engine `ITERATION_STARTED` observation 校验。第一版 Tool Trace 最小实现不强制投影 `RUNNER_CALL_INPUT_ITERATION_LINKED`；若未来投影 link event，只能作为独立 read-only signal 复制 manifest ref/digest、iteration fields、expected/observed count/digest 与 typed diagnostic，不得改变现有 `RUNNER_CALL_INPUT_ASSEMBLED` reconstruction signal 的含义。
+
 | field | type | required | semantics | validation rule |
 | --- | --- | ---: | --- | --- |
 | `runner_call_index` | `int` | yes | Host call index for locating the manifest | must match manifest |
@@ -1676,6 +1689,15 @@ Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only sig
 - `mismatch`：observed data 与 expected data 冲突。
 
 diagnostic 字段固定为 `status`、`reason`、`missing_atom_kind`、`missing_ref_kind`、`missing_ref`、`observed_count`、`expected_count`、`observed_digest`、`expected_digest`、`consumer_boundary`。`reason` 在非 `complete` 时必填，只允许 `missing_runner_call_manifest`、`missing_projection_artifact`、`missing_tool_call_arguments_atom`、`missing_semantic_query_atom`、`missing_compactor_manifest`、`missing_memory_snapshot_body`、`unsupported_projector_version`、`message_count_mismatch`、`role_sequence_digest_mismatch`、`input_projection_digest_mismatch`、`payload_digest_mismatch`、`unresolvable_ref`、`provider_specific_atom_deferred`。`missing_atom_kind` 只允许 `tool_call_arguments`、`semantic_query`、`runner_call_manifest`、`compactor_manifest`、`projection_artifact`、`memory_snapshot_body`。`missing_ref_kind` 只允许 `payload_ref`、`artifact_ref`、`event_ref`、`cursor_ref`。`consumer_boundary` 只允许 `tool_trace_query`、`analyzer_fixture`、`compact_evidence_projection`、`public_smoke`；compact LLM-facing text 只能得到业务中性的 unavailable wording，不能得到 refs、digests、event ids、cursors 或 diagnostic ledger details。
+
+`RUNNER_CALL_INPUT_ITERATION_LINKED` 只复用 runner-call diagnostic 中的 `message_count_mismatch` 与 `role_sequence_digest_mismatch` 表达 Engine observed input 与 prepared manifest expected input 的差异。Engine ingest rejected reason 不属于 `RunnerCallReconstructionDiagnostic.reason` 闭集，不得写入 Tool Trace runner-call diagnostic。
+
+Engine ingest rejected reason 的 runner-call link 子集固定为：
+
+- `missing_runner_call_manifest`：当前 `attempt_id` / `execution_id` 的第一个 accepted `ITERATION_STARTED` 到达时，没有唯一 unlinked prepared ordinary manifest。该 reason 用于 initial runner call fail-closed，不用于 Engine-only continuation。
+- `ambiguous_runner_call_manifest`：当前 `attempt_id` / `execution_id` 下存在多条 unlinked prepared ordinary manifest，Host 无法唯一确定 Engine iteration 对应哪个 prepared input。使用该 reason 时不得追加 `RUNNER_CALL_INPUT_ITERATION_LINKED`。
+- `runner_call_iteration_link_conflict`：同一 `run_id` / `attempt_id` / `execution_id` / `iteration_id` 已有 accepted `RUNNER_CALL_INPUT_ITERATION_LINKED`，但当前 Engine observation 与既有 link 的 manifest identity、iteration index、message count、role digest 或 serializer schema version 不一致。使用该 reason 时不得追加第二条 link。
+- `runner_call_manifest_mismatch`：存在唯一 unlinked prepared ordinary manifest，并已追加 `RUNNER_CALL_INPUT_ITERATION_LINKED` mismatch event；其 `message_count` 或 `role_sequence_digest` 与 Engine observation 不一致。具体差异写在 link event diagnostic 的 `message_count_mismatch` 或 `role_sequence_digest_mismatch` 中。
 
 约束：
 
@@ -2614,6 +2636,20 @@ RunInputBuilder 不创建独立 RunInputBuildTrace 子系统；上下文构造�
 RunInputBuilder 每次完成 logical runner call input assembly 后，Host 必须写入 `RUNNER_CALL_INPUT_ASSEMBLED` canonical reconstruction event，并把完整 manifest body 存为 `runner_call_input_manifest` payload descriptor / artifact。该 event 的 hot payload 只记录 `session_id`、`host_run_id`、`attempt_id`、`execution_id`、`runner_call_index`、`runner_call_kind`、`runner_call_trigger_reason`、`manifest_payload_ref`、`manifest_digest`、`manifest_schema_version` 与 `validation_status`。`manifest_digest` 必须等于 manifest body canonical JSON digest；hot payload scope fields 必须与 manifest identity fields 一致。该 event 没有 Run / Attempt 状态副作用，不驱动 recovery、memory、lifecycle、terminal decision 或 dispatch decision。
 
 ordinary RunInput 的 manifest 必须记录 one-system-message normalization 之后的最终 messages，而不是 merge 前候选 messages。`message_count`、`message_entries`、`role_sequence_digest`、每条 message 的 `index` / `role` / `content_digest` / `content_size_bytes` 必须与实际交给 Engine / Runner 的 `AgentRunRequest.messages` 同源。manifest 可以保存 source refs、projector metadata、projection artifact refs、digests 和 cursor refs 来解释 section 来源；这些 internal fields 仍只属于 reconstruction / Tool Trace / audit / diagnostic 边界，不得泄漏到 LLM-facing envelope。
+
+ordinary `RUNNER_CALL_INPUT_ASSEMBLED.validation_status="complete"` 只表示 Host prepared input manifest 自身完整，且与 Host-built final messages 同源；它不表示该 input 已被 Engine observation 校验。ordinary prepared manifest 的 `iteration_id` / `iteration_index` 可以为 `null`，因为它在 Engine `ITERATION_STARTED` 之前写入。RunInputBuilder 写入 ordinary prepared manifest 的 transaction 必须在 Attempt dispatch / worker start 前 durable commit；Engine ingest 若在当前 `attempt_id` / `execution_id` 的首次 accepted iteration observation 时看不到唯一 unlinked prepared ordinary manifest，必须 fail closed。
+
+Engine ingest 接受 `ITERATION_STARTED` 后，Host 必须通过追加式 `RUNNER_CALL_INPUT_ITERATION_LINKED` canonical fact 关联 prepared manifest 与 Engine iteration，不得回写旧 `RUNNER_CALL_INPUT_ASSEMBLED` manifest body、payload descriptor、payload digest 或 hot payload。`RUNNER_CALL_INPUT_ITERATION_LINKED.validation_status="complete"` 才表示 prepared input 已由 Engine `message_count` / `role_sequence_digest` observation 校验。link event 没有 Run / Attempt 状态副作用，不驱动 recovery、memory、lifecycle、terminal decision 或 dispatch decision。
+
+`RUNNER_CALL_INPUT_ITERATION_LINKED` resolution 规则：
+
+- 先在当前 `run_id` / `attempt_id` / `execution_id` / `iteration_id` 查找既有 link。只有既有 link 的 `validation_status="complete"` 且 observation 完全一致时才幂等接受；若 manifest identity、iteration index、message count、role digest 或 serializer schema version 不一致，写入 `ENGINE_EVENT_REJECTED(reason="runner_call_iteration_link_conflict", stop_worker_stream=true)` 并 fail closed；若既有 link 是 `validation_status="mismatch"`，继续写入 `ENGINE_EVENT_REJECTED(reason="runner_call_manifest_mismatch", stop_worker_stream=true)`，不得追加 accepted `ITERATION_STARTED` preview。
+- 查找 unlinked prepared ordinary manifest 时，只允许 `RUNNER_CALL_INPUT_ASSEMBLED.validation_status="complete"`、`iteration_id is null`、`iteration_index is null`、`compactor_identity is null`，且 `runner_call_kind` 属于 `initial_user_dispatch` / `followup_user_dispatch` / `post_compaction_dispatch`。`tool_result_continuation` 与 `compactor_proposal` 不得进入 ordinary link candidates。
+- unlinked 判定必须在同一个 Host transaction 内排除已被当前 `run_id` / `attempt_id` / `execution_id` 下 accepted `RUNNER_CALL_INPUT_ITERATION_LINKED.manifest_event_id` 引用的 manifest。实现可以使用 bounded scan 或 SQLite JSON anti-join；不得依赖 `RUNNER_CALL_INPUT_ASSEMBLED` 总计数。
+- 候选为 1 且 Engine `message_count` / `role_sequence_digest` 均匹配时，同一 Host transaction 内追加 `RUNNER_CALL_INPUT_ITERATION_LINKED` 与 accepted `ITERATION_STARTED` preview。
+- 候选为 1 但 count 或 role digest mismatch 时，同一 Host transaction 内追加 `RUNNER_CALL_INPUT_ITERATION_LINKED(validation_status="mismatch")` 与 `ENGINE_EVENT_REJECTED(reason="runner_call_manifest_mismatch", stop_worker_stream=true)`，不得追加 accepted `ITERATION_STARTED` preview。
+- 候选大于 1 时写入 `ENGINE_EVENT_REJECTED(reason="ambiguous_runner_call_manifest", stop_worker_stream=true)`，不得追加 link event。
+- 候选为 0 时，只有当前 `run_id` / `attempt_id` / `execution_id` 下已有 accepted `RUNNER_CALL_INPUT_ITERATION_LINKED` 或 accepted `ITERATION_STARTED` preview，才允许作为 Engine-only continuation 写 canonical limited-signal manifest；即使 continuation 的 `iteration_index == 0`，也不得匹配已 linked ordinary manifest。若没有 prior accepted iteration observation，必须写入 `ENGINE_EVENT_REJECTED(reason="missing_runner_call_manifest", stop_worker_stream=true)`，不得用 limited-signal manifest 掩盖 ordinary prepared manifest 缺失。
 
 验证边界分两层：public path smoke 只能通过实际 public request / scripted runner `messages_seen` 证明 ordinary runner call 至多一条 system message；focused durable manifest tests 可以通过 manifest recorder 或 payload resolution helper 读取 manifest，证明 manifest 与 normalized final messages 同源。focused manifest tests 不得把直接读取私有 SQLite table 当作证明 public message shape 的替代路径。
 

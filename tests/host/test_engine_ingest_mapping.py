@@ -119,7 +119,10 @@ from dayu.host.durable.run_transition import (
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
-from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.schema import (
+    RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+    TABLE_EVENT_LOG,
+)
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     AttemptRow,
@@ -2196,6 +2199,627 @@ def test_preview_event_accepts_matching_type_and_data(tmp_path: Path) -> None:
         assert _payload(result.events[0])["delta"] == "hello"
 
 
+def test_iteration_started_links_prepared_runner_call_manifest(
+    tmp_path: Path,
+) -> None:
+    """ordinary prepared manifest 会显式 link 到 Engine iteration。"""
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        manifest_event = _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-initial",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=20,
+            data=IterationStartedData(
+                iteration_id="iter-linked",
+                iteration_index=0,
+                message_count=2,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert [event.event_type for event in result.events] == [
+            "RUNNER_CALL_INPUT_ITERATION_LINKED",
+            "ITERATION_STARTED",
+        ]
+        link_payload = _payload(result.events[0])
+        preview_payload = _payload(result.events[1])
+        validation = preview_payload["runner_call_manifest_validation"]
+        assert isinstance(validation, Mapping)
+
+        assert link_payload["manifest_event_id"] == manifest_event.event_id
+        assert link_payload["iteration_id"] == "iter-linked"
+        assert link_payload["iteration_index"] == 0
+        assert link_payload["validation_status"] == "complete"
+        assert link_payload["diagnostic"] is None
+        assert link_payload["engine_message_count"] == 2
+        assert link_payload["expected_message_count"] == 2
+        assert link_payload["engine_role_sequence_digest"] == role_digest
+        assert link_payload["expected_role_sequence_digest"] == role_digest
+        assert preview_payload["runner_call_iteration_link_event_id"] == (
+            result.events[0].event_id
+        )
+        assert preview_payload["runner_call_manifest_event_id"] == (
+            manifest_event.event_id
+        )
+        assert validation["status"] == "complete"
+        assert validation["runner_call_iteration_link_event_id"] == (
+            result.events[0].event_id
+        )
+        assert validation["manifest_event_id"] == manifest_event.event_id
+        assert validation["continuation_limited_signal"] is False
+
+
+@pytest.mark.parametrize(
+    ("message_count", "role_digest", "expected_reason"),
+    (
+        (
+            3,
+            runner_role_sequence_digest(("system", "user")),
+            "message_count_mismatch",
+        ),
+        (
+            2,
+            runner_role_sequence_digest(("user", "system")),
+            "role_sequence_digest_mismatch",
+        ),
+    ),
+)
+def test_iteration_started_mismatch_fails_closed_after_link(
+    tmp_path: Path,
+    message_count: int,
+    role_digest: str,
+    expected_reason: str,
+) -> None:
+    """prepared manifest 与 Engine observed input 不一致时 fail closed。"""
+
+    expected_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        manifest_event = _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id=f"event-prepared-runner-call-{expected_reason}",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=expected_digest,
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=21,
+            data=IterationStartedData(
+                iteration_id=f"iter-{expected_reason}",
+                iteration_index=0,
+                message_count=message_count,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+        replay = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.stop_worker_stream is True
+        assert [event.event_type for event in result.events] == [
+            "RUNNER_CALL_INPUT_ITERATION_LINKED",
+            "ENGINE_EVENT_REJECTED",
+        ]
+        link_payload = _payload(result.events[0])
+        rejected_payload = _payload(result.events[1])
+        diagnostic = link_payload["diagnostic"]
+        assert isinstance(diagnostic, Mapping)
+
+        assert link_payload["manifest_event_id"] == manifest_event.event_id
+        assert link_payload["validation_status"] == "mismatch"
+        assert diagnostic["reason"] == expected_reason
+        assert diagnostic["observed_count"] == message_count
+        assert diagnostic["expected_count"] == 2
+        assert diagnostic["observed_digest"] == role_digest
+        assert diagnostic["expected_digest"] == expected_digest
+        assert rejected_payload["reason"] == "runner_call_manifest_mismatch"
+        assert rejected_payload["stop_worker_stream"] is True
+        assert rejected_payload["runner_call_iteration_link_event_id"] == (
+            result.events[0].event_id
+        )
+        assert rejected_payload["runner_call_manifest_event_id"] == (
+            manifest_event.event_id
+        )
+        assert replay.status == EngineIngestStatus.REJECTED
+        assert replay.stop_worker_stream is True
+        assert [event.event_type for event in replay.events] == [
+            "ENGINE_EVENT_REJECTED",
+        ]
+        replay_payload = _payload(replay.events[0])
+        assert replay_payload["reason"] == "runner_call_manifest_mismatch"
+        assert replay_payload["runner_call_iteration_link_event_id"] == (
+            result.events[0].event_id
+        )
+        assert replay_payload["runner_call_manifest_event_id"] == (
+            manifest_event.event_id
+        )
+        assert _event_count(
+            store.transaction_runner,
+            "RUNNER_CALL_INPUT_ITERATION_LINKED",
+        ) == 1
+        assert _event_count(store.transaction_runner, "ENGINE_EVENT_REJECTED") == 1
+        assert _event_count(store.transaction_runner, "ITERATION_STARTED") == 0
+
+
+def test_iteration_started_missing_initial_manifest_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """首个 iteration 缺少 prepared manifest 时不得降级为 limited signal。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=22,
+            data=IterationStartedData(
+                iteration_id="iter-missing-manifest",
+                iteration_index=0,
+                message_count=1,
+                role_sequence_digest=runner_role_sequence_digest(("user",)),
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.stop_worker_stream is True
+        assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
+        assert _payload(result.events[0])["reason"] == "missing_runner_call_manifest"
+        assert _payload(result.events[0])["stop_worker_stream"] is True
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 0
+        assert _event_count(store.transaction_runner, "ITERATION_STARTED") == 0
+
+
+def test_iteration_started_mismatch_link_does_not_seed_continuation(
+    tmp_path: Path,
+) -> None:
+    """mismatch link 属于 rejected path，不能作为 continuation prior observation。"""
+
+    expected_digest = runner_role_sequence_digest(("system", "user"))
+    observed_digest = runner_role_sequence_digest(("system", "assistant"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-mismatch-prior",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=expected_digest,
+        )
+        mismatch = _candidate(
+            seeded,
+            worker_event_index=23,
+            data=IterationStartedData(
+                iteration_id="iter-mismatch-prior",
+                iteration_index=0,
+                message_count=2,
+                role_sequence_digest=observed_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+        next_iteration = _candidate(
+            seeded,
+            worker_event_index=24,
+            data=IterationStartedData(
+                iteration_id="iter-after-mismatch-prior",
+                iteration_index=1,
+                message_count=4,
+                role_sequence_digest=runner_role_sequence_digest(
+                    ("system", "user", "assistant", "tool")
+                ),
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        mismatch_result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(mismatch)
+        next_result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(next_iteration)
+
+        assert mismatch_result.status == EngineIngestStatus.REJECTED
+        assert next_result.status == EngineIngestStatus.REJECTED
+        assert next_result.stop_worker_stream is True
+        assert [event.event_type for event in next_result.events] == [
+            "ENGINE_EVENT_REJECTED",
+        ]
+        assert _payload(next_result.events[0])["reason"] == (
+            "missing_runner_call_manifest"
+        )
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 1
+        assert _event_count(
+            store.transaction_runner,
+            "RUNNER_CALL_INPUT_ITERATION_LINKED",
+        ) == 1
+        assert _event_count(store.transaction_runner, "ITERATION_STARTED") == 0
+
+
+def test_iteration_started_rejected_event_does_not_seed_continuation(
+    tmp_path: Path,
+) -> None:
+    """ENGINE_EVENT_REJECTED 不能被 prior observation helper 当作 continuation。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        first = _candidate(
+            seeded,
+            worker_event_index=23,
+            data=IterationStartedData(
+                iteration_id="iter-missing-first",
+                iteration_index=0,
+                message_count=1,
+                role_sequence_digest=runner_role_sequence_digest(("user",)),
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+        second = _candidate(
+            seeded,
+            worker_event_index=24,
+            data=IterationStartedData(
+                iteration_id="iter-missing-second",
+                iteration_index=0,
+                message_count=1,
+                role_sequence_digest=runner_role_sequence_digest(("user",)),
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        first_result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(first)
+        second_result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(second)
+
+        assert first_result.status == EngineIngestStatus.REJECTED
+        assert second_result.status == EngineIngestStatus.REJECTED
+        assert _payload(second_result.events[0])["reason"] == (
+            "missing_runner_call_manifest"
+        )
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ASSEMBLED") == 0
+
+
+def test_iteration_started_ambiguous_prepared_manifest_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """多个 unlinked prepared manifest 无法唯一关联时 fail closed。"""
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-ambiguous-a",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-ambiguous-b",
+            runner_call_index=1,
+            runner_call_kind="followup_user_dispatch",
+            runner_call_trigger_reason="followup_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=25,
+            data=IterationStartedData(
+                iteration_id="iter-ambiguous",
+                iteration_index=0,
+                message_count=2,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.stop_worker_stream is True
+        assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
+        assert _payload(result.events[0])["reason"] == "ambiguous_runner_call_manifest"
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ITERATION_LINKED") == 0
+        assert _event_count(store.transaction_runner, "ITERATION_STARTED") == 0
+
+
+def test_iteration_started_link_conflict_fails_closed(tmp_path: Path) -> None:
+    """同一 iteration 的既有 link 与新 observation 冲突时 fail closed。"""
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-conflict",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        first = _candidate(
+            seeded,
+            worker_event_index=26,
+            data=IterationStartedData(
+                iteration_id="iter-conflict",
+                iteration_index=0,
+                message_count=2,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+        second = _candidate(
+            seeded,
+            worker_event_index=27,
+            data=IterationStartedData(
+                iteration_id="iter-conflict",
+                iteration_index=0,
+                message_count=3,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        accepted = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(first)
+        rejected = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(second)
+
+        assert accepted.status == EngineIngestStatus.ACCEPTED
+        assert rejected.status == EngineIngestStatus.REJECTED
+        assert rejected.stop_worker_stream is True
+        assert _payload(rejected.events[0])["reason"] == (
+            "runner_call_iteration_link_conflict"
+        )
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ITERATION_LINKED") == 1
+
+
+@pytest.mark.parametrize(
+    ("runner_call_kind", "trigger_reason"),
+    (
+        ("followup_user_dispatch", "followup_user_input"),
+        ("post_compaction_dispatch", "context_compaction_completed"),
+    ),
+)
+def test_iteration_started_links_all_ordinary_dispatch_kinds(
+    tmp_path: Path,
+    runner_call_kind: str,
+    trigger_reason: str,
+) -> None:
+    """ordinary dispatch kind 闭集覆盖 followup 与 post-compaction。"""
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        manifest_event = _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id=f"event-prepared-runner-call-{runner_call_kind}",
+            runner_call_index=0,
+            runner_call_kind=runner_call_kind,
+            runner_call_trigger_reason=trigger_reason,
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=28,
+            data=IterationStartedData(
+                iteration_id=f"iter-{runner_call_kind}",
+                iteration_index=0,
+                message_count=2,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.events[0].event_type == "RUNNER_CALL_INPUT_ITERATION_LINKED"
+        assert _payload(result.events[0])["manifest_event_id"] == (
+            manifest_event.event_id
+        )
+        assert _payload(result.events[0])["runner_call_kind"] == runner_call_kind
+
+
+def test_iteration_started_does_not_link_compactor_manifest(tmp_path: Path) -> None:
+    """compactor proposal manifest 不会被 ordinary link resolution 选中。"""
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-compactor",
+            runner_call_index=0,
+            runner_call_kind="compactor_proposal",
+            runner_call_trigger_reason="context_compaction_repair_attempt",
+            message_count=2,
+            role_sequence_digest=role_digest,
+            compactor_identity={"compaction_operation_id": "operation-test"},
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=29,
+            data=IterationStartedData(
+                iteration_id="iter-compactor-not-ordinary",
+                iteration_index=0,
+                message_count=2,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == "missing_runner_call_manifest"
+        assert _event_count(store.transaction_runner, "RUNNER_CALL_INPUT_ITERATION_LINKED") == 0
+
+
+def test_iteration_started_continuation_reset_uses_limited_signal_after_link(
+    tmp_path: Path,
+) -> None:
+    """iteration_index reset 为 0 时不能误匹配已 linked ordinary manifest。"""
+
+    initial_digest = runner_role_sequence_digest(("system", "user"))
+    continuation_digest = runner_role_sequence_digest(
+        ("system", "user", "assistant", "tool")
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prepared-runner-call-reset",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=initial_digest,
+        )
+        initial = _candidate(
+            seeded,
+            worker_event_index=30,
+            data=IterationStartedData(
+                iteration_id="iter-reset-initial",
+                iteration_index=0,
+                message_count=2,
+                role_sequence_digest=initial_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+        continuation = _candidate(
+            seeded,
+            worker_event_index=31,
+            data=IterationStartedData(
+                iteration_id="iter-reset-continuation",
+                iteration_index=0,
+                message_count=4,
+                role_sequence_digest=continuation_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        accepted = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(initial)
+        continued = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(continuation)
+
+        assert accepted.status == EngineIngestStatus.ACCEPTED
+        assert continued.status == EngineIngestStatus.ACCEPTED
+        assert [event.event_type for event in continued.events] == [
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+            "ITERATION_STARTED",
+        ]
+        manifest_hot = _payload(continued.events[0])
+        preview_payload = _payload(continued.events[1])
+        validation = preview_payload["runner_call_manifest_validation"]
+        assert isinstance(validation, Mapping)
+        assert manifest_hot["runner_call_kind"] == "tool_result_continuation"
+        assert manifest_hot["iteration_id"] == "iter-reset-continuation"
+        assert manifest_hot["runner_call_index"] == 1
+        assert validation["status"] == "limited_signal"
+        assert validation["continuation_limited_signal"] is True
+        assert validation["manifest_event_id"] == continued.events[0].event_id
+
+
 def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
     tmp_path: Path,
 ) -> None:
@@ -2206,6 +2830,13 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
     )
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
+        _append_prior_iteration_started_preview(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prior-iteration-preview",
+            iteration_id="iter-prior",
+            iteration_index=0,
+        )
         candidate = _candidate(
             seeded,
             worker_event_index=21,
@@ -2996,6 +3627,158 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
         )
 
     return transaction_runner.run_read(_operation)
+
+
+def _append_prepared_runner_call_manifest(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    event_id: str,
+    runner_call_index: int,
+    runner_call_kind: str,
+    runner_call_trigger_reason: str,
+    message_count: int,
+    role_sequence_digest: str,
+    compactor_identity: Mapping[str, JsonValue] | None = None,
+) -> EventLogRow:
+    """追加测试用 prepared runner-call manifest event。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded run。
+    :param event_id: manifest event id。
+    :param runner_call_index: Host runner call index。
+    :param runner_call_kind: runner-call kind。
+    :param runner_call_trigger_reason: runner-call trigger reason。
+    :param message_count: manifest message count。
+    :param role_sequence_digest: manifest role digest。
+    :param compactor_identity: 可选 compactor identity。
+    :returns: 写入的 EventLog row。
+    """
+
+    manifest_digest = sha256_digest_json(
+        {"event_id": event_id, "role_sequence_digest": role_sequence_digest}
+    )
+    payload: dict[str, JsonValue] = {
+        "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+        "manifest_id": f"runner-call-manifest:{event_id}",
+        "session_id": seeded.session_id,
+        "host_run_id": seeded.run_id,
+        "attempt_id": seeded.attempt_id,
+        "execution_id": seeded.execution_id,
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": runner_call_kind,
+        "runner_call_trigger_reason": runner_call_trigger_reason,
+        "iteration_id": None,
+        "iteration_index": None,
+        "manifest_payload_ref": f"payload-runner-call-manifest:{event_id}",
+        "manifest_digest": manifest_digest,
+        "manifest_schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+        "validation_status": "complete",
+        "message_count": message_count,
+        "role_sequence_digest": role_sequence_digest,
+        "input_projection_digest": sha256_digest_json(
+            {"projection": event_id}
+        ),
+        "projector_metadata_summary": [],
+        "diagnostic": None,
+        "compactor_identity": compactor_identity,
+    }
+
+    def _operation(transaction: HostTransaction) -> EventLogRow:
+        return EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=payload,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+
+    return transaction_runner.run_write(_operation)
+
+
+def _append_prior_iteration_started_preview(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    event_id: str,
+    iteration_id: str,
+    iteration_index: int,
+) -> EventLogRow:
+    """追加测试用 prior accepted ITERATION_STARTED preview。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded run。
+    :param event_id: preview event id。
+    :param iteration_id: Engine iteration id。
+    :param iteration_index: Engine iteration index。
+    :returns: 写入的 EventLog row。
+    """
+
+    def _operation(transaction: HostTransaction) -> EventLogRow:
+        return EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.PREVIEW,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                event_type="ITERATION_STARTED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={
+                    "attempt_id": seeded.attempt_id,
+                    "execution_id": seeded.execution_id,
+                    "worker_event_index": 1,
+                    "engine_event_type": "iteration_started",
+                    "iteration_id": iteration_id,
+                    "iteration_index": iteration_index,
+                    "message_count": 1,
+                    "role_sequence_digest": runner_role_sequence_digest(("user",)),
+                    "runner_input_serializer_schema_version": (
+                        RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                    ),
+                    "runner_call_manifest_validation": {
+                        "status": "complete",
+                        "reason": None,
+                        "runner_call_iteration_link_event_id": None,
+                        "manifest_event_id": None,
+                        "manifest_payload_ref": None,
+                        "manifest_digest": None,
+                        "observed_count": 1,
+                        "expected_count": 1,
+                        "observed_digest": runner_role_sequence_digest(("user",)),
+                        "expected_digest": runner_role_sequence_digest(("user",)),
+                        "continuation_limited_signal": False,
+                    },
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+
+    return transaction_runner.run_write(_operation)
 
 
 def _attempt_count(transaction_runner: HostTransactionRunner, run_id: str) -> int:
