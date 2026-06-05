@@ -2547,6 +2547,43 @@ messages 构造顺序必须稳定：
 9. replay / retry / steer / resume guidance。
 10. 当前 attempt 的工具 schema snapshot 与运行 policy。
 
+普通 public RunInputBuilder 输出必须满足 one-system-message hard contract。这里的普通 public RunInputBuilder 输出指由 Host public opener / follow-up / retry / replay / resume / forced-answer / length-continuation / tool-result continuation 等用户 Run 路径构造并交给 Engine / Runner 的 `AgentRunRequest.messages`；Host-owned compactor proposal call 不属于该 ordinary RunInput contract，而受 24.2 compact I/O 边界约束。ordinary RunInput 若存在任何 system-scoped material，最终 message list 至多包含一条 `system` role message，且这条 system envelope 必须是第一条；如果没有 system-scoped material，则 message list 可以没有 `system` role。selected recent window 中的用户输入继续使用 `user` role，助手最终回答继续使用 `assistant` role，当前 `USER_INPUT_ACCEPTED` 仍是最后的 current input `user` message。实现不得为了压低 system count 把普通用户 / 助手对话历史改写成 system role。
+
+system envelope 的 LLM-facing section 顺序、标题和分隔符是设计契约，不由实现临场发明。非空 section 按下列顺序渲染，空 section 不渲染；section header 使用 Markdown 二级标题，格式固定为 `## <title>`；相邻 section 之间使用且只使用两个换行符作为分隔，即 `\n\n`。section title 是业务可读标题，不是 projector id、Python 类型名、policy ref、内部模块名或 Host 治理字段。下表是 section title、顺序和 Conversation Memory section 映射的唯一真源；其它章节只能引用本表的映射关系，不得重复硬编码完整 title 列表。
+
+| 顺序 | section title | 内容来源 | 渲染规则 |
+|---:|---|---|---|
+| 1 | `Task Instructions` | caller / Service system prompt 与场景约束 | 保留调用方给模型的任务规则；不得附带 prompt fragment ref、source digest 或 scene manifest 诊断。 |
+| 2 | `Execution Guidance` | Host-neutral execution instruction、当前运行约束、工具可用性或必要继续说明 | 只写模型需要遵守的业务动作和限制；不得暴露 policy snapshot ref、Attempt / execution ledger 或调度状态。 |
+| 3 | `Conversation Summary` | Session Summary Memory 或 accepted compacted view 中的会话摘要 | 只写 compact / memory 已接受的业务摘要；不得内联 raw compact artifact JSON 或 compact boundary。 |
+| 4 | `Verified Evidence and Facts` | Evidence / Fact Memory、accepted evidence-backed facts，以及 memory / fact pipeline 已接受的 evidence material | 写业务可读 tool name、query / arguments projection、response / source text 和 prompt-local source label；不得写 tool_call_id、event id、payload ref、digest 或 cursor。 |
+| 5 | `Prior Answer Anchors` | Answer Anchor Memory | 写可被后续指代的历史回答轮廓；不得把 anchor 当作事实证明。 |
+| 6 | `Open Follow-up Context` | Forward Intent Memory | 写未完成任务、待澄清点或下一步上下文；不得把 intent 当作工具执行计划或事实。 |
+| 7 | `Reference Continuity` | Trace Memory reference continuity items | 写解析“刚才”“第二点”等局部指代所需的最小文本。 |
+| 8 | `Recent Evidence` | 未进入 memory / fact pipeline 的 recent-window fallback、wait-resume 或其它 evidence-like bounded material | 仅在 material 不能作为合法 `user` / `assistant` role 进入 Engine contract，且尚未被 memory / fact pipeline 接受时使用；不得暴露 fallback diagnostic、wait record id 或内部恢复状态。 |
+| 9 | `Resume Guidance` | replay / retry / steer / resume / wait continuity guidance | 只写当前继续目标和用户可理解的恢复说明；不得写 tool_call_id、Attempt id、execution id、runner iteration id 或内部账本字段。 |
+
+evidence material 的 section routing 必须唯一归属：已经作为 verified / accepted memory facts 或 memory / fact pipeline accepted evidence 的材料只能进入 `Verified Evidence and Facts`；未进入 memory / fact pipeline 的 recent-window fallback、wait-resume 或其它 evidence-like bounded material 只能进入 `Recent Evidence`；同一条 evidence material 不得同时渲染到两个 section。若某条 recent material 已被 memory / fact pipeline 接受，后续只能按 accepted memory / fact material 路由，不再按 recent fallback material 路由。
+
+selected recent window 的 role preservation 优先于原始交错位置 preservation。用户输入和助手最终回答必须保持原 role 和相对顺序；当前 Engine message contract 不支持 ordinary RunInput historical evidence 使用 `tool` role，因此 selected recent evidence 和其它不能作为 `user` / `assistant` role 保留的 historical evidence 默认进入首条 system envelope，并按上一段唯一归属规则路由到 `Verified Evidence and Facts` 或 `Recent Evidence` section。该选择会把原本夹在历史 user / assistant turn 中间的 evidence 提前到 system envelope 内，是被接受的 trade-off：它用稳定的 provider-independent one-system-message shape 换取 evidence 原始交错位置的弱化。实现必须用 public path smoke 证明 role shape 收敛，并用 focused tests 证明 follow-up 仍能读取 evidence 中的关键业务文本；未来如果 Engine contract 支持 historical evidence 使用 `tool` role，可在后续 work unit 中重新评估是否把 selected recent evidence 保留在原交错位置。
+
+ordinary RunInput 的 LLM-facing material 不得暴露内部治理标识。下表是实现时必须采用的替换边界；未列出的内部 ref / ledger 字段按同类最严格规则处理。可进入 manifest、Tool Trace、audit、diagnostic 或 payload descriptor 的 internal refs，不得作为模型阅读材料进入 system envelope、selected recent window 或 current input。
+
+| 内部字段 / 标识 | LLM-facing 策略 | 可接受替代文本 |
+|---|---|---|
+| `policy_snapshot_ref`、policy ref、policy name | 删除 ref；如模型需要知道行为约束，只保留 Host-neutral 业务规则 | “Use the available context and tools under the current run limits.” |
+| `tool_call_id`、tool request id、tool result id | 删除 id；用业务 tool name、query / arguments projection、response / source text 表达 | “A previous tool call to `<tool name>` returned: ...”；若 query 不可读则写 “The original tool query is not available in readable form.” |
+| EventLog event id、event sequence、durable event ref | 删除；如需顺序，只用自然语言或 prompt-local label 表达 | “Earlier in this conversation...” 或 `Source E1` 这类 prompt-local label。 |
+| payload ref、artifact ref、payload descriptor、artifact descriptor | 删除；改用已校验的 bounded readable content | 直接展示业务文本摘要或 “The detailed artifact is not available in readable form.” |
+| digest、content digest、semantic input digest、role sequence digest | 删除；不得把 digest 当作业务事实或 query 文本 | “The original query text is not available in readable form.” |
+| cursor、compact boundary、projection checkpoint、memory snapshot cursor | 删除；不要求模型理解边界 | “Recent conversation context:” 或 “Earlier accepted summary:” |
+| projector metadata、projector id、schema version、source contract refs、projection artifact ref | 删除；只保留 section title 和业务文本 | 不写替代字段；manifest 保留 provenance。 |
+| Attempt ledger、execution ledger、attempt id、execution id、iteration id、runner call index | 删除；如影响当前继续目标，用用户可读恢复说明 | “Continue from the previous interrupted step.” |
+| scheduler、lane、worker、dispatch、recovery 内部状态 | 删除；如用户需要知道状态，只写业务可见状态 | “The previous step was interrupted before a final answer.” |
+| Python 类型名、Host / Engine 内部类名、内部 enum 名 | 删除；用当前 prompt 自足说明字段含义 | 使用业务 schema 名或普通自然语言；不得写 `ConversationCompactOutputVNext` 这类实现类型名。 |
+
+system envelope merge 只能合并已经由各 input provider / projection policy 治理后的 bounded content，不得新增、展开或重新召回内容。实现必须保留各 section 原有 item cap、char cap、selected recent window cap、floor 和 compact / fallback budget 约束；merge 后的总 envelope 大小必须有可测断言：`len(merged_system_content) <= sum(len(candidate_system_content)) + deterministic_header_separator_overhead`，其中 `candidate_system_content` 是所有准备进入 system envelope 的 bounded rendered content，`deterministic_header_separator_overhead` 只包含非空 section 的固定 Markdown header、header 与内容之间的固定换行，以及 section 间固定 separator。若某 section 在 merge 前已超出其 provider cap，必须在 provider 边界 fail closed 或截断；merge helper 不得用新的全局截断掩盖上游 cap 失效。focused tests 必须覆盖 section cap preservation 或上述总字符数 sanity，并断言 merge 没有引入候选 system content 之外的新业务文本。
+
 同一 EventLog 在同一 policy 下必须构造出等价 messages；projection lag、preview delta 或 sink failure 不能改变 RunInputBuilder 输出。
 
 RunInputBuilder 的输出必须能由输入 fact refs、memory snapshot cursor、compact artifact refs 与 policy snapshot 解释；不得依赖未持久化的旧 provider request、旧 EngineRunner 内存或 UI 临时状态。
@@ -2575,6 +2612,10 @@ RunInputBuilder 不创建独立 RunInputBuildTrace 子系统；上下文构造�
 ### 23.1 Runner-call Input Assembly Manifest
 
 RunInputBuilder 每次完成 logical runner call input assembly 后，Host 必须写入 `RUNNER_CALL_INPUT_ASSEMBLED` canonical reconstruction event，并把完整 manifest body 存为 `runner_call_input_manifest` payload descriptor / artifact。该 event 的 hot payload 只记录 `session_id`、`host_run_id`、`attempt_id`、`execution_id`、`runner_call_index`、`runner_call_kind`、`runner_call_trigger_reason`、`manifest_payload_ref`、`manifest_digest`、`manifest_schema_version` 与 `validation_status`。`manifest_digest` 必须等于 manifest body canonical JSON digest；hot payload scope fields 必须与 manifest identity fields 一致。该 event 没有 Run / Attempt 状态副作用，不驱动 recovery、memory、lifecycle、terminal decision 或 dispatch decision。
+
+ordinary RunInput 的 manifest 必须记录 one-system-message normalization 之后的最终 messages，而不是 merge 前候选 messages。`message_count`、`message_entries`、`role_sequence_digest`、每条 message 的 `index` / `role` / `content_digest` / `content_size_bytes` 必须与实际交给 Engine / Runner 的 `AgentRunRequest.messages` 同源。manifest 可以保存 source refs、projector metadata、projection artifact refs、digests 和 cursor refs 来解释 section 来源；这些 internal fields 仍只属于 reconstruction / Tool Trace / audit / diagnostic 边界，不得泄漏到 LLM-facing envelope。
+
+验证边界分两层：public path smoke 只能通过实际 public request / scripted runner `messages_seen` 证明 ordinary runner call 至多一条 system message；focused durable manifest tests 可以通过 manifest recorder 或 payload resolution helper 读取 manifest，证明 manifest 与 normalized final messages 同源。focused manifest tests 不得把直接读取私有 SQLite table 当作证明 public message shape 的替代路径。
 
 `RunnerCallInputAssemblyManifest` 是 durable reconstruction contract，不是 message dump。字段固定为：
 
@@ -3007,6 +3048,10 @@ if accepted compacted view exists:
 ```
 
 第一阶段不根据 token estimator 在 runtime 做逐 section 裁剪。各 section 必须在 projection / assembly 前通过配置化 item cap、char cap、selected recent window cap、selected recent window floor 与 per-semantic bounded working set 形成确定性上限；provider context length failure 由 Context Governance 的 reactive compact / fallback 收口。需要 floor 的 section 只固定两类：`selected_recent_window_turn_floor` 与 `evidence_fact_floor`。其它 section 默认只有 cap，没有 floor；`reference_continuity_item_floor = 0` 可以显式进入配置。fallback selected recent window caps 必须不小于 selected recent window floor 所需材料，并且不大于普通 selected recent window caps。
+
+Prompt Assembly 渲染给 ordinary RunInput 时必须遵守 23 节 one-system-message hard contract。Conversation Memory 可以在内部维护 snapshot cursor、compact event ref、source refs、source label mapping digest、producer policy ref、projection checkpoint、diagnostic 与 item digest；但投影给 LLM 的 system envelope 和 selected recent window 只能包含业务可读内容、必要短来源说明和 prompt-local opaque label。ordinary RunInput 不得暴露 EventLog id、event sequence、payload ref、artifact ref、digest、cursor、policy ref、projection checkpoint、projector metadata、Attempt / execution ledger、tool_call_id、Python 类型名或 Host 内部治理术语。
+
+Conversation Memory section header 必须使用 23 节 system envelope section table 中对应内容来源的固定 LLM-facing title；23 节表格是 section title 与映射关系的唯一真源，本文不重复硬编码完整 title 列表。selected recent window 中的 user / assistant material 保留原 role；当前 Engine message contract 不支持 ordinary RunInput historical evidence 使用 `tool` role，因此 selected recent evidence 若不能保留为 `user` / `assistant` role，则进入 system envelope，并按 23 节 evidence material 唯一归属规则路由，用业务可读 tool / query / response / source text 表达。该迁移不得展开 compact 覆盖范围内的旧 raw history，也不得把 fallback diagnostic 或 compact failure payload 渲染给模型。
 
 ### 24.7 测试与评测边界
 
