@@ -185,7 +185,9 @@ Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取�
 
 Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
 
-`conversation_compaction` 是 Host-owned compactor 的专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为 Host runtime request 数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
+`conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为运行期请求数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
+
+会话压缩 prompt asset 是直接投给模型阅读的文本，必须自足说明输入 JSON、输出 JSON 字段、字段含义、类型、必填性、允许值、最小示例与 label 引用规则。prompt 中的 label 只能解释为本次请求内的引用标签，不得写成业务事实、财报事实或用户可见结论；prompt 不要求模型理解 Host 内部治理、Python 类型名、迁移术语或底层账本标识。
 
 Service assembly 不硬编码 compactor scene 名或 user template 路径；它从当前 execution profile 的 `compactor_baseline.scene_id` 读取 scene id，通过 ScenePrepare 装配 system prompt 与 AgentPolicy，并从 `compactor_baseline.user_prompt_template_path` 读取 user prompt template。
 

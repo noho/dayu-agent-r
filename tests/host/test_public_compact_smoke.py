@@ -92,6 +92,66 @@ _PACKAGE_CONFIG_ROOT = (
     pathlib.Path(__file__).resolve().parents[2] / "dayu" / "config"
 )
 _COMPACTOR_PROFILE_ID = "standard-256k"
+_FORBIDDEN_COMPACTOR_PROMPT_TERMS = (
+    "Host-owned context compaction",
+    "ConversationCompactOutputVNext",
+    "ConversationCompactInputVNext",
+    "vNext",
+    "migration",
+    "candidate_id",
+    "episode_summary_candidate",
+    "pinned_state_patch_candidate",
+    "minimum_preserve_item_candidates",
+    "preservation_evidence",
+    "stable_input",
+    "history_input",
+    "evidence_input",
+    "EventLog",
+    "payload ref",
+    "payload refs",
+    "payload_refs",
+    "digest",
+    "cursor",
+    "policy",
+)
+
+
+def test_default_compactor_prompt_is_llm_facing_and_self_contained() -> None:
+    """默认 compactor prompt 不暴露内部实现术语，并自足说明输入输出。
+
+    :returns: ``None``。
+    :raises AssertionError: prompt 文本缺少必要语义或包含内部术语时抛出。
+    """
+
+    system_prompt, user_prompt_template, _ = _compactor_baseline_inputs()
+    prompt_text = f"{system_prompt}\n{user_prompt_template}"
+
+    for forbidden_term in _FORBIDDEN_COMPACTOR_PROMPT_TERMS:
+        assert forbidden_term not in prompt_text
+
+    assert "<<compaction_request>>" in user_prompt_template
+    assert "输入 JSON 说明" in user_prompt_template
+    assert "输出 JSON 字段" in user_prompt_template
+    assert "输出 JSON 最小示例" in user_prompt_template
+    assert "label 是本次请求内的引用标签" in user_prompt_template
+    assert "label 本身不是业务事实、财报事实或结论" in system_prompt
+    assert "唯一允许值为 `conversation_compact_output_v1`" in user_prompt_template
+    assert (
+        "必须为每个确实需要保留的 evidence label 产出至少一个 "
+        "evidence_backed_facts 条目；不得合成无证据事实。"
+        in user_prompt_template
+    )
+    assert "应为每个确实需要保留的 evidence label" not in user_prompt_template
+    for required_field in (
+        "schema_version",
+        "session_summary",
+        "evidence_backed_facts",
+        "answer_anchors",
+        "forward_intents",
+        "reference_continuity_items",
+        "diagnostics",
+    ):
+        assert required_field in user_prompt_template
 
 
 @pytest.mark.asyncio
