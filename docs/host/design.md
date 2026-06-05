@@ -3149,10 +3149,8 @@ Host-owned compactor proposal call 必须写入 runner-call manifest，并在 ma
 | `compaction_attempt_number` | `int` | yes | proposal/repair attempt number within operation | positive and <= Host compaction policy max attempts |
 | `compaction_request_digest` | `Digest` | yes | digest of immutable compaction request | must match compactor input projection |
 | `compactor_input_projection_ref` | `HostInternalRef` | yes | artifact/descriptor for rendered compactor input data block | descriptor kind `compactor_input_projection` |
-| `accepted_context_compacted_event_ref` | `HostInternalRef | null` | no | accepted `CONTEXT_COMPACTED` event for successful attempt | present only for accepted attempt |
-| `rejected_attempt_diagnostic_ref` | `HostInternalRef | null` | no | diagnostic/progress ref for rejected/failed proposal attempt | present for rejected or failed attempts |
 
-`CompactorRunnerCallIdentity` 补充 `CONTEXT_COMPACTED`，不替代 compact truth。`CONTEXT_COMPACTED` 继续拥有 accepted compact artifact refs、accepted attempt number、candidate digest、prompt-local label mapping refs、source boundary refs、quality check 与 budget after compact。accepted compact event 可以引用 accepted proposal manifest；rejected attempts 可以通过 typed diagnostics 引用各自 manifest。任何 rejected proposal content、中间 transient artifact 或 compactor input projection 都不能进入 Conversation Memory，也不能成为 accepted compacted view。
+`CompactorRunnerCallIdentity` 只描述 proposal runner-call input 的 owner 与 input provenance，不保存 outcome ref。proposal manifest 在 runner call 前写入，不能回写 accepted / rejected outcome 字段，也不能重算 payload digest。`CONTEXT_COMPACTED` 继续拥有 accepted compact artifact refs、accepted attempt number、candidate digest、prompt-local label mapping refs、source boundary refs、quality check 与 budget after compact；accepted compact event 必须通过 `accepted_proposal_manifest_ref` / `accepted_proposal_manifest_digest` 反向引用 accepted proposal manifest。`CONTEXT_COMPACTION_ATTEMPT_REJECTED` 必须通过 `proposal_manifest_ref` / `proposal_manifest_digest` 反向引用该 rejected attempt 的 proposal manifest。任何 rejected proposal content、中间 transient artifact 或 compactor input projection 都不能进入 Conversation Memory，也不能成为 accepted compacted view。
 
 Compactor 与 retry / repair 的 owner 边界固定为：
 

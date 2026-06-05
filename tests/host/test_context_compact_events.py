@@ -235,6 +235,43 @@ def test_compacted_payload_rejects_rejected_quality_result() -> None:
         )
 
 
+def test_compacted_payload_records_accepted_proposal_manifest_reference() -> None:
+    """accepted outcome payload 反向引用 accepted proposal manifest。"""
+
+    payload = build_context_compacted_payload(
+        operation_id="event-context-compaction-requested-accepted",
+        accepted_attempt_number=1,
+        compact_artifact_ref="compact-artifact:abc",
+        compact_artifact_digest=_DIGEST_B,
+        accepted_candidate=_candidate(),
+        quality_check_result=_quality_result(),
+        budget_after_compact=512,
+        prompt_local_label_mapping_refs=("prompt-label:E1",),
+        source_boundary_refs=("event-user-1",),
+        accepted_evidence_mapping_refs=("evidence:accepted-1",),
+        projection_signal="conversation_memory_projection_catchup",
+        accepted_proposal_manifest_ref="runner-call-manifest:accepted",
+        accepted_proposal_manifest_digest=_DIGEST_A,
+    )
+
+    validate_context_compacted_payload(payload)
+    assert payload["accepted_proposal_manifest_ref"] == (
+        "runner-call-manifest:accepted"
+    )
+    assert payload["accepted_proposal_manifest_digest"] == _DIGEST_A
+
+
+def test_compacted_payload_requires_proposal_manifest_ref_digest_pair() -> None:
+    """accepted proposal manifest ref / digest 必须成对出现。"""
+
+    payload = _valid_compacted_payload()
+    payload["accepted_proposal_manifest_ref"] = "runner-call-manifest:accepted"
+    payload["accepted_proposal_manifest_digest"] = None
+
+    with pytest.raises(ValueError, match="accepted_proposal_manifest"):
+        validate_context_compacted_payload(payload)
+
+
 def test_failed_payload_builder_and_validator_no_fallback() -> None:
     """failed payload builder 输出无 fallback 时的完整诊断字段。"""
 
@@ -467,15 +504,19 @@ def test_failed_payload_rejects_missing_required_fields() -> None:
 def test_attempt_rejected_payload_builder_and_validator() -> None:
     """attempt rejected payload 输出 operation / attempt / diagnostics。"""
 
-    payload = build_context_compaction_attempt_rejected_payload(
-        operation_id="operation-1",
-        attempt_number=1,
-        failure_category="quality_check_rejected",
-        repairable=True,
-        runner_attempt_summary_refs=("runner-attempt:1",),
-        diagnostic_refs=("diagnostic:1",),
-        next_policy_decision="retry_semantic_repair",
-        budget_after_attempted_compact=128,
+    payload = dict(
+        build_context_compaction_attempt_rejected_payload(
+            operation_id="operation-1",
+            attempt_number=1,
+            failure_category="quality_check_rejected",
+            repairable=True,
+            runner_attempt_summary_refs=("runner-attempt:1",),
+            diagnostic_refs=("diagnostic:1",),
+            next_policy_decision="retry_semantic_repair",
+            budget_after_attempted_compact=128,
+            proposal_manifest_ref="runner-call-manifest:rejected",
+            proposal_manifest_digest=_DIGEST_A,
+        )
     )
 
     validate_context_compaction_attempt_rejected_payload(payload)
@@ -483,6 +524,31 @@ def test_attempt_rejected_payload_builder_and_validator() -> None:
         "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
     )
     assert payload["attempt_number"] == 1
+    assert payload["proposal_manifest_ref"] == "runner-call-manifest:rejected"
+    assert payload["proposal_manifest_digest"] == _DIGEST_A
+
+
+def test_attempt_rejected_payload_requires_proposal_manifest_ref_digest_pair() -> None:
+    """rejected proposal manifest ref / digest 必须成对出现。"""
+
+    payload = dict(
+        build_context_compaction_attempt_rejected_payload(
+            operation_id="operation-1",
+            attempt_number=1,
+            failure_category="quality_check_rejected",
+            repairable=True,
+            runner_attempt_summary_refs=("runner-attempt:1",),
+            diagnostic_refs=("diagnostic:1",),
+            next_policy_decision="retry_semantic_repair",
+            budget_after_attempted_compact=128,
+            proposal_manifest_ref="runner-call-manifest:rejected",
+            proposal_manifest_digest=_DIGEST_A,
+        )
+    )
+    payload["proposal_manifest_digest"] = None
+
+    with pytest.raises(ValueError, match="proposal_manifest"):
+        validate_context_compaction_attempt_rejected_payload(payload)
 
 
 def test_attempt_rejected_payload_rejects_missing_required_fields() -> None:
