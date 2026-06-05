@@ -496,6 +496,9 @@ async def test_proactive_compact_duplicate_prompt_does_not_exceed_compactor_wind
         followup.accepted_run_id,
     )
     assert manifest["runner_call_kind"] == "compactor_proposal"
+    assert manifest["runner_call_trigger_reason"] == (
+        "context_compaction_initial_proposal"
+    )
     _assert_runner_call_manifest_messages(
         manifest,
         expected_roles=(AgentMessageRole.SYSTEM, AgentMessageRole.USER),

@@ -66,6 +66,7 @@ _POST_COMPACT_BASE_MESSAGE_COUNT = 2
 _EVENT_ID_RUNNER_CALL_INPUT_ASSEMBLED_PREFIX = "event-runner-call-input-assembled"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _RUNNER_CALL_KIND_COMPACTOR_PROPOSAL = "compactor_proposal"
+_RUNNER_CALL_TRIGGER_COMPACTION_INITIAL = "context_compaction_initial_proposal"
 _RUNNER_CALL_TRIGGER_COMPACTION_REPAIR = "context_compaction_repair_attempt"
 _RUNNER_CALL_TRIGGER_COMPACTION_RETRY = "context_compaction_retry_attempt"
 _RUNNER_CALL_VALIDATION_COMPLETE = "complete"
@@ -1129,7 +1130,7 @@ def _compactor_trigger_reason(compaction_attempt_number: int) -> str:
     """
 
     if compaction_attempt_number <= 1:
-        return _RUNNER_CALL_TRIGGER_COMPACTION_REPAIR
+        return _RUNNER_CALL_TRIGGER_COMPACTION_INITIAL
     return _RUNNER_CALL_TRIGGER_COMPACTION_RETRY
 
 

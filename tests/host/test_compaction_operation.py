@@ -684,6 +684,44 @@ async def test_run_compaction_operation_records_prepared_proposal_manifest_befor
     assert len(result.rejected_attempts) == 0
 
 
+def test_compactor_proposal_manifest_uses_initial_trigger_for_first_attempt() -> None:
+    """首次 compactor proposal manifest 使用专用 initial trigger reason。"""
+
+    request = _request()
+    compactor = _PreparedManifestCompactor([])
+    prepared_input = compactor.prepare_compactor_proposal_run_input(
+        request,
+        StubCancellationToken(),
+        compaction_operation_id="operation-trigger",
+        compaction_attempt_number=1,
+    )
+
+    first_manifest = compaction_operation._compactor_runner_call_manifest_body(
+        request=request,
+        prepared_input=prepared_input,
+        event_id="event-trigger-first",
+        compaction_operation_id="operation-trigger",
+        compaction_attempt_number=1,
+        compactor_input_projection_ref="payload-ref-trigger-first",
+    )
+    retry_manifest = compaction_operation._compactor_runner_call_manifest_body(
+        request=request,
+        prepared_input=prepared_input,
+        event_id="event-trigger-retry",
+        compaction_operation_id="operation-trigger",
+        compaction_attempt_number=2,
+        compactor_input_projection_ref="payload-ref-trigger-retry",
+    )
+
+    assert first_manifest["runner_call_kind"] == "compactor_proposal"
+    assert first_manifest["runner_call_trigger_reason"] == (
+        "context_compaction_initial_proposal"
+    )
+    assert retry_manifest["runner_call_trigger_reason"] == (
+        "context_compaction_retry_attempt"
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest_ref() -> None:
     """proposal failure attempt 通过 rejected summary 暴露 proposal manifest。"""
