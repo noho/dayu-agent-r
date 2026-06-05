@@ -76,4 +76,4 @@ No current closeout residual remains open without owner.
 
 - User / maintainer action: inspect PR 118 and decide whether to mark ready for review or merge.
 - Merge, mark ready for review, request reviewers, approve, delete branch, or external issue closeout still require explicit user authorization.
-- After PR 118 merge, default implementation backlog can proceed to the next selected work unit; current control doc default remains `WU-CM-01-F01` until user selects the next backlog item.
+- After PR 118 merge, resume phaseflow at `WU-TOOLS-01` goal confirmation unless the user selects another backlog item.
