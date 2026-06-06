@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | goal confirmation |
-| implementation status | WU-CM-01-F04 completed in local commit `7a5b258c`; continuing same PR branch with WU-CM-01-F03 from goal confirmation |
+| gate | accepted plan commit |
+| implementation status | WU-CM-01-F04 completed in local commit `7a5b258c`; WU-CM-01-F03 plan re-review passed with MiMo and DS verdict `pass`; accepted plan commit pending |
 | active work unit | WU-CM-01-F03 |
 | default next work unit | WU-CM-01-F03 |
-| next entry point | WU-CM-01-F03 goal confirmation: verify assistant final answer continuity scope, design sufficiency, and direct code evidence before plan dispatch |
+| next entry point | WU-CM-01-F03 accepted plan commit gate, then implementation gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
