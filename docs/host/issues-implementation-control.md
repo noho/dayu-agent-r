@@ -141,10 +141,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | goal confirmation |
-| implementation status | WU-CM-01-F04 completed; PR 124 merged at https://github.com/noho/dayu-agent-r/pull/124 with merge commit `38bf01b05a26a8f7a6a8f8959abd15f6c8d26d13`; final closeout artifact `docs/reviews/wu-cm-01-f04-final-closeout-controller.md` |
-| active work unit | WU-TOOLS-01-F01 |
-| default next work unit | WU-TOOLS-01-F01 |
-| next entry point | WU-TOOLS-01-F01 goal confirmation: verify GitHub Issue #82 follow-up scope, dependency status, design sufficiency, and code evidence before plan dispatch |
+| implementation status | WU-CM-01-F04 completed in local commit `7a5b258c`; continuing same PR branch with WU-CM-01-F03 from goal confirmation |
+| active work unit | WU-CM-01-F03 |
+| default next work unit | WU-CM-01-F03 |
+| next entry point | WU-CM-01-F03 goal confirmation: verify assistant final answer continuity scope, design sufficiency, and direct code evidence before plan dispatch |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
