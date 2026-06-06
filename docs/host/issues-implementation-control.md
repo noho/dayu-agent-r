@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted plan commit |
-| implementation status | WU-CM-01-F04 plan accepted; plan artifact `docs/host/wu-cm-01-f04-proactive-compaction-manifest-test-seam-plan.md`; plan review / fix / re-review artifacts in `docs/reviews/`; AgentMiMo and AgentDS re-review passed with 0 unfixed / partial findings |
+| gate | implementation |
+| implementation status | WU-CM-01-F04 plan accepted; accepted plan commit `d90a2a99`; ready for AgentCodex implementation gate |
 | active work unit | WU-CM-01-F04 |
 | default next work unit | WU-TOOLS-01-F01 |
-| next entry point | Accepted plan commit for WU-CM-01-F04, then implementation gate; after closeout return to WU-TOOLS-01-F01 by default |
+| next entry point | Implementation gate for WU-CM-01-F04; after closeout return to WU-TOOLS-01-F01 by default |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
