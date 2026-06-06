@@ -41,11 +41,24 @@ HOST_BUSINESS_TOOL_SCAN_FORBIDDEN_PREFIXES: tuple[str, ...] = (
 FETCH_MORE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
     {"host/tool_runtime.py", "host/tooling.py", "runtime/tools_discovery.py"}
 )
+FETCH_MORE_DEFENSIVE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
+    {
+        "tools/_legacy_adapter/__init__.py",
+        "tools/_legacy_adapter/definition_adapter.py",
+        "tools/_legacy_adapter/registry_collector.py",
+    }
+)
 FETCH_MORE_OWNERSHIP_TOKEN: str = "fetch_more"
+OLD_FETCH_MORE_PROJECTION_TOKENS: tuple[str, ...] = (
+    "fetch_more_args",
+    "project_for_llm",
+    "continuation_hint",
+)
 ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)
 HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "_execution_config_projection.py",
     "api.py",
+    "compaction_operation.py",
     "dispatch.py",
     "engine_ingest.py",
     "llm_compaction.py",
@@ -221,22 +234,33 @@ def test_host_does_not_import_business_tool_scanners() -> None:
 
 
 def test_fetch_more_token_stays_inside_toolruntime_owner_modules() -> None:
-    """``fetch_more`` 只能出现在 ToolRuntime factory / tooling policy owner。
+    """``fetch_more`` 只能出现在 owner 或 legacy adapter 防御性引用中。
 
     :returns: ``None``。
     :raises AssertionError: Host 其它模块或 Engine / contracts / runtime 引用
-        ``fetch_more`` 时抛出。
+        ``fetch_more``，或迁移代码引入 OLD fetch-more projection 时抛出。
     """
 
     dayu_root = _host_root().parent
     violations: list[str] = []
+    old_projection_violations: list[str] = []
     for file_path in _iter_python_files(dayu_root):
         relative_path = file_path.relative_to(dayu_root).as_posix()
+        source = file_path.read_text(encoding="utf-8")
+        for token in OLD_FETCH_MORE_PROJECTION_TOKENS:
+            if token in source:
+                old_projection_violations.append(f"{relative_path}:{token}")
         if relative_path in FETCH_MORE_ALLOWED_RELATIVE_FILES:
             continue
-        if FETCH_MORE_OWNERSHIP_TOKEN in file_path.read_text(encoding="utf-8"):
+        if relative_path in FETCH_MORE_DEFENSIVE_ALLOWED_RELATIVE_FILES:
+            continue
+        if FETCH_MORE_OWNERSHIP_TOKEN in source:
             violations.append(str(file_path))
     assert not violations, f"fetch_more references outside ToolRuntime owner: {violations}"
+    assert not old_projection_violations, (
+        "OLD fetch-more projection references migrated: "
+        f"{old_projection_violations}"
+    )
 
 
 def test_host_engine_imports_stay_on_allowed_boundary_modules() -> None:

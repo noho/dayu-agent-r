@@ -311,6 +311,10 @@ def _minimal_package_config(root: Path) -> None:
                     "source_id": "tests.fake_tools",
                     "enabled": False,
                     "allow_empty": True,
+                    "config": {
+                        "nested": {"keep": ["provider", "json"]},
+                        "enabled_flag": True,
+                    },
                 }
             }
         },
@@ -377,6 +381,10 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     provider = config.tool_discovery.providers["financial-tools"]
     assert provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
     assert provider.import_path == "dayu.fins.tools:discover_tools"
+    assert provider.config["include_read_tools"] is True
+    assert provider.config["include_ingestion_tools"] is False
+    assert "doc-tools" in config.tool_discovery.providers
+    assert "web-tools" in config.tool_discovery.providers
 
 
 def test_workspace_record_replaces_package_record_without_deep_merge(
@@ -992,6 +1000,37 @@ def test_tool_discovery_providers_must_not_be_empty(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigFieldError, match="providers must not be empty"):
+        ConfigLoader(package_config_dir=package_root).load_tool_discovery()
+
+
+def test_tool_discovery_provider_config_must_be_json_object(tmp_path: Path) -> None:
+    """provider config 只能是层中立 JSON object。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 非 object config 未 fail fast 时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "tool_discovery.json",
+        {
+            "providers": {
+                "bad": {
+                    "import_path": "tests.fake_tools:provider",
+                    "entry_point": None,
+                    "source_kind": "explicit_provider",
+                    "source_id": "bad",
+                    "enabled": True,
+                    "allow_empty": False,
+                    "config": ["not", "object"],
+                }
+            }
+        },
+    )
+
+    with pytest.raises(ConfigShapeError, match="config must be a JSON object"):
         ConfigLoader(package_config_dir=package_root).load_tool_discovery()
 
 

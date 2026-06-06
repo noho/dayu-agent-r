@@ -36,6 +36,10 @@ UI -> Service -> Host -> Engine
 
 `dayu.runtime` 是层中立运行期基础设施包，不属于上述任一业务层。它只能承载日志、取消等待、cross-process lane、同步 filelock wrapper、diagnostic 文本脱敏与有界截断、文本 / JSON digest、工具发现装配、配置加载、scene manifest 装配、工具截断声明补齐等通用运行期能力，不持有 Host truth、业务语义或 Engine 协议状态机。
 
+`dayu.documents` 是共享文档处理基础包，也不属于 `UI / Service / Host / Engine` 任一业务层。它承载 Markdown、HTML、Docling JSON 等文档处理器、文档来源协议和 Docling runtime 装配能力，供 Doc 工具、Fins 能力和 Web 转换路径复用；它不持有 Host 生命周期、Engine tool loop、Service 装配状态或财报仓储真源。
+
+`dayu.tools` 是业务工具实现与 provider 适配边界，位于 Host / Engine 之外。工具通过 `dayu.runtime.tools_discovery` 显式 provider 进入 Service 装配，再作为 current `ToolDefinition` 交给 Host ToolRuntime；工具包不拥有 Host 生命周期、Engine tool loop 或财报仓储真源。当前包内的 `_legacy_adapter` 只用于把 OLD 风格同步工具声明适配为 current 工具声明，不是 OLD `ToolRegistry`。
+
 ## 稳定边界
 
 ### `dayu.contracts`
@@ -84,6 +88,18 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 - `tool_truncation`：把允许缺省 limit / TTL 的 `ToolTruncateSpec` declaration 按调用方提供的 policy defaults 补齐为 effective spec；不导入 Host 或 Engine。
 - `diagnostic_text`：提供层中立 diagnostic 文本敏感值检测、局部脱敏和有界截断；不承载 Host / Engine 诊断事件语义、provider payload 语义或业务字段语义。
 - `_digest`：提供层中立 canonical JSON digest 与 UTF-8 文本 digest helper，输出稳定 `sha256:<hex>` 摘要；不承载业务身份、Host truth 或 Engine 协议语义。
+
+### `dayu.documents`
+
+`dayu.documents` 承载共享文档处理基础能力，包括文档来源协议、通用处理器注册表、Markdown 处理器、HTML 处理器、Docling JSON 处理器、HTML 清洗 / 抽取 / markdown 渲染原语和 Docling PDF runtime 装配 helper。该包不依赖 Host、Engine、Service、UI、Fins 或具体工具实现。
+
+文档处理器只负责把调用方提供的文档来源解析为章节、表格、全文、页内容和搜索命中等业务可读结构；路径权限、工具参数校验、工具执行、截断、`fetch_more`、财报仓储访问和 Host accept barrier 都不属于本包职责。
+
+### `dayu.tools`
+
+`dayu.tools` 承载业务工具实现、工具 provider 和迁移期私有适配器。工具声明必须输出 current `ToolDefinition`，并经 `dayu.runtime.tools_discovery` 显式发现后交给 Service / Host 装配。
+
+`dayu.tools._legacy_adapter` 只收集 OLD 风格 decorator metadata、执行参数投影、路径策略校验、同步 callable 到 async callable 的适配，以及 OLD 返回 / 异常到 current outcome 的投影。它不迁移 OLD `ToolRegistry`、OLD 截断 manager、OLD `fetch_more` 或 OLD 截断 / fetch-more 投影逻辑。
 
 ### `dayu.fins`
 
@@ -140,5 +156,7 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 3. `docs/host/design.md` 与 `dayu.host/README.md`：理解 Host 稳定设计、Session / Run / Attempt / EventLog、admission、dispatch、ToolRuntime、memory / context governance。
 4. `dayu.host` 包根与 `dayu.host.open_host`：理解 public handle、`OpenHostOptions`、普通 command facade 和本地执行装配。
 5. `dayu.runtime`：理解日志、取消、lane、filelock 等层中立运行期能力。
-6. `dayu.service/README.md` 与 `dayu.service.host_assembly`：理解 Host 外部 runtime assembly 如何生成 Host public typed inputs。
-7. `tests/README.md` 与对应测试目录：用测试确认边界约束、公共入口和关键状态机行为。
+6. `dayu.documents`：理解共享文档处理器、Source 协议和 Docling runtime 的层外基础能力。
+7. `dayu.tools`：理解业务工具 provider 和 legacy adapter 如何输出 current `ToolDefinition`。
+8. `dayu.service/README.md` 与 `dayu.service.host_assembly`：理解 Host 外部 runtime assembly 如何生成 Host public typed inputs。
+9. `tests/README.md` 与对应测试目录：用测试确认边界约束、公共入口和关键状态机行为。

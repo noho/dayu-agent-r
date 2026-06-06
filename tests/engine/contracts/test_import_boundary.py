@@ -27,6 +27,7 @@ ENGINE_CONTRACTS_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.service",
     "dayu.ui",
     "dayu.fins",
+    "dayu.documents",
     "dayu.engine.runners",
     "dayu.engine.tools",
     "dayu.engine.processors",

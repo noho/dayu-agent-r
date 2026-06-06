@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Host、Runtime、Service 与 Engine 测试：
+运行当前契约、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/host tests/runtime tests/service tests/engine -q
+pytest tests/contracts tests/documents tests/fins tests/tools tests/host tests/runtime tests/service tests/engine -q
 ```
 
 运行类型检查：
@@ -36,6 +36,9 @@ pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 
 ```bash
 pytest tests/contracts -q
+pytest tests/documents -q
+pytest tests/fins -q
+pytest tests/tools -q
 pytest tests/host -q
 pytest tests/host/test_tooling_options.py tests/host/test_package_exports.py tests/host/test_import_boundary.py -q
 pytest tests/host/test_durable_schema.py tests/host/test_event_log_store.py -q
@@ -118,6 +121,32 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 - ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配、工具等待时间字段时区边界、工具参数 schema key 边界和截断策略 limit key 映射穷尽性。
 - tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine，校验展示名非空，默认拒绝调用方直接构造空 `ToolBundle`，并覆盖框架 no-tool 路径使用的类型真实空 bundle。
 
+### `tests/documents/`
+
+共享文档基础测试，覆盖 `dayu.documents` 的层中立边界与轻量处理器 fixture：
+
+- import boundary：阻止 `dayu.documents` 反向依赖 Engine、Host、Service、UI、Fins 或具体工具实现，并确认 Docling runtime 与 processors 子包被边界扫描覆盖。
+- processors：使用确定性 fixture 覆盖 Markdown、HTML 与 Docling JSON 处理器的章节提取、表格读取与搜索片段输出。
+
+### `tests/tools/`
+
+业务工具与 provider 适配测试，当前覆盖 `dayu.tools._legacy_adapter` 的迁移边界、Doc tools provider 与 Web tools provider：
+
+- legacy adapter：覆盖 OLD 风格同步 callable 到 current async `ToolCallable` 的适配、直接参数透传、需要投影 / 默认值 / 类型转换的参数校验、投影失败不进入迁移函数、显式路径策略校验、OLD ok/value envelope 解包、业务异常到 current failure outcome 的投影、reserved `fetch_more` 不作为业务工具输出、current `ToolTruncateSpec` 声明转换、默认 per-tool 串行执行，以及适配器不得导入 OLD registry / truncation / projection owner 的边界。
+- doc tools provider：覆盖 `dayu.tools.doc_provider` 通过当前 `ToolsDiscovery` 暴露五个 Doc tools、启用但缺少 `allowed_paths` 时 fail closed、显式路径白名单拒绝、路径参数进入迁移函数前投影为绝对路径、路径验证失败不进入迁移函数体、`file_path_params` metadata 收集与使用、collector 记录的 `register_allowed_paths` 不作为可信安全源、current outcome 投影、Markdown / Docling JSON 章节列表 / 搜索 / 章节读取、current `ToolTruncateSpec` 暴露，以及 current ToolRuntime accept barrier 集成。
+- web tools provider：覆盖 `dayu.tools.web` 通过当前 `ToolsDiscovery` 暴露 `search_web` 与 `fetch_web_page`、默认拒绝 private / local URL 且显式配置后才允许、搜索 optional 参数投影、非法 URL 类型进入 Web 逻辑前失败、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露，以及基于 AST import 解析确认未导入 OLD registry / truncation / `fetch_more` / UI。
+- combined tools acceptance：使用确定性 workspace config 同时启用 Doc、Fins 与 Web providers，覆盖单一 `ToolBundle` 聚合、reserved `fetch_more` 防线、current `ToolTruncateSpec` 暴露、current ToolRuntime 注入并拥有 framework `fetch_more`、Service assembly 将 effective bundle 传入 Host、三类 provider 代表工具通过 ToolRuntime accept barrier 执行、代表性失败投影为 current outcome、ScenePrepare 可按 `doc` / `fins` / `web` tags 选择工具，以及 Web provider 串行策略在并发 callable 下生效。
+
+`tests/tools/fixtures/documents/` 存放工具 provider 测试使用的确定性文档 fixture。当前包含 Markdown 与 Docling JSON 样本，测试应复制到临时目录后通过 provider 白名单访问，不直接把 fixture 根作为隐式生产路径。
+
+`tests/tools/web/` 的 Web provider 测试必须保持 deterministic：搜索 provider、requests 主路径和 Playwright fallback 都通过 monkeypatch / fixture 替身控制，不做 live network 请求。
+
+### `tests/fins/`
+
+财报仓储与 Fins read tools provider 测试，覆盖 `dayu.fins.storage` 文件系统仓储协议实现、确定性财报 fixture 的 list/read、`dayu.fins.tools.provider` 通过当前 `ToolsDiscovery` 暴露带 `fins` tag 的 read tools、`include_read_tools=false` 返回空工具集且不解析 workspace root、`list_documents` 与 `search_document` 通过当前 ToolRuntime accept path 执行、数组 / 标量参数投影、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露、ingestion tools fail-closed，以及基于 AST import 解析的 Fins / Engine / runtime import boundary。
+
+Fins fixture 由测试通过仓储 public API 写入临时 workspace，不依赖隐式 cwd、环境变量或手工拼生产路径。
+
 ### `tests/host/`
 
 Host 公共 API 类型、Session / Run public command facade、construction tooling options 与内部 durable foundation 测试，覆盖 `dayu.host` 的稳定边界：
@@ -135,7 +164,7 @@ Host 公共 API 类型、Session / Run public command facade、construction tool
 - P12.6 memory semantic smoke：`test_toolruntime_accept_barrier.py` 覆盖 ToolRuntime accept barrier；`test_compaction_contract.py` / `test_context_compact_events.py` / `test_llm_compaction.py` / `test_compaction_operation.py` 覆盖 compact material pack、prompt-local label 到 canonical provenance 映射、compaction-gated vNext fact candidate、accepted evidence material 注入、accepted evidence query_text 消费 durable tool-call request atoms、LLM compactor prepared proposal input 与真实 runner messages 同源、vNext accepted / rejected / failed operation payload、proposal manifest ref 传递和 whole-candidate repair 边界；`test_compact_material.py` 覆盖 deterministic segment selection、protected current / selected recent-window floor、reactive frozen overflow material list、already represented block 排除、current input anchor 去重、vNext material 对 user turn / assistant turn / evidence / previous fact view / current anchor non-citable 的直接映射边界，以及 snapshot cursor lag repair-required 语义；`test_memory_projection.py` 覆盖 vNext policy / snapshot contract、compact 前 selected recent window、accepted compact materialization、accepted evidence without fact diagnostic、failed compaction 不物化 memory、JSON / durable round-trip 和 projection consumer checkpoint；`test_run_input_builder.py` 覆盖 RunInputBuilder 对 vNext evidence fact、session summary、answer anchor、forward intent、reference continuity、selected recent window、post-compaction facts、no-compaction continuity、memory snapshot repair、shared ordinary material block source、ordinary runner-call input manifest，以及 fallback selected recent window rendering；`test_dispatch_scheduler.py` 覆盖 memory projection lag repair 不关闭 Run / Attempt 为失败终态，并覆盖 proactive / reactive compaction vNext closeout、compaction failure 后 recent-window fallback dispatch / hard-budget fail closed 不写 `CONTEXT_COMPACTED` 且不写 `RUN_LOST`。
 - runtime：覆盖取消 / 超时 race helper、日志装配、file lock、lane controller、config loader 与 runtime import / weak typing guard。
 - Phase 5 / 10 本地执行集成：`test_phase5_local_execution_integration.py` 使用 `_start_run` 内部 admission primitive / 低层测试路径、真实 `HostDispatchScheduler`、runtime lane 与 fake local worker 覆盖 no-tool Engine 闭环。fake worker 必须只通过 `LocalEngineWorkerFactory` / `LocalWorkerHandle` 边界产出 Engine public `EngineEvent`、响应 `on_cancel(reason)` hook 或模拟 clean EOF / stream crash；测试断言 Host durable Run / Attempt 终态、active cancel 传播、terminal / cancel 后 queue promotion 继续唤醒 pre-start governance / dispatch，不绕过 scheduler 直接改生产状态。
-- import boundary：允许 Host 在 LocalProxy 与 Host-owned LLM compaction 边界沿依赖方向调用 Engine public entry / contracts，阻止 Host 导入 Config、Fins、Service 或 UI，阻止 Host 使用动态模块扫描能力扫描业务工具模块，确认 business `ToolBundle` 不进入 per-run request dataclass 字段，并确认 `fetch_more` 只留在 ToolRuntime / tooling owner；显式覆盖 `dayu.host.durable.purge` 不依赖上层、runtime、public command owner 或 audit / dispatch owner。
+- import boundary：允许 Host 在 LocalProxy、Host-owned LLM compaction 与 compaction operation 边界沿依赖方向调用 Engine public entry / contracts，阻止 Host 导入 Config、Fins、Service 或 UI，阻止 Host 使用动态模块扫描能力扫描业务工具模块，确认 business `ToolBundle` 不进入 per-run request dataclass 字段，并确认 `fetch_more` 只留在 ToolRuntime / tooling owner 或 `_legacy_adapter` reserved-name 防御性引用中且不迁移 OLD fetch-more projection；显式覆盖 `dayu.host.durable.purge` 不依赖上层、runtime、public command owner 或 audit / dispatch owner。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入 Host 公共类型源码，并显式确认 `dayu.host.durable.purge` 被纳入扫描。
 - production stress：`test_host_production_stress.py` 使用 `stress` marker，默认 pytest 排除，需通过
   `pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q` 显式运行。stress summary

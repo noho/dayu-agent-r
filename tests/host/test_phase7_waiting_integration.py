@@ -341,8 +341,11 @@ def test_local_awaiting_tool_manual_resolve_resumes_run(
         assert snapshot.current_attempt_id != seeded.attempt_id
         assert any(
             isinstance(message.content, str)
-            and "Accepted wait result fact:" in message.content
-            and wait.wait_id in message.content
+            and "A previous interrupted step has an accepted wait result."
+            in message.content
+            and f"tool_name={_TOOL_NAME}" in message.content
+            and "resolution_kind=completed" in message.content
+            and '"answer":42' in message.content
             for message in resume_request.messages
         )
     finally:

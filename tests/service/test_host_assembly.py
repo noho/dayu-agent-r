@@ -192,7 +192,8 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
         continuation_prompt=("Continue the strict JSON object without repeating content " "already emitted."),
         max_consecutive_failed_tool_batches=1,
     )
-    assert "Host-owned context compaction" in (compactor_baseline.compactor_system_prompt)
+    assert "compaction_request" in compactor_baseline.compactor_system_prompt
+    assert "严格 JSON" in compactor_baseline.compactor_system_prompt
     assert "<<compaction_request>>" in (compactor_baseline.compactor_user_prompt_template)
     assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
     assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
@@ -554,6 +555,7 @@ def test_tool_discovery_specs_requires_provider_location() -> None:
         source_id="missing-location",
         enabled=True,
         allow_empty=False,
+        config={"path_policy": {"allowed_roots": ["workspace/docs"]}},
     )
 
     with pytest.raises(ValueError, match="import_path or entry_point"):
@@ -578,6 +580,7 @@ def test_tool_discovery_specs_uses_entry_point_location() -> None:
         source_id="dayu.test_tools:provider",
         enabled=True,
         allow_empty=False,
+        config={"provider_option": "entry"},
     )
 
     specs = _tool_discovery_specs((provider,))
@@ -585,6 +588,46 @@ def test_tool_discovery_specs_uses_entry_point_location() -> None:
     assert len(specs) == 1
     assert specs[0].spec_id == "entry-provider"
     assert specs[0].enabled is True
+    assert specs[0].config["provider_option"] == "entry"
+
+
+def test_tool_discovery_provider_config_survives_loader_and_service_mapping(
+    tmp_path: Path,
+) -> None:
+    """provider config 必须从 ConfigLoader 原样进入 ToolsDiscovery spec。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: provider config 被丢弃或解释时抛出。
+    """
+
+    package_root = tmp_path / "config"
+    _write_json(
+        package_root / "tool_discovery.json",
+        {
+            "providers": {
+                "doc-tools": {
+                    "import_path": "dayu.tools.doc_provider:discover_tools",
+                    "entry_point": None,
+                    "source_kind": "explicit_provider",
+                    "source_id": "dayu.tools.doc_provider",
+                    "enabled": False,
+                    "allow_empty": True,
+                    "config": {
+                        "allowed_paths": ["workspace/docs"],
+                        "limits": {"read_file_max_chars": 2048},
+                    },
+                }
+            }
+        },
+    )
+
+    config = ConfigLoader(package_config_dir=package_root).load_tool_discovery()
+    specs = _tool_discovery_specs(tuple(config.providers.values()))
+
+    assert len(specs) == 1
+    assert specs[0].config["allowed_paths"] == ["workspace/docs"]
+    assert specs[0].config["limits"] == {"read_file_max_chars": 2048}
 
 
 def test_truncation_manager_enabled_is_derived_from_execution_profile(
@@ -969,6 +1012,7 @@ def _write_tool_discovery_overlay(workspace_root: Path) -> None:
                     "source_id": "utils.smoke_host_public_multiturn",
                     "enabled": True,
                     "allow_empty": False,
+                    "config": {},
                 }
             }
         },

@@ -140,94 +140,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-DUR-P01 / WU-OBS-P00 / WU-CM-01-F02 / WU-CM-01-F01 closeout chain draft PR review passed |
-| active work unit | WU-DUR-P01 / WU-OBS-P00 / WU-CM-01-F02 / WU-CM-01-F01 |
-| default next work unit | WU-TOOLS-01 |
-| next entry point | user decision: inspect / mark ready / merge PR 118; after PR 118 merge, resume phaseflow at WU-TOOLS-01 goal confirmation unless user selects another backlog item |
-| design source | 由 phaseflow 调用参数提供；本文档只维护 issue-backed 实施总控状态 |
-| plan artifacts | docs/host/wu-cm-01-conversation-memory-plan.md; docs/host/wu-dur-obs-cm-closeout-plan.md; docs/host/wu-cm-01-f01-s7-r1-one-system-message-rescope-plan.md |
-| implementation commits | WU-CM-01-F01-S7-R1 S1 production one-system-message assembly accepted commit 2195a2ff; WU-CM-01-F01-S7-R1 S0 design contract accepted commit fc94e597; WU-CM-01-F01-S7-R1 one-system-message rescope accepted plan commit f07ce845; WU-CM-01-F02-S6-R1 compact instruction rescope accepted commit 0ec3c991; WU-CM-01-F02 Slice 6 compactor prompt semantic rewrite accepted commit f6474b0c; WU-CM-01-F02 Slice 5 compact evidence query readability accepted commit 104e10bb; WU-OBS-P00 Slice 4 Tool Trace reconstruction signal projection accepted commit 11688014; WU-DUR-P01 Slice 3 compactor internal runner-call manifest accepted commit bea9f488; WU-DUR-P01 Slice 2 runner-call manifest accepted commit 113c2838; WU-DUR-P01 Slice 1 durable tool-call request atoms accepted commit 82eb5813; WU-DUR-P01 Slice 0 design contract accepted commit 83cf38d8; WU-DUR-P01 / WU-OBS-P00 / WU-CM-01-F02 / WU-CM-01-F01 closeout chain accepted plan commit c1e9de3f; WU-CM-01 accepted plan commit 14d28009; WU-CM-01 plan reslice accepted commit a92416ec; WU-CM-01 compact contract closure accepted plan commit daa01004; WU-CM-01 compact contract closure blocker follow-up accepted commit ff6c225a; WU-CM-01 compact contract closure accepted slice commit b2b57c18; WU-CM-01 Slice C policy contract plan fix accepted commit 49990e97; WU-CM-01 Slice C accepted commit 29c86355; WU-CM-01 Slice D accepted commit 30a426b4; WU-CM-01 aggregate deepreview accepted commit 2248a395; WU-CM-01 accepted PR review commit f2db943f; WU-CM-01 deferred risk cleanup accepted commit 30759116d00d0ca58308e74b9f61a0ecc5b6ad9a; WU-CM-01 Slice A accepted commit f060853d; WU-CM-01 Slice B accepted commit 74fbb5e6; WU-ENG-02 merged via PR 114 as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
-| review artifacts | docs/reviews/wu-cm-01-plan-review-mimo.md; docs/reviews/wu-cm-01-plan-review-ds.md; docs/reviews/wu-cm-01-plan-review-controller-adjudication.md; docs/reviews/wu-cm-01-plan-fix-codex.md; docs/reviews/wu-cm-01-plan-rereview-mimo.md; docs/reviews/wu-cm-01-plan-rereview-ds.md; docs/reviews/wu-cm-01-plan-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-implementation-codex.md; docs/reviews/wu-cm-01-plan-reslice-fix-codex.md; docs/reviews/wu-cm-01-plan-reslice-rereview-mimo.md; docs/reviews/wu-cm-01-plan-reslice-rereview-ds.md; docs/reviews/wu-cm-01-plan-reslice-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-slice-a-implementation-codex.md; docs/reviews/wu-cm-01-slice-a-code-review-mimo.md; docs/reviews/wu-cm-01-slice-a-code-review-ds.md; docs/reviews/wu-cm-01-slice-a-code-review-controller-adjudication.md; docs/reviews/wu-cm-01-slice-a-fix-codex.md; docs/reviews/wu-cm-01-slice-a-rereview-mimo.md; docs/reviews/wu-cm-01-slice-a-rereview-ds.md; docs/reviews/wu-cm-01-slice-a-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-slice-b-implementation-codex.md; docs/reviews/wu-cm-01-slice-b-blocker-controller-adjudication.md; docs/reviews/wu-cm-01-slice-b-plan-fix-codex.md; docs/reviews/wu-cm-01-slice-b-plan-fix-rereview-mimo.md; docs/reviews/wu-cm-01-slice-b-plan-fix-rereview-ds.md; docs/reviews/wu-cm-01-slice-b-plan-fix-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-slice-b-plan-fix-followup-codex.md; docs/reviews/wu-cm-01-slice-b-plan-fix-followup-controller-adjudication.md; docs/reviews/wu-cm-01-slice-b-code-review-mimo.md; docs/reviews/wu-cm-01-slice-b-code-review-ds.md; docs/reviews/wu-cm-01-slice-b-code-review-controller-adjudication.md; docs/reviews/wu-cm-01-slice-b-fix-codex.md; docs/reviews/wu-cm-01-slice-b-rereview-mimo.md; docs/reviews/wu-cm-01-slice-b-rereview-ds.md; docs/reviews/wu-cm-01-slice-b-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-slice-c-implementation-codex.md; docs/reviews/wu-cm-01-slice-c-blocker-controller-adjudication.md; docs/reviews/wu-cm-01-slice-c-plan-fix-codex.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-codex.md |
-| slice c plan fix follow-up artifacts | docs/reviews/wu-cm-01-slice-c-plan-fix-rereview-mimo.md; docs/reviews/wu-cm-01-slice-c-plan-fix-rereview-ds.md; docs/reviews/wu-cm-01-slice-c-plan-fix-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-slice-c-plan-fix-followup-codex.md; docs/reviews/wu-cm-01-slice-c-plan-fix-followup-controller-adjudication.md |
-| slice c plan boundary follow-up artifacts | docs/reviews/wu-cm-01-slice-c-plan-boundary-followup-codex.md; docs/reviews/wu-cm-01-slice-c-plan-boundary-followup-controller-adjudication.md |
-| slice c implementation blocker artifacts | docs/reviews/wu-cm-01-slice-c-implementation-codex.md; docs/reviews/wu-cm-01-slice-c-implementation-blocker-controller-adjudication.md; docs/reviews/wu-cm-01-slice-c-implementation-retry-codex.md; docs/reviews/wu-cm-01-slice-c-implementation-retry-blocker-controller-adjudication.md |
-| slice c policy contract plan fix artifacts | docs/reviews/wu-cm-01-slice-c-policy-contract-plan-fix-codex.md |
-| slice c policy contract plan fix review artifacts | docs/reviews/wu-cm-01-slice-c-policy-contract-plan-fix-review-mimo.md; docs/reviews/wu-cm-01-slice-c-policy-contract-plan-fix-review-ds.md |
-| slice c policy contract plan fix artifacts after review | docs/reviews/wu-cm-01-slice-c-policy-contract-plan-fix-review-fix-codex.md |
-| slice c policy contract plan fix re-review artifacts | docs/reviews/wu-cm-01-slice-c-policy-contract-plan-fix-rereview-mimo.md; docs/reviews/wu-cm-01-slice-c-policy-contract-plan-fix-rereview-ds.md; docs/reviews/wu-cm-01-slice-c-policy-contract-plan-fix-rereview-controller-adjudication.md |
-| slice c implementation retry2 artifacts | docs/reviews/wu-cm-01-slice-c-implementation-retry2-codex.md |
-| slice c code review artifacts | docs/reviews/wu-cm-01-slice-c-code-review-mimo.md; docs/reviews/wu-cm-01-slice-c-code-review-ds.md; docs/reviews/wu-cm-01-slice-c-code-review-controller-adjudication.md |
-| slice c fix artifacts | docs/reviews/wu-cm-01-slice-c-fix-codex.md |
-| slice c fix re-review artifacts | docs/reviews/wu-cm-01-slice-c-rereview-mimo.md; docs/reviews/wu-cm-01-slice-c-rereview-ds.md; docs/reviews/wu-cm-01-slice-c-rereview-controller-adjudication.md |
-| slice d implementation artifacts | docs/reviews/wu-cm-01-slice-d-implementation-codex.md |
-| slice d code review artifacts | docs/reviews/wu-cm-01-slice-d-code-review-mimo.md; docs/reviews/wu-cm-01-slice-d-code-review-ds.md; docs/reviews/wu-cm-01-slice-d-code-review-controller-adjudication.md |
-| slice c engine ingest / context governance boundary follow-up artifacts | docs/reviews/wu-cm-01-slice-c-engine-ingest-context-governance-boundary-followup-codex.md; docs/reviews/wu-cm-01-slice-c-engine-ingest-context-governance-boundary-followup-controller-adjudication.md |
-| slice c compact contract blocker artifacts | docs/reviews/wu-cm-01-slice-c-implementation-codex.md; docs/reviews/wu-cm-01-slice-c-compact-contract-blocker-controller-adjudication.md |
-| compact contract closure plan artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-codex.md |
-| compact contract closure plan review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-review-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-review-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-review-controller-adjudication.md |
-| compact contract closure plan fix artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-fix-codex.md |
-| compact contract closure plan re-review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-rereview-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-rereview-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-rereview-controller-adjudication.md |
-| compact contract closure implementation blocker artifacts | docs/reviews/wu-cm-01-compact-contract-closure-implementation-codex.md; docs/reviews/wu-cm-01-compact-contract-closure-blocker-controller-adjudication.md |
-| compact contract closure plan blocker fix artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-codex.md |
-| compact contract closure plan blocker fix re-review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-rereview-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-rereview-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-fix-rereview-controller-adjudication.md |
-| compact contract closure plan blocker follow-up fix artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-codex.md |
-| compact contract closure plan blocker follow-up fix re-review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-rereview-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-rereview-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-plan-blocker-followup-fix-rereview-controller-adjudication.md |
-| compact contract closure implementation artifacts | docs/reviews/wu-cm-01-compact-contract-closure-implementation-retry-codex.md |
-| compact contract closure code review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-code-review-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-code-review-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-code-review-controller-adjudication.md |
-| compact contract closure fix artifacts | docs/reviews/wu-cm-01-compact-contract-closure-fix-codex.md |
-| compact contract closure fix re-review artifacts | docs/reviews/wu-cm-01-compact-contract-closure-fix-rereview-mimo.md; docs/reviews/wu-cm-01-compact-contract-closure-fix-rereview-ds.md; docs/reviews/wu-cm-01-compact-contract-closure-fix-rereview-controller-adjudication.md |
-| closeout chain plan review artifacts | docs/reviews/wu-dur-obs-cm-closeout-plan-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-plan-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-plan-review-controller-adjudication.md |
-| closeout chain plan fix artifacts | docs/reviews/wu-dur-obs-cm-closeout-plan-fix-codex.md |
-| closeout chain plan re-review artifacts | docs/reviews/wu-dur-obs-cm-closeout-plan-rereview-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-plan-rereview-ds.md; docs/reviews/wu-dur-obs-cm-closeout-plan-rereview-controller-adjudication.md |
-| closeout chain slice 0 implementation artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice0-implementation-codex.md |
-| closeout chain slice 0 design review artifacts | docs/reviews/wu-dur-obs-cm-closeout-design-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-design-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-design-review-controller-adjudication.md |
-| closeout chain slice 1 implementation artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice1-implementation-codex.md |
-| closeout chain slice 1 code review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice1-code-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice1-code-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice1-code-review-controller-adjudication.md |
-| closeout chain slice 1 fix artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice1-fix-codex.md |
-| closeout chain slice 1 fix re-review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice1-rereview-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice1-rereview-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice1-rereview-controller-adjudication.md |
-| closeout chain slice 2 implementation artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice2-implementation-codex.md |
-| closeout chain slice 2 code review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice2-code-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice2-code-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice2-code-review-controller-adjudication.md |
-| closeout chain slice 2 fix artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice2-fix-codex.md |
-| closeout chain slice 2 fix re-review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice2-rereview-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice2-rereview-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice2-rereview-controller-adjudication.md |
-| closeout chain slice 3 implementation artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice3-implementation-codex.md |
-| closeout chain slice 3 blocker review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice3-blocker-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice3-blocker-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice3-blocker-controller-adjudication.md |
-| closeout chain slice 3 implementation retry artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice3-implementation-retry-codex.md |
-| closeout chain slice 3 code review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice3-code-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice3-code-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice3-code-review-controller-adjudication.md |
-| closeout chain slice 3 fix artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice3-fix-codex.md |
-| closeout chain slice 3 fix re-review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice3-rereview-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice3-rereview-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice3-rereview-controller-adjudication.md |
-| closeout chain slice 4 implementation artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice4-implementation-codex.md |
-| closeout chain slice 4 code review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice4-code-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice4-code-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice4-code-review-controller-adjudication.md |
-| closeout chain slice 5 implementation artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice5-implementation-codex.md |
-| closeout chain slice 5 code review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice5-code-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice5-code-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice5-code-review-controller-adjudication.md |
-| closeout chain slice 6 implementation artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice6-implementation-codex.md |
-| closeout chain slice 6 code review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice6-code-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice6-code-review-ds.md |
-| closeout chain slice 6 fix artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice6-fix-codex.md |
-| closeout chain slice 6 fix re-review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice6-rereview-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-slice6-rereview-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice6-rereview-controller-adjudication.md |
-| closeout chain slice 7 blocker artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice7-blocker-codex.md; docs/reviews/wu-dur-obs-cm-closeout-slice7-blocker-controller-adjudication.md |
-| closeout chain slice 7 implementation retry artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice7-implementation-retry-codex.md |
-| closeout chain slice 7 retry blocker review artifacts | docs/reviews/wu-dur-obs-cm-closeout-slice7-retry-blocker-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-slice7-retry-blocker-controller-adjudication.md |
-| closeout chain S7-R1 one-system-message rescope plan artifacts | docs/host/wu-cm-01-f01-s7-r1-one-system-message-rescope-plan.md |
-| closeout chain S7-R1 one-system-message rescope plan review artifacts | docs/reviews/wu-cm-01-f01-s7-r1-plan-review-ds.md; docs/reviews/wu-cm-01-f01-s7-r1-plan-review-controller-adjudication.md |
-| closeout chain S7-R1 S0 design sync artifact | docs/reviews/wu-cm-01-f01-s7-r1-s0-design-sync-codex.md |
-| closeout chain S7-R1 S0 design review artifacts | docs/reviews/wu-cm-01-f01-s7-r1-s0-design-review-mimo.md; docs/reviews/wu-cm-01-f01-s7-r1-s0-design-review-ds.md; docs/reviews/wu-cm-01-f01-s7-r1-s0-design-review-controller-adjudication.md |
-| closeout chain S7-R1 S0 design fix artifact | docs/reviews/wu-cm-01-f01-s7-r1-s0-design-fix-codex.md |
-| closeout chain S7-R1 S0 design re-review artifacts | docs/reviews/wu-cm-01-f01-s7-r1-s0-design-rereview-mimo.md; docs/reviews/wu-cm-01-f01-s7-r1-s0-design-rereview-ds.md; docs/reviews/wu-cm-01-f01-s7-r1-s0-design-rereview-controller-adjudication.md |
-| closeout chain S7-R1 S1 implementation artifact | docs/reviews/wu-cm-01-f01-s7-r1-s1-implementation-codex.md |
-| closeout chain S7-R1 S1 code review artifacts | docs/reviews/wu-cm-01-f01-s7-r1-s1-code-review-mimo.md; docs/reviews/wu-cm-01-f01-s7-r1-s1-code-review-ds.md |
-| closeout chain S7-R1 S1 review fix artifact | docs/reviews/wu-cm-01-f01-s7-r1-s1-review-fix-codex.md |
-| closeout chain S7-R1 S1 re-review artifacts | docs/reviews/wu-cm-01-f01-s7-r1-s1-rereview-mimo.md; docs/reviews/wu-cm-01-f01-s7-r1-s1-rereview-ds.md; docs/reviews/wu-cm-01-f01-s7-r1-s1-rereview-controller-adjudication.md |
-| closeout chain slice 7 final validation artifact | docs/reviews/wu-dur-obs-cm-closeout-slice7-final-validation-codex.md |
-| closeout chain S6-R1 rescope plan artifacts | docs/host/wu-cm-01-f02-s6-r1-compact-instruction-rescope-plan.md |
-| closeout chain S6-R1 rescope plan review artifacts | docs/reviews/wu-cm-01-f02-s6-r1-plan-review-mimo.md; docs/reviews/wu-cm-01-f02-s6-r1-plan-review-ds.md; docs/reviews/wu-cm-01-f02-s6-r1-plan-review-controller-adjudication.md |
-| closeout chain S6-R1 rescope implementation artifacts | docs/reviews/wu-cm-01-f02-s6-r1-implementation-codex.md |
-| closeout chain S6-R1 rescope code review artifacts | docs/reviews/wu-cm-01-f02-s6-r1-code-review-mimo.md; docs/reviews/wu-cm-01-f02-s6-r1-code-review-ds.md; docs/reviews/wu-cm-01-f02-s6-r1-code-review-controller-adjudication.md |
-| aggregate review artifacts | docs/reviews/wu-cm-01-aggregate-deepreview-mimo.md; docs/reviews/wu-cm-01-aggregate-deepreview-ds.md; docs/reviews/wu-cm-01-aggregate-deepreview-controller-adjudication.md; docs/reviews/wu-cm-01-aggregate-deepreview-fix-codex.md; docs/reviews/wu-cm-01-aggregate-rereview-mimo.md; docs/reviews/wu-cm-01-aggregate-rereview-ds.md; docs/reviews/wu-cm-01-aggregate-rereview-controller-adjudication.md |
-| PR review artifacts | docs/reviews/wu-cm-01-pr-review-mimo.md; docs/reviews/wu-cm-01-pr-review-ds.md; docs/reviews/wu-cm-01-pr-review-controller-adjudication.md; docs/reviews/wu-cm-01-pr-review-fix-codex.md; docs/reviews/wu-cm-01-pr-rereview-mimo.md; docs/reviews/wu-cm-01-pr-rereview-ds.md; docs/reviews/wu-cm-01-pr-rereview-controller-adjudication.md; docs/reviews/wu-cm-01-pr-deferred-risk-controller-adjudication.md; docs/host/wu-cm-01-deferred-risk-cleanup-plan.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-implementation-codex.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-review-mimo.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-review-ds.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-rereview-mimo.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-rereview-ds.md; docs/reviews/wu-cm-01-deferred-risk-cleanup-controller-adjudication.md; docs/reviews/wu-dur-obs-cm-closeout-pr-review-mimo.md; docs/reviews/wu-dur-obs-cm-closeout-pr-review-ds.md; docs/reviews/wu-dur-obs-cm-closeout-pr-review-controller-adjudication.md |
-| final closeout artifacts | docs/reviews/wu-dur-obs-cm-closeout-final-closeout-controller.md |
-| draft PR status | WU-DUR-P01 / WU-OBS-P00 / WU-CM-01-F02 / WU-CM-01-F01 closeout draft PR 118 open at https://github.com/noho/dayu-agent-r/pull/118; AgentMiMo and AgentDS PR reviews passed with 0 blocking findings; branch `phaseflow/wu-dur-obs-cm-closeout` pushed through accepted PR review commit c57b7471 plus final closeout bookkeeping; GitHub reported no checks on branch `phaseflow/wu-dur-obs-cm-closeout`; WU-CM-01 draft PR 116 was previously merged manually by the user; WU-ENG-02 PR 114 merged at 2026-06-03 09:33:38 UTC as 58fb7a42a2a096ab279863250a9ffe63f63f0edc; WU-ENG-01 accepted commit 70a5a4e merged via PR 113 |
+| gate | draft-PR-pass / final closeout passed |
+| implementation status | WU-TOOLS-01 draft PR #123 review and re-review passed; S1-S6 and external blocker reconciliation accepted; all residual risks have owner / destination; ready for user merge decision |
+| active work unit | WU-TOOLS-01 |
+| default next work unit | WU-TOOLS-01-F01 |
+| next entry point | User merge decision for https://github.com/noho/dayu-agent-r/pull/123; after PR merge enter WU-TOOLS-01-F01 by default, or enter WU-CM-01-F04 first if broad Host validation must be restored before tool follow-ups |
+| design source | `docs/host/design.md`; `docs/engine/design.md` |
+| issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
-| current inspection note | 2026-06-05 phaseflow resumed after WU-CM-01 PR merge. Goal confirmation accepted the dependency chain WU-DUR-P01 -> WU-OBS-P00 -> WU-CM-01-F02 -> WU-CM-01-F01, with WU-CM-01-F01 as public smoke validation for the first three WU. Accepted plan commit is c1e9de3f. Slice 0 accepted commit is 83cf38d8. Slice 1 accepted commit is 82eb5813. Slice 2 accepted commit is 113c2838. Slice 3 accepted commit is bea9f488. Slice 4 accepted commit is 11688014. Slice 5 accepted commit is 104e10bb. Slice 6 accepted commit is f6474b0c. Slice 7 implementation blocker accepted: runtime `instruction.output_schema_name` exposed `ConversationCompactOutputVNext` in LLM-facing material JSON. `WU-CM-01-F02-S6-R1` replaced the runtime instruction literal with `conversation_compact_output_v1`; targeted tests, pyright, diff check, and production external grep passed. MiMo and DS code reviews both passed; Controller accepted the implementation and closed residual `WU-CM-01-F02-S6-R1` in commit 0ec3c991. Slice 7 implementation retry added focused public smoke assertions and found direct public path evidence that ordinary runner-call messages still contain multiple system messages. DS review and captured MiMo verdict accepted the blocker. Controller accepted `WU-CM-01-F01-S7-R1`: production RunInput / memory projection one-system-message rescope is required before final Slice 7 acceptance. Rescope plan is accepted in commit f07ce845. S0 design sync and fix are accepted in commit fc94e597 after MiMo / DS re-review. S1 production implementation normalizes ordinary RunInput messages to a single leading system envelope, keeps user / assistant roles, and records manifest input from normalized messages. S1 code review found test forbidden-fragment drift and same-section boundedness overhead risk; review fix reuses the production forbidden-fragment contract in focused tests and accounts for same-section item separator overhead. MiMo and DS re-review passed; Controller accepted S7-R1-S1 in commit 2195a2ff. Final Slice 7 public-path validation passed. Residual risks were reconciled: WU-DUR-P01 residuals closed, WU-ENG-02-S3-R1 transferred to issue-119 under issue-70. PR 118 review gate passed: AgentMiMo and AgentDS both reported pass with no blocking findings; GitHub reported no checks. |
 
 状态约定：
 
@@ -250,7 +170,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 - 涉及 public contract、durable schema、状态机、跨层依赖或用户可见行为时，必须先形成明确 design decision。
 - 测试优先按风险边界补齐；压力测试和长耗时测试必须与常规测试入口分开。
 - 实施完成后必须更新对应测试、类型检查、稳定文档说明和对应 GitHub Issue 状态。
-- 每个 work unit 进入 plan、implementation、review、ready-to-open-draft-PR 或 draft-PR-pass 时，必须更新“当前状态”中的 gate、active work unit、artifact、commit、review 和 residual risk 信息。
+- 每个 work unit 进入 plan、implementation、review、ready-to-open-draft-PR 或 draft-PR-pass 时，必须更新“当前状态”中的 gate、active work unit、next entry point 和 blocking open questions；artifact、commit、review 与历史验证记录写入对应 work unit、review artifact 或 closeout artifact，不在“当前状态”表中累积流水账。
 
 ## Residual Risk / 遗留问题追踪
 
@@ -272,9 +192,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；已关闭项从 active 表删除，关闭依据保存在对应 review / reconciliation artifact 中。
 
-| ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
-|---|---|---|---|---|---|---|
-| WU-ENG-02-S3-R1 | WU-ENG-02 Slice 3 code review | analyzer 需求边界 | transferred-to-issue | GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要 `client_correlation_id` 与 `provider_request_id`；若需要，必须先扩展 Runner usage / Engine `UsageReportedData` producer contract，再补 Host payload / Tool Trace analyzer tests。 | Local residual closed by transfer to https://github.com/noho/dayu-agent-r/issues/119; parent #70 updated at https://github.com/noho/dayu-agent-r/issues/70#issuecomment-4631651995. Current code evidence remains: usage 是 post-call observation / analyzer signal，不是 provider debugging terminal 主链路；`UsageReportedData` 当前无 correlation fields，Host 不从 `iteration_id` 推断 provider request identity。 |
+| ID | 状态 | Owner / Destination | 下一步 |
+|---|---|---|---|
+| WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
+| WU-TOOLS-01-S4-R1 | deferred-with-owner | WU-TOOLS-01-F01 | 迁移共享 Fins ingestion service/runtime，并分别提供 download / preprocess tool providers 的 awaiting adapter。 |
+| WU-TOOLS-01-S5-R2 | deferred-with-owner | WU-TOOLS-01-F02 then WU-TOOLS-01-F03 / GitHub Issue #120 | 先迁移 Web CI diagnostics pipeline，再生成可关闭 residual 的 Web smoke。 |
+| WU-TOOLS-01-S1-R1 | deferred-with-owner | WU-TOOLS-01-F04/F05 and WU-TOOLS-01-F06/F07 / GitHub Issues #121 and #122 | 分别迁移 SEC/Fins 与 CN/HK Docling CI pipeline，再生成各自 smoke。 |
+| WU-TOOLS-01-S1-R2 | deferred-with-owner | WU-TOOLS-01-F08 | 清理 documents processor registry 的 OLD `engine` 命名。 |
+| WU-TOOLS-01-S6-R1 | deferred-with-owner | WU-CM-01-F04 | 迁移 proactive scheduler tests 到 manifest-producing compactor test seam 后恢复 broad Host validation。 |
 
 ## 当前 Work Units
 
@@ -285,10 +210,21 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-01 | final-closeout-follow-up | Conversation Memory overall optimization | GitHub Issue #81 | #81 umbrella 的正式 implementation entry point |
 | WU-CM-01-F01 | completed | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | S7-R1 S1 one-system-message production assembly accepted; final public-path validation passed |
 | WU-CM-01-F02 | completed | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | Slice 5 compact evidence query readability, Slice 6 prompt semantic rewrite, and S6-R1 production compact instruction contract rescope are accepted |
+| WU-CM-01-F03 | pending | Assistant final answer continuity fidelity closeout | GitHub Issue #81 / WU-CM-01 final closeout | 收窄 Trace / Answer material 文本来源：selected recent window 与 compact answer material 不得用 `summary_text` / nested summary 替代 assistant final answer |
+| WU-CM-01-F04 | pending | Proactive compaction manifest-producing test seam closeout | GitHub Issue #81 / WU-CM-01 final closeout; unblocks WU-TOOLS-01 broad Host validation | 迁移 proactive scheduler tests 到当前 manifest-producing compact contract；owner for residual `WU-TOOLS-01-S6-R1` |
 | WU-CM-02 | closed | working_assumptions 生产者语义 | GitHub Issue #81 / WU-CM-01 | 已裁决；reject 旧 `working_assumptions` 独立语义，不单独实施，删除 / 迁移旧字段由 WU-CM-01 schema / projection slice 承接 |
 | WU-CM-03 | closed | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
 | WU-CM-04 | closed | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
-| WU-TOOLS-01 | pending | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98 | 单一 work unit，先迁移 shared document foundations，再按 Doc tools、Fins、Web tools slice 实施 |
+| WU-TOOLS-01 | draft-pr-pass-final-closeout-passed | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98；draft PR #123 | Accepted plan commit f6658fb4；Slices S1-S6 and external blocker reconciliation accepted；PR review and re-review passed；all active residual risks have owner / destination；ready for user merge decision at https://github.com/noho/dayu-agent-r/pull/123 |
+| WU-TOOLS-01-F01 | pending | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed | Build the shared Fins ingestion service/runtime first, then expose independent download and preprocess tool providers through current `ToolAwaitingOutcome` / wait-resume contract; owner for residual `WU-TOOLS-01-S4-R1` |
+| WU-TOOLS-01-F02 | pending | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up | First step of Web CI diagnostics pipeline: migrate OLD `web_ci_urls.jsonl`, `diag_web.sh`, `diag_web_batch.sh` and `utils/diagnose_web_access.py`; does not close `WU-TOOLS-01-S5-R2` by itself |
+| WU-TOOLS-01-F03 | pending | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | Generate explicit opt-in Web smoke from the migrated web CI diagnostics pipeline; defines pass / skip / diagnostic criteria and is the closing owner for residual `WU-TOOLS-01-S5-R2` |
+| WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
+| WU-TOOLS-01-F05 | pending | SEC/Fins CI smoke generation | GitHub Issue #121 under #82 follow-up; depends on WU-TOOLS-01-F04 | Generate explicit opt-in SEC/Fins smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for SEC/Fins coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
+| WU-TOOLS-01-F06 | pending | CN/HK Docling CI pipeline migration | GitHub Issue #122 under #82/#98 follow-up | First step of CN/HK Docling coverage: migrate OLD `docs/cn_hk_docling_ci.md`, shared process runner behavior, `utils/llm_docling_ci_score.py` and `dayu.fins.score_docling_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
+| WU-TOOLS-01-F07 | pending | CN/HK Docling CI smoke generation | GitHub Issue #122 under #82/#98 follow-up; depends on WU-TOOLS-01-F06 | Generate explicit opt-in CN/HK Docling smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for Docling coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
+| WU-TOOLS-01-F08 | pending | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Rename `build_engine_processor_registry(...)` to a documents/default registry name and update direct callers / exports / docs without changing processor registration behavior; owner for residual `WU-TOOLS-01-S1-R2` |
+| WU-TOOLS-01-F09 | pending | Fins upload ingestion migration and upload tool | WU-TOOLS-01 post-migration upload follow-up | Migrate OLD CLI-facing upload semantics into the shared Fins service/runtime and expose an independent upload ingestion tool provider; upload must use the same runtime foundation as read / download / preprocess |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 | Slice 0-3 accepted; residual follow-ups closed or transferred to dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 / #117 | Slice 4 accepted; full analyzer remains WU-OBS-00 non-goal |
@@ -298,6 +234,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-OBS-P04 | pending | Provider protocol partial tool-call trace signals | GitHub Issue #35 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 provider protocol error partial tool-call stable trace signal |
 | WU-OBS-00 | pending-prerequisite | Tool Trace analyzer | GitHub Issue #70 | trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
+| WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
 | WU-AUDIT-01 | pending | Audit Ledger viewer and integrity report | GitHub Issue #72 | read-only audit JSONL ledger viewer；审计责任链 / 完整性校验，不做 Tool Trace root-cause analyzer |
 | WU-AUDIT-02 | pending | External audit delivery contract with local validation adapters | GitHub Issue #75 | async external audit delivery 语义；无真实外部系统时先用 Noop / FileMirror adapter 验证 contract |
@@ -566,6 +503,73 @@ GitHub Issue #81 / WU-CM-01 final closeout follow-up，依赖 WU-DUR-P01 补齐 
 - compact 后 accepted candidate 仍只引用 prompt-local labels，不引用 `C1` 或 Host internal refs。
 - 受影响 focused tests 通过；pyright 0 errors。
 
+## WU-CM-01-F03 Assistant Final Answer Continuity Fidelity Closeout
+
+### 状态
+
+GitHub Issue #81 / WU-CM-01 final closeout follow-up。WU-CM-01 已落地 Conversation Memory vNext，但代码核对发现 assistant final answer continuity 的 helper contract 仍允许 `summary_text` / nested summary 作为 fallback。该 fallback 会把用户刚看到的 assistant answer 降级为摘要文本，影响 selected recent window、Answer Material 与后续 compact 输入质量。本条用于追踪实现契约收窄，不重新打开 WU-CM-01 主体设计。
+
+### 设计与代码核对
+
+- Host 设计真源要求 Trace Memory 数据来源包括 `RUN_SUCCEEDED.final_answer`，compact `answer_material` 只包含可读 assistant final answer / conclusion；Session Summary 只能来自 accepted `CONTEXT_COMPACTED` 的 session summary。
+- 当前生产 final answer 主路径中，Engine `final_answer` 会写入 terminal summary payload 的 `content` 字段；该 `content` 可作为 assistant final answer continuity 文本。
+- 当前 helper `assistant_summary_from_payload()` 会依次读取 `final_answer`、`content`、`summary_text` 与 nested `summary`。其中 `summary_text` / nested summary 作为 assistant answer fallback 与设计真源不一致。
+- 风险边界：若 selected recent window 或 compact `answer_material` 消费到 `summary_text`，用户体感上的“刚才那段回答”会被摘要替代；更下一轮 compact 也会基于摘要继续滚动，造成结构、序号、措辞和细节损失。
+
+### 目标
+
+- 将 LLM-facing Trace / Answer material 的 assistant 文本来源收窄为 assistant final answer / conclusion：允许 canonical `final_answer` 与 terminal summary `content`，不得接受 `summary_text` 或 nested summary 作为 assistant final answer fallback。
+- 保持 Session Summary Memory 的来源不变：只来自 accepted `CONTEXT_COMPACTED.session_summary`，不得借 terminal summary 或 helper fallback 伪造 session summary。
+- 更新 helper 命名、调用点或策略参数，使 selected recent window、fallback recent window、compact `answer_material` 与 compaction history material 的语义一致，避免 “summary” 命名继续误导实现。
+- 对缺失 assistant final answer / content 的 `RUN_SUCCEEDED` fail closed 或跳过 continuity item；不得用 ref、digest、event id、payload descriptor 或 `summary_text` 补洞。
+
+### 非目标
+
+- 不修改 compact output schema、Conversation Memory snapshot schema 或 section 顺序。
+- 不改变 terminal summary artifact 的持久化职责；本条只规定哪些字段可进入 LLM-facing assistant continuity。
+- 不把 compact `session_summary`、answer anchor、reference continuity 或 forward intent 回填成 assistant final answer。
+- 不实现深历史 recall、semantic search 或 prompt-conditioned recall。
+
+### 验收信号
+
+- focused tests 覆盖 `RUN_SUCCEEDED` payload 同时存在 `summary_text` 与 terminal `content` 时，selected recent window / compact `answer_material` 使用 final answer content。
+- focused tests 覆盖仅存在 `summary_text` / nested summary 且无 final answer / content 时，不生成 assistant continuity item，也不生成 compact answer material。
+- compact 输入测试证明 `ConversationCompactInputVNext.answer_material[*].answer_text` 不来自 `summary_text` fallback。
+- 现有 `utils/` 下 Host public smoke 仍通过；受影响 focused tests 通过；pyright 0 errors。
+
+## WU-CM-01-F04 Proactive Compaction Manifest-producing Test Seam Closeout
+
+### 状态
+
+Pending。该 work unit 是 `WU-TOOLS-01-S6-R1` 的明确 owner，用于修复 WU-CM-01 后遗留的 Host proactive scheduler test seam，不改变生产 compact fail-closed contract。
+
+### 动机
+
+WU-TOOLS-01 S6 broad Host validation 暴露 7 个 proactive compaction 测试失败，错误都是 `accepted compaction is missing proposal manifest ref`。这不是 WU-TOOLS provider migration 的代码缺陷，也不是要把生产 guard 放宽；根因是 WU-CM-01 升级 ConversationMemory / Compact 后，accepted compact outcome 必须能反向引用 durable proposal manifest ref / digest，而 proactive scheduler tests 还在使用升级前的 legacy fake compactor seam。
+
+### 目标
+
+- 保持 `dayu/host/dispatch.py` 对 accepted compaction 缺少 proposal manifest ref 的 fail-closed 行为不变。
+- 新增或抽取 deterministic manifest-producing Host test compactor，使它对齐当前 `CompactorProposalPreparedCompactor` contract。
+- 将受影响的 proactive scheduler tests 从 legacy fake compactor seam 迁移到 manifest-producing test seam。
+- 覆盖 accepted 和 rejected compact event，直接断言 proposal manifest ref / digest。
+- 恢复 broad Host validation 对 proactive compaction 路径的有效验收信号。
+
+### 非目标
+
+- 不为旧 fake compactor seam 增加兼容 wrapper / facade。
+- 不把 production compact guard 改成接受缺失 manifest ref。
+- 不重开 WU-TOOLS provider migration；本条只处理 WU-CM-01 compact contract 升级后的 Host 测试 seam fallout。
+- 不引入新的生产 compactor implementation。
+
+### 验收信号
+
+- 当前 7 个 proactive compaction manifest-ref failures 关闭。
+- focused tests 证明 accepted compact event 必须携带 proposal manifest ref / digest。
+- focused tests 证明 rejected compact event 的 manifest ref / digest 投影符合当前 contract。
+- broad Host validation 中 proactive scheduler compact 相关测试恢复通过；若仍有其它 broad Host failure，必须单独归因并转 owner。
+- pyright 0 errors。
+
 ## WU-CM-02 Working Assumptions Producer Semantics
 
 ### 状态
@@ -712,6 +716,328 @@ GitHub Issue #81 / WU-CM-01 final closeout follow-up，依赖 WU-DUR-P01 补齐 
 - import-boundary tests 证明 runtime / Host / Service / UI 不获得对 Fins / Doc / Web tool implementation internals 的 forbidden direct dependency。
 - deterministic tests 覆盖代表性 engine processors、Docling conversion、Docling JSON processor、Doc tools、Fins storage / provider、search / fetch / URL safety / truncation / fallback 或对应 mock 行为。
 - 任何源行为偏离都被记录，并证明是当前接口适配所必需。
+
+## WU-TOOLS-01-F01 Shared Fins Ingestion Runtime And Download / Preprocess Awaiting Tools
+
+### 状态
+
+Pending。该 work unit 是 `WU-TOOLS-01-S4-R1` 的明确 owner。裁决结论：F01 不只是迁移几个 tool name，而是先迁移 / 建立 NEW 的共享 Fins service/runtime；read、download 和 preprocess/process 都以这套 service/runtime 为业务底座。最关键约束是：CLI download 和 tool download 必须走同一套代码、同一套逻辑。Tool 侧只做当前 Host / ToolRuntime 的 awaiting adapter；未来 NEW CLI 也调用同一套 service/runtime，避免 CLI 和 tool 逻辑漂移。Upload 不纳入本条，转入 `WU-TOOLS-01-F09` 单独追踪。
+
+### 动机
+
+WU-TOOLS-01 S4 只迁移了 Fins read tools。这个残留不是因为 Host / ToolRuntime 缺少 awaiting 机制；当前 Host 已有 awaiting accept、wait record、resume / closeout、cancellation 与 late terminal governance，Engine 也以 `ToolAwaitingOutcome` 作为 suspended run 边界。真正缺口是 OLD 的共享 Fins ingestion service/runtime 尚未迁入 NEW：OLD download 与 preprocess/process 共用 `FinsIngestionService` / service runtime，CLI 和 tool 两处都应调用同一套业务逻辑，不能在 tool adapter 或未来 CLI 中各自重写一套。CLI 只能负责命令行参数解析、输出格式和退出码；tool 只能负责 schema、ToolDiscovery、ToolRuntime、awaiting / wait-resume；download / process 的参数校验、ticker / market 归一化、form/date/overwrite 语义、storage 写入、pipeline 调用、状态/result 归一化必须在 shared Fins service/runtime 中。
+
+Ticker / market 归一化的唯一真源是 `dayu/fins/ticker_normalization.py`。所有需要归一化 ticker 或判断 market 的 read、download、preprocess/process、upload、CI runner、smoke runner 与 future CLI 入口，都必须调用该模块暴露的 `normalize_ticker(...)` / `try_normalize_ticker(...)` / `ticker_to_company_id(...)` 等公共 API；不得在 service/runtime、tool adapter、CLI、CI script、pipeline selector 或 storage 外层重新实现第二套 ticker parsing、market suffix stripping、US/HK/CN 判断、交易所推断或 company id 生成逻辑。
+
+当前 `include_ingestion_tools=true` fail-closed 开关只是 S4 过渡期保护，不是 F01 目标形态。F01 后 Discovery 应能分别发现三组独立 Fins tool providers：read、download、preprocess，而不是通过一个 `include_ingestion_tools` 布尔开关混合启用。
+
+### 目标
+
+- 迁移 / 建立 NEW 的共享 Fins service/runtime，承载 read、download 与 preprocess/process 的业务底座；其中 download 与 preprocess/process 是长事务入口，未来 CLI 与 tool 必须共同调用它。
+- Shared Fins service/runtime 中所有 ticker / market 归一化必须调用 `dayu.fins.ticker_normalization` 的公共 API；如需新增归一化规则，只能改该真源模块及其测试，不能在调用点复制逻辑。
+- download tool provider、preprocess tool provider、read tool provider 三组独立进入 ToolDiscovery；不得继续用 `include_ingestion_tools=true` 这类混合开关作为目标形态。
+- CLI download 和 tool download 必须同源调用 shared Fins service/runtime；不得存在 CLI download 一套业务代码、tool download 另一套业务代码。
+- CLI process/preprocess 和 tool preprocess 必须同源调用 shared Fins service/runtime；不得存在 CI / CLI / tool 各自复制 process 逻辑。
+- Tool 侧只做当前 Host / ToolRuntime 的 awaiting adapter，把共享 service/runtime 的 queued / running / cancelling / succeeded / failed / cancelled 状态映射到当前 awaiting、resume、cancel 与 terminal result 语义。
+- Download 工具组覆盖财报下载长事务；preprocess 工具组覆盖文档预处理 / process 长事务。OLD 当前注册列表只暴露 download 三件套，但 preprocess/process 业务逻辑必须进入共享 service/runtime，后续是否对 LLM 暴露为工具由独立 preprocess provider 的 schema / awaiting plan 裁决。
+- 未来 NEW CLI 必须调用同一套 Fins ingestion service/runtime；F01 plan 应明确 CLI 入口属于本条实现、后续 slice，还是带 owner 的后续 work unit。
+- 保持财报文档存取仍只能通过 `dayu.fins.storage` 仓储协议与实现完成。
+- 保持工具结果通过 Host ToolRuntime / Tool Trace / accepted evidence path 流转，不绕过 Host 工具治理。
+- 关闭 `WU-TOOLS-01-S4-R1`，并移除或替换 S4 过渡期 Fins provider 对 ingestion tools 的 fail-closed 开关。
+
+### 非目标
+
+- 不重新设计 Host / Engine awaiting 基础 contract。
+- 不在 Fins 工具内部私自实现 Host 外的轮询、等待、取消或 late terminal 治理；这些语义必须进入 Host / ToolRuntime awaiting contract。
+- 不让 CLI 和 tool 分别实现 download / preprocess 业务逻辑；业务逻辑必须在共享 service/runtime 中。
+- 不把 CI runner、smoke runner 或未来 CLI 作为绕过 shared Fins service/runtime 的第二套 download / process 实现。
+- 不在 service/runtime、tool adapter、CLI、CI runner、smoke runner 或 pipeline selector 中再造 ticker / market 归一化逻辑；不得通过局部字符串规则替代 `dayu.fins.ticker_normalization`。
+- 不修改被迁移旧 ingestion 业务函数签名或函数实现；如需适配当前 ToolRuntime / ToolDiscovery / CLI，必须通过外层 adapter / provider / assembly code 完成。
+- 不迁移 upload；OLD upload 是 CLI-facing command runtime，不是 upload tool，迁移与 upload ingestion tool 由 `WU-TOOLS-01-F09` 追踪。
+- 不迁移旧 UI / FastAPI / Streamlit ingestion entrypoints。
+
+### 验收信号
+
+- ToolDiscovery 能分别发现 Fins read、Fins download、Fins preprocess 三组 provider；download / preprocess 不依赖 `include_ingestion_tools=true` 混合开关。
+- Download 和 preprocess 代表路径可通过当前 tool contract 调用，并返回当前 `ToolAwaitingOutcome` / wait-resume contract 所需信息，不把 queued / running job 伪装成 completed business result。
+- 共享 Fins service/runtime 有 focused tests，证明 CLI-facing download 与 tool-facing download 走同一业务逻辑入口；process/preprocess 同理。
+- Focused tests 或静态代码检查证明 download / preprocess / read 相关入口的 ticker / market 归一化均调用 `dayu.fins.ticker_normalization`，没有第二套 parsing / market inference 逻辑。
+- 若 F01 尚未实现 NEW CLI，必须提供 service/runtime 层测试和明确后续 CLI owner，证明未来 CLI 只能包 shared runtime，不能重写 download / process 逻辑。
+- Host wait record、resume、cancel 与 late terminal result 路径有 deterministic tests 覆盖。
+- 失败、取消、重复 start / reused job、迟到 terminal result 均有明确测试或记录为带 owner 的 residual。
+- Fins README、tests README 或相关 package README 只描述当前已实现行为，不保留旧 fail-closed 或混合开关误导说明。
+
+## WU-TOOLS-01-F02 Web CI Diagnostics Pipeline Migration
+
+### 状态
+
+Pending。该 work unit 是 `WU-TOOLS-01-S5-R2` 的明确 owner，也是 GitHub Issue #120 的第一步。目标不是迁移一个一次性诊断脚本，而是迁移 OLD web CI diagnostics pipeline，使 WU-TOOLS-01-F02 完成后可以日常运行 web CI，并把真实外部网站失败样本反馈给 Codex / Web tools 优化流程。
+
+### 动机
+
+WU-TOOLS-01 S5 / S6 已迁移 Web tools，并用 deterministic mock 覆盖 search provider、requests 主路径与 Playwright fallback。剩余缺口不是 Web tools 未迁移，而是真实网络、真实搜索 API、真实网页访问、真实 Playwright 浏览器与 storage state 行为未验证。OLD 流程由 `utils/web_ci_urls.jsonl`、`utils/diag_web.sh`、`utils/diag_web_batch.sh` 和 `utils/diagnose_web_access.py` 组成：URL corpus 驱动单 URL / 批量诊断，脚本对同一个 URL 比较浏览器导航、raw `requests`、仓库 `fetch_web_page` 调用和 Playwright 网络观察，并输出诊断 bucket。它是工程化优化 Web tools 的输入链路，不是简单 smoke。
+
+### 目标
+
+- 将 OLD `utils/web_ci_urls.jsonl`、`utils/diag_web.sh`、`utils/diag_web_batch.sh` 和 `utils/diagnose_web_access.py` 迁移到当前 `dayu-agent-r/utils/`，作为 Web CI diagnostics pipeline。
+- 用当前 Web tools contract 适配脚本调用：不得恢复 OLD `ToolRegistry`，不得迁移旧 `truncate` / `fetch_more`，不得绕过当前 ToolDiscovery / ToolRuntime 或当前 Web tool callable adapter。
+- 保留诊断能力：浏览器导航摘要、raw `requests` headers / GET 结果、当前 `fetch_web_page` 结果、Playwright 网络请求摘要、storage state 输入 / 输出、批量 URL 诊断与汇总。
+- 建立 explicit opt-in web CI diagnostics 入口，用 URL corpus 采集 live requests、fetch、可选 search provider API 与可选 Playwright browser path 的诊断证据。
+- web CI diagnostics 必须明确 network / API key / browser installation / storage state / headed mode policy，并默认不进入普通 deterministic CI。
+- 诊断输出必须能让 Codex 根据 JSON / JSONL summary 与 per-url diagnostics 分类失败 bucket，并把稳定失败拆成后续 Web tools 优化 work unit。
+
+### 非目标
+
+- 不把 live network / real browser web CI diagnostics 变成普通单元测试或默认 CI gate。
+- 不以 web CI 替代 S5 / S6 deterministic provider tests。
+- 不在 F02 定义 Web smoke 的 pass / fail gate；S5-R2 在 F02 后仍保持 open，交由 WU-TOOLS-01-F03 生成 smoke 后关闭。
+- 不恢复 OLD `dayu.engine.tool_registry`、OLD ToolRegistry path safety、OLD truncation manager 或 OLD `fetch_more`。
+- 不重写 Web search / fetch / Playwright 业务 pipeline；只迁移诊断脚本并做当前 contract adapter。
+- 不把真实网站偶发失败直接解释为生产代码 regression；web CI 结果必须输出诊断证据和可分类 failure reason。
+
+### 验收信号
+
+- `utils/diagnose_web_access.py`、`utils/diag_web.sh`、`utils/diag_web_batch.sh` 和 `utils/web_ci_urls.jsonl` 可在当前 repo 运行。
+- web CI diagnostics 有显式 opt-in 入口和跳过条件；缺少网络、API key 或浏览器依赖时给出清晰 diagnostic，而不是让普通 CI flaky。
+- 输出 JSON / JSONL summary 能区分 `all_success`、`browser_only_success`、`fetch_only_failure`、`requests_only_success`、challenge detected、provider authentication / rate limit 等诊断 bucket。
+- README / tests README 只描述当前实现：deterministic tests 仍默认无 live network；web CI diagnostics pipeline 是单独显式入口；Web smoke 尚未由 F02 生成。
+
+## WU-TOOLS-01-F03 Web CI Smoke Generation
+
+### 状态
+
+Pending。该 work unit 是 GitHub Issue #120 的第二步，依赖 WU-TOOLS-01-F02。F02 迁移 web CI diagnostics pipeline 后，`WU-TOOLS-01-S5-R2` 仍然存在，因为诊断管线只负责采集和分类真实外部访问证据，不提供稳定 pass / fail / skip gate。F03 用迁移后的诊断管线生成 Web smoke，并作为关闭 `WU-TOOLS-01-S5-R2` 的 owner。
+
+### 动机
+
+日常 web CI 可以持续暴露真实网络、真实浏览器、真实搜索 provider 与真实站点差异，但 residual risk 需要一个明确的验收 smoke：哪些 URL / provider / browser path 属于 smoke 样本，哪些失败应 skip，哪些失败是 diagnostic-only，哪些失败代表 Web tools regression。没有这层 smoke contract，S5-R2 即使在 F02 后仍只能说“有诊断”，不能说“已有可执行的 live coverage gate”。
+
+### 目标
+
+- 基于 F02 迁移后的 `web_ci_urls.jsonl` 与诊断 summary，选取小而稳定的 smoke corpus。
+- 定义 Web smoke 的 pass / fail / skip / diagnostic-only 判定规则。
+- 覆盖至少 raw `requests` + `fetch_web_page` 的 live 路径；Playwright、Tavily、Serper 可按配置和环境作为 opt-in smoke 子路径。
+- 明确 smoke 对 network、API key、browser installation、storage state、headed / headless 的环境要求。
+- 将 smoke 输出设计成 Codex 可读的摘要：失败 bucket、证据文件路径、失败 URL、建议下一步。
+- 成功后关闭 `WU-TOOLS-01-S5-R2`，或把仍不稳定的外部站点 / provider 子路径转成带 owner 的新 residual。
+
+### 非目标
+
+- 不把完整 web CI URL corpus 全部变成 smoke gate。
+- 不把真实网站偶发失败直接解释为生产代码 regression。
+- 不替代 deterministic provider tests；deterministic tests 仍负责固定已知逻辑。
+- 不在 F03 重迁移诊断脚本；脚本迁移属于 F02。
+
+### 验收信号
+
+- 存在显式 Web smoke 入口，默认不进入普通 deterministic CI。
+- smoke 在缺少 live network / API key / browser 依赖时能稳定 skip，并输出原因。
+- smoke 在满足环境时能运行代表性 URL，并输出 pass / fail / diagnostic-only summary。
+- README / tests README 说明 deterministic tests、web CI diagnostics 和 Web smoke 三者的职责区别。
+- `WU-TOOLS-01-S5-R2` 被关闭，或 remaining live coverage gap 被转移到新的 owner / issue。
+
+## WU-TOOLS-01-F04 SEC/Fins CI Pipeline Migration
+
+### 状态
+
+Pending。该 work unit 是 GitHub Issue #121 的第一步。它迁移 OLD SEC/Fins CI pipeline，但不单独关闭 `WU-TOOLS-01-S1-R1`。
+
+### 动机
+
+OLD `docs/ci.md` 定义的是 SEC/Fins 工程化 CI 优化闭环，不是普通测试说明：先通过 storage 扫描 SEC filing 全集，使用 `utils/llm_ci_process.py` 做最小增量 `process --ci`，使用 `utils/llm_ci_score.py` 批量调用 `dayu.fins.score_sec_ci`，输出 baseline / iter / final 的 JSON、Markdown、summary 和缺口诊断。当前 `dayu-agent-r` 只有 deterministic Fins / document fixture 覆盖，未看到等价 process runner、score runner、SEC scorer 或流程文档。
+
+本条继承 F01 的同源裁决：SEC/Fins CI 的 process runner 不得重写 process 业务逻辑。无论它直接调用 shared Fins service/runtime，还是通过未来 NEW CLI 的 `process --ci` 外壳调用，最终都必须落到同一套 shared Fins service/runtime。
+
+SEC/Fins CI 中如需聚合 ticker、推断 market 或生成 company id，也必须调用 `dayu.fins.ticker_normalization` 真源；CI runner 不得为了批处理便利复制 ticker / market 归一化规则。
+
+### 目标
+
+- 迁移 OLD `docs/ci.md` 的 SEC/Fins CI 流程说明。
+- 迁移或重建 `utils/llm_ci_process.py`，保持 storage 扫描、`--documents-json`、ticker 聚合、固定并发、日志和 process run summary；process 执行必须调用 shared Fins service/runtime 或调用以 shared runtime 为唯一业务实现的 NEW CLI 外壳。
+- `utils/llm_ci_process.py` 与 scorer 需要 ticker / market 归一化时必须调用 `dayu.fins.ticker_normalization`；不得在脚本中硬编码 SEC market 判断或 ticker suffix stripping。
+- 迁移或重建 `utils/llm_ci_score.py` 与 `dayu.fins.score_sec_ci`，保持 7 类 SEC form 的 score 输出、summary、overall summary 和 missing snapshot 诊断。
+- 所有文档、processed、blob、snapshot 读取必须走 `dayu.fins.storage` 仓储协议 / 实现。
+- 保持 SEC/Fins CI pipeline 为显式入口，不进入普通 deterministic CI。
+
+### 非目标
+
+- 不通过修改 scorer 权重、阈值或 hard gate 刷分。
+- 不把完整 SEC/Fins corpus 变成 smoke gate；smoke 由 F05 定义。
+- 不绕过 `dayu.fins.storage` 手拼 workspace 路径。
+- 不在 CI runner 中复制 CLI / tool process 业务逻辑；CI runner 只能作为批处理调度、日志和汇总外壳。
+- 不在 SEC/Fins CI runner 或 scorer 中再造 ticker / market 归一化逻辑。
+
+### 验收信号
+
+- 当前 repo 有可运行的 SEC/Fins process runner、score runner 和 scorer 入口。
+- SEC/Fins process runner 的 tests 或实现证据证明它与 CLI / tool process 同源调用 shared Fins service/runtime。
+- Tests 或实现证据证明 SEC/Fins CI 中的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
+- 能生成 baseline_probe / baseline / iter / final 所需目录和 JSON summary。
+- 缺少 processed / snapshot / score 输入时输出清晰 diagnostic。
+- README / tests README 说明 deterministic tests、SEC/Fins CI pipeline 和 SEC/Fins smoke 的职责区别。
+
+## WU-TOOLS-01-F05 SEC/Fins CI Smoke Generation
+
+### 状态
+
+Pending。该 work unit 是 GitHub Issue #121 的第二步，依赖 WU-TOOLS-01-F04。F04 迁移 pipeline 后，SEC/Fins 部分的 `WU-TOOLS-01-S1-R1` 仍然存在，因为 pipeline 只负责全量/增量评分闭环，不提供稳定 smoke gate。
+
+### 目标
+
+- 基于 F04 迁移后的 SEC/Fins CI pipeline 选取小而稳定的 smoke corpus。
+- 定义 pass / fail / skip / diagnostic-only 判定规则。
+- 覆盖至少一个代表性 SEC form 的 process + score 路径；更宽 form coverage 可作为 opt-in 子路径。
+- 缺少 workspace corpus、processed snapshot 或 heavy runtime 时可稳定 skip，并输出原因。
+- 关闭 `WU-TOOLS-01-S1-R1` 中 SEC/Fins CI coverage 部分，或把 remaining gap 转成带 owner 的新 residual。
+
+### 非目标
+
+- 不替代完整 SEC/Fins CI optimization loop。
+- 不把真实 corpus 偶发问题直接解释为 production regression。
+- 不修改 scorer 规则刷分。
+
+### 验收信号
+
+- 存在显式 SEC/Fins smoke 入口，默认不进入普通 deterministic CI。
+- smoke 在满足环境时能运行代表性 SEC fixture / workspace sample，并输出 pass / fail / diagnostic-only summary。
+- README / tests README 说明 SEC/Fins pipeline 与 SEC/Fins smoke 的职责区别。
+
+## WU-TOOLS-01-F06 CN/HK Docling CI Pipeline Migration
+
+### 状态
+
+Pending。该 work unit 是 GitHub Issue #122 的第一步。它迁移 OLD CN/HK Docling CI pipeline，但不单独关闭 `WU-TOOLS-01-S1-R1`。
+
+### 动机
+
+OLD `docs/cn_hk_docling_ci.md` 定义的是 CN/HK Docling 工程化 CI 优化闭环：通过 storage 扫描 A 股 / 港股 active `filing` / `material` 文档全集，复用 `utils/llm_ci_process.py` 做最小增量 process，使用 `utils/llm_docling_ci_score.py` 调用 `dayu.fins.score_docling_ci`，输出 `workspace/tmp/docling_ci_score/{tag}/` 下的 score、by_kind、summary 和 overall summary。当前 `dayu-agent-r` 有 deterministic Docling JSON fixture 和轻量 Fins/Web 消费路径，但未看到等价 CN/HK Docling CI runner、scorer 或流程文档。
+
+本条继承 F01 的同源裁决：CN/HK Docling CI 的 process runner 不得重写 process 业务逻辑。无论它直接调用 shared Fins service/runtime，还是通过未来 NEW CLI 的 `process --ci` 外壳调用，最终都必须落到同一套 shared Fins service/runtime。
+
+CN/HK Docling CI 中如需识别 CN / HK market、规范 A 股 / 港股 ticker 或生成 company id，也必须调用 `dayu.fins.ticker_normalization` 真源；不得在 CI runner、scorer 或 Docling adapter 中复制 CN/HK market 判断。
+
+### 目标
+
+- 迁移 OLD `docs/cn_hk_docling_ci.md` 的 CN/HK Docling CI 流程说明。
+- 迁移或重建 shared `utils/llm_ci_process.py` 必要行为；process 执行必须调用 shared Fins service/runtime 或调用以 shared runtime 为唯一业务实现的 NEW CLI 外壳。
+- `utils/llm_ci_process.py`、`utils/llm_docling_ci_score.py` 与 scorer 需要 ticker / market 归一化时必须调用 `dayu.fins.ticker_normalization`；不得在脚本中硬编码 CN/HK ticker 规则。
+- 迁移或重建 `utils/llm_docling_ci_score.py` 与 `dayu.fins.score_docling_ci`，保持 `source_kind + report_kind` scoring、by_kind 输出、summary 和 overall summary。
+- 文档、processed、blob、snapshot 读取必须走 `dayu.fins.storage` 仓储协议 / 实现。
+- 保持 CN/HK 财报语义在 Fins 层；shared `dayu.documents` 只承载通用 Docling 能力。
+- 保持 CN/HK Docling CI pipeline 为显式入口，不进入普通 deterministic CI。
+
+### 非目标
+
+- 不通过修改 scorer/profile 阈值、权重或 hard gate 刷分。
+- 不把 CN/HK 财报业务语义塞进 Engine 或 shared `dayu.documents`。
+- 不把完整 CN/HK corpus 变成 smoke gate；smoke 由 F07 定义。
+- 不在 CI runner 中复制 CLI / tool process 业务逻辑；CI runner 只能作为批处理调度、日志和汇总外壳。
+- 不在 CN/HK Docling CI runner、scorer 或 adapter 中再造 ticker / market 归一化逻辑。
+
+### 验收信号
+
+- 当前 repo 有可运行的 CN/HK Docling process runner、score runner 和 scorer 入口。
+- CN/HK Docling process runner 的 tests 或实现证据证明它与 CLI / tool process 同源调用 shared Fins service/runtime。
+- Tests 或实现证据证明 CN/HK Docling CI 中的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
+- 能生成 baseline_probe / baseline / iter / final 所需目录和 JSON summary。
+- 缺少 processed / snapshot / score 输入时输出清晰 diagnostic。
+- README / tests README 说明 deterministic tests、CN/HK Docling CI pipeline 和 CN/HK Docling smoke 的职责区别。
+
+## WU-TOOLS-01-F07 CN/HK Docling CI Smoke Generation
+
+### 状态
+
+Pending。该 work unit 是 GitHub Issue #122 的第二步，依赖 WU-TOOLS-01-F06。F06 迁移 pipeline 后，CN/HK Docling 部分的 `WU-TOOLS-01-S1-R1` 仍然存在，因为 pipeline 不等同于稳定 smoke gate。
+
+### 目标
+
+- 基于 F06 迁移后的 CN/HK Docling CI pipeline 选取小而稳定的 smoke corpus。
+- 定义 pass / fail / skip / diagnostic-only 判定规则。
+- 覆盖至少一个 active `filing` 或 `material` 的 process + score 路径；更宽 source_kind / report_kind coverage 可作为 opt-in 子路径。
+- 缺少 workspace corpus、processed snapshot、Docling runtime 或 heavy dependencies 时可稳定 skip，并输出原因。
+- 关闭 `WU-TOOLS-01-S1-R1` 中 CN/HK Docling coverage 部分，或把 remaining gap 转成带 owner 的新 residual。
+
+### 非目标
+
+- 不替代完整 CN/HK Docling CI optimization loop。
+- 不把真实 corpus 偶发问题直接解释为 production regression。
+- 不修改 scorer/profile 规则刷分。
+
+### 验收信号
+
+- 存在显式 CN/HK Docling smoke 入口，默认不进入普通 deterministic CI。
+- smoke 在满足环境时能运行代表性 CN/HK fixture / workspace sample，并输出 pass / fail / diagnostic-only summary。
+- README / tests README 说明 CN/HK Docling pipeline 与 CN/HK Docling smoke 的职责区别。
+
+## WU-TOOLS-01-F08 Documents Processor Registry Naming Cleanup
+
+### 状态
+
+Pending。该 work unit 是 `WU-TOOLS-01-S1-R2` 的明确 owner，用于清理迁移后遗留的 OLD `engine` 命名，不改变 processor registry 行为。
+
+### 动机
+
+`build_engine_processor_registry(...)` 当前位于 `dayu.documents.processors.registry`，实际注册的是通用 documents processor：Docling、Markdown 与 BS。Doc tools 和 Fins 都把它作为 documents 默认 processor registry 使用；它不属于 Engine。迁移期保留旧名是为了遵守 WU-TOOLS-01 的迁移原则，但迁移完成后继续暴露 `engine` 命名会误导 ownership，弱化 `dayu.documents` 作为共享文档基础能力 owner 的边界。
+
+### 目标
+
+- 将 `build_engine_processor_registry(...)` 重命名为 `build_documents_processor_registry(...)` 或 `build_default_processor_registry(...)`。
+- 同步更新 `dayu.documents.processors.__all__`、`dayu.documents.processors._doc_processor_factory`、`dayu.fins.processors.registry`、测试和 README / 文档引用。
+- 保持 processor 注册顺序与行为不变：DoclingProcessor、MarkdownProcessor、BSProcessor 仍按当前优先级注册。
+- 证明 Fins registry 仍先加载 documents 默认 registry，再覆盖注册 Fins 专属 processor。
+
+### 非目标
+
+- 不重构 `ProcessorRegistry` 行为。
+- 不改变 Docling / Markdown / BS / Fins processor 优先级或 fallback 规则。
+- 不新增旧名兼容 re-export、wrapper 或 facade；当前代码和文档必须全量改到新名。
+
+### 验收信号
+
+- `rg "build_engine_processor_registry"` 在生产代码、测试和稳定 README / control doc 中无残留；历史 review artifact 可保留。
+- Documents / Fins processor registry focused tests 证明行为不变。
+- import-boundary tests 与 pyright 通过。
+- 相关 README 只描述新命名和当前 ownership，不保留新旧术语并存。
+
+## WU-TOOLS-01-F09 Fins Upload Ingestion Migration And Upload Tool
+
+### 状态
+
+Pending。该 work unit 是 WU-TOOLS-01 的 post-migration upload follow-up。当前裁决结论：OLD upload 尚未迁移；它原本是 CLI-facing command runtime 语义，不是 OLD upload tool。后续迁移时，upload 不能成为 CLI 私有逻辑，也不能成为 tool adapter 私有逻辑，必须与 read、download、preprocess/process 一样落到 shared Fins service/runtime 底座。
+
+### 动机
+
+F01 已裁决 shared Fins service/runtime 是 read、download、preprocess/process 的共同业务底座，并要求 CLI download 与 tool download 同源。Upload 迁移虽然不纳入 F01，但它的性质也是 ingestion：会接收外部财报文件、写入 Fins storage，并影响后续 read / preprocess / process。若 upload 在未来 CLI 中单独实现，而 upload tool 又另写一套实现，就会重复制造 CLI / tool 逻辑漂移。因此 upload 需要单独 ISSUE 追踪，但必须继承同一个 runtime 底座原则。
+
+Upload 迁移同样继承 ticker / market 归一化唯一真源裁决：所有 upload 参数归一化、market 判断、company id 生成与 ticker alias 规范化都必须调用 `dayu.fins.ticker_normalization`，不得在 upload runtime、CLI adapter 或 upload tool adapter 中复制规则。
+
+### 目标
+
+- 核对 OLD upload command runtime 的输入参数、校验、storage 写入、metadata / ingest method 语义与错误处理，并迁移到 NEW shared Fins service/runtime。
+- 在 shared Fins service/runtime 中提供 upload 业务入口；CLI upload 和 upload ingestion tool 都必须调用该入口。
+- Upload runtime、CLI upload 与 upload ingestion tool 中所有 ticker / market 归一化必须调用 `dayu.fins.ticker_normalization` 的公共 API。
+- 增加独立 Fins upload ingestion tool provider，通过 ToolDiscovery 暴露；不得塞回 `include_ingestion_tools=true` 混合开关。
+- Tool 侧只做当前 Host / ToolRuntime adapter；若 upload 是长事务，必须映射到当前 awaiting、resume、cancel 与 terminal result 语义；若 upload 是短事务，也必须通过当前 tool accept path 与 evidence / trace path 流转。
+- 财报文件写入必须且只能通过 `dayu.fins.storage` 仓储协议与实现完成，不得由 CLI、tool 或 adapter 手拼 workspace 路径。
+- 同步 README 时只描述当前已实现 upload 行为，不把 F01 download/preprocess 范围写成已经覆盖 upload。
+
+### 非目标
+
+- 不在 F01 中迁移 upload；F01 只负责 shared runtime foundation 与 read / download / preprocess provider。
+- 不恢复 OLD ToolRegistry、OLD `file_path_params` path safety、OLD truncation manager 或 OLD `fetch_more`。
+- 不让 CLI upload 和 upload tool 分别实现业务逻辑；业务逻辑必须同源在 shared Fins service/runtime。
+- 不在 upload runtime、CLI adapter 或 tool adapter 中再造 ticker / market 归一化逻辑。
+- 不把 upload 设计成绕过 Fins storage 的文件复制工具。
+- 不迁移旧 UI / FastAPI / Streamlit upload entrypoints，除非后续 owner 明确裁决。
+
+### 验收信号
+
+- Shared Fins service/runtime 有 upload 业务入口，并有 focused tests 覆盖参数校验、storage 写入、metadata、失败路径和重复 / overwrite 语义。
+- CLI-facing upload 与 tool-facing upload 的 tests 或实现证据证明二者调用同一 shared runtime 入口。
+- Tests 或实现证据证明 upload 的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
+- ToolDiscovery 能独立发现 Fins upload ingestion tool provider，不依赖 `include_ingestion_tools=true` 混合开关。
+- Upload tool 结果通过当前 ToolRuntime / Tool Trace / accepted evidence path 流转；如果存在 queued / running 状态，不把未完成任务伪装成 completed result。
+- Fins README、tests README 或相关 package README 说明 upload、download、preprocess、read 的职责边界和 shared runtime 同源原则。
 
 ## WU-PROJ-01 Projection Catch-up Budgeting For Memory Pre-dispatch Path
 
@@ -1053,6 +1379,35 @@ GitHub Issue #70 当前为 OPEN。本条是 Tool Trace observability / debug too
 - 核心解析、聚合逻辑和代表性诊断规则有测试。
 - README 或 usage docs 说明输入、输出和典型命令。
 - WU-OBS-01 能复用本条 analyzer 或其诊断规则，而不是重新实现一套分层归因。
+
+## WU-OBS-00B Usage Observation Projection Correlation Boundary
+
+### 状态
+
+Pending。该 work unit 是 GitHub Issue #119 / #70 analyzer 子项，也是 residual `WU-ENG-02-S3-R1` 的 owner。
+
+### 动机
+
+WU-ENG-02 已完成 provider request identity 的 shared contract，但 Slice 3 review 发现 usage observation projection signal 是否需要 `client_correlation_id` 与 `provider_request_id` 还没有 analyzer 需求证据。当前 `UsageReportedData` 不包含这些字段，Host 也不能从 `iteration_id` 推断 provider request identity。这个问题应由 analyzer 需求确认，而不是在 Host payload 中提前硬塞 correlation 字段。
+
+### 目标
+
+- 在 WU-OBS-00 / #70 analyzer 设计和实现时，确认 usage observation 是否需要展示 client correlation id 或 provider request id。
+- 若 analyzer 需要这些字段，先扩展 Runner usage / Engine `UsageReportedData` producer contract，再补 Host payload projection 和 Tool Trace analyzer tests。
+- 若 analyzer 不需要这些字段，明确关闭 `WU-ENG-02-S3-R1`，记录 usage observation 只作为 post-call observation / analyzer signal。
+- 保持 provider debugging terminal 主链路与 usage observation signal 分离，避免把 provider request identity 从非同源字段推断出来。
+
+### 非目标
+
+- 不在 WU-OBS-00B 中实现完整 Tool Trace analyzer。
+- 不通过 Host 侧 hardcode 或 `iteration_id` 推断 provider request identity。
+- 不修改 WU-ENG-02 已接受的 provider request identity contract。
+
+### 验收信号
+
+- Analyzer plan 或 implementation 明确裁决 usage observation 是否需要 correlation fields。
+- 若需要扩展，Engine producer、Host projection 与 analyzer tests 同步通过。
+- 若不需要扩展，`WU-ENG-02-S3-R1` 从 active residual 表移除或标记 closed，并记录关闭依据。
 
 ## WU-OBS-01 Prompt-based Tool Trace Diagnostics
 

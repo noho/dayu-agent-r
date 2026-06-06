@@ -168,8 +168,15 @@ provider 字段：
 | `source_id` | 来源标识 |
 | `enabled` | 是否启用 provider |
 | `allow_empty` | 是否允许 provider 返回空工具集合 |
+| `config` | provider 自身的层中立 JSON 配置；ConfigLoader 原样读取，不解释 Doc / Fins / Web 语义 |
 
-`import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。
+`import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。`config` 缺省等价空对象；需要业务含义时由对应 provider 自行解析，例如文档路径白名单、财报 workspace root、Web 请求限制等。
+
+包内默认 `financial-tools` provider 指向 `dayu.fins.tools:discover_tools`，默认 `enabled=false`、`allow_empty=true`、`include_read_tools=true`、`include_ingestion_tools=false`，且 `workspace_root=null`。启用 Fins read tools 时必须在 workspace overlay 的 `config.workspace_root` 中提供绝对路径；provider 不从 cwd 或环境变量猜路径。`config.limits` 可覆盖 `processor_cache_max_entries`、`list_documents_max_items`、`get_document_sections_max_items`、`search_document_max_items`、`list_tables_max_items`、`read_section_max_chars`、`get_page_content_max_chars`、`get_table_max_items`、`get_financial_statement_max_items` 与 `query_xbrl_facts_max_items`。当前 provider 不暴露 ingestion tools；显式设置 `include_ingestion_tools=true` 会 fail closed。
+
+包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。启用 Doc tools 时必须在 `config.allowed_paths` 中显式配置可访问文件或目录根；provider 启用但白名单为空时会 fail closed，返回空工具集合，不注册可执行文档工具。Doc provider 的 `config.limits` 可覆盖 `list_files_max`、`get_sections_max`、`search_files_max_results`、`read_file_max_chars` 与 `read_file_section_max_chars`，未配置字段使用 provider 默认值。
+
+包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=false`、`allow_empty=true`，并默认拒绝 private / local network URL。启用 Web tools 时 provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
 
 ## prompts 目录职责
 
