@@ -16,8 +16,8 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.terminal_summary_payload import (
-    PayloadSummaryTextPolicy,
-    assistant_summary_from_payload,
+    PayloadTextReadPolicy,
+    assistant_final_answer_text_from_run_payload,
 )
 
 MemoryPolicyDigest: TypeAlias = str
@@ -1238,7 +1238,9 @@ def project_conversation_memory_event(
     if event.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
         selected = _replace_item_by_id(selected, _selected_user_item(event))
     elif event.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
-        selected = _replace_item_by_id(selected, _selected_assistant_item(event))
+        assistant_item = _selected_assistant_item(event)
+        if assistant_item is not None:
+            selected = _replace_item_by_id(selected, assistant_item)
     elif event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
         evidence_item = _selected_evidence_item(event)
         selected = _replace_item_by_id(selected, evidence_item)
@@ -1611,19 +1613,21 @@ def _selected_user_item(event: MemoryProjectionEvent) -> SelectedRecentWindowIte
     )
 
 
-def _selected_assistant_item(event: MemoryProjectionEvent) -> SelectedRecentWindowItem:
+def _selected_assistant_item(
+    event: MemoryProjectionEvent,
+) -> SelectedRecentWindowItem | None:
     """从 RUN_SUCCEEDED event 构造 selected recent item。
 
     :param event: RUN_SUCCEEDED event。
-    :returns: selected item。
+    :returns: selected item；缺失 final answer continuity 时返回 ``None``。
     """
 
-    text = assistant_summary_from_payload(
+    text = assistant_final_answer_text_from_run_payload(
         event.payload,
-        text_policy=PayloadSummaryTextPolicy.LENIENT_NON_EMPTY,
+        text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
     )
     if text is None:
-        text = _ref_summary_text(event)
+        return None
     return SelectedRecentWindowItem(
         item_id=_item_id(event, "selected_assistant"),
         role=SelectedRecentWindowRole.ASSISTANT,

@@ -58,12 +58,10 @@ from dayu.host.memory import (
     memory_diagnostic_to_json_value,
     project_conversation_memory_event,
 )
-from dayu.host.payload_resolution import (
-    sqlite_payload_object,
-)
+from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.terminal_summary_payload import (
-    PayloadSummaryTextPolicy,
-    assistant_summary_from_payload,
+    PayloadTextReadPolicy,
+    assistant_final_answer_text_from_run_payload,
 )
 from dayu.host.projection import (
     ProjectionApplyResult,
@@ -86,9 +84,7 @@ _ITEM_KIND_SESSION_SUMMARY = "session_summary"
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
-_PAYLOAD_FIELD_CONTENT = "content"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
+_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _EVENT_TYPE_FILTER = (
     _EVENT_TYPE_USER_INPUT_ACCEPTED,
     _EVENT_TYPE_RUN_SUCCEEDED,
@@ -197,7 +193,7 @@ def _memory_projection_event_from_view(
     :returns: memory projection event。
     """
 
-    payload = _payload_with_terminal_summary(transaction, event)
+    payload = _payload_with_assistant_final_answer(transaction, event)
     return MemoryProjectionEvent(
         event_sequence=event.event_sequence,
         event_id=event.event_id,
@@ -214,10 +210,10 @@ def _memory_projection_event_from_view(
     )
 
 
-def _payload_with_terminal_summary(
+def _payload_with_assistant_final_answer(
     transaction: HostTransaction, event: ProjectionEventView
 ) -> Mapping[str, JsonValue]:
-    """必要时把 terminal summary 摘要合并进 RUN_SUCCEEDED payload。
+    """必要时把 assistant final answer 合并进 ``RUN_SUCCEEDED`` transient payload。
 
     :param transaction: Host transaction。
     :param event: projection runner event view。
@@ -228,53 +224,23 @@ def _payload_with_terminal_summary(
     if event.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
         return event.payload
     if (
-        assistant_summary_from_payload(
+        assistant_final_answer_text_from_run_payload(
             event.payload,
-            text_policy=PayloadSummaryTextPolicy.STRICT_ALLOW_EMPTY,
+            text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
         is not None
     ):
         return event.payload
-    terminal_summary_ref = _optional_str(
-        event.payload, _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF
-    )
-    terminal_summary_digest = _optional_str(
-        event.payload, _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST
-    )
-    if terminal_summary_ref is None or terminal_summary_digest is None:
-        return event.payload
-    terminal_summary = sqlite_payload_object(
+    final_answer = assistant_final_answer_continuity_text(
         transaction,
-        payload_ref=terminal_summary_ref,
-        payload_digest=terminal_summary_digest,
-        payload_label="terminal summary",
+        event.payload,
+        text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
     )
-    summary = assistant_summary_from_payload(
-        terminal_summary,
-        text_policy=PayloadSummaryTextPolicy.STRICT_ALLOW_EMPTY,
-    )
-    if summary is None:
+    if final_answer is None:
         return event.payload
     merged: dict[str, JsonValue] = dict(event.payload)
-    merged[_PAYLOAD_FIELD_CONTENT] = summary
+    merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
     return merged
-
-
-def _optional_str(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
-    """读取可选字符串字段。
-
-    :param payload: JSON payload mapping。
-    :param field_name: 字段名。
-    :returns: 字段缺失或为 ``None`` 时返回 ``None``。
-    :raises HostDurableError: 字段存在但不是字符串时抛出。
-    """
-
-    value = payload.get(field_name)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise HostDurableError(f"{field_name} must be string")
-    return value
 
 
 @dataclass(frozen=True, slots=True)

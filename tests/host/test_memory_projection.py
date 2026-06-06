@@ -26,8 +26,14 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import (
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+)
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.schema import TABLE_HOST_MEMORY_ITEMS
+from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
@@ -255,7 +261,7 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
     snapshot = build_conversation_memory_snapshot_from_events(
         events=(
             _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "请分析收入。"}),
-            _event(2, "run-1", "RUN_SUCCEEDED", {"display_text": "收入同比增长。"}),
+            _event(2, "run-1", "RUN_SUCCEEDED", {"final_answer": "收入同比增长。"}),
             _event(
                 3,
                 "tool-1",
@@ -312,6 +318,128 @@ def test_accepted_compact_materializes_vnext_memory_sections() -> None:
     assert snapshot.trace_memory.reference_continuity_items[0].reason == (
         "pronoun_resolution"
     )
+
+
+def test_run_succeeded_summary_only_does_not_materialize_assistant_window() -> None:
+    """只有 summary_text 或 nested summary 时不生成 assistant selected recent item。"""
+
+    policy = _policy()
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "run-summary-only",
+                "RUN_SUCCEEDED",
+                {
+                    "summary_text": "摘要不应进入 assistant final answer",
+                    "summary": {"summary_text": "nested 摘要也不应进入"},
+                },
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.trace_memory.selected_recent_window == ()
+    assert snapshot.session_summary_memory.summary_text is None
+
+
+def test_run_succeeded_payload_refs_do_not_materialize_assistant_window() -> None:
+    """缺失 final answer 时不把 ref / digest / event id 投影给 assistant window。"""
+
+    policy = _policy()
+    event = _event(1, "run-ref-only", "RUN_SUCCEEDED", {})
+    event = replace(event, payload_ref="payload-run", payload_digest="sha256:digest")
+
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(event,),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.trace_memory.selected_recent_window == ()
+
+
+def test_projection_consumer_hydrates_terminal_content_as_final_answer(
+    tmp_path: Path,
+) -> None:
+    """durable projection 只把 digest-checked terminal content 合并为 final_answer。"""
+
+    policy = _policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def append_run_succeeded(transaction: HostTransaction) -> None:
+            """写入 terminal artifact 与仅含 descriptor 的 RUN_SUCCEEDED。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            descriptor = PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-terminal-final-answer",
+                    payload_id="sqlite-terminal-final-answer",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={
+                        "content": "artifact final answer",
+                        "summary_text": "artifact summary",
+                    },
+                ),
+            )
+            append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="run-terminal-content",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=_SESSION_ID,
+                    run_id=_RUN_ID,
+                    attempt_id=_ATTEMPT_ID,
+                    execution_id=_EXECUTION_ID,
+                    event_type="RUN_SUCCEEDED",
+                    occurred_at=_OCCURRED_AT,
+                    actor="pytest",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "final_answer": " ",
+                        "content": "裸 content 不应进入 assistant window",
+                        "summary_text": "run summary 不应进入 assistant window",
+                        "terminal_summary_ref": descriptor.payload_ref,
+                        "terminal_summary_digest": descriptor.payload_digest,
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+
+        store.transaction_runner.run_write(append_run_succeeded)
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        policy_digest = digest_memory_projection_policy(policy)
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=policy_digest,
+            )
+        )
+
+        assert latest is not None
+        assert latest.snapshot.trace_memory.selected_recent_window[0].text == (
+            "artifact final answer"
+        )
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:

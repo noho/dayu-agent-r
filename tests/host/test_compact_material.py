@@ -391,6 +391,51 @@ def test_conversation_compact_input_vnext_maps_assistant_turn_to_answer() -> Non
     assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
 
 
+def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer() -> None:
+    """Session summary material 不得映射为 assistant answer_material。"""
+
+    session_summary_block = run_input_material_block(
+        block_id="memory:session-summary",
+        section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+        kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+        text="summary text is navigation only",
+        canonical_source_refs=("event-compact",),
+        event_sequence=1,
+    )
+    answer_block = run_input_material_block(
+        block_id="history:assistant-answer",
+        section=CompactMaterialSection.ANSWER_MATERIAL,
+        kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+        text="assistant final answer",
+        canonical_source_refs=("event-run-succeeded",),
+        event_sequence=2,
+    )
+    pack = build_compact_material_pack(
+        selected_segment=select_compact_segment(
+            trigger_source=CompactSegmentTrigger.REACTIVE,
+            input_cursor=3,
+            memory_snapshot_cursor=None,
+            policy_digest=_POLICY_DIGEST,
+            material_blocks=(session_summary_block, answer_block),
+        ),
+        material_blocks=(session_summary_block, answer_block),
+        memory_snapshot=None,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    assert tuple(item.answer_text for item in vnext_input.answer_material) == (
+        "assistant final answer",
+    )
+    assert all(
+        item.answer_text != "summary text is navigation only"
+        for item in vnext_input.answer_material
+    )
+
+
 def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -> None:
     """vNext material 映射必须把 accepted evidence 放入 evidence_material。"""
 
