@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted deepreview commit |
-| implementation status | WU-CM-01-F04 aggregate deepreview completed; AgentMiMo pass, AgentDS pass-with-findings with 0 blocking; controller accepted no code/document fixes; full dispatch scheduler file passed, pyright 0 errors |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-CM-01-F04 accepted deepreview commit `6faff867`; ready to open draft PR |
 | active work unit | WU-CM-01-F04 |
 | default next work unit | WU-TOOLS-01-F01 |
-| next entry point | Accepted deepreview commit for WU-CM-01-F04; after closeout return to WU-TOOLS-01-F01 by default |
+| next entry point | Draft PR gate for WU-CM-01-F04; after closeout return to WU-TOOLS-01-F01 by default |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
