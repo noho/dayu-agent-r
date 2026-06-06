@@ -2,9 +2,9 @@
 
 ## 结论
 
-WU-TOOLS-01 本地 final closeout 通过。Fins / Web / Doc tools migration with shared document foundations 的 S1-S6 与 external blocker reconciliation 已接受；当前没有无 owner / destination 的 open residual risk。
+WU-TOOLS-01 draft PR gate 已打开，PR 为 https://github.com/noho/dayu-agent-r/pull/123。Fins / Web / Doc tools migration with shared document foundations 的 S1-S6 与 external blocker reconciliation 已接受；当前没有无 owner / destination 的 open residual risk。
 
-本 closeout 不声明 GitHub PR gate 已通过，也不关闭 GitHub Issue #82 / #97 / #98。当前分支仍需按用户授权进入 draft PR gate。PR merge 后，默认后续入口是 WU-TOOLS-01-F01；若用户优先恢复 broad Host validation，则先进入 WU-CM-01-F04。
+按流程，final closeout 不在 draft PR 之前完成。本 artifact 只记录 PR gate opened 与 final closeout 前置条件，不声明 GitHub PR review / merge gate 已通过，也不关闭 GitHub Issue #82 / #97 / #98。PR review / merge gate 完成后，默认后续入口是 WU-TOOLS-01-F01；若用户优先恢复 broad Host validation，则先进入 WU-CM-01-F04。
 
 GitHub issue status comments:
 
@@ -15,7 +15,8 @@ GitHub issue status comments:
 ## Scope
 
 - Work unit：WU-TOOLS-01。
-- 状态：local final closeout / PR-ready closeout。
+- 状态：draft PR opened / final closeout pending PR review and merge gate。
+- Draft PR：https://github.com/noho/dayu-agent-r/pull/123。
 - 设计真源：`docs/host/design.md`、`docs/engine/design.md`。
 - 总控真源：`docs/host/issues-implementation-control.md`。
 
@@ -63,14 +64,14 @@ For all Fins ingestion follow-ups, ticker / market normalization must call `dayu
 
 ## Validation Status
 
-The accepted slice artifacts record focused test and pyright validation. This closeout step made documentation-only control updates; no production code, test code, schema or README behavior changed.
+The accepted slice artifacts record focused test and pyright validation. This PR-gate status update made documentation-only control updates; no production code, test code, schema or README behavior changed.
 
-Final local checks for this closeout must verify:
+Local checks for this PR-gate status update verify:
 
 - `git diff --check` passes.
 - Residual risk table has no `open` item without owner / destination.
-- WU-TOOLS-01 row and current status point to PR-ready closeout and executable follow-up entry points.
+- WU-TOOLS-01 row and current status point to draft PR #123 and executable follow-up entry points.
 
 ## Next Entry Point
 
-Open the WU-TOOLS-01 draft PR from branch `phaseflow/wu-tools-01` with deferred residuals tracked in the control doc and GitHub Issues #119-#122. After PR merge, enter WU-TOOLS-01-F01 by default. If broad Host validation must be restored before tool follow-ups, enter WU-CM-01-F04 first.
+Run the WU-TOOLS-01 draft PR review gate for https://github.com/noho/dayu-agent-r/pull/123 with deferred residuals tracked in the control doc and GitHub Issues #119-#122. After PR merge, enter WU-TOOLS-01-F01 by default. If broad Host validation must be restored before tool follow-ups, enter WU-CM-01-F04 first.

@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final closeout / ready-to-open-draft-PR |
-| implementation status | WU-TOOLS-01 local final closeout passed; S1-S6 and external blocker reconciliation accepted; all residual risks have owner / destination |
+| gate | draft PR opened / final closeout pending PR gate |
+| implementation status | WU-TOOLS-01 draft PR #123 opened; S1-S6 and external blocker reconciliation accepted; all residual risks have owner / destination; final closeout waits for PR review / merge gate |
 | active work unit | WU-TOOLS-01 |
 | default next work unit | WU-TOOLS-01-F01 |
-| next entry point | Open WU-TOOLS-01 draft PR from `phaseflow/wu-tools-01`; after PR merge enter WU-TOOLS-01-F01 by default, or enter WU-CM-01-F04 first if broad Host validation must be restored before tool follow-ups |
+| next entry point | Run WU-TOOLS-01 draft PR review gate for https://github.com/noho/dayu-agent-r/pull/123; after PR merge enter WU-TOOLS-01-F01 by default, or enter WU-CM-01-F04 first if broad Host validation must be restored before tool follow-ups |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
@@ -215,7 +215,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-02 | closed | working_assumptions 生产者语义 | GitHub Issue #81 / WU-CM-01 | 已裁决；reject 旧 `working_assumptions` 独立语义，不单独实施，删除 / 迁移旧字段由 WU-CM-01 schema / projection slice 承接 |
 | WU-CM-03 | closed | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
 | WU-CM-04 | closed | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
-| WU-TOOLS-01 | final-closeout-pr-ready | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98 | Accepted plan commit f6658fb4；Slices S1-S6 and external blocker reconciliation accepted；all active residual risks have owner / destination；ready for draft PR from `phaseflow/wu-tools-01` |
+| WU-TOOLS-01 | draft-pr-open-final-closeout-pending | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98；draft PR #123 | Accepted plan commit f6658fb4；Slices S1-S6 and external blocker reconciliation accepted；all active residual risks have owner / destination；draft PR opened at https://github.com/noho/dayu-agent-r/pull/123；final closeout waits for PR review / merge gate |
 | WU-TOOLS-01-F01 | pending | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed | Build the shared Fins ingestion service/runtime first, then expose independent download and preprocess tool providers through current `ToolAwaitingOutcome` / wait-resume contract; owner for residual `WU-TOOLS-01-S4-R1` |
 | WU-TOOLS-01-F02 | pending | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up | First step of Web CI diagnostics pipeline: migrate OLD `web_ci_urls.jsonl`, `diag_web.sh`, `diag_web_batch.sh` and `utils/diagnose_web_access.py`; does not close `WU-TOOLS-01-S5-R2` by itself |
 | WU-TOOLS-01-F03 | pending | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | Generate explicit opt-in Web smoke from the migrated web CI diagnostics pipeline; defines pass / skip / diagnostic criteria and is the closing owner for residual `WU-TOOLS-01-S5-R2` |
