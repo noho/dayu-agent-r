@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass / final closeout passed |
-| implementation status | WU-TOOLS-01 draft PR #123 review and re-review passed; S1-S6 and external blocker reconciliation accepted; all residual risks have owner / destination; ready for user merge decision |
-| active work unit | WU-TOOLS-01 |
+| gate | draft-PR-pass |
+| implementation status | WU-CM-01-F04 draft PR opened at https://github.com/noho/dayu-agent-r/pull/124; PR review gate passed with 0 blocking findings |
+| active work unit | WU-CM-01-F04 |
 | default next work unit | WU-TOOLS-01-F01 |
-| next entry point | User merge decision for https://github.com/noho/dayu-agent-r/pull/123; after PR merge enter WU-TOOLS-01-F01 by default, or enter WU-CM-01-F04 first if broad Host validation must be restored before tool follow-ups |
+| next entry point | WU-CM-01-F04 closeout complete; return to WU-TOOLS-01-F01 by default |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
@@ -541,7 +541,7 @@ GitHub Issue #81 / WU-CM-01 final closeout follow-up。WU-CM-01 已落地 Conver
 
 ### 状态
 
-Pending。该 work unit 是 `WU-TOOLS-01-S6-R1` 的明确 owner，用于修复 WU-CM-01 后遗留的 Host proactive scheduler test seam，不改变生产 compact fail-closed contract。
+Draft PR pass。PR 124 已打开并完成 PR review gate：MiMo PASS，DS draft-PR-pass，0 blocking findings。DS low maintainability finding（`_RequestCapturingCompactor` 为空语义别名）裁决为后续 cleanup，不影响 correctness；全量 `tests/host/test_dispatch_scheduler.py` 与 pyright 均已通过。
 
 ### 动机
 

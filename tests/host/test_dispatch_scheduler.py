@@ -22,9 +22,10 @@ from dayu.engine.contracts.engine_events import (
     EngineEventType,
     FinalAnswerData,
     RunFailedData,
+    runner_role_sequence_digest,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
+from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, SystemMessage, UserMessage
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -58,6 +59,8 @@ from dayu.host.compaction import (
     ContextCompactor,
     ConversationCompactOutputVNext,
 )
+from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
+from dayu.host.compaction_operation import CompactorProposalRunInput
 from dayu.host.context_budget import ContextBudgetDecision
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
@@ -181,6 +184,7 @@ _SOFT_SAFETY_MARGIN_RATIO = 0.5
 _REPEATED_OVERFLOW_SYNC_TIMEOUT_SECONDS = 2.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _EVENT_LOG_TEST_READ_LIMIT = 200
+_RUNNER_CALL_MANIFEST_REF_PREFIX = "runner-call-manifest:"
 _ATTEMPT_TERMINAL_STATUSES = (
     AttemptStatus.SUCCEEDED,
     AttemptStatus.FAILED,
@@ -400,7 +404,102 @@ class _CrashingHandle(_FakeHandle):
             yield _unreachable_engine_event()
 
 
-class _TransactionReadableCompactor(FakeContextCompactor):
+class _PreparedManifestProactiveCompactor(FakeContextCompactor):
+    """支持 prepared proposal manifest 的 proactive 测试 compactor。"""
+
+    def __init__(self, *, fail_run: bool = False) -> None:
+        """初始化 prepared compactor。
+
+        :param fail_run: 是否在 proposal run 阶段抛出测试异常。
+        :returns: ``None``。
+        """
+
+        self.fail_run = fail_run
+        self.calls = 0
+        self.prepared_requests: list[CompactionRequest] = []
+        self._prepared_request: CompactionRequest | None = None
+
+    def prepare_compactor_proposal_run_input(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        compaction_operation_id: str | None,
+        compaction_attempt_number: int,
+    ) -> CompactorProposalRunInput:
+        """构造可持久化 manifest 的 deterministic proposal runner input。
+
+        :param request: Host 构造的 compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :param compaction_operation_id: Host compaction operation id。
+        :param compaction_attempt_number: operation 内 proposal attempt 序号。
+        :returns: prepared proposal runner input。
+        """
+
+        self.prepared_requests.append(request)
+        self._prepared_request = request
+        compact_input = conversation_compact_input_vnext_from_material_pack(
+            request.material_pack
+        )
+        agent_request = _proposal_compactor_agent_request(
+            request,
+            cancellation_token=cancellation_token,
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+        )
+        roles = tuple(message.role.value for message in agent_request.messages)
+        projection: Mapping[str, JsonValue] = {
+            "projection_kind": "proactive_compactor_input_projection",
+            "compaction_request_digest": request.digest(),
+        }
+        return CompactorProposalRunInput(
+            compact_input=compact_input,
+            agent_request=agent_request,
+            compaction_request_digest=request.digest(),
+            compactor_engine_run_id=agent_request.run_id,
+            message_count=len(agent_request.messages),
+            role_sequence_digest=runner_role_sequence_digest(roles),
+            system_prompt_asset_digest=_CALL_CONTEXT_DIGEST,
+            user_prompt_template_digest=_CALL_CONTEXT_DIGEST,
+            user_prompt_digest=sha256_digest_json({"user_prompt": "proactive"}),
+            compactor_input_projection=projection,
+            compactor_input_projection_digest=sha256_digest_json(projection),
+        )
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """执行 prepared proposal。
+
+        :param prepared_input: 已准备且可记录 manifest 的 proposal input。
+        :returns: fake compact candidate。
+        :raises RuntimeError: ``fail_run`` 为真时抛出。
+        :raises AssertionError: prepared request 缺失时抛出。
+        """
+
+        self.calls += 1
+        if self.fail_run:
+            raise RuntimeError("prepared proposal failed")
+        return await super().compact(
+            self._latest_prepared_request(),
+            prepared_input.agent_request.cancellation_token,
+        )
+
+    def _latest_prepared_request(self) -> CompactionRequest:
+        """读取最近一次 frozen compaction request。
+
+        :returns: 最近一次 prepared request。
+        :raises AssertionError: request 尚未准备时抛出。
+        """
+
+        request = self._prepared_request
+        if request is None:
+            raise AssertionError("prepared request is missing")
+        return request
+
+
+class _TransactionReadableCompactor(_PreparedManifestProactiveCompactor):
     """测试 compactor 调用期可开启独立读事务。"""
 
     def __init__(self, transaction_runner: HostTransactionRunner) -> None:
@@ -410,24 +509,23 @@ class _TransactionReadableCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self._transaction_runner = transaction_runner
-        self.calls = 0
-        self._fake = FakeContextCompactor()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
     ) -> ConversationCompactOutputVNext:
-        """执行 compact 并验证当前不在外层 write transaction 内。
+        """执行 prepared proposal 并验证当前不在外层 write transaction 内。
 
-        :param request: compaction request。
-        :param cancellation_token: Host 注入的取消 token。
+        :param prepared_input: 已准备且可记录 manifest 的 proposal input。
         :returns: fake compaction candidate。
         """
 
-        self.calls += 1
+        request = self._latest_prepared_request()
         row = self._transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, request.run_id))
         assert row is not None
-        return await self._fake.compact(request, cancellation_token)
+        return await super().run_prepared_compactor_proposal(prepared_input)
 
 
 class _StaleMutatingCompactor(FakeContextCompactor):
@@ -476,26 +574,19 @@ class _StaleMutatingCompactor(FakeContextCompactor):
         return await self._fake.compact(request, cancellation_token)
 
 
-class _RaisingCompactor(FakeContextCompactor):
-    """测试用始终失败 compactor。"""
+class _RaisingCompactor(_PreparedManifestProactiveCompactor):
+    """测试用 prepared proposal run 始终失败 compactor。"""
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
-        """模拟 proposal failure。
+    def __init__(self) -> None:
+        """初始化 prepared failure compactor。
 
-        :param request: compaction request。
-        :param cancellation_token: Host 注入的取消 token。
-        :returns: 不会返回。
-        :raises RuntimeError: 始终抛出测试错误。
+        :returns: ``None``。
         """
 
-        del request
-        del cancellation_token
-        raise RuntimeError("proposal failed")
+        super().__init__(fail_run=True)
 
 
-class _QualityRejectOnceCompactor(FakeContextCompactor):
+class _QualityRejectOnceCompactor(_PreparedManifestProactiveCompactor):
     """首次返回 quality rejection，第二次返回 accepted candidate。"""
 
     def __init__(self) -> None:
@@ -504,21 +595,19 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
-        self.calls = 0
-        self._fake = FakeContextCompactor()
+        super().__init__()
 
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
     ) -> ConversationCompactOutputVNext:
         """构造一次可修复 quality rejection。
 
-        :param request: compaction request。
-        :param cancellation_token: Host 注入的取消 token。
+        :param prepared_input: 已准备且可记录 manifest 的 proposal input。
         :returns: compaction candidate。
         """
 
-        self.calls += 1
-        candidate = await self._fake.compact(request, cancellation_token)
+        candidate = await super().run_prepared_compactor_proposal(prepared_input)
         if self.calls == 1:
             return replace(
                 candidate,
@@ -533,30 +622,8 @@ class _QualityRejectOnceCompactor(FakeContextCompactor):
         return candidate
 
 
-class _RequestCapturingCompactor(FakeContextCompactor):
+class _RequestCapturingCompactor(_PreparedManifestProactiveCompactor):
     """记录 proactive compaction request 的测试 compactor。"""
-
-    def __init__(self) -> None:
-        """初始化 request recorder。
-
-        :returns: ``None``。
-        """
-
-        self.requests: list[CompactionRequest] = []
-        self._fake = FakeContextCompactor()
-
-    async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
-        """记录 request 并返回 fake candidate。
-
-        :param request: compaction request。
-        :param cancellation_token: Host 注入的取消 token。
-        :returns: fake compaction candidate。
-        """
-
-        self.requests.append(request)
-        return await self._fake.compact(request, cancellation_token)
 
 
 class _CloseFailingHandle(_FakeHandle):
@@ -3627,18 +3694,26 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
             store,
             _FakeWorkerFactory(),
             context_budget_policy=_soft_compact_policy(),
-            context_compactor=FakeContextCompactor(),
+            context_compactor=_PreparedManifestProactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
             event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
+            compacted_payload = _event_payload(
+                _latest_event_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+            )
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
             assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < event_types.index(CONTEXT_COMPACTED)
             assert event_types.index(CONTEXT_COMPACTED) < event_types.index("RUN_STARTED")
             assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
+            _assert_accepted_payload_has_proposal_manifest(compacted_payload)
         finally:
             await scheduler.close()
 
@@ -3710,13 +3785,22 @@ async def test_proactive_compaction_uses_selected_material_not_session_start_ran
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
 
-            assert len(compactor.requests) == 1
-            request = compactor.requests[0]
+            assert len(compactor.prepared_requests) == 1
+            request = compactor.prepared_requests[0]
             assert request.segment_selection.input_cursor == (
                 _run_input_sequence(store.transaction_runner, seeded.run_id)
             )
             assert request.material_source_refs == (f"event-input-{seeded.run_id}",)
             assert request.segment_selection.selected_block_ids == ()
+            _assert_accepted_payload_has_proposal_manifest(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTED,
+                    )
+                )
+            )
         finally:
             await scheduler.close()
 
@@ -3745,10 +3829,19 @@ async def test_proactive_material_pack_not_larger_than_ordinary_material_for_sam
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
 
-            request = compactor.requests[0]
+            request = compactor.prepared_requests[0]
             ordinary_chars = len(_soft_threshold_prompt())
             pack_chars = len(str(request.llm_material_json()))
             assert pack_chars <= ordinary_chars + 512
+            _assert_accepted_payload_has_proposal_manifest(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTED,
+                    )
+                )
+            )
         finally:
             await scheduler.close()
 
@@ -3770,7 +3863,7 @@ async def test_wake_queue_promotion_uses_tracked_async_promotion_task(
             store,
             _FakeWorkerFactory(),
             context_budget_policy=_soft_compact_policy(),
-            context_compactor=FakeContextCompactor(),
+            context_compactor=_PreparedManifestProactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
         try:
@@ -3784,6 +3877,15 @@ async def test_wake_queue_promotion_uses_tracked_async_promotion_task(
             assert scheduler._promotion_drain_task is not None
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
             assert CONTEXT_COMPACTED in _event_types_for_run(store.transaction_runner, seeded.run_id)
+            _assert_accepted_payload_has_proposal_manifest(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTED,
+                    )
+                )
+            )
         finally:
             await scheduler.close()
 
@@ -3912,6 +4014,15 @@ async def test_proactive_compaction_calls_llm_outside_write_transaction(
 
             assert compactor.calls == 1
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            _assert_accepted_payload_has_proposal_manifest(
+                _event_payload(
+                    _latest_event_for_run(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTED,
+                    )
+                )
+            )
         finally:
             await scheduler.close()
 
@@ -4007,7 +4118,17 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
                 seeded.run_id,
                 CONTEXT_COMPACTION_ATTEMPT_REJECTED,
             )
-            assert _event_payload(rejected)["failure_category"] == ("quality_check_rejected")
+            rejected_payload = _event_payload(rejected)
+            compacted_payload = _event_payload(
+                _latest_event_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+            )
+            assert rejected_payload["failure_category"] == ("quality_check_rejected")
+            _assert_rejected_payload_has_proposal_manifest(rejected_payload)
+            _assert_accepted_payload_has_proposal_manifest(compacted_payload)
         finally:
             await scheduler.close()
 
@@ -4057,12 +4178,22 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                 seeded.run_id,
                 CONTEXT_COMPACTION_ATTEMPT_REJECTED,
             )
+            rejected_rows = _events_for_run_by_type(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            )
             failed = _latest_event_for_run(
                 store.transaction_runner,
                 seeded.run_id,
                 CONTEXT_COMPACTION_FAILED,
             )
             assert _event_payload(rejected)["operation_id"] == requested.event_id
+            assert len(rejected_rows) == 2
+            for rejected_row in rejected_rows:
+                _assert_rejected_payload_has_proposal_manifest(
+                    _event_payload(rejected_row)
+                )
             payload = _event_payload(failed)
             assert payload["operation_id"] == requested.event_id
             assert payload["attempt_count"] == 2
@@ -4266,7 +4397,7 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
             store,
             factory,
             context_budget_policy=_soft_compact_policy(),
-            context_compactor=FakeContextCompactor(),
+            context_compactor=_PreparedManifestProactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
         try:
@@ -4320,6 +4451,7 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
             assert compacted_payload["accepted_attempt_number"] == 1
             assert compacted_payload["compact_artifact_ref"] != ""
             assert compacted_payload["accepted_candidate_digest"] != ""
+            _assert_accepted_payload_has_proposal_manifest(compacted_payload)
         finally:
             await scheduler.close()
 
@@ -4727,6 +4859,49 @@ def _runner_spec() -> RunnerSpec:
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
+    )
+
+
+def _proposal_compactor_agent_request(
+    request: CompactionRequest,
+    *,
+    cancellation_token: CancellationToken,
+    compaction_operation_id: str | None,
+    compaction_attempt_number: int,
+) -> AgentRunRequest:
+    """构造 proactive compactor proposal 的 deterministic AgentRunRequest。
+
+    :param request: Host 构造的 compaction request。
+    :param cancellation_token: Host 注入 compactor 的真实取消 token。
+    :param compaction_operation_id: Host compaction operation id。
+    :param compaction_attempt_number: operation 内 proposal attempt 序号。
+    :returns: proposal runner request。
+    """
+
+    return AgentRunRequest(
+        run_id=(
+            f"compactor-run:{request.run_id}:"
+            f"{compaction_operation_id}:{compaction_attempt_number}"
+        ),
+        session_id="context-compactor:test",
+        attempt_id=None,
+        execution_id=None,
+        messages=(
+            SystemMessage(role=AgentMessageRole.SYSTEM, content="system"),
+            UserMessage(role=AgentMessageRole.USER, content="proactive user"),
+        ),
+        disable_tools=True,
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=_agent_policy(False),
+        tool_schemas=(),
+        tool_executor=NoToolExecutor(),
+        cancellation_token=cancellation_token,
     )
 
 
@@ -5489,6 +5664,34 @@ def _latest_event_for_run(transaction_runner: HostTransactionRunner, run_id: str
     return transaction_runner.run_read(_operation)
 
 
+def _events_for_run_by_type(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+    event_type: str,
+) -> tuple[EventLogRow, ...]:
+    """按 Run 读取指定类型的全部 EventLog row。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :param event_type: event type。
+    :returns: 匹配的 EventLog row 元组。
+    """
+
+    def _operation(transaction: HostTransaction) -> tuple[EventLogRow, ...]:
+        rows = EventLogStore().read_events_after(
+            transaction,
+            0,
+            limit=_EVENT_LOG_TEST_READ_LIMIT,
+        )
+        return tuple(
+            row
+            for row in rows
+            if row.run_id == run_id and row.event_type == event_type
+        )
+
+    return transaction_runner.run_read(_operation)
+
+
 def _event_payload(row: EventLogRow) -> Mapping[str, JsonValue]:
     """解析 EventLog row payload。
 
@@ -5499,6 +5702,42 @@ def _event_payload(row: EventLogRow) -> Mapping[str, JsonValue]:
     value = cast(JsonValue, json.loads(row.payload_json))
     assert isinstance(value, Mapping)
     return cast(Mapping[str, JsonValue], value)
+
+
+def _assert_accepted_payload_has_proposal_manifest(
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """断言 accepted compact payload 携带 proposal manifest 引用。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: ``None``。
+    :raises AssertionError: manifest ref 或 digest 缺失时抛出。
+    """
+
+    manifest_ref = payload["accepted_proposal_manifest_ref"]
+    manifest_digest = payload["accepted_proposal_manifest_digest"]
+    assert isinstance(manifest_ref, str)
+    assert manifest_ref.startswith(_RUNNER_CALL_MANIFEST_REF_PREFIX)
+    assert isinstance(manifest_digest, str)
+    assert manifest_digest != ""
+
+
+def _assert_rejected_payload_has_proposal_manifest(
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """断言 rejected compact attempt payload 携带 proposal manifest 引用。
+
+    :param payload: ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` payload。
+    :returns: ``None``。
+    :raises AssertionError: manifest ref 或 digest 缺失时抛出。
+    """
+
+    manifest_ref = payload["proposal_manifest_ref"]
+    manifest_digest = payload["proposal_manifest_digest"]
+    assert isinstance(manifest_ref, str)
+    assert manifest_ref.startswith(_RUNNER_CALL_MANIFEST_REF_PREFIX)
+    assert isinstance(manifest_digest, str)
+    assert manifest_digest != ""
 
 
 async def _wait_for_run_status(
