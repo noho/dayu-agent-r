@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass / final closeout passed |
-| implementation status | WU-TOOLS-01 draft PR #123 review and re-review passed; S1-S6 and external blocker reconciliation accepted; all residual risks have owner / destination; ready for user merge decision |
-| active work unit | WU-TOOLS-01 |
+| gate | accepted plan commit |
+| implementation status | WU-CM-01-F04 plan accepted; plan artifact `docs/host/wu-cm-01-f04-proactive-compaction-manifest-test-seam-plan.md`; plan review / fix / re-review artifacts in `docs/reviews/`; AgentMiMo and AgentDS re-review passed with 0 unfixed / partial findings |
+| active work unit | WU-CM-01-F04 |
 | default next work unit | WU-TOOLS-01-F01 |
-| next entry point | User merge decision for https://github.com/noho/dayu-agent-r/pull/123; after PR merge enter WU-TOOLS-01-F01 by default, or enter WU-CM-01-F04 first if broad Host validation must be restored before tool follow-ups |
+| next entry point | Accepted plan commit for WU-CM-01-F04, then implementation gate; after closeout return to WU-TOOLS-01-F01 by default |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
