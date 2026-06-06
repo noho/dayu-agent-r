@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | push |
-| implementation status | WU-CM-01-F04 completed in local commit `7a5b258c`; WU-CM-01-F03 accepted plan commit `d5a71f75`; WU-CM-01-F03 accepted implementation slice commit `a319edc8`; WU-CM-01-F03 accepted deepreview commit `d3d2119b`; draft PR readiness passed |
+| gate | PR review |
+| implementation status | WU-CM-01-F04 completed in local commit `7a5b258c`; WU-CM-01-F03 accepted plan commit `d5a71f75`; WU-CM-01-F03 accepted implementation slice commit `a319edc8`; WU-CM-01-F03 accepted deepreview commit `d3d2119b`; draft PR 125 created |
 | active work unit | WU-CM-01-F03 |
 | default next work unit | WU-CM-01-F03 |
-| next entry point | Push `phaseflow/wu-cm-01-f04-closeout`, then create one draft PR containing WU-CM-01-F04 closeout and WU-CM-01-F03 |
+| next entry point | WU-CM-01-F03 PR review gate: AgentMiMo and AgentDS review draft PR 125 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
@@ -209,7 +209,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-01 | final-closeout-follow-up | Conversation Memory overall optimization | GitHub Issue #81 | #81 umbrella 的正式 implementation entry point |
 | WU-CM-01-F01 | completed | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | S7-R1 S1 one-system-message production assembly accepted; final public-path validation passed |
 | WU-CM-01-F02 | completed | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | Slice 5 compact evidence query readability, Slice 6 prompt semantic rewrite, and S6-R1 production compact instruction contract rescope are accepted |
-| WU-CM-01-F03 | draft-pr-ready | Assistant final answer continuity fidelity closeout | GitHub Issue #81 / WU-CM-01 final closeout | Accepted implementation slice commit `a319edc8`; accepted deepreview commit `d3d2119b`; readiness artifact `docs/reviews/wu-cm-01-f03-draft-pr-readiness-controller.md`; next gate push / draft PR |
+| WU-CM-01-F03 | draft-pr-open | Assistant final answer continuity fidelity closeout | GitHub Issue #81 / WU-CM-01 final closeout | Draft PR 125: `https://github.com/noho/dayu-agent-r/pull/125`; accepted implementation slice commit `a319edc8`; accepted deepreview commit `d3d2119b`; next gate PR review |
 | WU-CM-01-F04 | completed | Proactive compaction manifest-producing test seam closeout | GitHub Issue #81 / WU-CM-01 final closeout; unblocks WU-TOOLS-01 broad Host validation | PR 124 merged with merge commit `38bf01b05a26a8f7a6a8f8959abd15f6c8d26d13`; final closeout artifact `docs/reviews/wu-cm-01-f04-final-closeout-controller.md`; residual `WU-TOOLS-01-S6-R1` closed and removed from active table |
 | WU-CM-02 | closed | working_assumptions 生产者语义 | GitHub Issue #81 / WU-CM-01 | 已裁决；reject 旧 `working_assumptions` 独立语义，不单独实施，删除 / 迁移旧字段由 WU-CM-01 schema / projection slice 承接 |
 | WU-CM-03 | closed | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
