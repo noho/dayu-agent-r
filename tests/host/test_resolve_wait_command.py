@@ -143,8 +143,11 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
         )
         assert any(
             isinstance(message.content, str)
-            and "Accepted wait result fact:" in message.content
-            and seeded.wait_id in message.content
+            and "A previous interrupted step has an accepted wait result."
+            in message.content
+            and "tool_name=long_tool" in message.content
+            and "resolution_kind=completed" in message.content
+            and '"answer":42' in message.content
             for message in request_for_resume.messages
         )
     finally:

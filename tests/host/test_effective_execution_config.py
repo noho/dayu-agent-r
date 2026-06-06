@@ -239,7 +239,13 @@ async def test_field_level_partial_merge_uses_baseline_for_omitted_fields(
     assert request.runner_options == override_options
     assert request.agent_policy.max_iterations == 2
     assert request.messages[0].role == AgentMessageRole.SYSTEM
-    assert request.messages[0].content == "system slice3"
+    assert "## Task Instructions\nsystem slice3" in request.messages[0].content
+    assert "## Execution Guidance" in request.messages[0].content
+    assert (
+        "Use the available context and tools under the current run limits."
+        in request.messages[0].content
+    )
+    assert "Tools are disabled for this runner call." in request.messages[0].content
 
 
 def test_effective_execution_snapshot_rejects_corrupted_json_with_durable_error() -> None:
@@ -412,7 +418,17 @@ async def test_descriptor_payload_dispatch_uses_per_run_override(
     assert resolved_payload["user_prompt"] == large_prompt
     assert request.runner_spec.model == "descriptor-override-model"
     assert request.agent_policy == override_policy
-    assert request.messages[0].content == "descriptor system prompt"
+    assert request.messages[0].role == AgentMessageRole.SYSTEM
+    assert (
+        "## Task Instructions\ndescriptor system prompt"
+        in request.messages[0].content
+    )
+    assert "## Execution Guidance" in request.messages[0].content
+    assert (
+        "Use the available context and tools under the current run limits."
+        in request.messages[0].content
+    )
+    assert "Tools are disabled for this runner call." in request.messages[0].content
     assert request.runner_spec.model != "baseline-model"
 
 
