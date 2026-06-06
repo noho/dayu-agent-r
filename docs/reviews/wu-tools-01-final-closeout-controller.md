@@ -2,9 +2,9 @@
 
 ## 结论
 
-WU-TOOLS-01 draft PR gate 已打开，PR 为 https://github.com/noho/dayu-agent-r/pull/123。Fins / Web / Doc tools migration with shared document foundations 的 S1-S6 与 external blocker reconciliation 已接受；当前没有无 owner / destination 的 open residual risk。
+WU-TOOLS-01 final closeout 通过。Draft PR gate、PR review gate 与 PR re-review gate 均已完成，PR 为 https://github.com/noho/dayu-agent-r/pull/123。Fins / Web / Doc tools migration with shared document foundations 的 S1-S6 与 external blocker reconciliation 已接受；当前没有无 owner / destination 的 open residual risk。
 
-按流程，final closeout 不在 draft PR 之前完成。本 artifact 只记录 PR gate opened 与 final closeout 前置条件，不声明 GitHub PR review / merge gate 已通过，也不关闭 GitHub Issue #82 / #97 / #98。PR review / merge gate 完成后，默认后续入口是 WU-TOOLS-01-F01；若用户优先恢复 broad Host validation，则先进入 WU-CM-01-F04。
+本 closeout 不声明 GitHub Issue #82 / #97 / #98 已关闭，也不代表用户已经 merge PR。当前结论是：draft PR 已打开，PR review / re-review 已 PASS，WU-TOOLS-01 已可交给用户做 merge decision。PR merge 后，默认后续入口是 WU-TOOLS-01-F01；若用户优先恢复 broad Host validation，则先进入 WU-CM-01-F04。
 
 GitHub issue status comments:
 
@@ -15,7 +15,7 @@ GitHub issue status comments:
 ## Scope
 
 - Work unit：WU-TOOLS-01。
-- 状态：draft PR opened / final closeout pending PR review and merge gate。
+- 状态：draft-PR-pass / final closeout passed / pending user merge decision。
 - Draft PR：https://github.com/noho/dayu-agent-r/pull/123。
 - 设计真源：`docs/host/design.md`、`docs/engine/design.md`。
 - 总控真源：`docs/host/issues-implementation-control.md`。
@@ -32,6 +32,11 @@ GitHub issue status comments:
 - External blocker reconciliation accepted commit：`ac036cbc`。
 - Fins ingestion follow-up control commit：`746f7db9`。
 - Host compactor seam residual plan clarification commit：`8dddea7d`。
+- Draft PR opened：https://github.com/noho/dayu-agent-r/pull/123。
+- Draft PR review artifacts：`docs/reviews/wu-tools-01-pr-review-mimo.md`、`docs/reviews/wu-tools-01-pr-review-ds.md`。
+- Draft PR review controller adjudication：`docs/reviews/wu-tools-01-pr-review-controller-adjudication.md`。
+- Draft PR re-review artifacts：`docs/reviews/wu-tools-01-pr-rereview-mimo.md`、`docs/reviews/wu-tools-01-pr-rereview-ds.md`。
+- Draft PR re-review verdict：AgentMiMo `pass`；AgentDS `pass`。
 
 ## Residual Risk Closeout
 
@@ -64,14 +69,15 @@ For all Fins ingestion follow-ups, ticker / market normalization must call `dayu
 
 ## Validation Status
 
-The accepted slice artifacts record focused test and pyright validation. This PR-gate status update made documentation-only control updates; no production code, test code, schema or README behavior changed.
+The accepted slice artifacts record focused test and pyright validation. The PR review fix updated GitHub PR metadata and review / closeout documentation only; no production code, test code, schema or README behavior changed in this gate.
 
-Local checks for this PR-gate status update verify:
+Local checks for final closeout verify:
 
 - `git diff --check` passes.
 - Residual risk table has no `open` item without owner / destination.
-- WU-TOOLS-01 row and current status point to draft PR #123 and executable follow-up entry points.
+- WU-TOOLS-01 row and current status point to draft-PR-pass / final closeout passed and executable follow-up entry points.
+- PR review / re-review artifacts record PASS after the accepted PR body fix.
 
 ## Next Entry Point
 
-Run the WU-TOOLS-01 draft PR review gate for https://github.com/noho/dayu-agent-r/pull/123 with deferred residuals tracked in the control doc and GitHub Issues #119-#122. After PR merge, enter WU-TOOLS-01-F01 by default. If broad Host validation must be restored before tool follow-ups, enter WU-CM-01-F04 first.
+User merge decision for https://github.com/noho/dayu-agent-r/pull/123 with deferred residuals tracked in the control doc and GitHub Issues #119-#122. After PR merge, enter WU-TOOLS-01-F01 by default. If broad Host validation must be restored before tool follow-ups, enter WU-CM-01-F04 first.
