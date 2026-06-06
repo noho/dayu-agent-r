@@ -280,7 +280,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
 | WU-ENG-02-S3-R1 | WU-ENG-02 Slice 3 code review | analyzer 需求边界 | transferred-to-issue | GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要 `client_correlation_id` 与 `provider_request_id`；若需要，必须先扩展 Runner usage / Engine `UsageReportedData` producer contract，再补 Host payload / Tool Trace analyzer tests。 | Local residual closed by transfer to https://github.com/noho/dayu-agent-r/issues/119; parent #70 updated at https://github.com/noho/dayu-agent-r/issues/70#issuecomment-4631651995. Current code evidence remains: usage 是 post-call observation / analyzer signal，不是 provider debugging terminal 主链路；`UsageReportedData` 当前无 correlation fields，Host 不从 `iteration_id` 推断 provider request identity。 |
-| WU-TOOLS-01-S4-R1 | WU-TOOLS-01 Slice S4 implementation | Fins ingestion waiting semantics | deferred-with-owner | Later WU-TOOLS follow-up or Host ToolRuntime wait-adapter work unit | Fins ingestion start/status/cancel tools were not migrated because they return queued/running job snapshots and require durable waiting, polling, cancellation and late terminal result semantics. S4 provider keeps `include_ingestion_tools=true` fail-closed. | Direct evidence: `docs/reviews/wu-tools-01-s4-ingestion-blocker-codex.md` records affected tools, direct evidence from OLD ingestion job manager and required `ToolAwaitingOutcome` / wait-adapter semantics. |
+| WU-TOOLS-01-S4-R1 | WU-TOOLS-01 Slice S4 implementation | Fins ingestion awaiting adapter not migrated | deferred-with-owner | WU-TOOLS-01-F01 | Fins ingestion start/status/cancel tools were not migrated in WU-TOOLS-01 S4 because the OLD background job model still needs to be adapted into the current Host / Engine `ToolAwaitingOutcome` and wait-resume contract. Host / ToolRuntime awaiting, wait record, resume, cancellation and late terminal governance already exist; the missing work is the Fins ingestion provider / adapter migration. S4 provider keeps `include_ingestion_tools=true` fail-closed until WU-TOOLS-01-F01 migrates it. | Direct evidence: `docs/reviews/wu-tools-01-s4-ingestion-blocker-codex.md` records affected tools and OLD ingestion job-manager behavior; current Host awaiting implementation exists in `dayu/host/waiting.py`, and Engine documents `ToolAwaitingOutcome` as the suspended run boundary. |
 | WU-TOOLS-01-S5-R2 | WU-TOOLS-01 Slice S5 implementation | Web live network / real browser coverage | deferred-with-owner | Later optional Web integration-test work unit with explicit live network / browser policy | S5 and S6 intentionally used deterministic mocked search, requests and Playwright paths. No live network, real browser, Tavily or Serper API validation was performed. | Direct evidence: S5 and S6 implementation, code review and re-review artifacts all record no-live-network scope and deterministic mock validation. |
 | WU-TOOLS-01-S1-R1 | WU-TOOLS-01 Slice S1 code review | documents coverage / parity | deferred-with-owner | Dedicated documents parity or provider integration work unit if required | S3/S6 Doc Markdown path, S3 Docling JSON fixture, S4/S6 Fins Markdown processor path and S5 Web mocked HTML/fetch paths cover currently consumed lightweight foundations. Full OLD parity, real PDF/OCR and heavy Docling runtime remain outside WU-TOOLS-01 deterministic migration scope. | Direct evidence: S6 implementation artifact records partial closure for consumed paths and defers full OLD parity / real PDF-OCR / heavy Docling runtime. |
 | WU-TOOLS-01-S1-R2 | WU-TOOLS-01 Slice S1 code review | OLD processor registry naming | deferred-with-owner | WU-TOOLS-01 post-migration design review | `build_engine_processor_registry(...)` remains intentionally unchanged in S1 to preserve migrated OLD function signatures. Revisit after WU-TOOLS-01 migration if public naming cleanup is still valuable and can be done as an explicit design cleanup. | Direct evidence: accepted plan S1 requires copied OLD processor class/function signatures and function bodies remain unchanged except import/package references; review finding identified the name as misleading but non-blocking. |
@@ -299,6 +299,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-03 | closed | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
 | WU-CM-04 | closed | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
 | WU-TOOLS-01 | ready-to-open-draft-PR-with-deferred-blocker | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98 | Accepted plan commit f6658fb4；Slices S1-S6 and external blocker reconciliation accepted；remaining Host compactor seam blocker is deferred-with-owner pending user decision before draft PR |
+| WU-TOOLS-01-F01 | pending | Fins ingestion tools awaiting adapter migration | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed | Migrate OLD Fins ingestion start/status/cancel tools into current `ToolAwaitingOutcome` / wait-resume contract; owner for residual `WU-TOOLS-01-S4-R1` |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 | Slice 0-3 accepted; residual follow-ups closed or transferred to dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 / #117 | Slice 4 accepted; full analyzer remains WU-OBS-00 non-goal |
@@ -722,6 +723,39 @@ GitHub Issue #81 / WU-CM-01 final closeout follow-up，依赖 WU-DUR-P01 补齐 
 - import-boundary tests 证明 runtime / Host / Service / UI 不获得对 Fins / Doc / Web tool implementation internals 的 forbidden direct dependency。
 - deterministic tests 覆盖代表性 engine processors、Docling conversion、Docling JSON processor、Doc tools、Fins storage / provider、search / fetch / URL safety / truncation / fallback 或对应 mock 行为。
 - 任何源行为偏离都被记录，并证明是当前接口适配所必需。
+
+## WU-TOOLS-01-F01 Fins Ingestion Tools Awaiting Adapter Migration
+
+### 状态
+
+Pending。该 work unit 是 `WU-TOOLS-01-S4-R1` 的明确 owner，用于迁移旧 Fins ingestion `start/status/cancel` 工具。
+
+### 动机
+
+WU-TOOLS-01 S4 只迁移了 Fins read tools，并让 `include_ingestion_tools=true` fail closed。这个残留不是因为 Host / ToolRuntime 缺少 awaiting 机制；当前 Host 已有 awaiting accept、wait record、resume / closeout、cancellation 与 late terminal governance，Engine 也以 `ToolAwaitingOutcome` 作为 suspended run 边界。真正缺口是旧 Fins ingestion 后台 job 模型尚未适配到当前 `ToolAwaitingOutcome` / wait-resume contract。
+
+### 目标
+
+- 迁移旧 Fins ingestion `start/status/cancel` 工具，使其通过当前 ToolDiscovery / ToolRuntime 暴露。
+- 将旧 ingestion job 的 queued / running / cancelling / succeeded / failed / cancelled 状态映射到当前 awaiting、resume、cancel 与 terminal result 语义。
+- 保持财报文档存取仍只能通过 `dayu.fins.storage` 仓储协议与实现完成。
+- 保持工具结果通过 Host ToolRuntime / Tool Trace / accepted evidence path 流转，不绕过 Host 工具治理。
+- 关闭 `WU-TOOLS-01-S4-R1`，并取消 Fins provider 对 ingestion tools 的 fail-closed 开关或改为当前 contract 下的明确启用策略。
+
+### 非目标
+
+- 不重新设计 Host / Engine awaiting 基础 contract。
+- 不在 Fins 工具内部私自实现 Host 外的轮询、等待、取消或 late terminal 治理。
+- 不修改旧 ingestion 业务函数签名或函数实现；如需适配当前 ToolRuntime / ToolDiscovery，必须通过外层 adapter / provider / assembly code 完成。
+- 不迁移旧 UI / FastAPI / Streamlit ingestion entrypoints。
+
+### 验收信号
+
+- ToolDiscovery 能发现 Fins ingestion provider / tools，且 `start/status/cancel` 代表路径可通过当前 tool contract 调用。
+- `start` 类工具对后台长事务返回当前 `ToolAwaitingOutcome` / wait-resume contract 所需信息，不把 queued / running job 伪装成 completed business result。
+- Host wait record、resume、cancel 与 late terminal result 路径有 deterministic tests 覆盖。
+- 失败、取消、重复 start / reused job、迟到 terminal result 均有明确测试或记录为带 owner 的 residual。
+- Fins README、tests README 或相关 package README 只描述当前已实现行为，不保留旧 fail-closed 误导说明。
 
 ## WU-PROJ-01 Projection Catch-up Budgeting For Memory Pre-dispatch Path
 

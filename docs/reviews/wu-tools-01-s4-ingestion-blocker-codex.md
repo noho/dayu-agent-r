@@ -34,9 +34,11 @@ Current `ToolRuntime` completed/failed outcomes describe the result of one tool 
 
 Mapping `start_*_job` to `ToolCompletedOutcome` would falsely tell Host/Engine that the business operation completed. Mapping it to `ToolFailedOutcome` would be incorrect for a valid queued/running job. Status polling is also semantic, not just duplicate governance: it needs durable waiting, cancellation, late result handling, and resume semantics.
 
-## Required Wait / Awaiting Semantics
+## Required Fins Awaiting Adapter
 
-Ingestion needs a current wait adapter design that can represent:
+Ingestion needs a Fins provider / adapter slice that maps the OLD background job model into the current Host / Engine awaiting contract. The base `ToolAwaitingOutcome`, wait record, resume, cancellation and late terminal governance already exist; the missing work is the Fins ingestion migration into that contract.
+
+The adapter must represent:
 
 - accepted start request with a durable job or wait handle;
 - suspended/awaiting tool outcome while background work continues;
@@ -47,14 +49,14 @@ Ingestion needs a current wait adapter design that can represent:
 
 ## Proposed Owner / Destination
 
-Owner: later WU-TOOLS follow-up or Host ToolRuntime wait-adapter work unit.
+Owner: `WU-TOOLS-01-F01`.
 
-Destination: `dayu.host` / `ToolRuntime` wait adapter design and a Fins ingestion provider slice after current `ToolAwaitingOutcome` semantics are explicitly available for business tools.
+Destination: Fins ingestion provider / adapter migration using current `ToolAwaitingOutcome` and Host wait-resume contract. Production callback / poller / physical cancel hardening may depend on #89 / #90 / #92 as needed, but the residual owner is the Fins ingestion migration work unit.
 
 ## Later Work Unit Needed
 
-Yes. A later wait-adapter work unit is needed before migrating Fins ingestion tools. S4 therefore migrates read tools only and makes `include_ingestion_tools=true` fail closed in `dayu.fins.tools.provider`.
+Yes. `WU-TOOLS-01-F01` is needed to migrate Fins ingestion tools into the current awaiting contract. S4 therefore migrates read tools only and makes `include_ingestion_tools=true` fail closed in `dayu.fins.tools.provider`.
 
 ## Residual Risk
 
-classified as assigned to later work unit: users cannot invoke Fins download / preprocessing tools through current provider until wait / awaiting semantics are implemented.
+classified as assigned to `WU-TOOLS-01-F01`: users cannot invoke Fins download / preprocessing tools through current provider until the OLD ingestion job model is adapted to current Host / Engine awaiting semantics.

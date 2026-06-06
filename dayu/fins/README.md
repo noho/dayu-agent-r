@@ -43,7 +43,7 @@ ToolsDiscovery
 
 ## Ingestion 状态
 
-当前 provider 不暴露下载 / 预处理 ingestion tools。旧 ingestion 工具是 `start/status/cancel` 后台 job 轮询模型，需要等待当前 ToolRuntime 的 `ToolAwaitingOutcome` 或 wait-adapter 语义承接后再迁移。
+当前 provider 不暴露下载 / 预处理 ingestion tools。旧 ingestion 工具是 `start/status/cancel` 后台 job 轮询模型，后续由 `WU-TOOLS-01-F01` 迁移到当前 Host / Engine `ToolAwaitingOutcome` 与 wait-resume contract；迁移前 provider 对 ingestion tools 保持 fail-closed。
 
 ## 扩展约束
 
