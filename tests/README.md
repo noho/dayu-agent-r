@@ -130,12 +130,15 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 
 ### `tests/tools/`
 
-业务工具与 provider 适配测试，当前覆盖 `dayu.tools._legacy_adapter` 的迁移边界与 Doc tools provider：
+业务工具与 provider 适配测试，当前覆盖 `dayu.tools._legacy_adapter` 的迁移边界、Doc tools provider 与 Web tools provider：
 
 - legacy adapter：覆盖 OLD 风格同步 callable 到 current async `ToolCallable` 的适配、直接参数透传、需要投影 / 默认值 / 类型转换的参数校验、投影失败不进入迁移函数、显式路径策略校验、OLD ok/value envelope 解包、业务异常到 current failure outcome 的投影、reserved `fetch_more` 不作为业务工具输出、current `ToolTruncateSpec` 声明转换、默认 per-tool 串行执行，以及适配器不得导入 OLD registry / truncation / projection owner 的边界。
 - doc tools provider：覆盖 `dayu.tools.doc_provider` 通过当前 `ToolsDiscovery` 暴露五个 Doc tools、启用但缺少 `allowed_paths` 时 fail closed、显式路径白名单拒绝、路径参数进入迁移函数前投影为绝对路径、路径验证失败不进入迁移函数体、`file_path_params` metadata 收集与使用、collector 记录的 `register_allowed_paths` 不作为可信安全源、current outcome 投影、Markdown / Docling JSON 章节列表 / 搜索 / 章节读取、current `ToolTruncateSpec` 暴露，以及 current ToolRuntime accept barrier 集成。
+- web tools provider：覆盖 `dayu.tools.web` 通过当前 `ToolsDiscovery` 暴露 `search_web` 与 `fetch_web_page`、默认拒绝 private / local URL 且显式配置后才允许、搜索 optional 参数投影、非法 URL 类型进入 Web 逻辑前失败、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露，以及基于 AST import 解析确认未导入 OLD registry / truncation / `fetch_more` / UI。
 
 `tests/tools/fixtures/documents/` 存放工具 provider 测试使用的确定性文档 fixture。当前包含 Markdown 与 Docling JSON 样本，测试应复制到临时目录后通过 provider 白名单访问，不直接把 fixture 根作为隐式生产路径。
+
+`tests/tools/web/` 的 Web provider 测试必须保持 deterministic：搜索 provider、requests 主路径和 Playwright fallback 都通过 monkeypatch / fixture 替身控制，不做 live network 请求。
 
 ### `tests/fins/`
 

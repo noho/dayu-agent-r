@@ -176,6 +176,8 @@ provider 字段：
 
 包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。启用 Doc tools 时必须在 `config.allowed_paths` 中显式配置可访问文件或目录根；provider 启用但白名单为空时会 fail closed，返回空工具集合，不注册可执行文档工具。Doc provider 的 `config.limits` 可覆盖 `list_files_max`、`get_sections_max`、`search_files_max_results`、`read_file_max_chars` 与 `read_file_section_max_chars`，未配置字段使用 provider 默认值。
 
+包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=false`、`allow_empty=true`，并默认拒绝 private / local network URL。启用 Web tools 时 provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
+
 ## prompts 目录职责
 
 `workspace/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
