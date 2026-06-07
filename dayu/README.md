@@ -68,6 +68,8 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 
 `dayu.service` 承载 Host 外部的 Service composition helper。当前 `host_assembly` helper 从 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 与 env/secret mapping 组合 `OpenHostOptions` 与 `SubmitFollowupRequest`。
 
+Service composition root 负责把业务 provider 的显式配置映射为 Host construction-time inputs。例如启用 Fins download / preprocess awaiting providers 时，Service 基于 provider id、import path、source id 与 provider config 校验同一绝对 workspace root，并为 Host `HostToolingOptions` 装配对应 wait adapter registry；`dayu.runtime.tools_discovery` 仍只输出工具 bundle、provider report 与 source refs，不承载 Fins adapter object。
+
 Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime` 反向依赖 Service，不得绕过 Host public handle 写 Host truth，也不得把 raw config fragment、profile id 或 patch dict 传入 Host。
 
 ### `dayu.runtime`

@@ -11,6 +11,7 @@
 - `dayu.fins.tools.download_provider.discover_tools` 是 download awaiting tool 的独立 ToolsDiscovery provider 入口。
 - `dayu.fins.tools.preprocess_provider.discover_tools` 是 preprocess awaiting tool 的独立 ToolsDiscovery provider 入口。
 - `dayu.fins.ingestion_runtime` 提供下载 / 预处理请求、下载 adapter 协议、job record、job store、start、read、cancel，以及 download source adapter -> source/blob/rejected artifact 与 preprocess source -> processed pipeline 的 typed runtime foundation。
+- `dayu.fins.ingestion.wait_adapter` 提供 Fins ingestion job 到 Host wait-resume contract 的 poll adapter 与 wait adapter binding factory；它只读取 / 取消 Fins job，不改变 Host wait record 或 Engine contract。
 - `dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins shared assembly root，装配 read repositories、blob / filing maintenance repositories、processor registry、`FinsToolService`，以及 workspace-scoped ingestion runtime foundation / job store / download / preprocess pipeline；它不持有 Host、Service 或 EventLog。
 
 ## 读取路径
@@ -49,6 +50,8 @@ ToolsDiscovery
 `DefaultFinsRuntime` 会装配 workspace-scoped ingestion runtime foundation。该 foundation 当前提供 typed download / preprocess request、download adapter protocol、job record、job store、start、read 与 cancel 基础能力。`start_download` 会先持久化 `queued` job record，再按 `normalize_ticker(...)` 后的 ticker / market 与 source 选择 Fins-owned adapter；有 adapter 时通过 source repository、blob repository 与 filing maintenance repository 写入源文档和 rejected filing artifact，无 adapter 时写入明确 unsupported-source failed 终态，不伪造成功。当前没有真实 SEC / CN / HK 网络下载 adapter。`start_preprocess` 会先持久化 `queued` job record，再通过 source repository 读取已存在源文档、通过 processor registry 生成 sections / tables 等 processed 产物，并通过 processed repository create / update 写入；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时重建。
 
 Download / preprocess 通过独立 provider 暴露为 awaiting tools。两个 provider 都必须显式配置绝对 `workspace_root`，并各自通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取 shared ingestion runtime；同一 workspace 的不同 provider/runtime 实例会落到同一个 workspace 派生 job store。工具调用只负责启动 durable job 并返回 `ToolAwaitingOutcome`，等待种类为 external job；工具本身不提供 status / cancel polling。read provider 不解析 `include_ingestion_tools` 作为 ingestion enablement，download / preprocess 能力必须通过独立 provider 启用。
+
+Service assembly 会基于启用的 Fins download / preprocess provider 显式配置构造 Host `WaitAdapterRegistry`。同一 Host assembly 中启用的 Fins awaiting provider 必须使用同一个绝对 `workspace_root`；poll adapter 将 `queued` / `running` / `cancelling` 映射为未就绪，将 `succeeded` / `failed` / `cancelled` 映射为 Host resolve outcome，将缺失或损坏的 job evidence 映射为 lost outcome。Host 取消 wait 时，adapter 只请求 Fins job 取消，不删除 source docs 或 Host wait records。
 
 job store 由 workspace root 派生，当前路径为 `.dayu/fins_ingestion/jobs`。它只保存 job governance records，不保存财报正文、processed payload 或 raw provider payload。
 

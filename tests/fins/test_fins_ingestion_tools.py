@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dayu.contracts.json_value import JsonValue
@@ -21,10 +21,29 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FsFinsIngestionJobStore,
 )
+from dayu.fins.ingestion import (
+    FINS_INGESTION_WAIT_ADAPTER_KEY,
+    FinsIngestionWaitPollAdapter,
+    build_fins_wait_adapter_registry,
+)
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
+from dayu.host.api import (
+    ResolveWaitCancelledOutcome,
+    ResolveWaitCompletedOutcome,
+    ResolveWaitFailedOutcome,
+    ResolveWaitLostOutcome,
+)
+from dayu.host.durable.state import (
+    ExternalJobRef,
+    WaitRecordRow,
+    WaitRecordStatus,
+    WaitResumePolicy,
+)
+from dayu.host.wait_adapter import WaitPollLost, WaitPollNotReady, WaitPollReady
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
@@ -49,6 +68,7 @@ _TERMINAL_JOB_STATUSES = frozenset(
 )
 _JOB_WAIT_TIMEOUT_SECONDS = 5.0
 _JOB_WAIT_POLL_SECONDS = 0.02
+_WAIT_RECORD_TIME = "2026-01-01T00:00:00Z"
 
 
 class _OpenCancellationToken:
@@ -361,6 +381,339 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
         assert "cursor" not in schema_text
         assert "raw job record" not in schema_text
         assert "Host" not in schema_text
+
+
+def test_fins_wait_adapter_registry_binds_download_and_preprocess_tools(
+    tmp_path: Path,
+) -> None:
+    """Fins wait adapter registry 应绑定 S4 稳定 awaiting 工具名。"""
+
+    registry = build_fins_wait_adapter_registry(
+        workspace_root=tmp_path.resolve(strict=False),
+        tool_names=(PREPROCESS_TOOL_NAME, DOWNLOAD_TOOL_NAME),
+    )
+
+    download_binding = registry.resolve_binding(
+        tool_name=DOWNLOAD_TOOL_NAME,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+    )
+    preprocess_binding = registry.resolve_binding(
+        tool_name=PREPROCESS_TOOL_NAME,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+    )
+    assert download_binding is not None
+    assert preprocess_binding is not None
+    assert download_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+    assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+    assert download_binding.resume_policy is WaitResumePolicy.POLL
+    assert preprocess_binding.resume_policy is WaitResumePolicy.POLL
+
+
+def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> None:
+    """重复 Fins wait binding 必须 deterministic fail fast。"""
+
+    workspace_root = tmp_path.resolve(strict=False)
+    try:
+        build_fins_wait_adapter_registry(
+            workspace_root=workspace_root,
+            tool_names=(DOWNLOAD_TOOL_NAME, DOWNLOAD_TOOL_NAME),
+        )
+    except ValueError as exc:
+        assert "duplicate Fins wait adapter binding" in str(exc)
+    else:
+        raise AssertionError("重复 Fins wait adapter binding 未失败")
+
+
+def test_fins_wait_poll_adapter_maps_terminal_and_missing_jobs(
+    tmp_path: Path,
+) -> None:
+    """Fins poll adapter 应把 job 状态映射为 Host wait resolve outcome。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+    succeeded = _persist_job(runtime, "00000000000000000000000000000001", FinsIngestionJobStatus.SUCCEEDED)
+    failed = _persist_job(runtime, "00000000000000000000000000000002", FinsIngestionJobStatus.FAILED)
+    cancelled = _persist_job(runtime, "00000000000000000000000000000003", FinsIngestionJobStatus.CANCELLED)
+    queued = _persist_job(runtime, "00000000000000000000000000000004", FinsIngestionJobStatus.QUEUED)
+    running = _persist_job(runtime, "00000000000000000000000000000005", FinsIngestionJobStatus.RUNNING)
+    cancelling = _persist_job(runtime, "00000000000000000000000000000006", FinsIngestionJobStatus.CANCELLING)
+
+    succeeded_poll = adapter.poll_wait(_wait_record(succeeded.job_id, DOWNLOAD_TOOL_NAME))
+    failed_poll = adapter.poll_wait(_wait_record(failed.job_id, DOWNLOAD_TOOL_NAME))
+    cancelled_poll = adapter.poll_wait(_wait_record(cancelled.job_id, PREPROCESS_TOOL_NAME))
+    queued_poll = adapter.poll_wait(_wait_record(queued.job_id, PREPROCESS_TOOL_NAME))
+    running_poll = adapter.poll_wait(_wait_record(running.job_id, DOWNLOAD_TOOL_NAME))
+    cancelling_poll = adapter.poll_wait(_wait_record(cancelling.job_id, PREPROCESS_TOOL_NAME))
+    missing_poll = adapter.poll_wait(
+        _wait_record("finsjob_00000000000000000000000000009999", DOWNLOAD_TOOL_NAME)
+    )
+
+    assert isinstance(succeeded_poll, WaitPollReady)
+    assert isinstance(succeeded_poll.outcome, ResolveWaitCompletedOutcome)
+    assert isinstance(failed_poll, WaitPollReady)
+    assert isinstance(failed_poll.outcome, ResolveWaitFailedOutcome)
+    assert isinstance(cancelled_poll, WaitPollReady)
+    assert isinstance(cancelled_poll.outcome, ResolveWaitCancelledOutcome)
+    assert isinstance(queued_poll, WaitPollNotReady)
+    assert isinstance(running_poll, WaitPollNotReady)
+    assert isinstance(cancelling_poll, WaitPollNotReady)
+    assert isinstance(missing_poll, WaitPollLost)
+
+
+def test_fins_wait_poll_adapter_maps_corrupt_job_evidence_to_lost(
+    tmp_path: Path,
+) -> None:
+    """poll_wait 遇到损坏 job evidence 时应返回 lost，而不是抛给 poller。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+    job_id = "finsjob_00000000000000000000000000000007"
+    _write_corrupt_job_evidence(workspace_root, job_id)
+
+    poll = adapter.poll_wait(_wait_record(job_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(poll, WaitPollLost)
+    assert isinstance(poll.outcome, ResolveWaitLostOutcome)
+
+
+def test_fins_wait_poll_adapter_abandon_marks_job_cancellation_requested(
+    tmp_path: Path,
+) -> None:
+    """abandon_wait 应请求取消 Fins job，不删除 job record。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+    record = _persist_job(
+        runtime,
+        "00000000000000000000000000000005",
+        FinsIngestionJobStatus.RUNNING,
+    )
+
+    adapter.abandon_wait(_wait_record(record.job_id, DOWNLOAD_TOOL_NAME))
+
+    updated = runtime.read_job(record.job_id)
+    assert updated.cancellation_requested is True
+    assert updated.status is FinsIngestionJobStatus.CANCELLING
+
+
+def test_fins_wait_poll_adapter_abandon_without_external_job_ref_is_noop(
+    tmp_path: Path,
+) -> None:
+    """abandon_wait 缺少 external_job_ref 时不应抛错或修改 Fins job。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+    record = _persist_job(
+        runtime,
+        "00000000000000000000000000000008",
+        FinsIngestionJobStatus.RUNNING,
+    )
+
+    adapter.abandon_wait(
+        _wait_record(
+            record.job_id,
+            DOWNLOAD_TOOL_NAME,
+            include_external_job_ref=False,
+        )
+    )
+
+    unchanged = runtime.read_job(record.job_id)
+    assert unchanged.cancellation_requested is False
+    assert unchanged.status is FinsIngestionJobStatus.RUNNING
+
+
+def test_fins_wait_poll_adapter_abandon_missing_job_evidence_is_noop(
+    tmp_path: Path,
+) -> None:
+    """abandon_wait 遇到缺失 job evidence 时不应抛错。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    adapter.abandon_wait(
+        _wait_record("finsjob_00000000000000000000000000009998", DOWNLOAD_TOOL_NAME)
+    )
+
+
+def test_fins_wait_poll_adapter_abandon_corrupt_job_evidence_is_noop(
+    tmp_path: Path,
+) -> None:
+    """abandon_wait 遇到损坏 job evidence 时不应抛错或删除 evidence 文件。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+    job_id = "finsjob_00000000000000000000000000000009"
+    corrupt_path = _write_corrupt_job_evidence(workspace_root, job_id)
+
+    adapter.abandon_wait(_wait_record(job_id, DOWNLOAD_TOOL_NAME))
+
+    assert corrupt_path.exists()
+
+
+def _persist_job(
+    runtime: FinsIngestionRuntime,
+    job_id_suffix: str,
+    status: FinsIngestionJobStatus,
+) -> FinsIngestionJobRecord:
+    """持久化指定状态的测试 job record。
+
+    Args:
+        runtime: 测试使用的 Fins ingestion runtime。
+        job_id_suffix: 32 位十六进制 job id suffix。
+        status: 目标 job 状态。
+
+    Returns:
+        已持久化 job record。
+
+    Raises:
+        OSError: job store 写入失败时抛出。
+        ValueError: record 字段非法时抛出。
+    """
+
+    record = _job_record(job_id=f"finsjob_{job_id_suffix}", status=status)
+    return runtime.job_store.create_job(record)
+
+
+def _job_record(
+    *,
+    job_id: str,
+    status: FinsIngestionJobStatus,
+) -> FinsIngestionJobRecord:
+    """构造测试用 Fins ingestion job record。
+
+    Args:
+        job_id: opaque job id。
+        status: job 状态。
+
+    Returns:
+        Fins ingestion job record。
+
+    Raises:
+        无。
+    """
+
+    terminal = status in _TERMINAL_JOB_STATUSES
+    now = _timestamp()
+    return FinsIngestionJobRecord(
+        job_id=job_id,
+        operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+        normalized_ticker="AAPL",
+        market="US",
+        exchange=None,
+        source="auto",
+        source_kind=SourceKind.FILING,
+        status=status,
+        created_at=now,
+        updated_at=now,
+        started_at=now,
+        finished_at=now if terminal else None,
+        request_summary={"ticker": "AAPL"},
+        result_summary={"written_document_ids": ["aapl-2024-10k"]}
+        if status is FinsIngestionJobStatus.SUCCEEDED
+        else {},
+        failure_summary={"message": "download failed"}
+        if status is FinsIngestionJobStatus.FAILED
+        else {},
+        cancellation_requested=status
+        in {FinsIngestionJobStatus.CANCELLING, FinsIngestionJobStatus.CANCELLED},
+    )
+
+
+def _wait_record(
+    job_id: str,
+    tool_name: str,
+    *,
+    include_external_job_ref: bool = True,
+) -> WaitRecordRow:
+    """构造测试用 Host wait record。
+
+    Args:
+        job_id: Fins external job id。
+        tool_name: 原始 awaiting 工具名。
+        include_external_job_ref: 是否带 external job ref。
+
+    Returns:
+        Host wait record row。
+
+    Raises:
+        ValueError: 字段非法时由 Host durable 类型抛出。
+    """
+
+    external_job_ref = (
+        ExternalJobRef(
+            adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
+            external_job_id=job_id,
+        )
+        if include_external_job_ref
+        else None
+    )
+    return WaitRecordRow(
+        wait_id=f"wait-{job_id}",
+        session_id="session-fins",
+        run_id="run-fins",
+        attempt_id="attempt-fins",
+        execution_id="execution-fins",
+        tool_call_id=f"call-{tool_name}",
+        tool_name=tool_name,
+        adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB.value,
+        resume_policy=WaitResumePolicy.POLL,
+        resume_token=job_id,
+        snapshot_ref=None,
+        external_job_ref=external_job_ref,
+        accept_idempotency_key=f"accept-{job_id}",
+        resolve_idempotency_key=None,
+        resolve_semantic_digest=None,
+        deadline_at=None,
+        expires_at=None,
+        status=WaitRecordStatus.WAITING,
+        created_event_id=f"event-created-{job_id}",
+        created_event_sequence=1,
+        updated_event_id=f"event-updated-{job_id}",
+        updated_event_sequence=1,
+        created_at=_WAIT_RECORD_TIME,
+        updated_at=_WAIT_RECORD_TIME,
+        terminal_at=None,
+    )
+
+
+def _timestamp() -> str:
+    """返回测试用 UTC 时间戳。
+
+    Returns:
+        UTC ISO8601 字符串。
+
+    Raises:
+        无。
+    """
+
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _write_corrupt_job_evidence(workspace_root: Path, job_id: str) -> Path:
+    """写入损坏的 Fins job evidence 文件。
+
+    Args:
+        workspace_root: Fins workspace root。
+        job_id: opaque job id。
+
+    Returns:
+        损坏 evidence 文件路径。
+
+    Raises:
+        OSError: 目录或文件写入失败时抛出。
+    """
+
+    path = _job_store_root(workspace_root) / f"{job_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not-json", encoding="utf-8")
+    return path
 
 
 def _build_workspace(tmp_path: Path) -> Path:
