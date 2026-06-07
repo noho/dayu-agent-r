@@ -543,6 +543,30 @@ class FinsIngestionJobStore(Protocol):
         """
         ...
 
+    def claim_running_or_cancelled(
+        self,
+        job_id: str,
+        *,
+        started_at: str,
+        updated_at: str,
+    ) -> FinsIngestionJobRecord:
+        """按当前取消状态原子 claim running 或 cancelled。
+
+        Args:
+            job_id: opaque job id。
+            started_at: 进入 running 时使用的开始时间。
+            updated_at: 本次状态更新时间；取消收口时也作为 finished_at。
+
+        Returns:
+            已持久化的 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、record 或时间字段非法时抛出。
+        """
+        ...
+
     def read_job(self, job_id: str) -> FinsIngestionJobRecord:
         """读取 job record。
 
@@ -754,6 +778,52 @@ class FsFinsIngestionJobStore:
             )
             self._write_record_locked(succeeded)
             return succeeded
+
+    def claim_running_or_cancelled(
+        self,
+        job_id: str,
+        *,
+        started_at: str,
+        updated_at: str,
+    ) -> FinsIngestionJobRecord:
+        """按当前取消状态原子 claim running 或 cancelled。
+
+        Args:
+            job_id: opaque job id。
+            started_at: 进入 running 时使用的开始时间。
+            updated_at: 本次状态更新时间；取消收口时也作为 finished_at。
+
+        Returns:
+            已持久化的 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、record 或时间字段非法时抛出。
+        """
+
+        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+            record = self._read_record_locked(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return record
+            if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
+                cancelled = replace(
+                    record,
+                    status=FinsIngestionJobStatus.CANCELLED,
+                    updated_at=updated_at,
+                    finished_at=updated_at,
+                    cancellation_requested=True,
+                )
+                self._write_record_locked(cancelled)
+                return cancelled
+            running = replace(
+                record,
+                status=FinsIngestionJobStatus.RUNNING,
+                started_at=record.started_at or started_at,
+                updated_at=updated_at,
+            )
+            self._write_record_locked(running)
+            return running
 
     def read_job(self, job_id: str) -> FinsIngestionJobRecord:
         """读取 job record。
@@ -1208,19 +1278,11 @@ class FinsIngestionRuntime:
             ValueError: job record 非法时抛出。
         """
 
-        record = self.job_store.read_job(job_id)
-        if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
-            return self._save_cancelled(record)
-        if record.status in _TERMINAL_STATUSES:
-            return record
         now = _utc_now()
-        return self.job_store.save_job(
-            replace(
-                record,
-                status=FinsIngestionJobStatus.RUNNING,
-                started_at=record.started_at or now,
-                updated_at=now,
-            )
+        return self.job_store.claim_running_or_cancelled(
+            job_id,
+            started_at=now,
+            updated_at=now,
         )
 
     def _execute_preprocess_request(

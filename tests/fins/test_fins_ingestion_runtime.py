@@ -188,6 +188,230 @@ class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
         )
 
 
+class _ClaimRaceJobStore:
+    """测试用 job store，精确模拟 claim-running 窗口中的取消请求。"""
+
+    def __init__(self) -> None:
+        """初始化空 job store。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+        """
+
+        self._record: ingestion_runtime.FinsIngestionJobRecord | None = None
+        self.read_race_triggered = False
+        self.claim_race_triggered = False
+        self.claim_running_calls = 0
+        self.save_job_calls = 0
+
+    def create_job(
+        self,
+        record: ingestion_runtime.FinsIngestionJobRecord,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """创建测试 job record。
+
+        Args:
+            record: 待创建的 job record。
+
+        Returns:
+            已保存的 job record。
+
+        Raises:
+            FileExistsError: job 已存在时抛出。
+        """
+
+        if self._record is not None:
+            raise FileExistsError(f"Fins ingestion job 已存在: {record.job_id}")
+        self._record = record
+        return record
+
+    def save_job(
+        self,
+        record: ingestion_runtime.FinsIngestionJobRecord,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """保存完整测试 job record。
+
+        Args:
+            record: 待保存的 job record。
+
+        Returns:
+            已保存的 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        self._require_record(record.job_id)
+        self.save_job_calls += 1
+        self._record = record
+        return record
+
+    def save_succeeded_or_cancelled(
+        self,
+        job_id: str,
+        *,
+        result_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """按当前取消状态保存 succeeded 或 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            result_summary: succeeded 终态结果摘要。
+            finished_at: 终态写入时间。
+
+        Returns:
+            已保存的终态 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        record = self._require_record(job_id)
+        if _is_terminal_job_status(record.status):
+            return record
+        if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
+            cancelled = replace(
+                record,
+                status=FinsIngestionJobStatus.CANCELLED,
+                updated_at=finished_at,
+                finished_at=finished_at,
+                cancellation_requested=True,
+            )
+            self._record = cancelled
+            return cancelled
+        succeeded = replace(
+            record,
+            status=FinsIngestionJobStatus.SUCCEEDED,
+            updated_at=finished_at,
+            finished_at=finished_at,
+            result_summary=result_summary,
+            failure_summary={},
+        )
+        self._record = succeeded
+        return succeeded
+
+    def claim_running_or_cancelled(
+        self,
+        job_id: str,
+        *,
+        started_at: str,
+        updated_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """在一次测试 claim 内模拟 queued 读取后收到取消请求。
+
+        Args:
+            job_id: opaque job id。
+            started_at: running 开始时间。
+            updated_at: 本次状态更新时间。
+
+        Returns:
+            claim 后的 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        self.claim_running_calls += 1
+        record = self._require_record(job_id)
+        if not self.claim_race_triggered and record.status is FinsIngestionJobStatus.QUEUED:
+            self.claim_race_triggered = True
+            self.request_cancel(job_id, updated_at=updated_at)
+            record = self._require_record(job_id)
+        if _is_terminal_job_status(record.status):
+            return record
+        if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
+            cancelled = replace(
+                record,
+                status=FinsIngestionJobStatus.CANCELLED,
+                updated_at=updated_at,
+                finished_at=updated_at,
+                cancellation_requested=True,
+            )
+            self._record = cancelled
+            return cancelled
+        running = replace(
+            record,
+            status=FinsIngestionJobStatus.RUNNING,
+            started_at=record.started_at or started_at,
+            updated_at=updated_at,
+        )
+        self._record = running
+        return running
+
+    def read_job(self, job_id: str) -> ingestion_runtime.FinsIngestionJobRecord:
+        """读取测试 job record，并模拟旧 read/save 窗口中的取消。
+
+        Args:
+            job_id: opaque job id。
+
+        Returns:
+            当前或刻意滞后的 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        record = self._require_record(job_id)
+        if not self.read_race_triggered and record.status is FinsIngestionJobStatus.QUEUED:
+            self.read_race_triggered = True
+            self.request_cancel(job_id, updated_at=record.updated_at)
+            return record
+        return record
+
+    def request_cancel(
+        self,
+        job_id: str,
+        *,
+        updated_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """标记测试 job 取消请求。
+
+        Args:
+            job_id: opaque job id。
+            updated_at: 本次状态更新时间。
+
+        Returns:
+            更新后的 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        record = self._require_record(job_id)
+        if _is_terminal_job_status(record.status):
+            return record
+        updated = replace(
+            record,
+            status=FinsIngestionJobStatus.CANCELLING,
+            updated_at=updated_at,
+            cancellation_requested=True,
+        )
+        self._record = updated
+        return updated
+
+    def _require_record(self, job_id: str) -> ingestion_runtime.FinsIngestionJobRecord:
+        """读取并校验当前测试 job record。
+
+        Args:
+            job_id: opaque job id。
+
+        Returns:
+            当前 job record。
+
+        Raises:
+            FileNotFoundError: 当前没有匹配 job 时抛出。
+        """
+
+        record = self._record
+        if record is None or record.job_id != job_id:
+            raise FileNotFoundError(f"Fins ingestion job 不存在: {job_id}")
+        return record
+
+
 def test_default_runtime_instances_share_workspace_job_store_without_singleton(tmp_path: Path) -> None:
     """同一 workspace 的两个 runtime 实例应共享持久化 store 而非 Python singleton。"""
 
@@ -648,6 +872,41 @@ def test_start_preprocess_cancel_before_execution_writes_cancelled_terminal(tmp_
 
     assert cancelling.status is FinsIngestionJobStatus.CANCELLING
     assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert record.cancellation_requested
+
+
+def test_claim_running_preserves_cancel_between_read_and_running_write(
+    tmp_path: Path,
+) -> None:
+    """claim running 期间收到取消请求时，不得覆盖为 running。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    executor = _HoldingExecutor()
+    job_store = _ClaimRaceJobStore()
+    ingestion = ingestion_runtime.FinsIngestionRuntime.create(
+        source_repository=default_runtime.source_repository,
+        blob_repository=default_runtime.blob_repository,
+        filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        processed_repository=default_runtime.processed_repository,
+        processor_registry=default_runtime.processor_registry,
+        job_store=job_store,
+        executor=executor,
+    )
+
+    start = ingestion.start_preprocess(
+        FinsPreprocessRequest(
+            ticker="AAPL",
+            document_ids=("aapl-2024-10k",),
+        )
+    )
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+
+    assert job_store.claim_running_calls == 1
+    assert job_store.save_job_calls == 0
+    assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert record.status is not FinsIngestionJobStatus.RUNNING
     assert record.cancellation_requested
 
 
@@ -1197,3 +1456,23 @@ def _fixture_markdown() -> str:
             "| Services | 100 |",
         )
     )
+
+
+def _is_terminal_job_status(status: FinsIngestionJobStatus) -> bool:
+    """判断 Fins ingestion job 状态是否为终态。
+
+    Args:
+        status: 待判断的 job 状态。
+
+    Returns:
+        终态返回 ``True``，否则返回 ``False``。
+
+    Raises:
+        无。
+    """
+
+    return status in {
+        FinsIngestionJobStatus.SUCCEEDED,
+        FinsIngestionJobStatus.FAILED,
+        FinsIngestionJobStatus.CANCELLED,
+    }
