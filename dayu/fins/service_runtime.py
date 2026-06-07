@@ -1,7 +1,7 @@
-"""Fins 读取工具运行时装配。
+"""Fins 工具与 ingestion 运行时装配。
 
-本模块只承载 S4 read tools provider 需要的仓储、处理器注册表与
-``FinsToolService`` 装配。下载/预处理 ingestion job 语义不在本 slice 暴露。
+本模块承载 Fins 共享 assembly root：read tools 使用的仓储、处理器注册表、
+``FinsToolService``，以及下载/预处理 ingestion runtime foundation。
 """
 
 from __future__ import annotations
@@ -9,8 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
+from typing import TYPE_CHECKING
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
+from dayu.fins.ingestion_runtime import FinsIngestionRuntime, FsFinsIngestionJobStore
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
@@ -21,15 +23,18 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.tools.service import FinsToolService
+
+if TYPE_CHECKING:
+    from dayu.fins.tools.service import FinsToolService
 
 
 @dataclass
 class DefaultFinsRuntime:
-    """默认 Fins 读取运行时实现。
+    """默认 Fins 共享运行时实现。
 
-    该运行时只装配 read tools 需要的仓储协议实现和处理器注册表，不持有
-    Host、Service、EventLog 或 ingestion job manager。
+    该运行时装配 read tools 与 ingestion foundation 共享的仓储协议实现、
+    处理器注册表和 workspace-scoped job store，不持有 Host、Service 或
+    EventLog。
     """
 
     workspace_root: Path
@@ -37,8 +42,11 @@ class DefaultFinsRuntime:
     source_repository: SourceDocumentRepositoryProtocol
     processed_repository: ProcessedDocumentRepositoryProtocol
     processor_registry: ProcessorRegistry
+    ingestion_job_store: FsFinsIngestionJobStore
     _tool_service: FinsToolService | None = field(init=False, default=None, repr=False)
     _tool_service_lock: Lock = field(init=False, repr=False)
+    _ingestion_runtime: FinsIngestionRuntime | None = field(init=False, default=None, repr=False)
+    _ingestion_runtime_lock: Lock = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """初始化内部锁。
@@ -54,16 +62,17 @@ class DefaultFinsRuntime:
         """
 
         self._tool_service_lock = Lock()
+        self._ingestion_runtime_lock = Lock()
 
     @classmethod
     def create(cls, *, workspace_root: Path) -> "DefaultFinsRuntime":
-        """创建默认 Fins 读取运行时。
+        """创建默认 Fins 共享运行时。
 
         Args:
             workspace_root: 已由 provider 显式解析的 Fins 工作区根目录。
 
         Returns:
-            默认 Fins 读取运行时。
+            默认 Fins 共享运行时。
 
         Raises:
             OSError: 仓储根目录创建或读取失败时抛出。
@@ -85,6 +94,7 @@ class DefaultFinsRuntime:
                 repository_set=repository_set,
             ),
             processor_registry=build_fins_processor_registry(),
+            ingestion_job_store=FsFinsIngestionJobStore.from_workspace_root(workspace_root),
         )
 
     def get_processor_registry(self) -> ProcessorRegistry:
@@ -120,6 +130,10 @@ class DefaultFinsRuntime:
         with self._tool_service_lock:
             if self._tool_service is not None:
                 return self._tool_service
+            # dayu.fins.tools 包初始化会导入 provider，provider 又需要本模块；
+            # 因此这里在运行时完成窄导入，避免直接 import service_runtime 时形成环。
+            from dayu.fins.tools.service import FinsToolService
+
             service = FinsToolService(
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
@@ -129,3 +143,29 @@ class DefaultFinsRuntime:
             )
             self._tool_service = service
             return service
+
+    def get_ingestion_runtime(self) -> FinsIngestionRuntime:
+        """返回共享的 Fins ingestion runtime 实例。
+
+        Args:
+            无。
+
+        Returns:
+            共享的 Fins ingestion runtime。
+
+        Raises:
+            无。
+        """
+
+        if self._ingestion_runtime is not None:
+            return self._ingestion_runtime
+        with self._ingestion_runtime_lock:
+            if self._ingestion_runtime is not None:
+                return self._ingestion_runtime
+            runtime = FinsIngestionRuntime.create(
+                source_repository=self.source_repository,
+                processed_repository=self.processed_repository,
+                job_store=self.ingestion_job_store,
+            )
+            self._ingestion_runtime = runtime
+            return runtime

@@ -1,6 +1,6 @@
 # Fins 开发手册
 
-`dayu.fins` 是财报分析能力包，当前提供财报文件系统仓储、财报文档处理器、读取服务和 read tools provider。它不属于 Host / Engine / Service / UI 任一层，具体财报文档访问必须通过 `dayu.fins.storage` 下的仓储协议与实现完成。
+`dayu.fins` 是财报分析能力包，当前提供财报文件系统仓储、财报文档处理器、读取服务、read tools provider 和 ingestion runtime foundation。它不属于 Host / Engine / Service / UI 任一层，具体财报文档访问必须通过 `dayu.fins.storage` 下的仓储协议与实现完成。
 
 ## 边界
 
@@ -8,7 +8,8 @@
 - `dayu.fins.processors` 复用 `dayu.documents.processors` 的共享文档处理器基础，补充财报表单、章节、表格和 XBRL 相关处理能力。
 - `dayu.fins.tools.service.FinsToolService` 负责参数标准化、ticker / document_id 路由、processor 缓存和 read tool 业务结果构造。
 - `dayu.fins.tools.provider.discover_tools` 是当前 ToolsDiscovery provider 入口，只暴露 read tools。
-- `dayu.fins.service_runtime.DefaultFinsRuntime` 只装配 read tools 需要的仓储实现、processor registry 与 `FinsToolService`，不持有 Host、Service、EventLog 或 ingestion job manager。
+- `dayu.fins.ingestion_runtime` 提供下载 / 预处理请求、job record、job store、start、read 与 cancel 的 typed runtime foundation。
+- `dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins shared assembly root，装配 read repositories、processor registry、`FinsToolService`，以及 workspace-scoped ingestion runtime foundation / job store；它不持有 Host、Service 或 EventLog。
 
 ## 读取路径
 
@@ -43,7 +44,11 @@ ToolsDiscovery
 
 ## Ingestion 状态
 
-当前 provider 不暴露下载 / 预处理 ingestion tools。旧 ingestion 工具是 `start/status/cancel` 后台 job 轮询模型，后续由 `WU-TOOLS-01-F01` 迁移到当前 Host / Engine `ToolAwaitingOutcome` 与 wait-resume contract；迁移前 provider 对 ingestion tools 保持 fail-closed。
+当前 `dayu.fins` 仍只通过 provider 暴露 read tools；download / preprocess tool providers 尚未实现。
+
+`DefaultFinsRuntime` 会装配 workspace-scoped ingestion runtime foundation。该 foundation 当前只提供 typed download / preprocess request、job record、job store、start、read 与 cancel 基础能力。`start_download` 与 `start_preprocess` 只持久化 `queued` job record，不执行真实 download / preprocess pipeline，也不暴露 Host wait adapter 或 tool provider。
+
+job store 由 workspace root 派生，当前路径为 `.dayu/fins_ingestion/jobs`。它只保存 job governance records，不保存财报正文、processed payload 或 raw provider payload。
 
 ## 扩展约束
 
