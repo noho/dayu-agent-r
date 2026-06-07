@@ -1,15 +1,31 @@
 # Dayu 开发手册总览
 
-本文档是 `dayu/` 包的开发手册总览，只写当前代码已实现的整体架构、设计意图、稳定边界、扩展入口和代码阅读顺序。Host 的细节设计以 `docs/host/design.md` 为准；包内细节以各包 README 为准。
+本文档是 `dayu/` 包的开发手册总览。
+
+整体架构如下：
+
+```text
+UI -> Service -> Host -> Engine
+```
 
 ## Agent更新约束【必须遵守】
 
-- 本文档只写当前代码已实现的整体架构、设计意图、稳定边界、扩展入口、代码阅读顺序。
-- 本文档不写过程状态，不写未来计划，不写实现细节，只保留稳定说明。
+- 本文档只写当前代码已实现的“总揽级别”的设计意图、整体架构、稳定边界、主要组件、关键执行路径、核心术语、公共契约概览、扩展入口和代码阅读顺序。
+- 不写用户手册、安装运行命令、测试清单或文件级流水账。
+- 不写过程状态，不写未来计划，不写路线图或时间表，不写实现细节，只保留稳定说明。
 
 ## 设计意图
 
-Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。LLM 参与分析与生成，但 Session / Run / Attempt 生命周期、取消、恢复、工具治理、事件事实和投影治理由 Host 掌控。
+Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。
+- LLM 参与分析与生成，但 Session / Run / Attempt 生命周期、取消、恢复、工具治理、事件事实和投影治理由 Host 掌控。
+- Engine 提供单次 run 的执行状态机、Runner 协议归一、工具调用闭环与强类型 `EngineEvent stream`。
+- Agent 与 Runner 都是 run-scoped 一次性对象：一次 `AgentRunRequest` 对应一次 Agent / Runner 生命周期；run 结束、失败、取消或挂起后，Engine 不复用旧实例。
+- Host 的核心设计意图是让 LLM 处于宿主强约束下运行：
+  - `Session`、`Run`、`Attempt`、`EventLog` 与同事务状态索引是 Host 治理真源。
+  - 同一 Session 的 active Run 由 Host admission 约束；queued Run 是 durable state，不是内存队列。
+  - EngineEvent 只是 Host ingest 的输入；Run / Attempt 终态必须由 Host 校验后写入 EventLog 与状态索引。
+  - 工具结果、工具等待、重复调用治理和截断治理必须经过 Host-owned ToolRuntime 与 accept barrier。
+  - Memory snapshot、timeline、projection、trace、outbox 与 diagnostic 都是派生视图，不能反向驱动 Run / Attempt 状态迁移。
 
 系统优先保证以下性质：
 
@@ -18,6 +34,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - Engine 只执行单次 `AgentRunRequest`，不持有 Session / Run 生命周期，也不恢复旧 Agent、Runner 或 EngineWorker。
 - 工具事实必须经过 Host / ToolRuntime 治理与 accept barrier；assistant final answer 不自动成为 evidence-backed fact。
 - 财报文档存取只通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
+
 
 ## 整体架构
 

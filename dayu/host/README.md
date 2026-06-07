@@ -1,27 +1,39 @@
 # Host 开发手册
 
-本文档是 `dayu.host` 包的开发手册，只写当前代码已实现的 Host 接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制和扩展点。Host 稳定术语与边界以当前代码和 `docs/host/design.md` 为准。
+本文档是 `dayu.host` 包的开发手册。
+
+Host 在整体架构中位置如下：
+
+```text
+UI -> Service -> Host -> Engine
+```
 
 ## Agent更新约束【必须遵守】
 
-- 本文档只服务 Host 开发者理解当前已实现的 Host 层契约，不写用户手册、安装运行命令、测试清单或文件级流水账。
-- 本文档只记录当前代码已实现的 Host 接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制和扩展点。
-- 本文档不写过程状态，不写路线图或时间表，不写实现细节，只保留稳定说明。
-- Host README 的事实来源是 `dayu.host` 当前代码与 `docs/host/design.md`；设计文档中尚未由代码承载的内容不得写成当前能力。
-- Service-facing public contract 与内部低层 / diagnostic 路径必须区分；普通 Service 不应依赖 durable store、dispatch scheduler、ToolRuntime factory、低层 command handle 或 run-level diagnostic stream。
+- 本文档只写当前代码已实现的 Agent 设计意图、架构边界，以及 `dayu.host` 的开发接口、公共契约、架构、稳定边界、主要组件、关键执行路径、状态机、事件流、关键机制、扩展点。
+- 不写用户手册、安装运行命令、测试清单或文件级流水账。
+- 不写过程状态，不写未来计划，不写路线图或时间表，不写实现细节，只保留稳定说明。
 
 ## 设计意图
 
-Host 是 `UI -> Service -> Host -> Engine` 分层中的治理边界。Service 负责业务入口、身份解析、场景装配和调用 Host public contract；Host 负责 Agent 运行宿主边界、状态治理、持久化、admission、dispatch、取消、重试、重放、等待恢复、ToolRuntime accept barrier、memory projection、context compaction、payload descriptor 和 terminal summary continuity；Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run / Attempt 治理状态。
+Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。
+- LLM 参与分析与生成，但 Session / Run / Attempt 生命周期、取消、恢复、工具治理、事件事实和投影治理由 Host 掌控。
+- Engine 提供单次 run 的执行状态机、Runner 协议归一、工具调用闭环与强类型 `EngineEvent stream`。
+- Agent 与 Runner 都是 run-scoped 一次性对象：一次 `AgentRunRequest` 对应一次 Agent / Runner 生命周期；run 结束、失败、取消或挂起后，Engine 不复用旧实例。
+- Host 的核心设计意图是让 LLM 处于宿主强约束下运行：
+  - `Session`、`Run`、`Attempt`、`EventLog` 与同事务状态索引是 Host 治理真源。
+  - 同一 Session 的 active Run 由 Host admission 约束；queued Run 是 durable state，不是内存队列。
+  - EngineEvent 只是 Host ingest 的输入；Run / Attempt 终态必须由 Host 校验后写入 EventLog 与状态索引。
+  - 工具结果、工具等待、重复调用治理和截断治理必须经过 Host-owned ToolRuntime 与 accept barrier。
+  - Memory snapshot、timeline、projection、trace、outbox 与 diagnostic 都是派生视图，不能反向驱动 Run / Attempt 状态迁移。
 
-Host 的核心设计意图是让 LLM 处于宿主强约束下运行：
+系统优先保证以下性质：
 
-- `Session`、`Run`、`Attempt`、`EventLog` 与同事务状态索引是 Host 治理真源。
-- 同一 Session 的 active Run 由 Host admission 约束；queued Run 是 durable state，不是内存队列。
-- EngineEvent 只是 Host ingest 的输入；Run / Attempt 终态必须由 Host 校验后写入 EventLog 与状态索引。
-- 工具结果、工具等待、重复调用治理和截断治理必须经过 Host-owned ToolRuntime 与 accept barrier。
-- Memory snapshot、timeline、projection、trace、outbox 与 diagnostic 都是派生视图，不能反向驱动 Run / Attempt 状态迁移。
-- Host 不承载财报业务语义，不直接读取或管理财报原文仓储；财报文档存取属于 `dayu.fins.storage` 边界。
+- durable facts 可恢复，EventLog 与同事务状态索引是 Host 治理事实真源。
+- 同一 Session 内执行并发受 Host admission 约束，远端执行环境不拥有 Host 状态。
+- Engine 只执行单次 `AgentRunRequest`，不持有 Session / Run 生命周期，也不恢复旧 Agent、Runner 或 EngineWorker。
+- 工具事实必须经过 Host / ToolRuntime 治理与 accept barrier；assistant final answer 不自动成为 evidence-backed fact。
+- 财报文档存取只通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 
 ## 架构边界
 
