@@ -165,6 +165,7 @@ class DefaultFinsRuntime:
             runtime = FinsIngestionRuntime.create(
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
+                processor_registry=self.processor_registry,
                 job_store=self.ingestion_job_store,
             )
             self._ingestion_runtime = runtime

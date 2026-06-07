@@ -2,28 +2,36 @@
 
 本模块只承载 Fins 自有 ingestion job 的 typed 请求、结果摘要、持久化
 job record、文件系统 job store 与运行时入口。它不实现真实下载、
-预处理 pipeline、Host wait adapter、tool provider 或 CLI。
+Host wait adapter、tool provider 或 CLI。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from types import TracebackType
 from typing import Final, Protocol, TextIO, cast, get_args
 
 import fcntl
 
 from dayu.contracts.json_value import JsonValue
+from dayu.documents.processors.base import DocumentProcessor
+from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
+from dayu.fins.domain.document_models import (
+    DocumentMeta,
+    ProcessedCreateRequest,
+    ProcessedUpdateRequest,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import (
     ProcessedDocumentRepositoryProtocol,
@@ -42,6 +50,7 @@ _JOB_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^finsjob_[0-9a-f]{32}$")
 _MAX_SUMMARY_JSON_CHARS: Final[int] = 4096
 _MAX_TEXT_CHARS: Final[int] = 240
 _MAX_TUPLE_ITEMS: Final[int] = 100
+_MAX_PREPROCESS_DOCUMENTS: Final[int] = 50
 _EMPTY_SUMMARY: Final[dict[str, JsonValue]] = {}
 _NORMALIZED_MARKET_VALUES: Final[frozenset[NormalizedTickerMarket]] = frozenset(
     cast(tuple[NormalizedTickerMarket, ...], get_args(NormalizedTickerMarket))
@@ -49,6 +58,7 @@ _NORMALIZED_MARKET_VALUES: Final[frozenset[NormalizedTickerMarket]] = frozenset(
 _NORMALIZED_EXCHANGE_VALUES: Final[frozenset[NormalizedTickerExchange]] = frozenset(
     cast(tuple[NormalizedTickerExchange, ...], get_args(NormalizedTickerExchange))
 )
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _KEY_JOB_ID: Final[str] = "job_id"
 _KEY_OPERATION_KIND: Final[str] = "operation_kind"
@@ -93,6 +103,10 @@ _TERMINAL_STATUSES = frozenset(
         FinsIngestionJobStatus.CANCELLED,
     }
 )
+
+
+class _PreprocessNotSupportedError(RuntimeError):
+    """源文档没有可用预处理器。"""
 
 
 @dataclass(frozen=True)
@@ -196,6 +210,9 @@ class FinsPreprocessResultSummary:
         skipped_count: 跳过数量。
         failed_count: 失败数量。
         processed_document_ids: 已写入的 processed 文档 ID。
+        skipped_document_ids: 因已有产物等原因跳过的源文档 ID。
+        failed_document_ids: 处理失败的源文档 ID。
+        not_supported_document_ids: 没有可用处理器的源文档 ID。
     """
 
     selected_count: int = 0
@@ -203,6 +220,9 @@ class FinsPreprocessResultSummary:
     skipped_count: int = 0
     failed_count: int = 0
     processed_document_ids: tuple[str, ...] = ()
+    skipped_document_ids: tuple[str, ...] = ()
+    failed_document_ids: tuple[str, ...] = ()
+    not_supported_document_ids: tuple[str, ...] = ()
 
     def to_json_summary(self) -> dict[str, JsonValue]:
         """转换为 JSON-compatible 摘要。
@@ -226,6 +246,27 @@ class FinsPreprocessResultSummary:
                 _bounded_text_tuple(
                     self.processed_document_ids,
                     "processed_document_ids",
+                    reject_path_separators=False,
+                )
+            ),
+            "skipped_document_ids": list(
+                _bounded_text_tuple(
+                    self.skipped_document_ids,
+                    "skipped_document_ids",
+                    reject_path_separators=False,
+                )
+            ),
+            "failed_document_ids": list(
+                _bounded_text_tuple(
+                    self.failed_document_ids,
+                    "failed_document_ids",
+                    reject_path_separators=False,
+                )
+            ),
+            "not_supported_document_ids": list(
+                _bounded_text_tuple(
+                    self.not_supported_document_ids,
+                    "not_supported_document_ids",
                     reject_path_separators=False,
                 )
             ),
@@ -355,6 +396,51 @@ class FinsIngestionJobStore(Protocol):
             ValueError: job id 或 record 内容非法时抛出。
         """
         ...
+
+
+class FinsIngestionExecutor(Protocol):
+    """Fins ingestion 后台执行器协议。"""
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """提交后台 job。
+
+        Args:
+            job_id: opaque job id，仅用于执行器诊断。
+            operation: 无参数、无返回值的 job 执行函数。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 执行器无法接受任务时抛出。
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class FinsIngestionThreadExecutor:
+    """基于 daemon thread 的最小 Fins ingestion 执行器。"""
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """提交后台 job。
+
+        Args:
+            job_id: opaque job id，仅用于线程命名。
+            operation: 无参数、无返回值的 job 执行函数。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 线程启动失败时抛出。
+        """
+
+        thread = Thread(
+            target=operation,
+            name=f"fins-ingestion-{job_id}",
+            daemon=True,
+        )
+        thread.start()
 
 
 @dataclass(frozen=True)
@@ -565,7 +651,9 @@ class FinsIngestionRuntime:
 
     source_repository: SourceDocumentRepositoryProtocol
     processed_repository: ProcessedDocumentRepositoryProtocol
+    processor_registry: ProcessorRegistry
     job_store: FinsIngestionJobStore
+    executor: FinsIngestionExecutor
     _start_lock: Lock
 
     @classmethod
@@ -574,14 +662,18 @@ class FinsIngestionRuntime:
         *,
         source_repository: SourceDocumentRepositoryProtocol,
         processed_repository: ProcessedDocumentRepositoryProtocol,
+        processor_registry: ProcessorRegistry,
         job_store: FinsIngestionJobStore,
+        executor: FinsIngestionExecutor | None = None,
     ) -> "FinsIngestionRuntime":
         """创建 ingestion runtime。
 
         Args:
             source_repository: 源文档仓储协议实现。
             processed_repository: processed 文档仓储协议实现。
+            processor_registry: 文档处理器注册表。
             job_store: Fins ingestion job record 存储。
+            executor: 可选后台执行器；不传入时使用最小 daemon thread 执行器。
 
         Returns:
             Fins ingestion runtime。
@@ -593,7 +685,9 @@ class FinsIngestionRuntime:
         return cls(
             source_repository=source_repository,
             processed_repository=processed_repository,
+            processor_registry=processor_registry,
             job_store=job_store,
+            executor=executor or FinsIngestionThreadExecutor(),
             _start_lock=Lock(),
         )
 
@@ -635,7 +729,8 @@ class FinsIngestionRuntime:
     def start_preprocess(self, request: FinsPreprocessRequest) -> FinsIngestionJobStart:
         """启动预处理 job。
 
-        S1 只创建 durable ``queued`` record，不启动真实预处理 pipeline。
+        本方法先创建 durable ``queued`` record，再提交后台 pipeline。后台
+        pipeline 只通过 Fins 仓储协议读取 source、写入 processed。
 
         Args:
             request: 预处理请求。
@@ -659,13 +754,21 @@ class FinsIngestionRuntime:
             ),
             "rebuild_processed": request.rebuild_processed,
         }
-        return self._create_queued_job(
+        start = self._create_queued_job(
             operation_kind=FinsIngestionOperationKind.PREPROCESS,
             normalized=normalized,
             source=None,
             source_kind=request.source_kind,
             request_summary=request_summary,
         )
+        self.executor.submit(
+            start.job_id,
+            lambda: self._run_preprocess_job(
+                job_id=start.job_id,
+                request=request,
+            ),
+        )
+        return start
 
     def read_job(self, job_id: str) -> FinsIngestionJobRecord:
         """读取 ingestion job。
@@ -755,6 +858,402 @@ class FinsIngestionRuntime:
             status=persisted.status,
             record=persisted,
         )
+
+    def _run_preprocess_job(self, *, job_id: str, request: FinsPreprocessRequest) -> None:
+        """执行预处理后台 job，并把异常收口到 job store。
+
+        Args:
+            job_id: opaque job id。
+            request: 原始预处理请求。
+
+        Returns:
+            无。
+
+        Raises:
+            无。所有业务与运行时异常都会转换为 failed terminal record。
+        """
+
+        try:
+            record = self._mark_job_running_or_cancelled(job_id)
+            if record.status is FinsIngestionJobStatus.CANCELLED:
+                return
+            summary = self._execute_preprocess_request(record, request)
+            latest = self.job_store.read_job(job_id)
+            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                self._save_cancelled(latest)
+                return
+            if (
+                summary.processed_count == 0
+                and (
+                    summary.selected_count == 0
+                    or summary.failed_count > 0
+                    or len(summary.not_supported_document_ids) > 0
+                )
+            ):
+                self._save_failed(
+                    latest,
+                    message="没有任何请求文档完成预处理",
+                    result_summary=summary.to_json_summary(),
+                )
+                return
+            self._save_succeeded(latest, summary.to_json_summary())
+        except Exception as exc:
+            self._save_failed_from_exception(job_id, exc)
+
+    def _mark_job_running_or_cancelled(self, job_id: str) -> FinsIngestionJobRecord:
+        """把 queued job 标记为 running，或按取消请求收口为 cancelled。
+
+        Args:
+            job_id: opaque job id。
+
+        Returns:
+            更新后的 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: job store 读写失败时抛出。
+            ValueError: job record 非法时抛出。
+        """
+
+        record = self.job_store.read_job(job_id)
+        if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
+            return self._save_cancelled(record)
+        if record.status in _TERMINAL_STATUSES:
+            return record
+        now = _utc_now()
+        return self.job_store.save_job(
+            replace(
+                record,
+                status=FinsIngestionJobStatus.RUNNING,
+                started_at=record.started_at or now,
+                updated_at=now,
+            )
+        )
+
+    def _execute_preprocess_request(
+        self,
+        record: FinsIngestionJobRecord,
+        request: FinsPreprocessRequest,
+    ) -> FinsPreprocessResultSummary:
+        """执行单个预处理请求。
+
+        Args:
+            record: 已进入 running 的 job record。
+            request: 原始预处理请求。
+
+        Returns:
+            预处理结果摘要。
+
+        Raises:
+            FileNotFoundError: ticker 或显式文档不存在时抛出。
+            ValueError: 选择数量超过上限或请求字段非法时抛出。
+            OSError: 仓储读取或写入失败时抛出。
+        """
+
+        ticker = record.normalized_ticker
+        document_ids = self._select_preprocess_documents(
+            ticker=ticker,
+            source_kind=request.source_kind,
+            document_ids=request.document_ids,
+            form_types=request.form_types,
+        )
+        processed_ids: list[str] = []
+        skipped_ids: list[str] = []
+        failed_ids: list[str] = []
+        not_supported_ids: list[str] = []
+
+        for document_id in document_ids:
+            latest = self.job_store.read_job(record.job_id)
+            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                break
+            try:
+                outcome = self._preprocess_one_document(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=request.source_kind,
+                    rebuild_processed=request.rebuild_processed,
+                )
+            except _PreprocessNotSupportedError:
+                not_supported_ids.append(document_id)
+                continue
+            except Exception:
+                failed_ids.append(document_id)
+                continue
+            if outcome == "processed":
+                processed_ids.append(document_id)
+            else:
+                skipped_ids.append(document_id)
+
+        return FinsPreprocessResultSummary(
+            selected_count=len(document_ids),
+            processed_count=len(processed_ids),
+            skipped_count=len(skipped_ids) + len(not_supported_ids),
+            failed_count=len(failed_ids),
+            processed_document_ids=tuple(processed_ids),
+            skipped_document_ids=tuple(skipped_ids),
+            failed_document_ids=tuple(failed_ids),
+            not_supported_document_ids=tuple(not_supported_ids),
+        )
+
+    def _select_preprocess_documents(
+        self,
+        *,
+        ticker: str,
+        source_kind: SourceKind,
+        document_ids: tuple[str, ...],
+        form_types: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """按请求选择待预处理源文档。
+
+        Args:
+            ticker: 标准化 ticker。
+            source_kind: 源文档类型。
+            document_ids: 显式源文档 ID；为空时按 ticker 全量选择。
+            form_types: 可选表单过滤。
+
+        Returns:
+            有界文档 ID 元组。
+
+        Raises:
+            FileNotFoundError: ticker 或显式文档不存在时抛出。
+            ValueError: 选择数量超过上限时抛出。
+        """
+
+        requested_ids = _bounded_text_tuple(document_ids, "document_ids", reject_path_separators=False)
+        requested_forms = _normalize_form_filter(form_types)
+        available_ids = tuple(self.source_repository.list_source_document_ids(ticker, source_kind))
+        if not available_ids:
+            raise FileNotFoundError(f"未找到 ticker={ticker} 的 {source_kind.value} 源文档")
+        selected_ids = requested_ids or available_ids
+
+        missing_ids = tuple(document_id for document_id in selected_ids if document_id not in available_ids)
+        if missing_ids:
+            missing_text = ", ".join(missing_ids[:3])
+            raise FileNotFoundError(f"源文档不存在: {missing_text}")
+
+        filtered_ids: list[str] = []
+        for document_id in selected_ids:
+            meta = self.source_repository.get_source_meta(ticker, document_id, source_kind)
+            if bool(meta.get("is_deleted", False)):
+                continue
+            if not bool(meta.get("ingest_complete", True)):
+                continue
+            form_type = _optional_bounded_text(_optional_text_from_meta(meta, "form_type"), "form_type")
+            if requested_forms and _normalize_form_value(form_type) not in requested_forms:
+                continue
+            filtered_ids.append(document_id)
+        if not filtered_ids:
+            raise FileNotFoundError("没有源文档匹配预处理选择条件")
+        if len(filtered_ids) > _MAX_PREPROCESS_DOCUMENTS:
+            raise ValueError(f"预处理文档数量超过上限: {_MAX_PREPROCESS_DOCUMENTS}")
+        return tuple(filtered_ids)
+
+    def _preprocess_one_document(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        rebuild_processed: bool,
+    ) -> str:
+        """处理单个源文档并写入 processed 仓储。
+
+        Args:
+            ticker: 标准化 ticker。
+            document_id: 源文档 ID。
+            source_kind: 源文档类型。
+            rebuild_processed: 是否允许覆盖已有 processed 产物。
+
+        Returns:
+            ``"processed"`` 或 ``"skipped"``。
+
+        Raises:
+            ValueError: 没有可用处理器时抛出。
+            FileNotFoundError: 源文档或 processed 更新目标不存在时抛出。
+            OSError: 仓储读取或写入失败时抛出。
+            RuntimeError: 处理器执行失败时抛出。
+        """
+
+        if not rebuild_processed and _processed_exists(self.processed_repository, ticker, document_id):
+            return "skipped"
+
+        source_meta = self.source_repository.get_source_meta(ticker, document_id, source_kind)
+        source = self.source_repository.get_primary_source(ticker, document_id, source_kind)
+        form_type = _optional_bounded_text(_optional_text_from_meta(source_meta, "form_type"), "form_type")
+        try:
+            processor = self.processor_registry.create_with_fallback(
+                source=source,
+                form_type=form_type,
+                media_type=source.media_type,
+            )
+        except ValueError as exc:
+            raise _PreprocessNotSupportedError(str(exc)) from exc
+        sections = _build_processed_sections(processor)
+        tables = _build_processed_tables(processor)
+        processed_meta = _build_processed_meta(
+            source_meta=source_meta,
+            parser_version=processor.get_parser_version(),
+        )
+
+        if _processed_exists(self.processed_repository, ticker, document_id):
+            self.processed_repository.update_processed(
+                ProcessedUpdateRequest(
+                    ticker=ticker,
+                    document_id=document_id,
+                    internal_document_id=_internal_document_id(source_meta, document_id),
+                    source_kind=source_kind.value,
+                    form_type=form_type,
+                    meta=processed_meta,
+                    sections=sections,
+                    tables=tables,
+                    financials=None,
+                )
+            )
+            return "processed"
+        self.processed_repository.create_processed(
+            ProcessedCreateRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=_internal_document_id(source_meta, document_id),
+                source_kind=source_kind.value,
+                form_type=form_type,
+                meta=processed_meta,
+                sections=sections,
+                tables=tables,
+                financials=None,
+            )
+        )
+        return "processed"
+
+    def _save_succeeded(
+        self,
+        record: FinsIngestionJobRecord,
+        result_summary: dict[str, JsonValue],
+    ) -> FinsIngestionJobRecord:
+        """保存 succeeded 终态。
+
+        Args:
+            record: 当前 job record。
+            result_summary: 有界业务结果摘要。
+
+        Returns:
+            更新后的 job record。
+
+        Raises:
+            OSError: job store 写入失败时抛出。
+            ValueError: 摘要非法时抛出。
+        """
+
+        _assert_bounded_summary(result_summary, "result_summary")
+        now = _utc_now()
+        return self.job_store.save_job(
+            replace(
+                record,
+                status=FinsIngestionJobStatus.SUCCEEDED,
+                updated_at=now,
+                finished_at=now,
+                result_summary=result_summary,
+                failure_summary=dict(_EMPTY_SUMMARY),
+            )
+        )
+
+    def _save_cancelled(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
+        """保存 cancelled 终态。
+
+        Args:
+            record: 当前 job record。
+
+        Returns:
+            更新后的 job record。
+
+        Raises:
+            OSError: job store 写入失败时抛出。
+        """
+
+        now = _utc_now()
+        return self.job_store.save_job(
+            replace(
+                record,
+                status=FinsIngestionJobStatus.CANCELLED,
+                updated_at=now,
+                finished_at=now,
+                cancellation_requested=True,
+            )
+        )
+
+    def _save_failed(
+        self,
+        record: FinsIngestionJobRecord,
+        *,
+        message: str,
+        result_summary: dict[str, JsonValue] | None = None,
+    ) -> FinsIngestionJobRecord:
+        """保存 failed 终态。
+
+        Args:
+            record: 当前 job record。
+            message: 有界失败说明。
+            result_summary: 可选业务结果摘要。
+
+        Returns:
+            更新后的 job record。
+
+        Raises:
+            OSError: job store 写入失败时抛出。
+            ValueError: 摘要非法时抛出。
+        """
+
+        failure_summary: dict[str, JsonValue] = {
+            "message": _bounded_text(
+                message,
+                "failure_message",
+                reject_path_separators=False,
+            )
+        }
+        _assert_bounded_summary(failure_summary, "failure_summary")
+        final_result = result_summary or dict(_EMPTY_SUMMARY)
+        _assert_bounded_summary(final_result, "result_summary")
+        now = _utc_now()
+        return self.job_store.save_job(
+            replace(
+                record,
+                status=FinsIngestionJobStatus.FAILED,
+                updated_at=now,
+                finished_at=now,
+                result_summary=final_result,
+                failure_summary=failure_summary,
+            )
+        )
+
+    def _save_failed_from_exception(self, job_id: str, exc: Exception) -> None:
+        """把后台异常转换为 failed job record。
+
+        Args:
+            job_id: opaque job id。
+            exc: 后台执行异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        try:
+            record = self.job_store.read_job(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return
+            self._save_failed(record, message=str(exc) or type(exc).__name__)
+        except Exception as terminal_exc:
+            _LOGGER.warning(
+                "fins.ingestion.failed_terminalization_failed "
+                "job_id=%s error_type=%s original_error_type=%s",
+                job_id,
+                type(terminal_exc).__name__,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return
 
 
 class _StoreFileLock:
@@ -950,6 +1449,182 @@ def _bounded_text_tuple(
     if len(values) > _MAX_TUPLE_ITEMS:
         raise ValueError(f"{field_name} 元素数量超出上限")
     return tuple(_bounded_text(value, field_name, reject_path_separators=reject_path_separators) for value in values)
+
+
+def _normalize_form_filter(values: tuple[str, ...]) -> frozenset[str]:
+    """归一化表单过滤条件。
+
+    Args:
+        values: 原始表单类型元组。
+
+    Returns:
+        大写后的表单类型集合。
+
+    Raises:
+        ValueError: 元素数量、元素内容非法时抛出。
+    """
+
+    return frozenset(
+        _normalize_form_value(value)
+        for value in _bounded_text_tuple(values, "form_types", reject_path_separators=False)
+    )
+
+
+def _normalize_form_value(value: str | None) -> str:
+    """归一化单个表单类型。
+
+    Args:
+        value: 表单类型或 ``None``。
+
+    Returns:
+        大写表单类型；空值返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    if value is None:
+        return ""
+    return value.strip().upper()
+
+
+def _optional_text_from_meta(meta: DocumentMeta, field_name: str) -> str | None:
+    """从元数据中读取可选文本字段。
+
+    Args:
+        meta: 源文档元数据。
+        field_name: 字段名。
+
+    Returns:
+        文本字段或 ``None``。
+
+    Raises:
+        无。
+    """
+
+    value = meta.get(field_name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _processed_exists(
+    repository: ProcessedDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+) -> bool:
+    """判断 processed 文档是否存在。
+
+    Args:
+        repository: processed 仓储协议。
+        ticker: 标准化 ticker。
+        document_id: 文档 ID。
+
+    Returns:
+        存在时返回 ``True``，否则返回 ``False``。
+
+    Raises:
+        OSError: 底层仓储读取失败时抛出。
+        ValueError: 元数据格式非法时抛出。
+    """
+
+    try:
+        repository.get_processed_meta(ticker, document_id)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _build_processed_sections(processor: DocumentProcessor) -> list[dict[str, JsonValue]]:
+    """构建 processed sections payload。
+
+    Args:
+        processor: 已创建的文档处理器。
+
+    Returns:
+        可交给 processed 仓储写入的章节列表。
+
+    Raises:
+        RuntimeError: 处理器读取章节失败时抛出。
+    """
+
+    sections: list[dict[str, JsonValue]] = []
+    for summary in processor.list_sections():
+        ref = str(summary["ref"])
+        payload = cast(dict[str, JsonValue], dict(processor.read_section(ref)))
+        payload.setdefault("summary", cast(JsonValue, dict(summary)))
+        sections.append(payload)
+    return sections
+
+
+def _build_processed_tables(processor: DocumentProcessor) -> list[dict[str, JsonValue]]:
+    """构建 processed tables payload。
+
+    Args:
+        processor: 已创建的文档处理器。
+
+    Returns:
+        可交给 processed 仓储写入的表格列表。
+
+    Raises:
+        RuntimeError: 处理器读取表格失败时抛出。
+    """
+
+    tables: list[dict[str, JsonValue]] = []
+    for summary in processor.list_tables():
+        table_ref = str(summary["table_ref"])
+        payload = cast(dict[str, JsonValue], dict(processor.read_table(table_ref)))
+        payload.setdefault("summary", cast(JsonValue, dict(summary)))
+        tables.append(payload)
+    return tables
+
+
+def _build_processed_meta(
+    *,
+    source_meta: DocumentMeta,
+    parser_version: str,
+) -> DocumentMeta:
+    """构建 processed meta。
+
+    Args:
+        source_meta: 源文档元数据。
+        parser_version: 处理器 parser version。
+
+    Returns:
+        processed meta 字典。
+
+    Raises:
+        无。
+    """
+
+    meta = dict(source_meta)
+    meta["parser_version"] = parser_version
+    meta["source_document_version"] = str(source_meta.get("document_version", "v1"))
+    meta["schema_version"] = "v1"
+    meta["reprocess_required"] = False
+    return meta
+
+
+def _internal_document_id(meta: DocumentMeta, document_id: str) -> str:
+    """解析内部文档 ID。
+
+    Args:
+        meta: 源文档元数据。
+        document_id: 源文档 ID。
+
+    Returns:
+        内部文档 ID；缺失时回退到源文档 ID。
+
+    Raises:
+        无。
+    """
+
+    value = meta.get("internal_document_id")
+    if value is None:
+        return document_id
+    text = str(value).strip()
+    return text or document_id
 
 
 def _assert_bounded_summary(summary: Mapping[str, JsonValue], field_name: str) -> None:

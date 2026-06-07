@@ -8,8 +8,8 @@
 - `dayu.fins.processors` 复用 `dayu.documents.processors` 的共享文档处理器基础，补充财报表单、章节、表格和 XBRL 相关处理能力。
 - `dayu.fins.tools.service.FinsToolService` 负责参数标准化、ticker / document_id 路由、processor 缓存和 read tool 业务结果构造。
 - `dayu.fins.tools.provider.discover_tools` 是当前 ToolsDiscovery provider 入口，只暴露 read tools。
-- `dayu.fins.ingestion_runtime` 提供下载 / 预处理请求、job record、job store、start、read 与 cancel 的 typed runtime foundation。
-- `dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins shared assembly root，装配 read repositories、processor registry、`FinsToolService`，以及 workspace-scoped ingestion runtime foundation / job store；它不持有 Host、Service 或 EventLog。
+- `dayu.fins.ingestion_runtime` 提供下载 / 预处理请求、job record、job store、start、read、cancel，以及预处理 source -> processed pipeline 的 typed runtime foundation。
+- `dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins shared assembly root，装配 read repositories、processor registry、`FinsToolService`，以及 workspace-scoped ingestion runtime foundation / job store / preprocess pipeline；它不持有 Host、Service 或 EventLog。
 
 ## 读取路径
 
@@ -46,7 +46,7 @@ ToolsDiscovery
 
 当前 `dayu.fins` 仍只通过 provider 暴露 read tools；download / preprocess tool providers 尚未实现。
 
-`DefaultFinsRuntime` 会装配 workspace-scoped ingestion runtime foundation。该 foundation 当前只提供 typed download / preprocess request、job record、job store、start、read 与 cancel 基础能力。`start_download` 与 `start_preprocess` 只持久化 `queued` job record，不执行真实 download / preprocess pipeline，也不暴露 Host wait adapter 或 tool provider。
+`DefaultFinsRuntime` 会装配 workspace-scoped ingestion runtime foundation。该 foundation 当前提供 typed download / preprocess request、job record、job store、start、read 与 cancel 基础能力。`start_preprocess` 会先持久化 `queued` job record，再通过 source repository 读取已存在源文档、通过 processor registry 生成 sections / tables 等 processed 产物，并通过 processed repository create / update 写入；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时重建。`start_download` 当前仍只持久化 `queued` job record，不执行真实 download pipeline。当前仍不暴露 Host wait adapter 或 tool provider。
 
 job store 由 workspace root 派生，当前路径为 `.dayu/fins_ingestion/jobs`。它只保存 job governance records，不保存财报正文、processed payload 或 raw provider payload。
 

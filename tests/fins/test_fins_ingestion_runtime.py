@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import io
+import logging
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -12,20 +15,85 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
+from dayu.fins.domain.document_models import (
+    CompanyMeta,
+    SourceDocumentUpsertRequest,
+    now_iso8601,
+)
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
     FinsDownloadResultSummary,
+    FinsIngestionExecutor,
     FinsIngestionJobStatus,
     FinsPreprocessRequest,
     FinsPreprocessResultSummary,
     _StoreFileLock,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.storage import (
+    FsBatchingRepository,
+    FsCompanyMetaRepository,
+    FsDocumentBlobRepository,
+    FsSourceDocumentRepository,
+)
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.service import FinsToolService
+
+
+class _HoldingExecutor(FinsIngestionExecutor):
+    """测试用延迟执行器。"""
+
+    def __init__(self) -> None:
+        """初始化待执行操作列表。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+        """
+
+        self.operations: list[Callable[[], None]] = []
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """记录后台操作但不立即执行。
+
+        Args:
+            job_id: opaque job id。
+            operation: 待执行操作。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del job_id
+        self.operations.append(operation)
+
+    def run_all(self) -> None:
+        """执行全部待执行操作。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        operations = tuple(self.operations)
+        self.operations.clear()
+        for operation in operations:
+            operation()
 
 
 def test_default_runtime_instances_share_workspace_job_store_without_singleton(tmp_path: Path) -> None:
@@ -138,7 +206,8 @@ def test_start_preprocess_persists_queued_record_and_uses_public_ticker_normaliz
     """预处理启动应通过 ticker_normalization 并先持久化 queued record。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     original_normalize = ticker_normalization.normalize_ticker
     calls: list[str] = []
 
@@ -173,6 +242,7 @@ def test_start_preprocess_persists_queued_record_and_uses_public_ticker_normaliz
 
     assert calls == ["HK.00700"]
     assert record.status is FinsIngestionJobStatus.QUEUED
+    assert len(executor.operations) == 1
     assert record.normalized_ticker == "0700"
     assert record.market == "HK"
     assert record.exchange == "HKEX"
@@ -215,8 +285,8 @@ def test_request_cancel_marks_active_job_and_keeps_terminal_job_terminal(tmp_pat
     """取消请求应标记 active job，且不得把终态 job 回退为 active。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
-    ingestion = default_runtime.get_ingestion_runtime()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
     queued_start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL"))
     cancelled = ingestion.request_cancel(queued_start.job_id)
 
@@ -227,7 +297,7 @@ def test_request_cancel_marks_active_job_and_keeps_terminal_job_terminal(tmp_pat
         result_summary={"processed_count": 0},
         finished_at=terminal_start.record.updated_at,
     )
-    default_runtime.ingestion_job_store.save_job(terminal_record)
+    ingestion.job_store.save_job(terminal_record)
     after_terminal_cancel = ingestion.request_cancel(terminal_start.job_id)
 
     assert cancelled.status is FinsIngestionJobStatus.CANCELLING
@@ -241,7 +311,8 @@ def test_job_records_do_not_expose_payload_bodies_raw_provider_payloads_or_paths
     """job record 只应包含治理摘要，不应暴露正文、raw payload 或文件系统路径。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
     start = ingestion.start_preprocess(
         FinsPreprocessRequest(
             ticker="AAPL",
@@ -265,6 +336,193 @@ def test_job_records_do_not_expose_payload_bodies_raw_provider_payloads_or_paths
         "form_types": ["10-K"],
         "rebuild_processed": False,
     }
+
+
+def test_start_preprocess_processes_source_document_to_processed_repository(tmp_path: Path) -> None:
+    """预处理应通过仓储读取 source 并写入 processed 产物。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+
+    start = ingestion.start_preprocess(
+        FinsPreprocessRequest(
+            ticker="AAPL",
+            document_ids=("aapl-2024-10k",),
+            form_types=("10-K",),
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+    processed_meta = runtime.processed_repository.get_processed_meta("AAPL", "aapl-2024-10k")
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["selected_count"] == 1
+    assert record.result_summary["processed_count"] == 1
+    assert record.result_summary["processed_document_ids"] == ["aapl-2024-10k"]
+    assert processed_meta["document_id"] == "aapl-2024-10k"
+    assert int(processed_meta["section_count"]) > 0
+    assert processed_meta["parser_version"] != ""
+
+
+def test_start_preprocess_whole_ticker_applies_limit_after_form_filter(tmp_path: Path) -> None:
+    """整 ticker 预处理上限应作用于表单过滤后的实际工作集。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    _add_unmatched_source_documents(
+        workspace_root=workspace_root,
+        count=ingestion_runtime._MAX_PREPROCESS_DOCUMENTS + 1,
+    )
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+
+    start = ingestion.start_preprocess(
+        FinsPreprocessRequest(
+            ticker="AAPL",
+            form_types=("10-K",),
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["selected_count"] == 1
+    assert record.result_summary["processed_count"] == 1
+    assert record.result_summary["processed_document_ids"] == ["aapl-2024-10k"]
+
+
+def test_start_preprocess_skips_existing_processed_document_without_rebuild(tmp_path: Path) -> None:
+    """rebuild_processed=False 时已有 processed 文档应被跳过。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+    first = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+    _wait_terminal(ingestion, first.job_id)
+
+    second = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+    record = _wait_terminal(ingestion, second.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["processed_count"] == 0
+    assert record.result_summary["skipped_count"] == 1
+    assert record.result_summary["skipped_document_ids"] == ["aapl-2024-10k"]
+
+
+def test_start_preprocess_rebuild_updates_existing_processed_document(tmp_path: Path) -> None:
+    """rebuild_processed=True 时已有 processed 文档应走 update。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+    first = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+    _wait_terminal(ingestion, first.job_id)
+
+    second = ingestion.start_preprocess(
+        FinsPreprocessRequest(
+            ticker="AAPL",
+            document_ids=("aapl-2024-10k",),
+            rebuild_processed=True,
+        )
+    )
+    record = _wait_terminal(ingestion, second.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["processed_count"] == 1
+    assert record.result_summary["processed_document_ids"] == ["aapl-2024-10k"]
+
+
+def test_start_preprocess_cancel_before_execution_writes_cancelled_terminal(tmp_path: Path) -> None:
+    """queued 后执行前收到取消请求时，后台执行应收口为 cancelled。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+    cancelling = ingestion.request_cancel(start.job_id)
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+
+    assert cancelling.status is FinsIngestionJobStatus.CANCELLING
+    assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert record.cancellation_requested
+
+
+def test_start_preprocess_missing_document_fails_terminal_record(tmp_path: Path) -> None:
+    """显式缺失文档应写入 failed 终态而不是后台异常逃逸。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("missing-doc",)))
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.FAILED
+    assert "源文档不存在" in str(record.failure_summary["message"])
+
+
+def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp_path: Path) -> None:
+    """无可用处理器时应记录 not_supported 文档并按无可处理文档失败。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = ingestion_runtime.FinsIngestionRuntime.create(
+        source_repository=default_runtime.source_repository,
+        processed_repository=default_runtime.processed_repository,
+        processor_registry=ProcessorRegistry(),
+        job_store=default_runtime.ingestion_job_store,
+    )
+
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.FAILED
+    assert record.result_summary["selected_count"] == 1
+    assert record.result_summary["processed_count"] == 0
+    assert record.result_summary["not_supported_document_ids"] == ["aapl-2024-10k"]
+    assert "没有任何请求文档完成预处理" in str(record.failure_summary["message"])
+
+
+def test_save_failed_from_exception_logs_secondary_job_store_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """失败收口二次写 job store 失败时应记录诊断且不向外传播。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+
+    def raise_save_job(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        record: ingestion_runtime.FinsIngestionJobRecord,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """模拟 failed 终态落盘失败。
+
+        Args:
+            store: 被替换方法所属 job store。
+            record: 待保存的 job record。
+
+        Returns:
+            不返回；始终抛出异常。
+
+        Raises:
+            OSError: 始终抛出，模拟 job store 写入失败。
+        """
+
+        del store, record
+        raise OSError("job store save failed")
+
+    monkeypatch.setattr(ingestion_runtime.FsFinsIngestionJobStore, "save_job", raise_save_job)
+
+    with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
+        ingestion._save_failed_from_exception(start.job_id, RuntimeError("primary failure"))
+
+    assert "fins.ingestion.failed_terminalization_failed" in caplog.text
+    assert f"job_id={start.job_id}" in caplog.text
+    assert "error_type=OSError" in caplog.text
+    assert "original_error_type=RuntimeError" in caplog.text
 
 
 def test_job_store_removes_temp_file_when_atomic_replace_fails(
@@ -369,3 +627,227 @@ def _job_file(workspace_root: Path, job_id: str) -> Path:
     """
 
     return workspace_root / ".dayu" / "fins_ingestion" / "jobs" / f"{job_id}.json"
+
+
+def _build_ingestion_runtime(
+    workspace_root: Path,
+    *,
+    executor: FinsIngestionExecutor,
+) -> ingestion_runtime.FinsIngestionRuntime:
+    """构建测试用 ingestion runtime。
+
+    Args:
+        workspace_root: Fins workspace root。
+        executor: 测试执行器。
+
+    Returns:
+        ingestion runtime。
+
+    Raises:
+        OSError: 仓储初始化失败时抛出。
+    """
+
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    return ingestion_runtime.FinsIngestionRuntime.create(
+        source_repository=default_runtime.source_repository,
+        processed_repository=default_runtime.processed_repository,
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=executor,
+    )
+
+
+def _add_unmatched_source_documents(
+    *,
+    workspace_root: Path,
+    count: int,
+) -> None:
+    """追加不匹配 10-K 表单过滤条件的源文档。
+
+    Args:
+        workspace_root: Fins workspace root。
+        count: 需要追加的 10-Q 源文档数量。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 仓储写入失败时抛出。
+        ValueError: 源文档字段非法时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    token = batching_repository.begin_batch("AAPL")
+    try:
+        for index in range(count):
+            document_id = f"aapl-2024-10q-{index:02d}"
+            source_repository.create_source_document(
+                SourceDocumentUpsertRequest(
+                    ticker="AAPL",
+                    document_id=document_id,
+                    internal_document_id=document_id,
+                    form_type="10-Q",
+                    primary_document=f"{document_id}.md",
+                    meta={
+                        "fiscal_year": 2024,
+                        "fiscal_period": "Q",
+                        "filing_date": "2024-08-01",
+                        "report_date": "2024-06-29",
+                        "amended": False,
+                        "ingest_method": "upload",
+                    },
+                ),
+                SourceKind.FILING,
+            )
+        batching_repository.commit_batch(token)
+    except Exception:
+        batching_repository.rollback_batch(token)
+        raise
+
+
+def _wait_terminal(
+    ingestion: ingestion_runtime.FinsIngestionRuntime,
+    job_id: str,
+) -> ingestion_runtime.FinsIngestionJobRecord:
+    """等待 job 进入终态。
+
+    Args:
+        ingestion: ingestion runtime。
+        job_id: opaque job id。
+
+    Returns:
+        终态 job record。
+
+    Raises:
+        AssertionError: 超时未进入终态时抛出。
+    """
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        record = ingestion.read_job(job_id)
+        if record.status in {
+            FinsIngestionJobStatus.SUCCEEDED,
+            FinsIngestionJobStatus.FAILED,
+            FinsIngestionJobStatus.CANCELLED,
+        }:
+            return record
+        time.sleep(0.02)
+    raise AssertionError(f"job 未进入终态: {job_id}")
+
+
+def _build_fins_workspace(
+    tmp_path: Path,
+    *,
+    content_type: str = "text/markdown",
+) -> Path:
+    """构造确定性 Fins fixture 工作区。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        content_type: 主文件 content type。
+
+    Returns:
+        Fins workspace root。
+
+    Raises:
+        OSError: 文件写入失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    company_repository.upsert_company_meta(
+        CompanyMeta(
+            company_id="0000320193",
+            company_name="Apple Inc.",
+            ticker="AAPL",
+            market="US",
+            resolver_version="test",
+            updated_at=now_iso8601(),
+            ticker_aliases=["APPLE"],
+        )
+    )
+    token = batching_repository.begin_batch("AAPL")
+    try:
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="aapl-2024-10k",
+                internal_document_id="aapl-2024-10k",
+                form_type="10-K",
+                primary_document="aapl-2024-10k.md",
+                meta={
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                    "filing_date": "2024-11-01",
+                    "report_date": "2024-09-28",
+                    "amended": False,
+                    "ingest_method": "upload",
+                },
+            ),
+            SourceKind.FILING,
+        )
+        handle = source_repository.get_source_handle("AAPL", "aapl-2024-10k", SourceKind.FILING)
+        file_meta = blob_repository.store_file(
+            handle,
+            "aapl-2024-10k.md",
+            io.BytesIO(_fixture_markdown().encode("utf-8")),
+            content_type=content_type,
+        )
+        source_repository.update_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="aapl-2024-10k",
+                internal_document_id="aapl-2024-10k",
+                form_type="10-K",
+                primary_document="aapl-2024-10k.md",
+                meta={
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                    "filing_date": "2024-11-01",
+                    "report_date": "2024-09-28",
+                    "amended": False,
+                    "ingest_method": "upload",
+                },
+                files=[file_meta],
+            ),
+            SourceKind.FILING,
+        )
+        batching_repository.commit_batch(token)
+    except Exception:
+        batching_repository.rollback_batch(token)
+        raise
+    return workspace_root
+
+
+def _fixture_markdown() -> str:
+    """返回测试财报 Markdown 内容。
+
+    Args:
+        无。
+
+    Returns:
+        Markdown 财报片段。
+
+    Raises:
+        无。
+    """
+
+    return "\n".join(
+        (
+            "# Apple 2024 Form 10-K",
+            "",
+            "## Item 1. Business",
+            "Annual recurring revenue increased in services.",
+            "",
+            "## Item 7. Management Discussion",
+            "| Segment | Revenue |",
+            "| --- | ---: |",
+            "| Services | 100 |",
+        )
+    )
