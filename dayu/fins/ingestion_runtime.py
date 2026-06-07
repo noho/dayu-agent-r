@@ -1,7 +1,7 @@
 """Fins 下载与预处理运行时基础能力。
 
 本模块只承载 Fins 自有 ingestion job 的 typed 请求、结果摘要、持久化
-job record、文件系统 job store 与运行时入口。它不实现真实下载、
+job record、文件系统 job store 与运行时入口。它不实现真实网络下载、
 Host wait adapter、tool provider 或 CLI。
 """
 
@@ -12,8 +12,9 @@ import logging
 import os
 import re
 import uuid
+from io import BytesIO
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -29,11 +30,19 @@ from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 from dayu.fins.domain.document_models import (
     DocumentMeta,
+    FileObjectMeta,
     ProcessedCreateRequest,
+    ProcessedHandle,
     ProcessedUpdateRequest,
+    RejectedFilingArtifactUpsertRequest,
+    SourceDocumentUpsertRequest,
+    SourceFileEntry,
+    SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import (
+    DocumentBlobRepositoryProtocol,
+    FilingMaintenanceRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
@@ -42,6 +51,8 @@ from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
 from dayu.fins.ticker_normalization import NormalizedTicker
 
 _DEFAULT_DOWNLOAD_SOURCE: Final[str] = "auto"
+_DOWNLOAD_INGEST_METHOD: Final[str] = "download"
+_DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
 _JOB_ID_PREFIX: Final[str] = "finsjob_"
 _JOB_FILE_SUFFIX: Final[str] = ".json"
 _LOCK_FILE_NAME: Final[str] = ".store.lock"
@@ -109,6 +120,10 @@ class _PreprocessNotSupportedError(RuntimeError):
     """源文档没有可用预处理器。"""
 
 
+class _UnsupportedDownloadSourceError(RuntimeError):
+    """没有可用下载 adapter。"""
+
+
 @dataclass(frozen=True)
 class FinsDownloadRequest:
     """下载任务请求。
@@ -130,6 +145,146 @@ class FinsDownloadRequest:
     filed_before: str | None = None
     overwrite_existing: bool = False
     rebuild_processed: bool = False
+
+
+@dataclass(frozen=True)
+class FinsDownloadedFile:
+    """下载 adapter 返回的单个业务文件。
+
+    Attributes:
+        filename: 文件名，不含路径。
+        content: 文件字节内容；只用于落盘，不进入 job record。
+        content_type: 可选 MIME 类型。
+        metadata: 文件级业务元数据。
+    """
+
+    filename: str
+    content: bytes
+    content_type: str | None = None
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FinsDownloadedSourceDocument:
+    """下载 adapter 返回的可进入 source 仓储的文档。
+
+    Attributes:
+        source_kind: 源文档类别。
+        document_id: 业务文档 ID。
+        internal_document_id: 来源系统内部文档 ID。
+        form_type: 表单类型。
+        primary_document: 主文件名。
+        meta: 业务元数据，不含 provider raw payload。
+        files: 需要落盘的文件列表。
+    """
+
+    source_kind: SourceKind
+    document_id: str
+    internal_document_id: str
+    form_type: str | None
+    primary_document: str
+    meta: dict[str, JsonValue]
+    files: tuple[FinsDownloadedFile, ...]
+
+
+@dataclass(frozen=True)
+class FinsRejectedFilingDownloadArtifact:
+    """下载 adapter 返回的 rejected filing artifact。
+
+    Attributes:
+        document_id: rejected artifact 文档 ID。
+        internal_document_id: 来源系统内部文档 ID。
+        accession_number: filing accession number 或等价来源编号。
+        company_id: 公司业务 ID。
+        form_type: 表单类型。
+        filing_date: 披露日期。
+        report_date: 报告期日期。
+        primary_document: 来源主文件名。
+        selected_primary_document: 被策略选中的主文件名。
+        rejection_reason: 拒绝原因。
+        rejection_category: 拒绝分类。
+        source_fingerprint: 来源指纹。
+        files: 需要作为 rejected artifact 保存的文件。
+        fiscal_year: 可选会计年度。
+        fiscal_period: 可选会计期间。
+        report_kind: 可选报告类型。
+        amended: 是否修正文件。
+        has_xbrl: 是否包含 XBRL。
+    """
+
+    document_id: str
+    internal_document_id: str
+    accession_number: str
+    company_id: str
+    form_type: str
+    filing_date: str
+    report_date: str | None
+    primary_document: str
+    selected_primary_document: str
+    rejection_reason: str
+    rejection_category: str
+    source_fingerprint: str
+    files: tuple[FinsDownloadedFile, ...] = ()
+    fiscal_year: int | None = None
+    fiscal_period: str | None = None
+    report_kind: str | None = None
+    amended: bool = False
+    has_xbrl: bool | None = None
+
+
+@dataclass(frozen=True)
+class FinsSourceDownloadAdapterRequest:
+    """传给 source-specific 下载 adapter 的请求。
+
+    Attributes:
+        normalized_ticker: 已由公共 API 归一化的 ticker。
+        source: 已归一化的来源标识。
+        form_types: 表单过滤条件。
+        filed_after: 可选起始披露日期字符串。
+        filed_before: 可选结束披露日期字符串。
+    """
+
+    normalized_ticker: NormalizedTicker
+    source: str
+    form_types: tuple[str, ...]
+    filed_after: str | None
+    filed_before: str | None
+
+
+@dataclass(frozen=True)
+class FinsSourceDownloadAdapterResult:
+    """source-specific 下载 adapter 返回值。
+
+    Attributes:
+        discovered_count: 来源侧发现的候选文档数量。
+        documents: 可写入 source 仓储的文档。
+        rejected_artifacts: 需要保存为 rejected filing artifact 的文档。
+        failed_count: 来源侧业务失败候选数量。
+    """
+
+    discovered_count: int
+    documents: tuple[FinsDownloadedSourceDocument, ...] = ()
+    rejected_artifacts: tuple[FinsRejectedFilingDownloadArtifact, ...] = ()
+    failed_count: int = 0
+
+
+class FinsSourceDownloadAdapter(Protocol):
+    """Fins source-specific 下载 adapter 协议。"""
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """下载指定来源的源文档。
+
+        Args:
+            request: 已归一化的下载请求。
+
+        Returns:
+            业务可读的下载结果；不得包含 provider raw payload。
+
+        Raises:
+            RuntimeError: 来源侧下载失败时抛出。
+            ValueError: adapter 返回业务字段非法时抛出。
+        """
+        ...
 
 
 @dataclass(frozen=True)
@@ -364,6 +519,30 @@ class FinsIngestionJobStore(Protocol):
         """
         ...
 
+    def save_succeeded_or_cancelled(
+        self,
+        job_id: str,
+        *,
+        result_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """按当前取消状态原子保存 succeeded 或 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            result_summary: succeeded 终态的有界业务结果摘要。
+            finished_at: 本次终态写入时间。
+
+        Returns:
+            已持久化的终态 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统写入失败时抛出。
+            ValueError: record 或摘要字段非法时抛出。
+        """
+        ...
+
     def read_job(self, job_id: str) -> FinsIngestionJobRecord:
         """读取 job record。
 
@@ -527,6 +706,55 @@ class FsFinsIngestionJobStore:
             self._write_record_locked(record)
             return record
 
+    def save_succeeded_or_cancelled(
+        self,
+        job_id: str,
+        *,
+        result_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """按当前取消状态原子保存 succeeded 或 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            result_summary: succeeded 终态的有界业务结果摘要。
+            finished_at: 本次终态写入时间。
+
+        Returns:
+            已持久化的终态 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、record 或摘要字段非法时抛出。
+        """
+
+        _assert_bounded_summary(result_summary, "result_summary")
+        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+            record = self._read_record_locked(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return record
+            if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
+                cancelled = replace(
+                    record,
+                    status=FinsIngestionJobStatus.CANCELLED,
+                    updated_at=finished_at,
+                    finished_at=finished_at,
+                    cancellation_requested=True,
+                )
+                self._write_record_locked(cancelled)
+                return cancelled
+            succeeded = replace(
+                record,
+                status=FinsIngestionJobStatus.SUCCEEDED,
+                updated_at=finished_at,
+                finished_at=finished_at,
+                result_summary=result_summary,
+                failure_summary=dict(_EMPTY_SUMMARY),
+            )
+            self._write_record_locked(succeeded)
+            return succeeded
+
     def read_job(self, job_id: str) -> FinsIngestionJobRecord:
         """读取 job record。
 
@@ -650,10 +878,13 @@ class FinsIngestionRuntime:
     """Fins 下载与预处理运行时基础入口。"""
 
     source_repository: SourceDocumentRepositoryProtocol
+    blob_repository: DocumentBlobRepositoryProtocol
+    filing_maintenance_repository: FilingMaintenanceRepositoryProtocol
     processed_repository: ProcessedDocumentRepositoryProtocol
     processor_registry: ProcessorRegistry
     job_store: FinsIngestionJobStore
     executor: FinsIngestionExecutor
+    download_adapters: Mapping[tuple[str, NormalizedTickerMarket], FinsSourceDownloadAdapter]
     _start_lock: Lock
 
     @classmethod
@@ -661,19 +892,25 @@ class FinsIngestionRuntime:
         cls,
         *,
         source_repository: SourceDocumentRepositoryProtocol,
+        blob_repository: DocumentBlobRepositoryProtocol,
+        filing_maintenance_repository: FilingMaintenanceRepositoryProtocol,
         processed_repository: ProcessedDocumentRepositoryProtocol,
         processor_registry: ProcessorRegistry,
         job_store: FinsIngestionJobStore,
         executor: FinsIngestionExecutor | None = None,
+        download_adapters: Mapping[tuple[str, NormalizedTickerMarket], FinsSourceDownloadAdapter] | None = None,
     ) -> "FinsIngestionRuntime":
         """创建 ingestion runtime。
 
         Args:
             source_repository: 源文档仓储协议实现。
+            blob_repository: 文档文件对象仓储协议实现。
+            filing_maintenance_repository: filing 维护治理仓储协议实现。
             processed_repository: processed 文档仓储协议实现。
             processor_registry: 文档处理器注册表。
             job_store: Fins ingestion job record 存储。
             executor: 可选后台执行器；不传入时使用最小 daemon thread 执行器。
+            download_adapters: 可选 source/market 下载 adapter 映射。
 
         Returns:
             Fins ingestion runtime。
@@ -684,17 +921,21 @@ class FinsIngestionRuntime:
 
         return cls(
             source_repository=source_repository,
+            blob_repository=blob_repository,
+            filing_maintenance_repository=filing_maintenance_repository,
             processed_repository=processed_repository,
             processor_registry=processor_registry,
             job_store=job_store,
             executor=executor or FinsIngestionThreadExecutor(),
+            download_adapters=dict(download_adapters or {}),
             _start_lock=Lock(),
         )
 
     def start_download(self, request: FinsDownloadRequest) -> FinsIngestionJobStart:
         """启动下载 job。
 
-        S1 只创建 durable ``queued`` record，不启动真实下载 pipeline。
+        本方法先创建 durable ``queued`` record，再提交后台下载 pipeline。
+        下载 pipeline 只通过 Fins 仓储协议写入 source/blob/rejected artifact。
 
         Args:
             request: 下载请求。
@@ -708,7 +949,7 @@ class FinsIngestionRuntime:
         """
 
         normalized = ticker_normalization.normalize_ticker(request.ticker)
-        source = _bounded_text(request.source, "source")
+        source = _normalize_download_source(request.source)
         request_summary: dict[str, JsonValue] = {
             "form_types": list(
                 _bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False)
@@ -718,13 +959,22 @@ class FinsIngestionRuntime:
             "overwrite_existing": request.overwrite_existing,
             "rebuild_processed": request.rebuild_processed,
         }
-        return self._create_queued_job(
+        start = self._create_queued_job(
             operation_kind=FinsIngestionOperationKind.DOWNLOAD,
             normalized=normalized,
             source=source,
             source_kind=None,
             request_summary=request_summary,
         )
+        self.executor.submit(
+            start.job_id,
+            lambda: self._run_download_job(
+                job_id=start.job_id,
+                normalized=normalized,
+                request=replace(request, source=source),
+            ),
+        )
+        return start
 
     def start_preprocess(self, request: FinsPreprocessRequest) -> FinsIngestionJobStart:
         """启动预处理 job。
@@ -875,7 +1125,7 @@ class FinsIngestionRuntime:
 
         try:
             record = self._mark_job_running_or_cancelled(job_id)
-            if record.status is FinsIngestionJobStatus.CANCELLED:
+            if record.status in _TERMINAL_STATUSES:
                 return
             summary = self._execute_preprocess_request(record, request)
             latest = self.job_store.read_job(job_id)
@@ -897,6 +1147,49 @@ class FinsIngestionRuntime:
                 )
                 return
             self._save_succeeded(latest, summary.to_json_summary())
+        except Exception as exc:
+            self._save_failed_from_exception(job_id, exc)
+
+    def _run_download_job(
+        self,
+        *,
+        job_id: str,
+        normalized: NormalizedTicker,
+        request: FinsDownloadRequest,
+    ) -> None:
+        """执行下载后台 job，并把异常收口到 job store。
+
+        Args:
+            job_id: opaque job id。
+            normalized: 已归一化 ticker。
+            request: 已规范化 source 字段的原始下载请求。
+
+        Returns:
+            无。
+
+        Raises:
+            无。所有业务与运行时异常都会转换为 terminal job record。
+        """
+
+        try:
+            record = self._mark_job_running_or_cancelled(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return
+            summary = self._execute_download_request(record, normalized, request)
+            latest = self.job_store.read_job(job_id)
+            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                self._save_cancelled(latest)
+                return
+            if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
+                self._save_failed(
+                    latest,
+                    message="下载请求未写入任何源文档",
+                    result_summary=summary.to_json_summary(),
+                )
+                return
+            self._save_succeeded(latest, summary.to_json_summary())
+        except _UnsupportedDownloadSourceError as exc:
+            self._save_download_unsupported(job_id, str(exc))
         except Exception as exc:
             self._save_failed_from_exception(job_id, exc)
 
@@ -993,6 +1286,309 @@ class FinsIngestionRuntime:
             skipped_document_ids=tuple(skipped_ids),
             failed_document_ids=tuple(failed_ids),
             not_supported_document_ids=tuple(not_supported_ids),
+        )
+
+    def _execute_download_request(
+        self,
+        record: FinsIngestionJobRecord,
+        normalized: NormalizedTicker,
+        request: FinsDownloadRequest,
+    ) -> FinsDownloadResultSummary:
+        """执行单个下载请求。
+
+        Args:
+            record: 已进入 running 的 job record。
+            normalized: 已归一化 ticker。
+            request: 下载请求。
+
+        Returns:
+            下载结果摘要。
+
+        Raises:
+            _UnsupportedDownloadSourceError: 没有匹配 adapter 时抛出。
+            ValueError: adapter 返回字段非法时抛出。
+            OSError: 仓储读取或写入失败时抛出。
+        """
+
+        adapter = self._select_download_adapter(source=request.source, market=normalized.market)
+        adapter_request = FinsSourceDownloadAdapterRequest(
+            normalized_ticker=normalized,
+            source=request.source,
+            form_types=_bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False),
+            filed_after=_optional_bounded_text(request.filed_after, "filed_after"),
+            filed_before=_optional_bounded_text(request.filed_before, "filed_before"),
+        )
+        adapter_result = adapter.download(adapter_request)
+        downloaded_ids: list[str] = []
+        skipped_count = 0
+        rejected_count = 0
+
+        for document in adapter_result.documents:
+            latest = self.job_store.read_job(record.job_id)
+            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                break
+            if self._store_downloaded_document(
+                ticker=normalized.canonical,
+                document=document,
+                overwrite_existing=request.overwrite_existing,
+                rebuild_processed=request.rebuild_processed,
+            ):
+                downloaded_ids.append(document.document_id)
+            else:
+                skipped_count += 1
+
+        for artifact in adapter_result.rejected_artifacts:
+            latest = self.job_store.read_job(record.job_id)
+            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                break
+            self._store_rejected_filing_artifact(
+                ticker=normalized.canonical,
+                artifact=artifact,
+            )
+            rejected_count += 1
+
+        return FinsDownloadResultSummary(
+            discovered_count=_non_negative_count(adapter_result.discovered_count, "discovered_count"),
+            downloaded_count=len(downloaded_ids),
+            skipped_count=skipped_count,
+            rejected_count=rejected_count,
+            failed_count=_non_negative_count(adapter_result.failed_count, "failed_count"),
+            written_document_ids=tuple(downloaded_ids),
+        )
+
+    def _select_download_adapter(
+        self,
+        *,
+        source: str,
+        market: NormalizedTickerMarket,
+    ) -> FinsSourceDownloadAdapter:
+        """按来源与市场选择下载 adapter。
+
+        Args:
+            source: 已归一化来源标识。
+            market: 已归一化市场。
+
+        Returns:
+            匹配的下载 adapter。
+
+        Raises:
+            _UnsupportedDownloadSourceError: 没有匹配 adapter 时抛出。
+        """
+
+        adapter = self.download_adapters.get((source, market))
+        if adapter is None:
+            raise _UnsupportedDownloadSourceError(f"不支持的下载来源: source={source}, market={market}")
+        return adapter
+
+    def _store_downloaded_document(
+        self,
+        *,
+        ticker: str,
+        document: FinsDownloadedSourceDocument,
+        overwrite_existing: bool,
+        rebuild_processed: bool,
+    ) -> bool:
+        """保存单个下载文档。
+
+        Args:
+            ticker: 标准化 ticker。
+            document: adapter 返回的源文档。
+            overwrite_existing: 是否覆盖已有源文档。
+            rebuild_processed: 是否标记已有 processed 产物需重处理。
+
+        Returns:
+            写入时返回 ``True``；已有且不覆盖时返回 ``False``。
+
+        Raises:
+            ValueError: 文档字段非法时抛出。
+            OSError: 仓储写入失败时抛出。
+        """
+
+        document_id = _bounded_text(document.document_id, "document_id", reject_path_separators=False)
+        if _source_document_exists(self.source_repository, ticker, document_id, document.source_kind):
+            if not overwrite_existing:
+                return False
+            self.source_repository.reset_source_document(ticker, document_id, document.source_kind)
+
+        primary_document = _bounded_text(document.primary_document, "primary_document")
+        create_request = SourceDocumentUpsertRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=_bounded_text(
+                document.internal_document_id,
+                "internal_document_id",
+                reject_path_separators=False,
+            ),
+            form_type=_optional_bounded_text(document.form_type, "form_type", reject_path_separators=False),
+            primary_document=primary_document,
+            meta=_download_document_meta(document.meta),
+        )
+        self.source_repository.create_source_document(create_request, document.source_kind)
+        handle = self.source_repository.get_source_handle(ticker, document_id, document.source_kind)
+        file_metas = tuple(
+            self._store_downloaded_file(handle=handle, downloaded_file=downloaded_file)
+            for downloaded_file in document.files
+        )
+        self.source_repository.update_source_document(
+            replace(create_request, files=list(file_metas)),
+            document.source_kind,
+        )
+        if rebuild_processed:
+            _mark_processed_reprocess_required_if_present(self.processed_repository, ticker, document_id)
+        return True
+
+    def _store_downloaded_file(
+        self,
+        *,
+        handle: SourceHandle | ProcessedHandle,
+        downloaded_file: FinsDownloadedFile,
+    ) -> FileObjectMeta:
+        """通过 blob 仓储保存单个下载文件。
+
+        Args:
+            handle: source 或 processed 文档句柄。
+            downloaded_file: adapter 返回的文件。
+
+        Returns:
+            文件对象元数据。
+
+        Raises:
+            ValueError: 文件名或元数据非法时抛出。
+            OSError: 仓储写入失败时抛出。
+        """
+
+        return self.blob_repository.store_file(
+            handle,
+            _bounded_text(downloaded_file.filename, "filename"),
+            BytesIO(downloaded_file.content),
+            content_type=_optional_bounded_text(downloaded_file.content_type, "content_type", reject_path_separators=False),
+            metadata=_bounded_metadata(downloaded_file.metadata),
+        )
+
+    def _store_rejected_filing_artifact(
+        self,
+        *,
+        ticker: str,
+        artifact: FinsRejectedFilingDownloadArtifact,
+    ) -> None:
+        """保存 rejected filing artifact。
+
+        Args:
+            ticker: 标准化 ticker。
+            artifact: adapter 返回的 rejected filing artifact。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: artifact 字段非法时抛出。
+            OSError: 仓储写入失败时抛出。
+        """
+
+        document_id = _bounded_text(artifact.document_id, "rejected_document_id", reject_path_separators=False)
+        file_entries = tuple(
+            self._store_rejected_file_entry(
+                ticker=ticker,
+                document_id=document_id,
+                downloaded_file=downloaded_file,
+            )
+            for downloaded_file in artifact.files
+        )
+        self.filing_maintenance_repository.upsert_rejected_filing_artifact(
+            RejectedFilingArtifactUpsertRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=_bounded_text(
+                    artifact.internal_document_id,
+                    "rejected_internal_document_id",
+                    reject_path_separators=False,
+                ),
+                accession_number=_bounded_text(
+                    artifact.accession_number,
+                    "accession_number",
+                    reject_path_separators=False,
+                ),
+                company_id=_bounded_text(artifact.company_id, "company_id", reject_path_separators=False),
+                form_type=_bounded_text(artifact.form_type, "rejected_form_type", reject_path_separators=False),
+                filing_date=_bounded_text(artifact.filing_date, "filing_date", reject_path_separators=False),
+                report_date=_optional_bounded_text(artifact.report_date, "report_date", reject_path_separators=False),
+                primary_document=_bounded_text(artifact.primary_document, "rejected_primary_document"),
+                selected_primary_document=_bounded_text(
+                    artifact.selected_primary_document,
+                    "selected_primary_document",
+                ),
+                rejection_reason=_bounded_text(
+                    artifact.rejection_reason,
+                    "rejection_reason",
+                    reject_path_separators=False,
+                ),
+                rejection_category=_bounded_text(
+                    artifact.rejection_category,
+                    "rejection_category",
+                    reject_path_separators=False,
+                ),
+                classification_version=_DOWNLOAD_REJECTION_CLASSIFICATION_VERSION,
+                source_fingerprint=_bounded_text(
+                    artifact.source_fingerprint,
+                    "source_fingerprint",
+                    reject_path_separators=False,
+                ),
+                files=list(file_entries),
+                fiscal_year=artifact.fiscal_year,
+                fiscal_period=_optional_bounded_text(artifact.fiscal_period, "fiscal_period"),
+                report_kind=_optional_bounded_text(artifact.report_kind, "report_kind"),
+                amended=artifact.amended,
+                has_xbrl=artifact.has_xbrl,
+                ingest_method=_DOWNLOAD_INGEST_METHOD,
+            )
+        )
+        registry = self.filing_maintenance_repository.load_download_rejection_registry(ticker)
+        registry[document_id] = {
+            "reason": artifact.rejection_reason,
+            "category": artifact.rejection_category,
+        }
+        self.filing_maintenance_repository.save_download_rejection_registry(ticker, registry)
+
+    def _store_rejected_file_entry(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        downloaded_file: FinsDownloadedFile,
+    ) -> SourceFileEntry:
+        """保存 rejected artifact 文件并转换为 SourceFileEntry。
+
+        Args:
+            ticker: 标准化 ticker。
+            document_id: rejected artifact 文档 ID。
+            downloaded_file: adapter 返回的文件。
+
+        Returns:
+            rejected artifact 元数据中的文件条目。
+
+        Raises:
+            ValueError: 文件字段非法时抛出。
+            OSError: 仓储写入失败时抛出。
+        """
+
+        filename = _bounded_text(downloaded_file.filename, "rejected_filename")
+        file_meta = self.filing_maintenance_repository.store_rejected_filing_file(
+            ticker,
+            document_id,
+            filename,
+            BytesIO(downloaded_file.content),
+            content_type=_optional_bounded_text(downloaded_file.content_type, "content_type", reject_path_separators=False),
+            metadata=_bounded_metadata(downloaded_file.metadata),
+        )
+        return SourceFileEntry(
+            name=filename,
+            uri=file_meta.uri,
+            etag=file_meta.etag,
+            last_modified=file_meta.last_modified,
+            size=file_meta.size,
+            content_type=file_meta.content_type,
+            sha256=file_meta.sha256,
+            ingested_at=_utc_now(),
         )
 
     def _select_preprocess_documents(
@@ -1146,15 +1742,10 @@ class FinsIngestionRuntime:
 
         _assert_bounded_summary(result_summary, "result_summary")
         now = _utc_now()
-        return self.job_store.save_job(
-            replace(
-                record,
-                status=FinsIngestionJobStatus.SUCCEEDED,
-                updated_at=now,
-                finished_at=now,
-                result_summary=result_summary,
-                failure_summary=dict(_EMPTY_SUMMARY),
-            )
+        return self.job_store.save_succeeded_or_cancelled(
+            record.job_id,
+            result_summary=result_summary,
+            finished_at=now,
         )
 
     def _save_cancelled(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
@@ -1224,6 +1815,39 @@ class FinsIngestionRuntime:
                 failure_summary=failure_summary,
             )
         )
+
+    def _save_download_unsupported(self, job_id: str, message: str) -> None:
+        """把 unsupported-source 下载结果保存为 failed 终态。
+
+        Args:
+            job_id: opaque job id。
+            message: 有界失败说明。
+
+        Returns:
+            无。
+
+        Raises:
+            无。二次落盘失败只记录诊断。
+        """
+
+        try:
+            record = self.job_store.read_job(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return
+            self._save_failed(
+                record,
+                message=message,
+                result_summary=FinsDownloadResultSummary(failed_count=1).to_json_summary(),
+            )
+        except Exception as terminal_exc:
+            _LOGGER.warning(
+                "fins.ingestion.download_unsupported_terminalization_failed "
+                "job_id=%s error_type=%s",
+                job_id,
+                type(terminal_exc).__name__,
+                exc_info=True,
+            )
+            return
 
     def _save_failed_from_exception(self, job_id: str, exc: Exception) -> None:
         """把后台异常转换为 failed job record。
@@ -1534,6 +2158,138 @@ def _processed_exists(
     except FileNotFoundError:
         return False
     return True
+
+
+def _source_document_exists(
+    repository: SourceDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+    source_kind: SourceKind,
+) -> bool:
+    """判断源文档是否已存在。
+
+    Args:
+        repository: 源文档仓储协议。
+        ticker: 标准化 ticker。
+        document_id: 源文档 ID。
+        source_kind: 源文档类别。
+
+    Returns:
+        存在时返回 ``True``，否则返回 ``False``。
+
+    Raises:
+        OSError: 底层仓储读取失败时抛出。
+        ValueError: 元数据格式非法时抛出。
+    """
+
+    try:
+        repository.get_source_meta(ticker, document_id, source_kind)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _mark_processed_reprocess_required_if_present(
+    repository: ProcessedDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+) -> None:
+    """若 processed 文档存在，则标记需要重处理。
+
+    Args:
+        repository: processed 仓储协议。
+        ticker: 标准化 ticker。
+        document_id: 文档 ID。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 底层仓储写入失败时抛出。
+        ValueError: 元数据格式非法时抛出。
+    """
+
+    if not _processed_exists(repository, ticker, document_id):
+        return
+    repository.mark_processed_reprocess_required(ticker, document_id, True)
+
+
+def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
+    """构建下载源文档 meta。
+
+    Args:
+        meta: adapter 返回的业务元数据。
+
+    Returns:
+        可交给 source 仓储写入的元数据。
+
+    Raises:
+        ValueError: meta 摘要超过 job 边界上限时抛出。
+    """
+
+    _assert_bounded_summary(meta, "download_document_meta")
+    result: DocumentMeta = dict(meta)
+    result["ingest_method"] = _DOWNLOAD_INGEST_METHOD
+    result["ingest_complete"] = True
+    return result
+
+
+def _normalize_download_source(source: str) -> str:
+    """归一化下载来源标识。
+
+    Args:
+        source: 原始来源标识。
+
+    Returns:
+        小写后的来源标识。
+
+    Raises:
+        ValueError: 来源标识为空、过长或包含路径分隔符时抛出。
+    """
+
+    return _bounded_text(source, "source").lower()
+
+
+def _bounded_metadata(metadata: Mapping[str, str]) -> dict[str, str]:
+    """校验文件级元数据。
+
+    Args:
+        metadata: 文件级元数据。
+
+    Returns:
+        有界元数据字典。
+
+    Raises:
+        ValueError: 键或值非法时抛出。
+    """
+
+    if len(metadata) > _MAX_TUPLE_ITEMS:
+        raise ValueError("metadata 元素数量超出上限")
+    result: dict[str, str] = {}
+    for key, value in metadata.items():
+        result[
+            _bounded_text(key, "metadata_key", reject_path_separators=False)
+        ] = _bounded_text(value, "metadata_value", reject_path_separators=False)
+    return result
+
+
+def _non_negative_count(value: int, field_name: str) -> int:
+    """校验非负计数字段。
+
+    Args:
+        value: 待校验数值。
+        field_name: 字段名。
+
+    Returns:
+        原数值。
+
+    Raises:
+        ValueError: 数值为负时抛出。
+    """
+
+    if value < 0:
+        raise ValueError(f"{field_name} 不能为负数")
+    return value
 
 
 def _build_processed_sections(processor: DocumentProcessor) -> list[dict[str, JsonValue]]:
@@ -1862,6 +2618,8 @@ def _fsync_directory(path: Path) -> None:
 
 
 __all__ = [
+    "FinsDownloadedFile",
+    "FinsDownloadedSourceDocument",
     "FinsDownloadRequest",
     "FinsDownloadResultSummary",
     "FinsIngestionJobRecord",
@@ -1870,7 +2628,11 @@ __all__ = [
     "FinsIngestionJobStore",
     "FinsIngestionOperationKind",
     "FinsIngestionRuntime",
+    "FinsRejectedFilingDownloadArtifact",
     "FinsPreprocessRequest",
     "FinsPreprocessResultSummary",
+    "FinsSourceDownloadAdapter",
+    "FinsSourceDownloadAdapterRequest",
+    "FinsSourceDownloadAdapterResult",
     "FsFinsIngestionJobStore",
 ]

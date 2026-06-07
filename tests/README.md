@@ -145,7 +145,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 
 财报仓储、Fins read tools provider 与 ingestion runtime 测试，覆盖 `dayu.fins.storage` 文件系统仓储协议实现、确定性财报 fixture 的 list/read、`dayu.fins.tools.provider` 通过当前 `ToolsDiscovery` 暴露带 `fins` tag 的 read tools、`include_read_tools=false` 返回空工具集且不解析 workspace root、`list_documents` 与 `search_document` 通过当前 ToolRuntime accept path 执行、数组 / 标量参数投影、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露、ingestion tools fail-closed，以及基于 AST import 解析的 Fins / Engine / runtime import boundary。
 
-`tests/fins/test_fins_ingestion_runtime.py` 覆盖 workspace-scoped ingestion runtime：cross-runtime shared workspace job store、download / preprocess queued job persistence、ticker normalization、preprocess source -> processed pipeline、已有 processed 跳过 / 重建、missing document failed terminal、unsupported processor not_supported summary、cancel transition、record leakage boundary、job store 原子写入失败清理、文件锁失败关闭，以及新增 ingestion runtime 不破坏 read provider / `FinsToolService` 懒加载行为。
+`tests/fins/test_fins_ingestion_runtime.py` 覆盖 workspace-scoped ingestion runtime：cross-runtime shared workspace job store、download / preprocess queued job persistence、ticker normalization、无网络 fake download adapter 写入 source/blob 仓储、unsupported source failed terminal、重复下载按 storage 语义跳过、rejected filing artifact 通过 maintenance 仓储保存、preprocess source -> processed pipeline、已有 processed 跳过 / 重建、missing document failed terminal、unsupported processor not_supported summary、cancel transition、record leakage boundary、job store 原子写入失败清理、文件锁失败关闭，以及新增 ingestion runtime 不破坏 read provider / `FinsToolService` 懒加载行为。
 
 Fins fixture 由测试通过仓储 public API 写入临时 workspace，不依赖隐式 cwd、环境变量或手工拼生产路径。
 

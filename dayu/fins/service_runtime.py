@@ -16,7 +16,11 @@ from dayu.fins.ingestion_runtime import FinsIngestionRuntime, FsFinsIngestionJob
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
+    DocumentBlobRepositoryProtocol,
+    FilingMaintenanceRepositoryProtocol,
     FsCompanyMetaRepository,
+    FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -40,6 +44,8 @@ class DefaultFinsRuntime:
     workspace_root: Path
     company_repository: CompanyMetaRepositoryProtocol
     source_repository: SourceDocumentRepositoryProtocol
+    blob_repository: DocumentBlobRepositoryProtocol
+    filing_maintenance_repository: FilingMaintenanceRepositoryProtocol
     processed_repository: ProcessedDocumentRepositoryProtocol
     processor_registry: ProcessorRegistry
     ingestion_job_store: FsFinsIngestionJobStore
@@ -86,6 +92,14 @@ class DefaultFinsRuntime:
                 repository_set=repository_set,
             ),
             source_repository=FsSourceDocumentRepository(
+                workspace_root,
+                repository_set=repository_set,
+            ),
+            blob_repository=FsDocumentBlobRepository(
+                workspace_root,
+                repository_set=repository_set,
+            ),
+            filing_maintenance_repository=FsFilingMaintenanceRepository(
                 workspace_root,
                 repository_set=repository_set,
             ),
@@ -164,6 +178,8 @@ class DefaultFinsRuntime:
                 return self._ingestion_runtime
             runtime = FinsIngestionRuntime.create(
                 source_repository=self.source_repository,
+                blob_repository=self.blob_repository,
+                filing_maintenance_repository=self.filing_maintenance_repository,
                 processed_repository=self.processed_repository,
                 processor_registry=self.processor_registry,
                 job_store=self.ingestion_job_store,
