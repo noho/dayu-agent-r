@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Final
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind
@@ -44,6 +46,7 @@ from dayu.host.durable.state import (
     WaitResumePolicy,
 )
 from dayu.host.wait_adapter import WaitPollLost, WaitPollNotReady, WaitPollReady
+from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
@@ -51,12 +54,14 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderSpec,
 )
 
-_READ_PROVIDER_ID = "financial-tools"
+_READ_PROVIDER_ID = "financial-read-tools"
 _DOWNLOAD_PROVIDER_ID = "financial-download-tools"
 _PREPROCESS_PROVIDER_ID = "financial-preprocess-tools"
 _READ_SPEC_ID = "financial-read-tools"
 _DOWNLOAD_SPEC_ID = "financial-download-tools"
 _PREPROCESS_SPEC_ID = "financial-preprocess-tools"
+_READ_SAMPLE_TOOL_NAME: Final[str] = "list_documents"
+_PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _DOWNLOAD_START_FAILED_ERROR = "fins_download_start_failed"
 _PREPROCESS_START_FAILED_ERROR = "fins_preprocess_start_failed"
 _TERMINAL_JOB_STATUSES = frozenset(
@@ -190,6 +195,36 @@ def test_tools_discovery_discovers_read_download_and_preprocess_independently(tm
     assert DOWNLOAD_TOOL_NAME not in reports_by_provider[_READ_PROVIDER_ID].tool_names
     assert PREPROCESS_TOOL_NAME not in reports_by_provider[_READ_PROVIDER_ID].tool_names
     assert len({report.source_refs[0].source_id for report in result.provider_reports}) == 3
+
+
+def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
+    """workspace overlay 应能分别启用 Fins read、download、preprocess providers。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    _write_split_fins_provider_overlay(tmp_path, workspace_root)
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=tmp_path / "workspace" / "config"
+    )
+
+    for provider_id in (_READ_SPEC_ID, _DOWNLOAD_SPEC_ID, _PREPROCESS_SPEC_ID):
+        provider_config = config.tool_discovery.providers[provider_id]
+        assert provider_config.enabled is True
+        assert "include_ingestion_tools" not in provider_config.config
+
+    result = ToolsDiscovery().discover(_provider_specs_from_loaded_config(config))
+    reports_by_spec = {report.spec_id: report for report in result.provider_reports}
+
+    assert tuple(reports_by_spec) == (
+        _READ_SPEC_ID,
+        _DOWNLOAD_SPEC_ID,
+        _PREPROCESS_SPEC_ID,
+    )
+    assert reports_by_spec[_READ_SPEC_ID].provider_id == _READ_PROVIDER_ID
+    assert reports_by_spec[_DOWNLOAD_SPEC_ID].provider_id == _DOWNLOAD_PROVIDER_ID
+    assert reports_by_spec[_PREPROCESS_SPEC_ID].provider_id == _PREPROCESS_PROVIDER_ID
+    assert _READ_SAMPLE_TOOL_NAME in reports_by_spec[_READ_SPEC_ID].tool_names
+    assert DOWNLOAD_TOOL_NAME in reports_by_spec[_DOWNLOAD_SPEC_ID].tool_names
+    assert PREPROCESS_TOOL_NAME in reports_by_spec[_PREPROCESS_SPEC_ID].tool_names
 
 
 def test_download_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
@@ -833,6 +868,106 @@ def _wait_ingestion_job_terminal(
             return record
         time.sleep(_JOB_WAIT_POLL_SECONDS)
     raise AssertionError(f"job 未进入终态: {job_id}")
+
+
+def _write_split_fins_provider_overlay(tmp_path: Path, workspace_root: Path) -> None:
+    """写入启用 split Fins providers 的 workspace overlay。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        workspace_root: Fins workspace root。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 配置文件写入失败时抛出。
+    """
+
+    payload: JsonValue = {
+        "providers": {
+            _READ_SPEC_ID: {
+                "import_path": "dayu.fins.tools.provider:discover_tools",
+                "entry_point": None,
+                "source_kind": "explicit_provider",
+                "source_id": "dayu.fins.tools.provider",
+                "enabled": True,
+                "allow_empty": False,
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "include_read_tools": True,
+                    "limits": {},
+                },
+            },
+            _DOWNLOAD_SPEC_ID: {
+                "import_path": "dayu.fins.tools.download_provider:discover_tools",
+                "entry_point": None,
+                "source_kind": "explicit_provider",
+                "source_id": "dayu.fins.tools.download_provider",
+                "enabled": True,
+                "allow_empty": False,
+                "config": {"workspace_root": str(workspace_root)},
+            },
+            _PREPROCESS_SPEC_ID: {
+                "import_path": "dayu.fins.tools.preprocess_provider:discover_tools",
+                "entry_point": None,
+                "source_kind": "explicit_provider",
+                "source_id": "dayu.fins.tools.preprocess_provider",
+                "enabled": True,
+                "allow_empty": False,
+                "config": {"workspace_root": str(workspace_root)},
+            },
+        }
+    }
+    _write_json(tmp_path / "workspace" / "config" / "tool_discovery.json", payload)
+
+
+def _provider_specs_from_loaded_config(
+    config: RuntimeConfig,
+) -> tuple[ToolsDiscoveryProviderSpec, ...]:
+    """从已加载配置构造 ToolsDiscovery provider specs。
+
+    Args:
+        config: ConfigLoader 加载后的 runtime config。
+
+    Returns:
+        provider spec 元组。
+
+    Raises:
+        AssertionError: 测试配置缺少 import_path 时抛出。
+    """
+
+    specs: list[ToolsDiscoveryProviderSpec] = []
+    for provider_config in config.tool_discovery.providers.values():
+        assert provider_config.import_path is not None
+        specs.append(
+            ToolsDiscoveryProviderSpec(
+                spec_id=provider_config.provider_id,
+                location=PythonImportPathProvider(import_path=provider_config.import_path),
+                enabled=provider_config.enabled,
+                allow_empty=provider_config.allow_empty,
+                config=provider_config.config,
+            )
+        )
+    return tuple(specs)
+
+
+def _write_json(path: Path, value: JsonValue) -> None:
+    """写入 JSON 文件。
+
+    Args:
+        path: 目标文件路径。
+        value: JSON 值。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 文件写入失败时抛出。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _spec(

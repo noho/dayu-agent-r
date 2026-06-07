@@ -628,17 +628,16 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
         tmp_path / "workspace" / "config" / "tool_discovery.json",
         {
             "providers": {
-                "financial-tools": {
-                    "import_path": "dayu.fins.tools:discover_tools",
+                "financial-read-tools": {
+                    "import_path": "dayu.fins.tools.provider:discover_tools",
                     "entry_point": None,
                     "source_kind": "explicit_provider",
-                    "source_id": "dayu.fins.tools",
+                    "source_id": "dayu.fins.tools.provider",
                     "enabled": True,
                     "allow_empty": False,
                     "config": {
                         "workspace_root": str(_fins_workspace_root(tmp_path)),
                         "include_read_tools": True,
-                        "include_ingestion_tools": False,
                         "limits": {
                             "list_documents_max_items": 20,
                             "search_document_max_items": 10,

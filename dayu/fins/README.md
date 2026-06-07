@@ -29,7 +29,7 @@ ToolsDiscovery
   -> current ToolDefinition / ToolRuntime
 ```
 
-启用 read tools 时，Provider config 必须显式提供绝对 `workspace_root`。Provider 不从当前工作目录或环境变量猜路径；默认包内配置保持 disabled 且 `workspace_root=null`，启用时必须由 workspace overlay 提供真实绝对路径。`include_read_tools=false` 时，provider 返回空工具集且不解析 `workspace_root`。
+启用 read tools 时，Provider config 必须显式提供绝对 `workspace_root`。Provider 不从当前工作目录或环境变量猜路径；包内默认 `financial-read-tools`、`financial-download-tools` 与 `financial-preprocess-tools` 都保持 disabled 且 `workspace_root=null`，启用时必须由 workspace overlay 提供真实绝对路径。`include_read_tools=false` 时，read provider 返回空工具集且不解析 `workspace_root`。
 
 当前 read tools：
 
@@ -49,7 +49,7 @@ ToolsDiscovery
 
 `DefaultFinsRuntime` 会装配 workspace-scoped ingestion runtime foundation。该 foundation 当前提供 typed download / preprocess request、download adapter protocol、job record、job store、start、read 与 cancel 基础能力。`start_download` 会先持久化 `queued` job record，再按 `normalize_ticker(...)` 后的 ticker / market 与 source 选择 Fins-owned adapter；有 adapter 时通过 source repository、blob repository 与 filing maintenance repository 写入源文档和 rejected filing artifact，无 adapter 时写入明确 unsupported-source failed 终态，不伪造成功。当前没有真实 SEC / CN / HK 网络下载 adapter。`start_preprocess` 会先持久化 `queued` job record，再通过 source repository 读取已存在源文档、通过 processor registry 生成 sections / tables 等 processed 产物，并通过 processed repository create / update 写入；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时重建。
 
-Download / preprocess 通过独立 provider 暴露为 awaiting tools。两个 provider 都必须显式配置绝对 `workspace_root`，并各自通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取 shared ingestion runtime；同一 workspace 的不同 provider/runtime 实例会落到同一个 workspace 派生 job store。工具调用只负责启动 durable job 并返回 `ToolAwaitingOutcome`，等待种类为 external job；工具本身不提供 status / cancel polling。read provider 不解析 `include_ingestion_tools` 作为 ingestion enablement，download / preprocess 能力必须通过独立 provider 启用。
+Download / preprocess 通过独立 provider 暴露为 awaiting tools。两个 provider 都必须显式配置绝对 `workspace_root`，并各自通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取 shared ingestion runtime；同一 workspace 的不同 provider/runtime 实例会落到同一个 workspace 派生 job store。工具调用只负责启动 durable job 并返回 `ToolAwaitingOutcome`，等待种类为 external job；工具本身不提供 status / cancel polling。Download / preprocess 能力必须通过 `financial-download-tools` 与 `financial-preprocess-tools` 独立启用，不由 read provider 混合启用。
 
 Service assembly 会基于启用的 Fins download / preprocess provider 显式配置构造 Host `WaitAdapterRegistry`。同一 Host assembly 中启用的 Fins awaiting provider 必须使用同一个绝对 `workspace_root`；poll adapter 将 `queued` / `running` / `cancelling` 映射为未就绪，将 `succeeded` / `failed` / `cancelled` 映射为 Host resolve outcome，将缺失或损坏的 job evidence 映射为 lost outcome。Host 取消 wait 时，adapter 只请求 Fins job 取消，不删除 source docs 或 Host wait records。
 

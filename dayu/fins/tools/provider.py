@@ -26,9 +26,9 @@ from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.fins.tools.fins_tools import register_fins_read_tools
 
-_PROVIDER_ID: Final[str] = "financial-tools"
+_PROVIDER_ID: Final[str] = "financial-read-tools"
 _VERSION_REF: Final[str] = "fins-read-tools-provider-v1"
-_SOURCE_ID: Final[str] = "dayu.fins.tools"
+_SOURCE_ID: Final[str] = "dayu.fins.tools.provider"
 _CONFIG_WORKSPACE_ROOT_FIELD: Final[str] = "workspace_root"
 _CONFIG_LIMITS_FIELD: Final[str] = "limits"
 _CONFIG_INCLUDE_READ_TOOLS_FIELD: Final[str] = "include_read_tools"
