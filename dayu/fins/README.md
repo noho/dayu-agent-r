@@ -1,13 +1,15 @@
 # Fins 开发手册
 
-`dayu.fins` 是财报分析能力包，当前提供财报文件系统仓储、财报文档处理器、读取服务、read tools provider 和 ingestion runtime foundation。它不属于 Host / Engine / Service / UI 任一层，具体财报文档访问必须通过 `dayu.fins.storage` 下的仓储协议与实现完成。
+`dayu.fins` 是财报分析能力包，当前提供财报文件系统仓储、财报文档处理器、读取服务、read tools provider、download / preprocess awaiting tool providers 和 ingestion runtime foundation。它不属于 Host / Engine / Service / UI 任一层，具体财报文档访问必须通过 `dayu.fins.storage` 下的仓储协议与实现完成。
 
 ## 边界
 
 - `dayu.fins.storage` 是财报文档存取边界，包含公司元数据、源文档、processed 文档、blob 文件和批处理事务仓储协议与文件系统实现。
 - `dayu.fins.processors` 复用 `dayu.documents.processors` 的共享文档处理器基础，补充财报表单、章节、表格和 XBRL 相关处理能力。
 - `dayu.fins.tools.service.FinsToolService` 负责参数标准化、ticker / document_id 路由、processor 缓存和 read tool 业务结果构造。
-- `dayu.fins.tools.provider.discover_tools` 是当前 ToolsDiscovery provider 入口，只暴露 read tools。
+- `dayu.fins.tools.provider.discover_tools` 是 read tools 的 ToolsDiscovery provider 入口，只暴露 read tools。
+- `dayu.fins.tools.download_provider.discover_tools` 是 download awaiting tool 的独立 ToolsDiscovery provider 入口。
+- `dayu.fins.tools.preprocess_provider.discover_tools` 是 preprocess awaiting tool 的独立 ToolsDiscovery provider 入口。
 - `dayu.fins.ingestion_runtime` 提供下载 / 预处理请求、下载 adapter 协议、job record、job store、start、read、cancel，以及 download source adapter -> source/blob/rejected artifact 与 preprocess source -> processed pipeline 的 typed runtime foundation。
 - `dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins shared assembly root，装配 read repositories、blob / filing maintenance repositories、processor registry、`FinsToolService`，以及 workspace-scoped ingestion runtime foundation / job store / download / preprocess pipeline；它不持有 Host、Service 或 EventLog。
 
@@ -44,9 +46,9 @@ ToolsDiscovery
 
 ## Ingestion 状态
 
-当前 `dayu.fins` 仍只通过 provider 暴露 read tools；download / preprocess tool providers 尚未实现。
+`DefaultFinsRuntime` 会装配 workspace-scoped ingestion runtime foundation。该 foundation 当前提供 typed download / preprocess request、download adapter protocol、job record、job store、start、read 与 cancel 基础能力。`start_download` 会先持久化 `queued` job record，再按 `normalize_ticker(...)` 后的 ticker / market 与 source 选择 Fins-owned adapter；有 adapter 时通过 source repository、blob repository 与 filing maintenance repository 写入源文档和 rejected filing artifact，无 adapter 时写入明确 unsupported-source failed 终态，不伪造成功。当前没有真实 SEC / CN / HK 网络下载 adapter。`start_preprocess` 会先持久化 `queued` job record，再通过 source repository 读取已存在源文档、通过 processor registry 生成 sections / tables 等 processed 产物，并通过 processed repository create / update 写入；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时重建。
 
-`DefaultFinsRuntime` 会装配 workspace-scoped ingestion runtime foundation。该 foundation 当前提供 typed download / preprocess request、download adapter protocol、job record、job store、start、read 与 cancel 基础能力。`start_download` 会先持久化 `queued` job record，再按 `normalize_ticker(...)` 后的 ticker / market 与 source 选择 Fins-owned adapter；有 adapter 时通过 source repository、blob repository 与 filing maintenance repository 写入源文档和 rejected filing artifact，无 adapter 时写入明确 unsupported-source failed 终态，不伪造成功。当前没有真实 SEC / CN / HK 网络下载 adapter。`start_preprocess` 会先持久化 `queued` job record，再通过 source repository 读取已存在源文档、通过 processor registry 生成 sections / tables 等 processed 产物，并通过 processed repository create / update 写入；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时重建。当前仍不暴露 Host wait adapter 或 tool provider。
+Download / preprocess 通过独立 provider 暴露为 awaiting tools。两个 provider 都必须显式配置绝对 `workspace_root`，并各自通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取 shared ingestion runtime；同一 workspace 的不同 provider/runtime 实例会落到同一个 workspace 派生 job store。工具调用只负责启动 durable job 并返回 `ToolAwaitingOutcome`，等待种类为 external job；工具本身不提供 status / cancel polling。read provider 不解析 `include_ingestion_tools` 作为 ingestion enablement，download / preprocess 能力必须通过独立 provider 启用。
 
 job store 由 workspace root 派生，当前路径为 `.dayu/fins_ingestion/jobs`。它只保存 job governance records，不保存财报正文、processed payload 或 raw provider payload。
 

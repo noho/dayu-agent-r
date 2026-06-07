@@ -32,7 +32,6 @@ _SOURCE_ID: Final[str] = "dayu.fins.tools"
 _CONFIG_WORKSPACE_ROOT_FIELD: Final[str] = "workspace_root"
 _CONFIG_LIMITS_FIELD: Final[str] = "limits"
 _CONFIG_INCLUDE_READ_TOOLS_FIELD: Final[str] = "include_read_tools"
-_CONFIG_INCLUDE_INGESTION_TOOLS_FIELD: Final[str] = "include_ingestion_tools"
 _FINS_READ_TOOL_NAMES: Final[tuple[str, ...]] = (
     "list_documents",
     "get_document_sections",
@@ -56,7 +55,7 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         provider 输出；read tools 关闭时返回空工具集。
 
     Raises:
-        ValueError: provider config 非法，或显式开启 ingestion tools 时抛出。
+        ValueError: provider config 非法时抛出。
     """
 
     include_read_tools = _parse_bool_default(
@@ -64,16 +63,6 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         _CONFIG_INCLUDE_READ_TOOLS_FIELD,
         default=True,
     )
-    include_ingestion_tools = _parse_bool_default(
-        spec.config,
-        _CONFIG_INCLUDE_INGESTION_TOOLS_FIELD,
-        default=False,
-    )
-    if include_ingestion_tools:
-        raise ValueError(
-            "fins provider does not expose ingestion tools in WU-TOOLS-01 S4; "
-            "ingestion requires current ToolAwaitingOutcome or wait-adapter semantics"
-        )
     source_ref = _source_ref()
     if not include_read_tools:
         return ToolsDiscoveryProviderOutput(
@@ -84,7 +73,7 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         )
 
     limits = _parse_limits(spec.config)
-    workspace_root = _parse_workspace_root(spec.config)
+    workspace_root = parse_fins_workspace_root_config(spec.config)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     service = runtime.get_tool_service(
         processor_cache_max_entries=limits.processor_cache_max_entries
@@ -106,8 +95,8 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
     )
 
 
-def _parse_workspace_root(config: Mapping[str, JsonValue]) -> Path:
-    """解析显式配置的 Fins workspace root。
+def parse_fins_workspace_root_config(config: Mapping[str, JsonValue]) -> Path:
+    """解析 Fins provider 显式配置的 workspace root。
 
     Args:
         config: provider 自有 JSON 配置。

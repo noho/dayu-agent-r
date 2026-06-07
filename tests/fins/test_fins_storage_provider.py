@@ -323,8 +323,8 @@ def test_fins_truncate_specs_use_current_contract(tmp_path: Path) -> None:
     assert search_document_truncate.target_field == "matches"
 
 
-def test_ingestion_tools_are_fail_closed_pending_wait_adapter(tmp_path: Path) -> None:
-    """显式开启 ingestion tools 时 provider 必须 fail closed。"""
+def test_read_provider_ignores_legacy_ingestion_switch(tmp_path: Path) -> None:
+    """旧 include_ingestion_tools 开关不得让 read provider 暴露 ingestion tools。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     spec = _spec(
@@ -332,8 +332,9 @@ def test_ingestion_tools_are_fail_closed_pending_wait_adapter(tmp_path: Path) ->
         extra_config={"include_ingestion_tools": True},
     )
 
-    with pytest.raises(ValueError, match="ToolAwaitingOutcome"):
-        discover_tools(spec)
+    output = discover_tools(spec)
+
+    assert tuple(definition.name for definition in output.definitions) == _FINS_READ_TOOL_NAMES
 
 
 def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
