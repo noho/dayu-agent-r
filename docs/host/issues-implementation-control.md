@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-pr-pass-final-closeout-passed |
-| implementation status | WU-CM-01 umbrella final closeout passed; Issue #81 closed; Issue #117 closed; PR 125 remains ready for user merge decision |
-| active work unit | WU-CM-01 |
+| gate | accepted-plan-commit |
+| implementation status | WU-TOOLS-01-F01 plan re-review passed; creating accepted plan commit |
+| active work unit | WU-TOOLS-01-F01 |
 | default next work unit | WU-TOOLS-01-F01 |
-| next entry point | User merge decision for PR 125, then WU-TOOLS-01-F01 unless user selects another pending work unit |
+| next entry point | Accepted plan commit for WU-TOOLS-01-F01, then implementation Slice S1 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
@@ -215,7 +215,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-03 | closed | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
 | WU-CM-04 | closed | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
 | WU-TOOLS-01 | draft-pr-pass-final-closeout-passed | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98；draft PR #123 | Accepted plan commit f6658fb4；Slices S1-S6 and external blocker reconciliation accepted；PR review and re-review passed；all active residual risks have owner / destination；ready for user merge decision at https://github.com/noho/dayu-agent-r/pull/123 |
-| WU-TOOLS-01-F01 | pending | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed | Build the shared Fins ingestion service/runtime first, then expose independent download and preprocess tool providers through current `ToolAwaitingOutcome` / wait-resume contract; owner for residual `WU-TOOLS-01-S4-R1` |
+| WU-TOOLS-01-F01 | planning | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed | Plan artifact `docs/host/wu-tools-01-f01-shared-fins-ingestion-runtime-plan.md` generated and fixed; plan reviews, fix summary, re-reviews and controller adjudications completed; accepted plan commit pending. Build the shared Fins ingestion service/runtime first, then expose independent download and preprocess tool providers through current `ToolAwaitingOutcome` / wait-resume contract; owner for residual `WU-TOOLS-01-S4-R1` |
 | WU-TOOLS-01-F02 | pending | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up | First step of Web CI diagnostics pipeline: migrate OLD `web_ci_urls.jsonl`, `diag_web.sh`, `diag_web_batch.sh` and `utils/diagnose_web_access.py`; does not close `WU-TOOLS-01-S5-R2` by itself |
 | WU-TOOLS-01-F03 | pending | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | Generate explicit opt-in Web smoke from the migrated web CI diagnostics pipeline; defines pass / skip / diagnostic criteria and is the closing owner for residual `WU-TOOLS-01-S5-R2` |
 | WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
@@ -720,7 +720,7 @@ WU-TOOLS-01 S6 broad Host validation 暴露 7 个 proactive compaction 测试失
 
 ### 状态
 
-Pending。该 work unit 是 `WU-TOOLS-01-S4-R1` 的明确 owner。裁决结论：F01 不只是迁移几个 tool name，而是先迁移 / 建立 NEW 的共享 Fins service/runtime；read、download 和 preprocess/process 都以这套 service/runtime 为业务底座。最关键约束是：CLI download 和 tool download 必须走同一套代码、同一套逻辑。Tool 侧只做当前 Host / ToolRuntime 的 awaiting adapter；未来 NEW CLI 也调用同一套 service/runtime，避免 CLI 和 tool 逻辑漂移。Upload 不纳入本条，转入 `WU-TOOLS-01-F09` 单独追踪。
+Planning。Plan artifact 已生成并修复：`docs/host/wu-tools-01-f01-shared-fins-ingestion-runtime-plan.md`。Plan review artifacts 已生成：`docs/reviews/wu-tools-01-f01-plan-review-mimo.md`、`docs/reviews/wu-tools-01-f01-plan-review-ds.md`。Controller adjudication 已生成：`docs/reviews/wu-tools-01-f01-plan-review-controller-adjudication.md`。Plan fix summary 已生成：`docs/reviews/wu-tools-01-f01-plan-fix-controller-summary.md`。Plan re-review artifacts 已生成：`docs/reviews/wu-tools-01-f01-plan-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-plan-rereview-ds.md`。Plan re-review controller adjudication 已生成：`docs/reviews/wu-tools-01-f01-plan-rereview-controller-adjudication.md`。当前等待 accepted plan commit。该 work unit 是 `WU-TOOLS-01-S4-R1` 的明确 owner。裁决结论：F01 不只是迁移几个 tool name，而是先迁移 / 建立 NEW 的共享 Fins service/runtime；read、download 和 preprocess/process 都以这套 service/runtime 为业务底座。最关键约束是：CLI download 和 tool download 必须走同一套代码、同一套逻辑。Tool 侧只做当前 Host / ToolRuntime 的 awaiting adapter；未来 NEW CLI 也调用同一套 service/runtime，避免 CLI 和 tool 逻辑漂移。Upload 不纳入本条，转入 `WU-TOOLS-01-F09` 单独追踪。
 
 ### 动机
 
