@@ -141,12 +141,12 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | draft-pr-pass-final-closeout-passed |
-| implementation status | WU-CM-01-F04 completed in local commit `7a5b258c`; WU-CM-01-F03 accepted plan commit `d5a71f75`; WU-CM-01-F03 accepted implementation slice commit `a319edc8`; WU-CM-01-F03 accepted deepreview commit `d3d2119b`; accepted PR review commit `f6494394`; WU-CM-01-F03 final closeout passed |
-| active work unit | WU-CM-01-F03 |
-| default next work unit | WU-CM-01 |
-| next entry point | User merge decision for PR 125, then WU-CM-01 umbrella final closeout / Issue #81 closeout assessment after merge |
+| implementation status | WU-CM-01 umbrella final closeout passed; Issue #81 closed; Issue #117 closed; PR 125 remains ready for user merge decision |
+| active work unit | WU-CM-01 |
+| default next work unit | WU-TOOLS-01-F01 |
+| next entry point | User merge decision for PR 125, then WU-TOOLS-01-F01 unless user selects another pending work unit |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 https://github.com/noho/dayu-agent-r/issues/81#issuecomment-4640952580; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
 
 状态约定：
@@ -206,7 +206,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|---|
 | WU-ENG-01 | completed | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | completed；PR 113 已 merge，稳定结论是 provider reasoning roundtrip 为协议要求，不进入 payload behavior change |
 | WU-ENG-02 | completed-with-follow-up | Provider request identity and vendor debugging correlation | GitHub Issue #63 closed；#64 current shared scope completed, native adapter-specific scope remains open | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；typed request identity 与 OpenAI-compatible correlation scope 已完成，#64 保留 native Anthropic / Claude Code gateway adapter-specific 后续语义 |
-| WU-CM-01 | final-closeout-follow-up | Conversation Memory overall optimization | GitHub Issue #81 | F01/F02/F03/F04 final closeout follow-ups are complete or final-closeout-passed; after PR 125 merge, enter WU-CM-01 umbrella final closeout / Issue #81 closeout assessment |
+| WU-CM-01 | completed | Conversation Memory overall optimization | GitHub Issue #81 closed | Umbrella final closeout artifact `docs/reviews/wu-cm-01-umbrella-final-closeout-controller.md`; F01/F02/F03/F04 complete; no active WU-CM-01 residual risks remain |
 | WU-CM-01-F01 | completed | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | S7-R1 S1 one-system-message production assembly accepted; final public-path validation passed |
 | WU-CM-01-F02 | completed | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | Slice 5 compact evidence query readability, Slice 6 prompt semantic rewrite, and S6-R1 production compact instruction contract rescope are accepted |
 | WU-CM-01-F03 | completed | Assistant final answer continuity fidelity closeout | GitHub Issue #81 / WU-CM-01 final closeout | Final closeout artifact `docs/reviews/wu-cm-01-f03-final-closeout-controller.md`; Draft PR 125: `https://github.com/noho/dayu-agent-r/pull/125`; accepted PR review commit `f6494394`; no active residual risks introduced; awaiting user merge decision |
@@ -225,8 +225,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F08 | pending | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Rename `build_engine_processor_registry(...)` to a documents/default registry name and update direct callers / exports / docs without changing processor registration behavior; owner for residual `WU-TOOLS-01-S1-R2` |
 | WU-TOOLS-01-F09 | pending | Fins upload ingestion migration and upload tool | WU-TOOLS-01 post-migration upload follow-up | Migrate OLD CLI-facing upload semantics into the shared Fins service/runtime and expose an independent upload ingestion tool provider; upload must use the same runtime foundation as read / download / preprocess |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
-| WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 | Slice 0-3 accepted; residual follow-ups closed or transferred to dedicated issue owner |
-| WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 / #117 | Slice 4 accepted; full analyzer remains WU-OBS-00 non-goal |
+| WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | Slice 0-3 accepted; residual follow-ups closed or transferred to dedicated issue owner |
+| WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | Slice 4 accepted; full analyzer remains WU-OBS-00 non-goal |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
 | WU-OBS-P02 | pending | Tool Trace tool latency signals | GitHub Issue #30 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 tool latency stable signal |
 | WU-OBS-P03 | pending | Tool Trace structured failure metadata | GitHub Issue #31 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 failure signature / repair hint stable signal |
