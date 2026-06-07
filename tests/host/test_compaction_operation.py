@@ -2088,6 +2088,112 @@ def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
         )
 
 
+def test_compaction_request_evidence_inputs_collect_terminal_content(
+    tmp_path: Path,
+) -> None:
+    """RUN_SUCCEEDED terminal artifact content 进入 history material。"""
+
+    session_id = "session-run-succeeded-terminal-content"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+        event_id = "event-run-succeeded-terminal-content"
+
+        def append_event(transaction: HostTransaction) -> None:
+            """写入 terminal artifact 与 RUN_SUCCEEDED descriptor。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            descriptor = PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-terminal-content",
+                    payload_id="sqlite-terminal-content",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={
+                        "content": "terminal artifact final answer",
+                        "summary_text": "terminal artifact summary",
+                    },
+                ),
+            )
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="RUN_SUCCEEDED",
+                    payload={
+                        "summary_text": "run summary should not be used",
+                        "terminal_summary_ref": descriptor.payload_ref,
+                        "terminal_summary_digest": descriptor.payload_digest,
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_event)
+
+        def read_history_material(transaction: HostTransaction) -> tuple[str, ...]:
+            """读取共享 helper 输出的 history material 文本。
+
+            :param transaction: Host transaction。
+            :returns: history material 文本 tuple。
+            """
+
+            inputs = collect_selected_compaction_request_evidence_inputs(
+                transaction,
+                event_log,
+                session_id=session_id,
+                selected_evidence_block_refs=(),
+                selected_history_event_refs=(event_id,),
+            )
+            return tuple(item.text for item in inputs.history_materials)
+
+        assert store.transaction_runner.run_read(read_history_material) == (
+            "terminal artifact final answer",
+        )
+
+
+def test_compaction_request_evidence_inputs_ignore_summary_only_run_succeeded(
+    tmp_path: Path,
+) -> None:
+    """只有 summary_text 或 nested summary 时不生成 assistant answer material。"""
+
+    session_id = "session-run-succeeded-summary-only"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+        event_id = "event-run-succeeded-summary-only"
+        _append_event_and_return_sequence(
+            store,
+            event_log,
+            event_id=event_id,
+            session_id=session_id,
+            event_type="RUN_SUCCEEDED",
+            payload={
+                "summary_text": "run summary should not be used",
+                "summary": {"summary_text": "nested summary should not be used"},
+            },
+        )
+
+        def read_history_material(transaction: HostTransaction) -> tuple[str, ...]:
+            """读取共享 helper 输出的 history material 文本。
+
+            :param transaction: Host transaction。
+            :returns: history material 文本 tuple。
+            """
+
+            inputs = collect_selected_compaction_request_evidence_inputs(
+                transaction,
+                event_log,
+                session_id=session_id,
+                selected_evidence_block_refs=(),
+                selected_history_event_refs=(event_id,),
+            )
+            return tuple(item.text for item in inputs.history_materials)
+
+        assert store.transaction_runner.run_read(read_history_material) == ()
+
+
 def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
     tmp_path: Path,
 ) -> None:

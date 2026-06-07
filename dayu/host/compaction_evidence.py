@@ -28,9 +28,9 @@ from dayu.host.payload_resolution import event_payload_object
 from dayu.host.payload_resolution import event_payload_object_for_result_ref
 from dayu.host.payload_resolution import tool_call_request_atoms
 from dayu.host.payload_resolution import ToolCallRequestAtoms
+from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.terminal_summary_payload import (
-    PayloadSummaryTextPolicy,
-    assistant_summary_from_payload,
+    PayloadTextReadPolicy,
 )
 
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
@@ -405,7 +405,7 @@ def _assistant_history_materials(
 
     :param transaction: 当前 Host transaction。
     :param row: RUN_SUCCEEDED EventLog row。
-    :returns: history material tuple；无可显示摘要时为空。
+    :returns: history material tuple；无 final answer continuity 时为空。
     :raises HostDurableError: strict 文本字段非法时抛出。
     """
 
@@ -414,16 +414,17 @@ def _assistant_history_materials(
         row,
         payload_label=_EVENT_TYPE_RUN_SUCCEEDED,
     )
-    summary = assistant_summary_from_payload(
+    answer_text = assistant_final_answer_continuity_text(
+        transaction,
         payload,
-        text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
+        text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
     )
-    if summary is None:
+    if answer_text is None:
         return ()
     return (
         InitialHistoryMaterial(
             canonical_source_ref=row.event_id,
-            text=summary,
+            text=answer_text,
             kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
         ),
     )

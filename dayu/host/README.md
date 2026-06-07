@@ -293,7 +293,7 @@ accepted compact closeout 写入 vNext compact artifact 和 `CONTEXT_COMPACTED` 
 
 Host payload descriptor 用于把较大或需要引用的 payload 从 EventLog inline JSON 中分离出来。当前 helper 支持按 EventLog payload ref 或 tool-call request atom ref 解析 SQLite payload descriptor，并校验 descriptor kind、digest 与 JSON object 形状。ToolRuntime accept barrier 是工具结果与工具请求参数冷热分离的 owner；工具实现只返回语义 outcome，不负责判断 EventLog inline threshold。
 
-terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory projection 可以从 terminal summary 或 `RUN_SUCCEEDED` payload 中按策略提取 assistant summary，形成后继输入 continuity。该 helper 只读取受控字段，不从 UI 临时文本、provider raw payload 或未持久化上下文恢复回答。
+terminal answer continuity 的稳定语义是：RunInputBuilder、memory projection 和 compaction evidence 只把 `RUN_SUCCEEDED.final_answer`，或经 `terminal_summary_ref` / `terminal_summary_digest` 校验后的 terminal summary artifact `content`，作为 assistant final answer / conclusion continuity。`RUN_SUCCEEDED` payload 中的裸 `content`、`summary_text` 与 nested `summary` 不作为 assistant final answer fallback；缺失可读 final answer 时跳过对应 assistant continuity item，不用 payload ref、digest 或 event id 补洞。Session Summary Memory 仍只来自 accepted `CONTEXT_COMPACTED.accepted_candidate.session_summary.summary_text`。
 
 `HostFinalAnswerView` 只在 public `SUCCEEDED` terminal HostEvent 中内联最终回答。失败、取消和 lost terminal event 不携带 final answer。
 

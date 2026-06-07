@@ -1211,6 +1211,100 @@ def test_small_memory_lag_repairs_inline_without_checkpoint_advance(
         assert any("prior memory prompt" in content for content in contents)
 
 
+def test_inline_delta_uses_terminal_content_and_ignores_summary_fallback(
+    tmp_path: Path,
+) -> None:
+    """inline delta 只用 final_answer / terminal content 渲染 assistant continuity。"""
+
+    policy = _memory_policy(max_lag_events_for_inline_delta=16)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior memory prompt",
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(
+                _memory_projection_event_from_test_row(prior_event),
+            ),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        def append_delta_events(transaction: HostTransaction) -> None:
+            """追加 inline delta 会消费的 RUN_SUCCEEDED 测试事件。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            descriptor = PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-terminal-answer",
+                    payload_id="sqlite-terminal-answer",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={
+                        "content": "terminal artifact final answer",
+                        "summary_text": "terminal artifact summary",
+                    },
+                ),
+            )
+            EventLogStore().append_event(
+                transaction,
+                _event_request(
+                    event_id="event-terminal-answer",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=session_id,
+                    run_id="run-terminal-answer",
+                    event_type="RUN_SUCCEEDED",
+                    payload={
+                        "content": "bare run content should not render",
+                        "summary_text": "run summary should not render",
+                        "terminal_summary_ref": descriptor.payload_ref,
+                        "terminal_summary_digest": descriptor.payload_digest,
+                    },
+                ),
+            )
+            EventLogStore().append_event(
+                transaction,
+                _event_request(
+                    event_id="event-summary-only",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=session_id,
+                    run_id="run-summary-only",
+                    event_type="RUN_SUCCEEDED",
+                    payload={
+                        "summary_text": "summary-only should not render",
+                        "summary": {"summary_text": "nested summary should not render"},
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_delta_events)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert "terminal artifact final answer" in contents
+        assert "terminal artifact summary" not in contents
+        assert "run summary should not render" not in contents
+        assert "summary-only should not render" not in contents
+        assert "nested summary should not render" not in contents
+        assert "bare run content should not render" not in contents
+
+
 def test_over_threshold_memory_lag_raises_repair_required(
     tmp_path: Path,
 ) -> None:

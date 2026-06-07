@@ -46,6 +46,7 @@ from dayu.host._event_payload import (
 from dayu.host._event_payload import (
     required_payload_text as _required_payload_text,
 )
+from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.context_events import CONTEXT_COMPACTED
@@ -99,11 +100,10 @@ from dayu.host.durable.state import (
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.payload_resolution import (
     event_payload_object,
-    sqlite_payload_object,
 )
 from dayu.host.terminal_summary_payload import (
-    PayloadSummaryTextPolicy,
-    assistant_summary_from_payload,
+    PayloadTextReadPolicy,
+    assistant_final_answer_text_from_run_payload,
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -137,9 +137,7 @@ _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_SYSTEM_PROMPT = "system_prompt"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
-_PAYLOAD_FIELD_CONTENT = "content"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
+_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
@@ -2987,7 +2985,7 @@ def _memory_projection_event_from_row(
     :raises HostDurableError: payload 不是 JSON object 时抛出。
     """
 
-    payload = _payload_with_terminal_summary(transaction, row)
+    payload = _payload_with_assistant_final_answer(transaction, row)
     return MemoryProjectionEvent(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
@@ -3004,10 +3002,10 @@ def _memory_projection_event_from_row(
     )
 
 
-def _payload_with_terminal_summary(
+def _payload_with_assistant_final_answer(
     transaction: HostTransaction, row: EventLogRow
 ) -> Mapping[str, JsonValue]:
-    """必要时把 terminal summary 摘要合并进 RUN_SUCCEEDED payload。
+    """必要时把 assistant final answer 合并进 ``RUN_SUCCEEDED`` transient payload。
 
     :param transaction: Host transaction。
     :param row: EventLog row。
@@ -3019,35 +3017,22 @@ def _payload_with_terminal_summary(
     if row.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
         return payload
     if (
-        assistant_summary_from_payload(
+        assistant_final_answer_text_from_run_payload(
             payload,
-            text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
+            text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
         is not None
     ):
         return payload
-    terminal_summary_ref = _optional_payload_text(
-        payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF
-    )
-    terminal_summary_digest = _optional_payload_text(
-        payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST
-    )
-    if terminal_summary_ref is None or terminal_summary_digest is None:
-        return payload
-    terminal_summary = sqlite_payload_object(
+    final_answer = assistant_final_answer_continuity_text(
         transaction,
-        payload_ref=terminal_summary_ref,
-        payload_digest=terminal_summary_digest,
-        payload_label="terminal summary",
+        payload,
+        text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
     )
-    summary = assistant_summary_from_payload(
-        terminal_summary,
-        text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
-    )
-    if summary is None:
+    if final_answer is None:
         return payload
     merged: dict[str, JsonValue] = dict(payload)
-    merged[_PAYLOAD_FIELD_CONTENT] = summary
+    merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
     return merged
 
 
@@ -3409,38 +3394,6 @@ def _execution_target_from_accepted_event(
     return value
 
 
-def _continuity_message_from_event(event: EventLogRow) -> AgentMessage | None:
-    """把 continuity canonical event 投影为 Engine message。
-
-    :param event: EventLog row。
-    :returns: AgentMessage；无需进入 messages 时返回 ``None``。
-    :raises HostDurableError: payload 字段无法投影时抛出。
-    """
-
-    if event.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
-        return UserMessage(
-            role=AgentMessageRole.USER,
-            content=_required_payload_text(
-                _payload_object(event),
-                field_name=_PAYLOAD_FIELD_DISPLAY_TEXT,
-            ),
-        )
-    if event.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
-        summary = assistant_summary_from_payload(
-            _payload_object(event),
-            text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
-        )
-        if summary is None:
-            return None
-        return AssistantMessage(
-            role=AgentMessageRole.ASSISTANT,
-            content=summary,
-            reasoning_content=None,
-            tool_calls=(),
-        )
-    return None
-
-
 def _resume_wait_message_from_current_start(
     transaction: HostTransaction, current_facts: CurrentRunFacts
 ) -> SystemMessage | None:
@@ -3508,59 +3461,6 @@ def _event_id_from_payload_ref(
     if not isinstance(event_id, str) or event_id.strip() == "":
         raise HostDurableError(f"payload field {field_name}.event_id is invalid")
     return event_id
-
-
-def _successful_run_continuity_messages(
-    *, events: tuple[EventLogRow, ...], current_run_id: str
-) -> tuple[AgentMessage, ...]:
-    """只把已成功收口的历史 Run 投影为完整 user/assistant 对。
-
-    :param events: 按 EventLog sequence 排序的 continuity events。
-    :param current_run_id: 当前 Run id；该 Run 的事件不进入历史 continuity。
-    :returns: 可进入 Engine request 的历史消息。
-    :raises HostDurableError: payload 字段无法投影时抛出。
-    """
-
-    ordered_run_ids: list[str] = []
-    events_by_run_id: dict[str, list[EventLogRow]] = {}
-    for event in events:
-        run_id = event.run_id
-        if run_id is None or run_id == current_run_id:
-            continue
-        if run_id not in events_by_run_id:
-            events_by_run_id[run_id] = []
-            ordered_run_ids.append(run_id)
-        events_by_run_id[run_id].append(event)
-
-    messages: list[AgentMessage] = []
-    for run_id in ordered_run_ids:
-        projected = _successful_run_message_pair(events_by_run_id[run_id])
-        if projected is not None:
-            messages.extend(projected)
-    return tuple(messages)
-
-
-def _successful_run_message_pair(
-    events: list[EventLogRow],
-) -> tuple[UserMessage, AssistantMessage] | None:
-    """从单个成功历史 Run 中提取 user/assistant 对。
-
-    :param events: 同一个 Run 的 continuity events。
-    :returns: 两条完整消息；缺少任一端时返回 ``None``。
-    :raises HostDurableError: payload 字段无法投影时抛出。
-    """
-
-    user_message: UserMessage | None = None
-    assistant_message: AssistantMessage | None = None
-    for event in events:
-        message = _continuity_message_from_event(event)
-        if isinstance(message, UserMessage):
-            user_message = message
-        elif isinstance(message, AssistantMessage):
-            assistant_message = message
-    if user_message is None or assistant_message is None:
-        return None
-    return (user_message, assistant_message)
 
 
 def _validate_tool_mode_snapshot(
