@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | aggregate deepreview |
-| implementation status | WU-TOOLS-01-F01-01 Slice 3 accepted commit `f80bf4bc`; all planned slices complete; ready for aggregate deepreview |
+| gate | accepted deepreview commit |
+| implementation status | WU-TOOLS-01-F01-01 aggregate deepreview passed by AgentMiMo and AgentDS with 0 accepted findings; ready to create accepted deepreview commit |
 | active work unit | WU-TOOLS-01-F01-01 |
 | default next work unit | WU-TOOLS-01-F01-01 |
-| next entry point | Dispatch AgentMiMo and AgentDS for WU-TOOLS-01-F01-01 aggregate deepreview |
+| next entry point | Create accepted deepreview commit for WU-TOOLS-01-F01-01 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
@@ -774,7 +774,9 @@ Ticker / market 归一化的唯一真源是 `dayu/fins/ticker_normalization.py`�
 
 ### 状态
 
-Discussion-ready。该 work unit 是 `WU-TOOLS-01-F01` draft PR 前置 follow-up。当前裁决：Fins 内部重复实现 filelock 是真实的公共契约收敛问题；最优设计是优先复用 `dayu.runtime.filelock`，而不是在 `dayu.fins` 中继续维护 `_StoreFileLock` 或 `dayu.fins._file_lock`。
+Accepted deepreview commit gate。该 work unit 是 `WU-TOOLS-01-F01` draft PR 前置 follow-up。当前裁决：Fins 内部重复实现 filelock 是真实的公共契约收敛问题；最优设计是优先复用 `dayu.runtime.filelock`，而不是在 `dayu.fins` 中继续维护 `_StoreFileLock` 或 `dayu.fins._file_lock`。
+
+Plan gate 已完成，artifact 为 `docs/host/wu-tools-01-f01-01-filelock-plan.md`；Plan review artifacts 为 `docs/reviews/wu-tools-01-f01-01-plan-review-mimo.md`、`docs/reviews/wu-tools-01-f01-01-plan-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-01-plan-review-controller-adjudication.md`；Plan fix artifact 为 `docs/reviews/wu-tools-01-f01-01-plan-fix-codex.md`；Plan re-review artifacts 为 `docs/reviews/wu-tools-01-f01-01-plan-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-01-plan-rereview-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-01-plan-rereview-controller-adjudication.md`；accepted plan commit 为 `c20ac977`。Slice 1 accepted commit 为 `7c33fb9d`，bookkeeping commit 为 `a846ed90`。Slice 2 accepted commit 为 `14cb3e97`，bookkeeping commit 为 `73d4f25a`。Slice 3 accepted commit 为 `f80bf4bc`，bookkeeping commit 为 `71a81277`。Aggregate deepreview artifacts 为 `docs/reviews/wu-tools-01-f01-01-aggregate-deepreview-mimo.md`、`docs/reviews/wu-tools-01-f01-01-aggregate-deepreview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-01-aggregate-deepreview-controller-adjudication.md`。两路 aggregate deepreview 均为 PASS，0 条 accepted findings；Controller 裁决不新增 active residual risk，当前准备创建 accepted deepreview commit。
 
 ### 动机
 
