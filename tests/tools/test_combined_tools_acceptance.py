@@ -202,6 +202,12 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
     assert len(names) == len(set(names))
     assert FrameworkToolName.FETCH_MORE.value not in names
     assert len(discovered_tools.source_refs) == 3
+    for definition in discovered_tools.tool_bundle.definitions:
+        properties = definition.schema.function.parameters.properties
+        assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in definition.schema.function.parameters.required
+        assert "cancellation_token" not in definition.schema.function.parameters.required
 
 
 def test_combined_truncate_specs_and_fetch_more_owner(tmp_path: Path) -> None:

@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
@@ -21,6 +22,17 @@ from dayu.contracts.tool_call import (
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
+from dayu.documents.processors.base import (
+    DocumentProcessor,
+    SearchHit,
+    SectionContent,
+    SectionSummary,
+    TableContent,
+    TableSummary,
+    build_search_hit,
+    build_section_summary,
+)
+from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     CompanyMeta,
     SourceDocumentUpsertRequest,
@@ -34,7 +46,10 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.tools.fins_tools import register_fins_read_tools
 from dayu.fins.tools.provider import discover_tools
+from dayu.fins.tools.read_runtime import FinsReadRuntime
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -55,6 +70,12 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderBinding,
     ToolsDiscoveryProviderSpec,
 )
+from dayu.tools._legacy_adapter.definition_adapter import (
+    LegacyToolConcurrencyPolicy,
+    adapt_collected_tools,
+)
+from dayu.tools._legacy_adapter.registry_collector import LegacyToolDeclarationCollector
+from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
 
 _FINS_READ_TOOL_NAMES = (
     "list_documents",
@@ -104,6 +125,365 @@ class _OpenCancellationToken:
         """
 
         return None
+
+
+class _ManualCancellationToken:
+    """测试用手动取消 token。"""
+
+    def __init__(self) -> None:
+        """初始化未取消状态。
+
+        Returns:
+            无。
+        """
+
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """标记 token 已取消。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        Returns:
+            已调用 ``cancel`` 时返回 ``True``。
+        """
+
+        return self._cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            已取消时返回测试原因；否则返回 None。
+        """
+
+        if self._cancelled:
+            return "test cancellation"
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Returns:
+            测试 token 不记录时间，始终返回 None。
+        """
+
+        return None
+
+
+class _SearchCancellingProcessor:
+    """测试用搜索时触发取消的处理器。"""
+
+    def __init__(self, token: _ManualCancellationToken) -> None:
+        """初始化处理器。
+
+        Args:
+            token: 搜索命中后要置为取消的 token。
+
+        Returns:
+            无。
+        """
+
+        self._token = token
+        self.search_calls: list[str] = []
+
+    @classmethod
+    def get_parser_version(cls) -> str:
+        """返回测试 parser 版本。
+
+        Returns:
+            parser 版本字符串。
+        """
+
+        return "test-search-cancelling"
+
+    @classmethod
+    def supports(
+        cls,
+        source: Source,
+        *,
+        form_type: str | None = None,
+        media_type: str | None = None,
+    ) -> bool:
+        """返回是否支持来源。
+
+        Args:
+            source: 文档来源。
+            form_type: 文档类型。
+            media_type: 媒体类型。
+
+        Returns:
+            始终支持。
+        """
+
+        del source, form_type, media_type
+        return True
+
+    def list_sections(self) -> list[SectionSummary]:
+        """返回测试章节列表。
+
+        Returns:
+            章节摘要列表。
+        """
+
+        return [
+            build_section_summary(
+                ref="s1",
+                title="Business",
+                level=1,
+                parent_ref=None,
+                preview="Annual recurring revenue",
+            )
+        ]
+
+    def list_tables(self) -> list[TableSummary]:
+        """返回测试表格列表。
+
+        Returns:
+            空列表。
+        """
+
+        return []
+
+    def read_section(self, ref: str) -> SectionContent:
+        """读取章节正文。
+
+        Args:
+            ref: 章节引用。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 本测试不应调用章节读取。
+        """
+
+        raise AssertionError(f"read_section should not be called: {ref}")
+
+    def read_table(self, table_ref: str) -> TableContent:
+        """读取表格。
+
+        Args:
+            table_ref: 表格引用。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 本测试不应调用表格读取。
+        """
+
+        raise AssertionError(f"read_table should not be called: {table_ref}")
+
+    def get_section_title(self, ref: str) -> str | None:
+        """读取章节标题。
+
+        Args:
+            ref: 章节引用。
+
+        Returns:
+            测试章节标题。
+        """
+
+        if ref == "s1":
+            return "Business"
+        return None
+
+    def search(self, query: str, within_ref: str | None = None) -> list[SearchHit]:
+        """记录搜索并触发取消。
+
+        Args:
+            query: 搜索词。
+            within_ref: 可选章节范围。
+
+        Returns:
+            单条搜索命中。
+        """
+
+        del within_ref
+        self.search_calls.append(query)
+        self._token.cancel()
+        return [
+            build_search_hit(
+                section_ref="s1",
+                section_title="Business",
+                snippet="Annual recurring revenue",
+            )
+        ]
+
+    def get_full_text(self) -> str:
+        """返回全文。
+
+        Returns:
+            测试全文。
+        """
+
+        return "Annual recurring revenue"
+
+    def get_full_text_with_table_markers(self) -> str:
+        """返回带表格标记的全文。
+
+        Returns:
+            测试全文。
+        """
+
+        return "Annual recurring revenue"
+
+
+class _ReadCancellingProcessor(_SearchCancellingProcessor):
+    """测试用创建后取消且禁止读取章节的处理器。"""
+
+    def __init__(self, token: _ManualCancellationToken) -> None:
+        """初始化处理器。
+
+        Args:
+            token: processor 创建后要取消的 token。
+
+        Returns:
+            无。
+        """
+
+        super().__init__(token)
+        self.read_section_calls = 0
+
+    def read_section(self, ref: str) -> SectionContent:
+        """记录章节读取调用。
+
+        Args:
+            ref: 章节引用。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 取消应发生在 processor 读取前。
+        """
+
+        self.read_section_calls += 1
+        raise AssertionError(f"read_section should not be called: {ref}")
+
+
+class _ParentTitleLookupCancellingProcessor(_SearchCancellingProcessor):
+    """测试用父标题查询期间触发取消的处理器。"""
+
+    def __init__(self, token: _ManualCancellationToken) -> None:
+        """初始化处理器。
+
+        Args:
+            token: 父标题查询时要置为取消的 token。
+
+        Returns:
+            无。
+        """
+
+        super().__init__(token)
+        self.get_section_title_calls = 0
+
+    def read_section(self, ref: str) -> SectionContent:
+        """返回带父章节引用的章节正文。
+
+        Args:
+            ref: 章节引用。
+
+        Returns:
+            章节正文；额外携带 parent_ref 以覆盖父标题查询路径。
+        """
+
+        return cast(
+            SectionContent,
+            {
+                "ref": ref,
+                "title": "Services Margin",
+                "content": "Services margin improved.",
+                "tables": [],
+                "word_count": 3,
+                "contains_full_text": False,
+                "parent_ref": "s1",
+            },
+        )
+
+    def get_section_title(self, ref: str) -> str | None:
+        """查询父章节标题并触发取消。
+
+        Args:
+            ref: 父章节引用。
+
+        Returns:
+            父章节标题。
+        """
+
+        self.get_section_title_calls += 1
+        self._token.cancel()
+        if ref == "s1":
+            return "Business"
+        return None
+
+
+class _XbrlFactsProcessor(_SearchCancellingProcessor):
+    """测试用 XBRL facts 处理器。"""
+
+    def __init__(self, token: _ManualCancellationToken) -> None:
+        """初始化查询计数。
+
+        Args:
+            token: XBRL 查询返回后要置为取消的 token。
+
+        Returns:
+            无。
+        """
+
+        super().__init__(token)
+        self.query_calls = 0
+
+    def query_xbrl_facts(
+        self,
+        *,
+        concepts: list[str],
+        statement_type: str | None,
+        period_end: str | None,
+        fiscal_year: int | None,
+        fiscal_period: str | None,
+        min_value: float | None,
+        max_value: float | None,
+    ) -> Mapping[str, JsonValue]:
+        """返回多条 facts 供取消检查截断过滤。
+
+        Args:
+            concepts: 查询概念列表。
+            statement_type: 报表类型过滤。
+            period_end: 期末日期过滤。
+            fiscal_year: 财年过滤。
+            fiscal_period: 财期过滤。
+            min_value: 最小值过滤。
+            max_value: 最大值过滤。
+
+        Returns:
+            XBRL 查询载荷。
+        """
+
+        del statement_type, period_end, fiscal_year, fiscal_period, min_value, max_value
+        self.query_calls += 1
+        self._token.cancel()
+        concept_values: list[JsonValue] = [concept for concept in concepts]
+        facts: list[JsonValue] = [
+            {"concept": "Revenue", "value": 100},
+            {"concept": "Revenue", "value": 101},
+            {"concept": "Revenue", "value": 102},
+        ]
+        return {
+            "query_params": {"concepts": concept_values},
+            "facts": facts,
+        }
 
 
 class _AcceptingPort(HostToolFactAcceptPort):
@@ -184,6 +564,23 @@ def test_fins_provider_discovers_read_tools_with_fins_tag(tmp_path: Path) -> Non
     assert all("fins" in definition.tags for definition in result.tool_bundle.definitions)
 
 
+def test_fins_read_declarations_request_execution_context_injection(tmp_path: Path) -> None:
+    """九个 Fins read tools 声明必须请求 execution_context 注入。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    collector = LegacyToolDeclarationCollector()
+
+    register_fins_read_tools(collector, read_runtime=read_runtime)
+
+    declarations = collector.collected_tools()
+    assert tuple(declaration.name for declaration in declarations) == _FINS_READ_TOOL_NAMES
+    assert all(
+        declaration.execution_context_param_name == "execution_context"
+        for declaration in declarations
+    )
+
+
 def test_fins_provider_can_disable_read_tools_without_workspace_root(tmp_path: Path) -> None:
     """关闭 read tools 时 provider 不应解析 workspace_root。"""
 
@@ -229,6 +626,197 @@ def test_list_documents_executes_through_current_tool_runtime(tmp_path: Path) ->
     assert isinstance(value, Mapping)
     assert value.get("matched") == 1
     assert "ok" not in value
+
+
+def test_list_documents_pre_cancel_returns_tool_cancelled(tmp_path: Path) -> None:
+    """list_documents 入口预取消时应投影为稳定 tool_cancelled 失败。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    definition = _definitions_by_name(_discover_definitions(workspace_root))["list_documents"]
+    token = _ManualCancellationToken()
+    token.cancel()
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("list_documents", {"ticker": "AAPL"}),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+
+
+def test_search_document_cancellation_during_search_stops_before_all_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_document 搜索循环中取消时不应继续执行后续候选查询。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    token = _ManualCancellationToken()
+    processor = _SearchCancellingProcessor(token)
+    _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["search_document"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                "search_document",
+                {
+                    "ticker": "AAPL",
+                    "document_id": "aapl-2024-10k",
+                    "query": "annual recurring revenue",
+                    "mode": "keyword",
+                },
+            ),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+    assert processor.search_calls == ["annual"]
+
+
+def test_search_document_semantic_enrichment_cancelled_error_is_not_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_document 语义增强降级块不应吞掉 tool_cancelled。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    token = _ManualCancellationToken()
+    processor = _SearchCancellingProcessor(token)
+    _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
+    monkeypatch.setattr(
+        read_runtime,
+        "_enrich_sections_with_semantic",
+        _raise_tool_cancelled_during_semantic_enrichment,
+    )
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["search_document"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                "search_document",
+                {
+                    "ticker": "AAPL",
+                    "document_id": "aapl-2024-10k",
+                    "query": "annual recurring revenue",
+                    "mode": "keyword",
+                },
+            ),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+    assert processor.search_calls == []
+
+
+def test_read_section_cancelled_before_processor_read_returns_tool_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """read_section 在 processor read 前观察到取消时应返回 tool_cancelled。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    token = _ManualCancellationToken()
+    processor = _ReadCancellingProcessor(token)
+    _install_processor(
+        read_runtime,
+        cast(DocumentProcessor, processor),
+        monkeypatch,
+        cancel_token_after_create=token,
+    )
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["read_section"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                "read_section",
+                {
+                    "ticker": "AAPL",
+                    "document_id": "aapl-2024-10k",
+                    "ref": "s1",
+                },
+            ),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+    assert processor.read_section_calls == 0
+
+
+def test_read_section_parent_title_lookup_cancelled_error_is_not_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """read_section 父标题查询降级块不应吞掉 tool_cancelled。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    token = _ManualCancellationToken()
+    processor = _ParentTitleLookupCancellingProcessor(token)
+    _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["read_section"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                "read_section",
+                {
+                    "ticker": "AAPL",
+                    "document_id": "aapl-2024-10k",
+                    "ref": "s2",
+                },
+            ),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+    assert processor.get_section_title_calls == 1
+
+
+def test_query_xbrl_facts_cancellation_during_filtering_stops_promptly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """query_xbrl_facts 在 facts 过滤检查中取消时应停止并返回 tool_cancelled。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    token = _ManualCancellationToken()
+    processor = _XbrlFactsProcessor(token)
+    _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["query_xbrl_facts"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                "query_xbrl_facts",
+                {
+                    "ticker": "AAPL",
+                    "document_id": "aapl-2024-10k",
+                    "concepts": ["Revenue"],
+                },
+            ),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+    assert processor.query_calls == 1
 
 
 def test_search_document_projection_and_failure_outcomes(tmp_path: Path) -> None:
@@ -715,8 +1303,119 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
     )
 
 
-def _context() -> BatchToolExecutionContext:
+def _definitions_for_read_runtime(read_runtime: FinsReadRuntime) -> tuple[ToolDefinition, ...]:
+    """为指定 read runtime 构造 Fins read 工具定义。
+
+    Args:
+        read_runtime: 已构造的 Fins read runtime。
+
+    Returns:
+        工具定义元组。
+
+    Raises:
+        Exception: 工具声明或 adapter 构造失败时透出。
+    """
+
+    collector = LegacyToolDeclarationCollector()
+    register_fins_read_tools(collector, read_runtime=read_runtime)
+    declarations = collector.collected_tools()
+    return adapt_collected_tools(
+        declarations,
+        path_policy_by_tool={},
+        concurrency_policy_by_tool={
+            declaration.name: LegacyToolConcurrencyPolicy.SERIAL_PER_PROVIDER
+            for declaration in declarations
+        },
+    )
+
+
+def _install_processor(
+    read_runtime: FinsReadRuntime,
+    processor: DocumentProcessor,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cancel_token_after_create: _ManualCancellationToken | None = None,
+) -> None:
+    """把 read runtime 的 processor factory 替换为测试 processor。
+
+    Args:
+        read_runtime: 要安装 fake processor 的 Fins read runtime。
+        processor: 测试 processor。
+        monkeypatch: pytest monkeypatch fixture。
+        cancel_token_after_create: 可选 token；返回 processor 后立即标记取消。
+
+    Returns:
+        无。
+
+    Raises:
+        Exception: monkeypatch 失败时透出。
+    """
+
+    def create_with_fallback(
+        *,
+        source: Source,
+        form_type: str | None = None,
+        media_type: str | None = None,
+    ) -> DocumentProcessor:
+        """返回指定测试 processor。
+
+        Args:
+            source: 文档来源。
+            form_type: 文档类型。
+            media_type: 媒体类型。
+
+        Returns:
+            测试 processor。
+
+        Raises:
+            无。
+        """
+
+        del source, form_type, media_type
+        if cancel_token_after_create is not None:
+            cancel_token_after_create.cancel()
+        return processor
+
+    monkeypatch.setattr(
+        read_runtime._processor_registry,
+        "create_with_fallback",
+        create_with_fallback,
+    )
+
+
+def _raise_tool_cancelled_during_semantic_enrichment(
+    *,
+    sections: list[SectionSummary],
+    form_type: str | None,
+    cancellation_token: CancellationToken | None = None,
+) -> list[dict[str, JsonValue]]:
+    """在 search_document 语义增强块内抛出取消错误。
+
+    Args:
+        sections: 调用方传入的章节摘要列表。
+        form_type: 文档类型。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Returns:
+        不返回。
+
+    Raises:
+        ToolBusinessError: 始终抛出 ``tool_cancelled``。
+    """
+
+    del sections, form_type, cancellation_token
+    raise ToolBusinessError(
+        code="tool_cancelled",
+        message="语义增强已取消。",
+        hint="当前工具调用已停止；等待新的用户指令或后续调度。",
+    )
+
+
+def _context(cancellation_token: CancellationToken | None = None) -> BatchToolExecutionContext:
     """构造批执行上下文。
+
+    Args:
+        cancellation_token: 可选取消 token；未提供时使用未取消 token。
 
     Returns:
         批执行上下文。
@@ -730,6 +1429,6 @@ def _context() -> BatchToolExecutionContext:
         session_id="session-fins",
         iteration_id="iteration-fins",
         timeout_seconds=30.0,
-        cancellation_token=_OpenCancellationToken(),
+        cancellation_token=cancellation_token or _OpenCancellationToken(),
         correlation_id="correlation-fins",
     )

@@ -12,8 +12,9 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from threading import Lock, RLock
-from typing import Any, Literal, Optional, cast
+from typing import Any, Final, Literal, NoReturn, Optional, cast
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.tools._legacy_adapter.exceptions import ToolArgumentError
 from dayu.fins._log import Log
 from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
@@ -115,6 +116,49 @@ _MISSING_TICKER_HINT = (
     "目标：先确认这家公司是否已被当前财报工具收录。允许动作：切到公司或网页来源确认公司标识。"
     "不允许：继续穷举 ticker 变体。下一步：先确认公司标识，再回到财报工具。"
 )
+_TOOL_CANCELLED_ERROR_CODE: Final = "tool_cancelled"
+
+
+def _raise_if_fins_cancelled(cancellation_token: CancellationToken | None) -> None:
+    """在财报读取慢边界执行协作式取消检查。
+
+    Args:
+        cancellation_token: Host 注入的取消观察令牌；未注入时为 None。
+
+    Returns:
+        无。
+
+    Raises:
+        ToolBusinessError: 当前工具调用已被 Host 取消时抛出，错误码固定为
+            ``tool_cancelled``。
+    """
+
+    if cancellation_token is not None and cancellation_token.is_cancelled():
+        _raise_fins_cancelled(cancellation_token)
+
+
+def _raise_fins_cancelled(cancellation_token: CancellationToken) -> NoReturn:
+    """抛出 legacy adapter 可稳定投影的 Fins 读取取消业务错误。
+
+    Args:
+        cancellation_token: 已处于取消状态的 Host 取消观察令牌。
+
+    Returns:
+        不返回。
+
+    Raises:
+        ToolBusinessError: 始终抛出，错误码固定为 ``tool_cancelled``。
+    """
+
+    reason = cancellation_token.cancel_reason()
+    message = "财报读取工具调用已被取消。"
+    if reason is not None and reason.strip() != "":
+        message = f"{message}取消原因: {reason}"
+    raise ToolBusinessError(
+        code=_TOOL_CANCELLED_ERROR_CODE,
+        message=message,
+        hint="当前工具调用已停止；等待新的用户指令或后续调度。",
+    )
 
 
 class FinsReadRuntime:
@@ -173,6 +217,7 @@ class FinsReadRuntime:
         document_types: Optional[list[str]] = None,
         fiscal_years: Optional[list[int]] = None,
         fiscal_periods: Optional[list[str]] = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> ListDocumentsResult:
         """列出可用文档。
 
@@ -181,6 +226,7 @@ class FinsReadRuntime:
             document_types: 可选文档类型过滤（枚举数组，如 ["annual_report", "quarterly_report"]）。
             fiscal_years: 可选财年过滤。
             fiscal_periods: 可选财期过滤。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             文档列表结果。
@@ -191,19 +237,27 @@ class FinsReadRuntime:
             RuntimeError: 仓储读取失败时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker = self._resolve_canonical_ticker(
             ticker=ticker,
             tool_name="list_documents",
+            cancellation_token=cancellation_token,
         )
         normalized_document_types = _normalize_document_types(document_types)
         normalized_fiscal_periods = _normalize_periods(fiscal_periods)
 
+        _raise_if_fins_cancelled(cancellation_token)
         company_name, market = self._read_company_info(normalized_ticker)
-        base_documents = self._collect_source_documents(normalized_ticker)
+        _raise_if_fins_cancelled(cancellation_token)
+        base_documents = self._collect_source_documents(
+            normalized_ticker,
+            cancellation_token=cancellation_token,
+        )
 
         # 先为全量文档附加 document_type，供推荐槽位与过滤逻辑共享。
         documents_with_type: list[dict[str, Any]] = []
         for item in base_documents:
+            _raise_if_fins_cancelled(cancellation_token)
             output = dict(item)
             output["document_type"] = resolve_document_type_for_source(
                 form_type=item.get("form_type"),
@@ -214,6 +268,7 @@ class FinsReadRuntime:
         # 主过滤逻辑：按类型 / 财年 / 财期筛选；推荐槽位仍基于全量文档构建。
         filtered_documents: list[dict[str, Any]] = []
         for item in documents_with_type:
+            _raise_if_fins_cancelled(cancellation_token)
             doc_type = item["document_type"]
             if normalized_document_types is not None and doc_type not in normalized_document_types:
                 continue
@@ -264,12 +319,19 @@ class FinsReadRuntime:
 
         return result
 
-    def get_document_sections(self, *, ticker: str, document_id: str) -> DocumentSectionsResult:
+    def get_document_sections(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> DocumentSectionsResult:
         """获取文档章节结构。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             章节结构结果。
@@ -280,21 +342,31 @@ class FinsReadRuntime:
             FileNotFoundError: 文档不存在时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="get_document_sections",
+            cancellation_token=cancellation_token,
         )
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
+        _raise_if_fins_cancelled(cancellation_token)
         sections_raw: list[SectionSummary] = processor.list_sections()
+        _raise_if_fins_cancelled(cancellation_token)
         form_type = self._resolve_document_form_type(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
         )
-        enriched_sections = self._enrich_sections_with_semantic(sections_raw, form_type)
+        enriched_sections = self._enrich_sections_with_semantic(
+            sections_raw,
+            form_type,
+            cancellation_token=cancellation_token,
+        )
         citation = self._build_citation(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
@@ -306,13 +378,21 @@ class FinsReadRuntime:
             "citation": citation,
         }
 
-    def read_section(self, *, ticker: str, document_id: str, ref: str) -> SectionContentResult:
+    def read_section(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        ref: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> SectionContentResult:
         """读取章节正文。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
             ref: 章节引用。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             章节正文结果。
@@ -323,21 +403,27 @@ class FinsReadRuntime:
             KeyError: 章节不存在时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="read_section",
+            cancellation_token=cancellation_token,
         )
         normalized_ref = require_non_empty_text(
             ref,
             empty_error=ToolArgumentError("read_section", "ref", ref, "Argument must not be empty"),
         )
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
         try:
+            _raise_if_fins_cancelled(cancellation_token)
             section_raw: SectionContent = processor.read_section(normalized_ref)
+            _raise_if_fins_cancelled(cancellation_token)
         except KeyError as exc:
             suspected_document_id = self._diagnose_cross_document_locator(
                 ticker=normalized_ticker,
@@ -379,7 +465,13 @@ class FinsReadRuntime:
         if parent_ref:
             # 直接走处理器的 O(1) 标题查询，避免为父标题再扫一遍全量 sections。
             try:
+                _raise_if_fins_cancelled(cancellation_token)
                 parent_title = processor.get_section_title(str(parent_ref))
+                _raise_if_fins_cancelled(cancellation_token)
+            except ToolBusinessError as exc:
+                if exc.code == _TOOL_CANCELLED_ERROR_CODE:
+                    raise
+                parent_title = None
             except Exception:
                 parent_title = None
 
@@ -443,6 +535,7 @@ class FinsReadRuntime:
         within_section_ref: Optional[str] = None,
         mode: Optional[str] = None,
         display_budget: Optional[int] = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> SearchDocumentResult:
         """在文档内搜索关键词，支持单查询和批量查询。
 
@@ -462,6 +555,7 @@ class FinsReadRuntime:
                 - ``semantic``：语义扩展（短语变体 + 同义词 + 关键词）。
             display_budget: 可选展示预算上限，传递给 exact 优先限流，
                 避免裁剪后条目数超出下游 truncation max_items 引发信号冲突。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             搜索结果。
@@ -473,10 +567,12 @@ class FinsReadRuntime:
 
         _QUERIES_MAX = 20
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="search_document",
+            cancellation_token=cancellation_token,
         )
         # 校验互斥：query 与 queries 必须提供其一
         resolved_queries = _resolve_search_queries(
@@ -487,9 +583,11 @@ class FinsReadRuntime:
         normalized_within_ref = normalize_optional_text(within_section_ref)
         resolved_mode = _resolve_search_mode(mode)
 
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
         # 预构建证据化所需的 form_type / ref_to_topic
         form_type = self._resolve_document_form_type(
@@ -507,16 +605,26 @@ class FinsReadRuntime:
             document_count=0,
         )
         try:
+            _raise_if_fins_cancelled(cancellation_token)
             all_secs = processor.list_sections()
+            _raise_if_fins_cancelled(cancellation_token)
             enriched_for_search = self._enrich_sections_with_semantic(
-                sections=all_secs, form_type=form_type
+                sections=all_secs,
+                form_type=form_type,
+                cancellation_token=cancellation_token,
             )
+            _raise_if_fins_cancelled(cancellation_token)
             bm25f_index = build_section_bm25f_index(enriched_for_search)
+            _raise_if_fins_cancelled(cancellation_token)
             semantic_profiles, query_term_df = _build_section_semantic_profiles(enriched_for_search)
             for sec in enriched_for_search:
+                _raise_if_fins_cancelled(cancellation_token)
                 ref = sec.get("ref")
                 if ref:
                     ref_to_topic[ref] = sec.get("topic")
+        except ToolBusinessError as exc:
+            if exc.code == _TOOL_CANCELLED_ERROR_CODE:
+                raise
         except Exception:
             pass
 
@@ -538,6 +646,7 @@ class FinsReadRuntime:
                 semantic_profiles=semantic_profiles,
                 query_term_df=query_term_df,
                 display_budget=display_budget,
+                cancellation_token=cancellation_token,
             )
 
         # ---- 单查询路径 ----
@@ -556,10 +665,13 @@ class FinsReadRuntime:
                 mode=resolved_mode,
                 diagnosis=diagnosis,
                 semantic_profiles=semantic_profiles,
+                cancellation_token=cancellation_token,
             )
         )
 
+        _raise_if_fins_cancelled(cancellation_token)
         deduplicated_entries = _deduplicate_ranked_search_entries(ranked_entries)
+        _raise_if_fins_cancelled(cancellation_token)
         sorted_entries = _sort_ranked_search_entries(
             deduplicated_entries,
             bm25f_index=bm25f_index,
@@ -568,7 +680,9 @@ class FinsReadRuntime:
         )
         # exact 优先限流：当精确命中存在时，压缩扩展结果占比
         capped_entries = _cap_entries_with_exact_priority(sorted_entries, display_budget=display_budget)
+        _raise_if_fins_cancelled(cancellation_token)
         matches = _build_evidence_matches(capped_entries, form_type, ref_to_topic)
+        _raise_if_fins_cancelled(cancellation_token)
         fallback_opened = any(bool(item.get("_token_fallback_opened", False)) for item in sorted_entries)
         noise_penalty_applied_count = sum(
             1 for item in sorted_entries if float(item.get("_context_noise_penalty", 0.0)) > 0.0
@@ -648,6 +762,7 @@ class FinsReadRuntime:
         semantic_profiles: dict[str, SectionSemanticProfile],
         query_term_df: dict[str, int],
         display_budget: Optional[int] = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> SearchDocumentResult:
         """批量查询聚合路径。
 
@@ -667,6 +782,7 @@ class FinsReadRuntime:
             semantic_profiles: 章节语义画像映射。
             query_term_df: 查询词 document frequency。
             display_budget: 可选展示预算上限，传递给 exact 优先限流。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             聚合搜索结果。
@@ -677,6 +793,7 @@ class FinsReadRuntime:
         merged_strategy_hits = _build_empty_search_strategy_hit_counts()
 
         for q in resolved_queries:
+            _raise_if_fins_cancelled(cancellation_token)
             query_diagnosis = _diagnose_search_query(
                 query=q,
                 term_document_frequency=query_term_df,
@@ -689,11 +806,14 @@ class FinsReadRuntime:
                     within_ref=normalized_within_ref, mode=resolved_mode,
                     diagnosis=query_diagnosis,
                     semantic_profiles=semantic_profiles,
+                    cancellation_token=cancellation_token,
                 )
             )
+            _raise_if_fins_cancelled(cancellation_token)
             all_ranked.extend(ranked)
             # 合并策略命中计数
             for strat, cnt in strategy_hits.items():
+                _raise_if_fins_cancelled(cancellation_token)
                 merged_strategy_hits[strat] = merged_strategy_hits.get(strat, 0) + cnt
             per_query_stats.append({
                 "query": q,
@@ -704,7 +824,9 @@ class FinsReadRuntime:
                 "intent": query_diagnosis.intent,
             })
 
+        _raise_if_fins_cancelled(cancellation_token)
         deduplicated = _deduplicate_ranked_search_entries(all_ranked)
+        _raise_if_fins_cancelled(cancellation_token)
         sorted_entries = _sort_ranked_search_entries(
             deduplicated,
             bm25f_index=bm25f_index,
@@ -713,6 +835,7 @@ class FinsReadRuntime:
         )
         # exact 优先限流：当精确命中存在时，压缩扩展结果占比
         capped_entries = _cap_entries_with_exact_priority(sorted_entries, display_budget=display_budget)
+        _raise_if_fins_cancelled(cancellation_token)
         matches = _build_evidence_matches(capped_entries, form_type, ref_to_topic)
 
         diagnostics = {
@@ -777,6 +900,7 @@ class FinsReadRuntime:
         document_id: str,
         financial_only: bool = False,
         within_section_ref: Optional[str] = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> TablesListResult:
         """列出文档表格元数据。
 
@@ -785,6 +909,7 @@ class FinsReadRuntime:
             document_id: 文档 ID。
             financial_only: 是否仅返回财务表格。
             within_section_ref: 可选章节范围。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             表格列表结果。
@@ -794,21 +919,27 @@ class FinsReadRuntime:
             ToolBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="list_tables",
+            cancellation_token=cancellation_token,
         )
         normalized_within_ref = normalize_optional_text(within_section_ref)
 
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
+        _raise_if_fins_cancelled(cancellation_token)
         tables_raw: list[TableSummary] = processor.list_tables()
 
         filtered_tables: list[dict[str, Any]] = []
         for item in tables_raw:
+            _raise_if_fins_cancelled(cancellation_token)
             is_financial = bool(item.get("is_financial", False))
             section_ref = item.get("section_ref")
             if financial_only and not is_financial:
@@ -835,7 +966,9 @@ class FinsReadRuntime:
             # within_section：与请求参数 within_section_ref 语义同源，表达 table 所属 section
             if section_ref:
                 ws: dict[str, str] = {"ref": section_ref}
+                _raise_if_fins_cancelled(cancellation_token)
                 sec_title = processor.get_section_title(section_ref)
+                _raise_if_fins_cancelled(cancellation_token)
                 if sec_title:
                     ws["title"] = sec_title
                 entry["within_section"] = ws
@@ -866,13 +999,21 @@ class FinsReadRuntime:
             ),
         }
 
-    def get_table(self, *, ticker: str, document_id: str, table_ref: str) -> TableDetailResult:
+    def get_table(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        table_ref: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TableDetailResult:
         """读取指定表格。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
             table_ref: 表格引用。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             表格数据结果。
@@ -883,21 +1024,27 @@ class FinsReadRuntime:
             KeyError: 表格不存在时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="get_table",
+            cancellation_token=cancellation_token,
         )
         normalized_table_ref = require_non_empty_text(
             table_ref,
             empty_error=ToolArgumentError("get_table", "table_ref", table_ref, "Argument must not be empty"),
         )
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
         try:
+            _raise_if_fins_cancelled(cancellation_token)
             table_raw: TableContent = processor.read_table(normalized_table_ref)
+            _raise_if_fins_cancelled(cancellation_token)
         except KeyError as exc:
             suspected_document_id = self._diagnose_cross_document_locator(
                 ticker=normalized_ticker,
@@ -920,13 +1067,16 @@ class FinsReadRuntime:
                 hint,
             ) from exc
         data_payload = _build_table_data_payload(table_raw)
+        _raise_if_fins_cancelled(cancellation_token)
 
         # within_section：通过 get_section_title O(1) 获取所属章节信息
         section_ref = table_raw.get("section_ref")
         within_section: dict[str, str] | None = None
         if section_ref:
             within_section = {"ref": section_ref}
+            _raise_if_fins_cancelled(cancellation_token)
             sec_title = processor.get_section_title(section_ref)
+            _raise_if_fins_cancelled(cancellation_token)
             if sec_title:
                 within_section["title"] = sec_title
 
@@ -955,13 +1105,21 @@ class FinsReadRuntime:
             result["page_no"] = page_no
         return result
 
-    def get_page_content(self, *, ticker: str, document_id: str, page_no: int) -> PageContentResult | NotSupportedResult:
+    def get_page_content(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        page_no: int,
+        cancellation_token: CancellationToken | None = None,
+    ) -> PageContentResult | NotSupportedResult:
         """读取页面上下文。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
             page_no: 目标页码（1-based）。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             页面内容结果；不支持时返回 `not_supported` 结构。
@@ -971,10 +1129,12 @@ class FinsReadRuntime:
             ToolBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="get_page_content",
+            cancellation_token=cancellation_token,
         )
         if not isinstance(page_no, int) or page_no <= 0:
             raise ToolArgumentError(
@@ -984,9 +1144,11 @@ class FinsReadRuntime:
                 "page_no must be a positive integer",
             )
 
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
         page_method = getattr(processor, "get_page_content", None)
         if not callable(page_method):
@@ -997,7 +1159,9 @@ class FinsReadRuntime:
                 payload={"page_no": page_no, "supported": False},
             )
 
+        _raise_if_fins_cancelled(cancellation_token)
         page_payload = cast(dict[str, Any], page_method(page_no))
+        _raise_if_fins_cancelled(cancellation_token)
         # processor 贡献的子字段通过 .get() 提取；已知字段由 PageContentResult 声明。
         result: PageContentResult = {
             "ticker": normalized_ticker,
@@ -1022,6 +1186,7 @@ class FinsReadRuntime:
         ticker: str,
         document_id: str,
         statement_type: str,
+        cancellation_token: CancellationToken | None = None,
     ) -> FinancialStatementResult | NotSupportedResult:
         """读取标准财务报表。
 
@@ -1029,6 +1194,7 @@ class FinsReadRuntime:
             ticker: 股票代码。
             document_id: 文档 ID。
             statement_type: 报表类型。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             财务报表结果；成功时除标准报表数据外，还包含 `statement_locator`
@@ -1040,10 +1206,12 @@ class FinsReadRuntime:
             ToolBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="get_financial_statement",
+            cancellation_token=cancellation_token,
         )
         normalized_statement_type = require_non_empty_text(
             statement_type,
@@ -1055,9 +1223,11 @@ class FinsReadRuntime:
             ),
         )
 
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
         statement_method = getattr(processor, "get_financial_statement", None)
         if not callable(statement_method):
@@ -1068,7 +1238,9 @@ class FinsReadRuntime:
                 payload={"statement_type": normalized_statement_type},
             )
 
+        _raise_if_fins_cancelled(cancellation_token)
         statement_payload = cast(dict[str, Any], statement_method(normalized_statement_type))
+        _raise_if_fins_cancelled(cancellation_token)
         citation = self._build_citation(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
@@ -1081,6 +1253,10 @@ class FinsReadRuntime:
             **statement_payload,
             "citation": citation,
         }
+        rows = result.get("rows")
+        if isinstance(rows, list):
+            for _row in rows:
+                _raise_if_fins_cancelled(cancellation_token)
         return cast(FinancialStatementResult, result)
 
     def query_xbrl_facts(
@@ -1095,6 +1271,7 @@ class FinsReadRuntime:
         fiscal_period: Optional[str] = None,
         min_value: Optional[float] = None,
         max_value: Optional[float] = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> XbrlQueryResult | NotSupportedResult:
         """查询 XBRL facts。
 
@@ -1108,6 +1285,7 @@ class FinsReadRuntime:
             fiscal_period: 可选财期。
             min_value: 可选最小值。
             max_value: 可选最大值。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             XBRL 数值 facts 查询结果；不支持时返回 `not_supported` 结构。
@@ -1117,10 +1295,12 @@ class FinsReadRuntime:
             ToolBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
             document_id=document_id,
             tool_name="query_xbrl_facts",
+            cancellation_token=cancellation_token,
         )
         if concepts is not None and not isinstance(concepts, list):
             raise ToolArgumentError(
@@ -1129,19 +1309,23 @@ class FinsReadRuntime:
                 concepts,
                 "concepts must be a string array or omitted",
             )
-        normalized_concepts = [
-            item
-            for item in (normalize_optional_text(concept) for concept in (concepts or []))
-            if item is not None
-        ]
+        normalized_concepts: list[str] = []
+        for concept in concepts or []:
+            _raise_if_fins_cancelled(cancellation_token)
+            item = normalize_optional_text(concept)
+            if item is not None:
+                normalized_concepts.append(item)
 
+        _raise_if_fins_cancelled(cancellation_token)
         form_type = self._resolve_document_form_type(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
         )
+        _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
+            cancellation_token=cancellation_token,
         )
         taxonomy = _resolve_processor_taxonomy(processor)
         resolved_concepts = (
@@ -1158,6 +1342,7 @@ class FinsReadRuntime:
                 payload={"concepts": resolved_concepts},
             )
 
+        _raise_if_fins_cancelled(cancellation_token)
         payload = cast(
             dict[str, Any],
             query_method(
@@ -1170,10 +1355,19 @@ class FinsReadRuntime:
                 max_value=max_value,
             ),
         )
+        _raise_if_fins_cancelled(cancellation_token)
+        raw_facts_for_checkpoint = payload.get("facts")
+        if isinstance(raw_facts_for_checkpoint, list):
+            for _raw_fact in raw_facts_for_checkpoint:
+                _raise_if_fins_cancelled(cancellation_token)
         normalized_payload = _normalize_xbrl_query_payload(
             payload=payload,
             default_concepts=resolved_concepts,
         )
+        facts = normalized_payload.get("facts")
+        if isinstance(facts, list):
+            for _fact in facts:
+                _raise_if_fins_cancelled(cancellation_token)
         # processor 贡献的字段（query_params, facts, total 等）通过 spread 合入；
         # 已知字段由 XbrlQueryResult TypedDict 声明，运行时由 normalizer 保证。
         result: dict[str, Any] = {
@@ -1193,6 +1387,7 @@ class FinsReadRuntime:
         ticker: str,
         document_id: str,
         tool_name: str,
+        cancellation_token: CancellationToken | None = None,
     ) -> tuple[str, str]:
         """标准化文档身份参数。
 
@@ -1200,6 +1395,7 @@ class FinsReadRuntime:
             ticker: 原始股票代码。
             document_id: 原始文档 ID。
             tool_name: 调用工具名。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             `(normalized_ticker, normalized_document_id)`。其中 ``normalized_document_id``
@@ -1210,7 +1406,12 @@ class FinsReadRuntime:
             ToolBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
-        normalized_ticker = self._resolve_canonical_ticker(ticker=ticker, tool_name=tool_name)
+        _raise_if_fins_cancelled(cancellation_token)
+        normalized_ticker = self._resolve_canonical_ticker(
+            ticker=ticker,
+            tool_name=tool_name,
+            cancellation_token=cancellation_token,
+        )
         normalized_document_id = require_non_empty_text(
             document_id,
             empty_error=ToolArgumentError(
@@ -1220,14 +1421,22 @@ class FinsReadRuntime:
                 "Argument must not be empty",
             ),
         )
+        _raise_if_fins_cancelled(cancellation_token)
         resolved_document_id = self._resolve_canonical_document_id(
             ticker=normalized_ticker,
             raw_document_id=normalized_document_id,
             tool_name=tool_name,
+            cancellation_token=cancellation_token,
         )
         return normalized_ticker, resolved_document_id
 
-    def _resolve_canonical_ticker(self, *, ticker: str, tool_name: str) -> str:
+    def _resolve_canonical_ticker(
+        self,
+        *,
+        ticker: str,
+        tool_name: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> str:
         """将外部 ticker 归一化为可用 ticker。
 
         解析顺序：
@@ -1242,6 +1451,7 @@ class FinsReadRuntime:
         Args:
             ticker: 原始 ticker。
             tool_name: 当前调用工具名。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             当前财报工具可用的 ticker。
@@ -1251,6 +1461,7 @@ class FinsReadRuntime:
             ToolBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker = require_non_empty_text(
             ticker,
             empty_error=ToolArgumentError(
@@ -1265,7 +1476,9 @@ class FinsReadRuntime:
             probe_ticker = normalized_source.canonical
         else:
             probe_ticker = normalized_ticker.strip().upper()
+        _raise_if_fins_cancelled(cancellation_token)
         resolved_ticker = self._company_repository.resolve_existing_ticker([probe_ticker])
+        _raise_if_fins_cancelled(cancellation_token)
         if resolved_ticker is None:
             raise ToolBusinessError(
                 code=ErrorCode.NOT_FOUND.value,
@@ -1286,6 +1499,7 @@ class FinsReadRuntime:
         ticker: str,
         raw_document_id: str,
         tool_name: str,
+        cancellation_token: CancellationToken | None = None,
     ) -> str:
         """将外部传入的文档标识归一化为仓储 `document_id`。
 
@@ -1300,6 +1514,7 @@ class FinsReadRuntime:
             ticker: 标准化股票代码。
             raw_document_id: 外部传入的文档标识。
             tool_name: 当前工具名，仅用于日志。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             仓储规范 `document_id`。
@@ -1308,13 +1523,16 @@ class FinsReadRuntime:
             无。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         direct_meta = self._get_document_meta_cached(ticker, raw_document_id)
         if direct_meta is not None:
             return raw_document_id
 
         normalized_alias = re.sub(r"\s+", "", raw_document_id).strip()
         for source_kind in (SourceKind.FILING, SourceKind.MATERIAL):
+            _raise_if_fins_cancelled(cancellation_token)
             for candidate_document_id in self._source_repository.list_source_document_ids(ticker, source_kind):
+                _raise_if_fins_cancelled(cancellation_token)
                 candidate_meta = self._get_document_meta_cached(ticker, candidate_document_id)
                 if not candidate_meta:
                     continue
@@ -1370,11 +1588,17 @@ class FinsReadRuntime:
             aliases[normalized_value.replace("-", "")] = field_name
         return aliases
 
-    def _collect_source_documents(self, ticker: str) -> list[dict[str, Any]]:
+    def _collect_source_documents(
+        self,
+        ticker: str,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> list[dict[str, Any]]:
         """汇总 source 层文档摘要。
 
         Args:
             ticker: 标准化股票代码。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             文档摘要列表。
@@ -1384,8 +1608,23 @@ class FinsReadRuntime:
         """
 
         documents: list[dict[str, Any]] = []
-        documents.extend(self._collect_source_documents_by_kind(ticker, SourceKind.FILING))
-        documents.extend(self._collect_source_documents_by_kind(ticker, SourceKind.MATERIAL))
+        _raise_if_fins_cancelled(cancellation_token)
+        documents.extend(
+            self._collect_source_documents_by_kind(
+                ticker,
+                SourceKind.FILING,
+                cancellation_token=cancellation_token,
+            )
+        )
+        _raise_if_fins_cancelled(cancellation_token)
+        documents.extend(
+            self._collect_source_documents_by_kind(
+                ticker,
+                SourceKind.MATERIAL,
+                cancellation_token=cancellation_token,
+            )
+        )
+        _raise_if_fins_cancelled(cancellation_token)
         documents.sort(key=build_document_recency_sort_key, reverse=True)
         return documents
 
@@ -1393,12 +1632,15 @@ class FinsReadRuntime:
         self,
         ticker: str,
         source_kind: SourceKind,
+        *,
+        cancellation_token: CancellationToken | None = None,
     ) -> list[dict[str, Any]]:
         """按来源类型采集文档摘要。
 
         Args:
             ticker: 标准化股票代码。
             source_kind: 文档来源。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             文档摘要列表。
@@ -1407,9 +1649,12 @@ class FinsReadRuntime:
             RuntimeError: 仓储读取失败时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         document_ids = self._source_repository.list_source_document_ids(ticker, source_kind)
+        _raise_if_fins_cancelled(cancellation_token)
         results: list[dict[str, Any]] = []
         for document_id in document_ids:
+            _raise_if_fins_cancelled(cancellation_token)
             try:
                 meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
             except FileNotFoundError:
@@ -1432,6 +1677,7 @@ class FinsReadRuntime:
             has_financial_data = self._read_capability_flags(
                 ticker, document_id,
             )
+            _raise_if_fins_cancelled(cancellation_token)
             results.append(
                 {
                     "document_id": document_id,
@@ -1528,6 +1774,8 @@ class FinsReadRuntime:
         self,
         sections: list[SectionSummary],
         form_type: Optional[str],
+        *,
+        cancellation_token: CancellationToken | None = None,
     ) -> list[dict[str, Any]]:
         """为章节列表注入语义层字段。
 
@@ -1537,6 +1785,7 @@ class FinsReadRuntime:
         Args:
             sections: processor 返回的章节摘要列表。
             form_type: 文档的 form_type。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             增强后的章节字典列表。
@@ -1544,6 +1793,7 @@ class FinsReadRuntime:
         # 构建 ref → section 索引，用于 parent_ref 追溯
         ref_to_section: dict[str, SectionSummary] = {}
         for sec in sections:
+            _raise_if_fins_cancelled(cancellation_token)
             ref = sec.get("ref")
             if ref:
                 ref_to_section[ref] = sec
@@ -1552,6 +1802,7 @@ class FinsReadRuntime:
         # 记录已解析的 ref → (item_number, topic)，供子章节继承使用
         ref_to_resolved: dict[str, tuple[Optional[str], Optional[str]]] = {}
         for sec in sections:
+            _raise_if_fins_cancelled(cancellation_token)
             entry = dict(sec)
             # 移除 preview 字段：与 title 高度重复，LLM 需要详情时用 read_section
             entry.pop("preview", None)
@@ -1725,12 +1976,19 @@ class FinsReadRuntime:
             return cache_key.document_id
         return None
 
-    def _get_or_create_processor(self, *, ticker: str, document_id: str) -> DocumentProcessor:
+    def _get_or_create_processor(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> DocumentProcessor:
         """读取或创建 Processor 实例。
 
         Args:
             ticker: 标准化股票代码。
             document_id: 标准化文档 ID。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             Processor 实例。
@@ -1740,6 +1998,7 @@ class FinsReadRuntime:
             ValueError: 未匹配处理器时抛出。
         """
 
+        _raise_if_fins_cancelled(cancellation_token)
         cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
         cached = self._processor_cache.get(cache_key)
         if cached is not None:
@@ -1748,10 +2007,16 @@ class FinsReadRuntime:
         lock = self._get_creation_lock(cache_key)
         with lock:
             # 复杂逻辑说明：并发线程在锁内二次检查，避免重复构建 Processor。
+            _raise_if_fins_cancelled(cancellation_token)
             cached = self._processor_cache.get(cache_key)
             if cached is not None:
                 return cached
-            processor = self._create_processor(ticker=ticker, document_id=document_id)
+            processor = self._create_processor(
+                ticker=ticker,
+                document_id=document_id,
+                cancellation_token=cancellation_token,
+            )
+            _raise_if_fins_cancelled(cancellation_token)
             self._processor_cache.put(cache_key, processor)
             Log.debug(
                 f"processor 已创建并缓存: ticker={ticker} document_id={document_id} type={type(processor).__name__}",
@@ -1759,12 +2024,19 @@ class FinsReadRuntime:
             )
             return processor
 
-    def _create_processor(self, *, ticker: str, document_id: str) -> DocumentProcessor:
+    def _create_processor(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> DocumentProcessor:
         """创建 Processor 实例。
 
         Args:
             ticker: 标准化股票代码。
             document_id: 标准化文档 ID。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             Processor 实例。
@@ -1775,26 +2047,41 @@ class FinsReadRuntime:
             RuntimeError: 候选处理器全部创建失败时抛出。
         """
 
-        source_kind = self._resolve_source_kind(ticker=ticker, document_id=document_id)
+        _raise_if_fins_cancelled(cancellation_token)
+        source_kind = self._resolve_source_kind(
+            ticker=ticker,
+            document_id=document_id,
+            cancellation_token=cancellation_token,
+        )
+        _raise_if_fins_cancelled(cancellation_token)
         source = self._source_repository.get_primary_source(
             ticker=ticker,
             document_id=document_id,
             source_kind=source_kind,
         )
+        _raise_if_fins_cancelled(cancellation_token)
         source_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
         form_type = normalize_optional_text(source_meta.get("form_type"))
+        _raise_if_fins_cancelled(cancellation_token)
         return self._processor_registry.create_with_fallback(
             source=source,
             form_type=form_type,
             media_type=getattr(source, "media_type", None),
         )
 
-    def _resolve_source_kind(self, *, ticker: str, document_id: str) -> SourceKind:
+    def _resolve_source_kind(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> SourceKind:
         """解析文档来源类型。
 
         Args:
             ticker: 标准化股票代码。
             document_id: 标准化文档 ID。
+            cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
             来源类型。
@@ -1804,12 +2091,16 @@ class FinsReadRuntime:
         """
 
         try:
+            _raise_if_fins_cancelled(cancellation_token)
             self._source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
+            _raise_if_fins_cancelled(cancellation_token)
             return SourceKind.FILING
         except FileNotFoundError:
             pass
         try:
+            _raise_if_fins_cancelled(cancellation_token)
             self._source_repository.get_source_handle(ticker, document_id, SourceKind.MATERIAL)
+            _raise_if_fins_cancelled(cancellation_token)
             return SourceKind.MATERIAL
         except FileNotFoundError:
             pass
