@@ -25,8 +25,10 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
+from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.tool_call import BatchToolExecutionContext
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.documents.processors._doc_processor_factory import create_doc_file_processor
 from dayu.documents.processors.search_utils import extract_query_anchored_snippets
@@ -34,6 +36,7 @@ from dayu.documents.processors.search_utils import extract_query_anchored_snippe
 from ._legacy_adapter.exceptions import FileAccessError, ToolArgumentError
 from ._legacy_adapter.registry_collector import LegacyToolDeclarationCollector
 from ._legacy_adapter.tool_decorator import tool
+from ._legacy_adapter.tool_errors import ToolBusinessError
 
 MODULE = "ENGINE.DOC_TOOLS"
 _LOGGER = logging.getLogger(__name__)
@@ -107,6 +110,68 @@ class Log:
         """
 
         _LOGGER.debug("[%s] %s", module, message)
+
+
+def _resolve_doc_cancellation_token(
+    execution_context: BatchToolExecutionContext | None,
+) -> CancellationToken | None:
+    """从工具执行上下文中解析 Host 注入的取消令牌。
+
+    Args:
+        execution_context: legacy adapter 注入的批式工具执行上下文；未注入时为 None。
+
+    Returns:
+        若上下文存在则返回其中的取消令牌，否则返回 None。
+
+    Raises:
+        无。
+    """
+
+    if execution_context is None:
+        return None
+    return execution_context.cancellation_token
+
+
+def _raise_if_doc_cancelled(cancellation_token: CancellationToken | None) -> None:
+    """在可能较慢的文档处理边界执行协作式取消检查。
+
+    Args:
+        cancellation_token: Host 注入的取消观察令牌；未注入时为 None。
+
+    Returns:
+        无。
+
+    Raises:
+        ToolBusinessError: Host 已请求取消当前工具调用时抛出，错误码固定为
+            ``tool_cancelled``。
+    """
+
+    if cancellation_token is not None and cancellation_token.is_cancelled():
+        _raise_doc_cancelled(cancellation_token)
+
+
+def _raise_doc_cancelled(cancellation_token: CancellationToken) -> NoReturn:
+    """抛出 legacy adapter 可稳定投影的文档工具取消业务错误。
+
+    Args:
+        cancellation_token: 已处于取消状态的 Host 取消观察令牌。
+
+    Returns:
+        不返回。
+
+    Raises:
+        ToolBusinessError: 始终抛出，错误码固定为 ``tool_cancelled``。
+    """
+
+    reason = cancellation_token.cancel_reason()
+    message = "文档工具调用已被取消。"
+    if reason is not None and reason.strip() != "":
+        message = f"{message}取消原因: {reason}"
+    raise ToolBusinessError(
+        code="tool_cancelled",
+        message=message,
+        hint="当前工具调用已停止；等待新的用户指令或后续调度。",
+    )
 
 
 def register_doc_tools(
@@ -210,13 +275,15 @@ def _create_list_files_tool(registry: LegacyToolDeclarationCollector, max_files:
         parameters=parameters,
         tags=("doc",),
         file_path_params=["directory"],
+        execution_context_param_name="execution_context",
         display_name="列出文件",
     )
     def list_files(
         directory: str,
         pattern: Optional[str] = None,
         recursive: bool = False,
-        limit: int = 20  # 默认 20，schema 中定义了 maximum
+        limit: int = 20,  # 默认 20，schema 中定义了 maximum
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> Dict[str, Any]:
         """
         列出目录中的文件
@@ -226,6 +293,7 @@ def _create_list_files_tool(registry: LegacyToolDeclarationCollector, max_files:
             pattern: 文件名 glob 模式
             recursive: 是否递归搜索
             limit: 最大返回数量
+            execution_context: legacy adapter 注入的工具执行上下文
 
         Returns:
             Dict 包含:
@@ -236,6 +304,7 @@ def _create_list_files_tool(registry: LegacyToolDeclarationCollector, max_files:
         """
         # 确保 limit 不超过配置的硬性上限
         actual_limit = min(limit, max_files)
+        cancellation_token = _resolve_doc_cancellation_token(execution_context)
 
         dir_path = Path(directory)
 
@@ -245,6 +314,7 @@ def _create_list_files_tool(registry: LegacyToolDeclarationCollector, max_files:
 
         # 收集文件
         files = []
+        _raise_if_doc_cancelled(cancellation_token)
         if recursive:
             all_files = dir_path.rglob(pattern if pattern else "*")
         else:
@@ -252,6 +322,7 @@ def _create_list_files_tool(registry: LegacyToolDeclarationCollector, max_files:
 
         # 过滤并收集文件信息
         for file_path in all_files:
+            _raise_if_doc_cancelled(cancellation_token)
             if not file_path.is_file():
                 continue
 
@@ -272,6 +343,7 @@ def _create_list_files_tool(registry: LegacyToolDeclarationCollector, max_files:
 
         total = len(files)
         filtered_files = files[:actual_limit] if actual_limit < total else files
+        _raise_if_doc_cancelled(cancellation_token)
 
         return {
             "directory": str(dir_path),
@@ -316,11 +388,13 @@ def _create_get_file_sections_tool(
         parameters=parameters,
         tags=("doc",),
         file_path_params=["file_path"],
+        execution_context_param_name="execution_context",
         display_name="浏览文件结构",
     )
     def get_file_sections(
         file_path: str,
-        limit: int = 10  # 默认 10，schema 中定义了 maximum
+        limit: int = 10,  # 默认 10，schema 中定义了 maximum
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> Dict[str, Any]:
         """
         列出文件中的所有 sections
@@ -331,6 +405,7 @@ def _create_get_file_sections_tool(
         Args:
             file_path: 已校验并归一化的文件路径。
             limit: 最大返回 section 数
+            execution_context: legacy adapter 注入的工具执行上下文
 
         Returns:
             Dict 包含:
@@ -341,14 +416,17 @@ def _create_get_file_sections_tool(
                 - total_lines: 文件总行数
         """
         actual_limit = min(limit, max_sections)
+        cancellation_token = _resolve_doc_cancellation_token(execution_context)
         path = Path(file_path)
 
         # 尝试通过处理器解析
+        _raise_if_doc_cancelled(cancellation_token)
         processor = _try_create_processor(path)
         if processor is not None:
-            return _sections_via_processor(processor, path, actual_limit)
+            return _sections_via_processor(processor, path, actual_limit, cancellation_token)
 
         # 降级路径：手动读取文件
+        _raise_if_doc_cancelled(cancellation_token)
         lines = _read_file_lines(path)
         if lines is None:
             return _fallback_single_section(file_path, path)
@@ -357,6 +435,7 @@ def _create_get_file_sections_tool(
 
         # 尝试提取 Markdown sections（纯文本 .md 但 processor 创建失败时的保底）
         if path.suffix.lower() in {".md", ".markdown"}:
+            _raise_if_doc_cancelled(cancellation_token)
             sections = _extract_markdown_sections(lines)
             if sections:
                 filtered_sections = sections[:actual_limit]
@@ -390,18 +469,25 @@ def _try_create_processor(path: Path):
         return None
 
 
-def _sections_via_processor(processor, path: Path, limit: int) -> Dict[str, Any]:
+def _sections_via_processor(
+    processor,
+    path: Path,
+    limit: int,
+    cancellation_token: CancellationToken | None = None,
+) -> Dict[str, Any]:
     """通过处理器获取章节列表并转换为工具输出格式。
 
     Args:
         processor: DocumentProcessor 实例。
         path: 文件路径。
         limit: 最大返回数。
+        cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
         工具输出字典。
     """
     raw_sections = processor.list_sections()
+    _raise_if_doc_cancelled(cancellation_token)
     total_lines = _count_file_lines(path)
 
     # 通过 list_tables 构建 section_ref → table_ref 列表映射
@@ -624,6 +710,7 @@ def _create_search_files_tool(
         parameters=parameters,
         tags=("doc",),
         file_path_params=["directory"],
+        execution_context_param_name="execution_context",
         display_name="搜索文件",
         summary_params=["query"],
     )
@@ -631,7 +718,8 @@ def _create_search_files_tool(
         directory: str,
         query: str,
         include_types: Optional[List[str]] = None,
-        limit: int = 20  # 默认 20，schema 中定义了 maximum
+        limit: int = 20,  # 默认 20，schema 中定义了 maximum
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> Dict[str, Any]:
         """
         在目录中搜索包含关键词的文件
@@ -645,6 +733,7 @@ def _create_search_files_tool(
             query: 搜索关键词
             include_types: 文件类型过滤
             limit: 最大返回数量
+            execution_context: legacy adapter 注入的工具执行上下文
 
         Returns:
             Dict 包含:
@@ -654,6 +743,7 @@ def _create_search_files_tool(
                 - total_matches: 匹配总数
         """
         actual_limit = min(limit, max_results)
+        cancellation_token = _resolve_doc_cancellation_token(execution_context)
         dir_path = Path(directory)
 
         if not dir_path.is_dir():
@@ -661,7 +751,9 @@ def _create_search_files_tool(
 
         matches: List[Dict[str, Any]] = []
 
+        _raise_if_doc_cancelled(cancellation_token)
         for file_path in dir_path.rglob("*"):
+            _raise_if_doc_cancelled(cancellation_token)
             if not file_path.is_file():
                 continue
 
@@ -675,20 +767,34 @@ def _create_search_files_tool(
             # 尝试通过处理器搜索
             processor = _try_create_processor(file_path)
             if processor is not None:
-                file_matches = _search_via_processor(processor, relative_path, query)
+                _raise_if_doc_cancelled(cancellation_token)
+                file_matches = _search_via_processor(
+                    processor,
+                    relative_path,
+                    query,
+                    cancellation_token,
+                )
                 matches.extend(file_matches)
                 if len(matches) >= actual_limit:
                     break
                 continue
 
             # 降级路径：行扫描 + 高质量 snippet
-            file_matches = _search_via_line_scan(file_path, relative_path, query, actual_limit - len(matches))
+            _raise_if_doc_cancelled(cancellation_token)
+            file_matches = _search_via_line_scan(
+                file_path,
+                relative_path,
+                query,
+                actual_limit - len(matches),
+                cancellation_token,
+            )
             matches.extend(file_matches)
             if len(matches) >= actual_limit:
                 break
 
         # 截断到限制
         matches = matches[:actual_limit]
+        _raise_if_doc_cancelled(cancellation_token)
 
         return {
             "query": query,
@@ -704,6 +810,7 @@ def _search_via_processor(
     processor,
     relative_path: str,
     query: str,
+    cancellation_token: CancellationToken | None = None,
 ) -> List[Dict[str, Any]]:
     """通过处理器搜索文件内容，返回标准化匹配列表。
 
@@ -711,13 +818,17 @@ def _search_via_processor(
         processor: DocumentProcessor 实例。
         relative_path: 文件相对路径。
         query: 搜索关键词。
+        cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
         匹配字典列表。
     """
     try:
+        _raise_if_doc_cancelled(cancellation_token)
         hits = processor.search(query)
     except Exception as exc:
+        if isinstance(exc, ToolBusinessError) and exc.code == "tool_cancelled":
+            raise
         Log.warn(f"处理器搜索失败: {relative_path} - {exc}", module=MODULE)
         return []
 
@@ -739,6 +850,7 @@ def _search_via_line_scan(
     relative_path: str,
     query: str,
     remaining: int,
+    cancellation_token: CancellationToken | None = None,
 ) -> List[Dict[str, Any]]:
     """行扫描搜索（降级路径），附带高质量 snippet。
 
@@ -747,6 +859,7 @@ def _search_via_line_scan(
         relative_path: 文件相对路径。
         query: 搜索关键词。
         remaining: 剩余可返回的匹配数。
+        cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
         匹配字典列表。
@@ -755,6 +868,7 @@ def _search_via_line_scan(
     matches: List[Dict[str, Any]] = []
 
     try:
+        _raise_if_doc_cancelled(cancellation_token)
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
     except (UnicodeDecodeError, OSError):
@@ -820,6 +934,7 @@ def _create_read_file_tool(registry: LegacyToolDeclarationCollector, max_chars: 
         parameters=parameters,
         tags=("doc",),
         file_path_params=["file_path"],
+        execution_context_param_name="execution_context",
         display_name="读取文件",
         truncate=ToolTruncateSpec(
             enabled=True,
@@ -833,7 +948,8 @@ def _create_read_file_tool(registry: LegacyToolDeclarationCollector, max_chars: 
     def read_file(
         file_path: str,
         start_line: Optional[int] = None,
-        end_line: Optional[int] = None
+        end_line: Optional[int] = None,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> Dict[str, Any]:
         """
         读取文件内容
@@ -842,6 +958,7 @@ def _create_read_file_tool(registry: LegacyToolDeclarationCollector, max_chars: 
             file_path: 文件路径
             start_line: 起始行号（1-based）
             end_line: 结束行号（inclusive）
+            execution_context: legacy adapter 注入的工具执行上下文
 
         Returns:
             Dict 包含:
@@ -853,6 +970,7 @@ def _create_read_file_tool(registry: LegacyToolDeclarationCollector, max_chars: 
         Note:
             工具函数返回读取到的内容；超过展示限制时由工具执行入口按声明处理。
         """
+        cancellation_token = _resolve_doc_cancellation_token(execution_context)
         path = Path(file_path)
 
         # 尝试多种编码读取
@@ -862,8 +980,10 @@ def _create_read_file_tool(registry: LegacyToolDeclarationCollector, max_chars: 
 
         for encoding in encodings:
             try:
+                _raise_if_doc_cancelled(cancellation_token)
                 with open(path, 'r', encoding=encoding) as f:
                     lines = f.readlines()
+                _raise_if_doc_cancelled(cancellation_token)
                 used_encoding = encoding
                 break
             except (UnicodeDecodeError, LookupError):
@@ -877,6 +997,7 @@ def _create_read_file_tool(registry: LegacyToolDeclarationCollector, max_chars: 
             )
 
         total_lines = len(lines)
+        _raise_if_doc_cancelled(cancellation_token)
 
         # 处理行范围
         if start_line is None:
@@ -947,6 +1068,7 @@ def _create_read_file_section_tool(
         parameters=parameters,
         tags=("doc",),
         file_path_params=["file_path"],
+        execution_context_param_name="execution_context",
         display_name="读取文件段落",
         truncate=ToolTruncateSpec(
             enabled=True,
@@ -960,6 +1082,7 @@ def _create_read_file_section_tool(
     def read_file_section(
         file_path: str,
         ref: str,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> Dict[str, Any]:
         """
         按 section ref 读取文件章节内容
@@ -970,6 +1093,7 @@ def _create_read_file_section_tool(
         Args:
             file_path: 已校验并归一化的文件路径。
             ref: 章节 ref（从 get_file_sections 获取）
+            execution_context: legacy adapter 注入的工具执行上下文
 
         Returns:
             Dict 包含:
@@ -984,9 +1108,11 @@ def _create_read_file_section_tool(
         Raises:
             ToolArgumentError: ref 无效时抛出
         """
+        cancellation_token = _resolve_doc_cancellation_token(execution_context)
         path = Path(file_path)
 
         # 创建处理器
+        _raise_if_doc_cancelled(cancellation_token)
         processor = _try_create_processor(path)
         if processor is None:
             raise ToolArgumentError(
@@ -1000,6 +1126,7 @@ def _create_read_file_section_tool(
 
         # 读取章节
         try:
+            _raise_if_doc_cancelled(cancellation_token)
             section_content = processor.read_section(ref)
         except KeyError:
             raise ToolArgumentError(
@@ -1010,7 +1137,8 @@ def _create_read_file_section_tool(
             )
 
         # 构建子章节导航
-        children = _get_section_children(processor, ref)
+        _raise_if_doc_cancelled(cancellation_token)
+        children = _get_section_children(processor, ref, cancellation_token)
 
         content = section_content.get("content", "")
         return {
@@ -1026,7 +1154,11 @@ def _create_read_file_section_tool(
     return read_file_section.__tool_name__, read_file_section, read_file_section.__tool_schema__
 
 
-def _get_section_children(processor, parent_ref: str) -> List[Dict[str, Any]]:
+def _get_section_children(
+    processor,
+    parent_ref: str,
+    cancellation_token: CancellationToken | None = None,
+) -> List[Dict[str, Any]]:
     """获取指定章节的直接子章节列表。
 
     遍历 processor.list_sections()，找出 parent_ref 匹配的子节点。
@@ -1034,17 +1166,22 @@ def _get_section_children(processor, parent_ref: str) -> List[Dict[str, Any]]:
     Args:
         processor: DocumentProcessor 实例。
         parent_ref: 父章节 ref。
+        cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
         子章节列表，每个元素包含 ref/title/level/preview。
     """
     children = []
     try:
+        _raise_if_doc_cancelled(cancellation_token)
         all_sections = processor.list_sections()
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, ToolBusinessError) and exc.code == "tool_cancelled":
+            raise
         return children
 
     for s in all_sections:
+        _raise_if_doc_cancelled(cancellation_token)
         if s.get("parent_ref") == parent_ref:
             children.append({
                 "ref": s.get("ref"),
