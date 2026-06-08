@@ -57,6 +57,7 @@ from dayu.engine.contracts import (
     AssistantToolCallBatchSnapshot,
     AsyncRunner,
     AwaitingToolExecutionRecord,
+    ClientCorrelationPolicy,
     ContentCompleteData,
     ContentDeltaData,
     ContextBudgetSnapshot,
@@ -98,6 +99,7 @@ from dayu.engine.contracts import (
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
     RunnerProtocolErrorData,
+    RunnerRequestIdentity,
     RunnerReasoningDeltaData,
     RunnerSpec,
     RunnerToolCallDeltaData,
@@ -114,6 +116,7 @@ from dayu.engine.contracts import (
     ToolResultAcceptedData,
     UsageReportedData,
     UserMessage,
+    build_runner_request_identity,
 )
 from dayu.engine.contracts.engine_events import (
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
@@ -140,6 +143,7 @@ __all__ = [
     "BatchToolExecutionRecord",
     "BatchToolExecutionRequest",
     "CancellationToken",
+    "ClientCorrelationPolicy",
     "ContentCompleteData",
     "ContentDeltaData",
     "ContextBudgetSnapshot",
@@ -187,6 +191,7 @@ __all__ = [
     "RunnerHTTPErrorCode",
     "RunnerHTTPErrorData",
     "RunnerProtocolErrorData",
+    "RunnerRequestIdentity",
     "RunnerReasoningDeltaData",
     "RunnerSpec",
     "RunnerToolCallDeltaData",
@@ -222,5 +227,6 @@ __all__ = [
     "ToolResultSuccess",
     "ToolSchema",
     "UserMessage",
+    "build_runner_request_identity",
     "runner_role_sequence_digest",
 ]

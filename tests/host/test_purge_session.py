@@ -8,7 +8,7 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, replace
 from multiprocessing import Process
 from pathlib import Path
-from typing import Protocol, TypeVar, cast
+from typing import TypeVar, cast
 
 import pytest
 
@@ -29,7 +29,6 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     OperationContext,
     PurgeSessionRequest,
-    PurgeSessionResult,
     ReplayRunRequest,
     RetryRunRequest,
 )
@@ -144,21 +143,6 @@ _NON_TERMINAL_RUN_STATUSES = (
 )
 _PROCESS_JOIN_TIMEOUT_SECONDS = 5.0
 _AwaitedT = TypeVar("_AwaitedT")
-
-
-class _PurgeCapableHost(Protocol):
-    """测试内收窄的 purge-capable public Host 协议。"""
-
-    async def purge_session(self, session_id: str, request: PurgeSessionRequest) -> PurgeSessionResult:
-        """清理已关闭 Session 的本地可恢复事实。
-
-        :param session_id: 目标 Session id。
-        :param request: purge 请求。
-        :returns: purge 结果。
-        :raises HostApiError: purge 前置条件不满足或 durable 操作失败时抛出。
-        """
-
-        ...
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -476,7 +460,7 @@ async def _purge_in_independent_process_async(*, root_path: Path, result_marker:
         allow_tool_calls=False,
     )
     async with open_host(options) as host:
-        result = await cast(_PurgeCapableHost, host).purge_session(_SESSION_ID, _purge_api_request())
+        result = await host.purge_session(_SESSION_ID, _purge_api_request())
     result_marker.write_text(
         json.dumps(
             {

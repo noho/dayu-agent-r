@@ -25,37 +25,37 @@ from .result_types import (
     TablesListResult,
     XbrlQueryResult,
 )
-from .service import FinsToolService
+from .read_runtime import FinsReadRuntime
 
 MODULE = "FINS.FINS_TOOLS"
 FINS_TOOL_TAGS = ("fins",)
 _ToolFactoryResult = tuple[str, LegacySyncToolCallable, ToolSchema]
 
 
-def _resolve_service(
+def _resolve_read_runtime(
     *,
-    service: FinsToolService,
-) -> FinsToolService:
-    """校验预构建的 FinsToolService 实例。
+    read_runtime: FinsReadRuntime,
+) -> FinsReadRuntime:
+    """校验预构建的 FinsReadRuntime 实例。
 
-    只允许复用预构建的 `FinsToolService`，避免工具注册阶段继续感知仓储装配细节。
+    只允许复用预构建的 `FinsReadRuntime`，避免工具注册阶段继续感知仓储装配细节。
 
     Args:
-        service: 预构建的 FinsToolService 实例。
+        read_runtime: 预构建的 FinsReadRuntime 实例。
     Returns:
-        可用的 FinsToolService 实例。
+        可用的 FinsReadRuntime 实例。
 
     Raises:
         无。
     """
 
-    return service
+    return read_runtime
 
 
 def register_fins_read_tools(
     registry: LegacyToolDeclarationCollector,
     *,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: Optional[FinsToolLimits] = None,
     timeout_budget: float | None = None,
 ) -> None:
@@ -63,7 +63,7 @@ def register_fins_read_tools(
 
     Args:
         registry: LegacyToolDeclarationCollector 实例。
-        service: 预构建的 FinsToolService 实例。
+        read_runtime: 预构建的 FinsReadRuntime 实例。
         limits: 可选工具限制配置。
         timeout_budget: Runner 为单次 tool call 提供的预算秒数；当前 fins 读工具预留该参数，
             暂未消费。
@@ -76,8 +76,8 @@ def register_fins_read_tools(
     """
 
     resolved_limits = limits or FinsToolLimits()
-    resolved_service = _resolve_service(
-        service=service,
+    resolved_read_runtime = _resolve_read_runtime(
+        read_runtime=read_runtime,
     )
 
     # 读取工具工厂函数列表（按注册顺序）
@@ -97,7 +97,7 @@ def register_fins_read_tools(
 
     # 批量注册读取工具。读工具已统一收口为单一 fins 标签。
     for factory in read_tool_factories:
-        name, func, schema = factory(registry, resolved_service, resolved_limits)
+        name, func, schema = factory(registry, resolved_read_runtime, resolved_limits)
         registry.register(name, func, schema)
 
     Log.verbose(f"已注册 {len(read_tool_factories)} 个财报读取工具", module=MODULE)
@@ -105,14 +105,14 @@ def register_fins_read_tools(
 
 def _create_list_documents_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `list_documents` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -202,7 +202,7 @@ def _create_list_documents_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return service.list_documents(
+        return read_runtime.list_documents(
             ticker=ticker,
             document_types=document_types,
             fiscal_years=fiscal_years,
@@ -214,14 +214,14 @@ def _create_list_documents_tool(
 
 def _create_get_document_sections_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `get_document_sections` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -275,21 +275,21 @@ def _create_get_document_sections_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return service.get_document_sections(ticker=ticker, document_id=document_id)
+        return read_runtime.get_document_sections(ticker=ticker, document_id=document_id)
 
     return get_document_sections.__tool_name__, get_document_sections, get_document_sections.__tool_schema__
 
 
 def _create_read_section_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `read_section` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -354,21 +354,21 @@ def _create_read_section_tool(
         """
         _ = _kwargs
 
-        return service.read_section(ticker=ticker, document_id=document_id, ref=ref)
+        return read_runtime.read_section(ticker=ticker, document_id=document_id, ref=ref)
 
     return read_section.__tool_name__, read_section, read_section.__tool_schema__
 
 
 def _create_search_document_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `search_document` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -451,7 +451,7 @@ def _create_search_document_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        result = service.search_document(
+        result = read_runtime.search_document(
             ticker=ticker,
             document_id=document_id,
             query=query,
@@ -469,14 +469,14 @@ def _create_search_document_tool(
 
 def _create_list_tables_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `list_tables` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -546,7 +546,7 @@ def _create_list_tables_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return service.list_tables(
+        return read_runtime.list_tables(
             ticker=ticker,
             document_id=document_id,
             financial_only=financial_only,
@@ -558,14 +558,14 @@ def _create_list_tables_tool(
 
 def _create_get_table_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `get_table` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -623,21 +623,21 @@ def _create_get_table_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return service.get_table(ticker=ticker, document_id=document_id, table_ref=table_ref)
+        return read_runtime.get_table(ticker=ticker, document_id=document_id, table_ref=table_ref)
 
     return get_table.__tool_name__, get_table, get_table.__tool_schema__
 
 
 def _create_get_page_content_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `get_page_content` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -693,21 +693,21 @@ def _create_get_page_content_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return service.get_page_content(ticker=ticker, document_id=document_id, page_no=page_no)
+        return read_runtime.get_page_content(ticker=ticker, document_id=document_id, page_no=page_no)
 
     return get_page_content.__tool_name__, get_page_content, get_page_content.__tool_schema__
 
 
 def _create_get_financial_statement_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `get_financial_statement` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -769,7 +769,7 @@ def _create_get_financial_statement_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return service.get_financial_statement(
+        return read_runtime.get_financial_statement(
             ticker=ticker,
             document_id=document_id,
             statement_type=statement_type,
@@ -780,14 +780,14 @@ def _create_get_financial_statement_tool(
 
 def _create_query_xbrl_facts_tool(
     registry: LegacyToolDeclarationCollector,
-    service: FinsToolService,
+    read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
 ) -> _ToolFactoryResult:
     """创建 `query_xbrl_facts` 工具。
 
     Args:
         registry: 工具注册表实例。
-        service: 财报工具服务实例。
+        read_runtime: 财报读取运行时实例。
         limits: 财报工具限制配置。
 
     Returns:
@@ -870,7 +870,7 @@ def _create_query_xbrl_facts_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return service.query_xbrl_facts(
+        return read_runtime.query_xbrl_facts(
             ticker=ticker,
             document_id=document_id,
             concepts=concepts,

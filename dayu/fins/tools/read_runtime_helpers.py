@@ -1,6 +1,6 @@
-"""服务层通用辅助函数。
+"""财报读取运行时通用辅助函数。
 
-该模块包含 FinsToolService 所用的非搜索辅助逻辑：
+该模块包含 FinsReadRuntime 所用的非搜索辅助逻辑：
 - 文本标准化（必填/可选/form_type）
 - 推荐文档构建
 - 章节标准化（children / page_range）

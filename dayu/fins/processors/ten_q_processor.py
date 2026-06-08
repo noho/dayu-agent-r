@@ -55,7 +55,7 @@ class TenQFormProcessor(_BaseSecReportFormProcessor):
 
         super().__init__(source=source, form_type=form_type, media_type=media_type)
         # 在父类初始化完成后再次执行一次 10-Q 专项正文修复，确保最终暴露给
-        # FinsToolService 的虚拟章节已应用最新边界收敛逻辑。
+        # FinsReadRuntime 的虚拟章节已应用最新边界收敛逻辑。
         self._postprocess_virtual_sections(self._collect_document_text())
 
     def _build_markers(self, full_text: str) -> list[tuple[int, Optional[str]]]:

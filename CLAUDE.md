@@ -92,34 +92,18 @@
 - 单文件测试覆盖率目标为 >= 80%。
 - `dayu/render/` 和 `utils/` 下的脚本默认无需测试、无覆盖率要求。
 
-## 文档与 README 同步
+## README 更新触发
 
-- 测试通过后，立即同步更新相关 README；以代码为准，不写“未来设计”。
-- 只更新 README 中与当前代码不一致的部分，不维护时间敏感的“近期更新”“版本记录”。
-- 更新 README 时，先检查三件事：
-  1. 文档示例是否仍对应当前接口、命令、参数名。
-  2. 是否残留旧术语、旧路径、旧入口、旧架构表述。
-  3. 文档职责是否越界，总览文档不抢包文档职责，包文档不重复用户手册。
-- 各 README 固定职责：
-  - 根目录 `README.md`：用户手册，只写安装、配置、跑通、常用工作流、CLI 命令、trace/render 入口、文档导航。
-  - `dayu/README.md`：开发手册总览，只写整体架构、设计意图、稳定边界、扩展入口、代码阅读顺序。
-  - `dayu/engine/README.md`：Engine 开发手册，只写接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制、扩展点。
-  - `dayu/host/README.md`：Host 开发手册，只写接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制、扩展点。
-  - `dayu/fins/README.md`：Fins 开发手册，只写 capability 定位、两条执行路径、对外接口、内部分层与机制。
-  - `dayu/config/README.md`：配置说明手册，只写默认配置、`workspace/config` 覆盖关系、常改项、最小示例、prompts 目录职责。
-  - `tests/README.md`：测试手册，只写测试分层、运行方式、约定与维护规则。
-- README 触发更新规则：
-  - 命中以下触发条件时，先检查变更是否属于该 README 的职责范围与目标读者；只有属于时才实际修改，不做机械同步。
-  - `dayu/engine/` 修改 -> 更新 `dayu/engine/README.md`
-  - `dayu/host/` 修改 -> 更新 `dayu/host/README.md`
-  - `dayu/fins/` 修改 -> 更新 `dayu/fins/README.md`
-  - `dayu/config/` 修改 -> 更新 `dayu/config/README.md`
-  - `tests/` 修改 -> 更新 `tests/README.md`
-  - `dayu/cli/`、`dayu/render/`、`utils/analyze_tool_trace.py`、项目级使用方式或配置入口变化 -> 更新根目录 `README.md`
-  - 涉及分层关系、装配方式、`UI / Service / Host / Agent` 边界变化 -> 更新 `dayu/README.md`
-- 文档写作约束：
-  - 不写过程状态，不写未来计划，不写实现细节，只保留稳定说明。
-  - 若概念已改名，必须全量清理旧名，禁止新旧术语并存。
+README 的写作边界、读者对象和内容约束由各 README 内的 `Agent更新约束【必须遵守】` 或等价章节定义。修改 README 前必须先阅读目标 README 的该约束；若目标 README 尚未定义该约束，先只按本节触发规则判断是否需要更新，不要自行扩写目标文档职责。
+
+命中以下触发条件时，先检查代码变更是否属于对应 README 的职责范围与目标读者；只有属于时才实际修改，不做机械同步。
+
+- `dayu/engine/` 修改 -> 检查并按需更新 `dayu/engine/README.md`
+- `dayu/host/` 修改 -> 检查并按需更新 `dayu/host/README.md`
+- `dayu/fins/` 修改 -> 检查并按需更新 `dayu/fins/README.md`
+- `dayu/config/` 修改 -> 检查并按需更新 `dayu/config/README.md`
+- `tests/` 修改 -> 检查并按需更新 `tests/README.md`
+- 涉及分层关系、装配方式、`UI / Service / Host / Agent` 边界变化 -> 检查并按需更新 `dayu/README.md`
 
 ## 目录约束
 

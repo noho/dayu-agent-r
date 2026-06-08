@@ -48,7 +48,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import NormalizedTicker
-from dayu.fins.tools.service import FinsToolService
+from dayu.fins.tools.read_runtime import FinsReadRuntime
 
 
 class _HoldingExecutor(FinsIngestionExecutor):
@@ -1200,16 +1200,16 @@ def test_store_file_lock_closes_stream_when_flock_fails(
         os.fstat(captured_fd)
 
 
-def test_default_runtime_keeps_read_tool_service_lazy_singleton(tmp_path: Path) -> None:
-    """新增 ingestion runtime 不应破坏 read tool service 懒加载行为。"""
+def test_default_runtime_keeps_read_runtime_lazy_singleton(tmp_path: Path) -> None:
+    """新增 ingestion runtime 不应破坏 read runtime 懒加载行为。"""
 
     workspace_root = tmp_path / "fins-workspace"
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
-    first_service = runtime.get_tool_service()
-    second_service = runtime.get_tool_service()
+    first_read_runtime = runtime.get_read_runtime()
+    second_read_runtime = runtime.get_read_runtime()
 
-    assert isinstance(first_service, FinsToolService)
-    assert first_service is second_service
+    assert isinstance(first_read_runtime, FinsReadRuntime)
+    assert first_read_runtime is second_read_runtime
 
 
 def _job_file(workspace_root: Path, job_id: str) -> Path:

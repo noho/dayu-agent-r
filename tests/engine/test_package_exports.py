@@ -21,6 +21,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "AssistantToolCall",
         "AsyncRunner",
         "CancellationToken",
+        "ClientCorrelationPolicy",
         "ContentCompleteData",
         "ContentDeltaData",
         "ContextBudgetSnapshot",
@@ -50,6 +51,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ProviderRequestExtension",
         "QwenThinkingExtension",
         "ReasoningDeltaData",
+        "RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION",
         "RUN_SUSPENDED_REASON_TOOL_AWAITING",
         "RunCancelledData",
         "RunFailedData",
@@ -67,6 +69,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunnerHTTPErrorCode",
         "RunnerHTTPErrorData",
         "RunnerProtocolErrorData",
+        "RunnerRequestIdentity",
         "RunnerReasoningDeltaData",
         "RunnerSpec",
         "RunnerToolCallDeltaData",
@@ -109,6 +112,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolResultSuccess",
         "ToolSchema",
         "UserMessage",
+        "build_runner_request_identity",
+        "runner_role_sequence_digest",
     }
 )
 

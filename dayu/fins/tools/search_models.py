@@ -1,7 +1,7 @@
 """搜索数据模型与常量。
 
 该模块定义搜索子系统的纯数据结构（dataclass）和词表/常量，
-不包含任何业务逻辑，作为 search_engine 和 service 的共享基础。
+不包含任何业务逻辑，作为 search_engine 和 read runtime 的共享基础。
 """
 
 from __future__ import annotations

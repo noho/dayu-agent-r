@@ -175,7 +175,8 @@ class ToolCallsBatchReadyData:
     """工具调用批次可执行事件 data。
 
     :param iteration_id: 当前迭代 id。
-    :param tool_calls: 本批工具调用，顺序与 Runner 完成顺序一致。
+    :param tool_calls: 本批工具调用，顺序为按 ``index_in_iteration`` 排序后
+        的执行输入顺序。
     """
 
     iteration_id: str

@@ -1,6 +1,6 @@
-"""FinsToolService 返回值类型定义。
+"""FinsReadRuntime 返回值类型定义。
 
-本模块为 FinsToolService 每个 public 方法定义结构化返回类型（TypedDict），
+本模块为 FinsReadRuntime 每个 public 方法定义结构化返回类型（TypedDict），
 消除方法签名中的 ``dict[str, Any]``，使消费方获得编译期键检查。
 
 设计原则：

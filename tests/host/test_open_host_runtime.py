@@ -7,7 +7,7 @@ import pathlib
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Protocol, cast
+from typing import cast
 
 import pytest
 
@@ -40,7 +40,6 @@ from dayu.host import (
     OperationContext,
     OrdinaryRunExecutionBaseline,
     PurgeSessionRequest,
-    PurgeSessionResult,
     RunSnapshot,
     RunStatus,
     SubmitFollowupRequest,
@@ -71,22 +70,6 @@ from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import StartupRecoveryScanner
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
-
-
-class _PurgeCapableHost(Protocol):
-    """测试 open_host concrete handle 的 purge 接线能力。"""
-
-    async def purge_session(
-        self, session_id: str, request: PurgeSessionRequest
-    ) -> PurgeSessionResult:
-        """清理已关闭 Session。
-
-        :param session_id: 目标 Session id。
-        :param request: purge 请求。
-        :returns: concrete public purge result。
-        """
-
-        ...
 
 
 class _FinalAnswerHandle:
@@ -620,8 +603,7 @@ async def test_open_host_purge_session_and_watch_after_purge_fail_closed(
             session.session_id,
             _close_request("close-before-purge"),
         )
-        purge_host = cast(_PurgeCapableHost, host)
-        result = await purge_host.purge_session(
+        result = await host.purge_session(
             session.session_id,
             _purge_request("purge-open-host"),
         )

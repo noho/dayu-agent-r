@@ -48,7 +48,7 @@ _STATEMENT_TITLE_BY_TYPE = {
     "comprehensive_income": "Comprehensive Income",
 }
 
-# decimals → scale 映射表（与 service 层 _DECIMALS_SCALE_MAP 保持一致）
+# decimals → scale 映射表（与 read runtime _DECIMALS_SCALE_MAP 保持一致）
 _DECIMALS_SCALE_MAP: dict[int, str] = {
     -9: "billions",
     -6: "millions",

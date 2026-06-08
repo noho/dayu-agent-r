@@ -1,7 +1,7 @@
 """Fins 工具与 ingestion 运行时装配。
 
 本模块承载 Fins 共享 assembly root：read tools 使用的仓储、处理器注册表、
-``FinsToolService``，以及下载/预处理 ingestion runtime foundation。
+``FinsReadRuntime``，以及下载/预处理 ingestion runtime foundation。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from dayu.fins.storage import (
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 
 if TYPE_CHECKING:
-    from dayu.fins.tools.service import FinsToolService
+    from dayu.fins.tools.read_runtime import FinsReadRuntime
 
 
 @dataclass
@@ -49,8 +49,8 @@ class DefaultFinsRuntime:
     processed_repository: ProcessedDocumentRepositoryProtocol
     processor_registry: ProcessorRegistry
     ingestion_job_store: FsFinsIngestionJobStore
-    _tool_service: FinsToolService | None = field(init=False, default=None, repr=False)
-    _tool_service_lock: Lock = field(init=False, repr=False)
+    _read_runtime: FinsReadRuntime | None = field(init=False, default=None, repr=False)
+    _read_runtime_lock: Lock = field(init=False, repr=False)
     _ingestion_runtime: FinsIngestionRuntime | None = field(init=False, default=None, repr=False)
     _ingestion_runtime_lock: Lock = field(init=False, repr=False)
 
@@ -67,7 +67,7 @@ class DefaultFinsRuntime:
             无。
         """
 
-        self._tool_service_lock = Lock()
+        self._read_runtime_lock = Lock()
         self._ingestion_runtime_lock = Lock()
 
     @classmethod
@@ -126,37 +126,37 @@ class DefaultFinsRuntime:
 
         return self.processor_registry
 
-    def get_tool_service(self, *, processor_cache_max_entries: int = 128) -> FinsToolService:
-        """返回共享的 FinsToolService 实例。
+    def get_read_runtime(self, *, processor_cache_max_entries: int = 128) -> FinsReadRuntime:
+        """返回共享的 FinsReadRuntime 实例。
 
         Args:
             processor_cache_max_entries: Processor 缓存最大条目数，仅首次创建时生效。
 
         Returns:
-            共享的 FinsToolService 实例。
+            共享的 FinsReadRuntime 实例。
 
         Raises:
-            ValueError: 缓存容量非法时由 FinsToolService 抛出。
+            ValueError: 缓存容量非法时由 FinsReadRuntime 抛出。
         """
 
-        if self._tool_service is not None:
-            return self._tool_service
-        with self._tool_service_lock:
-            if self._tool_service is not None:
-                return self._tool_service
+        if self._read_runtime is not None:
+            return self._read_runtime
+        with self._read_runtime_lock:
+            if self._read_runtime is not None:
+                return self._read_runtime
             # dayu.fins.tools 包初始化会导入 provider，provider 又需要本模块；
             # 因此这里在运行时完成窄导入，避免直接 import service_runtime 时形成环。
-            from dayu.fins.tools.service import FinsToolService
+            from dayu.fins.tools.read_runtime import FinsReadRuntime
 
-            service = FinsToolService(
+            read_runtime = FinsReadRuntime(
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
                 processor_registry=self.processor_registry,
                 processor_cache_max_entries=processor_cache_max_entries,
             )
-            self._tool_service = service
-            return service
+            self._read_runtime = read_runtime
+            return read_runtime
 
     def get_ingestion_runtime(self) -> FinsIngestionRuntime:
         """返回共享的 Fins ingestion runtime 实例。

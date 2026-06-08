@@ -75,13 +75,13 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
     limits = _parse_limits(spec.config)
     workspace_root = parse_fins_workspace_root_config(spec.config)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
-    service = runtime.get_tool_service(
+    read_runtime = runtime.get_read_runtime(
         processor_cache_max_entries=limits.processor_cache_max_entries
     )
     collector = LegacyToolDeclarationCollector()
     register_fins_read_tools(
         collector,
-        service=service,
+        read_runtime=read_runtime,
         limits=limits,
         timeout_budget=None,
     )
