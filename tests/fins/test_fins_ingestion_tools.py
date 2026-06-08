@@ -10,11 +10,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition
-from dayu.contracts.tool_outcome import ToolAwaitingOutcome, ToolFailedOutcome
+from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolAwaitingOutcome,
+    ToolCancelledOutcome,
+    ToolFailedOutcome,
+)
 from dayu.fins.ingestion_runtime import (
     FinsIngestionExecutor,
     FinsIngestionJobRecord,
@@ -105,6 +111,37 @@ class _OpenCancellationToken:
         """
 
         return None
+
+
+class _CancelledCancellationToken:
+    """测试用已取消 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        Returns:
+            始终返回 ``True``。
+        """
+
+        return True
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            测试取消原因。
+        """
+
+        return "host-cancelled"
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Returns:
+            固定取消请求时间。
+        """
+
+        return datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 class _OSErrorCreateJobStore(FsFinsIngestionJobStore):
@@ -306,6 +343,42 @@ def test_tool_argument_error_returns_failed_outcome_before_job_creation(tmp_path
     assert outcome.result.error == "invalid_argument"
     job_dir = workspace_root / ".dayu" / "fins_ingestion" / "jobs"
     assert not tuple(job_dir.glob("*.json"))
+
+
+def test_download_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
+    """下载工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsDownloadToolCallable(runtime=runtime)(
+            _call(DOWNLOAD_TOOL_NAME, {"ticker": "AAPL"}),
+            _context(cancellation_token=_CancelledCancellationToken()),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+def test_preprocess_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
+    """预处理工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsPreprocessToolCallable(runtime=runtime)(
+            _call(PREPROCESS_TOOL_NAME, {"ticker": "AAPL"}),
+            _context(cancellation_token=_CancelledCancellationToken()),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
 def test_download_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
@@ -1022,11 +1095,11 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
     )
 
 
-def _context() -> BatchToolExecutionContext:
+def _context(cancellation_token: CancellationToken | None = None) -> BatchToolExecutionContext:
     """构造批执行上下文。
 
     Args:
-        无。
+        cancellation_token: 可选测试取消 token；不传入时使用未取消 token。
 
     Returns:
         批执行上下文。
@@ -1040,7 +1113,7 @@ def _context() -> BatchToolExecutionContext:
         session_id="session-fins",
         iteration_id="iteration-fins",
         timeout_seconds=30.0,
-        cancellation_token=_OpenCancellationToken(),
+        cancellation_token=cancellation_token or _OpenCancellationToken(),
         correlation_id="correlation-fins",
     )
 
