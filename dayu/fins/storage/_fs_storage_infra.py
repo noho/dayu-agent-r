@@ -11,10 +11,10 @@ import shutil
 import socket
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Optional, TextIO, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
-from dayu.fins import _file_lock as file_lock_module
 from dayu.fins._log import Log
+from dayu.runtime.filelock import RuntimeFileLockTimeoutError, RuntimeFileLockToken, file_lock
 
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -117,7 +117,7 @@ class _FsStorageInfra:
         self._create_directories = create_directories
         self._batch_recovery_completed = False
         self._active_batches: dict[str, BatchToken] = {}
-        self._ticker_lock_streams: dict[str, TextIO] = {}
+        self._ticker_lock_tokens: dict[str, RuntimeFileLockToken] = {}
         self._company_meta_by_ticker: Optional[dict[str, CompanyMeta]] = None
         self._alias_index: Optional[dict[str, list[str]]] = None
         self._file_store = file_store
@@ -166,7 +166,7 @@ class _FsStorageInfra:
 
         self._ensure_batch_storage_dirs()
         self.ensure_batch_recovery()
-        lock_stream = self._acquire_ticker_lock(normalized_ticker)
+        lock_token = self._acquire_ticker_lock(normalized_ticker)
         token_id = uuid.uuid4().hex
         target_ticker_dir = self._target_ticker_dir(normalized_ticker)
         staging_root_dir = self.batch_root / token_id
@@ -192,7 +192,7 @@ class _FsStorageInfra:
                 self._ensure_ticker_structure(staging_ticker_dir)
         except Exception:
             shutil.rmtree(staging_root_dir, ignore_errors=True)
-            self._release_ticker_lock(normalized_ticker, stream=lock_stream)
+            self._release_ticker_lock(normalized_ticker, token=lock_token)
             raise
 
         self._active_batches[normalized_ticker] = token
@@ -366,12 +366,12 @@ class _FsStorageInfra:
         if not self._should_manage_batch_state():
             return ()
         self._ensure_batch_storage_dirs()
-        lock_stream = self._acquire_recovery_lock()
+        recovery_token = self._acquire_recovery_lock()
         try:
             actions = self._recover_orphan_batch_dirs(dry_run=dry_run)
             actions.extend(self._recover_orphan_backup_dirs(dry_run=dry_run))
         finally:
-            self._release_lock_stream(lock_stream)
+            self._release_lock_token(recovery_token)
         return tuple(actions)
 
     def _should_manage_batch_state(self) -> bool:
@@ -422,108 +422,102 @@ class _FsStorageInfra:
 
         return self._batch_lock_root / f"{ticker}.lock"
 
-    def _open_and_lock_stream(self, lock_path: Path, *, blocking: bool) -> TextIO:
-        """打开并持有文件锁。
+    def _acquire_lock_token(self, lock_path: Path, *, blocking: bool) -> RuntimeFileLockToken:
+        """获取并持有 runtime 文件锁 token。
 
         Args:
             lock_path: 锁文件路径。
             blocking: 是否阻塞等待锁。
 
         Returns:
-            已持锁的文件流。
+            已持锁的 runtime 文件锁 token。
 
         Raises:
             RuntimeError: 非阻塞模式下锁已被占用时抛出。
-            OSError: 锁文件打开或加锁失败时抛出。
+            RuntimeFileLockError: 锁文件访问或加锁失败时抛出。
         """
 
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        stream = lock_path.open("a+", encoding="utf-8")
         try:
-            file_lock_module.acquire_text_file_lock(
-                stream,
-                blocking=blocking,
-                lock_name="Fins batch 文件锁",
-            )
-        except OSError as exc:
-            stream.close()
-            if not blocking and file_lock_module.is_lock_contention_error(exc):
+            if blocking:
+                return file_lock(lock_path).acquire()
+            return file_lock(lock_path).acquire(timeout_seconds=0)
+        except RuntimeFileLockTimeoutError as exc:
+            if not blocking:
                 raise RuntimeError(f"ticker={lock_path.stem} 已存在跨进程活动 batch") from exc
             raise
-        return stream
 
-    def _release_lock_stream(self, stream: TextIO) -> None:
-        """释放并关闭文件锁流。
+    def _release_lock_token(self, token: RuntimeFileLockToken) -> None:
+        """释放 runtime 文件锁 token。
 
         Args:
-            stream: 已持锁的文件流。
+            token: 已持锁的 runtime 文件锁 token。
 
         Returns:
             无。
 
         Raises:
-            OSError: 解锁失败时抛出。
+            RuntimeFileLockError: 解锁失败时抛出。
         """
 
-        try:
-            file_lock_module.release_text_file_lock(
-                stream,
-                lock_name="Fins batch 文件锁",
-            )
-        finally:
-            stream.close()
+        token.release()
 
-    def _acquire_ticker_lock(self, ticker: str) -> TextIO:
+    def _acquire_ticker_lock(self, ticker: str) -> RuntimeFileLockToken:
         """获取某个 ticker 的跨进程事务锁。
 
         Args:
             ticker: 股票代码。
 
         Returns:
-            已持锁的文件流。
+            已持锁的 runtime 文件锁 token。
 
         Raises:
             RuntimeError: 锁已被其他进程持有时抛出。
-            OSError: 锁文件访问失败时抛出。
+            RuntimeFileLockError: 锁文件访问失败时抛出。
         """
 
-        stream = self._open_and_lock_stream(self._ticker_lock_path(ticker), blocking=False)
-        self._ticker_lock_streams[ticker] = stream
-        return stream
+        token = self._acquire_lock_token(self._ticker_lock_path(ticker), blocking=False)
+        self._ticker_lock_tokens[ticker] = token
+        return token
 
-    def _release_ticker_lock(self, ticker: str, *, stream: TextIO | None = None) -> None:
+    def _release_ticker_lock(
+        self,
+        ticker: str,
+        *,
+        token: RuntimeFileLockToken | None = None,
+    ) -> None:
         """释放某个 ticker 的跨进程事务锁。
 
         Args:
             ticker: 股票代码。
-            stream: 可选显式文件流；未提供时使用内部缓存流。
+            token: 可选显式 runtime 文件锁 token；未提供时使用内部缓存 token。
 
         Returns:
             无。
 
         Raises:
-            OSError: 解锁失败时抛出。
+            RuntimeFileLockError: 解锁失败时抛出。
         """
 
-        effective_stream = stream or self._ticker_lock_streams.pop(ticker, None)
-        if effective_stream is None:
+        cached_token = self._ticker_lock_tokens.pop(ticker, None)
+        effective_token = cached_token or token
+        if effective_token is None:
             return
-        self._release_lock_stream(effective_stream)
+        self._release_lock_token(effective_token)
 
-    def _acquire_recovery_lock(self) -> TextIO:
+    def _acquire_recovery_lock(self) -> RuntimeFileLockToken:
         """获取全局 batch 恢复锁。
 
         Args:
             无。
 
         Returns:
-            已持锁的文件流。
+            已持锁的 runtime 文件锁 token。
 
         Raises:
-            OSError: 锁文件访问失败时抛出。
+            RuntimeFileLockError: 锁文件访问失败时抛出。
         """
 
-        return self._open_and_lock_stream(self._recovery_lock_path, blocking=True)
+        return self._acquire_lock_token(self._recovery_lock_path, blocking=True)
 
     def _write_batch_journal(self, token: BatchToken, phase: str) -> None:
         """把事务 phase 写入 journal。
@@ -617,8 +611,8 @@ class _FsStorageInfra:
             actions.append(action)
             return actions
         normalized_ticker = _normalize_ticker(ticker)
-        ticker_stream = self._try_acquire_recovery_ticker_lock(normalized_ticker)
-        if ticker_stream is None:
+        ticker_token = self._try_acquire_recovery_ticker_lock(normalized_ticker)
+        if ticker_token is None:
             return actions
         try:
             target_dir = self._target_ticker_dir(normalized_ticker)
@@ -645,7 +639,7 @@ class _FsStorageInfra:
             if not dry_run:
                 shutil.rmtree(token_dir, ignore_errors=True)
         finally:
-            self._release_lock_stream(ticker_stream)
+            self._release_lock_token(ticker_token)
         return actions
 
     def _recover_orphan_backup_dirs(self, *, dry_run: bool) -> list[str]:
@@ -675,8 +669,8 @@ class _FsStorageInfra:
             if token_dir.exists():
                 continue
             normalized_ticker = _normalize_ticker(ticker)
-            ticker_stream = self._try_acquire_recovery_ticker_lock(normalized_ticker)
-            if ticker_stream is None:
+            ticker_token = self._try_acquire_recovery_ticker_lock(normalized_ticker)
+            if ticker_token is None:
                 continue
             try:
                 target_dir = self._target_ticker_dir(normalized_ticker)
@@ -690,7 +684,7 @@ class _FsStorageInfra:
                     target_dir.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(backup_dir), str(target_dir))
             finally:
-                self._release_lock_stream(ticker_stream)
+                self._release_lock_token(ticker_token)
         return actions
 
     def _infer_batch_ticker(self, token_dir: Path) -> str:
@@ -718,21 +712,21 @@ class _FsStorageInfra:
             return ""
         return ""
 
-    def _try_acquire_recovery_ticker_lock(self, ticker: str) -> TextIO | None:
+    def _try_acquire_recovery_ticker_lock(self, ticker: str) -> RuntimeFileLockToken | None:
         """尝试在恢复流程中获取某个 ticker 的锁。
 
         Args:
             ticker: 股票代码。
 
         Returns:
-            成功时返回已持锁的文件流；若锁正被活跃事务持有则返回 `None`。
+            成功时返回已持锁的 runtime 文件锁 token；若锁正被活跃事务持有则返回 `None`。
 
         Raises:
-            OSError: 锁文件访问失败时抛出。
+            RuntimeFileLockError: 锁文件访问失败时抛出。
         """
 
         try:
-            return self._open_and_lock_stream(self._ticker_lock_path(ticker), blocking=False)
+            return self._acquire_lock_token(self._ticker_lock_path(ticker), blocking=False)
         except RuntimeError:
             return None
 

@@ -341,6 +341,24 @@ def test_read_provider_only_exposes_read_tools(tmp_path: Path) -> None:
     assert "start_fins_preprocess" not in names
 
 
+def test_same_ticker_batch_fails_fast_across_independent_repository_cores(tmp_path: Path) -> None:
+    """同 workspace 独立仓储 core 的同 ticker 活动 batch 应保持 fail-fast 语义。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    first_repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    first_repository = FsBatchingRepository(workspace_root, repository_set=first_repository_set)
+    first_token = first_repository.begin_batch("AAPL")
+
+    second_repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    second_repository = FsBatchingRepository(workspace_root, repository_set=second_repository_set)
+    with pytest.raises(RuntimeError, match="ticker=AAPL 已存在跨进程活动 batch"):
+        second_repository.begin_batch("AAPL")
+
+    first_repository.rollback_batch(first_token)
+    second_token = second_repository.begin_batch("AAPL")
+    second_repository.rollback_batch(second_token)
+
+
 def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
     """workspace_root 不得从 cwd 或环境隐式解析。"""
 

@@ -37,7 +37,6 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
-    _StoreFileLock,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import (
@@ -1161,43 +1160,6 @@ def test_job_store_removes_temp_file_when_atomic_replace_fails(
 
     assert jobs_dir.is_dir()
     assert tuple(jobs_dir.glob(".*.tmp")) == ()
-
-
-def test_store_file_lock_closes_stream_when_flock_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """文件锁加锁失败时应显式关闭已打开的锁文件流。"""
-
-    captured_fd: int | None = None
-
-    def raise_flock(file_descriptor: int, operation: int) -> None:
-        """记录文件描述符并模拟 flock 失败。
-
-        Args:
-            file_descriptor: 锁文件描述符。
-            operation: flock 操作码。
-
-        Returns:
-            无。
-
-        Raises:
-            OSError: 始终抛出，模拟加锁失败。
-        """
-
-        nonlocal captured_fd
-        captured_fd = file_descriptor
-        raise OSError("flock failed")
-
-    monkeypatch.setattr(ingestion_runtime.fcntl, "flock", raise_flock)
-
-    with pytest.raises(OSError, match="flock failed"):
-        with _StoreFileLock(tmp_path / "jobs" / ".store.lock"):
-            pass
-
-    assert captured_fd is not None
-    with pytest.raises(OSError):
-        os.fstat(captured_fd)
 
 
 def test_default_runtime_keeps_read_runtime_lazy_singleton(tmp_path: Path) -> None:
