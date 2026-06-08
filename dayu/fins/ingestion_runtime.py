@@ -12,17 +12,14 @@ import logging
 import os
 import re
 import uuid
-from io import BytesIO
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
 from threading import Lock, Thread
-from types import TracebackType
-from typing import Final, Protocol, TextIO, cast, get_args
-
-import fcntl
+from typing import Final, Protocol, cast, get_args
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import DocumentProcessor
@@ -49,6 +46,7 @@ from dayu.fins.storage import (
 from dayu.fins.ticker_normalization import Exchange as NormalizedTickerExchange
 from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
 from dayu.fins.ticker_normalization import NormalizedTicker
+from dayu.runtime.filelock import file_lock
 
 _DEFAULT_DOWNLOAD_SOURCE: Final[str] = "auto"
 _DOWNLOAD_INGEST_METHOD: Final[str] = "download"
@@ -697,11 +695,12 @@ class FsFinsIngestionJobStore:
 
         Raises:
             FileExistsError: job id 已存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
             OSError: 文件系统写入失败时抛出。
             ValueError: record 字段非法时抛出。
         """
 
-        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
             path = self._job_path(record.job_id)
             if path.exists():
                 raise FileExistsError(f"Fins ingestion job 已存在: {record.job_id}")
@@ -719,11 +718,12 @@ class FsFinsIngestionJobStore:
 
         Raises:
             FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
             OSError: 文件系统写入失败时抛出。
             ValueError: record 字段非法时抛出。
         """
 
-        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
             path = self._job_path(record.job_id)
             if not path.exists():
                 raise FileNotFoundError(f"Fins ingestion job 不存在: {record.job_id}")
@@ -749,12 +749,13 @@ class FsFinsIngestionJobStore:
 
         Raises:
             FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
             OSError: 文件系统读写失败时抛出。
             ValueError: job id、record 或摘要字段非法时抛出。
         """
 
         _assert_bounded_summary(result_summary, "result_summary")
-        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
             record = self._read_record_locked(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return record
@@ -798,11 +799,12 @@ class FsFinsIngestionJobStore:
 
         Raises:
             FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
             OSError: 文件系统读写失败时抛出。
             ValueError: job id、record 或时间字段非法时抛出。
         """
 
-        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
             record = self._read_record_locked(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return record
@@ -836,11 +838,12 @@ class FsFinsIngestionJobStore:
 
         Raises:
             FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
             OSError: 文件系统读取失败时抛出。
             ValueError: job id 或 record 内容非法时抛出。
         """
 
-        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
             return self._read_record_locked(job_id)
 
     def request_cancel(self, job_id: str, *, updated_at: str) -> FinsIngestionJobRecord:
@@ -855,11 +858,12 @@ class FsFinsIngestionJobStore:
 
         Raises:
             FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
             OSError: 文件系统读写失败时抛出。
             ValueError: job id 或 record 内容非法时抛出。
         """
 
-        with _StoreFileLock(self.root_dir / _LOCK_FILE_NAME):
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
             record = self._read_record_locked(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return record
@@ -1940,77 +1944,6 @@ class FinsIngestionRuntime:
                 exc_info=True,
             )
             return
-
-
-class _StoreFileLock:
-    """进程间文件锁。"""
-
-    def __init__(self, path: Path) -> None:
-        """初始化文件锁。
-
-        Args:
-            path: 锁文件路径。
-
-        Returns:
-            无。
-
-        Raises:
-            无。
-        """
-
-        self._path = path
-        self._stream: TextIO | None = None
-
-    def __enter__(self) -> None:
-        """获取独占文件锁。
-
-        Args:
-            无。
-
-        Returns:
-            无。
-
-        Raises:
-            OSError: 锁文件打开或加锁失败时抛出。
-        """
-
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        stream = self._path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        except BaseException:
-            stream.close()
-            raise
-        self._stream = stream
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        """释放独占文件锁。
-
-        Args:
-            exc_type: 异常类型。
-            exc: 异常实例。
-            traceback: 异常 traceback。
-
-        Returns:
-            无。
-
-        Raises:
-            OSError: 解锁或关闭失败时抛出。
-        """
-
-        stream = self._stream
-        if stream is None:
-            return
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        finally:
-            stream.close()
-            self._stream = None
 
 
 def _new_job_id() -> str:
