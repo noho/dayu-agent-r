@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-TOOLS-01-F01-01 Slice 2 code re-review passed; ready to create accepted slice commit |
+| gate | implementation |
+| implementation status | WU-TOOLS-01-F01-01 Slice 2 accepted commit `14cb3e97`; ready for implementation Slice 3 |
 | active work unit | WU-TOOLS-01-F01-01 |
 | default next work unit | WU-TOOLS-01-F01-01 |
-| next entry point | Create accepted Slice 2 commit for WU-TOOLS-01-F01-01 |
+| next entry point | Dispatch AgentCodex for WU-TOOLS-01-F01-01 implementation Slice 3 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
