@@ -22,6 +22,7 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderBinding,
     ToolsDiscoveryProviderSpec,
 )
+from dayu.tools._legacy_adapter.registry_collector import LegacyToolDeclarationCollector
 from dayu.tools.web import discover_tools
 from dayu.tools.web import web_playwright_backend
 from dayu.tools.web import web_search_providers
@@ -130,6 +131,29 @@ def test_web_provider_discovers_search_and_fetch() -> None:
 
     assert tuple(definition.name for definition in result.tool_bundle.definitions) == _WEB_TOOL_NAMES
     assert result.provider_reports[0].tool_names == _WEB_TOOL_NAMES
+
+
+def test_web_audit_matrix_context_injection_and_schema_no_leak() -> None:
+    """Web 工具 cancellation audit matrix 必须覆盖注入声明与 schema 隔离。"""
+
+    collector = LegacyToolDeclarationCollector()
+    web_tools.register_web_tools(collector)
+    declarations = collector.collected_tools()
+    definitions = _definitions_by_name(_discover_definitions({}))
+
+    assert tuple(declaration.name for declaration in declarations) == _WEB_TOOL_NAMES
+    assert all(
+        declaration.execution_context_param_name == "execution_context"
+        for declaration in declarations
+    )
+    for tool_name in _WEB_TOOL_NAMES:
+        definition = definitions[tool_name]
+        properties = definition.schema.function.parameters.properties
+        required = definition.schema.function.parameters.required
+        assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in required
+        assert "cancellation_token" not in required
 
 
 def test_search_web_projects_optional_arguments_and_success(

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeGuard
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -67,7 +68,12 @@ _READ_SPEC_ID = "financial-read-tools"
 _DOWNLOAD_SPEC_ID = "financial-download-tools"
 _PREPROCESS_SPEC_ID = "financial-preprocess-tools"
 _READ_SAMPLE_TOOL_NAME: Final[str] = "list_documents"
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "dayu" / "config"
+_DOWNLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "download_tools.py"
+_PREPROCESS_TOOLS_PATH: Final[Path] = (
+    _REPO_ROOT / "dayu" / "fins" / "tools" / "preprocess_tools.py"
+)
 _DOWNLOAD_START_FAILED_ERROR = "fins_download_start_failed"
 _PREPROCESS_START_FAILED_ERROR = "fins_preprocess_start_failed"
 _TERMINAL_JOB_STATUSES = frozenset(
@@ -381,6 +387,21 @@ def test_preprocess_tool_cancelled_before_start_returns_cancelled_without_job(tm
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
+def test_awaiting_tool_callables_consume_context_and_bridge_token_to_runtime() -> None:
+    """download/preprocess callable 不得丢弃 context，且必须把 token 传给 runtime。"""
+
+    _assert_context_token_bridge(
+        source_path=_DOWNLOAD_TOOLS_PATH,
+        class_name="FinsDownloadToolCallable",
+        start_method="start_download",
+    )
+    _assert_context_token_bridge(
+        source_path=_PREPROCESS_TOOLS_PATH,
+        class_name="FinsPreprocessToolCallable",
+        start_method="start_preprocess",
+    )
+
+
 def test_download_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
     """下载工具遇到 start_download OSError 时应返回 start-failed 失败 outcome。"""
 
@@ -483,6 +504,13 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
     )
 
     for definition in definitions:
+        properties = definition.schema.function.parameters.properties
+        required = definition.schema.function.parameters.required
+        assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in required
+        assert "cancellation_token" not in required
+
         schema_text = _schema_text(definition)
         assert "tool_call_id" not in schema_text
         assert "digest" not in schema_text
@@ -1137,4 +1165,110 @@ def _schema_text(definition: ToolDefinition) -> str:
         + " ".join(definition.schema.function.parameters.properties.keys())
         + " "
         + str(definition.schema.function.parameters.properties)
+    )
+
+
+def _assert_context_token_bridge(
+    *,
+    source_path: Path,
+    class_name: str,
+    start_method: str,
+) -> None:
+    """断言 awaiting callable 源码消费 context 并传递 cancellation token。
+
+    Args:
+        source_path: 待检查的源码路径。
+        class_name: awaiting tool callable 类名。
+        start_method: runtime start 方法名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 找不到目标类、目标方法丢弃 context，或调用 runtime start
+            时未显式传入 ``cancellation_token``。
+    """
+
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    class_node = _find_class(tree, class_name)
+    call_node = _find_method(class_node, "__call__")
+    has_token_bridge = False
+
+    for node in ast.walk(call_node):
+        if isinstance(node, ast.Delete):
+            assert not any(
+                isinstance(target, ast.Name) and target.id == "context"
+                for target in node.targets
+            )
+        if _is_runtime_start_call(node, start_method=start_method):
+            has_token_bridge = any(
+                keyword.arg == "cancellation_token"
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "cancellation_token"
+                for keyword in node.keywords
+            )
+
+    assert has_token_bridge
+
+
+def _find_class(tree: ast.Module, class_name: str) -> ast.ClassDef:
+    """在模块 AST 中查找类定义。
+
+    Args:
+        tree: 模块 AST。
+        class_name: 类名。
+
+    Returns:
+        类定义节点。
+
+    Raises:
+        AssertionError: 找不到对应类定义。
+    """
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return node
+    raise AssertionError(f"missing class: {class_name}")
+
+
+def _find_method(class_node: ast.ClassDef, method_name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """在类 AST 中查找方法定义。
+
+    Args:
+        class_node: 类定义节点。
+        method_name: 方法名。
+
+    Returns:
+        方法定义节点。
+
+    Raises:
+        AssertionError: 找不到对应方法定义。
+    """
+
+    for node in class_node.body:
+        if isinstance(node, ast.FunctionDef) and node.name == method_name:
+            return node
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == method_name:
+            return node
+    raise AssertionError(f"missing method: {class_node.name}.{method_name}")
+
+
+def _is_runtime_start_call(node: ast.AST, *, start_method: str) -> TypeGuard[ast.Call]:
+    """判断 AST 节点是否为 runtime start 调用。
+
+    Args:
+        node: 待判断 AST 节点。
+        start_method: runtime start 方法名。
+
+    Returns:
+        若节点是目标 start 方法调用则返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == start_method
     )

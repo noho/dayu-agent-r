@@ -208,7 +208,25 @@ def test_doc_tool_schemas_do_not_expose_execution_context(tmp_path: Path) -> Non
 
     for definition in definitions:
         properties = definition.schema.function.parameters.properties
+        required = definition.schema.function.parameters.required
         assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in required
+        assert "cancellation_token" not in required
+
+
+def test_doc_declarations_request_execution_context_injection() -> None:
+    """五个 Doc tools 声明必须请求 execution_context 注入。"""
+
+    collector = LegacyToolDeclarationCollector()
+    register_doc_tools(collector)
+    declarations = collector.collected_tools()
+
+    assert tuple(declaration.name for declaration in declarations) == _DOC_TOOL_NAMES
+    assert all(
+        declaration.execution_context_param_name == "execution_context"
+        for declaration in declarations
+    )
 
 
 @pytest.mark.parametrize("tool_name", _DOC_TOOL_NAMES)

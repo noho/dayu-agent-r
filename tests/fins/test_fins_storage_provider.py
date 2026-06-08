@@ -581,6 +581,22 @@ def test_fins_read_declarations_request_execution_context_injection(tmp_path: Pa
     )
 
 
+def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) -> None:
+    """九个 Fins read tools 的 LLM-facing schema 不得暴露治理字段。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    definitions = _discover_definitions(workspace_root)
+
+    assert tuple(definition.name for definition in definitions) == _FINS_READ_TOOL_NAMES
+    for definition in definitions:
+        properties = definition.schema.function.parameters.properties
+        required = definition.schema.function.parameters.required
+        assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in required
+        assert "cancellation_token" not in required
+
+
 def test_fins_provider_can_disable_read_tools_without_workspace_root(tmp_path: Path) -> None:
     """关闭 read tools 时 provider 不应解析 workspace_root。"""
 
