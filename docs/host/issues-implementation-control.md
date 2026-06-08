@@ -215,6 +215,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-04 | closed | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
 | WU-TOOLS-01 | draft-pr-pass-final-closeout-passed | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98；draft PR #123 | Accepted plan commit f6658fb4；Slices S1-S6 and external blocker reconciliation accepted；PR review and re-review passed；all active residual risks have owner / destination；ready for user merge decision at https://github.com/noho/dayu-agent-r/pull/123 |
 | WU-TOOLS-01-F01 | ready-to-open-draft-PR | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed | Accepted plan commit `27f91192`; Slice S1 accepted commit `f598f8a2`; Slice S2 accepted commit `2e12dfb4`; Slice S3 accepted commit `4b91d3af`; Slice S4 accepted commit `2727b900`; Slice S5 accepted commit `5336d7b2`; Slice S6 accepted commit `157ec0b5`; aggregate final review artifacts `docs/reviews/wu-tools-01-f01-aggregate-final-review-mimo.md`, `docs/reviews/wu-tools-01-f01-aggregate-final-review-ds.md`; aggregate controller adjudication `docs/reviews/wu-tools-01-f01-aggregate-final-review-controller-adjudication.md`; aggregate final fix artifact `docs/reviews/wu-tools-01-f01-aggregate-final-fix-codex.md`; aggregate final re-review artifacts `docs/reviews/wu-tools-01-f01-aggregate-final-rereview-mimo.md`, `docs/reviews/wu-tools-01-f01-aggregate-final-rereview-ds.md`; aggregate final re-review controller adjudication `docs/reviews/wu-tools-01-f01-aggregate-final-rereview-controller-adjudication.md`; accepted deepreview fix commit `ba87e28b`; current gate is ready-to-open-draft-PR. Build the shared Fins ingestion service/runtime first, then expose independent download and preprocess tool providers through current `ToolAwaitingOutcome` / wait-resume contract; residual `WU-TOOLS-01-S4-R1` closed by Slice S6 re-review controller adjudication |
+| WU-TOOLS-01-F01-01 | discussion-ready | Fins filelock convergence to dayu.runtime.filelock | WU-TOOLS-01-F01 draft PR preflight follow-up | 收敛 Fins ingestion job store 与 storage batch 私有 filelock 到 `dayu.runtime.filelock`；实施前必须先评估 `dayu.runtime.filelock` 是否满足现有 job store blocking lock、storage batch non-blocking conflict、异常映射和跨进程互斥要求；不改变 Fins job schema、storage repository protocol、atomic replace 或 Host / Engine / ToolRuntime 契约 |
+| WU-TOOLS-01-F01-02 | discussion-ready | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up | 为当前已迁移 Fins / Web / Doc tools 补齐 `CancellationToken` 传递审计与取消响应；Host 仍是 cancel 治理真源；Fins download / preprocess 长事务工具和 Web tools 必须在本 WU 实现取消响应；Doc tools 与 Fins read 至少完成 token 传递和风险分级，按耗时 / 外部 I/O / CPU 文件处理风险决定是否本 WU 增加 checkpoint |
+| WU-TOOLS-01-F01-03 | discussion-ready | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09 | 迁移 / 建立 CN download、SEC download、CN upload、SEC upload 的真实可用 runtime 与 tool 入口；合并原 `WU-TOOLS-01-F09` upload follow-up；Tool 当前可访问，未来 CLI / CI 只能通过同一 shared Fins service/runtime 访问，不得再造 CLI / tool / CI 三套逻辑 |
 | WU-TOOLS-01-F02 | pending | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up | First step of Web CI diagnostics pipeline: migrate OLD `web_ci_urls.jsonl`, `diag_web.sh`, `diag_web_batch.sh` and `utils/diagnose_web_access.py`; does not close `WU-TOOLS-01-S5-R2` by itself |
 | WU-TOOLS-01-F03 | pending | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | Generate explicit opt-in Web smoke from the migrated web CI diagnostics pipeline; defines pass / skip / diagnostic criteria and is the closing owner for residual `WU-TOOLS-01-S5-R2` |
 | WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
@@ -222,7 +225,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F06 | pending | CN/HK Docling CI pipeline migration | GitHub Issue #122 under #82/#98 follow-up | First step of CN/HK Docling coverage: migrate OLD `docs/cn_hk_docling_ci.md`, shared process runner behavior, `utils/llm_docling_ci_score.py` and `dayu.fins.score_docling_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
 | WU-TOOLS-01-F07 | pending | CN/HK Docling CI smoke generation | GitHub Issue #122 under #82/#98 follow-up; depends on WU-TOOLS-01-F06 | Generate explicit opt-in CN/HK Docling smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for Docling coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
 | WU-TOOLS-01-F08 | pending | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Rename `build_engine_processor_registry(...)` to a documents/default registry name and update direct callers / exports / docs without changing processor registration behavior; owner for residual `WU-TOOLS-01-S1-R2` |
-| WU-TOOLS-01-F09 | pending | Fins upload ingestion migration and upload tool | WU-TOOLS-01 post-migration upload follow-up | Migrate OLD CLI-facing upload semantics into the shared Fins service/runtime and expose an independent upload ingestion tool provider; upload must use the same runtime foundation as read / download / preprocess |
+| WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | Slice 0-3 accepted; residual follow-ups closed or transferred to dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | Slice 4 accepted; full analyzer remains WU-OBS-00 non-goal |
@@ -719,7 +722,7 @@ WU-TOOLS-01 S6 broad Host validation 暴露 7 个 proactive compaction 测试失
 
 ### 状态
 
-Review。Accepted plan commit 为 `27f91192`。Slice S1 accepted commit 为 `f598f8a2`。Slice S2 accepted commit 为 `2e12dfb4`。Slice S3 accepted commit 为 `4b91d3af`。Slice S4 accepted commit 为 `2727b900`。Slice S5 accepted commit 为 `5336d7b2`。Slice S6 accepted commit 为 `157ec0b5`。`WU-TOOLS-01-S4-R1` 已关闭并从 active residual table 移除，关闭依据见 S6 re-review controller adjudication。当前进入 aggregate final review gate。Slice S6 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s6-implementation-codex.md`；AgentCodex 报告验证 138 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S6 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s6-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s6-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s6-code-review-controller-adjudication.md`，接受 read provider split identity 和 Fins wait adapter import-boundary path robustness 两项 fix。Slice S6 fix artifact 为 `docs/reviews/wu-tools-01-f01-s6-fix-codex.md`；AgentCodex 报告验证 138 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S6 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s6-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s6-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s6-rereview-controller-adjudication.md`，两项 accepted findings 均 fixed，无新增 finding；Controller 复验 138 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S5 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s5-implementation-codex.md`；AgentCodex 报告验证 49 tests passed、Service tests 34 passed、pyright 0 errors、`git diff --check` 通过。Slice S5 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s5-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s5-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s5-code-review-controller-adjudication.md`，接受 active-state poll 覆盖、无 Fins provider registry absent 覆盖、corrupt evidence lost 覆盖、abandon_wait defensive 覆盖、workspace_root 缺失/相对路径 fail-fast 覆盖五项 fix。Slice S5 fix artifact 为 `docs/reviews/wu-tools-01-f01-s5-fix-codex.md`；AgentCodex 报告验证 56 tests passed、Service tests 37 passed、pyright 0 errors、`git diff --check` 通过。Slice S5 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s5-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s5-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s5-rereview-controller-adjudication.md`，五项 accepted findings 均 fixed，无新增 finding；Controller 复验 56 tests passed、Service tests 37 passed、pyright 0 errors、`git diff --check` 通过。Slice S4 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s4-implementation-codex.md`；AgentCodex 报告验证 56 tests passed、pyright 0 errors。Slice S4 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s4-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s4-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s4-code-review-controller-adjudication.md`，接受 tool helper 去重、start failure path 测试覆盖、awaiting tests 等待后台 job 收口三项 fix。Slice S4 fix artifact 为 `docs/reviews/wu-tools-01-f01-s4-fix-codex.md`；AgentCodex 报告验证 60 tests passed、pyright 0 errors。Slice S4 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s4-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s4-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s4-rereview-controller-adjudication.md`，三项 accepted findings 均 fixed，无新增 finding；Controller 复验 60 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S3 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s3-implementation-codex.md`；AgentCodex 报告验证 35 tests passed、pyright 0 errors。Slice S3 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s3-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s3-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s3-code-review-controller-adjudication.md`，接受 success terminalization 与 cancellation TOCTOU、terminal record early return 两项 fix。Slice S3 fix artifact 为 `docs/reviews/wu-tools-01-f01-s3-fix-codex.md`；AgentCodex 报告验证 37 tests passed、pyright 0 errors。Slice S3 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s3-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s3-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s3-rereview-controller-adjudication.md`，两项 accepted findings 均 fixed，无新增 finding。Slice S2 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s2-implementation-codex.md`；AgentCodex 报告验证 `pytest tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_storage_provider.py` 通过、pyright 通过。Slice S2 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s2-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s2-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s2-code-review-controller-adjudication.md`，接受 form-filter 后再执行 `_MAX_PREPROCESS_DOCUMENTS` 上限检查、以及 `_save_failed_from_exception` 二次失败可观测诊断两项 fix。Slice S2 fix artifact 为 `docs/reviews/wu-tools-01-f01-s2-fix-codex.md`；AgentCodex 报告验证 31 tests passed、pyright 0 errors。Slice S2 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s2-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s2-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s2-rereview-controller-adjudication.md`，两项 accepted findings 均 fixed，无新增 finding。Slice S1 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s1-implementation-codex.md`；Controller 复验 `pytest tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_storage_provider.py` 通过，pyright 通过。Slice S1 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s1-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s1-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s1-code-review-controller-adjudication.md`。Slice S1 fix artifact 为 `docs/reviews/wu-tools-01-f01-s1-fix-codex.md`；Slice S1 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s1-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s1-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s1-rereview-controller-adjudication.md`。Plan artifact 已生成并修复：`docs/host/wu-tools-01-f01-shared-fins-ingestion-runtime-plan.md`。Plan review artifacts 已生成：`docs/reviews/wu-tools-01-f01-plan-review-mimo.md`、`docs/reviews/wu-tools-01-f01-plan-review-ds.md`。Controller adjudication 已生成：`docs/reviews/wu-tools-01-f01-plan-review-controller-adjudication.md`。Plan fix summary 已生成：`docs/reviews/wu-tools-01-f01-plan-fix-controller-summary.md`。Plan re-review artifacts 已生成：`docs/reviews/wu-tools-01-f01-plan-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-plan-rereview-ds.md`。Plan re-review controller adjudication 已生成：`docs/reviews/wu-tools-01-f01-plan-rereview-controller-adjudication.md`。裁决结论：F01 不只是迁移几个 tool name，而是先迁移 / 建立 NEW 的共享 Fins service/runtime；read、download 和 preprocess/process 都以这套 service/runtime 为业务底座。最关键约束是：CLI download 和 tool download 必须走同一套代码、同一套逻辑。Tool 侧只做当前 Host / ToolRuntime 的 awaiting adapter；未来 NEW CLI 也调用同一套 service/runtime，避免 CLI 和 tool 逻辑漂移。Upload 不纳入本条，转入 `WU-TOOLS-01-F09` 单独追踪。
+Review。Accepted plan commit 为 `27f91192`。Slice S1 accepted commit 为 `f598f8a2`。Slice S2 accepted commit 为 `2e12dfb4`。Slice S3 accepted commit 为 `4b91d3af`。Slice S4 accepted commit 为 `2727b900`。Slice S5 accepted commit 为 `5336d7b2`。Slice S6 accepted commit 为 `157ec0b5`。`WU-TOOLS-01-S4-R1` 已关闭并从 active residual table 移除，关闭依据见 S6 re-review controller adjudication。当前进入 aggregate final review gate。Slice S6 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s6-implementation-codex.md`；AgentCodex 报告验证 138 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S6 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s6-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s6-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s6-code-review-controller-adjudication.md`，接受 read provider split identity 和 Fins wait adapter import-boundary path robustness 两项 fix。Slice S6 fix artifact 为 `docs/reviews/wu-tools-01-f01-s6-fix-codex.md`；AgentCodex 报告验证 138 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S6 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s6-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s6-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s6-rereview-controller-adjudication.md`，两项 accepted findings 均 fixed，无新增 finding；Controller 复验 138 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S5 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s5-implementation-codex.md`；AgentCodex 报告验证 49 tests passed、Service tests 34 passed、pyright 0 errors、`git diff --check` 通过。Slice S5 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s5-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s5-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s5-code-review-controller-adjudication.md`，接受 active-state poll 覆盖、无 Fins provider registry absent 覆盖、corrupt evidence lost 覆盖、abandon_wait defensive 覆盖、workspace_root 缺失/相对路径 fail-fast 覆盖五项 fix。Slice S5 fix artifact 为 `docs/reviews/wu-tools-01-f01-s5-fix-codex.md`；AgentCodex 报告验证 56 tests passed、Service tests 37 passed、pyright 0 errors、`git diff --check` 通过。Slice S5 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s5-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s5-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s5-rereview-controller-adjudication.md`，五项 accepted findings 均 fixed，无新增 finding；Controller 复验 56 tests passed、Service tests 37 passed、pyright 0 errors、`git diff --check` 通过。Slice S4 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s4-implementation-codex.md`；AgentCodex 报告验证 56 tests passed、pyright 0 errors。Slice S4 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s4-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s4-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s4-code-review-controller-adjudication.md`，接受 tool helper 去重、start failure path 测试覆盖、awaiting tests 等待后台 job 收口三项 fix。Slice S4 fix artifact 为 `docs/reviews/wu-tools-01-f01-s4-fix-codex.md`；AgentCodex 报告验证 60 tests passed、pyright 0 errors。Slice S4 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s4-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s4-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s4-rereview-controller-adjudication.md`，三项 accepted findings 均 fixed，无新增 finding；Controller 复验 60 tests passed、pyright 0 errors、`git diff --check` 通过。Slice S3 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s3-implementation-codex.md`；AgentCodex 报告验证 35 tests passed、pyright 0 errors。Slice S3 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s3-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s3-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s3-code-review-controller-adjudication.md`，接受 success terminalization 与 cancellation TOCTOU、terminal record early return 两项 fix。Slice S3 fix artifact 为 `docs/reviews/wu-tools-01-f01-s3-fix-codex.md`；AgentCodex 报告验证 37 tests passed、pyright 0 errors。Slice S3 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s3-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s3-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s3-rereview-controller-adjudication.md`，两项 accepted findings 均 fixed，无新增 finding。Slice S2 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s2-implementation-codex.md`；AgentCodex 报告验证 `pytest tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_storage_provider.py` 通过、pyright 通过。Slice S2 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s2-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s2-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s2-code-review-controller-adjudication.md`，接受 form-filter 后再执行 `_MAX_PREPROCESS_DOCUMENTS` 上限检查、以及 `_save_failed_from_exception` 二次失败可观测诊断两项 fix。Slice S2 fix artifact 为 `docs/reviews/wu-tools-01-f01-s2-fix-codex.md`；AgentCodex 报告验证 31 tests passed、pyright 0 errors。Slice S2 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s2-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s2-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s2-rereview-controller-adjudication.md`，两项 accepted findings 均 fixed，无新增 finding。Slice S1 implementation artifact 为 `docs/reviews/wu-tools-01-f01-s1-implementation-codex.md`；Controller 复验 `pytest tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_storage_provider.py` 通过，pyright 通过。Slice S1 code review artifacts 为 `docs/reviews/wu-tools-01-f01-s1-code-review-mimo.md`、`docs/reviews/wu-tools-01-f01-s1-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s1-code-review-controller-adjudication.md`。Slice S1 fix artifact 为 `docs/reviews/wu-tools-01-f01-s1-fix-codex.md`；Slice S1 re-review artifacts 为 `docs/reviews/wu-tools-01-f01-s1-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-s1-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-s1-rereview-controller-adjudication.md`。Plan artifact 已生成并修复：`docs/host/wu-tools-01-f01-shared-fins-ingestion-runtime-plan.md`。Plan review artifacts 已生成：`docs/reviews/wu-tools-01-f01-plan-review-mimo.md`、`docs/reviews/wu-tools-01-f01-plan-review-ds.md`。Controller adjudication 已生成：`docs/reviews/wu-tools-01-f01-plan-review-controller-adjudication.md`。Plan fix summary 已生成：`docs/reviews/wu-tools-01-f01-plan-fix-controller-summary.md`。Plan re-review artifacts 已生成：`docs/reviews/wu-tools-01-f01-plan-rereview-mimo.md`、`docs/reviews/wu-tools-01-f01-plan-rereview-ds.md`。Plan re-review controller adjudication 已生成：`docs/reviews/wu-tools-01-f01-plan-rereview-controller-adjudication.md`。裁决结论：F01 不只是迁移几个 tool name，而是先迁移 / 建立 NEW 的共享 Fins service/runtime；read、download 和 preprocess/process 都以这套 service/runtime 为业务底座。最关键约束是：CLI download 和 tool download 必须走同一套代码、同一套逻辑。Tool 侧只做当前 Host / ToolRuntime 的 awaiting adapter；未来 NEW CLI 也调用同一套 service/runtime，避免 CLI 和 tool 逻辑漂移。原 upload follow-up `WU-TOOLS-01-F09` 已并入 `WU-TOOLS-01-F01-03`，由 F01-03 和 CN / SEC download 真实可用能力一起推进。
 
 ### 动机
 
@@ -751,7 +754,7 @@ Ticker / market 归一化的唯一真源是 `dayu/fins/ticker_normalization.py`�
 - 不把 CI runner、smoke runner 或未来 CLI 作为绕过 shared Fins service/runtime 的第二套 download / process 实现。
 - 不在 service/runtime、tool adapter、CLI、CI runner、smoke runner 或 pipeline selector 中再造 ticker / market 归一化逻辑；不得通过局部字符串规则替代 `dayu.fins.ticker_normalization`。
 - 不修改被迁移旧 ingestion 业务函数签名或函数实现；如需适配当前 ToolRuntime / ToolDiscovery / CLI，必须通过外层 adapter / provider / assembly code 完成。
-- 不迁移 upload；OLD upload 是 CLI-facing command runtime，不是 upload tool，迁移与 upload ingestion tool 由 `WU-TOOLS-01-F09` 追踪。
+- 不在 F01 已完成范围内补迁移 upload；OLD upload 迁移、CN / SEC upload tool 与 future CLI / CI 访问同源性由 `WU-TOOLS-01-F01-03` 追踪。
 - 不迁移旧 UI / FastAPI / Streamlit ingestion entrypoints。
 
 ### 验收信号
@@ -764,6 +767,141 @@ Ticker / market 归一化的唯一真源是 `dayu/fins/ticker_normalization.py`�
 - Host wait record、resume、cancel 与 late terminal result 路径有 deterministic tests 覆盖。
 - 失败、取消、重复 start / reused job、迟到 terminal result 均有明确测试或记录为带 owner 的 residual。
 - Fins README、tests README 或相关 package README 只描述当前已实现行为，不保留旧 fail-closed 或混合开关误导说明。
+
+## WU-TOOLS-01-F01-01 Fins Filelock Convergence To dayu.runtime.filelock
+
+### 状态
+
+Discussion-ready。该 work unit 是 `WU-TOOLS-01-F01` draft PR 前置 follow-up。当前裁决：Fins 内部重复实现 filelock 是真实的公共契约收敛问题；最优设计是优先复用 `dayu.runtime.filelock`，而不是在 `dayu.fins` 中继续维护 `_StoreFileLock` 或 `dayu.fins._file_lock`。
+
+### 动机
+
+`dayu.runtime.filelock` 已经是层中立公共运行时契约，Host 已在 audit / tool trace 等路径复用它。Fins 当前同时存在 ingestion job store 私有 `_StoreFileLock` 和 storage batch 私有 `dayu.fins._file_lock`，形成三套 filelock 语义并存。这会扩大跨平台行为、异常映射、timeout 语义和跨进程互斥治理的漂移风险，也违反“各层公共运行时能力优先复用 `dayu.runtime`”的架构约束。
+
+### 目标
+
+- 将 Fins ingestion job store 的私有 `_StoreFileLock` 收敛到 `dayu.runtime.filelock`。
+- 将 Fins storage batch 的 `dayu.fins._file_lock` 收敛到 `dayu.runtime.filelock`。
+- 若收敛后无生产引用，删除 `dayu.fins._file_lock` 与 `_StoreFileLock`。
+- 保持现有 job store 原子写入、跨进程互斥、storage batch 同 ticker fail-fast 冲突语义不变。
+- 不增加仅透传 `dayu.runtime.filelock` 的 Fins wrapper / facade。
+
+### 实施前置要求
+
+实施前必须先评估 `dayu.runtime.filelock` 的能力是否满足现有 Fins 要求；若不满足，先回到设计裁决，优先扩展 `dayu.runtime.filelock` 的公共能力，不得在 Fins 中再造第二套 filelock。评估至少覆盖：
+
+- ingestion job store 当前需要的 blocking lock、锁文件父目录创建、异常传播和 `RuntimeFileLock` 生命周期语义。
+- storage batch 当前需要的 non-blocking acquire、同 ticker 跨进程活动 batch 冲突、timeout / busy 异常映射与原有用户可读错误语义。
+- 跨进程互斥、锁释放、进程退出 / 文件句柄关闭后的清理行为。
+- macOS / Linux 运行环境下的行为一致性；不以 POSIX-only 私有实现作为 Fins 特例。
+- 现有测试中 `_StoreFileLock` / `dayu.fins._file_lock` 覆盖的行为是否都能迁移到 runtime filelock 或 Fins 行为测试。
+
+### 非目标
+
+- 不修改 Fins job schema。
+- 不修改 `dayu.fins.storage` 仓储协议。
+- 不修改 atomic replace / json store 数据落盘语义。
+- 不修改 Host / Engine / ToolRuntime contract。
+- 不引入 async filelock 或 Host 专用 durable lock。
+
+### 验收信号
+
+- `dayu/fins` 生产代码不再引用 `_StoreFileLock`、`dayu.fins._file_lock`、`acquire_text_file_lock` 或 `release_text_file_lock`。
+- Fins ingestion runtime 与 storage batch 相关测试证明锁语义未漂移。
+- `dayu.runtime.filelock` 如需扩展，扩展发生在 runtime 公共契约层，并有 runtime tests 覆盖。
+- pyright、受影响 Fins tests 与 `git diff --check` 通过。
+
+## WU-TOOLS-01-F01-02 Migrated Tools Cancellation Propagation And Response
+
+### 状态
+
+Discussion-ready。该 work unit 是 `WU-TOOLS-01-F01` draft PR 前置 follow-up。当前裁决：cancel 治理真源仍在 Host；本条不重做 Host cancel，而是补齐当前已迁移 Fins / Web / Doc tools 对 Host 注入 `CancellationToken` 的传递、观察与资源释放响应。Web tools 虽未设计为 awaiting 长事务工具，但真实执行包含网络、浏览器、页面解析等长耗时外部 I/O，本 WU 必须实现取消响应。
+
+### 动机
+
+Host 已通过 run cancel / session cancel、active worker registry、Engine cancellation token 与 wait abandon path 建立 run-level graceful cancel 治理。当前缺口在工具迁移层：Fins download / preprocess、Web tools、Doc tools 与 Fins read tools 虽已接入当前 ToolRuntime / ToolDiscovery，但业务 callable 对 `BatchToolExecutionContext.cancellation_token` 的传递和观察不完整。结果是 UI 可以发起 run cancel，Host / Engine 也能停止未来 LLM 工作，但部分工具或后台任务仍可能继续执行网络请求、文件处理或 ingestion job，造成取消响应漂移与资源浪费。
+
+### 目标
+
+- 对当前已迁移 Fins / Web / Doc tools 做 cancellation propagation audit，列明每个 tool callable 是否把 `BatchToolExecutionContext.cancellation_token` 传入业务执行层，是否在关键 side-effect 前后观察 token。
+- Fins download / preprocess awaiting 工具必须在本 WU 实现取消响应：start 前、durable job 创建前、后台 job checkpoint、wait abandon / `runtime.request_cancel(job_id)` 路径都要保持同源取消语义。
+- Web tools 必须在本 WU 实现取消响应：网络请求、Playwright/browser path、页面解析与 fetch/search 主路径都要至少在入口、外部 I/O 前、外部 I/O 后和结果 materialize 前观察 token；阻塞 I/O 必须结合 bounded timeout，不能把 token 当成可中断系统调用的魔法开关。
+- Doc tools 与 Fins read tools 至少完成 token 传递和风险分级；若实现路径存在长耗时外部 I/O、CPU 密集解析或大文件处理，本 WU 应补 checkpoint；若仅为短本地查询 / 参数解析，可记录为暂不需要细粒度响应。
+- ToolRuntime 侧按需补充统一取消边界检查，覆盖 dispatch 前、等待业务工具、accept / awaiting accept retry 与 retry sleep 等路径，避免 cancel 后继续等待治理动作。
+- 保持工具取消的核心语义：cancel 阻止未来工作并尽快释放资源，不撤回已 accepted facts，不伪造业务事实。
+
+### 非目标
+
+- 不改变 Host cancel 真源，不用工具私有 cancel 状态替代 Host durable cancel。
+- 不重新设计 `CancellationToken` 公共契约；token 仍是观察面，不提供工具侧写入 Host 状态的能力。
+- 不把所有 run cancel 都投影为 LLM-facing `ToolCancelledOutcome`；run-level cancel 仍由 Engine / Host 收口为 run cancellation。
+- 不把 Fins download / preprocess 改成同步等待工具；长事务仍通过 `ToolAwaitingOutcome` / Host wait-resume contract 表达。
+- 不要求所有短工具本 WU 都实现细粒度 checkpoint；但必须完成 token 传递审计与明确风险裁决。
+
+### 实施前置要求
+
+- 先审计 `dayu/fins/tools/`、`dayu/tools/web/`、`dayu/tools/documents/` 及 ToolRuntime dispatch path 的当前 token 使用情况，形成实现计划；不得直接局部加 `is_cancelled()` 作为表面修复。
+- 区分 run-level cancel、tool-level cancelled outcome、tool timeout、await wait abandon 和外部 job cancel，不得混淆终态语义。
+- 对阻塞网络 / 浏览器 / 文件处理路径，必须评估 token checkpoint 与 timeout 的组合；不能承诺 Python token 能中断已经进入的同步系统调用。
+- 对 Fins awaiting 工具，必须覆盖 job 已创建但 awaiting accept 尚未完成时发生 run cancel 的 orphan job 窗口，至少保证同进程取消能使 job 进入 cancelling / cancelled 收口。
+
+### 验收信号
+
+- Focused tests 覆盖 Fins download / preprocess 在 start 前取消、job 创建后取消、wait abandon 后取消的代表路径。
+- Focused tests 覆盖 Web tools 在搜索、fetch / requests path、Playwright path 或对应可用 backend 中的取消响应；测试必须证明取消不会等待长耗时操作自然完成。
+- ToolRuntime tests 覆盖 cancel 命中 dispatch / accept / awaiting accept 边界时不继续无意义等待。
+- 静态审计或 tests 证明当前迁移 tools 不再无条件 `del context` 丢弃 `cancellation_token`；若某工具暂不实现细粒度响应，必须有风险说明和 owner。
+- Host / Engine public contract 不变，Fins / Web / Doc README 与 tests README 按触发规则更新当前实现边界。
+- pyright、受影响 Fins / Web / Doc / Host ToolRuntime tests 与 `git diff --check` 通过。
+
+## WU-TOOLS-01-F01-03 Production Fins CN/SEC Download And Upload Runtime/Tool Migration
+
+### 状态
+
+Discussion-ready。该 work unit 是 `WU-TOOLS-01-F01` draft PR 前置 follow-up，并吸收原 `WU-TOOLS-01-F09`。当前裁决：Fins 不能只停留在抽象 download / upload contract；CN download、SEC download、CN upload、SEC upload 必须从 OLD 迁移代码并进入真实可用状态。Tool 侧当前可访问，未来 CLI / CI 也必须通过同一 shared Fins service/runtime 访问，避免 CLI / tool / CI 三套逻辑漂移。
+
+### 动机
+
+F01 已建立 shared Fins service/runtime 作为 read、download、preprocess/process 的业务底座，但真实生产能力仍取决于 source/market 适配器。当前 NEW 仓库证据显示：SEC 侧只有读取 / 解析处理器、download awaiting tool、`FinsSourceDownloadAdapter` 协议和 deterministic fake adapter test path；没有 `SecDownloader` / `SECDownloader` / `SecDownload` 或真实 SEC EDGAR network download adapter。CN download 也没有真实 production adapter。结果是 download tool 只能启动缺 adapter 的 job；没有 upload runtime/tool 时，用户已有的本地财报文件也不能通过 Host-governed tool path 进入 Fins storage。原 `WU-TOOLS-01-F09` 只追踪 upload，会把 download adapter 迁移和 upload 迁移拆成两套入口；这不利于统一 storage 写入、ticker / market 归一化、job lifecycle、cancel、wait-resume、future CLI / CI 调用方式。因此 upload 合并进 F01-03，与 CN / SEC download 一起形成完整 ingestion 可用闭环。
+
+### 目标
+
+- 从 OLD 迁移 CN download 与 SEC download 的真实 source adapter 代码，并接入 shared Fins service/runtime 的 download 入口。
+- 从 OLD 迁移 CN upload 与 SEC upload 的真实业务代码，并通过 shared Fins service/runtime 写入 `dayu.fins.storage`。
+- ToolDiscovery 暴露可用的 Fins download / upload tool provider；tool 侧只做 schema、ToolRuntime、awaiting / wait-resume 和 evidence / trace adapter，不承载业务逻辑。
+- Future CLI 与 future CI 只能调用同一套 shared Fins service/runtime 入口；若本 WU 不实现 CLI / CI 外壳，也必须提供 runtime-level API 与测试证据，使未来入口不需要复制业务规则。
+- 所有 CN / SEC download、upload、future CLI、future CI 中的 ticker / market 归一化必须调用 `dayu.fins.ticker_normalization` 真源。
+- CN / SEC download 与 upload 的文件、blob、source document、metadata / ingest method、rejected artifact 写入必须且只能通过 `dayu.fins.storage` 仓储协议与实现完成。
+- 长事务路径必须继承当前 Host / ToolRuntime awaiting、cancel、resume、late terminal governance；短事务路径也必须通过当前 tool accept path 与 Tool Trace / evidence path 流转。
+
+### 实施前置要求
+
+- 先核对 OLD 中 SecDownloader、CnDownloader 与 upload command runtime 的真实能力、输入参数、错误处理、存储语义、metadata / ingest method、重复 / overwrite 规则和测试覆盖；download / upload 代码必须从 OLD 迁移，NEW 侧只允许做分层 contract、类型、storage、ToolRuntime、awaiting/cancel 和测试适配；若 OLD 能力缺失或不可直接迁移，必须回到 controller 裁决，不得静默重写另一套实现。
+- SEC download 必须评估并实现 SEC EDGAR fair access 要求，包括明确 User-Agent 和请求控速；lane 只能治理并发，不等同于每秒请求数控速。
+- CN download 必须明确数据来源、请求限制、失败 / 重试 / 编码 / 文件类型处理与本地 artifact 写入语义；不允许把 source-specific 规则散落在 tool schema 或 CLI adapter 中。
+- Upload 必须先判断 CN / SEC upload 在 domain metadata、source_kind、filing/material 类型、company/ticker 归一化和文件命名上的差异；不能做成绕过 storage 的通用文件复制工具。
+- 先裁决 download / upload 是复用同一个 ingestion job model，还是 upload 走短事务；若 upload 存在文件解析、blob 写入、metadata materialize 等长耗时步骤，优先按 awaiting 长事务接入。
+- 若 `dayu.runtime.filelock` 或 cancellation work unit 尚未完成，F01-03 plan 必须显式声明依赖顺序或局部风险；不得在 downloader / uploader 中再造私有 runtime helper。
+
+### 非目标
+
+- 不迁移旧 UI / FastAPI / Streamlit ingestion entrypoints。
+- 不恢复 OLD ToolRegistry、OLD `file_path_params` path safety、OLD truncation manager 或 OLD `fetch_more`。
+- 不从零重写 CN / SEC download 或 upload 业务逻辑；本条是 OLD code migration + NEW contract adaptation，不是重新设计 downloader / uploader。
+- 不让 CLI / CI / tool 分别实现 CN / SEC download 或 upload 业务逻辑。
+- 不在 downloader、uploader、tool adapter、CLI adapter 或 CI runner 中再造 ticker / market 归一化逻辑。
+- 不把 SEC 控速压到 Host lane，lane 只负责 Host 执行并发治理；source-specific rate limit 属于 Fins downloader / runtime。
+- 不把 CI pipeline / smoke 的评分闭环并入本条；F04 / F05 / F06 / F07 仍负责迁移 CI pipeline 与生成 smoke，但它们必须复用 F01-03 提供的 shared runtime 能力。
+
+### 验收信号
+
+- CN download、SEC download、CN upload、SEC upload 均有 focused tests 覆盖成功、失败、重复 / overwrite、storage 写入、metadata 与 rejected / unsupported artifact 代表路径。
+- ToolDiscovery 能发现可用的 download / upload tool provider，工具调用通过当前 ToolRuntime / awaiting 或 accept path 流转。
+- Runtime-level tests 证明 future CLI / CI 可以直接调用 shared Fins service/runtime 入口；不存在 CLI / tool / CI 复制业务规则的实现路径。
+- Tests 或静态审计证明 CN / SEC download 与 upload 的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
+- SEC download tests 或 adapter contract 覆盖 User-Agent、请求控速和可诊断失败；真实网络路径必须是 explicit opt-in，不进入普通 deterministic CI。
+- Fins README、tests README 和总揽 README 按触发规则说明 download / upload 的当前可用边界、shared runtime 同源原则、future CLI / CI 调用方式和 live-network opt-in 策略。
+- pyright、受影响 Fins / Host ToolRuntime / tool discovery tests 与 `git diff --check` 通过。
 
 ## WU-TOOLS-01-F02 Web CI Diagnostics Pipeline Migration
 
@@ -1001,41 +1139,24 @@ Pending。该 work unit 是 `WU-TOOLS-01-S1-R2` 的明确 owner，用于清理�
 
 ### 状态
 
-Pending。该 work unit 是 WU-TOOLS-01 的 post-migration upload follow-up。当前裁决结论：OLD upload 尚未迁移；它原本是 CLI-facing command runtime 语义，不是 OLD upload tool。后续迁移时，upload 不能成为 CLI 私有逻辑，也不能成为 tool adapter 私有逻辑，必须与 read、download、preprocess/process 一样落到 shared Fins service/runtime 底座。
+Merged into `WU-TOOLS-01-F01-03`。该 work unit 不再单独实施。原 upload follow-up 的全部目标、边界和验收信号已并入 F01 draft PR 前置 follow-up `WU-TOOLS-01-F01-03`，与 CN / SEC download 真实可用能力一起推进。
 
 ### 动机
 
-F01 已裁决 shared Fins service/runtime 是 read、download、preprocess/process 的共同业务底座，并要求 CLI download 与 tool download 同源。Upload 迁移虽然不纳入 F01，但它的性质也是 ingestion：会接收外部财报文件、写入 Fins storage，并影响后续 read / preprocess / process。若 upload 在未来 CLI 中单独实现，而 upload tool 又另写一套实现，就会重复制造 CLI / tool 逻辑漂移。因此 upload 需要单独 ISSUE 追踪，但必须继承同一个 runtime 底座原则。
-
-Upload 迁移同样继承 ticker / market 归一化唯一真源裁决：所有 upload 参数归一化、market 判断、company id 生成与 ticker alias 规范化都必须调用 `dayu.fins.ticker_normalization`，不得在 upload runtime、CLI adapter 或 upload tool adapter 中复制规则。
+Upload 原本被拆成独立 follow-up，是为了防止 F01 已完成范围被扩大。但继续让 upload 单独排队会把 ingestion 能力拆成 download 一条线、upload 另一条线，未来 CLI / CI / tool 很容易再次分叉。现在裁决为：CN download、SEC download、CN upload、SEC upload 一起进入 F01-03 的 shared Fins service/runtime 闭环，upload 不再有独立 owner。
 
 ### 目标
 
-- 核对 OLD upload command runtime 的输入参数、校验、storage 写入、metadata / ingest method 语义与错误处理，并迁移到 NEW shared Fins service/runtime。
-- 在 shared Fins service/runtime 中提供 upload 业务入口；CLI upload 和 upload ingestion tool 都必须调用该入口。
-- Upload runtime、CLI upload 与 upload ingestion tool 中所有 ticker / market 归一化必须调用 `dayu.fins.ticker_normalization` 的公共 API。
-- 增加独立 Fins upload ingestion tool provider，通过 ToolDiscovery 暴露；不得塞回 `include_ingestion_tools=true` 混合开关。
-- Tool 侧只做当前 Host / ToolRuntime adapter；若 upload 是长事务，必须映射到当前 awaiting、resume、cancel 与 terminal result 语义；若 upload 是短事务，也必须通过当前 tool accept path 与 evidence / trace path 流转。
-- 财报文件写入必须且只能通过 `dayu.fins.storage` 仓储协议与实现完成，不得由 CLI、tool 或 adapter 手拼 workspace 路径。
-- 同步 README 时只描述当前已实现 upload 行为，不把 F01 download/preprocess 范围写成已经覆盖 upload。
+- 见 `WU-TOOLS-01-F01-03`。
 
 ### 非目标
 
-- 不在 F01 中迁移 upload；F01 只负责 shared runtime foundation 与 read / download / preprocess provider。
-- 不恢复 OLD ToolRegistry、OLD `file_path_params` path safety、OLD truncation manager 或 OLD `fetch_more`。
-- 不让 CLI upload 和 upload tool 分别实现业务逻辑；业务逻辑必须同源在 shared Fins service/runtime。
-- 不在 upload runtime、CLI adapter 或 tool adapter 中再造 ticker / market 归一化逻辑。
-- 不把 upload 设计成绕过 Fins storage 的文件复制工具。
-- 不迁移旧 UI / FastAPI / Streamlit upload entrypoints，除非后续 owner 明确裁决。
+- 见 `WU-TOOLS-01-F01-03`。
 
 ### 验收信号
 
-- Shared Fins service/runtime 有 upload 业务入口，并有 focused tests 覆盖参数校验、storage 写入、metadata、失败路径和重复 / overwrite 语义。
-- CLI-facing upload 与 tool-facing upload 的 tests 或实现证据证明二者调用同一 shared runtime 入口。
-- Tests 或实现证据证明 upload 的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
-- ToolDiscovery 能独立发现 Fins upload ingestion tool provider，不依赖 `include_ingestion_tools=true` 混合开关。
-- Upload tool 结果通过当前 ToolRuntime / Tool Trace / accepted evidence path 流转；如果存在 queued / running 状态，不把未完成任务伪装成 completed result。
-- Fins README、tests README 或相关 package README 说明 upload、download、preprocess、read 的职责边界和 shared runtime 同源原则。
+- `WU-TOOLS-01-F09` 在 Work Units 表中保持 `merged-into` 状态，不再作为 active / pending WU 出现。
+- Upload 相关验收由 `WU-TOOLS-01-F01-03` 承接。
 
 ## WU-PROJ-01 Projection Catch-up Budgeting For Memory Pre-dispatch Path
 
