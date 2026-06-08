@@ -175,7 +175,7 @@ All plan-required risk boundaries in Slice 4 are covered.
 
 **Evidence**:
 - `_raise_if_fins_cancelled` raises `ToolBusinessError(code="tool_cancelled", ...)` (`read_runtime.py:156-161`)
-- `_raise_if_search_cancelled` raises `ToolBusinessError(code="tool_cancelled", ...)` (`search_engine.py:78-82`)  
+- `_raise_if_search_cancelled` raises `ToolBusinessError(code="tool_cancelled", ...)` (`search_engine.py:78-82`)
 - Both produce the same stable error code `"tool_cancelled"`
 - Tests assert `outcome.result.error == "tool_cancelled"` in all cancellation scenarios (lines 590, 622, 659, 692 in `test_fins_storage_provider.py`)
 - Plan R3 acknowledges that legacy adapter projects `ToolBusinessError(code="tool_cancelled")` as `ToolFailedOutcome`, not `ToolCancelledOutcome` — consistent with plan decision

@@ -84,7 +84,7 @@
 **通过。** `start_download:1060-1067` 和 `start_preprocess:1117-1124` — `executor.submit` 传入的 lambda 不捕获 `cancellation_token`。后台方法 `_run_download_job` (line 1286) 和 `_run_preprocess_job` (line 1245) 不接收 token 参数。它们通过 `_mark_job_running_or_cancelled` → `claim_running_or_cancelled` 和循环中的 `job_store.read_job` + `cancellation_requested` 检查观察 durable cancel。
 
 ### ToolCancelledOutcome meta/message/hint 是否 LLM-facing 自解释
-**通过。** 
+**通过。**
 - `download_tools.py:44-46`: message=`"Fins download start was cancelled by the host."`, hint=`"Continue without this Fins download job unless the user asks to retry."`
 - `preprocess_tools.py:44-45`: message=`"Fins preprocess start was cancelled by the host."`, hint=`"Continue without this Fins preprocess job unless the user asks to retry."`
 - reason=`"host_cancelled"` 来自公共契约常量 `TOOL_CANCELLED_REASON_HOST_CANCELLED`

@@ -100,7 +100,7 @@ Plan 不需要修改，implementation agent 按此路径实现即可。
 
 **问题**: R1 说 "awaiting accept 前 orphan job 窗口无法被 token checkpoint 完全关闭"。Plan 的 mitigation 是 "start 前/后 checkpoint 与 durable cancel bridge"。但未明确该 mitigation 能关闭多少比例的 orphan 窗口。
 
-**分析**: 
+**分析**:
 - start 前 checkpoint：如果 token 在 job 创建前已取消，不创建 job → 完全关闭该路径。
 - start 后 checkpoint：如果 token 在 job 创建后、awaiting accept 前取消，立即 request_cancel → job 进入 cancelling，但 Host wait record 尚未建立，wait adapter 无法 poll 收口。此时 orphan 窗口 = job 已创建但未被 Host 接受的时间窗口。
 - 实际 mitigation：job 进入 durable cancelling 后，即使 Host 未 accept，下次任何 poller 或 cleanup 看到该 job 也会收口。所以 orphan 窗口的实际风险是 "job 已取消但 Host 不知道"，而非 "job 永远不会被取消"。

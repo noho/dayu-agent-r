@@ -54,7 +54,7 @@
 3. Section 6 mitigation (lines 127–129):
    > Fins tool start 前观察 token，若已取消则不创建 job。Fins tool start 后、返回 awaiting outcome 前再次观察 token；若已取消，立即 `runtime.request_cancel(job_id)` 并返回 `ToolCancelledOutcome` 或保证 job record 进入 cancelling/cancelled 可由 wait adapter 收口。
 
-**验证**: 
+**验证**:
 - 时序约束覆盖三处：Exact changes（实现细节）、Invariants（不可违反）、Mitigation（风险收口）。
 - 两种实现方案（扩展 `_start_lock` 或锁释放后二次同步 checkpoint）均被明确允许，且明确无论何种方案 invariant 必须成立。
 - "不得 submit 后台 job" 用否定句式直接禁止错误路径。
