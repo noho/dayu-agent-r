@@ -119,7 +119,7 @@ git push -u github <branch>
 
 不得假设 remote 名称为 `origin`。
 
-进入 draft PR gate 前，本文档必须更新当前 work unit 状态、plan artifact、review artifact、accepted commit、remaining risks / owners、GitHub Issue destination 和 next entry point。用户授权进入 draft PR gate 后，按既定 gate workflow 自动推进到 `draft-PR-pass`；merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
+进入 draft PR gate 前，本文档必须更新当前 work unit 状态、plan artifact、review artifact、accepted commit、remaining risks / owners、GitHub Issue destination 和 next entry point。进入 draft PR gate 后，按既定 gate workflow 自动推进到 `draft-PR-pass`；merge、approve、mark ready for review、request reviewers、delete branch、对外 comment 或创建 / 修改外部 issue 仍需额外授权。
 
 ## Slice 切分原则
 
@@ -144,7 +144,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | implementation status | WU-TOOLS-01-F01-01 accepted deepreview commit `8587cd1d`; no accepted aggregate findings; ready for draft PR gate |
 | active work unit | WU-TOOLS-01-F01-01 |
 | default next work unit | WU-TOOLS-01-F01-01 |
-| next entry point | Await user authorization to enter draft PR gate for WU-TOOLS-01-F01-01 |
+| next entry point | Push current branch and create draft PR for WU-TOOLS-01-F01-01 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
