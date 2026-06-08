@@ -19,6 +19,11 @@ from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.engine.provider_extensions import provider_request_extension_from_json
+from dayu.fins.ingestion import (
+    FINS_DOWNLOAD_AWAITING_TOOL_NAME,
+    FINS_PREPROCESS_AWAITING_TOOL_NAME,
+    build_fins_wait_adapter_registry,
+)
 from dayu.host.api import (
     CompactorRunnerBaseline,
     FollowupBehavior,
@@ -30,6 +35,7 @@ from dayu.host.api import (
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import MemoryProjectionPolicy
+from dayu.host.wait_adapter import WaitAdapterRegistry
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
     DuplicateGovernanceMessages,
@@ -79,6 +85,25 @@ from dayu.runtime.tools_discovery import (
 _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
 _COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT: Final[int] = 1
+_FINS_WORKSPACE_ROOT_CONFIG_FIELD: Final[str] = "workspace_root"
+_FINS_DOWNLOAD_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
+    {"financial-download-tools"}
+)
+_FINS_PREPROCESS_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
+    {"financial-preprocess-tools"}
+)
+_FINS_DOWNLOAD_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.download_provider:discover_tools"}
+)
+_FINS_PREPROCESS_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.preprocess_provider:discover_tools"}
+)
+_FINS_DOWNLOAD_SOURCE_IDS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.download_provider"}
+)
+_FINS_PREPROCESS_SOURCE_IDS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.preprocess_provider"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +487,7 @@ def _compose_options(
         tooling_options=_tooling_options_from_discovery(
             tool_bundle=effective_tool_bundle,
             source_refs=request.discovered_tools.source_refs,
+            provider_configs=tuple(request.config.tool_discovery.providers.values()),
             duplicate_governance_policy_config=(
                 execution_profile.tool_duplicate_governance_policy
             ),
@@ -1025,12 +1051,14 @@ def _tooling_options_from_discovery(
     *,
     tool_bundle: ToolBundle,
     source_refs: tuple[ToolBundleSourceRef, ...],
+    provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
     duplicate_governance_policy_config: ToolDuplicateGovernancePolicyConfig,
 ) -> HostToolingOptions | None:
     """把 ToolsDiscovery 输出映射为 HostToolingOptions。
 
     :param tool_bundle: 已发现业务工具 bundle。
     :param source_refs: 工具来源引用。
+    :param provider_configs: ConfigLoader 读出的工具 provider typed 配置。
     :param duplicate_governance_policy_config: execution profile 中的重复调用治理配置。
     :returns: HostToolingOptions；没有业务工具时为 ``None``。
     :raises ValueError: source refs 缺失但工具非空时抛出。
@@ -1040,14 +1068,118 @@ def _tooling_options_from_discovery(
         return None
     if not source_refs:
         raise ValueError("discovered tools must have source refs")
+    wait_adapter_registry = _fins_wait_adapter_registry_from_provider_configs(
+        provider_configs
+    )
     return HostToolingOptions(
         business_tool_bundle=tool_bundle,
         source_refs=source_refs,
-        wait_adapter_registry=None,
+        wait_adapter_registry=wait_adapter_registry,
         duplicate_governance_policy=_duplicate_governance_policy_from_config(
             duplicate_governance_policy_config
         ),
     )
+
+
+def _fins_wait_adapter_registry_from_provider_configs(
+    provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+) -> WaitAdapterRegistry | None:
+    """从显式 provider config 构造 Fins wait adapter registry。
+
+    :param provider_configs: 当前 Host assembly 使用的工具发现 provider 配置。
+    :returns: Fins wait adapter registry；没有启用 Fins awaiting provider 时为
+        ``None``。
+    :raises ValueError: workspace root 缺失、非绝对、不一致，或重复绑定时抛出。
+    """
+
+    tool_names: list[str] = []
+    workspace_roots: list[pathlib.Path] = []
+    for provider_config in sorted(provider_configs, key=lambda item: item.provider_id):
+        if not provider_config.enabled:
+            continue
+        tool_name = _fins_awaiting_tool_name_from_provider_config(provider_config)
+        if tool_name is None:
+            continue
+        tool_names.append(tool_name)
+        workspace_roots.append(
+            _fins_workspace_root_from_provider_config(provider_config)
+        )
+    if not tool_names:
+        return None
+    workspace_root = _single_fins_workspace_root(workspace_roots)
+    return build_fins_wait_adapter_registry(
+        workspace_root=workspace_root,
+        tool_names=tuple(tool_names),
+    )
+
+
+def _fins_awaiting_tool_name_from_provider_config(
+    provider_config: ToolDiscoveryProviderConfig,
+) -> str | None:
+    """识别显式配置中的 Fins awaiting provider 对应工具名。
+
+    :param provider_config: 单个工具发现 provider typed 配置。
+    :returns: Fins awaiting 工具名；非 Fins awaiting provider 时为 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if (
+        provider_config.provider_id in _FINS_DOWNLOAD_PROVIDER_IDS
+        or provider_config.import_path in _FINS_DOWNLOAD_IMPORT_PATHS
+        or provider_config.source_id in _FINS_DOWNLOAD_SOURCE_IDS
+    ):
+        return FINS_DOWNLOAD_AWAITING_TOOL_NAME
+    if (
+        provider_config.provider_id in _FINS_PREPROCESS_PROVIDER_IDS
+        or provider_config.import_path in _FINS_PREPROCESS_IMPORT_PATHS
+        or provider_config.source_id in _FINS_PREPROCESS_SOURCE_IDS
+    ):
+        return FINS_PREPROCESS_AWAITING_TOOL_NAME
+    return None
+
+
+def _fins_workspace_root_from_provider_config(
+    provider_config: ToolDiscoveryProviderConfig,
+) -> pathlib.Path:
+    """从 Fins awaiting provider config 解析绝对 workspace root。
+
+    :param provider_config: Fins awaiting provider typed 配置。
+    :returns: 解析后的绝对 workspace root。
+    :raises ValueError: workspace root 缺失、不是字符串或不是绝对路径时抛出。
+    """
+
+    value = provider_config.config.get(_FINS_WORKSPACE_ROOT_CONFIG_FIELD)
+    if not isinstance(value, str) or value.strip() == "":
+        raise ValueError(
+            f"Fins awaiting provider {provider_config.provider_id} config.workspace_root must be a non-empty absolute path"
+        )
+    workspace_root = pathlib.Path(value).expanduser()
+    if not workspace_root.is_absolute():
+        raise ValueError(
+            f"Fins awaiting provider {provider_config.provider_id} config.workspace_root must be absolute"
+        )
+    return workspace_root.resolve(strict=False)
+
+
+def _single_fins_workspace_root(
+    workspace_roots: Sequence[pathlib.Path],
+) -> pathlib.Path:
+    """校验本次 assembly 的 Fins awaiting providers 使用同一 workspace。
+
+    :param workspace_roots: 已解析的 workspace root 列表。
+    :returns: 唯一 workspace root。
+    :raises ValueError: 列表为空或存在多个不同 workspace root 时抛出。
+    """
+
+    if not workspace_roots:
+        raise ValueError("Fins awaiting provider workspace_root is required")
+    first = workspace_roots[0]
+    for workspace_root in workspace_roots[1:]:
+        if workspace_root != first:
+            raise ValueError(
+                "Fins awaiting providers must use the same absolute workspace_root"
+            )
+    return first
 
 
 def _duplicate_governance_policy_from_config(

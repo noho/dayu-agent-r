@@ -3285,6 +3285,20 @@ class Host(Protocol):
 
         ...
 
+    async def purge_session(
+        self, session_id: str, request: PurgeSessionRequest
+    ) -> PurgeSessionResult:
+        """清理已关闭且所有 Run 已终态的 Session 本地事实。
+
+        :param session_id: 目标 Session id。
+        :param request: purge session 请求。
+        :returns: purge tombstone ref 与删除计数摘要。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: purge 前置条件不满足、幂等冲突或写入失败时抛出。
+        """
+
+        ...
+
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
 

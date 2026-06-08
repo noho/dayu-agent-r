@@ -1,17 +1,38 @@
 {
   "providers": {
-    "financial-tools": {
-      "import_path": "dayu.fins.tools:discover_tools",
+    "financial-read-tools": {
+      "import_path": "dayu.fins.tools.provider:discover_tools",
       "entry_point": null,
       "source_kind": "explicit_provider",
-      "source_id": "dayu.fins.tools",
+      "source_id": "dayu.fins.tools.provider",
       "enabled": false,
       "allow_empty": true,
       "config": {
         "workspace_root": null,
         "include_read_tools": true,
-        "include_ingestion_tools": false,
         "limits": {}
+      }
+    },
+    "financial-download-tools": {
+      "import_path": "dayu.fins.tools.download_provider:discover_tools",
+      "entry_point": null,
+      "source_kind": "explicit_provider",
+      "source_id": "dayu.fins.tools.download_provider",
+      "enabled": false,
+      "allow_empty": true,
+      "config": {
+        "workspace_root": null
+      }
+    },
+    "financial-preprocess-tools": {
+      "import_path": "dayu.fins.tools.preprocess_provider:discover_tools",
+      "entry_point": null,
+      "source_kind": "explicit_provider",
+      "source_id": "dayu.fins.tools.preprocess_provider",
+      "enabled": false,
+      "allow_empty": true,
+      "config": {
+        "workspace_root": null
       }
     },
     "doc-tools": {

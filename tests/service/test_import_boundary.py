@@ -12,6 +12,9 @@ SERVICE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.ui",
     "dayu.fins",
 )
+SERVICE_ALLOWED_IMPORTS: tuple[str, ...] = (
+    "dayu.fins.ingestion",
+)
 
 
 def _service_root() -> Path:
@@ -68,12 +71,14 @@ def _matches_prefix(module: str, prefixes: tuple[str, ...]) -> bool:
 
 
 def test_service_does_not_import_forbidden_layers() -> None:
-    """Service 层不得反向依赖 UI、直接调用 Fins 或读取 config 包。"""
+    """Service 层不得反向依赖 UI、读取 config 包或越界读取 Fins。"""
 
     violations: list[tuple[str, str]] = []
     for file_path in _iter_python_files():
         source = file_path.read_text(encoding="utf-8")
         for module in _imported_module_names(source):
+            if _matches_prefix(module, SERVICE_ALLOWED_IMPORTS):
+                continue
             if _matches_prefix(module, SERVICE_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
 

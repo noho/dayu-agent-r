@@ -1,4 +1,4 @@
-"""财报工具服务层。
+"""财报读取运行时。
 
 该模块是财报工具与底层仓储/处理器之间的中间调用层，职责包括：
 - 参数校验与标准化。
@@ -40,7 +40,7 @@ from .section_semantic import (
 )
 from .cache import ProcessorCacheKey, ProcessorLRUCache
 
-# 从拆分模块导入（FinsToolService 直接使用）
+# 从拆分模块导入（FinsReadRuntime 直接使用）
 from .search_models import (
     QueryDiagnosis,
     SectionSemanticProfile,
@@ -73,7 +73,7 @@ from .result_types import (
 )
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
 from dayu.fins.ticker_normalization import try_normalize_ticker
-from .service_helpers import (
+from .read_runtime_helpers import (
     _collect_parent_titles,
     _normalize_form_type_for_matching,
     _normalize_document_types,
@@ -117,8 +117,8 @@ _MISSING_TICKER_HINT = (
 )
 
 
-class FinsToolService:
-    """财报工具服务。
+class FinsReadRuntime:
+    """财报读取运行时。
 
     设计约束：
     - 不依赖 `processed/*.json` 产物。
@@ -126,7 +126,8 @@ class FinsToolService:
     - 缓存仅保留 Processor 实例。
     """
 
-    MODULE = "FINS.TOOL_SERVICE"
+    MODULE = "FINS.READ_RUNTIME"
+
     def __init__(
         self,
         *,
@@ -1502,7 +1503,7 @@ class FinsToolService:
     def _get_document_meta_cached(self, ticker: str, document_id: str) -> Optional[dict[str, Any]]:
         """读取文档元数据（带实例级缓存）。
 
-        同一 FinsToolService 实例内，对相同 (ticker, document_id) 的
+        同一 FinsReadRuntime 实例内，对相同 (ticker, document_id) 的
         meta.json 读取做内存缓存，避免同一次工具调用链中重复 IO。
 
         Args:

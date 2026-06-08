@@ -1,33 +1,102 @@
 # Fins 开发手册
 
-`dayu.fins` 是财报分析能力包，当前提供财报文件系统仓储、财报文档处理器、读取服务和 read tools provider。它不属于 Host / Engine / Service / UI 任一层，具体财报文档访问必须通过 `dayu.fins.storage` 下的仓储协议与实现完成。
+本文档是 `dayu.fins` 包的开发手册。
 
-## 边界
-
-- `dayu.fins.storage` 是财报文档存取边界，包含公司元数据、源文档、processed 文档、blob 文件和批处理事务仓储协议与文件系统实现。
-- `dayu.fins.processors` 复用 `dayu.documents.processors` 的共享文档处理器基础，补充财报表单、章节、表格和 XBRL 相关处理能力。
-- `dayu.fins.tools.service.FinsToolService` 负责参数标准化、ticker / document_id 路由、processor 缓存和 read tool 业务结果构造。
-- `dayu.fins.tools.provider.discover_tools` 是当前 ToolsDiscovery provider 入口，只暴露 read tools。
-- `dayu.fins.service_runtime.DefaultFinsRuntime` 只装配 read tools 需要的仓储实现、processor registry 与 `FinsToolService`，不持有 Host、Service、EventLog 或 ingestion job manager。
-
-## 读取路径
-
-读取工具的执行路径为：
+Fins 在整体架构中不是 `UI / Service / Host / Engine` 的一层，而是由工具与 Service assembly 接入的财报业务能力包：
 
 ```text
-ToolsDiscovery
-  -> dayu.fins.tools.provider.discover_tools
-  -> DefaultFinsRuntime.create(workspace_root=...)
-  -> dayu.fins.storage filesystem repositories
-  -> FinsToolService
-  -> dayu.fins.processors / dayu.documents.processors
-  -> dayu.tools._legacy_adapter
-  -> current ToolDefinition / ToolRuntime
+UI -> Service -> Host -> Engine
+        |        |
+        |        v
+        |    ToolRuntime -> dayu.fins
+        v
+   Fins wait adapter assembly
 ```
 
-启用 read tools 时，Provider config 必须显式提供绝对 `workspace_root`。Provider 不从当前工作目录或环境变量猜路径；默认包内配置保持 disabled 且 `workspace_root=null`，启用时必须由 workspace overlay 提供真实绝对路径。`include_read_tools=false` 时，provider 返回空工具集且不解析 `workspace_root`。
+## Agent更新约束【必须遵守】
 
-当前 read tools：
+- 本文档只写两类内容：
+  - 当前代码已实现的整个 Agent 的设计意图、架构边界，范围包括 `UI -> Service -> Host -> Engine` 以及 Fins 作为财报业务能力包的位置。
+  - 当前代码已实现的 `dayu.fins` package 的 capability 定位、两条执行路径、对外接口、公共契约、架构、稳定边界、主要组件、状态机、关键机制、Processors 的类继承关系和扩展点。
+- 更新本文档时必须先核对 `dayu.fins` 当前代码；代码真源高于历史 plan、review artifact 或口头设计意图。
+- 必须按本文档现有章节职责写作：`设计意图` 和 `架构边界` 先说明整个 Agent 与 Fins 位置；其后章节只说明 `dayu.fins` package。
+- 不写用户手册、安装运行命令、测试清单、文件级流水账或 review / work unit 过程状态。
+- 不写未来计划、路线图、未落地能力或实现细节；只保留当前代码已经实现且对开发者稳定有用的说明。
+
+## 设计意图
+
+Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。
+
+在整个 Agent 中，LLM 负责分析、推理和生成；Host 负责生命周期、取消、恢复、工具治理、EventLog、memory / context governance 和持久化事实。Fins 提供买方财报分析所需的业务底座：财报文档存取、ticker 归一、read tools、download awaiting tool、preprocess / process awaiting tool、processor registry、XBRL / financial statement 能力，以及把 Fins durable job 映射到 Host wait-resume 的 adapter。
+
+`dayu.fins` 的设计重点是把财报业务能力从 Host / Engine 中剥离出来：
+
+- Host / Engine 不读取财报文件树，不理解 SEC 表单、ticker、XBRL、章节切分或 processed 产物。
+- 财报文档存取必须通过 `dayu.fins.storage` 的仓储协议与仓储实现完成。
+- read、download、preprocess / process 共用 `DefaultFinsRuntime`、仓储协议、processor registry 和 workspace-scoped ingestion job store，避免工具入口、测试 / CI 入口或其它入口复制业务逻辑后产生漂移。
+- Fins 工具只暴露业务语义结果；工具权限、ToolRuntime accept barrier、截断、`fetch_more`、长事务 wait、cancel、resume 和审计仍由 Host / ToolRuntime 治理。
+- Fins ingestion job 是 Fins 自有 durable record；Host wait record 是 Host 治理事实。两者只通过 wait adapter 做受限映射。
+
+## 架构边界
+
+整体依赖方向固定为：
+
+```text
+UI -> Service -> Host -> Engine
+```
+
+- `UI` 负责展示、输入收集、流式订阅和用户动作触发。
+- `Service` 负责业务入口、身份解析、配置 / scene / tool / runner 装配，并调用 Host。
+- `Host` 负责 Agent 运行宿主边界、状态治理、持久化、工具运行时治理、memory / context governance、projection、恢复和取消。
+- `Engine` 负责单次 run 的模型交互、Runner 协议归一、tool loop、取消观察和 `EngineEvent stream`。
+- `Fins` 是财报业务能力包；它通过工具 provider、Fins runtime、storage、processor 和 wait adapter integration 被装配到 Agent 中，不成为新的架构层。
+
+Fins 与其它层的稳定边界如下：
+
+- Host 不导入 `dayu.fins`，不读取财报仓储，不执行财报下载 / 预处理，不解释财报业务规则；Host 只接收受治理工具结果或 wait adapter 映射后的 wait poll 结果。
+- Engine 不导入 `dayu.fins`，不感知财报业务语义；Engine 只看到 Host 传入的 `ToolSchema` 和 `ToolExecutor`。
+- Service / composition root 可以装配 Fins tools provider，也可以基于显式 Fins awaiting provider 配置构造 Host `WaitAdapterRegistry`；Service 负责把 raw config 映射为 typed assembly 输入。
+- 除 `dayu.fins.ingestion.wait_adapter` 这个 Host wait integration 模块外，`dayu.fins` 不依赖 Host。wait adapter 只使用 Host wait-resume typed contract，不读取 Host durable store，也不改变 Host / Engine contract。
+- Fins 不依赖 `dayu.service`、`dayu.ui` 或 `dayu.engine`；`dayu.engine` 与 `dayu.runtime` 也不得反向导入 Fins。
+
+公共包边界固定如下：
+
+- `dayu.contracts` 是 Dayu Agent 公共契约包，承载 UI / Service / Host / Engine / ToolRuntime / tools 可共同使用的层中立数据与协议，例如 JSON 值、取消 token、工具声明、工具 schema、工具调用请求、工具执行 outcome、工具等待 outcome 和 `ToolExecutor`；它不承载 Host / Engine 状态机，也不承载财报业务事实。
+- `dayu.runtime` 是层中立运行期基础设施包，提供工具发现 provider contract、取消等待、日志级别、诊断文本脱敏、截断、filelock、lane 等可复用 helper；它不得依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`，也不承载任何层的状态机或业务语义。
+- `dayu.documents` 提供文档处理器公共协议、ProcessorRegistry 和通用 Docling / Markdown / BeautifulSoup 处理器；Fins 在其上注册财报业务增强处理器和 SEC 表单专项处理器。
+- 工具声明契约属于 `dayu.contracts`；具体 Fins read / download / preprocess 工具实现属于 `dayu.fins.tools`，工具发现装配属于 runtime discovery / Service assembly，工具运行时治理属于 Host / ToolRuntime。
+
+## 接口
+
+`dayu.fins` 包根当前不导出业务符号；开发者使用明确子包入口，避免把包根变成兼容性 re-export 面。
+
+### Shared runtime
+
+`dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins 默认共享装配根：
+
+- `DefaultFinsRuntime.create(workspace_root=Path)`：由显式 Fins workspace root 创建文件系统仓储、processor registry、`FsFinsIngestionJobStore`。
+- `get_read_runtime(processor_cache_max_entries=128)`：懒加载并缓存 `FinsReadRuntime`。
+- `get_ingestion_runtime()`：懒加载并缓存 `FinsIngestionRuntime`。
+- `get_processor_registry()`：返回 Fins processor registry。
+
+`DefaultFinsRuntime` 不持有 Host、Service、EventLog、ToolRuntime 或 Engine Runner。共享语义不是进程级 singleton，而是同一 `workspace_root` 下复用同一套业务代码、仓储布局和 durable job store。
+
+### Storage
+
+`dayu.fins.storage` 是财报文档存取边界，包内导出窄仓储协议与文件系统实现：
+
+- `CompanyMetaRepositoryProtocol`
+- `SourceDocumentRepositoryProtocol`
+- `ProcessedDocumentRepositoryProtocol`
+- `DocumentBlobRepositoryProtocol`
+- `FilingMaintenanceRepositoryProtocol`
+- `BatchingRepositoryProtocol`
+- 对应 `Fs*Repository` 文件系统实现
+- `FileStore` / `LocalFileStore`
+
+### Read runtime 与 read tools provider
+
+`dayu.fins.tools.read_runtime.FinsReadRuntime` 是 read path runtime，当前提供：
 
 - `list_documents`
 - `get_document_sections`
@@ -39,15 +108,470 @@ ToolsDiscovery
 - `get_financial_statement`
 - `query_xbrl_facts`
 
-这些工具统一带 `fins` tag。需要截断的工具声明当前 `dayu.contracts.tool_schema.ToolTruncateSpec`；实际截断和 `fetch_more` 由 Host ToolRuntime 负责。
+`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须在 provider config 中提供绝对 `workspace_root`；`include_read_tools=false` 时返回空工具集且不解析 `workspace_root`。
 
-## Ingestion 状态
+当前 read tools 名称为：
 
-当前 provider 不暴露下载 / 预处理 ingestion tools。旧 ingestion 工具是 `start/status/cancel` 后台 job 轮询模型，后续由 `WU-TOOLS-01-F01` 迁移到当前 Host / Engine `ToolAwaitingOutcome` 与 wait-resume contract；迁移前 provider 对 ingestion tools 保持 fail-closed。
+- `list_documents`
+- `get_document_sections`
+- `read_section`
+- `search_document`
+- `list_tables`
+- `get_table`
+- `get_page_content`
+- `get_financial_statement`
+- `query_xbrl_facts`
 
-## 扩展约束
+### Download / preprocess awaiting tools
 
-- 新增财报读取能力时，先扩展 storage protocol 或 processor 能力，再由 `FinsToolService` 暴露业务语义。
-- 不得让 Host、Engine、Service 或 runtime 直接读取财报文件树。
-- 不得迁移 OLD ToolRegistry、OLD TruncationManager、OLD `fetch_more` 或 OLD truncate / fetch-more projection。
-- 面向 LLM 的工具 schema、错误、结果字段必须自解释，不暴露裸内部 ref / digest 代替业务语义。
+Fins ingestion 通过两个独立 provider 暴露 awaiting tools：
+
+- `dayu.fins.tools.download_provider.discover_tools(spec)`：provider id 为 `financial-download-tools`，返回 `start_fins_download`。
+- `dayu.fins.tools.preprocess_provider.discover_tools(spec)`：provider id 为 `financial-preprocess-tools`，返回 `start_fins_preprocess`。
+
+两个 provider 都必须显式配置绝对 `workspace_root`。工具调用只启动 durable Fins job 并返回 `ToolAwaitingOutcome`，不轮询 job、不直接 resolve Host wait。
+
+### Ingestion runtime 与 wait adapter
+
+`dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载与预处理的 typed runtime foundation：
+
+- `start_download(FinsDownloadRequest) -> FinsIngestionJobStart`
+- `start_preprocess(FinsPreprocessRequest) -> FinsIngestionJobStart`
+- `read_job(job_id) -> FinsIngestionJobRecord`
+- `request_cancel(job_id) -> FinsIngestionJobRecord`
+
+`dayu.fins.ingestion.wait_adapter` 提供 Host wait-resume integration：
+
+- `FINS_INGESTION_WAIT_ADAPTER_KEY = "poll:fins-ingestion"`
+- `FINS_DOWNLOAD_AWAITING_TOOL_NAME = "start_fins_download"`
+- `FINS_PREPROCESS_AWAITING_TOOL_NAME = "start_fins_preprocess"`
+- `FinsIngestionWaitPollAdapter`
+- `build_fins_wait_adapter_registry(workspace_root=..., tool_names=...)`
+
+## 调用者装配示例
+
+调用者进入 Fins 的稳定入口是 `DefaultFinsRuntime`。不同入口可以创建各自的 runtime 实例，但同一 `workspace_root` 会使用同一套仓储布局、processor registry 构造逻辑和 workspace-scoped durable job store。
+
+### Read caller
+
+Tool discovery 的 read provider 已经内置这条路径：
+
+```text
+dayu.fins.tools.provider.discover_tools(spec)
+  -> parse_fins_workspace_root_config(spec.config)
+  -> DefaultFinsRuntime.create(workspace_root=...)
+  -> runtime.get_read_runtime(...)
+  -> register_fins_read_tools(..., read_runtime=read_runtime)
+```
+
+其它直接调用 read runtime 的入口也应走同一装配根：
+
+```python
+from pathlib import Path
+
+from dayu.fins.service_runtime import DefaultFinsRuntime
+
+workspace_root = Path("/abs/path/to/fins-workspace")
+runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+read_runtime = runtime.get_read_runtime()
+
+documents = read_runtime.list_documents(ticker="AAPL")
+sections = read_runtime.get_document_sections(
+    ticker="AAPL",
+    document_id="example-document-id",
+)
+```
+
+调用者不应自行拼装 `FsCompanyMetaRepository`、`FsSourceDocumentRepository`、`FsProcessedDocumentRepository` 或 `ProcessorRegistry`，也不应直接构造 `FinsReadRuntime(...)` 来绕过 shared runtime。
+
+### Download / preprocess caller
+
+Tool discovery 的 download / preprocess providers 已经内置这条路径：
+
+```text
+dayu.fins.tools.download_provider.discover_tools(spec)
+dayu.fins.tools.preprocess_provider.discover_tools(spec)
+  -> parse_fins_workspace_root_config(spec.config)
+  -> DefaultFinsRuntime.create(workspace_root=...)
+  -> runtime.get_ingestion_runtime()
+  -> build start_fins_download / start_fins_preprocess ToolDefinition
+```
+
+其它直接调用 ingestion runtime 的入口也应走同一装配根：
+
+```python
+from pathlib import Path
+
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_runtime import FinsDownloadRequest, FinsPreprocessRequest
+from dayu.fins.service_runtime import DefaultFinsRuntime
+
+workspace_root = Path("/abs/path/to/fins-workspace")
+runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+ingestion = runtime.get_ingestion_runtime()
+
+download_start = ingestion.start_download(
+    FinsDownloadRequest(
+        ticker="AAPL",
+        source="auto",
+    )
+)
+preprocess_start = ingestion.start_preprocess(
+    FinsPreprocessRequest(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        rebuild_processed=False,
+    )
+)
+```
+
+`FinsReadRuntime` 只服务 read path；download / preprocess 必须使用 `FinsIngestionRuntime`。当前默认 runtime 不内置真实网络下载 adapter；没有匹配 adapter 的 download job 会进入明确 failed 终态。preprocess path 读取 workspace 中已有 source docs，并通过 processor registry 写入 processed repository。
+
+## 公共契约
+
+Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处理器契约。
+
+### Fins 专属契约
+
+- `dayu.fins.domain`：财报领域模型与枚举，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact 等数据对象。
+- `dayu.fins.ticker_normalization`：ticker 标准化结果与 market / exchange 推导。
+- `dayu.fins.storage.repository_protocols`：公司、源文档、processed、blob、filing maintenance 与批处理事务仓储协议。
+- `FinsDownloadRequest` / `FinsPreprocessRequest`：下载与预处理请求。
+- `FinsSourceDownloadAdapter` / `FinsSourceDownloadAdapterRequest` / `FinsSourceDownloadAdapterResult`：下载来源 adapter 协议。
+- `FinsIngestionJobRecord` / `FinsIngestionJobStatus` / `FinsIngestionOperationKind` / `FinsIngestionJobStart`：ingestion durable job 契约。
+- `FinsIngestionJobStore` / `FsFinsIngestionJobStore`：ingestion job record 存储协议与文件系统实现。
+- `FinancialDataProcessor` / `FinancialStatementResult` / `XbrlFactsResult`：财务报表与 XBRL 查询能力协议。
+
+### Dayu Agent 公共契约
+
+这些契约定义真源在 `dayu.contracts` 或层中立公共位置；Fins 只消费、生成或适配，不拥有 Host / Engine 治理语义。
+
+- `JsonValue`：工具参数、工具结果和 job summary 的公共 JSON 值类型。
+- `ToolDefinition` / `ToolDisplayInfo`：Fins provider 暴露给 runtime discovery 的工具定义。
+- `ToolSchema` / `ToolFunctionSchema` / `ToolParametersSchema` / `ToolTruncateSpec`：工具 schema 与截断声明。
+- `ToolCallRequest` / `BatchToolExecutionContext`：工具 callable 接收的调用请求与执行上下文。
+- `ToolExecutionOutcome` / `ToolAwaitingOutcome`：普通工具结果、失败、取消和长事务等待 outcome。
+- `ToolAwaitKind.EXTERNAL_JOB`：Fins download / preprocess awaiting tools 使用的等待类型。
+- `ToolsDiscoveryProviderSpec` / `ToolsDiscoveryProviderOutput`：Fins providers 的 runtime discovery contract。
+
+### 文档处理器契约
+
+这些契约定义真源在 `dayu.documents.processors`：
+
+- `DocumentProcessor`：章节、表格、全文、搜索等通用文档读取协议。
+- `PageAwareProcessor`：按页读取的可选协议。
+- `ProcessorRegistry`：处理器注册、优先级选择与 fallback 创建。
+- `DoclingProcessor` / `MarkdownProcessor` / `BSProcessor`：Fins 复用并增强的通用处理器实现。
+
+## 架构
+
+`dayu.fins` 内部按 domain、storage、processors、read runtime、tools、ingestion 与 wait adapter 分工。
+
+```mermaid
+flowchart LR
+    assembly["Service / runtime discovery"]
+    read_provider["financial-read-tools\nprovider"]
+    download_provider["financial-download-tools\nprovider"]
+    preprocess_provider["financial-preprocess-tools\nprovider"]
+    runtime["DefaultFinsRuntime\nworkspace-scoped assembly root"]
+    storage["dayu.fins.storage\nrepositories"]
+    registry["ProcessorRegistry\nFins processors"]
+    read_service["FinsReadRuntime\nread runtime"]
+    read_tools["9 read ToolDefinitions"]
+    ingestion["FinsIngestionRuntime\nstart / read / cancel jobs"]
+    job_store["FsFinsIngestionJobStore\n.dayu/fins_ingestion/jobs"]
+    wait_adapter["Fins wait adapter\npoll:fins-ingestion"]
+    host_tool_runtime["Host ToolRuntime\naccept barrier"]
+    host_wait["Host wait-resume"]
+
+    assembly --> read_provider
+    assembly --> download_provider
+    assembly --> preprocess_provider
+    read_provider --> runtime
+    download_provider --> runtime
+    preprocess_provider --> runtime
+    runtime --> storage
+    runtime --> registry
+    runtime --> read_service
+    runtime --> ingestion
+    read_service --> storage
+    read_service --> registry
+    read_service --> read_tools
+    ingestion --> storage
+    ingestion --> registry
+    ingestion --> job_store
+    wait_adapter --> ingestion
+    read_tools --> host_tool_runtime
+    download_provider --> host_tool_runtime
+    preprocess_provider --> host_tool_runtime
+    host_wait --> wait_adapter
+```
+
+```text
+dayu.fins
+├── domain                    # 财报领域模型与枚举
+├── storage                   # 仓储协议、文件系统仓储、文件对象存储
+├── processors                # 财报处理器、SEC 表单专项处理器、registry
+├── tools                     # read tools、download/preprocess awaiting tools、providers、read runtime
+├── ingestion_runtime.py      # download/preprocess typed runtime 与 durable job store
+├── ingestion / wait_adapter  # Fins job -> Host wait-resume contract
+├── service_runtime.py        # DefaultFinsRuntime shared assembly root
+└── ticker_normalization.py   # ticker 标准化
+```
+
+## 稳定边界
+
+Fins 稳定边界是 workspace-scoped runtime、仓储协议、processor registry、tools provider 输出、ingestion job record 和 wait adapter binding。
+
+Fins 不负责：
+
+- Host Session / Run / Attempt / EventLog / admission / dispatch / memory / context governance。
+- Engine iteration、RunnerEvent、provider payload、provider retry、length continuation 或 context compaction。
+- Service 配置加载、scene manifest 解释、runner profile 选择或 UI 交互。
+- ToolRuntime accept barrier、工具权限、side-effect 幂等治理、truncation cursor、`fetch_more`、tool trace 或 audit。
+- 把 job store、processed 产物、raw provider payload 或工具诊断提升为 Host truth。
+
+Fins workspace 规则固定如下：
+
+- Fins provider config 的 `workspace_root` 必须是非空绝对路径；provider 不从 cwd 或环境变量推断。
+- 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools` 均为 disabled，`workspace_root=null`。
+- Service assembly 为 Fins awaiting providers 构造 wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess provider 使用同一个绝对 `workspace_root`。
+- ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，只保存 job governance records，不保存财报正文、processed payload 或 raw download payload。
+
+## 主要组件
+
+### Storage
+
+Storage 是财报文件系统的唯一访问边界。仓储协议按职责拆分为 company meta、source document、processed document、blob、filing maintenance 与 batching，避免把所有能力塞进单个宽仓储。文件系统实现通过 shared repository set 复用路径、锁和批处理事务语义。
+
+### Processors
+
+Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
+
+- Fins Docling / Markdown / BS 处理器对表格补充金融语义标注。
+- `SecProcessor` 基于 edgartools 读取 SEC 文档章节、表格、XBRL 与 financial statement。
+- SEC 表单专项处理器通过虚拟章节 mixin 处理 `10-K`、`10-Q`、`20-F`、`8-K`、`DEF 14A`、`SC 13D/G`、`6-K` 等表单的章节切分、搜索和财务表回退。
+- `build_fins_processor_registry()` 在 engine 文档处理器注册表基础上覆盖注册 Fins 增强处理器，并按优先级注册 SEC 表单专项主路径、回退路径和通用 SEC 兜底。
+
+### FinsReadRuntime
+
+`FinsReadRuntime` 是 read path runtime，负责 ticker 标准化、文档选择、document_id 到 source / processor 的路由、processor LRU 缓存、not-supported 降级、列表 / 章节 / 表格 / 页面 / 财务报表 / XBRL 查询结果构造。它不依赖 Host EventLog，也不把 processed 产物作为 read path 的唯一事实来源。
+
+### Tools providers
+
+Read、download、preprocess 是三个独立 provider：
+
+- read provider 只暴露 9 个 read tools。
+- download provider 只暴露 `start_fins_download`。
+- preprocess provider 只暴露 `start_fins_preprocess`。
+
+三者都通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取共享 Fins 底座。
+
+### Ingestion runtime
+
+`FinsIngestionRuntime` 负责 download / preprocess durable job 的创建、后台执行、取消请求、终态收口和 job record 读取。下载 pipeline 通过 `FinsSourceDownloadAdapter` 写入 source / blob / rejected filing artifact；预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository。
+
+当前 `DefaultFinsRuntime` 不内置真实 SEC / CN / HK 网络下载 adapter。没有匹配 adapter 时，download job 会进入明确的 failed 终态，不伪造成功。
+
+### Wait adapter
+
+`FinsIngestionWaitPollAdapter` 把 Fins job record 映射到 Host wait poll 结果：
+
+- `queued` / `running` / `cancelling` -> not ready。
+- `succeeded` -> completed outcome。
+- `failed` -> failed outcome。
+- `cancelled` -> cancelled outcome。
+- job evidence 缺失或损坏 -> lost outcome。
+
+Host 取消 wait 时，adapter 只调用 `FinsIngestionRuntime.request_cancel(job_id)`，不删除 Fins source docs、processed docs、job record 或 Host wait record。
+
+## 关键执行路径
+
+### Read 路径
+
+```text
+ToolsDiscovery
+  -> dayu.fins.tools.provider.discover_tools
+  -> parse explicit absolute workspace_root
+  -> DefaultFinsRuntime.create(workspace_root=...)
+  -> get_read_runtime(...)
+  -> register_fins_read_tools(...)
+  -> current ToolDefinition bundle
+  -> Host ToolRuntime
+  -> FinsReadRuntime method
+  -> storage repositories
+  -> ProcessorRegistry.create_with_fallback(...)
+  -> processor read / search / table / XBRL capability
+  -> tool result accepted by Host ToolRuntime
+```
+
+Read path 只读取 Fins workspace 中已经存在的财报材料。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
+
+### Download / preprocess 路径
+
+```text
+ToolsDiscovery
+  -> dayu.fins.tools.download_provider / preprocess_provider
+  -> parse explicit absolute workspace_root
+  -> DefaultFinsRuntime.create(workspace_root=...)
+  -> get_ingestion_runtime()
+  -> start_fins_download / start_fins_preprocess tool call
+  -> FinsIngestionRuntime.start_download / start_preprocess
+  -> create durable queued job record
+  -> return ToolAwaitingOutcome(EXTERNAL_JOB)
+  -> background executor runs pipeline
+  -> update Fins job terminal record
+  -> FinsIngestionWaitPollAdapter maps job record to Host wait result
+  -> Host resolve / resume governance
+```
+
+Download 与 preprocess 都先写 durable `queued` job record，再提交后台执行。工具调用边界内的参数错误或 job 创建失败会返回工具失败 outcome；job 创建成功后工具立即返回 awaiting outcome，不等待后台任务完成。
+
+## 状态机
+
+Fins ingestion job 状态集合：
+
+```text
+queued
+running
+cancelling
+succeeded
+failed
+cancelled
+```
+
+终态是 `succeeded`、`failed`、`cancelled`。`request_cancel(job_id)` 对非终态 job 写入取消请求；后台 pipeline 在 claim、循环处理文档、写入终态前反复观察取消请求。已经终态的 job 不会被取消请求改写业务结果。
+
+典型状态流如下：
+
+```text
+start_download / start_preprocess
+  -> queued
+  -> running
+      -> succeeded
+      -> failed
+      -> cancelling -> cancelled
+```
+
+`FsFinsIngestionJobStore` 使用 workspace 派生路径、文件锁、原子写和有界 JSON record。job id 是 opaque `finsjob_<32 hex>`；调用方不得解析其中语义。
+
+## 事件流
+
+Fins 不产出 `EngineEvent stream` 或 `Host event stream`。Fins 对 Agent 的可观察输出只有三类：
+
+- read tools 的普通 `ToolExecutionOutcome`。
+- download / preprocess start tools 的 `ToolAwaitingOutcome(EXTERNAL_JOB)`。
+- wait adapter poll 时把 Fins job terminal record 映射成 Host resolve outcome。
+
+Fins job record 是 Fins 自有治理记录；只有经 Host wait adapter 和 Host ingest / resolve 路径接受后，才会影响 Host Run / Attempt 状态。
+
+## Processors 的类继承关系
+
+Fins processors 以 `dayu.documents.processors` 的协议与通用处理器为基础，但 SEC 专项处理器分成 BS 主路径与 edgartools / SecProcessor 回退路径。
+
+```text
+DocumentProcessor Protocol
+PageAwareProcessor Protocol
+FinancialDataProcessor Protocol
+
+DoclingProcessor
+└── FinsDoclingProcessor(FinsProcessorMixin, DoclingProcessor)
+
+MarkdownProcessor
+└── FinsMarkdownProcessor(FinsProcessorMixin, MarkdownProcessor)
+
+BSProcessor
+└── FinsBSProcessor(FinsProcessorMixin, BSProcessor)
+    ├── _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
+    │   ├── BsTenKFormProcessor
+    │   ├── BsTenQFormProcessor
+    │   └── BsTwentyFFormProcessor
+    ├── BsDef14AFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
+    ├── BsEightKFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
+    ├── BsSc13FormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
+    └── BsSixKFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
+
+SecProcessor
+└── _BaseSecReportFormProcessor(_VirtualSectionProcessorMixin, SecProcessor)
+    ├── TenKFormProcessor
+    ├── TenQFormProcessor
+    ├── TwentyFFormProcessor
+    ├── Def14AFormProcessor
+    ├── EightKFormProcessor
+    └── Sc13FormProcessor
+```
+
+继承语义固定如下：
+
+- `FinsProcessorMixin` 只补充财报表格语义字段，不负责文档加载、章节切分或仓储。
+- `FinsDoclingProcessor`、`FinsMarkdownProcessor`、`FinsBSProcessor` 复用通用处理器解析能力，并在初始化后对表格执行金融语义重标注。
+- `SecProcessor` 是独立 SEC 文档处理器，结构上对齐 `DocumentProcessor` 与 `FinancialDataProcessor` 能力，但不继承 `FinsDoclingProcessor`。
+- `_VirtualSectionProcessorMixin` 必须放在 MRO 的基础处理器之前，例如 `(_VirtualSectionProcessorMixin, SecProcessor)` 或 `(_VirtualSectionProcessorMixin, FinsBSProcessor)`，以便 mixin 的 `super()` 下一跳具备标准 section / table / search 接口。
+- `_BaseBsReportFormProcessor` 是 10-K / 10-Q / 20-F 的 BeautifulSoup 主路径；`_BaseSecReportFormProcessor` 是 edgartools / SecProcessor 回退路径。
+- `BsDef14AFormProcessor`、`BsEightKFormProcessor`、`BsSc13FormProcessor`、`BsSixKFormProcessor` 直接组合虚拟章节 mixin 与 `FinsBSProcessor`，不经过 `_BaseBsReportFormProcessor`。
+
+`build_fins_processor_registry()` 当前注册优先级为：
+
+- SEC 表单专项 BS 主路径：priority `200`。
+- SEC 表单专项 edgartools 回退路径：priority `190`。
+- 通用 `SecProcessor`：priority `120`。
+- Fins Docling / Markdown：priority `100`。
+- Fins BS：priority `80`。
+
+## 关键机制
+
+### Shared Fins runtime
+
+`DefaultFinsRuntime` 是 read、download、preprocess / process 的 shared assembly root。它统一装配同一 workspace 下的文件系统仓储、processor registry、`FinsReadRuntime`、`FinsIngestionRuntime` 和 ingestion job store。
+
+这个机制用于保证多入口调用时 Fins 业务逻辑不漂移：工具 provider、测试 / CI 夹具或其它入口应调用 shared Fins runtime 的 typed API，而不是复制 ticker 归一、仓储路径、processor 选择、download job、preprocess / process 或 job terminal 逻辑。当前共享语义不是“所有入口必须共享同一个 Python 对象实例”，而是“同一 `workspace_root` 下走同一套业务代码与同一套 workspace-scoped durable state”。
+
+### Workspace root 与 provider fail fast
+
+三个 Fins provider 都要求显式绝对 `workspace_root`。read provider 在 `include_read_tools=false` 时允许不解析 workspace；其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+
+### Storage repository boundary
+
+财报文档存取必须通过 `dayu.fins.storage` 仓储协议完成。Read runtime、download pipeline、preprocess pipeline 都不能绕过仓储协议直接读写业务文件树。blob 文件、source meta、processed meta、rejected filing artifact 和 batching 事务分别由窄协议承担。
+
+### Processor registry 与 processor cache
+
+`build_fins_processor_registry()` 在通用文档处理器基础上注册 Fins 业务增强处理器。`FinsReadRuntime` 按 ticker / document_id / source kind 路由到 source repository 和 processor registry，并缓存 processor 实例；缓存只保存 processor，不把 Host tool result、EventLog fact 或 LLM-facing material 缓存在 Fins 内部。
+
+### Read tool 结果与截断
+
+Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具可以声明 `ToolTruncateSpec`，但截断执行、cursor 生命周期和 `fetch_more` 都由 Host ToolRuntime 处理。Fins 工具不得自行模拟 Host truncation manager，也不得把内部 ref / digest 当成业务事实返回给模型。
+
+### Download adapter 与 unsupported source
+
+`FinsIngestionRuntime` 通过 `(source, market)` 选择 `FinsSourceDownloadAdapter`。当前默认 runtime 没有真实网络下载 adapter；没有匹配 adapter 时，download job 写入明确 failed 终态和 unsupported-source 摘要。下载成功路径只通过 source repository、blob repository 和 filing maintenance repository 写入 source docs 与 rejected filing artifacts。
+
+### Preprocess / process pipeline
+
+`start_preprocess` 从 source repository 选择已存在源文档，按 `document_ids`、`form_types`、`source_kind` 和 `rebuild_processed` 控制处理范围。后台 pipeline 使用 processor registry 生成 sections / tables，并通过 processed repository create / update 写入 processed 产物。`rebuild_processed=false` 时跳过已有 processed 文档；`rebuild_processed=true` 时允许重建。
+
+### Durable job 与取消
+
+Download / preprocess 都先创建 durable `queued` job record，再提交后台 executor。job record 使用有界 JSON summary，不保存财报正文。取消是合作式的：Host wait cancel 或其它调用方通过 `request_cancel(job_id)` 写取消请求，后台 pipeline 观察到后收口为 `cancelled`。
+
+### Wait adapter 与 Host resume
+
+Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry；Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 Fins job record，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
+
+### Ticker normalization
+
+Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` 收口 ticker 输入，生成 canonical ticker、market 和 exchange。工具 schema 允许模型传自然 ticker 写法；业务路由以 canonical ticker 为准。
+
+## 扩展点
+
+扩展 read tool 时，先在 storage protocol、processor 或 `FinsReadRuntime` 中建立稳定业务语义，再通过 `register_fins_read_tools(...)` 暴露工具 schema。不要把仓储装配、Host 状态或 ToolRuntime 治理写进工具函数。
+
+扩展财报存储后端时，实现 `dayu.fins.storage` 的窄仓储协议，并保持 source / processed / blob / filing maintenance / batching 职责分离。调用方仍通过 `DefaultFinsRuntime` 或等价 assembly root 注入仓储实现。
+
+扩展 processor 时，实现 `DocumentProcessor` 所需能力或明确的财报能力协议，并在 `build_fins_processor_registry()` 中以可解释优先级注册。表单专项处理器应保持 BS 主路径与 SecProcessor 回退路径的职责边界。
+
+扩展下载来源时，实现 `FinsSourceDownloadAdapter`，并通过 `FinsIngestionRuntime.create(download_adapters=...)` 注入 `(source, market)` adapter 映射。Adapter 只返回 typed downloaded documents / rejected artifacts，不直接写文件系统。
+
+扩展 preprocess / process 时，保持 source repository -> processor registry -> processed repository 的闭环；不要在 CLI、tools、CI 或测试夹具中复制独立处理逻辑。
+
+扩展 wait-resume 时，保持 Fins job record 与 Host wait record 分离。新增等待工具需要显式工具名、await kind、adapter key、resume policy 和 external job ref source，不得把 adapter object 塞进 ToolsDiscovery provider output。

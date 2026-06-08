@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import dayu.host as host
 import dayu.host.api as api
 import dayu.host.context_fallback as context_fallback
@@ -343,6 +345,38 @@ def test_api_all_stays_request_snapshot_boundary() -> None:
     """``dayu.host.api.__all__`` 只包含 API 与本地执行配置类型。"""
 
     assert frozenset(api.__all__) == EXPECTED_API_EXPORTS
+
+
+def test_host_protocol_exposes_public_handle_methods() -> None:
+    """``Host`` Protocol 必须包含 opener public handle 的完整方法面。"""
+
+    expected_async_methods = frozenset(
+        {
+            "cancel_run",
+            "cancel_session_runs",
+            "close",
+            "close_session",
+            "create_session",
+            "drain_outbox_terminal_items",
+            "ensure_session",
+            "get_run",
+            "get_session",
+            "purge_session",
+            "read_outbox_terminal_items",
+            "replay_run",
+            "resolve_wait",
+            "retry_run",
+            "submit_followup",
+        }
+    )
+    actual_async_methods = frozenset(
+        name
+        for name in expected_async_methods
+        if inspect.iscoroutinefunction(getattr(api.Host, name, None))
+    )
+
+    assert actual_async_methods == expected_async_methods
+    assert callable(getattr(api.Host, "watch_session_events", None))
 
 
 def test_read_api_all_keeps_service_facing_read_boundary() -> None:

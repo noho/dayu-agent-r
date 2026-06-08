@@ -8,7 +8,7 @@
 - 排序（策略优先级 → 意图一致性 → 噪音惩罚 → BM25F → 邻近度）
 - 去重与证据化结构构建
 
-所有函数均为模块级私有函数，由 FinsToolService 调用。
+所有函数均为模块级私有函数，由 FinsReadRuntime 调用。
 """
 
 from __future__ import annotations

@@ -378,11 +378,24 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert host_runtime.payload_inline_threshold_bytes == 65535
     assert host_runtime.worker_startup_timeout_seconds == 10.0
     assert config.runtime_lanes.lanes["llm_api"].capacity == 4
-    provider = config.tool_discovery.providers["financial-tools"]
-    assert provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
-    assert provider.import_path == "dayu.fins.tools:discover_tools"
-    assert provider.config["include_read_tools"] is True
-    assert provider.config["include_ingestion_tools"] is False
+    read_provider = config.tool_discovery.providers["financial-read-tools"]
+    download_provider = config.tool_discovery.providers["financial-download-tools"]
+    preprocess_provider = config.tool_discovery.providers["financial-preprocess-tools"]
+    assert read_provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
+    assert read_provider.import_path == "dayu.fins.tools.provider:discover_tools"
+    assert read_provider.enabled is False
+    assert read_provider.config["include_read_tools"] is True
+    assert "include_ingestion_tools" not in read_provider.config
+    assert download_provider.import_path == (
+        "dayu.fins.tools.download_provider:discover_tools"
+    )
+    assert download_provider.enabled is False
+    assert download_provider.config["workspace_root"] is None
+    assert preprocess_provider.import_path == (
+        "dayu.fins.tools.preprocess_provider:discover_tools"
+    )
+    assert preprocess_provider.enabled is False
+    assert preprocess_provider.config["workspace_root"] is None
     assert "doc-tools" in config.tool_discovery.providers
     assert "web-tools" in config.tool_discovery.providers
 

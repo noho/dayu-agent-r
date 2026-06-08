@@ -15,6 +15,7 @@ from dayu.contracts import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolBundle,
     ToolBundleSourceKind,
+    ToolBundleSourceRef,
     ToolCallRequest,
     ToolCancelledOutcome,
     ToolDefinition,
@@ -24,6 +25,10 @@ from dayu.contracts import (
     ToolSchema,
 )
 from dayu.engine import AgentFallbackMode, AgentPolicy
+from dayu.fins.ingestion import FINS_INGESTION_WAIT_ADAPTER_KEY
+from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
+from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
+from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.host.api import (
     AuthorizationClaim,
     FollowupBehavior,
@@ -536,6 +541,176 @@ def test_tooling_options_from_discovery_requires_source_refs() -> None:
         _tooling_options_from_discovery(
             tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_fact"),)),
             source_refs=(),
+            provider_configs=(),
+            duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+        )
+
+
+def test_tooling_options_without_fins_awaiting_providers_has_no_wait_adapter_registry(
+    tmp_path: Path,
+) -> None:
+    """无 Fins awaiting provider config 时普通工具应正常装配且不绑定 wait adapter。"""
+
+    tooling_options = _tooling_options_from_discovery(
+        tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_fact"),)),
+        source_refs=(_source_ref("ordinary-provider"),),
+        provider_configs=(
+            _provider_config(
+                provider_id="ordinary-provider",
+                import_path="dayu.tools.doc_provider:discover_tools",
+                source_id="dayu.tools.doc_provider",
+                workspace_root=(tmp_path / "ordinary-workspace").resolve(strict=False),
+            ),
+        ),
+        duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+    )
+
+    assert tooling_options is not None
+    assert tooling_options.business_tool_bundle.definitions[0].name == "lookup_fact"
+    assert tooling_options.wait_adapter_registry is None
+
+
+def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_providers(
+    tmp_path: Path,
+) -> None:
+    """Service assembly 应为启用的 Fins awaiting providers 绑定 wait adapter。"""
+
+    workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    tooling_options = _tooling_options_from_discovery(
+        tool_bundle=ToolBundle(
+            definitions=(
+                _tool_definition(DOWNLOAD_TOOL_NAME),
+                _tool_definition(PREPROCESS_TOOL_NAME),
+            )
+        ),
+        source_refs=(_source_ref("fins-awaiting-test"),),
+        provider_configs=(
+            _provider_config(
+                provider_id="custom-download-provider",
+                import_path="dayu.fins.tools.download_provider:discover_tools",
+                source_id="custom-download-source",
+                workspace_root=workspace_root,
+            ),
+            _provider_config(
+                provider_id="custom-preprocess-provider",
+                import_path="custom.package:discover_tools",
+                source_id="dayu.fins.tools.preprocess_provider",
+                workspace_root=workspace_root,
+            ),
+        ),
+        duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+    )
+
+    assert tooling_options is not None
+    assert tooling_options.wait_adapter_registry is not None
+    download_binding = tooling_options.wait_adapter_registry.resolve_binding(
+        tool_name=DOWNLOAD_TOOL_NAME,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+    )
+    preprocess_binding = tooling_options.wait_adapter_registry.resolve_binding(
+        tool_name=PREPROCESS_TOOL_NAME,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+    )
+    assert download_binding is not None
+    assert preprocess_binding is not None
+    assert download_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+    assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+
+
+def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
+    tmp_path: Path,
+) -> None:
+    """同一 Host assembly 中 Fins awaiting provider workspace 必须一致。"""
+
+    with pytest.raises(ValueError, match="same absolute workspace_root"):
+        _tooling_options_from_discovery(
+            tool_bundle=ToolBundle(
+                definitions=(
+                    _tool_definition(DOWNLOAD_TOOL_NAME),
+                    _tool_definition(PREPROCESS_TOOL_NAME),
+                )
+            ),
+            source_refs=(_source_ref("fins-awaiting-test"),),
+            provider_configs=(
+                _provider_config(
+                    provider_id="financial-download-tools",
+                    import_path="custom.download:discover_tools",
+                    source_id="custom.download",
+                    workspace_root=(tmp_path / "one").resolve(strict=False),
+                ),
+                _provider_config(
+                    provider_id="financial-preprocess-tools",
+                    import_path="custom.preprocess:discover_tools",
+                    source_id="custom.preprocess",
+                    workspace_root=(tmp_path / "two").resolve(strict=False),
+                ),
+            ),
+            duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+        )
+
+
+def test_fins_awaiting_provider_missing_workspace_root_fails_before_open_host() -> None:
+    """Fins awaiting provider 缺少 workspace_root 时必须在 open_host 前失败。"""
+
+    with pytest.raises(ValueError, match="non-empty absolute path"):
+        _tooling_options_from_discovery(
+            tool_bundle=ToolBundle(definitions=(_tool_definition(DOWNLOAD_TOOL_NAME),)),
+            source_refs=(_source_ref("fins-awaiting-test"),),
+            provider_configs=(
+                _provider_config_with_config(
+                    provider_id="financial-download-tools",
+                    import_path="custom.download:discover_tools",
+                    source_id="custom.download",
+                    config={},
+                ),
+            ),
+            duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+        )
+
+
+def test_fins_awaiting_provider_relative_workspace_root_fails_before_open_host() -> None:
+    """Fins awaiting provider 使用相对 workspace_root 时必须在 open_host 前失败。"""
+
+    with pytest.raises(ValueError, match="must be absolute"):
+        _tooling_options_from_discovery(
+            tool_bundle=ToolBundle(definitions=(_tool_definition(DOWNLOAD_TOOL_NAME),)),
+            source_refs=(_source_ref("fins-awaiting-test"),),
+            provider_configs=(
+                _provider_config_with_config(
+                    provider_id="financial-download-tools",
+                    import_path="custom.download:discover_tools",
+                    source_id="custom.download",
+                    config={"workspace_root": "relative/fins-workspace"},
+                ),
+            ),
+            duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+        )
+
+
+def test_fins_awaiting_provider_duplicate_binding_fails_before_open_host(
+    tmp_path: Path,
+) -> None:
+    """重复 Fins awaiting binding 必须 fail fast，避免 registry 非确定合并。"""
+
+    workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    with pytest.raises(ValueError, match="duplicate Fins wait adapter binding"):
+        _tooling_options_from_discovery(
+            tool_bundle=ToolBundle(definitions=(_tool_definition(DOWNLOAD_TOOL_NAME),)),
+            source_refs=(_source_ref("fins-awaiting-test"),),
+            provider_configs=(
+                _provider_config(
+                    provider_id="financial-download-tools",
+                    import_path="custom.one:discover_tools",
+                    source_id="custom.one",
+                    workspace_root=workspace_root,
+                ),
+                _provider_config(
+                    provider_id="another-download-provider",
+                    import_path="dayu.fins.tools.download_provider:discover_tools",
+                    source_id="custom.two",
+                    workspace_root=workspace_root,
+                ),
+            ),
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
@@ -1359,6 +1534,80 @@ def _tool_definition(name: str) -> ToolDefinition:
         truncate=None,
         display=None,
         tags=(),
+    )
+
+
+def _source_ref(source_id: str) -> ToolBundleSourceRef:
+    """构造测试用工具来源引用。
+
+    :param source_id: 来源标识。
+    :returns: 工具来源引用。
+    :raises ValueError: 来源字段非法时由契约构造抛出。
+    """
+
+    return ToolBundleSourceRef(
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id=source_id,
+        version_ref=None,
+        content_digest=None,
+    )
+
+
+def _provider_config(
+    *,
+    provider_id: str,
+    import_path: str,
+    source_id: str,
+    workspace_root: Path,
+) -> ToolDiscoveryProviderConfig:
+    """构造测试用工具发现 provider 配置。
+
+    :param provider_id: provider spec id。
+    :param import_path: 显式 provider import path。
+    :param source_id: provider source id。
+    :param workspace_root: Fins workspace root。
+    :returns: ToolDiscoveryProviderConfig。
+    :raises ValueError: 不主动抛出异常。
+    """
+
+    return ToolDiscoveryProviderConfig(
+        provider_id=provider_id,
+        import_path=import_path,
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id=source_id,
+        enabled=True,
+        allow_empty=False,
+        config={"workspace_root": str(workspace_root)},
+    )
+
+
+def _provider_config_with_config(
+    *,
+    provider_id: str,
+    import_path: str,
+    source_id: str,
+    config: dict[str, JsonValue],
+) -> ToolDiscoveryProviderConfig:
+    """使用原始 config 构造测试用 provider 配置。
+
+    :param provider_id: provider spec id。
+    :param import_path: 显式 provider import path。
+    :param source_id: provider source id。
+    :param config: provider 自有 JSON config。
+    :returns: ToolDiscoveryProviderConfig。
+    :raises ValueError: 不主动抛出异常。
+    """
+
+    return ToolDiscoveryProviderConfig(
+        provider_id=provider_id,
+        import_path=import_path,
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id=source_id,
+        enabled=True,
+        allow_empty=False,
+        config=config,
     )
 
 

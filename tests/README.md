@@ -108,7 +108,8 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime typed config、locations、工具发现、prepared scene、显式 override 与 env/secret mapping 映射为 Host public typed inputs：
 
 - host assembly：覆盖 `host_runtime.json` 的 SQLite write retry、payload inline threshold、worker startup timeout 等 construction tuning 被映射进 `OpenHostOptions`，execution profile 的工具重复治理 policy 被映射进 `HostToolingOptions`，provider secret 占位符在 Service helper 中解析，prompt asset path / 工具发现 source refs / provider location 边界 fail-fast，compactor scene 必填 AgentPolicy 字段校验，以及 per-run helper 直接使用 `PreparedSceneInputs.system_prompt` 生成 `SubmitFollowupRequest`。
-- import boundary / weak typing guard：阻止 Service 导入 Config、UI、Fins 等越界层，并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
+- Fins awaiting assembly：覆盖 Service 基于启用 provider 的显式 provider id、import path、source id 与 provider config 识别 Fins download / preprocess awaiting providers，为 `HostToolingOptions` 绑定 wait adapter registry，并在 workspace root 不一致或重复 wait binding 时于 `open_host` 前 fail fast。
+- import boundary / weak typing guard：阻止 Service 导入 Config、UI 或 Fins 非 assembly 边界；当前只允许 Service composition helper 导入 `dayu.fins.ingestion` 来装配 Fins wait adapter，并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
 
 ### `tests/contracts/`
 
@@ -143,7 +144,11 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 
 ### `tests/fins/`
 
-财报仓储与 Fins read tools provider 测试，覆盖 `dayu.fins.storage` 文件系统仓储协议实现、确定性财报 fixture 的 list/read、`dayu.fins.tools.provider` 通过当前 `ToolsDiscovery` 暴露带 `fins` tag 的 read tools、`include_read_tools=false` 返回空工具集且不解析 workspace root、`list_documents` 与 `search_document` 通过当前 ToolRuntime accept path 执行、数组 / 标量参数投影、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露、ingestion tools fail-closed，以及基于 AST import 解析的 Fins / Engine / runtime import boundary。
+财报仓储、Fins read tools provider、Fins ingestion awaiting providers 与 ingestion runtime 测试，覆盖 `dayu.fins.storage` 文件系统仓储协议实现、确定性财报 fixture 的 list/read、`dayu.fins.tools.provider` 通过当前 `ToolsDiscovery` 暴露带 `fins` tag 的 read tools、`include_read_tools=false` 返回空工具集且不解析 workspace root、read provider 只暴露 read tools、`list_documents` 与 `search_document` 通过当前 ToolRuntime accept path 执行、数组 / 标量参数投影、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露、workspace overlay 独立启用 read / download / preprocess providers、download / preprocess 独立 provider discovery、awaiting callable 的 `EXTERNAL_JOB` outcome、Fins wait adapter registry binding、poll adapter 的 terminal / missing job 映射、abandon wait 请求 job cancellation、参数错误到 current failure outcome，以及基于 AST import 解析的 Fins / Engine / runtime import boundary。
+
+`tests/fins/test_fins_ingestion_tools.py` 覆盖 `dayu.fins.tools.download_provider` 与 `dayu.fins.tools.preprocess_provider` 的独立 ToolsDiscovery provider report、独立 provider id / spec id / tool name、download / preprocess 工具 schema 不暴露 Host 内部治理字段、工具调用启动 shared runtime job 后返回 `ToolAwaitingOutcome`、Fins wait adapter registry 对 S4 稳定工具名的绑定与重复 binding fail fast、poll adapter 对 succeeded / failed / cancelled / queued / missing job 的 Host wait outcome 映射、abandon wait 标记 cancellation requested，以及 provider 创建的不同 runtime 实例通过同一 workspace 派生 job store 收敛。
+
+`tests/fins/test_fins_ingestion_runtime.py` 覆盖 workspace-scoped ingestion runtime：cross-runtime shared workspace job store、download / preprocess queued job persistence、ticker normalization、无网络 fake download adapter 写入 source/blob 仓储、unsupported source failed terminal、重复下载按 storage 语义跳过、rejected filing artifact 通过 maintenance 仓储保存、preprocess source -> processed pipeline、已有 processed 跳过 / 重建、missing document failed terminal、unsupported processor not_supported summary、cancel transition、record leakage boundary、job store 原子写入失败清理、文件锁失败关闭，以及新增 ingestion runtime 不破坏 read provider / `FinsReadRuntime` 懒加载行为。
 
 Fins fixture 由测试通过仓储 public API 写入临时 workspace，不依赖隐式 cwd、环境变量或手工拼生产路径。
 

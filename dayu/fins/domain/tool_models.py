@@ -144,7 +144,7 @@ class Citation:
 class SectionSemantic:
     """章节语义层字段。
 
-    对 SectionSummary 的语义增强，由 service 层在返回时注入。
+    对 SectionSummary 的语义增强，由 read runtime在返回时注入。
 
     Attributes:
         item: Item 编号（如 "Item 1A"），非 SEC filing 时为 None。

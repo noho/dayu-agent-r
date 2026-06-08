@@ -128,7 +128,7 @@ def normalize_ticker(raw: str) -> NormalizedTicker:
 def try_normalize_ticker(raw: str) -> Optional[NormalizedTicker]:
     """``normalize_ticker`` 的非抛错版本。
 
-    用于 service 层"ticker 可能是公司名"的分支：识别失败时由上层回退到
+    用于 read runtime"ticker 可能是公司名"的分支：识别失败时由上层回退到
     公司 alias 查表，而不是直接报错。
 
     Args:

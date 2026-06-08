@@ -67,6 +67,12 @@ _FINS_READ_TOOL_NAMES = (
     "get_financial_statement",
     "query_xbrl_facts",
 )
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FINS_WAIT_ADAPTER_PATH = (
+    _REPO_ROOT / "dayu" / "fins" / "ingestion" / "wait_adapter.py"
+).resolve(strict=False)
+_FINS_DEFAULT_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.host", "dayu.service", "dayu.ui")
+_FINS_WAIT_ADAPTER_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.service", "dayu.ui")
 
 
 class _OpenCancellationToken:
@@ -323,31 +329,31 @@ def test_fins_truncate_specs_use_current_contract(tmp_path: Path) -> None:
     assert search_document_truncate.target_field == "matches"
 
 
-def test_ingestion_tools_are_fail_closed_pending_wait_adapter(tmp_path: Path) -> None:
-    """显式开启 ingestion tools 时 provider 必须 fail closed。"""
+def test_read_provider_only_exposes_read_tools(tmp_path: Path) -> None:
+    """read provider 不应混入 download / preprocess ingestion tools。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
-    spec = _spec(
-        workspace_root,
-        extra_config={"include_ingestion_tools": True},
-    )
+    output = discover_tools(_spec(workspace_root))
 
-    with pytest.raises(ValueError, match="ToolAwaitingOutcome"):
-        discover_tools(spec)
+    names = tuple(definition.name for definition in output.definitions)
+    assert names == _FINS_READ_TOOL_NAMES
+    assert "start_fins_download" not in names
+    assert "start_fins_preprocess" not in names
 
 
 def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
     """workspace_root 不得从 cwd 或环境隐式解析。"""
 
     spec = ToolsDiscoveryProviderSpec(
-        spec_id="financial-tools",
-        location=PythonImportPathProvider(import_path="dayu.fins.tools:discover_tools"),
+        spec_id="financial-read-tools",
+        location=PythonImportPathProvider(
+            import_path="dayu.fins.tools.provider:discover_tools"
+        ),
         enabled=True,
         allow_empty=False,
         config={
             "workspace_root": "workspace/fins",
             "include_read_tools": True,
-            "include_ingestion_tools": False,
             "limits": {},
         },
     )
@@ -359,10 +365,10 @@ def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
 def test_fins_import_boundaries_do_not_reverse_depend() -> None:
     """Fins imports 不得引入 Host/Service/UI/Engine 反向依赖。"""
 
-    forbidden = ("dayu.engine", "dayu.host", "dayu.service", "dayu.ui")
     offenders: list[str] = []
     for path in Path("dayu/fins").rglob("*.py"):
         imported_modules = _module_imports(path)
+        forbidden = _fins_forbidden_import_roots(path)
         if any(_is_forbidden_import(name, forbidden) for name in imported_modules):
             offenders.append(str(path))
 
@@ -511,7 +517,6 @@ def _spec(
     config: dict[str, JsonValue] = {
         "workspace_root": str(workspace_root),
         "include_read_tools": True,
-        "include_ingestion_tools": False,
         "limits": {
             "search_document_max_items": 10,
             "list_documents_max_items": 20,
@@ -520,8 +525,10 @@ def _spec(
     if extra_config is not None:
         config.update(extra_config)
     return ToolsDiscoveryProviderSpec(
-        spec_id="financial-tools",
-        location=PythonImportPathProvider(import_path="dayu.fins.tools:discover_tools"),
+        spec_id="financial-read-tools",
+        location=PythonImportPathProvider(
+            import_path="dayu.fins.tools.provider:discover_tools"
+        ),
         enabled=True,
         allow_empty=False,
         config=config,
@@ -608,6 +615,24 @@ def _is_forbidden_import(module_name: str, forbidden_roots: tuple[str, ...]) -> 
         module_name == root or module_name.startswith(f"{root}.")
         for root in forbidden_roots
     )
+
+
+def _fins_forbidden_import_roots(path: Path) -> tuple[str, ...]:
+    """返回指定 Fins 源文件适用的禁用 import 根模块。
+
+    Args:
+        path: Fins 源文件路径。
+
+    Returns:
+        禁用 import 根模块元组。
+
+    Raises:
+        无。
+    """
+
+    if path.resolve(strict=False) == _FINS_WAIT_ADAPTER_PATH:
+        return _FINS_WAIT_ADAPTER_FORBIDDEN_IMPORT_ROOTS
+    return _FINS_DEFAULT_FORBIDDEN_IMPORT_ROOTS
 
 
 def _tool_runtime(workspace_root: Path) -> tuple[ToolRuntimeHandle, _AcceptingPort]:
