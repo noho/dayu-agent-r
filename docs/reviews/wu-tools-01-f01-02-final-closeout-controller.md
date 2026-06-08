@@ -47,7 +47,7 @@ The work unit has no unresolved current-gate findings. Remaining residual risks 
 
 | ID | Status | Owner / Destination | Next Step |
 |---|---|---|---|
-| WU-TOOLS-01-F01-02-R1 | deferred-with-owner | WU-WAIT-03 or independent Host / Engine design follow-up | Design two-stage awaiting startup before changing Host wait adapter or Fins runtime activation contract. |
+| WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | Design two-stage awaiting startup before changing Host wait adapter or Fins runtime activation contract. |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | Provider-specific runtime owner | Add deeper physical interruption only where a provider/runtime can support it; current WU uses cooperative checkpoints and bounded waits. |
 | WU-TOOLS-01-F01-02-R3 | deferred-with-owner | Future tool adapter cancellation contract WU | Decide whether legacy adapter `ToolBusinessError(code="tool_cancelled")` should project as `ToolCancelledOutcome` instead of stable failed outcome. |
 
