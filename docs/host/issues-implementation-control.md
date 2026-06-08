@@ -199,7 +199,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-S1-R1 | deferred-with-owner | WU-TOOLS-01-F04/F05 and WU-TOOLS-01-F06/F07 / GitHub Issues #121 and #122 | 分别迁移 SEC/Fins 与 CN/HK Docling CI pipeline，再生成各自 smoke。 |
 | WU-TOOLS-01-S1-R2 | deferred-with-owner | WU-TOOLS-01-F08 | 清理 documents processor registry 的 OLD `engine` 命名。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
-| WU-TOOLS-01-F01-02-R2 | deferred-with-owner | Provider-specific runtime owner | 仅在具体 provider/runtime 支持时追加物理中断；当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
+| WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F01-02-R3 | deferred-with-owner | Future tool adapter cancellation contract WU | 裁决 legacy adapter 的 `tool_cancelled` 是否应投影为 `ToolCancelledOutcome`。 |
 
 ## 当前 Work Units
