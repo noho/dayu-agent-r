@@ -29,7 +29,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - Agent、Runner、Attempt 和 Engine worker 都是一次执行边界；steer、resume、recovery、retry、replay 都创建新的 Attempt 或新关联 Run，不恢复旧实例。
 - 工具调用必须经过 Host-owned ToolRuntime、accept barrier、截断治理、等待治理和重复调用治理；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。
 - Context compaction 治理由 Host 负责；Engine 只在 provider 明确报告输入上下文溢出时发出 `context_compaction_requested`。
-- 财报 read、download、preprocess / process 的业务底座收敛到共享 Fins service/runtime 与 `dayu.fins.storage` 仓储协议；Host 和 Engine 不直接读取财报原文或仓储文件。
+- 财报 read、download、preprocess / process 与 upload 的业务底座收敛到共享 Fins service/runtime 与 `dayu.fins.storage` 仓储协议；Host 和 Engine 不直接读取财报原文或仓储文件。
 
 ## 整体架构
 
@@ -88,7 +88,7 @@ flowchart TD
 - `dayu.host`：public Host handle、durable store、admission、dispatch、EngineEvent ingest、ToolRuntime、waiting、context compaction、Conversation Memory、projection、outbox、purge、startup recovery。
 - `dayu.engine`：`run_agent_messages`、`run_agent_and_wait`、Agent loop、Runner 协议归一、provider adapter、tool loop、length continuation、fallback、provider error classification 和 EngineEvent contract。
 - `dayu.tools`：业务工具 provider 与工具实现，输出 current `ToolDefinition` / `ToolBundle`。
-- `dayu.fins`：财报 storage repository、read runtime、ingestion runtime、download / preprocess / process job foundation、processors、Fins tools provider。
+- `dayu.fins`：财报 storage repository、read runtime、ingestion runtime、download / preprocess / process / upload job foundation、processors、Fins tools provider。
 - `dayu.documents`：Markdown、HTML、Docling JSON 等文档处理器与 Docling PDF runtime 装配 helper。
 
 ## 关键执行路径
@@ -107,7 +107,7 @@ UI / Service 调用 `open_host(options)` 得到 Host handle，先 ensure / creat
 
 ### 工具与 Fins
 
-Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host ToolRuntime 把业务 `ToolBundle` 包装成受治理的 batch executor，负责权限、截断、等待、重复调用治理、diagnostic、payload descriptor 和 accept barrier。Fins 工具通过共享 `DefaultFinsRuntime.get_read_runtime()` 与 `DefaultFinsRuntime.get_ingestion_runtime()` 复用同一套仓储、处理器注册表和 ingestion job store，避免 CLI / tools / CI 多入口下业务逻辑漂移。
+Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host ToolRuntime 把业务 `ToolBundle` 包装成受治理的 batch executor，负责权限、截断、等待、重复调用治理、diagnostic、payload descriptor 和 accept barrier。Fins 工具通过共享 `DefaultFinsRuntime.get_read_runtime()` 与 `DefaultFinsRuntime.get_ingestion_runtime()` 复用同一套仓储、处理器注册表和 ingestion job store；download、preprocess 与 upload 长事务通过 Fins wait adapter 接入 Host wait-resume，避免 CLI / tools / CI 多入口下业务逻辑漂移。
 
 ### Wait / resume
 
@@ -203,11 +203,11 @@ Fins public 使用边界不在 `dayu.fins` 包根导出，当前包根 `__all__`
 
 - `dayu.fins.storage`：财报文档、公司元数据、source document、blob、processed document、maintenance 等仓储协议与 filesystem 实现。
 - `dayu.fins.service_runtime.DefaultFinsRuntime`：共享 Fins runtime assembly root，提供 `get_read_runtime()` 与 `get_ingestion_runtime()`。
-- `dayu.fins.tools.*_provider`：把 Fins read / download / preprocess 能力声明为业务工具 provider。
+- `dayu.fins.tools.*_provider`：把 Fins read / download / preprocess / upload 能力声明为业务工具 provider。
 - `dayu.fins.ingestion_runtime`：download / preprocess / process 的 ingestion runtime foundation。
 - `dayu.fins.processors`：财报处理器和处理器注册表。
 
-财报存取必须通过 `dayu.fins.storage` 仓储协议；CLI、tool provider、CI 或其它入口需要复用同一 shared Fins service/runtime，避免 read、download、preprocess / process 逻辑在多个入口漂移。
+财报存取必须通过 `dayu.fins.storage` 仓储协议；CLI、tool provider、CI 或其它入口需要复用同一 shared Fins service/runtime，避免 read、download、preprocess / process、upload 逻辑在多个入口漂移。
 
 ## 日志与可观测性
 

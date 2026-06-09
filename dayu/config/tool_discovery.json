@@ -35,6 +35,18 @@
         "workspace_root": null
       }
     },
+    "financial-upload-tools": {
+      "import_path": "dayu.fins.tools.upload_provider:discover_tools",
+      "entry_point": null,
+      "source_kind": "explicit_provider",
+      "source_id": "dayu.fins.tools.upload_provider",
+      "enabled": false,
+      "allow_empty": true,
+      "config": {
+        "workspace_root": null,
+        "allowed_upload_roots": []
+      }
+    },
     "doc-tools": {
       "import_path": "dayu.tools.doc_provider:discover_tools",
       "entry_point": null,

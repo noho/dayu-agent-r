@@ -1,8 +1,9 @@
-"""Fins 下载与预处理运行时基础能力。
+"""Fins 下载、预处理与上传运行时基础能力。
 
 本模块只承载 Fins 自有 ingestion job 的 typed 请求、结果摘要、持久化
-job record、文件系统 job store 与运行时入口。它不实现真实网络下载、
-Host wait adapter、tool provider 或 CLI。
+job record、文件系统 job store、download / preprocess / upload job foundation
+与运行时入口。它不实现真实网络下载、真实 upload workflow、Host wait
+adapter、tool provider 或 CLI。
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from enum import Enum
 from io import BytesIO
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Final, Protocol, cast, get_args
+from typing import Final, Protocol, assert_never, cast, get_args
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -93,6 +94,7 @@ class FinsIngestionOperationKind(str, Enum):
 
     DOWNLOAD = "download"
     PREPROCESS = "preprocess"
+    UPLOAD = "upload"
 
 
 class FinsIngestionJobStatus(str, Enum):
@@ -138,7 +140,9 @@ class FinsDownloadRequest:
         filed_after: 可选起始披露日期字符串。
         filed_before: 可选结束披露日期字符串。
         overwrite_existing: 是否允许覆盖已存在源文档。
-        rebuild_processed: 下载后是否要求后续重建 processed 产物。
+        rebuild_processed: 下载后是否要求后续重建 processed 产物；source-specific
+            adapter 必须按自身仓储语义处理该治理标记，不得假设它等同于来源侧
+            下载工作流的本地重建开关。
     """
 
     ticker: str
@@ -245,6 +249,9 @@ class FinsSourceDownloadAdapterRequest:
         form_types: 表单过滤条件。
         filed_after: 可选起始披露日期字符串。
         filed_before: 可选结束披露日期字符串。
+        overwrite_existing: 是否允许覆盖已存在源文档。
+        rebuild_processed: 下载后是否要求后续重建 processed 产物。
+        cancellation_checker: runtime 提供的协作式取消检查器。
     """
 
     normalized_ticker: NormalizedTicker
@@ -252,6 +259,9 @@ class FinsSourceDownloadAdapterRequest:
     form_types: tuple[str, ...]
     filed_after: str | None
     filed_before: str | None
+    overwrite_existing: bool
+    rebuild_processed: bool
+    cancellation_checker: FinsJobCancellationChecker
 
 
 @dataclass(frozen=True)
@@ -263,12 +273,16 @@ class FinsSourceDownloadAdapterResult:
         documents: 可写入 source 仓储的文档。
         rejected_artifacts: 需要保存为 rejected filing artifact 的文档。
         failed_count: 来源侧业务失败候选数量。
+        persisted_summary: adapter 已通过仓储完成持久化时返回的下载摘要；返回该
+            字段表示 adapter 对 source 文件、rejected artifact 以及必要的
+            processed reprocess 标记等仓储副作用负责，runtime 只记录摘要。
     """
 
     discovered_count: int
     documents: tuple[FinsDownloadedSourceDocument, ...] = ()
     rejected_artifacts: tuple[FinsRejectedFilingDownloadArtifact, ...] = ()
     failed_count: int = 0
+    persisted_summary: FinsDownloadResultSummary | None = None
 
 
 class FinsSourceDownloadAdapter(Protocol):
@@ -307,6 +321,102 @@ class FinsPreprocessRequest:
     document_ids: tuple[str, ...] = ()
     form_types: tuple[str, ...] = ()
     rebuild_processed: bool = False
+
+
+_UPLOAD_ACTION_AUTO: Final[str] = "auto"
+_UPLOAD_ACTION_CREATE: Final[str] = "create"
+_UPLOAD_ACTION_UPDATE: Final[str] = "update"
+_UPLOAD_ACTION_DELETE: Final[str] = "delete"
+_UPLOAD_ACTION_VALUES: Final[frozenset[str]] = frozenset(
+    {
+        _UPLOAD_ACTION_AUTO,
+        _UPLOAD_ACTION_CREATE,
+        _UPLOAD_ACTION_UPDATE,
+        _UPLOAD_ACTION_DELETE,
+    }
+)
+_UPLOAD_RESULT_STATUS_UNKNOWN: Final[str] = "unknown"
+_UPLOAD_RESULT_STATUS_FAILED: Final[str] = "failed"
+_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE: Final[
+    str
+] = "不支持的上传运行时 (unsupported upload runtime): production upload runner 尚未装配"
+
+
+@dataclass(frozen=True)
+class FinsUploadFilingRequest:
+    """财报 filing 上传任务请求。
+
+    Attributes:
+        ticker: 用户提供的 ticker 文本，运行时会先调用公共 ticker 归一化 API。
+        source_kind: 源文档类别；filing 上传必须为 ``SourceKind.FILING``。
+        action: 上传动作，允许 ``auto``、``create``、``update`` 或 ``delete``。
+        files: 待上传文件路径；Slice 1 只保存文件数量摘要，不读取文件。
+        fiscal_year: 可选会计年度。
+        fiscal_period: 可选会计期间。
+        amended: 是否为修正 filing。
+        filing_date: 可选披露日期。
+        report_date: 可选报告期日期。
+        company_name: 可选公司名称。
+        ticker_aliases: 可选 ticker 别名。
+        overwrite: 是否覆盖已有 source document。
+    """
+
+    ticker: str
+    source_kind: SourceKind = SourceKind.FILING
+    action: str = _UPLOAD_ACTION_AUTO
+    files: tuple[Path, ...] = ()
+    fiscal_year: int | None = None
+    fiscal_period: str | None = None
+    amended: bool = False
+    filing_date: str | None = None
+    report_date: str | None = None
+    company_name: str | None = None
+    ticker_aliases: tuple[str, ...] = ()
+    overwrite: bool = False
+
+
+@dataclass(frozen=True)
+class FinsUploadMaterialRequest:
+    """财报 material 上传任务请求。
+
+    Attributes:
+        ticker: 用户提供的 ticker 文本，运行时会先调用公共 ticker 归一化 API。
+        source_kind: 源文档类别；material 上传必须为 ``SourceKind.MATERIAL``。
+        action: 上传动作，允许 ``auto``、``create``、``update`` 或 ``delete``。
+        files: 待上传文件路径；Slice 1 只保存文件数量摘要，不读取文件。
+        form_type: 可选材料表单类型。
+        material_name: 可选材料名称。
+        document_id: 可选业务文档 ID。
+        internal_document_id: 可选来源内部文档 ID。
+        fiscal_year: 可选会计年度。
+        fiscal_period: 可选会计期间。
+        amended: 是否为修正材料。
+        filing_date: 可选披露日期。
+        report_date: 可选报告期日期。
+        company_name: 可选公司名称。
+        ticker_aliases: 可选 ticker 别名。
+        overwrite: 是否覆盖已有 source document。
+    """
+
+    ticker: str
+    source_kind: SourceKind = SourceKind.MATERIAL
+    action: str = _UPLOAD_ACTION_AUTO
+    files: tuple[Path, ...] = ()
+    form_type: str | None = None
+    material_name: str | None = None
+    document_id: str | None = None
+    internal_document_id: str | None = None
+    fiscal_year: int | None = None
+    fiscal_period: str | None = None
+    amended: bool = False
+    filing_date: str | None = None
+    report_date: str | None = None
+    company_name: str | None = None
+    ticker_aliases: tuple[str, ...] = ()
+    overwrite: bool = False
+
+
+FinsUploadRequest = FinsUploadFilingRequest | FinsUploadMaterialRequest
 
 
 @dataclass(frozen=True)
@@ -432,17 +542,137 @@ class FinsPreprocessResultSummary:
 
 
 @dataclass(frozen=True)
+class FinsUploadResultSummary:
+    """上传任务结果摘要。
+
+    Attributes:
+        source_kind: 源文档类别，使用已有 ``SourceKind`` 区分 filing/material。
+        document_id: 可选业务文档 ID。
+        internal_document_id: 可选来源内部文档 ID。
+        status: 上传业务状态摘要。
+        uploaded_files: 已写入或处理的文件名摘要；不得包含路径。
+        primary_document: 可选主文件名。
+        deleted: 是否执行了删除动作。
+        skip_reason: 可选跳过原因。
+        document_version: 可选文档版本。
+        source_fingerprint: 可选来源指纹。
+    """
+
+    source_kind: SourceKind
+    document_id: str | None = None
+    internal_document_id: str | None = None
+    status: str = _UPLOAD_RESULT_STATUS_UNKNOWN
+    uploaded_files: tuple[str, ...] = ()
+    primary_document: str | None = None
+    deleted: bool = False
+    skip_reason: str | None = None
+    document_version: str | None = None
+    source_fingerprint: str | None = None
+
+    def to_json_summary(self) -> dict[str, JsonValue]:
+        """转换为 JSON-compatible 摘要。
+
+        Args:
+            无。
+
+        Returns:
+            只包含上传业务结果摘要字段的 JSON-compatible 字典。
+
+        Raises:
+            ValueError: 文档 ID、文件名或摘要大小超过 job record 边界时抛出。
+        """
+
+        return {
+            "source_kind": self.source_kind.value,
+            "document_id": _optional_bounded_text(
+                self.document_id,
+                "upload_document_id",
+                reject_path_separators=False,
+            ),
+            "internal_document_id": _optional_bounded_text(
+                self.internal_document_id,
+                "upload_internal_document_id",
+                reject_path_separators=False,
+            ),
+            "status": _bounded_text(self.status, "upload_status", reject_path_separators=False),
+            "uploaded_files": list(_bounded_text_tuple(self.uploaded_files, "uploaded_files")),
+            "primary_document": _optional_bounded_text(self.primary_document, "primary_document"),
+            "deleted": self.deleted,
+            "skip_reason": _optional_bounded_text(
+                self.skip_reason,
+                "skip_reason",
+                reject_path_separators=False,
+            ),
+            "document_version": _optional_bounded_text(
+                self.document_version,
+                "document_version",
+                reject_path_separators=False,
+            ),
+            "source_fingerprint": _optional_bounded_text(
+                self.source_fingerprint,
+                "source_fingerprint",
+                reject_path_separators=False,
+            ),
+        }
+
+
+class FinsJobCancellationChecker(Protocol):
+    """Fins 后台 job 协作式取消检查协议。"""
+
+    def __call__(self) -> bool:
+        """返回当前 Fins job 是否已被请求取消。
+
+        Args:
+            无。
+
+        Returns:
+            已请求取消时返回 ``True``，否则返回 ``False``。
+
+        Raises:
+            OSError: job store 读取失败时可由具体实现抛出。
+            ValueError: job record 非法时可由具体实现抛出。
+        """
+        ...
+
+
+class FinsUploadRunner(Protocol):
+    """Fins 上传业务 runner 协议。"""
+
+    def run_upload(
+        self,
+        request: FinsUploadRequest,
+        *,
+        cancellation_checker: FinsJobCancellationChecker,
+    ) -> FinsUploadResultSummary:
+        """执行上传业务逻辑。
+
+        Args:
+            request: 已通过 runtime 启动边界校验的上传请求。
+            cancellation_checker: runtime 提供的协作式取消检查器。
+
+        Returns:
+            有界上传结果摘要。
+
+        Raises:
+            RuntimeError: 上传业务失败时抛出。
+            ValueError: 请求字段或结果字段非法时抛出。
+            OSError: 上传过程中仓储读写失败时抛出。
+        """
+        ...
+
+
+@dataclass(frozen=True)
 class FinsIngestionJobRecord:
     """Fins ingestion 持久化 job record。
 
     Attributes:
         job_id: ASCII opaque job id。
-        operation_kind: 下载或预处理。
+        operation_kind: 下载、预处理或上传。
         normalized_ticker: 标准化后的 ticker 裸码。
         market: 标准化市场。
         exchange: 标准化交易所；美股无明确交易所时为 ``None``。
-        source: 下载来源标识；预处理任务可为 ``None``。
-        source_kind: 源文档类型；下载任务可为 ``None``。
+        source: 下载来源标识；预处理与上传任务为 ``None``。
+        source_kind: 源文档类型；预处理与上传任务用于区分 filing/material，下载任务为 ``None``。
         status: 当前 job 状态。
         created_at: 创建时间。
         updated_at: 最后更新时间。
@@ -543,6 +773,55 @@ class FinsIngestionJobStore(Protocol):
             FileNotFoundError: job id 不存在时抛出。
             OSError: 文件系统写入失败时抛出。
             ValueError: record 或摘要字段非法时抛出。
+        """
+        ...
+
+    def save_cancelled_if_active(
+        self,
+        job_id: str,
+        *,
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """仅当当前 job 非终态时原子保存 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            finished_at: 本次 cancelled 终态写入时间。
+
+        Returns:
+            已持久化的 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id 或 record 字段非法时抛出。
+        """
+        ...
+
+    def save_failed_or_cancelled_if_active(
+        self,
+        job_id: str,
+        *,
+        failure_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """按当前状态原子保存 failed 或 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            failure_summary: failed 终态的有界失败摘要。
+            result_summary: failed 终态的有界业务结果摘要。
+            finished_at: 本次终态写入时间。
+
+        Returns:
+            已持久化的 job record；若当前已是终态则原样返回；若当前已请求取消则返回
+            cancelled 终态，否则返回 failed 终态。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、record 或摘要字段非法时抛出。
         """
         ...
 
@@ -647,6 +926,35 @@ class FinsIngestionThreadExecutor:
             daemon=True,
         )
         thread.start()
+
+
+@dataclass(frozen=True)
+class _RuntimeJobCancellationChecker:
+    """基于 job store 的 Fins job 取消检查器。"""
+
+    job_store: FinsIngestionJobStore
+    job_id: str
+
+    def __call__(self) -> bool:
+        """返回当前 job 是否已请求取消。
+
+        Args:
+            无。
+
+        Returns:
+            job 已处于 cancelling 或 cancelled 时返回 ``True``。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: job store 读取失败时抛出。
+            ValueError: job record 非法时抛出。
+        """
+
+        record = self.job_store.read_job(self.job_id)
+        return record.cancellation_requested or record.status in {
+            FinsIngestionJobStatus.CANCELLING,
+            FinsIngestionJobStatus.CANCELLED,
+        }
 
 
 @dataclass(frozen=True)
@@ -784,6 +1092,96 @@ class FsFinsIngestionJobStore:
             )
             self._write_record_locked(succeeded)
             return succeeded
+
+    def save_cancelled_if_active(
+        self,
+        job_id: str,
+        *,
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """仅当当前 job 非终态时原子保存 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            finished_at: 本次 cancelled 终态写入时间。
+
+        Returns:
+            已持久化的 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id 或 record 字段非法时抛出。
+        """
+
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
+            record = self._read_record_locked(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return record
+            cancelled = replace(
+                record,
+                status=FinsIngestionJobStatus.CANCELLED,
+                updated_at=finished_at,
+                finished_at=finished_at,
+                cancellation_requested=True,
+            )
+            self._write_record_locked(cancelled)
+            return cancelled
+
+    def save_failed_or_cancelled_if_active(
+        self,
+        job_id: str,
+        *,
+        failure_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """按当前状态原子保存 failed 或 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            failure_summary: failed 终态的有界失败摘要。
+            result_summary: failed 终态的有界业务结果摘要。
+            finished_at: 本次终态写入时间。
+
+        Returns:
+            已持久化的 job record；若当前已是终态则原样返回；若当前已请求取消则返回
+            cancelled 终态，否则返回 failed 终态。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、record 或摘要字段非法时抛出。
+        """
+
+        _assert_bounded_summary(failure_summary, "failure_summary")
+        _assert_bounded_summary(result_summary, "result_summary")
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
+            record = self._read_record_locked(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return record
+            if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
+                cancelled = replace(
+                    record,
+                    status=FinsIngestionJobStatus.CANCELLED,
+                    updated_at=finished_at,
+                    finished_at=finished_at,
+                    cancellation_requested=True,
+                )
+                self._write_record_locked(cancelled)
+                return cancelled
+            failed = replace(
+                record,
+                status=FinsIngestionJobStatus.FAILED,
+                updated_at=finished_at,
+                finished_at=finished_at,
+                result_summary=result_summary,
+                failure_summary=failure_summary,
+            )
+            self._write_record_locked(failed)
+            return failed
 
     def claim_running_or_cancelled(
         self,
@@ -954,7 +1352,7 @@ class FsFinsIngestionJobStore:
 
 @dataclass
 class FinsIngestionRuntime:
-    """Fins 下载与预处理运行时基础入口。"""
+    """Fins 下载、预处理与上传 job 运行时基础入口。"""
 
     source_repository: SourceDocumentRepositoryProtocol
     blob_repository: DocumentBlobRepositoryProtocol
@@ -964,6 +1362,7 @@ class FinsIngestionRuntime:
     job_store: FinsIngestionJobStore
     executor: FinsIngestionExecutor
     download_adapters: Mapping[tuple[str, NormalizedTickerMarket], FinsSourceDownloadAdapter]
+    upload_runner: FinsUploadRunner | None
     _start_lock: Lock
 
     @classmethod
@@ -978,6 +1377,7 @@ class FinsIngestionRuntime:
         job_store: FinsIngestionJobStore,
         executor: FinsIngestionExecutor | None = None,
         download_adapters: Mapping[tuple[str, NormalizedTickerMarket], FinsSourceDownloadAdapter] | None = None,
+        upload_runner: FinsUploadRunner | None = None,
     ) -> "FinsIngestionRuntime":
         """创建 ingestion runtime。
 
@@ -990,6 +1390,7 @@ class FinsIngestionRuntime:
             job_store: Fins ingestion job record 存储。
             executor: 可选后台执行器；不传入时使用最小 daemon thread 执行器。
             download_adapters: 可选 source/market 下载 adapter 映射。
+            upload_runner: 可选上传业务 runner；不传入时上传 job 会失败为不支持。
 
         Returns:
             Fins ingestion runtime。
@@ -1007,6 +1408,7 @@ class FinsIngestionRuntime:
             job_store=job_store,
             executor=executor or FinsIngestionThreadExecutor(),
             download_adapters=dict(download_adapters or {}),
+            upload_runner=upload_runner,
             _start_lock=Lock(),
         )
 
@@ -1119,6 +1521,56 @@ class FinsIngestionRuntime:
                 lambda: self._run_preprocess_job(
                     job_id=start.job_id,
                     request=request,
+                ),
+            )
+            return start
+
+    def start_upload(
+        self,
+        request: FinsUploadRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> FinsIngestionJobStart:
+        """启动上传 job。
+
+        本方法只负责创建 durable ``queued`` record 并提交上传 runner 边界。
+        直接创建的 runtime 若未传入 runner 仍会以不支持结束；通过
+        ``DefaultFinsRuntime`` 装配的 runtime 已提供 production SEC/CN/HK
+        upload runner。process、CLI、Host、tool/provider 装配不在 Slice 4 内。
+
+        Args:
+            request: 上传请求。
+            cancellation_token: 可选调用方取消观察 token；只用于启动边界，
+                后台 job 提交后不再作为 Fins job cancel 真源。
+
+        Returns:
+            已持久化 job 的启动结果。
+
+        Raises:
+            FinsIngestionStartCancelledError: durable job 创建前观察到取消时抛出。
+            ValueError: ticker、source_kind 或请求摘要字段非法时抛出。
+            OSError: job record 持久化失败，或 create 后取消桥接落盘失败时抛出。
+        """
+
+        normalized = ticker_normalization.normalize_ticker(request.ticker)
+        normalized_request = _normalize_upload_request(request)
+        request_summary = _upload_request_summary(normalized_request)
+        _raise_if_start_cancelled(cancellation_token)
+        with self._start_lock:
+            start = self._create_queued_record_with_start_lock(
+                operation_kind=FinsIngestionOperationKind.UPLOAD,
+                normalized=normalized,
+                source=None,
+                source_kind=normalized_request.source_kind,
+                request_summary=request_summary,
+            )
+            if _is_start_cancelled(cancellation_token):
+                return _job_start_from_record(self._save_cancelled(start.record))
+            self.executor.submit(
+                start.job_id,
+                lambda: self._run_upload_job(
+                    job_id=start.job_id,
+                    request=normalized_request,
                 ),
             )
             return start
@@ -1291,6 +1743,54 @@ class FinsIngestionRuntime:
         except Exception as exc:
             self._save_failed_from_exception(job_id, exc)
 
+    def _run_upload_job(
+        self,
+        *,
+        job_id: str,
+        request: FinsUploadRequest,
+    ) -> None:
+        """执行上传后台 job，并把异常收口到 job store。
+
+        Args:
+            job_id: opaque job id。
+            request: 已通过 runtime 启动边界校验的上传请求。
+
+        Returns:
+            无。
+
+        Raises:
+            无。所有业务与运行时异常都会转换为 terminal job record。
+        """
+
+        try:
+            record = self._mark_job_running_or_cancelled(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return
+            if self.upload_runner is None:
+                self._save_failed(
+                    record,
+                    message=_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE,
+                    result_summary=FinsUploadResultSummary(
+                        source_kind=request.source_kind,
+                        status=_UPLOAD_RESULT_STATUS_FAILED,
+                    ).to_json_summary(),
+                )
+                return
+            summary = self.upload_runner.run_upload(
+                request,
+                cancellation_checker=_RuntimeJobCancellationChecker(
+                    job_store=self.job_store,
+                    job_id=job_id,
+                ),
+            )
+            latest = self.job_store.read_job(job_id)
+            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                self._save_cancelled(latest)
+                return
+            self._save_succeeded(latest, summary.to_json_summary())
+        except Exception as exc:
+            self._save_failed_from_exception(job_id, exc)
+
     def _mark_job_running_or_cancelled(self, job_id: str) -> FinsIngestionJobRecord:
         """把 queued job 标记为 running，或按取消请求收口为 cancelled。
 
@@ -1407,8 +1907,18 @@ class FinsIngestionRuntime:
             form_types=_bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False),
             filed_after=_optional_bounded_text(request.filed_after, "filed_after"),
             filed_before=_optional_bounded_text(request.filed_before, "filed_before"),
+            overwrite_existing=request.overwrite_existing,
+            rebuild_processed=request.rebuild_processed,
+            cancellation_checker=_RuntimeJobCancellationChecker(
+                job_store=self.job_store,
+                job_id=record.job_id,
+            ),
         )
         adapter_result = adapter.download(adapter_request)
+        if adapter_result.persisted_summary is not None:
+            if adapter_result.documents or adapter_result.rejected_artifacts:
+                raise ValueError("adapter persisted_summary 不得与 documents/rejected_artifacts 同时返回")
+            return _bounded_download_summary(adapter_result.persisted_summary)
         downloaded_ids: list[str] = []
         skipped_count = 0
         rejected_count = 0
@@ -1852,15 +2362,7 @@ class FinsIngestionRuntime:
         """
 
         now = _utc_now()
-        return self.job_store.save_job(
-            replace(
-                record,
-                status=FinsIngestionJobStatus.CANCELLED,
-                updated_at=now,
-                finished_at=now,
-                cancellation_requested=True,
-            )
-        )
+        return self.job_store.save_cancelled_if_active(record.job_id, finished_at=now)
 
     def _save_failed(
         self,
@@ -1895,15 +2397,11 @@ class FinsIngestionRuntime:
         final_result = result_summary or dict(_EMPTY_SUMMARY)
         _assert_bounded_summary(final_result, "result_summary")
         now = _utc_now()
-        return self.job_store.save_job(
-            replace(
-                record,
-                status=FinsIngestionJobStatus.FAILED,
-                updated_at=now,
-                finished_at=now,
-                result_summary=final_result,
-                failure_summary=failure_summary,
-            )
+        return self.job_store.save_failed_or_cancelled_if_active(
+            record.job_id,
+            failure_summary=failure_summary,
+            result_summary=final_result,
+            finished_at=now,
         )
 
     def _save_download_unsupported(self, job_id: str, message: str) -> None:
@@ -2269,6 +2767,184 @@ def _normalize_download_source(source: str) -> str:
     return _bounded_text(source, "source").lower()
 
 
+def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
+    """校验并归一化上传请求。
+
+    Args:
+        request: 原始上传请求。
+
+    Returns:
+        已归一化 action 字段的上传请求。
+
+    Raises:
+        ValueError: source_kind、action 或有界字段非法时抛出。
+    """
+
+    action = _normalize_upload_action(request.action)
+    _validate_upload_source_kind(request)
+    if isinstance(request, FinsUploadFilingRequest):
+        return replace(request, action=action)
+    if isinstance(request, FinsUploadMaterialRequest):
+        return replace(request, action=action)
+    assert_never(request)
+
+
+def _normalize_upload_action(action: str) -> str:
+    """归一化上传动作字段。
+
+    Args:
+        action: 原始上传动作。
+
+    Returns:
+        小写上传动作。
+
+    Raises:
+        ValueError: 上传动作为空、过长或不在允许集合内时抛出。
+    """
+
+    normalized = _bounded_text(action, "upload_action", reject_path_separators=False).lower()
+    if normalized not in _UPLOAD_ACTION_VALUES:
+        allowed = ", ".join(sorted(_UPLOAD_ACTION_VALUES))
+        raise ValueError(f"upload_action 非法: {normalized}; allowed={allowed}")
+    return normalized
+
+
+def _validate_upload_source_kind(request: FinsUploadRequest) -> None:
+    """校验上传请求类型与 SourceKind 一致。
+
+    Args:
+        request: 上传请求。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: filing/material 请求使用了错误的 ``SourceKind`` 时抛出。
+    """
+
+    if isinstance(request, FinsUploadFilingRequest):
+        if request.source_kind is not SourceKind.FILING:
+            raise ValueError("filing 上传请求必须使用 source_kind=filing")
+        return
+    if isinstance(request, FinsUploadMaterialRequest):
+        if request.source_kind is not SourceKind.MATERIAL:
+            raise ValueError("material 上传请求必须使用 source_kind=material")
+        return
+    assert_never(request)
+
+
+def _upload_request_summary(request: FinsUploadRequest) -> dict[str, JsonValue]:
+    """构建有界上传请求摘要。
+
+    Args:
+        request: 已归一化上传请求。
+
+    Returns:
+        可进入 job record 的 JSON-compatible 请求摘要；不包含本地文件路径。
+
+    Raises:
+        ValueError: 请求字段超出摘要边界时抛出。
+    """
+
+    _validate_upload_file_count(request.files)
+    summary: dict[str, JsonValue] = {
+        "source_kind": request.source_kind.value,
+        "action": request.action,
+        "file_count": len(request.files),
+        "overwrite": request.overwrite,
+        "fiscal_year": _optional_non_negative_int(request.fiscal_year, "fiscal_year"),
+        "fiscal_period": _optional_bounded_text(
+            request.fiscal_period,
+            "fiscal_period",
+            reject_path_separators=False,
+        ),
+        "amended": request.amended,
+        "filing_date": _optional_bounded_text(
+            request.filing_date,
+            "filing_date",
+            reject_path_separators=False,
+        ),
+        "report_date": _optional_bounded_text(
+            request.report_date,
+            "report_date",
+            reject_path_separators=False,
+        ),
+        "company_name": _optional_bounded_text(
+            request.company_name,
+            "company_name",
+            reject_path_separators=False,
+        ),
+        "ticker_aliases": list(
+            _bounded_text_tuple(request.ticker_aliases, "ticker_aliases", reject_path_separators=False)
+        ),
+    }
+    if isinstance(request, FinsUploadMaterialRequest):
+        summary.update(
+            {
+                "form_type": _optional_bounded_text(
+                    request.form_type,
+                    "form_type",
+                    reject_path_separators=False,
+                ),
+                "material_name": _optional_bounded_text(
+                    request.material_name,
+                    "material_name",
+                    reject_path_separators=False,
+                ),
+                "document_id": _optional_bounded_text(
+                    request.document_id,
+                    "document_id",
+                    reject_path_separators=False,
+                ),
+                "internal_document_id": _optional_bounded_text(
+                    request.internal_document_id,
+                    "internal_document_id",
+                    reject_path_separators=False,
+                ),
+            }
+        )
+    _assert_bounded_summary(summary, "upload_request_summary")
+    return summary
+
+
+def _validate_upload_file_count(files: tuple[Path, ...]) -> None:
+    """校验上传文件数量。
+
+    Args:
+        files: 上传请求携带的本地文件路径元组。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 文件数量超过 job 摘要边界时抛出。
+    """
+
+    if len(files) > _MAX_TUPLE_ITEMS:
+        raise ValueError("upload_files 元素数量超出上限")
+
+
+def _optional_non_negative_int(value: int | None, field_name: str) -> int | None:
+    """校验可空非负整数。
+
+    Args:
+        value: 待校验整数或 ``None``。
+        field_name: 字段名。
+
+    Returns:
+        原整数或 ``None``。
+
+    Raises:
+        ValueError: 数值为负时抛出。
+    """
+
+    if value is None:
+        return None
+    if value < 0:
+        raise ValueError(f"{field_name} 不能为负数")
+    return value
+
+
 def _bounded_metadata(metadata: Mapping[str, str]) -> dict[str, str]:
     """校验文件级元数据。
 
@@ -2309,6 +2985,33 @@ def _non_negative_count(value: int, field_name: str) -> int:
     if value < 0:
         raise ValueError(f"{field_name} 不能为负数")
     return value
+
+
+def _bounded_download_summary(summary: FinsDownloadResultSummary) -> FinsDownloadResultSummary:
+    """校验 adapter 已持久化下载摘要。
+
+    Args:
+        summary: adapter 返回的下载摘要。
+
+    Returns:
+        字段已校验的下载摘要。
+
+    Raises:
+        ValueError: 计数为负或文档 ID 越界时抛出。
+    """
+
+    return FinsDownloadResultSummary(
+        discovered_count=_non_negative_count(summary.discovered_count, "discovered_count"),
+        downloaded_count=_non_negative_count(summary.downloaded_count, "downloaded_count"),
+        skipped_count=_non_negative_count(summary.skipped_count, "skipped_count"),
+        rejected_count=_non_negative_count(summary.rejected_count, "rejected_count"),
+        failed_count=_non_negative_count(summary.failed_count, "failed_count"),
+        written_document_ids=_bounded_text_tuple(
+            summary.written_document_ids,
+            "written_document_ids",
+            reject_path_separators=False,
+        ),
+    )
 
 
 def _build_processed_sections(processor: DocumentProcessor) -> list[dict[str, JsonValue]]:
@@ -2435,6 +3138,7 @@ def _record_to_json(record: FinsIngestionJobRecord) -> dict[str, JsonValue]:
     """
 
     _validate_job_id(record.job_id)
+    _validate_record_operation_fields(record)
     _assert_bounded_summary(record.request_summary, _KEY_REQUEST_SUMMARY)
     _assert_bounded_summary(record.result_summary, _KEY_RESULT_SUMMARY)
     _assert_bounded_summary(record.failure_summary, _KEY_FAILURE_SUMMARY)
@@ -2494,6 +3198,37 @@ def _record_from_json(payload: Mapping[str, JsonValue]) -> FinsIngestionJobRecor
     )
     _record_to_json(record)
     return record
+
+
+def _validate_record_operation_fields(record: FinsIngestionJobRecord) -> None:
+    """校验 job 操作类型与 source/source_kind 字段组合。
+
+    Args:
+        record: 待校验 job record。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 操作类型与 source 或 source_kind 字段组合不一致时抛出。
+    """
+
+    if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD:
+        if record.source is None:
+            raise ValueError("download job record 必须包含 source")
+        if record.source_kind is not None:
+            raise ValueError("download job record 不得包含 source_kind")
+        return
+    if record.operation_kind is FinsIngestionOperationKind.PREPROCESS:
+        if record.source is not None:
+            raise ValueError("preprocess job record 不得包含 source")
+        if record.source_kind is None:
+            raise ValueError("preprocess job record 必须包含 source_kind")
+        return
+    if record.source is not None:
+        raise ValueError("upload job record 不得包含 source")
+    if record.source_kind is None:
+        raise ValueError("upload job record 必须包含 source_kind")
 
 
 def _required_str(payload: Mapping[str, JsonValue], key: str) -> str:
@@ -2694,6 +3429,7 @@ __all__ = [
     "FinsDownloadedSourceDocument",
     "FinsDownloadRequest",
     "FinsDownloadResultSummary",
+    "FinsJobCancellationChecker",
     "FinsIngestionJobRecord",
     "FinsIngestionJobStart",
     "FinsIngestionJobStatus",
@@ -2707,5 +3443,10 @@ __all__ = [
     "FinsSourceDownloadAdapter",
     "FinsSourceDownloadAdapterRequest",
     "FinsSourceDownloadAdapterResult",
+    "FinsUploadFilingRequest",
+    "FinsUploadMaterialRequest",
+    "FinsUploadRequest",
+    "FinsUploadResultSummary",
+    "FinsUploadRunner",
     "FsFinsIngestionJobStore",
 ]

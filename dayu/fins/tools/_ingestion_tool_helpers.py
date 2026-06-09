@@ -1,6 +1,6 @@
 """Fins ingestion awaiting tools 的私有共享辅助函数。
 
-本模块只承载 download/preprocess 工具适配层共用的 outcome 构造和
+本模块只承载 download/preprocess/upload 工具适配层共用的 outcome 构造和
 JSON 参数读取逻辑；具体请求对象仍由各工具模块自行构造。
 """
 
@@ -195,4 +195,46 @@ def _optional_bool(arguments: Mapping[str, JsonValue], field_name: str, *, defau
         return default
     if not isinstance(value, bool):
         raise ValueError(f"{field_name} must be boolean")
+    return value
+
+
+def _optional_int(arguments: Mapping[str, JsonValue], field_name: str) -> int | None:
+    """读取可选整数参数。
+
+    Args:
+        arguments: 工具参数。
+        field_name: 字段名。
+
+    Returns:
+        字段缺失或为 null 时返回 ``None``，否则返回整数。
+
+    Raises:
+        ValueError: 字段存在但不是整数时抛出。
+    """
+
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be integer or null")
+    return value
+
+
+def _required_int(arguments: Mapping[str, JsonValue], field_name: str) -> int:
+    """读取必填整数参数。
+
+    Args:
+        arguments: 工具参数。
+        field_name: 字段名。
+
+    Returns:
+        整数值。
+
+    Raises:
+        ValueError: 字段缺失、为 null 或不是整数时抛出。
+    """
+
+    value = _optional_int(arguments, field_name)
+    if value is None:
+        raise ValueError(f"{field_name} must be an integer")
     return value

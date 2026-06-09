@@ -31,7 +31,9 @@ from dayu.fins.ingestion_runtime import (
     FinsDownloadedSourceDocument,
     FinsDownloadRequest,
     FinsDownloadResultSummary,
+    FinsJobCancellationChecker,
     FinsIngestionExecutor,
+    FinsIngestionOperationKind,
     FinsIngestionJobStatus,
     FinsPreprocessRequest,
     FinsPreprocessResultSummary,
@@ -39,8 +41,15 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    FinsUploadFilingRequest,
+    FinsUploadMaterialRequest,
+    FinsUploadRequest,
+    FinsUploadResultSummary,
+    FinsUploadRunner,
 )
-from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter
+from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter
+from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
@@ -187,6 +196,101 @@ class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
             documents=(document,),
             rejected_artifacts=rejected_artifacts,
         )
+
+
+class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
+    """测试用 persisted-summary 下载 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化请求记录。"""
+
+        self.requests: list[FinsSourceDownloadAdapterRequest] = []
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """记录请求并返回已持久化摘要。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            只包含 persisted summary 的 adapter 结果。
+
+        Raises:
+            无。
+        """
+
+        self.requests.append(request)
+        return FinsSourceDownloadAdapterResult(
+            discovered_count=1,
+            persisted_summary=FinsDownloadResultSummary(
+                discovered_count=1,
+                downloaded_count=0,
+                skipped_count=1,
+                rejected_count=0,
+                failed_count=0,
+                written_document_ids=(),
+            ),
+        )
+
+
+class _FakeUploadRunner(FinsUploadRunner):
+    """测试用确定性上传 runner。"""
+
+    def __init__(self, result_summary: FinsUploadResultSummary) -> None:
+        """初始化 fake 上传 runner。
+
+        Args:
+            result_summary: 每次 run_upload 返回的确定性结果摘要。
+
+        Returns:
+            无。
+        """
+
+        self.result_summary = result_summary
+        self.requests: list[FinsUploadRequest] = []
+        self.cancellation_checks: list[bool] = []
+
+    def run_upload(
+        self,
+        request: FinsUploadRequest,
+        *,
+        cancellation_checker: FinsJobCancellationChecker,
+    ) -> FinsUploadResultSummary:
+        """记录上传请求并返回确定性结果摘要。
+
+        Args:
+            request: runtime 传入的上传请求。
+            cancellation_checker: runtime 提供的取消检查器。
+
+        Returns:
+            初始化时传入的结果摘要。
+
+        Raises:
+            OSError: 取消检查器读取 job store 失败时由检查器抛出。
+            ValueError: job record 非法时由检查器抛出。
+        """
+
+        self.requests.append(request)
+        self.cancellation_checks.append(cancellation_checker())
+        return self.result_summary
+
+
+def _upload_runtime_converter(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
+    """runtime production upload 测试用 Docling converter。
+
+    Args:
+        raw_data: 上传文件字节。
+        stream_name: 上传文件名。
+
+    Returns:
+        固定 Docling JSON 对象。
+
+    Raises:
+        无。
+    """
+
+    del raw_data
+    return {"name": stream_name, "format": "docling"}
 
 
 class _CancelOnSecondCheckToken(CancellationToken):
@@ -346,6 +450,85 @@ class _ClaimRaceJobStore:
         )
         self._record = succeeded
         return succeeded
+
+    def save_cancelled_if_active(
+        self,
+        job_id: str,
+        *,
+        finished_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """仅当当前测试 job 非终态时保存 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            finished_at: 终态写入时间。
+
+        Returns:
+            已保存的 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        record = self._require_record(job_id)
+        if _is_terminal_job_status(record.status):
+            return record
+        cancelled = replace(
+            record,
+            status=FinsIngestionJobStatus.CANCELLED,
+            updated_at=finished_at,
+            finished_at=finished_at,
+            cancellation_requested=True,
+        )
+        self._record = cancelled
+        return cancelled
+
+    def save_failed_or_cancelled_if_active(
+        self,
+        job_id: str,
+        *,
+        failure_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """按当前测试 job 状态保存 failed 或 cancelled 终态。
+
+        Args:
+            job_id: opaque job id。
+            failure_summary: failed 终态失败摘要。
+            result_summary: failed 终态结果摘要。
+            finished_at: 终态写入时间。
+
+        Returns:
+            已保存的 job record；若当前已是终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        record = self._require_record(job_id)
+        if _is_terminal_job_status(record.status):
+            return record
+        if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
+            cancelled = replace(
+                record,
+                status=FinsIngestionJobStatus.CANCELLED,
+                updated_at=finished_at,
+                finished_at=finished_at,
+                cancellation_requested=True,
+            )
+            self._record = cancelled
+            return cancelled
+        failed = replace(
+            record,
+            status=FinsIngestionJobStatus.FAILED,
+            updated_at=finished_at,
+            finished_at=finished_at,
+            failure_summary=failure_summary,
+            result_summary=result_summary,
+        )
+        self._record = failed
+        return failed
 
     def claim_running_or_cancelled(
         self,
@@ -629,14 +812,34 @@ def test_start_download_unsupported_source_writes_failed_terminal_record(tmp_pat
     workspace_root = tmp_path / "fins-workspace"
     ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="sec"))
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="unknown"))
     record = _wait_terminal(ingestion, start.job_id)
 
     assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["failed_count"] == 1
     assert "不支持的下载来源" in str(record.failure_summary["message"])
-    assert "source=sec" in str(record.failure_summary["message"])
+    assert "source=unknown" in str(record.failure_summary["message"])
     assert "market=US" in str(record.failure_summary["message"])
+
+
+def test_default_runtime_registers_production_download_adapters(tmp_path: Path) -> None:
+    """默认 runtime 应为 US/CN/HK 装配确定性的 production download adapter。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    sec_adapter = ingestion.download_adapters[("sec", "US")]
+    auto_adapter = ingestion.download_adapters[("auto", "US")]
+    cn_adapter = ingestion.download_adapters[("cninfo", "CN")]
+    auto_cn_adapter = ingestion.download_adapters[("auto", "CN")]
+    hk_adapter = ingestion.download_adapters[("hkexnews", "HK")]
+    auto_hk_adapter = ingestion.download_adapters[("auto", "HK")]
+
+    assert isinstance(sec_adapter, SecDownloadAdapter)
+    assert auto_adapter is sec_adapter
+    assert isinstance(cn_adapter, CnDownloadAdapter)
+    assert auto_cn_adapter is cn_adapter
+    assert isinstance(hk_adapter, CnDownloadAdapter)
+    assert auto_hk_adapter is hk_adapter
 
 
 def test_start_download_repeated_request_skips_existing_source_document(tmp_path: Path) -> None:
@@ -697,6 +900,35 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     assert artifacts[0].document_id == "aapl-fake-rejected"
     assert artifacts[0].rejection_category == "form_filter"
     assert content == b"<html>rejected</html>"
+
+
+def test_start_download_persisted_summary_adapter_receives_rebuild_processed(tmp_path: Path) -> None:
+    """persisted-summary adapter 应接收 NEW rebuild_processed 治理标记并记录请求。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _PersistedSummaryDownloadAdapter()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("persisted", "US"): adapter},
+    )
+
+    start = ingestion.start_download(
+        FinsDownloadRequest(
+            ticker="AAPL",
+            source="persisted",
+            rebuild_processed=True,
+        )
+    )
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.request_summary["rebuild_processed"] is True
+    assert record.result_summary["skipped_count"] == 1
+    assert len(adapter.requests) == 1
+    assert adapter.requests[0].rebuild_processed is True
 
 
 def test_start_preprocess_persists_queued_record_and_uses_public_ticker_normalization(
@@ -790,14 +1022,353 @@ def test_preprocess_start_cancel_between_create_and_submit_marks_job_cancelled_a
     assert executor.operations == []
 
 
+def test_start_upload_persists_queued_record_and_uses_public_ticker_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """上传启动应通过 ticker_normalization 并先持久化 queued record。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runner = _FakeUploadRunner(
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            document_id="aapl-2024-10k",
+            status="uploaded",
+        )
+    )
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
+    original_normalize = ticker_normalization.normalize_ticker
+    calls: list[str] = []
+
+    def normalize_upload_ticker(raw: str) -> NormalizedTicker:
+        """记录归一化调用并委托公共实现。
+
+        Args:
+            raw: 原始 ticker。
+
+        Returns:
+            标准化 ticker。
+
+        Raises:
+            ValueError: ticker 非法时由公共实现抛出。
+        """
+
+        calls.append(raw)
+        return original_normalize(raw)
+
+    monkeypatch.setattr(ticker_normalization, "normalize_ticker", normalize_upload_ticker)
+
+    start = runtime.start_upload(
+        FinsUploadFilingRequest(
+            ticker="aapl.us",
+            action="CREATE",
+            files=(tmp_path / "aapl-10k.pdf",),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            amended=True,
+            filing_date="2024-11-01",
+            report_date="2024-09-28",
+            company_name="Apple Inc.",
+            ticker_aliases=("APPLE",),
+        )
+    )
+    record = runtime.read_job(start.job_id)
+    payload_text = _job_file(workspace_root, start.job_id).read_text(encoding="utf-8")
+
+    assert calls == ["aapl.us"]
+    assert start.status is FinsIngestionJobStatus.QUEUED
+    assert record.operation_kind is FinsIngestionOperationKind.UPLOAD
+    assert record.normalized_ticker == "AAPL"
+    assert record.market == "US"
+    assert record.source is None
+    assert record.source_kind is SourceKind.FILING
+    assert record.request_summary["source_kind"] == "filing"
+    assert record.request_summary["action"] == "create"
+    assert record.request_summary["file_count"] == 1
+    assert record.request_summary["fiscal_year"] == 2024
+    assert record.request_summary["amended"] is True
+    assert record.request_summary["ticker_aliases"] == ["APPLE"]
+    assert str(tmp_path) not in payload_text
+    assert "aapl-10k.pdf" not in payload_text
+    assert len(executor.operations) == 1
+    assert runner.requests == []
+
+
+def test_upload_start_cancel_between_create_and_submit_marks_job_cancelled_and_does_not_submit(
+    tmp_path: Path,
+) -> None:
+    """上传 start 在 create 后、submit 前观察到取消时应标记 job 且不提交后台操作。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    token = _CancelOnSecondCheckToken()
+
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"), cancellation_token=token)
+    record = runtime.read_job(start.job_id)
+
+    assert start.status is FinsIngestionJobStatus.CANCELLED
+    assert record.operation_kind is FinsIngestionOperationKind.UPLOAD
+    assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert record.cancellation_requested
+    assert executor.operations == []
+
+
+def test_start_upload_without_runner_writes_failed_terminal_record(tmp_path: Path) -> None:
+    """未装配 upload runner 时应写入明确 unsupported upload runtime 失败终态。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+
+    start = runtime.start_upload(
+        FinsUploadMaterialRequest(
+            ticker="AAPL",
+            action="delete",
+            document_id="aapl-investor-day",
+            material_name="Investor Day",
+        )
+    )
+    executor.run_all()
+    record = runtime.read_job(start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.FAILED
+    assert record.operation_kind is FinsIngestionOperationKind.UPLOAD
+    assert record.source_kind is SourceKind.MATERIAL
+    assert record.result_summary["source_kind"] == "material"
+    assert record.result_summary["status"] == "failed"
+    assert record.result_summary["uploaded_files"] == []
+    assert "unsupported upload runtime" in str(record.failure_summary["message"])
+    assert "production upload runner" in str(record.failure_summary["message"])
+
+
+def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) -> None:
+    """上传 runner 结果应按有界 JSON 摘要写入 succeeded 终态。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runner = _FakeUploadRunner(
+        FinsUploadResultSummary(
+            source_kind=SourceKind.MATERIAL,
+            document_id="aapl-investor-day",
+            internal_document_id="aapl-investor-day-internal",
+            status="uploaded",
+            uploaded_files=("primary.pdf",),
+            primary_document="primary.pdf",
+            deleted=False,
+            skip_reason=None,
+            document_version="v2",
+            source_fingerprint="sha256:abc123",
+        )
+    )
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
+
+    start = runtime.start_upload(
+        FinsUploadMaterialRequest(
+            ticker="AAPL",
+            action="auto",
+            files=(tmp_path / "primary.pdf",),
+            form_type="8-K",
+            material_name="Investor Day",
+            document_id="aapl-investor-day",
+            internal_document_id="aapl-investor-day-internal",
+        )
+    )
+    executor.run_all()
+    record = runtime.read_job(start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["source_kind"] == "material"
+    assert record.result_summary["document_id"] == "aapl-investor-day"
+    assert record.result_summary["internal_document_id"] == "aapl-investor-day-internal"
+    assert record.result_summary["status"] == "uploaded"
+    assert record.result_summary["uploaded_files"] == ["primary.pdf"]
+    assert record.result_summary["primary_document"] == "primary.pdf"
+    assert record.result_summary["deleted"] is False
+    assert record.result_summary["document_version"] == "v2"
+    assert record.result_summary["source_fingerprint"] == "sha256:abc123"
+    assert len(runner.requests) == 1
+    assert isinstance(runner.requests[0], FinsUploadMaterialRequest)
+    assert runner.requests[0].action == "auto"
+    assert runner.cancellation_checks == [False]
+
+
+def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path: Path) -> None:
+    """DefaultFinsRuntime 应装配 production runner 并执行 SEC filing 上传。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    upload_runner = ingestion.upload_runner
+    assert isinstance(upload_runner, ProductionFinsUploadRunner)
+    upload_runner.sec_pipeline._upload_service._convert_with_docling = _upload_runtime_converter
+    filing_file = tmp_path / "aapl-10q.pdf"
+    filing_file.write_text("runtime sec filing", encoding="utf-8")
+
+    start = ingestion.start_upload(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            action="create",
+            files=(filing_file,),
+            fiscal_year=2025,
+            fiscal_period="Q1",
+            filing_date="2025-05-01",
+            report_date="2025-03-31",
+            company_name="Apple Inc.",
+            overwrite=False,
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["source_kind"] == "filing"
+    assert record.result_summary["status"] == "ok"
+    assert record.result_summary["primary_document"] == "aapl-10q_docling.json"
+    document_id = str(record.result_summary["document_id"])
+    meta = ingestion.source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
+    assert meta["ingest_method"] == "upload"
+    assert meta["primary_document"] == "aapl-10q_docling.json"
+
+
+def test_default_runtime_start_upload_cn_material_uses_production_runner(tmp_path: Path) -> None:
+    """DefaultFinsRuntime 应装配 production runner 并执行 CN material 上传。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    upload_runner = ingestion.upload_runner
+    assert isinstance(upload_runner, ProductionFinsUploadRunner)
+    upload_runner.cn_pipeline._upload_service._convert_with_docling = _upload_runtime_converter
+    material_file = tmp_path / "deck.pdf"
+    material_file.write_text("runtime cn material", encoding="utf-8")
+
+    start = ingestion.start_upload(
+        FinsUploadMaterialRequest(
+            ticker="600519",
+            action="create",
+            files=(material_file,),
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            company_name="贵州茅台",
+            overwrite=False,
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.market == "CN"
+    assert record.result_summary["source_kind"] == "material"
+    assert record.result_summary["status"] == "ok"
+    assert record.result_summary["primary_document"] == "deck_docling.json"
+    document_id = str(record.result_summary["document_id"])
+    meta = ingestion.source_repository.get_source_meta("600519", document_id, SourceKind.MATERIAL)
+    assert meta["material_name"] == "Deck"
+    assert meta["primary_document"] == "deck_docling.json"
+
+
+def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> None:
+    """上传请求与结果摘要应执行数量和长度边界。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    too_many_aliases = tuple(f"alias-{index}" for index in range(ingestion_runtime._MAX_TUPLE_ITEMS + 1))
+    too_many_files = tuple(f"file-{index}.pdf" for index in range(ingestion_runtime._MAX_TUPLE_ITEMS + 1))
+
+    with pytest.raises(ValueError, match="ticker_aliases 元素数量超出上限"):
+        runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", ticker_aliases=too_many_aliases))
+    with pytest.raises(ValueError, match="uploaded_files 元素数量超出上限"):
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="uploaded",
+            uploaded_files=too_many_files,
+        ).to_json_summary()
+    assert executor.operations == []
+
+
+def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_path: Path) -> None:
+    """上传请求应使用 SourceKind 区分 filing/material，错误组合在建 job 前失败。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+
+    with pytest.raises(ValueError, match="filing 上传请求必须使用 source_kind=filing"):
+        runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", source_kind=SourceKind.MATERIAL))
+    with pytest.raises(ValueError, match="material 上传请求必须使用 source_kind=material"):
+        runtime.start_upload(FinsUploadMaterialRequest(ticker="AAPL", source_kind=SourceKind.FILING))
+
+    material_start = runtime.start_upload(
+        FinsUploadMaterialRequest(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            document_id="aapl-investor-day",
+        )
+    )
+    material_record = runtime.read_job(material_start.job_id)
+
+    assert material_record.source_kind is SourceKind.MATERIAL
+    assert material_record.request_summary["source_kind"] == "material"
+    assert material_record.request_summary["document_id"] == "aapl-investor-day"
+    assert len(executor.operations) == 1
+
+
 def test_result_summaries_allow_slash_in_document_ids() -> None:
     """结果摘要中的 document-id 类字段应允许业务合法斜杠。"""
 
     download_summary = FinsDownloadResultSummary(written_document_ids=("sec/aapl-2024-10ka",))
     preprocess_summary = FinsPreprocessResultSummary(processed_document_ids=("processed/aapl-2024-10ka",))
+    upload_summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        document_id="sec/aapl-2024-10ka",
+        internal_document_id="sec/aapl-2024-10ka-internal",
+    )
 
     assert download_summary.to_json_summary()["written_document_ids"] == ["sec/aapl-2024-10ka"]
     assert preprocess_summary.to_json_summary()["processed_document_ids"] == ["processed/aapl-2024-10ka"]
+    assert upload_summary.to_json_summary()["document_id"] == "sec/aapl-2024-10ka"
+    assert upload_summary.to_json_summary()["internal_document_id"] == "sec/aapl-2024-10ka-internal"
+
+
+def test_job_serialization_validates_upload_operation_shape(tmp_path: Path) -> None:
+    """upload job record 序列化/反序列化应校验 operation/source/source_kind 组合。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    job_file = _job_file(workspace_root, start.job_id)
+    payload_value = cast(JsonValue, json.loads(job_file.read_text(encoding="utf-8")))
+
+    assert isinstance(payload_value, Mapping)
+    assert payload_value["operation_kind"] == "upload"
+    assert payload_value["source"] is None
+    assert payload_value["source_kind"] == "filing"
+
+    corrupt_payload = dict(cast(Mapping[str, JsonValue], payload_value))
+    corrupt_payload["source_kind"] = None
+    job_file.write_text(json.dumps(corrupt_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="upload job record 必须包含 source_kind"):
+        runtime.read_job(start.job_id)
 
 
 def test_request_cancel_marks_active_job_and_keeps_terminal_job_terminal(tmp_path: Path) -> None:
@@ -824,6 +1395,60 @@ def test_request_cancel_marks_active_job_and_keeps_terminal_job_terminal(tmp_pat
     assert after_terminal_cancel.status is FinsIngestionJobStatus.SUCCEEDED
     assert not after_terminal_cancel.cancellation_requested
     assert after_terminal_cancel.result_summary == {"processed_count": 0}
+
+
+def test_save_cancelled_does_not_overwrite_current_terminal_record(tmp_path: Path) -> None:
+    """_save_cancelled 应读取 store 当前状态，不能用旧 active record 覆盖终态。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL"))
+    terminal_record = replace(
+        start.record,
+        status=FinsIngestionJobStatus.SUCCEEDED,
+        updated_at=start.record.updated_at,
+        finished_at=start.record.updated_at,
+        result_summary={"processed_count": 0, "sentinel": True},
+        cancellation_requested=False,
+    )
+    ingestion.job_store.save_job(terminal_record)
+
+    saved = ingestion._save_cancelled(start.record)
+    reloaded = ingestion.read_job(start.job_id)
+
+    assert saved.status is FinsIngestionJobStatus.SUCCEEDED
+    assert reloaded.status is FinsIngestionJobStatus.SUCCEEDED
+    assert not reloaded.cancellation_requested
+    assert reloaded.result_summary == {"processed_count": 0, "sentinel": True}
+    assert reloaded.finished_at == terminal_record.finished_at
+
+
+def test_save_failed_uses_current_cancelling_record_instead_of_stale_active_record(
+    tmp_path: Path,
+) -> None:
+    """_save_failed 应读取 store 当前状态，不能用旧 active record 覆盖取消请求。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL"))
+    cancelling = ingestion.request_cancel(start.job_id)
+
+    saved = ingestion._save_failed(
+        start.record,
+        message="late failure",
+        result_summary={"processed_count": 1},
+    )
+    reloaded = ingestion.read_job(start.job_id)
+
+    assert cancelling.status is FinsIngestionJobStatus.CANCELLING
+    assert saved.status is FinsIngestionJobStatus.CANCELLED
+    assert reloaded.status is FinsIngestionJobStatus.CANCELLED
+    assert reloaded.cancellation_requested
+    assert reloaded.result_summary == {}
+    assert reloaded.failure_summary == {}
+    assert reloaded.finished_at is not None
 
 
 def test_job_records_do_not_expose_payload_bodies_raw_provider_payloads_or_paths(tmp_path: Path) -> None:
@@ -1185,15 +1810,22 @@ def test_save_failed_from_exception_logs_secondary_job_store_failure(
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
     start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
 
-    def raise_save_job(
+    def raise_save_failed_or_cancelled(
         store: ingestion_runtime.FsFinsIngestionJobStore,
-        record: ingestion_runtime.FinsIngestionJobRecord,
+        job_id: str,
+        *,
+        failure_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue],
+        finished_at: str,
     ) -> ingestion_runtime.FinsIngestionJobRecord:
         """模拟 failed 终态落盘失败。
 
         Args:
             store: 被替换方法所属 job store。
-            record: 待保存的 job record。
+            job_id: opaque job id。
+            failure_summary: failed 终态失败摘要。
+            result_summary: failed 终态结果摘要。
+            finished_at: 终态写入时间。
 
         Returns:
             不返回；始终抛出异常。
@@ -1202,10 +1834,14 @@ def test_save_failed_from_exception_logs_secondary_job_store_failure(
             OSError: 始终抛出，模拟 job store 写入失败。
         """
 
-        del store, record
+        del store, job_id, failure_summary, result_summary, finished_at
         raise OSError("job store save failed")
 
-    monkeypatch.setattr(ingestion_runtime.FsFinsIngestionJobStore, "save_job", raise_save_job)
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "save_failed_or_cancelled_if_active",
+        raise_save_failed_or_cancelled,
+    )
 
     with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
         ingestion._save_failed_from_exception(start.job_id, RuntimeError("primary failure"))
@@ -1288,6 +1924,7 @@ def _build_ingestion_runtime(
     *,
     executor: FinsIngestionExecutor,
     download_adapters: Mapping[tuple[str, ticker_normalization.Market], FinsSourceDownloadAdapter] | None = None,
+    upload_runner: FinsUploadRunner | None = None,
 ) -> ingestion_runtime.FinsIngestionRuntime:
     """构建测试用 ingestion runtime。
 
@@ -1295,6 +1932,7 @@ def _build_ingestion_runtime(
         workspace_root: Fins workspace root。
         executor: 测试执行器。
         download_adapters: 可选下载 adapter 映射。
+        upload_runner: 可选上传 runner。
 
     Returns:
         ingestion runtime。
@@ -1313,6 +1951,7 @@ def _build_ingestion_runtime(
         job_store=default_runtime.ingestion_job_store,
         executor=executor,
         download_adapters=download_adapters,
+        upload_runner=upload_runner,
     )
 
 

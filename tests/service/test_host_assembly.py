@@ -28,6 +28,7 @@ from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.fins.ingestion import FINS_INGESTION_WAIT_ADAPTER_KEY
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
+from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
 from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.host.api import (
     AuthorizationClaim,
@@ -581,6 +582,7 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
             definitions=(
                 _tool_definition(DOWNLOAD_TOOL_NAME),
                 _tool_definition(PREPROCESS_TOOL_NAME),
+                _tool_definition(UPLOAD_TOOL_NAME),
             )
         ),
         source_refs=(_source_ref("fins-awaiting-test"),),
@@ -597,6 +599,12 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
                 source_id="dayu.fins.tools.preprocess_provider",
                 workspace_root=workspace_root,
             ),
+            _provider_config(
+                provider_id="custom-upload-provider",
+                import_path="custom.package:discover_tools",
+                source_id="dayu.fins.tools.upload_provider",
+                workspace_root=workspace_root,
+            ),
         ),
         duplicate_governance_policy_config=_duplicate_governance_policy_config(),
     )
@@ -611,10 +619,16 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
         tool_name=PREPROCESS_TOOL_NAME,
         await_kind=ToolAwaitKind.EXTERNAL_JOB,
     )
+    upload_binding = tooling_options.wait_adapter_registry.resolve_binding(
+        tool_name=UPLOAD_TOOL_NAME,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+    )
     assert download_binding is not None
     assert preprocess_binding is not None
+    assert upload_binding is not None
     assert download_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+    assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
 
 
 def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
@@ -643,6 +657,12 @@ def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
                     import_path="custom.preprocess:discover_tools",
                     source_id="custom.preprocess",
                     workspace_root=(tmp_path / "two").resolve(strict=False),
+                ),
+                _provider_config(
+                    provider_id="financial-upload-tools",
+                    import_path="custom.upload:discover_tools",
+                    source_id="custom.upload",
+                    workspace_root=(tmp_path / "one").resolve(strict=False),
                 ),
             ),
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
@@ -707,6 +727,34 @@ def test_fins_awaiting_provider_duplicate_binding_fails_before_open_host(
                 _provider_config(
                     provider_id="another-download-provider",
                     import_path="dayu.fins.tools.download_provider:discover_tools",
+                    source_id="custom.two",
+                    workspace_root=workspace_root,
+                ),
+            ),
+            duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+        )
+
+
+def test_fins_upload_awaiting_provider_duplicate_binding_fails_before_open_host(
+    tmp_path: Path,
+) -> None:
+    """重复 upload awaiting binding 必须 fail fast。"""
+
+    workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    with pytest.raises(ValueError, match="duplicate Fins wait adapter binding"):
+        _tooling_options_from_discovery(
+            tool_bundle=ToolBundle(definitions=(_tool_definition(UPLOAD_TOOL_NAME),)),
+            source_refs=(_source_ref("fins-upload-awaiting-test"),),
+            provider_configs=(
+                _provider_config(
+                    provider_id="financial-upload-tools",
+                    import_path="custom.one:discover_tools",
+                    source_id="custom.one",
+                    workspace_root=workspace_root,
+                ),
+                _provider_config(
+                    provider_id="another-upload-provider",
+                    import_path="dayu.fins.tools.upload_provider:discover_tools",
                     source_id="custom.two",
                     workspace_root=workspace_root,
                 ),
