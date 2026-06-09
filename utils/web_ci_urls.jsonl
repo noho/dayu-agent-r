@@ -1,0 +1,60 @@
+{"url":"https://www.reuters.com/world/","label":"Reuters World","region":"foreign","category":"news","notes":"world-news-section"}
+{"url":"https://apnews.com/","label":"Associated Press","region":"foreign","category":"news","notes":"homepage"}
+{"url":"https://www.bbc.com/news","label":"BBC News","region":"foreign","category":"news","notes":"news-home"}
+{"url":"https://www.nytimes.com/","label":"New York Times","region":"foreign","category":"news","notes":"homepage"}
+{"url":"https://www.theguardian.com/world","label":"The Guardian World","region":"foreign","category":"news","notes":"world-news-section"}
+{"url":"https://www.wsj.com/news/world","label":"WSJ World News","region":"foreign","category":"news","notes":"world-news-section"}
+{"url":"https://www.ft.com/world","label":"Financial Times World","region":"foreign","category":"news","notes":"world-news-section"}
+{"url":"https://www.economist.com/","label":"The Economist","region":"foreign","category":"news","notes":"homepage"}
+{"url":"https://www.aljazeera.com/news/","label":"Al Jazeera News","region":"foreign","category":"news","notes":"news-section"}
+{"url":"https://www.cnn.com/world","label":"CNN World","region":"foreign","category":"news","notes":"world-news-section"}
+{"url":"https://finance.yahoo.com/","label":"Yahoo Finance","region":"foreign","category":"finance","notes":"homepage"}
+{"url":"https://www.bloomberg.com/markets","label":"Bloomberg Markets","region":"foreign","category":"finance","notes":"markets-section"}
+{"url":"https://www.marketwatch.com/","label":"MarketWatch","region":"foreign","category":"finance","notes":"homepage"}
+{"url":"https://www.cnbc.com/finance/","label":"CNBC Finance","region":"foreign","category":"finance","notes":"finance-section"}
+{"url":"https://www.investing.com/","label":"Investing.com","region":"foreign","category":"finance","notes":"homepage"}
+{"url":"https://www.tradingeconomics.com/","label":"Trading Economics","region":"foreign","category":"finance","notes":"homepage"}
+{"url":"https://www.morningstar.com/","label":"Morningstar","region":"foreign","category":"finance","notes":"homepage"}
+{"url":"https://www.nasdaq.com/market-activity","label":"Nasdaq Market Activity","region":"foreign","category":"finance","notes":"market-activity-section"}
+{"url":"https://seekingalpha.com/","label":"Seeking Alpha","region":"foreign","category":"finance","notes":"homepage"}
+{"url":"https://stockanalysis.com/","label":"Stock Analysis","region":"foreign","category":"finance","notes":"homepage"}
+{"url":"https://www.sec.gov/","label":"U.S. SEC","region":"foreign","category":"government","notes":"regulator-home"}
+{"url":"https://www.federalreserve.gov/","label":"Federal Reserve","region":"foreign","category":"government","notes":"central-bank-home"}
+{"url":"https://home.treasury.gov/","label":"U.S. Treasury","region":"foreign","category":"government","notes":"treasury-home"}
+{"url":"https://www.bls.gov/","label":"U.S. BLS","region":"foreign","category":"government","notes":"statistics-agency"}
+{"url":"https://www.bea.gov/","label":"U.S. BEA","region":"foreign","category":"government","notes":"economic-analysis-agency"}
+{"url":"https://www.ecb.europa.eu/","label":"European Central Bank","region":"foreign","category":"government","notes":"central-bank-home"}
+{"url":"https://www.imf.org/","label":"IMF","region":"foreign","category":"government","notes":"multilateral-org"}
+{"url":"https://www.worldbank.org/","label":"World Bank","region":"foreign","category":"government","notes":"multilateral-org"}
+{"url":"https://www.oecd.org/","label":"OECD","region":"foreign","category":"government","notes":"multilateral-org"}
+{"url":"https://www.fca.org.uk/","label":"UK FCA","region":"foreign","category":"government","notes":"financial-regulator"}
+{"url":"https://www.xinhuanet.com/","label":"Xinhua","region":"china","category":"news","notes":"homepage"}
+{"url":"https://www.people.com.cn/","label":"People Daily Online","region":"china","category":"news","notes":"homepage"}
+{"url":"https://news.cctv.com/","label":"CCTV News","region":"china","category":"news","notes":"news-home"}
+{"url":"https://www.chinadaily.com.cn/","label":"China Daily","region":"china","category":"news","notes":"homepage"}
+{"url":"https://www.globaltimes.cn/","label":"Global Times","region":"china","category":"news","notes":"homepage"}
+{"url":"https://www.thepaper.cn/","label":"The Paper","region":"china","category":"news","notes":"homepage"}
+{"url":"https://www.bjnews.com.cn/","label":"Beijing News","region":"china","category":"news","notes":"homepage"}
+{"url":"https://www.ce.cn/","label":"China Economic Net","region":"china","category":"news","notes":"homepage"}
+{"url":"https://www.stcn.com/","label":"Securities Times","region":"china","category":"news","notes":"news-home"}
+{"url":"https://www.yicai.com/","label":"Yicai","region":"china","category":"news","notes":"homepage"}
+{"url":"https://finance.sina.com.cn/","label":"Sina Finance","region":"china","category":"finance","notes":"finance-portal"}
+{"url":"https://money.163.com/","label":"NetEase Finance","region":"china","category":"finance","notes":"finance-portal"}
+{"url":"https://quote.eastmoney.com/","label":"Eastmoney Quote","region":"china","category":"finance","notes":"market-data-portal"}
+{"url":"https://stockpage.10jqka.com.cn/","label":"Tonghuashun Stock Page","region":"china","category":"finance","notes":"market-data-portal"}
+{"url":"https://xueqiu.com/","label":"Xueqiu","region":"china","category":"finance","notes":"investor-community"}
+{"url":"https://www.jrj.com.cn/","label":"JRJ","region":"china","category":"finance","notes":"finance-portal"}
+{"url":"https://www.hexun.com/","label":"Hexun","region":"china","category":"finance","notes":"finance-portal"}
+{"url":"https://www.cls.cn/","label":"Cailian Press","region":"china","category":"finance","notes":"finance-news"}
+{"url":"https://www.cnstock.com/","label":"China Securities Journal Online","region":"china","category":"finance","notes":"finance-news"}
+{"url":"https://www.cs.com.cn/","label":"China Securities Journal","region":"china","category":"finance","notes":"finance-news"}
+{"url":"https://www.gov.cn/","label":"China Gov","region":"china","category":"government","notes":"central-government-home"}
+{"url":"https://www.gov.cn/zhengce/","label":"China Gov Policy","region":"china","category":"government","notes":"policy-section"}
+{"url":"https://www.stats.gov.cn/","label":"National Bureau of Statistics of China","region":"china","category":"government","notes":"statistics-agency"}
+{"url":"https://www.pbc.gov.cn/","label":"PBOC","region":"china","category":"government","notes":"central-bank-home"}
+{"url":"https://www.csrc.gov.cn/","label":"CSRC","region":"china","category":"government","notes":"financial-regulator"}
+{"url":"https://www.nfra.gov.cn/","label":"NFRA","region":"china","category":"government","notes":"financial-regulator"}
+{"url":"https://www.sse.com.cn/","label":"Shanghai Stock Exchange","region":"china","category":"government","notes":"exchange"}
+{"url":"https://www.szse.cn/","label":"Shenzhen Stock Exchange","region":"china","category":"government","notes":"exchange"}
+{"url":"https://www.mof.gov.cn/","label":"Ministry of Finance of China","region":"china","category":"government","notes":"ministry"}
+{"url":"https://www.miit.gov.cn/","label":"MIIT","region":"china","category":"government","notes":"ministry"}
