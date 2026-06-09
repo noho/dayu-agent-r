@@ -773,6 +773,27 @@ def _parse_options(argv: Sequence[str] | None) -> CliOptions:
     )
 
 
+def _validate_cli_mode(options: CliOptions) -> None:
+    """校验 CLI 诊断模式选择。
+
+    Args:
+        options: 已解析的 CLI 选项。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: ``--url`` 与 ``--url-file`` 同时提供或同时缺失时抛出。
+    """
+
+    has_url = bool(options.url)
+    has_url_file = bool(options.url_file)
+    if has_url and has_url_file:
+        raise ValueError("--url 与 --url-file 不能同时提供；请只选择单 URL 模式或批量 URL 文件模式。")
+    if not has_url and not has_url_file:
+        raise ValueError("必须提供 --url 或 --url-file 其中一个，以选择单 URL 模式或批量 URL 文件模式。")
+
+
 def _utc_now_iso() -> str:
     """生成 UTC ISO 时间字符串。
 
@@ -2515,6 +2536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         options = _parse_options(argv)
+        _validate_cli_mode(options)
         if options.url_file:
             return _run_batch_diagnose(options)
         return _run_single_diagnose(options)

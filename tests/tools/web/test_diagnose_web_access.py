@@ -109,6 +109,75 @@ def test_storage_state_dir_resolves_existing_host_input_and_default_output(tmp_p
     assert storage_state_out == str(host_state)
 
 
+def test_url_normalization_requires_http_url() -> None:
+    """URL 规范化应补全 HTTPS，并拒绝空值、非 HTTP scheme 与缺失 host 的输入。"""
+
+    assert diag._normalize_url_for_http(" example.com/report ") == "https://example.com/report"
+    assert diag._normalize_url_for_http("http://example.com/report") == "http://example.com/report"
+
+    with pytest.raises(ValueError, match="URL 不能为空"):
+        diag._normalize_url_for_http(" ")
+    with pytest.raises(ValueError, match="只支持 http/https URL"):
+        diag._normalize_url_for_http("ftp://example.com/report")
+    with pytest.raises(ValueError, match="只支持 http/https URL"):
+        diag._normalize_url_for_http("https:///missing-host")
+
+
+def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
+    """默认 URL 安全策略应阻止内网、本地与 IPv4-mapped IPv6 目标。"""
+
+    blocked_urls = (
+        "http://localhost/report",
+        "http://service.localhost/report",
+        "http://printer.local/report",
+        "http://0.0.0.0/report",
+        "http://127.0.0.1/report",
+        "http://10.0.0.1/report",
+        "http://172.16.0.1/report",
+        "http://192.168.1.1/report",
+        "http://[::1]/report",
+        "http://[fe80::1]/report",
+        "http://[::ffff:10.0.0.1]/report",
+    )
+
+    for url in blocked_urls:
+        with pytest.raises(ValueError, match="安全策略阻止"):
+            diag._validate_url_safety(url, allow_private_network_url=False)
+
+    assert diag._is_private_or_local_host("::ffff:10.0.0.1") is True
+    assert diag._validate_url_safety(
+        "http://[::ffff:10.0.0.1]/report",
+        allow_private_network_url=True,
+    ) == "http://[::ffff:10.0.0.1]/report"
+    assert diag._validate_url_safety("example.com/report", allow_private_network_url=False) == (
+        "https://example.com/report"
+    )
+
+
+def test_header_redaction_masks_sensitive_header_values() -> None:
+    """header 脱敏应按 header 名称隐藏凭据，同时保留非敏感 header。"""
+
+    redacted = diag._redact_headers(
+        {
+            "Authorization": "Bearer secret-token",
+            "Cookie": "sid=abc",
+            "X-Api-Key": "api-key",
+            "X-Access-Token": "token",
+            "Client-Secret": "secret",
+            "User-Agent": "diagnostic-agent",
+            "Cache-Control": "no-cache",
+        }
+    )
+
+    assert redacted["Authorization"] == "<redacted>"
+    assert redacted["Cookie"] == "<redacted>"
+    assert redacted["X-Api-Key"] == "<redacted>"
+    assert redacted["X-Access-Token"] == "<redacted>"
+    assert redacted["Client-Secret"] == "<redacted>"
+    assert redacted["User-Agent"] == "diagnostic-agent"
+    assert redacted["Cache-Control"] == "no-cache"
+
+
 def test_comparison_bucket_matrix() -> None:
     """synthetic profile payload 应进入稳定 comparison bucket。"""
 
@@ -437,6 +506,26 @@ def test_cli_single_mode_writes_deterministic_json(
     assert payload["schema_version"] == "web-diagnostics-v1"
     assert payload["generated_at"] == "2026-06-09T00:00:00+00:00"
     assert payload["comparison_bucket"] == "all_success"
+
+
+def test_cli_requires_exactly_one_url_mode(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """CLI 应在 --url 与 --url-file 同时提供或同时缺失时清晰失败。"""
+
+    url_file = tmp_path / "urls.txt"
+    url_file.write_text("https://example.com\n", encoding="utf-8")
+
+    conflict_exit_code = diag.main(["--url", "https://example.com", "--url-file", str(url_file)])
+    conflict_output = capsys.readouterr()
+    missing_exit_code = diag.main([])
+    missing_output = capsys.readouterr()
+
+    assert conflict_exit_code == 2
+    assert "--url 与 --url-file 不能同时提供" in conflict_output.err
+    assert missing_exit_code == 2
+    assert "必须提供 --url 或 --url-file 其中一个" in missing_output.err
 
 
 def test_cli_batch_mode_uses_monkeypatched_child_execution(
