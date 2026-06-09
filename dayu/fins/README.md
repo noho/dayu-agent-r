@@ -135,8 +135,8 @@ Fins ingestion 通过两个独立 provider 暴露 awaiting tools：
 
 `dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载与预处理的 typed runtime foundation：
 
-- `start_download(FinsDownloadRequest) -> FinsIngestionJobStart`
-- `start_preprocess(FinsPreprocessRequest) -> FinsIngestionJobStart`
+- `start_download(FinsDownloadRequest, *, cancellation_token: CancellationToken | None = None) -> FinsIngestionJobStart`
+- `start_preprocess(FinsPreprocessRequest, *, cancellation_token: CancellationToken | None = None) -> FinsIngestionJobStart`
 - `read_job(job_id) -> FinsIngestionJobRecord`
 - `request_cancel(job_id) -> FinsIngestionJobRecord`
 
@@ -239,6 +239,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 - `FinsDownloadRequest` / `FinsPreprocessRequest`：下载与预处理请求。
 - `FinsSourceDownloadAdapter` / `FinsSourceDownloadAdapterRequest` / `FinsSourceDownloadAdapterResult`：下载来源 adapter 协议。
 - `FinsIngestionJobRecord` / `FinsIngestionJobStatus` / `FinsIngestionOperationKind` / `FinsIngestionJobStart`：ingestion durable job 契约。
+- `FinsIngestionStartCancelledError`：可选启动取消 token 在 durable job 创建前命中时的 runtime 异常。
 - `FinsIngestionJobStore` / `FsFinsIngestionJobStore`：ingestion job record 存储协议与文件系统实现。
 - `FinancialDataProcessor` / `FinancialStatementResult` / `XbrlFactsResult`：财务报表与 XBRL 查询能力协议。
 
@@ -416,8 +417,11 @@ ToolsDiscovery
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> get_ingestion_runtime()
   -> start_fins_download / start_fins_preprocess tool call
+  -> observe BatchToolExecutionContext.cancellation_token
   -> FinsIngestionRuntime.start_download / start_preprocess
+  -> checkpoint before durable job creation
   -> create durable queued job record
+  -> checkpoint before background submit
   -> return ToolAwaitingOutcome(EXTERNAL_JOB)
   -> background executor runs pipeline
   -> update Fins job terminal record
@@ -425,7 +429,9 @@ ToolsDiscovery
   -> Host resolve / resume governance
 ```
 
-Download 与 preprocess 都先写 durable `queued` job record，再提交后台执行。工具调用边界内的参数错误或 job 创建失败会返回工具失败 outcome；job 创建成功后工具立即返回 awaiting outcome，不等待后台任务完成。
+Download 与 preprocess 会先观察 Host ToolRuntime 传入的 cancellation token；start 前已取消时返回 `ToolCancelledOutcome`，不创建 durable job。runtime 在请求摘要完成后、durable job 创建前再次 checkpoint；durable `queued` job record 创建后、后台 submit 前同步 checkpoint，若命中取消则把 Fins job 收口为 `cancelled` 终态且不提交后台执行。后台 submit 后不再使用 token 作为真源，后台 pipeline 只通过 job store 的取消请求观察合作式取消。
+
+工具调用边界内的参数错误、job 创建失败或 create 后取消桥接落盘失败会返回工具失败 outcome；job 创建成功且未取消时工具立即返回 awaiting outcome，不等待后台任务完成。
 
 ## 状态机
 
@@ -447,6 +453,7 @@ cancelled
 ```text
 start_download / start_preprocess
   -> queued
+      -> cancelling
   -> running
       -> succeeded
       -> failed
@@ -552,7 +559,7 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 ### Durable job 与取消
 
-Download / preprocess 都先创建 durable `queued` job record，再提交后台 executor。job record 使用有界 JSON summary，不保存财报正文。取消是合作式的：Host wait cancel 或其它调用方通过 `request_cancel(job_id)` 写取消请求，后台 pipeline 观察到后收口为 `cancelled`。
+Download / preprocess 都先创建 durable `queued` job record，再提交后台 executor。job record 使用有界 JSON summary，不保存财报正文。取消是合作式的：awaiting tool 在启动边界观察 ToolRuntime cancellation token；create 后、submit 前的取消会桥接为 Fins job store 里的 `cancelled` 终态且不提交后台任务。Host wait cancel 或其它调用方也可通过 `request_cancel(job_id)` 写取消请求，后台 pipeline 观察到后收口为 `cancelled`。
 
 ### Wait adapter 与 Host resume
 

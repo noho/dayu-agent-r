@@ -1056,6 +1056,7 @@ def _create_search_web_tool(
         ),
         parameters=parameters,
         tags=("web",),
+        execution_context_param_name="execution_context",
         display_name="联网搜索",
         summary_params=["query"],
         truncate=ToolTruncateSpec(
@@ -1072,6 +1073,7 @@ def _create_search_web_tool(
         domains: Optional[list[str]] = None,
         recency_days: Optional[int] = None,
         max_results: int = 8,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> SearchWebOutput:
         """联网检索公开网页。
 
@@ -1080,6 +1082,7 @@ def _create_search_web_tool(
             domains: 可选域名过滤。
             recency_days: 可选最近天数过滤。
             max_results: 返回结果上限。
+            execution_context: 当前工具调用执行上下文。
 
         Returns:
             检索结果字典。
@@ -1088,6 +1091,9 @@ def _create_search_web_tool(
             ValueError: 当参数非法时抛出。
             RuntimeError: 当所有 provider 均失败时抛出。
         """
+
+        cancellation_token = _resolve_execution_cancellation_token(execution_context)
+        _raise_if_tool_cancelled(cancellation_token)
 
         return search_public_web(
             query=query,
@@ -1103,6 +1109,7 @@ def _create_search_web_tool(
             is_safe_public_url=_is_safe_public_url,
             normalize_whitespace=_normalize_whitespace,
             resolve_timeout_budget=_resolve_timeout_budget,
+            cancellation_token=cancellation_token,
         )
 
     return _build_registered_tool_parts(search_web)

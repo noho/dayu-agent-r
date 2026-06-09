@@ -13,6 +13,7 @@ from typing import Final, cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
@@ -201,6 +202,12 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
     assert len(names) == len(set(names))
     assert FrameworkToolName.FETCH_MORE.value not in names
     assert len(discovered_tools.source_refs) == 3
+    for definition in discovered_tools.tool_bundle.definitions:
+        properties = definition.schema.function.parameters.properties
+        assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in definition.schema.function.parameters.required
+        assert "cancellation_token" not in definition.schema.function.parameters.required
 
 
 def test_combined_truncate_specs_and_fetch_more_owner(tmp_path: Path) -> None:
@@ -313,6 +320,7 @@ def test_toolruntime_executes_representative_provider_tools_and_accepts_facts(
     """
 
     search_calls: list[Mapping[str, JsonValue]] = []
+    search_tokens: list[CancellationToken | None] = []
 
     def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
         """返回确定性 Web 搜索结果。
@@ -323,6 +331,7 @@ def test_toolruntime_executes_representative_provider_tools_and_accepts_facts(
         """
 
         search_calls.append(kwargs)
+        search_tokens.append(cast(CancellationToken | None, kwargs.get("cancellation_token")))
         return {
             "query": "AAPL revenue",
             "domains": ["sec.gov"],
@@ -351,6 +360,7 @@ def test_toolruntime_executes_representative_provider_tools_and_accepts_facts(
     doc_file = _write_doc_fixture(tmp_path)
     discovered_tools = _discover_combined_tools(tmp_path)
     runtime, accept_port = _tool_runtime(discovered_tools.tool_bundle, discovered_tools.source_refs)
+    context = _context()
 
     response = asyncio.run(
         runtime.tool_executor.execute(
@@ -368,7 +378,7 @@ def test_toolruntime_executes_representative_provider_tools_and_accepts_facts(
                         },
                     ),
                 ),
-                context=_context(),
+                context=context,
             )
         )
     )
@@ -393,6 +403,7 @@ def test_toolruntime_executes_representative_provider_tools_and_accepts_facts(
     assert "ok" not in web_value
     assert search_calls[0]["recency_days"] == 7
     assert search_calls[0]["max_results"] == 3
+    assert search_tokens == [context.cancellation_token]
     assert runtime.tool_schemas == runtime.effective_bundle.tool_schemas
     assert runtime.effective_bundle.business_bundle is discovered_tools.tool_bundle
 

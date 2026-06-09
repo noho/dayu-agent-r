@@ -9,11 +9,13 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
@@ -185,6 +187,58 @@ class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
             documents=(document,),
             rejected_artifacts=rejected_artifacts,
         )
+
+
+class _CancelOnSecondCheckToken(CancellationToken):
+    """第二次 checkpoint 开始返回已取消的测试 token。"""
+
+    def __init__(self) -> None:
+        """初始化 checkpoint 计数。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+        """
+
+        self.check_count = 0
+        self._cancelled = False
+        self._requested_at = datetime(2026, 6, 8, tzinfo=timezone.utc)
+
+    def is_cancelled(self) -> bool:
+        """返回当前是否已取消。
+
+        Returns:
+            第一次返回 ``False``，第二次及之后返回 ``True``。
+        """
+
+        self.check_count += 1
+        if self.check_count >= 2:
+            self._cancelled = True
+        return self._cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            取消被观察后返回测试原因，否则返回 ``None``。
+        """
+
+        if self._cancelled:
+            return "host-cancelled"
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Returns:
+            取消被观察后返回测试请求时间，否则返回 ``None``。
+        """
+
+        if self._cancelled:
+            return self._requested_at
+        return None
 
 
 class _ClaimRaceJobStore:
@@ -507,6 +561,25 @@ def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:
     assert record.request_summary["form_types"] == ["10-K/A"]
 
 
+def test_download_start_cancel_between_create_and_submit_marks_job_cancelled_and_does_not_submit(
+    tmp_path: Path,
+) -> None:
+    """下载 start 在 create 后、submit 前观察到取消时应标记 job 且不提交后台操作。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    token = _CancelOnSecondCheckToken()
+
+    start = runtime.start_download(FinsDownloadRequest(ticker="AAPL"), cancellation_token=token)
+    record = runtime.read_job(start.job_id)
+
+    assert start.status is FinsIngestionJobStatus.CANCELLED
+    assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert record.cancellation_requested
+    assert executor.operations == []
+
+
 def test_start_download_still_rejects_path_separator_in_source(tmp_path: Path) -> None:
     """下载来源标识仍应拒绝路径分隔符，避免 source-like 字段被当作路径片段。"""
 
@@ -696,6 +769,25 @@ def test_start_preprocess_allows_slash_in_document_ids(tmp_path: Path) -> None:
 
     assert record.request_summary["document_ids"] == ["sec/aapl-2024-10ka"]
     assert record.request_summary["form_types"] == ["10-K/A"]
+
+
+def test_preprocess_start_cancel_between_create_and_submit_marks_job_cancelled_and_does_not_submit(
+    tmp_path: Path,
+) -> None:
+    """预处理 start 在 create 后、submit 前观察到取消时应标记 job 且不提交后台操作。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    token = _CancelOnSecondCheckToken()
+
+    start = runtime.start_preprocess(FinsPreprocessRequest(ticker="AAPL"), cancellation_token=token)
+    record = runtime.read_job(start.job_id)
+
+    assert start.status is FinsIngestionJobStatus.CANCELLED
+    assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert record.cancellation_requested
+    assert executor.operations == []
 
 
 def test_result_summaries_allow_slash_in_document_ids() -> None:

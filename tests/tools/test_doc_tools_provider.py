@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
+import io
 import shutil
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Callable, TextIO, cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
@@ -51,6 +54,7 @@ from dayu.tools._legacy_adapter.registry_collector import (
     LegacyToolDeclarationCollector,
     LegacyToolKeywordValue,
 )
+from dayu.tools import doc_tools
 from dayu.tools.doc_provider import discover_tools
 from dayu.tools.doc_tools import register_doc_tools
 
@@ -90,6 +94,55 @@ class _OpenCancellationToken:
         """
 
         return None
+
+
+class _ManualCancellationToken:
+    """测试用可手动切换取消状态的 token。"""
+
+    def __init__(self) -> None:
+        """初始化未取消状态。
+
+        :returns: ``None``。
+        """
+
+        self._is_cancelled = False
+        self._reason: str | None = None
+        self._requested_at: datetime | None = None
+
+    def cancel(self, reason: str) -> None:
+        """请求取消。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        self._is_cancelled = True
+        self._reason = reason
+        self._requested_at = datetime(2026, 1, 1, 0, 0, 0)
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 已调用 ``cancel`` 后返回 ``True``。
+        """
+
+        return self._is_cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 已取消时返回原因，否则返回 ``None``。
+        """
+
+        return self._reason
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 已取消时返回固定时间戳，否则返回 ``None``。
+        """
+
+        return self._requested_at
 
 
 class _AcceptingPort(HostToolFactAcceptPort):
@@ -146,6 +199,57 @@ def test_provider_discovers_exactly_five_doc_tools(tmp_path: Path) -> None:
 
     assert tuple(definition.name for definition in result.tool_bundle.definitions) == _DOC_TOOL_NAMES
     assert result.provider_reports[0].tool_names == _DOC_TOOL_NAMES
+
+
+def test_doc_tool_schemas_do_not_expose_execution_context(tmp_path: Path) -> None:
+    """execution_context 注入参数不得进入 LLM-facing tool schema。"""
+
+    definitions = _discover_definitions(tmp_path)
+
+    for definition in definitions:
+        properties = definition.schema.function.parameters.properties
+        required = definition.schema.function.parameters.required
+        assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in required
+        assert "cancellation_token" not in required
+
+
+def test_doc_declarations_request_execution_context_injection() -> None:
+    """五个 Doc tools 声明必须请求 execution_context 注入。"""
+
+    collector = LegacyToolDeclarationCollector()
+    register_doc_tools(collector)
+    declarations = collector.collected_tools()
+
+    assert tuple(declaration.name for declaration in declarations) == _DOC_TOOL_NAMES
+    assert all(
+        declaration.execution_context_param_name == "execution_context"
+        for declaration in declarations
+    )
+
+
+@pytest.mark.parametrize("tool_name", _DOC_TOOL_NAMES)
+def test_doc_tools_cancelled_before_work_return_tool_cancelled(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    """五个 Doc tools 在业务入口预取消时必须返回稳定 tool_cancelled。"""
+
+    target = _copy_fixture(tmp_path, "sample.md")
+    definitions = _definitions_by_name(_discover_definitions(tmp_path))
+    token = _ManualCancellationToken()
+    token.cancel(f"cancel {tool_name}")
+
+    outcome = asyncio.run(
+        definitions[tool_name].callable(
+            _call(tool_name, _pre_cancel_arguments(tool_name, tmp_path, target)),
+            _context(token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
 
 
 def test_provider_enabled_without_allowed_paths_fails_closed() -> None:
@@ -379,6 +483,132 @@ def test_list_and_search_return_paths_can_chain_to_read_tools(
     )
     assert isinstance(read_search_outcome, ToolCompletedOutcome)
     assert isinstance(read_section_from_search_outcome, ToolCompletedOutcome)
+
+
+def test_search_files_cancelled_during_iteration_stops_before_later_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_files 遍历中取消后不得继续扫描后续文件。"""
+
+    first = tmp_path / "a.txt"
+    second = tmp_path / "b.txt"
+    third = tmp_path / "c.txt"
+    first.write_text("first revenue", encoding="utf-8")
+    second.write_text("second revenue", encoding="utf-8")
+    third.write_text("third revenue", encoding="utf-8")
+    definitions = _definitions_by_name(_discover_definitions(tmp_path))
+    token = _ManualCancellationToken()
+    scanned_paths: list[str] = []
+
+    def fake_try_create_processor(path: Path) -> None:
+        """强制搜索走行扫描 fallback。
+
+        :param path: 候选文件路径。
+        :returns: 始终返回 ``None``。
+        """
+
+        del path
+        return None
+
+    def fake_search_via_line_scan(
+        file_path: Path,
+        relative_path: str,
+        query: str,
+        remaining: int,
+        cancellation_token: CancellationToken | None = None,
+    ) -> list[dict[str, JsonValue]]:
+        """记录首个扫描文件并触发取消。
+
+        :param file_path: 当前扫描文件。
+        :param relative_path: 相对路径。
+        :param query: 搜索词。
+        :param remaining: 剩余结果数量。
+        :param cancellation_token: Host 注入的取消令牌。
+        :returns: 空匹配，迫使外层继续迭代并命中 checkpoint。
+        """
+
+        del file_path, query, remaining, cancellation_token
+        scanned_paths.append(relative_path)
+        token.cancel("cancel during iteration")
+        return []
+
+    monkeypatch.setattr(doc_tools, "_try_create_processor", fake_try_create_processor)
+    monkeypatch.setattr(doc_tools, "_search_via_line_scan", fake_search_via_line_scan)
+
+    outcome = asyncio.run(
+        definitions["search_files"].callable(
+            _call("search_files", {"directory": str(tmp_path), "query": "revenue"}),
+            _context(token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+    assert len(scanned_paths) == 1
+
+
+def test_read_file_cancelled_after_first_failed_encoding_stops_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """read_file 首个编码失败并触发取消后不得继续尝试 fallback 编码。"""
+
+    target = tmp_path / "encoded.txt"
+    target.write_bytes(b"\xffencoded")
+    definitions = _definitions_by_name(_discover_definitions(tmp_path))
+    token = _ManualCancellationToken()
+    attempted_encodings: list[str] = []
+    original_open = builtins.open
+
+    def fake_open(
+        file: int | str | bytes | Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+        closefd: bool = True,
+        opener: Callable[[str, int], int] | None = None,
+    ) -> TextIO:
+        """在 utf-8 解码失败后请求取消。
+
+        :param file: 打开的文件路径或描述符。
+        :param mode: 打开模式。
+        :param buffering: buffering 参数。
+        :param encoding: 文本编码。
+        :param errors: 解码错误策略。
+        :param newline: 换行策略。
+        :param closefd: 是否关闭 fd。
+        :param opener: 自定义 opener。
+        :returns: 文本文件对象。
+        :raises UnicodeDecodeError: 模拟 utf-8 解码失败。
+        """
+
+        if isinstance(file, (str, Path)) and Path(file).resolve() == target.resolve():
+            if encoding is not None:
+                attempted_encodings.append(encoding)
+            if encoding == "utf-8":
+                token.cancel("cancel before fallback encoding")
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            return io.StringIO("fallback content")
+        return cast(
+            TextIO,
+            original_open(file, mode, buffering, encoding, errors, newline, closefd, opener),
+        )
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    outcome = asyncio.run(
+        definitions["read_file"].callable(
+            _call("read_file", {"file_path": str(target)}),
+            _context(token),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "tool_cancelled"
+    assert attempted_encodings == ["utf-8"]
 
 
 def test_success_and_failure_responses_do_not_contain_old_envelope(
@@ -664,6 +894,33 @@ def _first_search_match_file_and_ref(outcome: ToolCompletedOutcome) -> tuple[str
     return file_value, first_match["ref"]
 
 
+def _pre_cancel_arguments(
+    tool_name: str,
+    directory: Path,
+    file_path: Path,
+) -> Mapping[str, JsonValue]:
+    """返回各 Doc tool 预取消测试所需的最小合法参数。
+
+    :param tool_name: Doc tool 名称。
+    :param directory: 已允许访问的目录。
+    :param file_path: 已存在的文件路径。
+    :returns: 工具调用参数。
+    :raises AssertionError: 工具名不在测试覆盖集合中时抛出。
+    """
+
+    if tool_name == "list_files":
+        return {"directory": str(directory)}
+    if tool_name == "get_file_sections":
+        return {"file_path": str(file_path)}
+    if tool_name == "search_files":
+        return {"directory": str(directory), "query": "Revenue"}
+    if tool_name == "read_file":
+        return {"file_path": str(file_path)}
+    if tool_name == "read_file_section":
+        return {"file_path": str(file_path), "ref": "section_1"}
+    raise AssertionError(f"unexpected doc tool: {tool_name}")
+
+
 def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
     """构造工具调用请求。
 
@@ -681,18 +938,23 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
     )
 
 
-def _context() -> BatchToolExecutionContext:
+def _context(
+    cancellation_token: CancellationToken | None = None,
+) -> BatchToolExecutionContext:
     """构造批式执行上下文。
 
+    :param cancellation_token: 可选测试取消令牌。
     :returns: BatchToolExecutionContext。
     """
 
+    if cancellation_token is None:
+        cancellation_token = _OpenCancellationToken()
     return BatchToolExecutionContext(
         run_id="run-doc",
         session_id="session-doc",
         iteration_id="iteration-doc",
         timeout_seconds=10.0,
-        cancellation_token=_OpenCancellationToken(),
+        cancellation_token=cancellation_token,
         correlation_id="correlation-doc",
     )
 

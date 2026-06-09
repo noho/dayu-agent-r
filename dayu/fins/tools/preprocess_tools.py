@@ -15,10 +15,20 @@ from typing import Final
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition, ToolDisplayInfo
-from dayu.contracts.tool_outcome import ToolExecutionOutcome
+from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolCancelledOutcome,
+    ToolExecutionOutcome,
+)
+from dayu.contracts.tool_result import ToolResultMeta
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.ingestion_runtime import FinsIngestionRuntime, FinsPreprocessRequest
+from dayu.fins.ingestion_runtime import (
+    FinsIngestionJobStatus,
+    FinsIngestionRuntime,
+    FinsIngestionStartCancelledError,
+    FinsPreprocessRequest,
+)
 from dayu.fins.tools._ingestion_tool_helpers import (
     _awaiting_outcome_from_job_start,
     _failed_outcome,
@@ -31,6 +41,8 @@ PREPROCESS_TOOL_NAME: Final[str] = "start_fins_preprocess"
 _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_preprocess_start_failed"
 _DEFAULT_SOURCE_KIND: Final[SourceKind] = SourceKind.FILING
+_CANCELLED_MESSAGE: Final[str] = "Fins preprocess start was cancelled by the host."
+_CANCELLED_HINT: Final[str] = "Continue without this Fins preprocess job unless the user asks to retry."
 
 
 @dataclass(frozen=True)
@@ -52,21 +64,28 @@ class FinsPreprocessToolCallable:
 
         Args:
             call: 当前工具调用请求。
-            context: 批式工具执行上下文；本工具不消费其中的 Host 治理字段。
+            context: 批式工具执行上下文；本工具只观察取消 token。
 
         Returns:
             参数或启动失败时返回 ``ToolFailedOutcome``；durable job 创建成功后
-            返回 ``ToolAwaitingOutcome``。
+            返回 ``ToolAwaitingOutcome``；启动边界观察到取消时返回
+            ``ToolCancelledOutcome``。
 
         Raises:
             无。工具边界内的启动异常会被归一化为失败 outcome。
         """
 
-        del context
         started_at = datetime.now(timezone.utc)
+        cancellation_token = context.cancellation_token
+        if cancellation_token.is_cancelled():
+            return _cancelled_outcome(started_at)
         try:
             request = _preprocess_request_from_arguments(call.arguments)
-            start = self.runtime.start_preprocess(request)
+            start = self.runtime.start_preprocess(request, cancellation_token=cancellation_token)
+            if start.status in {FinsIngestionJobStatus.CANCELLING, FinsIngestionJobStatus.CANCELLED}:
+                return _cancelled_outcome(started_at)
+        except FinsIngestionStartCancelledError:
+            return _cancelled_outcome(started_at)
         except ValueError as exc:
             return _failed_outcome(
                 tool_name=PREPROCESS_TOOL_NAME,
@@ -92,6 +111,32 @@ class FinsPreprocessToolCallable:
                 hint="请检查输入参数和 Fins ingestion runtime 配置。",
             )
         return _awaiting_outcome_from_job_start(start)
+
+
+def _cancelled_outcome(started_at: datetime) -> ToolCancelledOutcome:
+    """构造预处理启动取消 outcome。
+
+    Args:
+        started_at: 工具调用开始时间。
+
+    Returns:
+        工具级取消 outcome。
+
+    Raises:
+        ValueError: outcome 字段非法时由契约构造抛出。
+    """
+
+    finished_at = datetime.now(timezone.utc)
+    return ToolCancelledOutcome(
+        reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
+        message=_CANCELLED_MESSAGE,
+        hint=_CANCELLED_HINT,
+        meta=ToolResultMeta(
+            tool_name=PREPROCESS_TOOL_NAME,
+            started_at=started_at,
+            finished_at=finished_at,
+        ),
+    )
 
 
 def build_fins_preprocess_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:

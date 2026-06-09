@@ -17,8 +17,10 @@ from collections import Counter
 import re
 from typing import Any, Optional
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.tools._legacy_adapter.exceptions import ToolArgumentError
+from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
 from dayu.documents.processors.base import (
     DocumentProcessor,
     SearchHit,
@@ -52,6 +54,32 @@ from .search_models import (
 )
 from .section_semantic import resolve_section_semantic
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
+
+
+def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> None:
+    """在搜索策略内部循环执行协作式取消检查。
+
+    Args:
+        cancellation_token: Host 注入的取消观察令牌；未注入时为 None。
+
+    Returns:
+        无。
+
+    Raises:
+        ToolBusinessError: 当前工具调用已被 Host 取消时抛出，错误码固定为
+            ``tool_cancelled``。
+    """
+
+    if cancellation_token is not None and cancellation_token.is_cancelled():
+        reason = cancellation_token.cancel_reason()
+        message = "财报文档搜索已被取消。"
+        if reason is not None and reason.strip() != "":
+            message = f"{message}取消原因: {reason}"
+        raise ToolBusinessError(
+            code="tool_cancelled",
+            message=message,
+            hint="当前工具调用已停止；等待新的用户指令或后续调度。",
+        )
 
 
 # =====================================================================
@@ -536,6 +564,7 @@ def _execute_query_search(
     mode: str,
     diagnosis: QueryDiagnosis,
     semantic_profiles: dict[str, SectionSemanticProfile],
+    cancellation_token: CancellationToken | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]], list[dict[str, str]]]:
     """对单条查询执行搜索策略，返回原始 ranked_entries 及诊断数据。
 
@@ -546,11 +575,13 @@ def _execute_query_search(
         mode: 搜索模式。
         diagnosis: 查询诊断结果。
         semantic_profiles: 章节语义画像映射。
+        cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
         ``(ranked_entries, strategy_hit_counts, exact_matches, expansion_queries)`` 四元组。
     """
 
+    _raise_if_search_cancelled(cancellation_token)
     exact_matches: list[dict[str, Any]] = []
     expansion_queries: list[dict[str, str]] = []
     strategy_hit_counts = _build_empty_search_strategy_hit_counts()
@@ -567,7 +598,9 @@ def _execute_query_search(
         # run_exact 路径已隐含精确匹配语义，字面引号会导致假阴性。
         # 适用于 auto 和 exact 两种 mode（keyword/semantic 不走此路径）。
         exact_query = query.replace('"', '').strip()
+        _raise_if_search_cancelled(cancellation_token)
         exact_matches_raw: list[SearchHit] = processor.search(exact_query or query, within_ref)
+        _raise_if_search_cancelled(cancellation_token)
         all_normalized = _normalize_search_matches(exact_matches_raw)
         # 分离真正的精确命中与 processor 层 token fallback 命中。
         # 带 _token_fallback 标记的命中来自 processor 内部的 token OR 回退，
@@ -598,11 +631,15 @@ def _execute_query_search(
     )
     if should_expand:
         for phase_index, phase in enumerate(search_plan.expansion_phases, start=1):
+            _raise_if_search_cancelled(cancellation_token)
             for expansion in phase:
+                _raise_if_search_cancelled(cancellation_token)
                 expanded_query = expansion["query"]
                 strategy = expansion["strategy"]
                 expansion_queries.append({"query": expanded_query, "strategy": strategy})
+                _raise_if_search_cancelled(cancellation_token)
                 matches_raw = processor.search(expanded_query, within_ref)
+                _raise_if_search_cancelled(cancellation_token)
                 normalized_matches = _normalize_search_matches(matches_raw)
                 if not normalized_matches:
                     continue

@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final closeout passed |
-| implementation status | WU-TOOLS-01-F01-01 final closeout passed; draft PR 127 remains open draft and ready for user merge decision |
-| active work unit | WU-TOOLS-01-F01-01 |
+| gate | draft-PR-pass |
+| implementation status | WU-TOOLS-01-F01-02 draft PR pass final closeout completed |
+| active work unit | WU-TOOLS-01-F01-02 |
 | default next work unit | WU-TOOLS-01-F01-02 |
-| next entry point | After user merges PR 127, start WU-TOOLS-01-F01-02 goal confirmation |
+| next entry point | Await user merge decision for PR 128; after merge enter WU-TOOLS-01-F01-03 goal confirmation |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
 | blocking open questions | none |
@@ -198,6 +198,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-S5-R2 | deferred-with-owner | WU-TOOLS-01-F02 then WU-TOOLS-01-F03 / GitHub Issue #120 | 先迁移 Web CI diagnostics pipeline，再生成可关闭 residual 的 Web smoke。 |
 | WU-TOOLS-01-S1-R1 | deferred-with-owner | WU-TOOLS-01-F04/F05 and WU-TOOLS-01-F06/F07 / GitHub Issues #121 and #122 | 分别迁移 SEC/Fins 与 CN/HK Docling CI pipeline，再生成各自 smoke。 |
 | WU-TOOLS-01-S1-R2 | deferred-with-owner | WU-TOOLS-01-F08 | 清理 documents processor registry 的 OLD `engine` 命名。 |
+| WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
+| WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
+| WU-TOOLS-01-F01-02-R3 | transferred-to-issue | GitHub Issue #130 | 分阶段将 Doc / Web / Fins read tools native 化并删除 `dayu/tools/_legacy_adapter`；实施时必须消除 legacy `tool_cancelled` 投影为 failed outcome 的 bug，不能把该行为搬进 provider-local wrapper。 |
 
 ## 当前 Work Units
 
@@ -205,19 +208,19 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|---|
 | WU-ENG-01 | completed | provider_state 与 reasoning_content 写回策略优化 | GitHub Issue #10 | completed；PR 113 已 merge，稳定结论是 provider reasoning roundtrip 为协议要求，不进入 payload behavior change |
 | WU-ENG-02 | completed-with-follow-up | Provider request identity and vendor debugging correlation | GitHub Issue #63 closed；#64 current shared scope completed, native adapter-specific scope remains open | tool trace analyze 发现 provider/model bug 后，用 provider 可查 request id 向厂商报障；typed request identity 与 OpenAI-compatible correlation scope 已完成，#64 保留 native Anthropic / Claude Code gateway adapter-specific 后续语义 |
-| WU-CM-01 | completed | Conversation Memory overall optimization | GitHub Issue #81 closed | Umbrella final closeout artifact `docs/reviews/wu-cm-01-umbrella-final-closeout-controller.md`; F01/F02/F03/F04 complete; no active WU-CM-01 residual risks remain |
-| WU-CM-01-F01 | completed | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | S7-R1 S1 one-system-message production assembly accepted; final public-path validation passed |
-| WU-CM-01-F02 | completed | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | Slice 5 compact evidence query readability, Slice 6 prompt semantic rewrite, and S6-R1 production compact instruction contract rescope are accepted |
-| WU-CM-01-F03 | completed | Assistant final answer continuity fidelity closeout | GitHub Issue #81 / WU-CM-01 final closeout | Final closeout artifact `docs/reviews/wu-cm-01-f03-final-closeout-controller.md`; Draft PR 125: `https://github.com/noho/dayu-agent-r/pull/125`; accepted PR review commit `f6494394`; no active residual risks introduced; awaiting user merge decision |
-| WU-CM-01-F04 | completed | Proactive compaction manifest-producing test seam closeout | GitHub Issue #81 / WU-CM-01 final closeout; unblocks WU-TOOLS-01 broad Host validation | PR 124 merged with merge commit `38bf01b05a26a8f7a6a8f8959abd15f6c8d26d13`; final closeout artifact `docs/reviews/wu-cm-01-f04-final-closeout-controller.md`; residual `WU-TOOLS-01-S6-R1` closed and removed from active table |
+| WU-CM-01 | completed | Conversation Memory overall optimization | GitHub Issue #81 closed | F01/F02/F03/F04 complete；无 active WU-CM-01 residual risk |
+| WU-CM-01-F01 | completed | Conversation Memory smoke correctness closeout | GitHub Issue #81 / WU-CM-01 final closeout | one-system-message production assembly 与 final public-path validation 已完成 |
+| WU-CM-01-F02 | completed | Compact evidence query readability quality closeout | GitHub Issue #81 / WU-CM-01 final closeout；depends on WU-DUR-P01 durable tool-call atoms | compact evidence readability、prompt semantic rewrite 与 production compact instruction contract rescope 已完成 |
+| WU-CM-01-F03 | completed | Assistant final answer continuity fidelity closeout | GitHub Issue #81 / WU-CM-01 final closeout | Draft PR #125；无 active residual risk；等待用户 merge decision |
+| WU-CM-01-F04 | completed | Proactive compaction manifest-producing test seam closeout | GitHub Issue #81 / WU-CM-01 final closeout; unblocks WU-TOOLS-01 broad Host validation | PR #124 已 merge；`WU-TOOLS-01-S6-R1` 已关闭并从 active 表移除 |
 | WU-CM-02 | closed | working_assumptions 生产者语义 | GitHub Issue #81 / WU-CM-01 | 已裁决；reject 旧 `working_assumptions` 独立语义，不单独实施，删除 / 迁移旧字段由 WU-CM-01 schema / projection slice 承接 |
 | WU-CM-03 | closed | fact-candidate-only validation failure 策略 | GitHub Issue #81 / WU-CM-01 | 已裁决；fact candidate invalid 必须 fail closed / whole-candidate repair retry，不 partial materialize，独立 WU closed |
 | WU-CM-04 | closed | minimum preserve 与 Fins 事实边界 | GitHub Issue #81 / Fins integration | 已裁决；minimum preserve 是 bounded continuity item，不是事实真源，独立 WU closed；后续 Fins integration 继承该边界 |
-| WU-TOOLS-01 | draft-pr-pass-final-closeout-passed | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98；draft PR #123 | Accepted plan commit f6658fb4；Slices S1-S6 and external blocker reconciliation accepted；PR review and re-review passed；all active residual risks have owner / destination；ready for user merge decision at https://github.com/noho/dayu-agent-r/pull/123 |
-| WU-TOOLS-01-F01 | draft-PR-pass-final-closeout-passed | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed | Accepted plan commit `27f91192`; Slice S1 accepted commit `f598f8a2`; Slice S2 accepted commit `2e12dfb4`; Slice S3 accepted commit `4b91d3af`; Slice S4 accepted commit `2727b900`; Slice S5 accepted commit `5336d7b2`; Slice S6 accepted commit `157ec0b5`; aggregate final review artifacts `docs/reviews/wu-tools-01-f01-aggregate-final-review-mimo.md`, `docs/reviews/wu-tools-01-f01-aggregate-final-review-ds.md`; aggregate controller adjudication `docs/reviews/wu-tools-01-f01-aggregate-final-review-controller-adjudication.md`; aggregate final fix artifact `docs/reviews/wu-tools-01-f01-aggregate-final-fix-codex.md`; aggregate final re-review artifacts `docs/reviews/wu-tools-01-f01-aggregate-final-rereview-mimo.md`, `docs/reviews/wu-tools-01-f01-aggregate-final-rereview-ds.md`; aggregate final re-review controller adjudication `docs/reviews/wu-tools-01-f01-aggregate-final-rereview-controller-adjudication.md`; accepted deepreview fix commit `ba87e28b`; draft PR https://github.com/noho/dayu-agent-r/pull/126; PR review artifacts `docs/reviews/wu-tools-01-f01-pr-review-mimo.md`, `docs/reviews/wu-tools-01-f01-pr-review-ds.md`; PR review controller adjudication `docs/reviews/wu-tools-01-f01-pr-review-controller-adjudication.md`; no accepted PR fix; final closeout artifact `docs/reviews/wu-tools-01-f01-final-closeout-controller.md`; ready for user merge decision. Build the shared Fins ingestion service/runtime first, then expose independent download and preprocess tool providers through current `ToolAwaitingOutcome` / wait-resume contract; residual `WU-TOOLS-01-S4-R1` closed by Slice S6 re-review controller adjudication |
-| WU-TOOLS-01-F01-01 | draft-PR-pass-final-closeout-passed | Fins filelock convergence to dayu.runtime.filelock | WU-TOOLS-01-F01 draft PR preflight follow-up; draft PR https://github.com/noho/dayu-agent-r/pull/127 | Accepted plan commit `c20ac977`; Slice 1 accepted commit `7c33fb9d`; Slice 2 accepted commit `14cb3e97`; Slice 3 accepted commit `f80bf4bc`; aggregate deepreview artifacts `docs/reviews/wu-tools-01-f01-01-aggregate-deepreview-mimo.md`, `docs/reviews/wu-tools-01-f01-01-aggregate-deepreview-ds.md`; controller adjudication `docs/reviews/wu-tools-01-f01-01-aggregate-deepreview-controller-adjudication.md`; accepted deepreview commit `8587cd1d`; draft PR created at `https://github.com/noho/dayu-agent-r/pull/127`; PR review artifacts `docs/reviews/wu-tools-01-f01-01-pr-review-mimo.md`, `docs/reviews/wu-tools-01-f01-01-pr-review-ds.md`; controller adjudication `docs/reviews/wu-tools-01-f01-01-pr-review-controller-adjudication.md`; no accepted PR fix; accepted PR review commit `a28fc027`; final closeout artifact `docs/reviews/wu-tools-01-f01-01-final-closeout-controller.md`; no active residual risk introduced; ready for user merge decision. After merge, next entry point is WU-TOOLS-01-F01-02 goal confirmation |
-| WU-TOOLS-01-F01-02 | discussion-ready | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up | 为当前已迁移 Fins / Web / Doc tools 补齐 `CancellationToken` 传递审计与取消响应；Host 仍是 cancel 治理真源；Fins download / preprocess 长事务工具和 Web tools 必须在本 WU 实现取消响应；Doc tools 与 Fins read 至少完成 token 传递和风险分级，按耗时 / 外部 I/O / CPU 文件处理风险决定是否本 WU 增加 checkpoint |
-| WU-TOOLS-01-F01-03 | discussion-ready | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09 | 迁移 / 建立 CN download、SEC download、CN upload、SEC upload 的真实可用 runtime 与 tool 入口；合并原 `WU-TOOLS-01-F09` upload follow-up；Tool 当前可访问，未来 CLI / CI 只能通过同一 shared Fins service/runtime 访问，不得再造 CLI / tool / CI 三套逻辑 |
+| WU-TOOLS-01 | draft-pr-pass-final-closeout-passed | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98；draft PR #123 | all active residual risks have owner / destination；等待用户 merge decision |
+| WU-TOOLS-01-F01 | draft-PR-pass-final-closeout-passed | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed；draft PR #126 | shared Fins ingestion service/runtime 与 download / preprocess awaiting tool providers 已完成；等待用户 merge decision |
+| WU-TOOLS-01-F01-01 | draft-PR-pass-final-closeout-passed | Fins filelock convergence to dayu.runtime.filelock | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #127 | Fins filelock 已收敛到 `dayu.runtime.filelock`；无 active residual risk；等待用户 merge decision |
+| WU-TOOLS-01-F01-02 | draft-PR-pass-final-closeout-passed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；等待用户 merge decision |
+| WU-TOOLS-01-F01-03 | discussion-ready | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09 | 迁移 / 建立 CN download、SEC download、CN upload、SEC upload 的真实可用 runtime 与 tool 入口；合并原 `WU-TOOLS-01-F09` upload follow-up；Tool 当前可访问，未来 CLI / CI 只能通过同一 shared Fins service/runtime 访问，不得再造 CLI / tool / CI 三套逻辑；若 upload 进入 awaiting external job / `start_upload` 模型，必须同步更新 GitHub Issue #129，并把 `start_upload` 纳入后续 prepare / activate 两段式范围 |
 | WU-TOOLS-01-F02 | pending | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up | First step of Web CI diagnostics pipeline: migrate OLD `web_ci_urls.jsonl`, `diag_web.sh`, `diag_web_batch.sh` and `utils/diagnose_web_access.py`; does not close `WU-TOOLS-01-S5-R2` by itself |
 | WU-TOOLS-01-F03 | pending | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | Generate explicit opt-in Web smoke from the migrated web CI diagnostics pipeline; defines pass / skip / diagnostic criteria and is the closing owner for residual `WU-TOOLS-01-S5-R2` |
 | WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
@@ -227,8 +230,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F08 | pending | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Rename `build_engine_processor_registry(...)` to a documents/default registry name and update direct callers / exports / docs without changing processor registration behavior; owner for residual `WU-TOOLS-01-S1-R2` |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
-| WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | Slice 0-3 accepted; residual follow-ups closed or transferred to dedicated issue owner |
-| WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | Slice 4 accepted; full analyzer remains WU-OBS-00 non-goal |
+| WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
+| WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
 | WU-OBS-P02 | pending | Tool Trace tool latency signals | GitHub Issue #30 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 tool latency stable signal |
 | WU-OBS-P03 | pending | Tool Trace structured failure metadata | GitHub Issue #31 | WU-OBS-00 前置；NEW / dayu-agent-r 补齐 failure signature / repair hint stable signal |
@@ -877,6 +880,7 @@ F01 已建立 shared Fins service/runtime 作为 read、download、preprocess/pr
 - 所有 CN / SEC download、upload、future CLI、future CI 中的 ticker / market 归一化必须调用 `dayu.fins.ticker_normalization` 真源。
 - CN / SEC download 与 upload 的文件、blob、source document、metadata / ingest method、rejected artifact 写入必须且只能通过 `dayu.fins.storage` 仓储协议与实现完成。
 - 长事务路径必须继承当前 Host / ToolRuntime awaiting、cancel、resume、late terminal governance；短事务路径也必须通过当前 tool accept path 与 Tool Trace / evidence path 流转。
+- 如果本 WU 引入 awaiting external job 形态的 `start_upload`，必须同步更新 GitHub Issue #129，把 `start_upload` 与 `start_download` / `start_preprocess` 一起纳入未来 Host-governed prepare / activate 两段式启动治理；不得为 upload 单独实现私有 activation 绕路。
 
 ### 实施前置要求
 
@@ -885,6 +889,7 @@ F01 已建立 shared Fins service/runtime 作为 read、download、preprocess/pr
 - CN download 必须明确数据来源、请求限制、失败 / 重试 / 编码 / 文件类型处理与本地 artifact 写入语义；不允许把 source-specific 规则散落在 tool schema 或 CLI adapter 中。
 - Upload 必须先判断 CN / SEC upload 在 domain metadata、source_kind、filing/material 类型、company/ticker 归一化和文件命名上的差异；不能做成绕过 storage 的通用文件复制工具。
 - 先裁决 download / upload 是复用同一个 ingestion job model，还是 upload 走短事务；若 upload 存在文件解析、blob 写入、metadata materialize 等长耗时步骤，优先按 awaiting 长事务接入。
+- upload 生命周期裁决必须回写 GitHub Issue #129：若 upload 走 awaiting external job / `start_upload`，#129 必须明确后续拆分 `start_upload` 为 prepare / activate；若 upload 被证明是短事务且没有 awaiting external job，也必须在 #129 记录不适用理由。
 - 若 `dayu.runtime.filelock` 或 cancellation work unit 尚未完成，F01-03 plan 必须显式声明依赖顺序或局部风险；不得在 downloader / uploader 中再造私有 runtime helper。
 
 ### 非目标
@@ -902,6 +907,7 @@ F01 已建立 shared Fins service/runtime 作为 read、download、preprocess/pr
 - CN download、SEC download、CN upload、SEC upload 均有 focused tests 覆盖成功、失败、重复 / overwrite、storage 写入、metadata 与 rejected / unsupported artifact 代表路径。
 - ToolDiscovery 能发现可用的 download / upload tool provider，工具调用通过当前 ToolRuntime / awaiting 或 accept path 流转。
 - Runtime-level tests 证明 future CLI / CI 可以直接调用 shared Fins service/runtime 入口；不存在 CLI / tool / CI 复制业务规则的实现路径。
+- 若本 WU 引入 awaiting `start_upload`，GitHub Issue #129 已更新并明确 `start_upload` 的未来 prepare / activate 拆分要求；若 upload 非 awaiting external job，#129 已记录该裁决和不适用理由。
 - Tests 或静态审计证明 CN / SEC download 与 upload 的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
 - SEC download tests 或 adapter contract 覆盖 User-Agent、请求控速和可诊断失败；真实网络路径必须是 explicit opt-in，不进入普通 deterministic CI。
 - Fins README、tests README 和总揽 README 按触发规则说明 download / upload 的当前可用边界、shared runtime 同源原则、future CLI / CI 调用方式和 live-network opt-in 策略。

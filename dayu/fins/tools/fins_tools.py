@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.tool_call import BatchToolExecutionContext
 from dayu.contracts.tool_schema import ToolSchema, ToolTruncateSpec, ToolTruncationStrategy
 from dayu.fins._log import Log
 from dayu.fins.tools.fins_limits import FinsToolLimits
@@ -30,6 +32,26 @@ from .read_runtime import FinsReadRuntime
 MODULE = "FINS.FINS_TOOLS"
 FINS_TOOL_TAGS = ("fins",)
 _ToolFactoryResult = tuple[str, LegacySyncToolCallable, ToolSchema]
+
+
+def _resolve_fins_cancellation_token(
+    execution_context: BatchToolExecutionContext | None,
+) -> CancellationToken | None:
+    """从工具执行上下文中解析 Host 注入的取消令牌。
+
+    Args:
+        execution_context: legacy adapter 注入的批式工具执行上下文；未注入时为 None。
+
+    Returns:
+        若上下文存在则返回其中的取消令牌，否则返回 None。
+
+    Raises:
+        无。
+    """
+
+    if execution_context is None:
+        return None
+    return execution_context.cancellation_token
 
 
 def _resolve_read_runtime(
@@ -172,6 +194,7 @@ def _create_list_documents_tool(
         tags=FINS_TOOL_TAGS,
         display_name="列出文档",
         summary_params=["ticker"],
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -186,6 +209,7 @@ def _create_list_documents_tool(
         document_types: Optional[list[str]] = None,
         fiscal_years: Optional[list[int]] = None,
         fiscal_periods: Optional[list[str]] = None,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> ListDocumentsResult:
         """列出可用文档。
 
@@ -194,6 +218,7 @@ def _create_list_documents_tool(
             document_types: 可选文档类型过滤（枚举数组）。
             fiscal_years: 可选财年过滤。
             fiscal_periods: 可选财期过滤。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             文档列表结果。
@@ -207,6 +232,7 @@ def _create_list_documents_tool(
             document_types=document_types,
             fiscal_years=fiscal_years,
             fiscal_periods=fiscal_periods,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
         )
 
     return list_documents.__tool_name__, list_documents, list_documents.__tool_schema__
@@ -252,6 +278,7 @@ def _create_get_document_sections_tool(
         tags=FINS_TOOL_TAGS,
         display_name="浏览财报结构",
         summary_params=["ticker"],
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -261,12 +288,17 @@ def _create_get_document_sections_tool(
             ttl_seconds=None,
         ),
     )
-    def get_document_sections(ticker: str, document_id: str) -> DocumentSectionsResult:
+    def get_document_sections(
+        ticker: str,
+        document_id: str,
+        execution_context: BatchToolExecutionContext | None = None,
+    ) -> DocumentSectionsResult:
         """获取文档章节结构。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             章节结构结果。
@@ -275,7 +307,11 @@ def _create_get_document_sections_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return read_runtime.get_document_sections(ticker=ticker, document_id=document_id)
+        return read_runtime.get_document_sections(
+            ticker=ticker,
+            document_id=document_id,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
+        )
 
     return get_document_sections.__tool_name__, get_document_sections, get_document_sections.__tool_schema__
 
@@ -323,6 +359,7 @@ def _create_read_section_tool(
         parameters=parameters,
         tags=FINS_TOOL_TAGS,
         display_name="读取财报章节",
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.TEXT_CHARS,
@@ -336,7 +373,7 @@ def _create_read_section_tool(
         ticker: str,
         document_id: str,
         ref: str,
-        **_kwargs,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> SectionContentResult:
         """读取章节正文。
 
@@ -344,7 +381,7 @@ def _create_read_section_tool(
             ticker: 股票代码。
             document_id: 文档 ID。
             ref: 章节引用。
-            **_kwargs: 历史兼容参数（如 within_section_ref），均被忽略。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             章节内容结果。
@@ -352,9 +389,12 @@ def _create_read_section_tool(
         Raises:
             ToolArgumentError: 参数非法时抛出。
         """
-        _ = _kwargs
-
-        return read_runtime.read_section(ticker=ticker, document_id=document_id, ref=ref)
+        return read_runtime.read_section(
+            ticker=ticker,
+            document_id=document_id,
+            ref=ref,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
+        )
 
     return read_section.__tool_name__, read_section, read_section.__tool_schema__
 
@@ -417,6 +457,7 @@ def _create_search_document_tool(
         tags=FINS_TOOL_TAGS,
         display_name="检索文档",
         summary_params=["query"],
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -433,6 +474,7 @@ def _create_search_document_tool(
         queries: Optional[list[str]] = None,
         within_section_ref: Optional[str] = None,
         mode: Optional[str] = None,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> SearchDocumentResult:
         """搜索文档。
 
@@ -443,6 +485,7 @@ def _create_search_document_tool(
             queries: 批量搜索词（与 query 互斥，上限 20 条）。
             within_section_ref: 可选章节范围。
             mode: 搜索模式（auto/exact/keyword/semantic）。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             搜索结果。
@@ -459,6 +502,7 @@ def _create_search_document_tool(
             within_section_ref=within_section_ref,
             mode=mode,
             display_budget=limits.search_document_max_items,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
         )
         # 剥离内部诊断信息，不暴露给 LLM
         result.pop("diagnostics", None)
@@ -516,6 +560,7 @@ def _create_list_tables_tool(
         tags=FINS_TOOL_TAGS,
         display_name="列出表格",
         summary_params=["ticker"],
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -530,6 +575,7 @@ def _create_list_tables_tool(
         document_id: str,
         financial_only: bool = False,
         within_section_ref: Optional[str] = None,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> TablesListResult:
         """列出表格。
 
@@ -538,6 +584,7 @@ def _create_list_tables_tool(
             document_id: 文档 ID。
             financial_only: 是否仅返回财务表。
             within_section_ref: 可选章节范围。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             表格列表结果。
@@ -551,6 +598,7 @@ def _create_list_tables_tool(
             document_id=document_id,
             financial_only=financial_only,
             within_section_ref=within_section_ref,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
         )
 
     return list_tables.__tool_name__, list_tables, list_tables.__tool_schema__
@@ -599,6 +647,7 @@ def _create_get_table_tool(
         parameters=parameters,
         tags=FINS_TOOL_TAGS,
         display_name="查看表格",
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -608,13 +657,19 @@ def _create_get_table_tool(
             ttl_seconds=None,
         ),
     )
-    def get_table(ticker: str, document_id: str, table_ref: str) -> TableDetailResult:
+    def get_table(
+        ticker: str,
+        document_id: str,
+        table_ref: str,
+        execution_context: BatchToolExecutionContext | None = None,
+    ) -> TableDetailResult:
         """读取表格。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
             table_ref: 表格引用。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             表格结果。
@@ -623,7 +678,12 @@ def _create_get_table_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return read_runtime.get_table(ticker=ticker, document_id=document_id, table_ref=table_ref)
+        return read_runtime.get_table(
+            ticker=ticker,
+            document_id=document_id,
+            table_ref=table_ref,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
+        )
 
     return get_table.__tool_name__, get_table, get_table.__tool_schema__
 
@@ -669,6 +729,7 @@ def _create_get_page_content_tool(
         tags=FINS_TOOL_TAGS,
         display_name="读取页面",
         summary_params=["ticker"],
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.TEXT_CHARS,
@@ -678,13 +739,19 @@ def _create_get_page_content_tool(
             ttl_seconds=None,
         ),
     )
-    def get_page_content(ticker: str, document_id: str, page_no: int) -> PageContentResult | NotSupportedResult:
+    def get_page_content(
+        ticker: str,
+        document_id: str,
+        page_no: int,
+        execution_context: BatchToolExecutionContext | None = None,
+    ) -> PageContentResult | NotSupportedResult:
         """读取页面内容。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
             page_no: 页码。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             页面内容结果。
@@ -693,7 +760,12 @@ def _create_get_page_content_tool(
             ToolArgumentError: 参数非法时抛出。
         """
 
-        return read_runtime.get_page_content(ticker=ticker, document_id=document_id, page_no=page_no)
+        return read_runtime.get_page_content(
+            ticker=ticker,
+            document_id=document_id,
+            page_no=page_no,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
+        )
 
     return get_page_content.__tool_name__, get_page_content, get_page_content.__tool_schema__
 
@@ -745,6 +817,7 @@ def _create_get_financial_statement_tool(
         tags=FINS_TOOL_TAGS,
         display_name="查看财务报表",
         summary_params=["statement_type"],
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -754,13 +827,19 @@ def _create_get_financial_statement_tool(
             ttl_seconds=None,
         ),
     )
-    def get_financial_statement(ticker: str, document_id: str, statement_type: str) -> FinancialStatementResult | NotSupportedResult:
+    def get_financial_statement(
+        ticker: str,
+        document_id: str,
+        statement_type: str,
+        execution_context: BatchToolExecutionContext | None = None,
+    ) -> FinancialStatementResult | NotSupportedResult:
         """读取财务报表。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
             statement_type: 报表类型。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             财务报表结果。
@@ -773,6 +852,7 @@ def _create_get_financial_statement_tool(
             ticker=ticker,
             document_id=document_id,
             statement_type=statement_type,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
         )
 
     return get_financial_statement.__tool_name__, get_financial_statement, get_financial_statement.__tool_schema__
@@ -830,6 +910,7 @@ def _create_query_xbrl_facts_tool(
         tags=FINS_TOOL_TAGS,
         display_name="查询财务数据",
         summary_params=["concepts"],  # list[str]，_build_param_preview 展开为逗号分隔
+        execution_context_param_name="execution_context",
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -849,6 +930,7 @@ def _create_query_xbrl_facts_tool(
         fiscal_period: Optional[str] = None,
         min_value: Optional[float] = None,
         max_value: Optional[float] = None,
+        execution_context: BatchToolExecutionContext | None = None,
     ) -> XbrlQueryResult | NotSupportedResult:
         """查询 XBRL facts。
 
@@ -862,6 +944,7 @@ def _create_query_xbrl_facts_tool(
             fiscal_period: 可选财期。
             min_value: 可选最小值。
             max_value: 可选最大值。
+            execution_context: legacy adapter 注入的批式工具执行上下文。
 
         Returns:
             查询结果。
@@ -880,6 +963,7 @@ def _create_query_xbrl_facts_tool(
             fiscal_period=fiscal_period,
             min_value=min_value,
             max_value=max_value,
+            cancellation_token=_resolve_fins_cancellation_token(execution_context),
         )
 
     return query_xbrl_facts.__tool_name__, query_xbrl_facts, query_xbrl_facts.__tool_schema__

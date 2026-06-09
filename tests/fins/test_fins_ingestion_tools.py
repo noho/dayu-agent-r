@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeGuard
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition
-from dayu.contracts.tool_outcome import ToolAwaitingOutcome, ToolFailedOutcome
+from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolAwaitingOutcome,
+    ToolCancelledOutcome,
+    ToolFailedOutcome,
+)
 from dayu.fins.ingestion_runtime import (
     FinsIngestionExecutor,
     FinsIngestionJobRecord,
@@ -61,7 +68,12 @@ _READ_SPEC_ID = "financial-read-tools"
 _DOWNLOAD_SPEC_ID = "financial-download-tools"
 _PREPROCESS_SPEC_ID = "financial-preprocess-tools"
 _READ_SAMPLE_TOOL_NAME: Final[str] = "list_documents"
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "dayu" / "config"
+_DOWNLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "download_tools.py"
+_PREPROCESS_TOOLS_PATH: Final[Path] = (
+    _REPO_ROOT / "dayu" / "fins" / "tools" / "preprocess_tools.py"
+)
 _DOWNLOAD_START_FAILED_ERROR = "fins_download_start_failed"
 _PREPROCESS_START_FAILED_ERROR = "fins_preprocess_start_failed"
 _TERMINAL_JOB_STATUSES = frozenset(
@@ -105,6 +117,37 @@ class _OpenCancellationToken:
         """
 
         return None
+
+
+class _CancelledCancellationToken:
+    """测试用已取消 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        Returns:
+            始终返回 ``True``。
+        """
+
+        return True
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            测试取消原因。
+        """
+
+        return "host-cancelled"
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Returns:
+            固定取消请求时间。
+        """
+
+        return datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 class _OSErrorCreateJobStore(FsFinsIngestionJobStore):
@@ -308,6 +351,57 @@ def test_tool_argument_error_returns_failed_outcome_before_job_creation(tmp_path
     assert not tuple(job_dir.glob("*.json"))
 
 
+def test_download_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
+    """下载工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsDownloadToolCallable(runtime=runtime)(
+            _call(DOWNLOAD_TOOL_NAME, {"ticker": "AAPL"}),
+            _context(cancellation_token=_CancelledCancellationToken()),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+def test_preprocess_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
+    """预处理工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsPreprocessToolCallable(runtime=runtime)(
+            _call(PREPROCESS_TOOL_NAME, {"ticker": "AAPL"}),
+            _context(cancellation_token=_CancelledCancellationToken()),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+def test_awaiting_tool_callables_consume_context_and_bridge_token_to_runtime() -> None:
+    """download/preprocess callable 不得丢弃 context，且必须把 token 传给 runtime。"""
+
+    _assert_context_token_bridge(
+        source_path=_DOWNLOAD_TOOLS_PATH,
+        class_name="FinsDownloadToolCallable",
+        start_method="start_download",
+    )
+    _assert_context_token_bridge(
+        source_path=_PREPROCESS_TOOLS_PATH,
+        class_name="FinsPreprocessToolCallable",
+        start_method="start_preprocess",
+    )
+
+
 def test_download_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
     """下载工具遇到 start_download OSError 时应返回 start-failed 失败 outcome。"""
 
@@ -410,6 +504,13 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
     )
 
     for definition in definitions:
+        properties = definition.schema.function.parameters.properties
+        required = definition.schema.function.parameters.required
+        assert "execution_context" not in properties
+        assert "cancellation_token" not in properties
+        assert "execution_context" not in required
+        assert "cancellation_token" not in required
+
         schema_text = _schema_text(definition)
         assert "tool_call_id" not in schema_text
         assert "digest" not in schema_text
@@ -1022,11 +1123,11 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
     )
 
 
-def _context() -> BatchToolExecutionContext:
+def _context(cancellation_token: CancellationToken | None = None) -> BatchToolExecutionContext:
     """构造批执行上下文。
 
     Args:
-        无。
+        cancellation_token: 可选测试取消 token；不传入时使用未取消 token。
 
     Returns:
         批执行上下文。
@@ -1040,7 +1141,7 @@ def _context() -> BatchToolExecutionContext:
         session_id="session-fins",
         iteration_id="iteration-fins",
         timeout_seconds=30.0,
-        cancellation_token=_OpenCancellationToken(),
+        cancellation_token=cancellation_token or _OpenCancellationToken(),
         correlation_id="correlation-fins",
     )
 
@@ -1064,4 +1165,110 @@ def _schema_text(definition: ToolDefinition) -> str:
         + " ".join(definition.schema.function.parameters.properties.keys())
         + " "
         + str(definition.schema.function.parameters.properties)
+    )
+
+
+def _assert_context_token_bridge(
+    *,
+    source_path: Path,
+    class_name: str,
+    start_method: str,
+) -> None:
+    """断言 awaiting callable 源码消费 context 并传递 cancellation token。
+
+    Args:
+        source_path: 待检查的源码路径。
+        class_name: awaiting tool callable 类名。
+        start_method: runtime start 方法名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 找不到目标类、目标方法丢弃 context，或调用 runtime start
+            时未显式传入 ``cancellation_token``。
+    """
+
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    class_node = _find_class(tree, class_name)
+    call_node = _find_method(class_node, "__call__")
+    has_token_bridge = False
+
+    for node in ast.walk(call_node):
+        if isinstance(node, ast.Delete):
+            assert not any(
+                isinstance(target, ast.Name) and target.id == "context"
+                for target in node.targets
+            )
+        if _is_runtime_start_call(node, start_method=start_method):
+            has_token_bridge = any(
+                keyword.arg == "cancellation_token"
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "cancellation_token"
+                for keyword in node.keywords
+            )
+
+    assert has_token_bridge
+
+
+def _find_class(tree: ast.Module, class_name: str) -> ast.ClassDef:
+    """在模块 AST 中查找类定义。
+
+    Args:
+        tree: 模块 AST。
+        class_name: 类名。
+
+    Returns:
+        类定义节点。
+
+    Raises:
+        AssertionError: 找不到对应类定义。
+    """
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return node
+    raise AssertionError(f"missing class: {class_name}")
+
+
+def _find_method(class_node: ast.ClassDef, method_name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """在类 AST 中查找方法定义。
+
+    Args:
+        class_node: 类定义节点。
+        method_name: 方法名。
+
+    Returns:
+        方法定义节点。
+
+    Raises:
+        AssertionError: 找不到对应方法定义。
+    """
+
+    for node in class_node.body:
+        if isinstance(node, ast.FunctionDef) and node.name == method_name:
+            return node
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == method_name:
+            return node
+    raise AssertionError(f"missing method: {class_node.name}.{method_name}")
+
+
+def _is_runtime_start_call(node: ast.AST, *, start_method: str) -> TypeGuard[ast.Call]:
+    """判断 AST 节点是否为 runtime start 调用。
+
+    Args:
+        node: 待判断 AST 节点。
+        start_method: runtime start 方法名。
+
+    Returns:
+        若节点是目标 start 方法调用则返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == start_method
     )

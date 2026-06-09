@@ -21,6 +21,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Final, Protocol, cast, get_args
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.processor_registry import ProcessorRegistry
@@ -120,6 +121,10 @@ class _PreprocessNotSupportedError(RuntimeError):
 
 class _UnsupportedDownloadSourceError(RuntimeError):
     """没有可用下载 adapter。"""
+
+
+class FinsIngestionStartCancelledError(RuntimeError):
+    """启动 ingestion job 前观察到调用方取消。"""
 
 
 @dataclass(frozen=True)
@@ -1005,7 +1010,12 @@ class FinsIngestionRuntime:
             _start_lock=Lock(),
         )
 
-    def start_download(self, request: FinsDownloadRequest) -> FinsIngestionJobStart:
+    def start_download(
+        self,
+        request: FinsDownloadRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> FinsIngestionJobStart:
         """启动下载 job。
 
         本方法先创建 durable ``queued`` record，再提交后台下载 pipeline。
@@ -1013,13 +1023,16 @@ class FinsIngestionRuntime:
 
         Args:
             request: 下载请求。
+            cancellation_token: 可选调用方取消观察 token；只用于启动边界，
+                后台 job 提交后不再作为 Fins job cancel 真源。
 
         Returns:
             已持久化 job 的启动结果。
 
         Raises:
+            FinsIngestionStartCancelledError: durable job 创建前观察到取消时抛出。
             ValueError: ticker、来源或请求摘要字段非法时抛出。
-            OSError: job record 持久化失败时抛出。
+            OSError: job record 持久化失败，或 create 后取消桥接落盘失败时抛出。
         """
 
         normalized = ticker_normalization.normalize_ticker(request.ticker)
@@ -1033,24 +1046,33 @@ class FinsIngestionRuntime:
             "overwrite_existing": request.overwrite_existing,
             "rebuild_processed": request.rebuild_processed,
         }
-        start = self._create_queued_job(
-            operation_kind=FinsIngestionOperationKind.DOWNLOAD,
-            normalized=normalized,
-            source=source,
-            source_kind=None,
-            request_summary=request_summary,
-        )
-        self.executor.submit(
-            start.job_id,
-            lambda: self._run_download_job(
-                job_id=start.job_id,
+        _raise_if_start_cancelled(cancellation_token)
+        with self._start_lock:
+            start = self._create_queued_record_with_start_lock(
+                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
                 normalized=normalized,
-                request=replace(request, source=source),
-            ),
-        )
-        return start
+                source=source,
+                source_kind=None,
+                request_summary=request_summary,
+            )
+            if _is_start_cancelled(cancellation_token):
+                return _job_start_from_record(self._save_cancelled(start.record))
+            self.executor.submit(
+                start.job_id,
+                lambda: self._run_download_job(
+                    job_id=start.job_id,
+                    normalized=normalized,
+                    request=replace(request, source=source),
+                ),
+            )
+            return start
 
-    def start_preprocess(self, request: FinsPreprocessRequest) -> FinsIngestionJobStart:
+    def start_preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> FinsIngestionJobStart:
         """启动预处理 job。
 
         本方法先创建 durable ``queued`` record，再提交后台 pipeline。后台
@@ -1058,13 +1080,16 @@ class FinsIngestionRuntime:
 
         Args:
             request: 预处理请求。
+            cancellation_token: 可选调用方取消观察 token；只用于启动边界，
+                后台 job 提交后不再作为 Fins job cancel 真源。
 
         Returns:
             已持久化 job 的启动结果。
 
         Raises:
+            FinsIngestionStartCancelledError: durable job 创建前观察到取消时抛出。
             ValueError: ticker 或请求摘要字段非法时抛出。
-            OSError: job record 持久化失败时抛出。
+            OSError: job record 持久化失败，或 create 后取消桥接落盘失败时抛出。
         """
 
         normalized = ticker_normalization.normalize_ticker(request.ticker)
@@ -1078,21 +1103,25 @@ class FinsIngestionRuntime:
             ),
             "rebuild_processed": request.rebuild_processed,
         }
-        start = self._create_queued_job(
-            operation_kind=FinsIngestionOperationKind.PREPROCESS,
-            normalized=normalized,
-            source=None,
-            source_kind=request.source_kind,
-            request_summary=request_summary,
-        )
-        self.executor.submit(
-            start.job_id,
-            lambda: self._run_preprocess_job(
-                job_id=start.job_id,
-                request=request,
-            ),
-        )
-        return start
+        _raise_if_start_cancelled(cancellation_token)
+        with self._start_lock:
+            start = self._create_queued_record_with_start_lock(
+                operation_kind=FinsIngestionOperationKind.PREPROCESS,
+                normalized=normalized,
+                source=None,
+                source_kind=request.source_kind,
+                request_summary=request_summary,
+            )
+            if _is_start_cancelled(cancellation_token):
+                return _job_start_from_record(self._save_cancelled(start.record))
+            self.executor.submit(
+                start.job_id,
+                lambda: self._run_preprocess_job(
+                    job_id=start.job_id,
+                    request=request,
+                ),
+            )
+            return start
 
     def read_job(self, job_id: str) -> FinsIngestionJobRecord:
         """读取 ingestion job。
@@ -1128,7 +1157,7 @@ class FinsIngestionRuntime:
 
         return self.job_store.request_cancel(job_id, updated_at=_utc_now())
 
-    def _create_queued_job(
+    def _create_queued_record_with_start_lock(
         self,
         *,
         operation_kind: FinsIngestionOperationKind,
@@ -1137,7 +1166,7 @@ class FinsIngestionRuntime:
         source_kind: SourceKind | None,
         request_summary: dict[str, JsonValue],
     ) -> FinsIngestionJobStart:
-        """创建 queued job record。
+        """在调用方持有启动锁时创建 queued job record。
 
         Args:
             operation_kind: job 操作类型。
@@ -1155,33 +1184,28 @@ class FinsIngestionRuntime:
         """
 
         _assert_bounded_summary(request_summary, "request_summary")
-        with self._start_lock:
-            job_id = _new_job_id()
-            now = _utc_now()
-            record = FinsIngestionJobRecord(
-                job_id=job_id,
-                operation_kind=operation_kind,
-                normalized_ticker=normalized.canonical,
-                market=normalized.market,
-                exchange=normalized.exchange,
-                source=source,
-                source_kind=source_kind,
-                status=FinsIngestionJobStatus.QUEUED,
-                created_at=now,
-                updated_at=now,
-                started_at=None,
-                finished_at=None,
-                request_summary=request_summary,
-                result_summary=dict(_EMPTY_SUMMARY),
-                failure_summary=dict(_EMPTY_SUMMARY),
-                cancellation_requested=False,
-            )
-            persisted = self.job_store.create_job(record)
-        return FinsIngestionJobStart(
-            job_id=persisted.job_id,
-            status=persisted.status,
-            record=persisted,
+        job_id = _new_job_id()
+        now = _utc_now()
+        record = FinsIngestionJobRecord(
+            job_id=job_id,
+            operation_kind=operation_kind,
+            normalized_ticker=normalized.canonical,
+            market=normalized.market,
+            exchange=normalized.exchange,
+            source=source,
+            source_kind=source_kind,
+            status=FinsIngestionJobStatus.QUEUED,
+            created_at=now,
+            updated_at=now,
+            started_at=None,
+            finished_at=None,
+            request_summary=request_summary,
+            result_summary=dict(_EMPTY_SUMMARY),
+            failure_summary=dict(_EMPTY_SUMMARY),
+            cancellation_requested=False,
         )
+        persisted = self.job_store.create_job(record)
+        return _job_start_from_record(persisted)
 
     def _run_preprocess_job(self, *, job_id: str, request: FinsPreprocessRequest) -> None:
         """执行预处理后台 job，并把异常收口到 job store。
@@ -2612,6 +2636,59 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _is_start_cancelled(cancellation_token: CancellationToken | None) -> bool:
+    """判断启动边界是否已观察到取消。
+
+    Args:
+        cancellation_token: 可选取消观察 token。
+
+    Returns:
+        token 已取消返回 ``True``；无 token 或未取消返回 ``False``。
+
+    Raises:
+        无。
+    """
+
+    return cancellation_token is not None and cancellation_token.is_cancelled()
+
+
+def _raise_if_start_cancelled(cancellation_token: CancellationToken | None) -> None:
+    """在 durable job 创建前执行取消 checkpoint。
+
+    Args:
+        cancellation_token: 可选取消观察 token。
+
+    Returns:
+        无。
+
+    Raises:
+        FinsIngestionStartCancelledError: token 已取消时抛出。
+    """
+
+    if _is_start_cancelled(cancellation_token):
+        raise FinsIngestionStartCancelledError("Fins ingestion start cancelled before durable job creation")
+
+
+def _job_start_from_record(record: FinsIngestionJobRecord) -> FinsIngestionJobStart:
+    """从 durable job record 构造启动结果。
+
+    Args:
+        record: 已持久化 job record。
+
+    Returns:
+        与 record 状态一致的启动结果。
+
+    Raises:
+        无。
+    """
+
+    return FinsIngestionJobStart(
+        job_id=record.job_id,
+        status=record.status,
+        record=record,
+    )
+
+
 __all__ = [
     "FinsDownloadedFile",
     "FinsDownloadedSourceDocument",
@@ -2623,6 +2700,7 @@ __all__ = [
     "FinsIngestionJobStore",
     "FinsIngestionOperationKind",
     "FinsIngestionRuntime",
+    "FinsIngestionStartCancelledError",
     "FinsRejectedFilingDownloadArtifact",
     "FinsPreprocessRequest",
     "FinsPreprocessResultSummary",

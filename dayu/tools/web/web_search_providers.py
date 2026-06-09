@@ -14,6 +14,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from dayu.contracts.cancellation import CancellationToken
+from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
+
 MODULE = "ENGINE.WEB_SEARCH"
 _LOGGER = logging.getLogger(__name__)
 SERPER_API_KEY_ENV = "SERPER_API_KEY"
@@ -146,6 +149,7 @@ def search_public_web(
     is_safe_public_url: _PublicUrlSafetyChecker,
     normalize_whitespace: Callable[[str], str],
     resolve_timeout_budget: _TimeoutBudgetResolver,
+    cancellation_token: CancellationToken | None = None,
 ) -> SearchWebOutput:
     """执行公开网页检索并组装 tool 输出。
 
@@ -163,6 +167,7 @@ def search_public_web(
         is_safe_public_url: 公网 URL 安全校验函数。
         normalize_whitespace: 文本空白规整函数。
         resolve_timeout_budget: timeout 预算解析函数。
+        cancellation_token: 当前工具调用取消令牌。
 
     Returns:
         `search_web` 对外返回字典。
@@ -179,9 +184,12 @@ def search_public_web(
     normalized_domains = _normalize_domains(domains)
     limited_results = max(1, min(int(max_results), max_search_results))
     resolved_provider = _resolve_provider(preferred=provider)
+    _raise_if_search_cancelled(cancellation_token)
 
     for candidate_provider in _candidate_providers(resolved_provider):
+        _raise_if_search_cancelled(cancellation_token)
         try:
+            _raise_if_search_cancelled(cancellation_token)
             if candidate_provider == "tavily":
                 rows = _search_with_tavily(
                     query=normalized_query,
@@ -215,7 +223,10 @@ def search_public_web(
                     normalize_whitespace=normalize_whitespace,
                     resolve_timeout_budget=resolve_timeout_budget,
                 )
+            _raise_if_search_cancelled(cancellation_token)
         except Exception as exc:  # pragma: no cover - 失败路径由单测通过 monkeypatch 覆盖
+            if _is_search_cancelled_error(exc):
+                raise
             _log_search_provider_failure(
                 candidate_provider=candidate_provider,
                 error=exc,
@@ -247,6 +258,44 @@ def search_public_web(
         }
 
     raise RuntimeError("联网检索失败：所有 provider 均不可用")
+
+
+def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> None:
+    """检查联网检索取消令牌，并按 legacy Web 失败语义抛出取消错误。
+
+    Args:
+        cancellation_token: 当前工具调用取消令牌。
+
+    Returns:
+        无。
+
+    Raises:
+        ToolBusinessError: 当前调用已被 Host 请求取消时抛出。
+    """
+
+    if cancellation_token is None or not cancellation_token.is_cancelled():
+        return
+    raise ToolBusinessError(
+        code="tool_cancelled",
+        message=cancellation_token.cancel_reason() or "工具调用已取消",
+        hint="[continue_without_web] The host cancelled this web search; continue without this web search unless the user asks to retry.",
+    )
+
+
+def _is_search_cancelled_error(error: Exception) -> bool:
+    """判断异常是否为联网检索取消错误。
+
+    Args:
+        error: provider 调用阶段捕获到的异常。
+
+    Returns:
+        若异常表示工具取消则返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return isinstance(error, ToolBusinessError) and error.code == "tool_cancelled"
 
 
 def _filter_visible_results(
