@@ -49,7 +49,7 @@ The work unit has no unresolved current-gate findings. Remaining residual risks 
 |---|---|---|---|
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | Design two-stage awaiting startup before changing Host wait adapter or Fins runtime activation contract. |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92; provider-specific adapter owners | Route external job physical cancel / revoke / abandon through WU-WAIT-03; provider/runtime-specific physical interruption is added only where supported. Current WU uses cooperative checkpoints and bounded waits. |
-| WU-TOOLS-01-F01-02-R3 | deferred-with-owner | Future tool adapter cancellation contract WU | Decide whether legacy adapter `ToolBusinessError(code="tool_cancelled")` should project as `ToolCancelledOutcome` instead of stable failed outcome. |
+| WU-TOOLS-01-F01-02-R3 | transferred-to-issue | GitHub Issue #130 | Retire the legacy adapter by native-izing Doc / Web / Fins read tools, and ensure semantic `tool_cancelled` cancellation is not preserved as a failed outcome in provider-local wrappers. |
 
 ## Next Entry Point
 

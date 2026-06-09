@@ -200,8 +200,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-S1-R2 | deferred-with-owner | WU-TOOLS-01-F08 | 清理 documents processor registry 的 OLD `engine` 命名。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
-| WU-TOOLS-01-F01-02-R3 | deferred-with-owner | Future tool adapter cancellation contract WU | 裁决 legacy adapter 的 `tool_cancelled` 是否应投影为 `ToolCancelledOutcome`。 |
-| WU-TOOLS-01-LEGACY-ADAPTER-R1 | transferred-to-issue | GitHub Issue #130 | 分阶段将 Doc / Web / Fins read tools native 化并删除 `dayu/tools/_legacy_adapter`；该中期退场方向不替代 R3 在 adapter 仍使用期间的取消投影 bug 修复。 |
+| WU-TOOLS-01-F01-02-R3 | transferred-to-issue | GitHub Issue #130 | 分阶段将 Doc / Web / Fins read tools native 化并删除 `dayu/tools/_legacy_adapter`；实施时必须消除 legacy `tool_cancelled` 投影为 failed outcome 的 bug，不能把该行为搬进 provider-local wrapper。 |
 
 ## 当前 Work Units
 
