@@ -49,7 +49,7 @@ from dayu.fins.ingestion_runtime import (
 )
 from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter
-from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
@@ -273,6 +273,24 @@ class _FakeUploadRunner(FinsUploadRunner):
         self.requests.append(request)
         self.cancellation_checks.append(cancellation_checker())
         return self.result_summary
+
+
+def _upload_runtime_converter(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
+    """runtime production upload 测试用 Docling converter。
+
+    Args:
+        raw_data: 上传文件字节。
+        stream_name: 上传文件名。
+
+    Returns:
+        固定 Docling JSON 对象。
+
+    Raises:
+        无。
+    """
+
+    del raw_data
+    return {"name": stream_name, "format": "docling"}
 
 
 class _CancelOnSecondCheckToken(CancellationToken):
@@ -1174,6 +1192,97 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert isinstance(runner.requests[0], FinsUploadMaterialRequest)
     assert runner.requests[0].action == "auto"
     assert runner.cancellation_checks == [False]
+
+
+def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path: Path) -> None:
+    """DefaultFinsRuntime 应装配 production runner 并执行 SEC filing 上传。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    upload_runner = ingestion.upload_runner
+    assert isinstance(upload_runner, ProductionFinsUploadRunner)
+    upload_runner.sec_pipeline._upload_service._convert_with_docling = _upload_runtime_converter
+    filing_file = tmp_path / "aapl-10q.pdf"
+    filing_file.write_text("runtime sec filing", encoding="utf-8")
+
+    start = ingestion.start_upload(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            action="create",
+            files=(filing_file,),
+            fiscal_year=2025,
+            fiscal_period="Q1",
+            filing_date="2025-05-01",
+            report_date="2025-03-31",
+            company_name="Apple Inc.",
+            overwrite=False,
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["source_kind"] == "filing"
+    assert record.result_summary["status"] == "ok"
+    assert record.result_summary["primary_document"] == "aapl-10q_docling.json"
+    document_id = str(record.result_summary["document_id"])
+    meta = ingestion.source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
+    assert meta["ingest_method"] == "upload"
+    assert meta["primary_document"] == "aapl-10q_docling.json"
+
+
+def test_default_runtime_start_upload_cn_material_uses_production_runner(tmp_path: Path) -> None:
+    """DefaultFinsRuntime 应装配 production runner 并执行 CN material 上传。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    upload_runner = ingestion.upload_runner
+    assert isinstance(upload_runner, ProductionFinsUploadRunner)
+    upload_runner.cn_pipeline._upload_service._convert_with_docling = _upload_runtime_converter
+    material_file = tmp_path / "deck.pdf"
+    material_file.write_text("runtime cn material", encoding="utf-8")
+
+    start = ingestion.start_upload(
+        FinsUploadMaterialRequest(
+            ticker="600519",
+            action="create",
+            files=(material_file,),
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            company_name="贵州茅台",
+            overwrite=False,
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.market == "CN"
+    assert record.result_summary["source_kind"] == "material"
+    assert record.result_summary["status"] == "ok"
+    assert record.result_summary["primary_document"] == "deck_docling.json"
+    document_id = str(record.result_summary["document_id"])
+    meta = ingestion.source_repository.get_source_meta("600519", document_id, SourceKind.MATERIAL)
+    assert meta["material_name"] == "Deck"
+    assert meta["primary_document"] == "deck_docling.json"
 
 
 def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> None:

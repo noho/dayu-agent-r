@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnReportCandidate,
@@ -17,6 +19,8 @@ from dayu.fins.pipelines.cn_download_models import (
 )
 from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.pipelines.download_events import DownloadEventType
+from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
+from dayu.fins.pipelines.upload_material_events import UploadMaterialEventType
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
@@ -223,6 +227,24 @@ class _PipelineDownloadFakeConverter:
         return _DOCLING_BYTES
 
 
+def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
+    """返回固定 Docling 转换结果。
+
+    Args:
+        raw_data: 输入原始字节。
+        stream_name: 输入流名称。
+
+    Returns:
+        固定结构化结果。
+
+    Raises:
+        无。
+    """
+
+    del raw_data
+    return {"name": stream_name, "format": "docling"}
+
+
 def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path) -> None:
     """同步 ``download`` wrapper 应调用真实 CN workflow 且不访问网络。
 
@@ -377,3 +399,232 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     assert summary["downloaded"] == 1
     assert discovery.download_calls == 1
     assert converter.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -> None:
+    """CN filing upload stream 应完成上传并生成 Docling 主文件。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    pipeline = CnPipeline(workspace_root=tmp_path)
+    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            ticker="600519",
+            action="create",
+            files=[filing_file],
+            fiscal_year=2024,
+            fiscal_period="FY",
+            amended=False,
+            filing_date="2025-04-01",
+            report_date="2024-12-31",
+            company_name="贵州茅台",
+            ticker_aliases=["600519", "贵州茅台"],
+            overwrite=False,
+        )
+    ]
+
+    assert [event.event_type for event in events] == [
+        UploadFilingEventType.UPLOAD_STARTED,
+        UploadFilingEventType.CONVERSION_STARTED,
+        UploadFilingEventType.FILE_UPLOADED,
+        UploadFilingEventType.FILE_UPLOADED,
+        UploadFilingEventType.UPLOAD_COMPLETED,
+    ]
+    result_value = events[-1].payload["result"]
+    assert isinstance(result_value, dict)
+    assert result_value["pipeline"] == "cn"
+    assert result_value["action"] == "upload_filing"
+    assert result_value["status"] == "ok"
+    assert str(result_value["document_id"]).startswith("fil_cn_")
+    assert result_value["filing_action"] == "create"
+    meta = pipeline._source_repository.get_source_meta(
+        "600519",
+        str(result_value["document_id"]),
+        SourceKind.FILING,
+    )
+    assert str(meta["primary_document"]).endswith("_docling.json")
+    assert meta["report_kind"] == "annual"
+
+
+@pytest.mark.asyncio
+async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path) -> None:
+    """CN material upload stream 应完成上传并生成 Docling 主文件。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    pipeline = CnPipeline(workspace_root=tmp_path)
+    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    material_file = tmp_path / "deck.pdf"
+    material_file.write_text("demo cn material", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Roadshow Deck",
+            files=[material_file],
+            company_name="贵州茅台",
+            overwrite=False,
+        )
+    ]
+
+    assert [event.event_type for event in events] == [
+        UploadMaterialEventType.UPLOAD_STARTED,
+        UploadMaterialEventType.CONVERSION_STARTED,
+        UploadMaterialEventType.FILE_UPLOADED,
+        UploadMaterialEventType.FILE_UPLOADED,
+        UploadMaterialEventType.UPLOAD_COMPLETED,
+    ]
+    result_value = events[-1].payload["result"]
+    assert isinstance(result_value, dict)
+    assert result_value["pipeline"] == "cn"
+    assert result_value["action"] == "upload_material"
+    assert result_value["status"] == "ok"
+    assert str(result_value["document_id"]).startswith("mat_")
+    meta = pipeline._source_repository.get_source_meta(
+        "600519",
+        str(result_value["document_id"]),
+        SourceKind.MATERIAL,
+    )
+    assert str(meta["primary_document"]).endswith("_docling.json")
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: Path) -> None:
+    """CN filing upload stream 应自动 create/update 并跳过相同源文件。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    pipeline = CnPipeline(workspace_root=tmp_path)
+    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+
+    create_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            ticker="600519",
+            action=None,
+            files=[filing_file],
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="贵州茅台",
+        )
+    ]
+    skip_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            ticker="600519",
+            action=None,
+            files=[filing_file],
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="贵州茅台",
+        )
+    ]
+    create_result = create_events[-1].payload["result"]
+    skip_result = skip_events[-1].payload["result"]
+
+    assert isinstance(create_result, dict)
+    assert isinstance(skip_result, dict)
+    assert create_result["filing_action"] == "create"
+    assert skip_result["filing_action"] == "update"
+    assert skip_result["status"] == "skipped"
+    assert [event.event_type for event in skip_events] == [
+        UploadFilingEventType.UPLOAD_STARTED,
+        UploadFilingEventType.FILE_SKIPPED,
+        UploadFilingEventType.UPLOAD_COMPLETED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upload_material_stream_overwrite_resets_single_document(tmp_path: Path) -> None:
+    """CN material upload stream 的 overwrite 应重置当前 material 文档。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    pipeline = CnPipeline(workspace_root=tmp_path)
+    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    old_file = tmp_path / "deck_old.pdf"
+    new_file = tmp_path / "deck_new.pdf"
+    old_file.write_text("old material", encoding="utf-8")
+    new_file.write_text("new material", encoding="utf-8")
+
+    create_events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action=None,
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            files=[old_file],
+            company_name="贵州茅台",
+        )
+    ]
+    overwrite_events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action=None,
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            files=[new_file],
+            company_name="贵州茅台",
+            overwrite=True,
+        )
+    ]
+    create_result = create_events[-1].payload["result"]
+    overwrite_result = overwrite_events[-1].payload["result"]
+    assert isinstance(create_result, dict)
+    assert isinstance(overwrite_result, dict)
+    assert overwrite_result["status"] == "ok"
+    assert overwrite_result["material_action"] == "update"
+    assert overwrite_result["document_id"] == create_result["document_id"]
+
+    handle = pipeline._source_repository.get_source_handle(
+        "600519",
+        str(overwrite_result["document_id"]),
+        SourceKind.MATERIAL,
+    )
+    file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
+    assert file_names == ["deck_new.pdf", "deck_new_docling.json"]

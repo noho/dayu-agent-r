@@ -358,6 +358,7 @@ class FinsUploadFilingRequest:
         report_date: 可选报告期日期。
         company_name: 可选公司名称。
         ticker_aliases: 可选 ticker 别名。
+        overwrite: 是否覆盖已有 source document。
     """
 
     ticker: str
@@ -371,6 +372,7 @@ class FinsUploadFilingRequest:
     report_date: str | None = None
     company_name: str | None = None
     ticker_aliases: tuple[str, ...] = ()
+    overwrite: bool = False
 
 
 @dataclass(frozen=True)
@@ -393,6 +395,7 @@ class FinsUploadMaterialRequest:
         report_date: 可选报告期日期。
         company_name: 可选公司名称。
         ticker_aliases: 可选 ticker 别名。
+        overwrite: 是否覆盖已有 source document。
     """
 
     ticker: str
@@ -410,6 +413,7 @@ class FinsUploadMaterialRequest:
     report_date: str | None = None
     company_name: str | None = None
     ticker_aliases: tuple[str, ...] = ()
+    overwrite: bool = False
 
 
 FinsUploadRequest = FinsUploadFilingRequest | FinsUploadMaterialRequest
@@ -1529,8 +1533,10 @@ class FinsIngestionRuntime:
     ) -> FinsIngestionJobStart:
         """启动上传 job。
 
-        本方法只负责创建 durable ``queued`` record 并提交上传 runner 边界；
-        Slice 1 默认不装配生产 upload runner，因此后台 job 会失败为不支持。
+        本方法只负责创建 durable ``queued`` record 并提交上传 runner 边界。
+        直接创建的 runtime 若未传入 runner 仍会以不支持结束；通过
+        ``DefaultFinsRuntime`` 装配的 runtime 已提供 production SEC/CN/HK
+        upload runner。process、CLI、Host、tool/provider 装配不在 Slice 4 内。
 
         Args:
             request: 上传请求。
@@ -2845,6 +2851,7 @@ def _upload_request_summary(request: FinsUploadRequest) -> dict[str, JsonValue]:
         "source_kind": request.source_kind.value,
         "action": request.action,
         "file_count": len(request.files),
+        "overwrite": request.overwrite,
         "fiscal_year": _optional_non_negative_int(request.fiscal_year, "fiscal_year"),
         "fiscal_period": _optional_bounded_text(
             request.fiscal_period,

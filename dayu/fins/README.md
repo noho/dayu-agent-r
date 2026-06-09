@@ -231,7 +231,7 @@ upload_start = ingestion.start_upload(
 )
 ```
 
-`FinsReadRuntime` 只服务 read path；download、preprocess 与 upload job 必须使用 `FinsIngestionRuntime`。当前默认 runtime 为 US ticker 的 `source="sec"` / `source="auto"` 装配 SEC production download adapter，为 CN ticker 的 `source="cninfo"` / `source="auto"` 装配巨潮 production download adapter，为 HK ticker 的 `source="hkexnews"` / `source="auto"` 装配披露易 production download adapter；没有匹配 adapter 的 download job 会进入明确 failed 终态。preprocess path 读取 workspace 中已有 source docs，并通过 processor registry 写入 processed repository。当前默认 runtime 不内置生产 upload runner；`start_upload` 可以创建 durable upload job，但后台 job 会以明确 unsupported upload runtime 失败终态收口，直到调用方显式装配 `FinsUploadRunner`。
+`FinsReadRuntime` 只服务 read path；download、preprocess 与 upload job 必须使用 `FinsIngestionRuntime`。当前默认 runtime 为 US ticker 的 `source="sec"` / `source="auto"` 装配 SEC production download adapter，为 CN ticker 的 `source="cninfo"` / `source="auto"` 装配巨潮 production download adapter，为 HK ticker 的 `source="hkexnews"` / `source="auto"` 装配披露易 production download adapter；没有匹配 adapter 的 download job 会进入明确 failed 终态。preprocess path 读取 workspace 中已有 source docs，并通过 processor registry 写入 processed repository。当前默认 runtime 内置 production upload runner：US ticker 走 SEC upload workflow，CN/HK ticker 走 CN/HK upload facade，并通过 `DoclingUploadService` 写入 source/blob 仓储。
 
 ## 公共契约
 
@@ -320,7 +320,7 @@ dayu.fins
 ├── domain                    # 财报领域模型与枚举
 ├── downloaders               # source-specific 低层下载器；当前包含 SEC / 巨潮 / 披露易 downloader
 ├── storage                   # 仓储协议、文件系统仓储、文件对象存储
-├── pipelines                 # source-specific ingestion pipeline；当前包含 SEC 与 CN/HK download pipeline
+├── pipelines                 # source-specific ingestion pipeline；当前包含 SEC 与 CN/HK download / upload pipeline
 ├── processors                # 财报处理器、SEC 表单专项处理器、registry
 ├── tools                     # read tools、download/preprocess awaiting tools、providers、read runtime
 ├── ingestion_runtime.py      # download/preprocess/upload typed runtime 与 durable job store
@@ -383,7 +383,7 @@ Read、download、preprocess 是三个独立 provider：
 
 当前 `DefaultFinsRuntime` 内置三个 production download adapter：`source="sec"` 与 `source="auto"` 且 market 为 `US` 时走 SEC 下载；`source="cninfo"` 与 `source="auto"` 且 market 为 `CN` 时走巨潮下载；`source="hkexnews"` 与 `source="auto"` 且 market 为 `HK` 时走披露易下载。没有匹配 adapter 时，download job 会进入明确的 failed 终态，不伪造成功。
 
-当前 `DefaultFinsRuntime` 不内置生产 upload runner。没有显式装配 `FinsUploadRunner` 时，upload job 会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
+当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
 
 ### Wait adapter
 
@@ -456,10 +456,12 @@ direct caller
   -> create durable queued upload job record
   -> checkpoint before background submit
   -> background executor delegates to FinsUploadRunner
+  -> SEC/CN upload workflow
+  -> DoclingUploadService writes through storage repositories
   -> update Fins job terminal record
 ```
 
-当前 upload 只具备 direct runtime job contract 与 runner 边界，不暴露 upload tool provider，也不绑定 Host wait adapter。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；job request summary 只保存业务字段和文件数量，不保存本地文件路径。未装配 `FinsUploadRunner` 时，后台 upload job 写入 unsupported upload runtime 的 failed 终态。
+当前 upload 只具备 direct runtime job contract 与 production runner，不暴露 upload tool provider，也不绑定 Host wait adapter。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；job request summary 只保存业务字段和文件数量，不保存本地文件路径。未装配 `FinsUploadRunner` 时，后台 upload job 写入 unsupported upload runtime 的 failed 终态。
 
 ## 状态机
 

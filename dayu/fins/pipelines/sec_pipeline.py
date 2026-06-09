@@ -1,8 +1,9 @@
-"""SEC 下载管线与 NEW Fins runtime adapter。
+"""SEC 下载/上传管线与 NEW Fins runtime adapter。
 
-本模块只迁移 OLD SEC pipeline 的下载面：download、download_stream、
-下载过滤、skip/version、6-K 预筛选、SC13 补齐、rejection artifact
-持久化与本地 rebuild。上传、process、CLI 和 Host 集成不在本 Slice 内。
+本模块承载 OLD SEC pipeline 的下载面与 Slice 4 迁移的 production
+upload facade：download、download_stream、上传 filing/material、下载过滤、
+skip/version、6-K 预筛选、SC13 补齐、rejection artifact 持久化与本地
+rebuild。process、CLI、Host、tool/provider 装配不在本 Slice 内。
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import asyncio
 import datetime as dt
 from pathlib import Path
 from collections.abc import Mapping
-from typing import AsyncIterator, BinaryIO, Callable, Coroutine, Final, Optional, TypedDict, cast
+from typing import AsyncIterator, BinaryIO, Callable, Coroutine, Final, Optional, TypeAlias, TypedDict, cast
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins._log import Log
@@ -32,6 +33,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
 )
+from dayu.fins.pipelines.docling_upload_service import DoclingUploadService, UploadCancellationChecker
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_6k_rules import (
     _has_6k_exhibit_candidate,
@@ -118,6 +120,13 @@ from dayu.fins.pipelines.sec_sc13_filtering import (
     should_keep_sc13_direction as _should_keep_sc13_direction_impl,
     should_warn_missing_sc13,
 )
+from dayu.fins.pipelines.sec_upload_workflow import (
+    collect_upload_result_from_events as _collect_upload_result_from_events,
+    run_upload_filing_stream as _run_upload_filing_stream,
+    run_upload_material_stream as _run_upload_material_stream,
+)
+from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent
+from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
@@ -166,6 +175,32 @@ class SecPipelineDownloadResult(TypedDict):
     warnings: list[str]
     filings: list[dict[str, JsonValue]]
     summary: SecPipelineSummary
+
+
+SecPipelineUploadResult: TypeAlias = dict[str, JsonValue]
+"""SEC pipeline 上传聚合结果结构。"""
+
+
+def _run_async_upload_sync(
+    coro: Coroutine[None, None, SecPipelineUploadResult],
+) -> SecPipelineUploadResult:
+    """在同步上下文执行 SEC 上传协程。
+
+    Args:
+        coro: 上传协程。
+
+    Returns:
+        SEC 上传聚合结果。
+
+    Raises:
+        RuntimeError: 当前线程已有事件循环时抛出。
+    """
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    raise RuntimeError("检测到正在运行的事件循环，请改用 stream 异步接口")
 
 
 def _json_mapping(value: JsonValue | None) -> dict[str, JsonValue]:
@@ -412,6 +447,10 @@ class SecPipeline:
         self._user_agent = user_agent
         self._sleep_seconds = sleep_seconds
         self._max_retries = max_retries
+        self._upload_service = DoclingUploadService(
+            source_repository=self._source_repository,
+            blob_repository=self._blob_repository,
+        )
 
     def download(
         self,
@@ -555,6 +594,267 @@ class SecPipeline:
             warn_xbrl_missing_filings=warn_xbrl_missing_filings,
             cleanup_stale_filing_dirs=_cleanup_stale_filing_dirs,
             build_download_filing_event_payload=build_download_filing_event_payload,
+        ):
+            yield event
+
+    def upload_filing(
+        self,
+        ticker: str,
+        action: Optional[str],
+        files: list[Path],
+        fiscal_year: int,
+        fiscal_period: str,
+        amended: bool = False,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> SecPipelineUploadResult:
+        """执行 SEC 财报上传并同步返回聚合结果。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            files: 上传文件列表。
+            fiscal_year: 财年。
+            fiscal_period: 财期。
+            amended: 是否修订版。
+            filing_date: 可选 filing 日期。
+            report_date: 可选 report 日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Returns:
+            上传结果字典。
+
+        Raises:
+            RuntimeError: 当前线程已有事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            _collect_upload_result_from_events(
+                self.upload_filing_stream(
+                    ticker=ticker,
+                    action=action,
+                    files=files,
+                    fiscal_year=fiscal_year,
+                    fiscal_period=fiscal_period,
+                    amended=amended,
+                    filing_date=filing_date,
+                    report_date=report_date,
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker_aliases=ticker_aliases,
+                    overwrite=overwrite,
+                    cancellation_checker=cancellation_checker,
+                ),
+                stream_name="upload_filing_stream",
+            )
+        )
+
+    async def upload_filing_stream(
+        self,
+        ticker: str,
+        action: Optional[str],
+        files: list[Path],
+        fiscal_year: int,
+        fiscal_period: str,
+        amended: bool = False,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> AsyncIterator["UploadFilingEvent"]:
+        """执行流式 SEC 财报上传。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            files: 上传文件列表。
+            fiscal_year: 财年。
+            fiscal_period: 财期。
+            amended: 是否修订版。
+            filing_date: 可选 filing 日期。
+            report_date: 可选 report 日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Yields:
+            上传过程事件。
+
+        Raises:
+            RuntimeError: 上传执行失败时抛出。
+        """
+
+        async for event in _run_upload_filing_stream(
+            self,
+            ticker=ticker,
+            action=action,
+            files=files,
+            fiscal_year=fiscal_year,
+            fiscal_period=fiscal_period,
+            amended=amended,
+            filing_date=filing_date,
+            report_date=report_date,
+            company_id=company_id,
+            company_name=company_name,
+            ticker_aliases=ticker_aliases,
+            overwrite=overwrite,
+            cancellation_checker=cancellation_checker,
+        ):
+            yield event
+
+    def upload_material(
+        self,
+        ticker: str,
+        action: Optional[str],
+        form_type: str,
+        material_name: str,
+        files: Optional[list[Path]] = None,
+        document_id: Optional[str] = None,
+        internal_document_id: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        fiscal_period: Optional[str] = None,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> SecPipelineUploadResult:
+        """执行 SEC 材料上传并同步返回聚合结果。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            form_type: 材料类型。
+            material_name: 材料名称。
+            files: 可选上传文件列表。
+            document_id: 可选文档 ID。
+            internal_document_id: 可选内部文档 ID。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            filing_date: 可选 filing 日期。
+            report_date: 可选 report 日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Returns:
+            上传结果字典。
+
+        Raises:
+            RuntimeError: 当前线程已有事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            _collect_upload_result_from_events(
+                self.upload_material_stream(
+                    ticker=ticker,
+                    action=action,
+                    form_type=form_type,
+                    material_name=material_name,
+                    files=files,
+                    document_id=document_id,
+                    internal_document_id=internal_document_id,
+                    fiscal_year=fiscal_year,
+                    fiscal_period=fiscal_period,
+                    filing_date=filing_date,
+                    report_date=report_date,
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker_aliases=ticker_aliases,
+                    overwrite=overwrite,
+                    cancellation_checker=cancellation_checker,
+                ),
+                stream_name="upload_material_stream",
+            )
+        )
+
+    async def upload_material_stream(
+        self,
+        ticker: str,
+        action: Optional[str],
+        form_type: str,
+        material_name: str,
+        files: Optional[list[Path]] = None,
+        document_id: Optional[str] = None,
+        internal_document_id: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        fiscal_period: Optional[str] = None,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> AsyncIterator["UploadMaterialEvent"]:
+        """执行流式 SEC 材料上传。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            form_type: 材料类型。
+            material_name: 材料名称。
+            files: 可选上传文件列表。
+            document_id: 可选文档 ID。
+            internal_document_id: 可选内部文档 ID。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            filing_date: 可选 filing 日期。
+            report_date: 可选 report 日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Yields:
+            上传过程事件。
+
+        Raises:
+            ValueError: 市场类型非法时抛出。
+            RuntimeError: 上传执行失败时抛出。
+        """
+
+        async for event in _run_upload_material_stream(
+            self,
+            ticker=ticker,
+            action=action,
+            form_type=form_type,
+            material_name=material_name,
+            files=files,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            fiscal_year=fiscal_year,
+            fiscal_period=fiscal_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            company_id=company_id,
+            company_name=company_name,
+            ticker_aliases=ticker_aliases,
+            overwrite=overwrite,
+            cancellation_checker=cancellation_checker,
         ):
             yield event
 

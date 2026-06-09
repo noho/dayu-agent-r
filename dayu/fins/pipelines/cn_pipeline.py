@@ -1,8 +1,9 @@
-"""CN/HK 下载管线与 NEW Fins runtime adapter。
+"""CN/HK 下载/上传管线与 NEW Fins runtime adapter。
 
-本模块只迁移 OLD CN/HK pipeline 的下载面：download、download_stream、
-下载候选过滤、PDF gate、Docling JSON 转换、skip/overwrite 与本地 rebuild。
-上传、process、CLI 和 Host 集成不在本 Slice 内。
+本模块承载 OLD CN/HK pipeline 的下载面与 Slice 4 迁移的 production
+upload facade：download、download_stream、上传 filing/material、下载候选过滤、
+PDF gate、Docling JSON 转换、skip/overwrite 与本地 rebuild。process、CLI、
+Host、tool/provider 装配不在本 Slice 内。
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
 )
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import CnMarketKind
 from dayu.fins.pipelines.cn_download_pdf_gate import (
     CnDownloadPdfGateProtocol,
@@ -46,7 +48,25 @@ from dayu.fins.pipelines.cn_download_protocols import (
     PdfToDoclingJsonBytes,
 )
 from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
+from dayu.fins.pipelines.docling_upload_service import (
+    DoclingUploadService,
+    UploadCancellationChecker,
+    build_cn_filing_ids,
+    build_material_ids,
+    derive_report_kind,
+    normalize_cn_fiscal_period,
+    reset_upload_target_for_overwrite,
+    resolve_upload_action,
+    validate_material_upload_ids,
+)
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
+from dayu.fins.pipelines.upload_company_meta import build_upload_company_id, upsert_company_meta_for_upload
+from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
+from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent, UploadMaterialEventType
+from dayu.fins.pipelines.upload_progress_helpers import (
+    map_upload_file_event_to_filing_event_type as _map_upload_file_event_to_filing_event_type,
+    map_upload_file_event_to_material_event_type as _map_upload_file_event_to_material_event_type,
+)
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
@@ -60,7 +80,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
 
 CN_DOWNLOAD_SOURCE: Final[str] = "cninfo"
 HK_DOWNLOAD_SOURCE: Final[str] = "hkexnews"
@@ -73,6 +93,9 @@ _CN_STATUS_DOWNLOADED: Final[str] = "downloaded"
 CnPipelineDownloadResult: TypeAlias = dict[str, JsonValue]
 """CN/HK pipeline 下载聚合结果结构。"""
 
+CnPipelineUploadResult: TypeAlias = dict[str, JsonValue]
+"""CN/HK pipeline 上传聚合结果结构。"""
+
 
 def _run_async_download_sync(
     coro: Coroutine[None, None, CnPipelineDownloadResult],
@@ -84,6 +107,28 @@ def _run_async_download_sync(
 
     Returns:
         CN/HK 下载聚合结果。
+
+    Raises:
+        RuntimeError: 当前线程已有事件循环时抛出。
+    """
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    raise RuntimeError("检测到正在运行的事件循环，请改用 stream 异步接口")
+
+
+def _run_async_upload_sync(
+    coro: Coroutine[None, None, CnPipelineUploadResult],
+) -> CnPipelineUploadResult:
+    """在同步上下文执行 CN/HK 上传协程。
+
+    Args:
+        coro: 上传协程。
+
+    Returns:
+        CN/HK 上传聚合结果。
 
     Raises:
         RuntimeError: 当前线程已有事件循环时抛出。
@@ -118,6 +163,33 @@ async def collect_cn_download_result_from_events(
                 return cast(CnPipelineDownloadResult, dict(result))
             raise RuntimeError("CN/HK 下载完成事件缺少结果 payload")
     raise RuntimeError("CN/HK 下载事件流未产生完成事件")
+
+
+async def collect_cn_upload_result_from_events(
+    events: AsyncIterator[UploadFilingEvent | UploadMaterialEvent],
+    *,
+    stream_name: str,
+) -> CnPipelineUploadResult:
+    """从 CN/HK 上传事件流收集最终结果。
+
+    Args:
+        events: CN/HK 上传事件流。
+        stream_name: 事件流名称。
+
+    Returns:
+        完成或失败事件携带的 result 字典。
+
+    Raises:
+        RuntimeError: 事件流未产生完成/失败结果时抛出。
+    """
+
+    async for event in events:
+        if event.event_type.value not in {"upload_completed", "upload_failed"}:
+            continue
+        result = event.payload.get("result")
+        if isinstance(result, Mapping):
+            return dict(result)
+    raise RuntimeError(f"{stream_name} 未返回最终结果")
 
 
 def convert_pdf_bytes_to_docling_json_bytes(raw_data: bytes, stream_name: str) -> bytes:
@@ -242,6 +314,10 @@ class CnPipeline:
         self._pdf_download_gate = pdf_download_gate or NoopCnDownloadPdfGate()
         self._convert_pdf_to_docling_json = (
             convert_pdf_to_docling_json or convert_pdf_bytes_to_docling_json_bytes
+        )
+        self._upload_service = DoclingUploadService(
+            source_repository=self._source_repository,
+            blob_repository=self._blob_repository,
         )
 
     @property
@@ -530,6 +606,559 @@ class CnPipeline:
         ):
             yield event
 
+    def upload_filing(
+        self,
+        ticker: str,
+        action: Optional[str],
+        files: list[Path],
+        fiscal_year: int,
+        fiscal_period: str,
+        amended: bool = False,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> CnPipelineUploadResult:
+        """执行 CN/HK 财报上传并同步返回聚合结果。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            files: 上传文件列表。
+            fiscal_year: 财年。
+            fiscal_period: 财期。
+            amended: 是否修订版。
+            filing_date: 可选披露日期。
+            report_date: 可选报告日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否强制覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Returns:
+            上传结果字典。
+
+        Raises:
+            RuntimeError: 当前线程存在运行中的事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            collect_cn_upload_result_from_events(
+                self.upload_filing_stream(
+                    ticker=ticker,
+                    action=action,
+                    files=files,
+                    fiscal_year=fiscal_year,
+                    fiscal_period=fiscal_period,
+                    amended=amended,
+                    filing_date=filing_date,
+                    report_date=report_date,
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker_aliases=ticker_aliases,
+                    overwrite=overwrite,
+                    cancellation_checker=cancellation_checker,
+                ),
+                stream_name="upload_filing_stream",
+            )
+        )
+
+    async def upload_filing_stream(
+        self,
+        ticker: str,
+        action: Optional[str],
+        files: list[Path],
+        fiscal_year: int,
+        fiscal_period: str,
+        amended: bool = False,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> AsyncIterator[UploadFilingEvent]:
+        """执行流式 CN/HK 财报上传。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            files: 上传文件列表。
+            fiscal_year: 财年。
+            fiscal_period: 财期。
+            amended: 是否修订版。
+            filing_date: 可选披露日期。
+            report_date: 可选报告日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否强制覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Yields:
+            上传过程事件流。
+
+        Raises:
+            RuntimeError: 上传执行失败时抛出。
+        """
+
+        normalized_ticker = _normalize_upload_ticker(ticker)
+        normalized_company_id = build_upload_company_id(normalized_ticker)
+        normalized_period = normalize_cn_fiscal_period(fiscal_period)
+        form_type = normalized_period
+        requested_action = str(action or "").strip().lower() or None
+        document_id, internal_document_id = build_cn_filing_ids(
+            ticker=normalized_ticker,
+            form_type=form_type,
+            fiscal_year=fiscal_year,
+            fiscal_period=normalized_period,
+            amended=amended,
+        )
+        previous_meta = self._safe_get_upload_document_meta(
+            normalized_ticker,
+            document_id,
+            SourceKind.FILING,
+        )
+        resolved_action = resolve_upload_action(action, previous_meta)
+        yield UploadFilingEvent(
+            event_type=UploadFilingEventType.UPLOAD_STARTED,
+            ticker=normalized_ticker,
+            document_id=document_id,
+            payload={
+                "action": resolved_action,
+                "requested_action": requested_action,
+                "resolved_action": resolved_action,
+                "fiscal_year": fiscal_year,
+                "fiscal_period": normalized_period,
+                "amended": amended,
+                "filing_date": filing_date,
+                "report_date": report_date,
+                "company_id": normalized_company_id,
+                "company_name": company_name,
+                "ticker_aliases": _json_text_list(ticker_aliases),
+                "overwrite": overwrite,
+                "file_count": len(files),
+            },
+        )
+        try:
+            upsert_company_meta_for_upload(
+                repository=self._company_repository,
+                ticker=normalized_ticker,
+                action=resolved_action,
+                company_id=company_id,
+                company_name=company_name,
+                ticker_aliases=ticker_aliases,
+            )
+            reset_upload_target_for_overwrite(
+                source_repository=self._source_repository,
+                ticker=normalized_ticker,
+                document_id=document_id,
+                source_kind=SourceKind.FILING,
+                action=resolved_action,
+                overwrite=overwrite,
+                previous_meta=previous_meta,
+            )
+            upload_result = self._upload_service.execute_upload(
+                ticker=normalized_ticker,
+                source_kind=SourceKind.FILING,
+                action=resolved_action,
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                form_type=form_type,
+                files=files,
+                overwrite=overwrite,
+                cancellation_checker=cancellation_checker,
+                meta={
+                    "company_id": normalized_company_id,
+                    "ingest_method": "upload",
+                    "fiscal_year": fiscal_year,
+                    "fiscal_period": normalized_period,
+                    "report_kind": derive_report_kind(normalized_period),
+                    "filing_date": filing_date,
+                    "report_date": report_date,
+                    "amended": amended,
+                },
+            )
+            for file_event in upload_result.file_events:
+                yield UploadFilingEvent(
+                    event_type=_map_upload_file_event_to_filing_event_type(file_event),
+                    ticker=normalized_ticker,
+                    document_id=document_id,
+                    payload={"name": file_event.name, **file_event.payload},
+                )
+            final_result = self._build_upload_result(
+                action="upload_filing",
+                ticker=normalized_ticker,
+                filing_action=resolved_action,
+                requested_action=requested_action,
+                resolved_action=resolved_action,
+                files=_json_text_list([str(path) for path in files]),
+                fiscal_year=fiscal_year,
+                fiscal_period=normalized_period,
+                amended=amended,
+                filing_date=filing_date,
+                report_date=report_date,
+                company_id=normalized_company_id,
+                company_name=company_name,
+                ticker_aliases=_json_text_list(ticker_aliases),
+                overwrite=overwrite,
+                **upload_result.payload,
+                status=_resolve_upload_status(upload_result.status),
+            )
+            yield UploadFilingEvent(
+                event_type=UploadFilingEventType.UPLOAD_COMPLETED,
+                ticker=normalized_ticker,
+                document_id=document_id,
+                payload={"result": final_result},
+            )
+        except Exception as exc:
+            failed_result = self._build_upload_result(
+                action="upload_filing",
+                ticker=normalized_ticker,
+                filing_action=resolved_action,
+                requested_action=requested_action,
+                resolved_action=resolved_action,
+                files=_json_text_list([str(path) for path in files]),
+                fiscal_year=fiscal_year,
+                fiscal_period=normalized_period,
+                amended=amended,
+                filing_date=filing_date,
+                report_date=report_date,
+                company_id=normalized_company_id,
+                company_name=company_name,
+                ticker_aliases=_json_text_list(ticker_aliases),
+                overwrite=overwrite,
+                document_id=document_id,
+                status="failed",
+                message=str(exc),
+            )
+            yield UploadFilingEvent(
+                event_type=UploadFilingEventType.UPLOAD_FAILED,
+                ticker=normalized_ticker,
+                document_id=document_id,
+                payload={"error": str(exc), "result": failed_result},
+            )
+
+    def upload_material(
+        self,
+        ticker: str,
+        action: Optional[str],
+        form_type: str,
+        material_name: str,
+        files: Optional[list[Path]] = None,
+        document_id: Optional[str] = None,
+        internal_document_id: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        fiscal_period: Optional[str] = None,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> CnPipelineUploadResult:
+        """执行 CN/HK 材料上传并同步返回聚合结果。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            form_type: 材料类型。
+            material_name: 材料名称。
+            files: 可选上传文件列表。
+            document_id: 可选文档 ID。
+            internal_document_id: 可选内部文档 ID。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            filing_date: 可选披露日期。
+            report_date: 可选报告日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否强制覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Returns:
+            上传结果字典。
+
+        Raises:
+            RuntimeError: 当前线程存在运行中的事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            collect_cn_upload_result_from_events(
+                self.upload_material_stream(
+                    ticker=ticker,
+                    action=action,
+                    form_type=form_type,
+                    material_name=material_name,
+                    files=files,
+                    document_id=document_id,
+                    internal_document_id=internal_document_id,
+                    fiscal_year=fiscal_year,
+                    fiscal_period=fiscal_period,
+                    filing_date=filing_date,
+                    report_date=report_date,
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker_aliases=ticker_aliases,
+                    overwrite=overwrite,
+                    cancellation_checker=cancellation_checker,
+                ),
+                stream_name="upload_material_stream",
+            )
+        )
+
+    async def upload_material_stream(
+        self,
+        ticker: str,
+        action: Optional[str],
+        form_type: str,
+        material_name: str,
+        files: Optional[list[Path]] = None,
+        document_id: Optional[str] = None,
+        internal_document_id: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        fiscal_period: Optional[str] = None,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        overwrite: bool = False,
+        *,
+        cancellation_checker: UploadCancellationChecker | None = None,
+    ) -> AsyncIterator[UploadMaterialEvent]:
+        """执行流式 CN/HK 材料上传。
+
+        Args:
+            ticker: 股票代码。
+            action: 可选动作类型。
+            form_type: 材料类型。
+            material_name: 材料名称。
+            files: 可选上传文件列表。
+            document_id: 可选文档 ID。
+            internal_document_id: 可选内部文档 ID。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            filing_date: 可选披露日期。
+            report_date: 可选报告日期。
+            company_id: 可选兼容字段。
+            company_name: 公司名称。
+            ticker_aliases: 可选 ticker alias。
+            overwrite: 是否强制覆盖。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Yields:
+            上传过程事件流。
+
+        Raises:
+            RuntimeError: 上传执行失败时抛出。
+        """
+
+        file_list = files or []
+        normalized_ticker = _normalize_upload_ticker(ticker)
+        normalized_company_id = build_upload_company_id(normalized_ticker)
+        normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
+        stable_document_id, stable_internal_document_id = build_material_ids(
+            form_type=form_type,
+            material_name=material_name,
+            fiscal_year=fiscal_year,
+            fiscal_period=normalized_fiscal_period,
+        )
+        resolved_document_id, resolved_internal_id = validate_material_upload_ids(
+            stable_document_id=stable_document_id,
+            stable_internal_document_id=stable_internal_document_id,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+        )
+        previous_meta = self._safe_get_upload_document_meta(
+            normalized_ticker,
+            resolved_document_id,
+            SourceKind.MATERIAL,
+        )
+        requested_action = str(action or "").strip().lower() or None
+        resolved_action = resolve_upload_action(action, previous_meta)
+        yield UploadMaterialEvent(
+            event_type=UploadMaterialEventType.UPLOAD_STARTED,
+            ticker=normalized_ticker,
+            document_id=resolved_document_id,
+            payload={
+                "action": resolved_action,
+                "requested_action": requested_action,
+                "resolved_action": resolved_action,
+                "form_type": form_type,
+                "material_name": material_name,
+                "internal_document_id": resolved_internal_id,
+                "fiscal_year": fiscal_year,
+                "fiscal_period": normalized_fiscal_period,
+                "filing_date": filing_date,
+                "report_date": report_date,
+                "company_id": normalized_company_id,
+                "company_name": company_name,
+                "ticker_aliases": _json_text_list(ticker_aliases),
+                "overwrite": overwrite,
+                "file_count": len(file_list),
+            },
+        )
+        try:
+            upsert_company_meta_for_upload(
+                repository=self._company_repository,
+                ticker=normalized_ticker,
+                action=resolved_action,
+                company_id=company_id,
+                company_name=company_name,
+                ticker_aliases=ticker_aliases,
+            )
+            reset_upload_target_for_overwrite(
+                source_repository=self._source_repository,
+                ticker=normalized_ticker,
+                document_id=resolved_document_id,
+                source_kind=SourceKind.MATERIAL,
+                action=resolved_action,
+                overwrite=overwrite,
+                previous_meta=previous_meta,
+            )
+            upload_result = self._upload_service.execute_upload(
+                ticker=normalized_ticker,
+                source_kind=SourceKind.MATERIAL,
+                action=resolved_action,
+                document_id=resolved_document_id,
+                internal_document_id=resolved_internal_id,
+                form_type=form_type,
+                files=file_list,
+                overwrite=overwrite,
+                cancellation_checker=cancellation_checker,
+                meta={
+                    "company_id": normalized_company_id,
+                    "ingest_method": "upload",
+                    "material_name": material_name,
+                    "fiscal_year": fiscal_year,
+                    "fiscal_period": normalized_fiscal_period,
+                    "filing_date": filing_date,
+                    "report_date": report_date,
+                },
+            )
+            for file_event in upload_result.file_events:
+                yield UploadMaterialEvent(
+                    event_type=_map_upload_file_event_to_material_event_type(file_event),
+                    ticker=normalized_ticker,
+                    document_id=resolved_document_id,
+                    payload={"name": file_event.name, **file_event.payload},
+                )
+            final_result = self._build_upload_result(
+                action="upload_material",
+                ticker=normalized_ticker,
+                material_action=resolved_action,
+                requested_action=requested_action,
+                resolved_action=resolved_action,
+                form_type=form_type,
+                material_name=material_name,
+                files=_json_text_list([str(path) for path in file_list]),
+                fiscal_year=fiscal_year,
+                fiscal_period=normalized_fiscal_period,
+                filing_date=filing_date,
+                report_date=report_date,
+                company_id=normalized_company_id,
+                company_name=company_name,
+                overwrite=overwrite,
+                **upload_result.payload,
+                status=_resolve_upload_status(upload_result.status),
+            )
+            yield UploadMaterialEvent(
+                event_type=UploadMaterialEventType.UPLOAD_COMPLETED,
+                ticker=normalized_ticker,
+                document_id=resolved_document_id,
+                payload={"result": final_result},
+            )
+        except Exception as exc:
+            failed_result = self._build_upload_result(
+                action="upload_material",
+                ticker=normalized_ticker,
+                material_action=resolved_action,
+                requested_action=requested_action,
+                resolved_action=resolved_action,
+                form_type=form_type,
+                material_name=material_name,
+                files=_json_text_list([str(path) for path in file_list]),
+                document_id=resolved_document_id,
+                internal_document_id=resolved_internal_id,
+                fiscal_year=fiscal_year,
+                fiscal_period=normalized_fiscal_period,
+                filing_date=filing_date,
+                report_date=report_date,
+                company_id=normalized_company_id,
+                company_name=company_name,
+                overwrite=overwrite,
+                status="failed",
+                message=str(exc),
+            )
+            yield UploadMaterialEvent(
+                event_type=UploadMaterialEventType.UPLOAD_FAILED,
+                ticker=normalized_ticker,
+                document_id=resolved_document_id,
+                payload={"error": str(exc), "result": failed_result},
+            )
+
+    def _safe_get_upload_document_meta(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> dict[str, JsonValue] | None:
+        """安全读取上传目标 source meta。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            source_kind: 源文档类型。
+
+        Returns:
+            元数据字典；不存在时返回 ``None``。
+
+        Raises:
+            ValueError: 元数据格式非法时抛出。
+            OSError: 仓储读取失败时抛出。
+        """
+
+        try:
+            return self._source_repository.get_source_meta(
+                ticker=ticker,
+                document_id=document_id,
+                source_kind=source_kind,
+            )
+        except FileNotFoundError:
+            return None
+
+    def _build_upload_result(self, action: str, **payload: JsonValue) -> dict[str, JsonValue]:
+        """构建统一上传结果。
+
+        Args:
+            action: 动作名称。
+            **payload: 结果负载字段。
+
+        Returns:
+            统一结构的结果字典。
+
+        Raises:
+            无。
+        """
+
+        return {
+            "pipeline": _pipeline_name_for_ticker(str(payload.get("ticker", ""))),
+            "action": action,
+            "status": payload.pop("status", "placeholder"),
+            **payload,
+        }
+
 
 class CnDownloadAdapter(FinsSourceDownloadAdapter):
     """CN/HK persisted-summary 下载 adapter。"""
@@ -723,6 +1352,56 @@ def _pipeline_name_for_ticker(ticker: str) -> str:
     return CN_PIPELINE_NAME
 
 
+def _normalize_upload_ticker(ticker: str) -> str:
+    """按公共 ticker 真源标准化上传 ticker。
+
+    Args:
+        ticker: 原始 ticker。
+
+    Returns:
+        canonical ticker。
+
+    Raises:
+        ValueError: ticker 为空或无法归一化时抛出。
+    """
+
+    return normalize_ticker(ticker).canonical
+
+
+def _resolve_upload_status(upload_status: str) -> str:
+    """将上传服务状态映射为 pipeline 对外状态。
+
+    Args:
+        upload_status: 上传服务内部状态。
+
+    Returns:
+        pipeline 对外状态值。
+
+    Raises:
+        无。
+    """
+
+    if upload_status == "uploaded":
+        return "ok"
+    return upload_status
+
+
+def _json_text_list(values: list[str] | None) -> list[JsonValue]:
+    """将文本列表收窄为 JSON 数组。
+
+    Args:
+        values: 文本列表。
+
+    Returns:
+        JSON 数组。
+
+    Raises:
+        无。
+    """
+
+    return [item for item in values or []]
+
+
 def build_cn_download_adapter(
     *,
     workspace_root: Path,
@@ -823,5 +1502,6 @@ __all__ = [
     "build_cn_download_adapter",
     "build_hk_download_adapter",
     "collect_cn_download_result_from_events",
+    "collect_cn_upload_result_from_events",
     "convert_pdf_bytes_to_docling_json_bytes",
 ]
