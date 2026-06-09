@@ -83,6 +83,10 @@ _UPLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "uplo
 _DOWNLOAD_START_FAILED_ERROR = "fins_download_start_failed"
 _PREPROCESS_START_FAILED_ERROR = "fins_preprocess_start_failed"
 _UPLOAD_START_FAILED_ERROR = "fins_upload_start_failed"
+_FORBIDDEN_LLM_ERROR_FRAGMENTS: Final[tuple[str, ...]] = (
+    "durable job " + "record",
+    "Fins ingestion " + "runtime",
+)
 _TERMINAL_JOB_STATUSES = frozenset(
     {
         FinsIngestionJobStatus.SUCCEEDED,
@@ -161,7 +165,7 @@ class _OSErrorCreateJobStore(FsFinsIngestionJobStore):
     """测试用 job store，在创建 job 时模拟持久化失败。"""
 
     def create_job(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
-        """模拟 durable job record 创建失败。
+        """模拟任务记录创建失败。
 
         Args:
             record: 待创建的 job record。
@@ -649,6 +653,7 @@ def test_download_tool_os_error_from_start_returns_start_failed_outcome(tmp_path
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == _DOWNLOAD_START_FAILED_ERROR
+    _assert_failed_outcome_hides_internal_terms(outcome)
 
 
 def test_download_tool_unexpected_start_exception_returns_start_failed_outcome(tmp_path: Path) -> None:
@@ -669,6 +674,7 @@ def test_download_tool_unexpected_start_exception_returns_start_failed_outcome(t
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == _DOWNLOAD_START_FAILED_ERROR
+    _assert_failed_outcome_hides_internal_terms(outcome)
 
 
 def test_preprocess_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
@@ -689,6 +695,7 @@ def test_preprocess_tool_os_error_from_start_returns_start_failed_outcome(tmp_pa
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == _PREPROCESS_START_FAILED_ERROR
+    _assert_failed_outcome_hides_internal_terms(outcome)
 
 
 def test_preprocess_tool_unexpected_start_exception_returns_start_failed_outcome(tmp_path: Path) -> None:
@@ -709,6 +716,7 @@ def test_preprocess_tool_unexpected_start_exception_returns_start_failed_outcome
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == _PREPROCESS_START_FAILED_ERROR
+    _assert_failed_outcome_hides_internal_terms(outcome)
 
 
 def test_upload_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
@@ -739,6 +747,7 @@ def test_upload_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: 
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == _UPLOAD_START_FAILED_ERROR
+    _assert_failed_outcome_hides_internal_terms(outcome)
 
 
 def test_upload_tool_unexpected_start_exception_returns_start_failed_outcome(tmp_path: Path) -> None:
@@ -769,6 +778,25 @@ def test_upload_tool_unexpected_start_exception_returns_start_failed_outcome(tmp
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == _UPLOAD_START_FAILED_ERROR
+    _assert_failed_outcome_hides_internal_terms(outcome)
+
+
+def _assert_failed_outcome_hides_internal_terms(outcome: ToolFailedOutcome) -> None:
+    """断言失败 outcome 的模型可见文案不泄漏内部实现术语。
+
+    Args:
+        outcome: 工具失败 outcome。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: message 或 hint 含内部实现术语时抛出。
+    """
+
+    visible_text = f"{outcome.result.message}\n{outcome.result.hint}"
+    for fragment in _FORBIDDEN_LLM_ERROR_FRAGMENTS:
+        assert fragment not in visible_text
 
 
 def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> None:
@@ -1007,7 +1035,7 @@ def _persist_job(
     """持久化指定状态的测试 job record。
 
     Args:
-        runtime: 测试使用的 Fins ingestion runtime。
+        runtime: 测试使用的 Fins 摄取运行时。
         job_id_suffix: 32 位十六进制 job id suffix。
         status: 目标 job 状态。
 
@@ -1205,7 +1233,7 @@ def _runtime_with_job_store(
         job_store: 测试注入的 job store。
 
     Returns:
-        Fins ingestion runtime。
+        Fins ingestion 运行时。
 
     Raises:
         OSError: 默认 Fins runtime 初始化失败时抛出。
@@ -1234,7 +1262,7 @@ def _runtime_with_executor(
         executor: 测试注入的后台执行器。
 
     Returns:
-        Fins ingestion runtime。
+        Fins ingestion 运行时。
 
     Raises:
         OSError: 默认 Fins runtime 初始化失败时抛出。

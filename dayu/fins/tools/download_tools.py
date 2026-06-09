@@ -100,7 +100,7 @@ class FinsDownloadToolCallable:
                 tool_name=DOWNLOAD_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="下载任务未能创建 durable job record。",
+                message="下载任务启动失败，未能保存任务记录。",
                 hint="请稍后重试，或让系统维护者检查 Fins workspace 存储权限。",
             )
         except Exception:
@@ -109,7 +109,7 @@ class FinsDownloadToolCallable:
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
                 message="下载任务启动失败，未进入等待状态。",
-                hint="请检查输入参数和 Fins ingestion runtime 配置。",
+                hint="请确认 Fins workspace 存储目录存在且有写入权限，或联系系统管理员。",
             )
         return _awaiting_outcome_from_job_start(start)
 
