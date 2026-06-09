@@ -47,6 +47,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadResultSummary,
     FinsUploadRunner,
 )
+from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import (
@@ -803,16 +804,24 @@ def test_start_download_unsupported_source_writes_failed_terminal_record(tmp_pat
     assert "market=US" in str(record.failure_summary["message"])
 
 
-def test_default_runtime_registers_sec_and_auto_us_download_adapter(tmp_path: Path) -> None:
-    """默认 runtime 应为 US 的 sec/auto 确定性装配同一个 SEC production adapter。"""
+def test_default_runtime_registers_production_download_adapters(tmp_path: Path) -> None:
+    """默认 runtime 应为 US/CN/HK 装配确定性的 production download adapter。"""
 
     workspace_root = tmp_path / "fins-workspace"
     ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
     sec_adapter = ingestion.download_adapters[("sec", "US")]
     auto_adapter = ingestion.download_adapters[("auto", "US")]
+    cn_adapter = ingestion.download_adapters[("cninfo", "CN")]
+    auto_cn_adapter = ingestion.download_adapters[("auto", "CN")]
+    hk_adapter = ingestion.download_adapters[("hkexnews", "HK")]
+    auto_hk_adapter = ingestion.download_adapters[("auto", "HK")]
 
     assert isinstance(sec_adapter, SecDownloadAdapter)
     assert auto_adapter is sec_adapter
+    assert isinstance(cn_adapter, CnDownloadAdapter)
+    assert auto_cn_adapter is cn_adapter
+    assert isinstance(hk_adapter, CnDownloadAdapter)
+    assert auto_hk_adapter is hk_adapter
 
 
 def test_start_download_repeated_request_skips_existing_source_document(tmp_path: Path) -> None:

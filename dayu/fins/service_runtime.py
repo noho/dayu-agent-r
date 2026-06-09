@@ -176,11 +176,33 @@ class DefaultFinsRuntime:
         with self._ingestion_runtime_lock:
             if self._ingestion_runtime is not None:
                 return self._ingestion_runtime
+            from dayu.fins.pipelines.cn_pipeline import (
+                CN_DOWNLOAD_SOURCE,
+                HK_DOWNLOAD_SOURCE,
+                build_cn_download_adapter,
+                build_hk_download_adapter,
+            )
             from dayu.fins.pipelines.sec_pipeline import SEC_DOWNLOAD_SOURCE, build_sec_download_adapter
 
             sec_download_adapter = build_sec_download_adapter(
                 workspace_root=self.workspace_root,
                 processor_registry=self.processor_registry,
+                company_repository=self.company_repository,
+                source_repository=self.source_repository,
+                processed_repository=self.processed_repository,
+                blob_repository=self.blob_repository,
+                filing_maintenance_repository=self.filing_maintenance_repository,
+            )
+            cn_download_adapter = build_cn_download_adapter(
+                workspace_root=self.workspace_root,
+                company_repository=self.company_repository,
+                source_repository=self.source_repository,
+                processed_repository=self.processed_repository,
+                blob_repository=self.blob_repository,
+                filing_maintenance_repository=self.filing_maintenance_repository,
+            )
+            hk_download_adapter = build_hk_download_adapter(
+                workspace_root=self.workspace_root,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -197,6 +219,10 @@ class DefaultFinsRuntime:
                 download_adapters={
                     (SEC_DOWNLOAD_SOURCE, "US"): sec_download_adapter,
                     ("auto", "US"): sec_download_adapter,
+                    (CN_DOWNLOAD_SOURCE, "CN"): cn_download_adapter,
+                    ("auto", "CN"): cn_download_adapter,
+                    (HK_DOWNLOAD_SOURCE, "HK"): hk_download_adapter,
+                    ("auto", "HK"): hk_download_adapter,
                 },
             )
             self._ingestion_runtime = runtime

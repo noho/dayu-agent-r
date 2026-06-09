@@ -1,7 +1,7 @@
 """下载事件模型。
 
-该模块定义 `SecPipeline.download_stream` 对外输出的标准事件结构，
-用于 CLI 之外的 GUI/Web 实时消费。
+该模块定义 Fins source download workflow 对外输出的标准事件结构，用于
+runtime adapter 在同步边界内聚合最终结果，也可供 GUI/Web 实时消费。
 """
 
 from __future__ import annotations
