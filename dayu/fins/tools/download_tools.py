@@ -42,7 +42,7 @@ DOWNLOAD_TOOL_NAME: Final[str] = "start_fins_download"
 _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_download_start_failed"
 _DEFAULT_SOURCE: Final[str] = "auto"
-_CANCELLED_MESSAGE: Final[str] = "Fins download start was cancelled by the host."
+_CANCELLED_MESSAGE: Final[str] = "Fins download start was cancelled."
 _CANCELLED_HINT: Final[str] = "Continue without this Fins download job unless the user asks to retry."
 
 

@@ -41,7 +41,7 @@ PREPROCESS_TOOL_NAME: Final[str] = "start_fins_preprocess"
 _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_preprocess_start_failed"
 _DEFAULT_SOURCE_KIND: Final[SourceKind] = SourceKind.FILING
-_CANCELLED_MESSAGE: Final[str] = "Fins preprocess start was cancelled by the host."
+_CANCELLED_MESSAGE: Final[str] = "Fins preprocess start was cancelled."
 _CANCELLED_HINT: Final[str] = "Continue without this Fins preprocess job unless the user asks to retry."
 
 

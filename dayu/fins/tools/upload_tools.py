@@ -55,7 +55,7 @@ _UPLOAD_KIND_MATERIAL: Final[str] = "material"
 _UPLOAD_ACTION_DELETE: Final[str] = "delete"
 _UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"auto", "create", "update", "delete"})
 _UPLOAD_KINDS: Final[frozenset[str]] = frozenset({_UPLOAD_KIND_FILING, _UPLOAD_KIND_MATERIAL})
-_CANCELLED_MESSAGE: Final[str] = "Fins upload start was cancelled by the host."
+_CANCELLED_MESSAGE: Final[str] = "Fins upload start was cancelled."
 _CANCELLED_HINT: Final[str] = "Continue without this Fins upload job unless the user asks to retry."
 
 UploadKind: TypeAlias = Literal["filing", "material"]

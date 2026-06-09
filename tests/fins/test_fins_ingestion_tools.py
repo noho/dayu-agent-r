@@ -87,6 +87,7 @@ _FORBIDDEN_LLM_ERROR_FRAGMENTS: Final[tuple[str, ...]] = (
     "durable job " + "record",
     "Fins ingestion " + "runtime",
 )
+_FORBIDDEN_CANCELLED_MESSAGE_FRAGMENTS: Final[tuple[str, ...]] = ("host", "Host")
 _TERMINAL_JOB_STATUSES = frozenset(
     {
         FinsIngestionJobStatus.SUCCEEDED,
@@ -566,6 +567,7 @@ def test_download_tool_cancelled_before_start_returns_cancelled_without_job(tmp_
 
     assert isinstance(outcome, ToolCancelledOutcome)
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    _assert_cancelled_outcome_hides_host_term(outcome)
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
@@ -584,6 +586,7 @@ def test_preprocess_tool_cancelled_before_start_returns_cancelled_without_job(tm
 
     assert isinstance(outcome, ToolCancelledOutcome)
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    _assert_cancelled_outcome_hides_host_term(outcome)
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
@@ -612,6 +615,7 @@ def test_upload_tool_cancelled_before_start_returns_cancelled_without_job(tmp_pa
 
     assert isinstance(outcome, ToolCancelledOutcome)
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    _assert_cancelled_outcome_hides_host_term(outcome)
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
@@ -796,6 +800,24 @@ def _assert_failed_outcome_hides_internal_terms(outcome: ToolFailedOutcome) -> N
 
     visible_text = f"{outcome.result.message}\n{outcome.result.hint}"
     for fragment in _FORBIDDEN_LLM_ERROR_FRAGMENTS:
+        assert fragment not in visible_text
+
+
+def _assert_cancelled_outcome_hides_host_term(outcome: ToolCancelledOutcome) -> None:
+    """断言取消 outcome 的模型可见文案不暴露 host 术语。
+
+    Args:
+        outcome: 工具取消 outcome。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: message 或 hint 含 host / Host 时抛出。
+    """
+
+    visible_text = f"{outcome.message}\n{outcome.hint}"
+    for fragment in _FORBIDDEN_CANCELLED_MESSAGE_FRAGMENTS:
         assert fragment not in visible_text
 
 
