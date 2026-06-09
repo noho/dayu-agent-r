@@ -140,7 +140,9 @@ class FinsDownloadRequest:
         filed_after: 可选起始披露日期字符串。
         filed_before: 可选结束披露日期字符串。
         overwrite_existing: 是否允许覆盖已存在源文档。
-        rebuild_processed: 下载后是否要求后续重建 processed 产物。
+        rebuild_processed: 下载后是否要求后续重建 processed 产物；source-specific
+            adapter 必须按自身仓储语义处理该治理标记，不得假设它等同于来源侧
+            下载工作流的本地重建开关。
     """
 
     ticker: str
@@ -247,6 +249,9 @@ class FinsSourceDownloadAdapterRequest:
         form_types: 表单过滤条件。
         filed_after: 可选起始披露日期字符串。
         filed_before: 可选结束披露日期字符串。
+        overwrite_existing: 是否允许覆盖已存在源文档。
+        rebuild_processed: 下载后是否要求后续重建 processed 产物。
+        cancellation_checker: runtime 提供的协作式取消检查器。
     """
 
     normalized_ticker: NormalizedTicker
@@ -254,6 +259,9 @@ class FinsSourceDownloadAdapterRequest:
     form_types: tuple[str, ...]
     filed_after: str | None
     filed_before: str | None
+    overwrite_existing: bool
+    rebuild_processed: bool
+    cancellation_checker: FinsJobCancellationChecker
 
 
 @dataclass(frozen=True)
@@ -265,12 +273,16 @@ class FinsSourceDownloadAdapterResult:
         documents: 可写入 source 仓储的文档。
         rejected_artifacts: 需要保存为 rejected filing artifact 的文档。
         failed_count: 来源侧业务失败候选数量。
+        persisted_summary: adapter 已通过仓储完成持久化时返回的下载摘要；返回该
+            字段表示 adapter 对 source 文件、rejected artifact 以及必要的
+            processed reprocess 标记等仓储副作用负责，runtime 只记录摘要。
     """
 
     discovered_count: int
     documents: tuple[FinsDownloadedSourceDocument, ...] = ()
     rejected_artifacts: tuple[FinsRejectedFilingDownloadArtifact, ...] = ()
     failed_count: int = 0
+    persisted_summary: FinsDownloadResultSummary | None = None
 
 
 class FinsSourceDownloadAdapter(Protocol):
@@ -1889,8 +1901,18 @@ class FinsIngestionRuntime:
             form_types=_bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False),
             filed_after=_optional_bounded_text(request.filed_after, "filed_after"),
             filed_before=_optional_bounded_text(request.filed_before, "filed_before"),
+            overwrite_existing=request.overwrite_existing,
+            rebuild_processed=request.rebuild_processed,
+            cancellation_checker=_RuntimeJobCancellationChecker(
+                job_store=self.job_store,
+                job_id=record.job_id,
+            ),
         )
         adapter_result = adapter.download(adapter_request)
+        if adapter_result.persisted_summary is not None:
+            if adapter_result.documents or adapter_result.rejected_artifacts:
+                raise ValueError("adapter persisted_summary 不得与 documents/rejected_artifacts 同时返回")
+            return _bounded_download_summary(adapter_result.persisted_summary)
         downloaded_ids: list[str] = []
         skipped_count = 0
         rejected_count = 0
@@ -2956,6 +2978,33 @@ def _non_negative_count(value: int, field_name: str) -> int:
     if value < 0:
         raise ValueError(f"{field_name} 不能为负数")
     return value
+
+
+def _bounded_download_summary(summary: FinsDownloadResultSummary) -> FinsDownloadResultSummary:
+    """校验 adapter 已持久化下载摘要。
+
+    Args:
+        summary: adapter 返回的下载摘要。
+
+    Returns:
+        字段已校验的下载摘要。
+
+    Raises:
+        ValueError: 计数为负或文档 ID 越界时抛出。
+    """
+
+    return FinsDownloadResultSummary(
+        discovered_count=_non_negative_count(summary.discovered_count, "discovered_count"),
+        downloaded_count=_non_negative_count(summary.downloaded_count, "downloaded_count"),
+        skipped_count=_non_negative_count(summary.skipped_count, "skipped_count"),
+        rejected_count=_non_negative_count(summary.rejected_count, "rejected_count"),
+        failed_count=_non_negative_count(summary.failed_count, "failed_count"),
+        written_document_ids=_bounded_text_tuple(
+            summary.written_document_ids,
+            "written_document_ids",
+            reject_path_separators=False,
+        ),
+    )
 
 
 def _build_processed_sections(processor: DocumentProcessor) -> list[dict[str, JsonValue]]:

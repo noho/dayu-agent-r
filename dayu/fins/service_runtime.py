@@ -176,6 +176,17 @@ class DefaultFinsRuntime:
         with self._ingestion_runtime_lock:
             if self._ingestion_runtime is not None:
                 return self._ingestion_runtime
+            from dayu.fins.pipelines.sec_pipeline import SEC_DOWNLOAD_SOURCE, build_sec_download_adapter
+
+            sec_download_adapter = build_sec_download_adapter(
+                workspace_root=self.workspace_root,
+                processor_registry=self.processor_registry,
+                company_repository=self.company_repository,
+                source_repository=self.source_repository,
+                processed_repository=self.processed_repository,
+                blob_repository=self.blob_repository,
+                filing_maintenance_repository=self.filing_maintenance_repository,
+            )
             runtime = FinsIngestionRuntime.create(
                 source_repository=self.source_repository,
                 blob_repository=self.blob_repository,
@@ -183,6 +194,10 @@ class DefaultFinsRuntime:
                 processed_repository=self.processed_repository,
                 processor_registry=self.processor_registry,
                 job_store=self.ingestion_job_store,
+                download_adapters={
+                    (SEC_DOWNLOAD_SOURCE, "US"): sec_download_adapter,
+                    ("auto", "US"): sec_download_adapter,
+                },
             )
             self._ingestion_runtime = runtime
             return runtime

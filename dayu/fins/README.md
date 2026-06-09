@@ -231,7 +231,7 @@ upload_start = ingestion.start_upload(
 )
 ```
 
-`FinsReadRuntime` 只服务 read path；download、preprocess 与 upload job 必须使用 `FinsIngestionRuntime`。当前默认 runtime 不内置真实网络下载 adapter；没有匹配 adapter 的 download job 会进入明确 failed 终态。preprocess path 读取 workspace 中已有 source docs，并通过 processor registry 写入 processed repository。当前默认 runtime 也不内置生产 upload runner；`start_upload` 可以创建 durable upload job，但后台 job 会以明确 unsupported upload runtime 失败终态收口，直到调用方显式装配 `FinsUploadRunner`。
+`FinsReadRuntime` 只服务 read path；download、preprocess 与 upload job 必须使用 `FinsIngestionRuntime`。当前默认 runtime 为 US ticker 的 `source="sec"` 与 `source="auto"` 装配 SEC production download adapter；没有匹配 adapter 的 download job 会进入明确 failed 终态。preprocess path 读取 workspace 中已有 source docs，并通过 processor registry 写入 processed repository。当前默认 runtime 不内置生产 upload runner；`start_upload` 可以创建 durable upload job，但后台 job 会以明确 unsupported upload runtime 失败终态收口，直到调用方显式装配 `FinsUploadRunner`。
 
 ## 公共契约
 
@@ -318,7 +318,9 @@ flowchart LR
 ```text
 dayu.fins
 ├── domain                    # 财报领域模型与枚举
+├── downloaders               # source-specific 低层下载器；当前包含 SEC downloader
 ├── storage                   # 仓储协议、文件系统仓储、文件对象存储
+├── pipelines                 # source-specific ingestion pipeline；当前包含 SEC download pipeline
 ├── processors                # 财报处理器、SEC 表单专项处理器、registry
 ├── tools                     # read tools、download/preprocess awaiting tools、providers、read runtime
 ├── ingestion_runtime.py      # download/preprocess/upload typed runtime 与 durable job store
@@ -377,9 +379,9 @@ Read、download、preprocess 是三个独立 provider：
 
 ### Ingestion runtime
 
-`FinsIngestionRuntime` 负责 download / preprocess / upload durable job 的创建、后台执行、取消请求、终态收口和 job record 读取。下载 pipeline 通过 `FinsSourceDownloadAdapter` 写入 source / blob / rejected filing artifact；预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository；upload job 通过 `FinsUploadRunner` 边界执行上传业务，runtime 自身只负责 job lifecycle 和有界摘要。
+`FinsIngestionRuntime` 负责 download / preprocess / upload durable job 的创建、后台执行、取消请求、终态收口和 job record 读取。下载 pipeline 通过 `FinsSourceDownloadAdapter` 返回待持久化文档，或在 adapter 内通过仓储完成 source / blob / rejected filing artifact 写入并返回有界已持久化摘要；预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository；upload job 通过 `FinsUploadRunner` 边界执行上传业务，runtime 自身只负责 job lifecycle 和有界摘要。
 
-当前 `DefaultFinsRuntime` 不内置真实 SEC / CN / HK 网络下载 adapter。没有匹配 adapter 时，download job 会进入明确的 failed 终态，不伪造成功。
+当前 `DefaultFinsRuntime` 内置 SEC / US production download adapter：`source="sec"` 与 `source="auto"` 且 market 为 `US` 时走 SEC 下载。CN / HK 下载尚未内置；没有匹配 adapter 时，download job 会进入明确的 failed 终态，不伪造成功。
 
 当前 `DefaultFinsRuntime` 不内置生产 upload runner。没有显式装配 `FinsUploadRunner` 时，upload job 会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
 
@@ -577,7 +579,7 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 ### Download adapter 与 unsupported source
 
-`FinsIngestionRuntime` 通过 `(source, market)` 选择 `FinsSourceDownloadAdapter`。当前默认 runtime 没有真实网络下载 adapter；没有匹配 adapter 时，download job 写入明确 failed 终态和 unsupported-source 摘要。下载成功路径只通过 source repository、blob repository 和 filing maintenance repository 写入 source docs 与 rejected filing artifacts。
+`FinsIngestionRuntime` 通过 `(source, market)` 选择 `FinsSourceDownloadAdapter`。当前默认 runtime 注册 `(sec, US)` 与 `(auto, US)` 到同一个 SEC production adapter；没有匹配 adapter 时，download job 写入明确 failed 终态和 unsupported-source 摘要。下载成功路径只通过 source repository、blob repository 和 filing maintenance repository 写入 source docs 与 rejected filing artifacts。
 
 ### Preprocess / process pipeline
 
@@ -603,7 +605,7 @@ Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` �
 
 扩展 processor 时，实现 `DocumentProcessor` 所需能力或明确的财报能力协议，并在 `build_fins_processor_registry()` 中以可解释优先级注册。表单专项处理器应保持 BS 主路径与 SecProcessor 回退路径的职责边界。
 
-扩展下载来源时，实现 `FinsSourceDownloadAdapter`，并通过 `FinsIngestionRuntime.create(download_adapters=...)` 注入 `(source, market)` adapter 映射。Adapter 只返回 typed downloaded documents / rejected artifacts，不直接写文件系统。
+扩展下载来源时，实现 `FinsSourceDownloadAdapter`，并通过 `FinsIngestionRuntime.create(download_adapters=...)` 注入 `(source, market)` adapter 映射。Adapter 可以返回 typed downloaded documents / rejected artifacts 交给 runtime 持久化；若迁移的 source workflow 已在 adapter 内通过仓储完成持久化，则必须返回有界 persisted summary，且不得再同时返回 documents / rejected artifacts。
 
 扩展 preprocess / process 时，保持 source repository -> processor registry -> processed repository 的闭环；不要在 CLI、tools、CI 或测试夹具中复制独立处理逻辑。
 

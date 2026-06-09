@@ -1,0 +1,607 @@
+"""SEC fiscal 字段与财务载荷真源模块。"""
+
+from __future__ import annotations
+
+from dayu.contracts.json_value import JsonValue
+
+import re
+from pathlib import Path
+from typing import Optional, Protocol, TypeAlias, TypeGuard, runtime_checkable
+
+from dayu.fins.domain.document_models import SourceHandle, now_iso8601
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.storage import SourceDocumentRepositoryProtocol
+
+from .sec_6k_rules import _infer_filename_from_uri
+
+
+FINANCIAL_STATEMENT_TYPES = (
+    "income",
+    "balance_sheet",
+    "cash_flow",
+    "equity",
+    "comprehensive_income",
+)
+FINANCIAL_EXTRACTION_SKIP_FORMS = frozenset({"8-K", "8-K/A", "DEF 14A"})
+_XBRL_LINKBASE_FILE_SUFFIXES = ("_pre.xml", "_cal.xml", "_def.xml", "_lab.xml")
+_DOWNLOAD_DEI_FISCAL_YEAR_KEYS = (
+    "document_fiscal_year_focus",
+    "documentfiscalyearfocus",
+    "dei:documentfiscalyearfocus",
+)
+_DOWNLOAD_DEI_FISCAL_PERIOD_KEYS = (
+    "document_fiscal_period_focus",
+    "documentfiscalperiodfocus",
+    "dei:documentfiscalperiodfocus",
+)
+
+
+@runtime_checkable
+class _FinancialStatementProcessor(Protocol):
+    """可读取标准财务报表的处理器边界。"""
+
+    def get_financial_statement(self, *, statement_type: str) -> dict[str, JsonValue]:
+        """读取指定报表。
+
+        Args:
+            statement_type: 报表类型。
+
+        Returns:
+            报表 JSON 结果。
+
+        Raises:
+            处理器内部异常原样抛出。
+        """
+
+        ...
+
+
+@runtime_checkable
+class _XbrlQueryProcessor(Protocol):
+    """可查询 XBRL facts 的处理器边界。"""
+
+    def query_xbrl_facts(self, *, concepts: list[str]) -> dict[str, JsonValue]:
+        """查询 XBRL facts。
+
+        Args:
+            concepts: 待查询 concept 列表。
+
+        Returns:
+            XBRL 查询结果。
+
+        Raises:
+            处理器内部异常原样抛出。
+        """
+
+        ...
+
+
+_FiscalProcessor: TypeAlias = _FinancialStatementProcessor | _XbrlQueryProcessor
+
+
+def _supports_financial_data(processor: _FiscalProcessor | None) -> TypeGuard[_FinancialStatementProcessor]:
+    """判断处理器是否具备财务数据能力。"""
+
+    return isinstance(processor, _FinancialStatementProcessor)
+
+
+def _build_financials_payload(processor: _FiscalProcessor | None) -> tuple[Optional[dict[str, JsonValue]], bool]:
+    """构建 financials 载荷并返回 XBRL 可用状态。"""
+
+    if not _supports_financial_data(processor):
+        return None, False
+
+    statement_results: dict[str, dict[str, JsonValue]] = {}
+    has_xbrl = False
+    for statement_type in FINANCIAL_STATEMENT_TYPES:
+        statement_result: dict[str, JsonValue]
+        try:
+            raw_result = processor.get_financial_statement(statement_type=statement_type)
+        except Exception as exc:
+            statement_result = {
+                "statement_type": statement_type,
+                "periods": [],
+                "rows": [],
+                "currency": None,
+                "units": None,
+                "data_quality": "partial",
+                "reason": f"processor_error:{exc}",
+            }
+        else:
+            if isinstance(raw_result, dict):
+                statement_result = raw_result
+            else:
+                statement_result = {
+                    "statement_type": statement_type,
+                    "periods": [],
+                    "rows": [],
+                    "currency": None,
+                    "units": None,
+                    "data_quality": "partial",
+                    "reason": "invalid_statement_result",
+                }
+        statement_results[statement_type] = statement_result
+        statement_quality = str(statement_result.get("data_quality", "")).strip().lower()
+        if statement_quality == "xbrl" and bool(statement_result.get("rows")):
+            has_xbrl = True
+
+    if not has_xbrl:
+        return None, False
+
+    return {
+        "data_quality": "xbrl",
+        "generated_at": now_iso8601(),
+        "statements": statement_results,
+    }, True
+
+
+def _resolve_processed_quality(
+    has_xbrl: bool,
+    financial_capable: bool,
+    form_type: Optional[str] = None,
+) -> str:
+    """根据处理结果计算质量等级。"""
+
+    normalized_form_type = _normalize_form_for_fiscal(form_type)
+    if normalized_form_type == "DEF 14A":
+        return "partial"
+    if has_xbrl:
+        return "full"
+    if financial_capable:
+        return "partial"
+    return "fallback"
+
+
+def _resolve_processed_fiscal_fields(
+    source_meta: dict[str, JsonValue],
+    financials_payload: Optional[dict[str, JsonValue]],
+    processor: _FiscalProcessor | None,
+    allow_xbrl_query: bool = True,
+) -> tuple[Optional[int], Optional[str]]:
+    """解析 processed 元数据中的 fiscal_year/fiscal_period。"""
+
+    source_fiscal_year = _coerce_optional_int(source_meta.get("fiscal_year"))
+    source_fiscal_period = _normalize_optional_period(source_meta.get("fiscal_period"))
+    normalized_form_type = _normalize_form_for_fiscal(source_meta.get("form_type"))
+    if source_fiscal_period is not None:
+        source_fiscal_period = _sanitize_fiscal_period_by_form(
+            form_type=normalized_form_type,
+            fiscal_period=source_fiscal_period,
+        )
+    if source_fiscal_year is not None and source_fiscal_period is not None:
+        return source_fiscal_year, source_fiscal_period
+
+    if allow_xbrl_query:
+        query_fiscal_year, query_fiscal_period = _extract_fiscal_from_xbrl_query(processor)
+    else:
+        query_fiscal_year, query_fiscal_period = None, None
+    if query_fiscal_period is not None:
+        query_fiscal_period = _sanitize_fiscal_period_by_form(
+            form_type=normalized_form_type,
+            fiscal_period=query_fiscal_period,
+        )
+
+    payload_fiscal_year, payload_fiscal_period = _extract_fiscal_from_financials(financials_payload)
+    if payload_fiscal_period is not None:
+        payload_fiscal_period = _sanitize_fiscal_period_by_form(
+            form_type=normalized_form_type,
+            fiscal_period=payload_fiscal_period,
+        )
+    resolved_year_candidate = query_fiscal_year if query_fiscal_year is not None else payload_fiscal_year
+    resolved_period_candidate = query_fiscal_period if query_fiscal_period is not None else payload_fiscal_period
+    fiscal_year = source_fiscal_year if source_fiscal_year is not None else resolved_year_candidate
+    fiscal_period = source_fiscal_period if source_fiscal_period is not None else resolved_period_candidate
+
+    fiscal_year_from_report_date = False
+    if fiscal_year is None:
+        fiscal_year = _coerce_year_from_date(source_meta.get("report_date"))
+        fiscal_year_from_report_date = fiscal_year is not None
+    if fiscal_period is None:
+        fiscal_period = _resolve_fiscal_period_fallback(
+            form_type=normalized_form_type,
+            fiscal_year=fiscal_year,
+            fiscal_year_from_report_date=fiscal_year_from_report_date,
+        )
+    return fiscal_year, fiscal_period
+
+
+def _resolve_download_fiscal_fields(
+    *,
+    source_handle: SourceHandle,
+    source_repository: SourceDocumentRepositoryProtocol,
+    file_entries: list[dict[str, JsonValue]],
+    form_type: Optional[str],
+    report_date: Optional[str],
+) -> tuple[Optional[int], Optional[str]]:
+    """解析 download 阶段应写入 source meta 的 fiscal 字段。"""
+
+    dei_year, dei_period = _extract_download_fiscal_from_xbrl(
+        source_handle=source_handle,
+        source_repository=source_repository,
+        file_entries=file_entries,
+        form_type=form_type,
+    )
+    fallback_year, fallback_period = _infer_download_fiscal_fields(form_type=form_type, report_date=report_date)
+    if dei_year is None and dei_period is None:
+        return fallback_year, fallback_period
+
+    resolved_year = dei_year if dei_year is not None else fallback_year
+    normalized_form_type = _normalize_form_for_fiscal(form_type)
+    if dei_period is not None:
+        return resolved_year, dei_period
+    if dei_year is None:
+        return resolved_year, fallback_period
+    if normalized_form_type in {"10-K", "20-F"}:
+        return resolved_year, fallback_period
+    return resolved_year, None
+
+
+def _extract_download_fiscal_from_xbrl(
+    *,
+    source_handle: SourceHandle,
+    source_repository: SourceDocumentRepositoryProtocol,
+    file_entries: list[dict[str, JsonValue]],
+    form_type: Optional[str],
+) -> tuple[Optional[int], Optional[str]]:
+    """从下载后的本地 XBRL 中抽取 fiscal_year/fiscal_period。"""
+
+    local_file_map = _build_download_local_file_map(
+        source_handle=source_handle,
+        source_repository=source_repository,
+        file_entries=file_entries,
+    )
+    if not local_file_map:
+        return None, None
+
+    instance_file = _pick_download_xbrl_file(local_file_map, candidates=("_htm.xml", "_ins.xml"), xml_fallback=True)
+    schema_file = _pick_download_xbrl_file(local_file_map, candidates=(".xsd",))
+    if instance_file is None or schema_file is None:
+        return None, None
+
+    presentation_file = _pick_download_xbrl_file(local_file_map, candidates=("_pre.xml",))
+    calculation_file = _pick_download_xbrl_file(local_file_map, candidates=("_cal.xml",))
+    definition_file = _pick_download_xbrl_file(local_file_map, candidates=("_def.xml",))
+    label_file = _pick_download_xbrl_file(local_file_map, candidates=("_lab.xml",))
+
+    try:
+        from edgar.xbrl import XBRL
+    except Exception:
+        return None, None
+
+    try:
+        xbrl = XBRL.from_files(
+            instance_file=instance_file,
+            schema_file=schema_file,
+            presentation_file=presentation_file,
+            calculation_file=calculation_file,
+            definition_file=definition_file,
+            label_file=label_file,
+        )
+    except Exception:
+        return None, None
+
+    entity_info = getattr(xbrl, "entity_info", None)
+    raw_year = _pick_first_non_empty(
+        (
+            getattr(xbrl, "fiscal_year", None),
+            _mapping_get_case_insensitive(entity_info, _DOWNLOAD_DEI_FISCAL_YEAR_KEYS),
+        )
+    )
+    raw_period = _pick_first_non_empty(
+        (
+            getattr(xbrl, "fiscal_period", None),
+            _mapping_get_case_insensitive(entity_info, _DOWNLOAD_DEI_FISCAL_PERIOD_KEYS),
+        )
+    )
+    fiscal_year = _coerce_optional_int(raw_year)
+    fiscal_period = _normalize_optional_period(raw_period)
+    if fiscal_period is not None:
+        fiscal_period = _sanitize_fiscal_period_by_form(
+            form_type=_normalize_form_for_fiscal(form_type),
+            fiscal_period=fiscal_period,
+        )
+    return fiscal_year, fiscal_period
+
+
+def _build_download_local_file_map(
+    *,
+    source_handle: SourceHandle,
+    source_repository: SourceDocumentRepositoryProtocol,
+    file_entries: list[dict[str, JsonValue]],
+) -> dict[str, Path]:
+    """将下载文件条目解析为本地文件路径映射。"""
+
+    result: dict[str, Path] = {}
+    for item in file_entries:
+        if not isinstance(item, dict):
+            continue
+        uri = _normalize_optional_string(item.get("uri"))
+        if uri is None:
+            continue
+        name = _normalize_optional_string(item.get("name")) or _normalize_optional_string(_infer_filename_from_uri(uri))
+        if name is None:
+            continue
+        try:
+            source = source_repository.get_source(
+                source_handle.ticker,
+                source_handle.document_id,
+                SourceKind(source_handle.source_kind),
+                name,
+            )
+            local_path = source.materialize()
+        except Exception:
+            continue
+        if not local_path.exists() or not local_path.is_file():
+            continue
+        result[name.lower()] = local_path
+    return result
+
+
+def _pick_download_xbrl_file(
+    file_map: dict[str, Path],
+    *,
+    candidates: tuple[str, ...],
+    xml_fallback: bool = False,
+) -> Optional[Path]:
+    """按后缀优先级从下载文件映射中选择 XBRL 文件。"""
+
+    ordered_names = sorted(file_map.keys())
+    for suffix in candidates:
+        for name in ordered_names:
+            if name.endswith(suffix):
+                return file_map[name]
+    if not xml_fallback:
+        return None
+    for name in ordered_names:
+        if not name.endswith(".xml"):
+            continue
+        if name.endswith(_XBRL_LINKBASE_FILE_SUFFIXES):
+            continue
+        if name.endswith("filingsummary.xml"):
+            continue
+        return file_map[name]
+    return None
+
+
+def _mapping_get_case_insensitive(mapping: JsonValue, keys: tuple[str, ...]) -> JsonValue:
+    """从映射中按大小写不敏感方式读取首个可用键值。"""
+
+    if not isinstance(mapping, dict):
+        return None
+    normalized: dict[str, JsonValue] = {}
+    for key, value in mapping.items():
+        lowered = _normalize_optional_string(key)
+        if lowered is None:
+            continue
+        normalized[lowered.lower()] = value
+    for key in keys:
+        value = normalized.get(key.lower())
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _pick_first_non_empty(candidates: tuple[JsonValue, ...]) -> JsonValue:
+    """返回候选值中首个非空元素。"""
+
+    for item in candidates:
+        if item is None:
+            continue
+        if isinstance(item, str) and not item.strip():
+            continue
+        return item
+    return None
+
+
+def _infer_download_fiscal_fields(form_type: Optional[str], report_date: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+    """在 download 阶段为 source meta 推断 fiscal 字段。"""
+
+    normalized_form_type = _normalize_form_for_fiscal(form_type)
+    fiscal_year = _coerce_year_from_date(report_date)
+    if _is_6k_family_form(normalized_form_type):
+        fiscal_year = None
+    fiscal_period = _resolve_fiscal_period_fallback(
+        form_type=normalized_form_type,
+        fiscal_year=fiscal_year,
+        fiscal_year_from_report_date=fiscal_year is not None,
+    )
+    return fiscal_year, fiscal_period
+
+
+def _resolve_fiscal_period_fallback(
+    *,
+    form_type: Optional[str],
+    fiscal_year: Optional[int],
+    fiscal_year_from_report_date: bool,
+) -> Optional[str]:
+    """按 form 解析 fiscal_period 的保守回退值。"""
+
+    if fiscal_year is None:
+        return None
+    if form_type in {"10-K", "20-F"}:
+        return "FY"
+    return None
+
+
+def _extract_fiscal_from_financials(
+    financials_payload: Optional[dict[str, JsonValue]],
+) -> tuple[Optional[int], Optional[str]]:
+    """从 financials 载荷中提取 fiscal_year/fiscal_period。"""
+
+    if not isinstance(financials_payload, dict):
+        return None, None
+    statements = financials_payload.get("statements")
+    if not isinstance(statements, dict):
+        return None, None
+    for statement_type in FINANCIAL_STATEMENT_TYPES:
+        statement = statements.get(statement_type)
+        if not isinstance(statement, dict):
+            continue
+        periods = statement.get("periods")
+        if not isinstance(periods, list):
+            continue
+        for period in periods:
+            if not isinstance(period, dict):
+                continue
+            fiscal_year = _coerce_optional_int(period.get("fiscal_year"))
+            fiscal_period = _normalize_optional_period(period.get("fiscal_period"))
+            if fiscal_year is None:
+                fiscal_year = _coerce_year_from_date(period.get("period_end"))
+            if fiscal_year is not None or fiscal_period is not None:
+                return fiscal_year, fiscal_period
+    return None, None
+
+
+def _extract_fiscal_from_xbrl_query(processor: _FiscalProcessor | None) -> tuple[Optional[int], Optional[str]]:
+    """通过 query_xbrl_facts 提取 fiscal_year/fiscal_period。"""
+
+    if not isinstance(processor, _XbrlQueryProcessor):
+        return None, None
+    try:
+        query_result = processor.query_xbrl_facts(
+            concepts=[
+                "us-gaap:Assets",
+                "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+                "us-gaap:Revenues",
+                "us-gaap:NetIncomeLoss",
+                "ifrs-full:Assets",
+                "ifrs-full:Revenue",
+                "ifrs-full:ProfitLoss",
+            ]
+        )
+    except Exception:
+        return None, None
+    if not isinstance(query_result, dict):
+        return None, None
+    facts = query_result.get("facts")
+    if not isinstance(facts, list):
+        return None, None
+
+    first_year_only: Optional[int] = None
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        fiscal_year = _coerce_optional_int(fact.get("fiscal_year"))
+        fiscal_period = _normalize_optional_period(fact.get("fiscal_period"))
+        if fiscal_year is None:
+            fiscal_year = _coerce_year_from_date(fact.get("period_end"))
+        if fiscal_year is not None and first_year_only is None:
+            first_year_only = fiscal_year
+        if fiscal_year is not None and fiscal_period is not None:
+            return fiscal_year, fiscal_period
+    return first_year_only, None
+
+
+def _coerce_optional_int(value: JsonValue) -> Optional[int]:
+    """将输入值安全转换为可选整数。"""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if not re.fullmatch(r"-?\d+", text):
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _normalize_optional_string(value: JsonValue) -> Optional[str]:
+    """标准化可选字符串。"""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text
+
+
+def _normalize_optional_period(value: JsonValue) -> Optional[str]:
+    """标准化 fiscal_period 字段。"""
+
+    normalized = _normalize_optional_string(value)
+    if normalized is None:
+        return None
+    return normalized.upper()
+
+
+def _coerce_year_from_date(value: JsonValue) -> Optional[int]:
+    """从 `YYYY-MM-DD` 字符串中提取年份。"""
+
+    text = _normalize_optional_string(value)
+    if text is None:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return int(text[:4])
+    return None
+
+
+def _normalize_form_for_fiscal(value: JsonValue) -> Optional[str]:
+    """标准化用于 fiscal 推断的 SEC form。"""
+
+    form = _normalize_optional_string(value)
+    if form is None:
+        return None
+    normalized = form.upper().replace(" ", "")
+    mapping = {
+        "10K": "10-K",
+        "10K/A": "10-K/A",
+        "10Q": "10-Q",
+        "10Q/A": "10-Q/A",
+        "20F": "20-F",
+        "20F/A": "20-F/A",
+        "6K": "6-K",
+        "6K/A": "6-K/A",
+        "8K": "8-K",
+        "8K/A": "8-K/A",
+    }
+    return mapping.get(normalized, form.upper())
+
+
+def _is_6k_family_form(form_type: Optional[str]) -> bool:
+    """判断表单是否属于 6-K 家族。
+
+    Args:
+        form_type: 已归一化或原始 form_type。
+
+    Returns:
+        若属于 `6-K` 或 `6-K/A` 家族则返回 `True`。
+
+    Raises:
+        无。
+    """
+
+    return form_type in {"6-K", "6-K/A"}
+
+
+def _should_skip_financial_extraction(form_type: Optional[str]) -> bool:
+    """判断是否应跳过 financial statements 提取。"""
+
+    normalized = _normalize_optional_string(form_type)
+    if normalized is None:
+        return False
+    normalized_form = _normalize_form_for_fiscal(normalized)
+    if normalized_form in FINANCIAL_EXTRACTION_SKIP_FORMS:
+        return True
+    normalized_no_space = normalized.upper().replace(" ", "")
+    return normalized_no_space.startswith("SC13")
+
+
+def _sanitize_fiscal_period_by_form(form_type: Optional[str], fiscal_period: str) -> Optional[str]:
+    """按 form 约束 fiscal_period 合法值。"""
+
+    normalized_period = fiscal_period.strip().upper()
+    if not normalized_period:
+        return None
+    if form_type in {"10-K", "20-F"}:
+        return "FY" if normalized_period == "FY" else None
+    if form_type == "10-Q":
+        return normalized_period if normalized_period in {"Q1", "Q2", "Q3", "Q4"} else None
+    return normalized_period

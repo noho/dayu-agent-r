@@ -47,6 +47,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadResultSummary,
     FinsUploadRunner,
 )
+from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import (
     FsBatchingRepository,
@@ -193,6 +194,41 @@ class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
             discovered_count=1 + len(rejected_artifacts),
             documents=(document,),
             rejected_artifacts=rejected_artifacts,
+        )
+
+
+class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
+    """测试用 persisted-summary 下载 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化请求记录。"""
+
+        self.requests: list[FinsSourceDownloadAdapterRequest] = []
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """记录请求并返回已持久化摘要。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            只包含 persisted summary 的 adapter 结果。
+
+        Raises:
+            无。
+        """
+
+        self.requests.append(request)
+        return FinsSourceDownloadAdapterResult(
+            discovered_count=1,
+            persisted_summary=FinsDownloadResultSummary(
+                discovered_count=1,
+                downloaded_count=0,
+                skipped_count=1,
+                rejected_count=0,
+                failed_count=0,
+                written_document_ids=(),
+            ),
         )
 
 
@@ -757,14 +793,26 @@ def test_start_download_unsupported_source_writes_failed_terminal_record(tmp_pat
     workspace_root = tmp_path / "fins-workspace"
     ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="sec"))
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="unknown"))
     record = _wait_terminal(ingestion, start.job_id)
 
     assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["failed_count"] == 1
     assert "不支持的下载来源" in str(record.failure_summary["message"])
-    assert "source=sec" in str(record.failure_summary["message"])
+    assert "source=unknown" in str(record.failure_summary["message"])
     assert "market=US" in str(record.failure_summary["message"])
+
+
+def test_default_runtime_registers_sec_and_auto_us_download_adapter(tmp_path: Path) -> None:
+    """默认 runtime 应为 US 的 sec/auto 确定性装配同一个 SEC production adapter。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    sec_adapter = ingestion.download_adapters[("sec", "US")]
+    auto_adapter = ingestion.download_adapters[("auto", "US")]
+
+    assert isinstance(sec_adapter, SecDownloadAdapter)
+    assert auto_adapter is sec_adapter
 
 
 def test_start_download_repeated_request_skips_existing_source_document(tmp_path: Path) -> None:
@@ -825,6 +873,35 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     assert artifacts[0].document_id == "aapl-fake-rejected"
     assert artifacts[0].rejection_category == "form_filter"
     assert content == b"<html>rejected</html>"
+
+
+def test_start_download_persisted_summary_adapter_receives_rebuild_processed(tmp_path: Path) -> None:
+    """persisted-summary adapter 应接收 NEW rebuild_processed 治理标记并记录请求。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _PersistedSummaryDownloadAdapter()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("persisted", "US"): adapter},
+    )
+
+    start = ingestion.start_download(
+        FinsDownloadRequest(
+            ticker="AAPL",
+            source="persisted",
+            rebuild_processed=True,
+        )
+    )
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.request_summary["rebuild_processed"] is True
+    assert record.result_summary["skipped_count"] == 1
+    assert len(adapter.requests) == 1
+    assert adapter.requests[0].rebuild_processed is True
 
 
 def test_start_preprocess_persists_queued_record_and_uses_public_ticker_normalization(
