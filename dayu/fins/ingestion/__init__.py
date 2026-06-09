@@ -7,6 +7,7 @@ from .wait_adapter import (
     FINS_INGESTION_WAIT_ADAPTER_KEY,
     FINS_PREPROCESS_AWAITING_TOOL_NAME,
     FINS_SUPPORTED_AWAITING_TOOL_NAMES,
+    FINS_UPLOAD_AWAITING_TOOL_NAME,
     FinsIngestionWaitPollAdapter,
     build_fins_wait_adapter_registry,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "FINS_INGESTION_WAIT_ADAPTER_KEY",
     "FINS_PREPROCESS_AWAITING_TOOL_NAME",
     "FINS_SUPPORTED_AWAITING_TOOL_NAMES",
+    "FINS_UPLOAD_AWAITING_TOOL_NAME",
     "FinsIngestionWaitPollAdapter",
     "build_fins_wait_adapter_registry",
 ]

@@ -22,6 +22,7 @@ from dayu.engine.provider_extensions import provider_request_extension_from_json
 from dayu.fins.ingestion import (
     FINS_DOWNLOAD_AWAITING_TOOL_NAME,
     FINS_PREPROCESS_AWAITING_TOOL_NAME,
+    FINS_UPLOAD_AWAITING_TOOL_NAME,
     build_fins_wait_adapter_registry,
 )
 from dayu.host.api import (
@@ -92,17 +93,26 @@ _FINS_DOWNLOAD_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
 _FINS_PREPROCESS_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
     {"financial-preprocess-tools"}
 )
+_FINS_UPLOAD_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
+    {"financial-upload-tools"}
+)
 _FINS_DOWNLOAD_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.download_provider:discover_tools"}
 )
 _FINS_PREPROCESS_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.preprocess_provider:discover_tools"}
 )
+_FINS_UPLOAD_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.upload_provider:discover_tools"}
+)
 _FINS_DOWNLOAD_SOURCE_IDS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.download_provider"}
 )
 _FINS_PREPROCESS_SOURCE_IDS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.preprocess_provider"}
+)
+_FINS_UPLOAD_SOURCE_IDS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.upload_provider"}
 )
 
 
@@ -1135,6 +1145,12 @@ def _fins_awaiting_tool_name_from_provider_config(
         or provider_config.source_id in _FINS_PREPROCESS_SOURCE_IDS
     ):
         return FINS_PREPROCESS_AWAITING_TOOL_NAME
+    if (
+        provider_config.provider_id in _FINS_UPLOAD_PROVIDER_IDS
+        or provider_config.import_path in _FINS_UPLOAD_IMPORT_PATHS
+        or provider_config.source_id in _FINS_UPLOAD_SOURCE_IDS
+    ):
+        return FINS_UPLOAD_AWAITING_TOOL_NAME
     return None
 
 

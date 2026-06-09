@@ -172,15 +172,16 @@ provider 字段：
 
 `import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。`config` 缺省等价空对象；需要业务含义时由对应 provider 自行解析，例如文档路径白名单、财报 workspace root、Web 请求限制等。
 
-包内默认 Fins providers 分为三组，均为 `enabled=false`、`allow_empty=true` 且 `workspace_root=null`：
+包内默认 Fins providers 分为四组，均为 `enabled=false`、`allow_empty=true` 且 `workspace_root=null`：
 
 | provider id | import path | 能力 |
 |---|---|---|
 | `financial-read-tools` | `dayu.fins.tools.provider:discover_tools` | 财报 read tools |
 | `financial-download-tools` | `dayu.fins.tools.download_provider:discover_tools` | 财报 download awaiting tool |
 | `financial-preprocess-tools` | `dayu.fins.tools.preprocess_provider:discover_tools` | 财报 preprocess awaiting tool |
+| `financial-upload-tools` | `dayu.fins.tools.upload_provider:discover_tools` | 财报 upload awaiting tool |
 
-启用任一 Fins provider 时必须在 workspace overlay 的 `config.workspace_root` 中提供绝对路径；provider 不从 cwd 或环境变量猜路径。`financial-read-tools` 可额外配置 `include_read_tools` 与 `config.limits`，`config.limits` 可覆盖 `processor_cache_max_entries`、`list_documents_max_items`、`get_document_sections_max_items`、`search_document_max_items`、`list_tables_max_items`、`read_section_max_chars`、`get_page_content_max_chars`、`get_table_max_items`、`get_financial_statement_max_items` 与 `query_xbrl_facts_max_items`。Download / preprocess 能力通过独立 provider 启用，不通过 read provider 的布尔开关混合启用。
+启用任一 Fins provider 时必须在 workspace overlay 的 `config.workspace_root` 中提供绝对路径；provider 不从 cwd 或环境变量猜路径。`financial-read-tools` 可额外配置 `include_read_tools` 与 `config.limits`，`config.limits` 可覆盖 `processor_cache_max_entries`、`list_documents_max_items`、`get_document_sections_max_items`、`search_document_max_items`、`list_tables_max_items`、`read_section_max_chars`、`get_page_content_max_chars`、`get_table_max_items`、`get_financial_statement_max_items` 与 `query_xbrl_facts_max_items`。`financial-upload-tools` 还必须配置非空绝对路径数组 `config.allowed_upload_roots`，上传工具只接受这些根目录下的本地文件路径。Download / preprocess / upload 能力通过独立 provider 启用，不通过 read provider 的布尔开关混合启用。
 
 包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。启用 Doc tools 时必须在 `config.allowed_paths` 中显式配置可访问文件或目录根；provider 启用但白名单为空时会 fail closed，返回空工具集合，不注册可执行文档工具。Doc provider 的 `config.limits` 可覆盖 `list_files_max`、`get_sections_max`、`search_files_max_results`、`read_file_max_chars` 与 `read_file_section_max_chars`，未配置字段使用 provider 默认值。
 

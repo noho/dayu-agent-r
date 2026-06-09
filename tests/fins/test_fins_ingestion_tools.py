@@ -1,4 +1,4 @@
-"""Fins download/preprocess awaiting tools provider 测试。"""
+"""Fins download/preprocess/upload awaiting tools provider 测试。"""
 
 from __future__ import annotations
 
@@ -35,11 +35,14 @@ from dayu.fins.ingestion import (
     FinsIngestionWaitPollAdapter,
     build_fins_wait_adapter_registry,
 )
+from dayu.fins.ingestion.wait_adapter import FINS_UPLOAD_AWAITING_TOOL_NAME
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
+from dayu.fins.tools import upload_provider
+from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME, FinsUploadToolCallable
 from dayu.host.api import (
     ResolveWaitCancelledOutcome,
     ResolveWaitCompletedOutcome,
@@ -64,9 +67,11 @@ from dayu.runtime.tools_discovery import (
 _READ_PROVIDER_ID = "financial-read-tools"
 _DOWNLOAD_PROVIDER_ID = "financial-download-tools"
 _PREPROCESS_PROVIDER_ID = "financial-preprocess-tools"
+_UPLOAD_PROVIDER_ID = "financial-upload-tools"
 _READ_SPEC_ID = "financial-read-tools"
 _DOWNLOAD_SPEC_ID = "financial-download-tools"
 _PREPROCESS_SPEC_ID = "financial-preprocess-tools"
+_UPLOAD_SPEC_ID = "financial-upload-tools"
 _READ_SAMPLE_TOOL_NAME: Final[str] = "list_documents"
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "dayu" / "config"
@@ -74,8 +79,10 @@ _DOWNLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "do
 _PREPROCESS_TOOLS_PATH: Final[Path] = (
     _REPO_ROOT / "dayu" / "fins" / "tools" / "preprocess_tools.py"
 )
+_UPLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "upload_tools.py"
 _DOWNLOAD_START_FAILED_ERROR = "fins_download_start_failed"
 _PREPROCESS_START_FAILED_ERROR = "fins_preprocess_start_failed"
+_UPLOAD_START_FAILED_ERROR = "fins_upload_start_failed"
 _TERMINAL_JOB_STATUSES = frozenset(
     {
         FinsIngestionJobStatus.SUCCEEDED,
@@ -191,10 +198,13 @@ class _RuntimeErrorExecutor:
         raise RuntimeError("executor unavailable")
 
 
-def test_tools_discovery_discovers_read_download_and_preprocess_independently(tmp_path: Path) -> None:
-    """ToolsDiscovery 应能独立发现 read、download、preprocess provider。"""
+def test_tools_discovery_discovers_read_download_preprocess_and_upload_independently(
+    tmp_path: Path,
+) -> None:
+    """ToolsDiscovery 应能独立发现 read、download、preprocess、upload provider。"""
 
     workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
     result = ToolsDiscovery().discover_from_bindings(
         (
             ToolsDiscoveryProviderBinding(
@@ -221,6 +231,14 @@ def test_tools_discovery_discovers_read_download_and_preprocess_independently(tm
                 ),
                 provider=preprocess_provider.discover_tools,
             ),
+            ToolsDiscoveryProviderBinding(
+                spec=_upload_spec(
+                    spec_id=_UPLOAD_SPEC_ID,
+                    workspace_root=workspace_root,
+                    allowed_upload_roots=(upload_root,),
+                ),
+                provider=upload_provider.discover_tools,
+            ),
         )
     )
 
@@ -229,27 +247,32 @@ def test_tools_discovery_discovers_read_download_and_preprocess_independently(tm
         _READ_PROVIDER_ID,
         _DOWNLOAD_PROVIDER_ID,
         _PREPROCESS_PROVIDER_ID,
+        _UPLOAD_PROVIDER_ID,
     )
     assert reports_by_provider[_READ_PROVIDER_ID].spec_id == _READ_SPEC_ID
     assert reports_by_provider[_DOWNLOAD_PROVIDER_ID].spec_id == _DOWNLOAD_SPEC_ID
     assert reports_by_provider[_PREPROCESS_PROVIDER_ID].spec_id == _PREPROCESS_SPEC_ID
+    assert reports_by_provider[_UPLOAD_PROVIDER_ID].spec_id == _UPLOAD_SPEC_ID
     assert DOWNLOAD_TOOL_NAME in reports_by_provider[_DOWNLOAD_PROVIDER_ID].tool_names
     assert PREPROCESS_TOOL_NAME in reports_by_provider[_PREPROCESS_PROVIDER_ID].tool_names
+    assert UPLOAD_TOOL_NAME in reports_by_provider[_UPLOAD_PROVIDER_ID].tool_names
     assert DOWNLOAD_TOOL_NAME not in reports_by_provider[_READ_PROVIDER_ID].tool_names
     assert PREPROCESS_TOOL_NAME not in reports_by_provider[_READ_PROVIDER_ID].tool_names
-    assert len({report.source_refs[0].source_id for report in result.provider_reports}) == 3
+    assert UPLOAD_TOOL_NAME not in reports_by_provider[_READ_PROVIDER_ID].tool_names
+    assert len({report.source_refs[0].source_id for report in result.provider_reports}) == 4
 
 
 def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
-    """workspace overlay 应能分别启用 Fins read、download、preprocess providers。"""
+    """workspace overlay 应能分别启用 Fins read、download、preprocess、upload providers。"""
 
     workspace_root = _build_workspace(tmp_path)
-    _write_split_fins_provider_overlay(tmp_path, workspace_root)
+    upload_root = _build_upload_root(tmp_path)
+    _write_split_fins_provider_overlay(tmp_path, workspace_root, upload_root)
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=tmp_path / "workspace" / "config"
     )
 
-    for provider_id in (_READ_SPEC_ID, _DOWNLOAD_SPEC_ID, _PREPROCESS_SPEC_ID):
+    for provider_id in (_READ_SPEC_ID, _DOWNLOAD_SPEC_ID, _PREPROCESS_SPEC_ID, _UPLOAD_SPEC_ID):
         provider_config = config.tool_discovery.providers[provider_id]
         assert provider_config.enabled is True
         assert "include_ingestion_tools" not in provider_config.config
@@ -261,6 +284,7 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
         _READ_SPEC_ID,
         _DOWNLOAD_SPEC_ID,
         _PREPROCESS_SPEC_ID,
+        _UPLOAD_SPEC_ID,
     )
     assert reports_by_spec[_READ_SPEC_ID].provider_id == _READ_PROVIDER_ID
     assert reports_by_spec[_DOWNLOAD_SPEC_ID].provider_id == _DOWNLOAD_PROVIDER_ID
@@ -268,6 +292,29 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
     assert _READ_SAMPLE_TOOL_NAME in reports_by_spec[_READ_SPEC_ID].tool_names
     assert DOWNLOAD_TOOL_NAME in reports_by_spec[_DOWNLOAD_SPEC_ID].tool_names
     assert PREPROCESS_TOOL_NAME in reports_by_spec[_PREPROCESS_SPEC_ID].tool_names
+    assert UPLOAD_TOOL_NAME in reports_by_spec[_UPLOAD_SPEC_ID].tool_names
+
+
+def test_upload_provider_requires_allowed_upload_roots(tmp_path: Path) -> None:
+    """upload provider 启用时缺少 allowed_upload_roots 必须 fail closed。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    try:
+        upload_provider.discover_tools(
+            ToolsDiscoveryProviderSpec(
+                spec_id=_UPLOAD_SPEC_ID,
+                location=PythonImportPathProvider(
+                    import_path="dayu.fins.tools.upload_provider:discover_tools"
+                ),
+                enabled=True,
+                allow_empty=False,
+                config={"workspace_root": str(workspace_root)},
+            )
+        )
+    except ValueError as exc:
+        assert "allowed_upload_roots" in str(exc)
+    else:
+        raise AssertionError("upload provider 缺少 allowed_upload_roots 时未失败")
 
 
 def test_download_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
@@ -295,7 +342,7 @@ def test_download_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> 
     record = runtime.read_job(outcome.await_spec.resume_token)
     assert record.operation_kind is FinsIngestionOperationKind.DOWNLOAD
     assert record.normalized_ticker == "AAPL"
-    _wait_ingestion_job_terminal(runtime, outcome.await_spec.resume_token)
+    # Production download 是长事务；工具测试只验证 start 边界与 durable job 创建。
 
 
 def test_preprocess_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
@@ -326,6 +373,45 @@ def test_preprocess_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -
     _wait_ingestion_job_terminal(runtime, outcome.await_spec.resume_token)
 
 
+def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
+    """上传工具应在 durable job 创建后返回 EXTERNAL_JOB awaiting outcome。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
+    definition = upload_provider.discover_tools(
+        _upload_spec(
+            spec_id=_UPLOAD_SPEC_ID,
+            workspace_root=workspace_root,
+            allowed_upload_roots=(upload_root,),
+        )
+    ).definitions[0]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    record = runtime.read_job(outcome.await_spec.resume_token)
+    assert record.operation_kind is FinsIngestionOperationKind.UPLOAD
+    assert record.normalized_ticker == "AAPL"
+    assert record.source_kind is SourceKind.FILING
+    _wait_ingestion_job_terminal(runtime, outcome.await_spec.resume_token)
+
+
 def test_tool_argument_error_returns_failed_outcome_before_job_creation(tmp_path: Path) -> None:
     """工具参数错误必须返回失败 outcome，且不得创建 durable job。"""
 
@@ -349,6 +435,116 @@ def test_tool_argument_error_returns_failed_outcome_before_job_creation(tmp_path
     assert outcome.result.error == "invalid_argument"
     job_dir = workspace_root / ".dayu" / "fins_ingestion" / "jobs"
     assert not tuple(job_dir.glob("*.json"))
+
+
+def test_upload_tool_path_error_returns_failed_outcome_before_job_creation(tmp_path: Path) -> None:
+    """上传路径越界必须在 durable job 创建前返回失败 outcome。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    allowed_root = _build_upload_root(tmp_path)
+    outside_root = tmp_path / "outside"
+    outside_file = _write_upload_file(outside_root)
+    definition = upload_provider.discover_tools(
+        _upload_spec(
+            spec_id=_UPLOAD_SPEC_ID,
+            workspace_root=workspace_root,
+            allowed_upload_roots=(allowed_root,),
+        )
+    ).definitions[0]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "files": [str(outside_file)],
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert "outside allowed upload roots" in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+def test_upload_tool_empty_file_returns_failed_outcome_before_job_creation(tmp_path: Path) -> None:
+    """上传空文件必须在 durable job 创建前返回失败 outcome。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    allowed_root = _build_upload_root(tmp_path)
+    empty_file = allowed_root / "empty.pdf"
+    empty_file.write_bytes(b"")
+    definition = upload_provider.discover_tools(
+        _upload_spec(
+            spec_id=_UPLOAD_SPEC_ID,
+            workspace_root=workspace_root,
+            allowed_upload_roots=(allowed_root,),
+        )
+    ).definitions[0]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "files": [str(empty_file)],
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert "non-empty file" in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+def test_upload_tool_delete_rejects_unnecessary_files_before_job_creation(tmp_path: Path) -> None:
+    """上传 delete 动作带 files 时必须失败，避免误读本地文件。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    upload_file = _write_upload_file(_build_upload_root(tmp_path))
+    definition = upload_provider.discover_tools(
+        _upload_spec(
+            spec_id=_UPLOAD_SPEC_ID,
+            workspace_root=workspace_root,
+            allowed_upload_roots=(upload_file.parent,),
+        )
+    ).definitions[0]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "material",
+                    "action": "delete",
+                    "files": [str(upload_file)],
+                    "form_type": "MATERIAL_OTHER",
+                    "material_name": "Deck",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert "files must be omitted" in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
 def test_download_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
@@ -387,8 +583,36 @@ def test_preprocess_tool_cancelled_before_start_returns_cancelled_without_job(tm
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
+def test_upload_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
+    """上传工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime, allowed_upload_roots=(upload_root,))(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(cancellation_token=_CancelledCancellationToken()),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
 def test_awaiting_tool_callables_consume_context_and_bridge_token_to_runtime() -> None:
-    """download/preprocess callable 不得丢弃 context，且必须把 token 传给 runtime。"""
+    """download/preprocess/upload callable 不得丢弃 context，且必须把 token 传给 runtime。"""
 
     _assert_context_token_bridge(
         source_path=_DOWNLOAD_TOOLS_PATH,
@@ -399,6 +623,11 @@ def test_awaiting_tool_callables_consume_context_and_bridge_token_to_runtime() -
         source_path=_PREPROCESS_TOOLS_PATH,
         class_name="FinsPreprocessToolCallable",
         start_method="start_preprocess",
+    )
+    _assert_context_token_bridge(
+        source_path=_UPLOAD_TOOLS_PATH,
+        class_name="FinsUploadToolCallable",
+        start_method="start_upload",
     )
 
 
@@ -482,10 +711,71 @@ def test_preprocess_tool_unexpected_start_exception_returns_start_failed_outcome
     assert outcome.result.error == _PREPROCESS_START_FAILED_ERROR
 
 
-def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> None:
-    """下载和预处理工具 schema 不应暴露 Host 内部治理字段。"""
+def test_upload_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
+    """上传工具遇到 start_upload OSError 时应返回 start-failed 失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
+    runtime = _runtime_with_job_store(
+        workspace_root=workspace_root,
+        job_store=_OSErrorCreateJobStore(root_dir=_job_store_root(workspace_root)),
+    )
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime, allowed_upload_roots=(upload_root,))(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == _UPLOAD_START_FAILED_ERROR
+
+
+def test_upload_tool_unexpected_start_exception_returns_start_failed_outcome(tmp_path: Path) -> None:
+    """上传工具遇到 start_upload 非预期异常时应返回 start-failed 失败 outcome。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
+    runtime = _runtime_with_executor(
+        workspace_root=workspace_root,
+        executor=_RuntimeErrorExecutor(),
+    )
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime, allowed_upload_roots=(upload_root,))(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == _UPLOAD_START_FAILED_ERROR
+
+
+def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> None:
+    """下载、预处理和上传工具 schema 不应暴露 Host 内部治理字段。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
     definitions = (
         download_provider.discover_tools(
             _spec(
@@ -501,6 +791,13 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
                 workspace_root=workspace_root,
             )
         ).definitions
+        + upload_provider.discover_tools(
+            _upload_spec(
+                spec_id=_UPLOAD_SPEC_ID,
+                workspace_root=workspace_root,
+                allowed_upload_roots=(upload_root,),
+            )
+        ).definitions
     )
 
     for definition in definitions:
@@ -513,20 +810,23 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
 
         schema_text = _schema_text(definition)
         assert "tool_call_id" not in schema_text
+        assert "wait_id" not in schema_text
+        assert "EventLog" not in schema_text
         assert "digest" not in schema_text
         assert "cursor" not in schema_text
         assert "raw job record" not in schema_text
+        assert "internal governance" not in schema_text
         assert "Host" not in schema_text
 
 
-def test_fins_wait_adapter_registry_binds_download_and_preprocess_tools(
+def test_fins_wait_adapter_registry_binds_download_preprocess_and_upload_tools(
     tmp_path: Path,
 ) -> None:
-    """Fins wait adapter registry 应绑定 S4 稳定 awaiting 工具名。"""
+    """Fins wait adapter registry 应绑定稳定 awaiting 工具名。"""
 
     registry = build_fins_wait_adapter_registry(
         workspace_root=tmp_path.resolve(strict=False),
-        tool_names=(PREPROCESS_TOOL_NAME, DOWNLOAD_TOOL_NAME),
+        tool_names=(PREPROCESS_TOOL_NAME, UPLOAD_TOOL_NAME, DOWNLOAD_TOOL_NAME),
     )
 
     download_binding = registry.resolve_binding(
@@ -537,12 +837,19 @@ def test_fins_wait_adapter_registry_binds_download_and_preprocess_tools(
         tool_name=PREPROCESS_TOOL_NAME,
         await_kind=ToolAwaitKind.EXTERNAL_JOB,
     )
+    upload_binding = registry.resolve_binding(
+        tool_name=FINS_UPLOAD_AWAITING_TOOL_NAME,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+    )
     assert download_binding is not None
     assert preprocess_binding is not None
+    assert upload_binding is not None
     assert download_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+    assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert download_binding.resume_policy is WaitResumePolicy.POLL
     assert preprocess_binding.resume_policy is WaitResumePolicy.POLL
+    assert upload_binding.resume_policy is WaitResumePolicy.POLL
 
 
 def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> None:
@@ -743,7 +1050,7 @@ def _job_record(
         market="US",
         exchange=None,
         source="auto",
-        source_kind=SourceKind.FILING,
+        source_kind=None,
         status=status,
         created_at=now,
         updated_at=now,
@@ -971,12 +1278,17 @@ def _wait_ingestion_job_terminal(
     raise AssertionError(f"job 未进入终态: {job_id}")
 
 
-def _write_split_fins_provider_overlay(tmp_path: Path, workspace_root: Path) -> None:
+def _write_split_fins_provider_overlay(
+    tmp_path: Path,
+    workspace_root: Path,
+    upload_root: Path,
+) -> None:
     """写入启用 split Fins providers 的 workspace overlay。
 
     Args:
         tmp_path: pytest 临时目录。
         workspace_root: Fins workspace root。
+        upload_root: 上传文件 allowlist 根目录。
 
     Returns:
         无。
@@ -1017,6 +1329,18 @@ def _write_split_fins_provider_overlay(tmp_path: Path, workspace_root: Path) -> 
                 "enabled": True,
                 "allow_empty": False,
                 "config": {"workspace_root": str(workspace_root)},
+            },
+            _UPLOAD_SPEC_ID: {
+                "import_path": "dayu.fins.tools.upload_provider:discover_tools",
+                "entry_point": None,
+                "source_kind": "explicit_provider",
+                "source_id": "dayu.fins.tools.upload_provider",
+                "enabled": True,
+                "allow_empty": False,
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "allowed_upload_roots": [str(upload_root)],
+                },
             },
         }
     }
@@ -1098,6 +1422,77 @@ def _spec(
         allow_empty=False,
         config={"workspace_root": str(workspace_root)},
     )
+
+
+def _upload_spec(
+    *,
+    spec_id: str,
+    workspace_root: Path,
+    allowed_upload_roots: tuple[Path, ...],
+) -> ToolsDiscoveryProviderSpec:
+    """构造 upload provider spec。
+
+    Args:
+        spec_id: provider spec id。
+        workspace_root: Fins workspace root。
+        allowed_upload_roots: 上传文件 allowlist 根目录。
+
+    Returns:
+        provider spec。
+
+    Raises:
+        无。
+    """
+
+    return ToolsDiscoveryProviderSpec(
+        spec_id=spec_id,
+        location=PythonImportPathProvider(
+            import_path="dayu.fins.tools.upload_provider:discover_tools"
+        ),
+        enabled=True,
+        allow_empty=False,
+        config={
+            "workspace_root": str(workspace_root),
+            "allowed_upload_roots": [str(root) for root in allowed_upload_roots],
+        },
+    )
+
+
+def _build_upload_root(tmp_path: Path) -> Path:
+    """构造上传文件 allowlist 根目录。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        上传文件根目录。
+
+    Raises:
+        OSError: 目录创建失败时抛出。
+    """
+
+    upload_root = tmp_path / "uploads"
+    upload_root.mkdir(parents=True, exist_ok=True)
+    return upload_root.resolve(strict=False)
+
+
+def _write_upload_file(upload_root: Path) -> Path:
+    """写入测试上传文件。
+
+    Args:
+        upload_root: 上传文件根目录。
+
+    Returns:
+        测试文件路径。
+
+    Raises:
+        OSError: 目录或文件写入失败时抛出。
+    """
+
+    upload_root.mkdir(parents=True, exist_ok=True)
+    target = upload_root / "sample.pdf"
+    target.write_bytes(b"%PDF-1.4\n% test upload\n")
+    return target.resolve(strict=False)
 
 
 def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:

@@ -27,6 +27,7 @@ from dayu.fins.ingestion_runtime import (
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
+from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
 from dayu.host.api import (
     ResolveWaitCancelledOutcome,
     ResolveWaitCompletedOutcome,
@@ -56,10 +57,17 @@ FINS_DOWNLOAD_AWAITING_TOOL_NAME: Final[str] = DOWNLOAD_TOOL_NAME
 FINS_PREPROCESS_AWAITING_TOOL_NAME: Final[str] = PREPROCESS_TOOL_NAME
 """Fins preprocess awaiting tool 的稳定名称。"""
 
+FINS_UPLOAD_AWAITING_TOOL_NAME: Final[str] = UPLOAD_TOOL_NAME
+"""Fins upload awaiting tool 的稳定名称。"""
+
 FINS_SUPPORTED_AWAITING_TOOL_NAMES: Final[frozenset[str]] = frozenset(
-    {FINS_DOWNLOAD_AWAITING_TOOL_NAME, FINS_PREPROCESS_AWAITING_TOOL_NAME}
+    {
+        FINS_DOWNLOAD_AWAITING_TOOL_NAME,
+        FINS_PREPROCESS_AWAITING_TOOL_NAME,
+        FINS_UPLOAD_AWAITING_TOOL_NAME,
+    }
 )
-"""S4 已接受的 Fins awaiting 工具稳定名称集合。"""
+"""Fins awaiting 工具稳定名称集合。"""
 
 _ACTIVE_STATUSES: Final[frozenset[FinsIngestionJobStatus]] = frozenset(
     {

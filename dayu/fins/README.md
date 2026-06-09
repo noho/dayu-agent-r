@@ -27,7 +27,7 @@ UI -> Service -> Host -> Engine
 
 Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。
 
-在整个 Agent 中，LLM 负责分析、推理和生成；Host 负责生命周期、取消、恢复、工具治理、EventLog、memory / context governance 和持久化事实。Fins 提供买方财报分析所需的业务底座：财报文档存取、ticker 归一、read tools、download awaiting tool、preprocess / process awaiting tool、upload runtime job contract、processor registry、XBRL / financial statement 能力，以及把 Fins durable job 映射到 Host wait-resume 的 adapter。
+在整个 Agent 中，LLM 负责分析、推理和生成；Host 负责生命周期、取消、恢复、工具治理、EventLog、memory / context governance 和持久化事实。Fins 提供买方财报分析所需的业务底座：财报文档存取、ticker 归一、read tools、download / preprocess / upload awaiting tools、processor registry、XBRL / financial statement 能力，以及把 Fins durable job 映射到 Host wait-resume 的 adapter。
 
 `dayu.fins` 的设计重点是把财报业务能力从 Host / Engine 中剥离出来：
 
@@ -122,21 +122,23 @@ Fins 与其它层的稳定边界如下：
 - `get_financial_statement`
 - `query_xbrl_facts`
 
-### Download / preprocess awaiting tools
+### Download / preprocess / upload awaiting tools
 
-Fins ingestion 通过两个独立 provider 暴露 awaiting tools：
+Fins ingestion 通过三个独立 provider 暴露 awaiting tools：
 
 - `dayu.fins.tools.download_provider.discover_tools(spec)`：provider id 为 `financial-download-tools`，返回 `start_fins_download`。
 - `dayu.fins.tools.preprocess_provider.discover_tools(spec)`：provider id 为 `financial-preprocess-tools`，返回 `start_fins_preprocess`。
+- `dayu.fins.tools.upload_provider.discover_tools(spec)`：provider id 为 `financial-upload-tools`，返回 `start_fins_upload`。
 
-两个 provider 都必须显式配置绝对 `workspace_root`。工具调用只启动 durable Fins job 并返回 `ToolAwaitingOutcome`，不轮询 job、不直接 resolve Host wait。
+三个 provider 都必须显式配置绝对 `workspace_root`。upload provider 还必须显式配置非空绝对路径集合 `allowed_upload_roots`，上传工具只接受这些根目录下的本地文件。工具调用只启动 durable Fins job 并返回 `ToolAwaitingOutcome`，不轮询 job、不直接 resolve Host wait。
 
 ### Ingestion runtime 与 wait adapter
 
-`dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载与预处理的 typed runtime foundation：
+`dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载、预处理与上传的 typed runtime foundation：
 
 - `start_download(FinsDownloadRequest, *, cancellation_token: CancellationToken | None = None) -> FinsIngestionJobStart`
 - `start_preprocess(FinsPreprocessRequest, *, cancellation_token: CancellationToken | None = None) -> FinsIngestionJobStart`
+- `start_upload(FinsUploadRequest, *, cancellation_token: CancellationToken | None = None) -> FinsIngestionJobStart`
 - `read_job(job_id) -> FinsIngestionJobRecord`
 - `request_cancel(job_id) -> FinsIngestionJobRecord`
 
@@ -145,6 +147,7 @@ Fins ingestion 通过两个独立 provider 暴露 awaiting tools：
 - `FINS_INGESTION_WAIT_ADAPTER_KEY = "poll:fins-ingestion"`
 - `FINS_DOWNLOAD_AWAITING_TOOL_NAME = "start_fins_download"`
 - `FINS_PREPROCESS_AWAITING_TOOL_NAME = "start_fins_preprocess"`
+- `FINS_UPLOAD_AWAITING_TOOL_NAME = "start_fins_upload"`
 - `FinsIngestionWaitPollAdapter`
 - `build_fins_wait_adapter_registry(workspace_root=..., tool_names=...)`
 
@@ -186,15 +189,16 @@ sections = read_runtime.get_document_sections(
 
 ### Download / preprocess / upload caller
 
-Tool discovery 的 download / preprocess providers 已经内置这条路径：
+Tool discovery 的 download / preprocess / upload providers 已经内置这条路径：
 
 ```text
 dayu.fins.tools.download_provider.discover_tools(spec)
 dayu.fins.tools.preprocess_provider.discover_tools(spec)
+dayu.fins.tools.upload_provider.discover_tools(spec)
   -> parse_fins_workspace_root_config(spec.config)
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> runtime.get_ingestion_runtime()
-  -> build start_fins_download / start_fins_preprocess ToolDefinition
+  -> build start_fins_download / start_fins_preprocess / start_fins_upload ToolDefinition
 ```
 
 其它直接调用 ingestion runtime 的入口也应走同一装配根：
@@ -259,7 +263,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 - `ToolSchema` / `ToolFunctionSchema` / `ToolParametersSchema` / `ToolTruncateSpec`：工具 schema 与截断声明。
 - `ToolCallRequest` / `BatchToolExecutionContext`：工具 callable 接收的调用请求与执行上下文。
 - `ToolExecutionOutcome` / `ToolAwaitingOutcome`：普通工具结果、失败、取消和长事务等待 outcome。
-- `ToolAwaitKind.EXTERNAL_JOB`：Fins download / preprocess awaiting tools 使用的等待类型。
+- `ToolAwaitKind.EXTERNAL_JOB`：Fins download / preprocess / upload awaiting tools 使用的等待类型。
 - `ToolsDiscoveryProviderSpec` / `ToolsDiscoveryProviderOutput`：Fins providers 的 runtime discovery contract。
 
 ### 文档处理器契约
@@ -345,7 +349,7 @@ Fins workspace 规则固定如下：
 
 - Fins provider config 的 `workspace_root` 必须是非空绝对路径；provider 不从 cwd 或环境变量推断。
 - 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools` 均为 disabled，`workspace_root=null`。
-- Service assembly 为 Fins awaiting providers 构造 wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess provider 使用同一个绝对 `workspace_root`。
+- Service assembly 为 Fins awaiting providers 构造 wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess / upload provider 使用同一个绝对 `workspace_root`。
 - ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，只保存 job governance records，不保存财报正文、processed payload、raw download payload 或 upload 本地文件路径。
 
 ## 主要组件
@@ -429,7 +433,7 @@ ToolsDiscovery
   -> get_ingestion_runtime()
   -> start_fins_download / start_fins_preprocess tool call
   -> observe BatchToolExecutionContext.cancellation_token
-  -> FinsIngestionRuntime.start_download / start_preprocess
+  -> FinsIngestionRuntime.start_download / start_preprocess / start_upload
   -> checkpoint before durable job creation
   -> create durable queued job record
   -> checkpoint before background submit
@@ -440,7 +444,7 @@ ToolsDiscovery
   -> Host resolve / resume governance
 ```
 
-Download 与 preprocess 会先观察 Host ToolRuntime 传入的 cancellation token；start 前已取消时返回 `ToolCancelledOutcome`，不创建 durable job。runtime 在请求摘要完成后、durable job 创建前再次 checkpoint；durable `queued` job record 创建后、后台 submit 前同步 checkpoint，若命中取消则把 Fins job 收口为 `cancelled` 终态且不提交后台执行。后台 submit 后不再使用 token 作为真源，后台 pipeline 只通过 job store 的取消请求观察合作式取消。
+Download、preprocess 与 upload 会先观察 Host ToolRuntime 传入的 cancellation token；start 前已取消时返回 `ToolCancelledOutcome`，不创建 durable job。runtime 在请求摘要完成后、durable job 创建前再次 checkpoint；durable `queued` job record 创建后、后台 submit 前同步 checkpoint，若命中取消则把 Fins job 收口为 `cancelled` 终态且不提交后台执行。后台 submit 后不再使用 token 作为真源，后台 pipeline 只通过 job store 的取消请求观察合作式取消。
 
 工具调用边界内的参数错误、job 创建失败或 create 后取消桥接落盘失败会返回工具失败 outcome；job 创建成功且未取消时工具立即返回 awaiting outcome，不等待后台任务完成。
 
@@ -461,7 +465,7 @@ direct caller
   -> update Fins job terminal record
 ```
 
-当前 upload 只具备 direct runtime job contract 与 production runner，不暴露 upload tool provider，也不绑定 Host wait adapter。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；job request summary 只保存业务字段和文件数量，不保存本地文件路径。未装配 `FinsUploadRunner` 时，后台 upload job 写入 unsupported upload runtime 的 failed 终态。
+当前 upload 同时具备 direct runtime job contract、production runner、`start_fins_upload` awaiting tool provider 与 Host wait adapter binding。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；job request summary 只保存业务字段和文件数量，不保存本地文件路径。未装配 `FinsUploadRunner` 时，后台 upload job 写入 unsupported upload runtime 的 failed 终态。
 
 ## 状态机
 
@@ -500,7 +504,7 @@ Fins 不产出 `EngineEvent stream` 或 `Host event stream`。Fins 对 Agent 的
 - download / preprocess start tools 的 `ToolAwaitingOutcome(EXTERNAL_JOB)`。
 - wait adapter poll 时把 Fins job terminal record 映射成 Host resolve outcome。
 
-Fins job record 是 Fins 自有治理记录；只有经 Host wait adapter 和 Host ingest / resolve 路径接受后，才会影响 Host Run / Attempt 状态。当前 upload job 只存在 direct runtime start path，还没有 upload awaiting tool 或 wait adapter 绑定。
+Fins job record 是 Fins 自有治理记录；只有经 Host wait adapter 和 Host ingest / resolve 路径接受后，才会影响 Host Run / Attempt 状态。Download、preprocess 与 upload awaiting tools 都使用同一个 Fins wait adapter key，由 Service assembly 根据启用的 provider 显式绑定。
 
 ## Processors 的类继承关系
 
@@ -565,7 +569,7 @@ SecProcessor
 
 ### Workspace root 与 provider fail fast
 
-三个 Fins provider 都要求显式绝对 `workspace_root`。read provider 在 `include_read_tools=false` 时允许不解析 workspace；其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+四个 Fins provider 都要求显式绝对 `workspace_root`。read provider 在 `include_read_tools=false` 时允许不解析 workspace；upload provider 还要求非空绝对 `allowed_upload_roots`。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
 
 ### Storage repository boundary
 
@@ -589,7 +593,7 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 ### Durable job 与取消
 
-Download / preprocess / upload 都先创建 durable `queued` job record，再提交后台 executor。job record 使用有界 JSON summary，不保存财报正文或本地上传文件路径。取消是合作式的：awaiting tool 在启动边界观察 ToolRuntime cancellation token；create 后、submit 前的取消会桥接为 Fins job store 里的 `cancelled` 终态且不提交后台任务。Host wait cancel 或其它调用方也可通过 `request_cancel(job_id)` 写取消请求，后台 pipeline 或 upload runner 观察到后收口为 `cancelled`。
+Download / preprocess / upload 都先创建 durable `queued` job record，再提交后台 executor。job record 使用有界 JSON summary，不保存财报正文或本地上传文件路径。上传工具在 job 创建前校验本地文件路径位于配置的 `allowed_upload_roots` 内，delete 动作不接受 files。取消是合作式的：awaiting tool 在启动边界观察 ToolRuntime cancellation token；create 后、submit 前的取消会桥接为 Fins job store 里的 `cancelled` 终态且不提交后台任务。Host wait cancel 或其它调用方也可通过 `request_cancel(job_id)` 写取消请求，后台 pipeline 或 upload runner 观察到后收口为 `cancelled`。
 
 ### Wait adapter 与 Host resume
 
