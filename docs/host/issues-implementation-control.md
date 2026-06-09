@@ -140,13 +140,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-TOOLS-01-F01-02 draft PR pass final closeout completed |
-| active work unit | WU-TOOLS-01-F01-02 |
-| default next work unit | WU-TOOLS-01-F01-02 |
-| next entry point | Await user merge decision for PR 128; after merge enter WU-TOOLS-01-F01-03 goal confirmation |
+| gate | accepted plan commit |
+| implementation status | WU-TOOLS-01-F01-03 plan re-review accepted; accepted plan commit pending |
+| active work unit | WU-TOOLS-01-F01-03 |
+| default next work unit | WU-TOOLS-01-F01-03 |
+| next entry point | Create accepted plan commit for WU-TOOLS-01-F01-03 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924 |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128 |
 | blocking open questions | none |
 
 状态约定：
@@ -219,8 +219,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01 | draft-pr-pass-final-closeout-passed | Fins / Web / Doc tools migration with shared document foundations | GitHub Issue #82 / #97 / #98；draft PR #123 | all active residual risks have owner / destination；等待用户 merge decision |
 | WU-TOOLS-01-F01 | draft-PR-pass-final-closeout-passed | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed；draft PR #126 | shared Fins ingestion service/runtime 与 download / preprocess awaiting tool providers 已完成；等待用户 merge decision |
 | WU-TOOLS-01-F01-01 | draft-PR-pass-final-closeout-passed | Fins filelock convergence to dayu.runtime.filelock | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #127 | Fins filelock 已收敛到 `dayu.runtime.filelock`；无 active residual risk；等待用户 merge decision |
-| WU-TOOLS-01-F01-02 | draft-PR-pass-final-closeout-passed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；等待用户 merge decision |
-| WU-TOOLS-01-F01-03 | discussion-ready | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09 | 迁移 / 建立 CN download、SEC download、CN upload、SEC upload 的真实可用 runtime 与 tool 入口；合并原 `WU-TOOLS-01-F09` upload follow-up；Tool 当前可访问，未来 CLI / CI 只能通过同一 shared Fins service/runtime 访问，不得再造 CLI / tool / CI 三套逻辑；若 upload 进入 awaiting external job / `start_upload` 模型，必须同步更新 GitHub Issue #129，并把 `start_upload` 纳入后续 prepare / activate 两段式范围 |
+| WU-TOOLS-01-F01-02 | completed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 merged 2026-06-09 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；PR 128 已 merge |
+| WU-TOOLS-01-F01-03 | accepted-plan-commit-pending | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09 | Goal confirmation accepted in `docs/reviews/wu-tools-01-f01-03-goal-confirmation-controller.md`；plan artifact 为 `docs/host/wu-tools-01-f01-03-production-fins-ingestion-plan.md`；plan review artifacts 为 `docs/reviews/wu-tools-01-f01-03-plan-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-03-plan-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-03-plan-review-controller-adjudication.md`；plan fix artifact 为 `docs/reviews/wu-tools-01-f01-03-plan-fix-codex.md`；plan re-review artifacts 为 `docs/reviews/wu-tools-01-f01-03-plan-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-03-plan-rereview-ds.md`；re-review controller adjudication 为 `docs/reviews/wu-tools-01-f01-03-plan-rereview-controller-adjudication.md`。Plan 已 accepted，等待 accepted plan commit。迁移 / 建立 CN download、SEC download、CN upload、SEC upload 的真实可用 runtime 与 tool 入口；本 WU 是 OLD 实现迁移与 NEW contract adaptation，不是业务逻辑重写；OLD SEC/CN/HK downloader 与 SEC/CN pipeline download/upload workflow 实现代码不能重写，接口可为 NEW 分层和契约适配。Upload 已裁决为长事务；若引入 awaiting external job / `start_upload`，必须同步更新 GitHub Issue #129，并把 `start_upload` 纳入后续 prepare / activate 两段式范围。Tool 当前可访问，未来 CLI / CI 只能通过同一 shared Fins service/runtime 访问，不得再造 CLI / tool / CI 三套逻辑。 |
 | WU-TOOLS-01-F02 | pending | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up | First step of Web CI diagnostics pipeline: migrate OLD `web_ci_urls.jsonl`, `diag_web.sh`, `diag_web_batch.sh` and `utils/diagnose_web_access.py`; does not close `WU-TOOLS-01-S5-R2` by itself |
 | WU-TOOLS-01-F03 | pending | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | Generate explicit opt-in Web smoke from the migrated web CI diagnostics pipeline; defines pass / skip / diagnostic criteria and is the closing owner for residual `WU-TOOLS-01-S5-R2` |
 | WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
@@ -865,7 +865,7 @@ Host 已通过 run cancel / session cancel、active worker registry、Engine can
 
 ### 状态
 
-Discussion-ready。该 work unit 是 `WU-TOOLS-01-F01` draft PR 前置 follow-up，并吸收原 `WU-TOOLS-01-F09`。当前裁决：Fins 不能只停留在抽象 download / upload contract；CN download、SEC download、CN upload、SEC upload 必须从 OLD 迁移代码并进入真实可用状态。Tool 侧当前可访问，未来 CLI / CI 也必须通过同一 shared Fins service/runtime 访问，避免 CLI / tool / CI 三套逻辑漂移。
+Planning。该 work unit 是 `WU-TOOLS-01-F01` draft PR 前置 follow-up，并吸收原 `WU-TOOLS-01-F09`。Goal confirmation artifact 为 `docs/reviews/wu-tools-01-f01-03-goal-confirmation-controller.md`。当前裁决：Fins 不能只停留在抽象 download / upload contract；CN download、SEC download、CN upload、SEC upload 必须从 OLD 迁移代码并进入真实可用状态。Tool 侧当前可访问，未来 CLI / CI 也必须通过同一 shared Fins service/runtime 访问，避免 CLI / tool / CI 三套逻辑漂移。本 WU 是 OLD 可靠实现迁移与 NEW contract adaptation，不是业务逻辑重写；OLD SEC/CN/HK downloader 与 SEC/CN pipeline download/upload workflow 实现代码不能重写，接口可为 NEW 分层和契约适配。Upload 已由用户裁决为长事务，plan 必须按 awaiting / durable ingestion job 方向处理 `start_upload` 与 Issue #129 的后续 prepare / activate 追踪。
 
 ### 动机
 
