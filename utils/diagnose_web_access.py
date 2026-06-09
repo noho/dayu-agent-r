@@ -14,7 +14,6 @@ import asyncio
 import ipaddress
 import json
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -71,6 +70,7 @@ _REQUEST_ACCEPT: Final[str] = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,"
     "image/avif,image/webp,image/apng,*/*;q=0.8"
 )
+_NEXT_ACTION_HINT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\[([a-z_]+)\]\s*(.*)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1274,6 +1274,7 @@ def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
             "content_length": len(content),
         }
     if isinstance(outcome, ToolFailedOutcome):
+        hint = outcome.result.hint or ""
         return {
             "sampled": True,
             "ok": False,
@@ -1282,7 +1283,10 @@ def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
             "error_code": outcome.result.error,
             "error": outcome.result.error,
             "message": outcome.result.message,
-            "hint": outcome.result.hint or "",
+            "hint": hint,
+            "next_action": _next_action_from_hint(hint),
+            "http_status": None,
+            "diagnostics": _tool_failed_outcome_diagnostics(outcome.result.error),
         }
     if isinstance(outcome, ToolCancelledOutcome):
         return {
@@ -1311,6 +1315,54 @@ def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
         "status": "unknown_outcome",
         "elapsed_seconds": elapsed,
         "error": "current fetch_web_page returned an unknown outcome.",
+    }
+
+
+def _next_action_from_hint(hint: str) -> str:
+    """从 current Web 工具 hint 中恢复结构化 next action。
+
+    Args:
+        hint: current ``ToolFailedOutcome`` 携带的恢复提示。
+
+    Returns:
+        hint 以 ``[action]`` 开头时返回 action，否则返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    match = _NEXT_ACTION_HINT_PATTERN.match(hint.strip())
+    if match is None:
+        return ""
+    return match.group(1)
+
+
+def _tool_failed_outcome_diagnostics(error_code: str) -> JsonObject:
+    """构造 current failed outcome 的诊断字段来源说明。
+
+    current adapter 只把 ``ToolBusinessError`` 的 code/message/hint 投影到
+    ``ToolFailedOutcome``；Web 错误里的 http status 与内部诊断不会进入
+    outcome。诊断 artifact 必须显式说明这个边界，避免把缺失字段误解为
+    站点事实。
+
+    Args:
+        error_code: current failed outcome 的错误码。
+
+    Returns:
+        业务可读诊断来源说明。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "diagnostic_source": "current_tool_failed_outcome",
+        "error_code": error_code,
+        "available_fields": ["error_code", "message", "hint", "next_action_from_hint"],
+        "note": (
+            "current ToolFailedOutcome 不暴露 Web 工具内部 http_status 或 internal_diagnostics；"
+            "本诊断只记录 outcome 可见字段，并从 hint 的 [action] 前缀恢复 next_action。"
+        ),
     }
 
 
