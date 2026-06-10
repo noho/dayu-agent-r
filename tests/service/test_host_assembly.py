@@ -39,7 +39,7 @@ from dayu.host.api import (
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
 )
-from dayu.runtime.config_loader import ConfigLoader
+from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.config_loader import (
     ToolDuplicateGovernanceMessagesConfig,
     ToolDuplicateGovernancePolicyConfig,
@@ -73,6 +73,7 @@ from dayu.service.host_assembly import (
     _runner_spec_from_model,
     _tool_discovery_specs,
     _tooling_options_from_discovery,
+    assemble_effective_tool_provider_configs,
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
@@ -96,6 +97,26 @@ def _scene_tool_catalog(discovered_tools: ServiceDiscoveredTools) -> SceneToolCa
     """
 
     return SceneToolCatalog.from_tool_bundle(discovered_tools.tool_bundle)
+
+
+def _discover_service_tools_for_workspace(
+    config: RuntimeConfig,
+    *,
+    workspace_root: Path,
+) -> ServiceDiscoveredTools:
+    """按测试 workspace 装配 effective configs 后发现工具。
+
+    :param config: ConfigLoader 输出的 runtime typed config。
+    :param workspace_root: 测试 workspace root。
+    :returns: Service 工具发现结果。
+    :raises Exception: effective config 装配或工具发现失败时向上抛出。
+    """
+
+    effective_provider_configs = assemble_effective_tool_provider_configs(
+        tuple(config.tool_discovery.providers.values()),
+        workspace_root=workspace_root,
+    )
+    return discover_service_tools(effective_provider_configs)
 
 
 def _complete_compactor_agent_policy_override() -> SceneAgentPolicyOverride:
@@ -136,7 +157,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -230,7 +251,7 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -306,7 +327,7 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -632,6 +653,30 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
     assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
 
 
+def test_tooling_options_skips_wait_adapter_for_missing_awaiting_tool_definition(
+    tmp_path: Path,
+) -> None:
+    """Service assembly 只为实际进入 ToolBundle 的 awaiting 工具绑定 wait adapter。"""
+
+    workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    tooling_options = _tooling_options_from_discovery(
+        tool_bundle=ToolBundle(definitions=(_tool_definition(DOWNLOAD_TOOL_NAME),)),
+        source_refs=(_source_ref("fins-awaiting-test"),),
+        provider_configs=(
+            _provider_config(
+                provider_id="custom-upload-provider",
+                import_path="dayu.fins.tools.upload_provider:discover_tools",
+                source_id="dayu.fins.tools.upload_provider",
+                workspace_root=workspace_root,
+            ),
+        ),
+        duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+    )
+
+    assert tooling_options is not None
+    assert tooling_options.wait_adapter_registry is None
+
+
 def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
     tmp_path: Path,
 ) -> None:
@@ -914,7 +959,11 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
         config=raw_config,
     )
 
-    specs = _tool_discovery_specs((provider,), workspace_root=tmp_path)
+    effective_providers = assemble_effective_tool_provider_configs(
+        (provider,),
+        workspace_root=tmp_path,
+    )
+    specs = _tool_discovery_specs(effective_providers)
 
     assert len(specs) == 1
     assert specs[0].config["workspace_root"] == str(tmp_path.resolve(strict=False))
@@ -944,7 +993,11 @@ def test_fins_tool_discovery_spec_preserves_explicit_workspace_root(
         config={"workspace_root": str(configured_workspace)},
     )
 
-    specs = _tool_discovery_specs((provider,), workspace_root=runtime_workspace)
+    effective_providers = assemble_effective_tool_provider_configs(
+        (provider,),
+        workspace_root=runtime_workspace,
+    )
+    specs = _tool_discovery_specs(effective_providers)
 
     assert len(specs) == 1
     assert specs[0].config["workspace_root"] == str(configured_workspace)
@@ -1060,7 +1113,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=fins_workspace)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=fins_workspace)
     discovered_provider = discovered_tools.effective_provider_configs[0]
     assert discovered_provider.config["workspace_root"] == str(fins_workspace)
 
@@ -1146,14 +1199,16 @@ def test_config_loader_and_service_discover_web_tools_with_overlay_config(
         workspace_config_dir=overlay_dir
     )
 
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     tool_names = tuple(
         definition.name for definition in discovered_tools.tool_bundle.definitions
     )
 
-    assert tool_names == ("search_web", "fetch_web_page")
-    assert discovered_tools.provider_reports == (
-        "provider=web-tools,spec=web-tools,version=web-tools-provider-v1,tools=search_web,fetch_web_page",
+    assert "search_web" in tool_names
+    assert "fetch_web_page" in tool_names
+    assert (
+        "provider=web-tools,spec=web-tools,version=web-tools-provider-v1,tools=search_web,fetch_web_page"
+        in discovered_tools.provider_reports
     )
 
 
@@ -1176,7 +1231,7 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -1230,7 +1285,7 @@ def test_memory_projection_context_window_uses_effective_model_window(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -1294,7 +1349,7 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -1380,7 +1435,7 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -1432,7 +1487,7 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,

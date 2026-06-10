@@ -70,6 +70,7 @@ from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
     ServiceDiscoveredTools,
     ServiceOpenHostAssemblyRequest,
+    assemble_effective_tool_provider_configs,
     compose_open_host_options,
     discover_service_tools,
 )
@@ -93,6 +94,10 @@ _FINS_TOOL_NAMES: Final[tuple[str, ...]] = (
     "get_page_content",
     "get_financial_statement",
     "query_xbrl_facts",
+)
+_FINS_AWAITING_TOOL_NAMES: Final[tuple[str, ...]] = (
+    "start_fins_download",
+    "start_fins_preprocess",
 )
 _WEB_TOOL_NAMES: Final[tuple[str, ...]] = ("search_web", "fetch_web_page")
 _FORBIDDEN_IMPORT_ROOTS: Final[tuple[str, ...]] = (
@@ -198,10 +203,15 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
     discovered_tools = _discover_combined_tools(tmp_path)
     names = tuple(definition.name for definition in discovered_tools.tool_bundle.definitions)
 
-    assert names == (*_FINS_TOOL_NAMES, *_DOC_TOOL_NAMES, *_WEB_TOOL_NAMES)
+    assert names == (
+        *_FINS_TOOL_NAMES,
+        *_FINS_AWAITING_TOOL_NAMES,
+        *_DOC_TOOL_NAMES,
+        *_WEB_TOOL_NAMES,
+    )
     assert len(names) == len(set(names))
     assert FrameworkToolName.FETCH_MORE.value not in names
-    assert len(discovered_tools.source_refs) == 3
+    assert len(discovered_tools.source_refs) == 6
     for definition in discovered_tools.tool_bundle.definitions:
         properties = definition.schema.function.parameters.properties
         assert "execution_context" not in properties
@@ -278,7 +288,11 @@ def test_compose_open_host_options_passes_effective_bundle_to_host(
         project_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
-    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
+    effective_provider_configs = assemble_effective_tool_provider_configs(
+        tuple(config.tool_discovery.providers.values()),
+        workspace_root=tmp_path,
+    )
+    discovered_tools = discover_service_tools(effective_provider_configs)
     scene_inputs = _prepared_scene_inputs()
 
     result = compose_open_host_options(
@@ -586,7 +600,11 @@ def _discover_combined_tools(tmp_path: Path) -> ServiceDiscoveredTools:
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=tmp_path / "workspace" / "config"
     )
-    return discover_service_tools(config, workspace_root=tmp_path)
+    effective_provider_configs = assemble_effective_tool_provider_configs(
+        tuple(config.tool_discovery.providers.values()),
+        workspace_root=tmp_path,
+    )
+    return discover_service_tools(effective_provider_configs)
 
 
 def _tool_runtime(

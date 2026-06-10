@@ -87,6 +87,7 @@ from dayu.service.host_assembly import (
     ServiceDiscoveredTools,
     ServiceOpenHostAssemblyDiagnostics,
     ServiceOpenHostAssemblyRequest,
+    assemble_effective_tool_provider_configs,
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
@@ -594,7 +595,11 @@ def _discover_smoke_service_tools(
     :raises Exception: 工具发现 provider 失败时向上抛出。
     """
 
-    discovered = discover_service_tools(config, workspace_root=workspace_root)
+    effective_provider_configs = assemble_effective_tool_provider_configs(
+        tuple(config.tool_discovery.providers.values()),
+        workspace_root=workspace_root,
+    )
+    discovered = discover_service_tools(effective_provider_configs)
     existing_smoke_tool = _find_mock_finance_fact_tool(discovered.tool_bundle)
     if existing_smoke_tool is not None:
         return discovered

@@ -270,26 +270,20 @@ class _CompactorScenePrompts:
 
 
 def discover_service_tools(
-    config: RuntimeConfig,
-    *,
-    workspace_root: pathlib.Path | None = None,
+    effective_provider_configs: Sequence[ToolDiscoveryProviderConfig],
 ) -> ServiceDiscoveredTools:
-    """按 runtime config 执行工具发现。
+    """按 effective provider configs 执行工具发现。
 
-    :param config: ``ConfigLoader`` 输出的 runtime typed config。
-    :param workspace_root: 当前运行时 workspace root；提供后会进入需要
-        workspace 的 provider effective spec。
+    :param effective_provider_configs: 已由调用方完成 config 与运行时参数装配
+        的 provider configs。
     :returns: Service 工具发现结果。
     :raises ValueError: provider spec 同时缺少 import path 与 entry point 时抛出。
     :raises Exception: ``ToolsDiscovery`` provider 失败时向上抛出。
     """
 
-    effective_provider_configs = _effective_tool_provider_configs(
-        tuple(config.tool_discovery.providers.values()),
-        workspace_root=workspace_root,
-    )
+    provider_config_tuple = tuple(effective_provider_configs)
     discovery_result = ToolsDiscovery().discover(
-        _tool_discovery_specs(effective_provider_configs)
+        _tool_discovery_specs(provider_config_tuple)
     )
     return ServiceDiscoveredTools(
         tool_bundle=discovery_result.tool_bundle,
@@ -303,8 +297,34 @@ def discover_service_tools(
             )
             for output in discovery_result.provider_reports
         ),
-        effective_provider_configs=effective_provider_configs,
+        effective_provider_configs=provider_config_tuple,
     )
+
+
+def assemble_effective_tool_provider_configs(
+    provider_configs: Sequence[ToolDiscoveryProviderConfig],
+    *,
+    workspace_root: pathlib.Path | None,
+) -> tuple[ToolDiscoveryProviderConfig, ...]:
+    """装配工具 provider 的 effective configs。
+
+    :param provider_configs: ConfigLoader 产出的 raw provider typed configs。
+    :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
+    :returns: provider config tuple，必要时替换为 effective config。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    effective_configs: list[ToolDiscoveryProviderConfig] = []
+    for provider_config in provider_configs:
+        effective_config = _effective_tool_provider_config(
+            provider_config,
+            workspace_root=workspace_root,
+        )
+        if effective_config == provider_config.config:
+            effective_configs.append(provider_config)
+        else:
+            effective_configs.append(replace(provider_config, config=effective_config))
+    return tuple(effective_configs)
 
 
 def compose_open_host_options(
@@ -776,14 +796,10 @@ def _model_runner_override_from_overrides(
 
 def _tool_discovery_specs(
     provider_configs: Sequence[ToolDiscoveryProviderConfig],
-    *,
-    workspace_root: pathlib.Path | None = None,
 ) -> tuple[ToolsDiscoveryProviderSpec, ...]:
     """把 ConfigLoader provider view 映射为 ToolsDiscovery specs。
 
-    :param provider_configs: 配置中的 provider specs。
-    :param workspace_root: 当前运行时 workspace root；提供后用于补齐需要
-        workspace 的 provider effective config。
+    :param provider_configs: 已完成运行时参数装配的 provider configs。
     :returns: ToolsDiscovery 可消费的 provider specs。
     :raises ValueError: provider 同时缺少 import path 与 entry point 时抛出。
     """
@@ -807,10 +823,7 @@ def _tool_discovery_specs(
                 location=location,
                 enabled=provider_config.enabled,
                 allow_empty=provider_config.allow_empty,
-                config=_effective_tool_provider_config(
-                    provider_config,
-                    workspace_root=workspace_root,
-                ),
+                config=provider_config.config,
             )
         )
     return tuple(specs)
@@ -841,32 +854,6 @@ def _effective_tool_provider_config(
         workspace_root.expanduser().resolve(strict=False)
     )
     return effective_config
-
-
-def _effective_tool_provider_configs(
-    provider_configs: Sequence[ToolDiscoveryProviderConfig],
-    *,
-    workspace_root: pathlib.Path | None,
-) -> tuple[ToolDiscoveryProviderConfig, ...]:
-    """生成 Service 后续 assembly 使用的 effective provider configs。
-
-    :param provider_configs: ConfigLoader 产出的 provider typed configs。
-    :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
-    :returns: provider config tuple，必要时替换为 effective config。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    effective_configs: list[ToolDiscoveryProviderConfig] = []
-    for provider_config in provider_configs:
-        effective_config = _effective_tool_provider_config(
-            provider_config,
-            workspace_root=workspace_root,
-        )
-        if effective_config is provider_config.config:
-            effective_configs.append(provider_config)
-        else:
-            effective_configs.append(replace(provider_config, config=effective_config))
-    return tuple(effective_configs)
 
 
 def _is_fins_workspace_bound_provider_config(
@@ -1181,7 +1168,10 @@ def _tooling_options_from_discovery(
     if not source_refs:
         raise ValueError("discovered tools must have source refs")
     wait_adapter_registry = _fins_wait_adapter_registry_from_provider_configs(
-        provider_configs
+        provider_configs,
+        available_tool_names=frozenset(
+            definition.name for definition in tool_bundle.definitions
+        ),
     )
     return HostToolingOptions(
         business_tool_bundle=tool_bundle,
@@ -1195,10 +1185,13 @@ def _tooling_options_from_discovery(
 
 def _fins_wait_adapter_registry_from_provider_configs(
     provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+    *,
+    available_tool_names: frozenset[str],
 ) -> WaitAdapterRegistry | None:
     """从显式 provider config 构造 Fins wait adapter registry。
 
     :param provider_configs: 当前 Host assembly 使用的工具发现 provider 配置。
+    :param available_tool_names: 当前 ToolBundle 中实际存在的工具名。
     :returns: Fins wait adapter registry；没有启用 Fins awaiting provider 时为
         ``None``。
     :raises ValueError: workspace root 缺失、非绝对、不一致，或重复绑定时抛出。
@@ -1211,6 +1204,8 @@ def _fins_wait_adapter_registry_from_provider_configs(
             continue
         tool_name = _fins_awaiting_tool_name_from_provider_config(provider_config)
         if tool_name is None:
+            continue
+        if tool_name not in available_tool_names:
             continue
         tool_names.append(tool_name)
         workspace_roots.append(

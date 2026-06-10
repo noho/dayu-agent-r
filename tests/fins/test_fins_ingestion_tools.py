@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, TypeGuard
 
+import pytest
+
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind
@@ -285,12 +287,12 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
     result = ToolsDiscovery().discover(_provider_specs_from_loaded_config(config))
     reports_by_spec = {report.spec_id: report for report in result.provider_reports}
 
-    assert tuple(reports_by_spec) == (
+    assert {
         _READ_SPEC_ID,
         _DOWNLOAD_SPEC_ID,
         _PREPROCESS_SPEC_ID,
         _UPLOAD_SPEC_ID,
-    )
+    }.issubset(reports_by_spec)
     assert reports_by_spec[_READ_SPEC_ID].provider_id == _READ_PROVIDER_ID
     assert reports_by_spec[_DOWNLOAD_SPEC_ID].provider_id == _DOWNLOAD_PROVIDER_ID
     assert reports_by_spec[_PREPROCESS_SPEC_ID].provider_id == _PREPROCESS_PROVIDER_ID
@@ -300,11 +302,40 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
     assert UPLOAD_TOOL_NAME in reports_by_spec[_UPLOAD_SPEC_ID].tool_names
 
 
-def test_upload_provider_requires_allowed_upload_roots(tmp_path: Path) -> None:
-    """upload provider 启用时缺少 allowed_upload_roots 必须 fail closed。"""
+@pytest.mark.parametrize(
+    "provider_config",
+    (
+        {},
+        {"allowed_upload_roots": []},
+        {"allowed_upload_roots": None},
+    ),
+)
+def test_upload_provider_without_allowed_upload_roots_returns_empty_tools(
+    provider_config: Mapping[str, JsonValue],
+) -> None:
+    """upload provider 空 allowed_upload_roots 时必须安全返回空工具集。"""
+
+    result = upload_provider.discover_tools(
+        ToolsDiscoveryProviderSpec(
+            spec_id=_UPLOAD_SPEC_ID,
+            location=PythonImportPathProvider(
+                import_path="dayu.fins.tools.upload_provider:discover_tools"
+            ),
+            enabled=True,
+            allow_empty=True,
+            config=dict(provider_config),
+        )
+    )
+
+    assert result.provider_id == _UPLOAD_PROVIDER_ID
+    assert result.definitions == ()
+
+
+def test_upload_provider_rejects_relative_allowed_upload_roots(tmp_path: Path) -> None:
+    """upload provider 对非法 allowed_upload_roots 仍必须 fail fast。"""
 
     workspace_root = _build_workspace(tmp_path)
-    try:
+    with pytest.raises(ValueError, match="absolute paths"):
         upload_provider.discover_tools(
             ToolsDiscoveryProviderSpec(
                 spec_id=_UPLOAD_SPEC_ID,
@@ -312,14 +343,13 @@ def test_upload_provider_requires_allowed_upload_roots(tmp_path: Path) -> None:
                     import_path="dayu.fins.tools.upload_provider:discover_tools"
                 ),
                 enabled=True,
-                allow_empty=False,
-                config={"workspace_root": str(workspace_root)},
+                allow_empty=True,
+                config={
+                    "workspace_root": str(workspace_root),
+                    "allowed_upload_roots": ["relative/upload-root"],
+                },
             )
         )
-    except ValueError as exc:
-        assert "allowed_upload_roots" in str(exc)
-    else:
-        raise AssertionError("upload provider 缺少 allowed_upload_roots 时未失败")
 
 
 def test_download_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:

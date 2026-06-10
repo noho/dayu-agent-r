@@ -35,7 +35,10 @@ from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.log import LogLevel, configure
-from dayu.service.host_assembly import discover_service_tools
+from dayu.service.host_assembly import (
+    assemble_effective_tool_provider_configs,
+    discover_service_tools,
+)
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 DiagnosticRunner: TypeAlias = Callable[[Sequence[str]], "DiagnosticChildResult"]
@@ -110,7 +113,10 @@ _PDF_EXPECTED_STREAM_NAME: Final[str] = "page.pdf"
 _BROWSER_EXPECTED_FETCH_BACKEND: Final[str] = "playwright"
 _ASSEMBLY_SCHEMA_VERSION: Final[str] = "web-smoke-assembly-v1"
 _SEARCH_SCHEMA_VERSION: Final[str] = "web-smoke-search-v1"
-_ASSEMBLY_PATH_LABEL: Final[str] = "ConfigLoader -> discover_service_tools -> ToolDefinition.callable"
+_ASSEMBLY_PATH_LABEL: Final[str] = (
+    "ConfigLoader -> assemble_effective_tool_provider_configs -> "
+    "discover_service_tools -> ToolDefinition.callable"
+)
 _PACKAGE_CONFIG_DIR: Final[Path] = Path(__file__).resolve().parents[1] / "dayu" / "config"
 _ASSEMBLY_FETCH_TRUNCATE_CHARS: Final[int] = 3210
 _ASSEMBLY_PROVIDER_CONFIG: Final[JsonObject] = {
@@ -997,7 +1003,7 @@ def _discover_tools_by_name(
     *,
     workspace_root: Path,
 ) -> Mapping[str, ToolDefinition]:
-    """通过 Service assembly 发现工具并按名称索引。
+    """通过 Service assembly 装配 effective configs 并发现工具。
 
     Args:
         config: ConfigLoader.load 产出的 runtime config。
@@ -1010,7 +1016,11 @@ def _discover_tools_by_name(
         Exception: 工具发现失败时向上抛出。
     """
 
-    discovered = discover_service_tools(config, workspace_root=workspace_root)
+    effective_provider_configs = assemble_effective_tool_provider_configs(
+        tuple(config.tool_discovery.providers.values()),
+        workspace_root=workspace_root,
+    )
+    discovered = discover_service_tools(effective_provider_configs)
     return {definition.name: definition for definition in discovered.tool_bundle.definitions}
 
 

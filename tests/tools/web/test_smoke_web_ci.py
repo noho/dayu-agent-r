@@ -223,7 +223,10 @@ def test_local_assembly_config_case_writes_overlay_and_truncate_artifact(
     assert provider_config["fetch_truncate_chars"] == 3210
     assert artifact["truncate_max_chars"] == 3210
     assert artifact["content_contains_fixture_text"] is True
-    assert artifact["assembly_path"] == "ConfigLoader -> discover_service_tools -> ToolDefinition.callable"
+    assert (
+        artifact["assembly_path"]
+        == "ConfigLoader -> assemble_effective_tool_provider_configs -> discover_service_tools -> ToolDefinition.callable"
+    )
 
 
 def test_search_provider_cases_are_typed_diagnostic_only(

@@ -221,7 +221,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02 | completed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 merged 2026-06-09 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；PR 128 已 merge |
 | WU-TOOLS-01-F01-03 | draft-PR-pass | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09; draft PR #131 | Draft PR #131 已通过本地 gate；final closeout 见 `docs/reviews/wu-tools-01-f01-03-final-closeout-controller.md`。等待用户 merge decision；Issue #129 继续追踪 `start_upload` prepare/activate 后续。 |
 | WU-TOOLS-01-F02 | completed | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up; PR #132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f02-final-closeout-controller.md`。F02 completion 已完成，F03 前置条件已满足。 |
-| WU-TOOLS-01-F03 | review-follow-up | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | 直接运行的 Web smoke 已覆盖 local HTML/PDF/Browser 默认 matrix、summary contract、external diagnostic-only 语义、UI/log 输出、Web tools config assembly hard gate 与 search provider diagnostic-only cases；R3 implementation gate 已完成，下一步进入 code review gate。 |
+| WU-TOOLS-01-F03 | review-follow-up | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | 直接运行的 Web smoke 已覆盖 local HTML/PDF/Browser 默认 matrix、summary contract、external diagnostic-only 语义、UI/log 输出、Web tools config assembly hard gate 与 search provider diagnostic-only cases；R3 code review / fix / re-review 与 effective spec follow-up 已 pass；当前收尾默认 discovery provider enabled 语义修正。 |
 | WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
 | WU-TOOLS-01-F05 | pending | SEC/Fins CI smoke generation | GitHub Issue #121 under #82 follow-up; depends on WU-TOOLS-01-F04 | Generate explicit opt-in SEC/Fins smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for SEC/Fins coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
 | WU-TOOLS-01-F06 | pending | CN/HK Docling CI pipeline migration | GitHub Issue #122 under #82/#98 follow-up | First step of CN/HK Docling coverage: migrate OLD `docs/cn_hk_docling_ci.md`, shared process runner behavior, `utils/llm_docling_ci_score.py` and `dayu.fins.score_docling_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
@@ -1012,10 +1012,10 @@ Completed locally。Implementation artifact 为 `docs/reviews/wu-tools-01-f03-r3
 已完成：
 
 - `dayu/config/tool_discovery.json` 的 `web-tools.config` 默认字段补齐，并保持默认 provider discovery 可用；private / local network URL 仍默认拒绝。
-- `discover_service_tools(config, workspace_root=...)` 会在 Service 层把 raw provider config 与运行时 workspace 装配成 effective spec；Fins provider raw config 中 `workspace_root=null` 时可由 runtime workspace 注入，显式绝对 `workspace_root` 不被覆盖。
+- 调用方先用 `assemble_effective_tool_provider_configs(...)` 把 raw provider config 与运行时 workspace 装配成 effective spec；`discover_service_tools(...)` 只接收 effective provider configs 并执行 discovery。Fins provider raw config 中 `workspace_root=null` 时可由 runtime workspace 注入，显式绝对 `workspace_root` 不被覆盖。
 - ConfigLoader / Service assembly 测试覆盖默认 Web config typed view、Web config 原样进入 `ToolsDiscoveryProviderSpec.config`，以及完整 `ConfigLoader.load()` + `discover_service_tools()` 发现 `search_web` / `fetch_web_page`。
 - Web provider deterministic tests 覆盖 search provider config 闭包、`fetch_truncate_chars` truncate spec、Playwright fallback channel 与空/非空 storage state dir。
-- `utils/smoke_web_ci.py` 默认新增 local assembly config hard gate，直接走 `ConfigLoader.load()`、`discover_service_tools()` 与 `ToolDefinition.callable`，artifact 证明 overlay config 与 `truncate_max_chars`。
+- `utils/smoke_web_ci.py` 默认新增 local assembly config hard gate，直接走 `ConfigLoader.load()`、`assemble_effective_tool_provider_configs()`、`discover_service_tools()` 与 `ToolDefinition.callable`，artifact 证明 overlay config 与 `truncate_max_chars`。
 - `utils/smoke_web_ci.py` 默认新增 `auto` / `tavily` / `serper` / `duckduckgo` search provider diagnostic-only cases，summary 使用 typed `search_cases`，`external_cases` 只保留外部 URL fetch cases，不新增 metadata 弱类型字段，不写 secret。
 - `tests/README.md` 已按落地事实更新；`dayu/config/README.md` 已声明相关字段与职责，未修改。
 
@@ -1046,10 +1046,12 @@ Controller 裁决：DS F1 原结论不成立。`web-tools.enabled=true` 只让 W
 
 已完成：
 
-- `ServiceDiscoveredTools` 新增 `effective_provider_configs`，保存 `discover_service_tools(config, workspace_root=...)` 实际用于 `ToolsDiscovery` 的 effective provider configs。
+- `ServiceDiscoveredTools` 新增 `effective_provider_configs`，保存调用方传给 `discover_service_tools(...)` 并实际用于 `ToolsDiscovery` 的 effective provider configs。
 - `compose_open_host_options(...)` 复用 `request.discovered_tools.effective_provider_configs` 构造 Host tooling / Fins wait adapter registry，避免 Fins tool closure 与 wait adapter registry 使用不同 workspace。
 - Service tests 新增 Fins workspace-bound provider 识别边界、discovery -> compose effective config 复用集成测试，并更新 Host smoke assembly tests，明确 construction-time discovered tools 与 scene-selected tools 的边界。
 - Web smoke tests 新增 search provider HTTP status / error text 分类、ConfigLoader hard failure、discovery hard failure、callable timeout diagnostic-only 与 empty result diagnostic-only 覆盖。
+- `dayu/config/tool_discovery.json` 中默认 discovery provider 语义统一为 `enabled=true`：discovery 只暴露候选工具包，实际可见工具仍由 scene manifest 与 Host per-run `tool_names` 决定。Fins upload provider 在 `allowed_upload_roots=[]` 时返回空工具集，保持默认 discovery 可用但上传工具 fail closed。
+- 默认 enabled / effective discovery 边界修正已完成：调用方显式执行 `assemble_effective_tool_provider_configs(...)`，`discover_service_tools(...)` 只接收 effective provider configs；upload 空 allowlist 不注册工具，也不会绑定 `start_fins_upload` wait adapter。AgentDS re-review artifact 为 `docs/reviews/wu-tools-01-f03-default-enabled-effective-discovery-rereview-ds.md`，裁决 pass；AgentMiMo 简短 re-review 裁决 pass-with-findings，无 blocking findings。
 
 Re-review artifacts 为 `docs/reviews/wu-tools-01-f03-r3-effective-spec-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f03-r3-effective-spec-rereview-ds.md`；两路均裁决 pass，无新增 correctness / type / layering findings。
 
