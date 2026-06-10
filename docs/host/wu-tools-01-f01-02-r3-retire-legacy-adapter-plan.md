@@ -263,6 +263,8 @@ def build_doc_tool_definitions(
                 tool_name=DOC_READ_FILE_TOOL_NAME,
                 started_at=started_at,
                 finished_at=finished_at,
+                message=business_result.message,
+                hint=business_result.hint,
             )
         return completed_outcome(
             tool_name=DOC_READ_FILE_TOOL_NAME,
@@ -323,7 +325,8 @@ class ToolBusinessFailure:
 
 @dataclass(frozen=True, slots=True)
 class ToolBusinessCancelled:
-    reason: Literal["host_cancelled"]
+    message: str | None
+    hint: str | None
 
 def validate_and_project_arguments(
     call: ToolCallRequest,
@@ -365,7 +368,7 @@ Typed result 字段语义：
 - `ToolArgumentValidationFailure.error` 固定为 `invalid_argument`，不得根据字段名生成新错误码。
 - `ToolArgumentValidationFailure.field_name` 是失败字段名；unknown field 使用该 unknown key，顶层结构错误使用 `None`。
 - `ToolBusinessFailure` 只表达 native callable 与同步业务 helper 之间的通用失败传递；领域额外字段必须使用领域本地类型。
-- `ToolBusinessCancelled` 只允许作为同一工具业务 helper 返回值，供 callable 立刻映射为 `host_cancelled_outcome(...)`；不得跨 ToolRuntime 边界传播。
+- `ToolBusinessCancelled` 只允许作为同一工具业务 helper 返回值，供 callable 立刻映射为 `host_cancelled_outcome(message=business_result.message, hint=business_result.hint, ...)`；不得跨 ToolRuntime 边界传播。`message` / `hint` 是业务 helper 对本次取消的可选说明，为空时由 `host_cancelled_outcome(...)` 使用默认说明与默认提示。
 
 参数校验范围：
 
