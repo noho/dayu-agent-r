@@ -914,22 +914,19 @@ def test_read_tools_expose_current_truncate_spec_and_no_old_imports(
         assert isinstance(truncate, ToolTruncateSpec)
         assert truncate.strategy is ToolTruncationStrategy.TEXT_CHARS
         assert truncate.target_field == "content"
-    doc_tools_source = (Path(__file__).resolve().parents[2] / "dayu" / "tools" / "doc_tools.py").read_text(
-        encoding="utf-8"
-    )
-    doc_provider_source = (Path(__file__).resolve().parents[2] / "dayu" / "tools" / "doc_provider.py").read_text(
-        encoding="utf-8"
-    )
-    imported_modules = _imported_modules(doc_tools_source)
-    assert "dayu.engine.tool_registry" not in imported_modules
-    assert "dayu.engine.truncation_manager" not in imported_modules
-    assert "dayu.engine.tool_result" not in imported_modules
+    tools_root = Path(__file__).resolve().parents[2] / "dayu" / "tools"
+    doc_tools_source = (tools_root / "doc_tools.py").read_text(encoding="utf-8")
+    doc_provider_source = (tools_root / "doc_provider.py").read_text(encoding="utf-8")
+    old_runtime_modules = {
+        "dayu.engine.tool_registry",
+        "dayu.engine.truncation_manager",
+        "dayu.engine.tool_result",
+    }
+    for source in (doc_tools_source, doc_provider_source):
+        imported_modules = _imported_modules(source)
+        assert old_runtime_modules.isdisjoint(imported_modules)
     assert "fetch_more" not in doc_tools_source
     assert "TruncationManager" not in doc_tools_source
-    assert "_legacy_adapter" not in doc_tools_source
-    assert "_legacy_adapter" not in doc_provider_source
-    assert "LegacyToolDeclarationCollector" not in doc_provider_source
-    assert "adapt_collected_tools" not in doc_provider_source
 
 
 def test_toolruntime_executes_doc_tool_through_accept_barrier(tmp_path: Path) -> None:

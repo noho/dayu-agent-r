@@ -164,7 +164,7 @@ dayu.fins.tools.provider.discover_tools(spec)
   -> parse_fins_workspace_root_config(spec.config)
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> runtime.get_read_runtime(...)
-  -> register_fins_read_tools(..., read_runtime=read_runtime)
+  -> build_fins_read_tool_definitions(read_runtime=...)
 ```
 
 其它直接调用 read runtime 的入口也应走同一装配根：
@@ -426,7 +426,7 @@ ToolsDiscovery
   -> parse explicit absolute workspace_root
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> get_read_runtime(...)
-  -> register_fins_read_tools(...)
+  -> build_fins_read_tool_definitions(...)
   -> current ToolDefinition bundle
   -> Host ToolRuntime
   -> FinsReadRuntime method
@@ -621,7 +621,7 @@ Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` �
 
 ## 扩展点
 
-扩展 read tool 时，先在 storage protocol、processor 或 `FinsReadRuntime` 中建立稳定业务语义，再通过 `register_fins_read_tools(...)` 暴露工具 schema。不要把仓储装配、Host 状态或 ToolRuntime 治理写进工具函数。
+扩展 read tool 时，先在 storage protocol、processor 或 `FinsReadRuntime` 中建立稳定业务语义，再通过 `build_fins_read_tool_definitions(...)` 暴露工具 schema。不要把仓储装配、Host 状态或 ToolRuntime 治理写进工具函数。
 
 扩展财报存储后端时，实现 `dayu.fins.storage` 的窄仓储协议，并保持 source / processed / blob / filing maintenance / batching 职责分离。调用方仍通过 `DefaultFinsRuntime` 或等价 assembly root 注入仓储实现。
 
