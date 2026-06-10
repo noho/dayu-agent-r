@@ -521,6 +521,305 @@ def test_external_failure_is_diagnostic_only_and_does_not_override_local_pass(tm
     assert summary.diagnostic_only[0].bucket == "child_process_error"
 
 
+def test_external_child_returncode_does_not_override_local_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """external child returncode 非 0 只能进入 diagnostic-only，不能覆盖 local pass。"""
+
+    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
+    html_url = "http://127.0.0.1:43117/index.html"
+    pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    url_file = tmp_path / "urls.txt"
+    url_file.write_text("https://example.com/child-error\n", encoding="utf-8")
+    output_dir = tmp_path / "out"
+
+    @contextlib.contextmanager
+    def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
+        """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
+
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+
+    def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
+        """local case 写入 pass artifact，external case 返回非零退出码。"""
+
+        url = _command_value(command, "--url")
+        output = Path(_command_value(command, "--output"))
+        if url == html_url:
+            _write_payload(output, _diagnostic_payload(url=url))
+            return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+        if url == pdf_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    content_type="application/pdf",
+                    raw_length=512,
+                    fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                    docling_invoked=True,
+                    docling_completed=True,
+                ),
+            )
+            return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+        return smoke.DiagnosticChildResult(returncode=9, stdout="", stderr="external failed")
+
+    monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
+    monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+
+    exit_code = smoke.main(
+        [
+            "--output-dir",
+            str(output_dir),
+            "--run-label",
+            "external-child-error",
+            "--external-url-file",
+            str(url_file),
+            "--external-limit",
+            "1",
+        ]
+    )
+
+    summary = _load_json_object(output_dir / "summary.json")
+    external_cases = _list_field(summary, "external_cases")
+    diagnostic_only = _list_field(summary, "diagnostic_only")
+    assert exit_code == 0
+    assert summary["status"] == "passed"
+    assert summary["exit_code"] == 0
+    assert len(external_cases) == 1
+    assert _object_value(external_cases[0])["bucket"] == "child_process_error"
+    assert _object_value(diagnostic_only[0])["bucket"] == "child_process_error"
+
+
+def test_external_parse_and_artifact_gap_do_not_override_local_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """external parse failure 与 artifact missing 都只能进入 diagnostic-only。"""
+
+    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
+    html_url = "http://127.0.0.1:43117/index.html"
+    pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    url_file = tmp_path / "urls.txt"
+    url_file.write_text(
+        "https://example.com/parse-gap\nhttps://example.com/artifact-gap\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+
+    @contextlib.contextmanager
+    def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
+        """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
+
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+
+    def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
+        """local case 写入 pass artifact，external case 制造 parse/missing gap。"""
+
+        url = _command_value(command, "--url")
+        output = Path(_command_value(command, "--output"))
+        if url == html_url:
+            _write_payload(output, _diagnostic_payload(url=url))
+        elif url == pdf_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    content_type="application/pdf",
+                    raw_length=512,
+                    fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                    docling_invoked=True,
+                    docling_completed=True,
+                ),
+            )
+        elif url.endswith("/parse-gap"):
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("{not-json\n", encoding="utf-8")
+        elif url.endswith("/artifact-gap"):
+            pass
+        else:
+            raise AssertionError(f"unexpected url: {url}")
+        return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
+    monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+
+    exit_code = smoke.main(
+        [
+            "--output-dir",
+            str(output_dir),
+            "--run-label",
+            "external-artifact-gaps",
+            "--external-url-file",
+            str(url_file),
+            "--external-limit",
+            "2",
+        ]
+    )
+
+    summary = _load_json_object(output_dir / "summary.json")
+    buckets = [
+        str(_object_value(item)["bucket"])
+        for item in _list_field(summary, "diagnostic_only")
+    ]
+    assert exit_code == 0
+    assert summary["status"] == "passed"
+    assert summary["exit_code"] == 0
+    assert buckets == ["artifact_parse_failure", "artifact_missing"]
+
+
+def test_include_playwright_only_affects_external_diagnostic_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--include-playwright 只让 external diagnostic-only 命令采样 Playwright。"""
+
+    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
+    html_url = "http://127.0.0.1:43117/index.html"
+    pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    external_url = "https://example.com/playwright"
+    url_file = tmp_path / "urls.txt"
+    url_file.write_text(f"{external_url}\n", encoding="utf-8")
+    commands_by_url: dict[str, Sequence[str]] = {}
+
+    @contextlib.contextmanager
+    def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
+        """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
+
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+
+    def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
+        """记录命令并写入 pass/diagnostic-only artifact。"""
+
+        url = _command_value(command, "--url")
+        output = Path(_command_value(command, "--output"))
+        commands_by_url[url] = tuple(command)
+        if url == html_url:
+            _write_payload(output, _diagnostic_payload(url=url))
+        elif url == pdf_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    content_type="application/pdf",
+                    raw_length=512,
+                    fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                    docling_invoked=True,
+                    docling_completed=True,
+                ),
+            )
+        elif url == external_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    comparison_bucket="playwright_challenge_detected",
+                ),
+            )
+        else:
+            raise AssertionError(f"unexpected url: {url}")
+        return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
+    monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+
+    exit_code = smoke.main(
+        [
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--run-label",
+            "include-playwright-external-only",
+            "--include-playwright",
+            "--external-url-file",
+            str(url_file),
+            "--external-limit",
+            "1",
+        ]
+    )
+
+    summary = _load_json_object(tmp_path / "out" / "summary.json")
+    diagnostic_only = _list_field(summary, "diagnostic_only")
+    assert exit_code == 0
+    assert "--skip-playwright" in commands_by_url[html_url]
+    assert "--skip-playwright" in commands_by_url[pdf_url]
+    assert "--skip-playwright" not in commands_by_url[external_url]
+    assert _object_value(diagnostic_only[0])["bucket"] == "playwright_challenge_detected"
+
+
+def test_missing_external_file_returns_operator_input_error(tmp_path: Path) -> None:
+    """显式传入不存在的 external URL 文件时应返回 operator input error。"""
+
+    exit_code = smoke.main(
+        [
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--run-label",
+            "missing-external-file",
+            "--external-url-file",
+            str(tmp_path / "missing.jsonl"),
+            "--external-limit",
+            "1",
+        ]
+    )
+
+    assert exit_code == 2
+    assert not (tmp_path / "out" / "summary.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("file_name", "file_content"),
+    [
+        ("urls.jsonl", "{not-json\n"),
+        ("urls.txt", "ftp://example.com/not-http\n"),
+    ],
+)
+def test_invalid_external_file_returns_operator_input_error_before_local_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_name: str,
+    file_content: str,
+) -> None:
+    """非法 external 文件应在 local fixture 和 diagnostics 启动前失败。"""
+
+    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
+    url_file = tmp_path / file_name
+    url_file.write_text(file_content, encoding="utf-8")
+    output_dir = tmp_path / "out"
+    fixture_starts: list[str] = []
+
+    @contextlib.contextmanager
+    def raising_server() -> Iterator[smoke.LocalFixtureUrls]:
+        """非法参数路径不应启动 local fixture server。"""
+
+        fixture_starts.append("started")
+        raise AssertionError("local fixture should not start for invalid external URL file")
+        yield smoke.LocalFixtureUrls(html_url="", pdf_url="")
+
+    def raising_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
+        """非法参数路径不应触发 diagnostics runner。"""
+
+        raise AssertionError(f"runner should not be called: {command}")
+
+    monkeypatch.setattr(smoke, "_running_local_fixture_server", raising_server)
+    monkeypatch.setattr(smoke, "_run_diagnostic_command", raising_runner)
+
+    exit_code = smoke.main(
+        [
+            "--output-dir",
+            str(output_dir),
+            "--run-label",
+            "invalid-external-file",
+            "--external-url-file",
+            str(url_file),
+            "--external-limit",
+            "1",
+        ]
+    )
+
+    assert exit_code == 2
+    assert fixture_starts == []
+    assert not output_dir.exists()
+
+
 def test_external_limit_and_summary_paths_are_predictable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -534,7 +833,10 @@ def test_external_limit_and_summary_paths_are_predictable(
     url_file.write_text(
         "\n".join(
             (
+                "# comment",
+                "",
                 json.dumps({"url": "https://example.com/a"}),
+                "  # another comment",
                 json.dumps({"url": "https://example.com/b"}),
                 json.dumps({"url": "https://example.com/c"}),
             )

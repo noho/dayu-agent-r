@@ -45,6 +45,8 @@ _EXIT_SCHEMA_OR_INFRA_FAILURE: Final[int] = 2
 _CASE_LOCAL_HTML: Final[str] = "local_html"
 _CASE_LOCAL_PDF: Final[str] = "local_pdf"
 _CASE_EXTERNAL: Final[str] = "external"
+_JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
+_EXTERNAL_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 _LOCAL_FIXTURE_HOST: Final[str] = "127.0.0.1"
 _LOCAL_HTML_PATH: Final[str] = "/index.html"
 _LOCAL_PDF_PATH: Final[str] = "/fixture.pdf"
@@ -1421,6 +1423,16 @@ def _classify_child_result(
         无。
     """
 
+    if case_kind == _CASE_EXTERNAL and child_result.returncode != _EXIT_OK:
+        return _case_diagnostic_only(
+            case_name=case_name,
+            case_kind=case_kind,
+            url=fallback_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_CHILD_PROCESS_ERROR,
+            reason="外部 URL diagnostics 子进程失败；外部站点行为不作为 local smoke gate。",
+            suggested_next_step="查看 diagnostics stdout/stderr 和站点可达性；必要时缩小外部样本。",
+        )
     if not artifact_path.is_file():
         if case_kind == _CASE_EXTERNAL:
             return _case_diagnostic_only(
@@ -1657,11 +1669,57 @@ def _read_external_urls(path: Path, *, limit: int) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        if path.suffix.lower() in {".jsonl", ".jsonlines"}:
+        if path.suffix.lower() in _JSONL_SUFFIXES:
             urls.append(_url_from_jsonl_line(line, line_number))
         else:
             urls.append(line)
     return urls
+
+
+def _validate_external_url_file(path: Path) -> None:
+    """校验 external URL 文件内容，不做采样截断。
+
+    Args:
+        path: URL 文件路径，支持 JSONL 对象/字符串或纯文本。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 输入文件不存在、JSONL 非法或 URL 字符串非法时抛出。
+        OSError: 文件读取失败时抛出。
+    """
+
+    if not path.is_file():
+        raise ValueError(f"external URL 文件不存在: {path}")
+    is_jsonl = path.suffix.lower() in _JSONL_SUFFIXES
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        url = _url_from_jsonl_line(line, line_number) if is_jsonl else line
+        _validate_external_url_text(url, line_number)
+
+
+def _validate_external_url_text(url: str, line_number: int) -> None:
+    """校验 external URL 字符串可交给 diagnostics 处理。
+
+    Args:
+        url: URL 字符串；允许省略 scheme，此时 diagnostics 会按 HTTPS 处理。
+        line_number: URL 文件中的行号。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: URL 为空或不是 HTTP/HTTPS 目标时抛出。
+    """
+
+    raw_url = url.strip()
+    normalized_url = raw_url if "://" in raw_url else f"https://{raw_url}"
+    parsed = urlparse(normalized_url)
+    if parsed.scheme.lower() not in _EXTERNAL_URL_SCHEMES or not parsed.netloc:
+        raise ValueError(f"external URL 文件第 {line_number} 行不是 http/https URL: {url}")
 
 
 def _url_from_jsonl_line(line: str, line_number: int) -> str:
@@ -1721,6 +1779,7 @@ def _diagnostic_command(
     artifact_path: Path,
     options: SmokeOptions,
     allow_private_network_url: bool,
+    sample_playwright: bool,
 ) -> list[str]:
     """构造单 URL diagnostics 命令。
 
@@ -1729,6 +1788,7 @@ def _diagnostic_command(
         artifact_path: diagnostics 输出 artifact。
         options: smoke 选项。
         allow_private_network_url: 是否允许 diagnostics 访问内网或本地 URL。
+        sample_playwright: 是否让 diagnostics 采样 Playwright。
 
     Returns:
         子进程命令参数列表。
@@ -1752,7 +1812,7 @@ def _diagnostic_command(
     ]
     if allow_private_network_url:
         command.append("--allow-private-network-url")
-    if not options.include_playwright:
+    if not sample_playwright:
         command.append("--skip-playwright")
     return command
 
@@ -1785,6 +1845,7 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
                 artifact_path=artifact_path,
                 options=options,
                 allow_private_network_url=True,
+                sample_playwright=False,
             )
             child_result = runner(command)
             results.append(
@@ -1827,6 +1888,7 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
             artifact_path=artifact_path,
             options=options,
             allow_private_network_url=False,
+            sample_playwright=options.include_playwright,
         )
         child_result = runner(command)
         results.append(
@@ -2001,6 +2063,10 @@ def _options_from_namespace(namespace: argparse.Namespace) -> SmokeOptions:
         if isinstance(external_file_value, str) and external_file_value
         else None
     )
+    if external_url_file is not None and not external_url_file.is_file():
+        raise ValueError(f"external URL 文件不存在: {external_url_file}")
+    if external_url_file is not None:
+        _validate_external_url_file(external_url_file)
     return SmokeOptions(
         run_live=bool(namespace.run_live),
         output_dir=output_dir,
