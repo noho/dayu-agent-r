@@ -12,6 +12,16 @@ from typing import Iterator, cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_declaration import ToolCallable, ToolDefinition
+from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
+from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
+from dayu.contracts.tool_schema import (
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+    ToolTruncateSpec,
+    ToolTruncationStrategy,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
@@ -93,6 +103,7 @@ def test_default_run_executes_local_html_pdf_and_browser_cases(
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+    _patch_direct_assembly_and_search_cases(monkeypatch)
 
     exit_code = smoke.main(["--output-dir", str(tmp_path), "--run-label", "slice3-local"])
     captured = capsys.readouterr()
@@ -102,23 +113,33 @@ def test_default_run_executes_local_html_pdf_and_browser_cases(
     assert "SMOKE START Web CI smoke" in captured.out
     assert "SMOKE LOG_LEVEL DEBUG" in captured.out
     assert "SMOKE STATUS passed" in captured.out
-    assert "SMOKE LOCAL_CASES 3" in captured.out
+    assert "SMOKE LOCAL_CASES 4" in captured.out
     assert "SMOKE EXTERNAL_CASES 2" in captured.out
+    assert "SMOKE SEARCH_CASES 4" in captured.out
     assert "web smoke execution started" in captured.out
     assert "stdout_prefix=diagnostic result for" in captured.out
     assert summary["status"] == "passed"
     assert summary["exit_code"] == 0
     local_cases = _list_field(summary, "local_cases")
     external_cases = _list_field(summary, "external_cases")
+    search_cases = _list_field(summary, "search_cases")
     diagnostic_only = _list_field(summary, "diagnostic_only")
     assert [str(_object_value(item)["case_kind"]) for item in local_cases] == [
         "local_html",
         "local_pdf",
         "local_browser",
+        "local_assembly_config",
+    ]
+    assert [str(_object_value(item)["case_kind"]) for item in search_cases] == [
+        "search_provider",
+        "search_provider",
+        "search_provider",
+        "search_provider",
     ]
     assert len(called_commands) == 5
     assert len(external_cases) == 2
-    assert len(diagnostic_only) == 2
+    assert len(search_cases) == 4
+    assert len(diagnostic_only) == 6
     assert external_urls == ["https://www.reuters.com/world/", "https://apnews.com/"]
     commands_by_url = {_command_value(command, "--url"): command for command in called_commands}
     assert "--allow-private-network-url" in commands_by_url[html_url]
@@ -130,6 +151,455 @@ def test_default_run_executes_local_html_pdf_and_browser_cases(
     for external_url in external_urls:
         assert "--allow-private-network-url" not in commands_by_url[external_url]
         assert "--skip-playwright" in commands_by_url[external_url]
+
+
+def test_local_assembly_config_case_writes_overlay_and_truncate_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """local assembly case 必须证明 overlay config 与 truncate spec。"""
+
+    loaded_overlay_dirs: list[Path] = []
+    discovered_configs: list[smoke.RuntimeConfig] = []
+
+    async def fake_fetch_callable(
+        call: smoke.ToolCallRequest,
+        context: smoke.BatchToolExecutionContext,
+    ) -> smoke.ToolCompletedOutcome:
+        """模拟 fetch_web_page callable 成功返回 fixture 正文。"""
+
+        assert call.name == "fetch_web_page"
+        assert context.run_id == "web-smoke-run"
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={"content": smoke._HTML_FIXTURE_BODY, "title": "Fixture"},
+                meta=None,
+            )
+        )
+
+    def fake_load_runtime_config(workspace_config_dir: Path) -> smoke.RuntimeConfig:
+        """记录 ConfigLoader overlay 目录并返回占位 RuntimeConfig。"""
+
+        loaded_overlay_dirs.append(workspace_config_dir)
+        return cast(smoke.RuntimeConfig, object())
+
+    def fake_discover_tools(
+        config: smoke.RuntimeConfig,
+        *,
+        workspace_root: Path,
+    ) -> Mapping[str, ToolDefinition]:
+        """记录 Service discovery 输入并返回 fetch_web_page definition。"""
+
+        discovered_configs.append(config)
+        assert workspace_root == tmp_path
+        return {
+            "search_web": _tool_definition("search_web", fake_fetch_callable),
+            "fetch_web_page": _tool_definition(
+                "fetch_web_page",
+                fake_fetch_callable,
+                truncate_max_chars=3210,
+            ),
+        }
+
+    monkeypatch.setattr(smoke, "_load_runtime_config_for_overlay", fake_load_runtime_config)
+    monkeypatch.setattr(smoke, "_discover_tools_by_name", fake_discover_tools)
+
+    result = smoke._run_local_assembly_config_case(
+        fixture_urls=smoke.LocalFixtureUrls(
+            html_url="http://127.0.0.1:43117/index.html",
+            pdf_url="http://127.0.0.1:43117/fixture.pdf",
+            browser_url="http://127.0.0.1:43117/client-rendered.html",
+        ),
+        diagnostics_dir=tmp_path,
+    )
+
+    artifact = _load_json_object(Path(result.evidence_path))
+    provider_config = _object_value(artifact["provider_config"])
+    assert result.status == "passed"
+    assert loaded_overlay_dirs == [tmp_path / "assembly-workspace-config"]
+    assert len(discovered_configs) == 1
+    assert provider_config["provider"] == "duckduckgo"
+    assert provider_config["fetch_truncate_chars"] == 3210
+    assert artifact["truncate_max_chars"] == 3210
+    assert artifact["content_contains_fixture_text"] is True
+    assert artifact["assembly_path"] == "ConfigLoader -> discover_service_tools -> ToolDefinition.callable"
+
+
+def test_search_provider_cases_are_typed_diagnostic_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search provider cases 必须进入 typed search_cases，不混入 external_cases。"""
+
+    async def fake_success_search_callable(
+        call: smoke.ToolCallRequest,
+        context: smoke.BatchToolExecutionContext,
+    ) -> smoke.ToolCompletedOutcome:
+        """模拟 search_web 成功返回一个首选结果。"""
+
+        assert call.name == "search_web"
+        assert context.run_id == "web-smoke-run"
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={
+                    "total": 1,
+                    "preferred_result": {"url": "https://openai.com/investors"},
+                    "results": [],
+                },
+                meta=None,
+            )
+        )
+
+    async def fake_failed_search_callable(
+        call: smoke.ToolCallRequest,
+        context: smoke.BatchToolExecutionContext,
+    ) -> smoke.ToolFailedOutcome:
+        """模拟 Tavily 缺 key 的 search_web failed outcome。"""
+
+        assert call.name == "search_web"
+        assert context.run_id == "web-smoke-run"
+        return ToolFailedOutcome(
+            result=ToolResultFailure(
+                ok=False,
+                error="execution_error",
+                message="TAVILY_API_KEY 未配置",
+                hint=None,
+                meta=None,
+            )
+        )
+
+    loaded_overlay_dirs: list[Path] = []
+
+    def fake_load_runtime_config(workspace_config_dir: Path) -> smoke.RuntimeConfig:
+        """记录 search provider overlay 目录并返回占位 RuntimeConfig。"""
+
+        loaded_overlay_dirs.append(workspace_config_dir)
+        return cast(smoke.RuntimeConfig, object())
+
+    def fake_discover_tools(
+        config: smoke.RuntimeConfig,
+        *,
+        workspace_root: Path,
+    ) -> Mapping[str, ToolDefinition]:
+        """根据 overlay 路径返回 search_web fake definition。"""
+
+        del config
+        assert workspace_root == tmp_path
+        overlay_dir = loaded_overlay_dirs[-1]
+        if "tavily" in str(overlay_dir):
+            return {"search_web": _tool_definition("search_web", fake_failed_search_callable)}
+        return {"search_web": _tool_definition("search_web", fake_success_search_callable)}
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(smoke, "_load_runtime_config_for_overlay", fake_load_runtime_config)
+    monkeypatch.setattr(smoke, "_discover_tools_by_name", fake_discover_tools)
+    options = smoke.SmokeOptions(
+        output_dir=tmp_path,
+        request_timeout=1.0,
+        tool_timeout_budget=1.0,
+        include_playwright=False,
+        external_url_file=None,
+        external_limit=0,
+        diagnostic_only_external=True,
+        run_label="search-cases",
+        log_level=smoke.LogLevel.DEBUG,
+    )
+
+    search_cases = smoke._run_search_provider_cases(options=options)
+    summary = smoke._summary_from_cases(
+        run_label="search-cases",
+        output_dir=tmp_path,
+        local_cases=(
+            smoke.SmokeCaseResult(
+                case_name="local-html",
+                case_kind="local_html",
+                url="http://127.0.0.1/index.html",
+                status="passed",
+                bucket="passed",
+                evidence_path=str(tmp_path / "local.json"),
+                suggested_next_step="",
+                reason="",
+                exit_code=0,
+            ),
+        ),
+        external_cases=(),
+        search_cases=search_cases,
+    )
+
+    tavily_artifact = _load_json_object(tmp_path / "diagnostics" / "search" / "search-provider-tavily.json")
+    assert len(search_cases) == 4
+    assert summary.exit_code == 0
+    assert summary.external_cases == ()
+    assert len(summary.search_cases) == 4
+    assert len(summary.diagnostic_only) == 4
+    assert search_cases[1].bucket == "provider_key_missing"
+    assert tavily_artifact["api_key_env"] == "TAVILY_API_KEY"
+    assert tavily_artifact["api_key_present"] is False
+    assert "provider_config" in tavily_artifact
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_bucket"),
+    (
+        (401, "provider_auth_failure"),
+        (403, "provider_auth_failure"),
+        (429, "provider_quota_or_rate_limited"),
+        (500, "provider_unavailable"),
+    ),
+)
+def test_search_http_status_classifier(status_code: int, expected_bucket: str) -> None:
+    """search provider HTTP 状态分类必须稳定。
+
+    :param status_code: HTTP 状态码。
+    :param expected_bucket: 预期分类 bucket。
+    :returns: ``None``。
+    :raises AssertionError: 分类不符合预期时抛出。
+    """
+
+    assert smoke._classify_search_http_status(status_code) == expected_bucket
+
+
+@pytest.mark.parametrize(
+    ("provider", "error_text", "api_key_present", "expected_bucket"),
+    (
+        ("tavily", "missing credentials", False, "provider_key_missing"),
+        ("auto", "api_key 未配置", True, "provider_key_missing"),
+        ("duckduckgo", "unauthorized invalid key", True, "provider_auth_failure"),
+        ("duckduckgo", "quota exceeded", True, "provider_quota_or_rate_limited"),
+        ("duckduckgo", "connection timeout", True, "provider_network_failure"),
+        ("duckduckgo", "unexpected json parse error", True, "provider_response_parse_failure"),
+        ("auto", "所有 provider 均不可用", True, "provider_unavailable"),
+        ("duckduckgo", "unknown failure", True, "search_tool_execution_error"),
+    ),
+)
+def test_search_error_text_classifier(
+    provider: str,
+    error_text: str,
+    api_key_present: bool,
+    expected_bucket: str,
+) -> None:
+    """search provider 错误文本分类必须覆盖关键模式。
+
+    :param provider: provider 名称。
+    :param error_text: 错误文本。
+    :param api_key_present: API key 是否存在。
+    :param expected_bucket: 预期分类 bucket。
+    :returns: ``None``。
+    :raises AssertionError: 分类不符合预期时抛出。
+    """
+
+    assert (
+        smoke._classify_search_error_text(
+            provider=provider,
+            error_text=error_text,
+            api_key_present=api_key_present,
+        )
+        == expected_bucket
+    )
+
+
+def test_single_search_provider_case_reports_loader_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search provider case 的 ConfigLoader 失败必须是 hard failure。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 失败分类不符合预期时抛出。
+    """
+
+    def fake_load_runtime_config(workspace_config_dir: Path) -> smoke.RuntimeConfig:
+        """模拟 ConfigLoader 失败。"""
+
+        del workspace_config_dir
+        raise RuntimeError("loader down")
+
+    monkeypatch.setattr(smoke, "_load_runtime_config_for_overlay", fake_load_runtime_config)
+
+    result = smoke._run_single_search_provider_case(
+        case_name="search-provider-duckduckgo",
+        provider="duckduckgo",
+        provider_config={"provider": "duckduckgo"},
+        workspace_config_dir=tmp_path / "config",
+        artifact_path=tmp_path / "search-loader.json",
+        workspace_root=tmp_path,
+    )
+
+    artifact = _load_json_object(Path(result.evidence_path))
+    assert result.status == "failed"
+    assert result.exit_code == 2
+    assert result.bucket == "web_config_loader_failure"
+    assert artifact["error_summary"] == "loader down"
+
+
+def test_single_search_provider_case_reports_discovery_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search provider case 的 discovery 失败必须是 hard failure。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 失败分类不符合预期时抛出。
+    """
+
+    def fake_load_runtime_config(workspace_config_dir: Path) -> smoke.RuntimeConfig:
+        """返回占位 RuntimeConfig。"""
+
+        del workspace_config_dir
+        return cast(smoke.RuntimeConfig, object())
+
+    def fake_discover_tools(
+        config: smoke.RuntimeConfig,
+        *,
+        workspace_root: Path,
+    ) -> Mapping[str, ToolDefinition]:
+        """模拟 Service discovery 失败。"""
+
+        del config
+        del workspace_root
+        raise RuntimeError("discovery down")
+
+    monkeypatch.setattr(smoke, "_load_runtime_config_for_overlay", fake_load_runtime_config)
+    monkeypatch.setattr(smoke, "_discover_tools_by_name", fake_discover_tools)
+
+    result = smoke._run_single_search_provider_case(
+        case_name="search-provider-duckduckgo",
+        provider="duckduckgo",
+        provider_config={"provider": "duckduckgo"},
+        workspace_config_dir=tmp_path / "config",
+        artifact_path=tmp_path / "search-discovery.json",
+        workspace_root=tmp_path,
+    )
+
+    artifact = _load_json_object(Path(result.evidence_path))
+    assert result.status == "failed"
+    assert result.exit_code == 2
+    assert result.bucket == "web_assembly_discovery_failure"
+    assert artifact["error_summary"] == "discovery down"
+
+
+def test_single_search_provider_case_classifies_callable_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_web callable timeout 必须降级为 diagnostic-only 网络失败。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 失败分类不符合预期时抛出。
+    """
+
+    async def fake_timeout_search_callable(
+        call: smoke.ToolCallRequest,
+        context: smoke.BatchToolExecutionContext,
+    ) -> smoke.ToolCompletedOutcome:
+        """模拟 provider timeout。"""
+
+        del call
+        del context
+        raise smoke.requests.Timeout("search timeout")
+
+    def fake_load_runtime_config(workspace_config_dir: Path) -> smoke.RuntimeConfig:
+        """返回占位 RuntimeConfig。"""
+
+        del workspace_config_dir
+        return cast(smoke.RuntimeConfig, object())
+
+    def fake_discover_tools(
+        config: smoke.RuntimeConfig,
+        *,
+        workspace_root: Path,
+    ) -> Mapping[str, ToolDefinition]:
+        """返回会 timeout 的 search_web definition。"""
+
+        del config
+        del workspace_root
+        return {"search_web": _tool_definition("search_web", fake_timeout_search_callable)}
+
+    monkeypatch.setattr(smoke, "_load_runtime_config_for_overlay", fake_load_runtime_config)
+    monkeypatch.setattr(smoke, "_discover_tools_by_name", fake_discover_tools)
+
+    result = smoke._run_single_search_provider_case(
+        case_name="search-provider-duckduckgo",
+        provider="duckduckgo",
+        provider_config={"provider": "duckduckgo"},
+        workspace_config_dir=tmp_path / "config",
+        artifact_path=tmp_path / "search-timeout.json",
+        workspace_root=tmp_path,
+    )
+
+    assert result.status == "diagnostic_only"
+    assert result.exit_code == 0
+    assert result.bucket == "provider_network_failure"
+
+
+def test_single_search_provider_case_classifies_empty_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_web 成功但结果为空时必须记录 provider_no_results。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 分类不符合预期时抛出。
+    """
+
+    async def fake_empty_search_callable(
+        call: smoke.ToolCallRequest,
+        context: smoke.BatchToolExecutionContext,
+    ) -> smoke.ToolCompletedOutcome:
+        """模拟 provider 成功但无结果。"""
+
+        del call
+        del context
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={"total": 0, "preferred_result": {}, "results": []},
+                meta=None,
+            )
+        )
+
+    def fake_load_runtime_config(workspace_config_dir: Path) -> smoke.RuntimeConfig:
+        """返回占位 RuntimeConfig。"""
+
+        del workspace_config_dir
+        return cast(smoke.RuntimeConfig, object())
+
+    def fake_discover_tools(
+        config: smoke.RuntimeConfig,
+        *,
+        workspace_root: Path,
+    ) -> Mapping[str, ToolDefinition]:
+        """返回 search_web definition。"""
+
+        del config
+        del workspace_root
+        return {"search_web": _tool_definition("search_web", fake_empty_search_callable)}
+
+    monkeypatch.setattr(smoke, "_load_runtime_config_for_overlay", fake_load_runtime_config)
+    monkeypatch.setattr(smoke, "_discover_tools_by_name", fake_discover_tools)
+
+    result = smoke._run_single_search_provider_case(
+        case_name="search-provider-duckduckgo",
+        provider="duckduckgo",
+        provider_config={"provider": "duckduckgo"},
+        workspace_config_dir=tmp_path / "config",
+        artifact_path=tmp_path / "search-empty.json",
+        workspace_root=tmp_path,
+    )
+
+    assert result.status == "diagnostic_only"
+    assert result.exit_code == 0
+    assert result.bucket == "provider_no_results"
 
 
 def test_synthetic_diagnostics_results_map_to_pass_fail_skip_diagnostic_only_and_schema_gap(
@@ -419,11 +889,11 @@ def test_docling_skip_only_skips_pdf_and_does_not_hide_html_failure(tmp_path: Pa
     assert len(summary.skips) == 1
 
 
-def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
+def test_pdf_invocation_blocker_runs_search_cases_and_stops_external_cases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PDF fetch 成功但缺 invocation evidence 时应写 blocker 并停止 external。"""
+    """PDF invocation blocker 应写 artifact、保留 search cases 并停止 external。"""
 
     html_url = "http://127.0.0.1:43117/index.html"
     pdf_url = "http://127.0.0.1:43117/fixture.pdf"
@@ -463,6 +933,7 @@ def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
         return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
+    _patch_direct_assembly_and_search_cases(monkeypatch)
     options = smoke.SmokeOptions(
         output_dir=tmp_path,
         request_timeout=1.0,
@@ -482,6 +953,8 @@ def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
     assert summary.status == "failed"
     assert summary.exit_code == 1
     assert summary.external_cases == ()
+    assert len(summary.search_cases) == 4
+    assert len(summary.diagnostic_only) == 4
     assert blocker_path.is_file()
     assert "不能用 content-type" in blocker_path.read_text(encoding="utf-8")
 
@@ -625,6 +1098,7 @@ def test_external_child_returncode_does_not_override_local_pass(
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+    _patch_direct_assembly_and_search_cases(monkeypatch)
 
     exit_code = smoke.main(
         [
@@ -712,6 +1186,7 @@ def test_external_parse_and_artifact_gap_do_not_override_local_pass(
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+    _patch_direct_assembly_and_search_cases(monkeypatch)
 
     exit_code = smoke.main(
         [
@@ -729,7 +1204,7 @@ def test_external_parse_and_artifact_gap_do_not_override_local_pass(
     summary = _load_json_object(output_dir / "summary.json")
     buckets = [
         str(_object_value(item)["bucket"])
-        for item in _list_field(summary, "diagnostic_only")
+        for item in _list_field(summary, "external_cases")
     ]
     assert exit_code == 0
     assert summary["status"] == "passed"
@@ -801,6 +1276,7 @@ def test_default_browser_case_samples_playwright_and_include_playwright_affects_
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+    _patch_direct_assembly_and_search_cases(monkeypatch)
 
     exit_code = smoke.main(
         [
@@ -978,6 +1454,7 @@ def test_external_limit_and_summary_paths_are_predictable(
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+    _patch_direct_assembly_and_search_cases(monkeypatch)
 
     exit_code = smoke.main(
         [
@@ -997,8 +1474,9 @@ def test_external_limit_and_summary_paths_are_predictable(
     assert called_urls == ["https://example.com/a", "https://example.com/b"]
     assert summary["status"] == "passed"
     assert summary["output_dir"] == str(output_dir)
-    assert len(_list_field(summary, "local_cases")) == 3
+    assert len(_list_field(summary, "local_cases")) == 4
     assert len(_list_field(summary, "external_cases")) == 2
+    assert len(_list_field(summary, "search_cases")) == 4
     assert _list_field(summary, "skips") == []
     assert (output_dir / "summary.md").is_file()
 
@@ -1111,6 +1589,109 @@ def _object_value(value: JsonValue) -> JsonObject:
 
     assert isinstance(value, Mapping)
     return {str(key): item for key, item in value.items()}
+
+
+def _tool_definition(
+    name: str,
+    callable_: ToolCallable,
+    *,
+    truncate_max_chars: int | None = None,
+) -> ToolDefinition:
+    """构造 smoke 测试用最小工具定义。
+
+    :param name: 工具名。
+    :param callable_: 工具 callable。
+    :param truncate_max_chars: 可选 text chars 截断声明。
+    :returns: 工具定义。
+    :raises Exception: schema 构造失败时抛出。
+    """
+
+    truncate = (
+        ToolTruncateSpec(
+            enabled=True,
+            strategy=ToolTruncationStrategy.TEXT_CHARS,
+            limits={"max_chars": truncate_max_chars},
+            target_field="content",
+            field_path=None,
+            ttl_seconds=None,
+        )
+        if truncate_max_chars is not None
+        else None
+    )
+    return ToolDefinition(
+        name=name,
+        schema=ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=name,
+                description=f"{name} test tool",
+                parameters=ToolParametersSchema(
+                    type="object",
+                    properties={},
+                    required=(),
+                    additional_properties=False,
+                ),
+            ),
+        ),
+        callable=callable_,
+        truncate=truncate,
+        display=None,
+        tags=(),
+    )
+
+
+def _patch_direct_assembly_and_search_cases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """为高层 smoke 编排测试替换直接工具调用 cases。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    def fake_assembly_case(
+        *,
+        fixture_urls: smoke.LocalFixtureUrls,
+        diagnostics_dir: Path,
+    ) -> smoke.SmokeCaseResult:
+        """返回 deterministic local assembly pass case。"""
+
+        return smoke.SmokeCaseResult(
+            case_name="local-assembly-config",
+            case_kind="local_assembly_config",
+            url=fixture_urls.html_url,
+            status="passed",
+            bucket="passed",
+            evidence_path=str(diagnostics_dir / "local-assembly-config.json"),
+            suggested_next_step="",
+            reason="",
+            exit_code=0,
+        )
+
+    def fake_search_cases(*, options: smoke.SmokeOptions) -> list[smoke.SmokeCaseResult]:
+        """返回 deterministic search diagnostic cases。"""
+
+        return [
+            smoke.SmokeCaseResult(
+                case_name=f"search-provider-{provider}",
+                case_kind="search_provider",
+                url="",
+                status="diagnostic_only",
+                bucket="search_provider_passed",
+                evidence_path=str(
+                    options.output_dir
+                    / "diagnostics"
+                    / "search"
+                    / f"search-provider-{provider}.json"
+                ),
+                suggested_next_step="search diagnostic only",
+                reason="search provider case 只作为 diagnostic-only。",
+                exit_code=0,
+            )
+            for provider in ("auto", "tavily", "serper", "duckduckgo")
+        ]
+
+    monkeypatch.setattr(smoke, "_run_local_assembly_config_case", fake_assembly_case)
+    monkeypatch.setattr(smoke, "_run_search_provider_cases", fake_search_cases)
 
 
 def _command_value(command: Sequence[str], option_name: str) -> str:

@@ -397,7 +397,18 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert preprocess_provider.enabled is False
     assert preprocess_provider.config["workspace_root"] is None
     assert "doc-tools" in config.tool_discovery.providers
-    assert "web-tools" in config.tool_discovery.providers
+    web_provider = config.tool_discovery.providers["web-tools"]
+    assert web_provider.enabled is True
+    assert web_provider.config["provider"] == "auto"
+    assert web_provider.config["request_timeout_seconds"] == 20.0
+    assert web_provider.config["max_search_results"] == 8
+    assert web_provider.config["fetch_truncate_chars"] == 80000
+    assert web_provider.config["playwright_channel"] == "chrome"
+    assert (
+        web_provider.config["playwright_storage_state_dir"]
+        == "workspace/.dayu/web_tools_storage_states"
+    )
+    assert web_provider.config["allow_private_network_url"] is False
 
 
 def test_workspace_record_replaces_package_record_without_deep_merge(

@@ -278,7 +278,7 @@ def test_compose_open_host_options_passes_effective_bundle_to_host(
         project_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = discover_service_tools(config, workspace_root=tmp_path)
     scene_inputs = _prepared_scene_inputs()
 
     result = compose_open_host_options(
@@ -586,7 +586,7 @@ def _discover_combined_tools(tmp_path: Path) -> ServiceDiscoveredTools:
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=tmp_path / "workspace" / "config"
     )
-    return discover_service_tools(config)
+    return discover_service_tools(config, workspace_root=tmp_path)
 
 
 def _tool_runtime(

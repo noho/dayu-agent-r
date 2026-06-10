@@ -10,11 +10,13 @@ diagnostic-only 分类和 Codex 可读 summary 输出。网页访问、``request
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import html
 import http.server
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -25,8 +27,15 @@ from pathlib import Path
 from typing import Final, Iterator, TypeAlias, cast
 from urllib.parse import urlparse
 
+import requests
+
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
+from dayu.contracts.tool_declaration import ToolDefinition
+from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
+from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.log import LogLevel, configure
+from dayu.service.host_assembly import discover_service_tools
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 DiagnosticRunner: TypeAlias = Callable[[Sequence[str]], "DiagnosticChildResult"]
@@ -47,7 +56,9 @@ _EXIT_SCHEMA_OR_INFRA_FAILURE: Final[int] = 2
 _CASE_LOCAL_HTML: Final[str] = "local_html"
 _CASE_LOCAL_PDF: Final[str] = "local_pdf"
 _CASE_LOCAL_BROWSER: Final[str] = "local_browser"
+_CASE_LOCAL_ASSEMBLY_CONFIG: Final[str] = "local_assembly_config"
 _CASE_EXTERNAL: Final[str] = "external"
+_CASE_SEARCH_PROVIDER: Final[str] = "search_provider"
 _JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
 _EXTERNAL_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 _LOCAL_FIXTURE_HOST: Final[str] = "127.0.0.1"
@@ -80,8 +91,44 @@ _BUCKET_DOCLING_INIT_SKIP: Final[str] = "docling_runtime_initialization_error"
 _BUCKET_BROWSER_BACKEND_NOT_OBSERVED: Final[str] = "browser_backend_not_observed"
 _BUCKET_BROWSER_FETCH_FAILURE: Final[str] = "browser_fetch_failure"
 _BUCKET_BROWSER_PROFILE_NOT_SAMPLED: Final[str] = "browser_profile_not_sampled"
+_BUCKET_WEB_CONFIG_LOADER_FAILURE: Final[str] = "web_config_loader_failure"
+_BUCKET_WEB_ASSEMBLY_DISCOVERY_FAILURE: Final[str] = "web_assembly_discovery_failure"
+_BUCKET_WEB_TOOL_MISSING: Final[str] = "web_tool_missing"
+_BUCKET_WEB_ASSEMBLY_FETCH_FAILURE: Final[str] = "web_assembly_fetch_failure"
+_BUCKET_WEB_ASSEMBLY_FETCH_CONTENT_FAILURE: Final[str] = "web_assembly_fetch_content_failure"
+_BUCKET_WEB_ASSEMBLY_CONFIG_MISMATCH: Final[str] = "web_assembly_config_mismatch"
+_BUCKET_SEARCH_PROVIDER_PASSED: Final[str] = "search_provider_passed"
+_BUCKET_PROVIDER_KEY_MISSING: Final[str] = "provider_key_missing"
+_BUCKET_PROVIDER_AUTH_FAILURE: Final[str] = "provider_auth_failure"
+_BUCKET_PROVIDER_QUOTA_OR_RATE_LIMITED: Final[str] = "provider_quota_or_rate_limited"
+_BUCKET_PROVIDER_NETWORK_FAILURE: Final[str] = "provider_network_failure"
+_BUCKET_PROVIDER_RESPONSE_PARSE_FAILURE: Final[str] = "provider_response_parse_failure"
+_BUCKET_PROVIDER_NO_RESULTS: Final[str] = "provider_no_results"
+_BUCKET_PROVIDER_UNAVAILABLE: Final[str] = "provider_unavailable"
+_BUCKET_SEARCH_TOOL_EXECUTION_ERROR: Final[str] = "search_tool_execution_error"
 _PDF_EXPECTED_STREAM_NAME: Final[str] = "page.pdf"
 _BROWSER_EXPECTED_FETCH_BACKEND: Final[str] = "playwright"
+_ASSEMBLY_SCHEMA_VERSION: Final[str] = "web-smoke-assembly-v1"
+_SEARCH_SCHEMA_VERSION: Final[str] = "web-smoke-search-v1"
+_ASSEMBLY_PATH_LABEL: Final[str] = "ConfigLoader -> discover_service_tools -> ToolDefinition.callable"
+_PACKAGE_CONFIG_DIR: Final[Path] = Path(__file__).resolve().parents[1] / "dayu" / "config"
+_ASSEMBLY_FETCH_TRUNCATE_CHARS: Final[int] = 3210
+_ASSEMBLY_PROVIDER_CONFIG: Final[JsonObject] = {
+    "provider": "duckduckgo",
+    "request_timeout_seconds": 6.0,
+    "max_search_results": 3,
+    "fetch_truncate_chars": _ASSEMBLY_FETCH_TRUNCATE_CHARS,
+    "allow_private_network_url": True,
+    "playwright_channel": "chrome",
+    "playwright_storage_state_dir": "",
+}
+_SEARCH_PROVIDERS: Final[tuple[str, ...]] = ("auto", "tavily", "serper", "duckduckgo")
+_SEARCH_PROVIDER_QUERY: Final[str] = "OpenAI investor relations"
+_SEARCH_FETCH_TRUNCATE_CHARS: Final[int] = 4096
+_SEARCH_API_KEY_ENVS: Final[Mapping[str, str]] = {
+    "tavily": "TAVILY_API_KEY",
+    "serper": "SERPER_API_KEY",
+}
 PDF_FETCH_MIN_CHARS: Final[int] = 20
 _HTML_FIXTURE_TITLE: Final[str] = "Dayu Web Smoke HTML"
 _HTML_FIXTURE_BODY: Final[str] = "Dayu Web Smoke HTML fixture verifies local fetch_web_page access."
@@ -174,6 +221,55 @@ class DiagnosticChildResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+class _OpenCancellationToken:
+    """Smoke 直接调用工具时使用的未取消 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回当前取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +411,7 @@ class SmokeSummary:
         diagnostic_only: diagnostic-only 记录。
         local_cases: local case 结果。
         external_cases: external case 结果。
+        search_cases: search provider diagnostic case 结果。
 
     Returns:
         无。
@@ -332,6 +429,7 @@ class SmokeSummary:
     diagnostic_only: tuple[SmokeItem, ...]
     local_cases: tuple[SmokeCaseResult, ...]
     external_cases: tuple[SmokeCaseResult, ...]
+    search_cases: tuple[SmokeCaseResult, ...]
 
     def to_json(self) -> JsonObject:
         """转换为 summary JSON 对象。
@@ -356,6 +454,7 @@ class SmokeSummary:
             "diagnostic_only": [item.to_json() for item in self.diagnostic_only],
             "local_cases": [case.to_json() for case in self.local_cases],
             "external_cases": [case.to_json() for case in self.external_cases],
+            "search_cases": [case.to_json() for case in self.search_cases],
         }
 
 
@@ -837,6 +936,169 @@ def _write_json(path: Path, payload: Mapping[str, JsonValue]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_web_tool_discovery_overlay(
+    workspace_config_dir: Path,
+    *,
+    provider_config: Mapping[str, JsonValue],
+) -> None:
+    """写入只启用 Web tools 的 workspace overlay。
+
+    Args:
+        workspace_config_dir: workspace config 目录。
+        provider_config: Web provider config。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: overlay 写入失败时抛出。
+    """
+
+    _write_json(
+        workspace_config_dir / "tool_discovery.json",
+        {
+            "providers": {
+                "web-tools": {
+                    "import_path": "dayu.tools.web:discover_tools",
+                    "entry_point": None,
+                    "source_kind": "explicit_provider",
+                    "source_id": "dayu.tools.web",
+                    "enabled": True,
+                    "allow_empty": False,
+                    "config": dict(provider_config),
+                }
+            }
+        },
+    )
+
+
+def _load_runtime_config_for_overlay(workspace_config_dir: Path) -> RuntimeConfig:
+    """通过完整 ConfigLoader.load 读取 runtime config。
+
+    Args:
+        workspace_config_dir: workspace config overlay 目录。
+
+    Returns:
+        ConfigLoader 产出的 runtime config。
+
+    Raises:
+        Exception: 配置加载失败时向上抛出。
+    """
+
+    return ConfigLoader(package_config_dir=_PACKAGE_CONFIG_DIR).load(
+        workspace_config_dir=workspace_config_dir,
+    )
+
+
+def _discover_tools_by_name(
+    config: RuntimeConfig,
+    *,
+    workspace_root: Path,
+) -> Mapping[str, ToolDefinition]:
+    """通过 Service assembly 发现工具并按名称索引。
+
+    Args:
+        config: ConfigLoader.load 产出的 runtime config。
+        workspace_root: 当前 smoke 的 workspace root。
+
+    Returns:
+        工具定义映射。
+
+    Raises:
+        Exception: 工具发现失败时向上抛出。
+    """
+
+    discovered = discover_service_tools(config, workspace_root=workspace_root)
+    return {definition.name: definition for definition in discovered.tool_bundle.definitions}
+
+
+def _tool_call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
+    """构造 smoke 直接工具调用请求。
+
+    Args:
+        name: 工具名。
+        arguments: 工具参数。
+
+    Returns:
+        工具调用请求。
+
+    Raises:
+        无。
+    """
+
+    return ToolCallRequest(
+        tool_call_id=f"smoke-{name}",
+        name=name,
+        arguments=arguments,
+        index_in_iteration=0,
+        provider_state=None,
+    )
+
+
+def _tool_context() -> BatchToolExecutionContext:
+    """构造 smoke 直接工具调用上下文。
+
+    Args:
+        无。
+
+    Returns:
+        批式工具执行上下文。
+
+    Raises:
+        无。
+    """
+
+    return BatchToolExecutionContext(
+        run_id="web-smoke-run",
+        session_id="web-smoke-session",
+        iteration_id="web-smoke-iteration",
+        timeout_seconds=30.0,
+        cancellation_token=_OpenCancellationToken(),
+        correlation_id="web-smoke-run:web-smoke-iteration:tool_batch",
+    )
+
+
+def _truncate_max_chars(definition: ToolDefinition) -> int | None:
+    """读取工具定义中的 text max chars truncate 声明。
+
+    Args:
+        definition: 工具定义。
+
+    Returns:
+        ``max_chars`` 值；缺失或类型不符时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if definition.truncate is None:
+        return None
+    value = definition.truncate.limits.get("max_chars")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _mapping_or_empty(value: JsonValue) -> JsonObject:
+    """把 JSON 值收窄为对象。
+
+    Args:
+        value: JSON 值。
+
+    Returns:
+        JSON object；非对象时返回空对象。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items()}
+    return {}
 
 
 def _stdio_log_prefix(value: str) -> str:
@@ -1684,6 +1946,7 @@ def _summary_from_cases(
     output_dir: Path,
     local_cases: Sequence[SmokeCaseResult],
     external_cases: Sequence[SmokeCaseResult],
+    search_cases: Sequence[SmokeCaseResult] = (),
     extra_skips: Sequence[SmokeItem] = (),
 ) -> SmokeSummary:
     """按 case 结果构造 smoke summary。
@@ -1693,6 +1956,7 @@ def _summary_from_cases(
         output_dir: 输出目录。
         local_cases: local case 列表。
         external_cases: external case 列表。
+        search_cases: search provider case 列表。
         extra_skips: 不属于具体 case、但需要进入 summary 的 skip 信号。
 
     Returns:
@@ -1702,14 +1966,15 @@ def _summary_from_cases(
         无。
     """
 
-    all_cases = tuple(local_cases) + tuple(external_cases)
+    all_cases = tuple(local_cases) + tuple(external_cases) + tuple(search_cases)
     failures = tuple(case.to_item() for case in all_cases if case.status == _STATUS_FAILED)
     skips = tuple(case.to_item() for case in all_cases if case.status == _STATUS_SKIPPED) + tuple(extra_skips)
     diagnostic_only = tuple(case.to_item() for case in all_cases if case.status == _STATUS_DIAGNOSTIC_ONLY)
     local_exit_code = _EXIT_OK
-    if any(case.exit_code == _EXIT_SCHEMA_OR_INFRA_FAILURE for case in local_cases):
+    hard_gate_cases = tuple(local_cases) + tuple(search_cases)
+    if any(case.exit_code == _EXIT_SCHEMA_OR_INFRA_FAILURE for case in hard_gate_cases):
         local_exit_code = _EXIT_SCHEMA_OR_INFRA_FAILURE
-    elif any(case.exit_code == _EXIT_LOCAL_FAILURE for case in local_cases):
+    elif any(case.exit_code == _EXIT_LOCAL_FAILURE for case in hard_gate_cases):
         local_exit_code = _EXIT_LOCAL_FAILURE
 
     if local_exit_code != _EXIT_OK:
@@ -1731,6 +1996,7 @@ def _summary_from_cases(
         diagnostic_only=diagnostic_only,
         local_cases=tuple(local_cases),
         external_cases=tuple(external_cases),
+        search_cases=tuple(search_cases),
     )
 
 
@@ -1755,6 +2021,7 @@ def _summary_markdown(summary: SmokeSummary) -> str:
         f"- output_dir: {summary.output_dir}",
         f"- local_cases: {len(summary.local_cases)}",
         f"- external_cases: {len(summary.external_cases)}",
+        f"- search_cases: {len(summary.search_cases)}",
     ]
     lines.extend(_markdown_items("Failures", summary.failures))
     lines.extend(_markdown_items("Skips", summary.skips))
@@ -2000,6 +2267,322 @@ def _diagnostic_command(
     return command
 
 
+def _run_local_assembly_config_case(
+    *,
+    fixture_urls: LocalFixtureUrls,
+    diagnostics_dir: Path,
+) -> SmokeCaseResult:
+    """运行本地 Web config assembly hard gate。
+
+    Args:
+        fixture_urls: 本地 fixture URL 集合。
+        diagnostics_dir: local diagnostics 输出目录。
+
+    Returns:
+        assembly config case 结果。
+
+    Raises:
+        OSError: overlay 或 artifact 写入失败时抛出。
+    """
+
+    case_name = "local-assembly-config"
+    artifact_path = diagnostics_dir / "local-assembly-config.json"
+    workspace_config_dir = diagnostics_dir / "assembly-workspace-config"
+    provider_config = dict(_ASSEMBLY_PROVIDER_CONFIG)
+    _write_web_tool_discovery_overlay(
+        workspace_config_dir,
+        provider_config=provider_config,
+    )
+    try:
+        config = _load_runtime_config_for_overlay(workspace_config_dir)
+    except Exception as exc:
+        return _assembly_failure_result(
+            case_name=case_name,
+            url=fixture_urls.html_url,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=_BUCKET_WEB_CONFIG_LOADER_FAILURE,
+            error=exc,
+            suggested_next_step="检查 ConfigLoader.load 是否能读取包内默认配置与 workspace tool_discovery overlay。",
+        )
+    try:
+        definitions = _discover_tools_by_name(config, workspace_root=diagnostics_dir)
+    except Exception as exc:
+        return _assembly_failure_result(
+            case_name=case_name,
+            url=fixture_urls.html_url,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=_BUCKET_WEB_ASSEMBLY_DISCOVERY_FAILURE,
+            error=exc,
+            suggested_next_step="检查 discover_service_tools 是否能通过 web-tools provider 完成工具发现。",
+        )
+
+    tool_names = tuple(definitions)
+    fetch_definition = definitions.get("fetch_web_page")
+    if fetch_definition is None:
+        _write_assembly_artifact(
+            artifact_path=artifact_path,
+            url=fixture_urls.html_url,
+            tool_names=tool_names,
+            provider_config=provider_config,
+            fetch_ok=False,
+            content_length=0,
+            content_contains_fixture_text=False,
+            truncate_max_chars=None,
+            bucket=_BUCKET_WEB_TOOL_MISSING,
+            suggested_next_step="检查 web-tools provider 是否仍发现 fetch_web_page。",
+        )
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+            url=fixture_urls.html_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_WEB_TOOL_MISSING,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            suggested_next_step="检查 web-tools provider 是否仍发现 fetch_web_page。",
+        )
+
+    truncate_max_chars = _truncate_max_chars(fetch_definition)
+    if truncate_max_chars != _ASSEMBLY_FETCH_TRUNCATE_CHARS:
+        _write_assembly_artifact(
+            artifact_path=artifact_path,
+            url=fixture_urls.html_url,
+            tool_names=tool_names,
+            provider_config=provider_config,
+            fetch_ok=False,
+            content_length=0,
+            content_contains_fixture_text=False,
+            truncate_max_chars=truncate_max_chars,
+            bucket=_BUCKET_WEB_ASSEMBLY_CONFIG_MISMATCH,
+            suggested_next_step="检查 fetch_truncate_chars 是否从 provider config 闭进 fetch_web_page truncate spec。",
+        )
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+            url=fixture_urls.html_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_WEB_ASSEMBLY_CONFIG_MISMATCH,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step="检查 fetch_truncate_chars 是否从 provider config 闭进 fetch_web_page truncate spec。",
+        )
+
+    outcome = asyncio.run(
+        fetch_definition.callable(
+            _tool_call("fetch_web_page", {"url": fixture_urls.html_url}),
+            _tool_context(),
+        )
+    )
+    if isinstance(outcome, ToolFailedOutcome):
+        _write_assembly_artifact(
+            artifact_path=artifact_path,
+            url=fixture_urls.html_url,
+            tool_names=tool_names,
+            provider_config=provider_config,
+            fetch_ok=False,
+            content_length=0,
+            content_contains_fixture_text=False,
+            truncate_max_chars=truncate_max_chars,
+            bucket=_BUCKET_WEB_ASSEMBLY_FETCH_FAILURE,
+            suggested_next_step=outcome.result.hint or "检查 fetch_web_page callable 的本地 fixture 抓取路径。",
+        )
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+            url=fixture_urls.html_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_WEB_ASSEMBLY_FETCH_FAILURE,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step=outcome.result.hint or "检查 fetch_web_page callable 的本地 fixture 抓取路径。",
+        )
+    if not isinstance(outcome, ToolCompletedOutcome):
+        _write_assembly_artifact(
+            artifact_path=artifact_path,
+            url=fixture_urls.html_url,
+            tool_names=tool_names,
+            provider_config=provider_config,
+            fetch_ok=False,
+            content_length=0,
+            content_contains_fixture_text=False,
+            truncate_max_chars=truncate_max_chars,
+            bucket=_BUCKET_WEB_ASSEMBLY_FETCH_FAILURE,
+            suggested_next_step="fetch_web_page callable 返回未知 outcome 类型。",
+        )
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+            url=fixture_urls.html_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_WEB_ASSEMBLY_FETCH_FAILURE,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            suggested_next_step="fetch_web_page callable 返回未知 outcome 类型。",
+        )
+
+    value = _mapping_or_empty(outcome.result.value)
+    content = _string_field(value, "content")
+    content_contains_fixture_text = _HTML_FIXTURE_BODY in content
+    content_length = len(content)
+    if not content_contains_fixture_text:
+        _write_assembly_artifact(
+            artifact_path=artifact_path,
+            url=fixture_urls.html_url,
+            tool_names=tool_names,
+            provider_config=provider_config,
+            fetch_ok=True,
+            content_length=content_length,
+            content_contains_fixture_text=False,
+            truncate_max_chars=truncate_max_chars,
+            bucket=_BUCKET_WEB_ASSEMBLY_FETCH_CONTENT_FAILURE,
+            suggested_next_step="fetch_web_page 成功但未返回 local HTML fixture 正文，检查内容抽取或 URL 路径。",
+        )
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+            url=fixture_urls.html_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_WEB_ASSEMBLY_FETCH_CONTENT_FAILURE,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step="fetch_web_page 成功但未返回 local HTML fixture 正文，检查内容抽取或 URL 路径。",
+        )
+
+    _write_assembly_artifact(
+        artifact_path=artifact_path,
+        url=fixture_urls.html_url,
+        tool_names=tool_names,
+        provider_config=provider_config,
+        fetch_ok=True,
+        content_length=content_length,
+        content_contains_fixture_text=True,
+        truncate_max_chars=truncate_max_chars,
+        bucket=_BUCKET_PASSED,
+        suggested_next_step="",
+    )
+    return SmokeCaseResult(
+        case_name=case_name,
+        case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+        url=fixture_urls.html_url,
+        status=_STATUS_PASSED,
+        bucket=_BUCKET_PASSED,
+        evidence_path=str(artifact_path),
+        suggested_next_step="",
+        reason="",
+        exit_code=_EXIT_OK,
+    )
+
+
+def _assembly_failure_result(
+    *,
+    case_name: str,
+    url: str,
+    artifact_path: Path,
+    provider_config: Mapping[str, JsonValue],
+    bucket: str,
+    error: Exception,
+    suggested_next_step: str,
+) -> SmokeCaseResult:
+    """构造 assembly 失败结果并写入 artifact。
+
+    Args:
+        case_name: case 名称。
+        url: 目标 URL。
+        artifact_path: artifact 路径。
+        provider_config: Web provider config。
+        bucket: failure bucket。
+        error: 捕获到的异常。
+        suggested_next_step: 建议下一步。
+
+    Returns:
+        failure case result。
+
+    Raises:
+        OSError: artifact 写入失败时抛出。
+    """
+
+    _write_assembly_artifact(
+        artifact_path=artifact_path,
+        url=url,
+        tool_names=(),
+        provider_config=provider_config,
+        fetch_ok=False,
+        content_length=0,
+        content_contains_fixture_text=False,
+        truncate_max_chars=None,
+        bucket=bucket,
+        suggested_next_step=suggested_next_step,
+        error_type=type(error).__name__,
+        error_summary=str(error),
+    )
+    return _case_failure(
+        case_name=case_name,
+        case_kind=_CASE_LOCAL_ASSEMBLY_CONFIG,
+        url=url,
+        evidence_path=str(artifact_path),
+        bucket=bucket,
+        exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+        suggested_next_step=suggested_next_step,
+    )
+
+
+def _write_assembly_artifact(
+    *,
+    artifact_path: Path,
+    url: str,
+    tool_names: Sequence[str],
+    provider_config: Mapping[str, JsonValue],
+    fetch_ok: bool,
+    content_length: int,
+    content_contains_fixture_text: bool,
+    truncate_max_chars: int | None,
+    bucket: str,
+    suggested_next_step: str,
+    error_type: str = "",
+    error_summary: str = "",
+) -> None:
+    """写入 local assembly config artifact。
+
+    Args:
+        artifact_path: artifact 路径。
+        url: 抓取 URL。
+        tool_names: 发现到的工具名。
+        provider_config: Web provider config。
+        fetch_ok: fetch_web_page 是否成功。
+        content_length: 返回正文长度。
+        content_contains_fixture_text: 正文是否包含 fixture 文本。
+        truncate_max_chars: 观察到的 truncate max chars。
+        bucket: 分类 bucket。
+        suggested_next_step: 建议下一步。
+        error_type: 可选错误类型。
+        error_summary: 可选错误摘要。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: artifact 写入失败时抛出。
+    """
+
+    _write_json(
+        artifact_path,
+        {
+            "schema_version": _ASSEMBLY_SCHEMA_VERSION,
+            "case_kind": _CASE_LOCAL_ASSEMBLY_CONFIG,
+            "url": url,
+            "tool_names": list(tool_names),
+            "provider_config": dict(provider_config),
+            "called_tool": "fetch_web_page",
+            "fetch_ok": fetch_ok,
+            "content_length": content_length,
+            "content_contains_fixture_text": content_contains_fixture_text,
+            "truncate_max_chars": truncate_max_chars,
+            "assembly_path": _ASSEMBLY_PATH_LABEL,
+            "bucket": bucket,
+            "suggested_next_step": suggested_next_step,
+            "error_type": error_type,
+            "error_summary": error_summary,
+        },
+    )
+
+
 def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list[SmokeCaseResult]:
     """运行本地 fetch_web_page path matrix smoke cases。
 
@@ -2090,6 +2673,20 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
                     case_result.evidence_path,
                 )
                 break
+        if not _has_docling_invocation_blocker(results):
+            assembly_case = _run_local_assembly_config_case(
+                fixture_urls=fixture_urls,
+                diagnostics_dir=diagnostics_dir,
+            )
+            results.append(assembly_case)
+            _LOGGER.debug(
+                "classified local assembly config case: case=%s status=%s bucket=%s exit_code=%s evidence=%s",
+                assembly_case.case_name,
+                assembly_case.status,
+                assembly_case.bucket,
+                assembly_case.exit_code,
+                assembly_case.evidence_path,
+            )
     return results
 
 
@@ -2144,6 +2741,512 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
             case_result.evidence_path,
         )
     return results
+
+
+def _run_search_provider_cases(*, options: SmokeOptions) -> list[SmokeCaseResult]:
+    """运行 search_web provider diagnostic-only cases。
+
+    Args:
+        options: smoke 选项。
+
+    Returns:
+        search provider case 结果列表。
+
+    Raises:
+        OSError: overlay 或 artifact 写入失败时抛出。
+    """
+
+    diagnostics_dir = options.output_dir / "diagnostics" / "search"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    results: list[SmokeCaseResult] = []
+    for provider in _SEARCH_PROVIDERS:
+        case_name = f"search-provider-{provider}"
+        artifact_path = diagnostics_dir / f"{case_name}.json"
+        workspace_config_dir = diagnostics_dir / f"{case_name}-workspace-config"
+        provider_config: JsonObject = {
+            "provider": provider,
+            "request_timeout_seconds": options.request_timeout,
+            "max_search_results": 3,
+            "fetch_truncate_chars": _SEARCH_FETCH_TRUNCATE_CHARS,
+            "allow_private_network_url": False,
+            "playwright_channel": "chrome",
+            "playwright_storage_state_dir": "",
+        }
+        _write_web_tool_discovery_overlay(
+            workspace_config_dir,
+            provider_config=provider_config,
+        )
+        result = _run_single_search_provider_case(
+            case_name=case_name,
+            provider=provider,
+            provider_config=provider_config,
+            workspace_config_dir=workspace_config_dir,
+            artifact_path=artifact_path,
+            workspace_root=options.output_dir,
+        )
+        results.append(result)
+        _LOGGER.debug(
+            "classified search provider diagnostic case: case=%s status=%s bucket=%s evidence=%s",
+            result.case_name,
+            result.status,
+            result.bucket,
+            result.evidence_path,
+        )
+    return results
+
+
+def _run_single_search_provider_case(
+    *,
+    case_name: str,
+    provider: str,
+    provider_config: Mapping[str, JsonValue],
+    workspace_config_dir: Path,
+    artifact_path: Path,
+    workspace_root: Path,
+) -> SmokeCaseResult:
+    """运行单个 search provider diagnostic case。
+
+    Args:
+        case_name: case 名称。
+        provider: search provider 策略。
+        provider_config: Web provider config。
+        workspace_config_dir: workspace config overlay 目录。
+        artifact_path: artifact 路径。
+        workspace_root: 当前 smoke 的 workspace root。
+
+    Returns:
+        smoke case 结果。
+
+    Raises:
+        OSError: artifact 写入失败时抛出。
+    """
+
+    api_key_env = _SEARCH_API_KEY_ENVS.get(provider, "")
+    api_key_present = bool(api_key_env and os.environ.get(api_key_env, "").strip())
+    try:
+        config = _load_runtime_config_for_overlay(workspace_config_dir)
+    except Exception as exc:
+        return _search_failure_case(
+            case_name=case_name,
+            provider=provider,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=_BUCKET_WEB_CONFIG_LOADER_FAILURE,
+            status=_STATUS_FAILED,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            api_key_env=api_key_env,
+            api_key_present=api_key_present,
+            error_type=type(exc).__name__,
+            error_summary=str(exc),
+            suggested_next_step="检查 search provider overlay 是否能由 ConfigLoader.load 完整加载。",
+        )
+    try:
+        definitions = _discover_tools_by_name(config, workspace_root=workspace_root)
+    except Exception as exc:
+        return _search_failure_case(
+            case_name=case_name,
+            provider=provider,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=_BUCKET_WEB_ASSEMBLY_DISCOVERY_FAILURE,
+            status=_STATUS_FAILED,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            api_key_env=api_key_env,
+            api_key_present=api_key_present,
+            error_type=type(exc).__name__,
+            error_summary=str(exc),
+            suggested_next_step="检查 discover_service_tools 是否能装配 search_web。",
+        )
+
+    definition = definitions.get("search_web")
+    if definition is None:
+        return _search_failure_case(
+            case_name=case_name,
+            provider=provider,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=_BUCKET_WEB_TOOL_MISSING,
+            status=_STATUS_FAILED,
+            exit_code=_EXIT_SCHEMA_OR_INFRA_FAILURE,
+            api_key_env=api_key_env,
+            api_key_present=api_key_present,
+            error_type="ToolMissing",
+            error_summary="search_web not discovered",
+            suggested_next_step="检查 web-tools provider 是否仍发现 search_web。",
+        )
+
+    try:
+        outcome = asyncio.run(
+            definition.callable(
+                _tool_call("search_web", {"query": _SEARCH_PROVIDER_QUERY}),
+                _tool_context(),
+            )
+        )
+    except Exception as exc:
+        bucket = _classify_search_exception(provider=provider, error=exc)
+        return _search_failure_case(
+            case_name=case_name,
+            provider=provider,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=bucket,
+            status=_STATUS_DIAGNOSTIC_ONLY,
+            exit_code=_EXIT_OK,
+            api_key_env=api_key_env,
+            api_key_present=api_key_present,
+            error_type=type(exc).__name__,
+            error_summary=str(exc),
+            suggested_next_step=_search_suggested_next_step(bucket=bucket, provider=provider),
+        )
+
+    if isinstance(outcome, ToolFailedOutcome):
+        error_summary = " ".join(
+            item
+            for item in (
+                outcome.result.error,
+                outcome.result.message,
+                outcome.result.hint or "",
+            )
+            if item
+        )
+        bucket = _classify_search_error_text(
+            provider=provider,
+            error_text=error_summary,
+            api_key_present=api_key_present,
+        )
+        return _search_failure_case(
+            case_name=case_name,
+            provider=provider,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=bucket,
+            status=_STATUS_DIAGNOSTIC_ONLY,
+            exit_code=_EXIT_OK,
+            api_key_env=api_key_env,
+            api_key_present=api_key_present,
+            error_type=outcome.result.error,
+            error_summary=error_summary,
+            suggested_next_step=_search_suggested_next_step(bucket=bucket, provider=provider),
+        )
+    if not isinstance(outcome, ToolCompletedOutcome):
+        return _search_failure_case(
+            case_name=case_name,
+            provider=provider,
+            artifact_path=artifact_path,
+            provider_config=provider_config,
+            bucket=_BUCKET_SEARCH_TOOL_EXECUTION_ERROR,
+            status=_STATUS_DIAGNOSTIC_ONLY,
+            exit_code=_EXIT_OK,
+            api_key_env=api_key_env,
+            api_key_present=api_key_present,
+            error_type="UnknownOutcome",
+            error_summary=f"unknown outcome type: {type(outcome).__name__}",
+            suggested_next_step="检查 search_web adapter outcome 投影。",
+        )
+
+    value = _mapping_or_empty(outcome.result.value)
+    result_total = _int_field(value, "total") or 0
+    preferred_result = _nested_object(value, "preferred_result")
+    preferred_result_url = _string_field(preferred_result, "url")
+    if provider in _SEARCH_API_KEY_ENVS and not api_key_present:
+        bucket = _BUCKET_PROVIDER_KEY_MISSING
+    elif result_total > 0:
+        bucket = _BUCKET_SEARCH_PROVIDER_PASSED
+    else:
+        bucket = _BUCKET_PROVIDER_NO_RESULTS
+    _write_search_artifact(
+        artifact_path=artifact_path,
+        provider=provider,
+        provider_config=provider_config,
+        bucket=bucket,
+        status=_STATUS_DIAGNOSTIC_ONLY,
+        api_key_env=api_key_env,
+        api_key_present=api_key_present,
+        result_total=result_total,
+        preferred_result_url=preferred_result_url,
+        error_type="",
+        error_summary="",
+        suggested_next_step=_search_suggested_next_step(bucket=bucket, provider=provider),
+    )
+    return _case_diagnostic_only(
+        case_name=case_name,
+        case_kind=_CASE_SEARCH_PROVIDER,
+        url="",
+        evidence_path=str(artifact_path),
+        bucket=bucket,
+        reason="search provider case 只作为 diagnostic-only，不影响 local fetch hard gate。",
+        suggested_next_step=_search_suggested_next_step(bucket=bucket, provider=provider),
+    )
+
+
+def _search_failure_case(
+    *,
+    case_name: str,
+    provider: str,
+    artifact_path: Path,
+    provider_config: Mapping[str, JsonValue],
+    bucket: str,
+    status: str,
+    exit_code: int,
+    api_key_env: str,
+    api_key_present: bool,
+    error_type: str,
+    error_summary: str,
+    suggested_next_step: str,
+) -> SmokeCaseResult:
+    """构造 search provider case 失败或诊断结果。
+
+    Args:
+        case_name: case 名称。
+        provider: search provider 策略。
+        artifact_path: artifact 路径。
+        provider_config: Web provider config。
+        bucket: 分类 bucket。
+        status: case 状态。
+        exit_code: 退出码贡献。
+        api_key_env: API key 环境变量名。
+        api_key_present: API key 是否存在。
+        error_type: 错误类型。
+        error_summary: 错误摘要。
+        suggested_next_step: 建议下一步。
+
+    Returns:
+        smoke case result。
+
+    Raises:
+        OSError: artifact 写入失败时抛出。
+    """
+
+    _write_search_artifact(
+        artifact_path=artifact_path,
+        provider=provider,
+        provider_config=provider_config,
+        bucket=bucket,
+        status=status,
+        api_key_env=api_key_env,
+        api_key_present=api_key_present,
+        result_total=0,
+        preferred_result_url="",
+        error_type=error_type,
+        error_summary=error_summary,
+        suggested_next_step=suggested_next_step,
+    )
+    if status == _STATUS_FAILED:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=_CASE_SEARCH_PROVIDER,
+            url="",
+            evidence_path=str(artifact_path),
+            bucket=bucket,
+            exit_code=exit_code,
+            suggested_next_step=suggested_next_step,
+        )
+    return _case_diagnostic_only(
+        case_name=case_name,
+        case_kind=_CASE_SEARCH_PROVIDER,
+        url="",
+        evidence_path=str(artifact_path),
+        bucket=bucket,
+        reason="search provider case 只作为 diagnostic-only，不影响 local fetch hard gate。",
+        suggested_next_step=suggested_next_step,
+    )
+
+
+def _write_search_artifact(
+    *,
+    artifact_path: Path,
+    provider: str,
+    provider_config: Mapping[str, JsonValue],
+    bucket: str,
+    status: str,
+    api_key_env: str,
+    api_key_present: bool,
+    result_total: int,
+    preferred_result_url: str,
+    error_type: str,
+    error_summary: str,
+    suggested_next_step: str,
+) -> None:
+    """写入 search provider diagnostic artifact。
+
+    Args:
+        artifact_path: artifact 路径。
+        provider: search provider 策略。
+        provider_config: Web provider config。
+        bucket: 分类 bucket。
+        status: case 状态。
+        api_key_env: API key 环境变量名。
+        api_key_present: API key 是否存在。
+        result_total: 搜索结果数量。
+        preferred_result_url: 首选结果 URL。
+        error_type: 错误类型。
+        error_summary: 错误摘要。
+        suggested_next_step: 建议下一步。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: artifact 写入失败时抛出。
+    """
+
+    _write_json(
+        artifact_path,
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "case_kind": _CASE_SEARCH_PROVIDER,
+            "provider": provider,
+            "query": _SEARCH_PROVIDER_QUERY,
+            "status": status,
+            "bucket": bucket,
+            "api_key_env": api_key_env,
+            "api_key_present": api_key_present,
+            "provider_config": dict(provider_config),
+            "tool_name": "search_web",
+            "assembly_path": _ASSEMBLY_PATH_LABEL,
+            "result_total": result_total,
+            "preferred_result_url": preferred_result_url,
+            "error_type": error_type,
+            "error_summary": error_summary,
+            "suggested_next_step": suggested_next_step,
+        },
+    )
+
+
+def _classify_search_exception(*, provider: str, error: Exception) -> str:
+    """按异常类型分类 search provider diagnostic bucket。
+
+    Args:
+        provider: search provider 策略。
+        error: 捕获到的异常。
+
+    Returns:
+        search diagnostic bucket。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(error, requests.HTTPError):
+        response = error.response
+        status_code = response.status_code if response is not None else 0
+        return _classify_search_http_status(status_code)
+    if isinstance(error, (requests.Timeout, requests.ConnectionError)):
+        return _BUCKET_PROVIDER_NETWORK_FAILURE
+    if isinstance(error, json.JSONDecodeError):
+        return _BUCKET_PROVIDER_RESPONSE_PARSE_FAILURE
+    return _classify_search_error_text(
+        provider=provider,
+        error_text=str(error),
+        api_key_present=_provider_api_key_present(provider),
+    )
+
+
+def _classify_search_http_status(status_code: int) -> str:
+    """按 HTTP 状态码分类 search provider diagnostic bucket。
+
+    Args:
+        status_code: HTTP 状态码。
+
+    Returns:
+        search diagnostic bucket。
+
+    Raises:
+        无。
+    """
+
+    if status_code in {401, 403}:
+        return _BUCKET_PROVIDER_AUTH_FAILURE
+    if status_code == 429:
+        return _BUCKET_PROVIDER_QUOTA_OR_RATE_LIMITED
+    return _BUCKET_PROVIDER_UNAVAILABLE
+
+
+def _classify_search_error_text(
+    *,
+    provider: str,
+    error_text: str,
+    api_key_present: bool,
+) -> str:
+    """按错误文本分类 search provider diagnostic bucket。
+
+    Args:
+        provider: search provider 策略。
+        error_text: 错误摘要。
+        api_key_present: API key 是否存在。
+
+    Returns:
+        search diagnostic bucket。
+
+    Raises:
+        无。
+    """
+
+    normalized = error_text.lower()
+    if provider in _SEARCH_API_KEY_ENVS and not api_key_present:
+        return _BUCKET_PROVIDER_KEY_MISSING
+    if "api_key" in normalized and "未配置" in normalized:
+        return _BUCKET_PROVIDER_KEY_MISSING
+    if "unauthorized" in normalized or "forbidden" in normalized or "invalid key" in normalized:
+        return _BUCKET_PROVIDER_AUTH_FAILURE
+    if "quota" in normalized or "rate limit" in normalized or "too many requests" in normalized:
+        return _BUCKET_PROVIDER_QUOTA_OR_RATE_LIMITED
+    if "timeout" in normalized or "connection" in normalized or "dns" in normalized or "tls" in normalized:
+        return _BUCKET_PROVIDER_NETWORK_FAILURE
+    if "json" in normalized or "parse" in normalized or "unexpected response" in normalized:
+        return _BUCKET_PROVIDER_RESPONSE_PARSE_FAILURE
+    if "所有 provider 均不可用" in error_text:
+        return _BUCKET_PROVIDER_UNAVAILABLE
+    return _BUCKET_SEARCH_TOOL_EXECUTION_ERROR
+
+
+def _provider_api_key_present(provider: str) -> bool:
+    """判断 provider 对应 API key 是否存在。
+
+    Args:
+        provider: search provider 策略。
+
+    Returns:
+        依赖 key 且环境变量非空时返回 ``True``；无 key provider 返回 ``False``。
+
+    Raises:
+        无。
+    """
+
+    env_name = _SEARCH_API_KEY_ENVS.get(provider, "")
+    return bool(env_name and os.environ.get(env_name, "").strip())
+
+
+def _search_suggested_next_step(*, bucket: str, provider: str) -> str:
+    """为 search provider diagnostic bucket 生成建议。
+
+    Args:
+        bucket: 分类 bucket。
+        provider: search provider 策略。
+
+    Returns:
+        建议下一步。
+
+    Raises:
+        无。
+    """
+
+    if bucket == _BUCKET_SEARCH_PROVIDER_PASSED:
+        return "search_web provider path 已产生结果；该 case 仍只作为 diagnostic-only。"
+    if bucket == _BUCKET_PROVIDER_KEY_MISSING:
+        env_name = _SEARCH_API_KEY_ENVS.get(provider, "对应 provider API key")
+        return f"配置 {env_name} 后重跑；默认不影响 local smoke gate。"
+    if bucket == _BUCKET_PROVIDER_NO_RESULTS:
+        return "provider callable 成功但没有返回结果；检查 query、provider 可用性或站点索引。"
+    if bucket == _BUCKET_PROVIDER_AUTH_FAILURE:
+        return "检查 provider API key 权限或鉴权配置；不要把 secret 写入 artifact。"
+    if bucket == _BUCKET_PROVIDER_QUOTA_OR_RATE_LIMITED:
+        return "provider quota 或 rate limit 命中；等待额度恢复后重跑。"
+    if bucket == _BUCKET_PROVIDER_NETWORK_FAILURE:
+        return "检查外部网络、DNS、TLS 或 provider 服务可达性。"
+    if bucket == _BUCKET_PROVIDER_RESPONSE_PARSE_FAILURE:
+        return "检查 provider 响应格式是否变化。"
+    return "查看 search provider artifact；外部 provider 失败默认不影响 local smoke gate。"
 
 
 def _has_docling_invocation_blocker(local_cases: Sequence[SmokeCaseResult]) -> bool:
@@ -2234,6 +3337,7 @@ def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeS
         options.external_limit,
     )
     local_cases = _run_local_cases(options=options, runner=runner)
+    search_cases = _run_search_provider_cases(options=options)
     if _has_docling_invocation_blocker(local_cases):
         _write_docling_invocation_blocker_artifact(output_dir=options.output_dir, local_cases=local_cases)
         summary = _summary_from_cases(
@@ -2241,12 +3345,14 @@ def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeS
             output_dir=options.output_dir,
             local_cases=local_cases,
             external_cases=(),
+            search_cases=search_cases,
         )
         _LOGGER.info(
-            "web smoke execution finished: status=%s exit_code=%s local_cases=%s external_cases=0",
+            "web smoke execution finished: status=%s exit_code=%s local_cases=%s external_cases=0 search_cases=%s",
             summary.status,
             summary.exit_code,
             len(summary.local_cases),
+            len(summary.search_cases),
         )
         return summary
     external_cases = _run_external_cases(options=options, runner=runner)
@@ -2255,13 +3361,15 @@ def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeS
         output_dir=options.output_dir,
         local_cases=local_cases,
         external_cases=external_cases,
+        search_cases=search_cases,
     )
     _LOGGER.info(
-        "web smoke execution finished: status=%s exit_code=%s local_cases=%s external_cases=%s diagnostic_only=%s",
+        "web smoke execution finished: status=%s exit_code=%s local_cases=%s external_cases=%s search_cases=%s diagnostic_only=%s",
         summary.status,
         summary.exit_code,
         len(summary.local_cases),
         len(summary.external_cases),
+        len(summary.search_cases),
         len(summary.diagnostic_only),
     )
     return summary
@@ -2410,6 +3518,7 @@ def _print_summary_ui(summary: SmokeSummary) -> None:
     print(f"SMOKE EXIT_CODE {summary.exit_code}")
     print(f"SMOKE LOCAL_CASES {len(summary.local_cases)}")
     print(f"SMOKE EXTERNAL_CASES {len(summary.external_cases)}")
+    print(f"SMOKE SEARCH_CASES {len(summary.search_cases)}")
     print(f"SMOKE FAILURES {len(summary.failures)}")
     print(f"SMOKE SKIPS {len(summary.skips)}")
     print(f"SMOKE DIAGNOSTIC_ONLY {len(summary.diagnostic_only)}")

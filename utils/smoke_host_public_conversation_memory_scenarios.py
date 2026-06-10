@@ -1832,7 +1832,10 @@ def _prepare_runtime_assembly(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = _discover_smoke_service_tools(config)
+    discovered_tools = _discover_smoke_service_tools(
+        config,
+        workspace_root=args.workspace_root,
+    )
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=args.scene_id,
@@ -1872,16 +1875,21 @@ def _prepare_runtime_assembly(
     )
 
 
-def _discover_smoke_service_tools(config: RuntimeConfig) -> ServiceDiscoveredTools:
+def _discover_smoke_service_tools(
+    config: RuntimeConfig,
+    *,
+    workspace_root: pathlib.Path,
+) -> ServiceDiscoveredTools:
     """发现 Service 工具并确保 smoke mock 财报记忆工具可用。
 
     :param config: ``ConfigLoader`` 输出的 runtime typed config。
+    :param workspace_root: 当前 smoke 的 workspace root。
     :returns: 包含 smoke mock 工具的 Service 工具发现结果。
     :raises ValueError: 已发现同名非 smoke 工具时抛出。
     :raises Exception: 工具发现 provider 失败时向上抛出。
     """
 
-    discovered = discover_service_tools(config)
+    discovered = discover_service_tools(config, workspace_root=workspace_root)
     existing_smoke_tool = _find_mock_finance_memory_tool(discovered.tool_bundle)
     if existing_smoke_tool is not None:
         return discovered
@@ -1912,6 +1920,7 @@ def _discover_smoke_service_tools(config: RuntimeConfig) -> ServiceDiscoveredToo
                 for report in smoke_result.provider_reports
             ),
         ),
+        effective_provider_configs=discovered.effective_provider_configs,
     )
 
 

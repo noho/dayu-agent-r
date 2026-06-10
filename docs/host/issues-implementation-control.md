@@ -141,7 +141,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | ready-to-open-draft-PR |
-| implementation status | WU-TOOLS-01-F02 PR #132 merged 2026-06-10; WU-TOOLS-01-F03 local implementation gate completed through Slice 5; ready to open draft PR when authorized |
+| implementation status | WU-TOOLS-01-F02 PR #132 merged 2026-06-10; WU-TOOLS-01-F03-R3 code review / fix / re-review gate passed; Web config assembly and search provider smoke follow-up completed |
 | active work unit | WU-TOOLS-01-F03 |
 | default next work unit | WU-TOOLS-01-F03 |
 | next entry point | WU-TOOLS-01-F03 draft PR gate; do not open PR until authorized |
@@ -200,7 +200,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F01-02-R3 | transferred-to-issue | GitHub Issue #130 | 分阶段将 Doc / Web / Fins read tools native 化并删除 `dayu/tools/_legacy_adapter`；实施时必须消除 legacy `tool_cancelled` 投影为 failed outcome 的 bug，不能把该行为搬进 provider-local wrapper。 |
-| WU-TOOLS-01-F03-R3 | deferred-with-owner | Web tools CI owner / future provider/API hard-gate issue or work unit | provider/API availability gap：provider/API key、quota、auth 与环境可用性不是 F03 local Web smoke blocker；若未来升级为 hard gate，必须先建立稳定 provider/API 环境契约，并创建独立 owner / issue。 |
 
 ## 当前 Work Units
 
@@ -222,7 +221,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02 | completed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 merged 2026-06-09 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；PR 128 已 merge |
 | WU-TOOLS-01-F01-03 | draft-PR-pass | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09; draft PR #131 | Draft PR #131 已通过本地 gate；final closeout 见 `docs/reviews/wu-tools-01-f01-03-final-closeout-controller.md`。等待用户 merge decision；Issue #129 继续追踪 `start_upload` prepare/activate 后续。 |
 | WU-TOOLS-01-F02 | completed | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up; PR #132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f02-final-closeout-controller.md`。F02 completion 已完成，F03 前置条件已满足。 |
-| WU-TOOLS-01-F03 | ready-to-open-draft-PR | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | Plan accepted；plan artifact `docs/host/wu-tools-01-f03-web-ci-smoke-plan.md`；review artifacts `docs/reviews/wu-tools-01-f03-plan-review-mimo.md`, `docs/reviews/wu-tools-01-f03-plan-review-ds.md`, `docs/reviews/wu-tools-01-f03-plan-review-controller-adjudication.md`, `docs/reviews/wu-tools-01-f03-plan-rereview-mimo.md`, `docs/reviews/wu-tools-01-f03-plan-rereview-ds.md`；accepted plan commit `5e430086`。Slice 1 diagnostics observed facts and Docling invocation evidence accepted；implementation artifact `docs/reviews/wu-tools-01-f03-implementation-slice1-codex.md`；review artifacts `docs/reviews/wu-tools-01-f03-code-review-slice1-mimo.md`, `docs/reviews/wu-tools-01-f03-code-review-slice1-ds.md`, `docs/reviews/wu-tools-01-f03-code-review-slice1-controller-adjudication.md`, `docs/reviews/wu-tools-01-f03-fix-slice1-codex.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice1-mimo.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice1-ds.md`；accepted slice commit `36d57300`；controller validation `pytest tests/tools/web/test_diagnose_web_access.py -q` 19 passed, `python -m pyright dayu/ tests/ utils/` 0 errors, `git diff --check` passed。Slice 2 opt-in smoke CLI and summary contract accepted；implementation artifact `docs/reviews/wu-tools-01-f03-implementation-slice2-codex.md`；review artifacts `docs/reviews/wu-tools-01-f03-code-review-slice2-mimo.md`, `docs/reviews/wu-tools-01-f03-code-review-slice2-ds.md`, `docs/reviews/wu-tools-01-f03-code-review-slice2-controller-adjudication.md`, `docs/reviews/wu-tools-01-f03-fix-slice2-codex.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice2-mimo.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice2-ds.md`；accepted slice commit `72e2a8fd`；controller validation `pytest tests/tools/web/test_smoke_web_ci.py tests/tools/web/test_diagnose_web_access.py -q` 25 passed, `python -m pyright dayu/ tests/ utils/` 0 errors, `git diff --check` passed。Slice 3 local HTML/PDF live fixture and Docling route check accepted；implementation artifact `docs/reviews/wu-tools-01-f03-implementation-slice3-codex.md`；review artifacts `docs/reviews/wu-tools-01-f03-code-review-slice3-mimo.md`, `docs/reviews/wu-tools-01-f03-code-review-slice3-ds.md`, `docs/reviews/wu-tools-01-f03-code-review-slice3-controller-adjudication.md`, `docs/reviews/wu-tools-01-f03-fix-slice3-codex.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice3-mimo.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice3-ds.md`；accepted slice commit `ea2cef7c`；controller validation `pytest tests/tools/web/test_smoke_web_ci.py tests/tools/web/test_diagnose_web_access.py -q` 30 passed, `python -m pyright dayu/ tests/ utils/` 0 errors, `git diff --check` passed。Slice 4 optional external diagnostics without gate semantics accepted；implementation artifact `docs/reviews/wu-tools-01-f03-implementation-slice4-codex.md`；review artifacts `docs/reviews/wu-tools-01-f03-code-review-slice4-mimo.md`, `docs/reviews/wu-tools-01-f03-code-review-slice4-ds.md`, `docs/reviews/wu-tools-01-f03-code-review-slice4-controller-adjudication.md`, `docs/reviews/wu-tools-01-f03-fix-slice4-codex.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice4-mimo.md`, `docs/reviews/wu-tools-01-f03-code-rereview-slice4-ds.md`；accepted slice commit `e8514227`；controller validation `pytest tests/tools/web/test_smoke_web_ci.py tests/tools/web/test_diagnose_web_access.py -q` 36 passed, `python -m pyright dayu/ tests/ utils/` 0 errors, `git diff --check` passed。Slice 5 docs, validation, and residual reconciliation completed；implementation artifact `docs/reviews/wu-tools-01-f03-implementation-slice5-codex.md`；fix artifact `docs/reviews/wu-tools-01-f03-fix-slice5-codex.md`；validation `pytest tests/tools/web/test_diagnose_web_access.py tests/tools/web/test_smoke_web_ci.py -q` 36 passed, `python -m pyright dayu/ tests/ utils/` 0 errors, `git diff --check` passed；no `utils/smoke_web_ci.sh`, so `bash -n` not applicable；controller manual smoke `source .venv/bin/activate && python -m utils.smoke_web_ci` exit code 0，output `workspace/output/web_smoke/web-smoke-20260610T030021Z`，summary status passed，local_html passed，local_pdf passed，external_cases 0，skips 0。Default matrix and external diagnostic follow-up accepted：`utils/smoke_web_ci.py` 默认 run 无需 case 参数，local matrix 覆盖 local_html、local_pdf 与 local_browser，并默认从 `utils/web_ci_urls.jsonl` 采样 2 个 external diagnostic-only URL；controller manual smoke `source .venv/bin/activate && python utils/smoke_web_ci.py` exit code 0，output `workspace/output/web_smoke/web-smoke-20260610T051958Z`，summary status passed，local_html/local_pdf/local_browser 均 passed，external_cases 2 且均为 diagnostic_only，browser artifact 观察到 `fetch_web_page_profile.fetch_backend=playwright` 与 `playwright_profile.ok=true`。`WU-TOOLS-01-S5-R2` closed：local HTML/PDF/Browser smoke and summary contract are complete；external site instability 已由 Slice 4 diagnostic-only 设计吸收，不作为 active residual；real browser capability 已由默认 local_browser case 吸收，不作为 active residual；provider/API availability gap 已转入 Residual Risk 表，不是 F03 local Web smoke blocker。 |
+| WU-TOOLS-01-F03 | review-follow-up | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; depends on WU-TOOLS-01-F02 | 直接运行的 Web smoke 已覆盖 local HTML/PDF/Browser 默认 matrix、summary contract、external diagnostic-only 语义、UI/log 输出、Web tools config assembly hard gate 与 search provider diagnostic-only cases；R3 implementation gate 已完成，下一步进入 code review gate。 |
 | WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
 | WU-TOOLS-01-F05 | pending | SEC/Fins CI smoke generation | GitHub Issue #121 under #82 follow-up; depends on WU-TOOLS-01-F04 | Generate explicit opt-in SEC/Fins smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for SEC/Fins coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
 | WU-TOOLS-01-F06 | pending | CN/HK Docling CI pipeline migration | GitHub Issue #122 under #82/#98 follow-up | First step of CN/HK Docling coverage: migrate OLD `docs/cn_hk_docling_ci.md`, shared process runner behavior, `utils/llm_docling_ci_score.py` and `dayu.fins.score_docling_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
@@ -981,6 +980,85 @@ Ready-to-open-draft-PR。该 work unit 是 GitHub Issue #120 的第二步，依�
 - smoke 在满足环境时能运行代表性 URL，并输出 pass / fail / diagnostic-only summary。
 - README / tests README 说明 deterministic tests、web CI diagnostics 和 Web smoke 三者的职责区别。
 - `WU-TOOLS-01-S5-R2` 被关闭，或 remaining live coverage gap 被转移到新的 owner / issue。
+
+### R3 复核结论
+
+`WU-TOOLS-01-F03-R3` 不是单纯的 provider/API availability residual。代码核对后，该项暴露出两个必须在 F03 follow-up 中补齐的 smoke 面：
+
+- Web tools config assembly：OLD `run.json.web_tools_config` 中的 `provider`、`fetch_truncate_chars`、`playwright_channel`、`playwright_storage_state_dir` 必须完整迁入当前 `tool_discovery.json`，并由 smoke 证明这些配置经 `ConfigLoader -> Service discover_service_tools -> ToolsDiscovery -> web provider -> tool callable` 闭进 `search_web` / `fetch_web_page`。
+- Search provider path：smoke 必须覆盖 `search_web` 的 `auto`、Tavily、Serper、DuckDuckGo provider 路径。Tavily / Serper 的 API key 是否存在、auth 是否通过、quota 是否可用、provider 服务是否可达，都要进入 smoke artifact；成功或失败都应输出 provider、bucket、错误摘要和建议下一步。
+
+Tavily / Serper 的 key、quota、auth 与外部 provider 可用性默认是 diagnostic-only：它们要被 smoke 观测和记录，但在没有明确 provider 环境契约前，不把外部 provider 波动升级为 local hard gate。配置装配断裂、默认配置字段缺失、或 assembly 后工具闭包未收到配置，则属于 F03 local smoke blocker。
+
+### R3 Follow-up 方案
+
+- 补齐 `dayu/config/tool_discovery.json` 中 `web-tools.config` 的 `provider`、`fetch_truncate_chars`、`playwright_channel` 与 `playwright_storage_state_dir` 默认值，并让默认 provider discovery 与 scene manifest tool selection 语义对齐。
+- 收敛 ToolDiscovery 调用语义：provider 只消费 `discover_tools(spec)` 收到的 effective spec；raw config 与运行时参数（例如 Fins `workspace_root`）的 assembly 是 Service / 调用方职责，provider 不解析全局 runtime config。
+- 增加 ConfigLoader / Service assembly 测试，证明 Web provider config 原样进入 `ToolsDiscoveryProviderSpec.config`。
+- 增加 Web provider 闭包测试，证明 `provider` 进入 `search_web`，`fetch_truncate_chars` 进入 truncate spec，`playwright_channel` / `playwright_storage_state_dir` 进入 browser fallback 参数。
+- 增强 `utils/smoke_web_ci.py`：新增 local assembly config case，走生产式 `ConfigLoader -> Service discover_service_tools -> ToolDefinition.callable`，验证 Web config assembly 和本地 fetch path。
+- 增强 `utils/smoke_web_ci.py`：新增 search provider diagnostic cases，至少覆盖 `auto`、`tavily`、`serper`、`duckduckgo`；其中外部 provider 成功、缺 key、鉴权失败、quota/rate limit 或网络失败都写 artifact，默认不影响 local fetch hard gate exit code。
+
+### R3 Plan Gate
+
+Completed。Plan artifact 为 `docs/host/wu-tools-01-f03-r3-web-config-search-smoke-plan.md`。AgentMiMo 与 AgentDS plan review 均裁决 `pass-with-fixes`；review artifacts 为 `docs/reviews/wu-tools-01-f03-r3-plan-review-mimo.md` 与 `docs/reviews/wu-tools-01-f03-r3-plan-review-ds.md`。Controller adjudication 为 `docs/reviews/wu-tools-01-f03-r3-plan-review-controller-adjudication.md`。
+
+Controller 已接受并收敛 review blocking points：`utils/smoke_web_ci.py` 可作为仓库级 smoke harness import `ConfigLoader` 与 `discover_service_tools()`；local assembly / search provider smoke 使用显式 `package_config_dir=dayu/config` 与临时 `workspace_config_dir`，只 overlay `tool_discovery.json` 并调用完整 `ConfigLoader.load()`；summary 使用 typed `search_cases`，不新增 `metadata` 弱类型字段；local assembly artifact 必须证明 `fetch_truncate_chars` 进入 provider config 与 truncate spec；pytest 不做 live network / credential。
+
+### R3 Implementation Gate
+
+Completed locally。Implementation artifact 为 `docs/reviews/wu-tools-01-f03-r3-implementation-codex.md`。
+
+已完成：
+
+- `dayu/config/tool_discovery.json` 的 `web-tools.config` 默认字段补齐，并保持默认 provider discovery 可用；private / local network URL 仍默认拒绝。
+- `discover_service_tools(config, workspace_root=...)` 会在 Service 层把 raw provider config 与运行时 workspace 装配成 effective spec；Fins provider raw config 中 `workspace_root=null` 时可由 runtime workspace 注入，显式绝对 `workspace_root` 不被覆盖。
+- ConfigLoader / Service assembly 测试覆盖默认 Web config typed view、Web config 原样进入 `ToolsDiscoveryProviderSpec.config`，以及完整 `ConfigLoader.load()` + `discover_service_tools()` 发现 `search_web` / `fetch_web_page`。
+- Web provider deterministic tests 覆盖 search provider config 闭包、`fetch_truncate_chars` truncate spec、Playwright fallback channel 与空/非空 storage state dir。
+- `utils/smoke_web_ci.py` 默认新增 local assembly config hard gate，直接走 `ConfigLoader.load()`、`discover_service_tools()` 与 `ToolDefinition.callable`，artifact 证明 overlay config 与 `truncate_max_chars`。
+- `utils/smoke_web_ci.py` 默认新增 `auto` / `tavily` / `serper` / `duckduckgo` search provider diagnostic-only cases，summary 使用 typed `search_cases`，`external_cases` 只保留外部 URL fetch cases，不新增 metadata 弱类型字段，不写 secret。
+- `tests/README.md` 已按落地事实更新；`dayu/config/README.md` 已声明相关字段与职责，未修改。
+
+验证结果：
+
+- `pytest tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/tools/web/test_web_tools_provider.py tests/tools/web/test_smoke_web_ci.py tests/tools/web/test_diagnose_web_access.py -q`：133 passed。
+- `python -m pyright dayu/ tests/ utils/`：0 errors。
+- `python utils/smoke_web_ci.py`：exit code 0，output `workspace/output/web_smoke/web-smoke-20260610T070642Z`，summary status passed，local_cases 4，external_cases 2，search_cases 4，diagnostic_only 6。
+- `git diff --check`：passed。
+
+下一步进入 R3 code review gate。
+
+### R3 Code Review / Fix / Re-review Gate
+
+Completed。Code review artifacts 为 `docs/reviews/wu-tools-01-f03-r3-code-review-mimo.md` 与 `docs/reviews/wu-tools-01-f03-r3-code-review-ds.md`。AgentDS 裁决 `pass`；AgentMiMo 裁决 `pass-with-findings`。Controller adjudication 为 `docs/reviews/wu-tools-01-f03-r3-code-review-controller-adjudication.md`。
+
+Controller 接受 MiMo F1 / F2 / F4 进入 fix gate：Docling invocation blocker early return 时仍需运行 `search_cases`，`discovered_configs` 不能使用 `list[object]`，`_tool_context()` 中的 `cast(CancellationToken, ...)` 应移除。Fix artifact 为 `docs/reviews/wu-tools-01-f03-r3-fix-codex.md`。Re-review artifacts 为 `docs/reviews/wu-tools-01-f03-r3-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f03-r3-rereview-ds.md`，两路 re-review 均裁决 `pass`，无新增 blocking findings。
+
+Controller 复验：`pytest tests/tools/web/test_smoke_web_ci.py tests/tools/web/test_diagnose_web_access.py -q` 39 passed，`python -m pyright dayu/ tests/ utils/` 0 errors，`git diff --check` passed。Implementation / fix artifacts 记录完整指定测试组合 133 passed；Controller 最终 manual smoke exit 0，output 为 `workspace/output/web_smoke/web-smoke-20260610T070642Z`，summary status passed，local_cases 4，external_cases 2，search_cases 4，diagnostic_only 6。
+
+`WU-TOOLS-01-F03-R3` 已关闭并从 active residual table 移除。Tavily / Serper 的 key、auth、quota、rate limit 与外部 provider 可用性继续作为 smoke diagnostic-only 观测，不作为 local hard gate。
+
+### R3 Effective Spec Follow-up
+
+Completed。Follow-up review artifacts 为 `docs/reviews/wu-tools-01-f03-r3-effective-spec-review-mimo.md` 与 `docs/reviews/wu-tools-01-f03-r3-effective-spec-review-ds.md`。Controller adjudication 为 `docs/reviews/wu-tools-01-f03-r3-effective-spec-review-controller-adjudication.md`。
+
+Controller 裁决：DS F1 原结论不成立。`web-tools.enabled=true` 只让 Web tools 进入 construction-time candidate `ToolBundle`；实际 per-run 可见性由 scene manifest `tool_selection` 和 Host `SubmitFollowupRequest.tool_names` 决定。`allow_empty=true` 只允许 provider 成功返回空工具集合，不吞 import failure。真实需修复的问题是 discovery 与 compose 不能各自从 raw config 独立重算 effective config。
+
+已完成：
+
+- `ServiceDiscoveredTools` 新增 `effective_provider_configs`，保存 `discover_service_tools(config, workspace_root=...)` 实际用于 `ToolsDiscovery` 的 effective provider configs。
+- `compose_open_host_options(...)` 复用 `request.discovered_tools.effective_provider_configs` 构造 Host tooling / Fins wait adapter registry，避免 Fins tool closure 与 wait adapter registry 使用不同 workspace。
+- Service tests 新增 Fins workspace-bound provider 识别边界、discovery -> compose effective config 复用集成测试，并更新 Host smoke assembly tests，明确 construction-time discovered tools 与 scene-selected tools 的边界。
+- Web smoke tests 新增 search provider HTTP status / error text 分类、ConfigLoader hard failure、discovery hard failure、callable timeout diagnostic-only 与 empty result diagnostic-only 覆盖。
+
+Re-review artifacts 为 `docs/reviews/wu-tools-01-f03-r3-effective-spec-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f03-r3-effective-spec-rereview-ds.md`；两路均裁决 pass，无新增 correctness / type / layering findings。
+
+Controller 复验：
+
+- `pytest tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/tools/test_combined_tools_acceptance.py tests/tools/web/test_web_tools_provider.py tests/tools/web/test_smoke_web_ci.py tests/tools/web/test_diagnose_web_access.py tests/runtime/test_smoke_host_public_multiturn_assembly.py tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py -q`：179 passed。
+- `pyright dayu tests utils`：0 errors。
+- `python utils/smoke_web_ci.py`：exit code 0，output `workspace/output/web_smoke/web-smoke-20260610T074838Z`，summary status passed，local_cases 4，external_cases 2，search_cases 4，diagnostic_only 6。
+- `git diff --check`：passed。
 
 ## WU-TOOLS-01-F04 SEC/Fins CI Pipeline Migration
 
