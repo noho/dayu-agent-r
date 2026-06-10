@@ -74,10 +74,10 @@ def test_runtime_assembly_adds_builtin_smoke_tool_without_workspace_overlay(
     assert assembly.scene_inputs.tool_selection.tool_names == frozenset(
         {"record_smoke_fact"}
     )
-    assert assembly.diagnostics.tool_provider_reports == (
+    assert (
         "provider=host-public-multiturn-smoke,"
-        "spec=host-public-multiturn-smoke,version=v1,tools=record_smoke_fact",
-    )
+        "spec=host-public-multiturn-smoke,version=v1,tools=record_smoke_fact"
+    ) in assembly.diagnostics.tool_provider_reports
     assert assembly.smoke_tool is not None
 
 
@@ -107,10 +107,10 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
     assert assembly.scene_inputs.tool_selection.tool_names == frozenset(
         {"record_smoke_fact"}
     )
-    assert assembly.diagnostics.tool_provider_reports == (
+    assert (
         "provider=host-public-multiturn-smoke,"
-        "spec=financial-tools,version=v1,tools=record_smoke_fact",
-    )
+        "spec=financial-tools,version=v1,tools=record_smoke_fact"
+    ) in assembly.diagnostics.tool_provider_reports
     assert assembly.diagnostics.ordinary_provider_extension_status.endswith(
         "ok:DeepSeekThinkingExtension"
     )
@@ -121,10 +121,10 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
     assert options.payload_inline_threshold_bytes == 65535
     assert options.worker_startup_timeout_seconds == 10.0
     assert options.tooling_options is not None
-    assert tuple(
+    assert "record_smoke_fact" in tuple(
         definition.name
         for definition in options.tooling_options.business_tool_bundle.definitions
-    ) == ("record_smoke_fact",)
+    )
     assert options.ordinary_run_baseline.runner_spec.headers["Authorization"] == (
         f"Bearer {_API_KEY}"
     )

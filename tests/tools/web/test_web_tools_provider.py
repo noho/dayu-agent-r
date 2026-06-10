@@ -222,6 +222,61 @@ def test_search_web_projects_optional_arguments_and_success(
     assert "ok" not in value
 
 
+def test_search_web_receives_provider_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_web 闭包必须接收 Web provider config。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: provider config 未传入搜索路径时抛出。
+    """
+
+    calls: list[Mapping[str, JsonValue]] = []
+
+    def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 search_web 闭包参数。
+
+        :param kwargs: search_web 传入的关键字参数。
+        :returns: 确定性空搜索结果。
+        """
+
+        calls.append(kwargs)
+        return {
+            "query": "revenue",
+            "domains": [],
+            "total": 0,
+            "preferred_result": None,
+            "preferred_result_summary": "",
+            "next_action": "refine_query",
+            "next_action_args": {},
+            "hint": "refine query",
+            "results": [],
+        }
+
+    monkeypatch.setattr(web_tools, "search_public_web", fake_search_public_web)
+    definition = _definitions_by_name(
+        _discover_definitions(
+            {
+                "provider": "serper",
+                "request_timeout_seconds": 3.5,
+                "max_search_results": 4,
+                "allow_private_network_url": True,
+            }
+        )
+    )["search_web"]
+
+    outcome = asyncio.run(
+        definition.callable(_call("search_web", {"query": "revenue"}), _context())
+    )
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    assert calls[0]["provider"] == "serper"
+    assert calls[0]["request_timeout_seconds"] == 3.5
+    assert calls[0]["max_search_results"] == 4
+    assert calls[0]["allow_private_network_url"] is True
+
+
 def test_search_web_receives_execution_context_and_passes_cancellation_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -636,6 +691,192 @@ def test_fetch_playwright_cancel_projects_to_cancelled_failure(
     assert outcome.result.hint is not None
     assert "continue_without_web" in outcome.result.hint
     assert received_playwright_tokens == [token]
+
+
+def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Playwright fallback 必须收到 config 派生的 channel 与 storage state。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: browser fallback 参数未由 Web config 派生时抛出。
+    """
+
+    storage_dir = tmp_path / "states"
+    storage_file = storage_dir / "example.com.json"
+    storage_file.parent.mkdir(parents=True)
+    storage_file.write_text("{}", encoding="utf-8")
+    calls: list[Mapping[str, JsonValue]] = []
+    monkeypatch.setattr(web_tools, "_warmup_domain", lambda *args, **kwargs: {"attempted": True, "ok": False})
+    monkeypatch.setattr(web_tools, "_should_escalate_stage_result_to_browser", lambda stage_result: True)
+
+    def fake_fetch_and_convert_with_playwright(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        timeout_budget: float | None = None,
+        deadline_monotonic: float | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+        cancellation_token: CancellationToken | None = None,
+    ) -> Mapping[str, JsonValue]:
+        """记录 browser fallback 参数并返回确定性内容。
+
+        :param url: 目标 URL。
+        :param timeout_seconds: 抓取超时。
+        :param headers: 请求 headers。
+        :param timeout_budget: 工具预算。
+        :param deadline_monotonic: 工具 deadline。
+        :param playwright_channel: 浏览器 channel。
+        :param playwright_storage_state_path: storage state 文件路径。
+        :param cancellation_token: 取消令牌。
+        :returns: 确定性抓取内容。
+        """
+
+        del headers, timeout_budget, deadline_monotonic, cancellation_token
+        calls.append(
+            {
+                "url": url,
+                "timeout_seconds": timeout_seconds,
+                "playwright_channel": playwright_channel,
+                "playwright_storage_state_path": playwright_storage_state_path,
+            }
+        )
+        return {
+            "ok": True,
+            "final_url": url,
+            "title": "Example",
+            "content": "browser rendered content",
+            "http_status": 200,
+            "redirect_hops": 0,
+            "response_headers": {},
+            "response_excerpt": "browser rendered content",
+            "extraction_source": "playwright",
+            "renderer_source": "playwright",
+            "normalization_applied": False,
+            "quality_flags": [],
+            "content_stats": {},
+        }
+
+    monkeypatch.setattr(
+        web_tools,
+        "_fetch_and_convert_with_playwright",
+        fake_fetch_and_convert_with_playwright,
+    )
+    definition = _definitions_by_name(
+        _discover_definitions(
+            {
+                "allow_private_network_url": True,
+                "playwright_channel": "msedge",
+                "playwright_storage_state_dir": str(storage_dir),
+            }
+        )
+    )["fetch_web_page"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("fetch_web_page", {"url": "https://example.com/page"}),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    assert calls[0]["playwright_channel"] == "msedge"
+    assert calls[0]["playwright_storage_state_path"] == str(storage_file.resolve())
+
+
+def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """空 storage state dir 配置必须保持 fallback storage state 为空。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 空目录配置被误解析成 storage state path 时抛出。
+    """
+
+    calls: list[Mapping[str, JsonValue]] = []
+    monkeypatch.setattr(web_tools, "_warmup_domain", lambda *args, **kwargs: {"attempted": True, "ok": False})
+    monkeypatch.setattr(web_tools, "_should_escalate_stage_result_to_browser", lambda stage_result: True)
+
+    def fake_fetch_and_convert_with_playwright(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        timeout_budget: float | None = None,
+        deadline_monotonic: float | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+        cancellation_token: CancellationToken | None = None,
+    ) -> Mapping[str, JsonValue]:
+        """记录空 storage state dir 的 browser fallback 参数。
+
+        :param url: 目标 URL。
+        :param timeout_seconds: 抓取超时。
+        :param headers: 请求 headers。
+        :param timeout_budget: 工具预算。
+        :param deadline_monotonic: 工具 deadline。
+        :param playwright_channel: 浏览器 channel。
+        :param playwright_storage_state_path: storage state 文件路径。
+        :param cancellation_token: 取消令牌。
+        :returns: 确定性抓取内容。
+        """
+
+        del headers, timeout_budget, deadline_monotonic, cancellation_token
+        calls.append(
+            {
+                "url": url,
+                "timeout_seconds": timeout_seconds,
+                "playwright_channel": playwright_channel,
+                "playwright_storage_state_path": playwright_storage_state_path,
+            }
+        )
+        return {
+            "ok": True,
+            "final_url": url,
+            "title": "Example",
+            "content": "browser rendered content",
+            "http_status": 200,
+            "redirect_hops": 0,
+            "response_headers": {},
+            "response_excerpt": "browser rendered content",
+            "extraction_source": "playwright",
+            "renderer_source": "playwright",
+            "normalization_applied": False,
+            "quality_flags": [],
+            "content_stats": {},
+        }
+
+    monkeypatch.setattr(
+        web_tools,
+        "_fetch_and_convert_with_playwright",
+        fake_fetch_and_convert_with_playwright,
+    )
+    definition = _definitions_by_name(
+        _discover_definitions(
+            {
+                "allow_private_network_url": True,
+                "playwright_channel": "chrome",
+                "playwright_storage_state_dir": "",
+            }
+        )
+    )["fetch_web_page"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("fetch_web_page", {"url": "https://example.com/page"}),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    assert calls[0]["playwright_channel"] == "chrome"
+    assert calls[0]["playwright_storage_state_path"] == ""
 
 
 def test_invalid_fetch_url_type_fails_before_web_logic(

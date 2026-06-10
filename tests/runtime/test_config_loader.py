@@ -381,23 +381,38 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     read_provider = config.tool_discovery.providers["financial-read-tools"]
     download_provider = config.tool_discovery.providers["financial-download-tools"]
     preprocess_provider = config.tool_discovery.providers["financial-preprocess-tools"]
+    upload_provider = config.tool_discovery.providers["financial-upload-tools"]
     assert read_provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
     assert read_provider.import_path == "dayu.fins.tools.provider:discover_tools"
-    assert read_provider.enabled is False
+    assert read_provider.enabled is True
     assert read_provider.config["include_read_tools"] is True
     assert "include_ingestion_tools" not in read_provider.config
     assert download_provider.import_path == (
         "dayu.fins.tools.download_provider:discover_tools"
     )
-    assert download_provider.enabled is False
+    assert download_provider.enabled is True
     assert download_provider.config["workspace_root"] is None
     assert preprocess_provider.import_path == (
         "dayu.fins.tools.preprocess_provider:discover_tools"
     )
-    assert preprocess_provider.enabled is False
+    assert preprocess_provider.enabled is True
     assert preprocess_provider.config["workspace_root"] is None
-    assert "doc-tools" in config.tool_discovery.providers
-    assert "web-tools" in config.tool_discovery.providers
+    assert upload_provider.enabled is True
+    assert upload_provider.config["allowed_upload_roots"] == []
+    doc_provider = config.tool_discovery.providers["doc-tools"]
+    assert doc_provider.enabled is True
+    web_provider = config.tool_discovery.providers["web-tools"]
+    assert web_provider.enabled is True
+    assert web_provider.config["provider"] == "auto"
+    assert web_provider.config["request_timeout_seconds"] == 20.0
+    assert web_provider.config["max_search_results"] == 8
+    assert web_provider.config["fetch_truncate_chars"] == 80000
+    assert web_provider.config["playwright_channel"] == "chrome"
+    assert (
+        web_provider.config["playwright_storage_state_dir"]
+        == "workspace/.dayu/web_tools_storage_states"
+    )
+    assert web_provider.config["allow_private_network_url"] is False
 
 
 def test_workspace_record_replaces_package_record_without_deep_merge(

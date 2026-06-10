@@ -32,19 +32,27 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         provider 输出，包含上传 start 工具定义。
 
     Raises:
-        ValueError: provider config 缺少绝对 ``workspace_root`` 或
-            ``allowed_upload_roots`` 非空绝对路径集合时抛出。
+        ValueError: 注册上传工具时 provider config 缺少绝对
+            ``workspace_root``，或 ``allowed_upload_roots`` 字段类型非法时抛出。
         OSError: Fins runtime 仓储初始化失败时抛出。
     """
 
-    workspace_root = parse_fins_workspace_root_config(spec.config)
     allowed_upload_roots = parse_allowed_upload_roots_config(spec.config)
+    source_ref = _source_ref()
+    if not allowed_upload_roots:
+        return ToolsDiscoveryProviderOutput(
+            provider_id=_PROVIDER_ID,
+            version_ref=_VERSION_REF,
+            source_refs=(source_ref,),
+            definitions=(),
+        )
+    workspace_root = parse_fins_workspace_root_config(spec.config)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     ingestion_runtime = runtime.get_ingestion_runtime()
     return ToolsDiscoveryProviderOutput(
         provider_id=_PROVIDER_ID,
         version_ref=_VERSION_REF,
-        source_refs=(_source_ref(),),
+        source_refs=(source_ref,),
         definitions=(
             build_fins_upload_tool(
                 ingestion_runtime,
@@ -64,12 +72,16 @@ def parse_allowed_upload_roots_config(config: Mapping[str, JsonValue]) -> tuple[
         已 resolve 的绝对 allowlist 根目录元组。
 
     Raises:
-        ValueError: 字段缺失、不是非空数组，或数组元素不是绝对路径字符串时抛出。
+        ValueError: 字段不是数组，或数组元素不是绝对路径字符串时抛出。
     """
 
     value = config.get(_CONFIG_ALLOWED_UPLOAD_ROOTS_FIELD)
-    if not isinstance(value, list) or not value:
-        raise ValueError("fins upload provider config.allowed_upload_roots must be a non-empty array")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("fins upload provider config.allowed_upload_roots must be an array")
+    if not value:
+        return ()
     roots: list[Path] = []
     for item in value:
         if not isinstance(item, str) or item.strip() == "":

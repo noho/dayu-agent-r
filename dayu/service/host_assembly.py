@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Final
 
-from dayu.contracts import ToolBundle, ToolBundleSourceRef
+from dayu.contracts import JsonValue, ToolBundle, ToolBundleSourceRef
 from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
@@ -87,6 +87,7 @@ _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{\{([A-Za-z_][A
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
 _COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT: Final[int] = 1
 _FINS_WORKSPACE_ROOT_CONFIG_FIELD: Final[str] = "workspace_root"
+_FINS_READ_PROVIDER_IDS: Final[frozenset[str]] = frozenset({"financial-read-tools"})
 _FINS_DOWNLOAD_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
     {"financial-download-tools"}
 )
@@ -96,6 +97,9 @@ _FINS_PREPROCESS_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
 _FINS_UPLOAD_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
     {"financial-upload-tools"}
 )
+_FINS_READ_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.provider:discover_tools"}
+)
 _FINS_DOWNLOAD_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.download_provider:discover_tools"}
 )
@@ -104,6 +108,9 @@ _FINS_PREPROCESS_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
 )
 _FINS_UPLOAD_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.upload_provider:discover_tools"}
+)
+_FINS_READ_SOURCE_IDS: Final[frozenset[str]] = frozenset(
+    {"dayu.fins.tools.provider"}
 )
 _FINS_DOWNLOAD_SOURCE_IDS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.download_provider"}
@@ -140,11 +147,14 @@ class ServiceDiscoveredTools:
     :param tool_bundle: 已发现的业务工具 bundle。
     :param source_refs: 工具来源引用。
     :param provider_reports: 工具 provider 报告行。
+    :param effective_provider_configs: 本次工具发现实际使用的 effective provider
+        configs，供后续 Host tooling assembly 复用。
     """
 
     tool_bundle: ToolBundle
     source_refs: tuple[ToolBundleSourceRef, ...]
     provider_reports: tuple[str, ...]
+    effective_provider_configs: tuple[ToolDiscoveryProviderConfig, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,16 +269,22 @@ class _CompactorScenePrompts:
     agent_policy: AgentPolicy
 
 
-def discover_service_tools(config: RuntimeConfig) -> ServiceDiscoveredTools:
-    """按 runtime config 执行工具发现。
+def discover_service_tools(
+    effective_provider_configs: Sequence[ToolDiscoveryProviderConfig],
+) -> ServiceDiscoveredTools:
+    """按 effective provider configs 执行工具发现。
 
-    :param config: ``ConfigLoader`` 输出的 runtime typed config。
+    :param effective_provider_configs: 已由调用方完成 config 与运行时参数装配
+        的 provider configs。
     :returns: Service 工具发现结果。
     :raises ValueError: provider spec 同时缺少 import path 与 entry point 时抛出。
     :raises Exception: ``ToolsDiscovery`` provider 失败时向上抛出。
     """
 
-    discovery_result = ToolsDiscovery().discover(_tool_discovery_specs(tuple(config.tool_discovery.providers.values())))
+    provider_config_tuple = tuple(effective_provider_configs)
+    discovery_result = ToolsDiscovery().discover(
+        _tool_discovery_specs(provider_config_tuple)
+    )
     return ServiceDiscoveredTools(
         tool_bundle=discovery_result.tool_bundle,
         source_refs=discovery_result.source_refs,
@@ -281,7 +297,34 @@ def discover_service_tools(config: RuntimeConfig) -> ServiceDiscoveredTools:
             )
             for output in discovery_result.provider_reports
         ),
+        effective_provider_configs=provider_config_tuple,
     )
+
+
+def assemble_effective_tool_provider_configs(
+    provider_configs: Sequence[ToolDiscoveryProviderConfig],
+    *,
+    workspace_root: pathlib.Path | None,
+) -> tuple[ToolDiscoveryProviderConfig, ...]:
+    """装配工具 provider 的 effective configs。
+
+    :param provider_configs: ConfigLoader 产出的 raw provider typed configs。
+    :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
+    :returns: provider config tuple，必要时替换为 effective config。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    effective_configs: list[ToolDiscoveryProviderConfig] = []
+    for provider_config in provider_configs:
+        effective_config = _effective_tool_provider_config(
+            provider_config,
+            workspace_root=workspace_root,
+        )
+        if effective_config == provider_config.config:
+            effective_configs.append(provider_config)
+        else:
+            effective_configs.append(replace(provider_config, config=effective_config))
+    return tuple(effective_configs)
 
 
 def compose_open_host_options(
@@ -497,7 +540,7 @@ def _compose_options(
         tooling_options=_tooling_options_from_discovery(
             tool_bundle=effective_tool_bundle,
             source_refs=request.discovered_tools.source_refs,
-            provider_configs=tuple(request.config.tool_discovery.providers.values()),
+            provider_configs=request.discovered_tools.effective_provider_configs,
             duplicate_governance_policy_config=(
                 execution_profile.tool_duplicate_governance_policy
             ),
@@ -756,7 +799,7 @@ def _tool_discovery_specs(
 ) -> tuple[ToolsDiscoveryProviderSpec, ...]:
     """把 ConfigLoader provider view 映射为 ToolsDiscovery specs。
 
-    :param provider_configs: 配置中的 provider specs。
+    :param provider_configs: 已完成运行时参数装配的 provider configs。
     :returns: ToolsDiscovery 可消费的 provider specs。
     :raises ValueError: provider 同时缺少 import path 与 entry point 时抛出。
     """
@@ -784,6 +827,52 @@ def _tool_discovery_specs(
             )
         )
     return tuple(specs)
+
+
+def _effective_tool_provider_config(
+    provider_config: ToolDiscoveryProviderConfig,
+    *,
+    workspace_root: pathlib.Path | None,
+) -> Mapping[str, JsonValue]:
+    """生成传给工具发现 provider 的 effective config。
+
+    :param provider_config: ConfigLoader 产出的 provider typed config。
+    :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
+    :returns: provider 可直接消费的 effective config。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not _is_fins_workspace_bound_provider_config(provider_config):
+        return provider_config.config
+    configured_workspace_root = provider_config.config.get(
+        _FINS_WORKSPACE_ROOT_CONFIG_FIELD
+    )
+    if configured_workspace_root is not None or workspace_root is None:
+        return provider_config.config
+    effective_config: dict[str, JsonValue] = dict(provider_config.config)
+    effective_config[_FINS_WORKSPACE_ROOT_CONFIG_FIELD] = str(
+        workspace_root.expanduser().resolve(strict=False)
+    )
+    return effective_config
+
+
+def _is_fins_workspace_bound_provider_config(
+    provider_config: ToolDiscoveryProviderConfig,
+) -> bool:
+    """判断 provider 是否需要 Fins workspace root 进入 effective spec。
+
+    :param provider_config: ConfigLoader 产出的 provider typed config。
+    :returns: 是 Fins workspace-bound provider 时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if (
+        provider_config.provider_id in _FINS_READ_PROVIDER_IDS
+        or provider_config.import_path in _FINS_READ_IMPORT_PATHS
+        or provider_config.source_id in _FINS_READ_SOURCE_IDS
+    ):
+        return True
+    return _fins_awaiting_tool_name_from_provider_config(provider_config) is not None
 
 
 def _tool_bundle_with_effective_truncation(
@@ -1079,7 +1168,10 @@ def _tooling_options_from_discovery(
     if not source_refs:
         raise ValueError("discovered tools must have source refs")
     wait_adapter_registry = _fins_wait_adapter_registry_from_provider_configs(
-        provider_configs
+        provider_configs,
+        available_tool_names=frozenset(
+            definition.name for definition in tool_bundle.definitions
+        ),
     )
     return HostToolingOptions(
         business_tool_bundle=tool_bundle,
@@ -1093,10 +1185,13 @@ def _tooling_options_from_discovery(
 
 def _fins_wait_adapter_registry_from_provider_configs(
     provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+    *,
+    available_tool_names: frozenset[str],
 ) -> WaitAdapterRegistry | None:
     """从显式 provider config 构造 Fins wait adapter registry。
 
     :param provider_configs: 当前 Host assembly 使用的工具发现 provider 配置。
+    :param available_tool_names: 当前 ToolBundle 中实际存在的工具名。
     :returns: Fins wait adapter registry；没有启用 Fins awaiting provider 时为
         ``None``。
     :raises ValueError: workspace root 缺失、非绝对、不一致，或重复绑定时抛出。
@@ -1109,6 +1204,8 @@ def _fins_wait_adapter_registry_from_provider_configs(
             continue
         tool_name = _fins_awaiting_tool_name_from_provider_config(provider_config)
         if tool_name is None:
+            continue
+        if tool_name not in available_tool_names:
             continue
         tool_names.append(tool_name)
         workspace_roots.append(

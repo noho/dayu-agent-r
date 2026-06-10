@@ -39,7 +39,7 @@ from dayu.host.api import (
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
 )
-from dayu.runtime.config_loader import ConfigLoader
+from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.config_loader import (
     ToolDuplicateGovernanceMessagesConfig,
     ToolDuplicateGovernancePolicyConfig,
@@ -67,11 +67,13 @@ from dayu.service.host_assembly import (
     _compactor_prompts_from_scene_inputs,
     _duplicate_decision_from_config,
     _render_headers,
+    _is_fins_workspace_bound_provider_config,
     _resolve_prompt_asset_path,
     _resolve_project_path,
     _runner_spec_from_model,
     _tool_discovery_specs,
     _tooling_options_from_discovery,
+    assemble_effective_tool_provider_configs,
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
@@ -95,6 +97,26 @@ def _scene_tool_catalog(discovered_tools: ServiceDiscoveredTools) -> SceneToolCa
     """
 
     return SceneToolCatalog.from_tool_bundle(discovered_tools.tool_bundle)
+
+
+def _discover_service_tools_for_workspace(
+    config: RuntimeConfig,
+    *,
+    workspace_root: Path,
+) -> ServiceDiscoveredTools:
+    """按测试 workspace 装配 effective configs 后发现工具。
+
+    :param config: ConfigLoader 输出的 runtime typed config。
+    :param workspace_root: 测试 workspace root。
+    :returns: Service 工具发现结果。
+    :raises Exception: effective config 装配或工具发现失败时向上抛出。
+    """
+
+    effective_provider_configs = assemble_effective_tool_provider_configs(
+        tuple(config.tool_discovery.providers.values()),
+        workspace_root=workspace_root,
+    )
+    return discover_service_tools(effective_provider_configs)
 
 
 def _complete_compactor_agent_policy_override() -> SceneAgentPolicyOverride:
@@ -135,7 +157,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -229,7 +251,7 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -305,7 +327,7 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -631,6 +653,30 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
     assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
 
 
+def test_tooling_options_skips_wait_adapter_for_missing_awaiting_tool_definition(
+    tmp_path: Path,
+) -> None:
+    """Service assembly 只为实际进入 ToolBundle 的 awaiting 工具绑定 wait adapter。"""
+
+    workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    tooling_options = _tooling_options_from_discovery(
+        tool_bundle=ToolBundle(definitions=(_tool_definition(DOWNLOAD_TOOL_NAME),)),
+        source_refs=(_source_ref("fins-awaiting-test"),),
+        provider_configs=(
+            _provider_config(
+                provider_id="custom-upload-provider",
+                import_path="dayu.fins.tools.upload_provider:discover_tools",
+                source_id="dayu.fins.tools.upload_provider",
+                workspace_root=workspace_root,
+            ),
+        ),
+        duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+    )
+
+    assert tooling_options is not None
+    assert tooling_options.wait_adapter_registry is None
+
+
 def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
     tmp_path: Path,
 ) -> None:
@@ -853,6 +899,319 @@ def test_tool_discovery_provider_config_survives_loader_and_service_mapping(
     assert specs[0].config["limits"] == {"read_file_max_chars": 2048}
 
 
+def test_web_tool_discovery_config_survives_service_mapping() -> None:
+    """Web provider config 必须原样进入 ToolsDiscovery spec。
+
+    :returns: ``None``。
+    :raises AssertionError: Service assembly 解释或丢弃 Web config 时抛出。
+    """
+
+    web_config: dict[str, JsonValue] = {
+        "provider": "serper",
+        "request_timeout_seconds": 3.5,
+        "max_search_results": 4,
+        "fetch_truncate_chars": 4321,
+        "allow_private_network_url": True,
+        "playwright_channel": "msedge",
+        "playwright_storage_state_dir": "workspace/storage-states",
+    }
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="web-tools",
+        import_path="dayu.tools.web:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.tools.web",
+        enabled=True,
+        allow_empty=False,
+        config=web_config,
+    )
+
+    specs = _tool_discovery_specs((provider,))
+
+    assert len(specs) == 1
+    assert specs[0].spec_id == "web-tools"
+    assert specs[0].config == web_config
+
+
+def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
+    tmp_path: Path,
+) -> None:
+    """Fins provider effective spec 必须补齐运行时 workspace root。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: workspace root 未注入或污染 raw config 时抛出。
+    """
+
+    raw_config: dict[str, JsonValue] = {
+        "workspace_root": None,
+        "include_read_tools": True,
+        "limits": {},
+    }
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-read-tools",
+        import_path="dayu.fins.tools.provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.provider",
+        enabled=True,
+        allow_empty=False,
+        config=raw_config,
+    )
+
+    effective_providers = assemble_effective_tool_provider_configs(
+        (provider,),
+        workspace_root=tmp_path,
+    )
+    specs = _tool_discovery_specs(effective_providers)
+
+    assert len(specs) == 1
+    assert specs[0].config["workspace_root"] == str(tmp_path.resolve(strict=False))
+    assert raw_config["workspace_root"] is None
+
+
+def test_fins_tool_discovery_spec_preserves_explicit_workspace_root(
+    tmp_path: Path,
+) -> None:
+    """Fins provider 显式 workspace root 不能被运行时默认值覆盖。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: 显式 workspace root 被覆盖时抛出。
+    """
+
+    configured_workspace = (tmp_path / "configured").resolve(strict=False)
+    runtime_workspace = (tmp_path / "runtime").resolve(strict=False)
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-download-tools",
+        import_path="dayu.fins.tools.download_provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.download_provider",
+        enabled=True,
+        allow_empty=False,
+        config={"workspace_root": str(configured_workspace)},
+    )
+
+    effective_providers = assemble_effective_tool_provider_configs(
+        (provider,),
+        workspace_root=runtime_workspace,
+    )
+    specs = _tool_discovery_specs(effective_providers)
+
+    assert len(specs) == 1
+    assert specs[0].config["workspace_root"] == str(configured_workspace)
+
+
+def test_fins_workspace_bound_provider_detection_boundaries() -> None:
+    """Fins workspace-bound provider 识别必须覆盖关键边界。
+
+    :returns: ``None``。
+    :raises AssertionError: provider 识别结果与预期不符时抛出。
+    """
+
+    cases: tuple[tuple[str, ToolDiscoveryProviderConfig, bool], ...] = (
+        (
+            "ordinary-doc",
+            ToolDiscoveryProviderConfig(
+                provider_id="doc-tools",
+                import_path="dayu.tools.doc_provider:discover_tools",
+                entry_point=None,
+                source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+                source_id="dayu.tools.doc_provider",
+                enabled=True,
+                allow_empty=True,
+                config={},
+            ),
+            False,
+        ),
+        (
+            "read-entry-source",
+            ToolDiscoveryProviderConfig(
+                provider_id="custom-read",
+                import_path=None,
+                entry_point=ToolDiscoveryEntryPointConfig(
+                    group="dayu.tools",
+                    name="custom-read",
+                ),
+                source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+                source_id="dayu.fins.tools.provider",
+                enabled=True,
+                allow_empty=False,
+                config={},
+            ),
+            True,
+        ),
+        (
+            "download-import",
+            _provider_config_with_config(
+                provider_id="custom-download",
+                import_path="dayu.fins.tools.download_provider:discover_tools",
+                source_id="custom.download",
+                config={},
+            ),
+            True,
+        ),
+        (
+            "preprocess-source",
+            _provider_config_with_config(
+                provider_id="custom-preprocess",
+                import_path="custom.preprocess:discover_tools",
+                source_id="dayu.fins.tools.preprocess_provider",
+                config={},
+            ),
+            True,
+        ),
+        (
+            "upload-id",
+            _provider_config_with_config(
+                provider_id="financial-upload-tools",
+                import_path="custom.upload:discover_tools",
+                source_id="custom.upload",
+                config={},
+            ),
+            True,
+        ),
+    )
+
+    for label, provider_config, expected in cases:
+        assert _is_fins_workspace_bound_provider_config(provider_config) is expected, label
+
+
+def test_discover_service_tools_carries_effective_fins_config_into_compose(
+    tmp_path: Path,
+) -> None:
+    """compose_open_host_options 必须复用 discovery 阶段 effective provider config。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: compose 阶段重新解释 raw provider config 时抛出。
+    """
+
+    fins_workspace = (tmp_path / "fins-workspace").resolve(strict=False)
+    overlay_dir = tmp_path / "workspace" / "config"
+    _write_json(
+        overlay_dir / "tool_discovery.json",
+        {
+            "providers": {
+                "financial-download-tools": {
+                    "import_path": "dayu.fins.tools.download_provider:discover_tools",
+                    "entry_point": None,
+                    "source_kind": "explicit_provider",
+                    "source_id": "dayu.fins.tools.download_provider",
+                    "enabled": True,
+                    "allow_empty": False,
+                    "config": {"workspace_root": None},
+                }
+            }
+        },
+    )
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=fins_workspace)
+    discovered_provider = discovered_tools.effective_provider_configs[0]
+    assert discovered_provider.config["workspace_root"] == str(fins_workspace)
+
+    raw_provider = config.tool_discovery.providers["financial-download-tools"]
+    corrupted_config = replace(
+        config,
+        tool_discovery=replace(
+            config.tool_discovery,
+            providers={
+                "financial-download-tools": replace(
+                    raw_provider,
+                    config={"workspace_root": "relative/fins-workspace"},
+                )
+            },
+        ),
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=corrupted_config,
+            locations=locations,
+            scene_inputs=_compactor_scene_inputs(agent_policy_override=None),
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    tooling_options = result.options.tooling_options
+    assert tooling_options is not None
+    registry = tooling_options.wait_adapter_registry
+    assert registry is not None
+    binding = registry.resolve_binding(
+        tool_name=DOWNLOAD_TOOL_NAME,
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+    )
+    assert binding is not None
+    assert binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+
+
+def test_config_loader_and_service_discover_web_tools_with_overlay_config(
+    tmp_path: Path,
+) -> None:
+    """完整配置加载与 Service discovery 必须发现 Web tools。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: Web config 未进入生产式工具发现链路时抛出。
+    """
+
+    overlay_dir = tmp_path / "workspace" / "config"
+    _write_json(
+        overlay_dir / "tool_discovery.json",
+        {
+            "providers": {
+                "web-tools": {
+                    "import_path": "dayu.tools.web:discover_tools",
+                    "entry_point": None,
+                    "source_kind": "explicit_provider",
+                    "source_id": "dayu.tools.web",
+                    "enabled": True,
+                    "allow_empty": False,
+                    "config": {
+                        "provider": "duckduckgo",
+                        "request_timeout_seconds": 4.0,
+                        "max_search_results": 3,
+                        "fetch_truncate_chars": 9876,
+                        "allow_private_network_url": True,
+                        "playwright_channel": "chrome",
+                        "playwright_storage_state_dir": "workspace/web-state",
+                    },
+                }
+            }
+        },
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=overlay_dir
+    )
+
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
+    tool_names = tuple(
+        definition.name for definition in discovered_tools.tool_bundle.definitions
+    )
+
+    assert "search_web" in tool_names
+    assert "fetch_web_page" in tool_names
+    assert (
+        "provider=web-tools,spec=web-tools,version=web-tools-provider-v1,tools=search_web,fetch_web_page"
+        in discovered_tools.provider_reports
+    )
+
+
 def test_truncation_manager_enabled_is_derived_from_execution_profile(
     tmp_path: Path,
 ) -> None:
@@ -872,7 +1231,7 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -926,7 +1285,7 @@ def test_memory_projection_context_window_uses_effective_model_window(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -990,7 +1349,7 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -1076,7 +1435,7 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -1128,7 +1487,7 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,

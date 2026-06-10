@@ -122,10 +122,10 @@ def test_runtime_assembly_adds_builtin_mock_tool_and_selects_manual_smoke(
     )
 
     assert assembly.scene_inputs.tool_selection.tool_names == frozenset({_TOOL_NAME})
-    assert assembly.diagnostics.tool_provider_reports == (
+    assert (
         "provider=host-public-conversation-memory-scenarios-smoke,"
-        f"spec=host-public-conversation-memory-scenarios-smoke,version=v1,tools={_TOOL_NAME}",
-    )
+        f"spec=host-public-conversation-memory-scenarios-smoke,version=v1,tools={_TOOL_NAME}"
+    ) in assembly.diagnostics.tool_provider_reports
     assert isinstance(assembly.smoke_tool, MockFinanceMemoryTool)
     assert assembly.effective_tool_bundle is not None
     definitions = assembly.effective_tool_bundle.definitions

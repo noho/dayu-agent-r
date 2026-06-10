@@ -5,7 +5,7 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.provider",
-      "enabled": false,
+      "enabled": true,
       "allow_empty": true,
       "config": {
         "workspace_root": null,
@@ -18,7 +18,7 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.download_provider",
-      "enabled": false,
+      "enabled": true,
       "allow_empty": true,
       "config": {
         "workspace_root": null
@@ -29,7 +29,7 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.preprocess_provider",
-      "enabled": false,
+      "enabled": true,
       "allow_empty": true,
       "config": {
         "workspace_root": null
@@ -40,7 +40,7 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.upload_provider",
-      "enabled": false,
+      "enabled": true,
       "allow_empty": true,
       "config": {
         "workspace_root": null,
@@ -52,7 +52,7 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.tools.doc_provider",
-      "enabled": false,
+      "enabled": true,
       "allow_empty": true,
       "config": {
         "allowed_paths": [],
@@ -64,11 +64,15 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.tools.web",
-      "enabled": false,
+      "enabled": true,
       "allow_empty": true,
       "config": {
+        "provider": "auto",
         "request_timeout_seconds": 20.0,
         "max_search_results": 8,
+        "fetch_truncate_chars": 80000,
+        "playwright_channel": "chrome",
+        "playwright_storage_state_dir": "workspace/.dayu/web_tools_storage_states",
         "allow_private_network_url": false
       }
     }
