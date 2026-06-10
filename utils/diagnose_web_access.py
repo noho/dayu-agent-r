@@ -1300,6 +1300,7 @@ def _build_requests_profile(
         session.close()
 
     response_text = response.text
+    response_bytes = response.content
     challenge = detect_bot_challenge(response=response, content_text=response_text)
     profile["ok"] = True
     profile["status"] = "completed"
@@ -1310,6 +1311,8 @@ def _build_requests_profile(
         "final_url": response.url,
         "elapsed_seconds": _round_elapsed(started_at),
         "response_headers": _redact_headers(cast(Mapping[str, str], response.headers)),
+        "content_type": response.headers.get("Content-Type", ""),
+        "content_length": len(response_bytes),
         "text_prefix": _prefix_text(response_text, _TEXT_PREFIX_CHARS),
         "text_length": len(response_text),
         "challenge_detected": challenge.challenge_detected,

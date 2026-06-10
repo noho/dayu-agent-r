@@ -10,15 +10,20 @@ pass/fail/skip/diagnostic-only 分类和 Codex 可读 summary 输出。网页访
 from __future__ import annotations
 
 import argparse
+import contextlib
+import html
+import http.server
 import json
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, TypeAlias, cast
+from typing import Final, Iterator, TypeAlias, cast
+from urllib.parse import urlparse
 
 from dayu.contracts.json_value import JsonValue
 
@@ -40,9 +45,23 @@ _EXIT_SCHEMA_OR_INFRA_FAILURE: Final[int] = 2
 _CASE_LOCAL_HTML: Final[str] = "local_html"
 _CASE_LOCAL_PDF: Final[str] = "local_pdf"
 _CASE_EXTERNAL: Final[str] = "external"
+_LOCAL_FIXTURE_HOST: Final[str] = "127.0.0.1"
+_LOCAL_HTML_PATH: Final[str] = "/index.html"
+_LOCAL_PDF_PATH: Final[str] = "/fixture.pdf"
+_LOCAL_HTML_CONTENT_TYPE: Final[str] = "text/html; charset=utf-8"
+_LOCAL_PDF_CONTENT_TYPE: Final[str] = "application/pdf"
+_HTTP_GET_METHOD: Final[str] = "GET"
+_HTTP_HEADER_CONTENT_TYPE: Final[str] = "Content-Type"
+_HTTP_HEADER_CONTENT_LENGTH: Final[str] = "Content-Length"
+_HTTP_HEADER_CACHE_CONTROL: Final[str] = "Cache-Control"
+_HTTP_CACHE_CONTROL_NO_STORE: Final[str] = "no-store"
+_HTTP_STATUS_OK: Final[int] = 200
+_HTTP_STATUS_NOT_FOUND: Final[int] = 404
+_HTTP_STATUS_METHOD_NOT_ALLOWED: Final[int] = 405
+_SERVER_JOIN_TIMEOUT_SECONDS: Final[float] = 2.0
+_DOCLING_INVOCATION_BLOCKER_FILE: Final[str] = "local-pdf-docling-invocation-blocker.md"
 _BUCKET_PASSED: Final[str] = "passed"
 _BUCKET_NOT_OPTED_IN: Final[str] = "not_opted_in"
-_BUCKET_LOCAL_FIXTURE_ATTACHED_BY_SLICE3: Final[str] = "local_fixture_attached_by_slice3"
 _BUCKET_DIAGNOSTIC_SCHEMA_GAP: Final[str] = "diagnostic_schema_gap"
 _BUCKET_CHILD_PROCESS_ERROR: Final[str] = "child_process_error"
 _BUCKET_ARTIFACT_PARSE_FAILURE: Final[str] = "artifact_parse_failure"
@@ -53,7 +72,19 @@ _BUCKET_PDF_CONTENT_TYPE_FAILURE: Final[str] = "pdf_content_type_failure"
 _BUCKET_PDF_CONTENT_LENGTH_FAILURE: Final[str] = "pdf_content_length_failure"
 _BUCKET_PDF_DOCLING_INVOCATION_FAILURE: Final[str] = "pdf_docling_invocation_failure"
 _BUCKET_DOCLING_INIT_SKIP: Final[str] = "docling_runtime_initialization_error"
-_PDF_FETCH_MIN_CHARS: Final[int] = 20
+_PDF_EXPECTED_STREAM_NAME: Final[str] = "page.pdf"
+PDF_FETCH_MIN_CHARS: Final[int] = 20
+_HTML_FIXTURE_TITLE: Final[str] = "Dayu Web Smoke HTML"
+_HTML_FIXTURE_BODY: Final[str] = "Dayu Web Smoke HTML fixture verifies local fetch_web_page access."
+_PDF_FIXTURE_TEXT_LINE_1: Final[str] = "Dayu Web Smoke PDF"
+_PDF_FIXTURE_TEXT_LINE_2: Final[str] = "This PDF verifies Docling conversion."
+_PDF_STREAM_FONT_SIZE: Final[int] = 18
+_PDF_STREAM_X: Final[int] = 72
+_PDF_STREAM_Y: Final[int] = 720
+_PDF_STREAM_LINE_STEP: Final[int] = 28
+_PDF_PAGE_WIDTH: Final[int] = 612
+_PDF_PAGE_HEIGHT: Final[int] = 792
+_PDF_OBJECT_COUNT: Final[int] = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +118,25 @@ class SmokeOptions:
     external_limit: int
     diagnostic_only_external: bool
     run_label: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocalFixtureUrls:
+    """本地 HTTP fixture 的 URL 集合。
+
+    Args:
+        html_url: HTML fixture URL。
+        pdf_url: PDF fixture URL。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    html_url: str
+    pdf_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +341,263 @@ class SmokeSummary:
             "local_cases": [case.to_json() for case in self.local_cases],
             "external_cases": [case.to_json() for case in self.external_cases],
         }
+
+
+def _local_fixture_urls(port: int) -> LocalFixtureUrls:
+    """按端口构造本地 fixture URL。
+
+    Args:
+        port: 本地 HTTP server 监听端口。
+
+    Returns:
+        HTML 与 PDF fixture URL。
+
+    Raises:
+        ValueError: 端口非法时抛出。
+    """
+
+    if port <= 0:
+        raise ValueError("local fixture server 端口必须大于 0。")
+    origin = f"http://{_LOCAL_FIXTURE_HOST}:{port}"
+    return LocalFixtureUrls(
+        html_url=f"{origin}{_LOCAL_HTML_PATH}",
+        pdf_url=f"{origin}{_LOCAL_PDF_PATH}",
+    )
+
+
+def _html_fixture_bytes() -> bytes:
+    """构造本地 HTML fixture 响应体。
+
+    Args:
+        无。
+
+    Returns:
+        UTF-8 HTML bytes。
+
+    Raises:
+        无。
+    """
+
+    title = html.escape(_HTML_FIXTURE_TITLE)
+    body = html.escape(_HTML_FIXTURE_BODY)
+    document = (
+        "<!doctype html>\n"
+        "<html lang=\"en\">\n"
+        "<head><meta charset=\"utf-8\"><title>"
+        f"{title}</title></head>\n"
+        f"<body><main><h1>{title}</h1><p>{body}</p></main></body>\n"
+        "</html>\n"
+    )
+    return document.encode("utf-8")
+
+
+def _pdf_text_stream() -> bytes:
+    """构造 PDF 页面文本 stream。
+
+    Args:
+        无。
+
+    Returns:
+        PDF content stream bytes。
+
+    Raises:
+        无。
+    """
+
+    stream = (
+        "BT\n"
+        f"/F1 {_PDF_STREAM_FONT_SIZE} Tf\n"
+        f"{_PDF_STREAM_X} {_PDF_STREAM_Y} Td\n"
+        f"({_PDF_FIXTURE_TEXT_LINE_1}) Tj\n"
+        f"0 -{_PDF_STREAM_LINE_STEP} Td\n"
+        f"({_PDF_FIXTURE_TEXT_LINE_2}) Tj\n"
+        "ET\n"
+    )
+    return stream.encode("ascii")
+
+
+def _pdf_fixture_bytes() -> bytes:
+    """构造包含稳定可抽取文本的小型 PDF fixture。
+
+    Args:
+        无。
+
+    Returns:
+        PDF 文件 bytes。
+
+    Raises:
+        无。
+    """
+
+    content_stream = _pdf_text_stream()
+    objects = (
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {_PDF_PAGE_WIDTH} {_PDF_PAGE_HEIGHT}] "
+            "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        ).encode("ascii"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(content_stream)).encode("ascii") + b" >>\nstream\n" + content_stream + b"endstream",
+    )
+    chunks: list[bytes] = [b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"]
+    offsets: list[int] = []
+    for object_index, body in enumerate(objects, start=1):
+        offsets.append(sum(len(chunk) for chunk in chunks))
+        chunks.append(f"{object_index} 0 obj\n".encode("ascii"))
+        chunks.append(body)
+        chunks.append(b"\nendobj\n")
+    xref_offset = sum(len(chunk) for chunk in chunks)
+    chunks.append(f"xref\n0 {_PDF_OBJECT_COUNT + 1}\n".encode("ascii"))
+    chunks.append(b"0000000000 65535 f \n")
+    for offset in offsets:
+        chunks.append(f"{offset:010d} 00000 n \n".encode("ascii"))
+    chunks.append(
+        (
+            f"trailer\n<< /Size {_PDF_OBJECT_COUNT + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return b"".join(chunks)
+
+
+class _LocalFixtureRequestHandler(http.server.BaseHTTPRequestHandler):
+    """本地 Web smoke fixture HTTP handler。"""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        """处理 fixture GET 请求。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        path = urlparse(self.path).path
+        if path == _LOCAL_HTML_PATH:
+            _send_fixture_response(
+                self,
+                status_code=_HTTP_STATUS_OK,
+                content_type=_LOCAL_HTML_CONTENT_TYPE,
+                body=_html_fixture_bytes(),
+            )
+            return
+        if path == _LOCAL_PDF_PATH:
+            _send_fixture_response(
+                self,
+                status_code=_HTTP_STATUS_OK,
+                content_type=_LOCAL_PDF_CONTENT_TYPE,
+                body=_pdf_fixture_bytes(),
+            )
+            return
+        _send_fixture_response(
+            self,
+            status_code=_HTTP_STATUS_NOT_FOUND,
+            content_type="text/plain; charset=utf-8",
+            body=b"not found\n",
+        )
+
+    def do_HEAD(self) -> None:
+        """拒绝非 smoke 必需的 HEAD 请求。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        _send_fixture_response(
+            self,
+            status_code=_HTTP_STATUS_METHOD_NOT_ALLOWED,
+            content_type="text/plain; charset=utf-8",
+            body=b"",
+        )
+
+    def log_message(self, format: str, *args: str) -> None:
+        """关闭默认 stderr 访问日志。
+
+        Args:
+            format: BaseHTTPRequestHandler 的格式字符串。
+            args: 格式参数。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        return
+
+
+def _send_fixture_response(
+    handler: http.server.BaseHTTPRequestHandler,
+    *,
+    status_code: int,
+    content_type: str,
+    body: bytes,
+) -> None:
+    """发送 fixture HTTP 响应。
+
+    Args:
+        handler: 当前请求 handler。
+        status_code: HTTP 状态码。
+        content_type: 响应 Content-Type。
+        body: 响应 body bytes。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    handler.send_response(status_code)
+    handler.send_header(_HTTP_HEADER_CONTENT_TYPE, content_type)
+    handler.send_header(_HTTP_HEADER_CONTENT_LENGTH, str(len(body)))
+    handler.send_header(_HTTP_HEADER_CACHE_CONTROL, _HTTP_CACHE_CONTROL_NO_STORE)
+    handler.end_headers()
+    if handler.command == _HTTP_GET_METHOD and body:
+        handler.wfile.write(body)
+
+
+@contextlib.contextmanager
+def _running_local_fixture_server() -> Iterator[LocalFixtureUrls]:
+    """启动本地 loopback fixture server。
+
+    Args:
+        无。
+
+    Returns:
+        context manager 期间可访问的 fixture URLs。
+
+    Raises:
+        OSError: server 绑定或启动失败时抛出。
+    """
+
+    server = http.server.ThreadingHTTPServer((_LOCAL_FIXTURE_HOST, 0), _LocalFixtureRequestHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="dayu-web-smoke-local-fixture",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield _local_fixture_urls(int(server.server_address[1]))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=_SERVER_JOIN_TIMEOUT_SECONDS)
 
 
 def _utc_run_label() -> str:
@@ -937,7 +1244,7 @@ def _classify_pdf_loaded_artifact(
             suggested_next_step="local PDF raw response 必须包含非空 PDF bytes。",
         )
     fetch_length = _fetch_content_length(payload)
-    if fetch_length is None or fetch_length < _PDF_FETCH_MIN_CHARS:
+    if fetch_length is None or fetch_length < PDF_FETCH_MIN_CHARS:
         return _case_failure(
             case_name=case_name,
             case_kind=_CASE_LOCAL_PDF,
@@ -945,10 +1252,15 @@ def _classify_pdf_loaded_artifact(
             evidence_path=evidence_path,
             bucket=_BUCKET_PDF_CONTENT_LENGTH_FAILURE,
             exit_code=_EXIT_LOCAL_FAILURE,
-            suggested_next_step=f"fetch_web_page 返回内容长度必须至少 {_PDF_FETCH_MIN_CHARS} 个字符。",
+            suggested_next_step=f"fetch_web_page 返回内容长度必须至少 {PDF_FETCH_MIN_CHARS} 个字符。",
         )
     evidence = _docling_evidence(payload)
-    if not _bool_field(evidence, "invoked") or not _bool_field(evidence, "original_completed"):
+    stream_name = _string_field(evidence, "stream_name")
+    if (
+        not _bool_field(evidence, "invoked")
+        or stream_name != _PDF_EXPECTED_STREAM_NAME
+        or not _bool_field(evidence, "original_completed")
+    ):
         return _case_failure(
             case_name=case_name,
             case_kind=_CASE_LOCAL_PDF,
@@ -956,7 +1268,10 @@ def _classify_pdf_loaded_artifact(
             evidence_path=evidence_path,
             bucket=_BUCKET_PDF_DOCLING_INVOCATION_FAILURE,
             exit_code=_EXIT_LOCAL_FAILURE,
-            suggested_next_step="PDF local smoke 必须观察到 Docling conversion callable 实际调用并正常返回。",
+            suggested_next_step=(
+                "PDF local smoke 必须观察到 Docling conversion callable 实际调用、"
+                f"stream_name={_PDF_EXPECTED_STREAM_NAME} 且原始 callable 正常返回。"
+            ),
         )
     return None
 
@@ -1405,6 +1720,7 @@ def _diagnostic_command(
     url: str,
     artifact_path: Path,
     options: SmokeOptions,
+    allow_private_network_url: bool,
 ) -> list[str]:
     """构造单 URL diagnostics 命令。
 
@@ -1412,6 +1728,7 @@ def _diagnostic_command(
         url: 待诊断 URL。
         artifact_path: diagnostics 输出 artifact。
         options: smoke 选项。
+        allow_private_network_url: 是否允许 diagnostics 访问内网或本地 URL。
 
     Returns:
         子进程命令参数列表。
@@ -1433,9 +1750,53 @@ def _diagnostic_command(
         "--tool-timeout-budget",
         str(options.tool_timeout_budget),
     ]
+    if allow_private_network_url:
+        command.append("--allow-private-network-url")
     if not options.include_playwright:
         command.append("--skip-playwright")
     return command
+
+
+def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list[SmokeCaseResult]:
+    """运行本地 HTML/PDF fixture smoke cases。
+
+    Args:
+        options: smoke 选项。
+        runner: diagnostics 子进程 runner。
+
+    Returns:
+        local case 结果列表。
+
+    Raises:
+        OSError: local server、artifact 目录或子进程启动失败时抛出。
+    """
+
+    diagnostics_dir = options.output_dir / "diagnostics" / "local"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    results: list[SmokeCaseResult] = []
+    with _running_local_fixture_server() as fixture_urls:
+        local_cases = (
+            ("local-html", _CASE_LOCAL_HTML, fixture_urls.html_url, diagnostics_dir / "local-html.json"),
+            ("local-pdf", _CASE_LOCAL_PDF, fixture_urls.pdf_url, diagnostics_dir / "local-pdf.json"),
+        )
+        for case_name, case_kind, url, artifact_path in local_cases:
+            command = _diagnostic_command(
+                url=url,
+                artifact_path=artifact_path,
+                options=options,
+                allow_private_network_url=True,
+            )
+            child_result = runner(command)
+            results.append(
+                _classify_child_result(
+                    case_name=case_name,
+                    case_kind=case_kind,
+                    fallback_url=url,
+                    artifact_path=artifact_path,
+                    child_result=child_result,
+                )
+            )
+    return results
 
 
 def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list[SmokeCaseResult]:
@@ -1461,7 +1822,12 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
     results: list[SmokeCaseResult] = []
     for index, url in enumerate(urls, start=1):
         artifact_path = diagnostics_dir / f"external-{index:04d}.json"
-        command = _diagnostic_command(url=url, artifact_path=artifact_path, options=options)
+        command = _diagnostic_command(
+            url=url,
+            artifact_path=artifact_path,
+            options=options,
+            allow_private_network_url=False,
+        )
         child_result = runner(command)
         results.append(
             _classify_child_result(
@@ -1475,11 +1841,73 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
     return results
 
 
-def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeSummary:
-    """执行当前 Slice 2 smoke 流程。
+def _has_docling_invocation_blocker(local_cases: Sequence[SmokeCaseResult]) -> bool:
+    """判断 local cases 是否命中 Docling invocation blocker。
 
-    Slice 2 只提供 opt-in CLI、summary contract、子进程 artifact 映射和外部
-    diagnostic-only 执行框架；local HTTP fixture 由后续 Slice 3 接入。
+    Args:
+        local_cases: local smoke case 结果。
+
+    Returns:
+        命中 PDF fetch 成功但 Docling invocation evidence 不成立时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return any(
+        case.case_kind == _CASE_LOCAL_PDF
+        and case.status == _STATUS_FAILED
+        and case.bucket == _BUCKET_PDF_DOCLING_INVOCATION_FAILURE
+        for case in local_cases
+    )
+
+
+def _write_docling_invocation_blocker_artifact(
+    *,
+    output_dir: Path,
+    local_cases: Sequence[SmokeCaseResult],
+) -> Path:
+    """写入 Docling invocation blocker artifact。
+
+    Args:
+        output_dir: smoke 输出目录。
+        local_cases: local smoke case 结果。
+
+    Returns:
+        blocker artifact 路径。
+
+    Raises:
+        OSError: artifact 写入失败时抛出。
+    """
+
+    blocker_dir = output_dir / "blockers"
+    blocker_dir.mkdir(parents=True, exist_ok=True)
+    blocker_path = blocker_dir / _DOCLING_INVOCATION_BLOCKER_FILE
+    pdf_cases = [case for case in local_cases if case.bucket == _BUCKET_PDF_DOCLING_INVOCATION_FAILURE]
+    lines = [
+        "# Local PDF Docling Invocation Blocker",
+        "",
+        "local PDF fetch_web_page 成功后，smoke 无法从 diagnostics artifact 证明 Docling conversion callable 实际调用。",
+        "该情况不能用 content-type、fetch success、静态代码推断或生产 LLM-facing payload 字段替代。",
+        "",
+    ]
+    for case in pdf_cases:
+        lines.extend(
+            [
+                f"- case_name: {case.case_name}",
+                f"- url: {case.url}",
+                f"- evidence_path: {case.evidence_path}",
+                f"- bucket: {case.bucket}",
+                f"- suggested_next_step: {case.suggested_next_step}",
+                "",
+            ]
+        )
+    blocker_path.write_text("\n".join(lines), encoding="utf-8")
+    return blocker_path
+
+
+def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeSummary:
+    """执行 opt-in Web smoke 流程。
 
     Args:
         options: smoke 选项。
@@ -1493,35 +1921,21 @@ def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeS
         OSError: 文件读写或子进程启动失败时抛出。
     """
 
+    local_cases = _run_local_cases(options=options, runner=runner)
+    if _has_docling_invocation_blocker(local_cases):
+        _write_docling_invocation_blocker_artifact(output_dir=options.output_dir, local_cases=local_cases)
+        return _summary_from_cases(
+            run_label=options.run_label,
+            output_dir=options.output_dir,
+            local_cases=local_cases,
+            external_cases=(),
+        )
     external_cases = _run_external_cases(options=options, runner=runner)
     return _summary_from_cases(
         run_label=options.run_label,
         output_dir=options.output_dir,
-        local_cases=(),
+        local_cases=local_cases,
         external_cases=external_cases,
-        extra_skips=(_slice2_local_fixture_skip_item(),),
-    )
-
-
-def _slice2_local_fixture_skip_item() -> SmokeItem:
-    """构造 Slice 2 opt-in 但尚无 local fixture case 的 summary 信号。
-
-    Args:
-        无。
-
-    Returns:
-        说明 local fixture smoke 由 Slice 3 接入的 skip item。
-
-    Raises:
-        无。
-    """
-
-    return SmokeItem(
-        bucket=_BUCKET_LOCAL_FIXTURE_ATTACHED_BY_SLICE3,
-        evidence_path="",
-        url="",
-        suggested_next_step="进入 WU-TOOLS-01-F03 Slice 3 后接入 local HTML/PDF fixture smoke。",
-        reason="当前 Slice 2 只验证 opt-in CLI、summary contract 与 diagnostics artifact 映射；local fixture smoke 由 Slice 3 接入。",
     )
 
 

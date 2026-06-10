@@ -180,6 +180,62 @@ def test_header_redaction_masks_sensitive_header_values() -> None:
     assert redacted["Cache-Control"] == "no-cache"
 
 
+def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """requests profile 应记录 response.content 的原始字节长度。"""
+
+    class FakeResponse:
+        """测试用 HTTP 响应。"""
+
+        def __init__(self) -> None:
+            """初始化测试响应。"""
+
+            self.text = "decoded"
+            self.content = b"%PDF fixture bytes"
+            self.headers: Mapping[str, str] = {"Content-Type": "application/pdf"}
+            self.status_code = 200
+            self.url = "http://127.0.0.1:43117/fixture.pdf"
+
+    class FakeSession:
+        """测试用 requests session。"""
+
+        def prepare_request(self, request: diag.requests.Request) -> diag.requests.PreparedRequest:
+            """复用 requests 真实 prepare 逻辑。"""
+
+            return diag.requests.sessions.Session().prepare_request(request)
+
+        def send(
+            self,
+            prepared: diag.requests.PreparedRequest,
+            *,
+            timeout: float,
+            allow_redirects: bool,
+        ) -> FakeResponse:
+            """返回固定响应。"""
+
+            assert prepared.url == "http://127.0.0.1:43117/fixture.pdf"
+            assert timeout == 1.0
+            assert allow_redirects is True
+            return FakeResponse()
+
+        def close(self) -> None:
+            """关闭测试 session。"""
+
+            return
+
+    monkeypatch.setattr(diag.requests, "Session", FakeSession)
+
+    profile = diag._build_requests_profile(
+        "http://127.0.0.1:43117/fixture.pdf",
+        timeout_seconds=1.0,
+        allow_private_network_url=True,
+    )
+    result = _object_value(profile["result"])
+
+    assert result["content_type"] == "application/pdf"
+    assert result["content_length"] == len(b"%PDF fixture bytes")
+    assert result["text_length"] == len("decoded")
+
+
 def test_comparison_bucket_matrix() -> None:
     """synthetic profile payload 应进入稳定 comparison bucket。"""
 
@@ -1097,6 +1153,13 @@ def _fake_fetch_profile(url: str, options: diag.CliOptions) -> JsonObject:
         playwright_sampled=False,
         playwright_ok=False,
     )["fetch_web_page_profile"])
+
+
+def _object_value(value: JsonValue) -> JsonObject:
+    """把 JSON 值收窄为 JSON 对象。"""
+
+    assert isinstance(value, Mapping)
+    return {str(key): item for key, item in value.items()}
 
 
 def _fake_playwright_profile(url: str, options: diag.CliOptions) -> JsonObject:

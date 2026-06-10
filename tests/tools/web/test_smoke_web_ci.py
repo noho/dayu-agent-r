@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import sys
+import contextlib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Iterator, cast
 
 import pytest
 
@@ -49,33 +50,74 @@ def test_not_opted_in_writes_skipped_summary_and_does_not_call_runner(
     assert _object_value(skips[0])["bucket"] == "not_opted_in"
 
 
-def test_opted_in_without_local_cases_reports_slice3_fixture_skip(
+def test_local_fixture_urls_and_pdf_fixture_are_stable() -> None:
+    """本地 fixture URL 与 PDF 文本 fixture 应稳定可测。"""
+
+    urls = smoke._local_fixture_urls(43117)
+    pdf_bytes = smoke._pdf_fixture_bytes()
+
+    assert urls.html_url == "http://127.0.0.1:43117/index.html"
+    assert urls.pdf_url == "http://127.0.0.1:43117/fixture.pdf"
+    assert b"Dayu Web Smoke PDF" in pdf_bytes
+    assert b"This PDF verifies Docling conversion." in pdf_bytes
+    assert smoke.PDF_FETCH_MIN_CHARS >= 20
+
+
+def test_opted_in_runs_local_html_and_pdf_cases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Slice 2 opt-in 后暂无 local fixture 时，summary 必须显式说明 Slice 3 接入。"""
+    """opt-in 后必须运行 local HTML 与 PDF cases。"""
 
     monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
+    html_url = "http://127.0.0.1:43117/index.html"
+    pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    called_commands: list[Sequence[str]] = []
 
-    def raising_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
-        """未提供 external URL 时不应触发 diagnostics runner。"""
+    @contextlib.contextmanager
+    def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
+        """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
 
-        raise AssertionError(f"runner should not be called: {command}")
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
 
-    monkeypatch.setattr(smoke, "_run_diagnostic_command", raising_runner)
+    def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
+        """写入 synthetic local diagnostics artifact 并记录命令。"""
 
-    exit_code = smoke.main(["--output-dir", str(tmp_path), "--run-label", "slice2-no-local"])
+        called_commands.append(command)
+        url = _command_value(command, "--url")
+        output = Path(_command_value(command, "--output"))
+        if url == html_url:
+            _write_payload(output, _diagnostic_payload(url=url))
+        elif url == pdf_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    content_type="application/pdf",
+                    raw_length=512,
+                    fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                    docling_invoked=True,
+                    docling_completed=True,
+                ),
+            )
+        else:
+            raise AssertionError(f"unexpected url: {url}")
+        return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
+    monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
+
+    exit_code = smoke.main(["--output-dir", str(tmp_path), "--run-label", "slice3-local"])
 
     summary = _load_json_object(tmp_path / "summary.json")
     assert exit_code == 0
-    assert summary["status"] == "skipped"
+    assert summary["status"] == "passed"
     assert summary["exit_code"] == 0
-    assert _list_field(summary, "local_cases") == []
-    skips = _list_field(summary, "skips")
-    assert len(skips) == 1
-    skip = _object_value(skips[0])
-    assert skip["bucket"] == "local_fixture_attached_by_slice3"
-    assert "Slice 3" in str(skip["reason"])
+    local_cases = _list_field(summary, "local_cases")
+    assert [str(_object_value(item)["case_kind"]) for item in local_cases] == ["local_html", "local_pdf"]
+    assert len(called_commands) == 2
+    assert all("--allow-private-network-url" in command for command in called_commands)
+    assert all("--skip-playwright" in command for command in called_commands)
 
 
 def test_synthetic_diagnostics_results_map_to_pass_fail_skip_diagnostic_only_and_schema_gap(
@@ -127,6 +169,28 @@ def test_synthetic_diagnostics_results_map_to_pass_fail_skip_diagnostic_only_and
     assert schema_gap.bucket == "diagnostic_schema_gap"
     assert schema_gap.exit_code == 2
 
+    pdf_pass_path = tmp_path / "pdf-pass.json"
+    _write_payload(
+        pdf_pass_path,
+        _diagnostic_payload(
+            url="http://127.0.0.1/fixture.pdf",
+            content_type="application/pdf",
+            raw_length=512,
+            fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+            docling_invoked=True,
+            docling_completed=True,
+        ),
+    )
+    pdf_pass = smoke._classify_child_result(
+        case_name="local-pdf",
+        case_kind="local_pdf",
+        fallback_url="http://127.0.0.1/fixture.pdf",
+        artifact_path=pdf_pass_path,
+        child_result=smoke.DiagnosticChildResult(returncode=0, stdout="", stderr=""),
+    )
+    assert pdf_pass.status == "passed"
+    assert pdf_pass.exit_code == 0
+
     pdf_skip_path = tmp_path / "pdf-skip.json"
     _write_payload(
         pdf_skip_path,
@@ -169,6 +233,208 @@ def test_synthetic_diagnostics_results_map_to_pass_fail_skip_diagnostic_only_and
     assert external.status == "diagnostic_only"
     assert external.bucket == "all_failed"
     assert external.exit_code == 0
+
+
+def test_pdf_payload_failures_are_not_misclassified_as_pass(tmp_path: Path) -> None:
+    """PDF content-type、内容长度与 Docling evidence 缺口必须失败。"""
+
+    cases: list[tuple[str, JsonObject, str]] = [
+        (
+            "non-pdf-content-type",
+            _diagnostic_payload(
+                url="http://127.0.0.1/fixture.pdf",
+                content_type="text/html",
+                raw_length=512,
+                fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                docling_invoked=True,
+                docling_completed=True,
+            ),
+            "pdf_content_type_failure",
+        ),
+        (
+            "short-fetch-content",
+            _diagnostic_payload(
+                url="http://127.0.0.1/fixture.pdf",
+                content_type="application/pdf",
+                raw_length=512,
+                fetch_length=smoke.PDF_FETCH_MIN_CHARS - 1,
+                docling_invoked=True,
+                docling_completed=True,
+            ),
+            "pdf_content_length_failure",
+        ),
+        (
+            "empty-raw-response-bytes",
+            _diagnostic_payload(
+                url="http://127.0.0.1/fixture.pdf",
+                content_type="application/pdf",
+                raw_length=0,
+                fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                docling_invoked=True,
+                docling_completed=True,
+            ),
+            "pdf_content_length_failure",
+        ),
+        (
+            "missing-docling-evidence",
+            _payload_without_docling_evidence(
+                _diagnostic_payload(
+                    url="http://127.0.0.1/fixture.pdf",
+                    content_type="application/pdf",
+                    raw_length=512,
+                    fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                    docling_invoked=True,
+                    docling_completed=True,
+                )
+            ),
+            "diagnostic_schema_gap",
+        ),
+        (
+            "docling-invocation-not-completed",
+            _diagnostic_payload(
+                url="http://127.0.0.1/fixture.pdf",
+                content_type="application/pdf",
+                raw_length=512,
+                fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                docling_invoked=True,
+                docling_completed=False,
+                docling_init_error=False,
+                stream_name="page.pdf",
+            ),
+            "pdf_docling_invocation_failure",
+        ),
+        (
+            "wrong-stream-name",
+            _diagnostic_payload(
+                url="http://127.0.0.1/fixture.pdf",
+                content_type="application/pdf",
+                raw_length=512,
+                fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                docling_invoked=True,
+                docling_completed=True,
+                stream_name="fixture.bin",
+            ),
+            "pdf_docling_invocation_failure",
+        ),
+    ]
+
+    for case_name, payload, expected_bucket in cases:
+        artifact_path = tmp_path / f"{case_name}.json"
+        _write_payload(artifact_path, payload)
+        result = smoke._classify_child_result(
+            case_name="local-pdf",
+            case_kind="local_pdf",
+            fallback_url="http://127.0.0.1/fixture.pdf",
+            artifact_path=artifact_path,
+            child_result=smoke.DiagnosticChildResult(returncode=0, stdout="", stderr=""),
+        )
+        assert result.status == "failed"
+        assert result.bucket == expected_bucket
+
+
+def test_docling_skip_only_skips_pdf_and_does_not_hide_html_failure(tmp_path: Path) -> None:
+    """Docling init evidence 只能 skip PDF，不能掩盖 HTML failure。"""
+
+    html_failure = smoke.SmokeCaseResult(
+        case_name="local-html",
+        case_kind="local_html",
+        url="http://127.0.0.1/index.html",
+        status="failed",
+        bucket="local_fetch_failure",
+        evidence_path=str(tmp_path / "html.json"),
+        suggested_next_step="检查 HTML fetch。",
+        reason="",
+        exit_code=1,
+    )
+    pdf_skip = smoke.SmokeCaseResult(
+        case_name="local-pdf",
+        case_kind="local_pdf",
+        url="http://127.0.0.1/fixture.pdf",
+        status="skipped",
+        bucket="docling_runtime_initialization_error",
+        evidence_path=str(tmp_path / "pdf.json"),
+        suggested_next_step="安装或修复 Docling runtime 后重跑 opt-in smoke。",
+        reason="Docling init failure.",
+        exit_code=0,
+    )
+
+    summary = smoke._summary_from_cases(
+        run_label="html-failure-pdf-skip",
+        output_dir=tmp_path,
+        local_cases=(html_failure, pdf_skip),
+        external_cases=(),
+    )
+
+    assert summary.status == "failed"
+    assert summary.exit_code == 1
+    assert len(summary.failures) == 1
+    assert len(summary.skips) == 1
+
+
+def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PDF fetch 成功但缺 invocation evidence 时应写 blocker 并停止 external。"""
+
+    html_url = "http://127.0.0.1:43117/index.html"
+    pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    external_file = tmp_path / "urls.txt"
+    external_file.write_text("https://example.com/external\n", encoding="utf-8")
+    called_urls: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
+        """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
+
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+
+    def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
+        """写入 local diagnostics artifact 并拒绝 external 调用。"""
+
+        url = _command_value(command, "--url")
+        called_urls.append(url)
+        output = Path(_command_value(command, "--output"))
+        if url == html_url:
+            _write_payload(output, _diagnostic_payload(url=url))
+        elif url == pdf_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    content_type="application/pdf",
+                    raw_length=512,
+                    fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                    docling_invoked=False,
+                    docling_completed=False,
+                ),
+            )
+        else:
+            raise AssertionError(f"external should not run after blocker: {url}")
+        return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
+    options = smoke.SmokeOptions(
+        run_live=True,
+        output_dir=tmp_path,
+        request_timeout=1.0,
+        tool_timeout_budget=1.0,
+        include_playwright=False,
+        external_url_file=external_file,
+        external_limit=1,
+        diagnostic_only_external=True,
+        run_label="blocker",
+    )
+
+    summary = smoke._execute_smoke(options=options, runner=fake_runner)
+
+    blocker_path = tmp_path / "blockers" / "local-pdf-docling-invocation-blocker.md"
+    assert called_urls == [html_url, pdf_url]
+    assert summary.status == "failed"
+    assert summary.exit_code == 1
+    assert summary.external_cases == ()
+    assert blocker_path.is_file()
+    assert "不能用 content-type" in blocker_path.read_text(encoding="utf-8")
 
 
 def test_summary_exit_code_prefers_schema_gap_over_local_failure(tmp_path: Path) -> None:
@@ -262,6 +528,8 @@ def test_external_limit_and_summary_paths_are_predictable(
     """external-limit 应限制 runner 调用次数，summary 路径应固定在 output-dir 下。"""
 
     monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
+    html_url = "http://127.0.0.1:43117/index.html"
+    pdf_url = "http://127.0.0.1:43117/fixture.pdf"
     url_file = tmp_path / "urls.jsonl"
     url_file.write_text(
         "\n".join(
@@ -277,15 +545,37 @@ def test_external_limit_and_summary_paths_are_predictable(
     output_dir = tmp_path / "out"
     called_urls: list[str] = []
 
+    @contextlib.contextmanager
+    def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
+        """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
+
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+
     def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """写入 synthetic diagnostics artifact 并记录 URL。"""
 
         url = _command_value(command, "--url")
         output = Path(_command_value(command, "--output"))
-        called_urls.append(url)
-        _write_payload(output, _diagnostic_payload(url=url, comparison_bucket="all_failed"))
+        if url == html_url:
+            _write_payload(output, _diagnostic_payload(url=url))
+        elif url == pdf_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    content_type="application/pdf",
+                    raw_length=512,
+                    fetch_length=smoke.PDF_FETCH_MIN_CHARS,
+                    docling_invoked=True,
+                    docling_completed=True,
+                ),
+            )
+        else:
+            called_urls.append(url)
+            _write_payload(output, _diagnostic_payload(url=url, comparison_bucket="all_failed"))
         return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
 
+    monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
 
     exit_code = smoke.main(
@@ -304,12 +594,11 @@ def test_external_limit_and_summary_paths_are_predictable(
     summary = _load_json_object(output_dir / "summary.json")
     assert exit_code == 0
     assert called_urls == ["https://example.com/a", "https://example.com/b"]
-    assert summary["status"] == "diagnostic_only"
+    assert summary["status"] == "passed"
     assert summary["output_dir"] == str(output_dir)
+    assert len(_list_field(summary, "local_cases")) == 2
     assert len(_list_field(summary, "external_cases")) == 2
-    skips = _list_field(summary, "skips")
-    assert len(skips) == 1
-    assert _object_value(skips[0])["bucket"] == "local_fixture_attached_by_slice3"
+    assert _list_field(summary, "skips") == []
     assert (output_dir / "summary.md").is_file()
 
 
@@ -325,12 +614,13 @@ def _diagnostic_payload(
     docling_completed: bool = False,
     docling_init_error: bool = False,
     comparison_bucket: str = "all_success",
+    stream_name: str = "page.pdf",
 ) -> JsonObject:
     """构造 synthetic diagnostics artifact。"""
 
     evidence: JsonObject = {
         "invoked": docling_invoked,
-        "stream_name": "page.pdf" if docling_invoked else "",
+        "stream_name": stream_name if docling_invoked else "",
         "raw_bytes_length": raw_length if docling_invoked else None,
         "target_module": "dayu.tools.web.web_tools",
         "target_function": "_docling_convert_to_markdown",
@@ -380,6 +670,19 @@ def _write_payload(path: Path, payload: Mapping[str, JsonValue]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _payload_without_docling_evidence(payload: JsonObject) -> JsonObject:
+    """移除 synthetic payload 中的 Docling evidence 字段。"""
+
+    copied = dict(payload)
+    copied.pop("docling_conversion_invocation_evidence", None)
+    fetch_profile = copied.get("fetch_web_page_profile")
+    assert isinstance(fetch_profile, Mapping)
+    copied_fetch_profile = {str(key): value for key, value in fetch_profile.items()}
+    copied_fetch_profile.pop("docling_conversion_invocation_evidence", None)
+    copied["fetch_web_page_profile"] = copied_fetch_profile
+    return copied
 
 
 def _load_json_object(path: Path) -> JsonObject:
