@@ -15,11 +15,12 @@
     -> docling 转换 -> playwright fallback -> URL 安全检查), 各工具
     函数互相依赖. Playwright 子系统虽有 330 行, 但深度嵌入 fetch 的
     重试/fallback 逻辑, 拆分会引入大量参数传递. 外部仅消费
-    register_web_tools 一个符号.
+    build_web_tool_definitions 一个符号.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import ipaddress
 import logging
@@ -30,7 +31,8 @@ import ssl
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import NoReturn, Optional, TypeAlias, TypedDict, cast
+from datetime import UTC, datetime
+from typing import Final, NoReturn, Optional, TypeAlias, TypedDict, cast
 from urllib.parse import quote, urlparse
 
 import requests
@@ -39,12 +41,18 @@ from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_call import BatchToolExecutionContext
-from dayu.contracts.tool_schema import ToolSchema, ToolTruncateSpec, ToolTruncationStrategy
+from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
+from dayu.contracts.tool_declaration import ToolDefinition, tool
+from dayu.contracts.tool_outcome import ToolExecutionOutcome
+from dayu.contracts.tool_schema import ToolParametersSchema, ToolTruncateSpec, ToolTruncationStrategy
 from dayu.documents.processors.html_pipeline import HtmlPipelineStageError, convert_html_to_llm_markdown
-from dayu.tools._legacy_adapter.registry_collector import LegacySyncToolCallable, LegacyToolDeclarationCollector
-from dayu.tools._legacy_adapter.tool_decorator import tool
-from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError as _AdapterToolBusinessError
+from dayu.runtime.tool_call_projection import (
+    ToolArgumentValidationFailure,
+    completed_outcome,
+    failed_outcome,
+    host_cancelled_outcome,
+    validate_and_project_arguments,
+)
 
 from . import web_fetch_orchestrator as _web_fetch_orchestrator
 from . import web_playwright_backend as _web_playwright_backend
@@ -89,7 +97,12 @@ from .web_recovery import (
     normalize_next_action,
     normalize_reason,
 )
-from .web_search_providers import SearchWebOutput, search_public_web
+from .web_search_providers import (
+    SearchWebOutput,
+    WebSearchCancelledError,
+    WebSearchProviderUnavailableError,
+    search_public_web,
+)
 
 MODULE = "ENGINE.WEB_TOOLS"
 _LOGGER = logging.getLogger(__name__)
@@ -122,6 +135,26 @@ _DEFAULT_SEC_CH_UA_PLATFORM = '"macOS"'
 
 _RESPONSE_SNIPPET_MAX_CHARS = 500
 _EMPTY_CONTENT_MIN_CHARS = 5
+_SEARCH_WEB_TOOL_NAME: Final[str] = "search_web"
+_FETCH_WEB_PAGE_TOOL_NAME: Final[str] = "fetch_web_page"
+_WEB_TOOL_TAGS: Final[tuple[str, ...]] = ("web",)
+_SEARCH_WEB_DEFAULT_MAX_RESULTS: Final[int] = 8
+_SEARCH_TRUNCATE_ITEMS: Final[int] = 10
+_FETCH_WEB_PAGE_PARAMETERS: Final[ToolParametersSchema] = ToolParametersSchema(
+    type="object",
+    properties={
+        "url": {
+            "type": "string",
+        },
+    },
+    required=("url",),
+    additional_properties=False,
+)
+_SEARCH_PROVIDER_UNAVAILABLE_ERROR: Final[str] = "search_provider_unavailable"
+_SEARCH_PROVIDER_UNAVAILABLE_HINT: Final[str] = (
+    "[retry_later_or_use_known_source] Search providers are currently unavailable; "
+    "retry later, refine the query, or continue with a known source URL."
+)
 
 
 WebPayload: TypeAlias = dict[str, JsonValue]
@@ -129,6 +162,30 @@ WebMapping: TypeAlias = Mapping[str, JsonValue]
 StagePayload: TypeAlias = dict[str, str | bool | int | float | None]
 ContentProbePayload: TypeAlias = dict[str, str | bool | int | None]
 _FetchContentRuntimeContext = _web_fetch_orchestrator._FetchContentRuntimeContext
+
+
+@dataclass(frozen=True, slots=True)
+class WebToolsConfig:
+    """Web 工具 provider 配置。
+
+    :param provider: 搜索 provider 策略。
+    :param request_timeout_seconds: HTTP 请求超时秒数。
+    :param max_search_results: 搜索最大返回条数。
+    :param fetch_truncate_chars: 抓取正文截断声明字符数。
+    :param allow_private_network_url: 是否允许内网 / 本地 URL。
+    :param playwright_channel: Playwright fallback 使用的浏览器 channel。
+    :param playwright_storage_state_dir: Playwright storage state 目录。
+    :returns: dataclass 实例本身。
+    :raises Exception: 构造期不主动抛出异常。
+    """
+
+    provider: str = "auto"
+    request_timeout_seconds: float = 12.0
+    max_search_results: int = 20
+    fetch_truncate_chars: int = 80_000
+    allow_private_network_url: bool = False
+    playwright_channel: str | None = "chrome"
+    playwright_storage_state_dir: str = ""
 
 
 class _FetchContentResult(TypedDict, total=False):
@@ -203,7 +260,7 @@ class Log:
 
         Args:
             message: 日志正文。
-            module: OLD 模块标签。
+            module: 模块标签。
 
         Returns:
             无。
@@ -220,7 +277,7 @@ class Log:
 
         Args:
             message: 日志正文。
-            module: OLD 模块标签。
+            module: 模块标签。
 
         Returns:
             无。
@@ -232,8 +289,8 @@ class Log:
         _LOGGER.debug("[%s] %s", module or MODULE, message)
 
 
-class ToolBusinessError(_AdapterToolBusinessError):
-    """适配 OLD Web 工具扩展诊断参数的业务错误。
+class ToolBusinessError(Exception):
+    """Web 工具业务错误。
 
     Args:
         code: 错误码。
@@ -280,35 +337,37 @@ class ToolBusinessError(_AdapterToolBusinessError):
             无。
         """
 
-        extra: WebPayload = {
-            "url": url,
-            "next_action": next_action,
-            "internal_diagnostics": internal_diagnostics or {},
-        }
-        if http_status is not None:
-            extra["http_status"] = http_status
-        super().__init__(code=code, message=message, hint=hint, extra=extra)
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+        self.url = url
+        self.next_action = next_action
+        self.http_status = http_status
+        self.internal_diagnostics = internal_diagnostics or {}
 
 
-ToolParts: TypeAlias = tuple[str, LegacySyncToolCallable, ToolSchema]
+class WebToolCancelledError(Exception):
+    """Web 工具观察到 Host 取消时的模块内异常。
 
-
-def _build_registered_tool_parts(
-    tool_func: LegacySyncToolCallable,
-) -> ToolParts:
-    """提取带 decorator 元数据的工具三元组。
-
-    Args:
-        tool_func: 已经过 ``@tool`` 装饰的工具函数。
-
-    Returns:
-        ``(tool_name, tool_callable, tool_schema)`` 三元组。
-
-    Raises:
-        无。
+    :param message: 面向 LLM 的取消说明。
+    :param hint: 恢复提示。
+    :returns: 无。
+    :raises Exception: 构造期不主动抛出异常。
     """
 
-    return tool_func.__tool_name__, tool_func, tool_func.__tool_schema__
+    def __init__(self, message: str, hint: str) -> None:
+        """初始化取消异常。
+
+        :param message: 取消说明。
+        :param hint: 恢复提示。
+        :returns: ``None``。
+        :raises Exception: 构造期不主动抛出异常。
+        """
+
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
 
 
 _FetchContentConversionError = _web_fetch_orchestrator._FetchContentConversionError
@@ -476,7 +535,7 @@ def _is_timeout_like_exception(error: BaseException) -> bool:
 
 
 def _raise_fetch_cancelled(cancellation_token: CancellationToken | None) -> NoReturn:
-    """将工具取消投影为 Web 业务错误。
+    """将工具取消投影为 Web 模块内取消信号。
 
     Args:
         cancellation_token: 当前工具调用取消令牌。
@@ -485,17 +544,18 @@ def _raise_fetch_cancelled(cancellation_token: CancellationToken | None) -> NoRe
         无。
 
     Raises:
-        ToolBusinessError: 当前调用已取消时抛出。
+        WebToolCancelledError: 当前调用已取消时抛出。
     """
 
     reason = "工具调用已取消"
     if cancellation_token is not None:
         reason = cancellation_token.cancel_reason() or reason
-    raise ToolBusinessError(
-        code="tool_cancelled",
+    raise WebToolCancelledError(
         message=reason,
-        hint="[continue_without_web] The host cancelled this web fetch; continue without this page unless the user asks to retry.",
-        next_action=NEXT_ACTION_CONTINUE_WITHOUT_WEB,
+        hint=(
+            "[continue_without_web] The host cancelled this web fetch; "
+            "continue without this page unless the user asks to retry."
+        ),
     )
 
 
@@ -588,17 +648,7 @@ def _build_text_excerpt(text: str) -> str:
     return normalized[:_RESPONSE_SNIPPET_MAX_CHARS]
 
 
-def _resolve_execution_cancellation_token(
-    execution_context: BatchToolExecutionContext | None,
-) -> CancellationToken | None:
-    """从 execution context 中提取取消令牌。"""
-
-    if execution_context is None:
-        return None
-    return execution_context.cancellation_token
-
-
-def _raise_if_tool_cancelled(cancellation_token: CancellationToken | None) -> None:
+def _raise_if_host_cancelled(cancellation_token: CancellationToken | None) -> None:
     """在进入新的联网阶段前执行协作式取消检查。"""
 
     if cancellation_token is not None:
@@ -632,7 +682,7 @@ def _try_playwright_fallback(
         成功时返回标准化后的抓取结果；失败时返回 `None`。
 
     Raises:
-        无。
+        WebToolCancelledError: Playwright 执行期间 Host 取消时抛出。
     """
 
     try:
@@ -925,105 +975,101 @@ def _log_fetch_diagnostics(payload: WebMapping) -> None:
     Log.debug(f"fetch_web_page diagnostics={payload}", module=MODULE)
 
 
-@dataclass(frozen=True)
-class WebProviderConfig:
-    """联网检索 Provider 配置。
+def build_web_tool_definitions(config: WebToolsConfig) -> tuple[ToolDefinition, ...]:
+    """构造 Web 原生工具定义。
 
-    Args:
-        provider: provider 名称。
-
-    Returns:
-        无。
-
-    Raises:
-        无。
+    :param config: Web provider 配置。
+    :returns: ``search_web`` 与 ``fetch_web_page`` 的 current 工具定义。
+    :raises Exception: 工具 schema 或 truncate 声明构造失败时透出。
     """
 
-    provider: str
+    provider_lock = asyncio.Lock()
 
-
-def register_web_tools(
-    registry: LegacyToolDeclarationCollector,
-    *,
-    provider: str = "auto",
-    request_timeout_seconds: float = 12.0,
-    max_search_results: int = 20,
-    fetch_truncate_chars: int = 80000,
-    allow_private_network_url: bool = False,
-    playwright_channel: str | None = "chrome",
-    playwright_storage_state_dir: str = "",
-    timeout_budget: float | None = None,
-) -> None:
-    """向工具注册表注册联网检索工具。
-
-    Args:
-        registry: 工具注册表实例。
-        provider: Provider 选择策略，支持 ``auto``、``tavily``、``serper``、``duckduckgo``。
-        request_timeout_seconds: HTTP 请求超时秒数（搜索与网页下载共用）。
-        max_search_results: search_web 返回结果数量上限。
-        fetch_truncate_chars: fetch_web_page 内容截断字符上限。
-        allow_private_network_url: 是否允许访问内网/本地网络 URL。
-        playwright_channel: 浏览器回退使用的 Chromium channel；空字符串表示不指定。
-        playwright_storage_state_dir: 浏览器回退可选 storage state 目录；目录内按 host 自动查找 `<host>.json`。
-        timeout_budget: Runner 为单次 tool call 提供的预算秒数。
-
-    Returns:
-        无。
-
-    Raises:
-        ValueError: 当 provider 非法时抛出。
-    """
-    name_search, func_search, schema_search = _create_search_web_tool(
-        registry,
-        provider=provider,
-        request_timeout_seconds=request_timeout_seconds,
-        max_search_results=max_search_results,
-        allow_private_network_url=allow_private_network_url,
-        timeout_budget=timeout_budget,
+    @tool(
+        name=_SEARCH_WEB_TOOL_NAME,
+        description="搜索公开网页来源。",
+        parameters=_build_search_web_parameters(config.max_search_results),
+        tags=_WEB_TOOL_TAGS,
+        display_name="联网搜索",
+        truncate=ToolTruncateSpec(
+            enabled=True,
+            strategy=ToolTruncationStrategy.LIST_ITEMS,
+            limits={"max_items": _SEARCH_TRUNCATE_ITEMS},
+            target_field="results",
+            field_path=None,
+            ttl_seconds=None,
+        ),
     )
-    registry.register(name_search, func_search, schema_search)
-    name_fetch, func_fetch, schema_fetch = _create_fetch_web_page_tool(
-        registry,
-        request_timeout_seconds=request_timeout_seconds,
-        fetch_truncate_chars=fetch_truncate_chars,
-        allow_private_network_url=allow_private_network_url,
-        playwright_channel=playwright_channel,
-        playwright_storage_state_dir=playwright_storage_state_dir,
-        timeout_budget=timeout_budget,
+    async def search_web(
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """执行单次联网搜索工具调用。
+
+        :param call: 当前工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 工具执行 outcome。
+        :raises Exception: 不主动抛出异常；预期业务异常在本边界内转为 outcome。
+        """
+
+        return await _call_search_web(
+            call=call,
+            context=context,
+            config=config,
+            provider_lock=provider_lock,
+        )
+
+    @tool(
+        name=_FETCH_WEB_PAGE_TOOL_NAME,
+        description=(
+            "抓取网页正文并转成 Markdown。失败时先看 hint 和 next_action，再决定重试、换来源或忽略当前网页。"
+        ),
+        parameters=_FETCH_WEB_PAGE_PARAMETERS,
+        tags=_WEB_TOOL_TAGS,
+        display_name="抓取网页",
+        truncate=ToolTruncateSpec(
+            enabled=True,
+            strategy=ToolTruncationStrategy.TEXT_CHARS,
+            limits={"max_chars": config.fetch_truncate_chars},
+            target_field="content",
+            field_path=None,
+            ttl_seconds=None,
+        ),
     )
-    registry.register(name_fetch, func_fetch, schema_fetch)
-    Log.verbose(f"已注册 2 个联网工具 provider={provider}", module=MODULE)
+    async def fetch_web_page(
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """执行单次网页抓取工具调用。
+
+        :param call: 当前工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 工具执行 outcome。
+        :raises Exception: 不主动抛出异常；预期业务异常在本边界内转为 outcome。
+        """
+
+        return await _call_fetch_web_page(
+            call=call,
+            context=context,
+            config=config,
+            provider_lock=provider_lock,
+        )
+
+    Log.verbose(f"已注册 2 个联网工具 provider={config.provider}", module=MODULE)
+    return (search_web, fetch_web_page)
 
 
-def _create_search_web_tool(
-    registry: LegacyToolDeclarationCollector,
-    *,
-    provider: str,
-    request_timeout_seconds: float,
-    max_search_results: int,
-    allow_private_network_url: bool = False,
-    timeout_budget: float | None = None,
-) -> ToolParts:
-    """创建 `search_web` 工具。
+def _build_search_web_parameters(max_search_results: int) -> ToolParametersSchema:
+    """构造 ``search_web`` 参数 schema。
 
-    Args:
-        registry: 工具注册表实例。
-        provider: Provider 策略。
-        request_timeout_seconds: HTTP 请求超时秒数（闭包传入）。
-        max_search_results: 结果数量上限（闭包传入，同时影响 schema 约束）。
-        allow_private_network_url: 是否允许访问内网/本地网络 URL。
-        timeout_budget: Runner 为单次 tool call 提供的预算秒数（闭包传入）。
-
-    Returns:
-        `(tool_name, tool_callable, tool_schema)` 三元组。
-
-    Raises:
-        ValueError: 当 provider 非法时抛出。
+    :param max_search_results: 当前 provider 允许的搜索结果上限。
+    :returns: current 工具参数 schema。
+    :raises Exception: schema 构造失败时透出。
     """
 
-    parameters: WebPayload = {
-        "type": "object",
-        "properties": {
+    return ToolParametersSchema(
+        type="object",
+        properties={
             "query": {
                 "type": "string",
                 "description": "检索关键词。直接写你最自然的查询。",
@@ -1045,375 +1091,572 @@ def _create_search_web_tool(
                 "description": f"返回结果上限。只在你明确需要更少结果时调整；最大值 {max_search_results}。",
             },
         },
-        "required": ["query"],
-    }
-
-    @tool(
-        registry,
-        name="search_web",
-        description=(
-            "搜索公开网页来源。"
-        ),
-        parameters=parameters,
-        tags=("web",),
-        execution_context_param_name="execution_context",
-        display_name="联网搜索",
-        summary_params=["query"],
-        truncate=ToolTruncateSpec(
-            enabled=True,
-            strategy=ToolTruncationStrategy.LIST_ITEMS,
-            limits={"max_items": 10},
-            target_field="results",
-            field_path=None,
-            ttl_seconds=None,
-        ),
+        required=("query",),
+        additional_properties=False,
     )
-    def search_web(
-        query: str,
-        domains: Optional[list[str]] = None,
-        recency_days: Optional[int] = None,
-        max_results: int = 8,
-        execution_context: BatchToolExecutionContext | None = None,
-    ) -> SearchWebOutput:
-        """联网检索公开网页。
-
-        Args:
-            query: 检索关键词。
-            domains: 可选域名过滤。
-            recency_days: 可选最近天数过滤。
-            max_results: 返回结果上限。
-            execution_context: 当前工具调用执行上下文。
-
-        Returns:
-            检索结果字典。
-
-        Raises:
-            ValueError: 当参数非法时抛出。
-            RuntimeError: 当所有 provider 均失败时抛出。
-        """
-
-        cancellation_token = _resolve_execution_cancellation_token(execution_context)
-        _raise_if_tool_cancelled(cancellation_token)
-
-        return search_public_web(
-            query=query,
-            domains=domains,
-            recency_days=recency_days,
-            max_results=max_results,
-            max_search_results=max_search_results,
-            provider=provider,
-            request_timeout_seconds=request_timeout_seconds,
-            timeout_budget=timeout_budget,
-            deadline_monotonic=_compute_deadline_monotonic(timeout_budget),
-            allow_private_network_url=allow_private_network_url,
-            is_safe_public_url=_is_safe_public_url,
-            normalize_whitespace=_normalize_whitespace,
-            resolve_timeout_budget=_resolve_timeout_budget,
-            cancellation_token=cancellation_token,
-        )
-
-    return _build_registered_tool_parts(search_web)
 
 
-def _create_fetch_web_page_tool(
-    registry: LegacyToolDeclarationCollector,
+async def _call_search_web(
     *,
-    request_timeout_seconds: float,
-    fetch_truncate_chars: int,
-    allow_private_network_url: bool = False,
-    playwright_channel: str | None = "chrome",
-    playwright_storage_state_dir: str = "",
-    timeout_budget: float | None = None,
-) -> ToolParts:
-    """创建 `fetch_web_page` 工具。
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+    config: WebToolsConfig,
+    provider_lock: asyncio.Lock,
+) -> ToolExecutionOutcome:
+    """执行 search_web callable 外壳。
 
-    Args:
-        registry: 工具注册表实例。
-        request_timeout_seconds: HTTP 下载超时秒数（闭包传入）。
-        fetch_truncate_chars: 内容截断字符上限（闭包传入）。
-        allow_private_network_url: 是否允许访问内网/本地网络 URL。
-        playwright_channel: 浏览器回退使用的 Chromium channel（闭包传入）。
-        playwright_storage_state_dir: 浏览器回退可选 storage state 目录（闭包传入，目录内按 host 自动查找 `<host>.json`）。
-        timeout_budget: Runner 为单次 tool call 提供的预算秒数（闭包传入）。
-
-    Returns:
-        `(tool_name, tool_callable, tool_schema)` 三元组。
-
-    Raises:
-        无。
+    :param call: 当前工具调用请求。
+    :param context: 执行上下文。
+    :param config: Web provider 配置。
+    :param provider_lock: 当前 provider 共享串行锁。
+    :returns: 工具执行 outcome。
+    :raises Exception: 不主动抛出异常。
     """
 
-    parameters: WebPayload = {
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string"
-            },
-        },
-        "required": ["url"],
-    }
-
-    @tool(
-        registry,
-        name="fetch_web_page",
-        description=(
-            "抓取网页正文并转成 Markdown。失败时先看 hint 和 next_action，再决定重试、换来源或忽略当前网页。"
-        ),
-        parameters=parameters,
-        tags=("web",),
-        execution_context_param_name="execution_context",
-        display_name="抓取网页",
-        summary_params=["url"],
-        truncate=ToolTruncateSpec(
-            enabled=True,
-            strategy=ToolTruncationStrategy.TEXT_CHARS,
-            limits={"max_chars": fetch_truncate_chars},
-            target_field="content",
-            field_path=None,
-            ttl_seconds=None,
-        ),
+    started_at = datetime.now(UTC)
+    validation = validate_and_project_arguments(
+        call=call,
+        tool_name=_SEARCH_WEB_TOOL_NAME,
+        schema=_build_search_web_parameters(config.max_search_results),
     )
-    def fetch_web_page(
-        url: str,
-        execution_context: BatchToolExecutionContext | None = None,
-    ) -> WebPayload:
-        """抓取网页正文并转换为低噪音 Markdown。
+    if isinstance(validation, ToolArgumentValidationFailure):
+        return _validation_failed_outcome(
+            tool_name=_SEARCH_WEB_TOOL_NAME,
+            validation=validation,
+            started_at=started_at,
+        )
 
-        Args:
-            url: 网页链接。
-            execution_context: 当前工具调用执行上下文。
+    cancellation_token = context.cancellation_token
+    if cancellation_token.is_cancelled():
+        return _host_cancelled_from_token(
+            tool_name=_SEARCH_WEB_TOOL_NAME,
+            token=cancellation_token,
+            started_at=started_at,
+            hint=(
+                "[continue_without_web] The host cancelled this web search; "
+                "continue without this web search unless the user asks to retry."
+            ),
+        )
 
-        Returns:
-            抓取结果字典（不含 ``ok`` 字段，由当前 adapter 投影为成功 outcome）。
+    arguments = validation.arguments
+    query = _required_string_argument(arguments, "query")
+    domains = _optional_string_list_argument(arguments, "domains")
+    recency_days = _optional_int_argument(arguments, "recency_days")
+    max_results = (
+        _optional_int_argument(arguments, "max_results")
+        or _SEARCH_WEB_DEFAULT_MAX_RESULTS
+    )
 
-            成功时包含 ``url/final_url/title/content/fetch_backend``。
-
-        Raises:
-            ToolBusinessError: 当抓取失败时抛出（含 error_code/message/hint）。
-        """
-
-        cancellation_token = _resolve_execution_cancellation_token(execution_context)
-        _raise_if_tool_cancelled(cancellation_token)
-
-        if not _is_safe_public_url(url, allow_private_network_url=allow_private_network_url):
-            _raise_fetch_failure(
-                url=url,
-                error_code="permission_denied",
-                message=f"URL is blocked by fetch safety policy: {url}",
-                hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
-                next_action=NEXT_ACTION_CHANGE_SOURCE,
-                internal_diagnostics={
-                    "blocked_by_safety_policy": True,
-                    "input_url": url,
-                },
+    try:
+        async with provider_lock:
+            if cancellation_token.is_cancelled():
+                return _host_cancelled_from_token(
+                    tool_name=_SEARCH_WEB_TOOL_NAME,
+                    token=cancellation_token,
+                    started_at=started_at,
+                    hint=(
+                        "[continue_without_web] The host cancelled this web search; "
+                        "continue without this web search unless the user asks to retry."
+                    ),
+                )
+            value = await asyncio.to_thread(
+                _search_web_business,
+                query=query,
+                domains=domains,
+                recency_days=recency_days,
+                max_results=max_results,
+                config=config,
+                timeout_budget=None,
+                cancellation_token=cancellation_token,
             )
+    except WebSearchCancelledError as exc:
+        return host_cancelled_outcome(
+            tool_name=_SEARCH_WEB_TOOL_NAME,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+            message=exc.message,
+            hint=exc.hint,
+        )
+    except WebSearchProviderUnavailableError as exc:
+        return failed_outcome(
+            tool_name=_SEARCH_WEB_TOOL_NAME,
+            error=_SEARCH_PROVIDER_UNAVAILABLE_ERROR,
+            message=exc.message,
+            hint=_SEARCH_PROVIDER_UNAVAILABLE_HINT,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+        )
+    except Exception as exc:
+        return _unexpected_failed_outcome(
+            tool_name=_SEARCH_WEB_TOOL_NAME,
+            error=exc,
+            started_at=started_at,
+        )
 
-        normalized_url = _normalize_url_for_http(url)
-        deadline_monotonic = _compute_deadline_monotonic(timeout_budget)
-        playwright_storage_state_path = _resolve_playwright_storage_state_path(
-            url=normalized_url,
-            playwright_storage_state_dir=playwright_storage_state_dir,
+    return completed_outcome(
+        tool_name=_SEARCH_WEB_TOOL_NAME,
+        value=cast(JsonValue, value),
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+    )
+
+
+async def _call_fetch_web_page(
+    *,
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+    config: WebToolsConfig,
+    provider_lock: asyncio.Lock,
+) -> ToolExecutionOutcome:
+    """执行 fetch_web_page callable 外壳。
+
+    :param call: 当前工具调用请求。
+    :param context: 执行上下文。
+    :param config: Web provider 配置。
+    :param provider_lock: 当前 provider 共享串行锁。
+    :returns: 工具执行 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    started_at = datetime.now(UTC)
+    validation = validate_and_project_arguments(
+        call=call,
+        tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+        schema=_FETCH_WEB_PAGE_PARAMETERS,
+    )
+    if isinstance(validation, ToolArgumentValidationFailure):
+        return _validation_failed_outcome(
+            tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+            validation=validation,
+            started_at=started_at,
         )
-        base_session = _get_web_session()
-        session, should_close_session = _prepare_call_session(
-            base_session,
-            timeout_budget=timeout_budget,
+
+    cancellation_token = context.cancellation_token
+    if cancellation_token.is_cancelled():
+        return _host_cancelled_from_token(
+            tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+            token=cancellation_token,
+            started_at=started_at,
+            hint=(
+                "[continue_without_web] The host cancelled this web fetch; "
+                "continue without this page unless the user asks to retry."
+            ),
         )
-        applied_storage_state_cookie_count = _apply_storage_state_cookies_to_session(
-            session,
-            storage_state_path=playwright_storage_state_path,
+
+    url = _required_string_argument(validation.arguments, "url")
+    try:
+        async with provider_lock:
+            if cancellation_token.is_cancelled():
+                return _host_cancelled_from_token(
+                    tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+                    token=cancellation_token,
+                    started_at=started_at,
+                    hint=(
+                        "[continue_without_web] The host cancelled this web fetch; "
+                        "continue without this page unless the user asks to retry."
+                    ),
+                )
+            value = await asyncio.to_thread(
+                _fetch_web_page_business,
+                url=url,
+                config=config,
+                timeout_budget=None,
+                cancellation_token=cancellation_token,
+            )
+    except WebToolCancelledError as exc:
+        return host_cancelled_outcome(
+            tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+            message=exc.message,
+            hint=exc.hint,
         )
-        headers = _build_fetch_headers(normalized_url)
-        headers["Referer"] = _build_referer(normalized_url)
-        warmup: StagePayload = {"attempted": False}
-        content_type_probe: ContentProbePayload = {"attempted": False, "ok": False}
-        fetch_result: _FetchContentResult | None = None
-        playwright_fallback_kwargs: _PlaywrightFallbackKwargs = {
+    except ToolBusinessError as exc:
+        return failed_outcome(
+            tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+            error=exc.code,
+            message=exc.message,
+            hint=exc.hint,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+        )
+    except Exception as exc:
+        return _unexpected_failed_outcome(
+            tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+            error=exc,
+            started_at=started_at,
+        )
+
+    return completed_outcome(
+        tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+        value=value,
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+    )
+
+
+def _search_web_business(
+    *,
+    query: str,
+    domains: list[str] | None,
+    recency_days: int | None,
+    max_results: int,
+    config: WebToolsConfig,
+    timeout_budget: float | None,
+    cancellation_token: CancellationToken,
+) -> SearchWebOutput:
+    """执行同步联网搜索业务逻辑。
+
+    :param query: 检索关键词。
+    :param domains: 可选域名过滤。
+    :param recency_days: 可选最近天数过滤。
+    :param max_results: 返回结果上限。
+    :param config: Web provider 配置。
+    :param timeout_budget: 单次工具调用预算；当前保持旧行为传 ``None``。
+    :param cancellation_token: Host 取消令牌。
+    :returns: 搜索结果字典。
+    :raises WebSearchCancelledError: Host 取消时抛出。
+    :raises WebSearchProviderUnavailableError: 搜索 provider 全部不可用时抛出。
+    :raises Exception: 搜索 provider 失败时透出。
+    """
+
+    _raise_if_host_cancelled(cancellation_token)
+    return search_public_web(
+        query=query,
+        domains=domains,
+        recency_days=recency_days,
+        max_results=max_results,
+        max_search_results=config.max_search_results,
+        provider=config.provider,
+        request_timeout_seconds=config.request_timeout_seconds,
+        timeout_budget=timeout_budget,
+        deadline_monotonic=_compute_deadline_monotonic(timeout_budget),
+        allow_private_network_url=config.allow_private_network_url,
+        is_safe_public_url=_is_safe_public_url,
+        normalize_whitespace=_normalize_whitespace,
+        resolve_timeout_budget=_resolve_timeout_budget,
+        cancellation_token=cancellation_token,
+    )
+
+
+def _validation_failed_outcome(
+    *,
+    tool_name: str,
+    validation: ToolArgumentValidationFailure,
+    started_at: datetime,
+) -> ToolExecutionOutcome:
+    """把参数校验失败转为 failed outcome。
+
+    :param tool_name: 工具名。
+    :param validation: 参数校验失败结果。
+    :param started_at: 工具开始时间。
+    :returns: failed outcome。
+    :raises Exception: outcome 构造失败时透出。
+    """
+
+    return failed_outcome(
+        tool_name=tool_name,
+        error=validation.error,
+        message=validation.message,
+        hint=validation.hint,
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+    )
+
+
+def _unexpected_failed_outcome(
+    *,
+    tool_name: str,
+    error: Exception,
+    started_at: datetime,
+) -> ToolExecutionOutcome:
+    """把未预期异常转为 execution_error outcome。
+
+    :param tool_name: 工具名。
+    :param error: 捕获到的异常。
+    :param started_at: 工具开始时间。
+    :returns: failed outcome。
+    :raises Exception: outcome 构造失败时透出。
+    """
+
+    message = str(error).strip() or "Tool execution failed."
+    return failed_outcome(
+        tool_name=tool_name,
+        error="execution_error",
+        message=message,
+        hint=None,
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+    )
+
+
+def _host_cancelled_from_token(
+    *,
+    tool_name: str,
+    token: CancellationToken,
+    started_at: datetime,
+    hint: str,
+) -> ToolExecutionOutcome:
+    """根据 Host token 构造取消 outcome。
+
+    :param tool_name: 工具名。
+    :param token: Host 取消令牌。
+    :param started_at: 工具开始时间。
+    :param hint: Web 语义恢复提示。
+    :returns: cancelled outcome。
+    :raises Exception: outcome 构造失败时透出。
+    """
+
+    return host_cancelled_outcome(
+        tool_name=tool_name,
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+        message=token.cancel_reason() or "工具调用已取消",
+        hint=hint,
+    )
+
+
+def _required_string_argument(arguments: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取已校验的必填字符串参数。
+
+    :param arguments: 已投影参数。
+    :param field_name: 字段名。
+    :returns: 字符串参数值。
+    :raises TypeError: 参数不是字符串时抛出。
+    """
+
+    value = arguments.get(field_name)
+    if not isinstance(value, str):
+        raise TypeError(f"validated argument {field_name} must be string")
+    return value
+
+
+def _required_int_argument(arguments: Mapping[str, JsonValue], field_name: str) -> int:
+    """读取已校验的必填整数参数。
+
+    :param arguments: 已投影参数。
+    :param field_name: 字段名。
+    :returns: 整数参数值。
+    :raises TypeError: 参数不是整数时抛出。
+    """
+
+    value = arguments.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"validated argument {field_name} must be integer")
+    return value
+
+
+def _optional_int_argument(arguments: Mapping[str, JsonValue], field_name: str) -> int | None:
+    """读取已校验的可选整数参数。
+
+    :param arguments: 已投影参数。
+    :param field_name: 字段名。
+    :returns: 整数参数值或 ``None``。
+    :raises TypeError: 参数不是整数时抛出。
+    """
+
+    if field_name not in arguments:
+        return None
+    return _required_int_argument(arguments, field_name)
+
+
+def _optional_string_list_argument(
+    arguments: Mapping[str, JsonValue],
+    field_name: str,
+) -> list[str] | None:
+    """读取已校验的可选字符串数组参数。
+
+    :param arguments: 已投影参数。
+    :param field_name: 字段名。
+    :returns: 字符串列表或 ``None``。
+    :raises TypeError: 参数不是字符串数组时抛出。
+    """
+
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise TypeError(f"validated argument {field_name} must be array")
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError(f"validated argument {field_name} items must be string")
+        items.append(item)
+    return items
+
+
+def _fetch_web_page_business(
+    *,
+    url: str,
+    config: WebToolsConfig,
+    timeout_budget: float | None,
+    cancellation_token: CancellationToken,
+) -> WebPayload:
+    """执行同步网页抓取业务逻辑。
+
+    :param url: 目标网页 URL。
+    :param config: Web provider 配置。
+    :param timeout_budget: 单次工具调用预算；当前保持旧行为传 ``None``。
+    :param cancellation_token: Host 取消令牌。
+    :returns: 抓取成功载荷。
+    :raises WebToolCancelledError: Host 取消时抛出。
+    :raises ToolBusinessError: 抓取业务失败时抛出。
+    :raises Exception: 未预期异常时透出。
+    """
+
+    request_timeout_seconds = config.request_timeout_seconds
+    allow_private_network_url = config.allow_private_network_url
+    playwright_channel = config.playwright_channel
+    playwright_storage_state_dir = config.playwright_storage_state_dir
+    _raise_if_host_cancelled(cancellation_token)
+
+    if not _is_safe_public_url(url, allow_private_network_url=allow_private_network_url):
+        _raise_fetch_failure(
+            url=url,
+            error_code="permission_denied",
+            message=f"URL is blocked by fetch safety policy: {url}",
+            hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+            next_action=NEXT_ACTION_CHANGE_SOURCE,
+            internal_diagnostics={
+                "blocked_by_safety_policy": True,
+                "input_url": url,
+            },
+        )
+
+    normalized_url = _normalize_url_for_http(url)
+    deadline_monotonic = _compute_deadline_monotonic(timeout_budget)
+    playwright_storage_state_path = _resolve_playwright_storage_state_path(
+        url=normalized_url,
+        playwright_storage_state_dir=playwright_storage_state_dir,
+    )
+    base_session = _get_web_session()
+    session, should_close_session = _prepare_call_session(
+        base_session,
+        timeout_budget=timeout_budget,
+    )
+    applied_storage_state_cookie_count = _apply_storage_state_cookies_to_session(
+        session,
+        storage_state_path=playwright_storage_state_path,
+    )
+    headers = _build_fetch_headers(normalized_url)
+    headers["Referer"] = _build_referer(normalized_url)
+    warmup: StagePayload = {"attempted": False}
+    content_type_probe: ContentProbePayload = {"attempted": False, "ok": False}
+    fetch_result: _FetchContentResult | None = None
+    playwright_fallback_kwargs: _PlaywrightFallbackKwargs = {
+        "timeout_seconds": request_timeout_seconds,
+        "headers": headers,
+        "timeout_budget": timeout_budget,
+        "deadline_monotonic": deadline_monotonic,
+        "playwright_channel": playwright_channel,
+        "playwright_storage_state_path": playwright_storage_state_path,
+    }
+    if cancellation_token is not None:
+        playwright_fallback_kwargs["cancellation_token"] = cancellation_token
+    try:
+        _raise_if_host_cancelled(cancellation_token)
+        warmup_kwargs: _StageFetchKwargs = {
+            "url": normalized_url,
             "timeout_seconds": request_timeout_seconds,
             "headers": headers,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
-            "playwright_channel": playwright_channel,
-            "playwright_storage_state_path": playwright_storage_state_path,
         }
         if cancellation_token is not None:
-            playwright_fallback_kwargs["cancellation_token"] = cancellation_token
-        try:
-            _raise_if_tool_cancelled(cancellation_token)
-            warmup_kwargs: _StageFetchKwargs = {
-                "url": normalized_url,
-                "timeout_seconds": request_timeout_seconds,
-                "headers": headers,
-                "timeout_budget": timeout_budget,
-                "deadline_monotonic": deadline_monotonic,
-            }
-            if cancellation_token is not None:
-                warmup_kwargs["cancellation_token"] = cancellation_token
-            warmup = _warmup_domain(
-                session,
-                **warmup_kwargs,
-            )
-            if _should_escalate_stage_result_to_browser(warmup):
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-            _raise_if_tool_cancelled(cancellation_token)
-            probe_kwargs: _StageFetchKwargs = {
-                "url": normalized_url,
-                "timeout_seconds": request_timeout_seconds,
-                "headers": headers,
-                "timeout_budget": timeout_budget,
-                "deadline_monotonic": deadline_monotonic,
-            }
-            if cancellation_token is not None:
-                probe_kwargs["cancellation_token"] = cancellation_token
-            content_type_probe = _probe_content_type(
-                session,
-                **probe_kwargs,
-            )
-            if _should_escalate_stage_result_to_browser(cast(StagePayload, content_type_probe)):
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-            _raise_if_tool_cancelled(cancellation_token)
-            fetch_kwargs: _FetchConvertKwargs = {
-                "timeout_seconds": request_timeout_seconds,
-                "session": session,
-                "headers": headers,
+            warmup_kwargs["cancellation_token"] = cancellation_token
+        warmup = _warmup_domain(
+            session,
+            **warmup_kwargs,
+        )
+        if _should_escalate_stage_result_to_browser(warmup):
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
+        _raise_if_host_cancelled(cancellation_token)
+        probe_kwargs: _StageFetchKwargs = {
+            "url": normalized_url,
+            "timeout_seconds": request_timeout_seconds,
+            "headers": headers,
+            "timeout_budget": timeout_budget,
+            "deadline_monotonic": deadline_monotonic,
+        }
+        if cancellation_token is not None:
+            probe_kwargs["cancellation_token"] = cancellation_token
+        content_type_probe = _probe_content_type(
+            session,
+            **probe_kwargs,
+        )
+        if _should_escalate_stage_result_to_browser(cast(StagePayload, content_type_probe)):
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
+        _raise_if_host_cancelled(cancellation_token)
+        fetch_kwargs: _FetchConvertKwargs = {
+            "timeout_seconds": request_timeout_seconds,
+            "session": session,
+            "headers": headers,
+            "content_type_probe": content_type_probe,
+            "timeout_budget": timeout_budget,
+            "deadline_monotonic": deadline_monotonic,
+        }
+        if cancellation_token is not None:
+            fetch_kwargs["cancellation_token"] = cancellation_token
+        fetch_result = _fetch_and_convert_content(
+            normalized_url,
+            **fetch_kwargs,
+        )
+    except requests.TooManyRedirects as exc:
+        response = getattr(exc, "response", None)
+        _raise_fetch_failure(
+            url=url,
+            error_code="too_many_redirects",
+            message="Redirect chain too long; cannot reliably fetch this page",
+            http_status=response.status_code if response is not None else None,
+            hint=build_hint(REASON_REDIRECT_CHAIN_TOO_LONG),
+            next_action=NEXT_ACTION_CHANGE_SOURCE,
+            internal_diagnostics={
+                "final_url": response.url if response is not None else url,
+                "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
+                "response_excerpt": _extract_response_snippet(response),
+            },
+        )
+    except requests.Timeout as exc:
+        browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+        if browser_result is not None:
+            return browser_result
+        _raise_fetch_failure(
+            url=url,
+            error_code="request_timeout",
+            message=f"Request timed out: {exc}",
+            hint=build_hint(REASON_REQUEST_TIMEOUT),
+            next_action=NEXT_ACTION_RETRY,
+            internal_diagnostics={
+                "final_url": url,
+                "warmup": warmup,
                 "content_type_probe": content_type_probe,
-                "timeout_budget": timeout_budget,
-                "deadline_monotonic": deadline_monotonic,
-            }
-            if cancellation_token is not None:
-                fetch_kwargs["cancellation_token"] = cancellation_token
-            fetch_result = _fetch_and_convert_content(
-                normalized_url,
-                **fetch_kwargs,
-            )
-        except requests.TooManyRedirects as exc:
-            response = getattr(exc, "response", None)
-            _raise_fetch_failure(
-                url=url,
-                error_code="too_many_redirects",
-                message="Redirect chain too long; cannot reliably fetch this page",
-                http_status=response.status_code if response is not None else None,
-                hint=build_hint(REASON_REDIRECT_CHAIN_TOO_LONG),
-                next_action=NEXT_ACTION_CHANGE_SOURCE,
-                internal_diagnostics={
-                    "final_url": response.url if response is not None else url,
-                    "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                    "response_excerpt": _extract_response_snippet(response),
-                },
-            )
-        except requests.Timeout as exc:
+                "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
+            },
+        )
+    except requests.RequestException as exc:
+        response = getattr(exc, "response", None)
+        http_status = response.status_code if response is not None else None
+        challenge_hint = ""
+        error_code = "http_error"
+        next_action = (
+            NEXT_ACTION_RETRY
+            if http_status in {429, 500, 502, 503, 504} or http_status is None
+            else NEXT_ACTION_CHANGE_SOURCE
+        )
+        if _is_timeout_like_request_exception(exc):
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
             if browser_result is not None:
                 return browser_result
             _raise_fetch_failure(
                 url=url,
                 error_code="request_timeout",
-                message=f"Request timed out: {exc}",
+                message=str(exc),
                 hint=build_hint(REASON_REQUEST_TIMEOUT),
                 next_action=NEXT_ACTION_RETRY,
-                internal_diagnostics={
-                    "final_url": url,
-                    "warmup": warmup,
-                    "content_type_probe": content_type_probe,
-                    "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                },
-            )
-        except requests.RequestException as exc:
-            response = getattr(exc, "response", None)
-            http_status = response.status_code if response is not None else None
-            challenge_hint = ""
-            error_code = "http_error"
-            next_action = (
-                NEXT_ACTION_RETRY
-                if http_status in {429, 500, 502, 503, 504} or http_status is None
-                else NEXT_ACTION_CHANGE_SOURCE
-            )
-            if _is_timeout_like_request_exception(exc):
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-                _raise_fetch_failure(
-                    url=url,
-                    error_code="request_timeout",
-                    message=str(exc),
-                    hint=build_hint(REASON_REQUEST_TIMEOUT),
-                    next_action=NEXT_ACTION_RETRY,
-                    internal_diagnostics={
-                        "final_url": response.url if response is not None else url,
-                        "warmup": warmup,
-                        "content_type_probe": content_type_probe,
-                        "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                        "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                        "response_excerpt": _extract_response_snippet(response),
-                    },
-                )
-            if _is_ssl_like_request_exception(exc):
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-                _raise_fetch_failure(
-                    url=url,
-                    error_code="ssl_error",
-                    message=f"SSL/TLS 握手失败: {exc}",
-                    hint=build_hint(REASON_HTTP_ERROR),
-                    next_action=NEXT_ACTION_CHANGE_SOURCE,
-                    internal_diagnostics={
-                        "final_url": response.url if response is not None else url,
-                        "warmup": warmup,
-                        "content_type_probe": content_type_probe,
-                        "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                        "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                        "response_excerpt": _extract_response_snippet(response),
-                        "exception_types": [type(item).__name__ for item in _iter_exception_chain(exc)],
-                    },
-                )
-            challenge = _detect_bot_challenge(
-                response=response,
-                content_text=_extract_response_snippet(response),
-            )
-            if challenge.challenge_detected and http_status in {401, 403, 429, 503}:
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-                _raise_fetch_failure(
-                    url=url,
-                    error_code="blocked",
-                    message="Page appears to be a bot challenge page or access gate; fetched content is unusable.",
-                    http_status=http_status,
-                    hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
-                    next_action=NEXT_ACTION_CHANGE_SOURCE,
-                    internal_diagnostics={
-                        "final_url": response.url if response is not None else url,
-                        "warmup": warmup,
-                        "content_type_probe": content_type_probe,
-                        "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                        "challenge_signals": list(challenge.challenge_signals),
-                        "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                        "response_excerpt": _extract_response_snippet(response),
-                    },
-                )
-            if _should_escalate_http_status_to_browser(http_status):
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-            if http_status == 403:
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-                challenge_hint = "Target site may have anti-bot or access policies; try a different source."
-                next_action = NEXT_ACTION_CHANGE_SOURCE
-                error_code = "blocked"
-            _raise_fetch_failure(
-                url=url,
-                error_code=error_code,
-                message=str(exc),
-                http_status=http_status,
-                hint=challenge_hint or build_hint(REASON_HTTP_ERROR),
-                next_action=next_action,
                 internal_diagnostics={
                     "final_url": response.url if response is not None else url,
                     "warmup": warmup,
@@ -1423,173 +1666,242 @@ def _create_fetch_web_page_tool(
                     "response_excerpt": _extract_response_snippet(response),
                 },
             )
-        except RuntimeError as exc:
-            internal_diagnostics: WebPayload | None = None
-            challenge_context: _FetchContentRuntimeContext | None = None
-            challenge: BotChallengeDetectionResult | None = None
-            pipeline_error: HtmlPipelineStageError | None = None
-            conversion_failure_reason = ""
-            if isinstance(exc, _FetchContentConversionError):
-                challenge_context = exc.response_context
-                conversion_failure_reason = exc.failure_reason
-                if isinstance(exc.original_error, HtmlPipelineStageError):
-                    pipeline_error = exc.original_error
-            elif isinstance(exc, HtmlPipelineStageError):
-                pipeline_error = exc
-
-            if conversion_failure_reason in {"unsupported_content_encoding", "meta_refresh_requires_browser"}:
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-
-            if challenge_context is not None:
-                challenge = _detect_bot_challenge(
-                    response=None,
-                    response_headers=challenge_context.response_headers,
-                    http_status=challenge_context.http_status,
-                    content_text=challenge_context.raw_content_text or challenge_context.response_excerpt,
-                )
-                if challenge.challenge_detected:
-                    browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                    if browser_result is not None:
-                        return browser_result
-
-            if _should_escalate_pipeline_failure_to_browser(
-                pipeline_error=pipeline_error,
-                response_context=challenge_context,
-            ):
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-
-            if _should_escalate_conversion_failure_to_browser(
-                error_message=str(exc),
-                response_context=challenge_context,
-            ):
-                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
-                if browser_result is not None:
-                    return browser_result
-
-            if pipeline_error is not None or challenge_context is not None:
-                internal_diagnostics = {}
-                if pipeline_error is not None:
-                    internal_diagnostics.update(
-                        {
-                            "pipeline_stage": pipeline_error.stage,
-                            "extractor_source": pipeline_error.extractor_source,
-                            "quality_flags": list(pipeline_error.quality_flags),
-                            "content_stats": pipeline_error.content_stats,
-                        }
-                    )
-                if challenge_context is not None:
-                    internal_diagnostics.update(
-                        {
-                            "final_url": challenge_context.final_url or url,
-                            "http_status": challenge_context.http_status,
-                            "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                            "response_headers": _sanitize_plain_response_headers(challenge_context.response_headers),
-                            "response_excerpt": challenge_context.response_excerpt,
-                        }
-                    )
-                if conversion_failure_reason:
-                    internal_diagnostics["conversion_failure_reason"] = conversion_failure_reason
-                if challenge is not None and challenge.challenge_signals:
-                    internal_diagnostics["challenge_signals"] = list(challenge.challenge_signals)
+        if _is_ssl_like_request_exception(exc):
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
             _raise_fetch_failure(
                 url=url,
-                error_code="blocked" if challenge is not None and challenge.challenge_detected else "content_conversion_failed",
-                message=str(exc),
-                hint=(
-                    build_hint(REASON_BLOCKED_BY_SITE_POLICY)
-                    if challenge is not None and challenge.challenge_detected
-                    else build_hint(REASON_CONTENT_CONVERSION_FAILED)
-                ),
+                error_code="ssl_error",
+                message=f"SSL/TLS 握手失败: {exc}",
+                hint=build_hint(REASON_HTTP_ERROR),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
-                http_status=challenge_context.http_status if challenge_context is not None else None,
-                internal_diagnostics=internal_diagnostics,
+                internal_diagnostics={
+                    "final_url": response.url if response is not None else url,
+                    "warmup": warmup,
+                    "content_type_probe": content_type_probe,
+                    "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
+                    "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
+                    "response_excerpt": _extract_response_snippet(response),
+                    "exception_types": [type(item).__name__ for item in _iter_exception_chain(exc)],
+                },
             )
-        finally:
-            if should_close_session:
-                session.close()
-
-        if fetch_result is None:
-            raise RuntimeError("网页抓取流程异常结束，未获得抓取结果")
-
         challenge = _detect_bot_challenge(
-            response=fetch_result.get("response"),
-            content_text=fetch_result.get("content", ""),
+            response=response,
+            content_text=_extract_response_snippet(response),
         )
-        if challenge.challenge_detected:
+        if challenge.challenge_detected and http_status in {401, 403, 429, 503}:
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
             if browser_result is not None:
                 return browser_result
             _raise_fetch_failure(
                 url=url,
                 error_code="blocked",
-                message="Page appears to be a bot challenge page; fetched content is unusable.",
-                http_status=fetch_result.get("http_status"),
+                message="Page appears to be a bot challenge page or access gate; fetched content is unusable.",
+                http_status=http_status,
                 hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
                 internal_diagnostics={
-                    "final_url": fetch_result.get("final_url", url),
-                    "redirect_hops": fetch_result.get("redirect_hops"),
+                    "final_url": response.url if response is not None else url,
+                    "warmup": warmup,
+                    "content_type_probe": content_type_probe,
+                    "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
                     "challenge_signals": list(challenge.challenge_signals),
-                    "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
-                    "response_excerpt": fetch_result.get("response_excerpt", ""),
+                    "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
+                    "response_excerpt": _extract_response_snippet(response),
                 },
             )
+        if _should_escalate_http_status_to_browser(http_status):
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
+        if http_status == 403:
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
+            challenge_hint = "Target site may have anti-bot or access policies; try a different source."
+            next_action = NEXT_ACTION_CHANGE_SOURCE
+            error_code = "blocked"
+        _raise_fetch_failure(
+            url=url,
+            error_code=error_code,
+            message=str(exc),
+            http_status=http_status,
+            hint=challenge_hint or build_hint(REASON_HTTP_ERROR),
+            next_action=next_action,
+            internal_diagnostics={
+                "final_url": response.url if response is not None else url,
+                "warmup": warmup,
+                "content_type_probe": content_type_probe,
+                "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
+                "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
+                "response_excerpt": _extract_response_snippet(response),
+            },
+        )
+    except RuntimeError as exc:
+        internal_diagnostics: WebPayload | None = None
+        challenge_context: _FetchContentRuntimeContext | None = None
+        challenge: BotChallengeDetectionResult | None = None
+        pipeline_error: HtmlPipelineStageError | None = None
+        conversion_failure_reason = ""
+        if isinstance(exc, _FetchContentConversionError):
+            challenge_context = exc.response_context
+            conversion_failure_reason = exc.failure_reason
+            if isinstance(exc.original_error, HtmlPipelineStageError):
+                pipeline_error = exc.original_error
+        elif isinstance(exc, HtmlPipelineStageError):
+            pipeline_error = exc
 
-        content = fetch_result.get("content", "")
-        if len(content.strip()) < _EMPTY_CONTENT_MIN_CHARS:
-            _raise_fetch_failure(
-                url=url,
-                error_code="empty_content",
-                message="Page body is empty or too short to be useful.",
-                http_status=fetch_result.get("http_status"),
-                hint=build_hint(REASON_EMPTY_CONTENT),
-                next_action=NEXT_ACTION_CONTINUE_WITHOUT_WEB,
-                internal_diagnostics={
-                    "final_url": fetch_result.get("final_url", url),
-                    "redirect_hops": fetch_result.get("redirect_hops"),
-                    "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
-                    "response_excerpt": fetch_result.get("response_excerpt", ""),
-                },
+        if conversion_failure_reason in {"unsupported_content_encoding", "meta_refresh_requires_browser"}:
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
+
+        if challenge_context is not None:
+            challenge = _detect_bot_challenge(
+                response=None,
+                response_headers=challenge_context.response_headers,
+                http_status=challenge_context.http_status,
+                content_text=challenge_context.raw_content_text or challenge_context.response_excerpt,
             )
+            if challenge.challenge_detected:
+                browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+                if browser_result is not None:
+                    return browser_result
 
-        success: WebPayload = {
-            "url": url,
-            "final_url": fetch_result.get("final_url", url),
-            "title": fetch_result.get("title", ""),
-            "content": content,
-            "fetch_backend": "requests",
-        }
-        _log_fetch_diagnostics(
-            cast(WebMapping, {
-                **success,
+        if _should_escalate_pipeline_failure_to_browser(
+            pipeline_error=pipeline_error,
+            response_context=challenge_context,
+        ):
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
+
+        if _should_escalate_conversion_failure_to_browser(
+            error_message=str(exc),
+            response_context=challenge_context,
+        ):
+            browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+            if browser_result is not None:
+                return browser_result
+
+        if pipeline_error is not None or challenge_context is not None:
+            internal_diagnostics = {}
+            if pipeline_error is not None:
+                internal_diagnostics.update(
+                    {
+                        "pipeline_stage": pipeline_error.stage,
+                        "extractor_source": pipeline_error.extractor_source,
+                        "quality_flags": list(pipeline_error.quality_flags),
+                        "content_stats": pipeline_error.content_stats,
+                    }
+                )
+            if challenge_context is not None:
+                internal_diagnostics.update(
+                    {
+                        "final_url": challenge_context.final_url or url,
+                        "http_status": challenge_context.http_status,
+                        "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
+                        "response_headers": _sanitize_plain_response_headers(challenge_context.response_headers),
+                        "response_excerpt": challenge_context.response_excerpt,
+                    }
+                )
+            if conversion_failure_reason:
+                internal_diagnostics["conversion_failure_reason"] = conversion_failure_reason
+            if challenge is not None and challenge.challenge_signals:
+                internal_diagnostics["challenge_signals"] = list(challenge.challenge_signals)
+        _raise_fetch_failure(
+            url=url,
+            error_code="blocked" if challenge is not None and challenge.challenge_detected else "content_conversion_failed",
+            message=str(exc),
+            hint=(
+                build_hint(REASON_BLOCKED_BY_SITE_POLICY)
+                if challenge is not None and challenge.challenge_detected
+                else build_hint(REASON_CONTENT_CONVERSION_FAILED)
+            ),
+            next_action=NEXT_ACTION_CHANGE_SOURCE,
+            http_status=challenge_context.http_status if challenge_context is not None else None,
+            internal_diagnostics=internal_diagnostics,
+        )
+    finally:
+        if should_close_session:
+            session.close()
+
+    if fetch_result is None:
+        raise RuntimeError("网页抓取流程异常结束，未获得抓取结果")
+
+    challenge = _detect_bot_challenge(
+        response=fetch_result.get("response"),
+        content_text=fetch_result.get("content", ""),
+    )
+    if challenge.challenge_detected:
+        browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
+        if browser_result is not None:
+            return browser_result
+        _raise_fetch_failure(
+            url=url,
+            error_code="blocked",
+            message="Page appears to be a bot challenge page; fetched content is unusable.",
+            http_status=fetch_result.get("http_status"),
+            hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+            next_action=NEXT_ACTION_CHANGE_SOURCE,
+            internal_diagnostics={
+                "final_url": fetch_result.get("final_url", url),
+                "redirect_hops": fetch_result.get("redirect_hops"),
+                "challenge_signals": list(challenge.challenge_signals),
+                "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
+                "response_excerpt": fetch_result.get("response_excerpt", ""),
+            },
+        )
+
+    content = fetch_result.get("content", "")
+    if len(content.strip()) < _EMPTY_CONTENT_MIN_CHARS:
+        _raise_fetch_failure(
+            url=url,
+            error_code="empty_content",
+            message="Page body is empty or too short to be useful.",
+            http_status=fetch_result.get("http_status"),
+            hint=build_hint(REASON_EMPTY_CONTENT),
+            next_action=NEXT_ACTION_CONTINUE_WITHOUT_WEB,
+            internal_diagnostics={
+                "final_url": fetch_result.get("final_url", url),
+                "redirect_hops": fetch_result.get("redirect_hops"),
+                "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
+                "response_excerpt": fetch_result.get("response_excerpt", ""),
+            },
+        )
+
+    success: WebPayload = {
+        "url": url,
+        "final_url": fetch_result.get("final_url", url),
+        "title": fetch_result.get("title", ""),
+        "content": content,
+        "fetch_backend": "requests",
+    }
+    _log_fetch_diagnostics(
+        cast(WebMapping, {
+            **success,
+            "extraction_source": fetch_result.get("extraction_source", ""),
+            "renderer_source": fetch_result.get("renderer_source", ""),
+            "normalization_applied": fetch_result.get("normalization_applied", False),
+            "internal_diagnostics": {
+                "final_url": fetch_result.get("final_url", url),
+                "http_status": fetch_result.get("http_status"),
+                "redirect_hops": fetch_result.get("redirect_hops"),
+                "fetch_backend": "requests",
                 "extraction_source": fetch_result.get("extraction_source", ""),
                 "renderer_source": fetch_result.get("renderer_source", ""),
                 "normalization_applied": fetch_result.get("normalization_applied", False),
-                "internal_diagnostics": {
-                    "final_url": fetch_result.get("final_url", url),
-                    "http_status": fetch_result.get("http_status"),
-                    "redirect_hops": fetch_result.get("redirect_hops"),
-                    "fetch_backend": "requests",
-                    "extraction_source": fetch_result.get("extraction_source", ""),
-                    "renderer_source": fetch_result.get("renderer_source", ""),
-                    "normalization_applied": fetch_result.get("normalization_applied", False),
-                    "quality_flags": fetch_result.get("quality_flags", []),
-                    "content_stats": fetch_result.get("content_stats", {}),
-                    "content_type_probe": content_type_probe,
-                    "warmup": warmup,
-                    "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
-                    "response_excerpt": fetch_result.get("response_excerpt", ""),
-                },
-            })
-        )
-        return success
-
-    return _build_registered_tool_parts(fetch_web_page)
-
+                "quality_flags": fetch_result.get("quality_flags", []),
+                "content_stats": fetch_result.get("content_stats", {}),
+                "content_type_probe": content_type_probe,
+                "warmup": warmup,
+                "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
+                "response_excerpt": fetch_result.get("response_excerpt", ""),
+            },
+        })
+    )
+    return success
 
 
 def _docling_convert_to_markdown(raw_bytes: bytes, stream_name: str) -> tuple[str, str, str]:

@@ -1,14 +1,14 @@
 """Web tools 的当前 ToolsDiscovery provider。
 
-本模块只负责把迁移后的 OLD Web 工具声明收集并适配为当前
-``ToolDefinition``。URL 安全策略通过 provider config 显式传入迁移工具
-闭包；参数校验、响应投影和并发序列化由当前 adapter 边界完成。
+本模块只负责解析 Web provider 配置，并通过原生 ``ToolDefinition`` 暴露
+``search_web`` 与 ``fetch_web_page``。URL 安全策略、请求超时、搜索结果
+上限、正文截断和 Playwright 配置都通过 provider config 显式闭包投影给
+工具 callable。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Final
 
 from dayu.contracts.json_value import JsonValue
@@ -18,16 +18,8 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
 )
-from dayu.tools._legacy_adapter.definition_adapter import (
-    LegacyToolConcurrencyPolicy,
-    adapt_collected_tools,
-)
-from dayu.tools._legacy_adapter.registry_collector import (
-    CollectedLegacyTool,
-    LegacyToolDeclarationCollector,
-)
 
-from .web_tools import register_web_tools
+from .web_tools import WebToolsConfig, build_web_tool_definitions
 
 _PROVIDER_ID: Final[str] = "web-tools"
 _VERSION_REF: Final[str] = "web-tools-provider-v1"
@@ -42,28 +34,6 @@ _CONFIG_PLAYWRIGHT_STORAGE_STATE_DIR_FIELD: Final[str] = "playwright_storage_sta
 _WEB_TOOL_NAMES: Final[tuple[str, ...]] = ("search_web", "fetch_web_page")
 
 
-@dataclass(frozen=True, slots=True)
-class WebToolsConfig:
-    """Web 工具 provider 配置。
-
-    :param provider: 搜索 provider 策略。
-    :param request_timeout_seconds: HTTP 请求超时秒数。
-    :param max_search_results: 搜索最大返回条数。
-    :param fetch_truncate_chars: 抓取正文截断声明字符数。
-    :param allow_private_network_url: 是否允许内网 / 本地 URL。
-    :param playwright_channel: Playwright fallback 使用的浏览器 channel。
-    :param playwright_storage_state_dir: Playwright storage state 目录。
-    """
-
-    provider: str = "auto"
-    request_timeout_seconds: float = 12.0
-    max_search_results: int = 20
-    fetch_truncate_chars: int = 80_000
-    allow_private_network_url: bool = False
-    playwright_channel: str | None = "chrome"
-    playwright_storage_state_dir: str = ""
-
-
 def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
     """发现 Web tools。
 
@@ -74,31 +44,18 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         provider 输出，包含 ``search_web`` 与 ``fetch_web_page``。
 
     Raises:
-        ValueError: provider config 非法，或 OLD 声明集合不符合本 slice
+        ValueError: provider config 非法，或 native 定义集合不符合本 slice
             预期时抛出。
     """
 
-    config = _parse_config(spec.config)
-    collector = LegacyToolDeclarationCollector()
-    register_web_tools(
-        collector,
-        provider=config.provider,
-        request_timeout_seconds=config.request_timeout_seconds,
-        max_search_results=config.max_search_results,
-        fetch_truncate_chars=config.fetch_truncate_chars,
-        allow_private_network_url=config.allow_private_network_url,
-        playwright_channel=config.playwright_channel,
-        playwright_storage_state_dir=config.playwright_storage_state_dir,
-        timeout_budget=None,
-    )
-    declarations = collector.collected_tools()
-    _validate_web_declarations(declarations)
+    definitions = build_web_tool_definitions(_parse_config(spec.config))
+    _validate_web_definitions(definitions)
     source_ref = _source_ref()
     return ToolsDiscoveryProviderOutput(
         provider_id=_PROVIDER_ID,
         version_ref=_VERSION_REF,
         source_refs=(source_ref,),
-        definitions=_adapt_web_declarations(declarations),
+        definitions=definitions,
     )
 
 
@@ -313,11 +270,11 @@ def _text_default(
     return value.strip()
 
 
-def _validate_web_declarations(declarations: tuple[CollectedLegacyTool, ...]) -> None:
-    """校验迁移 Web tool 声明集合。
+def _validate_web_definitions(definitions: tuple[ToolDefinition, ...]) -> None:
+    """校验 Web tool 定义集合。
 
     Args:
-        declarations: collector 收集到的迁移声明。
+        definitions: native builder 返回的工具定义。
 
     Returns:
         无。
@@ -326,39 +283,12 @@ def _validate_web_declarations(declarations: tuple[CollectedLegacyTool, ...]) ->
         ValueError: 工具名集合或标签不符合 S5 预期时抛出。
     """
 
-    names = tuple(declaration.name for declaration in declarations)
+    names = tuple(definition.name for definition in definitions)
     if names != _WEB_TOOL_NAMES:
         raise ValueError(f"web provider expected tools {_WEB_TOOL_NAMES}, got {names}")
-    for declaration in declarations:
-        if "web" not in declaration.tags:
-            raise ValueError(f"web tool {declaration.name} must declare web tag")
-
-
-def _adapt_web_declarations(
-    declarations: tuple[CollectedLegacyTool, ...],
-) -> tuple[ToolDefinition, ...]:
-    """把 Web 声明适配为当前 ToolDefinition。
-
-    Args:
-        declarations: 迁移工具声明。
-
-    Returns:
-        current 工具定义元组。
-
-    Raises:
-        Exception: adapter 构造失败时透出。
-    """
-
-    concurrency_policy_by_tool: dict[str, LegacyToolConcurrencyPolicy] = {}
-    for declaration in declarations:
-        concurrency_policy_by_tool[declaration.name] = (
-            LegacyToolConcurrencyPolicy.SERIAL_PER_PROVIDER
-        )
-    return adapt_collected_tools(
-        declarations,
-        path_policy_by_tool={},
-        concurrency_policy_by_tool=concurrency_policy_by_tool,
-    )
+    for definition in definitions:
+        if "web" not in definition.tags:
+            raise ValueError(f"web tool {definition.name} must declare web tag")
 
 
 def _source_ref() -> ToolBundleSourceRef:
@@ -382,4 +312,4 @@ def _source_ref() -> ToolBundleSourceRef:
     )
 
 
-__all__ = ["WebToolsConfig", "discover_tools"]
+__all__ = ["discover_tools"]

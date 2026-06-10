@@ -7,6 +7,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import ParamSpec, TypeVar
 
 import pytest
 
@@ -14,7 +15,12 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
+from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolCancelledOutcome,
+    ToolCompletedOutcome,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
@@ -22,7 +28,6 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderBinding,
     ToolsDiscoveryProviderSpec,
 )
-from dayu.tools._legacy_adapter.registry_collector import LegacyToolDeclarationCollector
 from dayu.tools.web import discover_tools
 from dayu.tools.web import web_playwright_backend
 from dayu.tools.web import web_search_providers
@@ -31,11 +36,14 @@ from dayu.tools.web import web_tools
 _WEB_TOOL_NAMES = ("search_web", "fetch_web_page")
 _WEB_PACKAGE_ROOT = Path(__file__).resolve().parents[3] / "dayu" / "tools" / "web"
 _CANCEL_REQUESTED_AT = datetime(2026, 6, 8)
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 _FORBIDDEN_IMPORTS = (
     "dayu.engine.tool_registry",
     "dayu.engine.truncation_manager",
     "dayu.engine.tools.fetch_more",
     "dayu.web",
+    "dayu.tools." + "_legacy" + "_adapter",
 )
 
 
@@ -134,26 +142,24 @@ def test_web_provider_discovers_search_and_fetch() -> None:
 
 
 def test_web_audit_matrix_context_injection_and_schema_no_leak() -> None:
-    """Web 工具 cancellation audit matrix 必须覆盖注入声明与 schema 隔离。"""
+    """Web 工具 schema 不得暴露 Host 治理字段。"""
 
-    collector = LegacyToolDeclarationCollector()
-    web_tools.register_web_tools(collector)
-    declarations = collector.collected_tools()
     definitions = _definitions_by_name(_discover_definitions({}))
 
-    assert tuple(declaration.name for declaration in declarations) == _WEB_TOOL_NAMES
-    assert all(
-        declaration.execution_context_param_name == "execution_context"
-        for declaration in declarations
-    )
     for tool_name in _WEB_TOOL_NAMES:
         definition = definitions[tool_name]
         properties = definition.schema.function.parameters.properties
         required = definition.schema.function.parameters.required
+        assert "run_id" not in properties
+        assert "session_id" not in properties
         assert "execution_context" not in properties
         assert "cancellation_token" not in properties
+        assert "correlation_id" not in properties
+        assert "run_id" not in required
+        assert "session_id" not in required
         assert "execution_context" not in required
         assert "cancellation_token" not in required
+        assert "correlation_id" not in required
 
 
 def test_search_web_projects_optional_arguments_and_success(
@@ -362,10 +368,10 @@ def test_search_web_receives_execution_context_and_passes_cancellation_token(
     assert received_tokens == [token]
 
 
-def test_search_web_cancelled_before_provider_returns_tool_cancelled(
+def test_search_web_cancelled_before_provider_returns_host_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """search_web pre-cancel 必须返回 tool_cancelled 且不调用 provider。"""
+    """search_web pre-cancel 必须返回 cancelled outcome 且不调用 provider。"""
 
     token = _ManualCancellationToken()
     token.cancel("cancel before provider")
@@ -446,8 +452,13 @@ def test_search_web_cancelled_before_provider_returns_tool_cancelled(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert outcome.meta is not None
+    assert outcome.meta.tool_name == "search_web"
+    assert "run-web" not in outcome.message
+    assert outcome.hint is not None
+    assert "continue_without_web" in outcome.hint
     assert search_calls == []
 
 
@@ -551,8 +562,10 @@ def test_search_web_cancelled_between_provider_attempts_stops_fallback(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert outcome.meta is not None
+    assert outcome.meta.tool_name == "search_web"
     assert attempted_providers == ["tavily"]
 
 
@@ -623,10 +636,10 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
     assert "ok" not in value
 
 
-def test_fetch_playwright_cancel_projects_to_cancelled_failure(
+def test_fetch_playwright_cancel_projects_to_host_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Playwright fallback 取消必须投影为明确的失败 outcome。"""
+    """Playwright fallback 取消必须投影为 cancelled outcome。"""
 
     monkeypatch.setattr(web_tools, "_warmup_domain", lambda *args, **kwargs: {"attempted": True, "ok": False})
     monkeypatch.setattr(web_tools, "_should_escalate_stage_result_to_browser", lambda stage_result: True)
@@ -686,10 +699,12 @@ def test_fetch_playwright_cancel_projects_to_cancelled_failure(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
-    assert outcome.result.hint is not None
-    assert "continue_without_web" in outcome.result.hint
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert outcome.meta is not None
+    assert outcome.meta.tool_name == "fetch_web_page"
+    assert outcome.hint is not None
+    assert "continue_without_web" in outcome.hint
     assert received_playwright_tokens == [token]
 
 
@@ -912,22 +927,54 @@ def test_invalid_fetch_url_type_fails_before_web_logic(
     assert calls == []
 
 
-def test_search_failure_projects_to_current_failed_outcome(
+def test_search_provider_unavailable_projects_to_stable_business_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """搜索业务失败必须投影为 current ToolFailedOutcome。"""
+    """搜索 provider 全部耗尽必须投影为稳定业务失败。"""
 
-    def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
-        """模拟搜索 provider 失败。
+    attempted_providers: list[str] = []
 
-        :param kwargs: search_web 传入的关键字参数。
+    def fake_search_with_tavily(**kwargs: JsonValue) -> list[web_search_providers.SearchResultRow]:
+        """模拟 Tavily provider 不可用。
+
+        :param kwargs: provider 传入的关键字参数。
         :returns: 不返回。
-        :raises RuntimeError: 始终抛出搜索失败。
+        :raises RuntimeError: 始终抛出 provider 失败。
         """
 
-        raise RuntimeError("provider unavailable")
+        del kwargs
+        attempted_providers.append("tavily")
+        raise RuntimeError("tavily unavailable")
 
-    monkeypatch.setattr(web_tools, "search_public_web", fake_search_public_web)
+    def fake_search_with_serper(**kwargs: JsonValue) -> list[web_search_providers.SearchResultRow]:
+        """模拟 Serper provider 不可用。
+
+        :param kwargs: provider 传入的关键字参数。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出 provider 失败。
+        """
+
+        del kwargs
+        attempted_providers.append("serper")
+        raise RuntimeError("serper unavailable")
+
+    def fake_search_with_duckduckgo(**kwargs: JsonValue) -> list[web_search_providers.SearchResultRow]:
+        """模拟 DuckDuckGo provider 不可用。
+
+        :param kwargs: provider 传入的关键字参数。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出 provider 失败。
+        """
+
+        del kwargs
+        attempted_providers.append("duckduckgo")
+        raise RuntimeError("duckduckgo unavailable")
+
+    monkeypatch.setattr(web_search_providers, "_search_with_tavily", fake_search_with_tavily)
+    monkeypatch.setattr(web_search_providers, "_search_with_serper", fake_search_with_serper)
+    monkeypatch.setattr(web_search_providers, "_search_with_duckduckgo", fake_search_with_duckduckgo)
+    monkeypatch.setenv(web_search_providers.TAVILY_API_KEY_ENV, "test-tavily-key")
+    monkeypatch.setenv(web_search_providers.SERPER_API_KEY_ENV, "test-serper-key")
     definition = _definitions_by_name(_discover_definitions({}))["search_web"]
 
     outcome = asyncio.run(
@@ -935,7 +982,11 @@ def test_search_failure_projects_to_current_failed_outcome(
     )
 
     assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "execution_error"
+    assert outcome.result.error == "search_provider_unavailable"
+    assert "provider" in outcome.result.message
+    assert outcome.result.hint is not None
+    assert outcome.result.hint.strip() != ""
+    assert attempted_providers == ["tavily", "serper", "duckduckgo"]
 
 
 def test_web_truncate_specs_use_current_contract() -> None:
@@ -955,8 +1006,143 @@ def test_web_truncate_specs_use_current_contract() -> None:
     assert fetch_truncate.target_field == "content"
 
 
-def test_web_modules_do_not_import_old_registry_truncation_fetch_more_or_ui() -> None:
-    """迁移 Web 模块不得导入 OLD registry/truncation/fetch_more/UI。"""
+def test_web_provider_serializes_search_and_fetch_business(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 Web provider 内 search/fetch 不得并发进入业务体。"""
+
+    to_thread_entries: list[str] = []
+    business_entries: list[str] = []
+    active_business = False
+    observed_overlap = False
+
+    def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录搜索业务体进入并返回确定性结果。
+
+        :param kwargs: search_web 传入的关键字参数。
+        :returns: 确定性搜索结果。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del kwargs
+        business_entries.append("search")
+        return {
+            "query": "revenue",
+            "domains": [],
+            "total": 0,
+            "preferred_result": None,
+            "preferred_result_summary": "",
+            "next_action": "refine_query",
+            "next_action_args": {},
+            "hint": "refine query",
+            "results": [],
+        }
+
+    def fake_fetch_and_convert_content(url: str, **kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 fetch 业务体进入并返回确定性页面。
+
+        :param url: URL。
+        :param kwargs: 抓取辅助参数。
+        :returns: 确定性抓取结果。
+        """
+
+        del kwargs
+        business_entries.append("fetch")
+        return {
+            "final_url": url,
+            "title": "Example",
+            "content": "serialized fetch content",
+            "http_status": 200,
+            "redirect_hops": 0,
+            "response_headers": {},
+            "response_excerpt": "serialized fetch content",
+            "extraction_source": "mock",
+            "renderer_source": "mock",
+            "normalization_applied": False,
+            "quality_flags": [],
+            "content_stats": {},
+        }
+
+    monkeypatch.setattr(web_tools, "search_public_web", fake_search_public_web)
+    monkeypatch.setattr(web_tools, "_warmup_domain", lambda *args, **kwargs: {"attempted": True, "ok": True})
+    monkeypatch.setattr(web_tools, "_probe_content_type", lambda *args, **kwargs: {"attempted": True, "ok": True})
+    monkeypatch.setattr(web_tools, "_try_playwright_fallback", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_tools, "_fetch_and_convert_content", fake_fetch_and_convert_content)
+
+    definitions = _definitions_by_name(
+        _discover_definitions({"allow_private_network_url": True})
+    )
+
+    async def run_competing_calls() -> tuple[ToolCompletedOutcome, ToolCompletedOutcome]:
+        """并发执行 search 与 fetch。
+
+        :returns: 两个成功 outcome。
+        :raises AssertionError: 搜索未进入业务体或 outcome 类型不符时抛出。
+        """
+
+        first_to_thread_entered = asyncio.Event()
+        release_first_to_thread = asyncio.Event()
+
+        async def fake_to_thread(
+            func: Callable[_P, _R],
+            /,
+            *args: _P.args,
+            **kwargs: _P.kwargs,
+        ) -> _R:
+            """模拟 ``asyncio.to_thread`` 并记录业务体重叠。
+
+            :param func: 待执行的同步 callable。
+            :param args: 位置参数。
+            :param kwargs: 关键字参数。
+            :returns: callable 返回值。
+            :raises Exception: callable 执行失败时透出。
+            """
+
+            nonlocal active_business, observed_overlap
+            if active_business:
+                observed_overlap = True
+            active_business = True
+            to_thread_entries.append("enter")
+            if len(to_thread_entries) == 1:
+                first_to_thread_entered.set()
+                await release_first_to_thread.wait()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                active_business = False
+
+        monkeypatch.setattr(web_tools.asyncio, "to_thread", fake_to_thread)
+        search_task = asyncio.create_task(
+            definitions["search_web"].callable(
+                _call("search_web", {"query": "revenue"}),
+                _context(),
+            )
+        )
+        await first_to_thread_entered.wait()
+        fetch_task = asyncio.create_task(
+            definitions["fetch_web_page"].callable(
+                _call("fetch_web_page", {"url": "http://127.0.0.1/internal"}),
+                _context(),
+            )
+        )
+        await asyncio.sleep(0)
+        assert to_thread_entries == ["enter"]
+        release_first_to_thread.set()
+        search_outcome, fetch_outcome = await asyncio.gather(search_task, fetch_task)
+        assert isinstance(search_outcome, ToolCompletedOutcome)
+        assert isinstance(fetch_outcome, ToolCompletedOutcome)
+        return search_outcome, fetch_outcome
+
+    outcomes = asyncio.run(run_competing_calls())
+
+    assert len(outcomes) == 2
+    assert observed_overlap is False
+    assert to_thread_entries == ["enter", "enter"]
+    assert business_entries == ["search", "fetch"]
+
+
+def test_web_modules_do_not_import_legacy_registry_truncation_fetch_more_or_ui() -> None:
+    """Web 模块不得导入 legacy registry/truncation/fetch_more/UI。"""
 
     for source_path in _WEB_PACKAGE_ROOT.glob("*.py"):
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
