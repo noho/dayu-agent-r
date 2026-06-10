@@ -140,13 +140,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass-final-closeout-passed |
-| implementation status | WU-TOOLS-01-F02 PR #132 merged 2026-06-10; WU-TOOLS-01-F03 draft PR #134 opened; final closeout passed |
-| active work unit | WU-TOOLS-01-F03 |
-| default next work unit | WU-TOOLS-01-F04 |
-| next entry point | User merge decision for WU-TOOLS-01-F03 draft PR #134; after merge enter WU-TOOLS-01-F04 goal confirmation |
+| gate | implementation |
+| implementation status | WU-TOOLS-01-F03 draft PR #134 final closeout passed; WU-TOOLS-01-F01-02-R3 plan accepted after MiMo / DS re-review; accepted plan commit will include plan, review, fix, re-review and controller adjudication artifacts |
+| active work unit | WU-TOOLS-01-F01-02-R3 |
+| default next work unit | WU-TOOLS-01-F08 |
+| next entry point | WU-TOOLS-01-F01-02-R3 implementation Slice 0: Current ToolCallable Support |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
 
 状态约定：
@@ -195,11 +195,11 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | ID | 状态 | Owner / Destination | 下一步 |
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
-| WU-TOOLS-01-S1-R1 | deferred-with-owner | WU-TOOLS-01-F04/F05 and WU-TOOLS-01-F06/F07 / GitHub Issues #121 and #122 | 分别迁移 SEC/Fins 与 CN/HK Docling CI pipeline，再生成各自 smoke。 |
+| WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-TOOLS-01-S1-R2 | deferred-with-owner | WU-TOOLS-01-F08 | 清理 documents processor registry 的 OLD `engine` 命名。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
-| WU-TOOLS-01-F01-02-R3 | transferred-to-issue | GitHub Issue #130 | 分阶段将 Doc / Web / Fins read tools native 化并删除 `dayu/tools/_legacy_adapter`；实施时必须消除 legacy `tool_cancelled` 投影为 failed outcome 的 bug，不能把该行为搬进 provider-local wrapper。 |
+| WU-TOOLS-01-F01-02-R3 | open | GitHub Issue #130 | 分阶段将 Doc / Web / Fins read tools native 化并删除 `dayu/tools/_legacy_adapter`；实施时必须消除 legacy `tool_cancelled` 投影为 failed outcome 的 bug，不能把该行为搬进 provider-local wrapper。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 
 ## 当前 Work Units
@@ -220,13 +220,10 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01 | draft-PR-pass-final-closeout-passed | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed；draft PR #126 | shared Fins ingestion service/runtime 与 download / preprocess awaiting tool providers 已完成；等待用户 merge decision |
 | WU-TOOLS-01-F01-01 | draft-PR-pass-final-closeout-passed | Fins filelock convergence to dayu.runtime.filelock | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #127 | Fins filelock 已收敛到 `dayu.runtime.filelock`；无 active residual risk；等待用户 merge decision |
 | WU-TOOLS-01-F01-02 | completed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 merged 2026-06-09 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；PR 128 已 merge |
+| WU-TOOLS-01-F01-02-R3 | implementation | Retire legacy tool adapter and fix cancellation outcome projection | GitHub Issue #130 | Active work unit；plan 已由 MiMo / DS re-review 通过，当前进入 implementation Slice 0 |
 | WU-TOOLS-01-F01-03 | draft-PR-pass | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09; draft PR #131 | Draft PR #131 已通过本地 gate；final closeout 见 `docs/reviews/wu-tools-01-f01-03-final-closeout-controller.md`。等待用户 merge decision；Issue #129 继续追踪 `start_upload` prepare/activate 后续。 |
 | WU-TOOLS-01-F02 | completed | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up; PR #132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f02-final-closeout-controller.md`。F02 completion 已完成，F03 前置条件已满足。 |
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
-| WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
-| WU-TOOLS-01-F05 | pending | SEC/Fins CI smoke generation | GitHub Issue #121 under #82 follow-up; depends on WU-TOOLS-01-F04 | Generate explicit opt-in SEC/Fins smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for SEC/Fins coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
-| WU-TOOLS-01-F06 | pending | CN/HK Docling CI pipeline migration | GitHub Issue #122 under #82/#98 follow-up | First step of CN/HK Docling coverage: migrate OLD `docs/cn_hk_docling_ci.md`, shared process runner behavior, `utils/llm_docling_ci_score.py` and `dayu.fins.score_docling_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
-| WU-TOOLS-01-F07 | pending | CN/HK Docling CI smoke generation | GitHub Issue #122 under #82/#98 follow-up; depends on WU-TOOLS-01-F06 | Generate explicit opt-in CN/HK Docling smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for Docling coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
 | WU-TOOLS-01-F08 | pending | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Rename `build_engine_processor_registry(...)` to a documents/default registry name and update direct callers / exports / docs without changing processor registration behavior; owner for residual `WU-TOOLS-01-S1-R2` |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
