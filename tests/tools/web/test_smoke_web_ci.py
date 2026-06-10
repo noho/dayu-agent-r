@@ -22,34 +22,6 @@ from utils import smoke_web_ci as smoke
 JsonObject = dict[str, JsonValue]
 
 
-def test_not_opted_in_writes_skipped_summary_and_does_not_call_runner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """未显式 opt-in 时只写 skipped summary，不能调用 diagnostics runner。"""
-
-    monkeypatch.delenv("DAYU_RUN_WEB_CI_SMOKE", raising=False)
-
-    def raising_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
-        """未 opt-in 路径不应触发本 runner。"""
-
-        raise AssertionError(f"runner should not be called: {command}")
-
-    monkeypatch.setattr(smoke, "_run_diagnostic_command", raising_runner)
-
-    exit_code = smoke.main(["--output-dir", str(tmp_path), "--run-label", "skip-case"])
-
-    summary = _load_json_object(tmp_path / "summary.json")
-    assert exit_code == 0
-    assert summary["status"] == "skipped"
-    assert summary["exit_code"] == 0
-    assert summary["run_label"] == "skip-case"
-    assert (tmp_path / "summary.md").is_file()
-    skips = _list_field(summary, "skips")
-    assert len(skips) == 1
-    assert _object_value(skips[0])["bucket"] == "not_opted_in"
-
-
 def test_local_fixture_urls_and_pdf_fixture_are_stable() -> None:
     """本地 fixture URL 与 PDF 文本 fixture 应稳定可测。"""
 
@@ -58,27 +30,31 @@ def test_local_fixture_urls_and_pdf_fixture_are_stable() -> None:
 
     assert urls.html_url == "http://127.0.0.1:43117/index.html"
     assert urls.pdf_url == "http://127.0.0.1:43117/fixture.pdf"
+    assert urls.browser_url == "http://127.0.0.1:43117/client-rendered.html"
+    assert b"Dayu Web Smoke Browser Rendered" in smoke._browser_fixture_bytes()
     assert b"Dayu Web Smoke PDF" in pdf_bytes
     assert b"This PDF verifies Docling conversion." in pdf_bytes
     assert smoke.PDF_FETCH_MIN_CHARS >= 20
 
 
-def test_opted_in_runs_local_html_and_pdf_cases(
+def test_default_run_executes_local_html_pdf_and_browser_cases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """opt-in 后必须运行 local HTML 与 PDF cases。"""
+    """默认运行必须执行 local HTML、PDF 与 browser cases。"""
 
-    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
     html_url = "http://127.0.0.1:43117/index.html"
     pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    browser_url = "http://127.0.0.1:43117/client-rendered.html"
     called_commands: list[Sequence[str]] = []
+    external_urls: list[str] = []
 
     @contextlib.contextmanager
     def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
         """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
 
-        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url, browser_url=browser_url)
 
     def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """写入 synthetic local diagnostics artifact 并记录命令。"""
@@ -100,24 +76,60 @@ def test_opted_in_runs_local_html_and_pdf_cases(
                     docling_completed=True,
                 ),
             )
+        elif url == browser_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    fetch_backend="playwright",
+                    playwright_sampled=True,
+                    playwright_ok=True,
+                ),
+            )
         else:
-            raise AssertionError(f"unexpected url: {url}")
-        return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+            external_urls.append(url)
+            _write_payload(output, _diagnostic_payload(url=url, comparison_bucket="all_failed"))
+        return smoke.DiagnosticChildResult(returncode=0, stdout=f"diagnostic result for {url}\n", stderr="")
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
 
     exit_code = smoke.main(["--output-dir", str(tmp_path), "--run-label", "slice3-local"])
+    captured = capsys.readouterr()
 
     summary = _load_json_object(tmp_path / "summary.json")
     assert exit_code == 0
+    assert "SMOKE START Web CI smoke" in captured.out
+    assert "SMOKE LOG_LEVEL DEBUG" in captured.out
+    assert "SMOKE STATUS passed" in captured.out
+    assert "SMOKE LOCAL_CASES 3" in captured.out
+    assert "SMOKE EXTERNAL_CASES 2" in captured.out
+    assert "web smoke execution started" in captured.out
+    assert "stdout_prefix=diagnostic result for" in captured.out
     assert summary["status"] == "passed"
     assert summary["exit_code"] == 0
     local_cases = _list_field(summary, "local_cases")
-    assert [str(_object_value(item)["case_kind"]) for item in local_cases] == ["local_html", "local_pdf"]
-    assert len(called_commands) == 2
-    assert all("--allow-private-network-url" in command for command in called_commands)
-    assert all("--skip-playwright" in command for command in called_commands)
+    external_cases = _list_field(summary, "external_cases")
+    diagnostic_only = _list_field(summary, "diagnostic_only")
+    assert [str(_object_value(item)["case_kind"]) for item in local_cases] == [
+        "local_html",
+        "local_pdf",
+        "local_browser",
+    ]
+    assert len(called_commands) == 5
+    assert len(external_cases) == 2
+    assert len(diagnostic_only) == 2
+    assert external_urls == ["https://www.reuters.com/world/", "https://apnews.com/"]
+    commands_by_url = {_command_value(command, "--url"): command for command in called_commands}
+    assert "--allow-private-network-url" in commands_by_url[html_url]
+    assert "--allow-private-network-url" in commands_by_url[pdf_url]
+    assert "--allow-private-network-url" in commands_by_url[browser_url]
+    assert "--skip-playwright" in commands_by_url[html_url]
+    assert "--skip-playwright" in commands_by_url[pdf_url]
+    assert "--skip-playwright" not in commands_by_url[browser_url]
+    for external_url in external_urls:
+        assert "--allow-private-network-url" not in commands_by_url[external_url]
+        assert "--skip-playwright" in commands_by_url[external_url]
 
 
 def test_synthetic_diagnostics_results_map_to_pass_fail_skip_diagnostic_only_and_schema_gap(
@@ -233,6 +245,42 @@ def test_synthetic_diagnostics_results_map_to_pass_fail_skip_diagnostic_only_and
     assert external.status == "diagnostic_only"
     assert external.bucket == "all_failed"
     assert external.exit_code == 0
+
+
+def test_local_browser_case_without_playwright_backend_is_diagnostic_only(tmp_path: Path) -> None:
+    """browser fixture 未观察到 fetch_web_page browser backend 时只产生诊断项。"""
+
+    browser_path = tmp_path / "browser.json"
+    _write_payload(
+        browser_path,
+        _diagnostic_payload(
+            url="http://127.0.0.1/client-rendered.html",
+            fetch_backend="requests",
+            playwright_sampled=True,
+            playwright_ok=True,
+        ),
+    )
+
+    browser = smoke._classify_child_result(
+        case_name="local-browser",
+        case_kind="local_browser",
+        fallback_url="http://127.0.0.1/client-rendered.html",
+        artifact_path=browser_path,
+        child_result=smoke.DiagnosticChildResult(returncode=0, stdout="", stderr=""),
+    )
+    summary = smoke._summary_from_cases(
+        run_label="browser-diagnostic",
+        output_dir=tmp_path,
+        local_cases=(browser,),
+        external_cases=(),
+    )
+
+    assert browser.status == "diagnostic_only"
+    assert browser.bucket == "browser_backend_not_observed"
+    assert browser.exit_code == 0
+    assert summary.status == "diagnostic_only"
+    assert summary.exit_code == 0
+    assert len(summary.diagnostic_only) == 1
 
 
 def test_pdf_payload_failures_are_not_misclassified_as_pass(tmp_path: Path) -> None:
@@ -353,7 +401,7 @@ def test_docling_skip_only_skips_pdf_and_does_not_hide_html_failure(tmp_path: Pa
         status="skipped",
         bucket="docling_runtime_initialization_error",
         evidence_path=str(tmp_path / "pdf.json"),
-        suggested_next_step="安装或修复 Docling runtime 后重跑 opt-in smoke。",
+        suggested_next_step="安装或修复 Docling runtime 后重跑 smoke。",
         reason="Docling init failure.",
         exit_code=0,
     )
@@ -379,6 +427,7 @@ def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
 
     html_url = "http://127.0.0.1:43117/index.html"
     pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    browser_url = "http://127.0.0.1:43117/client-rendered.html"
     external_file = tmp_path / "urls.txt"
     external_file.write_text("https://example.com/external\n", encoding="utf-8")
     called_urls: list[str] = []
@@ -387,7 +436,7 @@ def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
     def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
         """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
 
-        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url, browser_url=browser_url)
 
     def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """写入 local diagnostics artifact 并拒绝 external 调用。"""
@@ -415,7 +464,6 @@ def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
 
     monkeypatch.setattr(smoke, "_running_local_fixture_server", fake_server)
     options = smoke.SmokeOptions(
-        run_live=True,
         output_dir=tmp_path,
         request_timeout=1.0,
         tool_timeout_budget=1.0,
@@ -424,6 +472,7 @@ def test_pdf_invocation_blocker_writes_artifact_and_stops_external_cases(
         external_limit=1,
         diagnostic_only_external=True,
         run_label="blocker",
+        log_level=smoke.LogLevel.DEBUG,
     )
 
     summary = smoke._execute_smoke(options=options, runner=fake_runner)
@@ -527,9 +576,9 @@ def test_external_child_returncode_does_not_override_local_pass(
 ) -> None:
     """external child returncode 非 0 只能进入 diagnostic-only，不能覆盖 local pass。"""
 
-    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
     html_url = "http://127.0.0.1:43117/index.html"
     pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    browser_url = "http://127.0.0.1:43117/client-rendered.html"
     url_file = tmp_path / "urls.txt"
     url_file.write_text("https://example.com/child-error\n", encoding="utf-8")
     output_dir = tmp_path / "out"
@@ -538,7 +587,7 @@ def test_external_child_returncode_does_not_override_local_pass(
     def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
         """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
 
-        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url, browser_url=browser_url)
 
     def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """local case 写入 pass artifact，external case 返回非零退出码。"""
@@ -558,6 +607,17 @@ def test_external_child_returncode_does_not_override_local_pass(
                     fetch_length=smoke.PDF_FETCH_MIN_CHARS,
                     docling_invoked=True,
                     docling_completed=True,
+                ),
+            )
+            return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
+        if url == browser_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    fetch_backend="playwright",
+                    playwright_sampled=True,
+                    playwright_ok=True,
                 ),
             )
             return smoke.DiagnosticChildResult(returncode=0, stdout="", stderr="")
@@ -596,9 +656,9 @@ def test_external_parse_and_artifact_gap_do_not_override_local_pass(
 ) -> None:
     """external parse failure 与 artifact missing 都只能进入 diagnostic-only。"""
 
-    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
     html_url = "http://127.0.0.1:43117/index.html"
     pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    browser_url = "http://127.0.0.1:43117/client-rendered.html"
     url_file = tmp_path / "urls.txt"
     url_file.write_text(
         "https://example.com/parse-gap\nhttps://example.com/artifact-gap\n",
@@ -610,7 +670,7 @@ def test_external_parse_and_artifact_gap_do_not_override_local_pass(
     def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
         """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
 
-        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url, browser_url=browser_url)
 
     def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """local case 写入 pass artifact，external case 制造 parse/missing gap。"""
@@ -629,6 +689,16 @@ def test_external_parse_and_artifact_gap_do_not_override_local_pass(
                     fetch_length=smoke.PDF_FETCH_MIN_CHARS,
                     docling_invoked=True,
                     docling_completed=True,
+                ),
+            )
+        elif url == browser_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    fetch_backend="playwright",
+                    playwright_sampled=True,
+                    playwright_ok=True,
                 ),
             )
         elif url.endswith("/parse-gap"):
@@ -667,15 +737,15 @@ def test_external_parse_and_artifact_gap_do_not_override_local_pass(
     assert buckets == ["artifact_parse_failure", "artifact_missing"]
 
 
-def test_include_playwright_only_affects_external_diagnostic_cases(
+def test_default_browser_case_samples_playwright_and_include_playwright_affects_external(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--include-playwright 只让 external diagnostic-only 命令采样 Playwright。"""
+    """默认 browser case 采样 Playwright，--include-playwright 额外影响 external。"""
 
-    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
     html_url = "http://127.0.0.1:43117/index.html"
     pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    browser_url = "http://127.0.0.1:43117/client-rendered.html"
     external_url = "https://example.com/playwright"
     url_file = tmp_path / "urls.txt"
     url_file.write_text(f"{external_url}\n", encoding="utf-8")
@@ -685,7 +755,7 @@ def test_include_playwright_only_affects_external_diagnostic_cases(
     def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
         """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
 
-        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url, browser_url=browser_url)
 
     def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """记录命令并写入 pass/diagnostic-only artifact。"""
@@ -705,6 +775,16 @@ def test_include_playwright_only_affects_external_diagnostic_cases(
                     fetch_length=smoke.PDF_FETCH_MIN_CHARS,
                     docling_invoked=True,
                     docling_completed=True,
+                ),
+            )
+        elif url == browser_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    fetch_backend="playwright",
+                    playwright_sampled=True,
+                    playwright_ok=True,
                 ),
             )
         elif url == external_url:
@@ -741,6 +821,7 @@ def test_include_playwright_only_affects_external_diagnostic_cases(
     assert exit_code == 0
     assert "--skip-playwright" in commands_by_url[html_url]
     assert "--skip-playwright" in commands_by_url[pdf_url]
+    assert "--skip-playwright" not in commands_by_url[browser_url]
     assert "--skip-playwright" not in commands_by_url[external_url]
     assert _object_value(diagnostic_only[0])["bucket"] == "playwright_challenge_detected"
 
@@ -765,6 +846,15 @@ def test_missing_external_file_returns_operator_input_error(tmp_path: Path) -> N
     assert not (tmp_path / "out" / "summary.json").exists()
 
 
+def test_log_level_cli_accepts_lowercase_verbose() -> None:
+    """--log-level 应不区分大小写并投影为 LogLevel。"""
+
+    namespace = smoke._parse_args(["--log-level", "verbose", "--external-limit", "0"])
+    options = smoke._options_from_namespace(namespace)
+
+    assert options.log_level == smoke.LogLevel.VERBOSE
+
+
 @pytest.mark.parametrize(
     ("file_name", "file_content"),
     [
@@ -780,7 +870,6 @@ def test_invalid_external_file_returns_operator_input_error_before_local_diagnos
 ) -> None:
     """非法 external 文件应在 local fixture 和 diagnostics 启动前失败。"""
 
-    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
     url_file = tmp_path / file_name
     url_file.write_text(file_content, encoding="utf-8")
     output_dir = tmp_path / "out"
@@ -792,7 +881,7 @@ def test_invalid_external_file_returns_operator_input_error_before_local_diagnos
 
         fixture_starts.append("started")
         raise AssertionError("local fixture should not start for invalid external URL file")
-        yield smoke.LocalFixtureUrls(html_url="", pdf_url="")
+        yield smoke.LocalFixtureUrls(html_url="", pdf_url="", browser_url="")
 
     def raising_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """非法参数路径不应触发 diagnostics runner。"""
@@ -826,9 +915,9 @@ def test_external_limit_and_summary_paths_are_predictable(
 ) -> None:
     """external-limit 应限制 runner 调用次数，summary 路径应固定在 output-dir 下。"""
 
-    monkeypatch.setenv("DAYU_RUN_WEB_CI_SMOKE", "1")
     html_url = "http://127.0.0.1:43117/index.html"
     pdf_url = "http://127.0.0.1:43117/fixture.pdf"
+    browser_url = "http://127.0.0.1:43117/client-rendered.html"
     url_file = tmp_path / "urls.jsonl"
     url_file.write_text(
         "\n".join(
@@ -851,7 +940,7 @@ def test_external_limit_and_summary_paths_are_predictable(
     def fake_server() -> Iterator[smoke.LocalFixtureUrls]:
         """提供 deterministic local fixture URL，不启动真实 HTTP server。"""
 
-        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url)
+        yield smoke.LocalFixtureUrls(html_url=html_url, pdf_url=pdf_url, browser_url=browser_url)
 
     def fake_runner(command: Sequence[str]) -> smoke.DiagnosticChildResult:
         """写入 synthetic diagnostics artifact 并记录 URL。"""
@@ -870,6 +959,16 @@ def test_external_limit_and_summary_paths_are_predictable(
                     fetch_length=smoke.PDF_FETCH_MIN_CHARS,
                     docling_invoked=True,
                     docling_completed=True,
+                ),
+            )
+        elif url == browser_url:
+            _write_payload(
+                output,
+                _diagnostic_payload(
+                    url=url,
+                    fetch_backend="playwright",
+                    playwright_sampled=True,
+                    playwright_ok=True,
                 ),
             )
         else:
@@ -898,7 +997,7 @@ def test_external_limit_and_summary_paths_are_predictable(
     assert called_urls == ["https://example.com/a", "https://example.com/b"]
     assert summary["status"] == "passed"
     assert summary["output_dir"] == str(output_dir)
-    assert len(_list_field(summary, "local_cases")) == 2
+    assert len(_list_field(summary, "local_cases")) == 3
     assert len(_list_field(summary, "external_cases")) == 2
     assert _list_field(summary, "skips") == []
     assert (output_dir / "summary.md").is_file()
@@ -917,6 +1016,9 @@ def _diagnostic_payload(
     docling_init_error: bool = False,
     comparison_bucket: str = "all_success",
     stream_name: str = "page.pdf",
+    fetch_backend: str = "requests",
+    playwright_sampled: bool = False,
+    playwright_ok: bool = False,
 ) -> JsonObject:
     """构造 synthetic diagnostics artifact。"""
 
@@ -955,14 +1057,15 @@ def _diagnostic_payload(
             "ok": fetch_ok,
             "status": "completed" if fetch_ok else "failed",
             "content_length": fetch_length,
+            "fetch_backend": fetch_backend,
             "docling_conversion_invocation_evidence": evidence,
         },
         "docling_conversion_invocation_evidence": evidence,
         "playwright_profile": {
-            "sampled": False,
-            "ok": False,
-            "skipped": True,
-            "status": "skipped",
+            "sampled": playwright_sampled,
+            "ok": playwright_ok,
+            "skipped": not playwright_sampled,
+            "status": "completed" if playwright_ok else "skipped",
         },
     }
 

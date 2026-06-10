@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""显式 opt-in 的 Web CI smoke 汇总脚本。
+"""Web CI smoke 汇总脚本。
 
-本模块只负责 smoke 级别的 opt-in、diagnostics artifact schema 校验、
-pass/fail/skip/diagnostic-only 分类和 Codex 可读 summary 输出。网页访问、
-``requests``、``fetch_web_page``、Playwright 与 Docling 事实均来自
-``utils.diagnose_web_access`` 输出的 artifact；本脚本不重新诊断网页内容。
+本模块负责 smoke 级别的 diagnostics artifact schema 校验、pass/fail/skip/
+diagnostic-only 分类和 Codex 可读 summary 输出。网页访问、``requests``、
+``fetch_web_page``、Playwright 与 Docling 事实均来自 ``utils.diagnose_web_access``
+输出的 artifact；本脚本不重新诊断网页内容。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import contextlib
 import html
 import http.server
 import json
-import os
+import logging
 import subprocess
 import sys
 import threading
@@ -26,13 +26,15 @@ from typing import Final, Iterator, TypeAlias, cast
 from urllib.parse import urlparse
 
 from dayu.contracts.json_value import JsonValue
+from dayu.runtime.log import LogLevel, configure
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 DiagnosticRunner: TypeAlias = Callable[[Sequence[str]], "DiagnosticChildResult"]
 
-_ENV_OPT_IN: Final[str] = "DAYU_RUN_WEB_CI_SMOKE"
-_ENV_OPT_IN_VALUE: Final[str] = "1"
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 _DEFAULT_OUTPUT_ROOT: Final[Path] = Path("workspace/output/web_smoke")
+_DEFAULT_EXTERNAL_URL_FILE: Final[Path] = Path(__file__).resolve().with_name("web_ci_urls.jsonl")
+_DEFAULT_EXTERNAL_LIMIT: Final[int] = 2
 _DIAGNOSTIC_SCHEMA_VERSION: Final[str] = "web-diagnostics-v1"
 _MIN_DIAGNOSTIC_SCHEMA_REVISION: Final[int] = 1
 _STATUS_PASSED: Final[str] = "passed"
@@ -44,12 +46,14 @@ _EXIT_LOCAL_FAILURE: Final[int] = 1
 _EXIT_SCHEMA_OR_INFRA_FAILURE: Final[int] = 2
 _CASE_LOCAL_HTML: Final[str] = "local_html"
 _CASE_LOCAL_PDF: Final[str] = "local_pdf"
+_CASE_LOCAL_BROWSER: Final[str] = "local_browser"
 _CASE_EXTERNAL: Final[str] = "external"
 _JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
 _EXTERNAL_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 _LOCAL_FIXTURE_HOST: Final[str] = "127.0.0.1"
 _LOCAL_HTML_PATH: Final[str] = "/index.html"
 _LOCAL_PDF_PATH: Final[str] = "/fixture.pdf"
+_LOCAL_BROWSER_PATH: Final[str] = "/client-rendered.html"
 _LOCAL_HTML_CONTENT_TYPE: Final[str] = "text/html; charset=utf-8"
 _LOCAL_PDF_CONTENT_TYPE: Final[str] = "application/pdf"
 _HTTP_GET_METHOD: Final[str] = "GET"
@@ -63,7 +67,6 @@ _HTTP_STATUS_METHOD_NOT_ALLOWED: Final[int] = 405
 _SERVER_JOIN_TIMEOUT_SECONDS: Final[float] = 2.0
 _DOCLING_INVOCATION_BLOCKER_FILE: Final[str] = "local-pdf-docling-invocation-blocker.md"
 _BUCKET_PASSED: Final[str] = "passed"
-_BUCKET_NOT_OPTED_IN: Final[str] = "not_opted_in"
 _BUCKET_DIAGNOSTIC_SCHEMA_GAP: Final[str] = "diagnostic_schema_gap"
 _BUCKET_CHILD_PROCESS_ERROR: Final[str] = "child_process_error"
 _BUCKET_ARTIFACT_PARSE_FAILURE: Final[str] = "artifact_parse_failure"
@@ -74,10 +77,18 @@ _BUCKET_PDF_CONTENT_TYPE_FAILURE: Final[str] = "pdf_content_type_failure"
 _BUCKET_PDF_CONTENT_LENGTH_FAILURE: Final[str] = "pdf_content_length_failure"
 _BUCKET_PDF_DOCLING_INVOCATION_FAILURE: Final[str] = "pdf_docling_invocation_failure"
 _BUCKET_DOCLING_INIT_SKIP: Final[str] = "docling_runtime_initialization_error"
+_BUCKET_BROWSER_BACKEND_NOT_OBSERVED: Final[str] = "browser_backend_not_observed"
+_BUCKET_BROWSER_FETCH_FAILURE: Final[str] = "browser_fetch_failure"
+_BUCKET_BROWSER_PROFILE_NOT_SAMPLED: Final[str] = "browser_profile_not_sampled"
 _PDF_EXPECTED_STREAM_NAME: Final[str] = "page.pdf"
+_BROWSER_EXPECTED_FETCH_BACKEND: Final[str] = "playwright"
 PDF_FETCH_MIN_CHARS: Final[int] = 20
 _HTML_FIXTURE_TITLE: Final[str] = "Dayu Web Smoke HTML"
 _HTML_FIXTURE_BODY: Final[str] = "Dayu Web Smoke HTML fixture verifies local fetch_web_page access."
+_BROWSER_FIXTURE_TITLE: Final[str] = "Dayu Web Smoke Browser Rendered"
+_BROWSER_FIXTURE_TEXT: Final[str] = (
+    "Playwright fallback rendered this client-side page for fetch_web_page smoke evidence."
+)
 _PDF_FIXTURE_TEXT_LINE_1: Final[str] = "Dayu Web Smoke PDF"
 _PDF_FIXTURE_TEXT_LINE_2: Final[str] = "This PDF verifies Docling conversion."
 _PDF_STREAM_FONT_SIZE: Final[int] = 18
@@ -87,6 +98,7 @@ _PDF_STREAM_LINE_STEP: Final[int] = 28
 _PDF_PAGE_WIDTH: Final[int] = 612
 _PDF_PAGE_HEIGHT: Final[int] = 792
 _PDF_OBJECT_COUNT: Final[int] = 5
+_CHILD_STDIO_LOG_CHARS: Final[int] = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,15 +106,15 @@ class SmokeOptions:
     """Smoke CLI 选项的强类型投影。
 
     Args:
-        run_live: CLI 是否显式要求执行 live smoke。
         output_dir: summary 与子 artifact 输出目录。
         request_timeout: 传给 diagnostics 的 requests timeout。
         tool_timeout_budget: 传给 diagnostics 的工具调用 timeout budget。
         include_playwright: 是否让 diagnostics 采样 Playwright。
-        external_url_file: 外部 URL 样本文件；为空时不运行外部诊断。
+        external_url_file: 外部 URL 样本文件。
         external_limit: 外部 URL 最多采样数量。
         diagnostic_only_external: 外部 URL 是否只作为 diagnostic-only。
         run_label: 本次 smoke 运行标签。
+        log_level: Dayu 诊断日志级别。
 
     Returns:
         无。
@@ -111,7 +123,6 @@ class SmokeOptions:
         无。
     """
 
-    run_live: bool
     output_dir: Path
     request_timeout: float
     tool_timeout_budget: float
@@ -120,6 +131,7 @@ class SmokeOptions:
     external_limit: int
     diagnostic_only_external: bool
     run_label: str
+    log_level: LogLevel
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +141,7 @@ class LocalFixtureUrls:
     Args:
         html_url: HTML fixture URL。
         pdf_url: PDF fixture URL。
+        browser_url: client-rendered browser fixture URL。
 
     Returns:
         无。
@@ -139,6 +152,7 @@ class LocalFixtureUrls:
 
     html_url: str
     pdf_url: str
+    browser_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +378,7 @@ def _local_fixture_urls(port: int) -> LocalFixtureUrls:
     return LocalFixtureUrls(
         html_url=f"{origin}{_LOCAL_HTML_PATH}",
         pdf_url=f"{origin}{_LOCAL_PDF_PATH}",
+        browser_url=f"{origin}{_LOCAL_BROWSER_PATH}",
     )
 
 
@@ -416,6 +431,34 @@ def _pdf_text_stream() -> bytes:
         "ET\n"
     )
     return stream.encode("ascii")
+
+
+def _browser_fixture_bytes() -> bytes:
+    """构造需要浏览器执行脚本后才产出正文的 HTML fixture。
+
+    Args:
+        无。
+
+    Returns:
+        UTF-8 HTML bytes。
+
+    Raises:
+        无。
+    """
+
+    title = html.escape(_BROWSER_FIXTURE_TITLE)
+    rendered_text = html.escape(_BROWSER_FIXTURE_TEXT)
+    rendered_html = json.dumps(f"<main><h1>{title}</h1><p>{rendered_text}</p></main>")
+    document = (
+        "<!doctype html>\n"
+        "<html lang=\"en\">\n"
+        f"<head><meta charset=\"utf-8\"><title>{title}</title></head>\n"
+        "<body><div id=\"app\"></div><script>\n"
+        f"document.getElementById('app').innerHTML = {rendered_html};\n"
+        "</script></body>\n"
+        "</html>\n"
+    )
+    return document.encode("utf-8")
 
 
 def _pdf_fixture_bytes() -> bytes:
@@ -496,6 +539,14 @@ class _LocalFixtureRequestHandler(http.server.BaseHTTPRequestHandler):
                 status_code=_HTTP_STATUS_OK,
                 content_type=_LOCAL_PDF_CONTENT_TYPE,
                 body=_pdf_fixture_bytes(),
+            )
+            return
+        if path == _LOCAL_BROWSER_PATH:
+            _send_fixture_response(
+                self,
+                status_code=_HTTP_STATUS_OK,
+                content_type=_LOCAL_HTML_CONTENT_TYPE,
+                body=_browser_fixture_bytes(),
             )
             return
         _send_fixture_response(
@@ -634,6 +685,27 @@ def _default_output_dir(run_label: str) -> Path:
     return (_DEFAULT_OUTPUT_ROOT / run_label).resolve()
 
 
+def _log_level_from_text(log_level_text: str) -> LogLevel:
+    """解析 CLI 日志级别文本。
+
+    Args:
+        log_level_text: CLI 传入的日志级别，不区分大小写。
+
+    Returns:
+        Dayu 日志级别。
+
+    Raises:
+        ValueError: 日志级别不属于 :class:`LogLevel` 时抛出。
+    """
+
+    normalized = log_level_text.strip().upper()
+    try:
+        return LogLevel[normalized]
+    except KeyError as exc:
+        allowed_values = ", ".join(level.name.lower() for level in LogLevel)
+        raise ValueError(f"--log-level 必须是以下之一: {allowed_values}") from exc
+
+
 def _json_object(value: JsonValue, *, field_name: str) -> JsonObject:
     """校验并复制 JSON 对象。
 
@@ -765,6 +837,25 @@ def _write_json(path: Path, payload: Mapping[str, JsonValue]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _stdio_log_prefix(value: str) -> str:
+    """生成可写入 DEBUG 日志的子进程输出前缀。
+
+    Args:
+        value: 子进程 stdout 或 stderr。
+
+    Returns:
+        有界且单行化的输出前缀；空输入返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    normalized = " ".join(value.split())
+    if len(normalized) <= _CHILD_STDIO_LOG_CHARS:
+        return normalized
+    return normalized[:_CHILD_STDIO_LOG_CHARS] + "...<truncated>"
 
 
 def _diagnostic_schema_gap(payload: Mapping[str, JsonValue], *, case_kind: str) -> str:
@@ -927,6 +1018,40 @@ def _fetch_content_length(payload: Mapping[str, JsonValue]) -> int | None:
 
     fetch_profile = _nested_object(payload, "fetch_web_page_profile")
     return _int_field(fetch_profile, "content_length")
+
+
+def _fetch_backend(payload: Mapping[str, JsonValue]) -> str:
+    """读取 fetch_web_page 实际使用的 backend。
+
+    Args:
+        payload: diagnostics artifact。
+
+    Returns:
+        backend 字符串；缺失时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    fetch_profile = _nested_object(payload, "fetch_web_page_profile")
+    return _string_field(fetch_profile, "fetch_backend")
+
+
+def _playwright_profile_sampled(payload: Mapping[str, JsonValue]) -> bool:
+    """判断 diagnostics 是否采样了 Playwright profile。
+
+    Args:
+        payload: diagnostics artifact。
+
+    Returns:
+        已采样时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    playwright_profile = _nested_object(payload, "playwright_profile")
+    return _bool_field(playwright_profile, "sampled")
 
 
 def _docling_evidence(payload: Mapping[str, JsonValue]) -> JsonObject:
@@ -1170,6 +1295,16 @@ def _classify_loaded_artifact(
             suggested_next_step="先检查 local fixture raw requests 路径；requests 失败不能由 fetch 成功掩盖。",
         )
     if not _fetch_ok(payload):
+        if case_kind == _CASE_LOCAL_BROWSER:
+            return _case_diagnostic_only(
+                case_name=case_name,
+                case_kind=case_kind,
+                url=url,
+                evidence_path=evidence_path,
+                bucket=_BUCKET_BROWSER_FETCH_FAILURE,
+                reason="client-rendered fixture 未观察到 fetch_web_page 成功；该 browser path 结果交给 Agent 结合 artifact 判断。",
+                suggested_next_step="查看 fetch_web_page_profile 的 error/message/hint，确认是 Playwright 环境缺失、浏览器回退未触发还是工具回归。",
+            )
         return _case_failure(
             case_name=case_name,
             case_kind=case_kind,
@@ -1188,6 +1323,15 @@ def _classify_loaded_artifact(
         )
         if pdf_failure is not None:
             return pdf_failure
+    if case_kind == _CASE_LOCAL_BROWSER:
+        browser_gap = _classify_browser_loaded_artifact(
+            case_name=case_name,
+            url=url,
+            evidence_path=evidence_path,
+            payload=payload,
+        )
+        if browser_gap is not None:
+            return browser_gap
     return SmokeCaseResult(
         case_name=case_name,
         case_kind=case_kind,
@@ -1278,6 +1422,55 @@ def _classify_pdf_loaded_artifact(
     return None
 
 
+def _classify_browser_loaded_artifact(
+    *,
+    case_name: str,
+    url: str,
+    evidence_path: str,
+    payload: Mapping[str, JsonValue],
+) -> SmokeCaseResult | None:
+    """分类 browser-rendered local case 的额外诊断事实。
+
+    Args:
+        case_name: case 名称。
+        url: URL。
+        evidence_path: 证据路径。
+        payload: diagnostics artifact。
+
+    Returns:
+        diagnostic-only 结果；browser backend 被观察到时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if not _playwright_profile_sampled(payload):
+        return _case_diagnostic_only(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_BROWSER,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=_BUCKET_BROWSER_PROFILE_NOT_SAMPLED,
+            reason="client-rendered fixture 未采样 Playwright profile，无法用本次 artifact 证明 browser path 环境。",
+            suggested_next_step="确认 smoke 默认 browser case 未被 --skip-playwright 或旧 diagnostics 命令绕过。",
+        )
+    fetch_backend = _fetch_backend(payload)
+    if fetch_backend != _BROWSER_EXPECTED_FETCH_BACKEND:
+        return _case_diagnostic_only(
+            case_name=case_name,
+            case_kind=_CASE_LOCAL_BROWSER,
+            url=url,
+            evidence_path=evidence_path,
+            bucket=_BUCKET_BROWSER_BACKEND_NOT_OBSERVED,
+            reason=(
+                "client-rendered fixture 未观察到 fetch_web_page 使用 Playwright backend；"
+                f"实际 backend={fetch_backend or '<missing>'}。"
+            ),
+            suggested_next_step="查看 raw HTML、fetch_web_page_profile 与 playwright_profile，判断是否浏览器回退未触发或 fixture 已被 requests 路径直接处理。",
+        )
+    return None
+
+
 def _case_failure(
     *,
     case_name: str,
@@ -1352,7 +1545,7 @@ def _case_skip(
         status=_STATUS_SKIPPED,
         bucket=bucket,
         evidence_path=evidence_path,
-        suggested_next_step="安装或修复 Docling runtime 后重跑 opt-in smoke。",
+        suggested_next_step="安装或修复 Docling runtime 后重跑 smoke。",
         reason=reason,
         exit_code=_EXIT_OK,
     )
@@ -1509,9 +1702,10 @@ def _summary_from_cases(
         无。
     """
 
-    failures = tuple(case.to_item() for case in local_cases if case.status == _STATUS_FAILED)
-    skips = tuple(case.to_item() for case in local_cases if case.status == _STATUS_SKIPPED) + tuple(extra_skips)
-    diagnostic_only = tuple(case.to_item() for case in external_cases if case.status == _STATUS_DIAGNOSTIC_ONLY)
+    all_cases = tuple(local_cases) + tuple(external_cases)
+    failures = tuple(case.to_item() for case in all_cases if case.status == _STATUS_FAILED)
+    skips = tuple(case.to_item() for case in all_cases if case.status == _STATUS_SKIPPED) + tuple(extra_skips)
+    diagnostic_only = tuple(case.to_item() for case in all_cases if case.status == _STATUS_DIAGNOSTIC_ONLY)
     local_exit_code = _EXIT_OK
     if any(case.exit_code == _EXIT_SCHEMA_OR_INFRA_FAILURE for case in local_cases):
         local_exit_code = _EXIT_SCHEMA_OR_INFRA_FAILURE
@@ -1537,40 +1731,6 @@ def _summary_from_cases(
         diagnostic_only=diagnostic_only,
         local_cases=tuple(local_cases),
         external_cases=tuple(external_cases),
-    )
-
-
-def _skipped_summary(*, run_label: str, output_dir: Path) -> SmokeSummary:
-    """构造未 opt-in summary。
-
-    Args:
-        run_label: 运行标签。
-        output_dir: 输出目录。
-
-    Returns:
-        skipped summary。
-
-    Raises:
-        无。
-    """
-
-    skip_item = SmokeItem(
-        bucket=_BUCKET_NOT_OPTED_IN,
-        evidence_path="",
-        url="",
-        suggested_next_step="设置 DAYU_RUN_WEB_CI_SMOKE=1 或传入 --run-live 后才会执行 live smoke。",
-        reason="未显式 opt-in；脚本未联网、未启动 server、未调用 diagnostics runner。",
-    )
-    return SmokeSummary(
-        status=_STATUS_SKIPPED,
-        exit_code=_EXIT_OK,
-        run_label=run_label,
-        output_dir=str(output_dir),
-        failures=(),
-        skips=(skip_item,),
-        diagnostic_only=(),
-        local_cases=(),
-        external_cases=(),
     )
 
 
@@ -1773,6 +1933,29 @@ def _run_diagnostic_command(command: Sequence[str]) -> DiagnosticChildResult:
     )
 
 
+def _log_diagnostic_child_result(*, case_name: str, child_result: DiagnosticChildResult) -> None:
+    """记录 diagnostics 子进程的有界输出前缀。
+
+    Args:
+        case_name: smoke case 名称。
+        child_result: diagnostics 子进程结果。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    _LOGGER.debug(
+        "diagnostics child finished: case=%s returncode=%s stdout_prefix=%s stderr_prefix=%s",
+        case_name,
+        child_result.returncode,
+        _stdio_log_prefix(child_result.stdout),
+        _stdio_log_prefix(child_result.stderr),
+    )
+
+
 def _diagnostic_command(
     *,
     url: str,
@@ -1818,7 +2001,7 @@ def _diagnostic_command(
 
 
 def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list[SmokeCaseResult]:
-    """运行本地 HTML/PDF fixture smoke cases。
+    """运行本地 fetch_web_page path matrix smoke cases。
 
     Args:
         options: smoke 选项。
@@ -1835,28 +2018,78 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     results: list[SmokeCaseResult] = []
     with _running_local_fixture_server() as fixture_urls:
-        local_cases = (
-            ("local-html", _CASE_LOCAL_HTML, fixture_urls.html_url, diagnostics_dir / "local-html.json"),
-            ("local-pdf", _CASE_LOCAL_PDF, fixture_urls.pdf_url, diagnostics_dir / "local-pdf.json"),
+        _LOGGER.info(
+            "local fixture server started: html=%s pdf=%s browser=%s",
+            fixture_urls.html_url,
+            fixture_urls.pdf_url,
+            fixture_urls.browser_url,
         )
-        for case_name, case_kind, url, artifact_path in local_cases:
+        local_cases = (
+            (
+                "local-html",
+                _CASE_LOCAL_HTML,
+                fixture_urls.html_url,
+                diagnostics_dir / "local-html.json",
+                False,
+            ),
+            (
+                "local-pdf",
+                _CASE_LOCAL_PDF,
+                fixture_urls.pdf_url,
+                diagnostics_dir / "local-pdf.json",
+                False,
+            ),
+            (
+                "local-browser",
+                _CASE_LOCAL_BROWSER,
+                fixture_urls.browser_url,
+                diagnostics_dir / "local-browser.json",
+                True,
+            ),
+        )
+        for case_name, case_kind, url, artifact_path, sample_playwright in local_cases:
+            _LOGGER.debug(
+                "running local smoke case: case=%s kind=%s sample_playwright=%s artifact=%s",
+                case_name,
+                case_kind,
+                sample_playwright,
+                artifact_path,
+            )
             command = _diagnostic_command(
                 url=url,
                 artifact_path=artifact_path,
                 options=options,
                 allow_private_network_url=True,
-                sample_playwright=False,
+                sample_playwright=sample_playwright,
             )
             child_result = runner(command)
-            results.append(
-                _classify_child_result(
-                    case_name=case_name,
-                    case_kind=case_kind,
-                    fallback_url=url,
-                    artifact_path=artifact_path,
-                    child_result=child_result,
-                )
+            _log_diagnostic_child_result(case_name=case_name, child_result=child_result)
+            case_result = _classify_child_result(
+                case_name=case_name,
+                case_kind=case_kind,
+                fallback_url=url,
+                artifact_path=artifact_path,
+                child_result=child_result,
             )
+            results.append(case_result)
+            _LOGGER.debug(
+                "classified local smoke case: case=%s status=%s bucket=%s exit_code=%s evidence=%s",
+                case_result.case_name,
+                case_result.status,
+                case_result.bucket,
+                case_result.exit_code,
+                case_result.evidence_path,
+            )
+            if (
+                case_result.case_kind == _CASE_LOCAL_PDF
+                and case_result.status == _STATUS_FAILED
+                and case_result.bucket == _BUCKET_PDF_DOCLING_INVOCATION_FAILURE
+            ):
+                _LOGGER.warning(
+                    "stopping local matrix after Docling invocation blocker: evidence=%s",
+                    case_result.evidence_path,
+                )
+                break
     return results
 
 
@@ -1876,13 +2109,16 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
     """
 
     if options.external_url_file is None:
+        _LOGGER.info("external diagnostic-only cases disabled")
         return []
     urls = _read_external_urls(options.external_url_file, limit=options.external_limit)
+    _LOGGER.info("external diagnostic-only cases loaded: file=%s count=%s", options.external_url_file, len(urls))
     diagnostics_dir = options.output_dir / "diagnostics" / "external"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     results: list[SmokeCaseResult] = []
     for index, url in enumerate(urls, start=1):
         artifact_path = diagnostics_dir / f"external-{index:04d}.json"
+        _LOGGER.debug("running external diagnostic case: index=%s artifact=%s", index, artifact_path)
         command = _diagnostic_command(
             url=url,
             artifact_path=artifact_path,
@@ -1891,14 +2127,21 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
             sample_playwright=options.include_playwright,
         )
         child_result = runner(command)
-        results.append(
-            _classify_child_result(
-                case_name=f"external-{index:04d}",
-                case_kind=_CASE_EXTERNAL,
-                fallback_url=url,
-                artifact_path=artifact_path,
-                child_result=child_result,
-            )
+        _log_diagnostic_child_result(case_name=f"external-{index:04d}", child_result=child_result)
+        case_result = _classify_child_result(
+            case_name=f"external-{index:04d}",
+            case_kind=_CASE_EXTERNAL,
+            fallback_url=url,
+            artifact_path=artifact_path,
+            child_result=child_result,
+        )
+        results.append(case_result)
+        _LOGGER.debug(
+            "classified external diagnostic case: case=%s status=%s bucket=%s evidence=%s",
+            case_result.case_name,
+            case_result.status,
+            case_result.bucket,
+            case_result.evidence_path,
         )
     return results
 
@@ -1965,11 +2208,12 @@ def _write_docling_invocation_blocker_artifact(
             ]
         )
     blocker_path.write_text("\n".join(lines), encoding="utf-8")
+    _LOGGER.warning("wrote Docling invocation blocker artifact: path=%s", blocker_path)
     return blocker_path
 
 
 def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeSummary:
-    """执行 opt-in Web smoke 流程。
+    """执行 Web smoke 流程。
 
     Args:
         options: smoke 选项。
@@ -1983,22 +2227,44 @@ def _execute_smoke(*, options: SmokeOptions, runner: DiagnosticRunner) -> SmokeS
         OSError: 文件读写或子进程启动失败时抛出。
     """
 
+    _LOGGER.info(
+        "web smoke execution started: run_label=%s output_dir=%s external_limit=%s",
+        options.run_label,
+        options.output_dir,
+        options.external_limit,
+    )
     local_cases = _run_local_cases(options=options, runner=runner)
     if _has_docling_invocation_blocker(local_cases):
         _write_docling_invocation_blocker_artifact(output_dir=options.output_dir, local_cases=local_cases)
-        return _summary_from_cases(
+        summary = _summary_from_cases(
             run_label=options.run_label,
             output_dir=options.output_dir,
             local_cases=local_cases,
             external_cases=(),
         )
+        _LOGGER.info(
+            "web smoke execution finished: status=%s exit_code=%s local_cases=%s external_cases=0",
+            summary.status,
+            summary.exit_code,
+            len(summary.local_cases),
+        )
+        return summary
     external_cases = _run_external_cases(options=options, runner=runner)
-    return _summary_from_cases(
+    summary = _summary_from_cases(
         run_label=options.run_label,
         output_dir=options.output_dir,
         local_cases=local_cases,
         external_cases=external_cases,
     )
+    _LOGGER.info(
+        "web smoke execution finished: status=%s exit_code=%s local_cases=%s external_cases=%s diagnostic_only=%s",
+        summary.status,
+        summary.exit_code,
+        len(summary.local_cases),
+        len(summary.external_cases),
+        len(summary.diagnostic_only),
+    )
+    return summary
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -2014,18 +2280,31 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         SystemExit: argparse 在参数非法时抛出。
     """
 
-    parser = argparse.ArgumentParser(description="显式 opt-in 的 Web CI smoke summary 生成器。")
-    parser.add_argument("--run-live", action="store_true", help="显式执行 live smoke。")
+    parser = argparse.ArgumentParser(description="Web CI smoke summary 生成器。")
     parser.add_argument("--output-dir", default="", help="summary 输出目录；缺省为 workspace/output/web_smoke/<run_label>。")
     parser.add_argument("--request-timeout", type=float, default=15.0, help="diagnostics requests timeout 秒数。")
     parser.add_argument("--tool-timeout-budget", type=float, default=30.0, help="diagnostics 工具调用 timeout budget 秒数。")
     parser.add_argument("--include-playwright", action="store_true", help="让 diagnostics 采样 Playwright；默认跳过。")
-    parser.add_argument("--external-url-file", default="", help="外部 URL 文件；提供后只作为 diagnostic-only。")
-    parser.add_argument("--external-limit", type=int, default=0, help="外部 URL 最多采样数量。")
+    parser.add_argument(
+        "--external-url-file",
+        default="",
+        help="外部 URL 文件；缺省使用 utils/web_ci_urls.jsonl，结果只作为 diagnostic-only。",
+    )
+    parser.add_argument(
+        "--external-limit",
+        type=int,
+        default=_DEFAULT_EXTERNAL_LIMIT,
+        help="外部 URL 最多采样数量；传 0 可只运行本地 matrix。",
+    )
     parser.add_argument(
         "--diagnostic-only-external",
         action="store_true",
         help="显式确认外部 URL 只作为 diagnostic-only；提供 external-url-file 时自动按此语义处理。",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=LogLevel.DEBUG.name.lower(),
+        help="诊断日志级别，不区分大小写；默认 debug。",
     )
     parser.add_argument("--run-label", default="", help="可选运行标签，主要供 deterministic 测试或人工复现使用。")
     return parser.parse_args(argv)
@@ -2047,28 +2326,35 @@ def _options_from_namespace(namespace: argparse.Namespace) -> SmokeOptions:
     run_label_value = namespace.run_label
     run_label = run_label_value if isinstance(run_label_value, str) and run_label_value else _utc_run_label()
     output_dir_value = namespace.output_dir
-    output_dir = Path(output_dir_value).expanduser().resolve() if isinstance(output_dir_value, str) and output_dir_value else _default_output_dir(run_label)
+    output_dir = (
+        Path(output_dir_value).expanduser().resolve()
+        if isinstance(output_dir_value, str) and output_dir_value
+        else _default_output_dir(run_label)
+    )
     request_timeout_value = namespace.request_timeout
     tool_timeout_budget_value = namespace.tool_timeout_budget
     external_limit_value = namespace.external_limit
     external_file_value = namespace.external_url_file
+    log_level_value = namespace.log_level
     if not isinstance(request_timeout_value, float) or request_timeout_value <= 0:
         raise ValueError("--request-timeout 必须大于 0。")
     if not isinstance(tool_timeout_budget_value, float) or tool_timeout_budget_value <= 0:
         raise ValueError("--tool-timeout-budget 必须大于 0。")
     if not isinstance(external_limit_value, int) or external_limit_value < 0:
         raise ValueError("--external-limit 必须大于等于 0。")
+    if not isinstance(log_level_value, str):
+        raise ValueError("--log-level 必须是字符串。")
+    log_level = _log_level_from_text(log_level_value)
     external_url_file = (
         Path(external_file_value).expanduser().resolve()
         if isinstance(external_file_value, str) and external_file_value
-        else None
+        else _DEFAULT_EXTERNAL_URL_FILE
     )
     if external_url_file is not None and not external_url_file.is_file():
         raise ValueError(f"external URL 文件不存在: {external_url_file}")
     if external_url_file is not None:
         _validate_external_url_file(external_url_file)
     return SmokeOptions(
-        run_live=bool(namespace.run_live),
         output_dir=output_dir,
         request_timeout=request_timeout_value,
         tool_timeout_budget=tool_timeout_budget_value,
@@ -2077,7 +2363,58 @@ def _options_from_namespace(namespace: argparse.Namespace) -> SmokeOptions:
         external_limit=external_limit_value,
         diagnostic_only_external=bool(namespace.diagnostic_only_external) or external_url_file is not None,
         run_label=run_label,
+        log_level=log_level,
     )
+
+
+def _print_start_ui(options: SmokeOptions) -> None:
+    """打印人类可读的 smoke 启动信息。
+
+    这些 ``SMOKE`` 行是 CLI UI 输出，不作为审计真源；稳定事实仍写入
+    summary artifact。
+
+    Args:
+        options: smoke 选项。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    external_url_file = str(options.external_url_file) if options.external_url_file is not None else "<disabled>"
+    print("SMOKE START Web CI smoke")
+    print(f"SMOKE RUN_LABEL {options.run_label}")
+    print(f"SMOKE LOG_LEVEL {options.log_level.name}")
+    print(f"SMOKE OUTPUT_DIR {options.output_dir}")
+    print(f"SMOKE EXTERNAL_URL_FILE {external_url_file}")
+    print(f"SMOKE EXTERNAL_LIMIT {options.external_limit}")
+
+
+def _print_summary_ui(summary: SmokeSummary) -> None:
+    """打印人类可读的 smoke 结果摘要。
+
+    Args:
+        summary: smoke summary。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    output_dir = Path(summary.output_dir)
+    print(f"SMOKE STATUS {summary.status}")
+    print(f"SMOKE EXIT_CODE {summary.exit_code}")
+    print(f"SMOKE LOCAL_CASES {len(summary.local_cases)}")
+    print(f"SMOKE EXTERNAL_CASES {len(summary.external_cases)}")
+    print(f"SMOKE FAILURES {len(summary.failures)}")
+    print(f"SMOKE SKIPS {len(summary.skips)}")
+    print(f"SMOKE DIAGNOSTIC_ONLY {len(summary.diagnostic_only)}")
+    print(f"SMOKE SUMMARY_JSON {output_dir / 'summary.json'}")
+    print(f"SMOKE SUMMARY_MD {output_dir / 'summary.md'}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2102,16 +2439,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"smoke 参数错误: {exc}", file=sys.stderr)
         return _EXIT_SCHEMA_OR_INFRA_FAILURE
 
-    opted_in = options.run_live or os.environ.get(_ENV_OPT_IN) == _ENV_OPT_IN_VALUE
+    configure(level=options.log_level, configure_root=True)
+    _print_start_ui(options)
     try:
-        if not opted_in:
-            summary = _skipped_summary(run_label=options.run_label, output_dir=options.output_dir)
-        else:
-            summary = _execute_smoke(options=options, runner=_run_diagnostic_command)
+        summary = _execute_smoke(options=options, runner=_run_diagnostic_command)
         _write_summary(summary)
     except (OSError, ValueError) as exc:
+        _LOGGER.error("web smoke execution failed before summary output: %s", exc)
         print(f"smoke 执行失败: {exc}", file=sys.stderr)
         return _EXIT_SCHEMA_OR_INFRA_FAILURE
+    _print_summary_ui(summary)
     print(f"Web CI smoke summary 已写入: {options.output_dir}")
     return summary.exit_code
 

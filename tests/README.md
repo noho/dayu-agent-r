@@ -141,7 +141,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 `tests/tools/fixtures/documents/` 存放工具 provider 测试使用的确定性文档 fixture。当前包含 Markdown 与 Docling JSON 样本，测试应复制到临时目录后通过 provider 白名单访问，不直接把 fixture 根作为隐式生产路径。
 
 `tests/tools/web/` 的 Web provider 测试必须保持 deterministic：搜索 provider、requests 主路径和 Playwright fallback 都通过 monkeypatch / fixture 替身控制，不做 live network 请求。
-显式 opt-in 的 Web live smoke 位于 `utils/smoke_web_ci.py`，不在默认 pytest 中运行；`tests/tools/web/test_smoke_web_ci.py` 只覆盖 smoke 判定、summary contract 与 diagnostic-only 边界。
+Web live smoke 位于 `utils/smoke_web_ci.py`，不在默认 pytest 中运行；直接运行该脚本会启动本地 fixture server，依次覆盖 HTML requests/fetch、PDF Docling conversion 与 client-rendered browser fallback，并默认从 `utils/web_ci_urls.jsonl` 采样 2 个 external URL 作为 diagnostic-only 输入；运行时会打印 `SMOKE ...` UI 摘要行并按 `--log-level` 输出诊断日志，默认日志级别为 `debug`；传 `--external-limit 0` 可只运行本地 matrix。`tests/tools/web/test_smoke_web_ci.py` 只覆盖 smoke 判定、summary contract、默认 case matrix、UI/log 输出与 diagnostic-only 边界。
 
 ### `tests/fins/`
 
