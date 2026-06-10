@@ -13,18 +13,13 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
 )
-from dayu.tools._legacy_adapter.definition_adapter import (
-    LegacyToolConcurrencyPolicy,
-    adapt_collected_tools,
-)
-from dayu.tools._legacy_adapter.registry_collector import (
-    CollectedLegacyTool,
-    LegacyToolDeclarationCollector,
-)
 
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
-from dayu.fins.tools.fins_tools import register_fins_read_tools
+from dayu.fins.tools.fins_tools import (
+    FINS_READ_TOOL_NAMES,
+    build_fins_read_tool_definitions,
+)
 
 _PROVIDER_ID: Final[str] = "financial-read-tools"
 _VERSION_REF: Final[str] = "fins-read-tools-provider-v1"
@@ -32,17 +27,6 @@ _SOURCE_ID: Final[str] = "dayu.fins.tools.provider"
 _CONFIG_WORKSPACE_ROOT_FIELD: Final[str] = "workspace_root"
 _CONFIG_LIMITS_FIELD: Final[str] = "limits"
 _CONFIG_INCLUDE_READ_TOOLS_FIELD: Final[str] = "include_read_tools"
-_FINS_READ_TOOL_NAMES: Final[tuple[str, ...]] = (
-    "list_documents",
-    "get_document_sections",
-    "read_section",
-    "search_document",
-    "list_tables",
-    "get_table",
-    "get_page_content",
-    "get_financial_statement",
-    "query_xbrl_facts",
-)
 
 
 def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
@@ -78,20 +62,13 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
     read_runtime = runtime.get_read_runtime(
         processor_cache_max_entries=limits.processor_cache_max_entries
     )
-    collector = LegacyToolDeclarationCollector()
-    register_fins_read_tools(
-        collector,
-        read_runtime=read_runtime,
-        limits=limits,
-        timeout_budget=None,
-    )
-    declarations = collector.collected_tools()
-    _validate_fins_declarations(declarations)
+    definitions = build_fins_read_tool_definitions(read_runtime=read_runtime, limits=limits)
+    _validate_fins_definitions(definitions)
     return ToolsDiscoveryProviderOutput(
         provider_id=_PROVIDER_ID,
         version_ref=_VERSION_REF,
         source_refs=(source_ref,),
-        definitions=_adapt_fins_declarations(declarations),
+        definitions=definitions,
     )
 
 
@@ -245,52 +222,27 @@ def _parse_bool_default(
     return value
 
 
-def _validate_fins_declarations(
-    declarations: tuple[CollectedLegacyTool, ...],
+def _validate_fins_definitions(
+    definitions: tuple[ToolDefinition, ...],
 ) -> None:
-    """校验迁移 Fins read tool 声明集合。
+    """校验 Fins read tool 定义集合。
 
     Args:
-        declarations: collector 收集到的迁移声明。
+        definitions: native 工具定义集合。
 
     Returns:
         无。
 
     Raises:
-        ValueError: 工具名集合不符合 S4 预期时抛出。
+        ValueError: 工具名集合不符合 Slice 3 预期时抛出。
     """
 
-    names = tuple(declaration.name for declaration in declarations)
-    if names != _FINS_READ_TOOL_NAMES:
-        raise ValueError(f"fins provider expected tools {_FINS_READ_TOOL_NAMES}, got {names}")
-    for declaration in declarations:
-        if "fins" not in declaration.tags:
-            raise ValueError(f"fins tool {declaration.name} must declare fins tag")
-
-
-def _adapt_fins_declarations(
-    declarations: tuple[CollectedLegacyTool, ...],
-) -> tuple[ToolDefinition, ...]:
-    """把 Fins 声明适配为当前 ToolDefinition。
-
-    Args:
-        declarations: 迁移工具声明。
-
-    Returns:
-        current 工具定义元组。
-
-    Raises:
-        Exception: adapter 构造失败时透出。
-    """
-
-    return adapt_collected_tools(
-        declarations,
-        path_policy_by_tool={},
-        concurrency_policy_by_tool={
-            declaration.name: LegacyToolConcurrencyPolicy.SERIAL_PER_PROVIDER
-            for declaration in declarations
-        },
-    )
+    names = tuple(definition.name for definition in definitions)
+    if names != FINS_READ_TOOL_NAMES:
+        raise ValueError(f"fins provider expected tools {FINS_READ_TOOL_NAMES}, got {names}")
+    for definition in definitions:
+        if "fins" not in definition.tags:
+            raise ValueError(f"fins tool {definition.name} must declare fins tag")
 
 
 def _source_ref() -> ToolBundleSourceRef:

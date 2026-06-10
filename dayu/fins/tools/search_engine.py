@@ -17,10 +17,8 @@ from collections import Counter
 import re
 from typing import Any, Optional
 
-from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.tools._legacy_adapter.exceptions import ToolArgumentError
-from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
+from dayu.contracts.cancellation import CancellationToken
 from dayu.documents.processors.base import (
     DocumentProcessor,
     SearchHit,
@@ -54,6 +52,10 @@ from .search_models import (
 )
 from .section_semantic import resolve_section_semantic
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
+from .read_runtime_helpers import (
+    FinsReadArgumentError,
+    raise_if_fins_cancelled,
+)
 
 
 def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> None:
@@ -66,20 +68,10 @@ def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> 
         无。
 
     Raises:
-        ToolBusinessError: 当前工具调用已被 Host 取消时抛出，错误码固定为
-            ``tool_cancelled``。
+        FinsReadCancelledError: 当前工具调用已被 Host 取消时抛出。
     """
 
-    if cancellation_token is not None and cancellation_token.is_cancelled():
-        reason = cancellation_token.cancel_reason()
-        message = "财报文档搜索已被取消。"
-        if reason is not None and reason.strip() != "":
-            message = f"{message}取消原因: {reason}"
-        raise ToolBusinessError(
-            code="tool_cancelled",
-            message=message,
-            hint="当前工具调用已停止；等待新的用户指令或后续调度。",
-        )
+    raise_if_fins_cancelled(cancellation_token, message="财报文档搜索已被取消。")
 
 
 # =====================================================================
@@ -138,7 +130,7 @@ def _resolve_search_mode(mode: Optional[str]) -> str:
         规范化后的搜索模式字符串。
 
     Raises:
-        ToolArgumentError: 模式值无效时抛出。
+        FinsReadArgumentError: 模式值无效时抛出。
     """
 
     if mode is None:
@@ -147,7 +139,7 @@ def _resolve_search_mode(mode: Optional[str]) -> str:
     if not normalized:
         return SEARCH_MODE_AUTO
     if normalized not in _VALID_SEARCH_MODES:
-        raise ToolArgumentError(
+        raise FinsReadArgumentError(
             "search_document",
             "mode",
             mode,
@@ -194,21 +186,21 @@ def _resolve_search_queries(
         非空的标准化查询列表。
 
     Raises:
-        ToolArgumentError: 两项同时指定、均未指定或超上限时抛出。
+        FinsReadArgumentError: 两项同时指定、均未指定或超上限时抛出。
     """
 
     has_query = query is not None and str(query).strip() != ""
     has_queries = queries is not None and len(queries) > 0
 
     if has_query and has_queries:
-        raise ToolArgumentError(
+        raise FinsReadArgumentError(
             "search_document",
             "query/queries",
             None,
             "Cannot specify both 'query' and 'queries'. Use one or the other.",
         )
     if not has_query and not has_queries:
-        raise ToolArgumentError(
+        raise FinsReadArgumentError(
             "search_document",
             "query/queries",
             None,
@@ -218,7 +210,7 @@ def _resolve_search_queries(
     if has_query:
         normalized = require_non_empty_text(
             query,
-            empty_error=ToolArgumentError(
+            empty_error=FinsReadArgumentError(
                 "search_document",
                 "query",
                 query,
@@ -243,14 +235,14 @@ def _resolve_search_queries(
 
     if not result:
         query_values: list[JsonValue] = [query for query in queries]
-        raise ToolArgumentError(
+        raise FinsReadArgumentError(
             "search_document",
             "queries",
             query_values,
             "'queries' must contain at least one non-empty string.",
         )
     if len(result) > max_queries:
-        raise ToolArgumentError(
+        raise FinsReadArgumentError(
             "search_document",
             "queries",
             None,
