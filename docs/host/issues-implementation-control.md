@@ -220,7 +220,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01 | draft-PR-pass-final-closeout-passed | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed；draft PR #126 | shared Fins ingestion service/runtime 与 download / preprocess awaiting tool providers 已完成；等待用户 merge decision |
 | WU-TOOLS-01-F01-01 | draft-PR-pass-final-closeout-passed | Fins filelock convergence to dayu.runtime.filelock | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #127 | Fins filelock 已收敛到 `dayu.runtime.filelock`；无 active residual risk；等待用户 merge decision |
 | WU-TOOLS-01-F01-02 | completed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 merged 2026-06-09 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；PR 128 已 merge |
-| WU-TOOLS-01-F01-02-R3 | review | Retire legacy tool adapter and fix cancellation outcome projection | GitHub Issue #130 | Active work unit；Slice 0 / Slice 1 / Slice 2 / Slice 3 / Slice 4 已接受；当前进入 R3 aggregate deepreview gate |
+| WU-TOOLS-01-F01-02-R3 | review | Retire legacy tool adapter and fix cancellation outcome projection | GitHub Issue #130 | Active work unit；accepted plan commit `7b465e19`；Slice 0 / 1 / 2 / 3 / 4 accepted commits `a5ab5364` / `1bbc45fe` / `ac0c7303` / `2a914234` / `a24f6dc9`；当前进入 R3 aggregate deepreview gate |
 | WU-TOOLS-01-F01-03 | draft-PR-pass | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09; draft PR #131 | Draft PR #131 已通过本地 gate；final closeout 见 `docs/reviews/wu-tools-01-f01-03-final-closeout-controller.md`。等待用户 merge decision；Issue #129 继续追踪 `start_upload` prepare/activate 后续。 |
 | WU-TOOLS-01-F02 | completed | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up; PR #132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f02-final-closeout-controller.md`。F02 completion 已完成，F03 前置条件已满足。 |
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
@@ -897,7 +897,7 @@ F01 已建立 shared Fins service/runtime 作为 read、download、preprocess/pr
 - 不让 CLI / CI / tool 分别实现 CN / SEC download 或 upload 业务逻辑。
 - 不在 downloader、uploader、tool adapter、CLI adapter 或 CI runner 中再造 ticker / market 归一化逻辑。
 - 不把 SEC 控速压到 Host lane，lane 只负责 Host 执行并发治理；source-specific rate limit 属于 Fins downloader / runtime。
-- 不把 CI pipeline / smoke 的评分闭环并入本条；F04 / F05 / F06 / F07 仍负责迁移 CI pipeline 与生成 smoke，但它们必须复用 F01-03 提供的 shared runtime 能力。
+- 不把 CI pipeline / smoke 的评分闭环并入本条；SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由 GitHub Issues #121 / #122 追踪；相关后续必须复用 F01-03 提供的 shared runtime 能力。
 
 ### 验收信号
 

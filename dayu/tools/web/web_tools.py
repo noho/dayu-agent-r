@@ -155,6 +155,8 @@ _SEARCH_PROVIDER_UNAVAILABLE_HINT: Final[str] = (
     "[retry_later_or_use_known_source] Search providers are currently unavailable; "
     "retry later, refine the query, or continue with a known source URL."
 )
+_WEB_SEARCH_CANCELLED_MESSAGE: Final[str] = "网页搜索工具调用已被宿主取消。"
+_WEB_FETCH_CANCELLED_MESSAGE: Final[str] = "网页抓取工具调用已被宿主取消。"
 
 
 WebPayload: TypeAlias = dict[str, JsonValue]
@@ -534,11 +536,11 @@ def _is_timeout_like_exception(error: BaseException) -> bool:
     return _is_timeout_like_request_exception(error)
 
 
-def _raise_fetch_cancelled(cancellation_token: CancellationToken | None) -> NoReturn:
+def _raise_fetch_cancelled() -> NoReturn:
     """将工具取消投影为 Web 模块内取消信号。
 
     Args:
-        cancellation_token: 当前工具调用取消令牌。
+        无。
 
     Returns:
         无。
@@ -547,11 +549,8 @@ def _raise_fetch_cancelled(cancellation_token: CancellationToken | None) -> NoRe
         WebToolCancelledError: 当前调用已取消时抛出。
     """
 
-    reason = "工具调用已取消"
-    if cancellation_token is not None:
-        reason = cancellation_token.cancel_reason() or reason
     raise WebToolCancelledError(
-        message=reason,
+        message=_WEB_FETCH_CANCELLED_MESSAGE,
         hint=(
             "[continue_without_web] The host cancelled this web fetch; "
             "continue without this page unless the user asks to retry."
@@ -649,11 +648,21 @@ def _build_text_excerpt(text: str) -> str:
 
 
 def _raise_if_host_cancelled(cancellation_token: CancellationToken | None) -> None:
-    """在进入新的联网阶段前执行协作式取消检查。"""
+    """在进入新的联网阶段前执行协作式取消检查。
+
+    Args:
+        cancellation_token: 当前工具调用取消令牌；为空时不触发取消。
+
+    Returns:
+        无。
+
+    Raises:
+        WebToolCancelledError: 取消令牌已请求取消时抛出。
+    """
 
     if cancellation_token is not None:
         if cancellation_token.is_cancelled():
-            _raise_fetch_cancelled(cancellation_token)
+            _raise_fetch_cancelled()
 
 
 def _try_playwright_fallback(
@@ -677,6 +686,7 @@ def _try_playwright_fallback(
         deadline_monotonic: 当前工具调用 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
+        cancellation_token: 当前工具调用取消令牌。
 
     Returns:
         成功时返回标准化后的抓取结果；失败时返回 `None`。
@@ -685,6 +695,7 @@ def _try_playwright_fallback(
         WebToolCancelledError: Playwright 执行期间 Host 取消时抛出。
     """
 
+    _raise_if_host_cancelled(cancellation_token)
     try:
         pw_result = _fetch_and_convert_with_playwright(
             url=url,
@@ -697,7 +708,7 @@ def _try_playwright_fallback(
             cancellation_token=cancellation_token,
         )
     except _web_playwright_backend.CancelledError:
-        _raise_fetch_cancelled(cancellation_token)
+        _raise_fetch_cancelled()
     if not pw_result.get("ok"):
         Log.debug(
             "Playwright 浏览器回退未成功: "
@@ -1130,8 +1141,8 @@ async def _call_search_web(
     if cancellation_token.is_cancelled():
         return _host_cancelled_from_token(
             tool_name=_SEARCH_WEB_TOOL_NAME,
-            token=cancellation_token,
             started_at=started_at,
+            message=_WEB_SEARCH_CANCELLED_MESSAGE,
             hint=(
                 "[continue_without_web] The host cancelled this web search; "
                 "continue without this web search unless the user asks to retry."
@@ -1152,8 +1163,8 @@ async def _call_search_web(
             if cancellation_token.is_cancelled():
                 return _host_cancelled_from_token(
                     tool_name=_SEARCH_WEB_TOOL_NAME,
-                    token=cancellation_token,
                     started_at=started_at,
+                    message=_WEB_SEARCH_CANCELLED_MESSAGE,
                     hint=(
                         "[continue_without_web] The host cancelled this web search; "
                         "continue without this web search unless the user asks to retry."
@@ -1174,7 +1185,7 @@ async def _call_search_web(
             tool_name=_SEARCH_WEB_TOOL_NAME,
             started_at=started_at,
             finished_at=datetime.now(UTC),
-            message=exc.message,
+            message=_WEB_SEARCH_CANCELLED_MESSAGE,
             hint=exc.hint,
         )
     except WebSearchProviderUnavailableError as exc:
@@ -1235,8 +1246,8 @@ async def _call_fetch_web_page(
     if cancellation_token.is_cancelled():
         return _host_cancelled_from_token(
             tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
-            token=cancellation_token,
             started_at=started_at,
+            message=_WEB_FETCH_CANCELLED_MESSAGE,
             hint=(
                 "[continue_without_web] The host cancelled this web fetch; "
                 "continue without this page unless the user asks to retry."
@@ -1249,8 +1260,8 @@ async def _call_fetch_web_page(
             if cancellation_token.is_cancelled():
                 return _host_cancelled_from_token(
                     tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
-                    token=cancellation_token,
                     started_at=started_at,
+                    message=_WEB_FETCH_CANCELLED_MESSAGE,
                     hint=(
                         "[continue_without_web] The host cancelled this web fetch; "
                         "continue without this page unless the user asks to retry."
@@ -1393,15 +1404,15 @@ def _unexpected_failed_outcome(
 def _host_cancelled_from_token(
     *,
     tool_name: str,
-    token: CancellationToken,
     started_at: datetime,
+    message: str,
     hint: str,
 ) -> ToolExecutionOutcome:
     """根据 Host token 构造取消 outcome。
 
     :param tool_name: 工具名。
-    :param token: Host 取消令牌。
     :param started_at: 工具开始时间。
+    :param message: 固定的安全取消说明。
     :param hint: Web 语义恢复提示。
     :returns: cancelled outcome。
     :raises Exception: outcome 构造失败时透出。
@@ -1411,7 +1422,7 @@ def _host_cancelled_from_token(
         tool_name=tool_name,
         started_at=started_at,
         finished_at=datetime.now(UTC),
-        message=token.cancel_reason() or "工具调用已取消",
+        message=message,
         hint=hint,
     )
 
@@ -1739,6 +1750,8 @@ def _fetch_web_page_business(
             },
         )
     except RuntimeError as exc:
+        if cancellation_token.is_cancelled():
+            _raise_fetch_cancelled()
         internal_diagnostics: WebPayload | None = None
         challenge_context: _FetchContentRuntimeContext | None = None
         challenge: BotChallengeDetectionResult | None = None

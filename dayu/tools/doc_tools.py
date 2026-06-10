@@ -725,10 +725,10 @@ async def _invoke_doc_business(
 
     token = context.cancellation_token
     if token.is_cancelled():
-        return _cancelled_outcome(tool_name, started_at, _doc_cancelled(token))
+        return _cancelled_outcome(tool_name, started_at, _doc_cancelled())
     async with provider_lock:
         if token.is_cancelled():
-            return _cancelled_outcome(tool_name, started_at, _doc_cancelled(token))
+            return _cancelled_outcome(tool_name, started_at, _doc_cancelled())
         try:
             raw_value = await asyncio.to_thread(business_call, token)
         except _DocCancelledError as error:
@@ -841,6 +841,12 @@ def _project_doc_paths(
                 error="permission_denied",
                 message=f"{candidate}: 路径不是目录",
                 hint="Use an existing directory under the provider configured allowed roots.",
+            )
+        if parameter_name != "directory" and not candidate.is_file():
+            return _DocPathFailure(
+                error="invalid_argument",
+                message=f"Path argument {parameter_name!r} must point to a file: {value}",
+                hint=f"Set {parameter_name} to an existing file under the provider configured allowed roots.",
             )
         projected[parameter_name] = str(candidate)
     return projected
@@ -1598,14 +1604,14 @@ def _raise_if_doc_cancelled(cancellation_token: CancellationToken | None) -> Non
     """
 
     if cancellation_token is not None and cancellation_token.is_cancelled():
-        _raise_doc_cancelled(cancellation_token)
+        _raise_doc_cancelled()
 
 
-def _raise_doc_cancelled(cancellation_token: CancellationToken) -> NoReturn:
+def _raise_doc_cancelled() -> NoReturn:
     """抛出携带 ``ToolBusinessCancelled`` 的本地取消信号。
 
     Args:
-        cancellation_token: 已处于取消状态的 Host 取消观察令牌。
+        无。
 
     Returns:
         不返回。
@@ -1614,14 +1620,14 @@ def _raise_doc_cancelled(cancellation_token: CancellationToken) -> NoReturn:
         _DocCancelledError: 始终抛出。
     """
 
-    raise _DocCancelledError(_doc_cancelled(cancellation_token))
+    raise _DocCancelledError(_doc_cancelled())
 
 
-def _doc_cancelled(cancellation_token: CancellationToken) -> ToolBusinessCancelled:
+def _doc_cancelled() -> ToolBusinessCancelled:
     """构造 Doc 深层 helper 使用的取消语义。
 
     Args:
-        cancellation_token: Host 取消观察令牌。
+        无。
 
     Returns:
         取消语义结果。
@@ -1630,11 +1636,7 @@ def _doc_cancelled(cancellation_token: CancellationToken) -> ToolBusinessCancell
         无。
     """
 
-    reason = cancellation_token.cancel_reason()
-    message = "文档工具调用已被取消。"
-    if reason is not None and reason.strip() != "":
-        message = f"{message}取消原因: {reason}"
-    return ToolBusinessCancelled(message=message, hint=_DOC_CANCELLED_HINT)
+    return ToolBusinessCancelled(message="文档工具调用已被宿主取消。", hint=_DOC_CANCELLED_HINT)
 
 
 def _cancelled_outcome(

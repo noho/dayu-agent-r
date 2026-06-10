@@ -95,25 +95,6 @@ class ToolArgumentValidationFailure:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolBusinessFailure:
-    """工具业务失败的 callable 内部传递结果。
-
-    该类型只表达业务 helper 到原生 callable 边界的失败语义；它不是异常，
-    也不携带 Host 治理字段。
-
-    :param error: 业务错误码。
-    :param message: 面向 LLM 的可读错误说明。
-    :param hint: 可选恢复提示。
-    :returns: dataclass 实例本身。
-    :raises Exception: 构造期不主动抛出异常。
-    """
-
-    error: str
-    message: str
-    hint: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class ToolBusinessCancelled:
     """工具业务 helper 观察到语义取消时的内部传递结果。
 
@@ -858,7 +839,6 @@ __all__ = [
     "ToolArgumentValidationFailure",
     "ToolArgumentValidationResult",
     "ToolBusinessCancelled",
-    "ToolBusinessFailure",
     "ValidatedToolArguments",
     "completed_outcome",
     "failed_outcome",

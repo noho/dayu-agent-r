@@ -56,6 +56,14 @@ _DOC_TOOL_NAMES = (
     "read_file",
     "read_file_section",
 )
+_FORBIDDEN_CANCEL_MESSAGE_PARTS = (
+    "run_id",
+    "session_id",
+    "payload_ref",
+    "digest",
+    "correlation_id",
+    "cancellation_token",
+)
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -226,7 +234,7 @@ def test_doc_tools_cancelled_before_work_return_host_cancelled(
     target = _copy_fixture(tmp_path, "sample.md")
     definitions = _definitions_by_name(_discover_definitions(tmp_path))
     token = _ManualCancellationToken()
-    token.cancel(f"cancel {tool_name}")
+    token.cancel(f"run_id=run-doc session_id=session-doc payload_ref=payload-{tool_name}")
 
     outcome = asyncio.run(
         definitions[tool_name].callable(
@@ -237,7 +245,7 @@ def test_doc_tools_cancelled_before_work_return_host_cancelled(
 
     assert isinstance(outcome, ToolCancelledOutcome)
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
-    assert "cancel" in outcome.message
+    _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
 
 
 def test_provider_enabled_without_allowed_paths_fails_closed() -> None:
@@ -294,6 +302,31 @@ def test_disallowed_nonexistent_path_returns_permission_denied(tmp_path: Path) -
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "permission_denied"
+
+
+@pytest.mark.parametrize("tool_name", ("get_file_sections", "read_file", "read_file_section"))
+def test_doc_file_path_pointing_to_directory_returns_invalid_argument(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    """file_path 指向目录时必须在路径投影层返回参数错误。"""
+
+    target_directory = tmp_path / "reports"
+    target_directory.mkdir()
+    definitions = _definitions_by_name(_discover_definitions(tmp_path))
+    arguments: dict[str, JsonValue] = {"file_path": str(target_directory)}
+    if tool_name == "read_file_section":
+        arguments["ref"] = "section-1"
+
+    outcome = asyncio.run(
+        definitions[tool_name].callable(
+            _call(tool_name, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
 
 
 def test_path_validation_failure_does_not_enter_migrated_function_body(
@@ -672,7 +705,7 @@ def test_search_via_line_scan_observes_loop_cancellation(
         """
 
         del content, query
-        token.cancel("cancel during line scan")
+        token.cancel("run_id=run-doc correlation_id=correlation-doc digest=sha256:doc")
         return ["Revenue"]
 
     monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
@@ -728,6 +761,7 @@ def test_search_files_line_scan_cancellation_returns_host_cancelled(
 
     assert isinstance(outcome, ToolCancelledOutcome)
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
 
 
 def test_read_file_cancelled_after_first_failed_encoding_stops_fallback(
@@ -1085,6 +1119,18 @@ def _first_search_match_file_and_ref(outcome: ToolCompletedOutcome) -> tuple[str
     file_value = first_match["file"]
     assert isinstance(file_value, str)
     return file_value, first_match["ref"]
+
+
+def _assert_no_governance_text(text: str) -> None:
+    """断言 LLM-facing 文本未泄漏 Host 治理字符串。
+
+    :param text: 待检查的 outcome message / hint 文本。
+    :returns: 无。
+    :raises AssertionError: 文本包含治理字符串时抛出。
+    """
+
+    for forbidden in _FORBIDDEN_CANCEL_MESSAGE_PARTS:
+        assert forbidden not in text
 
 
 def _pre_cancel_arguments(

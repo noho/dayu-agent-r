@@ -36,6 +36,14 @@ from dayu.tools.web import web_tools
 _WEB_TOOL_NAMES = ("search_web", "fetch_web_page")
 _WEB_PACKAGE_ROOT = Path(__file__).resolve().parents[3] / "dayu" / "tools" / "web"
 _CANCEL_REQUESTED_AT = datetime(2026, 6, 8)
+_FORBIDDEN_CANCEL_MESSAGE_PARTS = (
+    "run_id",
+    "session_id",
+    "payload_ref",
+    "digest",
+    "correlation_id",
+    "cancellation_token",
+)
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 _FORBIDDEN_IMPORTS = (
@@ -374,7 +382,7 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
     """search_web pre-cancel 必须返回 cancelled outcome 且不调用 provider。"""
 
     token = _ManualCancellationToken()
-    token.cancel("cancel before provider")
+    token.cancel("run_id=run-web session_id=session-web payload_ref=payload-web")
     search_calls: list[str] = []
 
     def fake_search_public_web(
@@ -456,10 +464,88 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
     assert outcome.meta is not None
     assert outcome.meta.tool_name == "search_web"
-    assert "run-web" not in outcome.message
+    _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
     assert outcome.hint is not None
     assert "continue_without_web" in outcome.hint
     assert search_calls == []
+
+
+def test_search_web_deep_cancel_message_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search provider 深层取消不得把 token reason 投影给 LLM。"""
+
+    def fake_search_public_web(
+        *,
+        query: str,
+        domains: list[str] | None,
+        recency_days: int | None,
+        max_results: int,
+        max_search_results: int,
+        provider: str,
+        request_timeout_seconds: float,
+        timeout_budget: float | None,
+        deadline_monotonic: float | None,
+        allow_private_network_url: bool,
+        is_safe_public_url: web_search_providers._PublicUrlSafetyChecker,
+        normalize_whitespace: Callable[[str], str],
+        resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
+        cancellation_token: CancellationToken | None = None,
+    ) -> web_search_providers.SearchWebOutput:
+        """模拟搜索 provider 在深层 checkpoint 抛出携带治理字段的取消。
+
+        :param query: 检索关键词。
+        :param domains: 可选域名限制。
+        :param recency_days: 可选最近天数。
+        :param max_results: 请求结果数量。
+        :param max_search_results: 注册配置中的结果上限。
+        :param provider: provider 策略。
+        :param request_timeout_seconds: 单次 provider 请求超时。
+        :param timeout_budget: 当前工具调用预算。
+        :param deadline_monotonic: 当前工具调用 deadline。
+        :param allow_private_network_url: 是否允许私网结果。
+        :param is_safe_public_url: URL 安全校验函数。
+        :param normalize_whitespace: 空白规整函数。
+        :param resolve_timeout_budget: timeout 预算解析函数。
+        :param cancellation_token: execution context 注入的取消令牌。
+        :returns: 不返回。
+        :raises web_search_providers.WebSearchCancelledError: 始终抛出测试取消。
+        """
+
+        del (
+            query,
+            domains,
+            recency_days,
+            max_results,
+            max_search_results,
+            provider,
+            request_timeout_seconds,
+            timeout_budget,
+            deadline_monotonic,
+            allow_private_network_url,
+            is_safe_public_url,
+            normalize_whitespace,
+            resolve_timeout_budget,
+            cancellation_token,
+        )
+        raise web_search_providers.WebSearchCancelledError(
+            message="run_id=run-web correlation_id=correlation-web digest=sha256:web",
+            hint="[continue_without_web] Host cancelled.",
+        )
+
+    monkeypatch.setattr(web_tools, "search_public_web", fake_search_public_web)
+    definition = _definitions_by_name(_discover_definitions({}))["search_web"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("search_web", {"query": "revenue"}),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
 
 
 def test_search_web_cancelled_between_provider_attempts_stops_fallback(
@@ -567,6 +653,62 @@ def test_search_web_cancelled_between_provider_attempts_stops_fallback(
     assert outcome.meta is not None
     assert outcome.meta.tool_name == "search_web"
     assert attempted_providers == ["tavily"]
+
+
+def test_fetch_web_page_cancelled_before_work_returns_safe_host_cancelled() -> None:
+    """fetch_web_page pre-cancel 必须返回安全 cancelled outcome。"""
+
+    token = _ManualCancellationToken()
+    token.cancel("run_id=run-web session_id=session-web cancellation_token=token-web")
+    definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("fetch_web_page", {"url": "http://example.com/report"}),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert outcome.meta is not None
+    assert outcome.meta.tool_name == "fetch_web_page"
+    _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
+
+
+def test_fetch_web_page_deep_runtime_cancel_message_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fetch 深层 RuntimeError 取消不得把 token reason 投影给 LLM。"""
+
+    token = _ManualCancellationToken()
+
+    def fake_warmup_domain(*args: JsonValue, **kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """模拟深层联网阶段观察到取消并抛出携带治理字段的 RuntimeError。
+
+        :param args: 位置参数。
+        :param kwargs: 关键字参数。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出测试取消。
+        """
+
+        del args, kwargs
+        token.cancel("run_id=run-web payload_ref=payload-web digest=sha256:web")
+        raise RuntimeError("run_id=run-web payload_ref=payload-web digest=sha256:web")
+
+    monkeypatch.setattr(web_tools, "_warmup_domain", fake_warmup_domain)
+    definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("fetch_web_page", {"url": "http://example.com/report"}),
+            _context(cancellation_token=token),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
 
 
 def test_fetch_private_url_fails_closed_by_default() -> None:
@@ -706,6 +848,72 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
     assert outcome.hint is not None
     assert "continue_without_web" in outcome.hint
     assert received_playwright_tokens == [token]
+
+
+def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fallback 入口已取消时不得启动 Playwright worker。"""
+
+    token = _ManualCancellationToken()
+    token.cancel("payload_ref=payload-web digest=sha256:web correlation_id=correlation-web")
+    playwright_calls: list[str] = []
+
+    def fake_fetch_and_convert_with_playwright(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        timeout_budget: float | None = None,
+        deadline_monotonic: float | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+        cancellation_token: CancellationToken | None = None,
+    ) -> Mapping[str, JsonValue]:
+        """记录非预期 Playwright worker 调用。
+
+        :param url: 目标 URL。
+        :param timeout_seconds: 浏览器抓取超时。
+        :param headers: 请求头。
+        :param timeout_budget: 工具总预算。
+        :param deadline_monotonic: 工具调用 deadline。
+        :param playwright_channel: 浏览器 channel。
+        :param playwright_storage_state_path: storage state 路径。
+        :param cancellation_token: 取消令牌。
+        :returns: 成功结果。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del (
+            timeout_seconds,
+            headers,
+            timeout_budget,
+            deadline_monotonic,
+            playwright_channel,
+            playwright_storage_state_path,
+            cancellation_token,
+        )
+        playwright_calls.append(url)
+        return {"ok": True, "content": "unexpected", "title": "unexpected"}
+
+    monkeypatch.setattr(
+        web_tools,
+        "_fetch_and_convert_with_playwright",
+        fake_fetch_and_convert_with_playwright,
+    )
+
+    with pytest.raises(web_tools.WebToolCancelledError) as captured:
+        web_tools._try_playwright_fallback(
+            url="http://example.com/report",
+            timeout_seconds=1.0,
+            headers={},
+            timeout_budget=None,
+            deadline_monotonic=None,
+            cancellation_token=token,
+        )
+
+    assert playwright_calls == []
+    _assert_no_governance_text(f"{captured.value.message} {captured.value.hint}")
 
 
 def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
@@ -1192,6 +1400,18 @@ def _mapping_value(value: JsonValue) -> Mapping[str, JsonValue]:
 
     assert isinstance(value, Mapping)
     return value
+
+
+def _assert_no_governance_text(text: str) -> None:
+    """断言 LLM-facing 文本未泄漏 Host 治理字符串。
+
+    :param text: 待检查的 outcome message / hint 文本。
+    :returns: 无。
+    :raises AssertionError: 文本包含治理字符串时抛出。
+    """
+
+    for forbidden in _FORBIDDEN_CANCEL_MESSAGE_PARTS:
+        assert forbidden not in text
 
 
 def _spec(config: Mapping[str, JsonValue]) -> ToolsDiscoveryProviderSpec:
