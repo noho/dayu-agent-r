@@ -36,16 +36,22 @@ from dayu.contracts.tool_outcome import (
     ToolCompletedOutcome,
     ToolFailedOutcome,
 )
+from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscoveryProviderSpec,
 )
+from dayu.tools.web import web_tools as _web_tools_module
 from dayu.tools.web.provider import discover_tools
 from dayu.tools.web.web_challenge_detection import detect_bot_challenge
 
 JsonObject: TypeAlias = dict[str, JsonValue]
+_DoclingConvertCallable: TypeAlias = Callable[[bytes, str], tuple[str, str, str]]
 
+# schema_version 标识 diagnostics artifact schema；diagnostic_schema_version/revision
+# 是 F03 smoke 校验同一 artifact 时使用的显式标记。
 _SCHEMA_VERSION: Final[str] = "web-diagnostics-v1"
+_DIAGNOSTIC_SCHEMA_REVISION: Final[int] = 1
 _FETCH_TOOL_NAME: Final[str] = "fetch_web_page"
 _DEFAULT_BATCH_OUTPUT_ROOT: Final[Path] = Path("workspace/output/web_diagnostics")
 _JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
@@ -71,6 +77,25 @@ _REQUEST_ACCEPT: Final[str] = (
     "image/avif,image/webp,image/apng,*/*;q=0.8"
 )
 _NEXT_ACTION_HINT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\[([a-z_]+)\]\s*(.*)$")
+_DOCLING_TARGET_MODULE: Final[str] = "dayu.tools.web.web_tools"
+_DOCLING_TARGET_FUNCTION: Final[str] = "_docling_convert_to_markdown"
+_OBSERVED_BUCKET_DOCLING_RUNTIME_SKIP: Final[str] = "docling_runtime_initialization_error"
+_OBSERVED_BUCKET_CHILD_PROCESS_ERROR: Final[str] = "child_process_error"
+_OBSERVED_BUCKET_ALL_SUCCESS: Final[str] = "all_success"
+_OBSERVED_BUCKET_PARTIAL_SAMPLE: Final[str] = "partial_sample"
+_OBSERVED_BUCKET_REQUESTS_ONLY_SAMPLED: Final[str] = "requests_only_sampled"
+_OBSERVED_BUCKET_PLAYWRIGHT_CHALLENGE: Final[str] = "playwright_challenge_detected"
+_OBSERVED_BUCKET_BROWSER_ONLY_SUCCESS: Final[str] = "browser_only_success"
+_OBSERVED_HINT_NONE: Final[str] = ""
+_OBSERVED_REASON_NONE: Final[str] = ""
+_PATH_CHILD_PROCESS: Final[str] = "diagnostic_child_process"
+_PATH_REQUESTS: Final[str] = "requests"
+_PATH_FETCH_WEB_PAGE: Final[str] = "fetch_web_page"
+_PATH_PLAYWRIGHT: Final[str] = "playwright"
+_PATH_DOCLING_CONVERSION: Final[str] = "docling_conversion"
+_DOCLING_DEPENDENCY_EXCEPTION_TYPES: Final[frozenset[str]] = frozenset(
+    {"DoclingRuntimeInitializationError", "ModuleNotFoundError", "ImportError"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +176,175 @@ class CliOptions:
     max_network: int
     fetch_truncate_chars: int
     allow_private_network_url: bool
+
+
+@dataclass(slots=True)
+class _DoclingInvocationEvidence:
+    """Docling 转换 callable 的诊断期调用证据。
+
+    Args:
+        diagnostic_url: 当前诊断 URL。
+        invoked: wrapper 是否观察到实际调用。
+        stream_name: 原始 callable 收到的流名称。
+        raw_bytes_length: 原始 callable 收到的字节长度；未调用时为 ``None``。
+        original_completed: 原始 callable 是否正常返回。
+        original_exception_type: 原始 callable 抛出的异常类型；未抛出时为空。
+        docling_runtime_initialization_error: 是否观察到 Docling 运行时初始化或依赖异常。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    diagnostic_url: str
+    invoked: bool = False
+    stream_name: str = ""
+    raw_bytes_length: int | None = None
+    original_completed: bool = False
+    original_exception_type: str = ""
+    docling_runtime_initialization_error: bool = False
+
+    def mark_invoked(self, *, stream_name: str, raw_bytes_length: int) -> None:
+        """记录原始 Docling callable 已被调用。
+
+        Args:
+            stream_name: 原始 callable 收到的流名称。
+            raw_bytes_length: 原始 callable 收到的原始字节长度。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.invoked = True
+        self.stream_name = stream_name
+        self.raw_bytes_length = raw_bytes_length
+        self.original_completed = False
+        self.original_exception_type = ""
+        self.docling_runtime_initialization_error = False
+
+    def mark_completed(self) -> None:
+        """记录原始 Docling callable 已正常返回。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.original_completed = True
+        self.original_exception_type = ""
+        self.docling_runtime_initialization_error = False
+
+    def mark_exception(self, exc: Exception) -> None:
+        """记录原始 Docling callable 抛出的异常。
+
+        Args:
+            exc: 原始 callable 抛出的异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        exception_type = type(exc).__name__
+        self.original_completed = False
+        self.original_exception_type = exception_type
+        self.docling_runtime_initialization_error = (
+            isinstance(exc, DoclingRuntimeInitializationError)
+            or exception_type in _DOCLING_DEPENDENCY_EXCEPTION_TYPES
+        )
+
+    def to_json(self) -> JsonObject:
+        """转换为诊断 artifact 使用的 JSON 对象。
+
+        Args:
+            无。
+
+        Returns:
+            Docling callable 调用证据 JSON 对象。
+
+        Raises:
+            无。
+        """
+
+        return {
+            "invoked": self.invoked,
+            "stream_name": self.stream_name,
+            "raw_bytes_length": self.raw_bytes_length,
+            "target_module": _DOCLING_TARGET_MODULE,
+            "target_function": _DOCLING_TARGET_FUNCTION,
+            "original_completed": self.original_completed,
+            "original_exception_type": self.original_exception_type,
+            "docling_runtime_initialization_error": self.docling_runtime_initialization_error,
+            "diagnostic_url": self.diagnostic_url,
+            "diagnostic_only_reason": (
+                "该字段只记录本次诊断是否观察到非 HTML 内容转换 callable 调用；"
+                "它不是网页业务事实，也不会写入生产 fetch_web_page 返回给 LLM 的成功 payload。"
+            ),
+        }
+
+
+class _DoclingInvocationWrapper:
+    """诊断期 Docling callable wrapper。
+
+    wrapper 只负责记录调用证据并委托原始 callable，不替代生产转换逻辑。
+    """
+
+    def __init__(
+        self,
+        *,
+        original: _DoclingConvertCallable,
+        evidence: _DoclingInvocationEvidence,
+    ) -> None:
+        """初始化 wrapper。
+
+        Args:
+            original: 被包装的原始 Docling callable。
+            evidence: 本次诊断的调用证据容器。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._original = original
+        self._evidence = evidence
+
+    def __call__(self, raw_bytes: bytes, stream_name: str) -> tuple[str, str, str]:
+        """记录调用证据后委托原始 Docling callable。
+
+        Args:
+            raw_bytes: 原始响应字节。
+            stream_name: Docling 输入流名称。
+
+        Returns:
+            原始 callable 的 ``(title, markdown, extraction_source)`` 返回值。
+
+        Raises:
+            Exception: 原始 callable 抛出的异常会原样透传。
+        """
+
+        self._evidence.mark_invoked(stream_name=stream_name, raw_bytes_length=len(raw_bytes))
+        try:
+            result = self._original(raw_bytes, stream_name)
+        except Exception as exc:
+            self._evidence.mark_exception(exc)
+            raise
+        self._evidence.mark_completed()
+        return result
 
 
 class _DiagnosticCancellationToken:
@@ -1250,6 +1444,68 @@ def _json_object_from_value(value: JsonValue) -> JsonObject:
     return {}
 
 
+def _new_docling_invocation_evidence(diagnostic_url: str) -> _DoclingInvocationEvidence:
+    """创建未调用状态的 Docling invocation evidence。
+
+    Args:
+        diagnostic_url: 当前诊断 URL。
+
+    Returns:
+        未调用状态的证据容器。
+
+    Raises:
+        无。
+    """
+
+    return _DoclingInvocationEvidence(diagnostic_url=diagnostic_url)
+
+
+def _docling_evidence_json_from_fetch_profile(
+    *,
+    diagnostic_url: str,
+    fetch_profile: Mapping[str, JsonValue],
+) -> JsonObject:
+    """从 fetch profile 读取或补齐 Docling 调用证据。
+
+    Args:
+        diagnostic_url: 当前诊断 URL。
+        fetch_profile: current ``fetch_web_page`` 路径 profile。
+
+    Returns:
+        Docling 调用证据 JSON 对象；没有观察到调用时返回 ``invoked=false``。
+
+    Raises:
+        无。
+    """
+
+    evidence = _nested_object(fetch_profile, "docling_conversion_invocation_evidence")
+    if evidence:
+        return evidence
+    return _new_docling_invocation_evidence(diagnostic_url).to_json()
+
+
+def _attach_docling_evidence(
+    *,
+    profile: JsonObject,
+    evidence: _DoclingInvocationEvidence,
+) -> JsonObject:
+    """把 Docling 调用证据附加到 fetch profile。
+
+    Args:
+        profile: current fetch 工具 profile。
+        evidence: 本次诊断采集到的 Docling 调用证据。
+
+    Returns:
+        已追加证据字段的 profile。
+
+    Raises:
+        无。
+    """
+
+    profile["docling_conversion_invocation_evidence"] = evidence.to_json()
+    return profile
+
+
 def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
     """采集 current ``fetch_web_page`` 工具路径证据。
 
@@ -1265,78 +1521,102 @@ def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
     """
 
     started_at = time.perf_counter()
+    evidence = _new_docling_invocation_evidence(url)
+    original_docling_callable: _DoclingConvertCallable = _web_tools_module._docling_convert_to_markdown
+    wrapper = _DoclingInvocationWrapper(original=original_docling_callable, evidence=evidence)
+    _web_tools_module._docling_convert_to_markdown = wrapper
     try:
         definition = _fetch_web_page_definition(options)
         outcome = asyncio.run(_call_fetch_tool_async(definition, url, options))
     except Exception as exc:
-        return {
-            "sampled": True,
-            "ok": False,
-            "status": "callable_exception",
-            "elapsed_seconds": _round_elapsed(started_at),
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-            "message": "current fetch_web_page callable 调用边界抛出异常。",
-        }
+        return _attach_docling_evidence(
+            profile={
+                "sampled": True,
+                "ok": False,
+                "status": "callable_exception",
+                "elapsed_seconds": _round_elapsed(started_at),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "message": "current fetch_web_page callable 调用边界抛出异常。",
+            },
+            evidence=evidence,
+        )
+    finally:
+        _web_tools_module._docling_convert_to_markdown = original_docling_callable
 
     elapsed = _round_elapsed(started_at)
     if isinstance(outcome, ToolCompletedOutcome):
         payload = _json_object_from_value(outcome.result.value)
         content = str(payload.get("content", "") or "")
-        return {
-            "sampled": True,
-            "ok": True,
-            "status": "completed",
-            "elapsed_seconds": elapsed,
-            "title": str(payload.get("title", "") or ""),
-            "final_url": str(payload.get("final_url", url) or url),
-            "fetch_backend": str(payload.get("fetch_backend", "") or ""),
-            "content_prefix": _prefix_text(content, _TEXT_PREFIX_CHARS),
-            "content_length": len(content),
-        }
+        return _attach_docling_evidence(
+            profile={
+                "sampled": True,
+                "ok": True,
+                "status": "completed",
+                "elapsed_seconds": elapsed,
+                "title": str(payload.get("title", "") or ""),
+                "final_url": str(payload.get("final_url", url) or url),
+                "fetch_backend": str(payload.get("fetch_backend", "") or ""),
+                "content_prefix": _prefix_text(content, _TEXT_PREFIX_CHARS),
+                "content_length": len(content),
+            },
+            evidence=evidence,
+        )
     if isinstance(outcome, ToolFailedOutcome):
         hint = outcome.result.hint or ""
-        return {
-            "sampled": True,
-            "ok": False,
-            "status": "failed",
-            "elapsed_seconds": elapsed,
-            "error_code": outcome.result.error,
-            "error": outcome.result.error,
-            "message": outcome.result.message,
-            "hint": hint,
-            "next_action": _next_action_from_hint(hint),
-            "http_status": None,
-            "diagnostics": _tool_failed_outcome_diagnostics(outcome.result.error),
-        }
+        return _attach_docling_evidence(
+            profile={
+                "sampled": True,
+                "ok": False,
+                "status": "failed",
+                "elapsed_seconds": elapsed,
+                "error_code": outcome.result.error,
+                "error": outcome.result.error,
+                "message": outcome.result.message,
+                "hint": hint,
+                "next_action": _next_action_from_hint(hint),
+                "http_status": None,
+                "diagnostics": _tool_failed_outcome_diagnostics(outcome.result.error),
+            },
+            evidence=evidence,
+        )
     if isinstance(outcome, ToolCancelledOutcome):
-        return {
-            "sampled": True,
-            "ok": False,
-            "status": "cancelled",
-            "elapsed_seconds": elapsed,
-            "error_code": outcome.reason,
-            "error": outcome.message,
-            "message": outcome.message,
-            "hint": outcome.hint or "",
-        }
+        return _attach_docling_evidence(
+            profile={
+                "sampled": True,
+                "ok": False,
+                "status": "cancelled",
+                "elapsed_seconds": elapsed,
+                "error_code": outcome.reason,
+                "error": outcome.message,
+                "message": outcome.message,
+                "hint": outcome.hint or "",
+            },
+            evidence=evidence,
+        )
     if isinstance(outcome, ToolAwaitingOutcome):
-        return {
+        return _attach_docling_evidence(
+            profile={
+                "sampled": True,
+                "ok": False,
+                "status": "awaiting",
+                "elapsed_seconds": elapsed,
+                "error_code": "unexpected_awaiting_outcome",
+                "error": "fetch_web_page returned awaiting outcome in diagnostics.",
+                "message": "current fetch_web_page 返回了等待型 outcome；该工具预期应同步完成。",
+            },
+            evidence=evidence,
+        )
+    return _attach_docling_evidence(
+        profile={
             "sampled": True,
             "ok": False,
-            "status": "awaiting",
+            "status": "unknown_outcome",
             "elapsed_seconds": elapsed,
-            "error_code": "unexpected_awaiting_outcome",
-            "error": "fetch_web_page returned awaiting outcome in diagnostics.",
-            "message": "current fetch_web_page 返回了等待型 outcome；该工具预期应同步完成。",
-        }
-    return {
-        "sampled": True,
-        "ok": False,
-        "status": "unknown_outcome",
-        "elapsed_seconds": elapsed,
-        "error": "current fetch_web_page returned an unknown outcome.",
-    }
+            "error": "current fetch_web_page returned an unknown outcome.",
+        },
+        evidence=evidence,
+    )
 
 
 def _next_action_from_hint(hint: str) -> str:
@@ -1888,6 +2168,8 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
 
     payload: JsonObject = {
         "schema_version": _SCHEMA_VERSION,
+        "diagnostic_schema_version": _SCHEMA_VERSION,
+        "diagnostic_schema_revision": _DIAGNOSTIC_SCHEMA_REVISION,
         "generated_at": _utc_now_iso(),
         "url": options.url,
     }
@@ -1900,6 +2182,10 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
         _skipped_profile("用户显式传入 --skip-tool-fetch。")
         if options.skip_tool_fetch
         else _build_tool_fetch_profile(options.url, options)
+    )
+    payload["docling_conversion_invocation_evidence"] = _docling_evidence_json_from_fetch_profile(
+        diagnostic_url=options.url,
+        fetch_profile=_nested_object(payload, "fetch_web_page_profile"),
     )
     payload["playwright_profile"] = (
         _skipped_profile("用户显式传入 --skip-playwright。")
@@ -2219,6 +2505,275 @@ def _status_code_value(mapping: Mapping[str, JsonValue], key: str) -> JsonValue:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _docling_runtime_initialization_observed(payload: Mapping[str, JsonValue]) -> bool:
+    """判断 payload 是否观察到 Docling 运行时初始化或依赖异常。
+
+    Args:
+        payload: 单 URL 诊断 payload 或批量结果行。
+
+    Returns:
+        观察到 Docling 初始化或依赖异常时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    evidence = _nested_object(payload, "docling_conversion_invocation_evidence")
+    if evidence.get("docling_runtime_initialization_error") is True:
+        return True
+    if payload.get("docling_runtime_initialization_error") is True:
+        return True
+    return False
+
+
+def _observed_bucket_from_payload(
+    *,
+    payload: Mapping[str, JsonValue],
+    comparison_bucket: str,
+) -> str:
+    """从诊断 payload 得到 observed bucket。
+
+    Args:
+        payload: 单 URL 诊断 payload 或批量结果行。
+        comparison_bucket: 访问路径 comparison bucket。
+
+    Returns:
+        observed bucket。Docling 初始化或依赖异常会被提升为显式 skip 观察项。
+
+    Raises:
+        无。
+    """
+
+    if _docling_runtime_initialization_observed(payload):
+        return _OBSERVED_BUCKET_DOCLING_RUNTIME_SKIP
+    return comparison_bucket
+
+
+def _observed_failing_path_from_payload(
+    *,
+    payload: Mapping[str, JsonValue],
+    comparison_bucket: str,
+) -> str:
+    """从诊断 payload 推断已观察到的失败路径。
+
+    Args:
+        payload: 单 URL 诊断 payload 或批量结果行。
+        comparison_bucket: 访问路径 comparison bucket。
+
+    Returns:
+        逗号分隔的失败路径名称；没有直接失败路径时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    if str(payload.get("status", "") or "") == _OBSERVED_BUCKET_CHILD_PROCESS_ERROR:
+        return _PATH_CHILD_PROCESS
+    if _docling_runtime_initialization_observed(payload):
+        return _PATH_DOCLING_CONVERSION
+
+    failing_paths: list[str] = []
+    fetch_profile = _nested_object(payload, "fetch_web_page_profile")
+    requests_profile = _nested_object(payload, "requests_profile")
+    requests_result = _nested_object(requests_profile, "result")
+    playwright_profile = _nested_object(payload, "playwright_profile")
+
+    fetch_sampled = payload.get("fetch_sampled") is True or _bool_from_mapping(fetch_profile, "sampled")
+    fetch_ok = payload.get("fetch_ok") is True or _bool_from_mapping(fetch_profile, "ok")
+    requests_sampled = payload.get("requests_sampled") is True or _bool_from_mapping(requests_profile, "sampled")
+    requests_ok = payload.get("requests_ok") is True or _bool_from_mapping(requests_result, "ok")
+    playwright_sampled = payload.get("playwright_sampled") is True or _bool_from_mapping(playwright_profile, "sampled")
+    playwright_ok = payload.get("playwright_ok") is True or _bool_from_mapping(playwright_profile, "ok")
+
+    if fetch_sampled and not fetch_ok:
+        failing_paths.append(_PATH_FETCH_WEB_PAGE)
+    if requests_sampled and not requests_ok:
+        failing_paths.append(_PATH_REQUESTS)
+    if playwright_sampled and not playwright_ok:
+        failing_paths.append(_PATH_PLAYWRIGHT)
+    if not failing_paths and comparison_bucket not in {
+        _OBSERVED_BUCKET_ALL_SUCCESS,
+        _OBSERVED_BUCKET_PARTIAL_SAMPLE,
+        _OBSERVED_BUCKET_REQUESTS_ONLY_SAMPLED,
+    }:
+        # 当前 fallback 仅服务既有 comparison bucket；新增 bucket 时需同步确认其是否代表真实失败路径。
+        return comparison_bucket
+    return ",".join(failing_paths)
+
+
+def _diagnostic_action_hint_from_payload(
+    *,
+    payload: Mapping[str, JsonValue],
+    comparison_bucket: str,
+    observed_failing_path: str,
+) -> str:
+    """构造诊断动作建议。
+
+    Args:
+        payload: 单 URL 诊断 payload 或批量结果行。
+        comparison_bucket: 访问路径 comparison bucket。
+        observed_failing_path: 已观察到的失败路径。
+
+    Returns:
+        诊断动作建议；没有需要动作的事实时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    if str(payload.get("status", "") or "") == _OBSERVED_BUCKET_CHILD_PROCESS_ERROR:
+        return "重新运行单 URL 诊断子进程，并检查 stdout/stderr 前缀与诊断脚本参数。"
+    if _docling_runtime_initialization_observed(payload):
+        return "检查 Docling 运行时依赖、模型初始化与本机设备配置；这是诊断观察到的环境问题。"
+    fetch_next_action = str(payload.get("fetch_next_action", "") or "")
+    if fetch_next_action:
+        return f"current fetch_web_page 提示下一步动作为 {fetch_next_action}。"
+    fetch_profile = _nested_object(payload, "fetch_web_page_profile")
+    nested_fetch_next_action = str(fetch_profile.get("next_action", "") or "")
+    if nested_fetch_next_action:
+        return f"current fetch_web_page 提示下一步动作为 {nested_fetch_next_action}。"
+    if comparison_bucket == _OBSERVED_BUCKET_PLAYWRIGHT_CHALLENGE:
+        return "浏览器路径观察到访问门禁或反爬挑战；需要换来源、补充登录态或转为外部诊断残留。"
+    if observed_failing_path:
+        return f"优先检查已观察失败路径：{observed_failing_path}。"
+    return _OBSERVED_HINT_NONE
+
+
+def _diagnostic_only_reason_from_payload(
+    *,
+    payload: Mapping[str, JsonValue],
+    comparison_bucket: str,
+) -> str:
+    """构造 diagnostic-only 原因说明。
+
+    Args:
+        payload: 单 URL 诊断 payload 或批量结果行。
+        comparison_bucket: 访问路径 comparison bucket。
+
+    Returns:
+        诊断事实说明；没有 diagnostic-only 原因时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    if _docling_runtime_initialization_observed(payload):
+        return "Docling 初始化或依赖异常是运行环境事实，可由后续 smoke 作为环境 skip 依据。"
+    if comparison_bucket == _OBSERVED_BUCKET_PLAYWRIGHT_CHALLENGE:
+        return "观察到浏览器访问门禁或反爬挑战；该事实通常只适合作为外部站点诊断残留。"
+    if comparison_bucket == _OBSERVED_BUCKET_BROWSER_ONLY_SUCCESS:
+        return "只有浏览器路径成功，说明 raw requests/current fetch 与真实浏览器环境存在差异。"
+    if str(payload.get("status", "") or "") == _OBSERVED_BUCKET_CHILD_PROCESS_ERROR:
+        return "单 URL 诊断子进程失败；该行没有可信单 URL 诊断 JSON，只能作为诊断基础设施事实。"
+    return _OBSERVED_REASON_NONE
+
+
+def _build_observed_diagnostic_item(row: Mapping[str, JsonValue]) -> JsonObject:
+    """把批量结果行投影为 smoke 可消费的 observed fact。
+
+    Args:
+        row: 批量结果行。
+
+    Returns:
+        observed fact JSON 对象，包含 URL、证据路径、失败路径和诊断动作建议。
+
+    Raises:
+        无。
+    """
+
+    comparison_bucket = str(row.get("comparison_bucket", "") or "")
+    observed_bucket = str(row.get("observed_bucket", "") or comparison_bucket)
+    observed_failing_path = str(row.get("observed_failing_path", "") or "")
+    diagnostic_action_hint = str(row.get("diagnostic_action_hint", "") or "")
+    diagnostic_only_reason = str(row.get("diagnostic_only_reason", "") or "")
+    evidence_path = str(row.get("evidence_path", "") or row.get("diagnostic_path", "") or "")
+    failure_url = str(row.get("failure_url", "") or "")
+    return {
+        "input_index": row.get("input_index"),
+        "url": str(row.get("url", "") or ""),
+        "label": str(row.get("label", "") or ""),
+        "observed_bucket": observed_bucket,
+        "comparison_bucket": comparison_bucket,
+        "observed_failing_path": observed_failing_path,
+        "evidence_path": evidence_path,
+        "failure_url": failure_url,
+        "diagnostic_action_hint": diagnostic_action_hint,
+        "diagnostic_only_reason": diagnostic_only_reason,
+        "diagnostic_schema_version": str(row.get("diagnostic_schema_version", "") or _SCHEMA_VERSION),
+        "diagnostic_schema_revision": row.get("diagnostic_schema_revision", _DIAGNOSTIC_SCHEMA_REVISION),
+    }
+
+
+def _observed_items_with_reason(rows: Sequence[Mapping[str, JsonValue]]) -> list[JsonValue]:
+    """筛选带 diagnostic-only reason 的 observed items。
+
+    Args:
+        rows: 批量结果行。
+
+    Returns:
+        带 diagnostic-only reason 的 observed item 列表。
+
+    Raises:
+        无。
+    """
+
+    items: list[JsonValue] = []
+    for row in rows:
+        item = _build_observed_diagnostic_item(row)
+        if str(item.get("diagnostic_only_reason", "") or ""):
+            items.append(item)
+    return items
+
+
+def _skip_observed_items(rows: Sequence[Mapping[str, JsonValue]]) -> list[JsonValue]:
+    """筛选可作为环境 skip 依据的 observed items。
+
+    Args:
+        rows: 批量结果行。
+
+    Returns:
+        只包含 Docling 初始化或依赖异常等 skip 观察项的列表。
+
+    Raises:
+        无。
+    """
+
+    items: list[JsonValue] = []
+    for row in rows:
+        item = _build_observed_diagnostic_item(row)
+        if str(item.get("observed_bucket", "") or "") == _OBSERVED_BUCKET_DOCLING_RUNTIME_SKIP:
+            items.append(item)
+    return items
+
+
+def _diagnostic_action_hints(rows: Sequence[Mapping[str, JsonValue]]) -> list[JsonValue]:
+    """提取批量结果中的诊断动作建议。
+
+    Args:
+        rows: 批量结果行。
+
+    Returns:
+        含 URL、证据路径和动作建议的列表。
+
+    Raises:
+        无。
+    """
+
+    hints: list[JsonValue] = []
+    for row in rows:
+        hint = str(row.get("diagnostic_action_hint", "") or "")
+        if not hint:
+            continue
+        hints.append(
+            {
+                "url": str(row.get("url", "") or ""),
+                "evidence_path": str(row.get("evidence_path", "") or row.get("diagnostic_path", "") or ""),
+                "diagnostic_action_hint": hint,
+            }
+        )
+    return hints
+
+
 def _build_batch_result_row(
     *,
     entry: DiagnosticUrlEntry,
@@ -2245,9 +2800,27 @@ def _build_batch_result_row(
     requests_profile = _nested_object(payload, "requests_profile")
     requests_result = _nested_object(requests_profile, "result")
     fetch_profile = _nested_object(payload, "fetch_web_page_profile")
+    docling_evidence = _nested_object(payload, "docling_conversion_invocation_evidence")
+    if not docling_evidence:
+        docling_evidence = _nested_object(fetch_profile, "docling_conversion_invocation_evidence")
     navigation = _nested_object(playwright_profile, "navigation")
     comparison_bucket = str(payload.get("comparison_bucket", "") or _classify_diagnostic_bucket(payload))
-    return {
+    observed_bucket = _observed_bucket_from_payload(payload=payload, comparison_bucket=comparison_bucket)
+    observed_failing_path = _observed_failing_path_from_payload(
+        payload=payload,
+        comparison_bucket=comparison_bucket,
+    )
+    diagnostic_action_hint = _diagnostic_action_hint_from_payload(
+        payload=payload,
+        comparison_bucket=comparison_bucket,
+        observed_failing_path=observed_failing_path,
+    )
+    diagnostic_only_reason = _diagnostic_only_reason_from_payload(
+        payload=payload,
+        comparison_bucket=comparison_bucket,
+    )
+    failure_url = entry.url if observed_failing_path else ""
+    row: JsonObject = {
         "input_index": index,
         "url": entry.url,
         "label": entry.label,
@@ -2275,11 +2848,25 @@ def _build_batch_result_row(
         "fetch_status": str(fetch_profile.get("status", "") or ""),
         "fetch_error_code": str(fetch_profile.get("error_code", "") or ""),
         "fetch_error": str(fetch_profile.get("error", "") or ""),
+        "fetch_next_action": str(fetch_profile.get("next_action", "") or ""),
         "fetch_final_url": str(fetch_profile.get("final_url", entry.url) or entry.url),
+        "docling_conversion_invoked": docling_evidence.get("invoked") is True,
+        "docling_stream_name": str(docling_evidence.get("stream_name", "") or ""),
+        "docling_original_exception_type": str(docling_evidence.get("original_exception_type", "") or ""),
+        "docling_runtime_initialization_error": docling_evidence.get("docling_runtime_initialization_error") is True,
         "child_returncode": payload.get("returncode") if str(payload.get("status", "") or "") == "child_process_error" else None,
         "child_stdout_prefix": str(payload.get("stdout_prefix", "") or ""),
         "child_stderr_prefix": str(payload.get("stderr_prefix", "") or ""),
+        "observed_bucket": observed_bucket,
+        "observed_failing_path": observed_failing_path,
+        "evidence_path": str(diagnostic_path) if diagnostic_path is not None else None,
+        "failure_url": failure_url,
+        "diagnostic_action_hint": diagnostic_action_hint,
+        "diagnostic_only_reason": diagnostic_only_reason,
+        "diagnostic_schema_version": str(payload.get("schema_version", "") or _SCHEMA_VERSION),
+        "diagnostic_schema_revision": payload.get("diagnostic_schema_revision", _DIAGNOSTIC_SCHEMA_REVISION),
     }
+    return row
 
 
 def _child_error_payload(
@@ -2302,6 +2889,8 @@ def _child_error_payload(
 
     payload: JsonObject = {
         "schema_version": _SCHEMA_VERSION,
+        "diagnostic_schema_version": _SCHEMA_VERSION,
+        "diagnostic_schema_revision": _DIAGNOSTIC_SCHEMA_REVISION,
         "generated_at": _utc_now_iso(),
         "url": entry.url,
         "status": "child_process_error",
@@ -2358,6 +2947,8 @@ def _build_batch_summary(
 
     return {
         "schema_version": _SCHEMA_VERSION,
+        "diagnostic_schema_version": _SCHEMA_VERSION,
+        "diagnostic_schema_revision": _DIAGNOSTIC_SCHEMA_REVISION,
         "generated_at": _utc_now_iso(),
         "run_label": run_label,
         "input_file": str(input_path),
@@ -2371,6 +2962,11 @@ def _build_batch_summary(
         "fetch_ok_count": sum(1 for row in rows if row.get("fetch_sampled") is True and row.get("fetch_ok") is True),
         "challenge_detected_count": sum(1 for row in rows if row.get("challenge_detected") is True),
         "comparison_buckets": _count_by_key(rows, "comparison_bucket"),
+        "observed_buckets": _count_by_key(rows, "observed_bucket"),
+        "observed_items": [_build_observed_diagnostic_item(row) for row in rows],
+        "diagnostic_only_observed_items": _observed_items_with_reason(rows),
+        "skip_observed_items": _skip_observed_items(rows),
+        "diagnostic_action_hints": _diagnostic_action_hints(rows),
         "child_returncodes": _count_by_key(
             [row for row in rows if row.get("status") == "child_process_error"],
             "child_returncode",
@@ -2437,6 +3033,7 @@ def _build_batch_summary_markdown(summary: Mapping[str, JsonValue]) -> str:
         f"- 检测到 challenge：{summary.get('challenge_detected_count', 0)}",
     ]
     lines.extend(_markdown_count_section("Comparison Buckets", _nested_object(summary, "comparison_buckets")))
+    lines.extend(_markdown_count_section("Observed Buckets", _nested_object(summary, "observed_buckets")))
     lines.extend(_markdown_count_section("Child Return Codes", _nested_object(summary, "child_returncodes")))
     lines.extend(_markdown_count_section("Playwright Statuses", _nested_object(summary, "playwright_statuses")))
     lines.extend(_markdown_count_section("Requests Statuses", _nested_object(summary, "requests_statuses")))
@@ -2499,6 +3096,8 @@ def _run_batch_diagnose(options: CliOptions) -> int:
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             error_payload: JsonObject = {
                 "schema_version": _SCHEMA_VERSION,
+                "diagnostic_schema_version": _SCHEMA_VERSION,
+                "diagnostic_schema_revision": _DIAGNOSTIC_SCHEMA_REVISION,
                 "generated_at": _utc_now_iso(),
                 "url": entry.url,
                 "status": "child_process_error",

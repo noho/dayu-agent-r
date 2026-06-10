@@ -18,6 +18,8 @@ from dayu.contracts.tool_declaration import ToolCallable, ToolDefinition
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
+from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
+from dayu.tools.web import web_tools as web_tools_module
 JsonObject = dict[str, JsonValue]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -385,7 +387,24 @@ def test_batch_rows_and_summary_counts(tmp_path: Path) -> None:
     assert summary["fetch_ok_count"] == 1
     assert summary["challenge_detected_count"] == 1
     assert summary["comparison_buckets"] == {"all_success": 1, "child_process_error": 1}
+    assert summary["observed_buckets"] == {"all_success": 1, "child_process_error": 1}
     assert summary["child_returncodes"] == {"7": 1}
+    assert rows[0]["observed_bucket"] == "all_success"
+    assert rows[0]["evidence_path"] == str(tmp_path / "a.json")
+    assert rows[0]["failure_url"] == ""
+    assert rows[0]["diagnostic_schema_version"] == "web-diagnostics-v1"
+    assert rows[1]["observed_bucket"] == "child_process_error"
+    assert rows[1]["observed_failing_path"] == "diagnostic_child_process"
+    assert rows[1]["evidence_path"] is None
+    assert rows[1]["failure_url"] == "https://example.com/b"
+    assert "重新运行单 URL 诊断子进程" in str(rows[1]["diagnostic_action_hint"])
+    assert summary["diagnostic_schema_version"] == "web-diagnostics-v1"
+    observed_items = summary["observed_items"]
+    assert isinstance(observed_items, list)
+    assert len(observed_items) == 2
+    action_hints = summary["diagnostic_action_hints"]
+    assert isinstance(action_hints, list)
+    assert len(action_hints) == 1
 
 
 def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
@@ -432,6 +451,298 @@ def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
     assert profile["fetch_backend"] == "requests"
     assert profile["content_prefix"] == "abcdef"
     assert profile["content_length"] == 6
+
+
+def test_docling_wrapper_records_invoked_true_and_restores_callable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Docling wrapper 应记录实际调用证据并在诊断后恢复原 callable。"""
+
+    def fake_docling(raw_bytes: bytes, stream_name: str) -> tuple[str, str, str]:
+        """模拟原始 Docling 转换成功。"""
+
+        assert raw_bytes == b"%PDF fixture"
+        assert stream_name == "page.pdf"
+        return "Fixture", "fixture markdown", "docling"
+
+    async def fake_callable(
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolCompletedOutcome:
+        """模拟 current fetch callable 进入非 HTML Docling 路径。"""
+
+        assert call.name == "fetch_web_page"
+        assert context.run_id == "diagnose-web"
+        title, markdown, backend = web_tools_module._docling_convert_to_markdown(b"%PDF fixture", "page.pdf")
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={
+                    "title": title,
+                    "final_url": "https://example.com/report.pdf",
+                    "fetch_backend": backend,
+                    "content": markdown,
+                },
+                meta=None,
+            )
+        )
+
+    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
+        """返回会触发 Docling callable 的工具定义。"""
+
+        assert options.url == "https://example.com/report.pdf"
+        return _tool_definition(fake_callable)
+
+    monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
+    monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
+
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com/report.pdf",
+        _options(url="https://example.com/report.pdf"),
+    )
+
+    evidence = _object_field(profile, "docling_conversion_invocation_evidence")
+    assert profile["ok"] is True
+    assert evidence["invoked"] is True
+    assert evidence["stream_name"] == "page.pdf"
+    assert evidence["raw_bytes_length"] == len(b"%PDF fixture")
+    assert evidence["target_module"] == "dayu.tools.web.web_tools"
+    assert evidence["target_function"] == "_docling_convert_to_markdown"
+    assert evidence["original_completed"] is True
+    assert evidence["original_exception_type"] == ""
+    assert evidence["docling_runtime_initialization_error"] is False
+    assert evidence["diagnostic_url"] == "https://example.com/report.pdf"
+    assert web_tools_module._docling_convert_to_markdown is fake_docling
+
+
+def test_html_fetch_profile_records_docling_invoked_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTML 成功路径未触发 Docling 时应显式记录 invoked=false。"""
+
+    async def fake_callable(
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolCompletedOutcome:
+        """模拟 HTML fetch 成功且不调用 Docling。"""
+
+        assert call.name == "fetch_web_page"
+        assert context.timeout_seconds == 2.0
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={
+                    "title": "HTML",
+                    "final_url": "https://example.com/page",
+                    "fetch_backend": "requests",
+                    "content": "html markdown",
+                },
+                meta=None,
+            )
+        )
+
+    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
+        """返回不触发 Docling 的工具定义。"""
+
+        assert options.url == "https://example.com/page"
+        return _tool_definition(fake_callable)
+
+    monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
+
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com/page",
+        _options(url="https://example.com/page"),
+    )
+
+    evidence = _object_field(profile, "docling_conversion_invocation_evidence")
+    assert profile["ok"] is True
+    assert evidence["invoked"] is False
+    assert evidence["stream_name"] == ""
+    assert evidence["raw_bytes_length"] is None
+    assert evidence["original_completed"] is False
+    assert evidence["docling_runtime_initialization_error"] is False
+
+
+def test_pdf_fetch_success_without_docling_invocation_keeps_failure_evidence_for_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PDF fetch 成功但 wrapper 未被调用时，应留下 invoked=false 供 smoke 判失败。"""
+
+    async def fake_callable(
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolCompletedOutcome:
+        """模拟 PDF URL 成功返回但没有进入 Docling callable。"""
+
+        assert call.arguments == {"url": "https://example.com/report.pdf"}
+        assert context.cancellation_token.is_cancelled() is False
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={
+                    "title": "PDF",
+                    "final_url": "https://example.com/report.pdf",
+                    "fetch_backend": "requests",
+                    "content": "pdf markdown",
+                },
+                meta=None,
+            )
+        )
+
+    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
+        """返回未触发 Docling 的 PDF 工具定义。"""
+
+        assert options.url == "https://example.com/report.pdf"
+        return _tool_definition(fake_callable)
+
+    monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
+
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com/report.pdf",
+        _options(url="https://example.com/report.pdf"),
+    )
+    evidence = _object_field(profile, "docling_conversion_invocation_evidence")
+
+    assert profile["ok"] is True
+    assert profile["content_length"] == len("pdf markdown")
+    assert evidence["invoked"] is False
+    assert evidence["diagnostic_url"] == "https://example.com/report.pdf"
+
+
+def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Docling 初始化异常应进入 skip observed items，并保留 wrapper 异常证据。"""
+
+    def fake_docling(raw_bytes: bytes, stream_name: str) -> tuple[str, str, str]:
+        """模拟 Docling 初始化失败。"""
+
+        assert raw_bytes == b"%PDF fixture"
+        assert stream_name == "page.pdf"
+        raise DoclingRuntimeInitializationError("docling runtime missing")
+
+    async def fake_callable(
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolCompletedOutcome:
+        """调用 Docling 后让初始化异常透传到诊断边界。"""
+
+        assert call.name == "fetch_web_page"
+        assert context.run_id == "diagnose-web"
+        web_tools_module._docling_convert_to_markdown(b"%PDF fixture", "page.pdf")
+        raise AssertionError("Docling 初始化异常应在上一行透传。")
+
+    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
+        """返回会触发 Docling 初始化异常的工具定义。"""
+
+        assert options.url == "https://example.com/report.pdf"
+        return _tool_definition(fake_callable)
+
+    monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
+    monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
+
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com/report.pdf",
+        _options(url="https://example.com/report.pdf"),
+    )
+    evidence = _object_field(profile, "docling_conversion_invocation_evidence")
+    payload = _payload(
+        requests_sampled=True,
+        requests_ok=True,
+        fetch_sampled=True,
+        fetch_ok=False,
+        playwright_sampled=False,
+        playwright_ok=False,
+    )
+    payload["fetch_web_page_profile"] = profile
+    payload["docling_conversion_invocation_evidence"] = evidence
+    row = diag._build_batch_result_row(
+        entry=diag.DiagnosticUrlEntry(url="https://example.com/report.pdf", label="PDF"),
+        diagnostic_path=tmp_path / "pdf.json",
+        payload=payload,
+        index=1,
+    )
+    summary = diag._build_batch_summary(run_label="run", input_path=tmp_path / "urls.jsonl", rows=[row])
+
+    assert profile["status"] == "callable_exception"
+    assert evidence["invoked"] is True
+    assert evidence["original_completed"] is False
+    assert evidence["original_exception_type"] == "DoclingRuntimeInitializationError"
+    assert evidence["docling_runtime_initialization_error"] is True
+    assert row["observed_bucket"] == "docling_runtime_initialization_error"
+    assert row["observed_failing_path"] == "docling_conversion"
+    skip_items = summary["skip_observed_items"]
+    assert isinstance(skip_items, list)
+    assert len(skip_items) == 1
+    assert summary["observed_buckets"] == {"docling_runtime_initialization_error": 1}
+    assert web_tools_module._docling_convert_to_markdown is fake_docling
+
+
+def test_generic_docling_conversion_exception_is_not_skip_observed_item(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """普通 Docling 转换异常只能作为失败事实，不能归为环境 skip。"""
+
+    def fake_docling(raw_bytes: bytes, stream_name: str) -> tuple[str, str, str]:
+        """模拟普通转换失败。"""
+
+        assert raw_bytes == b"%PDF fixture"
+        assert stream_name == "page.pdf"
+        raise RuntimeError("conversion failed")
+
+    async def fake_callable(
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolCompletedOutcome:
+        """调用 Docling 后让普通转换异常透传到诊断边界。"""
+
+        assert call.name == "fetch_web_page"
+        assert context.timeout_seconds == 2.0
+        web_tools_module._docling_convert_to_markdown(b"%PDF fixture", "page.pdf")
+        raise AssertionError("普通转换异常应在上一行透传。")
+
+    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
+        """返回会触发普通 Docling 转换异常的工具定义。"""
+
+        assert options.url == "https://example.com/report.pdf"
+        return _tool_definition(fake_callable)
+
+    monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
+    monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
+
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com/report.pdf",
+        _options(url="https://example.com/report.pdf"),
+    )
+    evidence = _object_field(profile, "docling_conversion_invocation_evidence")
+    payload = _payload(
+        requests_sampled=True,
+        requests_ok=True,
+        fetch_sampled=True,
+        fetch_ok=False,
+        playwright_sampled=False,
+        playwright_ok=False,
+    )
+    payload["fetch_web_page_profile"] = profile
+    payload["docling_conversion_invocation_evidence"] = evidence
+    row = diag._build_batch_result_row(
+        entry=diag.DiagnosticUrlEntry(url="https://example.com/report.pdf", label="PDF"),
+        diagnostic_path=tmp_path / "pdf.json",
+        payload=payload,
+        index=1,
+    )
+    summary = diag._build_batch_summary(run_label="run", input_path=tmp_path / "urls.jsonl", rows=[row])
+
+    assert evidence["invoked"] is True
+    assert evidence["original_exception_type"] == "RuntimeError"
+    assert evidence["docling_runtime_initialization_error"] is False
+    assert row["observed_bucket"] == "requests_only_success"
+    assert row["observed_failing_path"] == "fetch_web_page"
+    skip_items = summary["skip_observed_items"]
+    assert isinstance(skip_items, list)
+    assert skip_items == []
 
 
 def test_current_fetch_adapter_failed_outcome_generates_business_readable_profile(
@@ -504,8 +815,13 @@ def test_cli_single_mode_writes_deterministic_json(
     payload = _load_json_object(output_path)
     assert exit_code == 0
     assert payload["schema_version"] == "web-diagnostics-v1"
+    assert payload["diagnostic_schema_version"] == "web-diagnostics-v1"
+    assert payload["diagnostic_schema_revision"] == 1
     assert payload["generated_at"] == "2026-06-09T00:00:00+00:00"
     assert payload["comparison_bucket"] == "all_success"
+    evidence = _object_field(payload, "docling_conversion_invocation_evidence")
+    assert evidence["invoked"] is False
+    assert evidence["diagnostic_url"] == "https://example.com"
 
 
 def test_cli_requires_exactly_one_url_mode(
