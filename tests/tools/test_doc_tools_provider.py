@@ -5,25 +5,26 @@ from __future__ import annotations
 import ast
 import asyncio
 import builtins
+import inspect
 import io
 import shutil
 from collections.abc import Mapping
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, TextIO, cast
+from typing import Callable, ParamSpec, TextIO, TypeVar, cast
 
 import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_outcome import TOOL_CANCELLED_REASON_HOST_CANCELLED
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     BatchToolExecutionRequest,
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
+from dayu.contracts.tool_outcome import ToolCancelledOutcome, ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
@@ -44,19 +45,8 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderBinding,
     ToolsDiscoveryProviderSpec,
 )
-from dayu.tools._legacy_adapter.definition_adapter import (
-    LegacyToolConcurrencyPolicy,
-    ToolPathValidationPolicy,
-    adapt_collected_tool,
-)
-from dayu.tools._legacy_adapter.registry_collector import (
-    CollectedLegacyTool,
-    LegacyToolDeclarationCollector,
-    LegacyToolKeywordValue,
-)
 from dayu.tools import doc_tools
 from dayu.tools.doc_provider import discover_tools
-from dayu.tools.doc_tools import register_doc_tools
 
 _FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "documents"
 _DOC_TOOL_NAMES = (
@@ -66,6 +56,8 @@ _DOC_TOOL_NAMES = (
     "read_file",
     "read_file_section",
 )
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 class _OpenCancellationToken:
@@ -215,26 +207,21 @@ def test_doc_tool_schemas_do_not_expose_execution_context(tmp_path: Path) -> Non
         assert "cancellation_token" not in required
 
 
-def test_doc_declarations_request_execution_context_injection() -> None:
-    """五个 Doc tools 声明必须请求 execution_context 注入。"""
+def test_doc_provider_discovers_native_async_callables(tmp_path: Path) -> None:
+    """Doc provider 必须直接发现 current 原生 async callable。"""
 
-    collector = LegacyToolDeclarationCollector()
-    register_doc_tools(collector)
-    declarations = collector.collected_tools()
+    definitions = _discover_definitions(tmp_path)
 
-    assert tuple(declaration.name for declaration in declarations) == _DOC_TOOL_NAMES
-    assert all(
-        declaration.execution_context_param_name == "execution_context"
-        for declaration in declarations
-    )
+    assert tuple(definition.name for definition in definitions) == _DOC_TOOL_NAMES
+    assert all(inspect.iscoroutinefunction(definition.callable) for definition in definitions)
 
 
 @pytest.mark.parametrize("tool_name", _DOC_TOOL_NAMES)
-def test_doc_tools_cancelled_before_work_return_tool_cancelled(
+def test_doc_tools_cancelled_before_work_return_host_cancelled(
     tmp_path: Path,
     tool_name: str,
 ) -> None:
-    """五个 Doc tools 在业务入口预取消时必须返回稳定 tool_cancelled。"""
+    """五个 Doc tools 在业务入口预取消时必须返回 host_cancelled outcome。"""
 
     target = _copy_fixture(tmp_path, "sample.md")
     definitions = _definitions_by_name(_discover_definitions(tmp_path))
@@ -248,8 +235,9 @@ def test_doc_tools_cancelled_before_work_return_tool_cancelled(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert "cancel" in outcome.message
 
 
 def test_provider_enabled_without_allowed_paths_fails_closed() -> None:
@@ -287,10 +275,32 @@ def test_disallowed_path_returns_failed_outcome(tmp_path: Path) -> None:
     assert outcome.result.error == "permission_denied"
 
 
+def test_disallowed_nonexistent_path_returns_permission_denied(tmp_path: Path) -> None:
+    """白名单外不存在路径不得泄漏 file_not_found。"""
+
+    allowed = tmp_path / "allowed"
+    blocked = tmp_path / "blocked"
+    allowed.mkdir()
+    blocked.mkdir()
+    target = blocked / "missing.md"
+    definition = _definitions_by_name(_discover_definitions(allowed))["read_file"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("read_file", {"file_path": str(target)}),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "permission_denied"
+
+
 def test_path_validation_failure_does_not_enter_migrated_function_body(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """路径校验失败时必须在进入迁移函数体前失败。"""
+    """路径校验失败时必须在进入 Doc 业务函数前失败。"""
 
     allowed = tmp_path / "allowed"
     blocked = tmp_path / "blocked"
@@ -298,29 +308,32 @@ def test_path_validation_failure_does_not_enter_migrated_function_body(
     blocked.mkdir()
     target = blocked / "sample.md"
     target.write_text("blocked", encoding="utf-8")
-    calls: list[Mapping[str, JsonValue]] = []
-    declaration = _collected_by_name()["read_file"]
+    calls: list[str] = []
 
-    def spy_read_file(file_path: LegacyToolKeywordValue) -> JsonValue:
-        """记录是否进入迁移函数体。
+    def spy_read_file_business(
+        *,
+        file_path: str,
+        start_line: int | None,
+        end_line: int | None,
+        cancellation_token: CancellationToken,
+    ) -> JsonValue:
+        """记录是否进入 Doc 业务函数。
 
         :param file_path: 文件路径。
+        :param start_line: 起始行号。
+        :param end_line: 结束行号。
+        :param cancellation_token: 取消令牌。
         :returns: 测试返回值。
         """
 
-        calls.append({"file_path": cast(JsonValue, file_path)})
-        return {"file_path": file_path if isinstance(file_path, str) else ""}
+        del start_line
+        del end_line
+        del cancellation_token
+        calls.append(file_path)
+        return {"file_path": file_path}
 
-    spied = replace(declaration, callable=spy_read_file)
-    definition = adapt_collected_tool(
-        spied,
-        path_policy=ToolPathValidationPolicy(
-            allowed_roots=(allowed,),
-            file_path_params=spied.file_path_params,
-            must_exist=True,
-        ),
-        concurrency_policy=LegacyToolConcurrencyPolicy.SERIAL_PER_TOOL,
-    )
+    monkeypatch.setattr(doc_tools, "_read_file_business", spy_read_file_business)
+    definition = _definitions_by_name(_discover_definitions(allowed))["read_file"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -333,11 +346,136 @@ def test_path_validation_failure_does_not_enter_migrated_function_body(
     assert calls == []
 
 
-def test_file_path_params_metadata_is_collected_and_used(tmp_path: Path) -> None:
-    """file_path_params metadata 必须由旧 decorators 收集并用于路径验证。"""
+def test_same_provider_different_doc_callables_are_serialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 provider 的不同 Doc callable 不得并发进入同步业务体。"""
+
+    target = tmp_path / "sample.md"
+    target.write_text("Revenue grew quickly.", encoding="utf-8")
+    definitions = _definitions_by_name(_discover_definitions(tmp_path))
+    to_thread_entries: list[str] = []
+    business_entries: list[str] = []
+    active_business = False
+    observed_overlap = False
+
+    def fake_list_files_business(
+        *,
+        directory: str,
+        pattern: str | None,
+        recursive: bool,
+        limit: int,
+        max_files: int,
+        cancellation_token: CancellationToken,
+    ) -> JsonValue:
+        """记录 ``list_files`` 业务体进入。
+
+        :param directory: 目录路径。
+        :param pattern: 文件模式。
+        :param recursive: 是否递归。
+        :param limit: 返回限制。
+        :param max_files: 配置硬上限。
+        :param cancellation_token: 取消令牌。
+        :returns: list_files 成功载荷。
+        """
+
+        del pattern, recursive, limit, max_files, cancellation_token
+        business_entries.append("list_files")
+        return {"directory": directory, "files": [], "total": 0, "returned": 0}
+
+    def fake_read_file_business(
+        *,
+        file_path: str,
+        start_line: int | None,
+        end_line: int | None,
+        cancellation_token: CancellationToken,
+    ) -> JsonValue:
+        """记录 ``read_file`` 业务体进入。
+
+        :param file_path: 文件路径。
+        :param start_line: 起始行号。
+        :param end_line: 结束行号。
+        :param cancellation_token: 取消令牌。
+        :returns: read_file 成功载荷。
+        """
+
+        del start_line, end_line, cancellation_token
+        business_entries.append("read_file")
+        return {"file_path": file_path, "content": "ok", "total_lines": 1}
+
+    async def run_concurrent_calls() -> tuple[ToolCompletedOutcome, ToolCompletedOutcome]:
+        """并发执行两个不同 Doc callable。
+
+        :returns: 两个成功 outcome。
+        """
+
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def fake_to_thread(
+            func: Callable[_P, _R],
+            /,
+            *args: _P.args,
+            **kwargs: _P.kwargs,
+        ) -> _R:
+            """模拟 ``asyncio.to_thread`` 并记录同步业务体重叠。
+
+            :param func: 待执行的同步 callable。
+            :param args: 位置参数。
+            :param kwargs: 关键字参数。
+            :returns: callable 返回值。
+            """
+
+            nonlocal active_business, observed_overlap
+            if active_business:
+                observed_overlap = True
+            active_business = True
+            to_thread_entries.append("enter")
+            if len(to_thread_entries) == 1:
+                first_entered.set()
+                await release_first.wait()
+            result = func(*args, **kwargs)
+            active_business = False
+            return result
+
+        monkeypatch.setattr(doc_tools.asyncio, "to_thread", fake_to_thread)
+        list_task = asyncio.create_task(
+            definitions["list_files"].callable(
+                _call("list_files", {"directory": str(tmp_path)}),
+                _context(),
+            )
+        )
+        await first_entered.wait()
+        read_task = asyncio.create_task(
+            definitions["read_file"].callable(
+                _call("read_file", {"file_path": str(target)}),
+                _context(),
+            )
+        )
+        await asyncio.sleep(0)
+        assert to_thread_entries == ["enter"]
+        release_first.set()
+        list_outcome, read_outcome = await asyncio.gather(list_task, read_task)
+        assert isinstance(list_outcome, ToolCompletedOutcome)
+        assert isinstance(read_outcome, ToolCompletedOutcome)
+        return list_outcome, read_outcome
+
+    monkeypatch.setattr(doc_tools, "_list_files_business", fake_list_files_business)
+    monkeypatch.setattr(doc_tools, "_read_file_business", fake_read_file_business)
+
+    outcomes = asyncio.run(run_concurrent_calls())
+
+    assert len(outcomes) == 2
+    assert observed_overlap is False
+    assert to_thread_entries == ["enter", "enter"]
+    assert business_entries == ["list_files", "read_file"]
+
+
+def test_native_doc_path_projection_accepts_allowed_absolute_paths(tmp_path: Path) -> None:
+    """native Doc 路径投影必须接受白名单内绝对路径。"""
 
     markdown_path = _copy_fixture(tmp_path, "sample.md")
-    declarations = _collected_by_name()
     definition = _definitions_by_name(_discover_definitions(tmp_path))["read_file"]
 
     outcome = asyncio.run(
@@ -347,40 +485,7 @@ def test_file_path_params_metadata_is_collected_and_used(tmp_path: Path) -> None
         )
     )
 
-    assert declarations["list_files"].file_path_params == ("directory",)
-    assert declarations["read_file"].file_path_params == ("file_path",)
     assert isinstance(outcome, ToolCompletedOutcome)
-
-
-def test_collector_allowed_paths_are_not_trusted(tmp_path: Path) -> None:
-    """collector.register_allowed_paths 记录值不能成为可信路径安全源。"""
-
-    target = _copy_fixture(tmp_path, "sample.md")
-    collector = LegacyToolDeclarationCollector()
-    register_doc_tools(
-        collector,
-        allowed_paths=[tmp_path],
-        allow_file_write=True,
-        allowed_write_paths=[str(tmp_path)],
-        timeout_budget=1.0,
-    )
-    declaration = _by_name(collector.collected_tools())["read_file"]
-    definition = adapt_collected_tool(
-        declaration,
-        path_policy=None,
-        concurrency_policy=LegacyToolConcurrencyPolicy.SERIAL_PER_TOOL,
-    )
-
-    outcome = asyncio.run(
-        definition.callable(
-            _call("read_file", {"file_path": str(target)}),
-            _context(),
-        )
-    )
-
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "permission_denied"
-    assert collector._allowed_path_calls == []
 
 
 def test_path_args_are_projected_to_validated_absolute_paths(tmp_path: Path) -> None:
@@ -543,9 +648,86 @@ def test_search_files_cancelled_during_iteration_stops_before_later_scan(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
     assert len(scanned_paths) == 1
+
+
+def test_search_via_line_scan_observes_loop_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_search_via_line_scan 行扫描循环内必须观察取消。"""
+
+    target = tmp_path / "large.txt"
+    target.write_text("Revenue\nRevenue\n", encoding="utf-8")
+    token = _ManualCancellationToken()
+
+    def fake_extract_query_anchored_snippets(content: str, query: str) -> list[str]:
+        """在读取内容后、行扫描循环前请求取消。
+
+        :param content: 文件内容。
+        :param query: 搜索词。
+        :returns: 测试片段。
+        """
+
+        del content, query
+        token.cancel("cancel during line scan")
+        return ["Revenue"]
+
+    monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
+    monkeypatch.setattr(doc_tools, "extract_query_anchored_snippets", fake_extract_query_anchored_snippets)
+
+    with pytest.raises(doc_tools._DocCancelledError):
+        doc_tools._search_via_line_scan(target, "large.txt", "Revenue", 10, token)
+
+
+def test_search_files_line_scan_cancellation_returns_host_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """line scan 观察到取消时 search_files 必须返回 host_cancelled。"""
+
+    target = tmp_path / "large.txt"
+    target.write_text("Revenue\nRevenue\n", encoding="utf-8")
+    definitions = _definitions_by_name(_discover_definitions(tmp_path))
+    token = _ManualCancellationToken()
+
+    def fake_try_create_processor(path: Path) -> None:
+        """强制搜索走行扫描 fallback。
+
+        :param path: 候选文件路径。
+        :returns: 始终返回 ``None``。
+        """
+
+        del path
+        return None
+
+    def fake_extract_query_anchored_snippets(content: str, query: str) -> list[str]:
+        """在 line scan 进入循环前请求取消。
+
+        :param content: 文件内容。
+        :param query: 搜索词。
+        :returns: 测试片段。
+        """
+
+        del content, query
+        token.cancel("cancel during line scan")
+        return ["Revenue"]
+
+    monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
+    monkeypatch.setattr(doc_tools, "_try_create_processor", fake_try_create_processor)
+    monkeypatch.setattr(doc_tools, "extract_query_anchored_snippets", fake_extract_query_anchored_snippets)
+
+    outcome = asyncio.run(
+        definitions["search_files"].callable(
+            _call("search_files", {"directory": str(tmp_path), "query": "Revenue"}),
+            _context(token),
+        )
+    )
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
 
 
 def test_read_file_cancelled_after_first_failed_encoding_stops_fallback(
@@ -606,9 +788,38 @@ def test_read_file_cancelled_after_first_failed_encoding_stops_fallback(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
     assert attempted_encodings == ["utf-8"]
+
+
+def test_markdown_section_extraction_observes_cooperative_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Markdown 章节提取长循环必须提供协作式取消检查。"""
+
+    token = _ManualCancellationToken()
+    token.cancel("cancel markdown extraction")
+    monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
+
+    with pytest.raises(doc_tools._DocCancelledError):
+        doc_tools._extract_markdown_sections(["# A\n", "# B\n"], token)
+
+
+def test_count_file_lines_observes_cooperative_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """行数统计 helper 长循环必须提供协作式取消检查。"""
+
+    target = tmp_path / "large.md"
+    target.write_text("line 1\nline 2\n", encoding="utf-8")
+    token = _ManualCancellationToken()
+    token.cancel("cancel line count")
+    monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
+
+    with pytest.raises(doc_tools._DocCancelledError):
+        doc_tools._count_file_lines(target, token)
 
 
 def test_success_and_failure_responses_do_not_contain_old_envelope(
@@ -685,9 +896,10 @@ def test_markdown_and_docling_fixtures_support_sections_search_and_read(
 def test_no_old_fetch_more_business_tool() -> None:
     """Doc provider 不得暴露 OLD fetch_more business tool。"""
 
-    declarations = _collected_by_name()
+    output = discover_tools(_spec(_FIXTURE_ROOT))
+    names = {definition.name for definition in output.definitions}
 
-    assert "fetch_more" not in declarations
+    assert "fetch_more" not in names
 
 
 def test_read_tools_expose_current_truncate_spec_and_no_old_imports(
@@ -702,15 +914,22 @@ def test_read_tools_expose_current_truncate_spec_and_no_old_imports(
         assert isinstance(truncate, ToolTruncateSpec)
         assert truncate.strategy is ToolTruncationStrategy.TEXT_CHARS
         assert truncate.target_field == "content"
-    source = (Path(__file__).resolve().parents[2] / "dayu" / "tools" / "doc_tools.py").read_text(
+    doc_tools_source = (Path(__file__).resolve().parents[2] / "dayu" / "tools" / "doc_tools.py").read_text(
         encoding="utf-8"
     )
-    imported_modules = _imported_modules(source)
+    doc_provider_source = (Path(__file__).resolve().parents[2] / "dayu" / "tools" / "doc_provider.py").read_text(
+        encoding="utf-8"
+    )
+    imported_modules = _imported_modules(doc_tools_source)
     assert "dayu.engine.tool_registry" not in imported_modules
     assert "dayu.engine.truncation_manager" not in imported_modules
     assert "dayu.engine.tool_result" not in imported_modules
-    assert "fetch_more" not in source
-    assert "TruncationManager" not in source
+    assert "fetch_more" not in doc_tools_source
+    assert "TruncationManager" not in doc_tools_source
+    assert "_legacy_adapter" not in doc_tools_source
+    assert "_legacy_adapter" not in doc_provider_source
+    assert "LegacyToolDeclarationCollector" not in doc_provider_source
+    assert "adapt_collected_tools" not in doc_provider_source
 
 
 def test_toolruntime_executes_doc_tool_through_accept_barrier(tmp_path: Path) -> None:
@@ -821,29 +1040,6 @@ def _definitions_by_name(
     """
 
     return {definition.name: definition for definition in definitions}
-
-
-def _collected_by_name() -> Mapping[str, CollectedLegacyTool]:
-    """收集迁移 Doc 声明并按名称索引。
-
-    :returns: 工具名到收集声明的映射。
-    """
-
-    collector = LegacyToolDeclarationCollector()
-    register_doc_tools(collector)
-    return _by_name(collector.collected_tools())
-
-
-def _by_name(
-    declarations: tuple[CollectedLegacyTool, ...],
-) -> Mapping[str, CollectedLegacyTool]:
-    """按名称索引收集声明。
-
-    :param declarations: 收集声明。
-    :returns: 工具名到声明的映射。
-    """
-
-    return {declaration.name: declaration for declaration in declarations}
 
 
 def _copy_fixture(tmp_path: Path, fixture_name: str) -> Path:
