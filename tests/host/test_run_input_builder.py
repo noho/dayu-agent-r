@@ -1427,7 +1427,7 @@ def test_memory_provider_uses_latest_snapshot_before_required_cursor(
 def test_run_input_memory_messages_include_context_compacted_projection(
     tmp_path: Path,
 ) -> None:
-    """projection catch-up 后 RunInputBuilder 注入 compacted pinned state 与 summary。"""
+    """ordinary RunInput 读取 accepted compact 物化出的五类 memory section。"""
 
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -1448,10 +1448,17 @@ def test_run_input_memory_messages_include_context_compacted_projection(
 
         request = _build_request_with_memory(store, seeded, policy)
         contents = tuple(_message_content(message) for message in request.messages)
+        system_content = _single_system_content(request.messages)
 
+        assert "## Conversation Summary" in system_content
         assert any("summary=episode navigation only" in content for content in contents)
+        assert "## Verified Evidence and Facts" in system_content
+        assert "claim_text=Revenue increased year over year" in system_content
+        assert "## Prior Answer Anchors" in system_content
         assert any("compact pinned goal" in content for content in contents)
+        assert "## Open Follow-up Context" in system_content
         assert any("compact open question" in content for content in contents)
+        assert "## Reference Continuity" in system_content
         assert any("second factor: margin mix" in content for content in contents)
         assert contents[-1] == "current prompt"
 

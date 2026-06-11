@@ -221,6 +221,12 @@ def test_rebuild_resets_projection_and_finishes_empty_batch(
         runner,
         policy=_policy(),
         batch_size=10,
+        max_event_sequence=0,
+        budget=memory_repair.MemoryProjectionCatchupBudget(
+            max_batches=1,
+            max_scanned_events=10,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
+        ),
         consumer_id=consumer_id.value,
     )
 
@@ -229,7 +235,10 @@ def test_rebuild_resets_projection_and_finishes_empty_batch(
     assert result.started_cursor == 0
     assert result.finished_cursor == 0
     assert result.events_scanned == 0
-    assert _FakeProjectionRunner.run_calls == [(consumer_id, 10, None)]
+    assert result.batches_used == 1
+    assert result.stop_reason is memory_repair.MemoryProjectionRepairStopReason.TARGET_REACHED
+    assert result.target_reached is True
+    assert _FakeProjectionRunner.run_calls == [(consumer_id, 10, 0)]
 
 
 def test_catch_up_accumulates_batches_until_short_batch() -> None:
@@ -279,8 +288,248 @@ def test_catch_up_accumulates_batches_until_short_batch() -> None:
     assert result.events_matched == 5
     assert result.events_applied == 4
     assert result.duplicates == 1
+    assert result.batches_used == 3
+    assert result.stop_reason is memory_repair.MemoryProjectionRepairStopReason.TARGET_REACHED
+    assert result.target_reached is True
     assert len(_FakeProjectionRunner.run_calls) == 3
     assert all(call == (consumer_id, 2, 5) for call in _FakeProjectionRunner.run_calls)
+
+
+def test_catch_up_budget_exhausted_stops_before_idle() -> None:
+    """catch-up 总 batch 预算耗尽时停止且不标记 projection failure。"""
+
+    consumer_id = ProjectionConsumerId("memory.test")
+    _FakeProjectionRunner.queued_results = [
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=0,
+            finished_cursor=2,
+            scanned=2,
+            matched=2,
+            applied=2,
+        ),
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=2,
+            finished_cursor=4,
+            scanned=2,
+            matched=2,
+            applied=2,
+        ),
+    ]
+
+    result = memory_repair.catch_up_conversation_memory_projection(
+        cast(HostTransactionRunner, _FakeTransactionRunner()),
+        policy=_policy(),
+        batch_size=2,
+        consumer_id=consumer_id.value,
+        budget=memory_repair.MemoryProjectionCatchupBudget(
+            max_batches=1,
+            max_scanned_events=2,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
+        ),
+    )
+
+    assert result.finished_cursor == 2
+    assert result.events_scanned == 2
+    assert result.batches_used == 1
+    assert result.failures == 0
+    assert result.budget_exhausted is True
+    assert result.target_reached is False
+    assert (
+        result.stop_reason
+        is memory_repair.MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED
+    )
+    assert len(_FakeProjectionRunner.run_calls) == 1
+
+
+def test_catch_up_stops_when_target_reached_before_idle() -> None:
+    """catch-up 覆盖目标 cursor 后停止，不继续追 EventLog idle。"""
+
+    consumer_id = ProjectionConsumerId("memory.test")
+    _FakeProjectionRunner.queued_results = [
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=0,
+            finished_cursor=2,
+            scanned=2,
+            matched=2,
+            applied=2,
+        ),
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=2,
+            finished_cursor=4,
+            scanned=2,
+            matched=2,
+            applied=2,
+        ),
+    ]
+
+    result = memory_repair.catch_up_conversation_memory_projection(
+        cast(HostTransactionRunner, _FakeTransactionRunner()),
+        policy=_policy(),
+        batch_size=2,
+        consumer_id=consumer_id.value,
+        max_event_sequence=2,
+        budget=memory_repair.MemoryProjectionCatchupBudget(
+            max_batches=4,
+            max_scanned_events=8,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
+        ),
+    )
+
+    assert result.finished_cursor == 2
+    assert result.batches_used == 1
+    assert result.budget_exhausted is False
+    assert result.target_reached is True
+    assert result.stop_reason is memory_repair.MemoryProjectionRepairStopReason.TARGET_REACHED
+    assert _FakeProjectionRunner.run_calls == [(consumer_id, 2, 2)]
+
+
+def test_required_catch_up_without_budget_crosses_old_batch_cap_to_target() -> None:
+    """required catch-up 无 correctness batch cap，可跨超过旧 16 批追到目标。"""
+
+    consumer_id = ProjectionConsumerId("memory.test")
+    _FakeProjectionRunner.queued_results = [
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=index,
+            finished_cursor=index + 1,
+            scanned=1,
+            matched=1,
+            applied=1,
+        )
+        for index in range(17)
+    ]
+
+    result = memory_repair.catch_up_conversation_memory_projection(
+        cast(HostTransactionRunner, _FakeTransactionRunner()),
+        policy=_policy(),
+        batch_size=1,
+        consumer_id=consumer_id.value,
+        max_event_sequence=17,
+        budget=None,
+    )
+
+    assert result.finished_cursor == 17
+    assert result.batches_used == 17
+    assert result.events_scanned == 17
+    assert result.target_reached is True
+    assert result.budget_exhausted is False
+    assert result.max_batches is None
+    assert result.max_scanned_events is None
+    assert len(_FakeProjectionRunner.run_calls) == 17
+
+
+def test_rebuild_budget_exhausted_reports_target_not_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rebuild 总预算耗尽且未覆盖 required cursor 时返回可诊断结果。"""
+
+    consumer_id = ProjectionConsumerId("memory.test")
+
+    def fake_reset(transaction: HostTransaction, *, consumer_id: str) -> None:
+        """忽略 reset projection operation。
+
+        :param transaction: Host transaction。
+        :param consumer_id: consumer id。
+        :returns: ``None``。
+        """
+
+        del transaction, consumer_id
+
+    monkeypatch.setattr(
+        memory_repair,
+        "reset_conversation_memory_projection",
+        fake_reset,
+    )
+    _FakeProjectionRunner.queued_results = [
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=0,
+            finished_cursor=2,
+            scanned=2,
+            matched=2,
+            applied=2,
+        )
+    ]
+
+    result = memory_repair.rebuild_conversation_memory_projection(
+        cast(HostTransactionRunner, _FakeTransactionRunner()),
+        policy=_policy(),
+        batch_size=2,
+        max_event_sequence=4,
+        budget=memory_repair.MemoryProjectionCatchupBudget(
+            max_batches=1,
+            max_scanned_events=2,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
+        ),
+        consumer_id=consumer_id.value,
+    )
+
+    assert result.reset_checkpoint is True
+    assert result.finished_cursor == 2
+    assert result.target_reached is False
+    assert result.budget_exhausted is True
+    assert (
+        result.stop_reason
+        is memory_repair.MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED
+    )
+    assert _FakeProjectionRunner.run_calls == [(consumer_id, 2, 4)]
+
+
+def test_rebuild_without_budget_crosses_old_batch_cap_to_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rebuild 无 correctness batch cap，可跨超过旧 32 批追到目标。"""
+
+    consumer_id = ProjectionConsumerId("memory.test")
+
+    def fake_reset(transaction: HostTransaction, *, consumer_id: str) -> None:
+        """忽略 reset projection operation。
+
+        :param transaction: Host transaction。
+        :param consumer_id: consumer id。
+        :returns: ``None``。
+        """
+
+        del transaction, consumer_id
+
+    monkeypatch.setattr(
+        memory_repair,
+        "reset_conversation_memory_projection",
+        fake_reset,
+    )
+    _FakeProjectionRunner.queued_results = [
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=index,
+            finished_cursor=index + 1,
+            scanned=1,
+            matched=1,
+            applied=1,
+        )
+        for index in range(33)
+    ]
+
+    result = memory_repair.rebuild_conversation_memory_projection(
+        cast(HostTransactionRunner, _FakeTransactionRunner()),
+        policy=_policy(),
+        batch_size=1,
+        max_event_sequence=33,
+        budget=None,
+        consumer_id=consumer_id.value,
+    )
+
+    assert result.reset_checkpoint is True
+    assert result.finished_cursor == 33
+    assert result.batches_used == 33
+    assert result.target_reached is True
+    assert result.budget_exhausted is False
+    assert result.max_batches is None
+    assert result.max_scanned_events is None
+    assert len(_FakeProjectionRunner.run_calls) == 33
 
 
 def test_catch_up_stops_on_failure_and_counts_failure() -> None:
@@ -315,6 +564,8 @@ def test_catch_up_stops_on_failure_and_counts_failure() -> None:
     assert result.finished_cursor == 8
     assert result.events_scanned == 2
     assert result.failures == 1
+    assert result.stop_reason is memory_repair.MemoryProjectionRepairStopReason.FAILURE
+    assert result.budget_exhausted is False
     assert len(_FakeProjectionRunner.run_calls) == 1
 
 
@@ -323,7 +574,9 @@ def test_catchup_port_delegates_to_catch_up_function(
 ) -> None:
     """ConversationMemoryProjectionCatchupPort 委托模块级 catch-up 函数。"""
 
-    calls: list[tuple[int, str]] = []
+    calls: list[
+        tuple[int, str, memory_repair.MemoryProjectionCatchupBudget | None]
+    ] = []
     policy = _policy()
 
     def fake_catch_up(
@@ -333,6 +586,7 @@ def test_catchup_port_delegates_to_catch_up_function(
         batch_size: int,
         consumer_id: str,
         max_event_sequence: int | None = None,
+        budget: memory_repair.MemoryProjectionCatchupBudget | None = None,
     ) -> memory_repair.ConversationMemoryProjectionRepairResult:
         """记录端口传入参数并返回空结果。
 
@@ -341,11 +595,12 @@ def test_catchup_port_delegates_to_catch_up_function(
         :param batch_size: batch size。
         :param consumer_id: consumer id。
         :param max_event_sequence: 最大 event sequence。
+        :param budget: Host 内部单次总预算。
         :returns: repair result。
         """
 
         del transaction_runner, policy, max_event_sequence
-        calls.append((batch_size, consumer_id))
+        calls.append((batch_size, consumer_id, budget))
         projection_consumer_id = ProjectionConsumerId(consumer_id)
         return memory_repair.ConversationMemoryProjectionRepairResult(
             consumer_id=projection_consumer_id,
@@ -364,16 +619,22 @@ def test_catchup_port_delegates_to_catch_up_function(
         "catch_up_conversation_memory_projection",
         fake_catch_up,
     )
+    budget = memory_repair.MemoryProjectionCatchupBudget(
+        max_batches=1,
+        max_scanned_events=4,
+        purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
+    )
     port = memory_repair.ConversationMemoryProjectionCatchupPort(
         transaction_runner=cast(HostTransactionRunner, _FakeTransactionRunner()),
         policy=policy,
         batch_size=4,
         consumer_id="memory.port",
+        budget=budget,
     )
 
     port.catch_up_projection()
 
-    assert calls == [(4, "memory.port")]
+    assert calls == [(4, "memory.port", budget)]
 
 
 def test_catch_up_uses_real_durable_store_and_writes_snapshot(
@@ -430,6 +691,61 @@ def test_catch_up_uses_real_durable_store_and_writes_snapshot(
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == second_event.event_sequence
         assert checkpoint.checkpoint_event_id == second_event.event_id
+
+
+def test_catch_up_budget_exhausted_advances_only_processed_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """真实 durable catch-up 超预算时只推进已处理 row 的 checkpoint。"""
+
+    monkeypatch.setattr(memory_repair, "ProjectionRunner", RealProjectionRunner)
+    policy = _policy()
+    options = _options(tmp_path / "durable.sqlite3", tmp_path / "artifacts")
+    with open_host_durable_store(options) as store:
+        first_event = store.transaction_runner.run_write(
+            _AppendMemoryEventOperation(
+                event_id="event-memory-budget-1",
+                display_text="预算内问题",
+            )
+        )
+        store.transaction_runner.run_write(
+            _AppendMemoryEventOperation(
+                event_id="event-memory-budget-2",
+                display_text="预算外问题",
+            )
+        )
+
+        result = memory_repair.catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=1,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            budget=memory_repair.MemoryProjectionCatchupBudget(
+                max_batches=1,
+                max_scanned_events=1,
+                purpose=(
+                    memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT
+                ),
+            ),
+        )
+        snapshot_row = store.transaction_runner.run_read(
+            _ReadLatestMemorySnapshotOperation(policy)
+        )
+        checkpoint = store.transaction_runner.run_read(
+            _ReadMemoryCheckpointOperation()
+        )
+
+        assert result.budget_exhausted is True
+        assert result.failures == 0
+        assert result.finished_cursor == first_event.event_sequence
+        assert snapshot_row is not None
+        assert tuple(
+            item.text
+            for item in snapshot_row.snapshot.trace_memory.selected_recent_window
+        ) == ("预算内问题",)
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == first_event.event_sequence
+        assert checkpoint.checkpoint_event_id == first_event.event_id
 
 
 class _AppendMemoryEventOperation:

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_FAILED
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
@@ -237,6 +237,22 @@ def _fact(claim_text: str) -> dict[str, JsonValue]:
         "claim_text": claim_text,
         "evidence_labels": ["e1"],
     }
+
+
+def _memory_item_count(transaction: HostTransaction) -> int:
+    """读取 memory item durable row 数。
+
+    :param transaction: Host transaction。
+    :returns: memory item row 数。
+    """
+
+    row = transaction.fetchone(
+        f"SELECT COUNT(*) AS count FROM {TABLE_HOST_MEMORY_ITEMS}"
+    )
+    assert row is not None
+    count = row.get("count")
+    assert isinstance(count, int)
+    return count
 
 
 def test_memory_projection_policy_contract_uses_design_source_fields() -> None:
@@ -611,7 +627,7 @@ def test_write_snapshot_with_checkpoint_commits_snapshot_before_checkpoint(
 def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
     tmp_path: Path,
 ) -> None:
-    """ProjectionRunner 通过 consumer 写入 vNext snapshot 与 checkpoint。"""
+    """accepted compact 经 ProjectionRunner 物化五类 memory section 与 checkpoint。"""
 
     policy = _policy()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -676,12 +692,31 @@ def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
         )
 
         assert latest is not None
+        assert latest.snapshot.latest_compaction_event_ref == "compact-1"
+        assert latest.snapshot.session_summary_memory.summary_text == (
+            "用户关注收入增速和毛利率变化。"
+        )
         assert (
             latest.snapshot.evidence_fact_memory.evidence_backed_facts[0].claim_text
             == "收入增长。"
         )
+        assert latest.snapshot.answer_anchor_memory.anchors[0].anchor_title == (
+            "收入口径"
+        )
+        assert latest.snapshot.forward_intent_memory.intents[0].text == (
+            "下一轮继续核对费用率。"
+        )
+        assert latest.snapshot.trace_memory.reference_continuity_items[0].text == (
+            "“该公司”继续指向当前分析主体。"
+        )
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == 1
+        assert checkpoint.checkpoint_event_id == "compact-1"
+        assert (
+            latest.snapshot.cursor.checkpoint_event_sequence
+            == checkpoint.checkpoint_event_sequence
+        )
+        assert latest.snapshot.cursor.checkpoint_event_id == checkpoint.checkpoint_event_id
         assert set(item_kinds) == {
             "answer_anchor",
             "evidence_backed_fact",
@@ -689,6 +724,69 @@ def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
             "reference_continuity",
             "session_summary",
         }
+
+
+def test_projection_consumer_skips_failed_compact_without_memory_snapshot(
+    tmp_path: Path,
+) -> None:
+    """failed compact 不进入 Conversation Memory snapshot 或 compact sections。"""
+
+    policy = _policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="compact-failed-1",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=_SESSION_ID,
+                    run_id=_RUN_ID,
+                    attempt_id=_ATTEMPT_ID,
+                    execution_id=_EXECUTION_ID,
+                    event_type=CONTEXT_COMPACTION_FAILED,
+                    occurred_at=_OCCURRED_AT,
+                    actor="pytest",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"failure_reason": "compactor_unavailable"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        policy_digest = digest_memory_projection_policy(policy)
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=policy_digest,
+            )
+        )
+        item_count = store.transaction_runner.run_read(_memory_item_count)
+        checkpoint = store.transaction_runner.run_read(
+            lambda transaction: read_projection_checkpoint(
+                transaction,
+                CONVERSATION_MEMORY_CONSUMER_ID,
+            )
+        )
+
+        assert result.events_scanned == 1
+        assert result.events_matched == 0
+        assert result.events_applied == 0
+        assert latest is None
+        assert item_count == 0
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == 1
+        assert checkpoint.checkpoint_event_id == "compact-failed-1"
 
 
 def test_policy_digest_changes_when_design_field_changes() -> None:

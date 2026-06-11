@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
+from dayu.host.api import RunStatus
 from dayu.host.compact_material import (
+    CompactMaterialSourceBoundary,
     CompactMemorySnapshotRepairRequired,
     DuplicateMaterialSectionOwnerError,
     EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     InlineDeltaRepairMaterialView,
+    PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
     build_initial_material_pack,
     build_compact_material_pack,
+    build_pre_dispatch_compact_material_view,
     check_compact_memory_snapshot_cursor,
     conversation_compact_input_vnext_from_material_pack,
     prompt_local_evidence_map,
@@ -23,11 +30,51 @@ from dayu.host.compact_material import (
     select_compact_segment,
 )
 from dayu.host.compaction import (
+    AnswerAnchorCandidateVNext,
+    AnswerAnchorChildVNext,
+    CompactMaterialBlock,
+    CompactQualityCheckResultVNext,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactSegmentTrigger,
+    ConversationCompactOutputVNext,
+    EvidenceBackedFactCandidateVNext,
+    FactEvidenceKindVNext,
+    ForwardIntentCandidateVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityCandidateVNext,
+    ReferenceContinuityReasonVNext,
+    SessionSummaryCandidateVNext,
 )
+from dayu.host.context_events import build_context_compacted_payload
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogRow,
+    EventLogStore,
+)
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.schema import (
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+)
+from dayu.host.durable.state import RunRow
+from dayu.host.durable.transaction import HostTransaction
 from dayu.host.evidence import OpaqueEvidenceRef
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    accepted_evidence_envelope_to_json_value,
+)
 from dayu.host.memory import (
     AnswerAnchor,
     AnswerAnchorChild,
@@ -56,6 +103,7 @@ from dayu.host.memory import (
 _SESSION_ID = "session-compact-material"
 _POLICY_DIGEST = "policy-digest-compact-material"
 _NOW = "2026-05-24T00:00:00.000000Z"
+_DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
 def test_segment_selection_is_deterministic_for_same_inputs() -> None:
@@ -169,10 +217,9 @@ def test_already_represented_blocks_are_not_reexpanded() -> None:
 def test_vnext_snapshot_does_not_bridge_old_goal_into_previous_view() -> None:
     """vNext snapshot 不把旧 goal bridge 成 previous compacted view block。"""
 
-    snapshot = _snapshot_with_goal(
-        snapshot_id="snapshot-duplicate",
+    snapshot = _empty_snapshot(
+        "snapshot-duplicate",
         checkpoint_event_sequence=2,
-        current_goal="same goal",
     )
     duplicate = run_input_material_block(
         block_id="history-duplicate",
@@ -757,6 +804,693 @@ def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
     assert evidence_map["E1.2"].chunk_ordinal == 2
 
 
+def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp_path: Path) -> None:
+    """首次 compact 从 EventLog 构造 delta，当前输入只作为 anchor。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入首次 compact 所需 EventLog rows。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            user = _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-old",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "old user question"},
+            )
+            answer = _append_event(
+                transaction,
+                event_log,
+                event_id="event-answer-old",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "old assistant answer"},
+            )
+            evidence = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-old",
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-input",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            assert user.event_sequence < answer.event_sequence < evidence.event_sequence
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+
+        def build(transaction: HostTransaction) -> PreDispatchCompactMaterialView:
+            """构造 pre-dispatch material view。
+
+            :param transaction: Host transaction。
+            :returns: material view。
+            """
+
+            return build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+
+        view = store.transaction_runner.run_read(build)
+
+        assert isinstance(view.source_boundary, CompactMaterialSourceBoundary)
+        assert view.previous_compacted_view == ()
+        assert view.current_input_text == "current user question"
+        assert view.source_boundary.post_compact_delta_start_sequence == 1
+        assert (
+            view.source_boundary.post_compact_delta_end_sequence
+            == run.input_event_sequence
+        )
+        assert tuple(block.kind for block in view.material_blocks) == (
+            CompactMaterialBlockKind.USER_INPUT,
+            CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+        )
+        assert "current user question" not in tuple(
+            block.text for block in view.material_blocks
+        )
+        assert tuple(fragment.text for fragment in view.budget_fragments)[-1] == (
+            "current user question"
+        )
+
+
+def test_pre_dispatch_reads_delta_rows_beyond_old_cap(tmp_path: Path) -> None:
+    """pre-dispatch source builder 读取超过旧 256 限制的完整 delta rows。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入超过旧 delta cap 的历史 user facts。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            for index in range(260):
+                _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-user-delta-{index:03d}",
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": f"delta user {index:03d}"},
+                )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-large-delta",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after large delta"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after large delta",
+            )
+        )
+
+        assert len(view.material_blocks) == 260
+        assert view.material_blocks[0].text == "delta user 000"
+        assert view.material_blocks[-1].text == "delta user 259"
+        assert view.budget_fragments[-1].text == "current after large delta"
+
+
+def test_pre_dispatch_keeps_evidence_blocks_beyond_old_cap(tmp_path: Path) -> None:
+    """accepted evidence 超过旧 8 个时 source builder 不 fail closed。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入超过旧 evidence cap 的 accepted tool results。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            for index in range(10):
+                _append_tool_result_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-tool-result-evidence-{index:02d}",
+                )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-evidence",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after evidence"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after evidence",
+            )
+        )
+
+        evidence_blocks = tuple(
+            block
+            for block in view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        )
+        assert len(evidence_blocks) == 10
+        assert evidence_blocks[-1].accepted_evidence_id == (
+            "evidence:event-tool-result-evidence-09"
+        )
+
+
+def test_pre_dispatch_evidence_uses_full_tool_call_query_atom(tmp_path: Path) -> None:
+    """pre-dispatch evidence query 使用 TOOL_CALL_REQUESTED 完整 query atom。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入完整 tool call atom 与 accepted evidence。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-query-atom",
+                tool_call_id="tool-call-query-atom",
+                semantic_query_text="Search FY2025 revenue for MSFT",
+            )
+            result = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-query-atom",
+                tool_call_requested_event_ref=request.event_id,
+                tool_call_id="tool-call-query-atom",
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-query-atom",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            assert request.event_sequence < result.event_sequence < current.event_sequence
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        evidence_blocks = tuple(
+            block
+            for block in view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        )
+        assert len(evidence_blocks) == 1
+        assert evidence_blocks[0].readable_query_text == (
+            "Search FY2025 revenue for MSFT"
+        )
+
+
+def test_pre_dispatch_evidence_query_text_is_not_truncated(tmp_path: Path) -> None:
+    """pre-dispatch evidence query 只规范化，不按旧 1200 字符截断。"""
+
+    long_query = " ".join(("long-query", *("segment" for _ in range(240))))
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入超长 semantic query atom 与 accepted evidence。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-long-query",
+                tool_call_id="tool-call-long-query",
+                semantic_query_text=long_query,
+            )
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-long-query",
+                tool_call_requested_event_ref=request.event_id,
+                tool_call_id="tool-call-long-query",
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-long-query",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        evidence_blocks = tuple(
+            block
+            for block in view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        )
+        assert len(evidence_blocks) == 1
+        query_text = evidence_blocks[0].readable_query_text
+        assert query_text is not None
+        assert query_text == long_query
+        assert len(query_text) > 1200
+
+
+def test_compact_material_source_boundary_rejects_inverted_delta_boundary() -> None:
+    """Source boundary 直接拒绝 inverted delta 边界。"""
+
+    with pytest.raises(ValueError, match="post compact delta boundary is inverted"):
+        CompactMaterialSourceBoundary(
+            latest_compacted_event_id=None,
+            latest_compacted_event_sequence=None,
+            post_compact_delta_start_sequence=4,
+            post_compact_delta_end_sequence=3,
+            current_input_event_sequence=3,
+        )
+
+
+def test_compact_material_source_boundary_rejects_delta_end_mismatch() -> None:
+    """Source boundary 直接拒绝 delta end 与当前 input sequence 不一致。"""
+
+    with pytest.raises(
+        ValueError,
+        match="delta end sequence must equal current input sequence",
+    ):
+        CompactMaterialSourceBoundary(
+            latest_compacted_event_id=None,
+            latest_compacted_event_sequence=None,
+            post_compact_delta_start_sequence=2,
+            post_compact_delta_end_sequence=3,
+            current_input_event_sequence=4,
+        )
+
+
+def test_pre_dispatch_material_view_rejects_boundary_field_mismatches() -> None:
+    """Material view 直接拒绝便捷字段与 source boundary 不一致。"""
+
+    boundary = CompactMaterialSourceBoundary(
+        latest_compacted_event_id="event-compact",
+        latest_compacted_event_sequence=2,
+        post_compact_delta_start_sequence=3,
+        post_compact_delta_end_sequence=5,
+        current_input_event_sequence=5,
+    )
+    view = PreDispatchCompactMaterialView(
+        material_blocks=(),
+        previous_compacted_view=(),
+        current_input_text="current input",
+        source_boundary=boundary,
+        latest_compacted_event_id="event-compact",
+        latest_compacted_event_sequence=2,
+        post_compact_delta_start_sequence=3,
+        post_compact_delta_end_sequence=5,
+        represented_evidence_refs=(),
+        budget_fragments=(),
+    )
+
+    with pytest.raises(ValueError, match="latest compacted event id boundary mismatch"):
+        replace(view, latest_compacted_event_id="event-other-compact")
+    with pytest.raises(
+        ValueError,
+        match="latest compacted event sequence boundary mismatch",
+    ):
+        replace(view, latest_compacted_event_sequence=1)
+    with pytest.raises(ValueError, match="post compact delta start boundary mismatch"):
+        replace(view, post_compact_delta_start_sequence=4)
+    with pytest.raises(ValueError, match="post compact delta end boundary mismatch"):
+        replace(view, post_compact_delta_end_sequence=4)
+
+
+def test_pre_dispatch_first_compact_empty_delta_starts_at_current_input(tmp_path: Path) -> None:
+    """首次 compact 且 current input 前无 relevant fact 时 delta 为空。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """只写入当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-only",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current only"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current only",
+            )
+        )
+
+        assert view.material_blocks == ()
+        assert view.post_compact_delta_start_sequence == run.input_event_sequence
+        assert view.post_compact_delta_end_sequence == run.input_event_sequence
+
+
+def test_pre_dispatch_second_compact_rolls_from_latest_accepted_candidate(tmp_path: Path) -> None:
+    """第二次 compact 使用 latest accepted candidate，不重展旧 raw turn / tool result。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 old raw、accepted compact、新 delta 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-before-compact",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "old user before compact"},
+            )
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-before-compact",
+            )
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-accepted",
+                accepted_evidence_refs=("evidence:event-tool-result-before-compact",),
+            )
+            _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-after-compact",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "new user after compact"},
+            )
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-after-compact",
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-second",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current second"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current second",
+            )
+        )
+
+        assert tuple(block.text for block in view.previous_compacted_view) == (
+            "accepted session summary",
+            (
+                "fact=claim_text=accepted fact; evidence_refs=E1; "
+                "evidence_kind=accepted_evidence_material"
+            ),
+            "answer_anchor=accepted anchor",
+            "forward_intent=next_step_note; status=open; text=accepted next step",
+            "reference_continuity=local_reference; text=accepted reference",
+        )
+        assert tuple(block.text for block in view.material_blocks) == (
+            "new user after compact",
+            '{"kind":"completed","result":{"content":"raw content event-tool-result-after-compact"}}',
+        )
+        assert all("before compact" not in block.text for block in view.material_blocks)
+        assert view.represented_evidence_refs == (
+            "evidence:event-tool-result-before-compact",
+        )
+
+
+def test_pre_dispatch_builder_ignores_memory_snapshot_lag_or_missing(tmp_path: Path) -> None:
+    """Builder 不读取 memory snapshot，snapshot 缺失或滞后不影响输出。"""
+
+    event_log = EventLogStore()
+    lagged_snapshot = _snapshot_with_fact(
+        snapshot_id="snapshot-lagged-extra",
+        checkpoint_event_sequence=1,
+        claim_text="memory-only fact must not affect builder",
+        provenance_event_id="event-user-memory-independent",
+        tool_result_ref=None,
+    )
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入当前输入前的一条历史 user fact。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_event(
+                transaction,
+                event_log,
+                event_id="event-user-memory-independent",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "eventlog user"},
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-memory-independent",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current",
+            )
+        )
+
+        assert (
+            lagged_snapshot.evidence_fact_memory.evidence_backed_facts[0].claim_text
+            == "memory-only fact must not affect builder"
+        )
+        assert tuple(block.text for block in view.material_blocks) == ("eventlog user",)
+        assert view.represented_evidence_refs == ()
+
+
+def test_pre_dispatch_represented_evidence_refs_only_from_latest_compact(tmp_path: Path) -> None:
+    """Evidence 去重只看 latest compact accepted mapping，不看 memory facts。"""
+
+    event_log = EventLogStore()
+    memory_with_extra_evidence = _snapshot_with_fact(
+        snapshot_id="snapshot-extra-evidence",
+        checkpoint_event_sequence=10,
+        claim_text="memory has evidence:event-tool-result-after-compact",
+        provenance_event_id="event-tool-result-after-compact",
+        tool_result_ref="event-tool-result-after-compact",
+    )
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 compact 后 evidence 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-with-old-evidence",
+                accepted_evidence_refs=("evidence:event-old-only",),
+            )
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-after-compact",
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-evidence-boundary",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current",
+            )
+        )
+
+        assert (
+            memory_with_extra_evidence
+            .evidence_fact_memory
+            .evidence_backed_facts[0]
+            .evidence_refs
+            == ("evidence:accepted",)
+        )
+        assert view.represented_evidence_refs == ("evidence:event-old-only",)
+        assert tuple(block.accepted_evidence_id for block in view.material_blocks) == (
+            "evidence:event-tool-result-after-compact",
+        )
+
+
+def test_pre_dispatch_payload_damage_fails_closed_without_recovery_request(tmp_path: Path) -> None:
+    """Payload / artifact 损坏时 fail closed，错误不请求 Run recovery。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入损坏的 compact payload。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            compact_payload = _compacted_payload(
+                accepted_evidence_refs=("evidence:event-old",)
+            )
+            damaged: dict[str, JsonValue] = dict(compact_payload)
+            damaged["accepted_candidate_digest"] = _DIGEST
+            _append_event(
+                transaction,
+                event_log,
+                event_id="event-compact-damaged",
+                event_type="CONTEXT_COMPACTED",
+                payload=damaged,
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-damaged",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(HostDurableError) as exc_info:
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current",
+                )
+            )
+
+        assert isinstance(exc_info.value, HostDurableError)
+
+
+def test_build_compact_material_pack_uses_explicit_previous_view_without_snapshot() -> None:
+    """显式 previous view 路径不读取 snapshot path，空 tuple 也表示明确 previous view。"""
+
+    explicit_previous = (
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+            text="explicit summary",
+        ),
+    )
+    selected = _history_block("new-delta", event_sequence=2, text="new delta")
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(selected,),
+    )
+    snapshot = _snapshot_with_stable_blocks(
+        snapshot_id="snapshot-must-not-be-used",
+        checkpoint_event_sequence=2,
+    )
+
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(selected,),
+        memory_snapshot=snapshot,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current",
+        previous_compacted_view=explicit_previous,
+    )
+    first_pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(selected,),
+        memory_snapshot=snapshot,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current",
+        previous_compacted_view=(),
+    )
+
+    assert tuple(block.text for block in pack.previous_compacted_view) == (
+        "explicit summary",
+    )
+    assert first_pack.previous_compacted_view == ()
+
+
 def _history_block(
     block_id: str,
     *,
@@ -841,6 +1575,366 @@ def _current_block(
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
+    )
+
+
+def _previous_compact_block(
+    *,
+    label: str,
+    kind: CompactMaterialBlockKind,
+    text: str,
+) -> CompactMaterialBlock:
+    """构造测试用 explicit previous compact block。
+
+    :param label: prompt-local label。
+    :param kind: block kind。
+    :param text: block text。
+    :returns: CompactMaterialBlock。
+    """
+
+    return CompactMaterialBlock(
+        block_label=label,
+        section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+        kind=kind,
+        text=text,
+        size_units=len(text),
+        source_labels=(),
+        canonical_source_refs=("event-explicit-compact",),
+        content_digest=sha256_digest_json({"text": text}),
+    )
+
+
+def _durable_options(tmp_path: Path) -> HostDurableStoreOptions:
+    """构造 compact material 测试用 durable store options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Host durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=tmp_path / "durable.sqlite3",
+        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=0.25,
+            write_busy_retry_count=3,
+            write_retry_initial_delay_seconds=0.001,
+            write_retry_backoff_multiplier=1.2,
+            write_retry_max_delay_seconds=0.01,
+        ),
+    )
+
+
+def _append_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    event_type: str,
+    payload: JsonValue,
+) -> EventLogRow:
+    """向测试 EventLog 追加 canonical fact。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: event id。
+    :param event_type: event type。
+    :param payload: inline payload JSON。
+    :returns: appended EventLog row。
+    """
+
+    return event_log.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=_SESSION_ID,
+            run_id=None,
+            attempt_id=None,
+            execution_id=None,
+            event_type=event_type,
+            occurred_at=datetime(2026, 5, 24, 0, 0, 0, tzinfo=UTC),
+            actor="test",
+            source="test.compact_material",
+            client_request_id=None,
+            idempotency_key=event_id,
+            policy_decision=None,
+            reason=None,
+            payload_json=payload,
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def _append_tool_call_requested_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    tool_call_id: str,
+    semantic_query_text: str,
+) -> EventLogRow:
+    """追加带完整 request atom 的 TOOL_CALL_REQUESTED。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: event id。
+    :param tool_call_id: tool call id。
+    :param semantic_query_text: 业务可读 query 文本。
+    :returns: appended EventLog row。
+    """
+
+    arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query_digest = sha256_digest_json(
+        {"semantic_query_text": semantic_query_text}
+    )
+    return _append_event(
+        transaction,
+        event_log,
+        event_id=event_id,
+        event_type="TOOL_CALL_REQUESTED",
+        payload={
+            "tool_call_id": tool_call_id,
+            "tool_name": "fins.search",
+            "normalized_arguments_digest": arguments_digest,
+            "arguments_payload_digest": arguments_digest,
+            "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+            "arguments_payload_ref": None,
+            "arguments_inline_json": arguments_json,
+            "arguments_json_size_bytes": len(
+                canonical_json_dumps(arguments_json).encode("utf-8")
+            ),
+            "semantic_input_digest": _DIGEST,
+            "semantic_query_storage_kind": (
+                TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+            ),
+            "semantic_query_text": semantic_query_text,
+            "semantic_query_payload_ref": None,
+            "semantic_query_digest": semantic_query_digest,
+        },
+    )
+
+
+def _append_tool_result_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    tool_call_requested_event_ref: str | None = None,
+    tool_call_id: str | None = None,
+    normalized_arguments_digest: str = _DIGEST,
+) -> EventLogRow:
+    """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: tool result event id。
+    :param tool_call_requested_event_ref: 可选 TOOL_CALL_REQUESTED event ref。
+    :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
+    :param normalized_arguments_digest: envelope 参数 digest。
+    :returns: appended EventLog row。
+    """
+
+    envelope = _accepted_evidence_envelope_for_event(
+        event_id,
+        tool_call_requested_event_ref=tool_call_requested_event_ref,
+        tool_call_id=tool_call_id,
+        normalized_arguments_digest=normalized_arguments_digest,
+    )
+    return _append_event(
+        transaction,
+        event_log,
+        event_id=event_id,
+        event_type="TOOL_RESULT_ACCEPTED",
+        payload={
+            "accepted_evidence_envelope": (
+                accepted_evidence_envelope_to_json_value(envelope)
+            ),
+            "raw_tool_outcome": {
+                "kind": "completed",
+                "result": {"content": f"raw content {event_id}"},
+            },
+        },
+    )
+
+
+def _accepted_evidence_envelope_for_event(
+    event_id: str,
+    *,
+    tool_call_requested_event_ref: str | None = None,
+    tool_call_id: str | None = None,
+    normalized_arguments_digest: str = _DIGEST,
+) -> AcceptedEvidenceEnvelope:
+    """构造测试用 accepted evidence envelope。
+
+    :param event_id: producer event id。
+    :param tool_call_requested_event_ref: 可选 TOOL_CALL_REQUESTED event ref。
+    :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
+    :param normalized_arguments_digest: envelope 参数 digest。
+    :returns: AcceptedEvidenceEnvelope。
+    """
+
+    actual_tool_call_id = (
+        f"tool-call-{event_id}" if tool_call_id is None else tool_call_id
+    )
+    return AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{event_id}",
+        producer_event_ref=event_id,
+        tool_name="fins.search",
+        tool_call_id=actual_tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=tool_call_requested_event_ref,
+            normalized_arguments_digest=normalized_arguments_digest,
+            semantic_input_digest=_DIGEST,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=_DIGEST,
+            truncation_applied=False,
+        ),
+        source_refs=(
+            OpaqueEvidenceRef(ref_kind="source", ref_id=event_id, digest=None),
+        ),
+        locator_refs=(),
+    )
+
+
+def _append_compacted_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    accepted_evidence_refs: tuple[str, ...],
+) -> EventLogRow:
+    """追加 accepted CONTEXT_COMPACTED canonical fact。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: compacted event id。
+    :param accepted_evidence_refs: accepted evidence mapping refs。
+    :returns: appended EventLog row。
+    """
+
+    return _append_event(
+        transaction,
+        event_log,
+        event_id=event_id,
+        event_type="CONTEXT_COMPACTED",
+        payload=_compacted_payload(accepted_evidence_refs=accepted_evidence_refs),
+    )
+
+
+def _compacted_payload(
+    *, accepted_evidence_refs: tuple[str, ...]
+) -> dict[str, JsonValue]:
+    """构造测试用 accepted compact payload。
+
+    :param accepted_evidence_refs: accepted evidence mapping refs。
+    :returns: compacted payload。
+    """
+
+    return dict(
+        build_context_compacted_payload(
+            operation_id="operation-compact-test",
+            accepted_attempt_number=1,
+            compact_artifact_ref="artifact:compact-test",
+            compact_artifact_digest=_DIGEST,
+            accepted_candidate=_accepted_candidate(),
+            quality_check_result=CompactQualityCheckResultVNext(
+                accepted=True,
+                rejection_reasons=(),
+            ),
+            budget_after_compact=128,
+            prompt_local_label_mapping_refs=("label-map:test",),
+            source_boundary_refs=("source-boundary:test",),
+            accepted_evidence_mapping_refs=accepted_evidence_refs,
+            projection_signal="project_memory",
+        )
+    )
+
+
+def _accepted_candidate() -> ConversationCompactOutputVNext:
+    """构造测试用 accepted compact candidate。
+
+    :returns: ConversationCompactOutputVNext。
+    """
+
+    return ConversationCompactOutputVNext(
+        schema_version="conversation_compact_output_v1",
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text="accepted session summary",
+            source_labels=("T1",),
+        ),
+        evidence_backed_facts=(
+            EvidenceBackedFactCandidateVNext(
+                claim_text="accepted fact",
+                evidence_labels=("E1",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+            ),
+        ),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="accepted anchor",
+                anchor_items=(
+                    AnswerAnchorChildVNext(
+                        display_text="accepted anchor item",
+                        ordinal=1,
+                    ),
+                ),
+                answer_source_labels=("A1",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="accepted next step",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="accepted reference",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("T1",),
+            ),
+        ),
+        diagnostics=(),
+    )
+
+
+def _run_row(input_event: EventLogRow) -> RunRow:
+    """构造测试用 RunRow。
+
+    :param input_event: 当前 USER_INPUT_ACCEPTED EventLog row。
+    :returns: RunRow。
+    """
+
+    return RunRow(
+        run_id=f"run:{input_event.event_id}",
+        session_id=input_event.session_id,
+        status=RunStatus.QUEUED,
+        client_request_id="client-request-test",
+        input_event_id=input_event.event_id,
+        input_event_sequence=input_event.event_sequence,
+        accepted_event_id=input_event.event_id,
+        accepted_event_sequence=input_event.event_sequence,
+        queued_event_id=None,
+        queued_event_sequence=None,
+        started_event_id=None,
+        started_event_sequence=None,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        current_attempt_id=None,
+        source_run_id=None,
+        source_run_relation=None,
+        execution_target="local",
+        queue_policy="fifo",
+        created_at=_NOW,
+        updated_at=_NOW,
+        terminal_at=None,
     )
 
 
@@ -936,45 +2030,27 @@ def _empty_snapshot(
     )
 
 
-def _snapshot_with_goal(
-    *, snapshot_id: str, checkpoint_event_sequence: int, current_goal: str
+def _snapshot_with_fact(
+    *,
+    snapshot_id: str,
+    checkpoint_event_sequence: int,
+    claim_text: str,
+    provenance_event_id: str,
+    tool_result_ref: str | None,
 ) -> ConversationMemorySnapshotVNext:
-    """构造带 stable goal 的 memory snapshot。
+    """构造包含 evidence fact 的 snapshot。
 
     :param snapshot_id: snapshot id。
     :param checkpoint_event_sequence: cursor sequence。
-    :param current_goal: current goal。
+    :param claim_text: evidence-backed fact claim text。
+    :param provenance_event_id: evidence fact 来源事件 id。
+    :param tool_result_ref: evidence fact 对应工具结果事件；无工具结果时为 ``None``。
     :returns: ConversationMemorySnapshotVNext。
     """
 
     base = _empty_snapshot(
         snapshot_id,
         checkpoint_event_sequence=checkpoint_event_sequence,
-    )
-    del current_goal
-    return base
-
-
-def _snapshot_with_goal_and_fact(
-    *,
-    snapshot_id: str,
-    checkpoint_event_sequence: int,
-    current_goal: str,
-    claim_text: str,
-) -> ConversationMemorySnapshotVNext:
-    """构造同时包含非 fact stable block 与 evidence fact 的 snapshot。
-
-    :param snapshot_id: snapshot id。
-    :param checkpoint_event_sequence: cursor sequence。
-    :param current_goal: current goal。
-    :param claim_text: evidence-backed fact claim text。
-    :returns: ConversationMemorySnapshotVNext。
-    """
-
-    base = _snapshot_with_goal(
-        snapshot_id=snapshot_id,
-        checkpoint_event_sequence=checkpoint_event_sequence,
-        current_goal=current_goal,
     )
     snapshot_without_digest = replace(
         base,
@@ -988,17 +2064,17 @@ def _snapshot_with_goal_and_fact(
                 provenance=MemoryProvenanceRef(
                     producer_kind=MemoryProducerKind.HOST_PROJECTION,
                     producer_name="conversation_memory",
-                    event_id="event-memory-compact",
+                    event_id=provenance_event_id,
                     event_sequence=checkpoint_event_sequence,
                     run_id="run-memory",
                     attempt_id=None,
                     execution_id=None,
-                    tool_result_ref="event-tool-result",
+                    tool_result_ref=tool_result_ref,
                     payload_ref="compact-artifact:test",
                     digest_ref="digest:fact-test",
                     source_refs=(),
                 ),
-                extraction_operation_ref="event:event-memory-compact",
+                extraction_operation_ref=f"event:{provenance_event_id}",
                 compact_artifact_ref="compact-artifact:test",
                 candidate_id="candidate:fact-test",
                 included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
@@ -1026,11 +2102,12 @@ def _snapshot_with_stable_blocks(
     :returns: ConversationMemorySnapshotVNext。
     """
 
-    base = _snapshot_with_goal_and_fact(
+    base = _snapshot_with_fact(
         snapshot_id=snapshot_id,
         checkpoint_event_sequence=checkpoint_event_sequence,
-        current_goal="unused",
         claim_text="Revenue increased year over year",
+        provenance_event_id="event-stable-memory-source",
+        tool_result_ref=None,
     )
     snapshot_without_digest = replace(
         base,
