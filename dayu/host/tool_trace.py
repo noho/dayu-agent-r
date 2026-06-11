@@ -100,6 +100,19 @@ _FIELD_TOOL_TIMING = "tool_timing"
 _FIELD_FAILURE_METADATA = "failure_metadata"
 _FIELD_PARTIAL_TOOL_CALL_SIGNAL = "partial_tool_call_signal"
 _FIELD_OPERATION_CONTEXT = "operation_context"
+_FIELD_OPERATION_ID = "operation_id"
+_FIELD_TRIGGER_SOURCE = "trigger_source"
+_FIELD_BUDGET_REASON = "budget_reason"
+_FIELD_POLICY_REF = "policy_ref"
+_FIELD_ESTIMATOR_DIGEST = "estimator_digest"
+_FIELD_BUDGET_AFTER_COMPACT = "budget_after_compact"
+_FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT = "budget_after_attempted_compact"
+_FIELD_FALLBACK_ACTION = "fallback_action"
+_FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
+_FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED = "retry_repair_budget_exhausted"
+_FIELD_NEXT_POLICY_DECISION = "next_policy_decision"
+_FIELD_FAILURE_CATEGORY = "failure_category"
+_FIELD_REPAIRABLE = "repairable"
 _FIELD_COLD_TRACE_REF = "cold_trace_ref"
 _FIELD_COLD_TRACE_DIGEST = "cold_trace_digest"
 _FIELD_LINE_DIGEST = "line_digest"
@@ -141,6 +154,11 @@ _FIELD_PROJECTOR_ID = "projector_id"
 _FIELD_PROJECTOR_SCHEMA_VERSION = "projector_schema_version"
 _FIELD_PROJECTOR_DIGEST = "projector_digest"
 _FIELD_PURPOSE = "purpose"
+_CONTEXT_PRESSURE_SCHEMA_VERSION = 1
+_CONTEXT_PRESSURE_STATUS_COMPACTION_FAILED = "compaction_failed"
+_CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED = (
+    "compaction_attempt_rejected"
+)
 _PRODUCER_MISSING_REF_KIND_RUNNER_CALL_PROJECTION_ARTIFACT = (
     "runner_call_projection_artifact"
 )
@@ -375,7 +393,7 @@ class ToolTraceProjectionConsumer:
         row = read_event_by_id(transaction, event.event_id)
         if row is None:
             raise HostDurableError("tool trace source EventLog row is missing")
-        extracted = _extract_tool_trace(event)
+        extracted = _extract_tool_trace(transaction, event)
         if extracted is None:
             return ProjectionApplyResult(
                 ProjectionApplyStatus.SKIPPED,
@@ -498,9 +516,12 @@ def catch_up_tool_trace_projection(
     )
 
 
-def _extract_tool_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
+def _extract_tool_trace(
+    transaction: HostTransaction, event: ProjectionEventView
+) -> _ToolTraceExtract | None:
     """从白名单 EventLog payload 抽取 Tool Trace 字段。
 
+    :param transaction: 当前 Host transaction。
     :param event: typed projection event view。
     :returns: 可投影字段；当前 EventLog 字段不足以形成 trace 时返回 ``None``。
     :raises HostDurableError: 已命名字段存在但类型非法时抛出。
@@ -511,13 +532,16 @@ def _extract_tool_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
     if event.event_class is EventClass.PROJECTION_SIGNAL:
         return _extract_usage_trace(event)
     if event.event_class is EventClass.CANONICAL_FACT:
-        return _extract_canonical_trace(event)
+        return _extract_canonical_trace(transaction, event)
     return None
 
 
-def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
+def _extract_canonical_trace(
+    transaction: HostTransaction, event: ProjectionEventView
+) -> _ToolTraceExtract | None:
     """从 canonical fact payload 抽取 Tool Trace 字段。
 
+    :param transaction: 当前 Host transaction。
     :param event: typed projection event view。
     :returns: 可投影字段。
     :raises HostDurableError: 已命名字段存在但类型非法时抛出。
@@ -544,7 +568,7 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
         _optional_text(payload, _FIELD_PAYLOAD_DIGEST),
         event.payload_digest,
     )
-    signals = _trace_summary_signals(payload)
+    signals = _canonical_trace_summary_signals(transaction, event, payload)
     refs = tuple(
         ref
         for ref in (
@@ -1140,6 +1164,132 @@ def _trace_summary(
     return summary
 
 
+def _canonical_trace_summary_signals(
+    transaction: HostTransaction,
+    event: ProjectionEventView,
+    payload: Mapping[str, JsonValue],
+) -> _TraceSummarySignals:
+    """从 canonical fact payload 构造 Tool Trace signal 集合。
+
+    :param transaction: 当前 Host transaction。
+    :param event: typed projection event view。
+    :param payload: canonical fact payload。
+    :returns: optional summary signal carrier。
+    :raises HostDurableError: 已命名字段类型非法时抛出。
+    """
+
+    copied = _trace_summary_signals(payload)
+    if event.event_type == _EVENT_TYPE_CONTEXT_COMPACTION_FAILED:
+        return _TraceSummarySignals(
+            context_pressure=_context_compaction_failed_pressure(
+                transaction, payload
+            ),
+            tool_timing=copied.tool_timing,
+            failure_metadata=copied.failure_metadata,
+            partial_tool_call_signal=copied.partial_tool_call_signal,
+        )
+    if event.event_type == _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED:
+        return _TraceSummarySignals(
+            context_pressure=_context_compaction_attempt_rejected_pressure(payload),
+            tool_timing=copied.tool_timing,
+            failure_metadata=copied.failure_metadata,
+            partial_tool_call_signal=copied.partial_tool_call_signal,
+        )
+    return copied
+
+
+def _context_compaction_failed_pressure(
+    transaction: HostTransaction, payload: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    """从 ``CONTEXT_COMPACTION_FAILED`` 既有 payload 派生上下文压力 signal。
+
+    :param transaction: 当前 Host transaction。
+    :param payload: failed canonical payload。
+    :returns: context pressure JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    request_payload = _context_compaction_request_payload(transaction, payload)
+    return {
+        _FIELD_SCHEMA_VERSION: _CONTEXT_PRESSURE_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_FAILED,
+        "status": _CONTEXT_PRESSURE_STATUS_COMPACTION_FAILED,
+        _FIELD_POLICY_REF: _optional_text(request_payload, _FIELD_POLICY_REF)
+        if request_payload is not None
+        else None,
+        _FIELD_ESTIMATOR_DIGEST: _optional_text(
+            request_payload, _FIELD_ESTIMATOR_DIGEST
+        )
+        if request_payload is not None
+        else None,
+        _FIELD_OPERATION_ID: _required_text(payload, _FIELD_OPERATION_ID),
+        _FIELD_TRIGGER_SOURCE: _optional_text(request_payload, _FIELD_TRIGGER_SOURCE)
+        if request_payload is not None
+        else None,
+        _FIELD_BUDGET_REASON: _optional_text(request_payload, _FIELD_BUDGET_REASON)
+        if request_payload is not None
+        else None,
+        _FIELD_BUDGET_AFTER_COMPACT: None,
+        _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: _optional_int(
+            payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT
+        ),
+        _FIELD_FALLBACK_ACTION: _optional_text(payload, _FIELD_FALLBACK_ACTION),
+        _FIELD_FALLBACK_POLICY_DECISION: _optional_text(
+            payload, _FIELD_FALLBACK_POLICY_DECISION
+        ),
+        _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED: _required_bool(
+            payload, _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED
+        ),
+    }
+
+
+def _context_compaction_attempt_rejected_pressure(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` payload 派生压力 signal。
+
+    :param payload: attempt rejected canonical payload。
+    :returns: context pressure JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    return {
+        _FIELD_SCHEMA_VERSION: _CONTEXT_PRESSURE_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        "status": _CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED,
+        _FIELD_OPERATION_ID: _required_text(payload, _FIELD_OPERATION_ID),
+        _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: _optional_int(
+            payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT
+        ),
+        _FIELD_NEXT_POLICY_DECISION: _required_text(
+            payload, _FIELD_NEXT_POLICY_DECISION
+        ),
+        _FIELD_FAILURE_CATEGORY: _required_text(payload, _FIELD_FAILURE_CATEGORY),
+        _FIELD_REPAIRABLE: _required_bool(payload, _FIELD_REPAIRABLE),
+    }
+
+
+def _context_compaction_request_payload(
+    transaction: HostTransaction, payload: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue] | None:
+    """读取 compaction result payload 引用的 request fact payload。
+
+    :param transaction: 当前 Host transaction。
+    :param payload: failed/rejected canonical payload。
+    :returns: request payload；找不到 request fact 时返回 ``None``。
+    :raises HostDurableError: request fact payload 不是 JSON object 时抛出。
+    """
+
+    operation_id = _required_text(payload, _FIELD_OPERATION_ID)
+    row = read_event_by_id(transaction, operation_id)
+    if row is None:
+        return None
+    request_payload = cast(JsonValue, json.loads(row.payload_json))
+    if not isinstance(request_payload, Mapping):
+        raise HostDurableError("context compaction request payload must be JSON object")
+    return cast(Mapping[str, JsonValue], request_payload)
+
+
 def _trace_summary_signals(payload: Mapping[str, JsonValue]) -> _TraceSummarySignals:
     """从 payload 复制可选 Tool Trace signal 对象。
 
@@ -1332,6 +1482,21 @@ def _optional_int(payload: Mapping[str, JsonValue], field_name: str) -> int | No
             f"tool trace payload field {field_name} must be non-negative integer"
         )
     return value
+
+
+def _required_bool(payload: Mapping[str, JsonValue], field_name: str) -> bool:
+    """读取 payload 中的必填 bool。
+
+    :param payload: projection event payload。
+    :param field_name: 字段名。
+    :returns: bool 值。
+    :raises HostDurableError: 字段缺失或不是 bool 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool):
+        return value
+    raise HostDurableError(f"tool trace payload field {field_name} must be bool")
 
 
 def _json_value_or_none(payload: Mapping[str, JsonValue], field_name: str) -> JsonValue:

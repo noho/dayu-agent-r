@@ -261,6 +261,9 @@ _OWNER_PHASE10 = "phase10"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
 _NO_CONTEXT_BUDGET_POLICY_REF = "none"
 _USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
+_CONTEXT_PRESSURE_SCHEMA_VERSION = 1
+_CONTEXT_PRESSURE_SOURCE_USAGE_REPORTED = "USAGE_REPORTED"
+_CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN = "unknown"
 _RUNNER_CALL_MANIFEST_STATUS_COMPLETE = "complete"
 _RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL = "limited_signal"
 _RUNNER_CALL_MANIFEST_STATUS_MISMATCH = "mismatch"
@@ -2661,10 +2664,11 @@ class EngineEventIngestor:
         """
 
         candidate = context.candidate
+        estimate = self._estimate_usage_observation_input(transaction, context)
         diagnostic = self._usage_observation_diagnostic(
-            transaction,
             context=context,
             data=data,
+            estimate=estimate,
         )
         return self._event_log_store.append_event(
             transaction,
@@ -2694,6 +2698,11 @@ class EngineEventIngestor:
                     "usage_observation_status": diagnostic.status,
                     "usage_observation_digest": diagnostic.observation_digest,
                     "prompt_token_delta": diagnostic.prompt_token_delta,
+                    "context_pressure": _usage_context_pressure_signal(
+                        data=data,
+                        diagnostic=diagnostic,
+                        estimate=estimate,
+                    ),
                 },
                 reason=None,
             ),
@@ -2701,20 +2710,19 @@ class EngineEventIngestor:
 
     def _usage_observation_diagnostic(
         self,
-        transaction: HostTransaction,
         *,
         context: _ValidatedCandidate,
         data: UsageReportedData,
+        estimate: BudgetEstimate | None,
     ) -> UsageObservationDiagnostic:
         """构造 usage observation diagnostic，失败时降级为估算不可用。
 
-        :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
         :param data: usage_reported data。
+        :param estimate: 当前 Run 输入估算；不可用时为 ``None``。
         :returns: usage observation diagnostic。
         """
 
-        estimate = self._estimate_usage_observation_input(transaction, context)
         policy_ref = (
             self._context_budget_policy.policy_ref
             if self._context_budget_policy is not None
@@ -4082,6 +4090,68 @@ def _display_text_from_input_event(
         transaction, event, payload_label="USER_INPUT_ACCEPTED"
     )
     return _required_payload_text(payload, field_name="display_text")
+
+
+def _usage_context_pressure_signal(
+    *,
+    data: UsageReportedData,
+    diagnostic: UsageObservationDiagnostic,
+    estimate: BudgetEstimate | None,
+) -> Mapping[str, JsonValue]:
+    """构造 usage projection 的 context pressure signal。
+
+    本函数只序列化 Host budget owner 已产出的 ``BudgetEstimate`` 与
+    ``decide_context_budget`` 结果，不重新实现阈值计算。
+
+    :param data: Engine usage reported data。
+    :param diagnostic: usage observation diagnostic。
+    :param estimate: Host context budget estimate；不可用时为 ``None``。
+    :returns: 可写入 projection signal payload 的 JSON object。
+    """
+
+    budget_decision = (
+        decide_context_budget(estimate).value
+        if estimate is not None
+        else _CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN
+    )
+    overage_reason = (
+        estimate.overage_reason.value
+        if estimate is not None and estimate.overage_reason is not None
+        else None
+    )
+    return {
+        "schema_version": _CONTEXT_PRESSURE_SCHEMA_VERSION,
+        "signal_source": _CONTEXT_PRESSURE_SOURCE_USAGE_REPORTED,
+        "status": diagnostic.status,
+        "policy_ref": diagnostic.policy_ref,
+        "estimator_digest": diagnostic.estimator_digest,
+        "estimated_input_tokens": diagnostic.estimated_input_tokens,
+        "input_budget_tokens": (
+            estimate.input_budget_tokens if estimate is not None else None
+        ),
+        "soft_threshold_tokens": (
+            estimate.soft_threshold_tokens if estimate is not None else None
+        ),
+        "hard_threshold_tokens": (
+            estimate.hard_threshold_tokens if estimate is not None else None
+        ),
+        "soft_threshold_exceeded": (
+            estimate.estimated_input_tokens >= estimate.soft_threshold_tokens
+            if estimate is not None
+            else None
+        ),
+        "hard_threshold_exceeded": (
+            estimate.estimated_input_tokens >= estimate.hard_threshold_tokens
+            if estimate is not None
+            else None
+        ),
+        "budget_decision": budget_decision,
+        "overage_reason": overage_reason,
+        "prompt_tokens": data.prompt_tokens,
+        "completion_tokens": data.completion_tokens,
+        "total_tokens": data.total_tokens,
+        "prompt_token_delta": diagnostic.prompt_token_delta,
+    }
 
 
 def _invalid_usage_observation_digest(

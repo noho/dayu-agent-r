@@ -1526,6 +1526,26 @@ def test_usage_reported_is_projection_signal_without_state_change(
         assert payload["usage_observation_status"] == "observed"
         assert isinstance(payload["usage_observation_digest"], str)
         assert payload["prompt_token_delta"] == -4
+        context_pressure = payload["context_pressure"]
+        assert isinstance(context_pressure, Mapping)
+        pressure = cast(Mapping[str, JsonValue], context_pressure)
+        assert pressure["schema_version"] == 1
+        assert pressure["signal_source"] == "USAGE_REPORTED"
+        assert pressure["status"] == "observed"
+        assert pressure["policy_ref"] == _REACTIVE_POLICY_REF
+        assert pressure["estimator_digest"] == payload["estimator_digest"]
+        assert pressure["estimated_input_tokens"] == 14
+        assert pressure["input_budget_tokens"] == 100
+        assert pressure["soft_threshold_tokens"] == 45
+        assert pressure["hard_threshold_tokens"] == 80
+        assert pressure["soft_threshold_exceeded"] is False
+        assert pressure["hard_threshold_exceeded"] is False
+        assert pressure["budget_decision"] == "allow_dispatch"
+        assert pressure["overage_reason"] is None
+        assert pressure["prompt_tokens"] == 10
+        assert pressure["completion_tokens"] == 20
+        assert pressure["total_tokens"] == 30
+        assert pressure["prompt_token_delta"] == -4
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -1561,6 +1581,20 @@ def test_usage_reported_without_policy_keeps_projection_non_failing(
         assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "estimate_unavailable"
         assert payload["provider_request_id"] is None
+        context_pressure = payload["context_pressure"]
+        assert isinstance(context_pressure, Mapping)
+        pressure = cast(Mapping[str, JsonValue], context_pressure)
+        assert pressure["status"] == "estimate_unavailable"
+        assert pressure["policy_ref"] == "none"
+        assert pressure["estimator_digest"] is None
+        assert pressure["estimated_input_tokens"] is None
+        assert pressure["input_budget_tokens"] is None
+        assert pressure["soft_threshold_tokens"] is None
+        assert pressure["hard_threshold_tokens"] is None
+        assert pressure["soft_threshold_exceeded"] is None
+        assert pressure["hard_threshold_exceeded"] is None
+        assert pressure["budget_decision"] == "unknown"
+        assert pressure["prompt_token_delta"] is None
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -1601,6 +1635,10 @@ def test_usage_reported_missing_input_event_keeps_projection_non_failing(
         assert payload["estimator_digest"] is None
         assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "estimate_unavailable"
+        context_pressure = payload["context_pressure"]
+        assert isinstance(context_pressure, Mapping)
+        assert context_pressure["status"] == "estimate_unavailable"
+        assert context_pressure["budget_decision"] == "unknown"
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -1642,6 +1680,10 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
         assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "estimate_unavailable"
         assert payload["provider_request_id"] is None
+        context_pressure = payload["context_pressure"]
+        assert isinstance(context_pressure, Mapping)
+        assert context_pressure["status"] == "estimate_unavailable"
+        assert context_pressure["budget_decision"] == "unknown"
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -1680,6 +1722,14 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
         assert payload["usage_observation_status"] == "usage_invalid"
         assert isinstance(payload["usage_observation_digest"], str)
         assert payload["prompt_token_delta"] is None
+        context_pressure = payload["context_pressure"]
+        assert isinstance(context_pressure, Mapping)
+        pressure = cast(Mapping[str, JsonValue], context_pressure)
+        assert pressure["status"] == "usage_invalid"
+        assert pressure["estimated_input_tokens"] == 14
+        assert pressure["budget_decision"] == "allow_dispatch"
+        assert pressure["prompt_tokens"] == -1
+        assert pressure["prompt_token_delta"] is None
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING

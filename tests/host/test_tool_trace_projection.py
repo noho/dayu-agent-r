@@ -485,6 +485,130 @@ def test_tool_trace_copies_optional_summary_signal_objects(
         assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
 
 
+def test_tool_trace_derives_context_pressure_from_compaction_failed_payload(
+    tmp_path: Path,
+) -> None:
+    """failed compact fact 从现有 request/result payload 派生 context pressure。"""
+
+    cold_path = tmp_path / "trace" / "compact-failed.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _append_tool_event(
+            store.transaction_runner,
+            event_id="event-context-requested",
+            event_type="CONTEXT_COMPACTION_REQUESTED",
+            payload={
+                "trigger_source": "reactive",
+                "budget_reason": "provider_overflow",
+                "budget_snapshot_ref": "sha256:" + "a" * 64,
+                "input_snapshot_cursor": 12,
+                "estimator_digest": "sha256:" + "b" * 64,
+                "policy_ref": "policy-ref",
+                "provider_request_id": "provider-1",
+                "provider_error_ref": "engine-event-ref",
+                "attempt_id": "attempt-1",
+                "execution_id": "execution-1",
+            },
+        )
+        failed = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-context-failed",
+            event_type="CONTEXT_COMPACTION_FAILED",
+            payload={
+                "operation_id": "event-context-requested",
+                "failure_reason": "quality_check_failed",
+                "policy_decision": "reactive_compact_failed",
+                "retryable": False,
+                "attempt_count": 1,
+                "retry_repair_budget_exhausted": True,
+                "diagnostic_refs": ["diagnostic:compact"],
+                "budget_after_attempted_compact": 180,
+                "fallback_policy_decision": "recent_window_budget_passed",
+                "fallback_input_window": {"selected_block_ids": ["block-current"]},
+                "fallback_input_digest": "sha256:" + "c" * 64,
+                "fallback_budget_result": {
+                    "estimated_input_tokens": 42,
+                    "decision": "allow_dispatch",
+                },
+                "fallback_action": "dispatch",
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, failed.event_id
+            )
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        pressure = row.trace_summary[_FIELD_CONTEXT_PRESSURE]
+        assert isinstance(pressure, Mapping)
+        assert pressure == {
+            "schema_version": 1,
+            "signal_source": "CONTEXT_COMPACTION_FAILED",
+            "status": "compaction_failed",
+            "policy_ref": "policy-ref",
+            "estimator_digest": "sha256:" + "b" * 64,
+            "operation_id": "event-context-requested",
+            "trigger_source": "reactive",
+            "budget_reason": "provider_overflow",
+            "budget_after_compact": None,
+            "budget_after_attempted_compact": 180,
+            "fallback_action": "dispatch",
+            "fallback_policy_decision": "recent_window_budget_passed",
+            "retry_repair_budget_exhausted": True,
+        }
+        assert _cold_trace_summary(cold_lines, 1) == row.trace_summary
+
+
+def test_tool_trace_derives_context_pressure_from_compaction_rejected_payload(
+    tmp_path: Path,
+) -> None:
+    """attempt rejected compact fact 从现有 payload 派生最小 context pressure。"""
+
+    cold_path = tmp_path / "trace" / "compact-rejected.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        rejected = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-context-rejected",
+            event_type="CONTEXT_COMPACTION_ATTEMPT_REJECTED",
+            payload={
+                "operation_id": "event-context-requested",
+                "attempt_number": 1,
+                "failure_category": "quality_check_failed",
+                "repairable": True,
+                "runner_attempt_summary_refs": ["runner-attempt:1"],
+                "diagnostic_refs": ["diagnostic:reject"],
+                "next_policy_decision": "retry_or_fallback",
+                "budget_after_attempted_compact": 180,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, rejected.event_id
+            )
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        pressure = row.trace_summary[_FIELD_CONTEXT_PRESSURE]
+        assert isinstance(pressure, Mapping)
+        assert pressure == {
+            "schema_version": 1,
+            "signal_source": "CONTEXT_COMPACTION_ATTEMPT_REJECTED",
+            "status": "compaction_attempt_rejected",
+            "operation_id": "event-context-requested",
+            "budget_after_attempted_compact": 180,
+            "next_policy_decision": "retry_or_fallback",
+            "failure_category": "quality_check_failed",
+            "repairable": True,
+        }
+        assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
+
+
 def test_tool_trace_omits_missing_or_null_summary_signal_objects(
     tmp_path: Path,
 ) -> None:
