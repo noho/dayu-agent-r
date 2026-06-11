@@ -1,8 +1,8 @@
 """业务工具包。
 
-本包承载 Host / Engine 之外的业务工具实现与 provider 适配代码。当前
-slice 只提供 OLD 风格工具声明到当前 ``ToolDefinition`` 的私有适配器，
-不暴露兼容旧导入路径的公共 API。
+本包承载 Host / Engine 之外的业务工具实现与 provider。Doc、Web 与
+财报 read 工具通过当前 ``ToolDefinition`` / ``ToolCallable`` 契约暴露，
+由 runtime discovery 和 Host ToolRuntime 显式装配与治理。
 """
 
 __all__: list[str] = []

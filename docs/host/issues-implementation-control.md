@@ -140,13 +140,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass-final-closeout-passed |
-| implementation status | WU-TOOLS-01-F02 PR #132 merged 2026-06-10; WU-TOOLS-01-F03 draft PR #134 opened; final closeout passed |
-| active work unit | WU-TOOLS-01-F03 |
-| default next work unit | WU-TOOLS-01-F04 |
-| next entry point | User merge decision for WU-TOOLS-01-F03 draft PR #134; after merge enter WU-TOOLS-01-F04 goal confirmation |
+| gate | draft-PR-pass |
+| implementation status | WU-TOOLS-01-F08 final closeout passed; PR #135 updated and remains draft/open |
+| active work unit | WU-TOOLS-01-F08 |
+| default next work unit | WU-TOOLS-01-F08 |
+| next entry point | User merge decision for draft PR #135 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
 
 状态约定：
@@ -195,11 +195,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | ID | 状态 | Owner / Destination | 下一步 |
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
-| WU-TOOLS-01-S1-R1 | deferred-with-owner | WU-TOOLS-01-F04/F05 and WU-TOOLS-01-F06/F07 / GitHub Issues #121 and #122 | 分别迁移 SEC/Fins 与 CN/HK Docling CI pipeline，再生成各自 smoke。 |
-| WU-TOOLS-01-S1-R2 | deferred-with-owner | WU-TOOLS-01-F08 | 清理 documents processor registry 的 OLD `engine` 命名。 |
+| WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
-| WU-TOOLS-01-F01-02-R3 | transferred-to-issue | GitHub Issue #130 | 分阶段将 Doc / Web / Fins read tools native 化并删除 `dayu/tools/_legacy_adapter`；实施时必须消除 legacy `tool_cancelled` 投影为 failed outcome 的 bug，不能把该行为搬进 provider-local wrapper。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 
 ## 当前 Work Units
@@ -220,14 +218,11 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01 | draft-PR-pass-final-closeout-passed | Shared Fins ingestion runtime and download / preprocess awaiting tools | GitHub Issue #82 follow-up; may depend on #89 / #90 / #92 production WAIT hardening as needed；draft PR #126 | shared Fins ingestion service/runtime 与 download / preprocess awaiting tool providers 已完成；等待用户 merge decision |
 | WU-TOOLS-01-F01-01 | draft-PR-pass-final-closeout-passed | Fins filelock convergence to dayu.runtime.filelock | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #127 | Fins filelock 已收敛到 `dayu.runtime.filelock`；无 active residual risk；等待用户 merge decision |
 | WU-TOOLS-01-F01-02 | completed | Migrated tools cancellation propagation and response | WU-TOOLS-01-F01 draft PR preflight follow-up；draft PR #128 merged 2026-06-09 | CancellationToken 传递审计与取消响应已完成；active residual risks R1 / R2 / R3 已在上方 Residual Risk 表归口；PR 128 已 merge |
+| WU-TOOLS-01-F01-02-R3 | draft-PR-pass-final-closeout-passed | Retire legacy tool adapter and fix cancellation outcome projection | GitHub Issue #130；draft PR https://github.com/noho/dayu-agent-r/pull/135 | 已完成并进入 draft PR；legacy adapter 退役、取消结果投影修复和 R3 residual closeout 均已通过本地 gate。等待用户 merge decision。 |
 | WU-TOOLS-01-F01-03 | draft-PR-pass | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09; draft PR #131 | Draft PR #131 已通过本地 gate；final closeout 见 `docs/reviews/wu-tools-01-f01-03-final-closeout-controller.md`。等待用户 merge decision；Issue #129 继续追踪 `start_upload` prepare/activate 后续。 |
 | WU-TOOLS-01-F02 | completed | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up; PR #132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f02-final-closeout-controller.md`。F02 completion 已完成，F03 前置条件已满足。 |
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
-| WU-TOOLS-01-F04 | pending | SEC/Fins CI pipeline migration | GitHub Issue #121 under #82 follow-up | First step of SEC/Fins CI coverage: migrate OLD `docs/ci.md`, `utils/llm_ci_process.py`, `utils/llm_ci_score.py` and `dayu.fins.score_sec_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
-| WU-TOOLS-01-F05 | pending | SEC/Fins CI smoke generation | GitHub Issue #121 under #82 follow-up; depends on WU-TOOLS-01-F04 | Generate explicit opt-in SEC/Fins smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for SEC/Fins coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
-| WU-TOOLS-01-F06 | pending | CN/HK Docling CI pipeline migration | GitHub Issue #122 under #82/#98 follow-up | First step of CN/HK Docling coverage: migrate OLD `docs/cn_hk_docling_ci.md`, shared process runner behavior, `utils/llm_docling_ci_score.py` and `dayu.fins.score_docling_ci`; does not close `WU-TOOLS-01-S1-R1` by itself |
-| WU-TOOLS-01-F07 | pending | CN/HK Docling CI smoke generation | GitHub Issue #122 under #82/#98 follow-up; depends on WU-TOOLS-01-F06 | Generate explicit opt-in CN/HK Docling smoke from the migrated CI pipeline; defines pass / skip / diagnostic criteria for Docling coverage and closes or transfers its part of `WU-TOOLS-01-S1-R1` |
-| WU-TOOLS-01-F08 | pending | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Rename `build_engine_processor_registry(...)` to a documents/default registry name and update direct callers / exports / docs without changing processor registration behavior; owner for residual `WU-TOOLS-01-S1-R2` |
+| WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
@@ -900,7 +895,7 @@ F01 已建立 shared Fins service/runtime 作为 read、download、preprocess/pr
 - 不让 CLI / CI / tool 分别实现 CN / SEC download 或 upload 业务逻辑。
 - 不在 downloader、uploader、tool adapter、CLI adapter 或 CI runner 中再造 ticker / market 归一化逻辑。
 - 不把 SEC 控速压到 Host lane，lane 只负责 Host 执行并发治理；source-specific rate limit 属于 Fins downloader / runtime。
-- 不把 CI pipeline / smoke 的评分闭环并入本条；F04 / F05 / F06 / F07 仍负责迁移 CI pipeline 与生成 smoke，但它们必须复用 F01-03 提供的 shared runtime 能力。
+- 不把 CI pipeline / smoke 的评分闭环并入本条；SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由 GitHub Issues #121 / #122 追踪；相关后续必须复用 F01-03 提供的 shared runtime 能力。
 
 ### 验收信号
 
@@ -1063,152 +1058,21 @@ Controller 复验：
 - `python utils/smoke_web_ci.py`：exit code 0，output `workspace/output/web_smoke/web-smoke-20260610T074838Z`，summary status passed，local_cases 4，external_cases 2，search_cases 4，diagnostic_only 6。
 - `git diff --check`：passed。
 
-## WU-TOOLS-01-F04 SEC/Fins CI Pipeline Migration
-
-### 状态
-
-Pending。该 work unit 是 GitHub Issue #121 的第一步。它迁移 OLD SEC/Fins CI pipeline，但不单独关闭 `WU-TOOLS-01-S1-R1`。
-
-### 动机
-
-OLD `docs/ci.md` 定义的是 SEC/Fins 工程化 CI 优化闭环，不是普通测试说明：先通过 storage 扫描 SEC filing 全集，使用 `utils/llm_ci_process.py` 做最小增量 `process --ci`，使用 `utils/llm_ci_score.py` 批量调用 `dayu.fins.score_sec_ci`，输出 baseline / iter / final 的 JSON、Markdown、summary 和缺口诊断。当前 `dayu-agent-r` 只有 deterministic Fins / document fixture 覆盖，未看到等价 process runner、score runner、SEC scorer 或流程文档。
-
-本条继承 F01 的同源裁决：SEC/Fins CI 的 process runner 不得重写 process 业务逻辑。无论它直接调用 shared Fins service/runtime，还是通过未来 NEW CLI 的 `process --ci` 外壳调用，最终都必须落到同一套 shared Fins service/runtime。
-
-SEC/Fins CI 中如需聚合 ticker、推断 market 或生成 company id，也必须调用 `dayu.fins.ticker_normalization` 真源；CI runner 不得为了批处理便利复制 ticker / market 归一化规则。
-
-### 目标
-
-- 迁移 OLD `docs/ci.md` 的 SEC/Fins CI 流程说明。
-- 迁移或重建 `utils/llm_ci_process.py`，保持 storage 扫描、`--documents-json`、ticker 聚合、固定并发、日志和 process run summary；process 执行必须调用 shared Fins service/runtime 或调用以 shared runtime 为唯一业务实现的 NEW CLI 外壳。
-- `utils/llm_ci_process.py` 与 scorer 需要 ticker / market 归一化时必须调用 `dayu.fins.ticker_normalization`；不得在脚本中硬编码 SEC market 判断或 ticker suffix stripping。
-- 迁移或重建 `utils/llm_ci_score.py` 与 `dayu.fins.score_sec_ci`，保持 7 类 SEC form 的 score 输出、summary、overall summary 和 missing snapshot 诊断。
-- 所有文档、processed、blob、snapshot 读取必须走 `dayu.fins.storage` 仓储协议 / 实现。
-- 保持 SEC/Fins CI pipeline 为显式入口，不进入普通 deterministic CI。
-
-### 非目标
-
-- 不通过修改 scorer 权重、阈值或 hard gate 刷分。
-- 不把完整 SEC/Fins corpus 变成 smoke gate；smoke 由 F05 定义。
-- 不绕过 `dayu.fins.storage` 手拼 workspace 路径。
-- 不在 CI runner 中复制 CLI / tool process 业务逻辑；CI runner 只能作为批处理调度、日志和汇总外壳。
-- 不在 SEC/Fins CI runner 或 scorer 中再造 ticker / market 归一化逻辑。
-
-### 验收信号
-
-- 当前 repo 有可运行的 SEC/Fins process runner、score runner 和 scorer 入口。
-- SEC/Fins process runner 的 tests 或实现证据证明它与 CLI / tool process 同源调用 shared Fins service/runtime。
-- Tests 或实现证据证明 SEC/Fins CI 中的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
-- 能生成 baseline_probe / baseline / iter / final 所需目录和 JSON summary。
-- 缺少 processed / snapshot / score 输入时输出清晰 diagnostic。
-- README / tests README 说明 deterministic tests、SEC/Fins CI pipeline 和 SEC/Fins smoke 的职责区别。
-
-## WU-TOOLS-01-F05 SEC/Fins CI Smoke Generation
-
-### 状态
-
-Pending。该 work unit 是 GitHub Issue #121 的第二步，依赖 WU-TOOLS-01-F04。F04 迁移 pipeline 后，SEC/Fins 部分的 `WU-TOOLS-01-S1-R1` 仍然存在，因为 pipeline 只负责全量/增量评分闭环，不提供稳定 smoke gate。
-
-### 目标
-
-- 基于 F04 迁移后的 SEC/Fins CI pipeline 选取小而稳定的 smoke corpus。
-- 定义 pass / fail / skip / diagnostic-only 判定规则。
-- 覆盖至少一个代表性 SEC form 的 process + score 路径；更宽 form coverage 可作为 opt-in 子路径。
-- 缺少 workspace corpus、processed snapshot 或 heavy runtime 时可稳定 skip，并输出原因。
-- 关闭 `WU-TOOLS-01-S1-R1` 中 SEC/Fins CI coverage 部分，或把 remaining gap 转成带 owner 的新 residual。
-
-### 非目标
-
-- 不替代完整 SEC/Fins CI optimization loop。
-- 不把真实 corpus 偶发问题直接解释为 production regression。
-- 不修改 scorer 规则刷分。
-
-### 验收信号
-
-- 存在显式 SEC/Fins smoke 入口，默认不进入普通 deterministic CI。
-- smoke 在满足环境时能运行代表性 SEC fixture / workspace sample，并输出 pass / fail / diagnostic-only summary。
-- README / tests README 说明 SEC/Fins pipeline 与 SEC/Fins smoke 的职责区别。
-
-## WU-TOOLS-01-F06 CN/HK Docling CI Pipeline Migration
-
-### 状态
-
-Pending。该 work unit 是 GitHub Issue #122 的第一步。它迁移 OLD CN/HK Docling CI pipeline，但不单独关闭 `WU-TOOLS-01-S1-R1`。
-
-### 动机
-
-OLD `docs/cn_hk_docling_ci.md` 定义的是 CN/HK Docling 工程化 CI 优化闭环：通过 storage 扫描 A 股 / 港股 active `filing` / `material` 文档全集，复用 `utils/llm_ci_process.py` 做最小增量 process，使用 `utils/llm_docling_ci_score.py` 调用 `dayu.fins.score_docling_ci`，输出 `workspace/tmp/docling_ci_score/{tag}/` 下的 score、by_kind、summary 和 overall summary。当前 `dayu-agent-r` 有 deterministic Docling JSON fixture 和轻量 Fins/Web 消费路径，但未看到等价 CN/HK Docling CI runner、scorer 或流程文档。
-
-本条继承 F01 的同源裁决：CN/HK Docling CI 的 process runner 不得重写 process 业务逻辑。无论它直接调用 shared Fins service/runtime，还是通过未来 NEW CLI 的 `process --ci` 外壳调用，最终都必须落到同一套 shared Fins service/runtime。
-
-CN/HK Docling CI 中如需识别 CN / HK market、规范 A 股 / 港股 ticker 或生成 company id，也必须调用 `dayu.fins.ticker_normalization` 真源；不得在 CI runner、scorer 或 Docling adapter 中复制 CN/HK market 判断。
-
-### 目标
-
-- 迁移 OLD `docs/cn_hk_docling_ci.md` 的 CN/HK Docling CI 流程说明。
-- 迁移或重建 shared `utils/llm_ci_process.py` 必要行为；process 执行必须调用 shared Fins service/runtime 或调用以 shared runtime 为唯一业务实现的 NEW CLI 外壳。
-- `utils/llm_ci_process.py`、`utils/llm_docling_ci_score.py` 与 scorer 需要 ticker / market 归一化时必须调用 `dayu.fins.ticker_normalization`；不得在脚本中硬编码 CN/HK ticker 规则。
-- 迁移或重建 `utils/llm_docling_ci_score.py` 与 `dayu.fins.score_docling_ci`，保持 `source_kind + report_kind` scoring、by_kind 输出、summary 和 overall summary。
-- 文档、processed、blob、snapshot 读取必须走 `dayu.fins.storage` 仓储协议 / 实现。
-- 保持 CN/HK 财报语义在 Fins 层；shared `dayu.documents` 只承载通用 Docling 能力。
-- 保持 CN/HK Docling CI pipeline 为显式入口，不进入普通 deterministic CI。
-
-### 非目标
-
-- 不通过修改 scorer/profile 阈值、权重或 hard gate 刷分。
-- 不把 CN/HK 财报业务语义塞进 Engine 或 shared `dayu.documents`。
-- 不把完整 CN/HK corpus 变成 smoke gate；smoke 由 F07 定义。
-- 不在 CI runner 中复制 CLI / tool process 业务逻辑；CI runner 只能作为批处理调度、日志和汇总外壳。
-- 不在 CN/HK Docling CI runner、scorer 或 adapter 中再造 ticker / market 归一化逻辑。
-
-### 验收信号
-
-- 当前 repo 有可运行的 CN/HK Docling process runner、score runner 和 scorer 入口。
-- CN/HK Docling process runner 的 tests 或实现证据证明它与 CLI / tool process 同源调用 shared Fins service/runtime。
-- Tests 或实现证据证明 CN/HK Docling CI 中的 ticker / market 归一化调用 `dayu.fins.ticker_normalization` 真源。
-- 能生成 baseline_probe / baseline / iter / final 所需目录和 JSON summary。
-- 缺少 processed / snapshot / score 输入时输出清晰 diagnostic。
-- README / tests README 说明 deterministic tests、CN/HK Docling CI pipeline 和 CN/HK Docling smoke 的职责区别。
-
-## WU-TOOLS-01-F07 CN/HK Docling CI Smoke Generation
-
-### 状态
-
-Pending。该 work unit 是 GitHub Issue #122 的第二步，依赖 WU-TOOLS-01-F06。F06 迁移 pipeline 后，CN/HK Docling 部分的 `WU-TOOLS-01-S1-R1` 仍然存在，因为 pipeline 不等同于稳定 smoke gate。
-
-### 目标
-
-- 基于 F06 迁移后的 CN/HK Docling CI pipeline 选取小而稳定的 smoke corpus。
-- 定义 pass / fail / skip / diagnostic-only 判定规则。
-- 覆盖至少一个 active `filing` 或 `material` 的 process + score 路径；更宽 source_kind / report_kind coverage 可作为 opt-in 子路径。
-- 缺少 workspace corpus、processed snapshot、Docling runtime 或 heavy dependencies 时可稳定 skip，并输出原因。
-- 关闭 `WU-TOOLS-01-S1-R1` 中 CN/HK Docling coverage 部分，或把 remaining gap 转成带 owner 的新 residual。
-
-### 非目标
-
-- 不替代完整 CN/HK Docling CI optimization loop。
-- 不把真实 corpus 偶发问题直接解释为 production regression。
-- 不修改 scorer/profile 规则刷分。
-
-### 验收信号
-
-- 存在显式 CN/HK Docling smoke 入口，默认不进入普通 deterministic CI。
-- smoke 在满足环境时能运行代表性 CN/HK fixture / workspace sample，并输出 pass / fail / diagnostic-only summary。
-- README / tests README 说明 CN/HK Docling pipeline 与 CN/HK Docling smoke 的职责区别。
-
 ## WU-TOOLS-01-F08 Documents Processor Registry Naming Cleanup
 
 ### 状态
 
-Pending。该 work unit 是 `WU-TOOLS-01-S1-R2` 的明确 owner，用于清理迁移后遗留的 OLD `engine` 命名，不改变 processor registry 行为。
+Final closeout passed；PR #135 已更新并保持 draft/open，下一入口为用户 merge decision。该 work unit 已关闭 `WU-TOOLS-01-S1-R2`，清理迁移后遗留的 OLD `engine` 命名，不改变 processor registry 行为。
+
+Plan gate 已完成。Goal confirmation artifact 为 `docs/reviews/wu-tools-01-f08-goal-confirmation-controller.md`。Accepted plan artifact 为 `docs/host/wu-tools-01-f08-documents-processor-registry-naming-plan.md`，accepted plan commit 为 `a0c00567`。Plan review artifacts 为 `docs/reviews/wu-tools-01-f08-plan-review-mimo.md`、`docs/reviews/wu-tools-01-f08-plan-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-plan-review-controller-adjudication.md`。Plan fix artifact 为 `docs/reviews/wu-tools-01-f08-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/wu-tools-01-f08-plan-rereview-mimo.md`、`docs/reviews/wu-tools-01-f08-plan-rereview-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-plan-rereview-controller-adjudication.md`。两路 re-review 均裁决 pass，0 条 blocking finding。Implementation artifact 为 `docs/reviews/wu-tools-01-f08-implementation-codex.md`，accepted implementation commit 为 `f669942e`。Code review artifacts 为 `docs/reviews/wu-tools-01-f08-code-review-mimo.md`、`docs/reviews/wu-tools-01-f08-code-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-code-review-controller-adjudication.md`；两路 code review 均裁决 pass，0 条 accepted finding。Aggregate deepreview artifacts 为 `docs/reviews/wu-tools-01-f08-aggregate-deepreview-mimo.md`、`docs/reviews/wu-tools-01-f08-aggregate-deepreview-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-aggregate-deepreview-controller-adjudication.md`；两路 aggregate deepreview 均裁决 pass，0 条 accepted finding；accepted deepreview commit 为 `12812074`。PR review artifacts 为 `docs/reviews/wu-tools-01-f08-pr-review-mimo.md`、`docs/reviews/wu-tools-01-f08-pr-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-pr-review-controller-adjudication.md`；PR body 已补齐 local validation 输出和 no-checks 说明，CI workflow 以后单独配置，不作为当前 residual 追踪。Final closeout artifact 为 `docs/reviews/wu-tools-01-f08-final-closeout-controller.md`；下一入口为用户对 draft PR #135 的 merge decision。
 
 ### 动机
 
-`build_engine_processor_registry(...)` 当前位于 `dayu.documents.processors.registry`，实际注册的是通用 documents processor：Docling、Markdown 与 BS。Doc tools 和 Fins 都把它作为 documents 默认 processor registry 使用；它不属于 Engine。迁移期保留旧名是为了遵守 WU-TOOLS-01 的迁移原则，但迁移完成后继续暴露 `engine` 命名会误导 ownership，弱化 `dayu.documents` 作为共享文档基础能力 owner 的边界。
+原旧名 builder 位于 `dayu.documents.processors.registry`，实际注册的是通用 documents processor：Docling、Markdown 与 BS。Doc tools 和 Fins 都把它作为 documents 默认 processor registry 使用；它不属于 Engine。F08 已将稳定入口收敛为 `build_documents_processor_registry(...)`，避免 `engine` 命名误导 ownership。
 
 ### 目标
 
-- 将 `build_engine_processor_registry(...)` 重命名为 `build_documents_processor_registry(...)` 或 `build_default_processor_registry(...)`。
+- 将 documents 默认 processor registry builder 稳定命名为 `build_documents_processor_registry(...)`。
 - 同步更新 `dayu.documents.processors.__all__`、`dayu.documents.processors._doc_processor_factory`、`dayu.fins.processors.registry`、测试和 README / 文档引用。
 - 保持 processor 注册顺序与行为不变：DoclingProcessor、MarkdownProcessor、BSProcessor 仍按当前优先级注册。
 - 证明 Fins registry 仍先加载 documents 默认 registry，再覆盖注册 Fins 专属 processor。
@@ -1221,10 +1085,19 @@ Pending。该 work unit 是 `WU-TOOLS-01-S1-R2` 的明确 owner，用于清理�
 
 ### 验收信号
 
-- `rg "build_engine_processor_registry"` 在生产代码、测试和稳定 README / control doc 中无残留；历史 review artifact 可保留。
+- 旧 builder 名称在生产代码、测试和稳定 README / control doc 中无残留；历史 review artifact 可保留。
 - Documents / Fins processor registry focused tests 证明行为不变。
 - import-boundary tests 与 pyright 通过。
 - 相关 README 只描述新命名和当前 ownership，不保留新旧术语并存。
+
+### Implementation validation
+
+- 稳定目标旧名清理检查：passed，无匹配。
+- 历史 review artifact 检查：passed，仅历史 review / plan review artifact 保留旧名留痕。
+- Focused registry tests：`pytest tests/documents/test_processors.py tests/fins/test_processor_registry.py -q`，5 passed，3 warnings。
+- 相关包测试：`pytest tests/documents tests/fins -q`，263 passed，1 skipped，3 warnings；`tests/fins` 未出现 heavy fixture / environment failure。
+- 类型检查：`python -m pyright dayu/ tests/ utils/`，0 errors，0 warnings，0 informations。
+- Whitespace：`git diff --check`，passed。
 
 ## WU-TOOLS-01-F09 Fins Upload Ingestion Migration And Upload Tool
 

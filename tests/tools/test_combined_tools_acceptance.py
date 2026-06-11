@@ -221,7 +221,7 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
 
 
 def test_combined_truncate_specs_and_fetch_more_owner(tmp_path: Path) -> None:
-    """迁移工具只暴露 current ToolTruncateSpec，fetch_more 由 ToolRuntime 注入。
+    """当前工具只暴露 current ToolTruncateSpec，fetch_more 由 ToolRuntime 注入。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -249,15 +249,15 @@ def test_combined_truncate_specs_and_fetch_more_owner(tmp_path: Path) -> None:
     assert fetch_more.callable is runtime.effective_bundle.fetch_more_callable
 
 
-def test_migrated_providers_and_adapter_do_not_import_old_runtime() -> None:
-    """迁移 provider / adapter 不得导入 OLD registry/truncation/fetch_more 投影。
+def test_native_providers_do_not_import_old_runtime() -> None:
+    """当前原生 provider 不得导入 OLD registry/truncation/fetch_more 投影。
 
     :returns: ``None``。
     :raises AssertionError: AST import 或旧投影 token 命中时抛出。
     """
 
     offenders: list[str] = []
-    for source_path in _migrated_tool_source_paths():
+    for source_path in _native_tool_source_paths():
         imported_modules = _module_imports(source_path)
         for module_name in imported_modules:
             if _is_forbidden_import(module_name):
@@ -473,7 +473,7 @@ def test_representative_failures_project_to_current_failed_outcomes(
 
 
 def test_scene_prepare_tags_select_doc_fins_and_web_tools(tmp_path: Path) -> None:
-    """ScenePrepare 应能通过 doc/fins/web tags 选择迁移工具。
+    """ScenePrepare 应能通过 doc/fins/web tags 选择当前工具。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -948,8 +948,8 @@ def _definition_names(definitions: tuple[ToolDefinition, ...]) -> frozenset[str]
     return frozenset(definition.name for definition in definitions)
 
 
-def _migrated_tool_source_paths() -> tuple[Path, ...]:
-    """返回需要扫描旧 runtime import 的迁移 provider / adapter 源文件。
+def _native_tool_source_paths() -> tuple[Path, ...]:
+    """返回需要扫描旧 runtime import 的原生 provider 源文件。
 
     :returns: Python 源文件路径元组。
     :raises Exception: 不主动抛出异常。
@@ -957,7 +957,6 @@ def _migrated_tool_source_paths() -> tuple[Path, ...]:
 
     repo_root = Path(__file__).resolve().parents[2]
     roots = (
-        repo_root / "dayu" / "tools" / "_legacy_adapter",
         repo_root / "dayu" / "tools" / "web",
         repo_root / "dayu" / "fins" / "tools",
     )

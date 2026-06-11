@@ -12,12 +12,10 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from threading import Lock, RLock
-from typing import Any, Final, Literal, NoReturn, Optional, cast
+from typing import Any, Literal, Optional, cast
 
 from dayu.contracts.cancellation import CancellationToken
-from dayu.tools._legacy_adapter.exceptions import ToolArgumentError
 from dayu.fins._log import Log
-from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
 from dayu.documents.processors.base import (
     DocumentProcessor,
     SectionContent,
@@ -75,6 +73,9 @@ from .result_types import (
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
 from dayu.fins.ticker_normalization import try_normalize_ticker
 from .read_runtime_helpers import (
+    FinsReadArgumentError,
+    FinsReadBusinessError,
+    FinsReadCancelledError,
     _collect_parent_titles,
     _normalize_form_type_for_matching,
     _normalize_document_types,
@@ -97,6 +98,7 @@ from .read_runtime_helpers import (
     _build_search_hint,
     build_search_next_section_fields,
     build_document_recency_sort_key,
+    raise_if_fins_cancelled,
     resolve_has_financial_data,
     resolve_document_type_for_source,
 )
@@ -116,9 +118,6 @@ _MISSING_TICKER_HINT = (
     "目标：先确认这家公司是否已被当前财报工具收录。允许动作：切到公司或网页来源确认公司标识。"
     "不允许：继续穷举 ticker 变体。下一步：先确认公司标识，再回到财报工具。"
 )
-_TOOL_CANCELLED_ERROR_CODE: Final = "tool_cancelled"
-
-
 def _raise_if_fins_cancelled(cancellation_token: CancellationToken | None) -> None:
     """在财报读取慢边界执行协作式取消检查。
 
@@ -129,36 +128,10 @@ def _raise_if_fins_cancelled(cancellation_token: CancellationToken | None) -> No
         无。
 
     Raises:
-        ToolBusinessError: 当前工具调用已被 Host 取消时抛出，错误码固定为
-            ``tool_cancelled``。
+        FinsReadCancelledError: 当前工具调用已被 Host 取消时抛出。
     """
 
-    if cancellation_token is not None and cancellation_token.is_cancelled():
-        _raise_fins_cancelled(cancellation_token)
-
-
-def _raise_fins_cancelled(cancellation_token: CancellationToken) -> NoReturn:
-    """抛出 legacy adapter 可稳定投影的 Fins 读取取消业务错误。
-
-    Args:
-        cancellation_token: 已处于取消状态的 Host 取消观察令牌。
-
-    Returns:
-        不返回。
-
-    Raises:
-        ToolBusinessError: 始终抛出，错误码固定为 ``tool_cancelled``。
-    """
-
-    reason = cancellation_token.cancel_reason()
-    message = "财报读取工具调用已被取消。"
-    if reason is not None and reason.strip() != "":
-        message = f"{message}取消原因: {reason}"
-    raise ToolBusinessError(
-        code=_TOOL_CANCELLED_ERROR_CODE,
-        message=message,
-        hint="当前工具调用已停止；等待新的用户指令或后续调度。",
-    )
+    raise_if_fins_cancelled(cancellation_token, message="财报读取工具调用已被取消。")
 
 
 class FinsReadRuntime:
@@ -232,8 +205,8 @@ class FinsReadRuntime:
             文档列表结果。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
             RuntimeError: 仓储读取失败时抛出。
         """
 
@@ -337,8 +310,8 @@ class FinsReadRuntime:
             章节结构结果。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
             FileNotFoundError: 文档不存在时抛出。
         """
 
@@ -398,8 +371,8 @@ class FinsReadRuntime:
             章节正文结果。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
             KeyError: 章节不存在时抛出。
         """
 
@@ -412,7 +385,7 @@ class FinsReadRuntime:
         )
         normalized_ref = require_non_empty_text(
             ref,
-            empty_error=ToolArgumentError("read_section", "ref", ref, "Argument must not be empty"),
+            empty_error=FinsReadArgumentError("read_section", "ref", ref, "Argument must not be empty"),
         )
         _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
@@ -439,7 +412,7 @@ class FinsReadRuntime:
                 )
             else:
                 hint = "章节不存在；请先调用 get_document_sections，并原样复制返回的 ref，不要简写、重编号或自造 ref"
-            raise ToolArgumentError(
+            raise FinsReadArgumentError(
                 "read_section",
                 "ref",
                 normalized_ref,
@@ -468,10 +441,8 @@ class FinsReadRuntime:
                 _raise_if_fins_cancelled(cancellation_token)
                 parent_title = processor.get_section_title(str(parent_ref))
                 _raise_if_fins_cancelled(cancellation_token)
-            except ToolBusinessError as exc:
-                if exc.code == _TOOL_CANCELLED_ERROR_CODE:
-                    raise
-                parent_title = None
+            except FinsReadCancelledError:
+                raise
             except Exception:
                 parent_title = None
 
@@ -561,8 +532,8 @@ class FinsReadRuntime:
             搜索结果。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
         _QUERIES_MAX = 20
@@ -622,9 +593,8 @@ class FinsReadRuntime:
                 ref = sec.get("ref")
                 if ref:
                     ref_to_topic[ref] = sec.get("topic")
-        except ToolBusinessError as exc:
-            if exc.code == _TOOL_CANCELLED_ERROR_CODE:
-                raise
+        except FinsReadCancelledError:
+            raise
         except Exception:
             pass
 
@@ -915,8 +885,8 @@ class FinsReadRuntime:
             表格列表结果。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
@@ -1019,8 +989,8 @@ class FinsReadRuntime:
             表格数据结果。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
             KeyError: 表格不存在时抛出。
         """
 
@@ -1033,7 +1003,7 @@ class FinsReadRuntime:
         )
         normalized_table_ref = require_non_empty_text(
             table_ref,
-            empty_error=ToolArgumentError("get_table", "table_ref", table_ref, "Argument must not be empty"),
+            empty_error=FinsReadArgumentError("get_table", "table_ref", table_ref, "Argument must not be empty"),
         )
         _raise_if_fins_cancelled(cancellation_token)
         processor = self._get_or_create_processor(
@@ -1060,7 +1030,7 @@ class FinsReadRuntime:
                 )
             else:
                 hint = "表格不存在；请先调用 list_tables，并原样复制返回的 table_ref，不要简写、重编号或自造 table_ref"
-            raise ToolArgumentError(
+            raise FinsReadArgumentError(
                 "get_table",
                 "table_ref",
                 normalized_table_ref,
@@ -1125,8 +1095,8 @@ class FinsReadRuntime:
             页面内容结果；不支持时返回 `not_supported` 结构。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
@@ -1137,7 +1107,7 @@ class FinsReadRuntime:
             cancellation_token=cancellation_token,
         )
         if not isinstance(page_no, int) or page_no <= 0:
-            raise ToolArgumentError(
+            raise FinsReadArgumentError(
                 "get_page_content",
                 "page_no",
                 page_no,
@@ -1202,8 +1172,8 @@ class FinsReadRuntime:
             不支持时返回 `not_supported` 结构。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
@@ -1215,7 +1185,7 @@ class FinsReadRuntime:
         )
         normalized_statement_type = require_non_empty_text(
             statement_type,
-            empty_error=ToolArgumentError(
+            empty_error=FinsReadArgumentError(
                 "get_financial_statement",
                 "statement_type",
                 statement_type,
@@ -1291,8 +1261,8 @@ class FinsReadRuntime:
             XBRL 数值 facts 查询结果；不支持时返回 `not_supported` 结构。
 
         Raises:
-            ToolArgumentError: 参数非法时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数非法时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
@@ -1303,7 +1273,7 @@ class FinsReadRuntime:
             cancellation_token=cancellation_token,
         )
         if concepts is not None and not isinstance(concepts, list):
-            raise ToolArgumentError(
+            raise FinsReadArgumentError(
                 "query_xbrl_facts",
                 "concepts",
                 concepts,
@@ -1402,8 +1372,8 @@ class FinsReadRuntime:
             始终是仓储可识别的规范 `document_id`。
 
         Raises:
-            ToolArgumentError: 参数为空时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: 参数为空时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
@@ -1414,7 +1384,7 @@ class FinsReadRuntime:
         )
         normalized_document_id = require_non_empty_text(
             document_id,
-            empty_error=ToolArgumentError(
+            empty_error=FinsReadArgumentError(
                 tool_name,
                 "document_id",
                 document_id,
@@ -1457,14 +1427,14 @@ class FinsReadRuntime:
             当前财报工具可用的 ticker。
 
         Raises:
-            ToolArgumentError: ticker 为空时抛出。
-            ToolBusinessError: ticker 未收录于当前工作区时抛出。
+            FinsReadArgumentError: ticker 为空时抛出。
+            FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker = require_non_empty_text(
             ticker,
-            empty_error=ToolArgumentError(
+            empty_error=FinsReadArgumentError(
                 tool_name,
                 "ticker",
                 ticker,
@@ -1480,7 +1450,7 @@ class FinsReadRuntime:
         resolved_ticker = self._company_repository.resolve_existing_ticker([probe_ticker])
         _raise_if_fins_cancelled(cancellation_token)
         if resolved_ticker is None:
-            raise ToolBusinessError(
+            raise FinsReadBusinessError(
                 code=ErrorCode.NOT_FOUND.value,
                 message=f"Financial Document Tools do not have this company: ticker='{normalized_ticker}'.",
                 hint=_MISSING_TICKER_HINT,
@@ -1966,7 +1936,7 @@ class FinsReadRuntime:
                 continue
             except Exception as exc:
                 # 复杂逻辑说明：诊断属于尽力而为的辅助路径，任何非 KeyError 的底层异常都
-                # 不应让原始 ToolArgumentError 失真；记录调试日志后直接跳过该候选。
+                # 不应让原始参数错误失真；记录调试日志后直接跳过该候选。
                 Log.debug(
                     f"cross-document locator 诊断遇到非预期异常: ticker={ticker} "
                     f"candidate_document_id={cache_key.document_id} kind={kind} exc={exc}",

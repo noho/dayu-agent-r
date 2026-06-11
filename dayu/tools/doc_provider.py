@@ -1,8 +1,8 @@
 """Doc tools 的当前 ToolsDiscovery provider。
 
-本模块只负责把迁移后的 OLD Doc 工具声明收集并适配为当前
-``ToolDefinition``。路径白名单、参数投影和响应投影都在 provider /
-adapter 边界完成；Doc 工具函数体本身不拥有路径安全机制。
+本模块只负责解析 provider 配置、维护 provider id / version / source refs，
+并把 Doc 原生 ``ToolDefinition`` 集合交给 ``ToolsDiscovery``。路径白名单
+为空时 fail closed，返回空工具集合。
 """
 
 from __future__ import annotations
@@ -12,36 +12,19 @@ from pathlib import Path
 from typing import Final
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
 )
 
-from ._legacy_adapter.definition_adapter import (
-    LegacyToolConcurrencyPolicy,
-    ToolPathValidationPolicy,
-    adapt_collected_tools,
-)
-from ._legacy_adapter.registry_collector import (
-    CollectedLegacyTool,
-    LegacyToolDeclarationCollector,
-)
-from .doc_tools import DocToolLimits, register_doc_tools
+from .doc_tools import DocToolLimits, build_doc_tool_definitions
 
 _PROVIDER_ID: Final[str] = "doc-tools"
 _VERSION_REF: Final[str] = "doc-tools-provider-v1"
 _SOURCE_ID: Final[str] = "dayu.tools.doc_provider"
 _CONFIG_LIMITS_FIELD: Final[str] = "limits"
 _CONFIG_ALLOWED_PATHS_FIELD: Final[str] = "allowed_paths"
-_DOC_TOOL_NAMES: Final[tuple[str, ...]] = (
-    "list_files",
-    "get_file_sections",
-    "search_files",
-    "read_file",
-    "read_file_section",
-)
 
 
 def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
@@ -54,8 +37,7 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         provider 输出；当 provider 启用但未配置显式路径白名单时返回空工具集。
 
     Raises:
-        ValueError: provider config 字段类型非法，或 OLD 声明集合不符合本
-            provider 预期时抛出。
+        ValueError: provider config 字段类型非法时抛出。
     """
 
     limits = _parse_limits(spec.config)
@@ -69,25 +51,11 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
             definitions=(),
         )
 
-    collector = LegacyToolDeclarationCollector()
-    register_doc_tools(
-        collector,
-        limits=limits,
-        allowed_paths=None,
-        allow_file_write=False,
-        allowed_write_paths=None,
-        timeout_budget=None,
-    )
-    declarations = collector.collected_tools()
-    _validate_doc_declarations(declarations)
     return ToolsDiscoveryProviderOutput(
         provider_id=_PROVIDER_ID,
         version_ref=_VERSION_REF,
         source_refs=(source_ref,),
-        definitions=_adapt_doc_declarations(
-            declarations=declarations,
-            allowed_roots=allowed_roots,
-        ),
+        definitions=build_doc_tool_definitions(limits, allowed_roots),
     )
 
 
@@ -192,65 +160,6 @@ def _parse_allowed_paths(config: Mapping[str, JsonValue]) -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def _validate_doc_declarations(
-    declarations: tuple[CollectedLegacyTool, ...],
-) -> None:
-    """校验迁移 Doc 声明集合。
-
-    Args:
-        declarations: collector 收集到的迁移声明。
-
-    Returns:
-        无。
-
-    Raises:
-        ValueError: 工具名集合或路径参数 metadata 不符合 S3 预期时抛出。
-    """
-
-    names = tuple(declaration.name for declaration in declarations)
-    if names != _DOC_TOOL_NAMES:
-        raise ValueError(f"doc provider expected tools {_DOC_TOOL_NAMES}, got {names}")
-    for declaration in declarations:
-        if not declaration.file_path_params:
-            raise ValueError(f"doc tool {declaration.name} must declare file_path_params")
-
-
-def _adapt_doc_declarations(
-    *,
-    declarations: tuple[CollectedLegacyTool, ...],
-    allowed_roots: tuple[Path, ...],
-) -> tuple[ToolDefinition, ...]:
-    """把 Doc 声明适配为当前 ToolDefinition。
-
-    Args:
-        declarations: 迁移工具声明。
-        allowed_roots: provider 显式白名单根路径。
-
-    Returns:
-        current 工具定义元组。
-
-    Raises:
-        Exception: adapter 构造失败时透出。
-    """
-
-    path_policy_by_tool: dict[str, ToolPathValidationPolicy] = {}
-    concurrency_policy_by_tool: dict[str, LegacyToolConcurrencyPolicy] = {}
-    for declaration in declarations:
-        path_policy_by_tool[declaration.name] = ToolPathValidationPolicy(
-            allowed_roots=allowed_roots,
-            file_path_params=declaration.file_path_params,
-            must_exist=True,
-        )
-        concurrency_policy_by_tool[declaration.name] = (
-            LegacyToolConcurrencyPolicy.SERIAL_PER_PROVIDER
-        )
-    return adapt_collected_tools(
-        declarations,
-        path_policy_by_tool=path_policy_by_tool,
-        concurrency_policy_by_tool=concurrency_policy_by_tool,
-    )
-
-
 def _source_ref() -> ToolBundleSourceRef:
     """构造 Doc provider 来源引用。
 
@@ -258,18 +167,14 @@ def _source_ref() -> ToolBundleSourceRef:
         无。
 
     Returns:
-        工具来源引用。
+        provider 来源引用。
 
     Raises:
-        ValueError: 来源引用字段非法时由契约对象抛出。
+        Exception: ``ToolBundleSourceRef`` 契约校验失败时透出。
     """
 
     return ToolBundleSourceRef(
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id=_SOURCE_ID,
         version_ref=_VERSION_REF,
-        content_digest=None,
     )
-
-
-__all__ = ["discover_tools"]

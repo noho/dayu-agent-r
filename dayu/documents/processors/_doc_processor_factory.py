@@ -14,10 +14,11 @@ from typing import Optional
 
 from .base import DocumentProcessor
 from .local_file_source import LocalFileSource
-from .registry import build_engine_processor_registry
+from .processor_registry import ProcessorRegistry
+from .registry import build_documents_processor_registry
 
 # 模块级单例：避免每次调用都重新注册处理器
-_ENGINE_PROCESSOR_REGISTRY = None
+_DOCUMENTS_PROCESSOR_REGISTRY: ProcessorRegistry | None = None
 
 # 文件后缀到 MIME 类型的映射
 _SUFFIX_TO_MEDIA_TYPE: dict[str, str] = {
@@ -30,7 +31,7 @@ _SUFFIX_TO_MEDIA_TYPE: dict[str, str] = {
 }
 
 
-def _get_engine_processor_registry():
+def _get_documents_processor_registry() -> ProcessorRegistry:
     """获取/初始化 documents 处理器注册表（单例）。
 
     Args:
@@ -42,10 +43,10 @@ def _get_engine_processor_registry():
     Raises:
         RuntimeError: 构建注册表失败时抛出。
     """
-    global _ENGINE_PROCESSOR_REGISTRY
-    if _ENGINE_PROCESSOR_REGISTRY is None:
-        _ENGINE_PROCESSOR_REGISTRY = build_engine_processor_registry()
-    return _ENGINE_PROCESSOR_REGISTRY
+    global _DOCUMENTS_PROCESSOR_REGISTRY
+    if _DOCUMENTS_PROCESSOR_REGISTRY is None:
+        _DOCUMENTS_PROCESSOR_REGISTRY = build_documents_processor_registry()
+    return _DOCUMENTS_PROCESSOR_REGISTRY
 
 
 def create_doc_file_processor(file_path: Path) -> Optional[DocumentProcessor]:
@@ -84,7 +85,7 @@ def create_doc_file_processor(file_path: Path) -> Optional[DocumentProcessor]:
     )
 
     # 通过 ProcessorRegistry 选择处理器
-    registry = _get_engine_processor_registry()
+    registry = _get_documents_processor_registry()
     processor_cls = registry.resolve(source, media_type=media_type)
     if processor_cls is None:
         return None

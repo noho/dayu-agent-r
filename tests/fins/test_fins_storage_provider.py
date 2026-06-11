@@ -5,10 +5,12 @@ from __future__ import annotations
 import ast
 import asyncio
 import io
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from threading import Event, Lock
+from typing import Final, cast
 
 import pytest
 
@@ -20,7 +22,13 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
+from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolCancelledOutcome,
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.documents.processors.base import (
     DocumentProcessor,
@@ -47,9 +55,11 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.service_runtime import DefaultFinsRuntime
-from dayu.fins.tools.fins_tools import register_fins_read_tools
+from dayu.fins.tools.fins_limits import FinsToolLimits
+from dayu.fins.tools.fins_tools import build_fins_read_tool_definitions
 from dayu.fins.tools.provider import discover_tools
 from dayu.fins.tools.read_runtime import FinsReadRuntime
+from dayu.fins.tools.read_runtime_helpers import FinsReadCancelledError
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -70,12 +80,6 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderBinding,
     ToolsDiscoveryProviderSpec,
 )
-from dayu.tools._legacy_adapter.definition_adapter import (
-    LegacyToolConcurrencyPolicy,
-    adapt_collected_tools,
-)
-from dayu.tools._legacy_adapter.registry_collector import LegacyToolDeclarationCollector
-from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
 
 _FINS_READ_TOOL_NAMES = (
     "list_documents",
@@ -94,6 +98,24 @@ _FINS_WAIT_ADAPTER_PATH = (
 ).resolve(strict=False)
 _FINS_DEFAULT_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.host", "dayu.service", "dayu.ui")
 _FINS_WAIT_ADAPTER_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.service", "dayu.ui")
+_HOST_GOVERNANCE_CANCEL_REASON: Final[str] = (
+    "run_id=run-secret session_id=session-secret correlation_id=correlation-secret "
+    "payload_ref=payload-secret digest=sha256-secret cancellation_token=token-secret"
+)
+_HOST_GOVERNANCE_FORBIDDEN_TERMS: Final[tuple[str, ...]] = (
+    "run_id",
+    "session_id",
+    "correlation_id",
+    "payload_ref",
+    "digest",
+    "cancellation_token",
+    "run-secret",
+    "session-secret",
+    "correlation-secret",
+    "payload-secret",
+    "sha256-secret",
+    "token-secret",
+)
 
 
 class _OpenCancellationToken:
@@ -130,14 +152,18 @@ class _OpenCancellationToken:
 class _ManualCancellationToken:
     """测试用手动取消 token。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, cancel_reason: str = "test cancellation") -> None:
         """初始化未取消状态。
+
+        Args:
+            cancel_reason: 标记取消后返回的测试取消原因。
 
         Returns:
             无。
         """
 
         self._cancelled = False
+        self._cancel_reason = cancel_reason
 
     def cancel(self) -> None:
         """标记 token 已取消。
@@ -164,11 +190,11 @@ class _ManualCancellationToken:
         """返回取消原因。
 
         Returns:
-            已取消时返回测试原因；否则返回 None。
+            已取消时返回构造期传入的测试原因；否则返回 None。
         """
 
         if self._cancelled:
-            return "test cancellation"
+            return self._cancel_reason
         return None
 
     def requested_at(self) -> datetime | None:
@@ -486,6 +512,94 @@ class _XbrlFactsProcessor(_SearchCancellingProcessor):
         }
 
 
+class _ConcurrentReadRuntimeProbe:
+    """记录同一 provider read runtime 业务体并发进入情况。"""
+
+    def __init__(self) -> None:
+        """初始化并发探针。
+
+        Returns:
+            无。
+        """
+
+        self._active_guard = Lock()
+        self.entered = Event()
+        self._active_count = 0
+        self.max_active_count = 0
+
+    def list_documents(
+        self,
+        *,
+        ticker: str,
+        document_types: list[str] | None = None,
+        fiscal_years: list[int] | None = None,
+        fiscal_periods: list[str] | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Mapping[str, JsonValue]:
+        """测试用 list_documents 业务体。
+
+        Args:
+            ticker: 股票代码。
+            document_types: 文档类型过滤。
+            fiscal_years: 财年过滤。
+            fiscal_periods: 财期过滤。
+            cancellation_token: Host 取消令牌。
+
+        Returns:
+            最小文档列表载荷。
+
+        Raises:
+            无。
+        """
+
+        del ticker, document_types, fiscal_years, fiscal_periods, cancellation_token
+        self._enter_business()
+        return {"documents": [], "matched": 0, "total": 0}
+
+    def get_document_sections(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Mapping[str, JsonValue]:
+        """测试用 get_document_sections 业务体。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            cancellation_token: Host 取消令牌。
+
+        Returns:
+            最小章节列表载荷。
+
+        Raises:
+            无。
+        """
+
+        del ticker, document_id, cancellation_token
+        self._enter_business()
+        return {"sections": [], "ticker": "AAPL", "document_id": "aapl-2024-10k"}
+
+    def _enter_business(self) -> None:
+        """记录进入业务体的并发计数。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        with self._active_guard:
+            self._active_count += 1
+            self.max_active_count = max(self.max_active_count, self._active_count)
+            self.entered.set()
+        time.sleep(0.05)
+        with self._active_guard:
+            self._active_count -= 1
+
+
 class _AcceptingPort(HostToolFactAcceptPort):
     """测试用 Host accept barrier。"""
 
@@ -564,21 +678,29 @@ def test_fins_provider_discovers_read_tools_with_fins_tag(tmp_path: Path) -> Non
     assert all("fins" in definition.tags for definition in result.tool_bundle.definitions)
 
 
-def test_fins_read_declarations_request_execution_context_injection(tmp_path: Path) -> None:
-    """九个 Fins read tools 声明必须请求 execution_context 注入。"""
+def test_fins_read_tools_do_not_import_retired_adapter() -> None:
+    """Fins read provider、工具和测试 helper 不得依赖退役适配器。"""
 
-    workspace_root = _build_fins_workspace(tmp_path)
-    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
-    collector = LegacyToolDeclarationCollector()
-
-    register_fins_read_tools(collector, read_runtime=read_runtime)
-
-    declarations = collector.collected_tools()
-    assert tuple(declaration.name for declaration in declarations) == _FINS_READ_TOOL_NAMES
-    assert all(
-        declaration.execution_context_param_name == "execution_context"
-        for declaration in declarations
+    paths = (
+        Path("dayu/fins/tools/provider.py"),
+        Path("dayu/fins/tools/fins_tools.py"),
+        Path("dayu/fins/tools/read_runtime.py"),
+        Path("dayu/fins/tools/read_runtime_helpers.py"),
+        Path("dayu/fins/tools/search_engine.py"),
+        Path(__file__),
     )
+    forbidden = (
+        "_legacy" + "_adapter",
+        "LegacyTool" + "DeclarationCollector",
+        "adapt_collected" + "_tools",
+    )
+    offenders: list[str] = []
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        if any(token in source for token in forbidden):
+            offenders.append(str(path))
+
+    assert offenders == []
 
 
 def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) -> None:
@@ -644,8 +766,8 @@ def test_list_documents_executes_through_current_tool_runtime(tmp_path: Path) ->
     assert "ok" not in value
 
 
-def test_list_documents_pre_cancel_returns_tool_cancelled(tmp_path: Path) -> None:
-    """list_documents 入口预取消时应投影为稳定 tool_cancelled 失败。"""
+def test_list_documents_pre_cancel_returns_cancelled_outcome(tmp_path: Path) -> None:
+    """list_documents 入口预取消时应投影为 Host cancelled outcome。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     definition = _definitions_by_name(_discover_definitions(workspace_root))["list_documents"]
@@ -659,8 +781,54 @@ def test_list_documents_pre_cancel_returns_tool_cancelled(tmp_path: Path) -> Non
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    _assert_host_cancelled_outcome(outcome, "list_documents")
+
+
+def test_cancelled_read_outcomes_hide_host_governance_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """取消 outcome 的 message / hint 不得暴露 Host 治理取消原因。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime))
+
+    pre_cancel_token = _ManualCancellationToken(
+        cancel_reason=_HOST_GOVERNANCE_CANCEL_REASON,
+    )
+    pre_cancel_token.cancel()
+    pre_cancel_outcome = asyncio.run(
+        definitions["list_documents"].callable(
+            _call("list_documents", {"ticker": "AAPL"}),
+            _context(cancellation_token=pre_cancel_token),
+        )
+    )
+
+    _assert_host_cancelled_outcome(pre_cancel_outcome, "list_documents")
+
+    deep_cancel_token = _ManualCancellationToken(
+        cancel_reason=_HOST_GOVERNANCE_CANCEL_REASON,
+    )
+    processor = _SearchCancellingProcessor(deep_cancel_token)
+    _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
+    deep_cancel_outcome = asyncio.run(
+        definitions["search_document"].callable(
+            _call(
+                "search_document",
+                {
+                    "ticker": "AAPL",
+                    "document_id": "aapl-2024-10k",
+                    "query": "annual recurring revenue",
+                    "mode": "keyword",
+                },
+            ),
+            _context(cancellation_token=deep_cancel_token),
+        )
+    )
+
+    _assert_host_cancelled_outcome(deep_cancel_outcome, "search_document")
+    assert processor.search_calls == ["annual"]
 
 
 def test_search_document_cancellation_during_search_stops_before_all_candidates(
@@ -691,8 +859,7 @@ def test_search_document_cancellation_during_search_stops_before_all_candidates(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    _assert_host_cancelled_outcome(outcome, "search_document")
     assert processor.search_calls == ["annual"]
 
 
@@ -700,7 +867,7 @@ def test_search_document_semantic_enrichment_cancelled_error_is_not_swallowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """search_document 语义增强降级块不应吞掉 tool_cancelled。"""
+    """search_document 语义增强降级块不应吞掉 Host 取消。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
@@ -710,7 +877,7 @@ def test_search_document_semantic_enrichment_cancelled_error_is_not_swallowed(
     monkeypatch.setattr(
         read_runtime,
         "_enrich_sections_with_semantic",
-        _raise_tool_cancelled_during_semantic_enrichment,
+        _raise_fins_cancelled_during_semantic_enrichment,
     )
     definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["search_document"]
 
@@ -729,16 +896,15 @@ def test_search_document_semantic_enrichment_cancelled_error_is_not_swallowed(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    _assert_host_cancelled_outcome(outcome, "search_document")
     assert processor.search_calls == []
 
 
-def test_read_section_cancelled_before_processor_read_returns_tool_cancelled(
+def test_read_section_cancelled_before_processor_read_returns_cancelled_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """read_section 在 processor read 前观察到取消时应返回 tool_cancelled。"""
+    """read_section 在 processor read 前观察到取消时应返回 cancelled outcome。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
@@ -766,8 +932,7 @@ def test_read_section_cancelled_before_processor_read_returns_tool_cancelled(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    _assert_host_cancelled_outcome(outcome, "read_section")
     assert processor.read_section_calls == 0
 
 
@@ -775,7 +940,7 @@ def test_read_section_parent_title_lookup_cancelled_error_is_not_swallowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """read_section 父标题查询降级块不应吞掉 tool_cancelled。"""
+    """read_section 父标题查询降级块不应吞掉 Host 取消。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
@@ -798,8 +963,7 @@ def test_read_section_parent_title_lookup_cancelled_error_is_not_swallowed(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    _assert_host_cancelled_outcome(outcome, "read_section")
     assert processor.get_section_title_calls == 1
 
 
@@ -807,7 +971,7 @@ def test_query_xbrl_facts_cancellation_during_filtering_stops_promptly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """query_xbrl_facts 在 facts 过滤检查中取消时应停止并返回 tool_cancelled。"""
+    """query_xbrl_facts 在 facts 过滤检查中取消时应停止并返回 cancelled outcome。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
@@ -830,9 +994,26 @@ def test_query_xbrl_facts_cancellation_during_filtering_stops_promptly(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "tool_cancelled"
+    _assert_host_cancelled_outcome(outcome, "query_xbrl_facts")
     assert processor.query_calls == 1
+
+
+def test_same_provider_read_tools_do_not_enter_read_runtime_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 provider 的两个 Fins read tools 不得并发进入 read runtime。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    probe = _ConcurrentReadRuntimeProbe()
+    monkeypatch.setattr(read_runtime, "list_documents", probe.list_documents)
+    monkeypatch.setattr(read_runtime, "get_document_sections", probe.get_document_sections)
+    definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime))
+
+    asyncio.run(_run_two_fins_read_tools_concurrently(definitions, probe.entered))
+
+    assert probe.max_active_count == 1
 
 
 def test_search_document_projection_and_failure_outcomes(tmp_path: Path) -> None:
@@ -1191,6 +1372,50 @@ def _definitions_by_name(
     return {definition.name: definition for definition in definitions}
 
 
+def _assert_host_cancelled_outcome(
+    outcome: ToolExecutionOutcome,
+    tool_name: str,
+) -> None:
+    """断言工具调用返回 Host cancelled outcome。
+
+    Args:
+        outcome: 工具执行结果。
+        tool_name: 预期工具名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: outcome 类型、reason 或 meta 不符合预期时抛出。
+    """
+
+    assert isinstance(outcome, ToolCancelledOutcome)
+    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert outcome.meta is not None
+    assert outcome.meta.tool_name == tool_name
+    assert outcome.meta.started_at <= outcome.meta.finished_at
+    _assert_host_governance_terms_hidden(outcome)
+
+
+def _assert_host_governance_terms_hidden(outcome: ToolCancelledOutcome) -> None:
+    """断言 cancelled outcome 的 LLM-facing 文本不含 Host 治理标识。
+
+    Args:
+        outcome: 要检查的 cancelled outcome。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: message 或 hint 泄漏治理标识时抛出。
+    """
+
+    llm_facing_texts = (outcome.message, outcome.hint or "")
+    for text in llm_facing_texts:
+        for forbidden_term in _HOST_GOVERNANCE_FORBIDDEN_TERMS:
+            assert forbidden_term not in text
+
+
 def _module_imports(path: Path) -> set[str]:
     """解析 Python 文件里的 import 目标模块。
 
@@ -1329,20 +1554,50 @@ def _definitions_for_read_runtime(read_runtime: FinsReadRuntime) -> tuple[ToolDe
         工具定义元组。
 
     Raises:
-        Exception: 工具声明或 adapter 构造失败时透出。
+        Exception: 工具声明构造失败时透出。
     """
 
-    collector = LegacyToolDeclarationCollector()
-    register_fins_read_tools(collector, read_runtime=read_runtime)
-    declarations = collector.collected_tools()
-    return adapt_collected_tools(
-        declarations,
-        path_policy_by_tool={},
-        concurrency_policy_by_tool={
-            declaration.name: LegacyToolConcurrencyPolicy.SERIAL_PER_PROVIDER
-            for declaration in declarations
-        },
+    return build_fins_read_tool_definitions(
+        read_runtime=read_runtime,
+        limits=FinsToolLimits(),
     )
+
+
+async def _run_two_fins_read_tools_concurrently(
+    definitions: dict[str, ToolDefinition],
+    entered: Event,
+) -> None:
+    """并发执行两个同 provider Fins read tools。
+
+    Args:
+        definitions: 按工具名索引的工具定义。
+        entered: 第一个业务体进入信号。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一工具未成功完成时抛出。
+    """
+
+    first = asyncio.create_task(
+        definitions["list_documents"].callable(
+            _call("list_documents", {"ticker": "AAPL"}),
+            _context(),
+        )
+    )
+    await asyncio.to_thread(entered.wait, 1.0)
+    second = asyncio.create_task(
+        definitions["get_document_sections"].callable(
+            _call(
+                "get_document_sections",
+                {"ticker": "AAPL", "document_id": "aapl-2024-10k"},
+            ),
+            _context(),
+        )
+    )
+    outcomes = await asyncio.gather(first, second)
+    assert all(isinstance(outcome, ToolCompletedOutcome) for outcome in outcomes)
 
 
 def _install_processor(
@@ -1399,13 +1654,13 @@ def _install_processor(
     )
 
 
-def _raise_tool_cancelled_during_semantic_enrichment(
+def _raise_fins_cancelled_during_semantic_enrichment(
     *,
     sections: list[SectionSummary],
     form_type: str | None,
     cancellation_token: CancellationToken | None = None,
 ) -> list[dict[str, JsonValue]]:
-    """在 search_document 语义增强块内抛出取消错误。
+    """在 search_document 语义增强块内抛出 Fins 取消错误。
 
     Args:
         sections: 调用方传入的章节摘要列表。
@@ -1416,12 +1671,11 @@ def _raise_tool_cancelled_during_semantic_enrichment(
         不返回。
 
     Raises:
-        ToolBusinessError: 始终抛出 ``tool_cancelled``。
+        FinsReadCancelledError: 始终抛出。
     """
 
     del sections, form_type, cancellation_token
-    raise ToolBusinessError(
-        code="tool_cancelled",
+    raise FinsReadCancelledError(
         message="语义增强已取消。",
         hint="当前工具调用已停止；等待新的用户指令或后续调度。",
     )

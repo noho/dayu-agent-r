@@ -6,16 +6,15 @@
 
 from __future__ import annotations
 
-import os
 import logging
-from typing import Callable, NotRequired, Optional, Protocol, TypedDict
+import os
+from typing import Callable, Final, NotRequired, Optional, Protocol, TypedDict
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 from dayu.contracts.cancellation import CancellationToken
-from dayu.tools._legacy_adapter.tool_errors import ToolBusinessError
 
 MODULE = "ENGINE.WEB_SEARCH"
 _LOGGER = logging.getLogger(__name__)
@@ -25,6 +24,7 @@ TAVILY_API_KEY_ENV = "TAVILY_API_KEY"
 _SEARCH_WEB_SNIPPET_PREVIEW_CHARS = 240
 _SEARCH_WEB_NEXT_ACTION_FETCH_PAGE = "fetch_web_page"
 _SEARCH_WEB_NEXT_ACTION_REFINE_QUERY = "refine_query"
+_ALL_PROVIDERS_UNAVAILABLE_MESSAGE: Final[str] = "联网检索失败：所有 provider 均不可用"
 
 
 class Log:
@@ -79,6 +79,49 @@ class SearchWebOutput(TypedDict):
     next_action_args: dict[str, str]
     hint: str
     results: list[SearchResultRow]
+
+
+class WebSearchCancelledError(Exception):
+    """联网检索观察到 Host 取消时的模块内异常。
+
+    :param message: 面向 LLM 的取消说明。
+    :param hint: 恢复提示。
+    :returns: 无。
+    :raises Exception: 构造期不主动抛出异常。
+    """
+
+    def __init__(self, message: str, hint: str) -> None:
+        """初始化取消异常。
+
+        :param message: 取消说明。
+        :param hint: 恢复提示。
+        :returns: ``None``。
+        :raises Exception: 构造期不主动抛出异常。
+        """
+
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+
+
+class WebSearchProviderUnavailableError(RuntimeError):
+    """所有搜索 provider 均不可用时的稳定业务失败。
+
+    :param message: 面向 LLM 的失败说明。
+    :returns: 无。
+    :raises Exception: 构造期不主动抛出异常。
+    """
+
+    def __init__(self, message: str) -> None:
+        """初始化 provider 不可用异常。
+
+        :param message: 失败说明。
+        :returns: ``None``。
+        :raises Exception: 构造期不主动抛出异常。
+        """
+
+        super().__init__(message)
+        self.message = message
 
 
 class TavilyResultItem(TypedDict):
@@ -174,7 +217,7 @@ def search_public_web(
 
     Raises:
         ValueError: 当 query 或 domains 非法时抛出。
-        RuntimeError: 当所有 provider 都失败时抛出。
+        WebSearchProviderUnavailableError: 当所有 provider 都失败时抛出。
     """
 
     normalized_query = query.strip()
@@ -257,11 +300,11 @@ def search_public_web(
             "results": visible_results,
         }
 
-    raise RuntimeError("联网检索失败：所有 provider 均不可用")
+    raise WebSearchProviderUnavailableError(_ALL_PROVIDERS_UNAVAILABLE_MESSAGE)
 
 
 def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> None:
-    """检查联网检索取消令牌，并按 legacy Web 失败语义抛出取消错误。
+    """检查联网检索取消令牌，并抛出模块内取消信号。
 
     Args:
         cancellation_token: 当前工具调用取消令牌。
@@ -270,15 +313,17 @@ def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> 
         无。
 
     Raises:
-        ToolBusinessError: 当前调用已被 Host 请求取消时抛出。
+        WebSearchCancelledError: 当前调用已被 Host 请求取消时抛出。
     """
 
     if cancellation_token is None or not cancellation_token.is_cancelled():
         return
-    raise ToolBusinessError(
-        code="tool_cancelled",
+    raise WebSearchCancelledError(
         message=cancellation_token.cancel_reason() or "工具调用已取消",
-        hint="[continue_without_web] The host cancelled this web search; continue without this web search unless the user asks to retry.",
+        hint=(
+            "[continue_without_web] The host cancelled this web search; "
+            "continue without this web search unless the user asks to retry."
+        ),
     )
 
 
@@ -295,7 +340,7 @@ def _is_search_cancelled_error(error: Exception) -> bool:
         无。
     """
 
-    return isinstance(error, ToolBusinessError) and error.code == "tool_cancelled"
+    return isinstance(error, WebSearchCancelledError)
 
 
 def _filter_visible_results(

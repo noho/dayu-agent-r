@@ -14,7 +14,7 @@ from .processor_registry import ProcessorRegistry
 _GENERIC_PROCESSOR_PRIORITY = 10
 
 
-def build_engine_processor_registry() -> ProcessorRegistry:
+def build_documents_processor_registry() -> ProcessorRegistry:
     """构建 documents 默认处理器注册表。
 
     当前策略：

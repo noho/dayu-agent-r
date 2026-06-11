@@ -15,9 +15,10 @@ import json
 import re
 from collections.abc import Mapping
 from html import unescape
-from typing import Any, Optional, cast
+from typing import Any, NoReturn, Optional, cast
 
-from dayu.tools._legacy_adapter.exceptions import ToolArgumentError
+from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.json_value import JsonValue
 from dayu.fins._converters import normalize_optional_text
 from dayu.documents.processors.base import (
     SectionContent,
@@ -177,6 +178,164 @@ _MATERIAL_FORM_TYPE_ALIASES: dict[str, str] = {
     "EARNING_PRESENTATIONS": "EARNINGS_PRESENTATION",
     "EARNINGS_PRESENTATIONS": "EARNINGS_PRESENTATION",
 }
+
+
+class FinsReadArgumentError(Exception):
+    """Fins read 工具参数错误。
+
+    Args:
+        tool_name: 触发错误的工具名。
+        arg_name: 触发错误的参数名；非字段级错误可为 None。
+        arg_value: 原始参数值。
+        details: 面向 LLM 的错误说明。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    def __init__(
+        self,
+        tool_name: str,
+        arg_name: str | None = None,
+        arg_value: JsonValue | None = None,
+        details: str = "",
+    ) -> None:
+        """初始化 Fins 参数错误。
+
+        Args:
+            tool_name: 工具名。
+            arg_name: 参数名。
+            arg_value: 参数值。
+            details: 详细错误说明。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.tool_name = tool_name
+        self.arg_name = arg_name
+        self.arg_value = arg_value
+        self.details = details
+        message = f"Tool {tool_name!r} argument error"
+        if arg_name is not None:
+            message = f"{message}: {arg_name}"
+        if details:
+            message = f"{message}: {details}"
+        super().__init__(message)
+
+
+class FinsReadBusinessError(Exception):
+    """Fins read 工具业务失败。
+
+    Args:
+        code: 稳定业务错误码。
+        message: 面向 LLM 的错误说明。
+        hint: 可选恢复提示。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    def __init__(self, code: str, message: str, *, hint: str = "") -> None:
+        """初始化 Fins 业务失败。
+
+        Args:
+            code: 业务错误码。
+            message: 错误说明。
+            hint: 恢复提示。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.code = code
+        self.message = message
+        self.hint = hint
+        super().__init__(message)
+
+
+class FinsReadCancelledError(Exception):
+    """Fins read 深层 helper 观察到 Host 取消时的本地信号。
+
+    Args:
+        message: 取消说明。
+        hint: 恢复提示。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    def __init__(self, message: str, hint: str) -> None:
+        """初始化取消信号。
+
+        Args:
+            message: 取消说明。
+            hint: 恢复提示。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.message = message
+        self.hint = hint
+        super().__init__(message)
+
+
+def raise_if_fins_cancelled(cancellation_token: CancellationToken | None, *, message: str) -> None:
+    """在 Fins read 慢边界执行协作式取消检查。
+
+    Args:
+        cancellation_token: Host 注入的取消观察令牌；未注入时为 None。
+        message: 面向 LLM 的业务可读取消说明。
+
+    Returns:
+        无。
+
+    Raises:
+        FinsReadCancelledError: 当前工具调用已被 Host 取消时抛出。
+    """
+
+    if cancellation_token is not None and cancellation_token.is_cancelled():
+        raise_fins_cancelled(cancellation_token, message=message)
+
+
+def raise_fins_cancelled(cancellation_token: CancellationToken, *, message: str) -> NoReturn:
+    """抛出 Fins read 本地取消信号。
+
+    Args:
+        cancellation_token: 已处于取消状态的 Host 取消观察令牌。
+        message: 面向 LLM 的业务可读取消说明。
+
+    Returns:
+        不返回。
+
+    Raises:
+        FinsReadCancelledError: 始终抛出。
+    """
+
+    del cancellation_token
+    raise FinsReadCancelledError(
+        message=message,
+        hint="当前工具调用已停止；等待新的用户指令或后续调度。",
+    )
 
 
 def _resolve_document_type(form_type: Optional[str], source_kind: str) -> str:
@@ -371,13 +530,13 @@ def _normalize_document_types(document_types: Optional[list[str]]) -> Optional[l
         去重去空后的合法列表；输入为空时返回 `None`。
 
     Raises:
-        ToolArgumentError: 入参类型非法时抛出。
+        FinsReadArgumentError: 入参类型非法时抛出。
     """
 
     if document_types is None:
         return None
     if not isinstance(document_types, list):
-        raise ToolArgumentError("list_documents", "document_types", document_types, "Must be a string array")
+        raise FinsReadArgumentError("list_documents", "document_types", document_types, "Must be a string array")
     result: list[str] = []
     seen: set[str] = set()
     for dt in document_types:
@@ -679,13 +838,13 @@ def _normalize_periods(periods: Optional[list[str]]) -> Optional[list[str]]:
         规范化财期数组；输入为空时返回 `None`。
 
     Raises:
-        ToolArgumentError: 入参类型非法时抛出。
+        FinsReadArgumentError: 入参类型非法时抛出。
     """
 
     if periods is None:
         return None
     if not isinstance(periods, list):
-        raise ToolArgumentError("list_documents", "fiscal_periods", periods, "Must be a string array")
+        raise FinsReadArgumentError("list_documents", "fiscal_periods", periods, "Must be a string array")
     result: list[str] = []
     for period in periods:
         normalized = normalize_optional_text(period)

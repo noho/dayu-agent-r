@@ -164,7 +164,7 @@ dayu.fins.tools.provider.discover_tools(spec)
   -> parse_fins_workspace_root_config(spec.config)
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> runtime.get_read_runtime(...)
-  -> register_fins_read_tools(..., read_runtime=read_runtime)
+  -> build_fins_read_tool_definitions(read_runtime=...)
 ```
 
 其它直接调用 read runtime 的入口也应走同一装配根：
@@ -379,7 +379,7 @@ Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 - Fins Docling / Markdown / BS 处理器对表格补充金融语义标注。
 - `SecProcessor` 基于 edgartools 读取 SEC 文档章节、表格、XBRL 与 financial statement。
 - SEC 表单专项处理器通过虚拟章节 mixin 处理 `10-K`、`10-Q`、`20-F`、`8-K`、`DEF 14A`、`SC 13D/G`、`6-K` 等表单的章节切分、搜索和财务表回退。
-- `build_fins_processor_registry()` 在 engine 文档处理器注册表基础上覆盖注册 Fins 增强处理器，并按优先级注册 SEC 表单专项主路径、回退路径和通用 SEC 兜底。
+- `build_fins_processor_registry()` 在 documents 默认处理器注册表基础上覆盖注册 Fins 增强处理器，并按优先级注册 SEC 表单专项主路径、回退路径和通用 SEC 兜底。
 
 ### FinsReadRuntime
 
@@ -426,7 +426,7 @@ ToolsDiscovery
   -> parse explicit absolute workspace_root
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> get_read_runtime(...)
-  -> register_fins_read_tools(...)
+  -> build_fins_read_tool_definitions(...)
   -> current ToolDefinition bundle
   -> Host ToolRuntime
   -> FinsReadRuntime method
@@ -593,7 +593,7 @@ SecProcessor
 
 ### Processor registry 与 processor cache
 
-`build_fins_processor_registry()` 在通用文档处理器基础上注册 Fins 业务增强处理器。`FinsReadRuntime` 按 ticker / document_id / source kind 路由到 source repository 和 processor registry，并缓存 processor 实例；缓存只保存 processor，不把 Host tool result、EventLog fact 或 LLM-facing material 缓存在 Fins 内部。
+`build_fins_processor_registry()` 在 documents 默认处理器注册表基础上注册 Fins 业务增强处理器。`FinsReadRuntime` 按 ticker / document_id / source kind 路由到 source repository 和 processor registry，并缓存 processor 实例；缓存只保存 processor，不把 Host tool result、EventLog fact 或 LLM-facing material 缓存在 Fins 内部。
 
 ### Read tool 结果与截断
 
@@ -621,7 +621,7 @@ Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` �
 
 ## 扩展点
 
-扩展 read tool 时，先在 storage protocol、processor 或 `FinsReadRuntime` 中建立稳定业务语义，再通过 `register_fins_read_tools(...)` 暴露工具 schema。不要把仓储装配、Host 状态或 ToolRuntime 治理写进工具函数。
+扩展 read tool 时，先在 storage protocol、processor 或 `FinsReadRuntime` 中建立稳定业务语义，再通过 `build_fins_read_tool_definitions(...)` 暴露工具 schema。不要把仓储装配、Host 状态或 ToolRuntime 治理写进工具函数。
 
 扩展财报存储后端时，实现 `dayu.fins.storage` 的窄仓储协议，并保持 source / processed / blob / filing maintenance / batching 职责分离。调用方仍通过 `DefaultFinsRuntime` 或等价 assembly root 注入仓储实现。
 

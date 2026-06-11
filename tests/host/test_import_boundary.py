@@ -41,13 +41,6 @@ HOST_BUSINESS_TOOL_SCAN_FORBIDDEN_PREFIXES: tuple[str, ...] = (
 FETCH_MORE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
     {"host/tool_runtime.py", "host/tooling.py", "runtime/tools_discovery.py"}
 )
-FETCH_MORE_DEFENSIVE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
-    {
-        "tools/_legacy_adapter/__init__.py",
-        "tools/_legacy_adapter/definition_adapter.py",
-        "tools/_legacy_adapter/registry_collector.py",
-    }
-)
 FETCH_MORE_OWNERSHIP_TOKEN: str = "fetch_more"
 OLD_FETCH_MORE_PROJECTION_TOKENS: tuple[str, ...] = (
     "fetch_more_args",
@@ -234,7 +227,7 @@ def test_host_does_not_import_business_tool_scanners() -> None:
 
 
 def test_fetch_more_token_stays_inside_toolruntime_owner_modules() -> None:
-    """``fetch_more`` 只能出现在 owner 或 legacy adapter 防御性引用中。
+    """``fetch_more`` 只能出现在 ToolRuntime owner 模块中。
 
     :returns: ``None``。
     :raises AssertionError: Host 其它模块或 Engine / contracts / runtime 引用
@@ -251,8 +244,6 @@ def test_fetch_more_token_stays_inside_toolruntime_owner_modules() -> None:
             if token in source:
                 old_projection_violations.append(f"{relative_path}:{token}")
         if relative_path in FETCH_MORE_ALLOWED_RELATIVE_FILES:
-            continue
-        if relative_path in FETCH_MORE_DEFENSIVE_ALLOWED_RELATIVE_FILES:
             continue
         if FETCH_MORE_OWNERSHIP_TOKEN in source:
             violations.append(str(file_path))
