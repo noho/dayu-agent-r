@@ -19,7 +19,7 @@ WU-PROJ-01 residual follow-up 已进入 draft-PR-pass。等待用户 merge decis
 - Aggregate fix: `bd6488df` — removed unused required/rebuild memory repair purpose enum values.
 - PR review fix: `f0aa34c3` — corrected `budget=None` docstrings and recorded PR review closure.
 - Final closeout bookkeeping: `9e6a9704` — recorded draft-PR-pass status and Issue 86 update.
-- Final head bookkeeping: `ceafa9dd` — recorded final head alignment for PR #136 control artifacts.
+- Control artifact alignment: later doc-only commits may update this record; the PR branch is the source of truth for the latest head.
 
 流程备注：AgentMiMo 在 aggregate deepreview re-review gate 误创建 artifact-only commit `c0a34ef1`。该 commit 只包含 review artifact，不修改 production code、tests 或 control doc，已保留在分支历史中。
 
