@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | User decision after final closeout: WU-PROJ-01-S3-R1, WU-PROJ-01-S4-R1, and cap/limit overdesign must be implemented in PR #136 |
+| gate | accepted-PR-review-commit |
+| implementation status | WU-PROJ-01 PR review fix re-review passed; accepted PR review commit pending push |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 residual risk implementation gate via AgentCodex |
+| next entry point | Push WU-PROJ-01 accepted PR review fix commit to PR #136 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 draft PR #136 https://github.com/noho/dayu-agent-r/pull/136 |
 | blocking open questions | none |
@@ -224,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | accepted-deepreview-commit | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | Residual implementation accepted commits: CAP-R1 `448b70ba`, S3/S4 `3baeef53`. Aggregate deepreview and fix/re-review passed; artifacts: `docs/reviews/wu-proj-01-residual-aggregate-deepreview-controller-adjudication.md`, `docs/reviews/wu-proj-01-residual-aggregate-deepreview-fix-codex.md`, `docs/reviews/wu-proj-01-residual-aggregate-deepreview-rereview-controller-adjudication.md`. Controller复验：`python -m pytest tests/host/test_memory_repair.py tests/host/test_dispatch_scheduler.py tests/host/test_open_host_runtime.py` -> 91 passed; `pyright` -> 0 errors; `git diff --check` passed. Next gate: PR update push. |
+| WU-PROJ-01 | accepted-PR-review-commit | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | PR review fix re-review passed; artifacts: `docs/reviews/wu-proj-01-pr-review-residual-fix-codex.md`, `docs/reviews/wu-proj-01-pr-review-residual-rereview-mimo.md`, `docs/reviews/wu-proj-01-pr-review-residual-rereview-ds.md`, `docs/reviews/wu-proj-01-pr-review-residual-rereview-controller-adjudication.md`. Controller复验：`python -m pytest tests/host/test_memory_repair.py tests/host/test_dispatch_scheduler.py tests/host/test_open_host_runtime.py` -> 91 passed; `pyright` -> 0 errors; `git diff --check` passed. Next gate: push PR review fix commit. |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
@@ -1480,6 +1480,52 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
   - Required-before-dispatch and rebuild projection catch-up should run until required cursor is reached, idle, or failure; fixed max batch / max scanned event limits must not be production correctness semantics.
   - After-commit best-effort may remain bounded only as a non-correctness optimization; it must not be confused with required dispatch catch-up.
 - next gate: WU-PROJ-01 residual risk implementation gate via AgentCodex.
+
+### Residual risk implementation gate
+
+- status: completed
+- owner: AgentCodex
+- implementation commits: CAP-R1 `448b70ba`, S3/S4 `3baeef53`, aggregate fix `bd6488df`
+- aggregate deepreview artifacts:
+  - `docs/reviews/wu-proj-01-residual-aggregate-deepreview-controller-adjudication.md`
+  - `docs/reviews/wu-proj-01-residual-aggregate-deepreview-fix-codex.md`
+  - `docs/reviews/wu-proj-01-residual-aggregate-deepreview-rereview-controller-adjudication.md`
+- controller verification:
+  - `python -m pytest tests/host/test_memory_repair.py tests/host/test_dispatch_scheduler.py tests/host/test_open_host_runtime.py` -> 91 passed
+  - `pyright` -> 0 errors
+  - `git diff --check` -> passed
+- residual risk closures:
+  - `WU-PROJ-01-CAP-R1`: fixed caps removed from compact material source; `_bounded_query_text()` replaced by `_normalized_query_text()`; dispatch required catch-up uses `budget=None` (no fixed upper bound)
+  - `WU-PROJ-01-S3-R1`: dispatch before-worker catch-up happy-path coverage added; required cursor already covered -> ordinary RunInput continues without repeated catch-up
+  - `WU-PROJ-01-S4-R1`: lane-timeout flaky dispatch scheduler test stabilized via timing fixture adjustment
+- next gate: PR review gate via AgentMiMo / AgentDS
+
+### Residual risk PR review gate
+
+- status: re-review passed; awaiting push
+- owner: AgentMiMo / AgentDS review; AgentCodex fix
+- review artifacts:
+  - `docs/reviews/wu-proj-01-pr-review-residual-mimo.md`
+  - `docs/reviews/wu-proj-01-pr-review-residual-ds.md`
+- controller adjudication: `docs/reviews/wu-proj-01-pr-review-residual-controller-adjudication.md`
+- fix artifact: `docs/reviews/wu-proj-01-pr-review-residual-fix-codex.md`
+- re-review artifacts:
+  - `docs/reviews/wu-proj-01-pr-review-residual-rereview-mimo.md`
+  - `docs/reviews/wu-proj-01-pr-review-residual-rereview-ds.md`
+  - `docs/reviews/wu-proj-01-pr-review-residual-rereview-controller-adjudication.md`
+- verdict before fix: `PASS` with accepted docstring fix
+- blocking findings: 0
+- findings:
+  - NF1: `budget=None` parameter docstring says "close-only or test-only" but production dispatch paths use it for required-catch-up; wording should clarify "no fixed upper bound for correctness-required paths"
+  - NF2: reactive compact path uses broad `except Exception` for `build_pre_dispatch_compact_material_view()`; consistent with proactive path but could be narrowed later
+- fix status:
+  - NF1 fixed in `dayu/host/memory_repair.py`
+  - NF2 deferred-with-owner to future reactive recovery hardening
+- residual risk status:
+  - `WU-PROJ-01-CAP-R1`: closed
+  - `WU-PROJ-01-S3-R1`: closed
+  - `WU-PROJ-01-S4-R1`: closed
+- next gate: push PR review fix commit to PR #136
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 

@@ -122,8 +122,11 @@ class ConversationMemoryProjectionCatchupPort:
     :param policy: 固定 memory projection policy。
     :param batch_size: 单次 catch-up 最多扫描的 EventLog row 数。
     :param consumer_id: memory projection consumer id。
-    :param budget: Host 内部单次总预算；``None`` 仅供显式审阅的 close-only
-        或 test-only 调用。
+    :param budget: Host 内部单次总预算；传入预算对象时表示 bounded
+        opportunistic / diagnostic catch-up，``None`` 表示不设置固定批次数或
+        扫描事件总预算，由 runner 追到 idle 或 failure。dispatch required
+        cursor correctness path 通过模块级 catch-up / rebuild 传入
+        ``budget=None`` 与目标 cursor 表达。
     """
 
     def __init__(
@@ -141,7 +144,8 @@ class ConversationMemoryProjectionCatchupPort:
         :param policy: 固定 memory projection policy。
         :param batch_size: 单次 catch-up 最多扫描的 EventLog row 数。
         :param consumer_id: memory projection consumer id。
-        :param budget: Host 内部单次总预算。
+        :param budget: Host 内部单次总预算；``None`` 表示不设置固定批次数或
+            扫描事件总预算。
         :returns: ``None``。
         :raises HostDurableError: batch size 或 consumer id 非法时抛出。
         """
@@ -189,7 +193,9 @@ def rebuild_conversation_memory_projection(
     :param policy: 固定 memory projection policy。
     :param batch_size: 每批最多扫描的 EventLog row 数，必须为正数。
     :param max_event_sequence: 必须覆盖的最大 EventLog sequence。
-    :param budget: Host 内部单次总预算。
+    :param budget: Host 内部单次总预算；传入预算对象时表示 bounded
+        opportunistic / diagnostic rebuild，``None`` 表示不设置固定批次数或
+        扫描事件总预算，追到目标 cursor、idle 或 failure。
     :param consumer_id: memory projection consumer id。
     :returns: rebuild 汇总结果。
     :raises HostDurableError: batch size 非法、reset 或 projection runner 失败时抛出。
@@ -249,8 +255,9 @@ def catch_up_conversation_memory_projection(
     :param consumer_id: memory projection consumer id。
     :param max_event_sequence: 可选最大 EventLog sequence；下一条事件超过
         该值时停止，不推进 projection checkpoint。
-    :param budget: Host 内部单次总预算；``None`` 仅供显式审阅的 close-only
-        或 test-only 调用。
+    :param budget: Host 内部单次总预算；传入预算对象时表示 bounded
+        opportunistic / diagnostic catch-up，``None`` 表示不设置固定批次数或
+        扫描事件总预算，追到目标 cursor、idle 或 failure。
     :returns: catch-up 汇总结果。
     :raises HostDurableError: batch size 非法或 projection runner 初始化失败时抛出。
     """
@@ -302,7 +309,8 @@ def _run_memory_projection_bounded(
     :param consumer_id: memory projection consumer id。
     :param reset_checkpoint: 本次是否为 reset 后 rebuild。
     :param max_event_sequence: 可选最大 EventLog sequence。
-    :param budget: Host 内部单次总预算。
+    :param budget: Host 内部单次总预算；``None`` 表示不设置固定批次数或
+        扫描事件总预算。
     :returns: repair 汇总结果。
     """
 
