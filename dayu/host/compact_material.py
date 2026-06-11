@@ -7,10 +7,12 @@ provenance。
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import NoReturn
 
+from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
     AnswerReadableItemVNext,
     CompactInstructionVNext,
@@ -41,8 +43,16 @@ from dayu.host.compaction import (
     TraceReadableItemVNext,
     TraceReadableKindVNext,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.context_budget import BudgetTextFragment
+from dayu.host.context_events import CONTEXT_COMPACTED, validate_context_compacted_payload
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
+from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.state import RunRow
+from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.evidence import OpaqueEvidenceRef
+from dayu.host.evidence import accepted_evidence_envelope_from_json_value
 from dayu.host.memory import (
     ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
@@ -52,6 +62,13 @@ from dayu.host.memory import (
     MemorySnapshotCursor,
     digest_memory_projection_policy,
 )
+from dayu.host.payload_resolution import (
+    event_payload_object,
+    event_payload_object_for_result_ref,
+    tool_call_request_atoms,
+)
+from dayu.host.terminal_summary_payload import PayloadTextReadPolicy
+from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 
 _CURRENT_INPUT_PREFIX = "C"
 _TRACE_PREFIX = "T"
@@ -92,6 +109,52 @@ _PREVIOUS_FORWARD_STATUS_PREFIX = "status="
 _PREVIOUS_FORWARD_TEXT_PREFIX = "text="
 _PREVIOUS_REFERENCE_PREFIX = "reference_continuity="
 _PREVIOUS_REFERENCE_TEXT_PREFIX = "text="
+_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
+_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
+_PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
+_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_PAYLOAD_FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
+_PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
+_PAYLOAD_FIELD_RESULT_PREVIEW = "result_preview"
+_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
+_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
+_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
+_PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
+_PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
+_PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
+_PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
+_PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
+_PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
+_PAYLOAD_FIELD_DISPLAY_TEXT_CANDIDATE = "display_text"
+_PAYLOAD_FIELD_ORDINAL = "ordinal"
+_PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
+_PAYLOAD_FIELD_INTENT_TYPE = "intent_type"
+_PAYLOAD_FIELD_TEXT = "text"
+_PAYLOAD_FIELD_STATUS = "status"
+_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
+_PAYLOAD_FIELD_REASON = "reason"
+_PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
+_PAYLOAD_REF_PREFIX = "payload"
+_READABLE_SOURCE_EMPTY = "accepted tool evidence"
+_READABLE_SOURCE_SEPARATOR = ", "
+_LIMITED_SIGNAL_STATUS = "limited_signal"
+_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS = "已验收工具请求参数材料缺失"
+_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS = "已验收工具请求参数材料不可验证"
+_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH = "工具请求与当前证据来源不一致"
+_LIMITED_SIGNAL_DETAIL_UNAVAILABLE = "无法从已验收工具请求恢复查询参数"
+_LIMITED_SIGNAL_DETAIL_UNSAFE = "无法安全展示查询参数"
+_READABLE_ARGUMENTS_PREFIX = "工具参数: "
+_READABLE_QUERY_TEXT_MAX_CHARS = 1200
+_READABLE_QUERY_TRUNCATED_MARKER = "\n[truncated_query_text]"
+_DEFAULT_PRE_DISPATCH_MAX_DELTA_EVENTS = 256
+_DEFAULT_PRE_DISPATCH_MAX_EVIDENCE_BLOCKS = 8
+_PRE_DISPATCH_BUDGET_FRAGMENT_CURRENT_REF = "current_input_anchor"
+_PRE_DISPATCH_BUDGET_FRAGMENT_PREVIOUS_PREFIX = "previous:"
 
 _SECTION_PREFIXES = {
     CompactMaterialSection.CURRENT_INPUT_ANCHOR: _CURRENT_INPUT_PREFIX,
@@ -278,6 +341,224 @@ class RunInputMaterialBlock:
                 self.readable_source_text,
                 "RunInputMaterialBlock.readable_source_text",
             )
+
+
+@dataclass(frozen=True, slots=True)
+class CompactMaterialSourceBoundary:
+    """Pre-dispatch compact material 的 EventLog 来源边界诊断。
+
+    :param latest_compacted_event_id: 当前输入前最新 accepted compact event id。
+    :param latest_compacted_event_sequence: 当前输入前最新 accepted compact sequence。
+    :param post_compact_delta_start_sequence: delta material 的包含式起点。
+    :param post_compact_delta_end_sequence: delta material 的排他式终点。
+    :param current_input_event_sequence: 当前输入 EventLog sequence 的诊断副本。
+    """
+
+    latest_compacted_event_id: str | None
+    latest_compacted_event_sequence: int | None
+    post_compact_delta_start_sequence: int
+    post_compact_delta_end_sequence: int
+    current_input_event_sequence: int
+
+    def __post_init__(self) -> None:
+        """校验 EventLog compact material source boundary。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_optional_text(
+            self.latest_compacted_event_id,
+            "CompactMaterialSourceBoundary.latest_compacted_event_id",
+        )
+        if self.latest_compacted_event_sequence is not None:
+            if self.latest_compacted_event_sequence <= 0:
+                raise ValueError("latest_compacted_event_sequence must be positive")
+            if self.latest_compacted_event_id is None:
+                raise ValueError("latest compacted id is required with sequence")
+        if self.post_compact_delta_start_sequence <= 0:
+            raise ValueError("post_compact_delta_start_sequence must be positive")
+        if self.post_compact_delta_end_sequence <= 0:
+            raise ValueError("post_compact_delta_end_sequence must be positive")
+        if self.current_input_event_sequence <= 0:
+            raise ValueError("current_input_event_sequence must be positive")
+        if self.post_compact_delta_start_sequence > self.post_compact_delta_end_sequence:
+            raise ValueError("post compact delta boundary is inverted")
+        if self.post_compact_delta_end_sequence != self.current_input_event_sequence:
+            raise ValueError("delta end sequence must equal current input sequence")
+
+
+@dataclass(frozen=True, slots=True)
+class PreDispatchCompactMaterialView:
+    """EventLog-backed pre-dispatch compact material view。
+
+    :param material_blocks: latest compact 后、当前输入前的 delta material blocks。
+    :param previous_compacted_view: latest accepted compact candidate 映射出的 previous view。
+    :param current_input_text: 当前 USER_INPUT_ACCEPTED display text。
+    :param source_boundary: EventLog 来源边界诊断。
+    :param latest_compacted_event_id: latest accepted compact event id 便捷诊断字段。
+    :param latest_compacted_event_sequence: latest accepted compact sequence 便捷诊断字段。
+    :param post_compact_delta_start_sequence: delta 起点便捷诊断字段。
+    :param post_compact_delta_end_sequence: delta 终点便捷诊断字段。
+    :param represented_evidence_refs: latest compact accepted mapping 覆盖的 evidence refs。
+    :param budget_fragments: 与 material view 同源的预算文本片段。
+    """
+
+    material_blocks: tuple[RunInputMaterialBlock, ...]
+    previous_compacted_view: tuple[CompactMaterialBlock, ...]
+    current_input_text: str
+    source_boundary: CompactMaterialSourceBoundary
+    latest_compacted_event_id: str | None
+    latest_compacted_event_sequence: int | None
+    post_compact_delta_start_sequence: int
+    post_compact_delta_end_sequence: int
+    represented_evidence_refs: tuple[str, ...]
+    budget_fragments: tuple[BudgetTextFragment, ...]
+
+    def __post_init__(self) -> None:
+        """校验 pre-dispatch compact material view。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_material_block_tuple(self.material_blocks, "material_blocks")
+        _require_compact_material_block_tuple(
+            self.previous_compacted_view,
+            "previous_compacted_view",
+        )
+        _require_non_empty_text(self.current_input_text, "current_input_text")
+        if not isinstance(self.source_boundary, CompactMaterialSourceBoundary):
+            raise TypeError("source_boundary must be CompactMaterialSourceBoundary")
+        if self.latest_compacted_event_id != self.source_boundary.latest_compacted_event_id:
+            raise ValueError("latest compacted event id boundary mismatch")
+        if (
+            self.latest_compacted_event_sequence
+            != self.source_boundary.latest_compacted_event_sequence
+        ):
+            raise ValueError("latest compacted event sequence boundary mismatch")
+        if (
+            self.post_compact_delta_start_sequence
+            != self.source_boundary.post_compact_delta_start_sequence
+        ):
+            raise ValueError("post compact delta start boundary mismatch")
+        if (
+            self.post_compact_delta_end_sequence
+            != self.source_boundary.post_compact_delta_end_sequence
+        ):
+            raise ValueError("post compact delta end boundary mismatch")
+        _require_string_tuple(self.represented_evidence_refs, "represented_evidence_refs")
+        _require_budget_fragment_tuple(self.budget_fragments, "budget_fragments")
+
+
+def build_pre_dispatch_compact_material_view(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run: RunRow,
+    current_display_text: str,
+    max_delta_events: int = _DEFAULT_PRE_DISPATCH_MAX_DELTA_EVENTS,
+    max_evidence_blocks: int = _DEFAULT_PRE_DISPATCH_MAX_EVIDENCE_BLOCKS,
+) -> PreDispatchCompactMaterialView:
+    """从 EventLog durable truth 构造 pre-dispatch compact material view。
+
+    本 builder 只读取 EventLog、payload descriptor 与 artifact-backed payload
+    truth，不读取 Conversation Memory snapshot，也不伪造 snapshot。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param run: 当前 Run durable row。
+    :param current_display_text: 当前 ``USER_INPUT_ACCEPTED`` display text。
+    :param max_delta_events: 单次最多读取的 post-compact delta 事件数。
+    :param max_evidence_blocks: 单次最多纳入的 accepted evidence block 数。
+    :returns: EventLog-backed pre-dispatch compact material view。
+    :raises HostDurableError: EventLog 边界、payload 或 artifact truth 损坏时抛出。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: 参数值非法时抛出。
+    """
+
+    if not isinstance(run, RunRow):
+        raise TypeError("run must be RunRow")
+    _require_non_empty_text(current_display_text, "current_display_text")
+    if max_delta_events <= 0:
+        raise ValueError("max_delta_events must be positive")
+    if max_evidence_blocks <= 0:
+        raise ValueError("max_evidence_blocks must be positive")
+    current_event = _validated_current_input_event(
+        transaction,
+        event_log_store,
+        run=run,
+        current_display_text=current_display_text,
+    )
+    latest_compact = _latest_compacted_event_before_current_input(
+        transaction,
+        event_log_store,
+        session_id=run.session_id,
+        before_event_sequence=run.input_event_sequence,
+    )
+    represented_refs = (
+        ()
+        if latest_compact is None
+        else _accepted_evidence_mapping_refs_from_compacted_event(
+            transaction,
+            latest_compact,
+        )
+    )
+    previous_view = (
+        ()
+        if latest_compact is None
+        else _previous_compacted_view_from_compacted_event(
+            transaction,
+            latest_compact,
+        )
+    )
+    delta_start = _post_compact_delta_start_sequence(
+        transaction,
+        session_id=run.session_id,
+        current_input_sequence=current_event.event_sequence,
+        latest_compacted_event=latest_compact,
+    )
+    delta_rows = _post_compact_delta_rows(
+        transaction,
+        session_id=run.session_id,
+        start_sequence=delta_start,
+        end_sequence=current_event.event_sequence,
+        limit=max_delta_events,
+    )
+    material_blocks = _pre_dispatch_delta_material_blocks(
+        transaction,
+        event_log_store,
+        rows=delta_rows,
+        represented_evidence_refs=represented_refs,
+        max_evidence_blocks=max_evidence_blocks,
+    )
+    boundary = CompactMaterialSourceBoundary(
+        latest_compacted_event_id=None if latest_compact is None else latest_compact.event_id,
+        latest_compacted_event_sequence=(
+            None if latest_compact is None else latest_compact.event_sequence
+        ),
+        post_compact_delta_start_sequence=delta_start,
+        post_compact_delta_end_sequence=current_event.event_sequence,
+        current_input_event_sequence=current_event.event_sequence,
+    )
+    return PreDispatchCompactMaterialView(
+        material_blocks=material_blocks,
+        previous_compacted_view=previous_view,
+        current_input_text=current_display_text,
+        source_boundary=boundary,
+        latest_compacted_event_id=boundary.latest_compacted_event_id,
+        latest_compacted_event_sequence=boundary.latest_compacted_event_sequence,
+        post_compact_delta_start_sequence=boundary.post_compact_delta_start_sequence,
+        post_compact_delta_end_sequence=boundary.post_compact_delta_end_sequence,
+        represented_evidence_refs=represented_refs,
+        budget_fragments=_pre_dispatch_budget_fragments(
+            previous_view=previous_view,
+            material_blocks=material_blocks,
+            current_input_text=current_display_text,
+        ),
+    )
 
 
 def selected_material_source_refs(
@@ -678,6 +959,7 @@ def build_compact_material_pack(
     inline_delta_repair_view: InlineDeltaRepairMaterialView | None,
     current_input_ref: str,
     current_input_text: str,
+    previous_compacted_view: tuple[CompactMaterialBlock, ...] | None = None,
 ) -> CompactMaterialPack:
     """从 selected segment 和 memory view 构造 compact material pack。
 
@@ -687,6 +969,7 @@ def build_compact_material_pack(
     :param inline_delta_repair_view: inline delta repair view；无 repair 时为 ``None``。
     :param current_input_ref: 当前 USER_INPUT_ACCEPTED canonical ref。
     :param current_input_text: 当前用户输入 display text。
+    :param previous_compacted_view: 显式 previous view；``None`` 时走既有 snapshot path。
     :returns: CompactMaterialPack。
     :raises DuplicateMaterialSectionOwnerError: 同一 canonical content 跨 section 重复时抛出。
     :raises TypeError: 参数类型非法时抛出。
@@ -704,7 +987,14 @@ def build_compact_material_pack(
         material_blocks,
         current_anchor=current_anchor,
     )
-    previous_blocks = _previous_blocks_from_snapshot(snapshot)
+    if previous_compacted_view is None:
+        previous_blocks = _previous_blocks_from_snapshot(snapshot)
+    else:
+        _require_compact_material_block_tuple(
+            previous_compacted_view,
+            "previous_compacted_view",
+        )
+        previous_blocks = previous_compacted_view
     trace_blocks = _pack_section_blocks(selected_blocks, CompactMaterialSection.TRACE_MATERIAL)
     evidence_blocks = _pack_evidence_blocks(selected_blocks)
     answer_blocks = _pack_section_blocks(selected_blocks, CompactMaterialSection.ANSWER_MATERIAL)
@@ -1338,6 +1628,756 @@ def _effective_snapshot(
     return memory_snapshot
 
 
+def _validated_current_input_event(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run: RunRow,
+    current_display_text: str,
+) -> EventLogRow:
+    """读取并校验当前 Run input 对应的 ``USER_INPUT_ACCEPTED`` row。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param run: 当前 Run durable row。
+    :param current_display_text: 调用方持有的当前 display text。
+    :returns: 已校验的 current input EventLog row。
+    :raises HostDurableError: EventLog row 缺失、类型错误或 display text 不一致时抛出。
+    """
+
+    row = event_log_store.read_event_by_id(transaction, run.input_event_id)
+    if row is None:
+        raise HostDurableError("current input event is missing")
+    _require_canonical_session_event(
+        row,
+        session_id=run.session_id,
+        expected_event_type=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    if row.event_sequence != run.input_event_sequence:
+        raise HostDurableError("current input event sequence mismatch")
+    payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    display_text = _required_json_text(payload, _PAYLOAD_FIELD_DISPLAY_TEXT)
+    if display_text != current_display_text:
+        raise HostDurableError("current input display text mismatch")
+    return row
+
+
+def _latest_compacted_event_before_current_input(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    session_id: str,
+    before_event_sequence: int,
+) -> EventLogRow | None:
+    """读取当前 input 前最新 accepted compact canonical fact。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param session_id: 当前 Session id。
+    :param before_event_sequence: 当前 input EventLog sequence 排他上界。
+    :returns: 最新 ``CONTEXT_COMPACTED`` row；不存在时返回 ``None``。
+    :raises HostDurableError: 查询到的 row 消失或类型不匹配时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+          AND event_type = ?
+          AND event_class = ?
+          AND event_sequence < ?
+        ORDER BY event_sequence DESC
+        LIMIT 1
+        """,
+        (
+            session_id,
+            CONTEXT_COMPACTED,
+            EventClass.CANONICAL_FACT.value,
+            before_event_sequence,
+        ),
+    )
+    if row is None:
+        return None
+    event_id = _required_host_row_text(row, field_name="event_id")
+    event = event_log_store.read_event_by_id(transaction, event_id)
+    if event is None:
+        raise HostDurableError("latest compacted event disappeared during read")
+    _require_canonical_session_event(
+        event,
+        session_id=session_id,
+        expected_event_type=CONTEXT_COMPACTED,
+    )
+    return event
+
+
+def _accepted_evidence_mapping_refs_from_compacted_event(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> tuple[str, ...]:
+    """从 accepted compact EventLog payload 读取已覆盖的 evidence refs。
+
+    :param transaction: 当前 Host transaction。
+    :param row: ``CONTEXT_COMPACTED`` EventLog row。
+    :returns: 去重后的 accepted evidence mapping refs。
+    :raises HostDurableError: compact payload 损坏时抛出。
+    """
+
+    payload = _validated_compacted_payload(transaction, row)
+    return _required_json_text_tuple(payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
+
+
+def _previous_compacted_view_from_compacted_event(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> tuple[CompactMaterialBlock, ...]:
+    """把 latest accepted compact candidate 映射为 previous compacted view。
+
+    :param transaction: 当前 Host transaction。
+    :param row: ``CONTEXT_COMPACTED`` EventLog row。
+    :returns: prompt-local previous compacted view blocks。
+    :raises HostDurableError: accepted candidate JSON 损坏或 digest 不匹配时抛出。
+    """
+
+    payload = _validated_compacted_payload(transaction, row)
+    candidate = _required_json_mapping(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
+    expected_digest = _required_json_text(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE_DIGEST)
+    if sha256_digest_json(candidate) != expected_digest:
+        raise HostDurableError("accepted candidate digest mismatch")
+    blocks: list[RunInputMaterialBlock] = []
+    summary_text = _candidate_session_summary_text(candidate)
+    if summary_text is not None:
+        blocks.append(
+            run_input_material_block(
+                block_id=f"previous:{row.event_id}:session_summary",
+                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+                text=summary_text,
+                canonical_source_refs=(row.event_id,),
+                event_sequence=row.event_sequence,
+                event_sub_index=0,
+            )
+        )
+    facts_text = _candidate_facts_text(candidate)
+    if facts_text is not None:
+        blocks.append(
+            run_input_material_block(
+                block_id=f"previous:{row.event_id}:evidence_backed_facts",
+                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+                text=facts_text,
+                canonical_source_refs=(row.event_id,),
+                event_sequence=row.event_sequence,
+                event_sub_index=1,
+            )
+        )
+    anchors_text = _candidate_answer_anchors_text(candidate)
+    if anchors_text is not None:
+        blocks.append(
+            run_input_material_block(
+                block_id=f"previous:{row.event_id}:answer_anchors",
+                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
+                text=anchors_text,
+                canonical_source_refs=(row.event_id,),
+                event_sequence=row.event_sequence,
+                event_sub_index=2,
+            )
+        )
+    intents_text = _candidate_forward_intents_text(candidate)
+    if intents_text is not None:
+        blocks.append(
+            run_input_material_block(
+                block_id=f"previous:{row.event_id}:forward_intents",
+                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                kind=CompactMaterialBlockKind.FORWARD_INTENT,
+                text=intents_text,
+                canonical_source_refs=(row.event_id,),
+                event_sequence=row.event_sequence,
+                event_sub_index=3,
+            )
+        )
+    references_text = _candidate_reference_continuity_text(candidate)
+    if references_text is not None:
+        blocks.append(
+            run_input_material_block(
+                block_id=f"previous:{row.event_id}:reference_continuity",
+                section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+                kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+                text=references_text,
+                canonical_source_refs=(row.event_id,),
+                event_sequence=row.event_sequence,
+                event_sub_index=4,
+            )
+        )
+    return _pack_previous_blocks(tuple(blocks))
+
+
+def _validated_compacted_payload(
+    transaction: HostTransaction, row: EventLogRow
+) -> Mapping[str, JsonValue]:
+    """读取并校验 ``CONTEXT_COMPACTED`` payload。
+
+    :param transaction: 当前 Host transaction。
+    :param row: compacted EventLog row。
+    :returns: compacted payload object。
+    :raises HostDurableError: payload 结构或 digest 非法时抛出。
+    """
+
+    payload = event_payload_object(transaction, row, payload_label=CONTEXT_COMPACTED)
+    try:
+        validate_context_compacted_payload(payload)
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError("CONTEXT_COMPACTED payload is invalid") from exc
+    return payload
+
+
+def _post_compact_delta_start_sequence(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    current_input_sequence: int,
+    latest_compacted_event: EventLogRow | None,
+) -> int:
+    """计算 post-compact delta material 的 EventLog 起点。
+
+    :param transaction: 当前 Host transaction。
+    :param session_id: 当前 Session id。
+    :param current_input_sequence: 当前 input EventLog sequence。
+    :param latest_compacted_event: latest accepted compact row。
+    :returns: delta 起点 sequence。
+    :raises HostDurableError: EventLog 查询结果非法时抛出。
+    """
+
+    if latest_compacted_event is not None:
+        return latest_compacted_event.event_sequence + 1
+    row = transaction.fetchone(
+        f"""
+        SELECT event_sequence
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+          AND event_class = ?
+          AND event_type IN (?, ?, ?)
+          AND event_sequence < ?
+        ORDER BY event_sequence ASC
+        LIMIT 1
+        """,
+        (
+            session_id,
+            EventClass.CANONICAL_FACT.value,
+            _EVENT_TYPE_USER_INPUT_ACCEPTED,
+            _EVENT_TYPE_RUN_SUCCEEDED,
+            _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+            current_input_sequence,
+        ),
+    )
+    if row is None:
+        return current_input_sequence
+    return _required_host_row_int(row, field_name="event_sequence")
+
+
+def _post_compact_delta_rows(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    start_sequence: int,
+    end_sequence: int,
+    limit: int,
+) -> tuple[EventLogRow, ...]:
+    """读取 post-compact delta canonical fact rows。
+
+    :param transaction: 当前 Host transaction。
+    :param session_id: 当前 Session id。
+    :param start_sequence: 包含式起点。
+    :param end_sequence: 排他式终点，等于 current input sequence。
+    :param limit: 最大读取事件数。
+    :returns: delta rows，按 EventLog sequence 升序。
+    :raises HostDurableError: delta 超过 policy cap 时抛出。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          event_sequence,
+          event_id,
+          event_body_digest,
+          event_class,
+          session_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          event_type,
+          occurred_at,
+          actor,
+          source,
+          client_request_id,
+          idempotency_key,
+          policy_decision_json,
+          reason_json,
+          payload_json,
+          payload_ref,
+          payload_digest,
+          appended_at
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+          AND event_class = ?
+          AND event_type IN (?, ?, ?)
+          AND event_sequence >= ?
+          AND event_sequence < ?
+        ORDER BY event_sequence ASC
+        LIMIT ?
+        """,
+        (
+            session_id,
+            EventClass.CANONICAL_FACT.value,
+            _EVENT_TYPE_USER_INPUT_ACCEPTED,
+            _EVENT_TYPE_RUN_SUCCEEDED,
+            _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+            start_sequence,
+            end_sequence,
+            limit + 1,
+        ),
+    )
+    if len(rows) > limit:
+        raise HostDurableError("pre-dispatch compact delta event cap exceeded")
+    return tuple(_event_log_row_from_host_row(row) for row in rows)
+
+
+def _pre_dispatch_delta_material_blocks(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    rows: tuple[EventLogRow, ...],
+    represented_evidence_refs: tuple[str, ...],
+    max_evidence_blocks: int,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """把 delta EventLog rows 映射为 RunInputMaterialBlock。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param rows: post-compact delta rows。
+    :param represented_evidence_refs: latest compact 已覆盖的 accepted evidence refs。
+    :param max_evidence_blocks: 最多纳入 evidence blocks 数。
+    :returns: material block tuple。
+    :raises HostDurableError: payload 损坏或 evidence 数超过上限时抛出。
+    """
+
+    represented = frozenset(represented_evidence_refs)
+    blocks: list[RunInputMaterialBlock] = []
+    evidence_count = 0
+    for row in rows:
+        if row.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
+            blocks.append(_user_input_delta_block(transaction, row))
+        elif row.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+            answer_block = _assistant_answer_delta_block(transaction, row)
+            if answer_block is not None:
+                blocks.append(answer_block)
+        elif row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
+            evidence_blocks = _accepted_tool_evidence_delta_blocks(
+                transaction,
+                event_log_store,
+                row,
+                represented_evidence_refs=represented,
+            )
+            evidence_count += len(evidence_blocks)
+            if evidence_count > max_evidence_blocks:
+                raise HostDurableError("pre-dispatch compact evidence cap exceeded")
+            blocks.extend(evidence_blocks)
+    return tuple(blocks)
+
+
+def _user_input_delta_block(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> RunInputMaterialBlock:
+    """把历史 ``USER_INPUT_ACCEPTED`` 映射为 trace material。
+
+    :param transaction: 当前 Host transaction。
+    :param row: 历史 user input EventLog row。
+    :returns: user trace material block。
+    :raises HostDurableError: payload display text 缺失或非法时抛出。
+    """
+
+    payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    return run_input_material_block(
+        block_id=f"eventlog:user:{row.event_id}",
+        section=CompactMaterialSection.TRACE_MATERIAL,
+        kind=CompactMaterialBlockKind.USER_INPUT,
+        text=_required_json_text(payload, _PAYLOAD_FIELD_DISPLAY_TEXT),
+        canonical_source_refs=(row.event_id,),
+        event_sequence=row.event_sequence,
+    )
+
+
+def _assistant_answer_delta_block(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> RunInputMaterialBlock | None:
+    """把 ``RUN_SUCCEEDED`` final answer 映射为 answer material。
+
+    :param transaction: 当前 Host transaction。
+    :param row: run succeeded EventLog row。
+    :returns: answer material block；无可读 final answer continuity 时返回 ``None``。
+    :raises HostDurableError: terminal summary payload 损坏时抛出。
+    """
+
+    payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_RUN_SUCCEEDED,
+    )
+    answer_text = assistant_final_answer_continuity_text(
+        transaction,
+        payload,
+        text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+    )
+    if answer_text is None:
+        return None
+    return run_input_material_block(
+        block_id=f"eventlog:answer:{row.event_id}",
+        section=CompactMaterialSection.ANSWER_MATERIAL,
+        kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+        text=answer_text,
+        canonical_source_refs=(row.event_id,),
+        event_sequence=row.event_sequence,
+    )
+
+
+def _accepted_tool_evidence_delta_blocks(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    row: EventLogRow,
+    *,
+    represented_evidence_refs: frozenset[str],
+) -> tuple[RunInputMaterialBlock, ...]:
+    """把 ``TOOL_RESULT_ACCEPTED`` 映射为 evidence material blocks。
+
+    当 accepted evidence envelope 缺少 durable request atom 时，
+    ``tool_call_event_ref`` 会退化为当前 producer event ref。这个 ref 只用于
+    prompt-local provenance 追溯，不表示对应的 ``TOOL_CALL_REQUESTED`` event
+    一定存在。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param row: accepted tool result EventLog row。
+    :param represented_evidence_refs: latest compact 已覆盖的 evidence refs。
+    :returns: evidence material blocks。
+    :raises HostDurableError: evidence envelope 或 raw tool payload 损坏时抛出。
+    """
+
+    payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
+    envelope_value = payload.get(_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE)
+    if envelope_value is None:
+        return ()
+    try:
+        envelope = accepted_evidence_envelope_from_json_value(envelope_value)
+    except ValueError as exc:
+        raise HostDurableError("canonical evidence envelope is invalid") from exc
+    if envelope.producer_event_ref != row.event_id:
+        raise HostDurableError("accepted evidence producer_event_ref mismatch")
+    if envelope.evidence_id in represented_evidence_refs:
+        return ()
+    result_payload = event_payload_object_for_result_ref(
+        transaction,
+        row,
+        expected_payload_ref=envelope.result_ref.payload_ref,
+        expected_payload_digest=envelope.result_ref.payload_digest,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
+    if _PAYLOAD_FIELD_RESULT_PREVIEW in result_payload:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed")
+    raw_outcome = result_payload.get(_PAYLOAD_FIELD_RAW_TOOL_OUTCOME)
+    if raw_outcome is None:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
+    tool_call_event_ref = envelope.tool_query.tool_call_requested_event_ref
+    if tool_call_event_ref is None:
+        # 缺少 request atom 时只保留本地 provenance 线索，不伪造 request event。
+        tool_call_event_ref = row.event_id
+    return (
+        run_input_material_block(
+            block_id=f"eventlog:evidence:{row.event_id}:{envelope.evidence_id}",
+            section=CompactMaterialSection.EVIDENCE_MATERIAL,
+            kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+            text=canonical_json_dumps(raw_outcome),
+            canonical_source_refs=(envelope.evidence_id,),
+            event_sequence=row.event_sequence,
+            accepted_evidence_id=envelope.evidence_id,
+            tool_result_event_ref=row.event_id,
+            tool_call_event_ref=tool_call_event_ref,
+            payload_refs=_payload_refs_for_event(row),
+            source_locator_refs=envelope.locator_refs,
+            readable_tool_name=envelope.tool_name,
+            readable_query_text=_readable_query_text_from_envelope(
+                transaction,
+                event_log_store,
+                row,
+                envelope_tool_call_id=envelope.tool_call_id,
+                envelope_tool_name=envelope.tool_name,
+                envelope_arguments_digest=envelope.tool_query.normalized_arguments_digest,
+                requested_event_ref=envelope.tool_query.tool_call_requested_event_ref,
+            ),
+            readable_source_text=_readable_source_text_from_refs(
+                (*envelope.source_refs, *envelope.locator_refs)
+            ),
+        ),
+    )
+
+
+def _readable_query_text_from_envelope(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    result_row: EventLogRow,
+    *,
+    envelope_tool_call_id: str,
+    envelope_tool_name: str,
+    envelope_arguments_digest: str,
+    requested_event_ref: str | None,
+) -> str:
+    """从 accepted request atom 构造 evidence query 可读文本。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param result_row: TOOL_RESULT_ACCEPTED row。
+    :param envelope_tool_call_id: evidence envelope 中的 tool call id。
+    :param envelope_tool_name: evidence envelope 中的 tool name。
+    :param envelope_arguments_digest: evidence envelope 中的参数 digest。
+    :param requested_event_ref: envelope 指向的 TOOL_CALL_REQUESTED event id。
+    :returns: LLM-facing query text。
+    """
+
+    if requested_event_ref is None:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
+            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
+        )
+    request_row = event_log_store.read_event_by_id(transaction, requested_event_ref)
+    if request_row is None:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
+            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
+        )
+    if request_row.session_id != result_row.session_id:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
+            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
+        )
+    if request_row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
+            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
+        )
+    try:
+        atoms = tool_call_request_atoms(transaction, request_row)
+    except HostDurableError:
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS,
+            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
+        )
+    if (
+        atoms.tool_call_id != envelope_tool_call_id
+        or atoms.tool_name != envelope_tool_name
+        or atoms.normalized_arguments_digest != envelope_arguments_digest
+    ):
+        return _limited_signal_query_text(
+            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
+            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
+        )
+    if atoms.semantic_query_text is not None:
+        return _bounded_query_text(atoms.semantic_query_text)
+    return _bounded_query_text(
+        f"{_READABLE_ARGUMENTS_PREFIX}{canonical_json_dumps(atoms.arguments_json)}"
+    )
+
+
+def _limited_signal_query_text(*, reason: str, detail: str) -> str:
+    """构造 query material 的 limited-signal 文本。
+
+    :param reason: 不含内部 ref 的原因文本。
+    :param detail: 不含内部 ref 的影响说明。
+    :returns: 有界 query 文本。
+    """
+
+    return _bounded_query_text(
+        f"状态={_LIMITED_SIGNAL_STATUS}；原因={reason}；说明={detail}"
+    )
+
+
+def _bounded_query_text(text: str) -> str:
+    """规范化并截断 query 文本。
+
+    :param text: 原始 query 文本。
+    :returns: 有界非空 query 文本。
+    :raises ValueError: 规范化后为空时抛出。
+    """
+
+    normalized = normalized_material_text(text)
+    if len(normalized) <= _READABLE_QUERY_TEXT_MAX_CHARS:
+        return normalized
+    keep_chars = _READABLE_QUERY_TEXT_MAX_CHARS - len(_READABLE_QUERY_TRUNCATED_MARKER)
+    return f"{normalized[:keep_chars]}{_READABLE_QUERY_TRUNCATED_MARKER}"
+
+
+def _readable_source_text_from_refs(refs: tuple[OpaqueEvidenceRef, ...]) -> str:
+    """把 opaque evidence refs 映射为 LLM-facing source note。
+
+    :param refs: opaque source / locator refs。
+    :returns: source note 文本。
+    """
+
+    if len(refs) == 0:
+        return _READABLE_SOURCE_EMPTY
+    return _READABLE_SOURCE_SEPARATOR.join(
+        f"{ref.ref_kind}:{ref.ref_id}" for ref in refs
+    )
+
+
+def _pre_dispatch_budget_fragments(
+    *,
+    previous_view: tuple[CompactMaterialBlock, ...],
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    current_input_text: str,
+) -> tuple[BudgetTextFragment, ...]:
+    """从同源 material view 构造预算估算文本片段。
+
+    :param previous_view: latest compact previous view blocks。
+    :param material_blocks: post-compact delta material blocks。
+    :param current_input_text: 当前输入文本。
+    :returns: budget text fragments。
+    """
+
+    fragments: list[BudgetTextFragment] = []
+    for block in previous_view:
+        fragments.append(
+            BudgetTextFragment(
+                fragment_ref=f"{_PRE_DISPATCH_BUDGET_FRAGMENT_PREVIOUS_PREFIX}{block.block_label}",
+                text=block.text,
+            )
+        )
+    for block in material_blocks:
+        fragments.append(BudgetTextFragment(fragment_ref=block.block_id, text=block.text))
+    fragments.append(
+        BudgetTextFragment(
+            fragment_ref=_PRE_DISPATCH_BUDGET_FRAGMENT_CURRENT_REF,
+            text=current_input_text,
+        )
+    )
+    return tuple(fragments)
+
+
+def _candidate_session_summary_text(
+    candidate: Mapping[str, JsonValue],
+) -> str | None:
+    """读取 accepted candidate 的 session summary 文本。
+
+    :param candidate: accepted candidate JSON object。
+    :returns: summary text；无 summary 时为 ``None``。
+    :raises HostDurableError: candidate 结构损坏时抛出。
+    """
+
+    value = candidate.get(_PAYLOAD_FIELD_SESSION_SUMMARY)
+    if value is None:
+        return None
+    summary = _json_mapping(value, _PAYLOAD_FIELD_SESSION_SUMMARY)
+    return _required_json_text(summary, _PAYLOAD_FIELD_SUMMARY_TEXT)
+
+
+def _candidate_facts_text(candidate: Mapping[str, JsonValue]) -> str | None:
+    """把 accepted candidate facts 渲染为 previous view 文本。
+
+    :param candidate: accepted candidate JSON object。
+    :returns: facts 文本；无 facts 时为 ``None``。
+    :raises HostDurableError: candidate facts 结构损坏时抛出。
+    """
+
+    facts = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
+    if len(facts) == 0:
+        return None
+    lines: list[str] = []
+    for fact in facts:
+        lines.append(
+            "fact="
+            f"claim_text={_required_json_text(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}; "
+            f"evidence_refs={','.join(_required_json_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS))}; "
+            f"evidence_kind={_required_json_text(fact, _PAYLOAD_FIELD_EVIDENCE_KIND)}"
+        )
+    return "\n".join(lines)
+
+
+def _candidate_answer_anchors_text(candidate: Mapping[str, JsonValue]) -> str | None:
+    """把 accepted candidate answer anchors 渲染为 previous view 文本。
+
+    :param candidate: accepted candidate JSON object。
+    :returns: answer anchors 文本；无 anchors 时为 ``None``。
+    :raises HostDurableError: candidate anchors 结构损坏时抛出。
+    """
+
+    anchors = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
+    if len(anchors) == 0:
+        return None
+    return "\n".join(
+        f"{_PREVIOUS_ANSWER_ANCHOR_PREFIX}{_required_json_text(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)}"
+        for anchor in anchors
+    )
+
+
+def _candidate_forward_intents_text(candidate: Mapping[str, JsonValue]) -> str | None:
+    """把 accepted candidate forward intents 渲染为 previous view 文本。
+
+    :param candidate: accepted candidate JSON object。
+    :returns: forward intents 文本；无 intents 时为 ``None``。
+    :raises HostDurableError: candidate intents 结构损坏时抛出。
+    """
+
+    intents = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
+    if len(intents) == 0:
+        return None
+    lines: list[str] = []
+    for intent in intents:
+        lines.append(
+            f"{_PREVIOUS_FORWARD_INTENT_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_INTENT_TYPE)}; "
+            f"{_PREVIOUS_FORWARD_STATUS_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_STATUS)}; "
+            f"{_PREVIOUS_FORWARD_TEXT_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_TEXT)}"
+        )
+    return "\n".join(lines)
+
+
+def _candidate_reference_continuity_text(
+    candidate: Mapping[str, JsonValue],
+) -> str | None:
+    """把 accepted candidate reference continuity 渲染为 previous view 文本。
+
+    :param candidate: accepted candidate JSON object。
+    :returns: reference continuity 文本；无 items 时为 ``None``。
+    :raises HostDurableError: candidate references 结构损坏时抛出。
+    """
+
+    items = _required_json_mapping_tuple(
+        candidate,
+        _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS,
+    )
+    if len(items) == 0:
+        return None
+    lines: list[str] = []
+    for item in items:
+        lines.append(
+            f"{_PREVIOUS_REFERENCE_PREFIX}{_required_json_text(item, _PAYLOAD_FIELD_REASON)}; "
+            f"{_PREVIOUS_REFERENCE_TEXT_PREFIX}{_required_json_text(item, _PAYLOAD_FIELD_TEXT)}"
+        )
+    return "\n".join(lines)
+
+
 def _current_input_anchor(current_input_ref: str, current_input_text: str) -> CurrentInputAnchor:
     """构造 current input anchor。
 
@@ -1853,6 +2893,250 @@ def _require_material_block_tuple(value: tuple[RunInputMaterialBlock, ...], fiel
             raise TypeError(f"{field_name} items must be RunInputMaterialBlock")
 
 
+def _require_compact_material_block_tuple(
+    value: tuple[CompactMaterialBlock, ...], field_name: str
+) -> None:
+    """校验 compact material block tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, CompactMaterialBlock):
+            raise TypeError(f"{field_name} items must be CompactMaterialBlock")
+
+
+def _require_budget_fragment_tuple(
+    value: tuple[BudgetTextFragment, ...], field_name: str
+) -> None:
+    """校验 budget text fragment tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, BudgetTextFragment):
+            raise TypeError(f"{field_name} items must be BudgetTextFragment")
+
+
+def _require_canonical_session_event(
+    row: EventLogRow,
+    *,
+    session_id: str,
+    expected_event_type: str,
+) -> None:
+    """校验 EventLog row 属于当前 session 的 canonical fact。
+
+    :param row: EventLog row。
+    :param session_id: 当前 Session id。
+    :param expected_event_type: 期望 event type。
+    :returns: ``None``。
+    :raises HostDurableError: session、class 或 event type 不匹配时抛出。
+    """
+
+    if row.session_id != session_id:
+        raise HostDurableError("EventLog row session mismatch")
+    if row.event_class is not EventClass.CANONICAL_FACT:
+        raise HostDurableError("EventLog row is not canonical fact")
+    if row.event_type != expected_event_type:
+        raise HostDurableError("EventLog row event type mismatch")
+
+
+def _event_log_row_from_host_row(row: HostRow) -> EventLogRow:
+    """把 SQL row 转为 EventLogRow。
+
+    :param row: Host transaction row。
+    :returns: EventLogRow。
+    :raises HostDurableError: 字段缺失或类型非法时抛出。
+    """
+
+    try:
+        event_class = EventClass(_required_host_row_text(row, field_name="event_class"))
+    except ValueError as exc:
+        raise HostDurableError("EventLog row event_class is invalid") from exc
+    return EventLogRow(
+        event_sequence=_required_host_row_int(row, field_name="event_sequence"),
+        event_id=_required_host_row_text(row, field_name="event_id"),
+        event_body_digest=_required_host_row_text(row, field_name="event_body_digest"),
+        event_class=event_class,
+        session_id=_required_host_row_text(row, field_name="session_id"),
+        run_id=_optional_host_row_text(row, field_name="run_id"),
+        attempt_id=_optional_host_row_text(row, field_name="attempt_id"),
+        execution_id=_optional_host_row_text(row, field_name="execution_id"),
+        event_type=_required_host_row_text(row, field_name="event_type"),
+        occurred_at=_required_host_row_text(row, field_name="occurred_at"),
+        actor=_optional_host_row_text(row, field_name="actor"),
+        source=_optional_host_row_text(row, field_name="source"),
+        client_request_id=_optional_host_row_text(row, field_name="client_request_id"),
+        idempotency_key=_optional_host_row_text(row, field_name="idempotency_key"),
+        policy_decision_json=_optional_host_row_text(
+            row,
+            field_name="policy_decision_json",
+        ),
+        reason_json=_optional_host_row_text(row, field_name="reason_json"),
+        payload_json=_required_host_row_text(row, field_name="payload_json"),
+        payload_ref=_optional_host_row_text(row, field_name="payload_ref"),
+        payload_digest=_optional_host_row_text(row, field_name="payload_digest"),
+        appended_at=_required_host_row_text(row, field_name="appended_at"),
+    )
+
+
+def _required_host_row_text(row: HostRow, *, field_name: str) -> str:
+    """读取 HostRow 必填文本字段。
+
+    :param row: Host transaction row。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises HostDurableError: 字段缺失或非文本时抛出。
+    """
+
+    value = row.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"{field_name} must be non-empty text")
+
+
+def _optional_host_row_text(row: HostRow, *, field_name: str) -> str | None:
+    """读取 HostRow 可选文本字段。
+
+    :param row: Host transaction row。
+    :param field_name: 字段名。
+    :returns: 文本或 ``None``。
+    :raises HostDurableError: 字段存在但非文本时抛出。
+    """
+
+    value = row.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"{field_name} must be non-empty text when provided")
+
+
+def _required_host_row_int(row: HostRow, *, field_name: str) -> int:
+    """读取 HostRow 必填整数字段。
+
+    :param row: Host transaction row。
+    :param field_name: 字段名。
+    :returns: 整数字段值。
+    :raises HostDurableError: 字段缺失或非整数时抛出。
+    """
+
+    value = row.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HostDurableError(f"{field_name} must be integer")
+    return value
+
+
+def _required_json_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取 JSON object 必填非空文本字段。
+
+    :param payload: JSON object。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises HostDurableError: 字段缺失或类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"payload field {field_name} must be non-empty text")
+
+
+def _required_json_mapping(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> Mapping[str, JsonValue]:
+    """读取 JSON object 必填 object 字段。
+
+    :param payload: JSON object。
+    :param field_name: 字段名。
+    :returns: 子 object。
+    :raises HostDurableError: 字段缺失或非 object 时抛出。
+    """
+
+    return _json_mapping(payload.get(field_name), field_name)
+
+
+def _json_mapping(value: JsonValue | None, field_name: str) -> Mapping[str, JsonValue]:
+    """校验 JSON 值为 object。
+
+    :param value: JSON 值。
+    :param field_name: 字段名。
+    :returns: JSON object。
+    :raises HostDurableError: 值不是 object 时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"payload field {field_name} must be object")
+    return value
+
+
+def _required_json_mapping_tuple(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取 JSON object 必填 object list 字段。
+
+    :param payload: JSON object。
+    :param field_name: 字段名。
+    :returns: object tuple。
+    :raises HostDurableError: 字段缺失或元素类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        raise HostDurableError(f"payload field {field_name} must be list")
+    result: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError(f"payload field {field_name} item must be object")
+        result.append(item)
+    return tuple(result)
+
+
+def _required_json_text_tuple(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """读取 JSON object 必填文本 list 字段并去重。
+
+    :param payload: JSON object。
+    :param field_name: 字段名。
+    :returns: 去重后的文本 tuple。
+    :raises HostDurableError: 字段缺失或元素非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        raise HostDurableError(f"payload field {field_name} must be list")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item.strip() == "":
+            raise HostDurableError(f"payload field {field_name} item must be text")
+        result.append(item)
+    return tuple(dict.fromkeys(result))
+
+
+def _payload_refs_for_event(row: EventLogRow) -> tuple[str, ...]:
+    """返回 accepted evidence material 的 payload provenance refs。
+
+    :param row: EventLog row。
+    :returns: payload refs。
+    """
+
+    if row.payload_ref is not None:
+        return (row.payload_ref,)
+    return (f"{_PAYLOAD_REF_PREFIX}:{row.event_id}",)
+
+
 def _trace_material_vnext(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[TraceReadableItemVNext, ...]:
     """把 trace material blocks 映射为 vNext trace material。
 
@@ -2172,16 +3456,19 @@ __all__ = [
     "CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS",
     "EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS",
     "CompactMaterialBuildError",
+    "CompactMaterialSourceBoundary",
     "CompactMemorySnapshotRepairRequired",
     "DuplicateMaterialSectionOwnerError",
     "InitialEvidenceMaterial",
     "InitialHistoryMaterial",
     "InlineDeltaRepairMaterialView",
+    "PreDispatchCompactMaterialView",
     "RunInputMaterialBlock",
     "SnapshotCursorCheckKind",
     "SnapshotCursorCheckResult",
     "build_initial_material_pack",
     "build_compact_material_pack",
+    "build_pre_dispatch_compact_material_view",
     "check_compact_memory_snapshot_cursor",
     "conversation_compact_input_vnext_from_material_pack",
     "current_input_anchor_label",

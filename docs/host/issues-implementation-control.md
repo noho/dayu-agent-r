@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-PROJ-01 accepted plan committed; awaiting implementation by AgentCodex |
+| gate | accepted slice commit |
+| implementation status | WU-PROJ-01 Slice 1 re-review passed; accepted slice commit pending |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 implementation gate via AgentCodex |
+| next entry point | WU-PROJ-01 Slice 1 accepted slice commit gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
@@ -1216,6 +1216,49 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
 - controller decision after re-review: accepted plan; proceed to accepted plan commit
 - deferred implementation validation note: AgentDS NF1 is deferred-with-owner to implementation gate; validation must include `python -m pytest tests/host/test_memory_repair.py`, and if `tests/host/test_memory_projection_repair.py` is added, it must also run.
 - accepted plan commit: `fb3cc9ec`
+
+### Slice 1 implementation gate
+
+- slice: EventLog-backed pre-dispatch compact material source
+- implementation artifact: `docs/reviews/wu-proj-01-slice1-implementation-codex.md`
+- implemented by: AgentCodex
+- changed files:
+  - `dayu/host/compact_material.py`
+  - `tests/host/test_compact_material.py`
+  - `dayu/host/README.md`
+  - `tests/README.md`
+- validation:
+  - `source .venv/bin/activate && python -m pytest tests/host/test_compact_material.py` passed, 28 tests
+  - `source .venv/bin/activate && pyright` passed, 0 errors
+  - `git diff --check` passed by controller
+- controller decision: accepted for code review
+- review artifacts:
+  - `docs/reviews/wu-proj-01-slice1-code-review-mimo.md`
+  - `docs/reviews/wu-proj-01-slice1-code-review-ds.md`
+- review verdict:
+  - AgentMiMo: `pass-with-findings`
+  - AgentDS: `PASS`
+- code review controller adjudication: `docs/reviews/wu-proj-01-slice1-code-review-controller-adjudication.md`
+- accepted fix scope:
+  - add direct negative tests for `CompactMaterialSourceBoundary` validation.
+  - add direct negative tests for `PreDispatchCompactMaterialView` boundary mismatch validation.
+  - clarify fallback `tool_call_event_ref` semantics when durable request atom is missing.
+  - remove `_snapshot_with_goal` unused `current_goal` parameter or otherwise eliminate the misleading helper API.
+  - fix `_snapshot_with_goal_and_fact` fixture provenance so it does not reference a non-existent EventLog event id.
+- fix artifact: `docs/reviews/wu-proj-01-slice1-fix-codex.md`
+- fix status: completed by AgentCodex
+- fix validation:
+  - `source .venv/bin/activate && python -m pytest tests/host/test_compact_material.py` passed, 31 tests
+  - `source .venv/bin/activate && pyright` passed, 0 errors
+  - `git diff --check` passed by controller
+- re-review artifacts:
+  - `docs/reviews/wu-proj-01-slice1-rereview-mimo.md`
+  - `docs/reviews/wu-proj-01-slice1-rereview-ds.md`
+- re-review verdict:
+  - AgentMiMo: `PASS`
+  - AgentDS: `PASS`
+- re-review controller adjudication: `docs/reviews/wu-proj-01-slice1-rereview-controller-adjudication.md`
+- controller decision after re-review: accepted; proceed to accepted slice commit
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 
