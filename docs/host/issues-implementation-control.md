@@ -141,7 +141,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | implementation |
-| implementation status | User decision after final closeout: WU-PROJ-01-S3-R1 and WU-PROJ-01-S4-R1 must be implemented in PR #136 |
+| implementation status | User decision after final closeout: WU-PROJ-01-S3-R1, WU-PROJ-01-S4-R1, and cap/limit overdesign must be implemented in PR #136 |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
 | next entry point | WU-PROJ-01 residual risk implementation gate via AgentCodex |
@@ -201,6 +201,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 | WU-PROJ-01-S3-R1 | open | WU-PROJ-01 / PR #136 | 用户裁决必须在当前 PR 中实施；补 dispatch before-worker catch-up happy path 独立集成测试，覆盖 required cursor 已被 projection checkpoint 覆盖时不重复追账且继续构造 ordinary RunInput。 |
 | WU-PROJ-01-S4-R1 | open | WU-PROJ-01 / PR #136 | 用户裁决必须在当前 PR 中实施；稳定 `test_reactive_compact_failure_fallback_dispatch_uses_failed_view` 的 lane timeout flaky，调整 timing fixture 或测试结构。 |
+| WU-PROJ-01-CAP-R1 | open | WU-PROJ-01 / PR #136 | 用户第一性原理裁决：`_READABLE_QUERY_TEXT_MAX_CHARS`、`_DEFAULT_PRE_DISPATCH_MAX_DELTA_EVENTS`、`_DEFAULT_PRE_DISPATCH_MAX_EVIDENCE_BLOCKS`、`_MEMORY_PROJECTION_AFTER_COMMIT_MAX_BATCHES`、`_MEMORY_PROJECTION_REQUIRED_BEFORE_DISPATCH_MAX_BATCHES`、`_MEMORY_PROJECTION_REBUILD_BEFORE_DISPATCH_MAX_BATCHES`、`_MEMORY_PROJECTION_BEST_EFFORT_MAX_BATCHES` 暴露过度设计 / 过度实现嫌疑；当前 PR 内必须收敛。compact material source 应读取 latest accepted compact 后到当前 input 前的完整 canonical EventLog delta，不在 source builder 阶段截断 query、限制 delta event 数或 evidence block 数；required dispatch / rebuild projection 应追到 required cursor 或明确失败，不用固定 max_batches / max_scanned_events 作为生产语义上限；after-commit best-effort 不得影响 correctness。 |
 
 ## 当前 Work Units
 
@@ -226,7 +227,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | implementation | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | 用户裁决 `WU-PROJ-01-S3-R1` / `WU-PROJ-01-S4-R1` 必须在当前 PR 内实施；等待 residual risk implementation gate |
+| WU-PROJ-01 | implementation | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | 用户裁决 `WU-PROJ-01-S3-R1` / `WU-PROJ-01-S4-R1` / `WU-PROJ-01-CAP-R1` 必须在当前 PR 内实施；等待 residual risk implementation gate |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
@@ -1474,7 +1475,13 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
 
 - status: active
 - decision artifact: `docs/reviews/wu-proj-01-residual-risk-user-decision-controller.md`
-- user decision: `WU-PROJ-01-S3-R1` and `WU-PROJ-01-S4-R1` must be implemented in PR #136.
+- user decision: `WU-PROJ-01-S3-R1`, `WU-PROJ-01-S4-R1`, and `WU-PROJ-01-CAP-R1` must be implemented in PR #136.
+- cap / limit first-principles decision:
+  - Do not solve `_READABLE_QUERY_TEXT_MAX_CHARS`, `_DEFAULT_PRE_DISPATCH_MAX_DELTA_EVENTS`, `_DEFAULT_PRE_DISPATCH_MAX_EVIDENCE_BLOCKS`, `_MEMORY_PROJECTION_*_MAX_BATCHES` by merely moving them to a config file.
+  - Compact material source should read the complete canonical EventLog delta from latest accepted compact to current input, then let Context Governance / segment selection decide what fits the LLM-facing compact input.
+  - Source builder must not silently degrade memory quality by truncating readable query text or imposing fixed evidence / event caps.
+  - Required-before-dispatch and rebuild projection catch-up should run until required cursor is reached, idle, or failure; fixed max batch / max scanned event limits must not be production correctness semantics.
+  - After-commit best-effort may remain bounded only as a non-correctness optimization; it must not be confused with required dispatch catch-up.
 - next gate: WU-PROJ-01 residual risk implementation gate via AgentCodex.
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
