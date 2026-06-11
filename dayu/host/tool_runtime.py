@@ -184,6 +184,7 @@ _EVENT_TYPE_TOOL_CALL_GOVERNED = "TOOL_CALL_GOVERNED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
+_PAYLOAD_FIELD_TOOL_TIMING = "tool_timing"
 _TOOL_RESULT_PAYLOAD_REF_PREFIX = "payload-tool-result"
 _TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-tool-result"
 _TOOL_CALL_ARGUMENTS_PAYLOAD_REF_PREFIX = "payload-tool-call-arguments"
@@ -229,6 +230,11 @@ _TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON = (
 )
 _TOOL_RUNTIME_DUPLICATE_HARD_STOP_REASON = "duplicate_hard_stop"
 _TOOL_RUNTIME_DIAGNOSTIC_NOOP_REF = "tool-diagnostic-noop"
+_TOOL_TIMING_SCHEMA_VERSION = 1
+_TOOL_TIMING_STATUS_AVAILABLE = "available"
+_TOOL_TIMING_STATUS_MISSING_META = "missing_tool_result_meta"
+_TOOL_TIMING_DURATION_SOURCE_META = "tool_result_meta"
+_ONE_MILLISECOND = timedelta(milliseconds=1)
 _SIDE_EFFECT_IDEMPOTENCY_HINT = (
     "side-effect or paid tool requires a tool idempotency key"
 )
@@ -467,6 +473,7 @@ class ToolAcceptResult:
     :param payload_ref: result payload descriptor 引用；无则为 ``None``。
     :param truncation: 截断事实；无截断时为 ``None``。
     :param raw_tool_outcome: Host accepted 后写入 raw transcript 的工具 outcome。
+    :param tool_timing: 从工具 outcome meta 派生的稳定耗时 signal。
     :returns: 构造完成的结果值对象。
     :raises ValueError: digest 非法、payload 引用不一致或截断事实类型非法时抛出。
     """
@@ -476,6 +483,7 @@ class ToolAcceptResult:
     payload_ref: HostPayloadRef | None
     truncation: ToolTruncationFact | None
     raw_tool_outcome: JsonValue
+    tool_timing: Mapping[str, JsonValue]
 
     def __post_init__(self) -> None:
         """校验结果内部字段。
@@ -3799,6 +3807,7 @@ def _tool_result_payload(
         _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE: (
             accepted_evidence_envelope_to_json_value(accepted_evidence_envelope)
         ),
+        _PAYLOAD_FIELD_TOOL_TIMING: result.tool_timing,
     }
     if include_raw_tool_outcome:
         payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] = result.raw_tool_outcome
@@ -4329,7 +4338,7 @@ def _validate_tool_accept_result(result: ToolAcceptResult) -> None:
 
     :param result: 待校验的工具结果子结构。
     :returns: ``None``。
-    :raises ValueError: digest 非法、payload ref 不一致或截断事实类型非法时抛出。
+    :raises ValueError: digest、payload ref、截断事实或 timing signal 非法时抛出。
     """
 
     _require_sha256_digest(result.outcome_digest, field_name="outcome_digest")
@@ -4345,6 +4354,63 @@ def _validate_tool_accept_result(result: ToolAcceptResult) -> None:
         result.truncation, ToolTruncationFact
     ):
         raise ValueError("truncation must be ToolTruncationFact")
+    _validate_tool_timing_signal(result.tool_timing)
+
+
+def _validate_tool_timing_signal(signal: Mapping[str, JsonValue]) -> None:
+    """校验 ToolRuntime 生成的工具耗时 signal。
+
+    :param signal: tool_timing JSON object。
+    :returns: ``None``。
+    :raises ValueError: 必填字段缺失、字段类型非法或 duration 为负时抛出。
+    """
+
+    if not isinstance(signal, Mapping):
+        raise ValueError("tool_timing must be JSON object")
+    schema_version = signal.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != _TOOL_TIMING_SCHEMA_VERSION
+    ):
+        raise ValueError("tool_timing.schema_version must be 1")
+    status = signal.get("status")
+    if status == _TOOL_TIMING_STATUS_AVAILABLE:
+        _require_signal_text(signal, "started_at")
+        _require_signal_text(signal, "finished_at")
+        duration_ms = signal.get("duration_ms")
+        if (
+            isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, int)
+            or duration_ms < 0
+        ):
+            raise ValueError("tool_timing.duration_ms must be non-negative integer")
+        if signal.get("duration_source") != _TOOL_TIMING_DURATION_SOURCE_META:
+            raise ValueError("tool_timing.duration_source must be tool_result_meta")
+        return
+    if status == _TOOL_TIMING_STATUS_MISSING_META:
+        for field_name in ("started_at", "finished_at", "duration_ms"):
+            if signal.get(field_name) is not None:
+                raise ValueError(f"tool_timing.{field_name} must be null")
+        if signal.get("duration_source") is not None:
+            raise ValueError("tool_timing.duration_source must be null")
+        return
+    raise ValueError("tool_timing.status is unsupported")
+
+
+def _require_signal_text(signal: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取 timing signal 的必填文本字段。
+
+    :param signal: tool_timing JSON object。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises ValueError: 字段缺失或不是非空文本时抛出。
+    """
+
+    value = signal.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise ValueError(f"tool_timing.{field_name} must be text")
 
 
 def _validate_tool_accept_duplicate_governance(
@@ -5451,6 +5517,7 @@ def _tool_fact_accept_candidate(
             payload_ref=None,
             truncation=truncation_fact,
             raw_tool_outcome=_tool_outcome_json(outcome),
+            tool_timing=_tool_timing_from_meta(_tool_result_meta(outcome)),
         ),
         governance=ToolAcceptGovernance(
             policy_decision=policy_decision,
@@ -5836,6 +5903,55 @@ def _tool_accept_idempotency_key(
         }
     ).removeprefix("sha256:")
     return f"tool-accept-{digest}"
+
+
+def _tool_result_meta(outcome: ToolExecutionOutcome) -> ToolResultMeta | None:
+    """从普通工具 outcome 中提取结果 meta。
+
+    :param outcome: completed / failed / cancelled 工具 outcome。
+    :returns: outcome 携带的 ``ToolResultMeta``；缺失时为 ``None``。
+    :raises TypeError: 收到 awaiting 或未知 outcome 时抛出。
+    """
+
+    if isinstance(outcome, ToolCompletedOutcome):
+        return outcome.result.meta
+    if isinstance(outcome, ToolFailedOutcome):
+        return outcome.result.meta
+    if isinstance(outcome, ToolCancelledOutcome):
+        return outcome.meta
+    if isinstance(outcome, ToolAwaitingOutcome):
+        raise TypeError("ToolAwaitingOutcome does not carry accepted result timing")
+    raise TypeError("unsupported tool outcome")
+
+
+def _tool_timing_from_meta(meta: ToolResultMeta | None) -> Mapping[str, JsonValue]:
+    """从工具结果 meta 构造稳定耗时 signal。
+
+    :param meta: 工具结果 meta。
+    :returns: ``tool_timing`` JSON object。
+    :raises ValueError: meta 时间产生负耗时时抛出。
+    """
+
+    if meta is None:
+        return {
+            "schema_version": _TOOL_TIMING_SCHEMA_VERSION,
+            "status": _TOOL_TIMING_STATUS_MISSING_META,
+            "started_at": None,
+            "finished_at": None,
+            "duration_ms": None,
+            "duration_source": None,
+        }
+    duration_ms = int((meta.finished_at - meta.started_at) // _ONE_MILLISECOND)
+    if duration_ms < 0:
+        raise ValueError("tool_timing.duration_ms must be non-negative")
+    return {
+        "schema_version": _TOOL_TIMING_SCHEMA_VERSION,
+        "status": _TOOL_TIMING_STATUS_AVAILABLE,
+        "started_at": meta.started_at.isoformat(),
+        "finished_at": meta.finished_at.isoformat(),
+        "duration_ms": duration_ms,
+        "duration_source": _TOOL_TIMING_DURATION_SOURCE_META,
+    }
 
 
 def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:

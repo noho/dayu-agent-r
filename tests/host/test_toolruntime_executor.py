@@ -1338,6 +1338,14 @@ def _accepted_ack_for_call(tool_call_id: str) -> ToolFactAcceptedAck:
                     "meta": None,
                 },
             },
+            tool_timing={
+                "schema_version": 1,
+                "status": "missing_tool_result_meta",
+                "started_at": None,
+                "finished_at": None,
+                "duration_ms": None,
+                "duration_source": None,
+            },
         ),
         governance=ToolAcceptGovernance(
             policy_decision=ToolPolicyDecision(

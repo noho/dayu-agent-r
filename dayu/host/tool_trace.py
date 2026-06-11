@@ -155,6 +155,10 @@ _FIELD_PROJECTOR_SCHEMA_VERSION = "projector_schema_version"
 _FIELD_PROJECTOR_DIGEST = "projector_digest"
 _FIELD_PURPOSE = "purpose"
 _CONTEXT_PRESSURE_SCHEMA_VERSION = 1
+_TOOL_TIMING_SCHEMA_VERSION = 1
+_TOOL_TIMING_STATUS_AVAILABLE = "available"
+_TOOL_TIMING_STATUS_MISSING_META = "missing_tool_result_meta"
+_TOOL_TIMING_DURATION_SOURCE_META = "tool_result_meta"
 _CONTEXT_PRESSURE_STATUS_COMPACTION_FAILED = "compaction_failed"
 _CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED = (
     "compaction_attempt_rejected"
@@ -1300,12 +1304,58 @@ def _trace_summary_signals(payload: Mapping[str, JsonValue]) -> _TraceSummarySig
 
     return _TraceSummarySignals(
         context_pressure=_optional_signal_object(payload, _FIELD_CONTEXT_PRESSURE),
-        tool_timing=_optional_signal_object(payload, _FIELD_TOOL_TIMING),
+        tool_timing=_optional_tool_timing_signal(payload),
         failure_metadata=_optional_signal_object(payload, _FIELD_FAILURE_METADATA),
         partial_tool_call_signal=_optional_signal_object(
             payload, _FIELD_PARTIAL_TOOL_CALL_SIGNAL
         ),
     )
+
+
+def _optional_tool_timing_signal(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取并校验可选工具耗时 signal。
+
+    :param payload: projection event payload。
+    :returns: tool_timing JSON object；字段缺失或为 ``null`` 时返回 ``None``。
+    :raises HostDurableError: 字段类型、状态或 duration 非法时抛出。
+    """
+
+    signal = _optional_signal_object(payload, _FIELD_TOOL_TIMING)
+    if signal is None:
+        return None
+    schema_version = _required_int(signal, _FIELD_SCHEMA_VERSION)
+    if schema_version != _TOOL_TIMING_SCHEMA_VERSION:
+        raise HostDurableError("tool trace tool_timing schema_version is unsupported")
+    status = _required_text(signal, "status")
+    if status == _TOOL_TIMING_STATUS_AVAILABLE:
+        _required_text(signal, "started_at")
+        _required_text(signal, "finished_at")
+        duration_ms = _required_int(signal, "duration_ms")
+        if duration_ms < 0:
+            raise HostDurableError(
+                "tool trace tool_timing duration_ms must be non-negative integer"
+            )
+        if _required_text(signal, "duration_source") != (
+            _TOOL_TIMING_DURATION_SOURCE_META
+        ):
+            raise HostDurableError(
+                "tool trace tool_timing duration_source is unsupported"
+            )
+        return signal
+    if status == _TOOL_TIMING_STATUS_MISSING_META:
+        for field_name in ("started_at", "finished_at", "duration_ms"):
+            if signal.get(field_name) is not None:
+                raise HostDurableError(
+                    f"tool trace tool_timing {field_name} must be null"
+                )
+        if signal.get("duration_source") is not None:
+            raise HostDurableError(
+                "tool trace tool_timing duration_source must be null"
+            )
+        return signal
+    raise HostDurableError("tool trace tool_timing status is unsupported")
 
 
 def _optional_signal_object(
@@ -1480,6 +1530,23 @@ def _optional_int(payload: Mapping[str, JsonValue], field_name: str) -> int | No
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise HostDurableError(
             f"tool trace payload field {field_name} must be non-negative integer"
+        )
+    return value
+
+
+def _required_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
+    """读取 payload 中的必填整数。
+
+    :param payload: projection event payload。
+    :param field_name: 字段名。
+    :returns: 整数值。
+    :raises HostDurableError: 字段缺失或不是整数时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HostDurableError(
+            f"tool trace payload field {field_name} must be integer"
         )
     return value
 

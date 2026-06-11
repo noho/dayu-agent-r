@@ -883,6 +883,9 @@ def test_failed_cancelled_and_governed_error_are_accepted_as_result_facts(
             ToolFactKind.CANCELLED.value,
             ToolFactKind.GOVERNED_ERROR.value,
         )
+        assert payloads[0]["tool_timing"] == _missing_tool_timing()
+        assert payloads[1]["tool_timing"] == _missing_tool_timing()
+        assert payloads[2]["tool_timing"] == _missing_tool_timing()
         assert payloads[-1]["policy_decision"] == {
             "kind": ToolPolicyDecisionKind.GOVERNED_ERROR.value,
             "reason_code": "governed_error",
@@ -1026,6 +1029,7 @@ def test_tool_accept_result_rejects_payload_ref_digest_mismatch() -> None:
             ),
             truncation=None,
             raw_tool_outcome=_raw_tool_outcome("tool-call-payload-mismatch"),
+            tool_timing=_missing_tool_timing(),
         )
 
 
@@ -1311,6 +1315,7 @@ def _completed_candidate(
             payload_ref=None,
             truncation=None,
             raw_tool_outcome=_raw_tool_outcome(tool_call_id),
+            tool_timing=_missing_tool_timing(),
         ),
         governance=_allow_governance(duplicate=None),
         idempotency=_candidate_idempotency(tool_call_id),
@@ -1394,6 +1399,7 @@ def _fact_kind_candidate(
             payload_ref=None,
             truncation=None,
             raw_tool_outcome=_raw_tool_outcome(tool_call_id),
+            tool_timing=_missing_tool_timing(),
         ),
         governance=ToolAcceptGovernance(
             policy_decision=ToolPolicyDecision(
@@ -1526,6 +1532,22 @@ def _raw_tool_outcome(tool_call_id: str) -> JsonValue:
             "value": {"tool_call_id": tool_call_id},
             "meta": None,
         },
+    }
+
+
+def _missing_tool_timing() -> Mapping[str, JsonValue]:
+    """构造缺失工具结果 meta 的 timing signal。
+
+    :returns: tool_timing JSON object。
+    """
+
+    return {
+        "schema_version": 1,
+        "status": "missing_tool_result_meta",
+        "started_at": None,
+        "finished_at": None,
+        "duration_ms": None,
+        "duration_source": None,
     }
 
 

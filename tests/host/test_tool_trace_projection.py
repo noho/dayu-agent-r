@@ -440,7 +440,10 @@ def test_tool_trace_copies_optional_summary_signal_objects(
     tool_timing: Mapping[str, JsonValue] = {
         "schema_version": 1,
         "status": "available",
+        "started_at": "2026-06-11T00:00:00+00:00",
+        "finished_at": "2026-06-11T00:00:01.250000+00:00",
         "duration_ms": 1250,
+        "duration_source": "tool_result_meta",
     }
     failure_metadata: Mapping[str, JsonValue] = {
         "schema_version": 1,
@@ -483,6 +486,143 @@ def test_tool_trace_copies_optional_summary_signal_objects(
             == partial_tool_call_signal
         )
         assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
+
+
+def test_tool_trace_projects_tool_timing_available_and_missing_signals(
+    tmp_path: Path,
+) -> None:
+    """TOOL_RESULT_ACCEPTED 的 tool_timing 同步进入 hot / cold summary。"""
+
+    cold_path = tmp_path / "trace" / "tool-timing.jsonl"
+    available_timing: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "status": "available",
+        "started_at": "2026-06-11T00:00:00+00:00",
+        "finished_at": "2026-06-11T00:00:01.250000+00:00",
+        "duration_ms": 1250,
+        "duration_source": "tool_result_meta",
+    }
+    missing_timing: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "status": "missing_tool_result_meta",
+        "started_at": None,
+        "finished_at": None,
+        "duration_ms": None,
+        "duration_source": None,
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        available = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-tool-timing-available",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-duration",
+                "tool_name": "lookup_filing",
+                "outcome_digest": "sha256:outcome-duration",
+                _FIELD_TOOL_TIMING: available_timing,
+            },
+        )
+        missing = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-tool-timing-missing",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-missing-meta",
+                "tool_name": "lookup_filing",
+                "outcome_digest": "sha256:outcome-missing",
+                _FIELD_TOOL_TIMING: missing_timing,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        available_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, available.event_id
+            )
+        )
+        missing_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, missing.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert available_row is not None
+        assert missing_row is not None
+        assert available_row.trace_summary[_FIELD_TOOL_TIMING] == available_timing
+        assert missing_row.trace_summary[_FIELD_TOOL_TIMING] == missing_timing
+        assert _cold_trace_summary(cold_lines, 0)[_FIELD_TOOL_TIMING] == (
+            available_timing
+        )
+        assert _cold_trace_summary(cold_lines, 1)[_FIELD_TOOL_TIMING] == (
+            missing_timing
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_timing", "message"),
+    (
+        (
+            {
+                "schema_version": 1,
+                "status": "available",
+                "started_at": "2026-06-11T00:00:01+00:00",
+                "finished_at": "2026-06-11T00:00:00+00:00",
+                "duration_ms": -1,
+                "duration_source": "tool_result_meta",
+            },
+            "duration_ms",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "status": "available",
+                "started_at": "2026-06-11T00:00:00+00:00",
+                "finished_at": "2026-06-11T00:00:01+00:00",
+                "duration_ms": "1000",
+                "duration_source": "tool_result_meta",
+            },
+            "duration_ms",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "status": "missing_tool_result_meta",
+                "started_at": "2026-06-11T00:00:00+00:00",
+                "finished_at": None,
+                "duration_ms": None,
+                "duration_source": None,
+            },
+            "started_at",
+        ),
+    ),
+)
+def test_tool_trace_rejects_malformed_tool_timing_signal(
+    tmp_path: Path, tool_timing: Mapping[str, JsonValue], message: str
+) -> None:
+    """malformed tool_timing 以 HostDurableError fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id=f"event-malformed-tool-timing-{message}",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-malformed-timing",
+                "tool_name": "lookup_filing",
+                "outcome_digest": "sha256:outcome-malformed-timing",
+                _FIELD_TOOL_TIMING: tool_timing,
+            },
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
+        )
+
+        with pytest.raises(HostDurableError, match=message):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(event),
+                )
+            )
 
 
 def test_tool_trace_derives_context_pressure_from_compaction_failed_payload(
