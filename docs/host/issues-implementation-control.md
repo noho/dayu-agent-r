@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted plan commit |
-| implementation status | WU-PROJ-01 plan re-review passed; accepted plan commit pending |
+| gate | implementation |
+| implementation status | WU-PROJ-01 accepted plan committed; awaiting implementation by AgentCodex |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 accepted plan commit gate |
+| next entry point | WU-PROJ-01 implementation gate via AgentCodex |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
@@ -224,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | planning | Compact material truth and bounded memory catch-up | GitHub Issue #86 | pre-dispatch compact material must come from EventLog truth; ordinary memory catch-up must be bounded |
+| WU-PROJ-01 | implementation | Compact material truth and bounded memory catch-up | GitHub Issue #86 | pre-dispatch compact material must come from EventLog truth; ordinary memory catch-up must be bounded |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
@@ -1215,6 +1215,7 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
   - AgentDS: `pass`
 - controller decision after re-review: accepted plan; proceed to accepted plan commit
 - deferred implementation validation note: AgentDS NF1 is deferred-with-owner to implementation gate; validation must include `python -m pytest tests/host/test_memory_repair.py`, and if `tests/host/test_memory_projection_repair.py` is added, it must also run.
+- accepted plan commit: `fb3cc9ec`
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 
