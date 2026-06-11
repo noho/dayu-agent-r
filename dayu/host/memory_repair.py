@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import StrEnum
 
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.memory import (
@@ -29,6 +30,53 @@ _INITIAL_CURSOR = 0
 _LOGGER = logging.getLogger(__name__)
 
 
+class MemoryProjectionRepairPurpose(StrEnum):
+    """memory projection repair 的 Host 内部调用目的。"""
+
+    BEST_EFFORT_AFTER_COMMIT = "best_effort_after_commit"
+    REQUIRED_BEFORE_DISPATCH = "required_before_dispatch"
+    REBUILD_BEFORE_DISPATCH = "rebuild_before_dispatch"
+
+
+class MemoryProjectionRepairStopReason(StrEnum):
+    """memory projection repair 的 bounded loop 停止原因。"""
+
+    IDLE = "idle"
+    TARGET_REACHED = "target_reached"
+    FAILURE = "failure"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryProjectionCatchupBudget:
+    """memory projection catch-up / rebuild 单次总预算。
+
+    :param max_batches: 本次最多执行的 projection batch 数。
+    :param max_scanned_events: 本次最多扫描的 EventLog row 数。
+    :param purpose: 本次预算用途。
+    """
+
+    max_batches: int
+    max_scanned_events: int
+    purpose: MemoryProjectionRepairPurpose
+
+    def __post_init__(self) -> None:
+        """校验预算字段。
+
+        :returns: ``None``。
+        :raises HostDurableError: 预算字段非法时抛出。
+        """
+
+        if self.max_batches < _MIN_REPAIR_BATCH_SIZE:
+            raise HostDurableError("memory projection budget max_batches must be positive")
+        if self.max_scanned_events < _MIN_REPAIR_BATCH_SIZE:
+            raise HostDurableError(
+                "memory projection budget max_scanned_events must be positive"
+            )
+        if not isinstance(self.purpose, MemoryProjectionRepairPurpose):
+            raise HostDurableError("memory projection budget purpose is invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationMemoryProjectionRepairResult:
     """conversation memory projection repair 汇总结果。
@@ -42,6 +90,13 @@ class ConversationMemoryProjectionRepairResult:
     :param events_applied: consumer 返回 applied 的事件数。
     :param duplicates: consumer 返回 duplicate 的事件数。
     :param failures: runner 记录的 projection failure 数。
+    :param batches_used: 本次已执行 projection batch 数。
+    :param stop_reason: bounded loop 停止原因。
+    :param budget_exhausted: 是否因总预算耗尽停止。
+    :param target_reached: 是否已覆盖调用方要求的 EventLog cursor。
+    :param max_event_sequence: 本次目标 EventLog cursor。
+    :param max_batches: 本次总 batch 预算。
+    :param max_scanned_events: 本次总扫描事件预算。
     """
 
     consumer_id: ProjectionConsumerId
@@ -53,6 +108,13 @@ class ConversationMemoryProjectionRepairResult:
     events_applied: int
     duplicates: int
     failures: int
+    batches_used: int = 0
+    stop_reason: MemoryProjectionRepairStopReason = MemoryProjectionRepairStopReason.IDLE
+    budget_exhausted: bool = False
+    target_reached: bool = False
+    max_event_sequence: int | None = None
+    max_batches: int | None = None
+    max_scanned_events: int | None = None
 
 
 class ConversationMemoryProjectionCatchupPort:
@@ -62,6 +124,8 @@ class ConversationMemoryProjectionCatchupPort:
     :param policy: 固定 memory projection policy。
     :param batch_size: 单次 catch-up 最多扫描的 EventLog row 数。
     :param consumer_id: memory projection consumer id。
+    :param budget: Host 内部单次总预算；``None`` 仅供显式审阅的 close-only
+        或 test-only 调用。
     """
 
     def __init__(
@@ -71,6 +135,7 @@ class ConversationMemoryProjectionCatchupPort:
         policy: MemoryProjectionPolicy,
         batch_size: int,
         consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
+        budget: MemoryProjectionCatchupBudget | None = None,
     ) -> None:
         """初始化 catch-up 端口。
 
@@ -78,6 +143,7 @@ class ConversationMemoryProjectionCatchupPort:
         :param policy: 固定 memory projection policy。
         :param batch_size: 单次 catch-up 最多扫描的 EventLog row 数。
         :param consumer_id: memory projection consumer id。
+        :param budget: Host 内部单次总预算。
         :returns: ``None``。
         :raises HostDurableError: batch size 或 consumer id 非法时抛出。
         """
@@ -87,6 +153,7 @@ class ConversationMemoryProjectionCatchupPort:
         self._policy = policy
         self._batch_size = batch_size
         self._consumer_id = consumer_id
+        self._budget = budget
 
     def catch_up_projection(self) -> None:
         """best-effort hook 调用的 committed projection catch-up。
@@ -100,6 +167,7 @@ class ConversationMemoryProjectionCatchupPort:
             policy=self._policy,
             batch_size=self._batch_size,
             consumer_id=self._consumer_id,
+            budget=self._budget,
         )
 
 
@@ -108,6 +176,8 @@ def rebuild_conversation_memory_projection(
     *,
     policy: MemoryProjectionPolicy,
     batch_size: int,
+    max_event_sequence: int | None,
+    budget: MemoryProjectionCatchupBudget | None,
     consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
 ) -> ConversationMemoryProjectionRepairResult:
     """从 committed EventLog 全量重建 conversation memory projection。
@@ -120,6 +190,8 @@ def rebuild_conversation_memory_projection(
     :param transaction_runner: Host durable transaction runner。
     :param policy: 固定 memory projection policy。
     :param batch_size: 每批最多扫描的 EventLog row 数，必须为正数。
+    :param max_event_sequence: 必须覆盖的最大 EventLog sequence。
+    :param budget: Host 内部单次总预算。
     :param consumer_id: memory projection consumer id。
     :returns: rebuild 汇总结果。
     :raises HostDurableError: batch size 非法、reset 或 projection runner 失败时抛出。
@@ -129,9 +201,15 @@ def rebuild_conversation_memory_projection(
     projection_consumer_id = ProjectionConsumerId(consumer_id)
     _LOGGER.log(
         VERBOSE_LOG_LEVEL,
-        "host.memory_repair.rebuild.start consumer_id=%s batch_size=%s",
+        "host.memory_repair.rebuild.start consumer_id=%s batch_size=%s "
+        "max_event_sequence=%s budget_purpose=%s max_batches=%s "
+        "max_scanned_events=%s",
         projection_consumer_id.value,
         batch_size,
+        max_event_sequence,
+        _budget_purpose_value(budget),
+        _budget_max_batches(budget),
+        _budget_max_scanned_events(budget),
     )
     transaction_runner.run_write(
         lambda transaction: reset_conversation_memory_projection(
@@ -139,12 +217,14 @@ def rebuild_conversation_memory_projection(
             consumer_id=projection_consumer_id.value,
         )
     )
-    result = _run_memory_projection_until_idle(
+    result = _run_memory_projection_bounded(
         transaction_runner,
         policy=policy,
         batch_size=batch_size,
         consumer_id=projection_consumer_id,
         reset_checkpoint=True,
+        max_event_sequence=max_event_sequence,
+        budget=budget,
     )
     _log_memory_projection_result("rebuild", result)
     return result
@@ -157,6 +237,7 @@ def catch_up_conversation_memory_projection(
     batch_size: int,
     consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
     max_event_sequence: int | None = None,
+    budget: MemoryProjectionCatchupBudget | None = None,
 ) -> ConversationMemoryProjectionRepairResult:
     """从当前 checkpoint 追平 conversation memory projection。
 
@@ -170,6 +251,8 @@ def catch_up_conversation_memory_projection(
     :param consumer_id: memory projection consumer id。
     :param max_event_sequence: 可选最大 EventLog sequence；下一条事件超过
         该值时停止，不推进 projection checkpoint。
+    :param budget: Host 内部单次总预算；``None`` 仅供显式审阅的 close-only
+        或 test-only 调用。
     :returns: catch-up 汇总结果。
     :raises HostDurableError: batch size 非法或 projection runner 初始化失败时抛出。
     """
@@ -180,25 +263,30 @@ def catch_up_conversation_memory_projection(
         VERBOSE_LOG_LEVEL,
         (
             "host.memory_repair.catch_up.start consumer_id=%s "
-            "batch_size=%s max_event_sequence=%s"
+            "batch_size=%s max_event_sequence=%s budget_purpose=%s "
+            "max_batches=%s max_scanned_events=%s"
         ),
         projection_consumer_id.value,
         batch_size,
         max_event_sequence,
+        _budget_purpose_value(budget),
+        _budget_max_batches(budget),
+        _budget_max_scanned_events(budget),
     )
-    result = _run_memory_projection_until_idle(
+    result = _run_memory_projection_bounded(
         transaction_runner,
         policy=policy,
         batch_size=batch_size,
         consumer_id=projection_consumer_id,
         reset_checkpoint=False,
         max_event_sequence=max_event_sequence,
+        budget=budget,
     )
     _log_memory_projection_result("catch_up", result)
     return result
 
 
-def _run_memory_projection_until_idle(
+def _run_memory_projection_bounded(
     transaction_runner: HostTransactionRunner,
     *,
     policy: MemoryProjectionPolicy,
@@ -206,8 +294,9 @@ def _run_memory_projection_until_idle(
     consumer_id: ProjectionConsumerId,
     reset_checkpoint: bool,
     max_event_sequence: int | None = None,
+    budget: MemoryProjectionCatchupBudget | None = None,
 ) -> ConversationMemoryProjectionRepairResult:
-    """运行 memory projection runner 直到 idle 或遇到 failure。
+    """按可选总预算运行 memory projection runner。
 
     :param transaction_runner: Host durable transaction runner。
     :param policy: 固定 memory projection policy。
@@ -215,6 +304,7 @@ def _run_memory_projection_until_idle(
     :param consumer_id: memory projection consumer id。
     :param reset_checkpoint: 本次是否为 reset 后 rebuild。
     :param max_event_sequence: 可选最大 EventLog sequence。
+    :param budget: Host 内部单次总预算。
     :returns: repair 汇总结果。
     """
 
@@ -234,12 +324,22 @@ def _run_memory_projection_until_idle(
     events_applied = 0
     duplicates = 0
     failures = 0
+    batches_used = 0
+    stop_reason = MemoryProjectionRepairStopReason.IDLE
     while True:
+        if budget is not None and batches_used >= budget.max_batches:
+            stop_reason = MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED
+            break
+        limit = _bounded_batch_limit(batch_size, budget, events_scanned)
+        if limit < _MIN_REPAIR_BATCH_SIZE:
+            stop_reason = MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED
+            break
         batch_result = runner.run_once(
             consumer_id,
-            limit=batch_size,
+            limit=limit,
             max_event_sequence=max_event_sequence,
         )
+        batches_used += 1
         if started_cursor is None:
             started_cursor = batch_result.started_cursor
         finished_cursor = batch_result.finished_cursor
@@ -248,10 +348,22 @@ def _run_memory_projection_until_idle(
         events_applied += batch_result.events_applied
         duplicates += batch_result.duplicate_events
         failures += batch_result.failures
-        if batch_result.failures > 0 or batch_result.events_scanned < batch_size:
+        if batch_result.failures > 0:
+            stop_reason = MemoryProjectionRepairStopReason.FAILURE
+            break
+        if _target_reached(finished_cursor, max_event_sequence):
+            stop_reason = MemoryProjectionRepairStopReason.TARGET_REACHED
+            break
+        if batch_result.events_scanned < limit:
+            stop_reason = MemoryProjectionRepairStopReason.IDLE
+            break
+        if _budget_scanned_events_exhausted(budget, events_scanned):
+            stop_reason = MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED
             break
     if started_cursor is None:
         started_cursor = finished_cursor
+    target_reached = _target_reached(finished_cursor, max_event_sequence)
+    budget_exhausted = stop_reason is MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED
     return ConversationMemoryProjectionRepairResult(
         consumer_id=consumer_id,
         reset_checkpoint=reset_checkpoint,
@@ -262,6 +374,13 @@ def _run_memory_projection_until_idle(
         events_applied=events_applied,
         duplicates=duplicates,
         failures=failures,
+        batches_used=batches_used,
+        stop_reason=stop_reason,
+        budget_exhausted=budget_exhausted,
+        target_reached=target_reached,
+        max_event_sequence=max_event_sequence,
+        max_batches=_budget_max_batches(budget),
+        max_scanned_events=_budget_max_scanned_events(budget),
     )
 
 
@@ -280,7 +399,9 @@ def _log_memory_projection_result(
             (
                 "host.memory_repair.%s.failed consumer_id=%s "
                 "started_cursor=%s finished_cursor=%s events_scanned=%s "
-                "events_matched=%s events_applied=%s duplicates=%s failures=%s"
+                "events_matched=%s events_applied=%s duplicates=%s failures=%s "
+                "batches_used=%s stop_reason=%s max_event_sequence=%s "
+                "max_batches=%s max_scanned_events=%s"
             ),
             operation,
             result.consumer_id.value,
@@ -291,6 +412,35 @@ def _log_memory_projection_result(
             result.events_applied,
             result.duplicates,
             result.failures,
+            result.batches_used,
+            result.stop_reason.value,
+            result.max_event_sequence,
+            result.max_batches,
+            result.max_scanned_events,
+        )
+        return
+    if result.budget_exhausted:
+        _LOGGER.warning(
+            (
+                "host.memory_repair.%s.budget_exhausted consumer_id=%s "
+                "started_cursor=%s finished_cursor=%s events_scanned=%s "
+                "events_matched=%s events_applied=%s duplicates=%s "
+                "batches_used=%s stop_reason=%s max_event_sequence=%s "
+                "max_batches=%s max_scanned_events=%s"
+            ),
+            operation,
+            result.consumer_id.value,
+            result.started_cursor,
+            result.finished_cursor,
+            result.events_scanned,
+            result.events_matched,
+            result.events_applied,
+            result.duplicates,
+            result.batches_used,
+            result.stop_reason.value,
+            result.max_event_sequence,
+            result.max_batches,
+            result.max_scanned_events,
         )
         return
     _LOGGER.log(
@@ -298,7 +448,9 @@ def _log_memory_projection_result(
         (
             "host.memory_repair.%s.committed consumer_id=%s "
             "started_cursor=%s finished_cursor=%s events_scanned=%s "
-            "events_matched=%s events_applied=%s duplicates=%s"
+            "events_matched=%s events_applied=%s duplicates=%s "
+            "batches_used=%s stop_reason=%s target_reached=%s "
+            "max_event_sequence=%s max_batches=%s max_scanned_events=%s"
         ),
         operation,
         result.consumer_id.value,
@@ -308,6 +460,12 @@ def _log_memory_projection_result(
         result.events_matched,
         result.events_applied,
         result.duplicates,
+        result.batches_used,
+        result.stop_reason.value,
+        result.target_reached,
+        result.max_event_sequence,
+        result.max_batches,
+        result.max_scanned_events,
     )
 
 
@@ -321,3 +479,88 @@ def _validate_batch_size(batch_size: int) -> None:
 
     if batch_size < _MIN_REPAIR_BATCH_SIZE:
         raise HostDurableError("conversation memory repair batch_size must be positive")
+
+
+def _bounded_batch_limit(
+    batch_size: int,
+    budget: MemoryProjectionCatchupBudget | None,
+    events_scanned: int,
+) -> int:
+    """计算当前 batch 可扫描的 EventLog row 数。
+
+    :param batch_size: 调用方配置的单批扫描上限。
+    :param budget: Host 内部单次总预算。
+    :param events_scanned: 本次已扫描事件数。
+    :returns: 当前 batch limit；小于 1 表示扫描预算已耗尽。
+    """
+
+    if budget is None:
+        return batch_size
+    remaining_events = budget.max_scanned_events - events_scanned
+    return min(batch_size, remaining_events)
+
+
+def _budget_scanned_events_exhausted(
+    budget: MemoryProjectionCatchupBudget | None,
+    events_scanned: int,
+) -> bool:
+    """判断扫描事件总预算是否耗尽。
+
+    :param budget: Host 内部单次总预算。
+    :param events_scanned: 本次已扫描事件数。
+    :returns: 扫描事件预算耗尽时返回 ``True``。
+    """
+
+    return budget is not None and events_scanned >= budget.max_scanned_events
+
+
+def _target_reached(
+    finished_cursor: int,
+    max_event_sequence: int | None,
+) -> bool:
+    """判断 projection checkpoint 是否已覆盖目标 cursor。
+
+    :param finished_cursor: 当前 projection checkpoint cursor。
+    :param max_event_sequence: 调用方要求覆盖的最大 EventLog sequence。
+    :returns: 有目标且已覆盖目标时返回 ``True``。
+    """
+
+    return max_event_sequence is not None and finished_cursor >= max_event_sequence
+
+
+def _budget_purpose_value(budget: MemoryProjectionCatchupBudget | None) -> str | None:
+    """返回预算 purpose 的日志值。
+
+    :param budget: Host 内部单次总预算。
+    :returns: purpose 字符串或 ``None``。
+    """
+
+    if budget is None:
+        return None
+    return budget.purpose.value
+
+
+def _budget_max_batches(budget: MemoryProjectionCatchupBudget | None) -> int | None:
+    """返回预算 batch 上限。
+
+    :param budget: Host 内部单次总预算。
+    :returns: batch 上限或 ``None``。
+    """
+
+    if budget is None:
+        return None
+    return budget.max_batches
+
+
+def _budget_max_scanned_events(
+    budget: MemoryProjectionCatchupBudget | None,
+) -> int | None:
+    """返回预算扫描事件上限。
+
+    :param budget: Host 内部单次总预算。
+    :returns: 扫描事件上限或 ``None``。
+    """
+
+    if budget is None:
+        return None
+    return budget.max_scanned_events

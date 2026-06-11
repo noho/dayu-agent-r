@@ -173,6 +173,9 @@ def test_memory_catchup_logs_cursors_and_counts(
     assert "consumer_id=host.memory.session.v1" in caplog.text
     assert "events_scanned=0" in caplog.text
     assert "finished_cursor=0" in caplog.text
+    assert "stop_reason=idle" in caplog.text
+    assert "target_reached=False" in caplog.text
+    assert "max_batches=None" in caplog.text
 
 
 def test_engine_ingest_delta_events_use_debug_log_level() -> None:

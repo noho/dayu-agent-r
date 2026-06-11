@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import pathlib
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
@@ -56,20 +57,29 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.outbox import read_outbox_terminal_items_after
-from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.context_policy import default_context_budget_policy
-from dayu.host.memory import default_memory_projection_policy
+from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
+from dayu.host.memory_repair import (
+    ConversationMemoryProjectionRepairResult,
+    MemoryProjectionCatchupBudget,
+    MemoryProjectionRepairPurpose,
+)
 from dayu.host.open_host import (
     _CompositeProjectionCatchupPort,
+    _MemoryProjectionCatchupPort,
     _PublicHostHandle,
     _command_options_from_open_host_options,
     _local_execution_options_from_open_host_options,
 )
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.projection import ProjectionConsumerId
 from dayu.host.recovery import StartupRecoveryScanner
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
+_DISPATCH_MODULE = importlib.import_module("dayu.host.dispatch")
+_OPEN_HOST_MODULE = importlib.import_module("dayu.host.open_host")
 
 
 class _FinalAnswerHandle:
@@ -587,6 +597,139 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
             raise AssertionError("open_host must fail before yielding")
 
     assert catch_up_calls == 1
+
+
+def test_open_host_memory_projection_port_uses_best_effort_budget(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_host memory projection after-commit port 使用 bounded best-effort 预算。"""
+
+    options = _options(tmp_path, _FinalAnswerWorkerFactory())
+    calls: list[MemoryProjectionCatchupBudget | None] = []
+
+    def record_catch_up(
+        transaction_runner: HostTransactionRunner,
+        *,
+        policy: MemoryProjectionPolicy,
+        batch_size: int,
+        budget: MemoryProjectionCatchupBudget | None = None,
+        consumer_id: str = "host.memory.session.v1",
+        max_event_sequence: int | None = None,
+    ) -> ConversationMemoryProjectionRepairResult:
+        """记录 open_host memory catch-up port 注入的预算。
+
+        :param transaction_runner: durable transaction runner。
+        :param policy: memory projection policy。
+        :param batch_size: batch size。
+        :param budget: Host 内部单次总预算。
+        :param consumer_id: memory projection consumer id。
+        :param max_event_sequence: 最大 event sequence。
+        :returns: 空 repair result。
+        """
+
+        del transaction_runner, policy, batch_size, max_event_sequence
+        calls.append(budget)
+        return ConversationMemoryProjectionRepairResult(
+            consumer_id=ProjectionConsumerId(consumer_id),
+            reset_checkpoint=False,
+            started_cursor=0,
+            finished_cursor=0,
+            events_scanned=0,
+            events_matched=0,
+            events_applied=0,
+            duplicates=0,
+            failures=0,
+        )
+
+    monkeypatch.setattr(
+        _OPEN_HOST_MODULE,
+        "catch_up_conversation_memory_projection",
+        record_catch_up,
+    )
+    with open_host_durable_store(_durable_options_from_open_options(options)) as store:
+        port = _MemoryProjectionCatchupPort(durable_store=store, options=options)
+        port.catch_up_projection()
+
+    assert len(calls) == 1
+    assert calls[0] is not None
+    assert calls[0].purpose is MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT
+    assert calls[0].max_batches == 1
+    assert calls[0].max_scanned_events == options.memory_projection_catchup_batch_size
+
+
+@pytest.mark.asyncio
+async def test_open_host_dispatch_memory_catchup_budget_exhausted_blocks_worker_accept(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dispatch 前 memory catch-up 未覆盖 required cursor 时不调用 worker accept。"""
+
+    factory = _FinalAnswerWorkerFactory()
+    options = replace(
+        _options(tmp_path, factory),
+        memory_projection_catchup_batch_size=1,
+    )
+    monkeypatch.setattr(
+        _DISPATCH_MODULE,
+        "_MEMORY_PROJECTION_REQUIRED_BEFORE_DISPATCH_MAX_BATCHES",
+        1,
+    )
+
+    def skip_after_commit_memory_catch_up(
+        transaction_runner: HostTransactionRunner,
+        *,
+        policy: MemoryProjectionPolicy,
+        batch_size: int,
+        budget: MemoryProjectionCatchupBudget | None = None,
+        consumer_id: str = "host.memory.session.v1",
+        max_event_sequence: int | None = None,
+    ) -> ConversationMemoryProjectionRepairResult:
+        """让测试只覆盖 dispatch 前 required catch-up。
+
+        :param transaction_runner: durable transaction runner。
+        :param policy: memory projection policy。
+        :param batch_size: batch size。
+        :param budget: Host 内部单次总预算。
+        :param consumer_id: memory projection consumer id。
+        :param max_event_sequence: 最大 event sequence。
+        :returns: 空 repair result。
+        """
+
+        del transaction_runner, policy, batch_size, budget, max_event_sequence
+        return ConversationMemoryProjectionRepairResult(
+            consumer_id=ProjectionConsumerId(consumer_id),
+            reset_checkpoint=False,
+            started_cursor=0,
+            finished_cursor=0,
+            events_scanned=0,
+            events_matched=0,
+            events_applied=0,
+            duplicates=0,
+            failures=0,
+        )
+
+    monkeypatch.setattr(
+        _OPEN_HOST_MODULE,
+        "catch_up_conversation_memory_projection",
+        skip_after_commit_memory_catch_up,
+    )
+
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "bounded-memory-dispatch"),
+        )
+        final_run = await _wait_for_run_status(
+            host,
+            followup.accepted_run_id,
+            RunStatus.FAILED,
+        )
+
+    assert final_run.status is RunStatus.FAILED
+    assert factory.accepted_snapshots == []
+    assert factory.accepted_requests == []
 
 
 @pytest.mark.asyncio

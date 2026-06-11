@@ -71,7 +71,11 @@ from dayu.host.durable.connection import (
     open_host_durable_store,
 )
 from dayu.host.durable.event_log import EventLogStore
-from dayu.host.memory_repair import catch_up_conversation_memory_projection
+from dayu.host.memory_repair import (
+    MemoryProjectionCatchupBudget,
+    MemoryProjectionRepairPurpose,
+    catch_up_conversation_memory_projection,
+)
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.outbox import (
     DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE,
@@ -120,6 +124,9 @@ _TOOL_TRACE_COLD_JSONL_FILE_NAME = "tool-trace-cold.jsonl"
 _TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
 """默认 Tool Trace cold JSONL lock 文件名后缀。"""
 
+_MEMORY_PROJECTION_AFTER_COMMIT_MAX_BATCHES = 1
+"""open_host after-commit memory projection best-effort catch-up 总批次数。"""
+
 
 @dataclass(frozen=True, slots=True)
 class _CommandContextBudgetFields:
@@ -131,6 +138,22 @@ class _CommandContextBudgetFields:
 
     context_window_size: int
     reserved_output_tokens: int
+
+
+def _after_commit_memory_projection_budget(
+    batch_size: int,
+) -> MemoryProjectionCatchupBudget:
+    """构造 open_host after-commit memory projection best-effort 预算。
+
+    :param batch_size: 单批 projection scan 上限。
+    :returns: Host 内部 memory projection 总预算。
+    """
+
+    return MemoryProjectionCatchupBudget(
+        max_batches=_MEMORY_PROJECTION_AFTER_COMMIT_MAX_BATCHES,
+        max_scanned_events=batch_size * _MEMORY_PROJECTION_AFTER_COMMIT_MAX_BATCHES,
+        purpose=MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
+    )
 
 
 @dataclass(slots=True)
@@ -155,6 +178,9 @@ class _MemoryProjectionCatchupPort(ProjectionCatchupPort):
             self.durable_store.transaction_runner,
             policy=self.options.memory_projection_policy,
             batch_size=self.options.memory_projection_catchup_batch_size,
+            budget=_after_commit_memory_projection_budget(
+                self.options.memory_projection_catchup_batch_size
+            ),
         )
 
 

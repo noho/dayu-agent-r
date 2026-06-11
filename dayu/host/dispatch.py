@@ -119,6 +119,9 @@ from dayu.host.memory import (
     MemoryRepairReason,
 )
 from dayu.host.memory_repair import (
+    ConversationMemoryProjectionRepairResult,
+    MemoryProjectionCatchupBudget,
+    MemoryProjectionRepairPurpose,
     catch_up_conversation_memory_projection,
     rebuild_conversation_memory_projection,
 )
@@ -238,6 +241,63 @@ _COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
+_MEMORY_PROJECTION_BEST_EFFORT_MAX_BATCHES = 1
+_MEMORY_PROJECTION_REQUIRED_BEFORE_DISPATCH_MAX_BATCHES = 16
+_MEMORY_PROJECTION_REBUILD_BEFORE_DISPATCH_MAX_BATCHES = 32
+
+
+class _MemoryProjectionDispatchDiagnosticError(HostDurableError):
+    """dispatch 前 memory projection repair 未覆盖 required cursor 的诊断错误。
+
+    :param operation: 触发错误的 repair 操作。
+    :param run_id: 目标 Run id。
+    :param attempt_id: 目标 Attempt id。
+    :param execution_id: 目标 execution id。
+    :param required_event_sequence: dispatch 必须覆盖的 EventLog cursor。
+    :param result: repair 执行结果。
+    """
+
+    operation: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    required_event_sequence: int
+    result: ConversationMemoryProjectionRepairResult
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        run_id: str,
+        attempt_id: str,
+        execution_id: str,
+        required_event_sequence: int,
+        result: ConversationMemoryProjectionRepairResult,
+    ) -> None:
+        """初始化 diagnostic error。
+
+        :param operation: 触发错误的 repair 操作。
+        :param run_id: 目标 Run id。
+        :param attempt_id: 目标 Attempt id。
+        :param execution_id: 目标 execution id。
+        :param required_event_sequence: dispatch 必须覆盖的 EventLog cursor。
+        :param result: repair 执行结果。
+        :returns: ``None``。
+        """
+
+        self.operation = operation
+        self.run_id = run_id
+        self.attempt_id = attempt_id
+        self.execution_id = execution_id
+        self.required_event_sequence = required_event_sequence
+        self.result = result
+        super().__init__(
+            "dispatch memory projection repair did not reach required cursor: "
+            f"operation={operation}, run_id={run_id}, attempt_id={attempt_id}, "
+            f"execution_id={execution_id}, required_event_sequence="
+            f"{required_event_sequence}, finished_cursor={result.finished_cursor}, "
+            f"stop_reason={result.stop_reason.value}"
+        )
 _LOG_DRAIN_LOOP_IDLE = "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
 _LOG_DRAIN_LOOP_CLOSE_EXIT = "dispatch drain loop exiting after close host_handle_id=%s"
 _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = "dispatch drain loop cancelled during close host_handle_id=%s"
@@ -260,6 +320,63 @@ _LOG_WORKER_LOST_CLOSEOUT_FAILED = (
     "original_error_type=%s"
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+def _memory_projection_catchup_budget(
+    *,
+    batch_size: int,
+    purpose: MemoryProjectionRepairPurpose,
+) -> MemoryProjectionCatchupBudget:
+    """按 dispatch 调用目的构造 memory projection 总预算。
+
+    :param batch_size: 单批 projection scan 上限。
+    :param purpose: repair 调用目的。
+    :returns: Host 内部 memory projection 总预算。
+    :raises HostDurableError: purpose 非法时抛出。
+    """
+
+    if purpose is MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT:
+        max_batches = _MEMORY_PROJECTION_BEST_EFFORT_MAX_BATCHES
+    elif purpose is MemoryProjectionRepairPurpose.REQUIRED_BEFORE_DISPATCH:
+        max_batches = _MEMORY_PROJECTION_REQUIRED_BEFORE_DISPATCH_MAX_BATCHES
+    elif purpose is MemoryProjectionRepairPurpose.REBUILD_BEFORE_DISPATCH:
+        max_batches = _MEMORY_PROJECTION_REBUILD_BEFORE_DISPATCH_MAX_BATCHES
+    else:
+        raise HostDurableError("unsupported memory projection repair purpose")
+    return MemoryProjectionCatchupBudget(
+        max_batches=max_batches,
+        max_scanned_events=batch_size * max_batches,
+        purpose=purpose,
+    )
+
+
+def _raise_if_memory_projection_target_not_reached(
+    *,
+    operation: str,
+    record: PendingDispatchRecord,
+    required_event_sequence: int,
+    result: ConversationMemoryProjectionRepairResult,
+) -> None:
+    """确认 dispatch 前 memory projection 已覆盖 required cursor。
+
+    :param operation: repair 操作名称。
+    :param record: pending dispatch 摘要。
+    :param required_event_sequence: dispatch 必须覆盖的 EventLog cursor。
+    :param result: repair 执行结果。
+    :returns: ``None``。
+    :raises _MemoryProjectionDispatchDiagnosticError: repair 未覆盖目标时抛出。
+    """
+
+    if result.failures == 0 and result.target_reached:
+        return
+    raise _MemoryProjectionDispatchDiagnosticError(
+        operation=operation,
+        run_id=record.run_id,
+        attempt_id=record.attempt_id,
+        execution_id=record.execution_id,
+        required_event_sequence=required_event_sequence,
+        result=result,
+    )
 
 
 def _precondition_compaction_operation_id(
@@ -905,6 +1022,14 @@ class HostDispatchScheduler:
                 policy=self._local_execution.memory_projection_policy,
                 batch_size=(self._local_execution.memory_projection_catchup_batch_size),
                 max_event_sequence=stage.compact_accepted.compacted_event_sequence,
+                budget=_memory_projection_catchup_budget(
+                    batch_size=(
+                        self._local_execution.memory_projection_catchup_batch_size
+                    ),
+                    purpose=(
+                        MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT
+                    ),
+                ),
             )
             pending_dispatch = self._start_governed_after_compact(stage.compact_accepted)
         _LOGGER.log(
@@ -2606,6 +2731,38 @@ class HostDispatchScheduler:
                 worker.accept(snapshot, request),
                 timeout=self._local_execution.worker_startup_timeout_seconds,
             )
+        except _MemoryProjectionDispatchDiagnosticError as exc:
+            try:
+                _LOGGER.warning(
+                    "dispatch.memory_projection.repair_not_reached "
+                    "operation=%s run_id=%s attempt_id=%s execution_id=%s "
+                    "required_event_sequence=%s started_cursor=%s "
+                    "finished_cursor=%s events_scanned=%s batches_used=%s "
+                    "stop_reason=%s budget_exhausted=%s failures=%s "
+                    "max_batches=%s max_scanned_events=%s",
+                    exc.operation,
+                    exc.run_id,
+                    exc.attempt_id,
+                    exc.execution_id,
+                    exc.required_event_sequence,
+                    exc.result.started_cursor,
+                    exc.result.finished_cursor,
+                    exc.result.events_scanned,
+                    exc.result.batches_used,
+                    exc.result.stop_reason.value,
+                    exc.result.budget_exhausted,
+                    exc.result.failures,
+                    exc.result.max_batches,
+                    exc.result.max_scanned_events,
+                )
+                self._safe_closeout_worker_startup_timeout(
+                    record,
+                    reason=_MEMORY_PROJECTION_REPAIR_REQUIRED_REASON,
+                    original_error=exc,
+                )
+            finally:
+                await _safe_release_lane_token(token)
+            return "timed_out"
         except MemoryProjectionRepairRequired as exc:
             if exc.repair_request.reason is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD:
                 try:
@@ -2755,10 +2912,24 @@ class HostDispatchScheduler:
                 record.execution_id,
                 exc.repair_request.required_event_sequence,
             )
-            rebuild_conversation_memory_projection(
+            rebuild_budget = _memory_projection_catchup_budget(
+                batch_size=(
+                    self._local_execution.memory_projection_catchup_batch_size
+                ),
+                purpose=MemoryProjectionRepairPurpose.REBUILD_BEFORE_DISPATCH,
+            )
+            rebuild_result = rebuild_conversation_memory_projection(
                 self._transaction_runner,
                 policy=self._local_execution.memory_projection_policy,
                 batch_size=(self._local_execution.memory_projection_catchup_batch_size),
+                max_event_sequence=exc.repair_request.required_event_sequence,
+                budget=rebuild_budget,
+            )
+            _raise_if_memory_projection_target_not_reached(
+                operation="rebuild_before_dispatch",
+                record=record,
+                required_event_sequence=exc.repair_request.required_event_sequence,
+                result=rebuild_result,
             )
             retry_builder = self._run_input_builder_for_dispatch(
                 snapshot=snapshot,
@@ -2860,25 +3031,24 @@ class HostDispatchScheduler:
         :raises HostDurableError: projection runner 或 durable 操作失败时抛出。
         """
 
+        required_event_sequence = self._required_memory_event_sequence_for_dispatch(record)
         result = catch_up_conversation_memory_projection(
             self._transaction_runner,
             policy=self._local_execution.memory_projection_policy,
             batch_size=(self._local_execution.memory_projection_catchup_batch_size),
-            max_event_sequence=(self._required_memory_event_sequence_for_dispatch(record)),
+            max_event_sequence=required_event_sequence,
+            budget=_memory_projection_catchup_budget(
+                batch_size=(
+                    self._local_execution.memory_projection_catchup_batch_size
+                ),
+                purpose=MemoryProjectionRepairPurpose.REQUIRED_BEFORE_DISPATCH,
+            ),
         )
-        if result.failures == 0:
-            return
-        _LOGGER.warning(
-            "dispatch.memory_projection.catch_up_failed_rebuild " "run_id=%s attempt_id=%s execution_id=%s failures=%s",
-            record.run_id,
-            record.attempt_id,
-            record.execution_id,
-            result.failures,
-        )
-        rebuild_conversation_memory_projection(
-            self._transaction_runner,
-            policy=self._local_execution.memory_projection_policy,
-            batch_size=(self._local_execution.memory_projection_catchup_batch_size),
+        _raise_if_memory_projection_target_not_reached(
+            operation="catch_up_before_dispatch",
+            record=record,
+            required_event_sequence=required_event_sequence,
+            result=result,
         )
 
     def _required_memory_event_sequence_for_dispatch(self, record: PendingDispatchRecord) -> int:
