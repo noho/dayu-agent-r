@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | review |
-| implementation status | WU-PROJ-01 Slice 4 accepted commit completed; awaiting aggregate deepreview by AgentMiMo / AgentDS |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-PROJ-01 aggregate deepreview completed; ready for draft PR gate |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 aggregate deepreview gate via AgentMiMo / AgentDS |
+| next entry point | WU-PROJ-01 draft PR gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
@@ -226,7 +226,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | review | Compact material truth and bounded memory catch-up | GitHub Issue #86 | Slice 1-4 accepted；等待 aggregate deepreview 后进入 draft PR gate |
+| WU-PROJ-01 | ready-to-open-draft-PR | Compact material truth and bounded memory catch-up | GitHub Issue #86 | aggregate deepreview passed；等待 draft PR gate |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
@@ -1374,13 +1374,30 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
 
 ### Aggregate deepreview gate
 
-- status: next
+- status: completed
 - owner: AgentMiMo / AgentDS
 - entry point: WU-PROJ-01 aggregate deepreview gate
-- expected scope:
-  - accepted plan and Slice 1-4 commits.
-  - design/control doc consistency.
-  - residual risks have owners before draft PR gate.
+- review artifacts:
+  - `docs/reviews/wu-proj-01-aggregate-deepreview-mimo.md`
+  - `docs/reviews/wu-proj-01-aggregate-deepreview-ds.md`
+- verdict:
+  - AgentMiMo: `PASS-WITH-FINDINGS`
+  - AgentDS: `PASS`
+- controller adjudication: `docs/reviews/wu-proj-01-aggregate-deepreview-controller-adjudication.md`
+- findings:
+  - AgentMiMo NF1 (Low): `_memory_projection_catchup_budget` unsupported purpose 分支无测试 — rejected-as-nonblocking；defensive guard.
+  - AgentMiMo NF2 (Low): dispatch before-worker catch-up happy path 无独立集成测试 — deferred to `WU-PROJ-01-S3-R1`.
+  - AgentMiMo NF3 (Low): `test_reactive_compact_failure_fallback_dispatch_uses_failed_view` lane timeout flaky — deferred to `WU-PROJ-01-S4-R1`.
+  - AgentDS Low observations: accepted as nonblocking maintainability notes; no fix gate required.
+- blocking findings: 无
+- residual risks:
+  - `WU-PROJ-01-S3-R1` deferred-with-owner to Host dispatch test hardening — 不阻塞 draft PR gate
+  - `WU-PROJ-01-S4-R1` deferred-with-owner to Host dispatch scheduler test hardening — 不阻塞 draft PR gate
+- validation:
+  - 68 passed, 1 skipped, 123 deselected
+  - 143 aggregate focused tests passed by AgentDS
+  - pyright: 0 errors, 0 warnings, 0 informations
+- controller decision: accepted; no aggregate fix gate; proceed to draft PR gate
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 
