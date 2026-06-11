@@ -225,7 +225,7 @@ def test_rebuild_resets_projection_and_finishes_empty_batch(
         budget=memory_repair.MemoryProjectionCatchupBudget(
             max_batches=1,
             max_scanned_events=10,
-            purpose=memory_repair.MemoryProjectionRepairPurpose.REBUILD_BEFORE_DISPATCH,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
         ),
         consumer_id=consumer_id.value,
     )
@@ -326,7 +326,7 @@ def test_catch_up_budget_exhausted_stops_before_idle() -> None:
         budget=memory_repair.MemoryProjectionCatchupBudget(
             max_batches=1,
             max_scanned_events=2,
-            purpose=memory_repair.MemoryProjectionRepairPurpose.REQUIRED_BEFORE_DISPATCH,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
         ),
     )
 
@@ -375,7 +375,7 @@ def test_catch_up_stops_when_target_reached_before_idle() -> None:
         budget=memory_repair.MemoryProjectionCatchupBudget(
             max_batches=4,
             max_scanned_events=8,
-            purpose=memory_repair.MemoryProjectionRepairPurpose.REQUIRED_BEFORE_DISPATCH,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
         ),
     )
 
@@ -463,7 +463,7 @@ def test_rebuild_budget_exhausted_reports_target_not_reached(
         budget=memory_repair.MemoryProjectionCatchupBudget(
             max_batches=1,
             max_scanned_events=2,
-            purpose=memory_repair.MemoryProjectionRepairPurpose.REBUILD_BEFORE_DISPATCH,
+            purpose=memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
         ),
         consumer_id=consumer_id.value,
     )
@@ -724,7 +724,7 @@ def test_catch_up_budget_exhausted_advances_only_processed_checkpoint(
                 max_batches=1,
                 max_scanned_events=1,
                 purpose=(
-                    memory_repair.MemoryProjectionRepairPurpose.REQUIRED_BEFORE_DISPATCH
+                    memory_repair.MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT
                 ),
             ),
         )

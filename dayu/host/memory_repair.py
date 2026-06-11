@@ -34,8 +34,6 @@ class MemoryProjectionRepairPurpose(StrEnum):
     """memory projection repair 的 Host 内部调用目的。"""
 
     BEST_EFFORT_AFTER_COMMIT = "best_effort_after_commit"
-    REQUIRED_BEFORE_DISPATCH = "required_before_dispatch"
-    REBUILD_BEFORE_DISPATCH = "rebuild_before_dispatch"
 
 
 class MemoryProjectionRepairStopReason(StrEnum):
