@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-PROJ-01 Slice 3 code review passed; accepted slice commit pending |
+| gate | implementation |
+| implementation status | WU-PROJ-01 Slice 3 accepted commit completed; awaiting Slice 4 implementation by AgentCodex |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 Slice 3 accepted slice commit gate |
+| next entry point | WU-PROJ-01 Slice 4 implementation gate via AgentCodex |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
@@ -1338,6 +1338,15 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
   - AgentDS: `APPROVE`
 - code review controller adjudication: `docs/reviews/wu-proj-01-slice3-code-review-controller-adjudication.md`
 - controller decision after code review: accepted; no fix gate required; proceed to accepted slice commit
+- accepted slice commit: `a658ee1f`
+
+### Slice 4 implementation gate
+
+- slice: Accepted compact -> Conversation Memory -> ordinary RunInput regression
+- status: next
+- owner: AgentCodex
+- entry point: WU-PROJ-01 Slice 4 implementation gate
+- inherited residual risk: `WU-PROJ-01-S3-R1` dispatch before-worker catch-up happy path may be covered here if fixture naturally touches ordinary RunInput; otherwise remains later Host dispatch test hardening.
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 
