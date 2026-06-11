@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass-final-closeout-passed |
-| implementation status | WU-PROJ-01 final closeout passed; waiting for user merge / ready-for-review decision on PR #136 |
+| gate | implementation |
+| implementation status | User decision after final closeout: WU-PROJ-01-S3-R1 and WU-PROJ-01-S4-R1 must be implemented in PR #136 |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | user decision on WU-PROJ-01 draft PR #136 |
+| next entry point | WU-PROJ-01 residual risk implementation gate via AgentCodex |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 draft PR #136 https://github.com/noho/dayu-agent-r/pull/136 |
 | blocking open questions | none |
@@ -199,8 +199,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
-| WU-PROJ-01-S3-R1 | deferred-with-owner | Host dispatch test hardening | 补 dispatch before-worker catch-up happy path 独立集成测试，覆盖 required cursor 已被 projection checkpoint 覆盖时不重复追账且继续构造 ordinary RunInput。 |
-| WU-PROJ-01-S4-R1 | deferred-with-owner | Host dispatch scheduler test hardening | `test_reactive_compact_failure_fallback_dispatch_uses_failed_view` 存在 lane timeout flaky 观察；与 Slice 4 改动无关，后续单独稳定化或调整 timing fixture。 |
+| WU-PROJ-01-S3-R1 | open | WU-PROJ-01 / PR #136 | 用户裁决必须在当前 PR 中实施；补 dispatch before-worker catch-up happy path 独立集成测试，覆盖 required cursor 已被 projection checkpoint 覆盖时不重复追账且继续构造 ordinary RunInput。 |
+| WU-PROJ-01-S4-R1 | open | WU-PROJ-01 / PR #136 | 用户裁决必须在当前 PR 中实施；稳定 `test_reactive_compact_failure_fallback_dispatch_uses_failed_view` 的 lane timeout flaky，调整 timing fixture 或测试结构。 |
 
 ## 当前 Work Units
 
@@ -226,7 +226,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | draft-PR-pass-final-closeout-passed | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | Final closeout passed；PR #136 remains draft/open；等待用户 merge / ready-for-review decision |
+| WU-PROJ-01 | implementation | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | 用户裁决 `WU-PROJ-01-S3-R1` / `WU-PROJ-01-S4-R1` 必须在当前 PR 内实施；等待 residual risk implementation gate |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
@@ -1455,7 +1455,7 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
 
 ### Final closeout
 
-- status: passed
+- status: superseded-by-user-decision
 - closeout artifact: `docs/reviews/wu-proj-01-final-closeout-controller.md`
 - draft-PR-pass bookkeeping commit before final closeout: `171b6cd2`
 - draft PR: `https://github.com/noho/dayu-agent-r/pull/136`
@@ -1465,9 +1465,17 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
   - pyright passed, 0 errors.
   - `git diff --check` passed.
 - residual risks:
-  - `WU-PROJ-01-S3-R1` remains deferred-with-owner to Host dispatch test hardening.
-  - `WU-PROJ-01-S4-R1` remains deferred-with-owner to Host dispatch scheduler test hardening.
-- next entry point: user decision on draft PR #136.
+  - `WU-PROJ-01-S3-R1` was previously deferred-with-owner to Host dispatch test hardening.
+  - `WU-PROJ-01-S4-R1` was previously deferred-with-owner to Host dispatch scheduler test hardening.
+- superseding decision: `docs/reviews/wu-proj-01-residual-risk-user-decision-controller.md`
+- next entry point: WU-PROJ-01 residual risk implementation gate via AgentCodex.
+
+### Residual risk user decision
+
+- status: active
+- decision artifact: `docs/reviews/wu-proj-01-residual-risk-user-decision-controller.md`
+- user decision: `WU-PROJ-01-S3-R1` and `WU-PROJ-01-S4-R1` must be implemented in PR #136.
+- next gate: WU-PROJ-01 residual risk implementation gate via AgentCodex.
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 

@@ -13,6 +13,10 @@
 
 `WU-PROJ-01` 已完成本地 phaseflow gate，状态为 `draft-PR-pass-final-closeout-passed`。Draft PR #136 已创建并保持 draft 状态，等待用户 merge / ready-for-review decision。
 
+## Superseding User Decision
+
+2026-06-11 用户在 final closeout 后裁决：`WU-PROJ-01-S3-R1` 与 `WU-PROJ-01-S4-R1` 都必须在当前 PR #136 中实施。因此本文档记录的 closeout 状态已被 `docs/reviews/wu-proj-01-residual-risk-user-decision-controller.md` supersede；WU-PROJ-01 回到 implementation gate，等待 residual risk implementation。
+
 ## 完成交付
 
 - Accepted plan: `docs/host/wu-proj-01-compact-material-truth-and-bounded-memory-catchup-plan.md`
