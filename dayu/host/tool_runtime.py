@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 import math
 import secrets
@@ -185,6 +186,7 @@ _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 _PAYLOAD_FIELD_TOOL_TIMING = "tool_timing"
+_PAYLOAD_FIELD_FAILURE_METADATA = "failure_metadata"
 _TOOL_RESULT_PAYLOAD_REF_PREFIX = "payload-tool-result"
 _TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-tool-result"
 _TOOL_CALL_ARGUMENTS_PAYLOAD_REF_PREFIX = "payload-tool-call-arguments"
@@ -234,6 +236,12 @@ _TOOL_TIMING_SCHEMA_VERSION = 1
 _TOOL_TIMING_STATUS_AVAILABLE = "available"
 _TOOL_TIMING_STATUS_MISSING_META = "missing_tool_result_meta"
 _TOOL_TIMING_DURATION_SOURCE_META = "tool_result_meta"
+_FAILURE_METADATA_SCHEMA_VERSION = 1
+_TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS = 512
+_FAILURE_KIND_TOOL_FAILED = "tool_failed"
+_FAILURE_KIND_TOOL_CANCELLED = "tool_cancelled"
+_FAILURE_KIND_POLICY_BLOCKED = "policy_blocked"
+_FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED = _EVENT_TYPE_TOOL_RESULT_ACCEPTED
 _ONE_MILLISECOND = timedelta(milliseconds=1)
 _SIDE_EFFECT_IDEMPOTENCY_HINT = (
     "side-effect or paid tool requires a tool idempotency key"
@@ -474,6 +482,8 @@ class ToolAcceptResult:
     :param truncation: 截断事实；无截断时为 ``None``。
     :param raw_tool_outcome: Host accepted 后写入 raw transcript 的工具 outcome。
     :param tool_timing: 从工具 outcome meta 派生的稳定耗时 signal。
+    :param failure_metadata: 从工具 outcome / governance 派生的失败 signal；成功时为
+        ``None``。
     :returns: 构造完成的结果值对象。
     :raises ValueError: digest 非法、payload 引用不一致或截断事实类型非法时抛出。
     """
@@ -484,6 +494,7 @@ class ToolAcceptResult:
     truncation: ToolTruncationFact | None
     raw_tool_outcome: JsonValue
     tool_timing: Mapping[str, JsonValue]
+    failure_metadata: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
         """校验结果内部字段。
@@ -628,11 +639,20 @@ class ToolFactAcceptCandidate:
         if self.tool_fact_kind is ToolFactKind.COMPLETED:
             _validate_result_fact_policy(self)
             _require_raw_tool_outcome(self)
+            _validate_candidate_failure_metadata(self, expected_kind=None)
             if _candidate_result(self).payload_digest is None:
                 raise ValueError("completed requires payload_digest")
         elif self.tool_fact_kind in (ToolFactKind.FAILED, ToolFactKind.CANCELLED):
             _validate_result_fact_policy(self)
             _require_raw_tool_outcome(self)
+            _validate_candidate_failure_metadata(
+                self,
+                expected_kind=(
+                    _FAILURE_KIND_TOOL_FAILED
+                    if self.tool_fact_kind is ToolFactKind.FAILED
+                    else _FAILURE_KIND_TOOL_CANCELLED
+                ),
+            )
             if _candidate_reuse_prior_event_refs(self):
                 raise ValueError(
                     f"{self.tool_fact_kind.value} must not carry prior reuse refs"
@@ -640,6 +660,10 @@ class ToolFactAcceptCandidate:
         elif self.tool_fact_kind is ToolFactKind.GOVERNED_ERROR:
             _require_raw_tool_outcome(self)
             _validate_governed_error_candidate(self)
+            _validate_candidate_failure_metadata(
+                self,
+                expected_kind=_FAILURE_KIND_POLICY_BLOCKED,
+            )
         elif self.tool_fact_kind is ToolFactKind.REUSE:
             _validate_reuse_candidate(self)
         else:
@@ -3808,6 +3832,7 @@ def _tool_result_payload(
             accepted_evidence_envelope_to_json_value(accepted_evidence_envelope)
         ),
         _PAYLOAD_FIELD_TOOL_TIMING: result.tool_timing,
+        _PAYLOAD_FIELD_FAILURE_METADATA: result.failure_metadata,
     }
     if include_raw_tool_outcome:
         payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] = result.raw_tool_outcome
@@ -4338,7 +4363,8 @@ def _validate_tool_accept_result(result: ToolAcceptResult) -> None:
 
     :param result: 待校验的工具结果子结构。
     :returns: ``None``。
-    :raises ValueError: digest、payload ref、截断事实或 timing signal 非法时抛出。
+    :raises ValueError: digest、payload ref、截断事实、timing signal 或失败
+        metadata 非法时抛出。
     """
 
     _require_sha256_digest(result.outcome_digest, field_name="outcome_digest")
@@ -4355,6 +4381,7 @@ def _validate_tool_accept_result(result: ToolAcceptResult) -> None:
     ):
         raise ValueError("truncation must be ToolTruncationFact")
     _validate_tool_timing_signal(result.tool_timing)
+    _validate_failure_metadata_signal(result.failure_metadata)
 
 
 def _validate_tool_timing_signal(signal: Mapping[str, JsonValue]) -> None:
@@ -4411,6 +4438,130 @@ def _require_signal_text(signal: Mapping[str, JsonValue], field_name: str) -> st
     if isinstance(value, str) and value.strip() != "":
         return value
     raise ValueError(f"tool_timing.{field_name} must be text")
+
+
+def _validate_failure_metadata_signal(
+    signal: Mapping[str, JsonValue] | None,
+) -> None:
+    """校验 ToolRuntime 生成的失败元数据 signal。
+
+    :param signal: failure metadata JSON object；成功工具结果为 ``None``。
+    :returns: ``None``。
+    :raises ValueError: 必填字段缺失、字段类型非法或闭集枚举非法时抛出。
+    """
+
+    if signal is None:
+        return
+    if not isinstance(signal, Mapping):
+        raise ValueError("failure_metadata must be JSON object or null")
+    if signal.get("schema_version") != _FAILURE_METADATA_SCHEMA_VERSION:
+        raise ValueError("failure_metadata.schema_version must be 1")
+    if signal.get("signal_source") != _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED:
+        raise ValueError("failure_metadata.signal_source is unsupported")
+    failure_kind = signal.get("failure_kind")
+    if failure_kind == _FAILURE_KIND_TOOL_FAILED:
+        _require_failure_signal_text(signal, "error_code")
+        _validate_bounded_text_fields(signal, "repair_hint")
+        _validate_failure_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_TOOL_CANCELLED:
+        _require_failure_signal_text(signal, "cancel_reason")
+        _validate_bounded_text_fields(signal, "cancel_message")
+        _validate_bounded_text_fields(signal, "cancel_hint")
+        _validate_failure_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_POLICY_BLOCKED:
+        _require_failure_signal_text(signal, "policy_decision_kind")
+        _require_failure_signal_text(signal, "policy_block_reason")
+        _validate_failure_diagnostic_refs(signal)
+        return
+    raise ValueError("failure_metadata.failure_kind is unsupported")
+
+
+def _validate_candidate_failure_metadata(
+    candidate: ToolFactAcceptCandidate, *, expected_kind: str | None
+) -> None:
+    """校验 candidate fact kind 与 failure metadata 的一致性。
+
+    :param candidate: 工具事实候选。
+    :param expected_kind: 期望的 failure kind；成功结果为 ``None``。
+    :returns: ``None``。
+    :raises ValueError: metadata 缺失、额外存在或 kind 不匹配时抛出。
+    """
+
+    metadata = _candidate_result(candidate).failure_metadata
+    if expected_kind is None:
+        if metadata is not None:
+            raise ValueError("completed result requires failure_metadata=null")
+        return
+    if metadata is None:
+        raise ValueError(f"{candidate.tool_fact_kind.value} requires failure_metadata")
+    failure_kind = metadata.get("failure_kind")
+    if failure_kind != expected_kind:
+        raise ValueError(
+            f"{candidate.tool_fact_kind.value} failure_metadata kind mismatch"
+        )
+
+
+def _require_failure_signal_text(
+    signal: Mapping[str, JsonValue], field_name: str
+) -> str:
+    """读取 failure metadata 的必填文本字段。
+
+    :param signal: failure metadata JSON object。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises ValueError: 字段缺失或不是非空文本时抛出。
+    """
+
+    value = signal.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise ValueError(f"failure_metadata.{field_name} must be text")
+
+
+def _validate_bounded_text_fields(
+    signal: Mapping[str, JsonValue], field_name: str
+) -> None:
+    """校验 bounded text 三字段组合。
+
+    :param signal: failure metadata JSON object。
+    :param field_name: bounded text 字段名前缀。
+    :returns: ``None``。
+    :raises ValueError: bounded 文本、digest 或 truncated 字段组合非法时抛出。
+    """
+
+    value = signal.get(field_name)
+    digest = signal.get(f"{field_name}_sha256")
+    truncated = signal.get(f"{field_name}_truncated")
+    if not isinstance(truncated, bool):
+        raise ValueError(f"failure_metadata.{field_name}_truncated must be bool")
+    if value is None:
+        if digest is not None or truncated:
+            raise ValueError(f"failure_metadata.{field_name} null fields are invalid")
+        return
+    if not isinstance(value, str):
+        raise ValueError(f"failure_metadata.{field_name} must be text or null")
+    if len(value) > _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS:
+        raise ValueError(f"failure_metadata.{field_name} exceeds bounded limit")
+    if not isinstance(digest, str) or not is_sha256_digest(digest):
+        raise ValueError(f"failure_metadata.{field_name}_sha256 must be sha256 digest")
+
+
+def _validate_failure_diagnostic_refs(signal: Mapping[str, JsonValue]) -> None:
+    """校验 failure metadata diagnostic refs。
+
+    :param signal: failure metadata JSON object。
+    :returns: ``None``。
+    :raises ValueError: refs 字段不是文本数组时抛出。
+    """
+
+    refs = signal.get("diagnostic_refs")
+    if not isinstance(refs, list):
+        raise ValueError("failure_metadata.diagnostic_refs must be JSON array")
+    for ref in refs:
+        if not isinstance(ref, str) or ref.strip() == "":
+            raise ValueError("failure_metadata.diagnostic_refs must contain text")
 
 
 def _validate_tool_accept_duplicate_governance(
@@ -5518,6 +5669,11 @@ def _tool_fact_accept_candidate(
             truncation=truncation_fact,
             raw_tool_outcome=_tool_outcome_json(outcome),
             tool_timing=_tool_timing_from_meta(_tool_result_meta(outcome)),
+            failure_metadata=_failure_metadata_from_outcome(
+                outcome=outcome,
+                policy_decision=policy_decision,
+                diagnostic_refs=diagnostic_refs,
+            ),
         ),
         governance=ToolAcceptGovernance(
             policy_decision=policy_decision,
@@ -5952,6 +6108,103 @@ def _tool_timing_from_meta(meta: ToolResultMeta | None) -> Mapping[str, JsonValu
         "duration_ms": duration_ms,
         "duration_source": _TOOL_TIMING_DURATION_SOURCE_META,
     }
+
+
+def _failure_metadata_from_outcome(
+    *,
+    outcome: ToolExecutionOutcome,
+    policy_decision: ToolPolicyDecision,
+    diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...],
+) -> Mapping[str, JsonValue] | None:
+    """从 typed outcome 与治理决策构造失败元数据 signal。
+
+    :param outcome: 工具执行 outcome。
+    :param policy_decision: 工具治理决策。
+    :param diagnostic_refs: 本次工具事实携带的诊断引用。
+    :returns: failure metadata JSON object；成功结果为 ``None``。
+    :raises TypeError: 收到 awaiting 或未知 outcome 时抛出。
+    """
+
+    diagnostic_ref_ids: list[JsonValue] = [ref.ref_id for ref in diagnostic_refs]
+    if policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
+        return {
+            "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
+            "signal_source": _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED,
+            "failure_kind": _FAILURE_KIND_POLICY_BLOCKED,
+            "policy_decision_kind": policy_decision.kind.value,
+            "policy_block_reason": policy_decision.reason_code,
+            "diagnostic_refs": diagnostic_ref_ids,
+        }
+    if isinstance(outcome, ToolCompletedOutcome):
+        return None
+    if isinstance(outcome, ToolFailedOutcome):
+        bounded_hint = _bounded_failure_text(outcome.result.hint)
+        return {
+            "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
+            "signal_source": _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED,
+            "failure_kind": _FAILURE_KIND_TOOL_FAILED,
+            "error_code": outcome.result.error,
+            "repair_hint": bounded_hint.value,
+            "repair_hint_truncated": bounded_hint.truncated,
+            "repair_hint_sha256": bounded_hint.sha256_digest,
+            "diagnostic_refs": diagnostic_ref_ids,
+        }
+    if isinstance(outcome, ToolCancelledOutcome):
+        bounded_message = _bounded_failure_text(outcome.message)
+        bounded_hint = _bounded_failure_text(outcome.hint)
+        return {
+            "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
+            "signal_source": _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED,
+            "failure_kind": _FAILURE_KIND_TOOL_CANCELLED,
+            "cancel_reason": outcome.reason,
+            "cancel_message": bounded_message.value,
+            "cancel_message_truncated": bounded_message.truncated,
+            "cancel_message_sha256": bounded_message.sha256_digest,
+            "cancel_hint": bounded_hint.value,
+            "cancel_hint_truncated": bounded_hint.truncated,
+            "cancel_hint_sha256": bounded_hint.sha256_digest,
+            "diagnostic_refs": diagnostic_ref_ids,
+        }
+    if isinstance(outcome, ToolAwaitingOutcome):
+        raise TypeError("ToolAwaitingOutcome does not carry accepted failure metadata")
+    raise TypeError("unsupported tool outcome")
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundedFailureText:
+    """failure metadata 中的 bounded text 投影。
+
+    :param value: bounded 文本；原文为 ``None`` 时为 ``None``。
+    :param sha256_digest: full original UTF-8 文本 digest；原文为 ``None`` 时为
+        ``None``。
+    :param truncated: 原文是否超过 bounded 字符上限。
+    """
+
+    value: str | None
+    sha256_digest: str | None
+    truncated: bool
+
+
+def _bounded_failure_text(value: str | None) -> _BoundedFailureText:
+    """按 Tool Trace signal 规则裁剪失败文本。
+
+    :param value: 原始文本；可为 ``None``。
+    :returns: bounded 文本、full original digest 与截断标志。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return _BoundedFailureText(
+            value=None,
+            sha256_digest=None,
+            truncated=False,
+        )
+    digest = f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+    return _BoundedFailureText(
+        value=value[:_TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS],
+        sha256_digest=digest,
+        truncated=len(value) > _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS,
+    )
 
 
 def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:

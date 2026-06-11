@@ -1838,7 +1838,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
                         "0123456789abcdef0123456789abcdef"
                     ),
                     "provider_error": {
-                        "code": "invalid_stream",
+                        "code": "raw_payload_code_must_not_win",
                         "type": "protocol_error",
                     },
                 },
@@ -1853,8 +1853,16 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
 
         assert result.events[0].event_class == EventClass.DIAGNOSTIC
         assert result.events[0].event_type == "PROVIDER_PROTOCOL_ERROR"
-        assert _payload(result.events[0])["client_correlation_id"] == "client-protocol"
-        assert _payload(result.events[0])["raw_payload_ref"] is not None
+        payload = _payload(result.events[0])
+        assert payload["client_correlation_id"] == "client-protocol"
+        assert payload["raw_payload_ref"] is not None
+        assert payload["failure_metadata"] == {
+            "schema_version": 1,
+            "signal_source": "PROVIDER_PROTOCOL_ERROR",
+            "failure_kind": "provider_protocol_error",
+            "provider_error_code": "invalid_stream",
+            "diagnostic_refs": [payload["raw_payload_ref"], "req-protocol"],
+        }
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING

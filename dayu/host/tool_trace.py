@@ -18,6 +18,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     format_utc_timestamp,
+    is_sha256_digest,
     sha256_digest_json,
 )
 from dayu.host.durable.errors import HostDurableError
@@ -162,6 +163,26 @@ _TOOL_TIMING_DURATION_SOURCE_META = "tool_result_meta"
 _CONTEXT_PRESSURE_STATUS_COMPACTION_FAILED = "compaction_failed"
 _CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED = (
     "compaction_attempt_rejected"
+)
+_FAILURE_METADATA_SCHEMA_VERSION = 1
+_TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS = 512
+_FAILURE_KIND_TOOL_FAILED = "tool_failed"
+_FAILURE_KIND_TOOL_CANCELLED = "tool_cancelled"
+_FAILURE_KIND_POLICY_BLOCKED = "policy_blocked"
+_FAILURE_KIND_PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
+_FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED = (
+    "context_compaction_attempt_rejected"
+)
+_FAILURE_KIND_CONTEXT_COMPACTION_FAILED = "context_compaction_failed"
+_FAILURE_METADATA_ALLOWED_KINDS = frozenset(
+    {
+        _FAILURE_KIND_TOOL_FAILED,
+        _FAILURE_KIND_TOOL_CANCELLED,
+        _FAILURE_KIND_POLICY_BLOCKED,
+        _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
+        _FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        _FAILURE_KIND_CONTEXT_COMPACTION_FAILED,
+    }
 )
 _PRODUCER_MISSING_REF_KIND_RUNNER_CALL_PROJECTION_ARTIFACT = (
     "runner_call_projection_artifact"
@@ -1189,14 +1210,16 @@ def _canonical_trace_summary_signals(
                 transaction, payload
             ),
             tool_timing=copied.tool_timing,
-            failure_metadata=copied.failure_metadata,
+            failure_metadata=_context_compaction_failed_failure_metadata(payload),
             partial_tool_call_signal=copied.partial_tool_call_signal,
         )
     if event.event_type == _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED:
         return _TraceSummarySignals(
             context_pressure=_context_compaction_attempt_rejected_pressure(payload),
             tool_timing=copied.tool_timing,
-            failure_metadata=copied.failure_metadata,
+            failure_metadata=_context_compaction_attempt_rejected_failure_metadata(
+                payload
+            ),
             partial_tool_call_signal=copied.partial_tool_call_signal,
         )
     return copied
@@ -1273,6 +1296,61 @@ def _context_compaction_attempt_rejected_pressure(
     }
 
 
+def _context_compaction_attempt_rejected_failure_metadata(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 attempt rejected compact payload 派生失败元数据 signal。
+
+    :param payload: attempt rejected canonical payload。
+    :returns: failure metadata JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    return {
+        _FIELD_SCHEMA_VERSION: _FAILURE_METADATA_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        "failure_kind": _FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        _FIELD_FAILURE_CATEGORY: _required_text(payload, _FIELD_FAILURE_CATEGORY),
+        _FIELD_REPAIRABLE: _required_bool(payload, _FIELD_REPAIRABLE),
+        _FIELD_NEXT_POLICY_DECISION: _required_text(
+            payload, _FIELD_NEXT_POLICY_DECISION
+        ),
+        _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: _optional_int(
+            payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT
+        ),
+        _FIELD_DIAGNOSTIC_REFS: list(_diagnostic_refs(payload)),
+    }
+
+
+def _context_compaction_failed_failure_metadata(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 failed compact payload 派生失败元数据 signal。
+
+    :param payload: failed canonical payload。
+    :returns: failure metadata JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    return {
+        _FIELD_SCHEMA_VERSION: _FAILURE_METADATA_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_FAILED,
+        "failure_kind": _FAILURE_KIND_CONTEXT_COMPACTION_FAILED,
+        "failure_reason": _required_text(payload, "failure_reason"),
+        "policy_decision": _required_text(payload, _FIELD_POLICY_DECISION),
+        "retryable": _required_bool(payload, "retryable"),
+        "attempt_count": _required_int(payload, "attempt_count"),
+        _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED: _required_bool(
+            payload, _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED
+        ),
+        _FIELD_FALLBACK_ACTION: _optional_text(payload, _FIELD_FALLBACK_ACTION),
+        _FIELD_FALLBACK_POLICY_DECISION: _optional_text(
+            payload, _FIELD_FALLBACK_POLICY_DECISION
+        ),
+        _FIELD_DIAGNOSTIC_REFS: list(_diagnostic_refs(payload)),
+    }
+
+
 def _context_compaction_request_payload(
     transaction: HostTransaction, payload: Mapping[str, JsonValue]
 ) -> Mapping[str, JsonValue] | None:
@@ -1305,7 +1383,7 @@ def _trace_summary_signals(payload: Mapping[str, JsonValue]) -> _TraceSummarySig
     return _TraceSummarySignals(
         context_pressure=_optional_signal_object(payload, _FIELD_CONTEXT_PRESSURE),
         tool_timing=_optional_tool_timing_signal(payload),
-        failure_metadata=_optional_signal_object(payload, _FIELD_FAILURE_METADATA),
+        failure_metadata=_optional_failure_metadata_signal(payload),
         partial_tool_call_signal=_optional_signal_object(
             payload, _FIELD_PARTIAL_TOOL_CALL_SIGNAL
         ),
@@ -1356,6 +1434,184 @@ def _optional_tool_timing_signal(
             )
         return signal
     raise HostDurableError("tool trace tool_timing status is unsupported")
+
+
+def _optional_failure_metadata_signal(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取并校验可选失败元数据 signal。
+
+    :param payload: projection event payload。
+    :returns: failure metadata JSON object；字段缺失或为 ``null`` 时返回 ``None``。
+    :raises HostDurableError: 字段类型、schema、source、kind 或变体字段非法时抛出。
+    """
+
+    signal = _optional_signal_object(payload, _FIELD_FAILURE_METADATA)
+    if signal is None:
+        return None
+    schema_version = _required_int(signal, _FIELD_SCHEMA_VERSION)
+    if schema_version != _FAILURE_METADATA_SCHEMA_VERSION:
+        raise HostDurableError(
+            "tool trace failure_metadata schema_version is unsupported"
+        )
+    signal_source = _required_text(signal, "signal_source")
+    failure_kind = _required_text(signal, "failure_kind")
+    if failure_kind not in _FAILURE_METADATA_ALLOWED_KINDS:
+        raise HostDurableError("tool trace failure_metadata failure_kind is unsupported")
+    _validate_failure_metadata_variant(
+        signal=signal,
+        signal_source=signal_source,
+        failure_kind=failure_kind,
+    )
+    return signal
+
+
+def _validate_failure_metadata_variant(
+    *,
+    signal: Mapping[str, JsonValue],
+    signal_source: str,
+    failure_kind: str,
+) -> None:
+    """按 failure_kind 校验失败元数据闭集变体。
+
+    :param signal: failure metadata JSON object。
+    :param signal_source: 已读取的 signal source。
+    :param failure_kind: 已读取的 failure kind。
+    :returns: ``None``。
+    :raises HostDurableError: source 或变体字段非法时抛出。
+    """
+
+    if failure_kind == _FAILURE_KIND_TOOL_FAILED:
+        _require_failure_source(signal_source, _EVENT_TYPE_TOOL_RESULT_ACCEPTED)
+        _require_text_field(signal, "error_code")
+        _validate_bounded_text_field(signal, "repair_hint")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_TOOL_CANCELLED:
+        _require_failure_source(signal_source, _EVENT_TYPE_TOOL_RESULT_ACCEPTED)
+        _require_text_field(signal, "cancel_reason")
+        _validate_bounded_text_field(signal, "cancel_message")
+        _validate_bounded_text_field(signal, "cancel_hint")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_POLICY_BLOCKED:
+        _require_failure_source(signal_source, _EVENT_TYPE_TOOL_RESULT_ACCEPTED)
+        _require_text_field(signal, "policy_decision_kind")
+        _require_text_field(signal, "policy_block_reason")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR:
+        _require_failure_source(signal_source, _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR)
+        _require_text_field(signal, "provider_error_code")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED:
+        _require_failure_source(
+            signal_source, _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED
+        )
+        _require_text_field(signal, _FIELD_FAILURE_CATEGORY)
+        _required_bool(signal, _FIELD_REPAIRABLE)
+        _require_text_field(signal, _FIELD_NEXT_POLICY_DECISION)
+        _optional_int(signal, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT)
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_CONTEXT_COMPACTION_FAILED:
+        _require_failure_source(signal_source, _EVENT_TYPE_CONTEXT_COMPACTION_FAILED)
+        _require_text_field(signal, "failure_reason")
+        _require_text_field(signal, _FIELD_POLICY_DECISION)
+        _required_bool(signal, "retryable")
+        _required_int(signal, "attempt_count")
+        _required_bool(signal, _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED)
+        _optional_text(signal, _FIELD_FALLBACK_ACTION)
+        _optional_text(signal, _FIELD_FALLBACK_POLICY_DECISION)
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    raise HostDurableError("tool trace failure_metadata failure_kind is unsupported")
+
+
+def _require_failure_source(actual: str, expected: str) -> None:
+    """校验 failure metadata 的 signal source。
+
+    :param actual: payload 中的 signal source。
+    :param expected: 当前变体要求的 signal source。
+    :returns: ``None``。
+    :raises HostDurableError: signal source 不匹配时抛出。
+    """
+
+    if actual != expected:
+        raise HostDurableError("tool trace failure_metadata signal_source mismatch")
+
+
+def _require_text_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> str:
+    """读取 failure metadata 变体必填文本字段。
+
+    :param payload: failure metadata JSON object。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises HostDurableError: 字段缺失或不是非空文本时抛出。
+    """
+
+    return _required_text(payload, field_name)
+
+
+def _validate_bounded_text_field(
+    signal: Mapping[str, JsonValue], field_name: str
+) -> None:
+    """校验 failure metadata bounded text 字段组合。
+
+    :param signal: failure metadata JSON object。
+    :param field_name: bounded text 字段名前缀。
+    :returns: ``None``。
+    :raises HostDurableError: bounded 文本、digest 或 truncated 字段组合非法时抛出。
+    """
+
+    value = signal.get(field_name)
+    digest = signal.get(f"{field_name}_sha256")
+    truncated = signal.get(f"{field_name}_truncated")
+    if not isinstance(truncated, bool):
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name}_truncated must be bool"
+        )
+    if value is None:
+        if digest is not None or truncated:
+            raise HostDurableError(
+                f"tool trace failure_metadata {field_name} null fields are invalid"
+            )
+        return
+    if not isinstance(value, str):
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name} must be text or null"
+        )
+    if len(value) > _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS:
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name} exceeds bounded limit"
+        )
+    if not isinstance(digest, str) or not is_sha256_digest(digest):
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name}_sha256 must be sha256 digest"
+        )
+
+
+def _validate_metadata_diagnostic_refs(signal: Mapping[str, JsonValue]) -> None:
+    """校验 failure metadata diagnostic refs。
+
+    :param signal: failure metadata JSON object。
+    :returns: ``None``。
+    :raises HostDurableError: refs 字段不是文本数组时抛出。
+    """
+
+    refs = signal.get(_FIELD_DIAGNOSTIC_REFS)
+    if not isinstance(refs, list):
+        raise HostDurableError(
+            "tool trace failure_metadata diagnostic_refs must be JSON array"
+        )
+    for ref in refs:
+        if not isinstance(ref, str) or ref.strip() == "":
+            raise HostDurableError(
+                "tool trace failure_metadata diagnostic_refs must contain text"
+            )
 
 
 def _optional_signal_object(

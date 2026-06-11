@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -223,6 +224,7 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.source_refs == ()
         assert envelope.locator_refs == ()
         assert payload["raw_tool_outcome"] == candidate_result.raw_tool_outcome
+        assert payload["failure_metadata"] is None
         assert "result_preview" not in payload
 
 
@@ -886,6 +888,18 @@ def test_failed_cancelled_and_governed_error_are_accepted_as_result_facts(
         assert payloads[0]["tool_timing"] == _missing_tool_timing()
         assert payloads[1]["tool_timing"] == _missing_tool_timing()
         assert payloads[2]["tool_timing"] == _missing_tool_timing()
+        assert payloads[0]["failure_metadata"] == _failure_metadata_for_fact_kind(
+            fact_kind=ToolFactKind.FAILED,
+            policy_kind=ToolPolicyDecisionKind.ALLOW,
+        )
+        assert payloads[1]["failure_metadata"] == _failure_metadata_for_fact_kind(
+            fact_kind=ToolFactKind.CANCELLED,
+            policy_kind=ToolPolicyDecisionKind.ALLOW,
+        )
+        assert payloads[2]["failure_metadata"] == _failure_metadata_for_fact_kind(
+            fact_kind=ToolFactKind.GOVERNED_ERROR,
+            policy_kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+        )
         assert payloads[-1]["policy_decision"] == {
             "kind": ToolPolicyDecisionKind.GOVERNED_ERROR.value,
             "reason_code": "governed_error",
@@ -1400,6 +1414,10 @@ def _fact_kind_candidate(
             truncation=None,
             raw_tool_outcome=_raw_tool_outcome(tool_call_id),
             tool_timing=_missing_tool_timing(),
+            failure_metadata=_failure_metadata_for_fact_kind(
+                fact_kind=fact_kind,
+                policy_kind=policy_kind,
+            ),
         ),
         governance=ToolAcceptGovernance(
             policy_decision=ToolPolicyDecision(
@@ -1518,6 +1536,53 @@ def _required_duplicate(
     return candidate.governance.duplicate
 
 
+def _failure_metadata_for_fact_kind(
+    *, fact_kind: ToolFactKind, policy_kind: ToolPolicyDecisionKind
+) -> Mapping[str, JsonValue] | None:
+    """构造测试候选使用的 failure metadata。
+
+    :param fact_kind: 工具事实类别。
+    :param policy_kind: policy decision 类别。
+    :returns: failure metadata JSON object；成功时为 ``None``。
+    """
+
+    if fact_kind is ToolFactKind.FAILED:
+        return {
+            "schema_version": 1,
+            "signal_source": "TOOL_RESULT_ACCEPTED",
+            "failure_kind": "tool_failed",
+            "error_code": "lookup_failed",
+            "repair_hint": "retry lookup",
+            "repair_hint_truncated": False,
+            "repair_hint_sha256": _text_sha256("retry lookup"),
+            "diagnostic_refs": [],
+        }
+    if fact_kind is ToolFactKind.CANCELLED:
+        return {
+            "schema_version": 1,
+            "signal_source": "TOOL_RESULT_ACCEPTED",
+            "failure_kind": "tool_cancelled",
+            "cancel_reason": "host_cancelled",
+            "cancel_message": "cancelled by host",
+            "cancel_message_truncated": False,
+            "cancel_message_sha256": _text_sha256("cancelled by host"),
+            "cancel_hint": None,
+            "cancel_hint_truncated": False,
+            "cancel_hint_sha256": None,
+            "diagnostic_refs": [],
+        }
+    if fact_kind is ToolFactKind.GOVERNED_ERROR:
+        return {
+            "schema_version": 1,
+            "signal_source": "TOOL_RESULT_ACCEPTED",
+            "failure_kind": "policy_blocked",
+            "policy_decision_kind": policy_kind.value,
+            "policy_block_reason": policy_kind.value,
+            "diagnostic_refs": [],
+        }
+    return None
+
+
 def _raw_tool_outcome(tool_call_id: str) -> JsonValue:
     """构造测试用 raw tool outcome。
 
@@ -1533,6 +1598,16 @@ def _raw_tool_outcome(tool_call_id: str) -> JsonValue:
             "meta": None,
         },
     }
+
+
+def _text_sha256(value: str) -> str:
+    """计算文本 UTF-8 sha256 digest。
+
+    :param value: 原始文本。
+    :returns: ``sha256:`` 前缀 digest。
+    """
+
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def _missing_tool_timing() -> Mapping[str, JsonValue]:

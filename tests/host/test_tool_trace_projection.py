@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -449,6 +450,11 @@ def test_tool_trace_copies_optional_summary_signal_objects(
         "schema_version": 1,
         "signal_source": "TOOL_RESULT_ACCEPTED",
         "failure_kind": "tool_failed",
+        "error_code": "lookup_failed",
+        "repair_hint": "retry lookup",
+        "repair_hint_truncated": False,
+        "repair_hint_sha256": _text_sha256("retry lookup"),
+        "diagnostic_refs": ["diag-result"],
     }
     partial_tool_call_signal: Mapping[str, JsonValue] = {
         "schema_version": 1,
@@ -557,6 +563,141 @@ def test_tool_trace_projects_tool_timing_available_and_missing_signals(
         )
 
 
+def test_tool_trace_projects_failure_metadata_variants(tmp_path: Path) -> None:
+    """Tool Trace 投影 tool failure / cancel / policy block 失败元数据。"""
+
+    cold_path = tmp_path / "trace" / "failure-metadata.jsonl"
+    failed_metadata: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "TOOL_RESULT_ACCEPTED",
+        "failure_kind": "tool_failed",
+        "error_code": "lookup_failed",
+        "repair_hint": None,
+        "repair_hint_truncated": False,
+        "repair_hint_sha256": None,
+        "diagnostic_refs": ["diag-failed"],
+    }
+    cancelled_metadata: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "TOOL_RESULT_ACCEPTED",
+        "failure_kind": "tool_cancelled",
+        "cancel_reason": "host_cancelled",
+        "cancel_message": None,
+        "cancel_message_truncated": False,
+        "cancel_message_sha256": None,
+        "cancel_hint": "retry later",
+        "cancel_hint_truncated": False,
+        "cancel_hint_sha256": _text_sha256("retry later"),
+        "diagnostic_refs": ["diag-cancelled"],
+    }
+    policy_metadata: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "TOOL_RESULT_ACCEPTED",
+        "failure_kind": "policy_blocked",
+        "policy_decision_kind": "governed_error",
+        "policy_block_reason": "tool_idempotency_key_required",
+        "diagnostic_refs": ["diag-policy"],
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        failed = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-tool-failed-metadata",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-failed",
+                "tool_name": "lookup_filing",
+                _FIELD_FAILURE_METADATA: failed_metadata,
+            },
+        )
+        cancelled = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-tool-cancelled-metadata",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-cancelled",
+                "tool_name": "lookup_filing",
+                _FIELD_FAILURE_METADATA: cancelled_metadata,
+            },
+        )
+        policy = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-tool-policy-metadata",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-policy",
+                "tool_name": "lookup_filing",
+                _FIELD_FAILURE_METADATA: policy_metadata,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        failed_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, failed.event_id)
+        )
+        cancelled_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, cancelled.event_id
+            )
+        )
+        policy_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, policy.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert failed_row is not None
+        assert cancelled_row is not None
+        assert policy_row is not None
+        assert failed_row.trace_summary[_FIELD_FAILURE_METADATA] == failed_metadata
+        assert (
+            cancelled_row.trace_summary[_FIELD_FAILURE_METADATA]
+            == cancelled_metadata
+        )
+        cancelled_summary = cancelled_row.trace_summary[_FIELD_FAILURE_METADATA]
+        assert isinstance(cancelled_summary, Mapping)
+        assert cancelled_summary["failure_kind"] != "tool_failed"
+        assert policy_row.trace_summary[_FIELD_FAILURE_METADATA] == policy_metadata
+        assert _cold_trace_summary(cold_lines, 0) == failed_row.trace_summary
+        assert _cold_trace_summary(cold_lines, 1) == cancelled_row.trace_summary
+        assert _cold_trace_summary(cold_lines, 2) == policy_row.trace_summary
+
+
+def test_tool_trace_projects_provider_protocol_failure_metadata(
+    tmp_path: Path,
+) -> None:
+    """PROVIDER_PROTOCOL_ERROR 的 failure_metadata 同步进入 hot / cold。"""
+
+    cold_path = tmp_path / "trace" / "provider-failure-metadata.jsonl"
+    metadata: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "PROVIDER_PROTOCOL_ERROR",
+        "failure_kind": "provider_protocol_error",
+        "provider_error_code": "invalid_tool_arguments",
+        "diagnostic_refs": ["provider-req-1"],
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-provider-protocol-failure",
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": "provider-req-1",
+                "error_code": "invalid_tool_arguments",
+                _FIELD_FAILURE_METADATA: metadata,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.trace_summary[_FIELD_FAILURE_METADATA] == metadata
+        assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
+
+
 @pytest.mark.parametrize(
     ("tool_timing", "message"),
     (
@@ -610,6 +751,78 @@ def test_tool_trace_rejects_malformed_tool_timing_signal(
                 "tool_name": "lookup_filing",
                 "outcome_digest": "sha256:outcome-malformed-timing",
                 _FIELD_TOOL_TIMING: tool_timing,
+            },
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
+        )
+
+        with pytest.raises(HostDurableError, match=message):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(event),
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("failure_metadata", "message"),
+    (
+        (
+            {
+                "schema_version": 1,
+                "signal_source": "TOOL_RESULT_ACCEPTED",
+                "failure_kind": "unknown_failure",
+                "diagnostic_refs": [],
+            },
+            "failure_kind",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "signal_source": "PROVIDER_PROTOCOL_ERROR",
+                "failure_kind": "tool_failed",
+                "error_code": "lookup_failed",
+                "repair_hint": None,
+                "repair_hint_truncated": False,
+                "repair_hint_sha256": None,
+                "diagnostic_refs": [],
+            },
+            "signal_source",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "signal_source": "TOOL_RESULT_ACCEPTED",
+                "failure_kind": "tool_failed",
+                "error_code": "lookup_failed",
+                "repair_hint": "x" * 513,
+                "repair_hint_truncated": False,
+                "repair_hint_sha256": (
+                    "sha256:"
+                    + hashlib.sha256(("x" * 513).encode("utf-8")).hexdigest()
+                ),
+                "diagnostic_refs": [],
+            },
+            "repair_hint",
+        ),
+    ),
+)
+def test_tool_trace_rejects_malformed_failure_metadata_signal(
+    tmp_path: Path, failure_metadata: Mapping[str, JsonValue], message: str
+) -> None:
+    """malformed failure_metadata 以 HostDurableError fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id=f"event-malformed-failure-metadata-{message}",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-malformed-failure",
+                "tool_name": "lookup_filing",
+                _FIELD_FAILURE_METADATA: failure_metadata,
             },
         )
         consumer = ToolTraceProjectionConsumer(
@@ -699,6 +912,19 @@ def test_tool_trace_derives_context_pressure_from_compaction_failed_payload(
             "fallback_policy_decision": "recent_window_budget_passed",
             "retry_repair_budget_exhausted": True,
         }
+        assert row.trace_summary[_FIELD_FAILURE_METADATA] == {
+            "schema_version": 1,
+            "signal_source": "CONTEXT_COMPACTION_FAILED",
+            "failure_kind": "context_compaction_failed",
+            "failure_reason": "quality_check_failed",
+            "policy_decision": "reactive_compact_failed",
+            "retryable": False,
+            "attempt_count": 1,
+            "retry_repair_budget_exhausted": True,
+            "fallback_action": "dispatch",
+            "fallback_policy_decision": "recent_window_budget_passed",
+            "diagnostic_refs": ["diagnostic:compact"],
+        }
         assert _cold_trace_summary(cold_lines, 1) == row.trace_summary
 
 
@@ -745,6 +971,16 @@ def test_tool_trace_derives_context_pressure_from_compaction_rejected_payload(
             "next_policy_decision": "retry_or_fallback",
             "failure_category": "quality_check_failed",
             "repairable": True,
+        }
+        assert row.trace_summary[_FIELD_FAILURE_METADATA] == {
+            "schema_version": 1,
+            "signal_source": "CONTEXT_COMPACTION_ATTEMPT_REJECTED",
+            "failure_kind": "context_compaction_attempt_rejected",
+            "failure_category": "quality_check_failed",
+            "repairable": True,
+            "next_policy_decision": "retry_or_fallback",
+            "budget_after_attempted_compact": 180,
+            "diagnostic_refs": ["diagnostic:reject"],
         }
         assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
 
@@ -1391,3 +1627,13 @@ def test_default_tool_trace_path_is_derived_from_artifact_root(
     assert _default_tool_trace_cold_jsonl_path(tmp_path / "artifacts") == (
         tmp_path / "artifacts" / "tool-trace" / "tool-trace-cold.jsonl"
     )
+
+
+def _text_sha256(value: str) -> str:
+    """计算文本 UTF-8 sha256 digest。
+
+    :param value: 原始文本。
+    :returns: ``sha256:`` 前缀 digest。
+    """
+
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"

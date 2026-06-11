@@ -350,7 +350,7 @@ Conversation Memory 是 Session-level projection / read model，只消费 commit
 
 ### Outbox、audit 与 tool trace
 
-Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断。它们都不能反向驱动 Run / Attempt 状态。
+Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata 等只读结构化 signal。它们都不能反向驱动 Run / Attempt 状态。
 
 ## 关键执行路径
 

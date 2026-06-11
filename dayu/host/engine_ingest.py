@@ -258,6 +258,8 @@ _RECOVERY_FAILURE_POLICY_DECISION = "reactive_compact_failed"
 _REACTIVE_PRECONDITION_OPERATION_PREFIX = "reactive_precondition"
 _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
+_FAILURE_METADATA_SCHEMA_VERSION = 1
+_FAILURE_KIND_PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
 _NO_CONTEXT_BUDGET_POLICY_REF = "none"
 _USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
@@ -2868,6 +2870,14 @@ class EngineEventIngestor:
                 raw_descriptor.payload_digest if raw_descriptor is not None else None
             ),
             "partial_tool_call_count": len(data.partial_tool_calls),
+            "failure_metadata": _provider_protocol_failure_metadata(
+                data=data,
+                raw_payload_ref=(
+                    raw_descriptor.payload_ref
+                    if raw_descriptor is not None
+                    else None
+                ),
+            ),
         }
         return self._event_log_store.append_event(
             transaction,
@@ -5927,6 +5937,34 @@ def _tool_awaiting_payload(
         "execution_id": context.attempt.execution_id,
         "iteration_id": data.iteration_id,
         "unsupported_later_owner": _OWNER_PHASE7,
+    }
+
+
+def _provider_protocol_failure_metadata(
+    *,
+    data: ProviderProtocolErrorData,
+    raw_payload_ref: str | None,
+) -> Mapping[str, JsonValue]:
+    """构造 provider protocol error 的失败元数据 signal。
+
+    :param data: Engine provider protocol error data。
+    :param raw_payload_ref: Host 写入的 raw payload descriptor ref；无时为
+        ``None``。
+    :returns: failure metadata JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    diagnostic_refs = tuple(
+        ref
+        for ref in (raw_payload_ref, data.provider_request_id)
+        if ref is not None
+    )
+    return {
+        "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
+        "failure_kind": _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
+        "provider_error_code": data.error_code,
+        "diagnostic_refs": list(diagnostic_refs),
     }
 
 
