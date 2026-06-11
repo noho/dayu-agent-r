@@ -57,8 +57,11 @@ Controller verified or accepted from gate artifacts:
 
 ## Residual Risk
 
-- `PR-135-R1`: PR #135 has no GitHub checks reported. This is deferred to repository CI configuration / future CI workflow owner. It does not reopen R3 or F08 implementation because focused tests, related package tests, pyright, diff check, and two-agent review/deepreview gates passed locally.
 - Repository-external consumers importing the old builder name may break. Compatibility aliases, re-exports, wrappers, or facades were intentionally not added under project rules and the accepted plan.
+
+## CI Note
+
+PR #135 has no GitHub checks reported. Local gate validation passed, and CI workflow setup will be handled separately later per user decision. This is not tracked as a current residual risk for F08.
 
 ## Next Step
 
