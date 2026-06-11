@@ -459,7 +459,10 @@ def test_tool_trace_copies_optional_summary_signal_objects(
     partial_tool_call_signal: Mapping[str, JsonValue] = {
         "schema_version": 1,
         "signal_source": "PROVIDER_PROTOCOL_ERROR",
-        "status": "partial_summary_present",
+        "partial_tool_call_count": 0,
+        "summary_status": "none",
+        "raw_payload_present": False,
+        "partial_tool_calls": [],
     }
     with open_host_durable_store(_options(tmp_path)) as store:
         event = _append_tool_event(
@@ -698,6 +701,104 @@ def test_tool_trace_projects_provider_protocol_failure_metadata(
         assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
 
 
+def test_tool_trace_projects_provider_protocol_partial_tool_call_signal_states(
+    tmp_path: Path,
+) -> None:
+    """PROVIDER_PROTOCOL_ERROR 区分 absent、none 与 present partial signal。"""
+
+    cold_path = tmp_path / "trace" / "provider-partial-tool-call.jsonl"
+    arguments_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    none_signal: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "PROVIDER_PROTOCOL_ERROR",
+        "partial_tool_call_count": 0,
+        "summary_status": "none",
+        "raw_payload_present": True,
+        "partial_tool_calls": [],
+    }
+    present_signal: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "PROVIDER_PROTOCOL_ERROR",
+        "partial_tool_call_count": 1,
+        "summary_status": "present",
+        "raw_payload_present": False,
+        "partial_tool_calls": [
+            {
+                "tool_call_index": 0,
+                "tool_call_id": "call-bounded",
+                "name_fragment": "lookup_filing",
+                "arguments_byte_size": 42,
+                "arguments_sha256": arguments_sha256,
+                "arguments_present": True,
+            }
+        ],
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        absent = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-provider-partial-absent",
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": "provider-req-absent",
+                "error_code": "invalid_stream",
+            },
+        )
+        none = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-provider-partial-none",
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": "provider-req-none",
+                "error_code": "invalid_stream",
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: none_signal,
+            },
+        )
+        present = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-provider-partial-present",
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": "provider-req-present",
+                "error_code": "invalid_stream",
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: present_signal,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        absent_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, absent.event_id)
+        )
+        none_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, none.event_id)
+        )
+        present_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, present.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert absent_row is not None
+        assert none_row is not None
+        assert present_row is not None
+        assert _FIELD_PARTIAL_TOOL_CALL_SIGNAL not in absent_row.trace_summary
+        assert none_row.trace_summary[_FIELD_PARTIAL_TOOL_CALL_SIGNAL] == none_signal
+        assert (
+            present_row.trace_summary[_FIELD_PARTIAL_TOOL_CALL_SIGNAL]
+            == present_signal
+        )
+        assert _FIELD_PARTIAL_TOOL_CALL_SIGNAL not in _cold_trace_summary(
+            cold_lines, 0
+        )
+        assert _cold_trace_summary(cold_lines, 1)[
+            _FIELD_PARTIAL_TOOL_CALL_SIGNAL
+        ] == none_signal
+        assert _cold_trace_summary(cold_lines, 2)[
+            _FIELD_PARTIAL_TOOL_CALL_SIGNAL
+        ] == present_signal
+
+
 @pytest.mark.parametrize(
     ("tool_timing", "message"),
     (
@@ -823,6 +924,97 @@ def test_tool_trace_rejects_malformed_failure_metadata_signal(
                 "tool_call_id": "tool-call-malformed-failure",
                 "tool_name": "lookup_filing",
                 _FIELD_FAILURE_METADATA: failure_metadata,
+            },
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
+        )
+
+        with pytest.raises(HostDurableError, match=message):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(event),
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("partial_tool_call_signal", "message"),
+    (
+        (
+            {
+                "schema_version": 1,
+                "signal_source": "PROVIDER_PROTOCOL_ERROR",
+                "partial_tool_call_count": 0,
+                "summary_status": "present",
+                "raw_payload_present": False,
+                "partial_tool_calls": [],
+            },
+            "present status",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "signal_source": "PROVIDER_PROTOCOL_ERROR",
+                "partial_tool_call_count": 2,
+                "summary_status": "present",
+                "raw_payload_present": False,
+                "partial_tool_calls": [
+                    {
+                        "tool_call_index": 0,
+                        "tool_call_id": "call-bounded",
+                        "name_fragment": "lookup_filing",
+                        "arguments_byte_size": 42,
+                        "arguments_sha256": (
+                            "0123456789abcdef0123456789abcdef"
+                            "0123456789abcdef0123456789abcdef"
+                        ),
+                        "arguments_present": True,
+                    }
+                ],
+            },
+            "count mismatch",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "signal_source": "PROVIDER_PROTOCOL_ERROR",
+                "partial_tool_call_count": 1,
+                "summary_status": "present",
+                "raw_payload_present": False,
+                "partial_tool_calls": [
+                    {
+                        "tool_call_index": 0,
+                        "tool_call_id": "call-bounded",
+                        "name_fragment": "lookup_filing",
+                        "arguments_byte_size": 42,
+                        "arguments_sha256": "sha256:not-engine-format",
+                        "arguments_present": True,
+                    }
+                ],
+            },
+            "arguments_sha256",
+        ),
+    ),
+)
+def test_tool_trace_rejects_malformed_partial_tool_call_signal(
+    tmp_path: Path,
+    partial_tool_call_signal: Mapping[str, JsonValue],
+    message: str,
+) -> None:
+    """malformed partial_tool_call_signal 以 HostDurableError fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id=f"event-malformed-partial-tool-call-{message}",
+            event_type="PROVIDER_PROTOCOL_ERROR",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": "provider-req-malformed-partial",
+                "error_code": "invalid_stream",
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: partial_tool_call_signal,
             },
         )
         consumer = ToolTraceProjectionConsumer(

@@ -208,6 +208,26 @@ def test_provider_request_id_terminal_diagnostic_query(
 ) -> None:
     """provider_request_id 可查询 terminal diagnostic chain。"""
 
+    partial_tool_call_signal: JsonValue = {
+        "schema_version": 1,
+        "signal_source": "PROVIDER_PROTOCOL_ERROR",
+        "partial_tool_call_count": 1,
+        "summary_status": "present",
+        "raw_payload_present": True,
+        "partial_tool_calls": [
+            {
+                "tool_call_index": 0,
+                "tool_call_id": "call-bounded",
+                "name_fragment": "lookup_filing",
+                "arguments_byte_size": 42,
+                "arguments_sha256": (
+                    "0123456789abcdef0123456789abcdef"
+                    "0123456789abcdef0123456789abcdef"
+                ),
+                "arguments_present": True,
+            }
+        ],
+    }
     with open_host_durable_store(_options(tmp_path)) as store:
         _append_event(
             store.transaction_runner,
@@ -234,6 +254,7 @@ def test_provider_request_id_terminal_diagnostic_query(
                 "raw_payload_ref": "raw-ref",
                 "raw_payload_digest": "sha256:raw",
                 "error_code": "invalid_stream",
+                "partial_tool_call_signal": partial_tool_call_signal,
             },
         )
         _catch_up(store.transaction_runner, tmp_path)
@@ -259,6 +280,10 @@ def test_provider_request_id_terminal_diagnostic_query(
         assert (
             page.rows[1].trace_summary["client_correlation_id"]
             == "client-protocol"
+        )
+        assert (
+            page.rows[1].trace_summary["partial_tool_call_signal"]
+            == partial_tool_call_signal
         )
         assert page.rows[1].diagnostic_ref == "raw-ref"
 

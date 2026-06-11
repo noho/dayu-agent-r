@@ -49,6 +49,7 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -1856,6 +1857,15 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
         payload = _payload(result.events[0])
         assert payload["client_correlation_id"] == "client-protocol"
         assert payload["raw_payload_ref"] is not None
+        assert payload["partial_tool_call_count"] == 0
+        assert payload["partial_tool_call_signal"] == {
+            "schema_version": 1,
+            "signal_source": "PROVIDER_PROTOCOL_ERROR",
+            "partial_tool_call_count": 0,
+            "summary_status": "none",
+            "raw_payload_present": True,
+            "partial_tool_calls": [],
+        }
         assert payload["failure_metadata"] == {
             "schema_version": 1,
             "signal_source": "PROVIDER_PROTOCOL_ERROR",
@@ -1866,6 +1876,86 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_provider_protocol_error_serializes_partial_tool_call_signal(
+    tmp_path: Path,
+) -> None:
+    """provider_protocol_error 写入 Engine bounded partial tool-call signal。"""
+
+    arguments_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=11,
+            data=ProviderProtocolErrorData(
+                iteration_id="iter-protocol-partial",
+                error_code="invalid_stream",
+                message="bad stream",
+                provider_request_id="req-protocol-partial",
+                client_correlation_id="client-protocol-partial",
+                raw_payload=None,
+                partial_tool_calls=(
+                    PartialToolCallSummary(
+                        tool_call_index=0,
+                        tool_call_id="call-bounded",
+                        name_fragment="lookup_filing",
+                        arguments_byte_size=42,
+                        arguments_sha256=arguments_sha256,
+                    ),
+                    PartialToolCallSummary(
+                        tool_call_index=1,
+                        tool_call_id=None,
+                        name_fragment=None,
+                        arguments_byte_size=0,
+                        arguments_sha256=None,
+                    ),
+                ),
+            ),
+            event_type=EngineEventType.PROVIDER_PROTOCOL_ERROR,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        payload = _payload(result.events[0])
+        assert payload["raw_payload_ref"] is None
+        assert payload["raw_payload_digest"] is None
+        assert payload["partial_tool_call_count"] == 2
+        assert payload["partial_tool_call_signal"] == {
+            "schema_version": 1,
+            "signal_source": "PROVIDER_PROTOCOL_ERROR",
+            "partial_tool_call_count": 2,
+            "summary_status": "present",
+            "raw_payload_present": False,
+            "partial_tool_calls": [
+                {
+                    "tool_call_index": 0,
+                    "tool_call_id": "call-bounded",
+                    "name_fragment": "lookup_filing",
+                    "arguments_byte_size": 42,
+                    "arguments_sha256": arguments_sha256,
+                    "arguments_present": True,
+                },
+                {
+                    "tool_call_index": 1,
+                    "tool_call_id": None,
+                    "name_fragment": None,
+                    "arguments_byte_size": 0,
+                    "arguments_sha256": None,
+                    "arguments_present": False,
+                },
+            ],
+        }
+        assert _legacy_provider_protocol_diagnostic_view(payload) == {
+            "error_code": "invalid_stream",
+            "provider_request_id": "req-protocol-partial",
+            "client_correlation_id": "client-protocol-partial",
+            "raw_payload_ref": None,
+            "partial_tool_call_count": 2,
+        }
 
 
 def test_tool_call_requested_and_result_accepted_are_preview(
@@ -4107,3 +4197,21 @@ def _payload(row: EventLogRow) -> Mapping[str, JsonValue]:
     value = cast(JsonValue, json.loads(row.payload_json))
     assert isinstance(value, Mapping)
     return cast(Mapping[str, JsonValue], value)
+
+
+def _legacy_provider_protocol_diagnostic_view(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """模拟只读取旧 provider protocol diagnostic 字段的消费者。
+
+    :param payload: provider protocol diagnostic payload。
+    :returns: 旧消费者关心的字段视图。
+    """
+
+    return {
+        "error_code": payload["error_code"],
+        "provider_request_id": payload["provider_request_id"],
+        "client_correlation_id": payload["client_correlation_id"],
+        "raw_payload_ref": payload["raw_payload_ref"],
+        "partial_tool_call_count": payload["partial_tool_call_count"],
+    }

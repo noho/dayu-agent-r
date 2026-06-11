@@ -49,6 +49,7 @@ from dayu.engine.contracts.engine_events import (
     ToolResultAcceptedData,
     UsageReportedData,
 )
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.host.admission import (
     AdmissionWakeupPort,
     NoopAdmissionWakeupPort,
@@ -260,6 +261,9 @@ _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
 _FAILURE_METADATA_SCHEMA_VERSION = 1
 _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
+_PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION = 1
+_PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE = "none"
+_PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT = "present"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
 _NO_CONTEXT_BUDGET_POLICY_REF = "none"
 _USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
@@ -2854,6 +2858,13 @@ class EngineEventIngestor:
             context=context,
             raw_payload=data.raw_payload,
         )
+        raw_payload_present = raw_descriptor is not None
+        raw_payload_ref = (
+            raw_descriptor.payload_ref if raw_descriptor is not None else None
+        )
+        raw_payload_digest = (
+            raw_descriptor.payload_digest if raw_descriptor is not None else None
+        )
         candidate = context.candidate
         payload: dict[str, JsonValue] = {
             "attempt_id": context.attempt.attempt_id,
@@ -2863,20 +2874,16 @@ class EngineEventIngestor:
             "message": data.message,
             "provider_request_id": data.provider_request_id,
             "client_correlation_id": data.client_correlation_id,
-            "raw_payload_ref": (
-                raw_descriptor.payload_ref if raw_descriptor is not None else None
-            ),
-            "raw_payload_digest": (
-                raw_descriptor.payload_digest if raw_descriptor is not None else None
-            ),
+            "raw_payload_ref": raw_payload_ref,
+            "raw_payload_digest": raw_payload_digest,
             "partial_tool_call_count": len(data.partial_tool_calls),
+            "partial_tool_call_signal": _provider_protocol_partial_tool_call_signal(
+                partial_tool_calls=data.partial_tool_calls,
+                raw_payload_present=raw_payload_present,
+            ),
             "failure_metadata": _provider_protocol_failure_metadata(
                 data=data,
-                raw_payload_ref=(
-                    raw_descriptor.payload_ref
-                    if raw_descriptor is not None
-                    else None
-                ),
+                raw_payload_ref=raw_payload_ref,
             ),
         }
         return self._event_log_store.append_event(
@@ -5965,6 +5972,59 @@ def _provider_protocol_failure_metadata(
         "failure_kind": _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
         "provider_error_code": data.error_code,
         "diagnostic_refs": list(diagnostic_refs),
+    }
+
+
+def _provider_protocol_partial_tool_call_signal(
+    *,
+    partial_tool_calls: tuple[PartialToolCallSummary, ...],
+    raw_payload_present: bool,
+) -> Mapping[str, JsonValue]:
+    """构造 provider protocol error 的 partial tool-call signal。
+
+    :param partial_tool_calls: Engine 已提供的未完成工具调用有界摘要。
+    :param raw_payload_present: Host raw payload descriptor 是否存在。
+    :returns: partial tool-call signal JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    partial_count = len(partial_tool_calls)
+    summary_status = (
+        _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT
+        if partial_count > 0
+        else _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE
+    )
+    return {
+        "schema_version": _PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
+        "partial_tool_call_count": partial_count,
+        "summary_status": summary_status,
+        "raw_payload_present": raw_payload_present,
+        "partial_tool_calls": [
+            _partial_tool_call_summary_payload(summary)
+            for summary in partial_tool_calls
+        ],
+    }
+
+
+def _partial_tool_call_summary_payload(
+    summary: PartialToolCallSummary,
+) -> Mapping[str, JsonValue]:
+    """序列化 Engine partial tool-call 有界摘要。
+
+    :param summary: Engine 已裁剪和脱敏的 partial tool-call summary。
+    :returns: 可写入 Host diagnostic payload 的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    arguments_present = summary.arguments_sha256 is not None
+    return {
+        "tool_call_index": summary.tool_call_index,
+        "tool_call_id": summary.tool_call_id,
+        "name_fragment": summary.name_fragment,
+        "arguments_byte_size": summary.arguments_byte_size,
+        "arguments_sha256": summary.arguments_sha256,
+        "arguments_present": arguments_present,
     }
 
 

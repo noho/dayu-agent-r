@@ -165,6 +165,11 @@ _CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED = (
     "compaction_attempt_rejected"
 )
 _FAILURE_METADATA_SCHEMA_VERSION = 1
+_PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION = 1
+_PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE = "none"
+_PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT = "present"
+_PARTIAL_ARGUMENTS_SHA256_HEX_LENGTH = 64
+_LOWER_HEX_CHARS = frozenset("0123456789abcdef")
 _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS = 512
 _FAILURE_KIND_TOOL_FAILED = "tool_failed"
 _FAILURE_KIND_TOOL_CANCELLED = "tool_cancelled"
@@ -1384,9 +1389,7 @@ def _trace_summary_signals(payload: Mapping[str, JsonValue]) -> _TraceSummarySig
         context_pressure=_optional_signal_object(payload, _FIELD_CONTEXT_PRESSURE),
         tool_timing=_optional_tool_timing_signal(payload),
         failure_metadata=_optional_failure_metadata_signal(payload),
-        partial_tool_call_signal=_optional_signal_object(
-            payload, _FIELD_PARTIAL_TOOL_CALL_SIGNAL
-        ),
+        partial_tool_call_signal=_optional_partial_tool_call_signal(payload),
     )
 
 
@@ -1527,6 +1530,131 @@ def _validate_failure_metadata_variant(
         _validate_metadata_diagnostic_refs(signal)
         return
     raise HostDurableError("tool trace failure_metadata failure_kind is unsupported")
+
+
+def _optional_partial_tool_call_signal(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取并校验可选 partial tool-call signal。
+
+    :param payload: projection event payload。
+    :returns: partial tool-call signal JSON object；字段缺失或为 ``null`` 时返回
+        ``None``。
+    :raises HostDurableError: 字段类型、schema、source、状态或 summary 字段非法时抛出。
+    """
+
+    signal = _optional_signal_object(payload, _FIELD_PARTIAL_TOOL_CALL_SIGNAL)
+    if signal is None:
+        return None
+    schema_version = _required_int(signal, _FIELD_SCHEMA_VERSION)
+    if schema_version != _PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal schema_version is unsupported"
+        )
+    signal_source = _required_text(signal, "signal_source")
+    if signal_source != _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR:
+        raise HostDurableError("tool trace partial_tool_call_signal source mismatch")
+    partial_count = _required_int(signal, "partial_tool_call_count")
+    if partial_count < 0:
+        raise HostDurableError("tool trace partial_tool_call_signal count is invalid")
+    summary_status = _required_text(signal, "summary_status")
+    _required_bool(signal, "raw_payload_present")
+    partial_tool_calls = _required_partial_tool_call_summary_list(signal)
+    if partial_count != len(partial_tool_calls):
+        raise HostDurableError("tool trace partial_tool_call_signal count mismatch")
+    if summary_status == _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE:
+        if partial_count != 0:
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal none status has summaries"
+            )
+    elif summary_status == _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT:
+        if partial_count == 0:
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal present status is empty"
+            )
+    else:
+        raise HostDurableError("tool trace partial_tool_call_signal status unsupported")
+    for summary in partial_tool_calls:
+        _validate_partial_tool_call_summary(summary)
+    return signal
+
+
+def _required_partial_tool_call_summary_list(
+    signal: Mapping[str, JsonValue],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取 partial tool-call summary 数组。
+
+    :param signal: partial tool-call signal JSON object。
+    :returns: summary JSON object 元组。
+    :raises HostDurableError: 字段缺失、不是数组或数组成员不是 JSON object 时抛出。
+    """
+
+    value = signal.get("partial_tool_calls")
+    if not isinstance(value, list):
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal partial_tool_calls must be JSON array"
+        )
+    summaries: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal summary must be JSON object"
+            )
+        summaries.append(cast(Mapping[str, JsonValue], item))
+    return tuple(summaries)
+
+
+def _validate_partial_tool_call_summary(
+    summary: Mapping[str, JsonValue],
+) -> None:
+    """校验单个 partial tool-call 有界摘要。
+
+    :param summary: partial tool-call summary JSON object。
+    :returns: ``None``。
+    :raises HostDurableError: index、bounded 字段、arguments 字节数或 digest 标志非法时抛出。
+    """
+
+    tool_call_index = _required_int(summary, "tool_call_index")
+    if tool_call_index < 0:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal tool_call_index is invalid"
+        )
+    _optional_text(summary, "tool_call_id")
+    _optional_text(summary, "name_fragment")
+    arguments_byte_size = _required_int(summary, "arguments_byte_size")
+    if arguments_byte_size < 0:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal arguments_byte_size is invalid"
+        )
+    arguments_sha256 = _optional_text(summary, "arguments_sha256")
+    arguments_present = _required_bool(summary, "arguments_present")
+    if arguments_sha256 is None:
+        if arguments_present:
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal arguments_present mismatch"
+            )
+        return
+    if not _is_bare_sha256_hex(arguments_sha256):
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal arguments_sha256 is invalid"
+        )
+    if not arguments_present:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal arguments_present mismatch"
+        )
+
+
+def _is_bare_sha256_hex(value: str) -> bool:
+    """判断字符串是否为 Engine partial arguments 使用的裸 sha256 hex digest。
+
+    :param value: 待检查字符串。
+    :returns: 64 位小写十六进制字符串时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if len(value) != _PARTIAL_ARGUMENTS_SHA256_HEX_LENGTH:
+        return False
+    return all(character in _LOWER_HEX_CHARS for character in value)
 
 
 def _require_failure_source(actual: str, expected: str) -> None:
