@@ -884,6 +884,99 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
         )
 
 
+def test_pre_dispatch_reads_delta_rows_beyond_old_cap(tmp_path: Path) -> None:
+    """pre-dispatch source builder 读取超过旧 256 限制的完整 delta rows。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入超过旧 delta cap 的历史 user facts。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            for index in range(260):
+                _append_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-user-delta-{index:03d}",
+                    event_type="USER_INPUT_ACCEPTED",
+                    payload={"display_text": f"delta user {index:03d}"},
+                )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-large-delta",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after large delta"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after large delta",
+            )
+        )
+
+        assert len(view.material_blocks) == 260
+        assert view.material_blocks[0].text == "delta user 000"
+        assert view.material_blocks[-1].text == "delta user 259"
+        assert view.budget_fragments[-1].text == "current after large delta"
+
+
+def test_pre_dispatch_keeps_evidence_blocks_beyond_old_cap(tmp_path: Path) -> None:
+    """accepted evidence 超过旧 8 个时 source builder 不 fail closed。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入超过旧 evidence cap 的 accepted tool results。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            for index in range(10):
+                _append_tool_result_event(
+                    transaction,
+                    event_log,
+                    event_id=f"event-tool-result-evidence-{index:02d}",
+                )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-after-evidence",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after evidence"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after evidence",
+            )
+        )
+
+        evidence_blocks = tuple(
+            block
+            for block in view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        )
+        assert len(evidence_blocks) == 10
+        assert evidence_blocks[-1].accepted_evidence_id == (
+            "evidence:event-tool-result-evidence-09"
+        )
+
+
 def test_pre_dispatch_evidence_uses_full_tool_call_query_atom(tmp_path: Path) -> None:
     """pre-dispatch evidence query 使用 TOOL_CALL_REQUESTED 完整 query atom。"""
 
@@ -943,6 +1036,67 @@ def test_pre_dispatch_evidence_uses_full_tool_call_query_atom(tmp_path: Path) ->
         assert evidence_blocks[0].readable_query_text == (
             "Search FY2025 revenue for MSFT"
         )
+
+
+def test_pre_dispatch_evidence_query_text_is_not_truncated(tmp_path: Path) -> None:
+    """pre-dispatch evidence query 只规范化，不按旧 1200 字符截断。"""
+
+    long_query = " ".join(("long-query", *("segment" for _ in range(240))))
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入超长 semantic query atom 与 accepted evidence。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-long-query",
+                tool_call_id="tool-call-long-query",
+                semantic_query_text=long_query,
+            )
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-long-query",
+                tool_call_requested_event_ref=request.event_id,
+                tool_call_id="tool-call-long-query",
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-long-query",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        evidence_blocks = tuple(
+            block
+            for block in view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        )
+        assert len(evidence_blocks) == 1
+        query_text = evidence_blocks[0].readable_query_text
+        assert query_text is not None
+        assert query_text == long_query
+        assert len(query_text) > 1200
 
 
 def test_compact_material_source_boundary_rejects_inverted_delta_boundary() -> None:

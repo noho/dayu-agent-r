@@ -1514,6 +1514,73 @@ def test_evidence_input_prefers_semantic_query_from_tool_request_atom(
         ) == semantic_query
 
 
+def test_evidence_input_semantic_query_text_is_not_truncated(
+    tmp_path: Path,
+) -> None:
+    """Selected evidence query 只规范化，不按旧 1200 字符截断。"""
+
+    session_id = "session-selected-long-semantic-query"
+    event_id = "event-tool-result-long-semantic-query"
+    tool_call_event_id = "event-tool-call-long-semantic-query"
+    tool_arguments: dict[str, JsonValue] = {"ticker": "MSFT", "period": "FY2025"}
+    long_query = " ".join(
+        ("读取 MSFT FY2025 年报收入分部说明", *("segment" for _ in range(240)))
+    )
+    arguments_digest = _accepted_arguments_digest(tool_arguments)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_rows(transaction: HostTransaction) -> None:
+            """写入超长 semantic query request atom 与 selected evidence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=tool_call_event_id,
+                session_id=session_id,
+                tool_call_id=f"tool-call:{event_id}",
+                arguments=tool_arguments,
+                semantic_query_text=long_query,
+            )
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_tool_request(
+                                    event_id,
+                                    tool_call_requested_event_ref=tool_call_event_id,
+                                    tool_call_id=f"tool-call:{event_id}",
+                                    normalized_arguments_digest=arguments_digest,
+                                )
+                            )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(event_id),
+                    },
+                ),
+            )
+
+        store.transaction_runner.run_write(append_rows)
+
+        query_text = _collect_selected_query_text(
+            store,
+            event_log,
+            session_id=session_id,
+            event_id=event_id,
+        )
+        assert query_text == long_query
+        assert len(query_text) > 1200
+        assert "[truncated_query_text]" not in query_text
+
+
 def test_evidence_input_missing_tool_request_atom_emits_limited_signal(
     tmp_path: Path,
 ) -> None:

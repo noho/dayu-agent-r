@@ -13,7 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.compact_material import InitialEvidenceMaterial, InitialHistoryMaterial
+from dayu.host.compact_material import (
+    InitialEvidenceMaterial,
+    InitialHistoryMaterial,
+    normalized_material_text,
+)
 from dayu.host.compaction import CompactMaterialBlockKind
 from dayu.host.context_events import CONTEXT_COMPACTED
 from dayu.host.durable.codec import canonical_json_dumps
@@ -44,8 +48,6 @@ _MEMORY_ITEM_EVIDENCE_BACKED_FACT_PREFIX = "memory-item:evidence_backed_fact"
 _PAYLOAD_REF_PREFIX = "payload"
 _LOCATOR_REF_SEPARATOR = ", "
 _READABLE_SOURCE_EMPTY = "accepted tool evidence"
-_READABLE_QUERY_TEXT_MAX_CHARS = 1200
-_READABLE_QUERY_TRUNCATED_MARKER = "\n[truncated_query_text]"
 _READABLE_ARGUMENTS_PREFIX = "工具参数: "
 _LIMITED_SIGNAL_STATUS = "limited_signal"
 _LIMITED_SIGNAL_FIELD_SEPARATOR = "；"
@@ -323,8 +325,8 @@ def _readable_query_text(
             detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
         )
     if atoms.semantic_query_text is not None:
-        return _bounded_query_text(atoms.semantic_query_text)
-    return _bounded_query_text(
+        return _normalized_query_text(atoms.semantic_query_text)
+    return _normalized_query_text(
         f"{_READABLE_ARGUMENTS_PREFIX}{canonical_json_dumps(atoms.arguments_json)}"
     )
 
@@ -347,21 +349,15 @@ def _request_atoms_match_envelope(
     )
 
 
-def _bounded_query_text(text: str) -> str:
-    """把 query 文本规范化并截断到 compact material 字段预算内。
+def _normalized_query_text(text: str) -> str:
+    """规范化 query 文本并保留完整非空内容。
 
     :param text: 原始 query 文本。
-    :returns: 有界、非空、可投影给 LLM 的 query 文本。
+    :returns: 规范化后的非空 query 文本。
     :raises ValueError: 规范化后为空时抛出。
     """
 
-    normalized = " ".join(text.split())
-    if normalized == "":
-        raise ValueError("query text must be non-empty after normalization")
-    if len(normalized) <= _READABLE_QUERY_TEXT_MAX_CHARS:
-        return normalized
-    keep_chars = _READABLE_QUERY_TEXT_MAX_CHARS - len(_READABLE_QUERY_TRUNCATED_MARKER)
-    return f"{normalized[:keep_chars]}{_READABLE_QUERY_TRUNCATED_MARKER}"
+    return normalized_material_text(text)
 
 
 def _limited_signal_query_text(*, reason: str, detail: str) -> str:
@@ -372,7 +368,7 @@ def _limited_signal_query_text(*, reason: str, detail: str) -> str:
     :returns: 结构化 limited-signal query 文本。
     """
 
-    return _bounded_query_text(
+    return _normalized_query_text(
         _LIMITED_SIGNAL_FIELD_SEPARATOR.join(
             (
                 f"状态={_LIMITED_SIGNAL_STATUS}",

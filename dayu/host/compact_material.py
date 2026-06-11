@@ -149,10 +149,6 @@ _LIMITED_SIGNAL_REASON_SOURCE_MISMATCH = "工具请求与当前证据来源不�
 _LIMITED_SIGNAL_DETAIL_UNAVAILABLE = "无法从已验收工具请求恢复查询参数"
 _LIMITED_SIGNAL_DETAIL_UNSAFE = "无法安全展示查询参数"
 _READABLE_ARGUMENTS_PREFIX = "工具参数: "
-_READABLE_QUERY_TEXT_MAX_CHARS = 1200
-_READABLE_QUERY_TRUNCATED_MARKER = "\n[truncated_query_text]"
-_DEFAULT_PRE_DISPATCH_MAX_DELTA_EVENTS = 256
-_DEFAULT_PRE_DISPATCH_MAX_EVIDENCE_BLOCKS = 8
 _PRE_DISPATCH_BUDGET_FRAGMENT_CURRENT_REF = "current_input_anchor"
 _PRE_DISPATCH_BUDGET_FRAGMENT_PREVIOUS_PREFIX = "previous:"
 
@@ -459,20 +455,17 @@ def build_pre_dispatch_compact_material_view(
     *,
     run: RunRow,
     current_display_text: str,
-    max_delta_events: int = _DEFAULT_PRE_DISPATCH_MAX_DELTA_EVENTS,
-    max_evidence_blocks: int = _DEFAULT_PRE_DISPATCH_MAX_EVIDENCE_BLOCKS,
 ) -> PreDispatchCompactMaterialView:
     """从 EventLog durable truth 构造 pre-dispatch compact material view。
 
     本 builder 只读取 EventLog、payload descriptor 与 artifact-backed payload
-    truth，不读取 Conversation Memory snapshot，也不伪造 snapshot。
+    truth，不读取 Conversation Memory snapshot，不伪造 snapshot，也不在 source
+    builder 阶段用固定条数裁剪 post-compact delta 或 accepted evidence blocks。
 
     :param transaction: 当前 Host transaction。
     :param event_log_store: EventLog store。
     :param run: 当前 Run durable row。
     :param current_display_text: 当前 ``USER_INPUT_ACCEPTED`` display text。
-    :param max_delta_events: 单次最多读取的 post-compact delta 事件数。
-    :param max_evidence_blocks: 单次最多纳入的 accepted evidence block 数。
     :returns: EventLog-backed pre-dispatch compact material view。
     :raises HostDurableError: EventLog 边界、payload 或 artifact truth 损坏时抛出。
     :raises TypeError: 参数类型非法时抛出。
@@ -482,10 +475,6 @@ def build_pre_dispatch_compact_material_view(
     if not isinstance(run, RunRow):
         raise TypeError("run must be RunRow")
     _require_non_empty_text(current_display_text, "current_display_text")
-    if max_delta_events <= 0:
-        raise ValueError("max_delta_events must be positive")
-    if max_evidence_blocks <= 0:
-        raise ValueError("max_evidence_blocks must be positive")
     current_event = _validated_current_input_event(
         transaction,
         event_log_store,
@@ -525,14 +514,12 @@ def build_pre_dispatch_compact_material_view(
         session_id=run.session_id,
         start_sequence=delta_start,
         end_sequence=current_event.event_sequence,
-        limit=max_delta_events,
     )
     material_blocks = _pre_dispatch_delta_material_blocks(
         transaction,
         event_log_store,
         rows=delta_rows,
         represented_evidence_refs=represented_refs,
-        max_evidence_blocks=max_evidence_blocks,
     )
     boundary = CompactMaterialSourceBoundary(
         latest_compacted_event_id=None if latest_compact is None else latest_compact.event_id,
@@ -1886,7 +1873,6 @@ def _post_compact_delta_rows(
     session_id: str,
     start_sequence: int,
     end_sequence: int,
-    limit: int,
 ) -> tuple[EventLogRow, ...]:
     """读取 post-compact delta canonical fact rows。
 
@@ -1894,9 +1880,8 @@ def _post_compact_delta_rows(
     :param session_id: 当前 Session id。
     :param start_sequence: 包含式起点。
     :param end_sequence: 排他式终点，等于 current input sequence。
-    :param limit: 最大读取事件数。
     :returns: delta rows，按 EventLog sequence 升序。
-    :raises HostDurableError: delta 超过 policy cap 时抛出。
+    :raises HostDurableError: EventLog row 转换失败时抛出。
     """
 
     rows = transaction.fetchall(
@@ -1929,7 +1914,6 @@ def _post_compact_delta_rows(
           AND event_sequence >= ?
           AND event_sequence < ?
         ORDER BY event_sequence ASC
-        LIMIT ?
         """,
         (
             session_id,
@@ -1939,11 +1923,8 @@ def _post_compact_delta_rows(
             _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
             start_sequence,
             end_sequence,
-            limit + 1,
         ),
     )
-    if len(rows) > limit:
-        raise HostDurableError("pre-dispatch compact delta event cap exceeded")
     return tuple(_event_log_row_from_host_row(row) for row in rows)
 
 
@@ -1953,7 +1934,6 @@ def _pre_dispatch_delta_material_blocks(
     *,
     rows: tuple[EventLogRow, ...],
     represented_evidence_refs: tuple[str, ...],
-    max_evidence_blocks: int,
 ) -> tuple[RunInputMaterialBlock, ...]:
     """把 delta EventLog rows 映射为 RunInputMaterialBlock。
 
@@ -1961,14 +1941,12 @@ def _pre_dispatch_delta_material_blocks(
     :param event_log_store: EventLog store。
     :param rows: post-compact delta rows。
     :param represented_evidence_refs: latest compact 已覆盖的 accepted evidence refs。
-    :param max_evidence_blocks: 最多纳入 evidence blocks 数。
     :returns: material block tuple。
-    :raises HostDurableError: payload 损坏或 evidence 数超过上限时抛出。
+    :raises HostDurableError: payload 损坏时抛出。
     """
 
     represented = frozenset(represented_evidence_refs)
     blocks: list[RunInputMaterialBlock] = []
-    evidence_count = 0
     for row in rows:
         if row.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
             blocks.append(_user_input_delta_block(transaction, row))
@@ -1983,9 +1961,6 @@ def _pre_dispatch_delta_material_blocks(
                 row,
                 represented_evidence_refs=represented,
             )
-            evidence_count += len(evidence_blocks)
-            if evidence_count > max_evidence_blocks:
-                raise HostDurableError("pre-dispatch compact evidence cap exceeded")
             blocks.extend(evidence_blocks)
     return tuple(blocks)
 
@@ -2195,8 +2170,8 @@ def _readable_query_text_from_envelope(
             detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
         )
     if atoms.semantic_query_text is not None:
-        return _bounded_query_text(atoms.semantic_query_text)
-    return _bounded_query_text(
+        return _normalized_query_text(atoms.semantic_query_text)
+    return _normalized_query_text(
         f"{_READABLE_ARGUMENTS_PREFIX}{canonical_json_dumps(atoms.arguments_json)}"
     )
 
@@ -2206,27 +2181,23 @@ def _limited_signal_query_text(*, reason: str, detail: str) -> str:
 
     :param reason: 不含内部 ref 的原因文本。
     :param detail: 不含内部 ref 的影响说明。
-    :returns: 有界 query 文本。
+    :returns: 规范化 query 文本。
     """
 
-    return _bounded_query_text(
+    return _normalized_query_text(
         f"状态={_LIMITED_SIGNAL_STATUS}；原因={reason}；说明={detail}"
     )
 
 
-def _bounded_query_text(text: str) -> str:
-    """规范化并截断 query 文本。
+def _normalized_query_text(text: str) -> str:
+    """规范化 query 文本并保留完整非空内容。
 
     :param text: 原始 query 文本。
-    :returns: 有界非空 query 文本。
+    :returns: 规范化后的非空 query 文本。
     :raises ValueError: 规范化后为空时抛出。
     """
 
-    normalized = normalized_material_text(text)
-    if len(normalized) <= _READABLE_QUERY_TEXT_MAX_CHARS:
-        return normalized
-    keep_chars = _READABLE_QUERY_TEXT_MAX_CHARS - len(_READABLE_QUERY_TRUNCATED_MARKER)
-    return f"{normalized[:keep_chars]}{_READABLE_QUERY_TRUNCATED_MARKER}"
+    return normalized_material_text(text)
 
 
 def _readable_source_text_from_refs(refs: tuple[OpaqueEvidenceRef, ...]) -> str:

@@ -78,7 +78,6 @@ from dayu.host.projection import ProjectionConsumerId
 from dayu.host.recovery import StartupRecoveryScanner
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
-_DISPATCH_MODULE = importlib.import_module("dayu.host.dispatch")
 _OPEN_HOST_MODULE = importlib.import_module("dayu.host.open_host")
 
 
@@ -659,21 +658,16 @@ def test_open_host_memory_projection_port_uses_best_effort_budget(
 
 
 @pytest.mark.asyncio
-async def test_open_host_dispatch_memory_catchup_budget_exhausted_blocks_worker_accept(
+async def test_open_host_dispatch_memory_catchup_reaches_required_cursor(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """dispatch 前 memory catch-up 未覆盖 required cursor 时不调用 worker accept。"""
+    """dispatch 前 required memory catch-up 会追到 required cursor 后接受 worker。"""
 
     factory = _FinalAnswerWorkerFactory()
     options = replace(
         _options(tmp_path, factory),
         memory_projection_catchup_batch_size=1,
-    )
-    monkeypatch.setattr(
-        _DISPATCH_MODULE,
-        "_MEMORY_PROJECTION_REQUIRED_BEFORE_DISPATCH_MAX_BATCHES",
-        1,
     )
 
     def skip_after_commit_memory_catch_up(
@@ -719,17 +713,17 @@ async def test_open_host_dispatch_memory_catchup_budget_exhausted_blocks_worker_
         session = await host.ensure_session(_ensure_request())
         followup = await host.submit_followup(
             session.session_id,
-            _followup_request(session.session_id, "bounded-memory-dispatch"),
+            _followup_request(session.session_id, "required-memory-dispatch"),
         )
         final_run = await _wait_for_run_status(
             host,
             followup.accepted_run_id,
-            RunStatus.FAILED,
+            RunStatus.SUCCEEDED,
         )
 
-    assert final_run.status is RunStatus.FAILED
-    assert factory.accepted_snapshots == []
-    assert factory.accepted_requests == []
+    assert final_run.status is RunStatus.SUCCEEDED
+    assert len(factory.accepted_snapshots) == 1
+    assert len(factory.accepted_requests) == 1
 
 
 @pytest.mark.asyncio

@@ -241,9 +241,8 @@ _COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
-_MEMORY_PROJECTION_BEST_EFFORT_MAX_BATCHES = 1
-_MEMORY_PROJECTION_REQUIRED_BEFORE_DISPATCH_MAX_BATCHES = 16
-_MEMORY_PROJECTION_REBUILD_BEFORE_DISPATCH_MAX_BATCHES = 32
+_OPPORTUNISTIC_AFTER_COMPACT_MEMORY_PROJECTION_BATCH_COUNT = 1
+"""compact accepted 后的非 correctness opportunistic projection catch-up 批次数。"""
 
 
 class _MemoryProjectionDispatchDiagnosticError(HostDurableError):
@@ -322,31 +321,26 @@ _LOG_WORKER_LOST_CLOSEOUT_FAILED = (
 _LOGGER = logging.getLogger(__name__)
 
 
-def _memory_projection_catchup_budget(
+def _opportunistic_memory_projection_catchup_budget(
     *,
     batch_size: int,
-    purpose: MemoryProjectionRepairPurpose,
 ) -> MemoryProjectionCatchupBudget:
-    """按 dispatch 调用目的构造 memory projection 总预算。
+    """构造 compact accepted 后的 opportunistic memory projection 预算。
+
+    该预算只影响 compact 后、正式 dispatch 前的轻量投影推进；worker accept 前
+    的 required catch-up / rebuild 不共享该预算，仍追到 required cursor、idle
+    或 failure。
 
     :param batch_size: 单批 projection scan 上限。
-    :param purpose: repair 调用目的。
-    :returns: Host 内部 memory projection 总预算。
-    :raises HostDurableError: purpose 非法时抛出。
+    :returns: Host 内部 memory projection opportunistic 预算。
     """
 
-    if purpose is MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT:
-        max_batches = _MEMORY_PROJECTION_BEST_EFFORT_MAX_BATCHES
-    elif purpose is MemoryProjectionRepairPurpose.REQUIRED_BEFORE_DISPATCH:
-        max_batches = _MEMORY_PROJECTION_REQUIRED_BEFORE_DISPATCH_MAX_BATCHES
-    elif purpose is MemoryProjectionRepairPurpose.REBUILD_BEFORE_DISPATCH:
-        max_batches = _MEMORY_PROJECTION_REBUILD_BEFORE_DISPATCH_MAX_BATCHES
-    else:
-        raise HostDurableError("unsupported memory projection repair purpose")
     return MemoryProjectionCatchupBudget(
-        max_batches=max_batches,
-        max_scanned_events=batch_size * max_batches,
-        purpose=purpose,
+        max_batches=_OPPORTUNISTIC_AFTER_COMPACT_MEMORY_PROJECTION_BATCH_COUNT,
+        max_scanned_events=(
+            batch_size * _OPPORTUNISTIC_AFTER_COMPACT_MEMORY_PROJECTION_BATCH_COUNT
+        ),
+        purpose=MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
     )
 
 
@@ -1022,12 +1016,9 @@ class HostDispatchScheduler:
                 policy=self._local_execution.memory_projection_policy,
                 batch_size=(self._local_execution.memory_projection_catchup_batch_size),
                 max_event_sequence=stage.compact_accepted.compacted_event_sequence,
-                budget=_memory_projection_catchup_budget(
+                budget=_opportunistic_memory_projection_catchup_budget(
                     batch_size=(
                         self._local_execution.memory_projection_catchup_batch_size
-                    ),
-                    purpose=(
-                        MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT
                     ),
                 ),
             )
@@ -2912,18 +2903,12 @@ class HostDispatchScheduler:
                 record.execution_id,
                 exc.repair_request.required_event_sequence,
             )
-            rebuild_budget = _memory_projection_catchup_budget(
-                batch_size=(
-                    self._local_execution.memory_projection_catchup_batch_size
-                ),
-                purpose=MemoryProjectionRepairPurpose.REBUILD_BEFORE_DISPATCH,
-            )
             rebuild_result = rebuild_conversation_memory_projection(
                 self._transaction_runner,
                 policy=self._local_execution.memory_projection_policy,
                 batch_size=(self._local_execution.memory_projection_catchup_batch_size),
                 max_event_sequence=exc.repair_request.required_event_sequence,
-                budget=rebuild_budget,
+                budget=None,
             )
             _raise_if_memory_projection_target_not_reached(
                 operation="rebuild_before_dispatch",
@@ -3037,12 +3022,7 @@ class HostDispatchScheduler:
             policy=self._local_execution.memory_projection_policy,
             batch_size=(self._local_execution.memory_projection_catchup_batch_size),
             max_event_sequence=required_event_sequence,
-            budget=_memory_projection_catchup_budget(
-                batch_size=(
-                    self._local_execution.memory_projection_catchup_batch_size
-                ),
-                purpose=MemoryProjectionRepairPurpose.REQUIRED_BEFORE_DISPATCH,
-            ),
+            budget=None,
         )
         _raise_if_memory_projection_target_not_reached(
             operation="catch_up_before_dispatch",

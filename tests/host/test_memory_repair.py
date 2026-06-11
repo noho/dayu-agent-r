@@ -387,6 +387,41 @@ def test_catch_up_stops_when_target_reached_before_idle() -> None:
     assert _FakeProjectionRunner.run_calls == [(consumer_id, 2, 2)]
 
 
+def test_required_catch_up_without_budget_crosses_old_batch_cap_to_target() -> None:
+    """required catch-up 无 correctness batch cap，可跨超过旧 16 批追到目标。"""
+
+    consumer_id = ProjectionConsumerId("memory.test")
+    _FakeProjectionRunner.queued_results = [
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=index,
+            finished_cursor=index + 1,
+            scanned=1,
+            matched=1,
+            applied=1,
+        )
+        for index in range(17)
+    ]
+
+    result = memory_repair.catch_up_conversation_memory_projection(
+        cast(HostTransactionRunner, _FakeTransactionRunner()),
+        policy=_policy(),
+        batch_size=1,
+        consumer_id=consumer_id.value,
+        max_event_sequence=17,
+        budget=None,
+    )
+
+    assert result.finished_cursor == 17
+    assert result.batches_used == 17
+    assert result.events_scanned == 17
+    assert result.target_reached is True
+    assert result.budget_exhausted is False
+    assert result.max_batches is None
+    assert result.max_scanned_events is None
+    assert len(_FakeProjectionRunner.run_calls) == 17
+
+
 def test_rebuild_budget_exhausted_reports_target_not_reached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -442,6 +477,59 @@ def test_rebuild_budget_exhausted_reports_target_not_reached(
         is memory_repair.MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED
     )
     assert _FakeProjectionRunner.run_calls == [(consumer_id, 2, 4)]
+
+
+def test_rebuild_without_budget_crosses_old_batch_cap_to_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rebuild 无 correctness batch cap，可跨超过旧 32 批追到目标。"""
+
+    consumer_id = ProjectionConsumerId("memory.test")
+
+    def fake_reset(transaction: HostTransaction, *, consumer_id: str) -> None:
+        """忽略 reset projection operation。
+
+        :param transaction: Host transaction。
+        :param consumer_id: consumer id。
+        :returns: ``None``。
+        """
+
+        del transaction, consumer_id
+
+    monkeypatch.setattr(
+        memory_repair,
+        "reset_conversation_memory_projection",
+        fake_reset,
+    )
+    _FakeProjectionRunner.queued_results = [
+        _result(
+            consumer_id=consumer_id,
+            started_cursor=index,
+            finished_cursor=index + 1,
+            scanned=1,
+            matched=1,
+            applied=1,
+        )
+        for index in range(33)
+    ]
+
+    result = memory_repair.rebuild_conversation_memory_projection(
+        cast(HostTransactionRunner, _FakeTransactionRunner()),
+        policy=_policy(),
+        batch_size=1,
+        max_event_sequence=33,
+        budget=None,
+        consumer_id=consumer_id.value,
+    )
+
+    assert result.reset_checkpoint is True
+    assert result.finished_cursor == 33
+    assert result.batches_used == 33
+    assert result.target_reached is True
+    assert result.budget_exhausted is False
+    assert result.max_batches is None
+    assert result.max_scanned_events is None
+    assert len(_FakeProjectionRunner.run_calls) == 33
 
 
 def test_catch_up_stops_on_failure_and_counts_failure() -> None:
