@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-TOOLS-01-F08 plan accepted after focused re-review; ready for implementation gate |
+| gate | review |
+| implementation status | WU-TOOLS-01-F08 code review passed; ready for aggregate deepreview gate |
 | active work unit | WU-TOOLS-01-F08 |
 | default next work unit | WU-TOOLS-01-F08 |
-| next entry point | WU-TOOLS-01-F08 implementation gate |
+| next entry point | WU-TOOLS-01-F08 aggregate deepreview gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
@@ -196,7 +196,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
-| WU-TOOLS-01-S1-R2 | open | WU-TOOLS-01-F08 | 清理 documents processor registry 的 OLD `engine` 命名；当前由 F08 承接。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
@@ -223,7 +222,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-03 | draft-PR-pass | Production Fins CN/SEC download and upload runtime/tool migration | WU-TOOLS-01-F01 draft PR preflight follow-up; absorbs WU-TOOLS-01-F09; draft PR #131 | Draft PR #131 已通过本地 gate；final closeout 见 `docs/reviews/wu-tools-01-f01-03-final-closeout-controller.md`。等待用户 merge decision；Issue #129 继续追踪 `start_upload` prepare/activate 后续。 |
 | WU-TOOLS-01-F02 | completed | Web CI diagnostics pipeline migration | GitHub Issue #120 under #98 follow-up; PR #132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f02-final-closeout-controller.md`。F02 completion 已完成，F03 前置条件已满足。 |
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
-| WU-TOOLS-01-F08 | implementation | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Plan accepted after focused re-review; implementation gate next. Accepted plan commit `a0c00567`; accepted plan artifact `docs/host/wu-tools-01-f08-documents-processor-registry-naming-plan.md`; plan review artifacts `docs/reviews/wu-tools-01-f08-plan-review-mimo.md`, `docs/reviews/wu-tools-01-f08-plan-review-ds.md`, `docs/reviews/wu-tools-01-f08-plan-review-controller-adjudication.md`; plan fix artifact `docs/reviews/wu-tools-01-f08-plan-fix-codex.md`; re-review artifacts `docs/reviews/wu-tools-01-f08-plan-rereview-mimo.md`, `docs/reviews/wu-tools-01-f08-plan-rereview-ds.md`, `docs/reviews/wu-tools-01-f08-plan-rereview-controller-adjudication.md`. Rename `build_engine_processor_registry(...)` to `build_documents_processor_registry(...)` and update direct callers / exports / docs without changing processor registration behavior; owner for residual `WU-TOOLS-01-S1-R2` |
+| WU-TOOLS-01-F08 | review | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup | Implementation and code review passed; aggregate deepreview gate next. Accepted plan commit `a0c00567`; accepted plan artifact `docs/host/wu-tools-01-f08-documents-processor-registry-naming-plan.md`; implementation artifact `docs/reviews/wu-tools-01-f08-implementation-codex.md`; code review artifacts `docs/reviews/wu-tools-01-f08-code-review-mimo.md`, `docs/reviews/wu-tools-01-f08-code-review-ds.md`, `docs/reviews/wu-tools-01-f08-code-review-controller-adjudication.md`. Renamed documents registry builder to `build_documents_processor_registry(...)`, updated direct callers / exports / docs, and kept processor registration behavior unchanged. Residual `WU-TOOLS-01-S1-R2` closed by implementation evidence. |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
 | WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
@@ -1063,17 +1062,17 @@ Controller 复验：
 
 ### 状态
 
-Implementation gate。该 work unit 是 `WU-TOOLS-01-S1-R2` 的明确 owner，用于清理迁移后遗留的 OLD `engine` 命名，不改变 processor registry 行为。
+Implementation and code review passed；下一入口为 aggregate deepreview gate。该 work unit 已关闭 `WU-TOOLS-01-S1-R2`，清理迁移后遗留的 OLD `engine` 命名，不改变 processor registry 行为。
 
-Plan gate 已完成。Goal confirmation artifact 为 `docs/reviews/wu-tools-01-f08-goal-confirmation-controller.md`。Accepted plan artifact 为 `docs/host/wu-tools-01-f08-documents-processor-registry-naming-plan.md`，accepted plan commit 为 `a0c00567`。Plan review artifacts 为 `docs/reviews/wu-tools-01-f08-plan-review-mimo.md`、`docs/reviews/wu-tools-01-f08-plan-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-plan-review-controller-adjudication.md`。Plan fix artifact 为 `docs/reviews/wu-tools-01-f08-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/wu-tools-01-f08-plan-rereview-mimo.md`、`docs/reviews/wu-tools-01-f08-plan-rereview-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-plan-rereview-controller-adjudication.md`。两路 re-review 均裁决 pass，0 条 blocking finding；下一入口为 implementation gate。
+Plan gate 已完成。Goal confirmation artifact 为 `docs/reviews/wu-tools-01-f08-goal-confirmation-controller.md`。Accepted plan artifact 为 `docs/host/wu-tools-01-f08-documents-processor-registry-naming-plan.md`，accepted plan commit 为 `a0c00567`。Plan review artifacts 为 `docs/reviews/wu-tools-01-f08-plan-review-mimo.md`、`docs/reviews/wu-tools-01-f08-plan-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-plan-review-controller-adjudication.md`。Plan fix artifact 为 `docs/reviews/wu-tools-01-f08-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/wu-tools-01-f08-plan-rereview-mimo.md`、`docs/reviews/wu-tools-01-f08-plan-rereview-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-plan-rereview-controller-adjudication.md`。两路 re-review 均裁决 pass，0 条 blocking finding。Implementation artifact 为 `docs/reviews/wu-tools-01-f08-implementation-codex.md`。Code review artifacts 为 `docs/reviews/wu-tools-01-f08-code-review-mimo.md`、`docs/reviews/wu-tools-01-f08-code-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f08-code-review-controller-adjudication.md`；两路 code review 均裁决 pass，0 条 accepted finding。下一入口为 aggregate deepreview gate。
 
 ### 动机
 
-`build_engine_processor_registry(...)` 当前位于 `dayu.documents.processors.registry`，实际注册的是通用 documents processor：Docling、Markdown 与 BS。Doc tools 和 Fins 都把它作为 documents 默认 processor registry 使用；它不属于 Engine。迁移期保留旧名是为了遵守 WU-TOOLS-01 的迁移原则，但迁移完成后继续暴露 `engine` 命名会误导 ownership，弱化 `dayu.documents` 作为共享文档基础能力 owner 的边界。
+原旧名 builder 位于 `dayu.documents.processors.registry`，实际注册的是通用 documents processor：Docling、Markdown 与 BS。Doc tools 和 Fins 都把它作为 documents 默认 processor registry 使用；它不属于 Engine。F08 已将稳定入口收敛为 `build_documents_processor_registry(...)`，避免 `engine` 命名误导 ownership。
 
 ### 目标
 
-- 将 `build_engine_processor_registry(...)` 重命名为 `build_documents_processor_registry(...)` 或 `build_default_processor_registry(...)`。
+- 将 documents 默认 processor registry builder 稳定命名为 `build_documents_processor_registry(...)`。
 - 同步更新 `dayu.documents.processors.__all__`、`dayu.documents.processors._doc_processor_factory`、`dayu.fins.processors.registry`、测试和 README / 文档引用。
 - 保持 processor 注册顺序与行为不变：DoclingProcessor、MarkdownProcessor、BSProcessor 仍按当前优先级注册。
 - 证明 Fins registry 仍先加载 documents 默认 registry，再覆盖注册 Fins 专属 processor。
@@ -1086,10 +1085,19 @@ Plan gate 已完成。Goal confirmation artifact 为 `docs/reviews/wu-tools-01-f
 
 ### 验收信号
 
-- `rg "build_engine_processor_registry"` 在生产代码、测试和稳定 README / control doc 中无残留；历史 review artifact 可保留。
+- 旧 builder 名称在生产代码、测试和稳定 README / control doc 中无残留；历史 review artifact 可保留。
 - Documents / Fins processor registry focused tests 证明行为不变。
 - import-boundary tests 与 pyright 通过。
 - 相关 README 只描述新命名和当前 ownership，不保留新旧术语并存。
+
+### Implementation validation
+
+- 稳定目标旧名清理检查：passed，无匹配。
+- 历史 review artifact 检查：passed，仅历史 review / plan review artifact 保留旧名留痕。
+- Focused registry tests：`pytest tests/documents/test_processors.py tests/fins/test_processor_registry.py -q`，5 passed，3 warnings。
+- 相关包测试：`pytest tests/documents tests/fins -q`，263 passed，1 skipped，3 warnings；`tests/fins` 未出现 heavy fixture / environment failure。
+- 类型检查：`python -m pyright dayu/ tests/ utils/`，0 errors，0 warnings，0 informations。
+- Whitespace：`git diff --check`，passed。
 
 ## WU-TOOLS-01-F09 Fins Upload Ingestion Migration And Upload Tool
 

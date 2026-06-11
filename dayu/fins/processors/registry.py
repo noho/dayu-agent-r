@@ -1,6 +1,6 @@
 """fins 业务域处理器注册构建器。
 
-本模块负责在 engine 核心处理器注册表基础上，追加 fins 业务特化处理器。
+本模块负责在 documents 默认处理器注册表基础上，追加 fins 业务特化处理器。
 设计原则：注册责任由调用方显式触发，不在模块导入时自动注册。
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dayu.fins._log import Log
 from dayu.documents.processors.processor_registry import ProcessorRegistry
-from dayu.documents.processors.registry import build_engine_processor_registry
+from dayu.documents.processors.registry import build_documents_processor_registry
 
 from .fins_bs_processor import FinsBSProcessor
 from .fins_docling_processor import FinsDoclingProcessor
@@ -41,7 +41,7 @@ def build_fins_processor_registry() -> ProcessorRegistry:
     """构建 fins 默认处理器注册表。
 
     注册顺序：
-    1. 先加载 engine 核心处理器。
+    1. 先加载 documents 默认处理器。
     2. 覆盖注册 fins 业务增强处理器（Docling/Markdown/BS）。
     3. 注册 SEC 表单专项处理器（SC13/6-K/DEF 14A/8-K/10-K/10-Q/20-F）。
        BS 路线为主处理器，edgartools 路线为回退。
@@ -57,7 +57,7 @@ def build_fins_processor_registry() -> ProcessorRegistry:
         RuntimeError: 注册流程失败时抛出。
     """
 
-    registry = build_engine_processor_registry()
+    registry = build_documents_processor_registry()
     registry.register(
         FinsDoclingProcessor,
         name="docling_processor",
@@ -186,5 +186,5 @@ def build_bs_experiment_registry() -> ProcessorRegistry:
         RuntimeError: 注册流程失败时抛出。
     """
 
-    # BsTenKFormProcessor 已在默认注册表中作为主路径，此函数保持向后兼容
+    # BsTenKFormProcessor 已在默认注册表中作为主路径，此函数保留实验入口语义。
     return build_fins_processor_registry()

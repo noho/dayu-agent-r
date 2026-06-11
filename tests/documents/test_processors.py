@@ -15,6 +15,7 @@ from docling_core.types.doc.document import (
 )
 from docling_core.types.doc.labels import DocItemLabel
 
+from dayu.documents.processors import build_documents_processor_registry
 from dayu.documents.processors.bs_processor import BSProcessor
 from dayu.documents.processors.docling_processor import DoclingProcessor
 from dayu.documents.processors.local_file_source import LocalFileSource
@@ -40,6 +41,18 @@ def _ref_item(ref: str) -> RefItem:
     """
 
     return RefItem.model_validate({"$ref": ref})
+
+
+def test_documents_processor_registry_registers_default_processors() -> None:
+    """documents 默认注册表应保持通用处理器注册行为不变。"""
+
+    registry = build_documents_processor_registry()
+
+    assert registry.list_processors() == [
+        {"name": "docling_processor", "class": "DoclingProcessor", "priority": 10},
+        {"name": "markdown_processor", "class": "MarkdownProcessor", "priority": 10},
+        {"name": "bs_processor", "class": "BSProcessor", "priority": 10},
+    ]
 
 
 def test_markdown_processor_sections_tables_and_search(tmp_path: Path) -> None:

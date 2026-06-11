@@ -9,7 +9,7 @@ from .html_markdown import RenderedMarkdownResult, render_html_to_markdown
 from .html_normalization import NormalizedHtmlResult, normalize_html_fragment
 from .html_pipeline import HtmlPipelineResult, HtmlPipelineStageError, convert_html_to_llm_markdown
 from .processor_registry import ProcessorRegistry
-from .registry import build_engine_processor_registry
+from .registry import build_documents_processor_registry
 from .search_utils import SEARCH_PER_SECTION_LIMIT, SEARCH_SNIPPET_MAX_CHARS
 from .source import Source
 from .table_utils import parse_html_table_dataframe
@@ -20,7 +20,7 @@ __all__ = [
     "DocumentProcessor",
     "PageAwareProcessor",
     "ProcessorRegistry",
-    "build_engine_processor_registry",
+    "build_documents_processor_registry",
     "ExtractedHtmlContent",
     "ExtractionQualityReport",
     "extract_main_content",
