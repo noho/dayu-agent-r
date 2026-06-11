@@ -40,7 +40,7 @@ Pass with one deferred PR-level residual risk. No code fix gate is required.
 
 ## Residual Risk
 
-`WU-TOOLS-01-F08-R1`: PR #135 has no GitHub checks reported. Local gate validation is complete, but PR-page auditability is weaker than it would be with GitHub Actions or equivalent CI. This is deferred to repository CI configuration / future CI workflow owner and does not block this PR gate.
+`PR-135-R1`: PR #135 has no GitHub checks reported. Local gate validation is complete, but PR-page auditability is weaker than it would be with GitHub Actions or equivalent CI. This is deferred to repository CI configuration / future CI workflow owner and does not block this PR gate.
 
 ## Next Gate
 
