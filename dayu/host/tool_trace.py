@@ -95,6 +95,10 @@ _FIELD_ENGINE_EVENT_REF = "engine_event_ref"
 _FIELD_PROVIDER_ERROR_REF = "provider_error_ref"
 _FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
+_FIELD_CONTEXT_PRESSURE = "context_pressure"
+_FIELD_TOOL_TIMING = "tool_timing"
+_FIELD_FAILURE_METADATA = "failure_metadata"
+_FIELD_PARTIAL_TOOL_CALL_SIGNAL = "partial_tool_call_signal"
 _FIELD_OPERATION_CONTEXT = "operation_context"
 _FIELD_COLD_TRACE_REF = "cold_trace_ref"
 _FIELD_COLD_TRACE_DIGEST = "cold_trace_digest"
@@ -247,6 +251,42 @@ class ToolTraceCatchupResult:
     events_applied: int
     duplicates: int
     failures: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TraceSummarySignals:
+    """Tool Trace summary 的可选结构化 signal 集合。
+
+    :param context_pressure: 可选上下文压力 signal JSON object。
+    :param tool_timing: 可选工具耗时 signal JSON object。
+    :param failure_metadata: 可选失败元数据 signal JSON object。
+    :param partial_tool_call_signal: 可选 partial tool-call signal JSON object。
+    """
+
+    context_pressure: Mapping[str, JsonValue] | None = None
+    tool_timing: Mapping[str, JsonValue] | None = None
+    failure_metadata: Mapping[str, JsonValue] | None = None
+    partial_tool_call_signal: Mapping[str, JsonValue] | None = None
+
+    def present_items(self) -> tuple[tuple[str, Mapping[str, JsonValue]], ...]:
+        """返回非空 signal 字段和值。
+
+        :returns: 按稳定字段顺序排列的 ``(field_name, signal_object)`` 元组。
+        :raises: 无。
+        """
+
+        items: list[tuple[str, Mapping[str, JsonValue]]] = []
+        if self.context_pressure is not None:
+            items.append((_FIELD_CONTEXT_PRESSURE, self.context_pressure))
+        if self.tool_timing is not None:
+            items.append((_FIELD_TOOL_TIMING, self.tool_timing))
+        if self.failure_metadata is not None:
+            items.append((_FIELD_FAILURE_METADATA, self.failure_metadata))
+        if self.partial_tool_call_signal is not None:
+            items.append(
+                (_FIELD_PARTIAL_TOOL_CALL_SIGNAL, self.partial_tool_call_signal)
+            )
+        return tuple(items)
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +544,7 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
         _optional_text(payload, _FIELD_PAYLOAD_DIGEST),
         event.payload_digest,
     )
+    signals = _trace_summary_signals(payload)
     refs = tuple(
         ref
         for ref in (
@@ -533,6 +574,7 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
         ),
         policy_decision=_json_value_or_none(payload, _FIELD_POLICY_DECISION),
         client_correlation_id=client_correlation_id,
+        signals=signals,
     )
     return _ToolTraceExtract(
         tool_call_id=tool_call_id,
@@ -855,6 +897,7 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
             terminal_summary_digest=None,
             policy_decision=None,
             client_correlation_id=client_correlation_id,
+            signals=_trace_summary_signals(payload),
         ),
     )
 
@@ -905,6 +948,7 @@ def _extract_usage_trace(event: ProjectionEventView) -> _ToolTraceExtract | None
             terminal_summary_digest=None,
             policy_decision=None,
             client_correlation_id=client_correlation_id,
+            signals=_trace_summary_signals(payload),
         ),
     )
 
@@ -1038,6 +1082,7 @@ def _trace_summary(
     terminal_summary_digest: str | None,
     policy_decision: JsonValue | None,
     client_correlation_id: str | None,
+    signals: _TraceSummarySignals,
 ) -> Mapping[str, JsonValue]:
     """构造 hot trace summary JSON object。
 
@@ -1056,6 +1101,7 @@ def _trace_summary(
     :param terminal_summary_digest: 可选 terminal summary digest。
     :param policy_decision: 可选 policy decision JSON。
     :param client_correlation_id: 可选本地客户端关联 id。
+    :param signals: 可选结构化 signal 集合。
     :returns: trace summary JSON object。
     :raises HostDurableError: operation context 字段类型非法时抛出。
     """
@@ -1070,7 +1116,7 @@ def _trace_summary(
         if operation_context is not None
         else None
     )
-    return {
+    summary: dict[str, JsonValue] = {
         "event_type": event.event_type,
         _FIELD_TOOL_SCHEMA_DIGEST: tool_schema_digest,
         _FIELD_TOOL_IDENTITY_DIGEST: tool_identity_digest,
@@ -1089,6 +1135,46 @@ def _trace_summary(
         _FIELD_OPERATION_CONTEXT_REFS: list(operation_context_refs),
         _FIELD_OPERATION_CONTEXT_DIGEST: operation_context_digest,
     }
+    for field_name, signal_object in signals.present_items():
+        summary[field_name] = signal_object
+    return summary
+
+
+def _trace_summary_signals(payload: Mapping[str, JsonValue]) -> _TraceSummarySignals:
+    """从 payload 复制可选 Tool Trace signal 对象。
+
+    :param payload: projection event payload。
+    :returns: 四类 optional summary signal 的 grouped carrier。
+    :raises HostDurableError: signal 字段存在但不是 JSON object 或 ``null`` 时抛出。
+    """
+
+    return _TraceSummarySignals(
+        context_pressure=_optional_signal_object(payload, _FIELD_CONTEXT_PRESSURE),
+        tool_timing=_optional_signal_object(payload, _FIELD_TOOL_TIMING),
+        failure_metadata=_optional_signal_object(payload, _FIELD_FAILURE_METADATA),
+        partial_tool_call_signal=_optional_signal_object(
+            payload, _FIELD_PARTIAL_TOOL_CALL_SIGNAL
+        ),
+    )
+
+
+def _optional_signal_object(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> Mapping[str, JsonValue] | None:
+    """读取可选 Tool Trace signal JSON object。
+
+    :param payload: projection event payload。
+    :param field_name: signal 字段名。
+    :returns: JSON object；字段缺失或为 ``null`` 时返回 ``None``。
+    :raises HostDurableError: 字段存在但不是 JSON object 或 ``null`` 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"tool trace {field_name} must be JSON object or null")
+    return cast(Mapping[str, JsonValue], value)
 
 
 def _diagnostic_refs(payload: Mapping[str, JsonValue]) -> tuple[str, ...]:

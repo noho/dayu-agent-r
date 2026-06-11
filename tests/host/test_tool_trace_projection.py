@@ -53,6 +53,16 @@ from dayu.host.tool_trace import (
 )
 
 _FIXED_NOW = datetime(2026, 5, 29, 2, 3, 4, tzinfo=UTC)
+_FIELD_CONTEXT_PRESSURE = "context_pressure"
+_FIELD_TOOL_TIMING = "tool_timing"
+_FIELD_FAILURE_METADATA = "failure_metadata"
+_FIELD_PARTIAL_TOOL_CALL_SIGNAL = "partial_tool_call_signal"
+_SIGNAL_FIELD_NAMES: tuple[str, ...] = (
+    _FIELD_CONTEXT_PRESSURE,
+    _FIELD_TOOL_TIMING,
+    _FIELD_FAILURE_METADATA,
+    _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
+)
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -259,6 +269,22 @@ def _reset_tool_trace_projection(transaction_runner: HostTransactionRunner) -> N
     )
 
 
+def _cold_trace_summary(
+    cold_lines: tuple[Mapping[str, JsonValue], ...], index: int
+) -> Mapping[str, JsonValue]:
+    """读取 cold JSONL 指定行的 trace_summary object。
+
+    :param cold_lines: 已解析的 cold JSONL 行。
+    :param index: 目标行序号。
+    :returns: trace_summary JSON object。
+    :raises AssertionError: 指定字段不是 JSON object 时抛出。
+    """
+
+    summary = cold_lines[index]["trace_summary"]
+    assert isinstance(summary, Mapping)
+    return cast(Mapping[str, JsonValue], summary)
+
+
 def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> None:
     """TOOL_CALL_REQUESTED / GOVERNED / RESULT_ACCEPTED 投影关键字段。"""
 
@@ -398,6 +424,155 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             "kind": "attempt",
             "attempt_id": "attempt-trace",
         }
+
+
+def test_tool_trace_copies_optional_summary_signal_objects(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 将已存在的四类 signal object 复制进 hot/cold summary。"""
+
+    cold_path = tmp_path / "trace" / "signals.jsonl"
+    context_pressure: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "USAGE_REPORTED",
+        "status": "observed",
+    }
+    tool_timing: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "status": "available",
+        "duration_ms": 1250,
+    }
+    failure_metadata: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "TOOL_RESULT_ACCEPTED",
+        "failure_kind": "tool_failed",
+    }
+    partial_tool_call_signal: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "signal_source": "PROVIDER_PROTOCOL_ERROR",
+        "status": "partial_summary_present",
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-signals",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-signals",
+                "tool_name": "lookup_filing",
+                "outcome_digest": "sha256:outcome",
+                _FIELD_CONTEXT_PRESSURE: context_pressure,
+                _FIELD_TOOL_TIMING: tool_timing,
+                _FIELD_FAILURE_METADATA: failure_metadata,
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: partial_tool_call_signal,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.trace_summary[_FIELD_CONTEXT_PRESSURE] == context_pressure
+        assert row.trace_summary[_FIELD_TOOL_TIMING] == tool_timing
+        assert row.trace_summary[_FIELD_FAILURE_METADATA] == failure_metadata
+        assert (
+            row.trace_summary[_FIELD_PARTIAL_TOOL_CALL_SIGNAL]
+            == partial_tool_call_signal
+        )
+        assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
+
+
+def test_tool_trace_omits_missing_or_null_summary_signal_objects(
+    tmp_path: Path,
+) -> None:
+    """缺失或 null 的 signal 不写入 summary，避免表达不存在的事实。"""
+
+    cold_path = tmp_path / "trace" / "signals-null.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        missing_event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-signals-missing",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": "tool-call-missing",
+                "tool_name": "lookup_filing",
+            },
+        )
+        null_event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-signals-null",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-null",
+                "tool_name": "lookup_filing",
+                _FIELD_CONTEXT_PRESSURE: None,
+                _FIELD_TOOL_TIMING: None,
+                _FIELD_FAILURE_METADATA: None,
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: None,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        missing_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, missing_event.event_id
+            )
+        )
+        null_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, null_event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert missing_row is not None
+        assert null_row is not None
+        missing_summary = _cold_trace_summary(cold_lines, 0)
+        null_summary = _cold_trace_summary(cold_lines, 1)
+        for field_name in _SIGNAL_FIELD_NAMES:
+            assert field_name not in missing_row.trace_summary
+            assert field_name not in null_row.trace_summary
+            assert field_name not in missing_summary
+            assert field_name not in null_summary
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        (_FIELD_CONTEXT_PRESSURE, "invalid-context-pressure"),
+        (_FIELD_TOOL_TIMING, 123),
+        (_FIELD_FAILURE_METADATA, ["invalid-failure-metadata"]),
+        (_FIELD_PARTIAL_TOOL_CALL_SIGNAL, False),
+    ),
+)
+def test_tool_trace_rejects_non_object_summary_signal_fields(
+    tmp_path: Path, field_name: str, invalid_value: JsonValue
+) -> None:
+    """signal 字段存在但不是 object/null 时以 durable error fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id=f"event-invalid-{field_name}",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "tool-call-invalid-signal",
+                "tool_name": "lookup_filing",
+                field_name: invalid_value,
+            },
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
+        )
+
+        with pytest.raises(HostDurableError, match=field_name):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(event),
+                )
+            )
 
 
 def test_tool_trace_does_not_inline_large_tool_call_arguments(
