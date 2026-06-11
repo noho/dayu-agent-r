@@ -4412,6 +4412,7 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
     """proactive compact 缺 compactor 后 fallback 预算通过会创建 Attempt。"""
 
     factory = _FakeWorkerFactory()
+    compact_artifact_root = tmp_path / "compact-artifacts"
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_accepted_run(
             store,
@@ -4423,6 +4424,7 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             store,
             factory,
             context_budget_policy=_soft_compact_policy(),
+            compact_artifact_root=compact_artifact_root,
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -4454,6 +4456,7 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             )
             assert isinstance(payload["fallback_budget_result"], Mapping)
             assert payload["fallback_budget_result"]["status"] == "within_hard_budget"
+            assert _compact_artifact_files(compact_artifact_root) == ()
         finally:
             await scheduler.close()
 
@@ -5966,6 +5969,18 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
         )
 
     return transaction_runner.run_read(_operation)
+
+
+def _compact_artifact_files(root: Path) -> tuple[Path, ...]:
+    """返回 compact artifact 根目录下的文件。
+
+    :param root: compact artifact 根目录。
+    :returns: 已存在文件路径，按路径排序。
+    """
+
+    if not root.exists():
+        return ()
+    return tuple(sorted(path for path in root.rglob("*") if path.is_file()))
 
 
 def _event_log_types_after_cursor(
