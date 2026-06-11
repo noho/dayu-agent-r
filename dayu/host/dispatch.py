@@ -49,7 +49,6 @@ from dayu.host.durable.event_log import (
     EventLogStore,
 )
 from dayu.host.durable.errors import HostDurableError, HostTransactionRetryExhaustedError
-from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
     heartbeat_current_instance,
@@ -113,24 +112,19 @@ from dayu.host.run_input import (
     PolicySnapshot,
     RunInputBuilder,
     ToolExecutionMode,
-    build_accepted_tool_evidence_material_blocks,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
 from dayu.host.memory import (
-    CONVERSATION_MEMORY_CONSUMER_ID,
     MemoryRepairReason,
-    digest_memory_projection_policy,
 )
 from dayu.host.memory_repair import (
     catch_up_conversation_memory_projection,
     rebuild_conversation_memory_projection,
 )
-from dayu.host._event_payload import payload_object as _payload_object
 from dayu.host.compact_payload import (
     COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT,
     COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP,
-    accepted_evidence_mapping_refs,
     accepted_evidence_mapping_refs_for_candidate,
     compact_artifact_descriptor_metadata_vnext,
     compact_artifact_json_vnext,
@@ -139,7 +133,9 @@ from dayu.host.compact_payload import (
     source_boundary_refs,
 )
 from dayu.host.compact_material import (
+    PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
+    build_pre_dispatch_compact_material_view,
     build_compact_material_pack,
     run_input_material_block,
     select_compact_segment,
@@ -339,6 +335,7 @@ class _GovernanceCompactPending:
     :param expected_status: compact request 写入时 Run 状态。
     :param expected_input_event_sequence: compact request 对应输入 cursor。
     :param request: Host-owned compaction request。
+    :param material_view: request 使用的冻结 material view。
     :param operation_id: 对应 ``CONTEXT_COMPACTION_REQUESTED`` event id。
     :param estimate: compact 前预算估算。
     :param decision: 预算决策。
@@ -349,6 +346,7 @@ class _GovernanceCompactPending:
     expected_status: RunStatus
     expected_input_event_sequence: int
     request: CompactionRequest
+    material_view: PreDispatchCompactMaterialView
     operation_id: str
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
@@ -966,17 +964,63 @@ class HostDispatchScheduler:
                     compact_accepted=None,
                 )
             display_text = _display_text_from_input_event(transaction, input_event)
+            try:
+                material_view = build_pre_dispatch_compact_material_view(
+                    transaction,
+                    self._event_log_store,
+                    run=run,
+                    current_display_text=display_text,
+                )
+            except Exception as exc:
+                _LOGGER.error(
+                    "dispatch.governance.material_source_failed session_id=%s "
+                    "run_id=%s failure_reason=%s",
+                    run.session_id,
+                    run.run_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+                estimate = estimate_context_budget(
+                    policy,
+                    BudgetEstimateInput(
+                        session_id=run.session_id,
+                        run_id=run.run_id,
+                        message_fragments=(
+                            BudgetTextFragment(
+                                fragment_ref="current-input:source-failure-diagnostic",
+                                text=display_text,
+                            ),
+                        ),
+                        current_prompt_ref=run.input_event_id,
+                    ),
+                )
+                self._append_compaction_failed_event(
+                    transaction,
+                    run=run,
+                    estimate=estimate,
+                    decision=decide_context_budget(estimate),
+                    operation_id=_precondition_compaction_operation_id(
+                        failure_reason="material_source_failed",
+                        estimate=estimate,
+                    ),
+                    failure_reason="material_source_failed",
+                    attempt_count=0,
+                    retry_repair_budget_exhausted=False,
+                )
+                self._fail_unstarted_in_transaction(
+                    transaction,
+                    run,
+                    reason=_GOVERNANCE_FAILURE_REASON,
+                    error_code="context_compaction_failed",
+                    message="Context compaction material source failed before dispatch",
+                )
+                return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
             estimate = estimate_context_budget(
                 policy,
                 BudgetEstimateInput(
                     session_id=run.session_id,
                     run_id=run.run_id,
-                    message_fragments=(
-                        BudgetTextFragment(
-                            fragment_ref=run.input_event_id,
-                            text=display_text,
-                        ),
-                    ),
+                    message_fragments=material_view.budget_fragments,
                     current_prompt_ref=run.input_event_id,
                 ),
             )
@@ -1018,7 +1062,7 @@ class HostDispatchScheduler:
                     estimate.hard_threshold_tokens,
                     policy.policy_ref,
                 )
-                fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
+                self._append_compaction_failed_event(
                     transaction,
                     run=run,
                     estimate=estimate,
@@ -1031,11 +1075,6 @@ class HostDispatchScheduler:
                     attempt_count=0,
                     retry_repair_budget_exhausted=False,
                 )
-                if fallback_dispatch is not None:
-                    return _GovernanceStageResult(
-                        pending_dispatch=fallback_dispatch,
-                        compact_accepted=None,
-                    )
                 self._fail_unstarted_in_transaction(
                     transaction,
                     run,
@@ -1115,7 +1154,7 @@ class HostDispatchScheduler:
             prepared = self._prepare_compact_before_dispatch(
                 transaction,
                 run=run,
-                display_text=display_text,
+                material_view=material_view,
                 estimate=estimate,
                 decision=decision,
             )
@@ -1220,6 +1259,7 @@ class HostDispatchScheduler:
                 fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
                     transaction,
                     run=run,
+                    material_view=pending.material_view,
                     estimate=pending.estimate,
                     decision=pending.decision,
                     operation_id=pending.operation_id,
@@ -1438,7 +1478,7 @@ class HostDispatchScheduler:
         transaction: HostTransaction,
         *,
         run: RunRow,
-        display_text: str,
+        material_view: PreDispatchCompactMaterialView,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
     ) -> _GovernanceStageResult:
@@ -1446,7 +1486,7 @@ class HostDispatchScheduler:
 
         :param transaction: 当前 Host transaction。
         :param run: 待 compact Run。
-        :param display_text: 当前输入展示文本。
+        :param material_view: 已冻结的 EventLog-backed compact material view。
         :param estimate: compact 前预算估算。
         :param decision: 触发 compact 的预算决策。
         :returns: 待事务外执行的 compact 或 fallback dispatch / fail closed 结果。
@@ -1485,6 +1525,7 @@ class HostDispatchScheduler:
             fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
                 transaction,
                 run=run,
+                material_view=material_view,
                 estimate=estimate,
                 decision=decision,
                 operation_id=requested.event_id,
@@ -1505,32 +1546,29 @@ class HostDispatchScheduler:
                 message="Context compactor or artifact store is not configured",
             )
             return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
-        material_blocks = _proactive_material_blocks(
-            transaction,
-            self._event_log_store,
-            run=run,
-            display_text=display_text,
-            represented_evidence_refs=_proactive_represented_evidence_refs(
-                transaction,
-                self._event_log_store,
-                run=run,
-                policy_digest=digest_memory_projection_policy(self._local_execution.memory_projection_policy),
-            ),
-        )
         segment_selection = select_compact_segment(
             trigger_source=CompactSegmentTrigger.PROACTIVE,
             input_cursor=run.input_event_sequence,
             memory_snapshot_cursor=None,
             policy_digest=estimate.estimator_digest,
-            material_blocks=material_blocks,
+            material_blocks=material_view.material_blocks,
         )
         material_pack = build_compact_material_pack(
             selected_segment=segment_selection,
-            material_blocks=material_blocks,
+            material_blocks=material_view.material_blocks,
             memory_snapshot=None,
             inline_delta_repair_view=None,
             current_input_ref=run.input_event_id,
-            current_input_text=display_text,
+            current_input_text=material_view.current_input_text,
+            previous_compacted_view=material_view.previous_compacted_view,
+        )
+        selected_evidence_refs = _selected_evidence_refs(
+            material_blocks=material_view.material_blocks,
+            selected_block_ids=segment_selection.selected_block_ids,
+        )
+        selected_raw_turn_refs = _selected_raw_turn_refs(
+            material_blocks=material_view.material_blocks,
+            selected_block_ids=segment_selection.selected_block_ids,
         )
         request = CompactionRequest(
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
@@ -1541,10 +1579,10 @@ class HostDispatchScheduler:
             memory_snapshot_cursor=None,
             material_pack=material_pack,
             segment_selection=segment_selection,
-            evidence_backed_fact_refs=(),
-            recent_raw_turn_refs=(run.input_event_id,),
+            evidence_backed_fact_refs=selected_evidence_refs,
+            recent_raw_turn_refs=_dedupe_texts((run.input_event_id, *selected_raw_turn_refs)),
             older_raw_turn_refs=selected_material_source_refs(
-                material_blocks=material_blocks,
+                material_blocks=material_view.material_blocks,
                 selected_block_ids=segment_selection.selected_block_ids,
             ),
             existing_episode_summary_refs=(),
@@ -1559,6 +1597,7 @@ class HostDispatchScheduler:
                 expected_status=run.status,
                 expected_input_event_sequence=run.input_event_sequence,
                 request=request,
+                material_view=material_view,
                 operation_id=requested.event_id,
                 estimate=estimate,
                 decision=decision,
@@ -1735,6 +1774,7 @@ class HostDispatchScheduler:
         transaction: HostTransaction,
         *,
         run: RunRow,
+        material_view: PreDispatchCompactMaterialView,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
         operation_id: str,
@@ -1747,6 +1787,7 @@ class HostDispatchScheduler:
 
         :param transaction: 当前 Host transaction。
         :param run: 目标 Run。
+        :param material_view: compact request 使用的可信冻结 material view。
         :param estimate: compact 前预算估算。
         :param decision: 触发 compact 的预算决策。
         :param operation_id: compact operation id。
@@ -1773,8 +1814,8 @@ class HostDispatchScheduler:
             return None
         try:
             selection = self._build_proactive_fallback_selection(
-                transaction,
                 run=run,
+                material_view=material_view,
                 policy=policy,
             )
             budget = estimate_recent_window_fallback_budget(
@@ -1846,41 +1887,23 @@ class HostDispatchScheduler:
 
     def _build_proactive_fallback_selection(
         self,
-        transaction: HostTransaction,
         *,
         run: RunRow,
+        material_view: PreDispatchCompactMaterialView,
         policy: ContextBudgetPolicy,
     ) -> RecentWindowFallbackSelection:
         """构造 proactive fallback selection。
 
-        :param transaction: 当前 Host transaction。
         :param run: 目标 Run。
+        :param material_view: compact request 使用的可信冻结 material view。
         :param policy: context budget policy。
         :returns: recent-window fallback selection。
-        :raises HostDurableError: input event 缺失或 payload 损坏时抛出。
         :raises ValueError: material view 无法选择 current anchor 时抛出。
         """
 
-        input_event = self._event_log_store.read_event_by_id(
-            transaction,
-            run.input_event_id,
-        )
-        if input_event is None:
-            raise HostDurableError("fallback current input event is missing")
-        display_text = _display_text_from_input_event(transaction, input_event)
-        material_blocks = _proactive_material_blocks(
-            transaction,
-            self._event_log_store,
+        material_blocks = _proactive_fallback_material_blocks(
             run=run,
-            display_text=display_text,
-            represented_evidence_refs=_proactive_represented_evidence_refs(
-                transaction,
-                self._event_log_store,
-                run=run,
-                policy_digest=digest_memory_projection_policy(
-                    self._local_execution.memory_projection_policy
-                ),
-            ),
+            material_view=material_view,
         )
         return build_recent_window_fallback_selection(
             policy=policy,
@@ -3633,40 +3656,29 @@ def _new_event_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
-def _proactive_material_blocks(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
+def _proactive_fallback_material_blocks(
     *,
     run: RunRow,
-    display_text: str,
-    represented_evidence_refs: tuple[str, ...],
+    material_view: PreDispatchCompactMaterialView,
 ) -> tuple[RunInputMaterialBlock, ...]:
-    """构造 proactive pre-dispatch 的 ordinary material block view。
+    """从可信 material view 构造 proactive fallback 可选择视图。
 
-    proactive 发生在 ``RUN_STARTED`` / ``ATTEMPT_STARTED`` 之前，尚不能通过
-    AttemptDispatchSnapshot 调用完整 RunInputBuilder。本 helper 使用当前
-    accepted Run 已冻结的 input anchor，并补入当前输入 cursor 之前 bounded
-    accepted tool evidence material，避免恢复从 Session 起点扫描 EventLog 的
-    旧 range collector。
+    fallback selector 需要 current input anchor 出现在 material list 中；
+    compact selection / pack 则由 ``build_compact_material_pack`` 单独加入
+    current anchor。这里仅把同源 view 的 current anchor 追加给 fallback，
+    不重新读取 EventLog 或 Conversation Memory projection。
 
-    :param transaction: Host transaction。
-    :param event_log_store: EventLog store。
-    :param run: 待 dispatch Run。
-    :param display_text: 当前输入展示文本。
-    :param represented_evidence_refs: 已被 stable fact / compact artifact 表示的
-        accepted evidence refs。
-    :returns: ordinary material blocks。
+    :param run: 当前 Run。
+    :param material_view: 已冻结的 EventLog-backed material view。
+    :returns: fallback 可消费的 material blocks。
     """
 
     return (
-        *build_accepted_tool_evidence_material_blocks(
-            transaction,
-            event_log_store,
-            session_id=run.session_id,
-            before_event_sequence=run.input_event_sequence,
-            represented_evidence_refs=represented_evidence_refs,
+        *material_view.material_blocks,
+        _current_input_material_block(
+            run=run,
+            display_text=material_view.current_input_text,
         ),
-        _current_input_material_block(run=run, display_text=display_text),
     )
 
 
@@ -3688,37 +3700,60 @@ def _current_input_material_block(*, run: RunRow, display_text: str) -> RunInput
     )
 
 
-def _proactive_represented_evidence_refs(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
+def _selected_evidence_refs(
     *,
-    run: RunRow,
-    policy_digest: str,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    selected_block_ids: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """读取 proactive material 中应排除的已表示 accepted evidence refs。
+    """从 selected evidence material blocks 派生 accepted evidence refs。
 
-    :param transaction: Host transaction。
-    :param event_log_store: EventLog store。
-    :param run: 待 dispatch Run。
-    :param policy_digest: memory projection policy digest。
-    :returns: 去重后的 canonical evidence refs。
+    :param material_blocks: 与 selection 同源的 material blocks。
+    :param selected_block_ids: selection 选中的 block ids。
+    :returns: 去重后的 accepted evidence refs。
     """
 
+    selected = frozenset(selected_block_ids)
     refs: list[str] = []
-    snapshot_row = read_latest_memory_snapshot_at_or_before(
-        transaction,
-        session_id=run.session_id,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy_digest=policy_digest,
-        max_checkpoint_event_sequence=run.input_event_sequence,
-    )
-    if snapshot_row is not None:
-        for fact in snapshot_row.snapshot.evidence_fact_memory.evidence_backed_facts:
-            refs.extend(fact.evidence_refs)
-    compacted = _latest_session_compacted_event_before_input(transaction, event_log_store, run=run)
-    if compacted is not None:
-        refs.extend(accepted_evidence_mapping_refs(_payload_object(compacted)))
-    return tuple(dict.fromkeys(refs))
+    for block in material_blocks:
+        if block.block_id in selected and block.accepted_evidence_id is not None:
+            refs.append(block.accepted_evidence_id)
+    return _dedupe_texts(tuple(refs))
+
+
+def _selected_raw_turn_refs(
+    *,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    selected_block_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """从 selected raw turn blocks 派生 canonical source refs。
+
+    :param material_blocks: 与 selection 同源的 material blocks。
+    :param selected_block_ids: selection 选中的 block ids。
+    :returns: 去重后的 raw turn canonical refs。
+    """
+
+    selected = frozenset(selected_block_ids)
+    refs: list[str] = []
+    for block in material_blocks:
+        if block.block_id not in selected:
+            continue
+        if block.kind not in (
+            CompactMaterialBlockKind.USER_INPUT,
+            CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+        ):
+            continue
+        refs.extend(block.canonical_source_refs)
+    return _dedupe_texts(tuple(refs))
+
+
+def _dedupe_texts(values: tuple[str, ...]) -> tuple[str, ...]:
+    """按原顺序去重文本元组。
+
+    :param values: 输入文本元组。
+    :returns: 去重后的文本元组。
+    """
+
+    return tuple(dict.fromkeys(values))
 
 
 def _accepted_attempt_number(result: CompactionOperationResult) -> int:
@@ -3757,44 +3792,6 @@ def _required_compactor_manifest_digest(result: CompactionOperationResult) -> st
     if value is None or value.strip() == "":
         raise RuntimeError("accepted compaction is missing proposal manifest digest")
     return value
-
-
-def _latest_session_compacted_event_before_input(
-    transaction: HostTransaction, event_log_store: EventLogStore, *, run: RunRow
-) -> EventLogRow | None:
-    """读取当前输入前最新 Session-level compacted event。
-
-    :param transaction: Host transaction。
-    :param event_log_store: EventLog store。
-    :param run: 待 dispatch Run。
-    :returns: 最新 CONTEXT_COMPACTED event；不存在时返回 ``None``。
-    """
-
-    rows = transaction.fetchall(
-        f"""
-        SELECT event_id
-        FROM {TABLE_EVENT_LOG}
-        WHERE session_id = ?
-          AND event_type = ?
-          AND event_class = ?
-          AND event_sequence < ?
-        ORDER BY event_sequence DESC
-        LIMIT 1
-        """,
-        (
-            run.session_id,
-            CONTEXT_COMPACTED,
-            EventClass.CANONICAL_FACT.value,
-            run.input_event_sequence,
-        ),
-    )
-    if len(rows) == 0:
-        return None
-    event_id = _required_row_text(rows[0], "event_id")
-    event = event_log_store.read_event_by_id(transaction, event_id)
-    if event is None:
-        return None
-    return event
 
 
 def _required_row_text(row: HostRow, field_name: str) -> str:

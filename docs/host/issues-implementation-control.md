@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-PROJ-01 Slice 1 accepted commit completed; awaiting Slice 2 implementation by AgentCodex |
+| gate | accepted slice commit |
+| implementation status | WU-PROJ-01 Slice 2 re-review passed; accepted slice commit pending |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 Slice 2 implementation gate via AgentCodex |
+| next entry point | WU-PROJ-01 Slice 2 accepted slice commit gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
@@ -1264,10 +1264,47 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
 ### Slice 2 implementation gate
 
 - slice: Proactive Context Governance uses same-source material view
-- status: next
+- status: implementation completed; code review pending
 - owner: AgentCodex
 - entry point: WU-PROJ-01 Slice 2 implementation gate
 - inherited residual risk: `WU-PROJ-01-S1-R1` requires Slice 2 to confirm `_readable_query_text_from_envelope` full query atom path coverage or add focused test if missing.
+- implementation artifact: `docs/reviews/wu-proj-01-slice2-implementation-codex.md`
+- changed files:
+  - `dayu/host/dispatch.py`
+  - `dayu/host/engine_ingest.py`
+  - `tests/host/test_compact_material.py`
+  - `tests/host/test_dispatch_scheduler.py`
+- validation:
+  - `source .venv/bin/activate && python -m pytest tests/host/test_compact_material.py` passed, 32 tests
+  - `source .venv/bin/activate && python -m pytest tests/host/test_dispatch_scheduler.py -k "governance or compact or proactive"` passed, 18 tests
+  - `source .venv/bin/activate && python -m pytest tests/host/test_public_compact_smoke.py` passed, 6 tests and 1 skipped
+  - `source .venv/bin/activate && pyright` passed, 0 errors
+  - `git diff --check` passed by controller
+- controller decision: accepted for code review
+- review artifacts:
+  - `docs/reviews/wu-proj-01-slice2-code-review-mimo.md`
+  - `docs/reviews/wu-proj-01-slice2-code-review-ds.md`
+- review verdict:
+  - AgentMiMo: `APPROVE`
+  - AgentDS: `PASS`
+- code review controller adjudication: `docs/reviews/wu-proj-01-slice2-code-review-controller-adjudication.md`
+- accepted fix scope:
+  - add focused test for `_proactive_fallback_material_blocks` current input de-duplication boundary.
+  - add test comment explaining why `test_multi_turn_proactive_compact_feeds_subsequent_run_input` uses a wider hard threshold after same-source material estimation.
+- fix artifact: `docs/reviews/wu-proj-01-slice2-fix-codex.md`
+- fix status: completed by AgentCodex
+- fix validation:
+  - `source .venv/bin/activate && python -m pytest tests/host/test_dispatch_scheduler.py -k "governance or compact or proactive"` passed, 19 tests
+  - `source .venv/bin/activate && pyright` passed, 0 errors
+  - `git diff --check` passed by controller
+- re-review artifacts:
+  - `docs/reviews/wu-proj-01-slice2-rereview-mimo.md`
+  - `docs/reviews/wu-proj-01-slice2-rereview-ds.md`
+- re-review verdict:
+  - AgentMiMo: `APPROVE`
+  - AgentDS: `PASS`
+- re-review controller adjudication: `docs/reviews/wu-proj-01-slice2-rereview-controller-adjudication.md`
+- controller decision after re-review: accepted; proceed to accepted slice commit
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 

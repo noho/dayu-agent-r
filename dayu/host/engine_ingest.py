@@ -67,6 +67,7 @@ from dayu.host.compact_payload import (
 )
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
+    build_pre_dispatch_compact_material_view,
     build_compact_material_pack,
     run_input_material_block,
     select_compact_segment,
@@ -74,6 +75,7 @@ from dayu.host.compact_material import (
 )
 from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
+    CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactSegmentSelection,
@@ -480,6 +482,7 @@ class _ReactiveCompactPending:
     :param expected_input_event_sequence: 冻结 ordinary material list 对应 cursor。
     :param display_text: 当前输入展示文本。
     :param frozen_material_blocks: overflow 时冻结的 ordinary input material list。
+    :param previous_compacted_view: latest accepted compact 映射出的 previous view。
     :param frozen_material_list_digest: 冻结 material list digest。
     :param frozen_material_refs: 冻结 material source refs。
     :param operation_id: request fact event id。
@@ -494,6 +497,7 @@ class _ReactiveCompactPending:
     expected_input_event_sequence: int
     display_text: str
     frozen_material_blocks: tuple[RunInputMaterialBlock, ...]
+    previous_compacted_view: tuple[CompactMaterialBlock, ...]
     frozen_material_list_digest: str
     frozen_material_refs: tuple[str, ...]
     operation_id: str
@@ -1319,6 +1323,29 @@ class EngineEventIngestor:
             context=context,
             display_text=display_text,
         )
+        try:
+            previous_compacted_view = build_pre_dispatch_compact_material_view(
+                transaction,
+                self._event_log_store,
+                run=context.run,
+                current_display_text=display_text,
+            ).previous_compacted_view
+        except Exception:
+            _LOGGER.error(
+                "engine_ingest.reactive_compact_material_source_failed "
+                "session_id=%s run_id=%s",
+                context.run.session_id,
+                context.run.run_id,
+                exc_info=True,
+            )
+            return self._fail_reactive_recovery_without_request(
+                transaction,
+                context=context,
+                data=data,
+                failure_reason="material_source_failed",
+                message="Reactive compaction material source failed",
+                estimate=estimate,
+            )
         frozen_material_list_digest = _material_list_digest(frozen_material_blocks)
         frozen_material_refs = _material_source_refs(frozen_material_blocks)
         requested = self._append_reactive_compaction_requested_event(
@@ -1351,6 +1378,7 @@ class EngineEventIngestor:
             expected_input_event_sequence=context.run.input_event_sequence,
             display_text=display_text,
             frozen_material_blocks=frozen_material_blocks,
+            previous_compacted_view=previous_compacted_view,
             frozen_material_list_digest=frozen_material_list_digest,
             frozen_material_refs=frozen_material_refs,
             operation_id=requested.event_id,
@@ -3596,6 +3624,7 @@ def _reactive_compaction_request(
         inline_delta_repair_view=None,
         current_input_ref=context.run.input_event_id,
         current_input_text=pending.display_text,
+        previous_compacted_view=pending.previous_compacted_view,
     )
     return CompactionRequest(
         trigger_source=ContextCompactionTriggerSource.REACTIVE,
@@ -3644,6 +3673,7 @@ def _reactive_compaction_pass_queue(
             inline_delta_repair_view=None,
             current_input_ref=pending.context.run.input_event_id,
             current_input_text=pending.display_text,
+            previous_compacted_view=pending.previous_compacted_view,
         )
         pass_requests.append(
             CompactionRequest(

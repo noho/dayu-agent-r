@@ -48,7 +48,7 @@ from dayu.host.compaction import (
     SessionSummaryCandidateVNext,
 )
 from dayu.host.context_events import build_context_compacted_payload
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -61,6 +61,10 @@ from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
+)
+from dayu.host.durable.schema import (
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
 from dayu.host.durable.state import RunRow
 from dayu.host.durable.transaction import HostTransaction
@@ -880,6 +884,67 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
         )
 
 
+def test_pre_dispatch_evidence_uses_full_tool_call_query_atom(tmp_path: Path) -> None:
+    """pre-dispatch evidence query 使用 TOOL_CALL_REQUESTED 完整 query atom。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入完整 tool call atom 与 accepted evidence。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-query-atom",
+                tool_call_id="tool-call-query-atom",
+                semantic_query_text="Search FY2025 revenue for MSFT",
+            )
+            result = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-query-atom",
+                tool_call_requested_event_ref=request.event_id,
+                tool_call_id="tool-call-query-atom",
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-query-atom",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            assert request.event_sequence < result.event_sequence < current.event_sequence
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        evidence_blocks = tuple(
+            block
+            for block in view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        )
+        assert len(evidence_blocks) == 1
+        assert evidence_blocks[0].readable_query_text == (
+            "Search FY2025 revenue for MSFT"
+        )
+
+
 def test_compact_material_source_boundary_rejects_inverted_delta_boundary() -> None:
     """Source boundary 直接拒绝 inverted delta 边界。"""
 
@@ -1447,21 +1512,82 @@ def _append_event(
     ).row
 
 
+def _append_tool_call_requested_event(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    tool_call_id: str,
+    semantic_query_text: str,
+) -> EventLogRow:
+    """追加带完整 request atom 的 TOOL_CALL_REQUESTED。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: event id。
+    :param tool_call_id: tool call id。
+    :param semantic_query_text: 业务可读 query 文本。
+    :returns: appended EventLog row。
+    """
+
+    arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query_digest = sha256_digest_json(
+        {"semantic_query_text": semantic_query_text}
+    )
+    return _append_event(
+        transaction,
+        event_log,
+        event_id=event_id,
+        event_type="TOOL_CALL_REQUESTED",
+        payload={
+            "tool_call_id": tool_call_id,
+            "tool_name": "fins.search",
+            "normalized_arguments_digest": arguments_digest,
+            "arguments_payload_digest": arguments_digest,
+            "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+            "arguments_payload_ref": None,
+            "arguments_inline_json": arguments_json,
+            "arguments_json_size_bytes": len(
+                canonical_json_dumps(arguments_json).encode("utf-8")
+            ),
+            "semantic_input_digest": _DIGEST,
+            "semantic_query_storage_kind": (
+                TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+            ),
+            "semantic_query_text": semantic_query_text,
+            "semantic_query_payload_ref": None,
+            "semantic_query_digest": semantic_query_digest,
+        },
+    )
+
+
 def _append_tool_result_event(
     transaction: HostTransaction,
     event_log: EventLogStore,
     *,
     event_id: str,
+    tool_call_requested_event_ref: str | None = None,
+    tool_call_id: str | None = None,
+    normalized_arguments_digest: str = _DIGEST,
 ) -> EventLogRow:
     """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
 
     :param transaction: Host transaction。
     :param event_log: EventLog store。
     :param event_id: tool result event id。
+    :param tool_call_requested_event_ref: 可选 TOOL_CALL_REQUESTED event ref。
+    :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
+    :param normalized_arguments_digest: envelope 参数 digest。
     :returns: appended EventLog row。
     """
 
-    envelope = _accepted_evidence_envelope_for_event(event_id)
+    envelope = _accepted_evidence_envelope_for_event(
+        event_id,
+        tool_call_requested_event_ref=tool_call_requested_event_ref,
+        tool_call_id=tool_call_id,
+        normalized_arguments_digest=normalized_arguments_digest,
+    )
     return _append_event(
         transaction,
         event_log,
@@ -1479,21 +1605,33 @@ def _append_tool_result_event(
     )
 
 
-def _accepted_evidence_envelope_for_event(event_id: str) -> AcceptedEvidenceEnvelope:
+def _accepted_evidence_envelope_for_event(
+    event_id: str,
+    *,
+    tool_call_requested_event_ref: str | None = None,
+    tool_call_id: str | None = None,
+    normalized_arguments_digest: str = _DIGEST,
+) -> AcceptedEvidenceEnvelope:
     """构造测试用 accepted evidence envelope。
 
     :param event_id: producer event id。
+    :param tool_call_requested_event_ref: 可选 TOOL_CALL_REQUESTED event ref。
+    :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
+    :param normalized_arguments_digest: envelope 参数 digest。
     :returns: AcceptedEvidenceEnvelope。
     """
 
+    actual_tool_call_id = (
+        f"tool-call-{event_id}" if tool_call_id is None else tool_call_id
+    )
     return AcceptedEvidenceEnvelope(
         evidence_id=f"evidence:{event_id}",
         producer_event_ref=event_id,
         tool_name="fins.search",
-        tool_call_id=f"tool-call-{event_id}",
+        tool_call_id=actual_tool_call_id,
         tool_query=AcceptedEvidenceToolQuery(
-            tool_call_requested_event_ref=None,
-            normalized_arguments_digest=_DIGEST,
+            tool_call_requested_event_ref=tool_call_requested_event_ref,
+            normalized_arguments_digest=normalized_arguments_digest,
             semantic_input_digest=_DIGEST,
         ),
         result_ref=AcceptedEvidenceResultRef(
