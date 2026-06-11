@@ -140,11 +140,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-PROJ-01 Slice 1 re-review passed; accepted slice commit pending |
+| gate | implementation |
+| implementation status | WU-PROJ-01 Slice 1 accepted commit completed; awaiting Slice 2 implementation by AgentCodex |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 Slice 1 accepted slice commit gate |
+| next entry point | WU-PROJ-01 Slice 2 implementation gate via AgentCodex |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
@@ -1259,6 +1259,15 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
   - AgentDS: `PASS`
 - re-review controller adjudication: `docs/reviews/wu-proj-01-slice1-rereview-controller-adjudication.md`
 - controller decision after re-review: accepted; proceed to accepted slice commit
+- accepted slice commit: `1b4e7b67`
+
+### Slice 2 implementation gate
+
+- slice: Proactive Context Governance uses same-source material view
+- status: next
+- owner: AgentCodex
+- entry point: WU-PROJ-01 Slice 2 implementation gate
+- inherited residual risk: `WU-PROJ-01-S1-R1` requires Slice 2 to confirm `_readable_query_text_from_envelope` full query atom path coverage or add focused test if missing.
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 
