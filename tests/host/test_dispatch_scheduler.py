@@ -13,6 +13,7 @@ from typing import TypeVar, cast
 
 import pytest
 
+import dayu.host.dispatch as host_dispatch
 from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
@@ -110,11 +111,17 @@ from dayu.host.engine_ingest import (
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
+    MemoryProjectionPolicy,
     MemoryRepairReason,
     MemoryRepairRequest,
     MemorySnapshotCursor,
     default_memory_projection_policy,
     digest_memory_projection_policy,
+)
+from dayu.host.memory_repair import (
+    ConversationMemoryProjectionRepairResult,
+    MemoryProjectionCatchupBudget,
+    catch_up_conversation_memory_projection,
 )
 from dayu.host.run_input import (
     MemoryProjectionRepairRequired,
@@ -135,6 +142,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
     CreateAcceptedRunInput,
@@ -1971,6 +1979,122 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
             assert payload["lane_claim_id"] == dispatch_record.lane_claim_id
             assert factory.accepted_snapshots[0].dispatch_record_id == seeded.dispatch_record_id
             assert factory.accepted_requests[0].disable_tools is True
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_checkpoint_covered_catchup_accepts_ordinary_run_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """checkpoint 已覆盖 required cursor 时 dispatch 继续接受 ordinary worker。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: dispatch 走到 lag fail-closed、recovery 或未构造
+        ordinary RunInput 时抛出。
+    """
+
+    policy = default_memory_projection_policy()
+    observed_catchups: list[ConversationMemoryProjectionRepairResult] = []
+    factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        _, seeded_attempt, _ = _read_rows(store.transaction_runner, seeded)
+        required_event_sequence = seeded_attempt.started_event_sequence - 1
+        prewarmed = catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=32,
+            max_event_sequence=required_event_sequence,
+            budget=None,
+        )
+        checkpoint_before_dispatch = _read_memory_checkpoint_sequence(
+            store.transaction_runner
+        )
+
+        def _observed_catch_up(
+            transaction_runner: HostTransactionRunner,
+            *,
+            policy: MemoryProjectionPolicy,
+            batch_size: int,
+            consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
+            max_event_sequence: int | None = None,
+            budget: MemoryProjectionCatchupBudget | None = None,
+        ) -> ConversationMemoryProjectionRepairResult:
+            """调用真实 catch-up 并记录 dispatch 内部返回值。
+
+            :param transaction_runner: Host transaction runner。
+            :param policy: memory projection policy。
+            :param batch_size: 每批扫描事件数。
+            :param consumer_id: projection consumer id。
+            :param max_event_sequence: 本次最多追到的 EventLog sequence。
+            :param budget: 可选 catch-up 预算。
+            :returns: 真实 catch-up 返回值。
+            """
+
+            result = catch_up_conversation_memory_projection(
+                transaction_runner,
+                policy=policy,
+                batch_size=batch_size,
+                consumer_id=consumer_id,
+                max_event_sequence=max_event_sequence,
+                budget=budget,
+            )
+            observed_catchups.append(result)
+            return result
+
+        assert prewarmed.target_reached is True
+        assert prewarmed.finished_cursor == required_event_sequence
+        assert checkpoint_before_dispatch == required_event_sequence
+
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
+        monkeypatch.setattr(
+            host_dispatch,
+            "catch_up_conversation_memory_projection",
+            _observed_catch_up,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
+            checkpoint_after_dispatch = _read_memory_checkpoint_sequence(
+                store.transaction_runner
+            )
+            assert len(observed_catchups) == 1
+            assert len(factory.accepted_snapshots) == 1
+            assert len(factory.accepted_requests) == 1
+            dispatch_catchup = observed_catchups[0]
+            accepted_contents = tuple(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[0].messages
+                )
+                if content is not None
+            )
+            assert result.dispatched == 1
+            assert dispatch_catchup.started_cursor == required_event_sequence
+            assert dispatch_catchup.finished_cursor == required_event_sequence
+            assert dispatch_catchup.events_scanned == 0
+            assert dispatch_catchup.target_reached is True
+            assert checkpoint_after_dispatch == checkpoint_before_dispatch
+            assert run.status == RunStatus.RUNNING
+            assert attempt.status == AttemptStatus.RUNNING
+            assert dispatch_record.status == DispatchRecordStatus.DISPATCHING
+            assert factory.accepted_requests[0].disable_tools is True
+            assert accepted_contents[-1] == "dispatch prompt"
+            assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+            assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
         finally:
             await scheduler.close()
 
@@ -4874,6 +4998,7 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
             store,
             factory,
             context_budget_policy=_soft_compact_policy(),
+            lane_default_timeout_seconds=1.0,
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
@@ -5998,6 +6123,32 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
             )
             if row.event_type == event_type
         )
+
+    return transaction_runner.run_read(_operation)
+
+
+def _read_memory_checkpoint_sequence(transaction_runner: HostTransactionRunner) -> int:
+    """读取 conversation memory projection checkpoint sequence。
+
+    :param transaction_runner: transaction runner。
+    :returns: memory projection checkpoint sequence。
+    :raises AssertionError: checkpoint 尚未存在时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        """读取 checkpoint row。
+
+        :param transaction: Host transaction。
+        :returns: checkpoint sequence。
+        :raises AssertionError: checkpoint 尚未存在时抛出。
+        """
+
+        checkpoint = read_projection_checkpoint(
+            transaction,
+            CONVERSATION_MEMORY_CONSUMER_ID,
+        )
+        assert checkpoint is not None
+        return checkpoint.checkpoint_event_sequence
 
     return transaction_runner.run_read(_operation)
 

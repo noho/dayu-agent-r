@@ -199,8 +199,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
-| WU-PROJ-01-S3-R1 | open | WU-PROJ-01 / PR #136 | 用户裁决必须在当前 PR 中实施；补 dispatch before-worker catch-up happy path 独立集成测试，覆盖 required cursor 已被 projection checkpoint 覆盖时不重复追账且继续构造 ordinary RunInput。 |
-| WU-PROJ-01-S4-R1 | open | WU-PROJ-01 / PR #136 | 用户裁决必须在当前 PR 中实施；稳定 `test_reactive_compact_failure_fallback_dispatch_uses_failed_view` 的 lane timeout flaky，调整 timing fixture 或测试结构。 |
 
 ## 当前 Work Units
 
@@ -226,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | implementation | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | `WU-PROJ-01-CAP-R1` re-review passed and is closed; accepted artifacts include `docs/reviews/wu-proj-01-cap-r1-rereview-controller-adjudication.md`. `WU-PROJ-01-S3-R1` / `WU-PROJ-01-S4-R1` remain open for current PR follow-up gates. |
+| WU-PROJ-01 | implementation | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | `WU-PROJ-01-CAP-R1` accepted commit `448b70ba`. `WU-PROJ-01-S3-R1` / `WU-PROJ-01-S4-R1` implementation and code review passed; controller adjudication `docs/reviews/wu-proj-01-s3-s4-code-review-controller-adjudication.md`. Controller复验：`python -m pytest tests/host/test_dispatch_scheduler.py` -> 68 passed; `pyright` -> 0 errors; `git diff --check` passed. Next gate: accepted S3/S4 slice commit. |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
