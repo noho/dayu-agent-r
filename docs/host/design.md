@@ -2789,6 +2789,8 @@ rendered_context =
 
 `selected_recent_window_policy` 从 material 中确定性选择 bounded recent window；`protected_recent_floor_policy` 在 selected recent window 内保底最近若干 turn / item，用来保护“刚才”“继续”“第二点”等短链路承接。二者都是 Host policy，不暴露给模型。
 
+Compact material 的真源是 Host durable EventLog、payload descriptor 与 artifact。构造 compact input 时，Host 必须从这些真源读取 latest accepted compact event、post-compact delta canonical material 与当前 input anchor；不得依赖 Conversation Memory projection checkpoint 作为 compact input 是否可构造的前置真源。Conversation Memory projection 是 accepted compact 之后的 read model 物化路径，不是 compact operation 的材料所有者。
+
 before compact 不需要独立阶段建模。它只是 `latest_accepted_compacted_view` 为空、`post_compact_delta_material` 从 session 起点开始的普通情况：
 
 ```text
@@ -3132,7 +3134,9 @@ Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace�
   调用总数；默认 packaged policy 为 5 次。代码 fallback 默认值与 execution profile 默认值必须保持一致，避免同一 Host 在不同装配路径下出现不同 compact retry 语义。该字段不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
 - 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
 
-Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 `ConversationMemorySnapshotVNext`、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 session summary 替代 `evidence_backed_fact` 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。
+Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 ordinary RunInputBuilder 提供 `ConversationMemorySnapshotVNext`、snapshot cursor、policy digest 和 diagnostics。Context Governance 只负责读取同源 material view、估算预算、裁决 allow dispatch / compact / fallback / fail closed，并编排 bounded compaction operation；它不拥有 material 语义，不直接写 memory snapshot，不能让 session summary 替代 `evidence_backed_fact` 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。
+
+Proactive compact 的 material view 必须由 EventLog-backed compact material builder 生成，而不是由 Context Governance 临时拼接。该 builder 的职责是从 latest accepted `CONTEXT_COMPACTED` 构造 `previous_compacted_view`，从 latest compact cursor 之后到当前 input 之前的 committed canonical facts 构造 post-compact delta material，并把当前 `USER_INPUT_ACCEPTED` 作为 current input anchor。Context Governance 只消费 builder 输出做预算估算、segment selection 与 compact operation 编排。
 
 第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出 `ConversationCompactOutputVNext` 结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出 schema、candidate 字段和 source label 规则以第 24 章的 vNext compact I/O contract 为准。
 
@@ -3184,7 +3188,7 @@ compact material selection 必须满足：
 - proactive path 的目标是压缩旧 prefix，为当前 Run dispatch 腾出预算；current input anchor 与 protected recent floor 必须保留。
 - reactive path 来自被冻结的 overflow ordinary input material list，优先压缩 older prefix；current input anchor 与 protected recent floor 必须保留到 recovery dispatch。
 - selection 按 material block 与 budget 压力裁剪，不按固定轮数裁剪；一轮中包含的长 tool result 可以单独形成 evidence material block 或 evidence-block 内部分段。
-- 给定 input cursor、snapshot cursor、policy 与 ordinary input material list，selection 必须确定性输出本次进入 compact input 的 block ids，供 tests、trace 与 audit 解释。
+- 给定 input cursor、material source cursor、policy 与 ordinary input material list，selection 必须确定性输出本次进入 compact input 的 block ids，供 tests、trace 与 audit 解释。
 - 已被 latest accepted compacted view 代表的旧 raw turns / old tool results 不应在下一次 compact 中重新展开。
 
 material data block 的 section 映射必须一对一，不允许同一 canonical content 同时进入两个 LLM-facing section：
@@ -3195,7 +3199,9 @@ material data block 的 section 映射必须一对一，不允许同一 canonica
 - `evidence_material` 渲染 accepted tool evidence block。raw evidence 内容来自 `TOOL_RESULT_ACCEPTED` canonical fact 所引用且 digest 校验通过的 Host payload / raw result descriptor；accepted evidence envelope 只提供 Host 内部 provenance mapping，不作为 lossy result preview 或事实内容容器。
 - `answer_material` 渲染 assistant final answer / conclusion 的可读文本，用于 answer anchor candidate；它不得作为 evidence-backed fact 的 source。
 
-material data block build 启动前必须校验 memory snapshot cursor。若 snapshot cursor 不能覆盖构造 previous compacted view 与 compact material 所需的 EventLog cursor，Host 必须先执行 memory projection catch-up / rebuild 或在 policy 允许范围内做 inline delta repair；失败时按 compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
+Compact material data block build 启动前必须校验 EventLog / payload / artifact source refs 与 digest 可读、可校验，并且 latest accepted compact boundary 与 post-compact delta boundary 一致。它不得因为 Conversation Memory snapshot lag 而要求先追平 memory projection；如果 EventLog-backed material source 不完整、payload 损坏、artifact 缺失或 source boundary 不可校验，按 compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
+
+Ordinary RunInput 的 memory section 仍依赖 Conversation Memory snapshot。若 ordinary dispatch 前 snapshot cursor 不能覆盖 required EventLog cursor，Host 必须执行 bounded memory projection catch-up / rebuild 或在 policy 允许范围内做 inline delta repair；失败或超出 catch-up 执行预算时产生结构化 diagnostic，并按 pre-dispatch failure / retry / defer 策略收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`，也不得让 dispatch hot path 无上限同步补账。
 
 Host 必须同时维护 prompt-local label 到 canonical provenance 的内部映射，例如 `E1 -> TOOL_RESULT_ACCEPTED event -> TOOL_CALL_REQUESTED event -> payload / artifact / source locator refs`。该映射用于 accept barrier、audit 与 rebuild，不作为 LLM 主要语义输入。compact material data block 不得包含 full EventLog range wrapper、裸 event id / payload ref / digest / cursor / policy / artifact descriptor 作为模型阅读主体，也不得重复渲染同一 current input、raw turn 或 raw tool result。当单条 accepted evidence 被 chunk 成 `E1.1`、`E1.2` 等子 label 时，Host proposal parser 可以把父 label `E1` 解析为同一 canonical evidence 的 shorthand；该 shorthand 只允许用于 evidence section，仍必须拒绝未知 label 或跨 section label。
 

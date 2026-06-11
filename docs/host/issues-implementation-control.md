@@ -140,13 +140,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-TOOLS-01-F08 final closeout passed; PR #135 updated and remains draft/open |
-| active work unit | WU-TOOLS-01-F08 |
-| default next work unit | WU-TOOLS-01-F08 |
-| next entry point | User merge decision for draft PR #135 |
+| gate | accepted plan commit |
+| implementation status | WU-PROJ-01 plan re-review passed; accepted plan commit pending |
+| active work unit | WU-PROJ-01 |
+| default next work unit | WU-PROJ-01 |
+| next entry point | WU-PROJ-01 accepted plan commit gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132 |
 | blocking open questions | none |
 
 状态约定：
@@ -224,7 +224,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | pending | Projection catch-up budgeting | GitHub Issue #86 | memory pre-dispatch projection catch-up budgeting |
+| WU-PROJ-01 | planning | Compact material truth and bounded memory catch-up | GitHub Issue #86 | pre-dispatch compact material must come from EventLog truth; ordinary memory catch-up must be bounded |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
@@ -1122,33 +1122,99 @@ Upload 原本被拆成独立 follow-up，是为了防止 F01 已完成范围被�
 - `WU-TOOLS-01-F09` 在 Work Units 表中保持 `merged-into` 状态，不再作为 active / pending WU 出现。
 - Upload 相关验收由 `WU-TOOLS-01-F01-03` 承接。
 
-## WU-PROJ-01 Projection Catch-up Budgeting For Memory Pre-dispatch Path
+## WU-PROJ-01 Compact Material Truth And Bounded Memory Catch-up
 
 ### 状态
 
 由 GitHub Issue #86 跟踪并实施。
 
+### 第一性原理裁决
+
+本条不是 context window token 超限修复。`soft_threshold_context_ratio` / `context_window_tokens` 触发 compact 属于 Context Governance 的预算裁决；本条修复的是 pre-dispatch compact / Conversation Memory projection 的职责错位和无界补账风险。
+
+Compact operation 的事实闭环应为：
+
+```text
+EventLog / payload descriptor / artifact truth
+  -> EventLog-backed compact material builder
+  -> ConversationCompactInputVNext
+  -> Host-owned compactor
+  -> Host accept barrier
+  -> CONTEXT_COMPACTED canonical fact
+```
+
+Conversation Memory projection 只在 accepted compact fact 提交后消费 EventLog，物化 ordinary RunInput 使用的 session read model；它不是 compact input 的前置真源。Context Governance 只负责读取同源 material view、估算预算、裁决 allow dispatch / compact / fallback / fail closed，并编排 bounded compaction operation；它不拥有 material 语义。
+
+### 代码核对结论
+
+- 当前 proactive Context Governance 的预算估算只使用当前用户输入文本，不能代表完整 ordinary input material，也不能覆盖 compact 后多轮 post-compact delta 再次触发 compact 的真实场景。
+- 当前 proactive compact material helper 只构造 accepted tool evidence 与 current input anchor，没有完整构造 latest accepted compacted view、post-compact trace / answer delta 与 current input anchor 的 rolling compact input。
+- 当前 proactive compact 构造 material pack 时没有传入 previous compacted view；第二次及后续 compact 不能稳定形成 `previous_compacted_view + post_compact_delta_material + current_input_anchor`。
+- `ProjectionRunner` 的设计是每条 EventLog row 在同一个 write transaction 内完成 consumer write 与 checkpoint advance；若出现“projection runner 已成功应用 event 但 checkpoint 未推进”，应作为直接 cursor bug 修复。但当前 WU 的主要证据指向 pre-dispatch compact material 真源路径不完整，以及 ordinary memory catch-up / rebuild 无单次总预算。
+
 ### 目标
 
-- 聚焦 memory projection catch-up / rebuild 在 pre-dispatch 路径上的预算、背压和诊断边界。
-- 为 memory catch-up 定义总预算，而不仅是单批大小，例如 max batches、max scanned events、timeout 或等价 bounded execution policy。
-- 明确 admission after-commit 的 catch-up 只能是 bounded best-effort 或 wake background supervisor，不得在 command path 上无上限追平。
-- 明确 dispatch 前 catch-up / rebuild 的行为：成功追到 required cursor 时继续 dispatch；超预算或失败时产生结构化 diagnostic。
+- 修复 proactive compact 的 material truth：compact input 必须从 EventLog / payload descriptor / artifact 真源构造，不得依赖 Conversation Memory projection checkpoint 作为 compact input 的前置真源。
+- 为 pre-dispatch compact 建立或收敛 EventLog-backed compact material builder：latest accepted `CONTEXT_COMPACTED` 生成 `previous_compacted_view`，latest compact 之后到当前 input 之前的 committed canonical facts 生成 post-compact delta material，当前 `USER_INPUT_ACCEPTED` 生成 current input anchor。
+- Context Governance 只消费同源 material view 做预算估算、segment selection 和 compact / fallback / fail-closed 裁决；不得在 Context Governance 内临时拼接不完整 material。
+- 第二次及后续 compact 必须实现 rolling compact 语义：只输入 previous accepted compacted view、selected post-compact delta material 与 current input anchor；不得重新展开上一轮 accepted compact 覆盖的旧 raw history。
+- accepted `CONTEXT_COMPACTED` 提交后，再由 Conversation Memory projection 消费并物化 ordinary RunInput 使用的 session summary、facts、answer anchors、forward intents 和 reference continuity items。
+- ordinary dispatch 读取 Conversation Memory snapshot 时，memory projection catch-up / rebuild 必须具备总预算，而不仅是单批大小，例如 max batches、max scanned events、timeout 或等价 bounded execution policy。
+- 明确 admission after-commit 的 memory catch-up 只能是 bounded best-effort 或 wake background supervisor，不得在 command path 上无上限追平。
+- 明确 dispatch 前 ordinary memory catch-up / rebuild 的行为：成功追到 required cursor 时继续 dispatch；超预算或失败时产生结构化 diagnostic，且不得触发 Run recovery。
 
 ### 非目标
 
 - 不改变 EventLog 作为投影真源的语义。
+- 不把 Conversation Memory projection 提升为 compact input 真源。
+- 不让 Context Governance 拥有 material 语义、memory snapshot 写入或 projection checkpoint 推进。
 - 不让 projection lag 影响 recovery truth。
 - 不把 Audit / Tool Trace / Outbox 纳入本条。
 - 不重写 ProjectionRunner 为大型调度系统。
 - 不把所有 projection sink 合并成 God runner。
+- 不修复 context window token 超限本身；context budget / compaction retry / fallback 的通用策略仍按 `docs/host/design.md` 的 Context Governance 章节执行。
 
 ### 验收信号
 
+- proactive compact 的预算估算使用完整同源 material view，不再只估当前 user prompt。
+- pre-dispatch compact input 可由 EventLog / payload / artifact truth 构造 `previous_compacted_view + post_compact_delta_material + current_input_anchor`，并覆盖第二次及后续 rolling compact。
+- compact material build 不依赖 Conversation Memory projection checkpoint；memory snapshot lag 不阻断 compact input 构造。
+- accepted compact 后 Conversation Memory projection 消费 `CONTEXT_COMPACTED` 并推进 snapshot / checkpoint，ordinary RunInput 可读取 accepted compact 物化出的 session summary / facts / anchors / intents / reference continuity。
 - memory projection catch-up 的单批大小与单次总预算边界均有明确代码或配置表达。
 - admission after-commit catch-up 不会无上限同步追平大量 EventLog。
 - dispatch 前 memory catch-up / rebuild 超预算或失败时有结构化 diagnostic，且不会改写 EventLog / Run / Attempt governance truth。
-- 测试覆盖 bounded catch-up、required cursor 已覆盖、lag / failure / rebuild 超预算不误触发 recovery，以及 Audit / Tool Trace / Outbox 不被改成 command-path blocking sink。
+- 测试覆盖 rolling compact、post-compact delta 不重展旧 raw history、bounded catch-up、required cursor 已覆盖、lag / failure / rebuild 超预算不误触发 recovery，以及 Audit / Tool Trace / Outbox 不被改成 command-path blocking sink。
+
+### Plan gate
+
+- plan artifact: `docs/host/wu-proj-01-compact-material-truth-and-bounded-memory-catchup-plan.md`
+- plan status: ready
+- produced by: AgentCodex
+- controller decision: accepted for plan review
+- review artifacts:
+  - `docs/reviews/plan-review-20260611-124757.md`
+  - `docs/reviews/wu-proj-01-plan-review-ds.md`
+- controller adjudication: `docs/reviews/wu-proj-01-plan-review-controller-adjudication.md`
+- review verdict:
+  - AgentMiMo: `pass-with-risks`
+  - AgentDS: `needs-fix`
+- controller decision after review: plan fix required
+- accepted plan fix scope:
+  - fix validation commands to use actual dispatch compact / proactive governance tests and public compact smoke.
+  - clarify `build_compact_material_pack` interface path for EventLog-backed previous compacted view.
+  - clarify evidence de-dup source, memory projection budget injection path, default module placement, reactive minimal adaptation boundary, no `timeout_seconds` in first version, Slice 4 fixture source, first compact cursor semantics, budget fragment mapping, and material source failure fail-closed behavior.
+- plan fix artifact: `docs/reviews/wu-proj-01-plan-fix-codex.md`
+- plan fix status: completed by AgentCodex; plan status is `code-generation-ready after AgentCodex plan fix`
+- plan fix validation: not run; plan text fix only
+- re-review artifacts:
+  - `docs/reviews/wu-proj-01-plan-rereview-mimo.md`
+  - `docs/reviews/wu-proj-01-plan-rereview-ds.md`
+- re-review controller adjudication: `docs/reviews/wu-proj-01-plan-rereview-controller-adjudication.md`
+- re-review verdict:
+  - AgentMiMo: `pass`
+  - AgentDS: `pass`
+- controller decision after re-review: accepted plan; proceed to accepted plan commit
+- deferred implementation validation note: AgentDS NF1 is deferred-with-owner to implementation gate; validation must include `python -m pytest tests/host/test_memory_repair.py`, and if `tests/host/test_memory_projection_repair.py` is added, it must also run.
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 
