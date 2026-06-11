@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import logging
 import math
 import secrets
@@ -116,6 +115,18 @@ from dayu.host.evidence import (
 from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
+)
+from dayu.host.tool_trace_signals import (
+    FAILURE_KIND_POLICY_BLOCKED as _FAILURE_KIND_POLICY_BLOCKED,
+    FAILURE_KIND_TOOL_CANCELLED as _FAILURE_KIND_TOOL_CANCELLED,
+    FAILURE_KIND_TOOL_FAILED as _FAILURE_KIND_TOOL_FAILED,
+    FAILURE_METADATA_SCHEMA_VERSION as _FAILURE_METADATA_SCHEMA_VERSION,
+    TOOL_TIMING_DURATION_SOURCE_META as _TOOL_TIMING_DURATION_SOURCE_META,
+    TOOL_TIMING_SCHEMA_VERSION as _TOOL_TIMING_SCHEMA_VERSION,
+    TOOL_TIMING_STATUS_AVAILABLE as _TOOL_TIMING_STATUS_AVAILABLE,
+    TOOL_TIMING_STATUS_MISSING_META as _TOOL_TIMING_STATUS_MISSING_META,
+    TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS as _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS,
+    bound_trace_signal_text,
 )
 from dayu.runtime.cancellation import (
     WaitCancelled,
@@ -232,15 +243,6 @@ _TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON = (
 )
 _TOOL_RUNTIME_DUPLICATE_HARD_STOP_REASON = "duplicate_hard_stop"
 _TOOL_RUNTIME_DIAGNOSTIC_NOOP_REF = "tool-diagnostic-noop"
-_TOOL_TIMING_SCHEMA_VERSION = 1
-_TOOL_TIMING_STATUS_AVAILABLE = "available"
-_TOOL_TIMING_STATUS_MISSING_META = "missing_tool_result_meta"
-_TOOL_TIMING_DURATION_SOURCE_META = "tool_result_meta"
-_FAILURE_METADATA_SCHEMA_VERSION = 1
-_TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS = 512
-_FAILURE_KIND_TOOL_FAILED = "tool_failed"
-_FAILURE_KIND_TOOL_CANCELLED = "tool_cancelled"
-_FAILURE_KIND_POLICY_BLOCKED = "policy_blocked"
 _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED = _EVENT_TYPE_TOOL_RESULT_ACCEPTED
 _ONE_MILLISECOND = timedelta(milliseconds=1)
 _SIDE_EFFECT_IDEMPOTENCY_HINT = (
@@ -6138,7 +6140,7 @@ def _failure_metadata_from_outcome(
     if isinstance(outcome, ToolCompletedOutcome):
         return None
     if isinstance(outcome, ToolFailedOutcome):
-        bounded_hint = _bounded_failure_text(outcome.result.hint)
+        bounded_hint = bound_trace_signal_text(outcome.result.hint)
         return {
             "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
             "signal_source": _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED,
@@ -6150,8 +6152,8 @@ def _failure_metadata_from_outcome(
             "diagnostic_refs": diagnostic_ref_ids,
         }
     if isinstance(outcome, ToolCancelledOutcome):
-        bounded_message = _bounded_failure_text(outcome.message)
-        bounded_hint = _bounded_failure_text(outcome.hint)
+        bounded_message = bound_trace_signal_text(outcome.message)
+        bounded_hint = bound_trace_signal_text(outcome.hint)
         return {
             "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
             "signal_source": _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED,
@@ -6168,43 +6170,6 @@ def _failure_metadata_from_outcome(
     if isinstance(outcome, ToolAwaitingOutcome):
         raise TypeError("ToolAwaitingOutcome does not carry accepted failure metadata")
     raise TypeError("unsupported tool outcome")
-
-
-@dataclass(frozen=True, slots=True)
-class _BoundedFailureText:
-    """failure metadata 中的 bounded text 投影。
-
-    :param value: bounded 文本；原文为 ``None`` 时为 ``None``。
-    :param sha256_digest: full original UTF-8 文本 digest；原文为 ``None`` 时为
-        ``None``。
-    :param truncated: 原文是否超过 bounded 字符上限。
-    """
-
-    value: str | None
-    sha256_digest: str | None
-    truncated: bool
-
-
-def _bounded_failure_text(value: str | None) -> _BoundedFailureText:
-    """按 Tool Trace signal 规则裁剪失败文本。
-
-    :param value: 原始文本；可为 ``None``。
-    :returns: bounded 文本、full original digest 与截断标志。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if value is None:
-        return _BoundedFailureText(
-            value=None,
-            sha256_digest=None,
-            truncated=False,
-        )
-    digest = f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
-    return _BoundedFailureText(
-        value=value[:_TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS],
-        sha256_digest=digest,
-        truncated=len(value) > _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS,
-    )
 
 
 def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:
