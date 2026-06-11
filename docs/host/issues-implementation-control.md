@@ -141,10 +141,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | review |
-| implementation status | WU-PROJ-01 PR review found accepted blocking findings; awaiting PR review fix by AgentCodex |
+| implementation status | WU-PROJ-01 PR review re-review passed; awaiting accepted PR review commit |
 | active work unit | WU-PROJ-01 |
 | default next work unit | WU-PROJ-01 |
-| next entry point | WU-PROJ-01 PR review fix gate via AgentCodex |
+| next entry point | WU-PROJ-01 accepted PR review commit |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 draft PR #136 https://github.com/noho/dayu-agent-r/pull/136 |
 | blocking open questions | none |
@@ -226,7 +226,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03 | draft-PR-pass-final-closeout-passed | Web CI smoke generation | GitHub Issue #120 under #98 follow-up; draft PR #134; depends on WU-TOOLS-01-F02 | Final closeout 已通过；详细历史见 `docs/reviews/wu-tools-01-f03-final-closeout-controller.md`。等待用户 merge decision；Tools Discovery spec 语义后续评估已转移到 GitHub Issue #133。 |
 | WU-TOOLS-01-F08 | draft-PR-pass-final-closeout-passed | Documents processor registry naming cleanup | WU-TOOLS-01 post-migration cleanup；draft PR #135 | 已完成并进入 draft PR；documents 默认 registry builder 已收敛为 `build_documents_processor_registry(...)`，直接调用方 / 导出 / README / tests 已同步，processor 注册行为保持不变。`WU-TOOLS-01-S1-R2` 已关闭；PR 仍等待用户 merge decision。 |
 | WU-TOOLS-01-F09 | merged-into | Fins upload ingestion migration and upload tool | WU-TOOLS-01-F01-03 | 原 upload follow-up 已并入 `WU-TOOLS-01-F01-03`；upload 不再单独实施，CN / SEC upload 与 CN / SEC download 一起进入 shared Fins service/runtime 与 tool 可用性闭环 |
-| WU-PROJ-01 | implementation | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | PR review accepted fix scope；等待 AgentCodex 修复旧 dispatch scheduler 测试断言与 PR body validation |
+| WU-PROJ-01 | review | Compact material truth and bounded memory catch-up | GitHub Issue #86；draft PR #136 | PR review fix / re-review passed；等待 accepted PR review commit |
 | WU-DUR-P01 | completed | EventLog runner-call reconstruction atoms | GitHub Issue #117 closed | runner-call reconstruction atoms 已完成；follow-up 已关闭或转移到 dedicated issue owner |
 | WU-OBS-P00 | completed | Runner call input reconstruction signals | GitHub Issue #70 remains open; #117 closed | runner call input reconstruction signals 已完成；full analyzer 仍由 WU-OBS-00 追踪 |
 | WU-OBS-P01 | pending | Tool Trace context budget snapshot signals | GitHub Issue #29 | WU-OBS-00 前置；NEW / dayu-agent-r 对齐 OLD / dayu-agent analyzer 的 context pressure 信号 |
@@ -1428,6 +1428,28 @@ Conversation Memory projection 只在 accepted compact fact 提交后消费 Even
   - `PR-F1`: 3 个旧 dispatch scheduler 测试在 PR 分支失败但在 `main` 通过；更新测试断言以匹配 WU-PROJ-01 fail-closed 新设计。
   - `PR-F2`: PR body validation 描述不完整；fix 后改为报告完整受影响测试文件结果。
 - next gate: WU-PROJ-01 PR review fix gate via AgentCodex
+
+### PR review fix / re-review gate
+
+- status: completed
+- fix owner: AgentCodex
+- fix artifact: `docs/reviews/wu-proj-01-pr-review-fix-codex.md`
+- changed files:
+  - `tests/host/test_dispatch_scheduler.py`
+  - `docs/host/issues-implementation-control.md`
+- PR body: updated via `gh pr edit 136`; validation now reports complete affected Host test files `185 passed`, pyright `0 errors`, and `git diff --check` pass.
+- fix validation:
+  - `source .venv/bin/activate && python -m pytest tests/host/test_compact_material.py tests/host/test_dispatch_scheduler.py tests/host/test_memory_repair.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_logging.py tests/host/test_open_host_runtime.py` passed, 185 tests
+  - `source .venv/bin/activate && pyright` passed, 0 errors
+  - `git diff --check` passed
+- re-review artifacts:
+  - `docs/reviews/wu-proj-01-pr-review-rereview-mimo.md`
+  - `docs/reviews/wu-proj-01-pr-review-rereview-ds.md`
+- re-review verdict:
+  - AgentMiMo: `PASS`
+  - AgentDS: `PASS`
+- re-review controller adjudication: `docs/reviews/wu-proj-01-pr-review-rereview-controller-adjudication.md`
+- controller decision: accepted; proceed to accepted PR review commit
 
 ## WU-DUR-P01 EventLog Runner-call Reconstruction Atoms
 

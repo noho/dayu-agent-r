@@ -1976,11 +1976,21 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_lag_repair_rebuild_retry_does_not_fail_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_dispatch_lag_repair_rebuild_not_reached_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """SNAPSHOT_LAG_OVER_THRESHOLD 触发 rebuild retry，不关闭 Run。"""
+    """验证 rebuild 未达 required cursor 时 dispatch fail-closed。
 
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    :raises AssertionError: scheduler 未按 fail-closed 语义收口时抛出。
+    """
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
     builder = _LagRepairRunInputBuilder()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -2032,11 +2042,17 @@ async def test_dispatch_lag_repair_rebuild_retry_does_not_fail_run(
             scheduler.wake_dispatch(_pending_dispatch(seeded))
             result = await scheduler.drain_once()
 
-            assert result.dispatched == 1
-            assert builder.calls == 2
-            assert factory.created == 1
-            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
-            assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+            run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
+            assert result.dispatched == 0
+            assert result.timed_out == 1
+            assert builder.calls == 1
+            assert factory.created == 0
+            assert run.status == RunStatus.FAILED
+            assert attempt.status == AttemptStatus.FAILED
+            assert dispatch_record.status == DispatchRecordStatus.CANCELLED
+            assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+            assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
+            assert "dispatch.memory_projection.repair_not_reached" in caplog.text
         finally:
             await scheduler.close()
 
@@ -2110,7 +2126,13 @@ async def test_inline_repair_view_missing_does_not_rebuild_retry(
 async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """pre-dispatch memory lag repair 不得把 Run 推入 RECOVERING。"""
+    """验证 pre-dispatch memory lag repair 失败不进入 RECOVERING。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: Run 进入 recovery 或未 fail-closed 时抛出。
+    """
 
     factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
     builder = _LagRepairRunInputBuilder()
@@ -2159,7 +2181,9 @@ async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
             await scheduler.drain_once()
 
             assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
-            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) == RunStatus.FAILED
+            assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
         finally:
             await scheduler.close()
 
@@ -2168,7 +2192,13 @@ async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
 async def test_persistent_memory_lag_repair_failure_closes_starting_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """worker startup memory lag 修复失败不得遗留 running / dispatching 状态。"""
+    """验证持续 memory lag repair failure 关闭 STARTING Run。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: Run / Attempt / dispatch record 未正确收口时抛出。
+    """
 
     factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
     builder = _PersistentLagRepairRunInputBuilder()
@@ -2223,12 +2253,13 @@ async def test_persistent_memory_lag_repair_failure_closes_starting_run(
 
             run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
             assert result.timed_out == 1
-            assert builder.calls == 2
+            assert builder.calls == 1
             assert factory.created == 0
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
             assert dispatch_record.status == DispatchRecordStatus.CANCELLED
             assert dispatch_record.cancelled_event_id is not None
+            assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
         finally:
             await scheduler.close()
 
