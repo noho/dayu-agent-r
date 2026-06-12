@@ -142,11 +142,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 draft PR pass; PR 139 is open draft and updated to latest accepted review commit |
-| active work unit | WU-RET-00 |
+| gate | accepted plan commit |
+| implementation status | WU-CM-05 plan re-review passed by AgentMiMo / AgentDS；ready for accepted plan commit |
+| active work unit | WU-CM-05 |
 | default next work unit | WU-OBS-00 |
-| next entry point | after PR 139 merge: WU-OBS-00 discussion gate |
+| next entry point | WU-CM-05 accepted plan commit；after commit enter WU-CM-05 implementation gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -223,7 +223,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-WAIT-02 | pending | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | production poller loop |
 | WU-WAIT-03 | pending | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
-| WU-CM-05 | deferred | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | deferred behind #81 |
+| WU-CM-05 | planning | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | #81 已关闭；用户指定恢复推进，当前 plan gate |
 | WU-CM-06 | deferred | Terminal summary text policy convergence | GitHub Issue #94 / #81 child | deferred behind #81 |
 | WU-CM-08 | deferred | Compaction material readability and smoke maintenance | GitHub Issue #95 / #81 child | #81 子任务，测试可维护性 cleanup |
 | WU-CM-09 | deferred | Durable memory snapshot corruption policy | GitHub Issue #41 | deferred behind #81；post-#81 durable memory hardening / operator repair policy |
@@ -866,7 +866,7 @@ research 已写入 GitHub Issue #89；本条后续按 callback adapter -> common
 
 ### 状态
 
-GitHub Issue #93，作为 GitHub Issue #81 的后续子任务；deferred behind #81。#81 会调整 Conversation Memory 与 compact JSON 的目标 shape；本条不应抢先实施。
+GitHub Issue #93，作为 GitHub Issue #81 的后续子任务。#81 已关闭，本条 deferred 前置条件已解除；用户指定恢复推进。Plan artifact 已生成并完成 fix：`docs/host/host-issues/wu-cm-05-llm-compaction-proposal-typed-parsing-plan.md`。Plan review artifacts：`docs/reviews/plan-review-20260612-140624.md`、`docs/reviews/plan-review-20260612-140644.md`；plan re-review artifacts：`docs/reviews/plan-review-20260612-141710.md`、`docs/reviews/plan-review-20260612-141946.md`。AgentMiMo / AgentDS re-review 均为 pass，accepted findings 全部已修复；当前处于 accepted plan commit gate。
 
 ### 目标
 
