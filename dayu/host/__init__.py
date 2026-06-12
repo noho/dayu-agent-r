@@ -98,9 +98,15 @@ from dayu.host.command import (
 )
 from dayu.host.read_api import get_run, get_session
 from dayu.host.open_host import open_host
+from dayu.host.durable.maintenance import HostWalCheckpointMode, HostWalCheckpointResult
 from dayu.host.storage_maintenance import (
+    DEFAULT_ORPHAN_ARTIFACT_GRACE_SECONDS,
+    HostStorageMaintenanceFileError,
+    HostStorageMaintenanceRequest,
+    HostStorageMaintenanceResult,
     HostStorageUsageReport,
     report_storage_usage,
+    run_storage_maintenance,
 )
 from dayu.host.tooling import (
     FrameworkToolName,
@@ -149,9 +155,14 @@ __all__ = [
     "HostFinalAnswerView",
     "HostMetadataEntry",
     "HostPayloadRef",
+    "HostStorageMaintenanceFileError",
+    "HostStorageMaintenanceRequest",
+    "HostStorageMaintenanceResult",
     "HostStorageUsageReport",
     "HostStreamCursor",
     "HostTerminalStatus",
+    "HostWalCheckpointMode",
+    "HostWalCheckpointResult",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",
     "LocalWorkerHandle",
@@ -194,6 +205,7 @@ __all__ = [
     "close_session",
     "create_session",
     "default_framework_tool_policy_view",
+    "DEFAULT_ORPHAN_ARTIFACT_GRACE_SECONDS",
     "ensure_session",
     "get_run",
     "get_session",
@@ -203,5 +215,6 @@ __all__ = [
     "report_storage_usage",
     "resolve_wait",
     "retry_run",
+    "run_storage_maintenance",
     "submit_followup",
 ]

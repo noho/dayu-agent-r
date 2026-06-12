@@ -1,16 +1,19 @@
 """Host durable storage lifecycle 只读诊断。
 
 本模块只提供 storage usage report 所需的 SQLite row count、logical payload
-字节统计和 DB/WAL 文件大小读取。它不写 durable 状态、不扫描 artifact root、
-不执行 WAL checkpoint，也不删除任何文件或 row。
+字节统计、DB/WAL 文件大小读取、artifact 引用证明和 dry-run 文件扫描原语。
+它不写 durable 状态、不执行 WAL checkpoint，也不删除任何文件或 row。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import AbstractSet
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.durable.artifact import iter_published_artifact_relative_paths
 from dayu.host.durable.payload import PayloadKind
 from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
@@ -275,6 +278,127 @@ def read_storage_usage(
     )
 
 
+def artifact_relative_path_is_referenced(
+    transaction: HostTransaction,
+    relative_path: str,
+) -> bool:
+    """判断 artifact 相对路径是否仍被存活 descriptor 引用。
+
+    该证明只读取 ``payload_descriptors`` 中 ``payload_kind='artifact_ref'`` 且
+    ``artifact_relative_path`` 完全匹配的 durable descriptor。audit JSONL、
+    tool-trace JSONL、EventLog 内部 id 或其它内部治理标签都不是 artifact
+    物理文件删除证明的业务事实来源。
+
+    :param transaction: 调用方提供的 read transaction。
+    :param relative_path: artifact root 下的 POSIX 相对路径。
+    :returns: 存在匹配 artifact descriptor 时返回 ``True``。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT 1 AS referenced
+        FROM {TABLE_PAYLOAD_DESCRIPTORS}
+        WHERE payload_kind = ?
+          AND artifact_relative_path = ?
+        LIMIT 1
+        """,
+        (PayloadKind.ARTIFACT_REF.value, relative_path),
+    )
+    return row is not None
+
+
+def collect_referenced_artifact_paths(
+    transaction: HostTransaction,
+) -> frozenset[str]:
+    """收集当前所有 artifact descriptor 引用的相对路径。
+
+    结果只来自 ``payload_descriptors`` 中 ``payload_kind='artifact_ref'`` 且
+    ``artifact_relative_path`` 非空的 descriptor；它不解析 audit、tool-trace
+    或 EventLog payload JSON。
+
+    :param transaction: 调用方提供的 read transaction。
+    :returns: artifact relative path 的不可变集合。
+    :raises AssertionError: SQLite 返回了非字符串路径时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT artifact_relative_path
+        FROM {TABLE_PAYLOAD_DESCRIPTORS}
+        WHERE payload_kind = ?
+          AND artifact_relative_path IS NOT NULL
+        """,
+        (PayloadKind.ARTIFACT_REF.value,),
+    )
+    paths: set[str] = set()
+    for row in rows:
+        value = row.get("artifact_relative_path")
+        if not isinstance(value, str):
+            raise AssertionError("artifact_relative_path must be returned as str")
+        paths.add(value)
+    return frozenset(paths)
+
+
+def scan_orphan_artifact_files(
+    artifact_root: Path,
+    referenced: AbstractSet[str],
+    *,
+    now: datetime,
+    grace_seconds: float,
+) -> tuple[str, ...]:
+    """扫描 dry-run orphan artifact 候选文件。
+
+    扫描只使用 ``iter_published_artifact_relative_paths`` 枚举
+    ``artifact_root/sha256`` 内容寻址 namespace 下的已发布普通文件，因此
+    ``.tmp``、audit JSONL、tool-trace JSONL 与其它非 artifact namespace 文件
+    不会进入候选。候选条件是 ``on_disk - referenced``，且文件 mtime 不晚于
+    ``now - grace_seconds``。
+
+    :param artifact_root: artifact 根目录。
+    :param referenced: 当前 descriptor 引用的 artifact 相对路径集合。
+    :param now: 调用方显式注入的当前时间。
+    :param grace_seconds: orphan grace window 秒数，必须非负。
+    :returns: 排序稳定的 orphan artifact 相对路径元组。
+    :raises ValueError: ``now`` 缺少时区或 ``grace_seconds`` 为负数时抛出。
+    :raises OSError: 候选文件 metadata 读取失败时抛出。
+    :raises dayu.host.durable.errors.HostArtifactWriteError: artifact 枚举失败时抛出。
+    """
+
+    _require_aware_datetime(now, field_name="now")
+    if grace_seconds < 0:
+        raise ValueError("grace_seconds must be non-negative")
+    cutoff_timestamp = now.timestamp() - grace_seconds
+    candidates: list[str] = []
+    for relative_path in iter_published_artifact_relative_paths(artifact_root):
+        if relative_path in referenced:
+            continue
+        artifact_path = _artifact_file_path(artifact_root, relative_path)
+        if artifact_path.stat().st_mtime <= cutoff_timestamp:
+            candidates.append(relative_path)
+    return tuple(sorted(candidates))
+
+
+def physical_artifact_bytes(artifact_root: Path) -> int:
+    """统计已发布 artifact 文件的物理字节数。
+
+    该值只统计 ``artifact_root/sha256`` 内容寻址 namespace 下的已发布普通文件
+    ``stat().st_size`` 之和，并排除 ``.tmp``、audit JSONL、tool-trace JSONL 和
+    其它非 descriptor-managed namespace。它不执行 checkpoint，也不删除文件。
+
+    :param artifact_root: artifact 根目录。
+    :returns: 已发布 artifact 物理文件字节和。
+    :raises OSError: 文件 metadata 读取失败时抛出。
+    :raises dayu.host.durable.errors.HostArtifactWriteError: artifact 枚举失败时抛出。
+    """
+
+    total = 0
+    for relative_path in iter_published_artifact_relative_paths(artifact_root):
+        total += _artifact_file_path(artifact_root, relative_path).stat().st_size
+    return total
+
+
 def _assert_report_tables_cover_schema() -> None:
     """校验 report table 映射覆盖当前 durable schema 真源。
 
@@ -410,6 +534,30 @@ def _wal_path_for_db_path(db_path: Path) -> Path:
     return Path(f"{db_path}-wal")
 
 
+def _artifact_file_path(artifact_root: Path, relative_path: str) -> Path:
+    """把 artifact POSIX 相对路径转换为平台路径。
+
+    :param artifact_root: artifact 根目录。
+    :param relative_path: artifact POSIX 相对路径。
+    :returns: artifact root 下的平台路径。
+    """
+
+    return artifact_root.joinpath(*PurePosixPath(relative_path).parts)
+
+
+def _require_aware_datetime(value: datetime, *, field_name: str) -> None:
+    """校验 datetime 带有可用时区。
+
+    :param value: 待校验时间。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises ValueError: ``value`` 不是 aware datetime 时抛出。
+    """
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+
+
 def _require_non_negative_int(value: int, *, field_name: str) -> None:
     """校验 report 字段为非负严格整数。
 
@@ -428,5 +576,9 @@ def _require_non_negative_int(value: int, *, field_name: str) -> None:
 
 __all__ = [
     "HostStorageUsageReport",
+    "artifact_relative_path_is_referenced",
+    "collect_referenced_artifact_paths",
+    "physical_artifact_bytes",
     "read_storage_usage",
+    "scan_orphan_artifact_files",
 ]

@@ -115,13 +115,20 @@ EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
         "report_storage_usage",
         "resolve_wait",
         "retry_run",
+        "run_storage_maintenance",
         "submit_followup",
     }
 )
 
 EXPECTED_STORAGE_MAINTENANCE_EXPORTS: frozenset[str] = frozenset(
     {
+        "DEFAULT_ORPHAN_ARTIFACT_GRACE_SECONDS",
+        "HostStorageMaintenanceFileError",
+        "HostStorageMaintenanceRequest",
+        "HostStorageMaintenanceResult",
         "HostStorageUsageReport",
+        "HostWalCheckpointMode",
+        "HostWalCheckpointResult",
         "report_storage_usage",
     }
 )
@@ -376,6 +383,7 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
             "replay_run",
             "resolve_wait",
             "retry_run",
+            "run_storage_maintenance",
             "submit_followup",
         }
     )

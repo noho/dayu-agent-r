@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from sqlite3 import Connection
 from typing import NoReturn
 from uuid import uuid4
 
@@ -248,6 +249,36 @@ class HostCommandHandle:
         self._raise_if_closed()
         try:
             return self._durable_store.options.db_path
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
+
+    def _artifact_root(self) -> Path:
+        """返回当前 handle 持有的 Host artifact root 路径。
+
+        :returns: artifact root 路径。
+        :raises HostApiError: handle 已关闭或 durable store 配置不可读取时抛出。
+        """
+
+        self._raise_if_closed()
+        try:
+            return self._durable_store.options.payload_policy.artifact_root
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
+
+    def _open_durable_connection(self) -> Connection:
+        """打开一条独立 Host durable SQLite connection。
+
+        调用方负责关闭返回的 connection。该 accessor 只委托当前 handle 持有的
+        durable store，不进入 command transaction，供 WAL checkpoint 等
+        connection-level maintenance primitive 使用。
+
+        :returns: 已配置并校验 schema 的独立 SQLite connection。
+        :raises HostApiError: handle 已关闭或 durable connection 打开失败时抛出。
+        """
+
+        self._raise_if_closed()
+        try:
+            return self._durable_store.connect()
         except HostDurableError as exc:
             raise _host_api_error_from_durable_error(exc) from exc
 

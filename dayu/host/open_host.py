@@ -98,8 +98,11 @@ from dayu.host.read_api import (
 )
 from dayu.host.recovery import StartupRecoveryScanner
 from dayu.host.storage_maintenance import (
+    HostStorageMaintenanceRequest,
+    HostStorageMaintenanceResult,
     HostStorageUsageReport,
     report_storage_usage as _report_storage_usage,
+    run_storage_maintenance as _run_storage_maintenance,
 )
 from dayu.host.tool_trace import (
     DEFAULT_TOOL_TRACE_CATCHUP_BATCH_SIZE,
@@ -518,6 +521,21 @@ class _PublicHostHandle:
 
         self._raise_if_closed()
         return _report_storage_usage(self._command_handle)
+
+    async def run_storage_maintenance(
+        self,
+        request: HostStorageMaintenanceRequest,
+    ) -> HostStorageMaintenanceResult:
+        """执行 Host storage maintenance dry-run。
+
+        :param request: maintenance 请求。
+        :returns: dry-run maintenance 结果。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: maintenance 读取、扫描或 checkpoint 失败时抛出。
+        """
+
+        self._raise_if_closed()
+        return _run_storage_maintenance(self._command_handle, request)
 
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。

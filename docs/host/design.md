@@ -897,7 +897,7 @@ Service-facing 第一版应表现为一个简单 Host opener / handle，而不�
 
 P10.5 冻结 async-only Host opener / handle。Service-facing opener 名称固定为 `open_host(options)`，并且必须是 async context manager：`async with open_host(options) as host:`。handle methods 与 event stream consumption 均以 async public contract 为准。Host public contract 不提供同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，应在 Service / CLI adapter 边界用 `asyncio.run(...)` 或等价机制包装 async Host contract，不要求 Host 层维护第二套同步 API。
 
-Host opener close 是 Host handle lifecycle 语义，不是 Session / Run 治理事实。`host.close()` 与 `open_host(...).__aexit__` 必须幂等；重复 close 不报错。close 完成后，调用该 handle 上的 `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`report_storage_usage`、`get_run`、`watch_session_events`、`submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run` 等 Host API，必须 fail-fast 抛出 typed `HostClosedError` 或等价 Host lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经进入 admission / command transaction 的调用按正常事务语义完成；close gate 之后新进入的调用统一抛 closed-handle exception。
+Host opener close 是 Host handle lifecycle 语义，不是 Session / Run 治理事实。`host.close()` 与 `open_host(...).__aexit__` 必须幂等；重复 close 不报错。close 完成后，调用该 handle 上的 `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`、`get_run`、`watch_session_events`、`submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run` 等 Host API，必须 fail-fast 抛出 typed `HostClosedError` 或等价 Host lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经进入 admission / command transaction 的调用按正常事务语义完成；close gate 之后新进入的调用统一抛 closed-handle exception。
 
 Host opener close 会终止当前 handle 持有的本地运行环境，但不得伪装成用户取消。close 流程必须停止 scheduler / promotion / background supervisor，不再启动新的 Attempt；必须向 active worker registry 传播 lifecycle cancel，使 Host 注入 Engine 的 cancellation token 可见，并通知 `LocalWorkerHandle.on_cancel(reason)` 这个 best-effort hook；随后关闭或取消当前 handle 持有的 active worker task、lane wait、stream fanout task 与本地 runtime resource，避免进程内任务泄漏。若 close 过程中 active worker 已经产出可确认 terminal event，Host 按正常 ingest / terminal closeout 追加事实。若 active worker 没有可确认 terminal，Host close 不得写 `CANCEL_REQUESTED`、`RUN_CANCELLED`、`RUN_FAILED` 或其它伪装用户意图 / 确认失败的 canonical fact；未收口 active Attempt 后续必须通过 Host lifecycle / Recovery 的 positive orphan proof 路径进入 `ATTEMPT_LOST`，再按 policy 进入 `RUN_RECOVERING` 或 `RUN_LOST`。调用方若要表达用户明确停止，应在 close 前显式调用 `cancel_run(...)` 或 `cancel_session_runs(...)`。
 
@@ -976,6 +976,7 @@ purge_session(host, session_id, request) -> PurgeSessionResult
 get_run(host, run_id) -> RunSnapshot
 watch_session_events(host, session_id) -> AsyncIterator[HostEvent]
 report_storage_usage(host) -> HostStorageUsageReport
+run_storage_maintenance(host, request) -> HostStorageMaintenanceResult
 cancel_run(host, run_id, request) -> RunSnapshot
 cancel_session_runs(host, session_id, request) -> SessionSnapshot
 submit_followup(host, session_id, request) -> FollowupSnapshot
@@ -1197,10 +1198,11 @@ Run 读取与结果边界：
 - P10.5 不定义 public payload reader、`read_payload(ref)` 或 `get_run_result(...)`；普通 Service 不得为了展示 final answer 读取内部 payload 表。若后续需要大结果分页或多版本 replay result，必须作为新的 read-model public contract 单独讨论，且不能成为事实真源。
 - Session timeline 仍通过 `get_session` snapshot 或后续 read-model API 暴露；它不能替代 Host event stream 的 live watch 语义，也不能替代 Outbox 的离线 terminal 投递职责。
 - `report_storage_usage` 是 operator-facing 只读诊断入口。它只读取 durable SQLite row count、SQLite payload logical bytes、artifact descriptor logical bytes、orphan SQLite payload 诊断计数以及 DB / WAL 文件 `stat`。它不写 EventLog，不改变 Session / Run / Attempt 状态，不扫描 artifact root，不执行 checkpoint，也不删除文件或 row。artifact descriptor logical bytes 只是 descriptor 记录的 logical sum，不代表内容寻址 artifact 的物理文件占用。
+- `run_storage_maintenance` 当前只实现 operator-facing dry-run maintenance。它基于 `payload_descriptors` 中的 `artifact_ref` 相对路径收集引用集合，只扫描 artifact root 下 `sha256/` 内容寻址 namespace，返回超过 grace window 的 orphan artifact 候选、`sha256/` 已发布 artifact 物理字节和、同一次 usage report，并可用独立 SQLite connection 执行 WAL checkpoint。dry-run 不删除文件、不删除 SQLite row、不执行 `VACUUM`，也不启动 scheduler；`reclaim_orphan_artifacts=True` 在当前实现中返回 unsupported operation。
 
 接口分层：
 
-- `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`report_storage_usage`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是普通 Service-facing 稳定公共能力。
+- `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`report_storage_usage`、`run_storage_maintenance`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是普通 Service-facing 稳定公共能力。
 - `stream_run_events` 不进入 P10.5 普通 Service-facing public contract；现有实现若保留，只能作为 Host 内部 diagnostic / detail read path。未来若要公开 run-scoped diagnostic read API，必须另行讨论 public contract，且不能直接暴露内部 `HostEventView`。
 - `cancel_session_runs` 是客户端退出 / supervisor shutdown 的便利公共能力；它只取消指定 Session 下未终态 Run，不表达客户端拥有的 Session 集合。
 - `ensure_session` 表示“给我这个 slot 的当前会话，必要时创建并绑定”。

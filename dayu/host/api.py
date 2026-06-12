@@ -45,7 +45,11 @@ from dayu.host.memory import (
 from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
 
 if TYPE_CHECKING:
-    from dayu.host.durable.storage_lifecycle import HostStorageUsageReport
+    from dayu.host.storage_maintenance import (
+        HostStorageMaintenanceRequest,
+        HostStorageMaintenanceResult,
+        HostStorageUsageReport,
+    )
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
@@ -3308,6 +3312,21 @@ class Host(Protocol):
         :returns: storage usage report。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def run_storage_maintenance(
+        self,
+        request: HostStorageMaintenanceRequest,
+    ) -> HostStorageMaintenanceResult:
+        """执行 Host storage maintenance dry-run。
+
+        :param request: maintenance 请求。
+        :returns: dry-run maintenance 结果。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: maintenance 读取、扫描、checkpoint 或不支持的
+            destructive reclaim 请求失败时抛出。
         """
 
         ...
