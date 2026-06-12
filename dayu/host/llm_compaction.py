@@ -1106,7 +1106,12 @@ def _required_enum(
     value = _required_string(source, key, parent_path=parent_path)
     field_path = _field_path(parent_path, key)
     if value not in allowed_values:
-        raise ValueError(f"{field_path} has invalid enum value")
+        safe_value = truncate_diagnostic_text(
+            redact_sensitive_diagnostic_values(value, redaction_marker=_REDACTED_SECRET),
+            max_chars=_MAX_SAFE_OUTCOME_MESSAGE_CHARS,
+            truncated_suffix=_TRUNCATED_SUFFIX,
+        )
+        raise ValueError(f"{field_path} has invalid enum value: {safe_value}")
     return value
 
 
