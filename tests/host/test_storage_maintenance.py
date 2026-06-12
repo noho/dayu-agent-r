@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Set as AbstractSet
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
@@ -19,6 +21,8 @@ from dayu.engine.contracts.runner_spec import (
 )
 from dayu.host import (
     CreateSessionRequest,
+    HostApiError,
+    HostApiErrorCode,
     HostCallContext,
     HostClosedError,
     HostStorageMaintenanceRequest,
@@ -44,13 +48,14 @@ from dayu.host.command import (
 )
 from dayu.host.durable import storage_lifecycle as storage_lifecycle_module
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
-from dayu.host.durable.errors import HostArtifactWriteError
+from dayu.host.durable.errors import HostArtifactWriteError, HostDurableError
 from dayu.host.durable.payload import write_payload_descriptor_for_artifact
 from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import open_host
 from dayu.host.read_api import get_run, get_session
+from dayu.host import storage_maintenance as storage_maintenance_module
 from dayu.host.storage_maintenance import report_storage_usage
 
 _OLD_TIMESTAMP_SECONDS = 1_700_000_000
@@ -449,34 +454,115 @@ def test_storage_maintenance_reclaim_keeps_shared_referenced_artifact(
 
 def test_storage_maintenance_reclaim_recheck_hit_skips_delete(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """候选扫描后新增 descriptor 引用时，删除前 recheck 会跳过该文件。"""
+    """public maintenance recheck 看见 scan 后新增 descriptor 并跳过删除。"""
 
     options = _command_options(tmp_path)
     host = create_host_command_handle(options)
     try:
         artifact_ref = _write_orphan_artifact_ref(options.artifact_root, b"recheck")
         _set_old_mtime(options.artifact_root / artifact_ref.artifact_relative_path)
+        original_scan = storage_maintenance_module.scan_orphan_artifact_files
 
-        def recheck_after_new_descriptor(relative_path: str) -> bool:
-            """模拟 scan 后、delete 前出现新的 descriptor 引用。"""
+        def scan_then_write_descriptor(
+            artifact_root: Path,
+            referenced: AbstractSet[str],
+            *,
+            now: datetime,
+            grace_seconds: float,
+        ) -> tuple[str, ...]:
+            """扫描完成后写入 descriptor，模拟 scan/recheck 之间的新引用。
 
+            :param artifact_root: artifact 根目录。
+            :param referenced: 扫描时已知的引用路径集合。
+            :param now: 扫描使用的当前时间。
+            :param grace_seconds: orphan grace window 秒数。
+            :returns: 原始扫描候选。
+            """
+
+            candidates = original_scan(
+                artifact_root,
+                referenced,
+                now=now,
+                grace_seconds=grace_seconds,
+            )
             _write_artifact_descriptor(host, artifact_ref, "payload-ref-recheck")
-            return _artifact_path_is_referenced(host, relative_path)
+            return candidates
 
-        result = storage_lifecycle_module.reclaim_orphan_artifact_files(
-            options.artifact_root,
-            (artifact_ref.artifact_relative_path,),
-            is_artifact_path_referenced=recheck_after_new_descriptor,
+        monkeypatch.setattr(
+            storage_maintenance_module,
+            "scan_orphan_artifact_files",
+            scan_then_write_descriptor,
+        )
+
+        result = run_storage_maintenance(
+            host,
+            HostStorageMaintenanceRequest(
+                reclaim_orphan_artifacts=True,
+                run_wal_checkpoint=False,
+            ),
         )
         after_usage = report_storage_usage(host)
     finally:
         host.close()
 
-    assert result.reclaimed_paths == ()
+    assert result.orphan_artifact_candidates == (
+        artifact_ref.artifact_relative_path,
+    )
+    assert result.reclaimed_artifact_paths == ()
     assert result.file_errors == ()
     assert (options.artifact_root / artifact_ref.artifact_relative_path).is_file()
     assert after_usage.payload_descriptor_rows == 1
+
+
+def test_storage_maintenance_recheck_durable_error_fails_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recheck 的 durable 错误经 public facade fail-safe 传播。"""
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        orphan_path = _write_orphan_artifact(options.artifact_root, b"recheck-error")
+        _set_old_mtime(options.artifact_root / orphan_path)
+
+        def fail_recheck(
+            transaction: HostTransaction,
+            relative_path: str,
+        ) -> bool:
+            """模拟 recheck read transaction 中 durable 层失败。
+
+            :param transaction: Host read transaction。
+            :param relative_path: artifact root 下的 POSIX 相对路径。
+            :returns: 不会返回。
+            :raises HostDurableError: 始终抛出测试错误。
+            """
+
+            raise HostDurableError("forced recheck durable failure")
+
+        monkeypatch.setattr(
+            storage_maintenance_module,
+            "artifact_relative_path_is_referenced",
+            fail_recheck,
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            run_storage_maintenance(
+                host,
+                HostStorageMaintenanceRequest(
+                    reclaim_orphan_artifacts=True,
+                    run_wal_checkpoint=False,
+                ),
+            )
+    finally:
+        host.close()
+
+    assert exc_info.value.code == HostApiErrorCode.INTERNAL_ERROR
+    assert "durable operation failed" in exc_info.value.message
+    assert isinstance(exc_info.value.__cause__, HostDurableError)
+    assert (options.artifact_root / orphan_path).is_file()
 
 
 def test_storage_maintenance_reclaim_file_error_keeps_processing(
@@ -556,6 +642,42 @@ def test_storage_maintenance_reclaim_is_idempotent(tmp_path: Path) -> None:
     assert second_result.orphan_artifact_candidates == ()
     assert second_result.reclaimed_artifact_paths == ()
     assert second_result.file_errors == ()
+
+
+def test_storage_maintenance_result_json_value_is_stable_self_explaining_and_non_negative(
+    tmp_path: Path,
+) -> None:
+    """maintenance result json_value 返回稳定、自解释且非负的 JSON object。"""
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        orphan_path = _write_orphan_artifact(options.artifact_root, b"json-value")
+        _set_old_mtime(options.artifact_root / orphan_path)
+        result = run_storage_maintenance(
+            host,
+            HostStorageMaintenanceRequest(run_wal_checkpoint=False),
+        )
+        values = result.json_value()
+    finally:
+        host.close()
+
+    assert isinstance(values, Mapping)
+    expected_keys = (
+        "usage",
+        "physical_artifact_bytes",
+        "orphan_artifact_candidates",
+        "reclaimed_artifact_paths",
+        "file_errors",
+        "wal_checkpoint",
+    )
+    assert tuple(values.keys()) == expected_keys
+    assert isinstance(values["usage"], Mapping)
+    assert _json_int(values, "physical_artifact_bytes") >= 0
+    assert values["orphan_artifact_candidates"] == [orphan_path]
+    assert values["reclaimed_artifact_paths"] == []
+    assert values["file_errors"] == []
+    assert values["wal_checkpoint"] is None
 
 
 @pytest.mark.asyncio
@@ -703,29 +825,6 @@ def _delete_payload_descriptor(host: HostCommandHandle, payload_ref: str) -> Non
     host._run_write(delete_descriptor)
 
 
-def _artifact_path_is_referenced(host: HostCommandHandle, relative_path: str) -> bool:
-    """通过 durable read transaction 判断 artifact 路径是否被引用。
-
-    :param host: Host command handle。
-    :param relative_path: artifact root 下的 POSIX 相对路径。
-    :returns: 路径被引用时返回 ``True``。
-    """
-
-    def read_reference(transaction: HostTransaction) -> bool:
-        """读取 artifact descriptor 引用证明。
-
-        :param transaction: Host read transaction。
-        :returns: 路径被引用时返回 ``True``。
-        """
-
-        return storage_lifecycle_module.artifact_relative_path_is_referenced(
-            transaction,
-            relative_path,
-        )
-
-    return host._run_read(read_reference)
-
-
 def _write_non_artifact_files(artifact_root: Path) -> None:
     """写入不应被 maintenance 统计为 artifact 的文件。
 
@@ -749,3 +848,18 @@ def _set_old_mtime(path: Path) -> None:
     """
 
     os.utime(path, (_OLD_TIMESTAMP_SECONDS, _OLD_TIMESTAMP_SECONDS))
+
+
+def _json_int(values: JsonValue, key: str) -> int:
+    """从 JSON object 中读取整数字段。
+
+    :param values: JSON value。
+    :param key: 字段名。
+    :returns: 整数字段值。
+    :raises AssertionError: 输入不是 JSON object 或字段不是整数时抛出。
+    """
+
+    assert isinstance(values, Mapping)
+    value = values[key]
+    assert isinstance(value, int)
+    return value

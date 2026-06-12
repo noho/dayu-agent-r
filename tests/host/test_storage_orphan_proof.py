@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
 from dayu.host.durable.codec import sha256_digest_bytes
 from dayu.host.durable.connection import open_host_durable_store
@@ -251,6 +253,34 @@ def test_scan_orphan_artifact_files_filters_namespace_grace_and_sorts(
     )
 
     assert candidates == tuple(sorted((old_orphan_a, old_orphan_b)))
+
+
+def test_scan_orphan_artifact_files_rejects_negative_grace_seconds(
+    tmp_path: Path,
+) -> None:
+    """orphan 扫描拒绝负数 grace window。"""
+
+    with pytest.raises(ValueError, match="grace_seconds must be non-negative"):
+        scan_orphan_artifact_files(
+            tmp_path / "artifacts",
+            frozenset(),
+            now=_NOW,
+            grace_seconds=-1.0,
+        )
+
+
+def test_scan_orphan_artifact_files_rejects_naive_datetime(
+    tmp_path: Path,
+) -> None:
+    """orphan 扫描拒绝缺少时区的当前时间。"""
+
+    with pytest.raises(ValueError, match="now must be timezone-aware"):
+        scan_orphan_artifact_files(
+            tmp_path / "artifacts",
+            frozenset(),
+            now=datetime(2026, 6, 12, 12, 0, 0),
+            grace_seconds=0.0,
+        )
 
 
 def test_physical_artifact_bytes_counts_only_published_sha256_files(
