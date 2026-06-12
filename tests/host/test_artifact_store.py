@@ -10,6 +10,8 @@ import pytest
 from dayu.host.durable.artifact import (
     LocalArtifactRef,
     LocalArtifactStore,
+    delete_artifact_file,
+    iter_published_artifact_relative_paths,
     validate_artifact_ref,
 )
 from dayu.host.durable.codec import sha256_digest_bytes
@@ -166,6 +168,122 @@ def test_artifact_helper_rejects_symlink_escape(tmp_path: Path) -> None:
 
     with pytest.raises(HostArtifactWriteError):
         LocalArtifactStore(artifact_root).write_artifact_bytes(b"content")
+
+
+def test_iter_published_artifact_relative_paths_returns_only_sha256_files(
+    tmp_path: Path,
+) -> None:
+    """published artifact 枚举只返回 sha256 namespace 下的普通文件。"""
+
+    artifact_root = tmp_path / "artifacts"
+    first_artifact = artifact_root / "sha256" / "ab" / "artifact-a"
+    second_artifact = artifact_root / "sha256" / "cd" / "nested" / "artifact-b"
+    first_artifact.parent.mkdir(parents=True)
+    second_artifact.parent.mkdir(parents=True)
+    first_artifact.write_bytes(b"a")
+    second_artifact.write_bytes(b"b")
+    (artifact_root / "sha256" / "empty-dir").mkdir()
+    (artifact_root / ".tmp").mkdir()
+    (artifact_root / ".tmp" / "temp-file").write_bytes(b"temp")
+    (artifact_root / "audit").mkdir()
+    (artifact_root / "audit" / "audit.jsonl").write_text("{}", encoding="utf-8")
+    (artifact_root / "tool-trace").mkdir()
+    (artifact_root / "tool-trace" / "trace.jsonl").write_text("{}", encoding="utf-8")
+    (artifact_root / "other").mkdir()
+    (artifact_root / "other" / "file").write_bytes(b"other")
+    (artifact_root / "loose-file").write_bytes(b"loose")
+
+    relative_paths = sorted(iter_published_artifact_relative_paths(artifact_root))
+
+    assert relative_paths == [
+        "sha256/ab/artifact-a",
+        "sha256/cd/nested/artifact-b",
+    ]
+
+
+def test_iter_published_artifact_relative_paths_empty_without_sha256(
+    tmp_path: Path,
+) -> None:
+    """artifact root 为空或 sha256 namespace 缺失时枚举为空。"""
+
+    missing_root = tmp_path / "missing-artifacts"
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+
+    assert tuple(iter_published_artifact_relative_paths(missing_root)) == ()
+    assert tuple(iter_published_artifact_relative_paths(artifact_root)) == ()
+
+
+def test_iter_published_artifact_relative_paths_rejects_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    """published artifact 枚举拒绝 sha256 namespace 内的 symlink 逃逸。"""
+
+    artifact_root = tmp_path / "artifacts"
+    outside_root = tmp_path / "outside"
+    outside_file = outside_root / "artifact"
+    (artifact_root / "sha256" / "ab").mkdir(parents=True)
+    outside_root.mkdir()
+    outside_file.write_bytes(b"outside")
+    (artifact_root / "sha256" / "ab" / "escape").symlink_to(outside_file)
+
+    with pytest.raises(HostArtifactWriteError):
+        tuple(iter_published_artifact_relative_paths(artifact_root))
+
+
+def test_delete_artifact_file_deletes_existing_file_and_reports_missing(
+    tmp_path: Path,
+) -> None:
+    """artifact 删除 helper 删除存在文件，缺失文件返回 False。"""
+
+    artifact_root = tmp_path / "artifacts"
+    artifact_path = artifact_root / "sha256" / "ab" / "artifact"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(b"content")
+
+    assert delete_artifact_file(artifact_root, "sha256/ab/artifact") is True
+    assert artifact_path.exists() is False
+    assert delete_artifact_file(artifact_root, "sha256/ab/artifact") is False
+    assert delete_artifact_file(artifact_root, "sha256/ab/missing") is False
+
+
+def test_delete_artifact_file_rejects_non_sha256_namespace_without_deleting(
+    tmp_path: Path,
+) -> None:
+    """artifact 删除 helper 拒绝非 sha256 namespace 路径且不删除对应文件。"""
+
+    artifact_root = tmp_path / "artifacts"
+    audit_file = artifact_root / "audit" / "audit.jsonl"
+    audit_file.parent.mkdir(parents=True)
+    audit_file.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(HostArtifactWriteError):
+        delete_artifact_file(artifact_root, "audit/audit.jsonl")
+
+    assert audit_file.read_text(encoding="utf-8") == "{}"
+
+
+def test_delete_artifact_file_rejects_traversal_and_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    """artifact 删除 helper 拒绝越界路径与最终文件 symlink 逃逸。"""
+
+    artifact_root = tmp_path / "artifacts"
+    outside_root = tmp_path / "outside"
+    outside_file = outside_root / "artifact"
+    (artifact_root / "sha256" / "ab").mkdir(parents=True)
+    outside_root.mkdir()
+    outside_file.write_bytes(b"outside")
+    symlink_path = artifact_root / "sha256" / "ab" / "escape"
+    symlink_path.symlink_to(outside_file)
+
+    with pytest.raises(HostArtifactWriteError):
+        delete_artifact_file(artifact_root, "../outside/artifact")
+    with pytest.raises(HostArtifactWriteError):
+        delete_artifact_file(artifact_root, "sha256/ab/escape")
+
+    assert outside_file.read_bytes() == b"outside"
+    assert symlink_path.is_symlink()
 
 
 def test_temp_area_is_under_artifact_root_and_concurrent_writes_do_not_collide(

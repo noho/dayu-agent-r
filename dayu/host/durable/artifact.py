@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -132,6 +133,70 @@ def validate_artifact_ref(artifact_ref: LocalArtifactRef) -> None:
         raise HostDurableError("Artifact size must be non-negative")
 
 
+def iter_published_artifact_relative_paths(artifact_root: Path) -> Iterator[str]:
+    """枚举已发布 artifact 文件的 POSIX 相对路径。
+
+    该 helper 只遍历 ``artifact_root/sha256`` 内容寻址 namespace，跳过
+    ``.tmp`` 子树和其它非 artifact namespace。它不读取 SQLite descriptor，
+    也不判断文件是否为 orphan。
+
+    :param artifact_root: artifact 根目录。
+    :returns: 已发布普通文件的 POSIX 相对路径迭代器。
+    :raises HostArtifactWriteError: 路径越界、symlink 逃逸或文件系统枚举失败时抛出。
+    """
+
+    namespace_dir = artifact_root / _ARTIFACT_NAMESPACE
+    try:
+        if not artifact_root.exists():
+            return
+        if not artifact_root.is_dir():
+            raise HostArtifactWriteError("Artifact root is not a directory")
+        if not namespace_dir.exists():
+            return
+        _ensure_contained(artifact_root, namespace_dir)
+        if not namespace_dir.is_dir():
+            return
+    except HostArtifactWriteError:
+        raise
+    except OSError as exc:
+        raise HostArtifactWriteError("Artifact file enumeration failed") from exc
+
+    yield from _iter_contained_regular_files(artifact_root, namespace_dir)
+
+
+def delete_artifact_file(artifact_root: Path, relative_path: str) -> bool:
+    """删除 artifact root 内 ``sha256/`` namespace 下的单个已发布 artifact 文件。
+
+    删除前会按 POSIX 相对路径规则校验输入，并对最终文件路径本身执行
+    containment 校验，防止通过 symlink 删除 artifact root 外文件。该 helper
+    只删除 ``sha256/`` 内容寻址 namespace 下的已发布 artifact 文件。
+
+    :param artifact_root: artifact 根目录。
+    :param relative_path: artifact root 下 ``sha256/`` namespace 内的 POSIX
+        相对路径。
+    :returns: 删除了已存在文件时返回 ``True``；文件不存在时返回 ``False``。
+    :raises HostArtifactWriteError: 路径无效、路径越界、symlink 逃逸或删除失败时抛出。
+    """
+
+    try:
+        _validate_relative_path_text(relative_path)
+        _validate_published_artifact_relative_path(relative_path)
+        final_path = _path_from_posix_relative(artifact_root, relative_path)
+    except HostDurableError as exc:
+        raise HostArtifactWriteError("Artifact relative path invalid") from exc
+
+    try:
+        if not os.path.lexists(final_path):
+            return False
+        _ensure_contained(artifact_root, final_path)
+        final_path.unlink(missing_ok=True)
+        return True
+    except HostArtifactWriteError:
+        raise
+    except OSError as exc:
+        raise HostArtifactWriteError("Artifact file delete failed") from exc
+
+
 def _artifact_relative_path_for_digest(digest: str) -> str:
     """根据 digest 生成稳定 artifact 相对路径。
 
@@ -184,6 +249,21 @@ def _validate_relative_path_text(relative_path: str) -> None:
         raise HostDurableError("Artifact relative path must not traverse")
 
 
+def _validate_published_artifact_relative_path(relative_path: str) -> None:
+    """校验相对路径位于已发布 artifact 的 ``sha256/`` namespace 下。
+
+    :param relative_path: 已通过基础文本校验的 artifact 相对路径。
+    :returns: ``None``。
+    :raises HostArtifactWriteError: 路径不在 ``sha256/`` namespace 下时抛出。
+    """
+
+    path = PurePosixPath(relative_path)
+    if len(path.parts) < 2 or path.parts[0] != _ARTIFACT_NAMESPACE:
+        raise HostArtifactWriteError(
+            "Artifact relative path must be under sha256 namespace"
+        )
+
+
 def _is_temp_relative_path(relative_path: str) -> bool:
     """判断相对路径是否指向 artifact temp 区域。
 
@@ -220,6 +300,32 @@ def _unlink_if_exists(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         return
+
+
+def _iter_contained_regular_files(root: Path, directory: Path) -> Iterator[str]:
+    """递归枚举 containment 内目录下的普通文件。
+
+    :param root: artifact 根目录。
+    :param directory: 已确认位于 root 内的待遍历目录。
+    :returns: 普通文件的 POSIX 相对路径迭代器。
+    :raises HostArtifactWriteError: 路径越界、symlink 逃逸或文件系统枚举失败时抛出。
+    """
+
+    try:
+        for entry in directory.iterdir():
+            if entry.name == _ARTIFACT_TEMP_DIR_NAME:
+                continue
+            _ensure_contained(root, entry)
+            if entry.is_dir() and not entry.is_symlink():
+                yield from _iter_contained_regular_files(root, entry)
+            elif entry.is_file() and not entry.is_symlink():
+                yield entry.relative_to(root).as_posix()
+    except HostArtifactWriteError:
+        raise
+    except ValueError as exc:
+        raise HostArtifactWriteError("Artifact path escapes artifact root") from exc
+    except OSError as exc:
+        raise HostArtifactWriteError("Artifact file enumeration failed") from exc
 
 
 def _fsync_directory(path: Path) -> None:
