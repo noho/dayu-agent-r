@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -12,6 +13,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.api import RunStatus
 from dayu.host.compact_material import (
     CompactMaterialSourceBoundary,
+    CompactMaterialPack,
     CompactMemorySnapshotRepairRequired,
     DuplicateMaterialSectionOwnerError,
     EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
@@ -37,6 +39,7 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CompactSegmentTrigger,
+    ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
     FactEvidenceKindVNext,
@@ -104,6 +107,129 @@ _SESSION_ID = "session-compact-material"
 _POLICY_DIGEST = "policy-digest-compact-material"
 _NOW = "2026-05-24T00:00:00.000000Z"
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_CURRENT_VNEXT_MATERIAL_KEYS = (
+    "previous_compacted_view",
+    "trace_material",
+    "evidence_material",
+    "answer_material",
+    "current_input_anchor",
+    "instruction",
+)
+_VNEXT_TOP_LEVEL_KEYS = ("schema_version", *_CURRENT_VNEXT_MATERIAL_KEYS)
+
+
+class _MaterialPackShape(NamedTuple):
+    """测试用 compact material pack prompt-local shape 摘要。"""
+
+    previous_labels: tuple[str, ...]
+    trace_labels: tuple[str, ...]
+    evidence_labels: tuple[str, ...]
+    answer_labels: tuple[str, ...]
+    current_anchor_label: str
+    citable_source_labels: tuple[str, ...]
+
+
+class _VNextInputShape(NamedTuple):
+    """测试用 vNext compactor input JSON shape 摘要。"""
+
+    top_level_keys: tuple[str, ...]
+    previous_count: int
+    trace_count: int
+    evidence_count: int
+    answer_count: int
+    current_anchor_label: str
+
+
+def _material_pack_shape(pack: CompactMaterialPack) -> _MaterialPackShape:
+    """返回 compact material pack 的 prompt-local label shape。
+
+    :param pack: compact material pack。
+    :returns: 测试用 section label 摘要。
+    """
+
+    return _MaterialPackShape(
+        previous_labels=tuple(
+            block.block_label for block in pack.previous_compacted_view
+        ),
+        trace_labels=tuple(block.block_label for block in pack.trace_material),
+        evidence_labels=tuple(
+            block.evidence_label for block in pack.evidence_material
+        ),
+        answer_labels=tuple(block.block_label for block in pack.answer_material),
+        current_anchor_label=pack.current_input_anchor.anchor_label,
+        citable_source_labels=(
+            *tuple(block.block_label for block in pack.previous_compacted_view),
+            *tuple(block.block_label for block in pack.trace_material),
+            *tuple(block.evidence_label for block in pack.evidence_material),
+            *tuple(block.block_label for block in pack.answer_material),
+        ),
+    )
+
+
+def _assert_material_pack_shape(
+    pack: CompactMaterialPack, *, expected: _MaterialPackShape
+) -> None:
+    """断言 compact material pack 的 section / prompt-local label shape。
+
+    :param pack: compact material pack。
+    :param expected: 期望 shape。
+    :returns: ``None``。
+    :raises AssertionError: section 或 label shape 不符合预期时抛出。
+    """
+
+    observed = _material_pack_shape(pack)
+    assert (
+        observed == expected
+    ), f"material pack prompt-local label shape mismatch: expected={expected!r}, observed={observed!r}"
+
+
+def _vnext_input_shape(
+    vnext_input: ConversationCompactInputVNext,
+) -> _VNextInputShape:
+    """返回 vNext compactor input 的顶层 JSON / section count shape。
+
+    :param vnext_input: vNext compactor input。
+    :returns: 测试用 vNext input shape。
+    :raises AssertionError: vNext input 未输出 JSON object 时抛出。
+    """
+
+    vnext_json = vnext_input.to_json()
+    assert isinstance(vnext_json, dict), "vNext material JSON must be an object"
+    previous_view = vnext_input.previous_compacted_view
+    previous_count = 0
+    if previous_view is not None:
+        previous_count = (
+            (1 if previous_view.session_summary is not None else 0)
+            + len(previous_view.evidence_backed_facts)
+            + len(previous_view.answer_anchors)
+            + len(previous_view.forward_intents)
+            + len(previous_view.reference_continuity_items)
+        )
+    return _VNextInputShape(
+        top_level_keys=tuple(vnext_json),
+        previous_count=previous_count,
+        trace_count=len(vnext_input.trace_material),
+        evidence_count=len(vnext_input.evidence_material),
+        answer_count=len(vnext_input.answer_material),
+        current_anchor_label=vnext_input.current_input_anchor.anchor_label,
+    )
+
+
+def _assert_vnext_input_shape(
+    vnext_input: ConversationCompactInputVNext, *, expected: _VNextInputShape
+) -> None:
+    """断言 vNext compactor input 的 section / top-level key shape。
+
+    :param vnext_input: vNext compactor input。
+    :param expected: 期望 shape。
+    :returns: ``None``。
+    :raises AssertionError: 顶层 JSON key 或 section count 不符合预期时抛出。
+    """
+
+    observed = _vnext_input_shape(vnext_input)
+    assert (
+        observed == expected
+    ), f"vNext material section shape mismatch: expected={expected!r}, observed={observed!r}"
 
 
 def test_segment_selection_is_deterministic_for_same_inputs() -> None:
@@ -370,13 +496,35 @@ def test_conversation_compact_input_vnext_maps_material_without_citable_current_
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
     vnext_json = vnext_input.to_json()
 
-    assert vnext_input.current_input_anchor.anchor_label == "C1"
+    _assert_material_pack_shape(
+        pack,
+        expected=_MaterialPackShape(
+            previous_labels=(),
+            trace_labels=("T1",),
+            evidence_labels=("E1",),
+            answer_labels=("A1",),
+            current_anchor_label="C1",
+            citable_source_labels=("T1", "E1", "A1"),
+        ),
+    )
+    _assert_vnext_input_shape(
+        vnext_input,
+        expected=_VNextInputShape(
+            top_level_keys=_VNEXT_TOP_LEVEL_KEYS,
+            previous_count=0,
+            trace_count=1,
+            evidence_count=1,
+            answer_count=1,
+            current_anchor_label="C1",
+        ),
+    )
     assert "C1" not in vnext_input.citable_source_labels
     assert tuple(item.source_label for item in vnext_input.trace_material) == ("T1",)
     assert tuple(item.source_label for item in vnext_input.answer_material) == ("A1",)
     assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
     assert isinstance(vnext_json, dict)
-    assert "trace_material" in vnext_json
+    for key in _CURRENT_VNEXT_MATERIAL_KEYS:
+        assert key in vnext_json, f"vNext material JSON missing current key: {key}"
     assert "stable_input" not in vnext_json
     assert "history_input" not in vnext_json
     assert "evidence_input" not in vnext_json
@@ -791,6 +939,17 @@ def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
     )
     evidence_map = prompt_local_evidence_map(pack)
 
+    _assert_material_pack_shape(
+        pack,
+        expected=_MaterialPackShape(
+            previous_labels=(),
+            trace_labels=(),
+            evidence_labels=("E1.1", "E1.2"),
+            answer_labels=(),
+            current_anchor_label="C1",
+            citable_source_labels=("E1.1", "E1.2"),
+        ),
+    )
     assert pack.evidence_labels == ("E1.1", "E1.2")
     assert tuple(block.raw_result_text for block in pack.evidence_material) == (
         "A" * EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
@@ -1488,7 +1647,40 @@ def test_build_compact_material_pack_uses_explicit_previous_view_without_snapsho
     assert tuple(block.text for block in pack.previous_compacted_view) == (
         "explicit summary",
     )
+    _assert_material_pack_shape(
+        pack,
+        expected=_MaterialPackShape(
+            previous_labels=("P1",),
+            trace_labels=("T1",),
+            evidence_labels=(),
+            answer_labels=(),
+            current_anchor_label="C1",
+            citable_source_labels=("P1", "T1"),
+        ),
+    )
+    _assert_vnext_input_shape(
+        conversation_compact_input_vnext_from_material_pack(pack),
+        expected=_VNextInputShape(
+            top_level_keys=_VNEXT_TOP_LEVEL_KEYS,
+            previous_count=1,
+            trace_count=1,
+            evidence_count=0,
+            answer_count=0,
+            current_anchor_label="C1",
+        ),
+    )
     assert first_pack.previous_compacted_view == ()
+    _assert_material_pack_shape(
+        first_pack,
+        expected=_MaterialPackShape(
+            previous_labels=(),
+            trace_labels=("T1",),
+            evidence_labels=(),
+            answer_labels=(),
+            current_anchor_label="C1",
+            citable_source_labels=("T1",),
+        ),
+    )
 
 
 def _history_block(
