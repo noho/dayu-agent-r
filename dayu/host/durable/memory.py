@@ -9,12 +9,15 @@ Attempt / wait / dispatch 等治理真源。
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.durable._validation import (
+    require_int as _require_int,
     optional_text as _optional_text,
     require_non_empty_text as _require_non_empty_text,
     require_optional_non_empty_text as _require_optional_non_empty_text,
@@ -91,6 +94,120 @@ _EVENT_TYPE_FILTER = (
     _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     CONTEXT_COMPACTED,
 )
+
+
+class MemorySnapshotIntegrityFailureKind(StrEnum):
+    """Memory snapshot durable row 损坏分类。
+
+    这些分类只服务 operator-facing integrity report，不改变 snapshot 读路径的
+    fail-closed 行为，也不触发 rebuild / overwrite。
+    """
+
+    INVALID_JSON = "invalid_json"
+    SCHEMA_MISMATCH = "schema_mismatch"
+    DIGEST_MISMATCH = "digest_mismatch"
+    UNSUPPORTED_ITEM_KIND = "unsupported_item_kind"
+    STORAGE_READ_FAILED = "storage_read_failed"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MemorySnapshotIntegrityIssue:
+    """Memory snapshot integrity 只读诊断。
+
+    :param failure_kind: 损坏分类。
+    :param message: operator 可读的短错误摘要。
+    :param snapshot_id: 可选 snapshot id；扫描级错误可能没有具体 row。
+    :param session_id: 可选 session id。
+    :param consumer_id: 可选 projection consumer id。
+    :param policy_digest: 可选 memory policy digest。
+    :param checkpoint_event_sequence: 可选 snapshot cursor sequence。
+    :raises TypeError: ``failure_kind`` 类型不正确时抛出。
+    :raises ValueError: 文本字段为空或 cursor 为负时抛出。
+    """
+
+    failure_kind: MemorySnapshotIntegrityFailureKind
+    message: str
+    snapshot_id: str | None
+    session_id: str | None
+    consumer_id: str | None
+    policy_digest: str | None
+    checkpoint_event_sequence: int | None
+
+    def __post_init__(self) -> None:
+        """校验诊断字段。
+
+        :returns: ``None``。
+        :raises TypeError: ``failure_kind`` 类型不正确时抛出。
+        :raises ValueError: 文本字段为空或 cursor 为负时抛出。
+        """
+
+        if not isinstance(self.failure_kind, MemorySnapshotIntegrityFailureKind):
+            raise TypeError(
+                "MemorySnapshotIntegrityIssue.failure_kind must be "
+                "MemorySnapshotIntegrityFailureKind"
+            )
+        _require_non_empty_text(
+            self.message,
+            field_name="MemorySnapshotIntegrityIssue.message",
+        )
+        _require_optional_non_empty_text(
+            self.snapshot_id,
+            field_name="MemorySnapshotIntegrityIssue.snapshot_id",
+        )
+        _require_optional_non_empty_text(
+            self.session_id,
+            field_name="MemorySnapshotIntegrityIssue.session_id",
+        )
+        _require_optional_non_empty_text(
+            self.consumer_id,
+            field_name="MemorySnapshotIntegrityIssue.consumer_id",
+        )
+        _require_optional_non_empty_text(
+            self.policy_digest,
+            field_name="MemorySnapshotIntegrityIssue.policy_digest",
+        )
+        if (
+            self.checkpoint_event_sequence is not None
+            and self.checkpoint_event_sequence < _ZERO_CURSOR_SEQUENCE
+        ):
+            raise ValueError(
+                "MemorySnapshotIntegrityIssue.checkpoint_event_sequence "
+                "must be non-negative"
+            )
+
+    def json_value(self) -> JsonValue:
+        """返回 operator-facing 自解释 JSON object。
+
+        :returns: 包含损坏分类、row identity 和短错误摘要的 JSON object。
+        """
+
+        return {
+            "failure_kind": self.failure_kind.value,
+            "message": self.message,
+            "snapshot_id": self.snapshot_id,
+            "session_id": self.session_id,
+            "consumer_id": self.consumer_id,
+            "policy_digest": self.policy_digest,
+            "checkpoint_event_sequence": self.checkpoint_event_sequence,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _MemorySnapshotIntegrityRowIdentity:
+    """Memory snapshot integrity 扫描中的 row identity。
+
+    :param snapshot_id: snapshot id。
+    :param session_id: session id。
+    :param consumer_id: projection consumer id。
+    :param policy_digest: memory policy digest。
+    :param checkpoint_event_sequence: snapshot cursor sequence。
+    """
+
+    snapshot_id: str
+    session_id: str
+    consumer_id: str
+    policy_digest: str
+    checkpoint_event_sequence: int
 
 
 class ConversationMemoryProjectionConsumer:
@@ -378,6 +495,36 @@ def read_latest_memory_snapshot_at_or_before(
     if row is None:
         return None
     return _snapshot_row_from_host_row(transaction, row)
+
+
+def inspect_memory_snapshot_integrity(
+    transaction: HostTransaction,
+) -> tuple[MemorySnapshotIntegrityIssue, ...]:
+    """扫描 memory snapshot durable rows 并返回损坏分类。
+
+    本函数是 operator-facing maintenance report 使用的只读 classifier。它不
+    修改 SQLite row，不触发 rebuild / overwrite，也不改变现有
+    ``read_memory_snapshot`` fail-closed 语义。手工 SQL 修改导致的损坏会被
+    JSON、schema、digest、item kind 或 storage read 分类捕获。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :returns: 按 snapshot id 排序的 integrity issue tuple；无损坏时为空。
+    """
+
+    try:
+        rows = _memory_snapshot_integrity_rows(transaction)
+    except sqlite3.Error as exc:
+        return (
+            _memory_snapshot_integrity_issue(
+                failure_kind=MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED,
+                message=f"memory snapshot integrity scan failed: {exc}",
+                identity=None,
+            ),
+        )
+    issues: list[MemorySnapshotIntegrityIssue] = []
+    for row in rows:
+        issues.extend(_memory_snapshot_integrity_issues_for_row(transaction, row))
+    return tuple(issues)
 
 
 def write_memory_snapshot(
@@ -1020,6 +1167,252 @@ def _snapshot_row_from_host_row(
     _validate_snapshot_digest(snapshot)
     _validate_snapshot_item_kinds(transaction, snapshot.snapshot_id)
     return MemorySnapshotRow(snapshot=snapshot, updated_at=updated_at)
+
+
+def _memory_snapshot_integrity_rows(
+    transaction: HostTransaction,
+) -> tuple[HostRow, ...]:
+    """读取 memory snapshot integrity scan 需要的 row。
+
+    :param transaction: Host durable transaction。
+    :returns: snapshot row 元组。
+    :raises sqlite3.Error: SQLite 查询失败时抛出。
+    """
+
+    return transaction.fetchall(
+        f"""
+        SELECT
+          snapshot_id,
+          session_id,
+          consumer_id,
+          checkpoint_event_sequence,
+          policy_digest,
+          snapshot_digest,
+          snapshot_json
+        FROM {TABLE_HOST_MEMORY_SNAPSHOTS}
+        ORDER BY snapshot_id
+        """
+    )
+
+
+def _memory_snapshot_integrity_issues_for_row(
+    transaction: HostTransaction,
+    row: HostRow,
+) -> tuple[MemorySnapshotIntegrityIssue, ...]:
+    """返回单个 snapshot row 的 integrity issues。
+
+    :param transaction: Host durable transaction。
+    :param row: snapshot durable row。
+    :returns: 当前 row 的 issue tuple。
+    """
+
+    try:
+        identity = _memory_snapshot_integrity_row_identity(row)
+        snapshot_json = _require_text(
+            row.get("snapshot_json"),
+            field_name="snapshot_json",
+        )
+        row_snapshot_digest = _require_text(
+            row.get("snapshot_digest"),
+            field_name="snapshot_digest",
+        )
+    except (HostDurableError, KeyError) as exc:
+        return (
+            _memory_snapshot_integrity_issue(
+                failure_kind=MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED,
+                message=f"memory snapshot row identity read failed: {exc}",
+                identity=None,
+            ),
+        )
+    snapshot_issue = _memory_snapshot_json_integrity_issue(
+        snapshot_json,
+        row_snapshot_digest=row_snapshot_digest,
+        identity=identity,
+    )
+    if snapshot_issue is not None:
+        return (snapshot_issue,)
+    return _memory_snapshot_item_kind_integrity_issues(transaction, identity)
+
+
+def _memory_snapshot_integrity_row_identity(
+    row: HostRow,
+) -> _MemorySnapshotIntegrityRowIdentity:
+    """从 snapshot scan row 读取 identity 字段。
+
+    :param row: snapshot durable row。
+    :returns: row identity。
+    :raises HostDurableError: 字段类型不符合预期时抛出。
+    :raises KeyError: 缺少字段时抛出。
+    """
+
+    return _MemorySnapshotIntegrityRowIdentity(
+        snapshot_id=_require_text(row.get("snapshot_id"), field_name="snapshot_id"),
+        session_id=_require_text(row.get("session_id"), field_name="session_id"),
+        consumer_id=_require_text(row.get("consumer_id"), field_name="consumer_id"),
+        policy_digest=_require_text(
+            row.get("policy_digest"),
+            field_name="policy_digest",
+        ),
+        checkpoint_event_sequence=_require_int(
+            row.get("checkpoint_event_sequence"),
+            field_name="checkpoint_event_sequence",
+        ),
+    )
+
+
+def _memory_snapshot_json_integrity_issue(
+    snapshot_json: str,
+    *,
+    row_snapshot_digest: str,
+    identity: _MemorySnapshotIntegrityRowIdentity,
+) -> MemorySnapshotIntegrityIssue | None:
+    """检查 snapshot JSON、typed shape 与 digest。
+
+    :param snapshot_json: durable row 中的 snapshot JSON 文本。
+    :param row_snapshot_digest: durable row 中的 snapshot digest 列值。
+    :param identity: snapshot row identity。
+    :returns: 发现损坏时返回 issue，否则返回 ``None``。
+    """
+
+    try:
+        json_value = cast(JsonValue, json.loads(snapshot_json))
+    except json.JSONDecodeError as exc:
+        return _memory_snapshot_integrity_issue(
+            failure_kind=MemorySnapshotIntegrityFailureKind.INVALID_JSON,
+            message=f"memory snapshot JSON is invalid: {exc.msg}",
+            identity=identity,
+        )
+    try:
+        snapshot = conversation_memory_snapshot_from_json_value(json_value)
+    except (TypeError, ValueError) as exc:
+        return _memory_snapshot_integrity_issue(
+            failure_kind=MemorySnapshotIntegrityFailureKind.SCHEMA_MISMATCH,
+            message=f"memory snapshot JSON schema mismatch: {exc}",
+            identity=identity,
+        )
+    expected_digest = calculate_memory_snapshot_digest(snapshot)
+    if snapshot.snapshot_digest != expected_digest:
+        return _memory_snapshot_integrity_issue(
+            failure_kind=MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH,
+            message="memory snapshot digest does not match canonical content",
+            identity=identity,
+        )
+    if row_snapshot_digest != snapshot.snapshot_digest:
+        return _memory_snapshot_integrity_issue(
+            failure_kind=MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH,
+            message="memory snapshot row digest does not match snapshot content",
+            identity=identity,
+        )
+    return None
+
+
+def _memory_snapshot_item_kind_integrity_issues(
+    transaction: HostTransaction,
+    identity: _MemorySnapshotIntegrityRowIdentity,
+) -> tuple[MemorySnapshotIntegrityIssue, ...]:
+    """检查 snapshot 关联 item rows 的 kind 是否仍受支持。
+
+    :param transaction: Host durable transaction。
+    :param identity: snapshot row identity。
+    :returns: item kind issue tuple。
+    """
+
+    try:
+        rows = transaction.fetchall(
+            f"""
+            SELECT item_kind
+            FROM {TABLE_HOST_MEMORY_ITEMS}
+            WHERE snapshot_id = ?
+            ORDER BY item_kind
+            """,
+            (identity.snapshot_id,),
+        )
+    except sqlite3.Error as exc:
+        return (
+            _memory_snapshot_integrity_issue(
+                failure_kind=MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED,
+                message=f"memory snapshot item kind scan failed: {exc}",
+                identity=identity,
+            ),
+        )
+    allowed_kinds = (
+        _ITEM_KIND_EVIDENCE_BACKED_FACT,
+        _ITEM_KIND_SELECTED_RECENT_WINDOW,
+        _ITEM_KIND_REFERENCE_CONTINUITY,
+        _ITEM_KIND_ANSWER_ANCHOR,
+        _ITEM_KIND_FORWARD_INTENT,
+        _ITEM_KIND_SESSION_SUMMARY,
+    )
+    issues: list[MemorySnapshotIntegrityIssue] = []
+    for row in rows:
+        try:
+            item_kind = _require_text(row.get("item_kind"), field_name="item_kind")
+        except (HostDurableError, KeyError) as exc:
+            issues.append(
+                _memory_snapshot_integrity_issue(
+                    failure_kind=MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED,
+                    message=f"memory snapshot item kind read failed: {exc}",
+                    identity=identity,
+                )
+            )
+            continue
+        if item_kind == _ITEM_KIND_OLD_VERIFIED_FACT:
+            issues.append(
+                _memory_snapshot_integrity_issue(
+                    failure_kind=(
+                        MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
+                    ),
+                    message="old durable memory item kind verified_fact is not supported",
+                    identity=identity,
+                )
+            )
+            continue
+        if item_kind not in allowed_kinds:
+            issues.append(
+                _memory_snapshot_integrity_issue(
+                    failure_kind=(
+                        MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
+                    ),
+                    message=f"unsupported durable memory item kind: {item_kind}",
+                    identity=identity,
+                )
+            )
+    return tuple(issues)
+
+
+def _memory_snapshot_integrity_issue(
+    *,
+    failure_kind: MemorySnapshotIntegrityFailureKind,
+    message: str,
+    identity: _MemorySnapshotIntegrityRowIdentity | None,
+) -> MemorySnapshotIntegrityIssue:
+    """构造 memory snapshot integrity issue。
+
+    :param failure_kind: 损坏分类。
+    :param message: operator 可读短错误摘要。
+    :param identity: snapshot row identity；扫描级错误为 ``None``。
+    :returns: integrity issue。
+    """
+
+    if identity is None:
+        return MemorySnapshotIntegrityIssue(
+            failure_kind=failure_kind,
+            message=message,
+            snapshot_id=None,
+            session_id=None,
+            consumer_id=None,
+            policy_digest=None,
+            checkpoint_event_sequence=None,
+        )
+    return MemorySnapshotIntegrityIssue(
+        failure_kind=failure_kind,
+        message=message,
+        snapshot_id=identity.snapshot_id,
+        session_id=identity.session_id,
+        consumer_id=identity.consumer_id,
+        policy_digest=identity.policy_digest,
+        checkpoint_event_sequence=identity.checkpoint_event_sequence,
+    )
 
 
 def _validate_snapshot_item_kinds(
