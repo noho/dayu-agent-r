@@ -33,7 +33,7 @@ The policy to freeze is:
 | `RUN_CANCELLED` | no assistant final answer; cancellation reason is terminal status display only | cancellation reason as answer |
 | `RUN_LOST` | no assistant final answer; lifecycle diagnostic is terminal status display only | lifecycle reason as answer |
 | Compaction material / run input continuity | uses strict assistant final-answer continuity resolver; may fall back from `RUN_SUCCEEDED` descriptor to digest-checked terminal summary artifact `content` | must not use bare `content`, `summary_text`, nested `summary`, failed/cancelled/lost diagnostic text |
-| Conversation Memory selected recent window | uses inline `RUN_SUCCEEDED.final_answer` only, leniently; does not follow terminal summary artifact descriptor indirection | must not create evidence-backed facts from terminal summary or assistant final answer |
+| Conversation Memory selected recent window | consumer accepts inline `RUN_SUCCEEDED.final_answer` only and remains lenient; durable projection / run-input adapters may first hydrate a digest-checked terminal summary artifact `content` into transient `final_answer` | must not create evidence-backed facts from terminal summary or assistant final answer |
 
 Text handling:
 
@@ -48,7 +48,7 @@ Allowed files:
 
 - `tests/host/test_terminal_summary_payload.py`
 - `tests/host/test_public_host_event.py`, only if non-success terminal public-event coverage needs a small assertion update
-- `tests/host/test_read_api_terminal_policy.py`, or the nearest existing read API projection test file, for focused EventLog row -> HostEvent projection assertions
+- `tests/host/test_read_api_terminal_policy.py`
 - `tests/host/test_engine_ingest_mapping.py`, only for a focused `empty_final_answer` terminal summary shape assertion
 - `tests/host/test_memory_projection.py`, only if evidence-backed fact separation needs a focused assertion
 - `docs/reviews/wu-cm-06-s1-implementation-report.md`
@@ -61,7 +61,9 @@ Exact changes:
 - Add tests that overlong `final_answer` and overlong artifact `content` are preserved by the source-selection helper; document in the test name/docstring that caller-side truncation is out of scope.
 - Add direct read API projection tests for `RUN_FAILED`, `RUN_CANCELLED`, and `RUN_LOST` EventLog rows proving their projected `HostEvent.final_answer` is `None`. Dataclass construction tests do not satisfy this requirement because they do not exercise `_host_event_from_row(...)` / read API projection logic.
 - Add or strengthen an `empty_final_answer` ingest test proving Host governance converts empty Engine `final_answer` to `RUN_FAILED` and the terminal summary payload does not contain displayable final-answer `content`.
-- Add a focused memory projection assertion proving assistant terminal text enters only `selected_recent_window` with `MemoryIncludedReason.SELECTED_RECENT_WINDOW`, not evidence-backed fact memory; also prove descriptor-only `RUN_SUCCEEDED` does not materialize an assistant item in memory projection.
+- Add focused memory projection assertions proving assistant terminal text enters only `selected_recent_window` with `MemoryIncludedReason.SELECTED_RECENT_WINDOW`, not evidence-backed fact memory.
+- Add a direct consumer test proving `build_conversation_memory_snapshot_from_events(...)` does not follow terminal summary descriptors by itself; descriptor hydration belongs to durable projection / run-input adapters.
+- Strengthen the existing durable projection test proving descriptor-backed terminal summary artifact `content` is hydrated into transient `final_answer` before memory consumer and still remains selected-recent-window continuity, not evidence-backed fact memory.
 
 Validation:
 
@@ -81,7 +83,7 @@ Exact changes:
 
 - Tighten module and function docstrings to name the policy explicitly as assistant final-answer continuity text source selection.
 - Clarify that terminal summary artifact `content` is a fallback source only for `RUN_SUCCEEDED` continuity, not a general terminal summary or fact source.
-- Clarify consumer differences: compaction material / run input use the strict continuity resolver with artifact fallback; memory selected recent window uses the inline run-payload reader only and remains lenient.
+- Clarify consumer differences: compaction material uses the strict continuity resolver with artifact fallback; memory selected recent window consumes inline `final_answer` leniently; durable projection / run-input adapters may hydrate descriptor-backed terminal artifact `content` into transient `final_answer` before memory consumption.
 - Clarify that overlong handling is not performed in these helpers.
 - Do not rename public imports, introduce compatibility re-exports, or change helper return values unless Slice 1 exposes a real behavior defect.
 
