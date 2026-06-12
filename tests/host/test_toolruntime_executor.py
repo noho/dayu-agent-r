@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from collections.abc import Mapping
 from datetime import datetime
 
 import pytest
@@ -19,11 +21,12 @@ from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
     ToolAwaitingOutcome,
+    ToolCancelledOutcome,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
 )
-from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
@@ -188,6 +191,36 @@ class _CountingCallable:
         return ToolCompletedOutcome(
             result=ToolResultSuccess(ok=True, value=self._value, meta=None)
         )
+
+
+class _OutcomeCallable:
+    """返回指定工具 outcome 并记录调用次数的 fake 工具。"""
+
+    def __init__(self, outcome: ToolExecutionOutcome) -> None:
+        """初始化 fake callable。
+
+        :param outcome: 预设工具 outcome。
+        :returns: ``None``。
+        """
+
+        self._outcome = outcome
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """返回预设 outcome。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 预设工具 outcome。
+        """
+
+        del call, context
+        self.call_count += 1
+        return self._outcome
 
 
 class _BlockingCallable:
@@ -501,6 +534,112 @@ async def test_oversized_tool_result_returns_completed_outcome_without_default_g
     }
     assert isinstance(record.outcome, ToolCompletedOutcome)
     assert record.outcome.result.value == oversized_value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("repair_hint", "expected_truncated"),
+    (
+        (None, False),
+        ("r" * 512, False),
+        ("r" * 513, True),
+    ),
+)
+async def test_tool_runtime_produces_tool_failed_failure_metadata(
+    repair_hint: str | None, expected_truncated: bool
+) -> None:
+    """failed outcome 生产 tool_failed failure_metadata 且 repair_hint 有界。"""
+
+    outcome = ToolFailedOutcome(
+        result=ToolResultFailure(
+            ok=False,
+            error="lookup_failed",
+            message="tool failed body must not become analyzer fact",
+            hint=repair_hint,
+            meta=None,
+        )
+    )
+    callable_ = _OutcomeCallable(outcome)
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(callable_, accept_port)
+
+    result = await executor.execute(_request(_call("tool-call-1")))
+
+    assert result.records[0].outcome == outcome
+    metadata = _required_failure_metadata(accept_port.candidates[0])
+    assert metadata["failure_kind"] == "tool_failed"
+    assert metadata["error_code"] == "lookup_failed"
+    assert "message" not in metadata
+    _assert_bounded_text(metadata, "repair_hint", repair_hint, expected_truncated)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cancel_message", "cancel_hint", "message_truncated", "hint_truncated"),
+    (
+        ("m" * 512, None, False, False),
+        ("m" * 513, "h" * 512, True, False),
+        ("short message", "h" * 513, False, True),
+    ),
+)
+async def test_tool_runtime_produces_tool_cancelled_failure_metadata(
+    cancel_message: str,
+    cancel_hint: str | None,
+    message_truncated: bool,
+    hint_truncated: bool,
+) -> None:
+    """cancelled outcome 生产 tool_cancelled，且不会混入 tool_failed。"""
+
+    outcome = ToolCancelledOutcome(
+        reason="host_cancelled",
+        message=cancel_message,
+        hint=cancel_hint,
+        meta=None,
+    )
+    callable_ = _OutcomeCallable(outcome)
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(callable_, accept_port)
+
+    result = await executor.execute(_request(_call("tool-call-1")))
+
+    assert result.records[0].outcome == outcome
+    metadata = _required_failure_metadata(accept_port.candidates[0])
+    assert metadata["failure_kind"] == "tool_cancelled"
+    assert metadata["failure_kind"] != "tool_failed"
+    assert metadata["cancel_reason"] == "host_cancelled"
+    _assert_bounded_text(
+        metadata, "cancel_message", cancel_message, message_truncated
+    )
+    _assert_bounded_text(metadata, "cancel_hint", cancel_hint, hint_truncated)
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_produces_policy_blocked_failure_metadata() -> None:
+    """治理拒绝生产 policy_blocked，原因只来自 reason_code。"""
+
+    callable_ = _CountingCallable({"secret": "side-effect"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    policy_view = ToolRuntimePolicyView(
+        rules_by_tool_name={
+            "fake_tool": ToolRuntimeToolPolicy(
+                side_effect_kind=ToolSideEffectKind.SIDE_EFFECT,
+                idempotency_key_argument_name="tool_idempotency_key",
+            )
+        }
+    )
+    executor = _executor(callable_, accept_port, policy_view=policy_view)
+
+    await executor.execute(_request(_call("tool-call-1")))
+
+    metadata = _required_failure_metadata(accept_port.candidates[0])
+    assert metadata == {
+        "schema_version": 1,
+        "signal_source": "TOOL_RESULT_ACCEPTED",
+        "failure_kind": "policy_blocked",
+        "policy_decision_kind": "governed_error",
+        "policy_block_reason": "tool_idempotency_key_required",
+        "diagnostic_refs": [],
+    }
 
 
 def test_fetch_more_returns_oversized_continuation_without_default_inline_limit() -> None:
@@ -1103,7 +1242,9 @@ async def test_batch_mixed_accept_outcomes_keep_accepted_visible() -> None:
 
 
 def _executor(
-    callable_: _CountingCallable | _AwaitingCallable | _BlockingCallable,
+    callable_: (
+        _CountingCallable | _OutcomeCallable | _AwaitingCallable | _BlockingCallable
+    ),
     accept_port: HostToolFactAcceptPort,
     *,
     awaiting_accept_port: HostToolAwaitingAcceptPort | None = None,
@@ -1206,7 +1347,10 @@ def _call(tool_call_id: str, *, ticker: str = "DAYU") -> ToolCallRequest:
 
 
 def _definition(
-    name: str, callable_: _CountingCallable | _AwaitingCallable | _BlockingCallable
+    name: str,
+    callable_: (
+        _CountingCallable | _OutcomeCallable | _AwaitingCallable | _BlockingCallable
+    ),
 ) -> ToolDefinition:
     """构造工具声明。
 
@@ -1338,6 +1482,14 @@ def _accepted_ack_for_call(tool_call_id: str) -> ToolFactAcceptedAck:
                     "meta": None,
                 },
             },
+            tool_timing={
+                "schema_version": 1,
+                "status": "missing_tool_result_meta",
+                "started_at": None,
+                "finished_at": None,
+                "duration_ms": None,
+                "duration_source": None,
+            },
         ),
         governance=ToolAcceptGovernance(
             policy_decision=ToolPolicyDecision(
@@ -1407,3 +1559,53 @@ def _required_result(candidate: ToolFactAcceptCandidate) -> ToolAcceptResult:
 
     assert candidate.result is not None
     return candidate.result
+
+
+def _required_failure_metadata(
+    candidate: ToolFactAcceptCandidate,
+) -> Mapping[str, JsonValue]:
+    """读取必须存在的 failure metadata。
+
+    :param candidate: 工具事实候选。
+    :returns: failure metadata JSON object。
+    :raises AssertionError: candidate 未携带 result 或 failure metadata 时抛出。
+    """
+
+    metadata = _required_result(candidate).failure_metadata
+    assert metadata is not None
+    return metadata
+
+
+def _assert_bounded_text(
+    metadata: Mapping[str, JsonValue],
+    field_name: str,
+    original: str | None,
+    expected_truncated: bool,
+) -> None:
+    """断言 bounded text 字段值、截断标志和 full original digest。
+
+    :param metadata: failure metadata JSON object。
+    :param field_name: bounded text 字段名前缀。
+    :param original: 原始文本。
+    :param expected_truncated: 预期截断标志。
+    :returns: ``None``。
+    """
+
+    if original is None:
+        assert metadata[field_name] is None
+        assert metadata[f"{field_name}_sha256"] is None
+        assert metadata[f"{field_name}_truncated"] is False
+        return
+    assert metadata[field_name] == original[:512]
+    assert metadata[f"{field_name}_sha256"] == _text_sha256(original)
+    assert metadata[f"{field_name}_truncated"] is expected_truncated
+
+
+def _text_sha256(value: str) -> str:
+    """计算文本 UTF-8 sha256 digest。
+
+    :param value: 原始文本。
+    :returns: ``sha256:`` 前缀 digest。
+    """
+
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"

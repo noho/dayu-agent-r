@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,6 +37,16 @@ from dayu.host.tool_trace import (
 )
 
 _FIXED_NOW = datetime(2026, 5, 29, 3, 4, 5, tzinfo=UTC)
+_FIELD_CONTEXT_PRESSURE = "context_pressure"
+_FIELD_TOOL_TIMING = "tool_timing"
+_FIELD_FAILURE_METADATA = "failure_metadata"
+_FIELD_PARTIAL_TOOL_CALL_SIGNAL = "partial_tool_call_signal"
+_ALL_SIGNAL_FIELDS: tuple[str, ...] = (
+    _FIELD_CONTEXT_PRESSURE,
+    _FIELD_TOOL_TIMING,
+    _FIELD_FAILURE_METADATA,
+    _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
+)
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -116,11 +127,86 @@ def _catch_up(
     )
 
 
+def _query_signal_objects() -> Mapping[str, JsonValue]:
+    """构造 query helper 闭环测试使用的四类 signal object。
+
+    :returns: 以 signal 字段名索引的 JSON object。
+    """
+
+    return {
+        _FIELD_CONTEXT_PRESSURE: {
+            "schema_version": 1,
+            "signal_source": "USAGE_REPORTED",
+            "status": "observed",
+            "input_budget_tokens": 100,
+            "soft_threshold_tokens": 45,
+            "hard_threshold_tokens": 80,
+            "budget_decision": "allow_dispatch",
+        },
+        _FIELD_TOOL_TIMING: {
+            "schema_version": 1,
+            "status": "available",
+            "started_at": "2026-06-11T00:00:00+00:00",
+            "finished_at": "2026-06-11T00:00:01.250000+00:00",
+            "duration_ms": 1250,
+            "duration_source": "tool_result_meta",
+        },
+        _FIELD_FAILURE_METADATA: {
+            "schema_version": 1,
+            "signal_source": "TOOL_RESULT_ACCEPTED",
+            "failure_kind": "tool_failed",
+            "error_code": "lookup_failed",
+            "repair_hint": None,
+            "repair_hint_truncated": False,
+            "repair_hint_sha256": None,
+            "diagnostic_refs": ["diag-signal"],
+        },
+        _FIELD_PARTIAL_TOOL_CALL_SIGNAL: {
+            "schema_version": 1,
+            "signal_source": "PROVIDER_PROTOCOL_ERROR",
+            "partial_tool_call_count": 1,
+            "summary_status": "present",
+            "raw_payload_present": False,
+            "partial_tool_calls": [
+                {
+                    "tool_call_index": 0,
+                    "tool_call_id": "call-bounded",
+                    "name_fragment": "lookup_filing",
+                    "arguments_byte_size": 42,
+                    "arguments_sha256": (
+                        "0123456789abcdef0123456789abcdef"
+                        "0123456789abcdef0123456789abcdef"
+                    ),
+                    "arguments_present": True,
+                }
+            ],
+        },
+    }
+
+
+def _assert_trace_summary_signals(
+    trace_summary: Mapping[str, JsonValue],
+    expected: Mapping[str, JsonValue],
+    fields: tuple[str, ...],
+) -> None:
+    """断言 query helper 返回的 trace_summary 保留指定 signal。
+
+    :param trace_summary: query helper 返回的 hot trace summary。
+    :param expected: 期望 signal object 索引。
+    :param fields: 需要验证的 signal 字段名。
+    :returns: ``None``。
+    """
+
+    for field_name in fields:
+        assert trace_summary[field_name] == expected[field_name]
+
+
 def test_query_helpers_return_rows_ordered_by_event_sequence(
     tmp_path: Path,
 ) -> None:
     """run/tool_call/provider/diagnostic 查询按 event_sequence ASC 分页。"""
 
+    signal_objects = _query_signal_objects()
     with open_host_durable_store(_options(tmp_path)) as store:
         _append_event(
             store.transaction_runner,
@@ -141,6 +227,9 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
                 "tool_name": "lookup_filing",
                 "outcome_digest": "sha256:outcome",
                 "diagnostic_refs": [{"ref_id": "diag-shared"}],
+                _FIELD_CONTEXT_PRESSURE: signal_objects[_FIELD_CONTEXT_PRESSURE],
+                _FIELD_TOOL_TIMING: signal_objects[_FIELD_TOOL_TIMING],
+                _FIELD_FAILURE_METADATA: signal_objects[_FIELD_FAILURE_METADATA],
             },
         )
         _append_event(
@@ -153,6 +242,9 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
                 "engine_event_ref": "event-engine-terminal",
                 "terminal_summary_ref": "summary-ref",
                 "terminal_summary_digest": "sha256:summary",
+                _FIELD_PARTIAL_TOOL_CALL_SIGNAL: (
+                    signal_objects[_FIELD_PARTIAL_TOOL_CALL_SIGNAL]
+                ),
             },
         )
         _catch_up(store.transaction_runner, tmp_path)
@@ -201,6 +293,44 @@ def test_query_helpers_return_rows_ordered_by_event_sequence(
             == "client-terminal"
         )
         assert [row.event_id for row in by_diagnostic.rows] == ["event-2"]
+        _assert_trace_summary_signals(
+            by_run.rows[1].trace_summary,
+            signal_objects,
+            (
+                _FIELD_CONTEXT_PRESSURE,
+                _FIELD_TOOL_TIMING,
+                _FIELD_FAILURE_METADATA,
+            ),
+        )
+        _assert_trace_summary_signals(
+            by_tool_call.rows[1].trace_summary,
+            signal_objects,
+            (
+                _FIELD_CONTEXT_PRESSURE,
+                _FIELD_TOOL_TIMING,
+                _FIELD_FAILURE_METADATA,
+            ),
+        )
+        _assert_trace_summary_signals(
+            by_diagnostic.rows[0].trace_summary,
+            signal_objects,
+            (
+                _FIELD_CONTEXT_PRESSURE,
+                _FIELD_TOOL_TIMING,
+                _FIELD_FAILURE_METADATA,
+            ),
+        )
+        _assert_trace_summary_signals(
+            by_run_next.rows[0].trace_summary,
+            signal_objects,
+            (_FIELD_PARTIAL_TOOL_CALL_SIGNAL,),
+        )
+        _assert_trace_summary_signals(
+            by_provider.rows[0].trace_summary,
+            signal_objects,
+            (_FIELD_PARTIAL_TOOL_CALL_SIGNAL,),
+        )
+        assert set(_ALL_SIGNAL_FIELDS) == set(signal_objects)
 
 
 def test_provider_request_id_terminal_diagnostic_query(
@@ -208,6 +338,26 @@ def test_provider_request_id_terminal_diagnostic_query(
 ) -> None:
     """provider_request_id 可查询 terminal diagnostic chain。"""
 
+    partial_tool_call_signal: JsonValue = {
+        "schema_version": 1,
+        "signal_source": "PROVIDER_PROTOCOL_ERROR",
+        "partial_tool_call_count": 1,
+        "summary_status": "present",
+        "raw_payload_present": True,
+        "partial_tool_calls": [
+            {
+                "tool_call_index": 0,
+                "tool_call_id": "call-bounded",
+                "name_fragment": "lookup_filing",
+                "arguments_byte_size": 42,
+                "arguments_sha256": (
+                    "0123456789abcdef0123456789abcdef"
+                    "0123456789abcdef0123456789abcdef"
+                ),
+                "arguments_present": True,
+            }
+        ],
+    }
     with open_host_durable_store(_options(tmp_path)) as store:
         _append_event(
             store.transaction_runner,
@@ -234,6 +384,7 @@ def test_provider_request_id_terminal_diagnostic_query(
                 "raw_payload_ref": "raw-ref",
                 "raw_payload_digest": "sha256:raw",
                 "error_code": "invalid_stream",
+                "partial_tool_call_signal": partial_tool_call_signal,
             },
         )
         _catch_up(store.transaction_runner, tmp_path)
@@ -259,6 +410,10 @@ def test_provider_request_id_terminal_diagnostic_query(
         assert (
             page.rows[1].trace_summary["client_correlation_id"]
             == "client-protocol"
+        )
+        assert (
+            page.rows[1].trace_summary["partial_tool_call_signal"]
+            == partial_tool_call_signal
         )
         assert page.rows[1].diagnostic_ref == "raw-ref"
 

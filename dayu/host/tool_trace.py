@@ -18,6 +18,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     format_utc_timestamp,
+    is_sha256_digest,
     sha256_digest_json,
 )
 from dayu.host.durable.errors import HostDurableError
@@ -41,6 +42,29 @@ from dayu.host.projection import (
     ProjectionEventFilter,
     ProjectionEventView,
     ProjectionRunner,
+)
+from dayu.host.tool_trace_signals import (
+    CONTEXT_PRESSURE_SCHEMA_VERSION as _CONTEXT_PRESSURE_SCHEMA_VERSION,
+    FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED
+    as _FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    FAILURE_KIND_CONTEXT_COMPACTION_FAILED
+    as _FAILURE_KIND_CONTEXT_COMPACTION_FAILED,
+    FAILURE_KIND_POLICY_BLOCKED as _FAILURE_KIND_POLICY_BLOCKED,
+    FAILURE_KIND_PROVIDER_PROTOCOL_ERROR as _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
+    FAILURE_KIND_TOOL_CANCELLED as _FAILURE_KIND_TOOL_CANCELLED,
+    FAILURE_KIND_TOOL_FAILED as _FAILURE_KIND_TOOL_FAILED,
+    FAILURE_METADATA_ALLOWED_KINDS as _FAILURE_METADATA_ALLOWED_KINDS,
+    FAILURE_METADATA_SCHEMA_VERSION as _FAILURE_METADATA_SCHEMA_VERSION,
+    PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION
+    as _PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION,
+    PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE,
+    PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT
+    as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT,
+    TOOL_TIMING_DURATION_SOURCE_META as _TOOL_TIMING_DURATION_SOURCE_META,
+    TOOL_TIMING_SCHEMA_VERSION as _TOOL_TIMING_SCHEMA_VERSION,
+    TOOL_TIMING_STATUS_AVAILABLE as _TOOL_TIMING_STATUS_AVAILABLE,
+    TOOL_TIMING_STATUS_MISSING_META as _TOOL_TIMING_STATUS_MISSING_META,
+    TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS as _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS,
 )
 from dayu.runtime.filelock import file_lock
 
@@ -95,7 +119,24 @@ _FIELD_ENGINE_EVENT_REF = "engine_event_ref"
 _FIELD_PROVIDER_ERROR_REF = "provider_error_ref"
 _FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
+_FIELD_CONTEXT_PRESSURE = "context_pressure"
+_FIELD_TOOL_TIMING = "tool_timing"
+_FIELD_FAILURE_METADATA = "failure_metadata"
+_FIELD_PARTIAL_TOOL_CALL_SIGNAL = "partial_tool_call_signal"
 _FIELD_OPERATION_CONTEXT = "operation_context"
+_FIELD_OPERATION_ID = "operation_id"
+_FIELD_TRIGGER_SOURCE = "trigger_source"
+_FIELD_BUDGET_REASON = "budget_reason"
+_FIELD_POLICY_REF = "policy_ref"
+_FIELD_ESTIMATOR_DIGEST = "estimator_digest"
+_FIELD_BUDGET_AFTER_COMPACT = "budget_after_compact"
+_FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT = "budget_after_attempted_compact"
+_FIELD_FALLBACK_ACTION = "fallback_action"
+_FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
+_FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED = "retry_repair_budget_exhausted"
+_FIELD_NEXT_POLICY_DECISION = "next_policy_decision"
+_FIELD_FAILURE_CATEGORY = "failure_category"
+_FIELD_REPAIRABLE = "repairable"
 _FIELD_COLD_TRACE_REF = "cold_trace_ref"
 _FIELD_COLD_TRACE_DIGEST = "cold_trace_digest"
 _FIELD_LINE_DIGEST = "line_digest"
@@ -137,6 +178,12 @@ _FIELD_PROJECTOR_ID = "projector_id"
 _FIELD_PROJECTOR_SCHEMA_VERSION = "projector_schema_version"
 _FIELD_PROJECTOR_DIGEST = "projector_digest"
 _FIELD_PURPOSE = "purpose"
+_CONTEXT_PRESSURE_STATUS_COMPACTION_FAILED = "compaction_failed"
+_CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED = (
+    "compaction_attempt_rejected"
+)
+_PARTIAL_ARGUMENTS_SHA256_HEX_LENGTH = 64
+_LOWER_HEX_CHARS = frozenset("0123456789abcdef")
 _PRODUCER_MISSING_REF_KIND_RUNNER_CALL_PROJECTION_ARTIFACT = (
     "runner_call_projection_artifact"
 )
@@ -250,6 +297,42 @@ class ToolTraceCatchupResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _TraceSummarySignals:
+    """Tool Trace summary 的可选结构化 signal 集合。
+
+    :param context_pressure: 可选上下文压力 signal JSON object。
+    :param tool_timing: 可选工具耗时 signal JSON object。
+    :param failure_metadata: 可选失败元数据 signal JSON object。
+    :param partial_tool_call_signal: 可选 partial tool-call signal JSON object。
+    """
+
+    context_pressure: Mapping[str, JsonValue] | None = None
+    tool_timing: Mapping[str, JsonValue] | None = None
+    failure_metadata: Mapping[str, JsonValue] | None = None
+    partial_tool_call_signal: Mapping[str, JsonValue] | None = None
+
+    def present_items(self) -> tuple[tuple[str, Mapping[str, JsonValue]], ...]:
+        """返回非空 signal 字段和值。
+
+        :returns: 按稳定字段顺序排列的 ``(field_name, signal_object)`` 元组。
+        :raises: 无。
+        """
+
+        items: list[tuple[str, Mapping[str, JsonValue]]] = []
+        if self.context_pressure is not None:
+            items.append((_FIELD_CONTEXT_PRESSURE, self.context_pressure))
+        if self.tool_timing is not None:
+            items.append((_FIELD_TOOL_TIMING, self.tool_timing))
+        if self.failure_metadata is not None:
+            items.append((_FIELD_FAILURE_METADATA, self.failure_metadata))
+        if self.partial_tool_call_signal is not None:
+            items.append(
+                (_FIELD_PARTIAL_TOOL_CALL_SIGNAL, self.partial_tool_call_signal)
+            )
+        return tuple(items)
+
+
+@dataclass(frozen=True, slots=True)
 class _ToolTraceExtract:
     """从白名单 EventLog payload 抽出的 Tool Trace 字段。"""
 
@@ -335,7 +418,7 @@ class ToolTraceProjectionConsumer:
         row = read_event_by_id(transaction, event.event_id)
         if row is None:
             raise HostDurableError("tool trace source EventLog row is missing")
-        extracted = _extract_tool_trace(event)
+        extracted = _extract_tool_trace(transaction, event)
         if extracted is None:
             return ProjectionApplyResult(
                 ProjectionApplyStatus.SKIPPED,
@@ -458,9 +541,12 @@ def catch_up_tool_trace_projection(
     )
 
 
-def _extract_tool_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
+def _extract_tool_trace(
+    transaction: HostTransaction, event: ProjectionEventView
+) -> _ToolTraceExtract | None:
     """从白名单 EventLog payload 抽取 Tool Trace 字段。
 
+    :param transaction: 当前 Host transaction。
     :param event: typed projection event view。
     :returns: 可投影字段；当前 EventLog 字段不足以形成 trace 时返回 ``None``。
     :raises HostDurableError: 已命名字段存在但类型非法时抛出。
@@ -471,13 +557,16 @@ def _extract_tool_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
     if event.event_class is EventClass.PROJECTION_SIGNAL:
         return _extract_usage_trace(event)
     if event.event_class is EventClass.CANONICAL_FACT:
-        return _extract_canonical_trace(event)
+        return _extract_canonical_trace(transaction, event)
     return None
 
 
-def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:
+def _extract_canonical_trace(
+    transaction: HostTransaction, event: ProjectionEventView
+) -> _ToolTraceExtract | None:
     """从 canonical fact payload 抽取 Tool Trace 字段。
 
+    :param transaction: 当前 Host transaction。
     :param event: typed projection event view。
     :returns: 可投影字段。
     :raises HostDurableError: 已命名字段存在但类型非法时抛出。
@@ -504,6 +593,7 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
         _optional_text(payload, _FIELD_PAYLOAD_DIGEST),
         event.payload_digest,
     )
+    signals = _canonical_trace_summary_signals(transaction, event, payload)
     refs = tuple(
         ref
         for ref in (
@@ -533,6 +623,7 @@ def _extract_canonical_trace(event: ProjectionEventView) -> _ToolTraceExtract | 
         ),
         policy_decision=_json_value_or_none(payload, _FIELD_POLICY_DECISION),
         client_correlation_id=client_correlation_id,
+        signals=signals,
     )
     return _ToolTraceExtract(
         tool_call_id=tool_call_id,
@@ -855,6 +946,7 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
             terminal_summary_digest=None,
             policy_decision=None,
             client_correlation_id=client_correlation_id,
+            signals=_trace_summary_signals(payload),
         ),
     )
 
@@ -905,6 +997,7 @@ def _extract_usage_trace(event: ProjectionEventView) -> _ToolTraceExtract | None
             terminal_summary_digest=None,
             policy_decision=None,
             client_correlation_id=client_correlation_id,
+            signals=_trace_summary_signals(payload),
         ),
     )
 
@@ -1038,6 +1131,7 @@ def _trace_summary(
     terminal_summary_digest: str | None,
     policy_decision: JsonValue | None,
     client_correlation_id: str | None,
+    signals: _TraceSummarySignals,
 ) -> Mapping[str, JsonValue]:
     """构造 hot trace summary JSON object。
 
@@ -1056,6 +1150,7 @@ def _trace_summary(
     :param terminal_summary_digest: 可选 terminal summary digest。
     :param policy_decision: 可选 policy decision JSON。
     :param client_correlation_id: 可选本地客户端关联 id。
+    :param signals: 可选结构化 signal 集合。
     :returns: trace summary JSON object。
     :raises HostDurableError: operation context 字段类型非法时抛出。
     """
@@ -1070,7 +1165,7 @@ def _trace_summary(
         if operation_context is not None
         else None
     )
-    return {
+    summary: dict[str, JsonValue] = {
         "event_type": event.event_type,
         _FIELD_TOOL_SCHEMA_DIGEST: tool_schema_digest,
         _FIELD_TOOL_IDENTITY_DIGEST: tool_identity_digest,
@@ -1089,6 +1184,576 @@ def _trace_summary(
         _FIELD_OPERATION_CONTEXT_REFS: list(operation_context_refs),
         _FIELD_OPERATION_CONTEXT_DIGEST: operation_context_digest,
     }
+    for field_name, signal_object in signals.present_items():
+        summary[field_name] = signal_object
+    return summary
+
+
+def _canonical_trace_summary_signals(
+    transaction: HostTransaction,
+    event: ProjectionEventView,
+    payload: Mapping[str, JsonValue],
+) -> _TraceSummarySignals:
+    """从 canonical fact payload 构造 Tool Trace signal 集合。
+
+    :param transaction: 当前 Host transaction。
+    :param event: typed projection event view。
+    :param payload: canonical fact payload。
+    :returns: optional summary signal carrier。
+    :raises HostDurableError: 已命名字段类型非法时抛出。
+    """
+
+    copied = _trace_summary_signals(payload)
+    if event.event_type == _EVENT_TYPE_CONTEXT_COMPACTION_FAILED:
+        return _TraceSummarySignals(
+            context_pressure=_context_compaction_failed_pressure(
+                transaction, payload
+            ),
+            tool_timing=copied.tool_timing,
+            failure_metadata=_context_compaction_failed_failure_metadata(payload),
+            partial_tool_call_signal=copied.partial_tool_call_signal,
+        )
+    if event.event_type == _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED:
+        return _TraceSummarySignals(
+            context_pressure=_context_compaction_attempt_rejected_pressure(payload),
+            tool_timing=copied.tool_timing,
+            failure_metadata=_context_compaction_attempt_rejected_failure_metadata(
+                payload
+            ),
+            partial_tool_call_signal=copied.partial_tool_call_signal,
+        )
+    return copied
+
+
+def _context_compaction_failed_pressure(
+    transaction: HostTransaction, payload: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    """从 ``CONTEXT_COMPACTION_FAILED`` 既有 payload 派生上下文压力 signal。
+
+    :param transaction: 当前 Host transaction。
+    :param payload: failed canonical payload。
+    :returns: context pressure JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    request_payload = _context_compaction_request_payload(transaction, payload)
+    return {
+        _FIELD_SCHEMA_VERSION: _CONTEXT_PRESSURE_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_FAILED,
+        "status": _CONTEXT_PRESSURE_STATUS_COMPACTION_FAILED,
+        _FIELD_POLICY_REF: _optional_text(request_payload, _FIELD_POLICY_REF)
+        if request_payload is not None
+        else None,
+        _FIELD_ESTIMATOR_DIGEST: _optional_text(
+            request_payload, _FIELD_ESTIMATOR_DIGEST
+        )
+        if request_payload is not None
+        else None,
+        _FIELD_OPERATION_ID: _required_text(payload, _FIELD_OPERATION_ID),
+        _FIELD_TRIGGER_SOURCE: _optional_text(request_payload, _FIELD_TRIGGER_SOURCE)
+        if request_payload is not None
+        else None,
+        _FIELD_BUDGET_REASON: _optional_text(request_payload, _FIELD_BUDGET_REASON)
+        if request_payload is not None
+        else None,
+        _FIELD_BUDGET_AFTER_COMPACT: None,
+        _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: _optional_int(
+            payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT
+        ),
+        _FIELD_FALLBACK_ACTION: _optional_text(payload, _FIELD_FALLBACK_ACTION),
+        _FIELD_FALLBACK_POLICY_DECISION: _optional_text(
+            payload, _FIELD_FALLBACK_POLICY_DECISION
+        ),
+        _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED: _required_bool(
+            payload, _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED
+        ),
+    }
+
+
+def _context_compaction_attempt_rejected_pressure(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` payload 派生压力 signal。
+
+    :param payload: attempt rejected canonical payload。
+    :returns: context pressure JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    return {
+        _FIELD_SCHEMA_VERSION: _CONTEXT_PRESSURE_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        "status": _CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED,
+        _FIELD_OPERATION_ID: _required_text(payload, _FIELD_OPERATION_ID),
+        _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: _optional_int(
+            payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT
+        ),
+        _FIELD_NEXT_POLICY_DECISION: _required_text(
+            payload, _FIELD_NEXT_POLICY_DECISION
+        ),
+        _FIELD_FAILURE_CATEGORY: _required_text(payload, _FIELD_FAILURE_CATEGORY),
+        _FIELD_REPAIRABLE: _required_bool(payload, _FIELD_REPAIRABLE),
+    }
+
+
+def _context_compaction_attempt_rejected_failure_metadata(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 attempt rejected compact payload 派生失败元数据 signal。
+
+    :param payload: attempt rejected canonical payload。
+    :returns: failure metadata JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    return {
+        _FIELD_SCHEMA_VERSION: _FAILURE_METADATA_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        "failure_kind": _FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        _FIELD_FAILURE_CATEGORY: _required_text(payload, _FIELD_FAILURE_CATEGORY),
+        _FIELD_REPAIRABLE: _required_bool(payload, _FIELD_REPAIRABLE),
+        _FIELD_NEXT_POLICY_DECISION: _required_text(
+            payload, _FIELD_NEXT_POLICY_DECISION
+        ),
+        _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: _optional_int(
+            payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT
+        ),
+        _FIELD_DIAGNOSTIC_REFS: list(_diagnostic_refs(payload)),
+    }
+
+
+def _context_compaction_failed_failure_metadata(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 failed compact payload 派生失败元数据 signal。
+
+    :param payload: failed canonical payload。
+    :returns: failure metadata JSON object。
+    :raises HostDurableError: payload 字段类型非法时抛出。
+    """
+
+    return {
+        _FIELD_SCHEMA_VERSION: _FAILURE_METADATA_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_CONTEXT_COMPACTION_FAILED,
+        "failure_kind": _FAILURE_KIND_CONTEXT_COMPACTION_FAILED,
+        "failure_reason": _required_text(payload, "failure_reason"),
+        "policy_decision": _required_text(payload, _FIELD_POLICY_DECISION),
+        "retryable": _required_bool(payload, "retryable"),
+        "attempt_count": _required_int(payload, "attempt_count"),
+        _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED: _required_bool(
+            payload, _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED
+        ),
+        _FIELD_FALLBACK_ACTION: _optional_text(payload, _FIELD_FALLBACK_ACTION),
+        _FIELD_FALLBACK_POLICY_DECISION: _optional_text(
+            payload, _FIELD_FALLBACK_POLICY_DECISION
+        ),
+        _FIELD_DIAGNOSTIC_REFS: list(_diagnostic_refs(payload)),
+    }
+
+
+def _context_compaction_request_payload(
+    transaction: HostTransaction, payload: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue] | None:
+    """读取 compaction result payload 引用的 request fact payload。
+
+    :param transaction: 当前 Host transaction。
+    :param payload: failed/rejected canonical payload。
+    :returns: request payload；找不到 request fact 时返回 ``None``。
+    :raises HostDurableError: request fact payload 不是 JSON object 时抛出。
+    """
+
+    operation_id = _required_text(payload, _FIELD_OPERATION_ID)
+    row = read_event_by_id(transaction, operation_id)
+    if row is None:
+        return None
+    request_payload = cast(JsonValue, json.loads(row.payload_json))
+    if not isinstance(request_payload, Mapping):
+        raise HostDurableError("context compaction request payload must be JSON object")
+    return cast(Mapping[str, JsonValue], request_payload)
+
+
+def _trace_summary_signals(payload: Mapping[str, JsonValue]) -> _TraceSummarySignals:
+    """从 payload 复制可选 Tool Trace signal 对象。
+
+    :param payload: projection event payload。
+    :returns: 四类 optional summary signal 的 grouped carrier。
+    :raises HostDurableError: signal 字段存在但不是 JSON object 或 ``null`` 时抛出。
+    """
+
+    return _TraceSummarySignals(
+        context_pressure=_optional_signal_object(payload, _FIELD_CONTEXT_PRESSURE),
+        tool_timing=_optional_tool_timing_signal(payload),
+        failure_metadata=_optional_failure_metadata_signal(payload),
+        partial_tool_call_signal=_optional_partial_tool_call_signal(payload),
+    )
+
+
+def _optional_tool_timing_signal(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取并校验可选工具耗时 signal。
+
+    :param payload: projection event payload。
+    :returns: tool_timing JSON object；字段缺失或为 ``null`` 时返回 ``None``。
+    :raises HostDurableError: 字段类型、状态或 duration 非法时抛出。
+    """
+
+    signal = _optional_signal_object(payload, _FIELD_TOOL_TIMING)
+    if signal is None:
+        return None
+    schema_version = _required_int(signal, _FIELD_SCHEMA_VERSION)
+    if schema_version != _TOOL_TIMING_SCHEMA_VERSION:
+        raise HostDurableError("tool trace tool_timing schema_version is unsupported")
+    status = _required_text(signal, "status")
+    if status == _TOOL_TIMING_STATUS_AVAILABLE:
+        _required_text(signal, "started_at")
+        _required_text(signal, "finished_at")
+        duration_ms = _required_int(signal, "duration_ms")
+        if duration_ms < 0:
+            raise HostDurableError(
+                "tool trace tool_timing duration_ms must be non-negative integer"
+            )
+        if _required_text(signal, "duration_source") != (
+            _TOOL_TIMING_DURATION_SOURCE_META
+        ):
+            raise HostDurableError(
+                "tool trace tool_timing duration_source is unsupported"
+            )
+        return signal
+    if status == _TOOL_TIMING_STATUS_MISSING_META:
+        for field_name in ("started_at", "finished_at", "duration_ms"):
+            if signal.get(field_name) is not None:
+                raise HostDurableError(
+                    f"tool trace tool_timing {field_name} must be null"
+                )
+        if signal.get("duration_source") is not None:
+            raise HostDurableError(
+                "tool trace tool_timing duration_source must be null"
+            )
+        return signal
+    raise HostDurableError("tool trace tool_timing status is unsupported")
+
+
+def _optional_failure_metadata_signal(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取并校验可选失败元数据 signal。
+
+    :param payload: projection event payload。
+    :returns: failure metadata JSON object；字段缺失或为 ``null`` 时返回 ``None``。
+    :raises HostDurableError: 字段类型、schema、source、kind 或变体字段非法时抛出。
+    """
+
+    signal = _optional_signal_object(payload, _FIELD_FAILURE_METADATA)
+    if signal is None:
+        return None
+    schema_version = _required_int(signal, _FIELD_SCHEMA_VERSION)
+    if schema_version != _FAILURE_METADATA_SCHEMA_VERSION:
+        raise HostDurableError(
+            "tool trace failure_metadata schema_version is unsupported"
+        )
+    signal_source = _required_text(signal, "signal_source")
+    failure_kind = _required_text(signal, "failure_kind")
+    if failure_kind not in _FAILURE_METADATA_ALLOWED_KINDS:
+        raise HostDurableError("tool trace failure_metadata failure_kind is unsupported")
+    _validate_failure_metadata_variant(
+        signal=signal,
+        signal_source=signal_source,
+        failure_kind=failure_kind,
+    )
+    return signal
+
+
+def _validate_failure_metadata_variant(
+    *,
+    signal: Mapping[str, JsonValue],
+    signal_source: str,
+    failure_kind: str,
+) -> None:
+    """按 failure_kind 校验失败元数据闭集变体。
+
+    :param signal: failure metadata JSON object。
+    :param signal_source: 已读取的 signal source。
+    :param failure_kind: 已读取的 failure kind。
+    :returns: ``None``。
+    :raises HostDurableError: source 或变体字段非法时抛出。
+    """
+
+    if failure_kind == _FAILURE_KIND_TOOL_FAILED:
+        _require_failure_source(signal_source, _EVENT_TYPE_TOOL_RESULT_ACCEPTED)
+        _require_text_field(signal, "error_code")
+        _validate_bounded_text_field(signal, "repair_hint")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_TOOL_CANCELLED:
+        _require_failure_source(signal_source, _EVENT_TYPE_TOOL_RESULT_ACCEPTED)
+        _require_text_field(signal, "cancel_reason")
+        _validate_bounded_text_field(signal, "cancel_message")
+        _validate_bounded_text_field(signal, "cancel_hint")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_POLICY_BLOCKED:
+        _require_failure_source(signal_source, _EVENT_TYPE_TOOL_RESULT_ACCEPTED)
+        _require_text_field(signal, "policy_decision_kind")
+        _require_text_field(signal, "policy_block_reason")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR:
+        _require_failure_source(signal_source, _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR)
+        _require_text_field(signal, "provider_error_code")
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_CONTEXT_COMPACTION_ATTEMPT_REJECTED:
+        _require_failure_source(
+            signal_source, _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED
+        )
+        _require_text_field(signal, _FIELD_FAILURE_CATEGORY)
+        _required_bool(signal, _FIELD_REPAIRABLE)
+        _require_text_field(signal, _FIELD_NEXT_POLICY_DECISION)
+        _optional_int(signal, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT)
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    if failure_kind == _FAILURE_KIND_CONTEXT_COMPACTION_FAILED:
+        _require_failure_source(signal_source, _EVENT_TYPE_CONTEXT_COMPACTION_FAILED)
+        _require_text_field(signal, "failure_reason")
+        _require_text_field(signal, _FIELD_POLICY_DECISION)
+        _required_bool(signal, "retryable")
+        _required_int(signal, "attempt_count")
+        _required_bool(signal, _FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED)
+        _optional_text(signal, _FIELD_FALLBACK_ACTION)
+        _optional_text(signal, _FIELD_FALLBACK_POLICY_DECISION)
+        _validate_metadata_diagnostic_refs(signal)
+        return
+    raise HostDurableError("tool trace failure_metadata failure_kind is unsupported")
+
+
+def _optional_partial_tool_call_signal(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取并校验可选 partial tool-call signal。
+
+    :param payload: projection event payload。
+    :returns: partial tool-call signal JSON object；字段缺失或为 ``null`` 时返回
+        ``None``。
+    :raises HostDurableError: 字段类型、schema、source、状态或 summary 字段非法时抛出。
+    """
+
+    signal = _optional_signal_object(payload, _FIELD_PARTIAL_TOOL_CALL_SIGNAL)
+    if signal is None:
+        return None
+    schema_version = _required_int(signal, _FIELD_SCHEMA_VERSION)
+    if schema_version != _PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal schema_version is unsupported"
+        )
+    signal_source = _required_text(signal, "signal_source")
+    if signal_source != _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR:
+        raise HostDurableError("tool trace partial_tool_call_signal source mismatch")
+    partial_count = _required_int(signal, "partial_tool_call_count")
+    if partial_count < 0:
+        raise HostDurableError("tool trace partial_tool_call_signal count is invalid")
+    summary_status = _required_text(signal, "summary_status")
+    _required_bool(signal, "raw_payload_present")
+    partial_tool_calls = _required_partial_tool_call_summary_list(signal)
+    if partial_count != len(partial_tool_calls):
+        raise HostDurableError("tool trace partial_tool_call_signal count mismatch")
+    if summary_status == _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE:
+        if partial_count != 0:
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal none status has summaries"
+            )
+    elif summary_status == _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT:
+        if partial_count == 0:
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal present status is empty"
+            )
+    else:
+        raise HostDurableError("tool trace partial_tool_call_signal status unsupported")
+    for summary in partial_tool_calls:
+        _validate_partial_tool_call_summary(summary)
+    return signal
+
+
+def _required_partial_tool_call_summary_list(
+    signal: Mapping[str, JsonValue],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取 partial tool-call summary 数组。
+
+    :param signal: partial tool-call signal JSON object。
+    :returns: summary JSON object 元组。
+    :raises HostDurableError: 字段缺失、不是数组或数组成员不是 JSON object 时抛出。
+    """
+
+    value = signal.get("partial_tool_calls")
+    if not isinstance(value, list):
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal partial_tool_calls must be JSON array"
+        )
+    summaries: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal summary must be JSON object"
+            )
+        summaries.append(cast(Mapping[str, JsonValue], item))
+    return tuple(summaries)
+
+
+def _validate_partial_tool_call_summary(
+    summary: Mapping[str, JsonValue],
+) -> None:
+    """校验单个 partial tool-call 有界摘要。
+
+    :param summary: partial tool-call summary JSON object。
+    :returns: ``None``。
+    :raises HostDurableError: index、bounded 字段、arguments 字节数或 digest 标志非法时抛出。
+    """
+
+    tool_call_index = _required_int(summary, "tool_call_index")
+    if tool_call_index < 0:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal tool_call_index is invalid"
+        )
+    _optional_text(summary, "tool_call_id")
+    _optional_text(summary, "name_fragment")
+    arguments_byte_size = _required_int(summary, "arguments_byte_size")
+    if arguments_byte_size < 0:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal arguments_byte_size is invalid"
+        )
+    arguments_sha256 = _optional_text(summary, "arguments_sha256")
+    arguments_present = _required_bool(summary, "arguments_present")
+    if arguments_sha256 is None:
+        if arguments_present:
+            raise HostDurableError(
+                "tool trace partial_tool_call_signal arguments_present mismatch"
+            )
+        return
+    if not _is_bare_sha256_hex(arguments_sha256):
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal arguments_sha256 is invalid"
+        )
+    if not arguments_present:
+        raise HostDurableError(
+            "tool trace partial_tool_call_signal arguments_present mismatch"
+        )
+
+
+def _is_bare_sha256_hex(value: str) -> bool:
+    """判断字符串是否为 Engine partial arguments 使用的裸 sha256 hex digest。
+
+    :param value: 待检查字符串。
+    :returns: 64 位小写十六进制字符串时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if len(value) != _PARTIAL_ARGUMENTS_SHA256_HEX_LENGTH:
+        return False
+    return all(character in _LOWER_HEX_CHARS for character in value)
+
+
+def _require_failure_source(actual: str, expected: str) -> None:
+    """校验 failure metadata 的 signal source。
+
+    :param actual: payload 中的 signal source。
+    :param expected: 当前变体要求的 signal source。
+    :returns: ``None``。
+    :raises HostDurableError: signal source 不匹配时抛出。
+    """
+
+    if actual != expected:
+        raise HostDurableError("tool trace failure_metadata signal_source mismatch")
+
+
+def _require_text_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> str:
+    """读取 failure metadata 变体必填文本字段。
+
+    :param payload: failure metadata JSON object。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises HostDurableError: 字段缺失或不是非空文本时抛出。
+    """
+
+    return _required_text(payload, field_name)
+
+
+def _validate_bounded_text_field(
+    signal: Mapping[str, JsonValue], field_name: str
+) -> None:
+    """校验 failure metadata bounded text 字段组合。
+
+    :param signal: failure metadata JSON object。
+    :param field_name: bounded text 字段名前缀。
+    :returns: ``None``。
+    :raises HostDurableError: bounded 文本、digest 或 truncated 字段组合非法时抛出。
+    """
+
+    value = signal.get(field_name)
+    digest = signal.get(f"{field_name}_sha256")
+    truncated = signal.get(f"{field_name}_truncated")
+    if not isinstance(truncated, bool):
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name}_truncated must be bool"
+        )
+    if value is None:
+        if digest is not None or truncated:
+            raise HostDurableError(
+                f"tool trace failure_metadata {field_name} null fields are invalid"
+            )
+        return
+    if not isinstance(value, str):
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name} must be text or null"
+        )
+    if len(value) > _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS:
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name} exceeds bounded limit"
+        )
+    if not isinstance(digest, str) or not is_sha256_digest(digest):
+        raise HostDurableError(
+            f"tool trace failure_metadata {field_name}_sha256 must be sha256 digest"
+        )
+
+
+def _validate_metadata_diagnostic_refs(signal: Mapping[str, JsonValue]) -> None:
+    """校验 failure metadata diagnostic refs。
+
+    :param signal: failure metadata JSON object。
+    :returns: ``None``。
+    :raises HostDurableError: refs 字段不是文本数组时抛出。
+    """
+
+    refs = signal.get(_FIELD_DIAGNOSTIC_REFS)
+    if not isinstance(refs, list):
+        raise HostDurableError(
+            "tool trace failure_metadata diagnostic_refs must be JSON array"
+        )
+    for ref in refs:
+        if not isinstance(ref, str) or ref.strip() == "":
+            raise HostDurableError(
+                "tool trace failure_metadata diagnostic_refs must contain text"
+            )
+
+
+def _optional_signal_object(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> Mapping[str, JsonValue] | None:
+    """读取可选 Tool Trace signal JSON object。
+
+    :param payload: projection event payload。
+    :param field_name: signal 字段名。
+    :returns: JSON object；字段缺失或为 ``null`` 时返回 ``None``。
+    :raises HostDurableError: 字段存在但不是 JSON object 或 ``null`` 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"tool trace {field_name} must be JSON object or null")
+    return cast(Mapping[str, JsonValue], value)
 
 
 def _diagnostic_refs(payload: Mapping[str, JsonValue]) -> tuple[str, ...]:
@@ -1246,6 +1911,38 @@ def _optional_int(payload: Mapping[str, JsonValue], field_name: str) -> int | No
             f"tool trace payload field {field_name} must be non-negative integer"
         )
     return value
+
+
+def _required_int(payload: Mapping[str, JsonValue], field_name: str) -> int:
+    """读取 payload 中的必填整数。
+
+    :param payload: projection event payload。
+    :param field_name: 字段名。
+    :returns: 整数值。
+    :raises HostDurableError: 字段缺失或不是整数时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HostDurableError(
+            f"tool trace payload field {field_name} must be integer"
+        )
+    return value
+
+
+def _required_bool(payload: Mapping[str, JsonValue], field_name: str) -> bool:
+    """读取 payload 中的必填 bool。
+
+    :param payload: projection event payload。
+    :param field_name: 字段名。
+    :returns: bool 值。
+    :raises HostDurableError: 字段缺失或不是 bool 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool):
+        return value
+    raise HostDurableError(f"tool trace payload field {field_name} must be bool")
 
 
 def _json_value_or_none(payload: Mapping[str, JsonValue], field_name: str) -> JsonValue:

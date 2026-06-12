@@ -18,7 +18,7 @@ from dayu.contracts.tool_call import (
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
-from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.contracts.tool_result import ToolResultMeta, ToolResultSuccess
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
@@ -140,6 +140,15 @@ class _OpenCancellationToken:
 class _FakeBusinessTool:
     """返回固定 JSON 的 fake business tool。"""
 
+    def __init__(self, meta: ToolResultMeta | None = None) -> None:
+        """初始化 fake business tool。
+
+        :param meta: 可选工具结果 meta。
+        :returns: ``None``。
+        """
+
+        self._meta = meta
+
     async def __call__(
         self,
         call: ToolCallRequest,
@@ -157,7 +166,7 @@ class _FakeBusinessTool:
             result=ToolResultSuccess(
                 ok=True,
                 value={"accepted_value": "from-host-toolruntime"},
-                meta=None,
+                meta=self._meta,
             )
         )
 
@@ -285,11 +294,87 @@ async def test_engine_continues_only_after_toolruntime_host_accept(
             "TOOL_CALL_REQUESTED",
             "TOOL_RESULT_ACCEPTED",
         ]
+        result_payload = json.loads(tool_events[1].payload_json)
+        assert result_payload["tool_timing"] == {
+            "schema_version": 1,
+            "status": "missing_tool_result_meta",
+            "started_at": None,
+            "finished_at": None,
+            "duration_ms": None,
+            "duration_source": None,
+        }
         run_status, attempt_status = _run_attempt_status(
             store.transaction_runner, seeded
         )
         assert run_status is RunStatus.RUNNING
         assert attempt_status is AttemptStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_toolruntime_result_payload_carries_duration_from_result_meta(
+    tmp_path: Path,
+) -> None:
+    """TOOL_RESULT_ACCEPTED 从 ToolResultMeta 投影稳定 tool_timing。"""
+
+    started_at = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
+    finished_at = datetime(2026, 5, 15, 1, 2, 4, 250000, tzinfo=UTC)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        tool_runtime = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
+            ToolRuntimeBuildRequest(
+                effective_bundle_request=EffectiveToolBundleBuildRequest(
+                    business_tool_bundle=ToolBundle(
+                        definitions=(
+                            _definition(
+                                _FakeBusinessTool(
+                                    ToolResultMeta(
+                                        tool_name="fake_tool",
+                                        started_at=started_at,
+                                        finished_at=finished_at,
+                                    )
+                                )
+                            ),
+                        )
+                    ),
+                    source_refs=(_source_ref(),),
+                    framework_tool_policy=default_framework_tool_policy_view(),
+                    policy_snapshot_digest=_POLICY_DIGEST,
+                ),
+                execution_scope=ToolRuntimeExecutionScope(
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    allow_tool_calls=True,
+                ),
+                accept_port=DefaultHostToolFactAcceptPort(
+                    transaction_runner=store.transaction_runner
+                ),
+            )
+        )
+        _accept_worker_running(store.transaction_runner, seeded)
+
+        outcome = await tool_runtime.tool_executor.execute(
+            _tool_request(seeded, _tool_call("tool-call-duration"))
+        )
+        tool_events = _tool_events(store.transaction_runner)
+        result_payload = json.loads(tool_events[1].payload_json)
+
+        assert isinstance(outcome.records[0].outcome, ToolCompletedOutcome)
+        assert [row.event_type for row in tool_events] == [
+            "TOOL_CALL_REQUESTED",
+            "TOOL_RESULT_ACCEPTED",
+        ]
+        assert result_payload["tool_timing"] == {
+            "schema_version": 1,
+            "status": "available",
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_ms": 1250,
+            "duration_source": "tool_result_meta",
+        }
 
 
 @pytest.mark.asyncio

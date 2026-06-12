@@ -49,6 +49,7 @@ from dayu.engine.contracts.engine_events import (
     ToolResultAcceptedData,
     UsageReportedData,
 )
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.host.admission import (
     AdmissionWakeupPort,
     NoopAdmissionWakeupPort,
@@ -198,6 +199,14 @@ from dayu.host.run_input import (
     build_run_input_material_blocks,
 )
 from dayu.host.payload_resolution import event_payload_object
+from dayu.host.tool_trace_signals import (
+    CONTEXT_PRESSURE_SCHEMA_VERSION as _CONTEXT_PRESSURE_SCHEMA_VERSION,
+    FAILURE_KIND_PROVIDER_PROTOCOL_ERROR as _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
+    FAILURE_METADATA_SCHEMA_VERSION as _FAILURE_METADATA_SCHEMA_VERSION,
+    PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION as _PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION,
+    PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE,
+    PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
@@ -261,6 +270,8 @@ _OWNER_PHASE10 = "phase10"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
 _NO_CONTEXT_BUDGET_POLICY_REF = "none"
 _USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
+_CONTEXT_PRESSURE_SOURCE_USAGE_REPORTED = "USAGE_REPORTED"
+_CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN = "unknown"
 _RUNNER_CALL_MANIFEST_STATUS_COMPLETE = "complete"
 _RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL = "limited_signal"
 _RUNNER_CALL_MANIFEST_STATUS_MISMATCH = "mismatch"
@@ -2661,10 +2672,11 @@ class EngineEventIngestor:
         """
 
         candidate = context.candidate
+        estimate = self._estimate_usage_observation_input(transaction, context)
         diagnostic = self._usage_observation_diagnostic(
-            transaction,
             context=context,
             data=data,
+            estimate=estimate,
         )
         return self._event_log_store.append_event(
             transaction,
@@ -2694,6 +2706,11 @@ class EngineEventIngestor:
                     "usage_observation_status": diagnostic.status,
                     "usage_observation_digest": diagnostic.observation_digest,
                     "prompt_token_delta": diagnostic.prompt_token_delta,
+                    "context_pressure": _usage_context_pressure_signal(
+                        data=data,
+                        diagnostic=diagnostic,
+                        estimate=estimate,
+                    ),
                 },
                 reason=None,
             ),
@@ -2701,20 +2718,19 @@ class EngineEventIngestor:
 
     def _usage_observation_diagnostic(
         self,
-        transaction: HostTransaction,
         *,
         context: _ValidatedCandidate,
         data: UsageReportedData,
+        estimate: BudgetEstimate | None,
     ) -> UsageObservationDiagnostic:
         """构造 usage observation diagnostic，失败时降级为估算不可用。
 
-        :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
         :param data: usage_reported data。
+        :param estimate: 当前 Run 输入估算；不可用时为 ``None``。
         :returns: usage observation diagnostic。
         """
 
-        estimate = self._estimate_usage_observation_input(transaction, context)
         policy_ref = (
             self._context_budget_policy.policy_ref
             if self._context_budget_policy is not None
@@ -2844,6 +2860,13 @@ class EngineEventIngestor:
             context=context,
             raw_payload=data.raw_payload,
         )
+        raw_payload_present = raw_descriptor is not None
+        raw_payload_ref = (
+            raw_descriptor.payload_ref if raw_descriptor is not None else None
+        )
+        raw_payload_digest = (
+            raw_descriptor.payload_digest if raw_descriptor is not None else None
+        )
         candidate = context.candidate
         payload: dict[str, JsonValue] = {
             "attempt_id": context.attempt.attempt_id,
@@ -2853,13 +2876,17 @@ class EngineEventIngestor:
             "message": data.message,
             "provider_request_id": data.provider_request_id,
             "client_correlation_id": data.client_correlation_id,
-            "raw_payload_ref": (
-                raw_descriptor.payload_ref if raw_descriptor is not None else None
-            ),
-            "raw_payload_digest": (
-                raw_descriptor.payload_digest if raw_descriptor is not None else None
-            ),
+            "raw_payload_ref": raw_payload_ref,
+            "raw_payload_digest": raw_payload_digest,
             "partial_tool_call_count": len(data.partial_tool_calls),
+            "partial_tool_call_signal": _provider_protocol_partial_tool_call_signal(
+                partial_tool_calls=data.partial_tool_calls,
+                raw_payload_present=raw_payload_present,
+            ),
+            "failure_metadata": _provider_protocol_failure_metadata(
+                data=data,
+                raw_payload_ref=raw_payload_ref,
+            ),
         }
         return self._event_log_store.append_event(
             transaction,
@@ -4082,6 +4109,68 @@ def _display_text_from_input_event(
         transaction, event, payload_label="USER_INPUT_ACCEPTED"
     )
     return _required_payload_text(payload, field_name="display_text")
+
+
+def _usage_context_pressure_signal(
+    *,
+    data: UsageReportedData,
+    diagnostic: UsageObservationDiagnostic,
+    estimate: BudgetEstimate | None,
+) -> Mapping[str, JsonValue]:
+    """构造 usage projection 的 context pressure signal。
+
+    本函数只序列化 Host budget owner 已产出的 ``BudgetEstimate`` 与
+    ``decide_context_budget`` 结果，不重新实现阈值计算。
+
+    :param data: Engine usage reported data。
+    :param diagnostic: usage observation diagnostic。
+    :param estimate: Host context budget estimate；不可用时为 ``None``。
+    :returns: 可写入 projection signal payload 的 JSON object。
+    """
+
+    budget_decision = (
+        decide_context_budget(estimate).value
+        if estimate is not None
+        else _CONTEXT_PRESSURE_BUDGET_DECISION_UNKNOWN
+    )
+    overage_reason = (
+        estimate.overage_reason.value
+        if estimate is not None and estimate.overage_reason is not None
+        else None
+    )
+    return {
+        "schema_version": _CONTEXT_PRESSURE_SCHEMA_VERSION,
+        "signal_source": _CONTEXT_PRESSURE_SOURCE_USAGE_REPORTED,
+        "status": diagnostic.status,
+        "policy_ref": diagnostic.policy_ref,
+        "estimator_digest": diagnostic.estimator_digest,
+        "estimated_input_tokens": diagnostic.estimated_input_tokens,
+        "input_budget_tokens": (
+            estimate.input_budget_tokens if estimate is not None else None
+        ),
+        "soft_threshold_tokens": (
+            estimate.soft_threshold_tokens if estimate is not None else None
+        ),
+        "hard_threshold_tokens": (
+            estimate.hard_threshold_tokens if estimate is not None else None
+        ),
+        "soft_threshold_exceeded": (
+            estimate.estimated_input_tokens >= estimate.soft_threshold_tokens
+            if estimate is not None
+            else None
+        ),
+        "hard_threshold_exceeded": (
+            estimate.estimated_input_tokens >= estimate.hard_threshold_tokens
+            if estimate is not None
+            else None
+        ),
+        "budget_decision": budget_decision,
+        "overage_reason": overage_reason,
+        "prompt_tokens": data.prompt_tokens,
+        "completion_tokens": data.completion_tokens,
+        "total_tokens": data.total_tokens,
+        "prompt_token_delta": diagnostic.prompt_token_delta,
+    }
 
 
 def _invalid_usage_observation_digest(
@@ -5857,6 +5946,87 @@ def _tool_awaiting_payload(
         "execution_id": context.attempt.execution_id,
         "iteration_id": data.iteration_id,
         "unsupported_later_owner": _OWNER_PHASE7,
+    }
+
+
+def _provider_protocol_failure_metadata(
+    *,
+    data: ProviderProtocolErrorData,
+    raw_payload_ref: str | None,
+) -> Mapping[str, JsonValue]:
+    """构造 provider protocol error 的失败元数据 signal。
+
+    :param data: Engine provider protocol error data。
+    :param raw_payload_ref: Host 写入的 raw payload descriptor ref；无时为
+        ``None``。
+    :returns: failure metadata JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    diagnostic_refs = tuple(
+        ref
+        for ref in (raw_payload_ref, data.provider_request_id)
+        if ref is not None
+    )
+    return {
+        "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
+        "failure_kind": _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
+        "provider_error_code": data.error_code,
+        "diagnostic_refs": list(diagnostic_refs),
+    }
+
+
+def _provider_protocol_partial_tool_call_signal(
+    *,
+    partial_tool_calls: tuple[PartialToolCallSummary, ...],
+    raw_payload_present: bool,
+) -> Mapping[str, JsonValue]:
+    """构造 provider protocol error 的 partial tool-call signal。
+
+    :param partial_tool_calls: Engine 已提供的未完成工具调用有界摘要。
+    :param raw_payload_present: Host raw payload descriptor 是否存在。
+    :returns: partial tool-call signal JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    partial_count = len(partial_tool_calls)
+    summary_status = (
+        _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT
+        if partial_count > 0
+        else _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE
+    )
+    return {
+        "schema_version": _PARTIAL_TOOL_CALL_SIGNAL_SCHEMA_VERSION,
+        "signal_source": _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
+        "partial_tool_call_count": partial_count,
+        "summary_status": summary_status,
+        "raw_payload_present": raw_payload_present,
+        "partial_tool_calls": [
+            _partial_tool_call_summary_payload(summary)
+            for summary in partial_tool_calls
+        ],
+    }
+
+
+def _partial_tool_call_summary_payload(
+    summary: PartialToolCallSummary,
+) -> Mapping[str, JsonValue]:
+    """序列化 Engine partial tool-call 有界摘要。
+
+    :param summary: Engine 已裁剪和脱敏的 partial tool-call summary。
+    :returns: 可写入 Host diagnostic payload 的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    arguments_present = summary.arguments_sha256 is not None
+    return {
+        "tool_call_index": summary.tool_call_index,
+        "tool_call_id": summary.tool_call_id,
+        "name_fragment": summary.name_fragment,
+        "arguments_byte_size": summary.arguments_byte_size,
+        "arguments_sha256": summary.arguments_sha256,
+        "arguments_present": arguments_present,
     }
 
 
