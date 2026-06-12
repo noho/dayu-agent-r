@@ -129,6 +129,7 @@ EXPECTED_STORAGE_MAINTENANCE_EXPORTS: frozenset[str] = frozenset(
         "HostStorageUsageReport",
         "HostWalCheckpointMode",
         "HostWalCheckpointResult",
+        "MemorySnapshotIntegrityIssue",
         "report_storage_usage",
     }
 )

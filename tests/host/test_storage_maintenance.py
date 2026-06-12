@@ -50,7 +50,10 @@ from dayu.host.durable import storage_lifecycle as storage_lifecycle_module
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
 from dayu.host.durable.errors import HostArtifactWriteError, HostDurableError
 from dayu.host.durable.payload import write_payload_descriptor_for_artifact
-from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
+from dayu.host.durable.schema import (
+    TABLE_HOST_MEMORY_SNAPSHOTS,
+    TABLE_PAYLOAD_DESCRIPTORS,
+)
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import open_host
@@ -345,6 +348,7 @@ def test_storage_maintenance_dry_run_reports_candidates_without_deleting(
     assert result.orphan_artifact_candidates == (orphan_path,)
     assert result.reclaimed_artifact_paths == ()
     assert result.file_errors == ()
+    assert result.memory_snapshot_integrity_issues == ()
     assert result.wal_checkpoint is None
     assert result.physical_artifact_bytes == (
         (options.artifact_root / referenced_path).stat().st_size
@@ -371,6 +375,30 @@ def test_storage_maintenance_wal_checkpoint_true_returns_result(
 
     assert result.wal_checkpoint is not None
     assert result.wal_checkpoint.mode.value == "PASSIVE"
+
+
+def test_storage_maintenance_reports_memory_snapshot_integrity_issue(
+    tmp_path: Path,
+) -> None:
+    """maintenance result 暴露 memory snapshot integrity 只读诊断。"""
+
+    host = create_host_command_handle(_command_options(tmp_path))
+    try:
+        _insert_invalid_memory_snapshot_json(host)
+
+        result = run_storage_maintenance(
+            host,
+            HostStorageMaintenanceRequest(run_wal_checkpoint=False),
+        )
+    finally:
+        host.close()
+
+    assert len(result.memory_snapshot_integrity_issues) == 1
+    issue = result.memory_snapshot_integrity_issues[0]
+    assert issue.failure_kind.value == "invalid_json"
+    assert issue.snapshot_id == "snapshot-invalid-json"
+    assert issue.session_id == "session-invalid-json"
+    assert issue.checkpoint_event_sequence == 0
 
 
 def test_storage_maintenance_reclaim_true_deletes_orphan_without_db_row_changes(
@@ -669,6 +697,7 @@ def test_storage_maintenance_result_json_value_is_stable_self_explaining_and_non
         "orphan_artifact_candidates",
         "reclaimed_artifact_paths",
         "file_errors",
+        "memory_snapshot_integrity_issues",
         "wal_checkpoint",
     )
     assert tuple(values.keys()) == expected_keys
@@ -677,6 +706,7 @@ def test_storage_maintenance_result_json_value_is_stable_self_explaining_and_non
     assert values["orphan_artifact_candidates"] == [orphan_path]
     assert values["reclaimed_artifact_paths"] == []
     assert values["file_errors"] == []
+    assert values["memory_snapshot_integrity_issues"] == []
     assert values["wal_checkpoint"] is None
 
 
@@ -823,6 +853,52 @@ def _delete_payload_descriptor(host: HostCommandHandle, payload_ref: str) -> Non
         )
 
     host._run_write(delete_descriptor)
+
+
+def _insert_invalid_memory_snapshot_json(host: HostCommandHandle) -> None:
+    """插入 JSON 损坏的 memory snapshot row。
+
+    :param host: Host command handle。
+    :returns: ``None``。
+    """
+
+    def insert_snapshot(transaction: HostTransaction) -> None:
+        """写入损坏 snapshot row。
+
+        :param transaction: Host write transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"""
+            INSERT INTO {TABLE_HOST_MEMORY_SNAPSHOTS} (
+              snapshot_id,
+              session_id,
+              consumer_id,
+              checkpoint_event_sequence,
+              checkpoint_event_id,
+              policy_digest,
+              snapshot_digest,
+              snapshot_json,
+              built_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "snapshot-invalid-json",
+                "session-invalid-json",
+                "conversation_memory_v1",
+                0,
+                None,
+                "policy-digest-invalid-json",
+                "snapshot-digest-invalid-json",
+                "{not-json",
+                "2026-06-12T00:00:00.000000Z",
+                "2026-06-12T00:00:00.000000Z",
+            ),
+        )
+
+    host._run_write(insert_snapshot)
 
 
 def _write_non_artifact_files(artifact_root: Path) -> None:
