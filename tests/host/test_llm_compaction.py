@@ -6,7 +6,7 @@ import inspect
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import TypeGuard
 
 import pytest
 
@@ -180,7 +180,7 @@ def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None
     candidate = parse_conversation_compact_output_vnext(
         compact_input,
         fake_compaction_proposal_from_material_json(
-            cast(Mapping[str, JsonValue], compact_input.to_json())
+            _compact_input_json(compact_input)
         ),
     )
 
@@ -725,7 +725,7 @@ async def test_llm_context_compactor_compact_uses_vnext_material(
         )
         return _final(
             fake_compaction_proposal_from_material_json(
-                cast(Mapping[str, JsonValue], compact_input.to_json())
+                _compact_input_json(compact_input)
             )
         )
 
@@ -793,16 +793,28 @@ def _proposal_json(compact_input: ConversationCompactInputVNext) -> dict[str, Js
 
     :param compact_input: vNext compact input。
     :returns: vNext proposal dict。
-    :raises TypeError: fake proposal 不是 JSON object 时抛出。
+    :raises json.JSONDecodeError: fake proposal 不是合法 JSON 时抛出。
+    :raises AssertionError: fake proposal 不是 JSON object 时抛出。
     """
 
     raw = fake_compaction_proposal_from_material_json(
-        cast(Mapping[str, JsonValue], compact_input.to_json())
+        _compact_input_json(compact_input)
     )
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise TypeError("proposal must be object")
-    return cast(dict[str, JsonValue], parsed)
+    parsed: JsonValue = json.loads(raw)
+    return dict(_required_mapping(parsed, field_name="proposal"))
+
+
+def _compact_input_json(
+    compact_input: ConversationCompactInputVNext,
+) -> Mapping[str, JsonValue]:
+    """返回 vNext compact input 的 JSON object 视图。
+
+    :param compact_input: vNext compact input。
+    :returns: compact input JSON object。
+    :raises AssertionError: compact input 序列化结果不是 JSON object 时抛出。
+    """
+
+    return _required_mapping(compact_input.to_json(), field_name="compact_input")
 
 
 def _fact_json() -> dict[str, JsonValue]:
@@ -828,7 +840,7 @@ def _material_json_from_compactor_prompt(prompt: str) -> Mapping[str, JsonValue]
     :raises json.JSONDecodeError: prompt 中 material JSON 非法时抛出。
     """
 
-    parsed = cast(JsonValue, json.loads(_material_json_text_from_prompt(prompt)))
+    parsed: JsonValue = json.loads(_material_json_text_from_prompt(prompt))
     return _required_mapping(parsed, field_name="material_json")
 
 
@@ -857,8 +869,18 @@ def _required_mapping(value: JsonValue, *, field_name: str) -> Mapping[str, Json
     :raises AssertionError: value 不是 JSON object 时抛出。
     """
 
-    assert isinstance(value, Mapping), field_name
-    return cast(Mapping[str, JsonValue], value)
+    assert _is_json_mapping(value), field_name
+    return value
+
+
+def _is_json_mapping(value: JsonValue) -> TypeGuard[Mapping[str, JsonValue]]:
+    """判断 JSON value 是否为 JSON object。
+
+    :param value: 待判断 JSON value。
+    :returns: ``value`` 是 JSON object 时返回 ``True``，否则返回 ``False``。
+    """
+
+    return isinstance(value, Mapping)
 
 
 def _prompt_schema_pipe_values(field_name: str) -> tuple[str, ...]:
