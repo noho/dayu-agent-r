@@ -142,13 +142,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | push |
-| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 accepted PR review commit ready to push |
+| gate | draft-PR-pass |
+| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 draft PR pass; PR 139 is open draft and updated to latest accepted review commit |
 | active work unit | WU-RET-00 |
 | default next work unit | WU-OBS-00 |
-| next entry point | WU-RET-00 post-PR-review push gate |
+| next entry point | after PR 139 merge: WU-OBS-00 discussion gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
 
 状态约定：
@@ -212,7 +212,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-OBS-01 | pending-prerequisite | Prompt-based Tool Trace diagnostics | GitHub Issue #71；GitHub Issue #27 superseded | #71 作为主 issue，吸收 #27 的 prompt / final answer 反查诉求 |
 | WU-AUDIT-01 | pending | Audit Ledger viewer and integrity report | GitHub Issue #72 | read-only audit JSONL ledger viewer；审计责任链 / 完整性校验，不做 Tool Trace root-cause analyzer |
 | WU-AUDIT-02 | pending | External audit delivery contract with local validation adapters | GitHub Issue #75 | async external audit delivery 语义；无真实外部系统时先用 Noop / FileMirror adapter 验证 contract |
-| WU-RET-00 | ready-to-open-draft-PR | Host storage lifecycle retention policy | GitHub Issue #43 | retention umbrella；purge 已完成，剩余 payload / descriptor / DB / workspace-level cleanup |
+| WU-RET-00 | draft-PR-pass | Host storage lifecycle retention policy | GitHub Issue #43 | draft PR #139 open；retention umbrella first delivery ready for review / merge；GitHub Issue #43 remains open until PR merge |
 | WU-RET-01 | pending | Tool Trace cold JSONL storage governance | GitHub Issue #36 | Tool Trace cold JSONL rotation / retention / compaction / size reporting；不作为 #70 前置 |
 | WU-RET-02 | pending | Audit JSONL storage governance | GitHub Issue #96 | Audit JSONL rotation / retention / compaction / size reporting；保留 purge tombstone 可验证关联 |
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
@@ -541,6 +541,9 @@ GitHub Issue #43 当前为 OPEN，已 currentize 为 Host storage lifecycle / re
 - PR review re-review: `docs/reviews/wu-ret-00-pr139-rereview-mimo.md`; `docs/reviews/wu-ret-00-pr139-rereview-ds.md`
 - PR review re-review conclusion: PASS; blocking findings 0; validation `pytest tests/host/test_storage_maintenance.py tests/host/test_storage_orphan_proof.py -q` 18 passed; `pyright tests/host/test_storage_maintenance.py tests/host/test_storage_orphan_proof.py` 0 errors
 - PR review accepted commit: `20b1b4ac`
+- post-PR-review push commit: `5f591ae4`; pushed to `github/work/wu-ret-00-retention`; PR 139 merge state CLEAN at closeout check; GitHub status check rollup empty on draft PR branch
+- final validation: `pytest tests/host/test_artifact_store.py tests/host/test_storage_usage_report.py tests/host/test_storage_orphan_proof.py tests/host/test_storage_maintenance.py tests/host/test_purge_session.py tests/host/test_package_exports.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py -q` 97 passed; full `pyright` 0 errors; `git diff --check` passed
+- final closeout: draft-PR-pass; GitHub Issue #43 not closed because PR 139 is still draft/open and merge/issue closure requires separate authorization; after PR 139 merge, next entry point is WU-OBS-00 discussion gate
 
 ## WU-RET-01 Tool Trace Cold JSONL Storage Governance
 
