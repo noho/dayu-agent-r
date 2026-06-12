@@ -38,6 +38,7 @@ from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
     MemoryDiagnosticReason,
+    MemoryIncludedReason,
     MemoryProjectionEvent,
     MemoryProjectionPolicy,
     SelectedRecentWindowRole,
@@ -298,6 +299,8 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
         SelectedRecentWindowRole.ASSISTANT,
         SelectedRecentWindowRole.EVIDENCE,
     )
+    assistant_item = snapshot.trace_memory.selected_recent_window[1]
+    assert assistant_item.included_reason is MemoryIncludedReason.SELECTED_RECENT_WINDOW
     assert snapshot.session_summary_memory.summary_text is None
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
     assert snapshot.answer_anchor_memory.anchors == ()
@@ -380,10 +383,10 @@ def test_run_succeeded_payload_refs_do_not_materialize_assistant_window() -> Non
     assert snapshot.trace_memory.selected_recent_window == ()
 
 
-def test_projection_consumer_hydrates_terminal_content_as_final_answer(
+def test_durable_projection_hydrates_terminal_content_as_selected_recent_window(
     tmp_path: Path,
 ) -> None:
-    """durable projection 只把 digest-checked terminal content 合并为 final_answer。"""
+    """durable projection adapter hydrate terminal content 后进入 continuity。"""
 
     policy = _policy()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -453,9 +456,46 @@ def test_projection_consumer_hydrates_terminal_content_as_final_answer(
         )
 
         assert latest is not None
-        assert latest.snapshot.trace_memory.selected_recent_window[0].text == (
-            "artifact final answer"
-        )
+        selected = latest.snapshot.trace_memory.selected_recent_window
+        assert len(selected) == 1
+        assert selected[0].text == "artifact final answer"
+        assert selected[0].included_reason is MemoryIncludedReason.SELECTED_RECENT_WINDOW
+        assert latest.snapshot.evidence_fact_memory.evidence_backed_facts == ()
+
+
+def test_memory_direct_consumer_does_not_follow_terminal_descriptor() -> None:
+    """直接 memory consumer 不跟随 terminal summary descriptor。
+
+    Durable projection / run-input adapter 负责把 digest-checked terminal content
+    合并成 transient ``final_answer``；纯 consumer 只读取 inline final_answer。
+
+    :returns: ``None``。
+    :raises AssertionError: direct consumer 错误跟随 descriptor 时抛出。
+    """
+
+    policy = _policy()
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "run-descriptor-only",
+                "RUN_SUCCEEDED",
+                {
+                    "terminal_summary_ref": "payload-terminal-final-answer",
+                    "terminal_summary_digest": "sha256:terminal-final-answer",
+                    "content": "裸 content 不应进入 assistant window",
+                    "summary_text": "summary 不应进入 assistant window",
+                },
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.trace_memory.selected_recent_window == ()
+    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:
