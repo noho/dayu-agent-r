@@ -242,6 +242,82 @@ def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() 
         )
 
 
+def test_parse_conversation_compact_output_vnext_reports_fact_evidence_kind_path() -> None:
+    """vNext parser 对 fact evidence_kind 返回完整嵌套字段路径。"""
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["evidence_backed_facts"] = [
+        {
+            "claim_text": "经营现金流同比增长",
+            "evidence_labels": ["E1"],
+            "evidence_kind": "unsupported_kind",
+            "source_labels": [],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"evidence_backed_facts\[0\]\.evidence_kind",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_anchor_ordinal_path() -> None:
+    """vNext parser 对 answer anchor 子项 ordinal 返回完整嵌套字段路径。"""
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["answer_anchors"] = [
+        {
+            "anchor_title": "现金流结论",
+            "anchor_items": [
+                {"display_text": "经营现金流同比增长", "ordinal": 0},
+                {"display_text": "第二条锚点", "ordinal": -1},
+            ],
+            "answer_source_labels": ["A1"],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"answer_anchors\[0\]\.anchor_items\[1\]\.ordinal",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_wraps_candidate_safety_net() -> None:
+    """vNext parser 将 candidate safety-net 拒绝包装为公开 proposal 失败类型。"""
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["session_summary"] = {
+        "summary_text": "缺少支撑标签的摘要",
+        "source_labels": [],
+    }
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="compactor vNext proposal schema invalid",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
 @pytest.mark.asyncio
 async def test_llm_context_compactor_compact_uses_vnext_material(
     monkeypatch: pytest.MonkeyPatch,

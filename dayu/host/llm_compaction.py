@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping
 from json import JSONDecodeError
 from math import ceil
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -66,6 +66,7 @@ from dayu.host.compaction import (
     MAX_VNEXT_FACT_ITEMS,
     MAX_VNEXT_FORWARD_INTENT_ITEMS,
     MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS,
+    MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
     ReferenceContinuityCandidateVNext,
     ReferenceContinuityReasonVNext,
     SessionSummaryCandidateVNext,
@@ -101,6 +102,34 @@ _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
 _POST_COMPACT_BASE_MESSAGE_COUNT = 2
 _POST_COMPACT_TOOL_SCHEMA_OVERHEAD_COUNT = 1
 _COMPACTOR_PROJECTION_SCHEMA_VERSION = "compactor_input_projection.v1"
+_SCHEMA_VERSION_FIELD = "schema_version"
+_SESSION_SUMMARY_FIELD = "session_summary"
+_EVIDENCE_BACKED_FACTS_FIELD = "evidence_backed_facts"
+_ANSWER_ANCHORS_FIELD = "answer_anchors"
+_FORWARD_INTENTS_FIELD = "forward_intents"
+_REFERENCE_CONTINUITY_ITEMS_FIELD = "reference_continuity_items"
+_DIAGNOSTICS_FIELD = "diagnostics"
+_SUMMARY_TEXT_FIELD = "summary_text"
+_SOURCE_LABELS_FIELD = "source_labels"
+_CLAIM_TEXT_FIELD = "claim_text"
+_EVIDENCE_LABELS_FIELD = "evidence_labels"
+_EVIDENCE_KIND_FIELD = "evidence_kind"
+_ANCHOR_TITLE_FIELD = "anchor_title"
+_ANCHOR_ITEMS_FIELD = "anchor_items"
+_ANSWER_SOURCE_LABELS_FIELD = "answer_source_labels"
+_DISPLAY_TEXT_FIELD = "display_text"
+_ORDINAL_FIELD = "ordinal"
+_INTENT_TYPE_FIELD = "intent_type"
+_TEXT_FIELD = "text"
+_STATUS_FIELD = "status"
+_REASON_FIELD = "reason"
+_CODE_FIELD = "code"
+_FACT_EVIDENCE_KIND_VALUES = frozenset(item.value for item in FactEvidenceKindVNext)
+_FORWARD_INTENT_TYPE_VALUES = frozenset(item.value for item in ForwardIntentTypeVNext)
+_FORWARD_INTENT_STATUS_VALUES = frozenset(item.value for item in ForwardIntentStatusVNext)
+_REFERENCE_CONTINUITY_REASON_VALUES = frozenset(item.value for item in ReferenceContinuityReasonVNext)
+
+
 @runtime_checkable
 class _CancellationSignalToken(CancellationToken, Protocol):
     """Host 内部可写取消 token 协议。"""
@@ -558,28 +587,19 @@ def parse_conversation_compact_output_vnext(
 
     if not isinstance(request, ConversationCompactInputVNext):
         raise TypeError("request must be ConversationCompactInputVNext")
-    proposal = _parse_vnext_proposal(final_answer)
     try:
-        candidate = ConversationCompactOutputVNext(
-            schema_version=_required_string(proposal, "schema_version"),
-            session_summary=_session_summary_candidate_vnext(proposal),
-            evidence_backed_facts=_fact_candidates_vnext(proposal),
-            answer_anchors=_answer_anchor_candidates_vnext(proposal),
-            forward_intents=_forward_intent_candidates_vnext(proposal),
-            reference_continuity_items=_reference_candidates_vnext(proposal),
-            diagnostics=_diagnostics_vnext(proposal),
-        )
+        candidate = _parse_vnext_proposal(final_answer)
         _validate_vnext_candidate_source_labels(request, candidate)
     except (KeyError, TypeError, ValueError) as exc:
         raise LLMCompactionProposalError(f"compactor vNext proposal schema invalid: {exc}") from exc
     return candidate
 
 
-def _parse_vnext_proposal(final_answer: str) -> Mapping[str, JsonValue]:
+def _parse_vnext_proposal(final_answer: str) -> ConversationCompactOutputVNext:
     """解析 vNext LLM strict JSON proposal。
 
     :param final_answer: LLM final answer 原文。
-    :returns: top-level JSON object。
+    :returns: vNext compact output candidate。
     :raises LLMCompactionProposalError: 空文本、非 JSON 或缺少必需字段时抛出。
     """
 
@@ -587,25 +607,26 @@ def _parse_vnext_proposal(final_answer: str) -> Mapping[str, JsonValue]:
     if len(raw) < _MIN_PROPOSAL_LENGTH:
         raise LLMCompactionProposalError("compactor vNext proposal is empty")
     try:
-        parsed = json.loads(raw)
+        parsed: JsonValue = json.loads(raw)
     except JSONDecodeError as exc:
         raise LLMCompactionProposalError(f"compactor vNext proposal is not valid JSON: {exc.msg}") from exc
-    if not isinstance(parsed, Mapping):
-        raise LLMCompactionProposalError("compactor vNext proposal top-level value must be object")
-    proposal = cast(Mapping[str, JsonValue], parsed)
-    required_keys = (
-        "schema_version",
-        "session_summary",
-        "evidence_backed_facts",
-        "answer_anchors",
-        "forward_intents",
-        "reference_continuity_items",
-        "diagnostics",
+    proposal = _json_object(parsed, "proposal")
+    schema_version = _required_string(
+        proposal,
+        _SCHEMA_VERSION_FIELD,
+        parent_path="",
     )
-    for key in required_keys:
-        if key not in proposal:
-            raise LLMCompactionProposalError(f"compactor vNext proposal missing required key: {key}")
-    return proposal
+    if schema_version != CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT:
+        raise ValueError(f"{_SCHEMA_VERSION_FIELD} is invalid")
+    return ConversationCompactOutputVNext(
+        schema_version=schema_version,
+        session_summary=_session_summary_candidate_vnext(proposal),
+        evidence_backed_facts=_fact_candidates_vnext(proposal),
+        answer_anchors=_answer_anchor_candidates_vnext(proposal),
+        forward_intents=_forward_intent_candidates_vnext(proposal),
+        reference_continuity_items=_reference_candidates_vnext(proposal),
+        diagnostics=_diagnostics_vnext(proposal),
+    )
 
 
 def _session_summary_candidate_vnext(
@@ -617,13 +638,13 @@ def _session_summary_candidate_vnext(
     :returns: session summary candidate；JSON null 时为 ``None``。
     """
 
-    value = proposal["session_summary"]
+    value = _required_value(proposal, _SESSION_SUMMARY_FIELD, parent_path="")
     if value is None:
         return None
-    data = _json_mapping(value, "session_summary")
+    data = _json_object(value, _SESSION_SUMMARY_FIELD)
     return SessionSummaryCandidateVNext(
-        summary_text=_required_string(data, "summary_text"),
-        source_labels=_required_string_tuple(data, "source_labels"),
+        summary_text=_required_string(data, _SUMMARY_TEXT_FIELD, parent_path=_SESSION_SUMMARY_FIELD),
+        source_labels=_required_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=_SESSION_SUMMARY_FIELD),
     )
 
 
@@ -634,16 +655,29 @@ def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[EvidenceB
     :returns: fact candidate tuple。
     """
 
-    values = _required_sequence(proposal, "evidence_backed_facts", max_items=MAX_VNEXT_FACT_ITEMS)
+    values = _required_array(
+        proposal,
+        _EVIDENCE_BACKED_FACTS_FIELD,
+        parent_path="",
+        max_items=MAX_VNEXT_FACT_ITEMS,
+    )
     candidates: list[EvidenceBackedFactCandidateVNext] = []
     for index, item in enumerate(values):
-        data = _json_mapping(item, f"evidence_backed_facts[{index}]")
+        item_path = _item_path(_EVIDENCE_BACKED_FACTS_FIELD, index)
+        data = _json_object(item, item_path)
         candidates.append(
             EvidenceBackedFactCandidateVNext(
-                claim_text=_required_string(data, "claim_text"),
-                evidence_labels=_required_string_tuple(data, "evidence_labels"),
-                evidence_kind=FactEvidenceKindVNext(_required_string(data, "evidence_kind")),
-                source_labels=_optional_string_tuple(data, "source_labels"),
+                claim_text=_required_string(data, _CLAIM_TEXT_FIELD, parent_path=item_path),
+                evidence_labels=_required_string_tuple(data, _EVIDENCE_LABELS_FIELD, parent_path=item_path),
+                evidence_kind=FactEvidenceKindVNext(
+                    _required_enum(
+                        data,
+                        _EVIDENCE_KIND_FIELD,
+                        parent_path=item_path,
+                        allowed_values=_FACT_EVIDENCE_KIND_VALUES,
+                    )
+                ),
+                source_labels=_optional_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(candidates)
@@ -656,15 +690,21 @@ def _answer_anchor_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[
     :returns: answer anchor candidate tuple。
     """
 
-    values = _required_sequence(proposal, "answer_anchors", max_items=MAX_VNEXT_ANSWER_ANCHOR_ITEMS)
+    values = _required_array(
+        proposal,
+        _ANSWER_ANCHORS_FIELD,
+        parent_path="",
+        max_items=MAX_VNEXT_ANSWER_ANCHOR_ITEMS,
+    )
     candidates: list[AnswerAnchorCandidateVNext] = []
     for index, item in enumerate(values):
-        data = _json_mapping(item, f"answer_anchors[{index}]")
+        item_path = _item_path(_ANSWER_ANCHORS_FIELD, index)
+        data = _json_object(item, item_path)
         candidates.append(
             AnswerAnchorCandidateVNext(
-                anchor_title=_required_string(data, "anchor_title"),
-                anchor_items=_answer_anchor_children_vnext(data, f"answer_anchors[{index}].anchor_items"),
-                answer_source_labels=_required_string_tuple(data, "answer_source_labels"),
+                anchor_title=_required_string(data, _ANCHOR_TITLE_FIELD, parent_path=item_path),
+                anchor_items=_answer_anchor_children_vnext(data, item_path),
+                answer_source_labels=_required_string_tuple(data, _ANSWER_SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(candidates)
@@ -672,23 +712,30 @@ def _answer_anchor_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[
 
 def _answer_anchor_children_vnext(
     source: Mapping[str, JsonValue],
-    field_name: str,
+    parent_path: str,
 ) -> tuple[AnswerAnchorChildVNext, ...]:
     """解析 vNext answer anchor children。
 
     :param source: answer anchor JSON object。
-    :param field_name: 错误字段名。
+    :param parent_path: answer anchor 的完整字段路径。
     :returns: answer anchor child tuple。
     """
 
-    values = _required_sequence(source, "anchor_items", max_items=MAX_VNEXT_ANSWER_ANCHOR_ITEMS)
+    values = _required_array(
+        source,
+        _ANCHOR_ITEMS_FIELD,
+        parent_path=parent_path,
+        max_items=MAX_VNEXT_ANSWER_ANCHOR_ITEMS,
+    )
+    field_path = _field_path(parent_path, _ANCHOR_ITEMS_FIELD)
     children: list[AnswerAnchorChildVNext] = []
     for index, item in enumerate(values):
-        data = _json_mapping(item, f"{field_name}[{index}]")
+        item_path = _item_path(field_path, index)
+        data = _json_object(item, item_path)
         children.append(
             AnswerAnchorChildVNext(
-                display_text=_required_string(data, "display_text"),
-                ordinal=_optional_int_or_none(data, "ordinal"),
+                display_text=_required_string(data, _DISPLAY_TEXT_FIELD, parent_path=item_path),
+                ordinal=_optional_non_negative_int(data, _ORDINAL_FIELD, parent_path=item_path),
             )
         )
     return tuple(children)
@@ -701,16 +748,36 @@ def _forward_intent_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple
     :returns: forward intent candidate tuple。
     """
 
-    values = _required_sequence(proposal, "forward_intents", max_items=MAX_VNEXT_FORWARD_INTENT_ITEMS)
+    values = _required_array(
+        proposal,
+        _FORWARD_INTENTS_FIELD,
+        parent_path="",
+        max_items=MAX_VNEXT_FORWARD_INTENT_ITEMS,
+    )
     candidates: list[ForwardIntentCandidateVNext] = []
     for index, item in enumerate(values):
-        data = _json_mapping(item, f"forward_intents[{index}]")
+        item_path = _item_path(_FORWARD_INTENTS_FIELD, index)
+        data = _json_object(item, item_path)
         candidates.append(
             ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext(_required_string(data, "intent_type")),
-                text=_required_string(data, "text"),
-                status=ForwardIntentStatusVNext(_required_string(data, "status")),
-                source_labels=_required_string_tuple(data, "source_labels"),
+                intent_type=ForwardIntentTypeVNext(
+                    _required_enum(
+                        data,
+                        _INTENT_TYPE_FIELD,
+                        parent_path=item_path,
+                        allowed_values=_FORWARD_INTENT_TYPE_VALUES,
+                    )
+                ),
+                text=_required_string(data, _TEXT_FIELD, parent_path=item_path),
+                status=ForwardIntentStatusVNext(
+                    _required_enum(
+                        data,
+                        _STATUS_FIELD,
+                        parent_path=item_path,
+                        allowed_values=_FORWARD_INTENT_STATUS_VALUES,
+                    )
+                ),
+                source_labels=_required_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(candidates)
@@ -723,19 +790,28 @@ def _reference_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[Refe
     :returns: reference continuity candidate tuple。
     """
 
-    values = _required_sequence(
+    values = _required_array(
         proposal,
-        "reference_continuity_items",
+        _REFERENCE_CONTINUITY_ITEMS_FIELD,
+        parent_path="",
         max_items=MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS,
     )
     candidates: list[ReferenceContinuityCandidateVNext] = []
     for index, item in enumerate(values):
-        data = _json_mapping(item, f"reference_continuity_items[{index}]")
+        item_path = _item_path(_REFERENCE_CONTINUITY_ITEMS_FIELD, index)
+        data = _json_object(item, item_path)
         candidates.append(
             ReferenceContinuityCandidateVNext(
-                text=_required_string(data, "text"),
-                reason=ReferenceContinuityReasonVNext(_required_string(data, "reason")),
-                source_labels=_required_string_tuple(data, "source_labels"),
+                text=_required_string(data, _TEXT_FIELD, parent_path=item_path),
+                reason=ReferenceContinuityReasonVNext(
+                    _required_enum(
+                        data,
+                        _REASON_FIELD,
+                        parent_path=item_path,
+                        allowed_values=_REFERENCE_CONTINUITY_REASON_VALUES,
+                    )
+                ),
+                source_labels=_required_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(candidates)
@@ -748,15 +824,21 @@ def _diagnostics_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactCandid
     :returns: diagnostic tuple。
     """
 
-    values = _required_sequence(proposal, "diagnostics", max_items=MAX_VNEXT_DIAGNOSTIC_ITEMS)
+    values = _required_array(
+        proposal,
+        _DIAGNOSTICS_FIELD,
+        parent_path="",
+        max_items=MAX_VNEXT_DIAGNOSTIC_ITEMS,
+    )
     diagnostics: list[CompactCandidateDiagnosticVNext] = []
     for index, item in enumerate(values):
-        data = _json_mapping(item, f"diagnostics[{index}]")
+        item_path = _item_path(_DIAGNOSTICS_FIELD, index)
+        data = _json_object(item, item_path)
         diagnostics.append(
             CompactCandidateDiagnosticVNext(
-                code=_required_string(data, "code"),
-                text=_required_string(data, "text"),
-                source_labels=_optional_string_tuple(data, "source_labels"),
+                code=_required_string(data, _CODE_FIELD, parent_path=item_path),
+                text=_required_string(data, _TEXT_FIELD, parent_path=item_path),
+                source_labels=_optional_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )
     return tuple(diagnostics)
@@ -860,45 +942,80 @@ def _validate_vnext_labels(
 
 
 
-def _required_mapping(source: Mapping[str, JsonValue], key: str) -> Mapping[str, JsonValue]:
-    """读取必需 JSON object 字段。
+def _field_path(parent: str, key: str) -> str:
+    """拼接 JSON object 字段路径。
 
-    :param source: JSON object。
-    :param key: 字段名。
-    :returns: JSON object 字段值。
-    :raises KeyError: 字段缺失时抛出。
-    :raises TypeError: 字段不是 object 时抛出。
+    :param parent: 父字段路径；顶层字段传空字符串。
+    :param key: 当前字段名。
+    :returns: 完整字段路径。
     """
 
-    if key not in source:
-        raise KeyError(f"{key} is required")
-    return _json_mapping(source[key], key)
+    if parent == "":
+        return key
+    return f"{parent}.{key}"
 
 
-def _json_mapping(value: JsonValue, field_name: str) -> Mapping[str, JsonValue]:
+def _item_path(parent: str, index: int) -> str:
+    """拼接 JSON array 元素路径。
+
+    :param parent: 数组字段的完整路径。
+    :param index: 元素下标。
+    :returns: 完整元素路径。
+    """
+
+    return f"{parent}[{index}]"
+
+
+def _json_object(value: JsonValue, field_path: str) -> Mapping[str, JsonValue]:
     """校验 JSON 值为 object。
 
     :param value: JSON 值。
-    :param field_name: 错误字段名。
+    :param field_path: 待校验值的完整字段路径。
     :returns: JSON object。
-    :raises TypeError: 值不是 object 时抛出。
+    :raises TypeError: 值不是 object 或 object key 不是字符串时抛出。
     """
 
     if not isinstance(value, Mapping):
-        raise TypeError(f"{field_name} must be object")
+        raise TypeError(f"{field_path} must be object")
+    for key in value:
+        if not isinstance(key, str):
+            raise TypeError(f"{field_path} object keys must be strings")
     return value
 
 
-def _required_sequence(
+def _required_value(
     source: Mapping[str, JsonValue],
     key: str,
     *,
+    parent_path: str,
+) -> JsonValue:
+    """读取必需 JSON 字段值。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :param parent_path: ``source`` 对应的父字段路径。
+    :returns: JSON 字段值。
+    :raises KeyError: 字段缺失时抛出。
+    """
+
+    field_path = _field_path(parent_path, key)
+    if key not in source:
+        raise KeyError(f"missing required key: {field_path}")
+    return source[key]
+
+
+def _required_array(
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    parent_path: str,
     max_items: int,
 ) -> tuple[JsonValue, ...]:
     """读取必需 JSON array 字段。
 
     :param source: JSON object。
     :param key: 字段名。
+    :param parent_path: ``source`` 对应的父字段路径。
     :param max_items: 数组元素上限。
     :returns: JSON 值 tuple。
     :raises KeyError: 字段缺失时抛出。
@@ -906,133 +1023,162 @@ def _required_sequence(
     :raises ValueError: 数组超过上限时抛出。
     """
 
-    if key not in source:
-        raise KeyError(f"{key} is required")
-    value = source[key]
+    field_path = _field_path(parent_path, key)
+    value = _required_value(source, key, parent_path=parent_path)
     if not isinstance(value, list):
-        raise TypeError(f"{key} must be array")
+        raise TypeError(f"{field_path} must be array")
     if len(value) > max_items:
-        raise ValueError(f"{key} exceeds maximum item count")
+        raise ValueError(f"{field_path} exceeds maximum item count")
     return tuple(value)
 
 
-def _required_string(source: Mapping[str, JsonValue], key: str) -> str:
+def _required_string(
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    parent_path: str,
+) -> str:
     """读取必需字符串字段。
 
     :param source: JSON object。
     :param key: 字段名。
+    :param parent_path: ``source`` 对应的父字段路径。
     :returns: 字符串值。
     :raises KeyError: 字段缺失时抛出。
     :raises TypeError: 字段不是字符串时抛出。
     """
 
-    if key not in source:
-        raise KeyError(f"{key} is required")
-    value = source[key]
+    field_path = _field_path(parent_path, key)
+    value = _required_value(source, key, parent_path=parent_path)
     if not isinstance(value, str):
-        raise TypeError(f"{key} must be string")
+        raise TypeError(f"{field_path} must be string")
     return value
 
 
-def _optional_string_or_none(source: Mapping[str, JsonValue], key: str) -> str | None:
-    """读取可选字符串或 null 字段。
+def _optional_non_negative_int(
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    parent_path: str,
+) -> int | None:
+    """读取可选非负整数或 null 字段。
 
     :param source: JSON object。
     :param key: 字段名。
-    :returns: 字符串、``None`` 或缺省时的 ``None``。
-    :raises TypeError: 字段既不是字符串也不是 null 时抛出。
-    """
-
-    if key not in source:
-        return None
-    value = source[key]
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise TypeError(f"{key} must be string or null")
-    return value
-
-
-def _optional_int_or_none(source: Mapping[str, JsonValue], key: str) -> int | None:
-    """读取可选整数或 null 字段。
-
-    :param source: JSON object。
-    :param key: 字段名。
-    :returns: 整数、``None`` 或缺省时的 ``None``。
+    :param parent_path: ``source`` 对应的父字段路径。
+    :returns: 非负整数、``None`` 或缺省时的 ``None``。
     :raises TypeError: 字段既不是整数也不是 null 时抛出。
+    :raises ValueError: 字段是负整数时抛出。
     """
 
     if key not in source:
         return None
+    field_path = _field_path(parent_path, key)
     value = source[key]
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{key} must be integer or null")
+        raise TypeError(f"{field_path} must be non-negative integer or null")
+    if value < 0:
+        raise ValueError(f"{field_path} must be non-negative integer or null")
     return value
 
 
-def _optional_string_tuple(source: Mapping[str, JsonValue], key: str) -> tuple[str, ...]:
+def _required_enum(
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    parent_path: str,
+    allowed_values: frozenset[str],
+) -> str:
+    """读取必需枚举字符串字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :param parent_path: ``source`` 对应的父字段路径。
+    :param allowed_values: 允许的枚举字符串集合。
+    :returns: 枚举字符串值。
+    :raises KeyError: 字段缺失时抛出。
+    :raises TypeError: 字段不是字符串时抛出。
+    :raises ValueError: 字段值不在允许集合中时抛出。
+    """
+
+    value = _required_string(source, key, parent_path=parent_path)
+    field_path = _field_path(parent_path, key)
+    if value not in allowed_values:
+        raise ValueError(f"{field_path} has invalid enum value")
+    return value
+
+
+def _optional_string_tuple(
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    parent_path: str,
+) -> tuple[str, ...]:
     """读取可选字符串数组字段。
 
     :param source: JSON object。
     :param key: 字段名。
+    :param parent_path: ``source`` 对应的父字段路径。
     :returns: 字符串 tuple；缺省时为空 tuple。
     :raises TypeError: 字段不是字符串数组时抛出。
+    :raises ValueError: 数组超过上限时抛出。
     """
 
     if key not in source:
         return ()
-    return _string_tuple(source[key], key)
+    return _string_tuple(
+        source[key],
+        _field_path(parent_path, key),
+        max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
+    )
 
 
-def _required_string_tuple(source: Mapping[str, JsonValue], key: str) -> tuple[str, ...]:
+def _required_string_tuple(
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    parent_path: str,
+) -> tuple[str, ...]:
     """读取必需字符串数组字段。
 
     :param source: JSON object。
     :param key: 字段名。
+    :param parent_path: ``source`` 对应的父字段路径。
     :returns: 字符串 tuple。
     :raises KeyError: 字段缺失时抛出。
     :raises TypeError: 字段不是字符串数组时抛出。
+    :raises ValueError: 数组超过上限时抛出。
     """
 
-    if key not in source:
-        raise KeyError(f"{key} is required")
-    return _string_tuple(source[key], key)
+    field_path = _field_path(parent_path, key)
+    return _string_tuple(
+        _required_value(source, key, parent_path=parent_path),
+        field_path,
+        max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
+    )
 
 
-def _optional_string_tuple_or_none(source: Mapping[str, JsonValue], key: str) -> tuple[str, ...] | None:
-    """读取字符串数组或 null 字段。
-
-    :param source: JSON object。
-    :param key: 字段名。
-    :returns: 字符串 tuple、``None`` 或缺省时的 ``None``。
-    :raises TypeError: 字段既不是字符串数组也不是 null 时抛出。
-    """
-
-    if key not in source:
-        return None
-    value = source[key]
-    if value is None:
-        return None
-    return _string_tuple(value, key)
-
-
-def _string_tuple(value: JsonValue, field_name: str) -> tuple[str, ...]:
+def _string_tuple(value: JsonValue, field_path: str, *, max_items: int) -> tuple[str, ...]:
     """校验 JSON 值为字符串数组。
 
     :param value: JSON 值。
-    :param field_name: 错误字段名。
+    :param field_path: 待校验值的完整字段路径。
+    :param max_items: 字符串数组元素上限。
     :returns: 字符串 tuple。
     :raises TypeError: 值不是字符串数组时抛出。
+    :raises ValueError: 数组超过上限时抛出。
     """
 
     if not isinstance(value, list):
-        raise TypeError(f"{field_name} must be array")
+        raise TypeError(f"{field_path} must be array")
+    if len(value) > max_items:
+        raise ValueError(f"{field_path} exceeds maximum item count")
     strings: list[str] = []
     for index, item in enumerate(value):
         if not isinstance(item, str):
-            raise TypeError(f"{field_name}[{index}] must be string")
+            raise TypeError(f"{_item_path(field_path, index)} must be string")
         strings.append(item)
     return tuple(strings)
 
