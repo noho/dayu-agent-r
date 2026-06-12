@@ -130,6 +130,25 @@ _FORBIDDEN_COMPACTOR_MATERIAL_TERMS = (
     "tool_call_id=",
     "vNext",
 )
+_COMPACTOR_MATERIAL_TOP_LEVEL_KEYS = (
+    "schema_version",
+    "previous_compacted_view",
+    "trace_material",
+    "evidence_material",
+    "answer_material",
+    "current_input_anchor",
+    "instruction",
+)
+_COMPACTOR_MATERIAL_LIST_SECTION_KEYS = (
+    "trace_material",
+    "evidence_material",
+    "answer_material",
+)
+_STALE_COMPACTOR_MATERIAL_SECTION_KEYS = (
+    "stable_input",
+    "history_input",
+    "evidence_input",
+)
 
 
 def test_default_compactor_prompt_is_llm_facing_and_self_contained() -> None:
@@ -168,6 +187,100 @@ def test_default_compactor_prompt_is_llm_facing_and_self_contained() -> None:
         "diagnostics",
     ):
         assert required_field in user_prompt_template
+
+
+def test_compactor_material_assertion_helpers_accept_valid_material() -> None:
+    """Public compact material assertion helpers 接受有效 material / proposal。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 拒绝有效 material 或 proposal 时抛出。
+    """
+
+    material_json = _valid_compactor_material_json()
+    _assert_compactor_material_instruction_contract(material_json)
+    _assert_material_evidence_contains_marker(
+        material_json, marker=_LONG_CHAPTER_MARKER
+    )
+    proposal = _required_mapping(
+        cast(
+            JsonValue,
+            json.loads(fake_compaction_proposal_from_material_json(material_json)),
+        ),
+        field_name="fake proposal",
+    )
+    _assert_label_only_fake_proposal(proposal, marker=_LONG_CHAPTER_MARKER)
+
+
+def test_compactor_material_section_shape_rejects_stale_legacy_key() -> None:
+    """Material section helper 拒绝 stale legacy section key。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未拒绝 stale key 时抛出。
+    """
+
+    material_json = _valid_compactor_material_json()
+    stale_value: list[JsonValue] = []
+    material_json["stable_input"] = stale_value
+
+    with pytest.raises(AssertionError, match="material pack / labels boundary"):
+        _assert_compactor_material_section_shape(material_json)
+
+
+def test_compactor_material_forbidden_terms_rejects_internal_text() -> None:
+    """Forbidden-term helper 拒绝 LLM-facing material 内部术语泄漏。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未拒绝内部术语时抛出。
+    """
+
+    material_json = _valid_compactor_material_json()
+    anchor = dict(
+        _required_mapping(
+            material_json["current_input_anchor"], field_name="current_input_anchor"
+        )
+    )
+    anchor["text"] = "EventLog should never be LLM-facing material."
+    material_json["current_input_anchor"] = anchor
+
+    with pytest.raises(AssertionError, match="LLM-facing material boundary"):
+        _assert_no_forbidden_compactor_material_terms(material_json)
+
+
+def test_compactor_material_evidence_marker_rejects_missing_marker() -> None:
+    """Evidence marker helper 拒绝缺少期望 marker 的 material。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未拒绝缺失 marker 时抛出。
+    """
+
+    material_json = _valid_compactor_material_json(include_marker=False)
+
+    with pytest.raises(AssertionError, match="evidence material marker boundary"):
+        _assert_material_evidence_contains_marker(
+            material_json, marker=_LONG_CHAPTER_MARKER
+        )
+
+
+def test_label_only_fake_proposal_rejects_canonical_ref_leakage() -> None:
+    """Fake proposal helper 拒绝 canonical ref 泄漏。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未拒绝 canonical ref 泄漏时抛出。
+    """
+
+    proposal: dict[str, JsonValue] = {
+        "evidence_backed_facts": [
+            {
+                "evidence_labels": ["E1"],
+                "claim_text": (
+                    f"{_LONG_CHAPTER_MARKER} payload:event-tool-result-accepted"
+                ),
+            }
+        ]
+    }
+
+    with pytest.raises(AssertionError, match="compactor proposal boundary"):
+        _assert_label_only_fake_proposal(proposal, marker=_LONG_CHAPTER_MARKER)
 
 
 @pytest.mark.asyncio
@@ -287,11 +400,10 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
     assert len(fake_compactor.material_jsons) >= 1
     material_json = _first_material_json_with_evidence(fake_compactor.material_jsons)
     _assert_compactor_material_instruction_contract(material_json)
-    evidence_material = material_json["evidence_material"]
-    assert isinstance(evidence_material, list)
-    assert len(evidence_material) >= 1
+    _assert_material_evidence_contains_marker(
+        material_json, marker=_LONG_CHAPTER_MARKER
+    )
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
-    assert _LONG_CHAPTER_MARKER in material_text
     assert "result_preview" not in material_text
     assert "payload:" not in material_text
     assert "event-tool-result" not in material_text
@@ -316,18 +428,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
         ),
         field_name="fake proposal",
     )
-    fact_candidates = proposal["evidence_backed_facts"]
-    assert isinstance(fact_candidates, list)
-    assert len(fact_candidates) == 1
-    fact = _required_mapping(fact_candidates[0], field_name="fact")
-    assert fact["evidence_labels"] == ["E1"]
-    claim_text = fact["claim_text"]
-    assert isinstance(claim_text, str)
-    assert _LONG_CHAPTER_MARKER in claim_text
-    proposal_text = json.dumps(proposal, ensure_ascii=False, sort_keys=True)
-    assert "result_preview" not in proposal_text
-    assert "event-tool-result-accepted" not in proposal_text
-    assert "payload:" not in proposal_text
+    _assert_label_only_fake_proposal(proposal, marker=_LONG_CHAPTER_MARKER)
 
 
 @pytest.mark.asyncio
@@ -775,9 +876,11 @@ def _assert_compactor_material_instruction_contract(
 
     :param material_json: compactor request 中投影给 LLM 的 material JSON。
     :returns: ``None``。
-    :raises AssertionError: instruction contract 暴露内部类型名或字面量错误时抛出。
+    :raises AssertionError: material shape 或 instruction contract 非法时抛出。
     """
 
+    _assert_compactor_material_section_shape(material_json)
+    _assert_no_forbidden_compactor_material_terms(material_json)
     instruction_value = material_json["instruction"]
     assert isinstance(instruction_value, Mapping)
     instruction = cast(Mapping[str, JsonValue], instruction_value)
@@ -785,9 +888,109 @@ def _assert_compactor_material_instruction_contract(
         instruction["output_schema_name"]
         == _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER
     )
+
+
+def _assert_compactor_material_section_shape(
+    material_json: Mapping[str, JsonValue],
+) -> None:
+    """校验 public compactor material 顶层 section shape。
+
+    :param material_json: compactor request 中投影给 LLM 的 material JSON。
+    :returns: ``None``。
+    :raises AssertionError: 顶层 section key 或 section 类型不符合预期时抛出。
+    """
+
+    for key in _COMPACTOR_MATERIAL_TOP_LEVEL_KEYS:
+        assert (
+            key in material_json
+        ), f"material pack / labels boundary missing top-level key: {key}"
+    for key in _STALE_COMPACTOR_MATERIAL_SECTION_KEYS:
+        assert (
+            key not in material_json
+        ), f"material pack / labels boundary leaked stale section key: {key}"
+    for key in _COMPACTOR_MATERIAL_LIST_SECTION_KEYS:
+        section_value = material_json[key]
+        assert isinstance(
+            section_value, list
+        ), f"material pack / labels boundary expected list section: {key}"
+    assert isinstance(
+        material_json["current_input_anchor"], Mapping
+    ), "material pack / labels boundary expected current_input_anchor object"
+    assert isinstance(
+        material_json["instruction"], Mapping
+    ), "material pack / labels boundary expected instruction object"
+
+
+def _assert_no_forbidden_compactor_material_terms(
+    material_json: Mapping[str, JsonValue],
+) -> None:
+    """校验 LLM-facing material 未泄漏内部术语。
+
+    :param material_json: compactor request 中投影给 LLM 的 material JSON。
+    :returns: ``None``。
+    :raises AssertionError: material 文本包含内部术语时抛出。
+    """
+
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
     for forbidden_term in _FORBIDDEN_COMPACTOR_MATERIAL_TERMS:
-        assert forbidden_term not in material_text
+        assert (
+            forbidden_term not in material_text
+        ), f"LLM-facing material boundary leaked forbidden term: {forbidden_term}"
+
+
+def _assert_material_evidence_contains_marker(
+    material_json: Mapping[str, JsonValue], *, marker: str
+) -> None:
+    """校验 public compactor material 的 evidence section 保留 marker。
+
+    :param material_json: compactor request 中投影给 LLM 的 material JSON。
+    :param marker: 期望出现在 evidence material 中的 marker。
+    :returns: ``None``。
+    :raises AssertionError: evidence material 缺失 marker 时抛出。
+    """
+
+    evidence_material = material_json["evidence_material"]
+    assert isinstance(
+        evidence_material, list
+    ), "evidence material marker boundary expected evidence_material list"
+    assert len(evidence_material) >= 1
+    evidence_text = json.dumps(evidence_material, ensure_ascii=False, sort_keys=True)
+    assert (
+        marker in evidence_text
+    ), f"evidence material marker boundary missing marker: {marker}"
+
+
+def _assert_label_only_fake_proposal(
+    proposal: Mapping[str, JsonValue], *, marker: str
+) -> None:
+    """校验 fake compactor proposal 只使用 prompt-local label。
+
+    :param proposal: fake compactor proposal JSON object。
+    :param marker: 期望保留在 claim text 中的 marker。
+    :returns: ``None``。
+    :raises AssertionError: proposal 缺少 fact、marker 或泄漏 canonical ref 时抛出。
+    """
+
+    fact_candidates = proposal["evidence_backed_facts"]
+    assert isinstance(fact_candidates, list)
+    assert len(fact_candidates) == 1
+    fact = _required_mapping(fact_candidates[0], field_name="fact")
+    assert fact["evidence_labels"] == [
+        "E1"
+    ], "compactor proposal boundary must use prompt-local E label"
+    claim_text = fact["claim_text"]
+    assert isinstance(claim_text, str)
+    assert marker in claim_text, "compactor proposal boundary lost evidence marker"
+    proposal_text = json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+    assert (
+        "result_preview" not in proposal_text
+    ), "compactor proposal boundary leaked result_preview"
+    assert (
+        "event-tool-result-accepted" not in proposal_text
+    ), "compactor proposal boundary leaked canonical event ref"
+    assert (
+        "payload:" not in proposal_text
+    ), "compactor proposal boundary leaked payload ref"
 
 
 def _assert_runner_call_manifest_messages(
@@ -872,32 +1075,56 @@ def _compactor_user_prompt(request: AgentRunRequest) -> str:
     return user_messages[0].content
 
 
+def _valid_compactor_material_json(
+    *, include_marker: bool = True
+) -> dict[str, JsonValue]:
+    """构造 helper 自测用有效 public compactor material JSON。
+
+    :param include_marker: 是否在 evidence material 中包含长章节 marker。
+    :returns: public compactor material JSON。
+    """
+
+    result_text = (
+        _long_chapter_tool_result()
+        if include_marker
+        else "accepted raw tool evidence without marker"
+    )
+    evidence_item: dict[str, JsonValue] = {
+        "label": "E1",
+        "kind": "accepted_tool_evidence",
+        "tool_name": "lookup_mock_fact",
+        "query_text": "读取长章节工具证据",
+        "result_text": result_text,
+        "source_text": "accepted raw tool evidence",
+    }
+    current_anchor: dict[str, JsonValue] = {
+        "label": "C1",
+        "kind": "current_input_anchor",
+        "text": "复用 raw evidence fact。",
+        "truncated": False,
+    }
+    instruction: dict[str, JsonValue] = {
+        "output_schema_name": _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER,
+        "compact_goal": "保留可复用证据。",
+    }
+    return {
+        "schema_version": "conversation_compact_input_v1",
+        "previous_compacted_view": None,
+        "trace_material": [],
+        "evidence_material": [evidence_item],
+        "answer_material": [],
+        "current_input_anchor": current_anchor,
+        "instruction": instruction,
+    }
+
+
 def _llm_material_with_long_tool_evidence() -> Mapping[str, JsonValue]:
     """构造只含 prompt-local label 的 LLM-facing raw evidence material。
 
     :returns: LLM-facing material JSON。
     """
 
-    return {
-        "previous_compacted_view": [],
-        "trace_material": [],
-        "evidence_material": [
-            {
-                "label": "E1",
-                "kind": "accepted_tool_evidence",
-                "tool_name": "lookup_mock_fact",
-                "query_text": "读取长章节工具证据",
-                "result_text": _long_chapter_tool_result(),
-                "source_text": "accepted raw tool evidence",
-            }
-        ],
-        "current_input_anchor": {
-            "label": "C1",
-            "kind": "current_input_anchor",
-            "text": "复用 raw evidence fact。",
-            "truncated": False,
-        },
-    }
+    return _valid_compactor_material_json()
 
 
 class _LongChapterMockTool:
