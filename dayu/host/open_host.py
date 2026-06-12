@@ -526,12 +526,16 @@ class _PublicHostHandle:
         self,
         request: HostStorageMaintenanceRequest,
     ) -> HostStorageMaintenanceResult:
-        """执行 Host storage maintenance dry-run。
+        """执行 Host storage maintenance。
 
         :param request: maintenance 请求。
-        :returns: dry-run maintenance 结果。
+            默认 dry-run 不删除文件；当
+            ``request.reclaim_orphan_artifacts`` 为 ``True`` 时，会执行破坏性
+            orphan artifact 回收。
+        :returns: maintenance 结果。
         :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: maintenance 读取、扫描或 checkpoint 失败时抛出。
+        :raises HostApiError: maintenance 读取、扫描、checkpoint 或 orphan artifact
+            回收失败时抛出。
         """
 
         self._raise_if_closed()

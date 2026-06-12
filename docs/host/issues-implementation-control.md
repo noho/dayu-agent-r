@@ -142,11 +142,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | aggregate-deepreview |
-| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 implementation slices accepted and awaiting aggregate deepreview |
+| gate | accepted-deepreview-commit |
+| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 aggregate deepreview and re-review PASS, awaiting accepted deepreview commit |
 | active work unit | WU-RET-00 |
 | default next work unit | WU-OBS-00 |
-| next entry point | WU-RET-00 aggregate deepreview gate |
+| next entry point | WU-RET-00 accepted deepreview commit gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -527,6 +527,12 @@ GitHub Issue #43 当前为 OPEN，已 currentize 为 Host storage lifecycle / re
 - slice 4 code review: `docs/reviews/wu-ret-00-slice4-code-review-mimo.md`; `docs/reviews/wu-ret-00-slice4-code-review-ds.md`
 - slice 4 review conclusion: PASS; blocking findings 0; validation full `pyright` 0 errors
 - slice 4 accepted commit: `f5b1cccd`
+- aggregate deepreview: `docs/reviews/wu-ret-00-aggregate-deepreview-mimo.md`; `docs/reviews/wu-ret-00-aggregate-deepreview-ds.md`
+- aggregate deepreview conclusion: PASS; blocking findings 0; DS Finding 001 accepted and fixed; DS Findings 002/003 deferred as non-blocking diagnostics/defensive hardening; DS Open Question Q1 fixed; DS Open Question Q2 deferred as non-blocking consistency question
+- aggregate deepreview fix: `docs/reviews/wu-ret-00-aggregate-deepreview-fix-codex.md`
+- aggregate deepreview re-review: `docs/reviews/wu-ret-00-aggregate-deepreview-rereview-mimo.md`; `docs/reviews/wu-ret-00-aggregate-deepreview-rereview-ds.md`
+- aggregate deepreview re-review conclusion: PASS; blocking findings 0; validation `pyright dayu/host/api.py dayu/host/open_host.py` 0 errors; `git diff --check` passed
+- aggregate deepreview accepted commit: pending
 
 ## WU-RET-01 Tool Trace Cold JSONL Storage Governance
 
