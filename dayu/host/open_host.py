@@ -97,6 +97,10 @@ from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
 from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.storage_maintenance import (
+    HostStorageUsageReport,
+    report_storage_usage as _report_storage_usage,
+)
 from dayu.host.tool_trace import (
     DEFAULT_TOOL_TRACE_CATCHUP_BATCH_SIZE,
     ToolTraceSinkOptions,
@@ -503,6 +507,17 @@ class _PublicHostHandle:
 
         self._raise_if_closed()
         return _purge_session(self._command_handle, session_id, request)
+
+    async def report_storage_usage(self) -> HostStorageUsageReport:
+        """读取 Host durable storage usage report。
+
+        :returns: storage usage report。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        self._raise_if_closed()
+        return _report_storage_usage(self._command_handle)
 
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。

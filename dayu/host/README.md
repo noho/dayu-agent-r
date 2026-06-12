@@ -78,12 +78,13 @@ Host 与其它层的稳定边界如下：
 - `resolve_wait(wait_id, request)`：接收外部 wait result，由 Host 恢复或收口 Run。
 - `close_session(session_id, request)`：关闭 Session 的新输入入口。
 - `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 本地可恢复事实。
+- `report_storage_usage()`：读取只读 storage usage report，包含 durable SQLite 表 row count、payload logical bytes、orphan SQLite payload 诊断计数以及 DB/WAL 文件大小。
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
 - `watch_session_events(session_id)`：创建 live HostEvent 订阅；订阅从当前 live cursor 开始，不提供离线 replay cursor。
 - `close()`：关闭当前 opener runtime，向 active worker 传播 lifecycle cancel；该操作不写用户 cancel / failed terminal facts。
 
-包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
+包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
 `OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up batch size 与 truncation manager 开关。
 
@@ -416,6 +417,10 @@ reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该�
 ### Purge
 
 `purge_session` 只接受已经 `CLOSED` 且所有 Run 均为终态、没有 active / queued / waiting / cancelling / recovering Run 的 Session。成功后，Host 删除目标 Session 的本地可恢复事实和派生视图数据，保留独立 purge tombstone、purge 幂等记录和 append-only audit JSONL。purge tombstone 不位于被 purge 的 Session EventLog 中，也不参与 resume、retry、replay、memory、RunInputBuilder 或普通 read truth。
+
+### Storage Usage Report
+
+`report_storage_usage` 是 operator-facing 只读诊断入口。它在 durable read transaction 内统计当前 Host SQLite 表 row count，读取 SQLite payload logical bytes、artifact descriptor logical bytes、未被 descriptor 引用的 SQLite payload row 数，并通过文件 `stat` 返回 DB / WAL 文件大小。该 report 不写 EventLog，不改变 Session / Run / Attempt 状态，不扫描 artifact root，不执行 checkpoint，也不删除文件或 row。
 
 ## 状态机
 

@@ -142,11 +142,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 Slice 1 accepted and ready for implementation Slice 2 |
+| gate | accepted-slice-commit |
+| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 Slice 2 re-review PASS and awaiting accepted slice commit |
 | active work unit | WU-RET-00 |
 | default next work unit | WU-OBS-00 |
-| next entry point | WU-RET-00 implementation gate Slice 2: read-only storage usage report |
+| next entry point | WU-RET-00 Slice 2 accepted slice commit gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -508,6 +508,15 @@ GitHub Issue #43 当前为 OPEN，已 currentize 为 Host storage lifecycle / re
 - slice 1 re-review: `docs/reviews/wu-ret-00-slice1-rereview-mimo.md`; `docs/reviews/wu-ret-00-slice1-rereview-ds.md`
 - slice 1 review conclusion: PASS; accepted findings fixed 3/3; validation `pytest tests/host/test_artifact_store.py -q` 16 passed; `pyright dayu/host/durable/artifact.py tests/host/test_artifact_store.py` 0 errors; full `pyright` 0 errors
 - slice 1 accepted commit: `473f1e6d`
+- slice 2 implementation: `docs/reviews/wu-ret-00-slice2-implementation-codex.md`
+- slice 2 validation: `pytest tests/host/test_storage_usage_report.py -q` 5 passed; `pytest tests/host/test_package_exports.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py -q` 28 passed; target `pyright` 0 errors
+- slice 2 code review: `docs/reviews/wu-ret-00-slice2-code-review-mimo.md`; `docs/reviews/wu-ret-00-slice2-code-review-ds.md`
+- slice 2 finding adjudication: MiMo F01 accepted for fix; DS Finding 2 deferred in general but current public facade error mapping fixed now; all other findings accepted or deferred-with-owner by review
+- slice 2 fix: `docs/reviews/wu-ret-00-slice2-fix-codex.md`
+- slice 2 fix validation: `pytest tests/host/test_storage_usage_report.py -q` 7 passed; `pytest tests/host/test_package_exports.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py -q` 28 passed; `pyright dayu/host/storage_maintenance.py tests/host/test_storage_usage_report.py` 0 errors
+- slice 2 re-review: `docs/reviews/wu-ret-00-slice2-rereview-mimo.md`; `docs/reviews/wu-ret-00-slice2-rereview-ds.md`
+- slice 2 review conclusion: PASS; accepted findings fixed 1/1; validation `pytest tests/host/test_storage_usage_report.py -q` 7 passed; `pytest tests/host/test_package_exports.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py -q` 28 passed; full `pyright` 0 errors
+- slice 2 accepted commit: pending
 
 ## WU-RET-01 Tool Trace Cold JSONL Storage Governance
 

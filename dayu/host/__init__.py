@@ -98,6 +98,10 @@ from dayu.host.command import (
 )
 from dayu.host.read_api import get_run, get_session
 from dayu.host.open_host import open_host
+from dayu.host.storage_maintenance import (
+    HostStorageUsageReport,
+    report_storage_usage,
+)
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
@@ -145,6 +149,7 @@ __all__ = [
     "HostFinalAnswerView",
     "HostMetadataEntry",
     "HostPayloadRef",
+    "HostStorageUsageReport",
     "HostStreamCursor",
     "HostTerminalStatus",
     "LocalEngineWorker",
@@ -195,6 +200,7 @@ __all__ = [
     "open_host",
     "purge_session",
     "replay_run",
+    "report_storage_usage",
     "resolve_wait",
     "retry_run",
     "submit_followup",

@@ -12,6 +12,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import NoReturn
 from uuid import uuid4
 
@@ -236,6 +237,19 @@ class HostCommandHandle:
             options.payload_policy.artifact_root,
             create_parent_dirs=options.payload_policy.create_artifact_root,
         )
+
+    def _db_path(self) -> Path:
+        """返回当前 handle 持有的 Host durable SQLite DB 路径。
+
+        :returns: durable SQLite DB 文件路径。
+        :raises HostApiError: handle 已关闭或 durable store 配置不可读取时抛出。
+        """
+
+        self._raise_if_closed()
+        try:
+            return self._durable_store.options.db_path
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
 
     def _run_read(self, operation: HostReadTransactionOperation[T]) -> T:
         """在 handle 私有 store 上执行 read transaction。

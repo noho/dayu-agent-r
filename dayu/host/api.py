@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol, TypeAlias
+from typing import TYPE_CHECKING, Protocol, TypeAlias
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -43,6 +43,9 @@ from dayu.host.memory import (
     default_memory_projection_policy,
 )
 from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
+
+if TYPE_CHECKING:
+    from dayu.host.durable.storage_lifecycle import HostStorageUsageReport
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
@@ -3295,6 +3298,16 @@ class Host(Protocol):
         :returns: purge tombstone ref 与删除计数摘要。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: purge 前置条件不满足、幂等冲突或写入失败时抛出。
+        """
+
+        ...
+
+    async def report_storage_usage(self) -> HostStorageUsageReport:
+        """读取 Host durable storage usage report。
+
+        :returns: storage usage report。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
         """
 
         ...
