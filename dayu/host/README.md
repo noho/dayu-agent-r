@@ -425,11 +425,13 @@ reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该�
 
 ### Storage Maintenance
 
-`run_storage_maintenance` 是 operator-facing 显式 maintenance 入口。它基于 `payload_descriptors` 中 `artifact_ref` 的 artifact 相对路径收集引用集合，只扫描 artifact root 下 `sha256/` 内容寻址 namespace，返回超过 grace window 的 orphan artifact 候选、已发布 artifact 物理字节和、usage report 与可选 WAL checkpoint 诊断。checkpoint 使用独立 durable connection，不在 command transaction 内执行。
+`run_storage_maintenance` 是 operator-facing 显式 maintenance 入口。它基于 `payload_descriptors` 中 `artifact_ref` 的 artifact 相对路径收集引用集合，只扫描 artifact root 下 `sha256/` 内容寻址 namespace，返回超过 grace window 的 orphan artifact 候选、已发布 artifact 物理字节和、usage report、memory snapshot integrity issues 与可选 WAL checkpoint 诊断。checkpoint 使用独立 durable connection，不在 command transaction 内执行。
 
 maintenance 默认 dry-run，不删除 artifact 文件或 SQLite row。请求 `reclaim_orphan_artifacts=True` 时，只回收候选扫描证明为 orphan、且删除前 recheck 仍未被 descriptor 引用的 `sha256/` artifact 物理文件；失败的单文件删除以 `path`、`operation`、`message` 结构化诊断返回，成功删除的路径进入 `reclaimed_artifact_paths`。recheck 与 unlink 之间仍有极短 TOCTOU 窗口；默认 grace、content-addressed artifact 可重写性与 containment-guarded delete 用于降低风险。
 
-maintenance 不删除任何 SQLite row，不回收 SQLite orphan payload row，不执行 `VACUUM`、不启动 scheduler，也不处理 audit JSONL 或 tool-trace JSONL；SQLite space reclamation / VACUUM 继续归 Issue 76。audit JSONL、tool-trace JSONL、`.tmp` 和其它非 `sha256/` namespace 文件不参与 artifact orphan 候选。
+maintenance 的 memory snapshot integrity issues 只报告 `invalid_json`、`schema_mismatch`、`digest_mismatch`、`unsupported_item_kind` 或 `storage_read_failed` 分类、短错误摘要和 row identity；不会内联 snapshot JSON、prompt、tool payload 或大内容。
+
+maintenance 不删除任何 SQLite row，不回收 SQLite orphan payload row，不 quarantine / rebuild / overwrite memory snapshot，不执行 `VACUUM`、不启动 scheduler，也不处理 audit JSONL 或 tool-trace JSONL；SQLite space reclamation / VACUUM 继续归 Issue 76。audit JSONL、tool-trace JSONL、`.tmp` 和其它非 `sha256/` namespace 文件不参与 artifact orphan 候选。
 
 ## 状态机
 
