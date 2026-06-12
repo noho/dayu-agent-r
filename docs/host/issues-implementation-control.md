@@ -501,7 +501,7 @@ GitHub Issue #43 当前为 OPEN，已 currentize 为 Host storage lifecycle / re
 - plan adjudication / fix: `docs/reviews/wu-ret-00-plan-review-adjudication.md`
 - plan re-review: `docs/reviews/wu-ret-00-plan-rereview-mimo.md`; `docs/reviews/wu-ret-00-plan-rereview-ds.md`
 - accepted plan decision: PASS; accepted findings 12/12 fixed; DB VACUUM / SQLite space reclamation deferred to GitHub Issue #76
-- accepted plan commit: pending local commit for this gate
+- accepted plan commit: `a2f94be0`
 
 ## WU-RET-01 Tool Trace Cold JSONL Storage Governance
 
