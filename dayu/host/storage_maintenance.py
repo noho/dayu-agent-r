@@ -1,8 +1,9 @@
 """Host storage maintenance public facade。
 
-本模块提供只读 storage usage report 和显式 dry-run maintenance entrypoint。
-当前 slice 的 maintenance 不删除 artifact 文件、不删除 SQLite row、不执行
-VACUUM，也不实现 scheduler。
+本模块提供只读 storage usage report 和显式 maintenance entrypoint。
+maintenance 默认 dry-run；只有调用方显式设置 ``reclaim_orphan_artifacts=True``
+时，才会回收删除前 recheck 仍未被引用的 orphan artifact 文件。它不删除
+SQLite row、不执行 VACUUM，也不实现 scheduler。
 """
 
 from __future__ import annotations
@@ -22,10 +23,13 @@ from dayu.host.durable.maintenance import (
     run_host_wal_checkpoint,
 )
 from dayu.host.durable.storage_lifecycle import (
+    DurableArtifactFileError,
     HostStorageUsageReport,
+    artifact_relative_path_is_referenced,
     collect_referenced_artifact_paths,
     physical_artifact_bytes as _physical_artifact_bytes,
     read_storage_usage,
+    reclaim_orphan_artifact_files,
     scan_orphan_artifact_files,
 )
 from dayu.host.durable.transaction import HostTransaction
@@ -38,12 +42,13 @@ DEFAULT_ORPHAN_ARTIFACT_GRACE_SECONDS = 3600.0
 class HostStorageMaintenanceRequest:
     """Host storage maintenance 请求。
 
-    当前 slice 只支持 dry-run：``reclaim_orphan_artifacts`` 必须保持
-    ``False``。dry-run 会返回 orphan artifact 候选、物理 artifact bytes、
-    usage report 和可选 WAL checkpoint 诊断，但不会删除文件或 row。
+    默认 dry-run 会返回 orphan artifact 候选、物理 artifact bytes、usage
+    report 和可选 WAL checkpoint 诊断，但不会删除文件或 row。只有
+    ``reclaim_orphan_artifacts=True`` 时才会执行 opt-in orphan artifact
+    物理文件回收。
 
     :param reclaim_orphan_artifacts: 是否执行 destructive orphan artifact 回收；
-        当前 slice 不支持 ``True``。
+        启用后仍会对每个候选执行删除前 recheck。
     :param orphan_grace_seconds: orphan 文件进入候选前必须超过的 mtime grace 秒数。
     :param run_wal_checkpoint: 是否用独立 SQLite connection 执行 WAL checkpoint。
     :param wal_checkpoint_mode: checkpoint 模式。
@@ -87,18 +92,18 @@ class HostStorageMaintenanceRequest:
 class HostStorageMaintenanceFileError:
     """storage maintenance 单文件错误诊断。
 
-    当前 dry-run slice 不执行删除，因此该类型主要保留给后续 destructive slice
-    使用；本 slice 结果中的 ``file_errors`` 应为空元组。
+    该类型用于 opt-in orphan artifact 回收中的单文件失败；失败文件不会进入
+    ``reclaimed_artifact_paths``，maintenance 会继续处理其它候选。
 
-    :param artifact_relative_path: 出错 artifact 的 POSIX 相对路径。
+    :param path: 出错 artifact 的 POSIX 相对路径。
     :param operation: 出错操作名。
-    :param error_message: 人类可读错误摘要。
+    :param message: 人类可读错误摘要。
     :raises ValueError: 任一文本字段为空时抛出。
     """
 
-    artifact_relative_path: str
+    path: str
     operation: str
-    error_message: str
+    message: str
 
     def __post_init__(self) -> None:
         """校验错误诊断字段。
@@ -108,16 +113,16 @@ class HostStorageMaintenanceFileError:
         """
 
         _require_non_empty_text(
-            self.artifact_relative_path,
-            field_name="HostStorageMaintenanceFileError.artifact_relative_path",
+            self.path,
+            field_name="HostStorageMaintenanceFileError.path",
         )
         _require_non_empty_text(
             self.operation,
             field_name="HostStorageMaintenanceFileError.operation",
         )
         _require_non_empty_text(
-            self.error_message,
-            field_name="HostStorageMaintenanceFileError.error_message",
+            self.message,
+            field_name="HostStorageMaintenanceFileError.message",
         )
 
     def json_value(self) -> JsonValue:
@@ -127,21 +132,21 @@ class HostStorageMaintenanceFileError:
         """
 
         return {
-            "artifact_relative_path": self.artifact_relative_path,
+            "path": self.path,
             "operation": self.operation,
-            "error_message": self.error_message,
+            "message": self.message,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class HostStorageMaintenanceResult:
-    """Host storage maintenance dry-run 结果。
+    """Host storage maintenance 结果。
 
     :param usage: maintenance 开始时读取的 storage usage report。
     :param physical_artifact_bytes: ``sha256/`` namespace 下已发布 artifact 物理字节和。
     :param orphan_artifact_candidates: 已证明无 descriptor 引用且超过 grace 的候选路径。
-    :param reclaimed_artifact_paths: 已删除路径；当前 dry-run slice 始终为空。
-    :param file_errors: 文件级错误；当前 dry-run slice 无删除错误时为空。
+    :param reclaimed_artifact_paths: opt-in 回收时已删除的路径；dry-run 时为空。
+    :param file_errors: 文件级错误；dry-run 或无删除错误时为空。
     :param wal_checkpoint: WAL checkpoint 诊断；请求关闭 checkpoint 时为 ``None``。
     :raises TypeError: 字段类型不符合契约时抛出。
     :raises ValueError: 整数字段为负数时抛出。
@@ -229,26 +234,23 @@ def run_storage_maintenance(
     host: HostCommandHandle,
     request: HostStorageMaintenanceRequest,
 ) -> HostStorageMaintenanceResult:
-    """执行 Host storage maintenance dry-run。
+    """执行 Host storage maintenance。
 
     本入口不在 command transaction 内执行 checkpoint；当请求 checkpoint 时，
     它会打开独立 durable connection，调用 ``run_host_wal_checkpoint`` 后在
-    ``finally`` 中关闭。当前 slice 不支持 destructive reclaim，设置
-    ``reclaim_orphan_artifacts=True`` 会 fail fast。
+    ``finally`` 中关闭。默认 dry-run 不删除任何文件；设置
+    ``reclaim_orphan_artifacts=True`` 时，仅回收已由候选扫描证明为 orphan、
+    且删除前 recheck 仍未被任何 descriptor 引用的 ``sha256/`` artifact
+    文件。recheck 与 unlink 之间仍存在极短 TOCTOU 窗口；默认 grace、
+    content-addressed artifact 可重写性与 containment-guarded delete 用于降低
+    风险。
 
     :param host: Host command handle。
     :param request: maintenance 请求。
-    :returns: dry-run maintenance 结果。
-    :raises dayu.host.api.HostApiError: durable 读取、artifact 扫描、文件 stat、
-        checkpoint 失败，或请求 destructive reclaim 时抛出。
+    :returns: maintenance 结果。
+    :raises dayu.host.api.HostApiError: durable 读取、artifact 扫描、文件 stat
+        或 checkpoint 失败时抛出。
     """
-
-    if request.reclaim_orphan_artifacts:
-        raise HostApiError(
-            code=HostApiErrorCode.UNSUPPORTED_OPERATION,
-            message="Orphan artifact reclaim is not supported in this slice",
-            retryable=False,
-        )
 
     db_path = host._db_path()
     artifact_root = host._artifact_root()
@@ -261,6 +263,12 @@ def run_storage_maintenance(
             read_state.referenced_artifact_paths,
             now=datetime.now(UTC),
             grace_seconds=request.orphan_grace_seconds,
+        )
+        reclaim_result = _reclaim_orphan_artifacts_if_requested(
+            host,
+            artifact_root=artifact_root,
+            candidates=candidates,
+            request=request,
         )
         physical_bytes = _physical_artifact_bytes(artifact_root)
         wal_checkpoint = _run_wal_checkpoint_if_requested(
@@ -285,8 +293,8 @@ def run_storage_maintenance(
         usage=read_state.usage,
         physical_artifact_bytes=physical_bytes,
         orphan_artifact_candidates=candidates,
-        reclaimed_artifact_paths=(),
-        file_errors=(),
+        reclaimed_artifact_paths=reclaim_result.reclaimed_paths,
+        file_errors=_maintenance_file_errors(reclaim_result.file_errors),
         wal_checkpoint=wal_checkpoint,
     )
 
@@ -332,7 +340,7 @@ class _ReadStorageMaintenanceStateOperation:
     db_path: Path
 
     def __call__(self, transaction: HostTransaction) -> _StorageMaintenanceReadState:
-        """读取 maintenance dry-run 所需的 DB 快照。
+        """读取 maintenance 扫描所需的 DB 快照。
 
         :param transaction: 当前 Host read transaction。
         :returns: usage report 与 referenced artifact paths。
@@ -342,6 +350,104 @@ class _ReadStorageMaintenanceStateOperation:
             usage=read_storage_usage(transaction, db_path=self.db_path),
             referenced_artifact_paths=collect_referenced_artifact_paths(transaction),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactPathReferencedOperation:
+    """单个 artifact 相对路径引用复查 read transaction body。
+
+    :param relative_path: artifact root 下的 POSIX 相对路径。
+    """
+
+    relative_path: str
+
+    def __call__(self, transaction: HostTransaction) -> bool:
+        """执行 artifact descriptor 引用复查。
+
+        :param transaction: 当前 Host read transaction。
+        :returns: 路径仍被任意 artifact descriptor 引用时返回 ``True``。
+        """
+
+        return artifact_relative_path_is_referenced(transaction, self.relative_path)
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactPathReferenceChecker:
+    """通过 Host read transaction 执行 artifact 路径引用复查。
+
+    :param host: Host command handle。
+    """
+
+    host: HostCommandHandle
+
+    def __call__(self, relative_path: str) -> bool:
+        """判断 artifact 路径是否仍被 descriptor 引用。
+
+        :param relative_path: artifact root 下的 POSIX 相对路径。
+        :returns: 路径仍被引用时返回 ``True``。
+        """
+
+        return self.host._run_read(_ArtifactPathReferencedOperation(relative_path))
+
+
+@dataclass(frozen=True, slots=True)
+class _MaintenanceReclaimResult:
+    """facade 内部 orphan artifact 回收结果。
+
+    :param reclaimed_paths: 已成功删除的路径。
+    :param file_errors: durable 单文件错误诊断。
+    """
+
+    reclaimed_paths: tuple[str, ...]
+    file_errors: tuple[DurableArtifactFileError, ...]
+
+
+def _reclaim_orphan_artifacts_if_requested(
+    host: HostCommandHandle,
+    *,
+    artifact_root: Path,
+    candidates: tuple[str, ...],
+    request: HostStorageMaintenanceRequest,
+) -> _MaintenanceReclaimResult:
+    """按请求执行 opt-in orphan artifact 文件回收。
+
+    :param host: Host command handle。
+    :param artifact_root: artifact 根目录。
+    :param candidates: 已由 dry-run 扫描产生的候选路径。
+    :param request: maintenance 请求。
+    :returns: 回收结果；dry-run 时为空结果。
+    """
+
+    if not request.reclaim_orphan_artifacts:
+        return _MaintenanceReclaimResult(reclaimed_paths=(), file_errors=())
+    result = reclaim_orphan_artifact_files(
+        artifact_root,
+        candidates,
+        is_artifact_path_referenced=_ArtifactPathReferenceChecker(host),
+    )
+    return _MaintenanceReclaimResult(
+        reclaimed_paths=result.reclaimed_paths,
+        file_errors=result.file_errors,
+    )
+
+
+def _maintenance_file_errors(
+    file_errors: tuple[DurableArtifactFileError, ...],
+) -> tuple[HostStorageMaintenanceFileError, ...]:
+    """把 durable 文件错误诊断转换为 Host facade 诊断。
+
+    :param file_errors: durable 文件错误诊断。
+    :returns: Host maintenance 文件错误诊断。
+    """
+
+    return tuple(
+        HostStorageMaintenanceFileError(
+            path=file_error.path,
+            operation=file_error.operation,
+            message=file_error.message,
+        )
+        for file_error in file_errors
+    )
 
 
 def _run_wal_checkpoint_if_requested(

@@ -1,19 +1,25 @@
-"""Host durable storage lifecycle 只读诊断。
+"""Host durable storage lifecycle 诊断与 artifact 文件回收原语。
 
 本模块只提供 storage usage report 所需的 SQLite row count、logical payload
-字节统计、DB/WAL 文件大小读取、artifact 引用证明和 dry-run 文件扫描原语。
-它不写 durable 状态、不执行 WAL checkpoint，也不删除任何文件或 row。
+字节统计、DB/WAL 文件大小读取、artifact 引用证明、dry-run 文件扫描原语，
+以及 opt-in maintenance 使用的 artifact 物理文件回收 helper。它不写
+durable 状态、不执行 WAL checkpoint，也不删除任何 SQLite row。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import AbstractSet
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.artifact import iter_published_artifact_relative_paths
+from dayu.host.durable.artifact import (
+    delete_artifact_file,
+    iter_published_artifact_relative_paths,
+)
+from dayu.host.durable.errors import HostArtifactWriteError
 from dayu.host.durable.payload import PayloadKind
 from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
@@ -74,6 +80,75 @@ _REPORT_TABLES: tuple[str, ...] = tuple(
     table_name for table_name, _field_name in _HOST_DURABLE_TABLE_TO_REPORT_FIELD
 )
 """report 覆盖的 durable table 名称集合。"""
+
+_RECLAIM_ARTIFACT_OPERATION = "delete_artifact_file"
+"""artifact 文件回收失败诊断使用的操作名。"""
+
+
+@dataclass(frozen=True, slots=True)
+class DurableArtifactFileError:
+    """durable artifact 单文件操作错误诊断。
+
+    该类型只表达 durable/file 层可理解的信息，不依赖 Host facade 类型。
+
+    :param path: artifact root 下的 POSIX 相对路径。
+    :param operation: 失败的文件操作名。
+    :param message: 人类可读错误摘要。
+    :raises ValueError: 任一文本字段为空时抛出。
+    """
+
+    path: str
+    operation: str
+    message: str
+
+    def __post_init__(self) -> None:
+        """校验错误诊断字段。
+
+        :returns: ``None``。
+        :raises ValueError: 任一文本字段为空时抛出。
+        """
+
+        _require_non_empty_text(self.path, field_name="DurableArtifactFileError.path")
+        _require_non_empty_text(
+            self.operation,
+            field_name="DurableArtifactFileError.operation",
+        )
+        _require_non_empty_text(
+            self.message,
+            field_name="DurableArtifactFileError.message",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DurableArtifactReclaimResult:
+    """artifact 文件回收结果。
+
+    :param reclaimed_paths: 已成功删除的 artifact 相对路径。
+    :param file_errors: 单文件删除失败诊断；失败文件不会进入
+        ``reclaimed_paths``。
+    :raises TypeError: 字段类型不符合契约时抛出。
+    """
+
+    reclaimed_paths: tuple[str, ...]
+    file_errors: tuple[DurableArtifactFileError, ...]
+
+    def __post_init__(self) -> None:
+        """校验回收结果字段。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型不符合契约时抛出。
+        """
+
+        _require_string_tuple(
+            self.reclaimed_paths,
+            field_name="DurableArtifactReclaimResult.reclaimed_paths",
+        )
+        for file_error in self.file_errors:
+            if not isinstance(file_error, DurableArtifactFileError):
+                raise TypeError(
+                    "DurableArtifactReclaimResult.file_errors must contain "
+                    "DurableArtifactFileError"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +455,55 @@ def scan_orphan_artifact_files(
     return tuple(sorted(candidates))
 
 
+def reclaim_orphan_artifact_files(
+    artifact_root: Path,
+    candidates: tuple[str, ...],
+    *,
+    is_artifact_path_referenced: Callable[[str], bool],
+) -> DurableArtifactReclaimResult:
+    """回收删除前复查仍为 orphan 的 artifact 物理文件。
+
+    调用方必须传入显式 recheck callable；该 callable 应在自身事务边界内判断
+    candidate 是否仍被任意 artifact descriptor 引用。若 recheck 返回
+    ``True``，本函数跳过该路径；若返回 ``False``，再调用
+    ``delete_artifact_file`` 执行 containment-guarded 删除。recheck 与
+    unlink 之间仍存在极短 TOCTOU 窗口；maintenance 默认 grace window、
+    content-addressed artifact 可重写性与 containment 守卫共同降低风险。
+
+    :param artifact_root: artifact 根目录。
+    :param candidates: 已由 dry-run 扫描证明超过 grace 且快照中无引用的候选路径。
+    :param is_artifact_path_referenced: 删除前复查 callable；路径仍被引用时返回
+        ``True``。
+    :returns: 已删除路径与单文件错误诊断。
+    :raises dayu.host.durable.errors.HostDurableError: recheck callable 或删除
+        helper 抛出非单文件可恢复错误时透传。
+    """
+
+    _require_string_tuple(candidates, field_name="candidates")
+    reclaimed_paths: list[str] = []
+    file_errors: list[DurableArtifactFileError] = []
+    for relative_path in candidates:
+        if is_artifact_path_referenced(relative_path):
+            continue
+        try:
+            deleted = delete_artifact_file(artifact_root, relative_path)
+        except HostArtifactWriteError as exc:
+            file_errors.append(
+                DurableArtifactFileError(
+                    path=relative_path,
+                    operation=_RECLAIM_ARTIFACT_OPERATION,
+                    message=str(exc),
+                )
+            )
+            continue
+        if deleted:
+            reclaimed_paths.append(relative_path)
+    return DurableArtifactReclaimResult(
+        reclaimed_paths=tuple(reclaimed_paths),
+        file_errors=tuple(file_errors),
+    )
+
+
 def physical_artifact_bytes(artifact_root: Path) -> int:
     """统计已发布 artifact 文件的物理字节数。
 
@@ -574,11 +698,43 @@ def _require_non_negative_int(value: int, *, field_name: str) -> None:
         raise ValueError(f"{field_name} must be non-negative")
 
 
+def _require_string_tuple(value: tuple[str, ...], *, field_name: str) -> None:
+    """校验字段为字符串元组。
+
+    :param value: 待校验值。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是字符串元组时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError(f"{field_name} must contain str")
+
+
+def _require_non_empty_text(value: str, *, field_name: str) -> None:
+    """校验字段为非空字符串。
+
+    :param value: 待校验值。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises ValueError: 字符串为空时抛出。
+    """
+
+    if value.strip() == "":
+        raise ValueError(f"{field_name} must be non-empty")
+
+
 __all__ = [
+    "DurableArtifactFileError",
+    "DurableArtifactReclaimResult",
     "HostStorageUsageReport",
     "artifact_relative_path_is_referenced",
     "collect_referenced_artifact_paths",
     "physical_artifact_bytes",
     "read_storage_usage",
+    "reclaim_orphan_artifact_files",
     "scan_orphan_artifact_files",
 ]

@@ -79,7 +79,7 @@ Host 与其它层的稳定边界如下：
 - `close_session(session_id, request)`：关闭 Session 的新输入入口。
 - `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 本地可恢复事实。
 - `report_storage_usage()`：读取只读 storage usage report，包含 durable SQLite 表 row count、payload logical bytes、orphan SQLite payload 诊断计数以及 DB/WAL 文件大小。
-- `run_storage_maintenance(request)`：执行显式 dry-run maintenance，返回 orphan artifact 候选、已发布 artifact 物理字节和、usage report 与可选 WAL checkpoint 诊断；当前不删除文件或 row。
+- `run_storage_maintenance(request)`：执行显式 maintenance，返回 orphan artifact 候选、已发布 artifact 物理字节和、usage report 与可选 WAL checkpoint 诊断；默认 dry-run 不删除文件，显式 `reclaim_orphan_artifacts=True` 时只回收删除前 recheck 仍未被引用的 orphan artifact 物理文件。
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
 - `watch_session_events(session_id)`：创建 live HostEvent 订阅；订阅从当前 live cursor 开始，不提供离线 replay cursor。
@@ -423,11 +423,13 @@ reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该�
 
 `report_storage_usage` 是 operator-facing 只读诊断入口。它在 durable read transaction 内统计当前 Host SQLite 表 row count，读取 SQLite payload logical bytes、artifact descriptor logical bytes、未被 descriptor 引用的 SQLite payload row 数，并通过文件 `stat` 返回 DB / WAL 文件大小。该 report 不写 EventLog，不改变 Session / Run / Attempt 状态，不扫描 artifact root，不执行 checkpoint，也不删除文件或 row。
 
-### Storage Maintenance Dry-Run
+### Storage Maintenance
 
-`run_storage_maintenance` 是 operator-facing 显式 dry-run maintenance 入口。它基于 `payload_descriptors` 中 `artifact_ref` 的 artifact 相对路径收集引用集合，只扫描 artifact root 下 `sha256/` 内容寻址 namespace，返回超过 grace window 的 orphan artifact 候选、已发布 artifact 物理字节和、usage report 与可选 WAL checkpoint 诊断。checkpoint 使用独立 durable connection，不在 command transaction 内执行。
+`run_storage_maintenance` 是 operator-facing 显式 maintenance 入口。它基于 `payload_descriptors` 中 `artifact_ref` 的 artifact 相对路径收集引用集合，只扫描 artifact root 下 `sha256/` 内容寻址 namespace，返回超过 grace window 的 orphan artifact 候选、已发布 artifact 物理字节和、usage report 与可选 WAL checkpoint 诊断。checkpoint 使用独立 durable connection，不在 command transaction 内执行。
 
-当前 maintenance 不删除 artifact 文件、不删除 SQLite row、不执行 `VACUUM`、不启动 scheduler；请求 `reclaim_orphan_artifacts=True` 会返回 unsupported operation。audit JSONL、tool-trace JSONL、`.tmp` 和其它非 `sha256/` namespace 文件不参与 artifact orphan 候选。
+maintenance 默认 dry-run，不删除 artifact 文件或 SQLite row。请求 `reclaim_orphan_artifacts=True` 时，只回收候选扫描证明为 orphan、且删除前 recheck 仍未被 descriptor 引用的 `sha256/` artifact 物理文件；失败的单文件删除以 `path`、`operation`、`message` 结构化诊断返回，成功删除的路径进入 `reclaimed_artifact_paths`。recheck 与 unlink 之间仍有极短 TOCTOU 窗口；默认 grace、content-addressed artifact 可重写性与 containment-guarded delete 用于降低风险。
+
+maintenance 不删除任何 SQLite row，不回收 SQLite orphan payload row，不执行 `VACUUM`、不启动 scheduler，也不处理 audit JSONL 或 tool-trace JSONL；SQLite space reclamation / VACUUM 继续归 Issue 76。audit JSONL、tool-trace JSONL、`.tmp` 和其它非 `sha256/` namespace 文件不参与 artifact orphan 候选。
 
 ## 状态机
 

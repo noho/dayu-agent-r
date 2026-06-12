@@ -1,4 +1,4 @@
-"""Host storage maintenance dry-run public entrypoint 测试。"""
+"""Host storage maintenance public entrypoint 测试。"""
 
 from __future__ import annotations
 
@@ -19,8 +19,6 @@ from dayu.engine.contracts.runner_spec import (
 )
 from dayu.host import (
     CreateSessionRequest,
-    HostApiError,
-    HostApiErrorCode,
     HostCallContext,
     HostClosedError,
     HostStorageMaintenanceRequest,
@@ -44,8 +42,11 @@ from dayu.host.command import (
     create_session as command_create_session,
     start_run,
 )
-from dayu.host.durable.artifact import LocalArtifactStore
+from dayu.host.durable import storage_lifecycle as storage_lifecycle_module
+from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
+from dayu.host.durable.errors import HostArtifactWriteError
 from dayu.host.durable.payload import write_payload_descriptor_for_artifact
+from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import open_host
@@ -367,32 +368,194 @@ def test_storage_maintenance_wal_checkpoint_true_returns_result(
     assert result.wal_checkpoint.mode.value == "PASSIVE"
 
 
-def test_storage_maintenance_reclaim_true_fails_fast_without_deleting(
+def test_storage_maintenance_reclaim_true_deletes_orphan_without_db_row_changes(
     tmp_path: Path,
 ) -> None:
-    """当前 slice 不支持 destructive reclaim，且 fail fast 不删除文件。"""
+    """opt-in reclaim 删除 orphan 物理文件，不删除 SQLite row 或被引用文件。"""
 
     options = _command_options(tmp_path)
     host = create_host_command_handle(options)
     try:
-        orphan_path = _write_orphan_artifact(options.artifact_root, b"blocked")
+        session = command_create_session(host, _create_request())
+        run = start_run(host, _start_request(session.session_id))
+        referenced_path = _write_referenced_artifact(host, options.artifact_root)
+        orphan_path = _write_orphan_artifact(options.artifact_root, b"reclaim")
+        _set_old_mtime(options.artifact_root / referenced_path)
         _set_old_mtime(options.artifact_root / orphan_path)
         before_usage = report_storage_usage(host)
+        before_session = get_session(host, session.session_id)
+        before_run = get_run(host, run.run_id)
 
-        with pytest.raises(HostApiError) as exc_info:
-            run_storage_maintenance(
-                host,
-                HostStorageMaintenanceRequest(reclaim_orphan_artifacts=True),
-            )
+        result = run_storage_maintenance(
+            host,
+            HostStorageMaintenanceRequest(
+                reclaim_orphan_artifacts=True,
+                run_wal_checkpoint=False,
+            ),
+        )
 
+        after_usage = report_storage_usage(host)
+        after_session = get_session(host, session.session_id)
+        after_run = get_run(host, run.run_id)
+    finally:
+        host.close()
+
+    assert result.orphan_artifact_candidates == (orphan_path,)
+    assert result.reclaimed_artifact_paths == (orphan_path,)
+    assert result.file_errors == ()
+    assert not (options.artifact_root / orphan_path).exists()
+    assert (options.artifact_root / referenced_path).is_file()
+    assert after_usage.payload_descriptor_rows == before_usage.payload_descriptor_rows
+    assert after_usage.event_log_rows == before_usage.event_log_rows
+    assert after_session.status == before_session.status
+    assert after_run.status == before_run.status
+
+
+def test_storage_maintenance_reclaim_keeps_shared_referenced_artifact(
+    tmp_path: Path,
+) -> None:
+    """同一物理 artifact 仍有其它 descriptor 引用时不进入回收候选。"""
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        artifact_ref = _write_referenced_artifact_with_ref(
+            host,
+            options.artifact_root,
+            b"shared",
+            "payload-ref-shared-a",
+        )
+        _write_artifact_descriptor(host, artifact_ref, "payload-ref-shared-b")
+        _delete_payload_descriptor(host, "payload-ref-shared-a")
+        _set_old_mtime(options.artifact_root / artifact_ref.artifact_relative_path)
+
+        result = run_storage_maintenance(
+            host,
+            HostStorageMaintenanceRequest(
+                reclaim_orphan_artifacts=True,
+                run_wal_checkpoint=False,
+            ),
+        )
         after_usage = report_storage_usage(host)
     finally:
         host.close()
 
-    assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
-    assert (options.artifact_root / orphan_path).is_file()
-    assert after_usage.payload_descriptor_rows == before_usage.payload_descriptor_rows
-    assert after_usage.event_log_rows == before_usage.event_log_rows
+    assert result.orphan_artifact_candidates == ()
+    assert result.reclaimed_artifact_paths == ()
+    assert result.file_errors == ()
+    assert (options.artifact_root / artifact_ref.artifact_relative_path).is_file()
+    assert after_usage.payload_descriptor_rows == 1
+
+
+def test_storage_maintenance_reclaim_recheck_hit_skips_delete(
+    tmp_path: Path,
+) -> None:
+    """候选扫描后新增 descriptor 引用时，删除前 recheck 会跳过该文件。"""
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        artifact_ref = _write_orphan_artifact_ref(options.artifact_root, b"recheck")
+        _set_old_mtime(options.artifact_root / artifact_ref.artifact_relative_path)
+
+        def recheck_after_new_descriptor(relative_path: str) -> bool:
+            """模拟 scan 后、delete 前出现新的 descriptor 引用。"""
+
+            _write_artifact_descriptor(host, artifact_ref, "payload-ref-recheck")
+            return _artifact_path_is_referenced(host, relative_path)
+
+        result = storage_lifecycle_module.reclaim_orphan_artifact_files(
+            options.artifact_root,
+            (artifact_ref.artifact_relative_path,),
+            is_artifact_path_referenced=recheck_after_new_descriptor,
+        )
+        after_usage = report_storage_usage(host)
+    finally:
+        host.close()
+
+    assert result.reclaimed_paths == ()
+    assert result.file_errors == ()
+    assert (options.artifact_root / artifact_ref.artifact_relative_path).is_file()
+    assert after_usage.payload_descriptor_rows == 1
+
+
+def test_storage_maintenance_reclaim_file_error_keeps_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单文件删除失败进入 file_errors，其它候选仍继续回收。"""
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        failing_path = _write_orphan_artifact(options.artifact_root, b"fail-delete")
+        deleted_path = _write_orphan_artifact(options.artifact_root, b"delete-ok")
+        _set_old_mtime(options.artifact_root / failing_path)
+        _set_old_mtime(options.artifact_root / deleted_path)
+        original_delete = storage_lifecycle_module.delete_artifact_file
+
+        def flaky_delete(artifact_root: Path, relative_path: str) -> bool:
+            """对指定文件注入删除失败，其它文件走真实删除 helper。"""
+
+            if relative_path == failing_path:
+                raise HostArtifactWriteError("forced delete failure")
+            return original_delete(artifact_root, relative_path)
+
+        monkeypatch.setattr(
+            storage_lifecycle_module,
+            "delete_artifact_file",
+            flaky_delete,
+        )
+
+        result = run_storage_maintenance(
+            host,
+            HostStorageMaintenanceRequest(
+                reclaim_orphan_artifacts=True,
+                run_wal_checkpoint=False,
+            ),
+        )
+    finally:
+        host.close()
+
+    assert set(result.orphan_artifact_candidates) == {failing_path, deleted_path}
+    assert result.reclaimed_artifact_paths == (deleted_path,)
+    assert len(result.file_errors) == 1
+    assert result.file_errors[0].path == failing_path
+    assert result.file_errors[0].operation == "delete_artifact_file"
+    assert "forced delete failure" in result.file_errors[0].message
+    assert result.file_errors[0].json_value() == {
+        "path": failing_path,
+        "operation": "delete_artifact_file",
+        "message": "forced delete failure",
+    }
+    assert (options.artifact_root / failing_path).is_file()
+    assert not (options.artifact_root / deleted_path).exists()
+
+
+def test_storage_maintenance_reclaim_is_idempotent(tmp_path: Path) -> None:
+    """连续两次 opt-in reclaim 时，第二次无候选且不抛错。"""
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        orphan_path = _write_orphan_artifact(options.artifact_root, b"idempotent")
+        _set_old_mtime(options.artifact_root / orphan_path)
+        request = HostStorageMaintenanceRequest(
+            reclaim_orphan_artifacts=True,
+            run_wal_checkpoint=False,
+        )
+
+        first_result = run_storage_maintenance(host, request)
+        second_result = run_storage_maintenance(host, request)
+    finally:
+        host.close()
+
+    assert first_result.orphan_artifact_candidates == (orphan_path,)
+    assert first_result.reclaimed_artifact_paths == (orphan_path,)
+    assert first_result.file_errors == ()
+    assert second_result.orphan_artifact_candidates == ()
+    assert second_result.reclaimed_artifact_paths == ()
+    assert second_result.file_errors == ()
 
 
 @pytest.mark.asyncio
@@ -432,9 +595,47 @@ def _write_referenced_artifact(host: HostCommandHandle, artifact_root: Path) -> 
     :returns: artifact 相对路径。
     """
 
-    artifact_ref = LocalArtifactStore(artifact_root).write_artifact_bytes(
-        b"referenced"
+    artifact_ref = _write_referenced_artifact_with_ref(
+        host,
+        artifact_root,
+        b"referenced",
+        "payload-ref-referenced",
     )
+    return artifact_ref.artifact_relative_path
+
+
+def _write_referenced_artifact_with_ref(
+    host: HostCommandHandle,
+    artifact_root: Path,
+    content: bytes,
+    payload_ref: str,
+) -> LocalArtifactRef:
+    """写入 artifact 并用指定 payload ref 写入 descriptor。
+
+    :param host: Host command handle。
+    :param artifact_root: artifact root。
+    :param content: artifact 文件内容。
+    :param payload_ref: descriptor payload ref。
+    :returns: 已发布 artifact ref。
+    """
+
+    artifact_ref = _write_orphan_artifact_ref(artifact_root, content)
+    _write_artifact_descriptor(host, artifact_ref, payload_ref)
+    return artifact_ref
+
+
+def _write_artifact_descriptor(
+    host: HostCommandHandle,
+    artifact_ref: LocalArtifactRef,
+    payload_ref: str,
+) -> None:
+    """为已发布 artifact 写入 descriptor。
+
+    :param host: Host command handle。
+    :param artifact_ref: 已发布 artifact ref。
+    :param payload_ref: descriptor payload ref。
+    :returns: ``None``。
+    """
 
     def write_descriptor(transaction: HostTransaction) -> None:
         """写入 artifact descriptor。
@@ -445,14 +646,13 @@ def _write_referenced_artifact(host: HostCommandHandle, artifact_root: Path) -> 
 
         write_payload_descriptor_for_artifact(
             transaction,
-            "payload-ref-referenced",
+            payload_ref,
             artifact_ref,
             "application/octet-stream",
             {},
         )
 
     host._run_write(write_descriptor)
-    return artifact_ref.artifact_relative_path
 
 
 def _write_orphan_artifact(artifact_root: Path, content: bytes) -> str:
@@ -463,8 +663,67 @@ def _write_orphan_artifact(artifact_root: Path, content: bytes) -> str:
     :returns: artifact 相对路径。
     """
 
-    artifact_ref = LocalArtifactStore(artifact_root).write_artifact_bytes(content)
-    return artifact_ref.artifact_relative_path
+    return _write_orphan_artifact_ref(artifact_root, content).artifact_relative_path
+
+
+def _write_orphan_artifact_ref(
+    artifact_root: Path,
+    content: bytes,
+) -> LocalArtifactRef:
+    """写入未被 descriptor 引用的已发布 artifact。
+
+    :param artifact_root: artifact root。
+    :param content: 文件内容。
+    :returns: artifact ref。
+    """
+
+    return LocalArtifactStore(artifact_root).write_artifact_bytes(content)
+
+
+def _delete_payload_descriptor(host: HostCommandHandle, payload_ref: str) -> None:
+    """删除测试构造用 payload descriptor。
+
+    :param host: Host command handle。
+    :param payload_ref: 待删除 descriptor payload ref。
+    :returns: ``None``。
+    """
+
+    def delete_descriptor(transaction: HostTransaction) -> None:
+        """删除 payload descriptor row。
+
+        :param transaction: Host write transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"DELETE FROM {TABLE_PAYLOAD_DESCRIPTORS} WHERE payload_ref = ?",
+            (payload_ref,),
+        )
+
+    host._run_write(delete_descriptor)
+
+
+def _artifact_path_is_referenced(host: HostCommandHandle, relative_path: str) -> bool:
+    """通过 durable read transaction 判断 artifact 路径是否被引用。
+
+    :param host: Host command handle。
+    :param relative_path: artifact root 下的 POSIX 相对路径。
+    :returns: 路径被引用时返回 ``True``。
+    """
+
+    def read_reference(transaction: HostTransaction) -> bool:
+        """读取 artifact descriptor 引用证明。
+
+        :param transaction: Host read transaction。
+        :returns: 路径被引用时返回 ``True``。
+        """
+
+        return storage_lifecycle_module.artifact_relative_path_is_referenced(
+            transaction,
+            relative_path,
+        )
+
+    return host._run_read(read_reference)
 
 
 def _write_non_artifact_files(artifact_root: Path) -> None:
