@@ -69,7 +69,7 @@ flowchart TD
 ## 稳定边界
 
 - `UI` 当前是外部调用者角色，不是 `dayu/` 下的实现包。它只通过 Service / Host public view 发起动作和订阅结果，不写 Host truth。
-- `dayu.service` 是 Host 外部 composition boundary。它把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`，并提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up terminal observation、cancel request 构造和 watcher failure 诊断。
+- `dayu.service` 是 Host 外部 composition boundary。它把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`，并提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up terminal observation、cancel request 构造和 watcher failure 诊断；Fins direct job 入口通过 `dayu.service.fins_direct` 复用 Fins runtime 的 start / poll / cancel 语义，不伪装成 Host Run。
 - `dayu.host` 是宿主治理真源。它拥有 Session / Run / Attempt / EventLog、admission、dispatch、cancel、steer、wait-resume、retry、replay、ToolRuntime、context governance、Conversation Memory、projection、outbox、purge 和 startup recovery。
 - `dayu.engine` 是单次 run 执行边界。它不导入 Host，不读取 Host durable store，不管理 Session / Run / Attempt，不发现工具，不持有工具权限或财报业务语义。
 - `dayu.contracts` 是 Dayu Agent 公共契约包。它承载层中立数据与协议，不承载 Host / Engine 状态机、Service 流程、UI 展示语义或 Fins 业务事实。
@@ -85,6 +85,7 @@ flowchart TD
 - `dayu.runtime`：日志级别与装配、协作式取消等待、runtime lane、filelock、diagnostic 文本脱敏、有界截断、digest、config loader、location resolver、scene prepare、tool discovery、assembly helper 与 tool truncation defaults。
 - `dayu.config`：包内默认 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes`、`tool_discovery` 和 prompt / scene 资产。
 - `dayu.service.host_assembly`：从 runtime config、prepared scene、工具发现和 secret mapping 组合 Host construction-time inputs 与 per-run request。
+- `dayu.service.fins_direct`：从 product entrypoint 显式参数构造 Fins download / preprocess / upload typed request，并把 Fins ingestion job id、poll terminal、durable cancel 与终态映射收敛到 Service 边界。
 - `dayu.host`：public Host handle、durable store、admission、dispatch、EngineEvent ingest、ToolRuntime、waiting、context compaction、Conversation Memory、projection、outbox、purge、startup recovery。
 - `dayu.engine`：`run_agent_messages`、`run_agent_and_wait`、Agent loop、Runner 协议归一、provider adapter、tool loop、length continuation、fallback、provider error classification 和 EngineEvent contract。
 - `dayu.tools`：业务工具 provider 与工具实现，输出 current `ToolDefinition` / `ToolBundle`。
@@ -107,7 +108,7 @@ UI / Service 调用 `open_host(options)` 得到 Host handle，先 ensure / creat
 
 ### 工具与 Fins
 
-Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host ToolRuntime 把业务 `ToolBundle` 包装成受治理的 batch executor，负责权限、截断、等待、重复调用治理、diagnostic、payload descriptor 和 accept barrier。Fins 工具通过共享 `DefaultFinsRuntime.get_read_runtime()` 与 `DefaultFinsRuntime.get_ingestion_runtime()` 复用同一套仓储、处理器注册表和 ingestion job store；download、preprocess 与 upload 长事务通过 Fins wait adapter 接入 Host wait-resume，避免 CLI / tools / CI 多入口下业务逻辑漂移。
+Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host ToolRuntime 把业务 `ToolBundle` 包装成受治理的 batch executor，负责权限、截断、等待、重复调用治理、diagnostic、payload descriptor 和 accept barrier。Fins 工具通过共享 `DefaultFinsRuntime.get_read_runtime()` 与 `DefaultFinsRuntime.get_ingestion_runtime()` 复用同一套仓储、处理器注册表和 ingestion job store；工具触发的 download、preprocess 与 upload 长事务通过 Fins wait adapter 接入 Host wait-resume。CLI 等 direct 数据命令不创建 Host Run，而是在 Service/Fins boundary 内启动 Fins ingestion job、轮询 `read_job(job_id)` 并用 `request_cancel(job_id)` 取消，避免 CLI / tools / CI 多入口下业务逻辑漂移。
 
 ### Wait / resume
 

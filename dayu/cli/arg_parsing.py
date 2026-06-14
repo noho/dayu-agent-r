@@ -118,6 +118,28 @@ class ParsedCliArgs(argparse.Namespace):
     duplicate_tool_hint_prompt: str | None
     doc_limits_json: str | None
     fins_limits_json: str | None
+    forms: list[str] | None
+    start: str | None
+    end: str | None
+    overwrite: bool
+    rebuild: bool
+    infer: bool
+    action: str
+    files: list[str] | None
+    fiscal_year: int | None
+    fiscal_period: str | None
+    amended: bool
+    filing_date: str | None
+    report_date: str | None
+    company_name: str | None
+    material_name: str | None
+    document_id: str | list[str] | None
+    internal_document_id: str | None
+    ci: bool
+    source_dir: str | None
+    output: str | None
+    recursive: bool
+    material_forms: list[str] | None
 
 
 def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
@@ -179,6 +201,50 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.workspace_root = DEFAULT_WORKSPACE
     namespace.config_dir = None
     namespace.log_level = DEFAULT_LOG_LEVEL
+    namespace.ticker = None
+    namespace.label = None
+    namespace.new_session = False
+    namespace.model_name = None
+    namespace.thinking = None
+    namespace.web_provider = None
+    namespace.temperature = None
+    namespace.debug_sse = False
+    namespace.debug_tool_delta = False
+    namespace.debug_sse_sample_rate = None
+    namespace.debug_sse_throttle_sec = None
+    namespace.tool_timeout_seconds = None
+    namespace.enable_tool_trace = False
+    namespace.tool_trace_dir = None
+    namespace.max_iterations = None
+    namespace.fallback_mode = None
+    namespace.fallback_prompt = None
+    namespace.max_consecutive_failed_tool_batches = None
+    namespace.max_duplicate_tool_calls = None
+    namespace.duplicate_tool_hint_prompt = None
+    namespace.doc_limits_json = None
+    namespace.fins_limits_json = None
+    namespace.forms = None
+    namespace.start = None
+    namespace.end = None
+    namespace.overwrite = False
+    namespace.rebuild = False
+    namespace.infer = False
+    namespace.action = "create"
+    namespace.files = None
+    namespace.fiscal_year = None
+    namespace.fiscal_period = None
+    namespace.amended = False
+    namespace.filing_date = None
+    namespace.report_date = None
+    namespace.company_name = None
+    namespace.material_name = None
+    namespace.document_id = None
+    namespace.internal_document_id = None
+    namespace.ci = False
+    namespace.source_dir = None
+    namespace.output = None
+    namespace.recursive = False
+    namespace.material_forms = None
     return namespace
 
 

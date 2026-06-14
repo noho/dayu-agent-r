@@ -88,7 +88,11 @@ Host slot key、unsupported 旧执行参数 fail fast、真实 `prompt.json` req
 open/follow-up terminal path、fast terminal、outbox fallback、FAILED terminal 输出和 SIGINT 后 Host public cancel request；
 `interactive` 命令测试覆盖 label / new-session session binding、真实 `interactive.json` required context slots、两轮同
 Session、每轮独立 watcher attach/close、fast terminal、FAILED / CANCELLED 继续输入、LOST fatal、运行态 SIGINT cancel、
-第二次 SIGINT 本地 130、显式 config 错误和 unsupported 旧执行参数 fail fast。
+第二次 SIGINT 本地 130、显式 config 错误和 unsupported 旧执行参数 fail fast。Fins direct command 测试覆盖
+`download`、`upload_filing`、`upload_material`、`process`、`process_filing`、`process_material` 的 CLI 参数到
+`FinsDirectCommandService` 显式方法参数转换、upload file 存在性与 allowlist 前置校验、`--infer` / `--ci`
+fail fast、`upload_filings_from` 在当前 slice 执行 unsupported、terminal exit mapping、SIGINT 后
+`request_cancel(job_id)` 与第二次 SIGINT 本地 130，以及 CLI 不直接 import `dayu.fins.storage`。
 CLI 测试不得启动真实 Host / Fins 业务路径；涉及 Host 状态机时使用 Service helper 与 mocked Host public API。
 
 ### `tests/runtime/`
@@ -123,8 +127,9 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 
 - host assembly：覆盖 `host_runtime.json` 的 SQLite write retry、payload inline threshold、worker startup timeout 等 construction tuning 被映射进 `OpenHostOptions`，execution profile 的工具重复治理 policy 被映射进 `HostToolingOptions`，provider secret 占位符在 Service helper 中解析，prompt asset path / 工具发现 source refs / provider location 边界 fail-fast，compactor scene 必填 AgentPolicy 字段校验，per-run helper 直接使用 `PreparedSceneInputs.system_prompt` 生成 `SubmitFollowupRequest`，以及 `ServiceRunOverrides` 到完整 `RunnerCallOptions` / `AgentPolicy` 的 typed override 合并。
 - entrypoint runtime：覆盖 reusable Agent entrypoint Service boundary 的 runtime 准备、Session ensure/create、session helper 参数校验、submit 前 watcher attach、fast terminal race、无关 terminal 过滤、watcher failure 诊断后 outbox fallback、`get_run` + outbox fallback、`OutboxTerminalCursor` / `seen_terminal_event_ids` / `limit=50`、`CAUGHT_UP` 分页、`LAGGED` 重试、`FAILED` 与 caught-up-without-match 错误、watcher close、cancel 已终态跳过 `cancel_run(...)`、cancel 与终态竞争失败后继续 public terminal fallback，以及 `CancelRunRequest(context, client_request_id, reason, mode)` 构造；interactive path 覆盖真实 `interactive.json` required slots 和连续两轮独立 terminal wait state。
+- Fins direct：覆盖 reusable Fins direct Service boundary 的 download / preprocess typed request 构造、upload wrapper 到 `FinsIngestionRuntime.start_upload(...)` union API、默认 1.0 秒 poll interval、非终态 sleep、SUCCEEDED / FAILED / CANCELLED exit mapping、durable `request_cancel(job_id)` 和非法 poll interval fail fast。
 - Fins awaiting assembly：覆盖 Service 基于启用 provider 的显式 provider id、import path、source id 与 provider config 识别 Fins download / preprocess / upload awaiting providers，为 `HostToolingOptions` 绑定 wait adapter registry，并在 workspace root 不一致或重复 wait binding 时于 `open_host` 前 fail fast。
-- import boundary / weak typing guard：阻止 Service 导入 Config、UI 或 Fins 非 assembly 边界；当前只允许 Service composition helper 导入 `dayu.fins.ingestion` 来装配 Fins wait adapter，并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
+- import boundary / weak typing guard：阻止 Service 导入 Config、UI 或 Fins 非 assembly 边界；当前只允许 Service composition helper 导入 `dayu.fins.ingestion` 装配 Fins wait adapter，以及 `dayu.service.fins_direct` 导入 Fins runtime / request / enum public boundary，并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
 
 ### `tests/contracts/`
 

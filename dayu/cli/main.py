@@ -11,12 +11,20 @@ from collections.abc import Callable, Sequence
 
 from dayu.cli.arg_parsing import (
     CLI_COMMAND_NAMES,
+    COMMAND_DOWNLOAD,
     COMMAND_INTERACTIVE,
+    COMMAND_PROCESS,
+    COMMAND_PROCESS_FILING,
+    COMMAND_PROCESS_MATERIAL,
     COMMAND_PROMPT,
+    COMMAND_UPLOAD_FILING,
+    COMMAND_UPLOAD_FILINGS_FROM,
+    COMMAND_UPLOAD_MATERIAL,
     ParsedCliArgs,
     parse_cli_args,
 )
 from dayu.cli.commands import run_not_implemented_command
+from dayu.cli.commands.fins import run_fins_direct_command
 from dayu.cli.commands.interactive import run_interactive_command
 from dayu.cli.commands.prompt import run_prompt_command
 from dayu.cli.exit_codes import (
@@ -35,6 +43,13 @@ COMMAND_RUNNERS: dict[str, CommandRunner] = {
 }
 COMMAND_RUNNERS[COMMAND_INTERACTIVE] = run_interactive_command
 COMMAND_RUNNERS[COMMAND_PROMPT] = run_prompt_command
+COMMAND_RUNNERS[COMMAND_DOWNLOAD] = run_fins_direct_command
+COMMAND_RUNNERS[COMMAND_UPLOAD_FILING] = run_fins_direct_command
+COMMAND_RUNNERS[COMMAND_UPLOAD_MATERIAL] = run_fins_direct_command
+COMMAND_RUNNERS[COMMAND_UPLOAD_FILINGS_FROM] = run_fins_direct_command
+COMMAND_RUNNERS[COMMAND_PROCESS] = run_fins_direct_command
+COMMAND_RUNNERS[COMMAND_PROCESS_FILING] = run_fins_direct_command
+COMMAND_RUNNERS[COMMAND_PROCESS_MATERIAL] = run_fins_direct_command
 
 
 def main(argv: Sequence[str] | None = None) -> int:
