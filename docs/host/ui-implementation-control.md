@@ -142,7 +142,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S2 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
-| implementation commits | none；accepted plan commit `de99831f` |
+| implementation commits | CLI-01-S1 `52db520c`；accepted plan commit `de99831f` |
 | review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
@@ -322,7 +322,8 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - `source .venv/bin/activate && pytest tests/cli --cov=dayu.cli --cov-report=term-missing -q`：25 passed，总覆盖率 99%。
   - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
   - `git diff --check`：clean。
-- 下一步：提交 CLI-01-S1 accepted implementation commit，然后进入 CLI-01-S2 implementation gate。
+- Accepted implementation commit: `52db520c`。
+- 下一步：进入 CLI-01-S2 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
