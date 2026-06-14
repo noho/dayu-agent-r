@@ -1,7 +1,7 @@
 """Dayu CLI 进程入口。
 
-本模块只负责参数解析、命令分发和退出码映射。CLI-01-S1 不执行 Host 或 Fins
-业务流程。
+本模块负责参数解析、命令分发和顶层退出码映射。具体业务流程由各命令模块
+通过 Service 边界执行；本模块不直接编排 Host、Engine 或 Fins runtime。
 """
 
 from __future__ import annotations
@@ -11,11 +11,13 @@ from collections.abc import Callable, Sequence
 
 from dayu.cli.arg_parsing import (
     CLI_COMMAND_NAMES,
+    COMMAND_INTERACTIVE,
     COMMAND_PROMPT,
     ParsedCliArgs,
     parse_cli_args,
 )
 from dayu.cli.commands import run_not_implemented_command
+from dayu.cli.commands.interactive import run_interactive_command
 from dayu.cli.commands.prompt import run_prompt_command
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
@@ -31,6 +33,7 @@ MISSING_RUNNER_DIAGNOSTIC_TEMPLATE: str = (
 COMMAND_RUNNERS: dict[str, CommandRunner] = {
     command_name: run_not_implemented_command for command_name in CLI_COMMAND_NAMES
 }
+COMMAND_RUNNERS[COMMAND_INTERACTIVE] = run_interactive_command
 COMMAND_RUNNERS[COMMAND_PROMPT] = run_prompt_command
 
 

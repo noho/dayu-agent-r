@@ -98,6 +98,7 @@ class ParsedCliArgs(argparse.Namespace):
     prompt: str
     ticker: str | None
     label: str | None
+    new_session: bool
     model_name: str | None
     thinking: bool | None
     web_provider: str | None

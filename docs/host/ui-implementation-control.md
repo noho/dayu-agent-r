@@ -136,14 +136,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Product entrypoint implementation backlog |
 | gate | implementation |
-| implementation status | CLI-01-S3 accepted; ready for CLI-01-S4 |
+| implementation status | CLI-01-S4 accepted; ready for CLI-01-S5 |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S4 |
+| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S5 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; accepted plan commit `de99831f` |
-| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md` |
+| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
 | blocking open questions | none |
@@ -419,6 +419,72 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - 不支持 `loop.add_signal_handler` 的事件循环环境会降级为默认 `KeyboardInterrupt`；当前目标运行环境不是 Windows ProactorEventLoop，如未来需要跨平台 typed cancel，再单独设计 signal / cancellation adapter contract。
 - Accepted implementation commit: `4b28bbe5`。
 - 下一步：进入 CLI-01-S4 implementation gate。
+
+### CLI-01-S4 Implementation Gate
+
+- Implementation report: `docs/reviews/wu-cli-01-s4-implementation-codex.md`。
+- 实现范围：`dayu-cli interactive` REPL，经 `EntrypointRuntimeRequest(scene_id="interactive")`、Service helper 与 Host public API 完成 Session ensure/create、多轮 follow-up、terminal observation 与运行中 cancel。
+- 总控复核：
+  - S4 目标是迁移旧 `interactive` 的用户可见业务语义，并适配当前 Host public contract / API；不是迁移旧 `interactive_ui.py` 或旧 label registry。
+  - CLI adapter 负责输入、输出、signal 与 Host context/id 构造；Session、turn、terminal observation 与 cancel 仍复用 `dayu.service.entrypoint_runtime`。
+  - `--label` 使用 `cli.interactive.<label>` slot；`--new-session` 使用 `create_session(bind_slot=True)`；无 label 时创建当前进程 fresh session，不写旧 registry。
+  - `--ticker` 映射为 `fins_default_subject`，未传时使用 `"未指定具体公司"`；`base_user` 使用 `"本地 CLI 用户"`。
+  - 每轮生成新的 Host request id 与 submit `client_request_id`；同一轮 cancel 使用稳定 run-id based cancel `client_request_id`。
+  - 终态策略符合 S4：`SUCCEEDED` 输出答案继续；`FAILED` / `CANCELLED` 输出状态并回到输入态；`LOST` 为 fatal exit 1。
+  - Controller pre-review blocker 已在 implementation gate 内修复：第一次 SIGINT 后等待 run id 阶段若 submit task 先完成，会 `await submit_task` 返回 terminal 或透传异常，不再误映射为本地 130。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/cli/test_interactive_command.py tests/service/test_entrypoint_runtime_interactive_path.py tests/cli/test_arg_parsing.py tests/cli/test_prompt_command.py --cov=dayu.cli.commands.interactive --cov=dayu.cli.host_context --cov=dayu.cli.output --cov=dayu.cli.arg_parsing --cov=dayu.cli.main --cov-report=term-missing -q`：63 passed，3 条 edgar deprecation warnings；`interactive.py` 88%，`host_context.py` 99%，`output.py` 83%，`arg_parsing.py` 100%，`main.py` 94%。
+  - `source .venv/bin/activate && pytest tests/cli/test_prompt_command.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_host_assembly.py -q`：82 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S4 implementation review gate。
+
+### CLI-01-S4 Review Gate 裁决
+
+- Review artifacts: `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`、`docs/reviews/wu-cli-01-s4-implementation-review-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`。
+- 总控裁决：pass-with-fix。
+- 审查通过项：
+  - `interactive` 只通过 `EntrypointRuntimeRequest(scene_id="interactive")`、Service helper、`open_host(...)` 与 Host public API，未直接构造 Engine request，未访问 Host durable/internal，未读取 Fins storage。
+  - CLI / Service 边界清晰：CLI 负责 REPL 输入、signal、stdout/stderr、exit code、Host context/id；Service helper 仍不依赖 CLI，可被后续 WeChat / GUI 复用。
+  - `--label`、`--new-session`、`--ticker`、`--model-name`、execution overrides 与 unsupported legacy flags 的映射符合 accepted plan。
+  - 多轮状态机符合 S4：两轮同 session，每轮新的 Host request id / submit client request id，每轮独立 watcher attach/close 与 terminal wait state。
+  - SIGINT cancel 语义符合 S4：运行态第一次 Ctrl-C 发 typed Host cancel；第二次 Ctrl-C 本地 130；同一轮 cancel id 稳定；等待 run id 阶段 submit 先完成/失败不误映射为 130。
+  - Terminal policy 符合 S4：`SUCCEEDED` 继续；`FAILED` / `CANCELLED` 继续；`LOST` / Service fatal 退出 1。
+- Accepted findings：
+  - S4-IMPL-F01：输入态 Ctrl-C 行为缺少明确测试覆盖。当前实现选择退出当前 command 并返回 130；accepted plan 明确要求“按实现测试固定”，因此需要补测试。
+  - S4-IMPL-F02：运行态 SIGINT task cleanup 存在分支和 finally 重复 cancel / await 的代码异味。功能正确但增加状态机阅读负担，应低风险清理。
+- 下一步：AgentCodex low-fix gate。
+
+### CLI-01-S4 Low-Fix Gate
+
+- Updated implementation report: `docs/reviews/wu-cli-01-s4-implementation-codex.md`。
+- 修复范围：
+  - S4-IMPL-F01：新增输入态 Ctrl-C 测试，固定为退出当前 command、返回 130，且不发 submit / cancel。
+  - S4-IMPL-F02：新增 `_cancel_and_await_task(...)` 统一清理运行态 SIGINT 相关 task，移除分支与 finally 重复 cancel / await 的代码异味，语义保持不变。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/cli/test_interactive_command.py tests/service/test_entrypoint_runtime_interactive_path.py tests/cli/test_arg_parsing.py tests/cli/test_prompt_command.py --cov=dayu.cli.commands.interactive --cov=dayu.cli.host_context --cov=dayu.cli.output --cov=dayu.cli.arg_parsing --cov=dayu.cli.main --cov-report=term-missing -q`：64 passed，3 条 edgar deprecation warnings；`interactive.py` 88%，`host_context.py` 99%，`output.py` 83%，`arg_parsing.py` 100%，`main.py` 94%。
+  - `source .venv/bin/activate && pytest tests/cli/test_prompt_command.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_host_assembly.py -q`：82 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S4 implementation re-review gate。
+
+### CLI-01-S4 Re-Review Gate 裁决
+
+- Re-review artifacts: `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`、`docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`。
+- 总控裁决：pass。
+- Closed findings：
+  - S4-IMPL-F01：输入态 Ctrl-C 行为已由测试固定为退出当前 command、返回 130，且不发 submit / cancel。
+  - S4-IMPL-F02：运行态 SIGINT task cleanup 已集中到 `_cancel_and_await_task(...)`，重复 cancel / await 代码异味已关闭。
+  - Controller pre-review blocker 仍关闭：等待 run id 阶段 submit task 先完成时返回 terminal；submit task 先失败时透传异常；不误映射为本地 130。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/cli/test_interactive_command.py tests/service/test_entrypoint_runtime_interactive_path.py tests/cli/test_arg_parsing.py tests/cli/test_prompt_command.py --cov=dayu.cli.commands.interactive --cov=dayu.cli.host_context --cov=dayu.cli.output --cov=dayu.cli.arg_parsing --cov=dayu.cli.main --cov-report=term-missing -q`：64 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli/test_prompt_command.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_host_assembly.py -q`：82 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- Accepted implementation commit: pending local commit。
+- 下一步：进入 CLI-01-S5 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 

@@ -15,11 +15,16 @@ CLI_ACTOR: str = "cli-user"
 CLI_SOURCE: str = "dayu-cli"
 CLI_PROMPT_COMMAND: str = "prompt"
 CLI_PROMPT_OPERATION_KIND: str = "cli_prompt"
+CLI_INTERACTIVE_COMMAND: str = "interactive"
+CLI_INTERACTIVE_OPERATION_KIND: str = "cli_interactive"
 CLI_BUSINESS_DOMAIN: str = "fins"
 CLI_TICKER_OBJECT_TYPE: str = "ticker"
 CLI_PROMPT_SCENARIO: str = "prompt"
+CLI_INTERACTIVE_SCENARIO: str = "interactive"
 PROMPT_SESSION_SCOPE: str = "cli.prompt"
 PROMPT_SLOT_KEY_PREFIX: str = "cli.prompt."
+INTERACTIVE_SESSION_SCOPE: str = "cli.interactive"
+INTERACTIVE_SLOT_KEY_PREFIX: str = "cli.interactive."
 CLI_SIGINT_REASON: str = "cli_sigint"
 _REQUEST_ID_OPERATION_SEPARATOR: str = ":"
 
@@ -87,8 +92,45 @@ def prompt_slot_key(label: str) -> str:
     return f"{PROMPT_SLOT_KEY_PREFIX}{stripped_label}"
 
 
+def interactive_slot_key(label: str) -> str:
+    """把 interactive 用户 label 映射为稳定 Host slot key。
+
+    :param label: 用户通过 ``--label`` 传入的会话标签。
+    :returns: 形如 ``cli.interactive.<label>`` 的 Host slot key。
+    :raises ValueError: label 为空或仅包含空白时抛出。
+    """
+
+    stripped_label = _require_non_empty_text(label, field_name="label").strip()
+    return f"{INTERACTIVE_SLOT_KEY_PREFIX}{stripped_label}"
+
+
+def interactive_process_slot_key(invocation: CliInvocation) -> str:
+    """构造 interactive 当前进程新会话使用的临时 slot key。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :returns: 形如 ``cli.interactive.<invocation_id>`` 的进程本地 slot key。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"{INTERACTIVE_SLOT_KEY_PREFIX}{invocation.invocation_id}"
+
+
 def prompt_create_session_client_request_id(invocation: CliInvocation) -> str:
     """构造 prompt create-session 幂等 id。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :returns: Host create-session client_request_id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        f"dayu-cli:{invocation.command_name}:{invocation.invocation_id}:"
+        "session:create"
+    )
+
+
+def interactive_create_session_client_request_id(invocation: CliInvocation) -> str:
+    """构造 interactive create-session 幂等 id。
 
     :param invocation: 当前 CLI invocation 身份。
     :returns: Host create-session client_request_id。
@@ -106,6 +148,24 @@ def prompt_submit_client_request_id(invocation: CliInvocation, *, turn_index: in
 
     :param invocation: 当前 CLI invocation 身份。
     :param turn_index: prompt one-shot 的轮次序号。
+    :returns: Host submit client_request_id。
+    :raises ValueError: 轮次序号小于 1 时抛出。
+    """
+
+    _require_positive_turn_index(turn_index)
+    return (
+        f"dayu-cli:{invocation.command_name}:{invocation.invocation_id}:"
+        f"turn-{turn_index}:submit"
+    )
+
+
+def interactive_submit_client_request_id(
+    invocation: CliInvocation, *, turn_index: int
+) -> str:
+    """构造 interactive 单轮 submit 幂等 id。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :param turn_index: interactive 轮次序号。
     :returns: Host submit client_request_id。
     :raises ValueError: 轮次序号小于 1 时抛出。
     """
@@ -137,6 +197,26 @@ def prompt_cancel_client_request_id(
     )
 
 
+def interactive_cancel_client_request_id(
+    invocation: CliInvocation, *, turn_index: int, run_id: str
+) -> str:
+    """构造 interactive 单轮 cancel 幂等 id。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :param turn_index: interactive 轮次序号。
+    :param run_id: 待取消的 Host Run id。
+    :returns: Host cancel client_request_id；同一 Run 重复取消应复用该值。
+    :raises ValueError: 轮次序号或 run id 非法时抛出。
+    """
+
+    _require_positive_turn_index(turn_index)
+    _require_non_empty_text(run_id, field_name="run_id")
+    return (
+        f"dayu-cli:{invocation.command_name}:{invocation.invocation_id}:"
+        f"turn-{turn_index}:run-{run_id}:cancel:{CLI_SIGINT_REASON}"
+    )
+
+
 def build_prompt_host_context(
     invocation: CliInvocation,
     *,
@@ -150,7 +230,53 @@ def build_prompt_host_context(
     :raises ValueError: operation 为空时抛出。
     """
 
+    return _build_host_context(
+        invocation,
+        operation=operation,
+        operation_kind=CLI_PROMPT_OPERATION_KIND,
+    )
+
+
+def build_interactive_host_context(
+    invocation: CliInvocation,
+    *,
+    operation: str,
+) -> HostCallContext:
+    """构造 interactive 命令调用 Host public API 的上下文。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :param operation: 当前 Host API 操作短名。
+    :returns: HostCallContext。
+    :raises ValueError: operation 为空时抛出。
+    """
+
+    return _build_host_context(
+        invocation,
+        operation=operation,
+        operation_kind=CLI_INTERACTIVE_OPERATION_KIND,
+    )
+
+
+def _build_host_context(
+    invocation: CliInvocation,
+    *,
+    operation: str,
+    operation_kind: str,
+) -> HostCallContext:
+    """按 CLI invocation 构造 Host public 调用上下文。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :param operation: 当前 Host API 操作短名。
+    :param operation_kind: Host operation kind。
+    :returns: HostCallContext。
+    :raises ValueError: operation 或 operation_kind 为空时抛出。
+    """
+
     operation_name = _require_non_empty_text(operation, field_name="operation")
+    checked_operation_kind = _require_non_empty_text(
+        operation_kind,
+        field_name="operation_kind",
+    )
     business_object_type = None
     business_object_id = None
     if invocation.ticker is not None:
@@ -166,7 +292,7 @@ def build_prompt_host_context(
         authorization_claims=(),
         operation_context=OperationContext(
             operation_name=f"dayu_cli.{invocation.command_name}.{operation_name}",
-            operation_kind=CLI_PROMPT_OPERATION_KIND,
+            operation_kind=checked_operation_kind,
             business_domain=CLI_BUSINESS_DOMAIN,
             business_object_type=business_object_type,
             business_object_id=business_object_id,
@@ -231,12 +357,21 @@ def _require_positive_turn_index(value: int) -> None:
 
 
 __all__: tuple[str, ...] = (
+    "CLI_INTERACTIVE_COMMAND",
+    "CLI_INTERACTIVE_SCENARIO",
     "CLI_PROMPT_COMMAND",
     "CLI_PROMPT_SCENARIO",
     "CLI_SIGINT_REASON",
     "CliInvocation",
+    "INTERACTIVE_SESSION_SCOPE",
     "PROMPT_SESSION_SCOPE",
+    "build_interactive_host_context",
     "build_prompt_host_context",
+    "interactive_cancel_client_request_id",
+    "interactive_create_session_client_request_id",
+    "interactive_process_slot_key",
+    "interactive_slot_key",
+    "interactive_submit_client_request_id",
     "new_cli_invocation",
     "prompt_cancel_client_request_id",
     "prompt_create_session_client_request_id",
