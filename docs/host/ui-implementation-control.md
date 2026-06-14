@@ -135,14 +135,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Product entrypoint implementation backlog |
-| gate | accepted slice commit |
-| implementation status | CLI-01-S6 re-review pass; ready for accepted slice commit |
+| gate | implementation |
+| implementation status | CLI-01-S6 accepted; ready for CLI-01-S7 |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | accepted slice commit gate：创建 CLI-01-S6 accepted local commit |
+| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S7 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
-| implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; accepted plan commit `de99831f` |
+| implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; CLI-01-S6 `0f08a13c`; accepted plan commit `de99831f` |
 | review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
@@ -582,7 +582,8 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - upload suffix allowlist 已收敛为 `FINS_UPLOAD_FILE_SUFFIXES` Fins public constant，batch plan 与 CLI direct upload precheck 同源。
   - 空 `--from`、`material_forms=("",)`、`source_dir` 为普通文件三条错误路径测试已补齐。
   - Fix 未扩大到 rejected findings，未修改 recognition rule、CLI async/sync 边界或 S7 scope。
-- 下一步：进入 CLI-01-S6 accepted slice commit gate。
+- Accepted implementation commit: `0f08a13c`。
+- 下一步：进入 CLI-01-S7 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
