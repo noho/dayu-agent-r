@@ -142,7 +142,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S4 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
-| implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; accepted plan commit `de99831f` |
+| implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; accepted plan commit `de99831f` |
 | review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
@@ -417,7 +417,7 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
 - Non-blocking observations：
   - `render_prompt_terminal_result` 的 CANCELLED / LOST / SUCCEEDED-without-answer 防御分支可在后续触碰 CLI output 时补直接单测；当前 `dayu/cli/output.py` 覆盖率 80%，满足单文件覆盖率门槛，且不影响 S3 Host public path 正确性。
   - 不支持 `loop.add_signal_handler` 的事件循环环境会降级为默认 `KeyboardInterrupt`；当前目标运行环境不是 Windows ProactorEventLoop，如未来需要跨平台 typed cancel，再单独设计 signal / cancellation adapter contract。
-- Accepted implementation commit: pending local commit。
+- Accepted implementation commit: `4b28bbe5`。
 - 下一步：进入 CLI-01-S4 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
