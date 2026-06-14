@@ -135,17 +135,17 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Product entrypoint implementation backlog |
-| gate | ready-to-open-draft-PR |
-| implementation status | WU-CLI-01 local gates accepted; ready to open draft PR |
+| gate | review |
+| implementation status | draft PR opened; ready for PR review |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | draft PR gate：push branch and create draft PR |
+| next entry point | PR review gate：review draft PR 141 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; CLI-01-S6 `0f08a13c`; CLI-01-S7 `35db913e`; accepted plan commit `de99831f` |
 | review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | `docs/reviews/wu-cli-01-aggregate-deepreview-mimo.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-ds.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-controller-adjudication.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-fix-codex.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-mimo.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-ds.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-controller-adjudication.md` |
-| draft PR status | not-started |
+| draft PR status | opened: https://github.com/noho/dayu-agent-r/pull/141 |
 | blocking open questions | none |
 
 状态约定：
@@ -723,6 +723,13 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - `git diff --check`：clean。
 - Accepted deepreview commit: `9b4a4407`。
 - 下一步：进入 ready-to-open-draft-PR gate。
+
+### Draft PR Gate
+
+- Branch pushed: `phase/host-ui-implementation` -> `github/phase/host-ui-implementation`。
+- Draft PR: https://github.com/noho/dayu-agent-r/pull/141。
+- PR title: `WU-CLI-01 CLI entrypoint integration`。
+- 下一步：进入 PR review gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
