@@ -9,12 +9,13 @@ Fins storage，也不把 direct job 伪装成 Host Run。
 from __future__ import annotations
 
 import asyncio
+import shlex
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Final
+from typing import Final, cast
 
 from dayu.cli.arg_parsing import (
     COMMAND_DOWNLOAD,
@@ -29,6 +30,7 @@ from dayu.cli.arg_parsing import (
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
+    EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
 from dayu.cli.output import (
@@ -38,6 +40,15 @@ from dayu.cli.output import (
     render_fins_direct_terminal_result,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.upload_batch import (
+    FINS_UPLOAD_FILE_SUFFIXES,
+    BatchUploadAction,
+    UploadBatchPlanEmptyError,
+    UploadBatchPlanEntry,
+    UploadBatchPlanRequest,
+    UploadBatchPlanUsageError,
+    generate_upload_batch_plan,
+)
 from dayu.service.fins_direct import (
     FinsDirectCommandService,
     FinsDirectJobHandle,
@@ -49,9 +60,6 @@ _BASE_OPTION: Final[str] = "--base"
 _TICKER_OPTION: Final[str] = "--ticker"
 _INFER_OPTION: Final[str] = "--infer"
 _CI_OPTION: Final[str] = "--ci"
-_UPLOAD_FILINGS_FROM_UNSUPPORTED: Final[str] = (
-    "upload_filings_from 属于 CLI-01-S6，本切片只保留 parser，执行暂不支持。"
-)
 _UNSUPPORTED_OPTION_TEMPLATE: Final[str] = "unsupported option {option}: {reason}"
 _UNSUPPORTED_INFER_REASON: Final[str] = "当前没有 approved Fins alias inference boundary"
 _UNSUPPORTED_CI_REASON: Final[str] = "当前没有 public CI snapshot contract"
@@ -65,24 +73,6 @@ _MISSING_UPLOAD_FILE_TEMPLATE: Final[str] = "upload file does not exist: {path}"
 _UPLOAD_PATH_NOT_FILE_TEMPLATE: Final[str] = "upload path is not a file: {path}"
 _UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = (
     "upload file suffix is not allowed: {path}"
-)
-_ALLOWED_UPLOAD_FILE_SUFFIXES: Final[frozenset[str]] = frozenset(
-    {
-        ".csv",
-        ".docx",
-        ".htm",
-        ".html",
-        ".json",
-        ".md",
-        ".pdf",
-        ".txt",
-        ".xbrl",
-        ".xhtml",
-        ".xls",
-        ".xlsx",
-        ".xml",
-        ".zip",
-    }
 )
 
 
@@ -198,6 +188,12 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
     except CliFinsUsageError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
+    except UploadBatchPlanUsageError as exc:
+        render_cli_error(f"dayu-cli {args.command_name}: {exc}")
+        return EXIT_USAGE_ERROR
+    except UploadBatchPlanEmptyError as exc:
+        render_cli_error(f"dayu-cli {args.command_name}: {exc}")
+        return EXIT_FAILURE
     except FinsDirectUsageError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
@@ -218,7 +214,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     """
 
     if args.command_name == COMMAND_UPLOAD_FILINGS_FROM:
-        raise CliFinsUsageError(_UPLOAD_FILINGS_FROM_UNSUPPORTED)
+        return _run_upload_filings_from(args)
     _raise_for_unsupported_flags(args)
     workspace_root = _resolve_workspace_root(args.workspace_root)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
@@ -231,6 +227,112 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     if terminal is None:
         return EXIT_KEYBOARD_INTERRUPT
     return render_fins_direct_terminal_result(terminal)
+
+
+def _run_upload_filings_from(args: ParsedCliArgs) -> int:
+    """执行 ``upload_filings_from`` 本地计划生成。
+
+    :param args: argparse 已解析的 upload_filings_from 参数。
+    :returns: CLI 退出码。
+    :raises CliFinsUsageError: ticker 或 source dir 参数非法时抛出。
+    :raises UploadBatchPlanUsageError: Fins batch helper 判断输入非法时抛出。
+    :raises UploadBatchPlanEmptyError: 源目录无可识别文件时抛出。
+    :raises OSError: 输出文件写入失败时由底层抛出。
+    """
+
+    ticker = _parse_ticker_csv(args.ticker)
+    if args.source_dir is None or args.source_dir.strip() == "":
+        raise CliFinsUsageError("--from must not be empty")
+    plan = generate_upload_batch_plan(
+        UploadBatchPlanRequest(
+            ticker=ticker.canonical,
+            source_dir=Path(args.source_dir),
+            action=cast(BatchUploadAction, args.action),
+            recursive=args.recursive,
+            fiscal_year=args.fiscal_year,
+            fiscal_period=_optional_stripped_text(args.fiscal_period),
+            amended=args.amended,
+            filing_date=_optional_stripped_text(args.filing_date),
+            report_date=_optional_stripped_text(args.report_date),
+            company_name=_optional_stripped_text(args.company_name),
+            material_forms=_normalized_text_tuple(
+                args.material_forms,
+                field_name="--material-forms",
+            ),
+        )
+    )
+    script = _render_upload_batch_script(plan.entries)
+    if args.output is None:
+        print(script, end="")
+        return EXIT_SUCCESS
+    output_path = Path(args.output).expanduser().resolve(strict=False)
+    output_path.write_text(script, encoding="utf-8")
+    return EXIT_SUCCESS
+
+
+def _render_upload_batch_script(entries: tuple[UploadBatchPlanEntry, ...]) -> str:
+    """把结构化上传计划渲染为 ``dayu-cli`` 命令脚本。
+
+    :param entries: Fins batch helper 返回的结构化计划条目。
+    :returns: shell 可执行的命令脚本文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    lines = tuple(_render_upload_batch_command(entry) for entry in entries)
+    return "\n".join(lines) + "\n"
+
+
+def _render_upload_batch_command(entry: UploadBatchPlanEntry) -> str:
+    """渲染单条上传命令。
+
+    :param entry: 结构化上传计划条目。
+    :returns: shell quoted 命令行。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts = [
+        "dayu-cli",
+        entry.command_name,
+        "--ticker",
+        entry.ticker,
+        "--action",
+        entry.action,
+    ]
+    if entry.command_name == COMMAND_UPLOAD_MATERIAL:
+        if entry.form_type is not None:
+            parts.extend(("--forms", entry.form_type))
+        if entry.material_name is not None:
+            parts.extend(("--material-name", entry.material_name))
+    parts.append("--files")
+    parts.extend(str(path) for path in entry.files)
+    _append_optional_entry_metadata(parts, entry)
+    return shlex.join(parts)
+
+
+def _append_optional_entry_metadata(
+    parts: list[str],
+    entry: UploadBatchPlanEntry,
+) -> None:
+    """向命令参数列表追加可选 metadata flags。
+
+    :param parts: 正在构造的命令参数列表。
+    :param entry: 结构化上传计划条目。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if entry.fiscal_year is not None:
+        parts.extend(("--fiscal-year", str(entry.fiscal_year)))
+    if entry.fiscal_period is not None:
+        parts.extend(("--fiscal-period", entry.fiscal_period))
+    if entry.amended:
+        parts.append("--amended")
+    if entry.filing_date is not None:
+        parts.extend(("--filing-date", entry.filing_date))
+    if entry.report_date is not None:
+        parts.extend(("--report-date", entry.report_date))
+    if entry.company_name is not None:
+        parts.extend(("--company-name", entry.company_name))
 
 
 def _start_direct_job(
@@ -544,7 +646,7 @@ def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:
             raise CliFinsUsageError(
                 _UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path)
             )
-        if path.suffix.lower() not in _ALLOWED_UPLOAD_FILE_SUFFIXES:
+        if path.suffix.lower() not in FINS_UPLOAD_FILE_SUFFIXES:
             raise CliFinsUsageError(
                 _UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE.format(path=path)
             )

@@ -135,15 +135,15 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Product entrypoint implementation backlog |
-| gate | implementation |
-| implementation status | CLI-01-S5 accepted; ready for CLI-01-S6 |
+| gate | accepted slice commit |
+| implementation status | CLI-01-S6 re-review pass; ready for accepted slice commit |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S6 |
+| next entry point | accepted slice commit gate：创建 CLI-01-S6 accepted local commit |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; accepted plan commit `de99831f` |
-| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md` |
+| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
 | blocking open questions | none |
@@ -191,7 +191,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-CLI-01-RR-01 | WU-CLI-01 plan re-review | behavior parity | deferred-with-owner | Fins owner；后续 Fins alias inference WU / GitHub Issue #83 intentional deviation | WU-CLI-01 解析保留 `--infer`，执行时报 unsupported；后续单独定义 approved Fins alias inference boundary | 旧 `--infer` alias inference 当前无 approved Fins boundary，download / upload 与旧 CLI 行为不完全一致。 |
 | WU-CLI-01-RR-02 | WU-CLI-01 plan re-review | behavior parity | deferred-with-owner | Fins / tooling owner；后续 CI snapshot contract WU | WU-CLI-01 解析保留 `--ci`，执行时报 unsupported；后续定义 process snapshot public contract | 旧 `--ci` process snapshot 当前无公共 contract。 |
 | WU-CLI-01-RR-03 | WU-CLI-01 plan re-review | Host observability | deferred-with-owner | Host / Service owner；后续 observability / per-run governance WU | WU-CLI-01 对旧 debug / trace / duplicate governance flags fail fast；后续若需要再设计 Host public per-run contract | 旧 debug / trace / duplicate governance flags 无当前 Host public per-run contract。 |
-| WU-CLI-01-RR-04 | WU-CLI-01 plan re-review | Fins batch parity | deferred-with-owner | Fins owner；CLI-01-S6 implementation slice | 在 Fins boundary 建 typed batch plan helper；若无法自洽，降级并登记 deviation | `upload_filings_from` 的旧文件识别规则可能依赖旧 Fins helper。 |
+| WU-CLI-01-RR-04 | WU-CLI-01 plan re-review / S6 implementation | Fins batch parity | deferred-with-owner | Fins owner；后续 Fins batch recognition parity WU（如需要旧 CLI 完全 parity） | S6 已在 Fins boundary 建 typed batch plan helper，采用当前 Fins domain 可自洽的保守文件名 token 识别；若后续需要旧 CLI 完全 parity，由 Fins owner 定义更完整 typed recognition contract | `upload_filings_from` 的旧文件识别规则可能依赖旧 Fins helper；当前不搬旧实现细节。 |
 | WU-CLI-01-RR-05 | WU-CLI-01 plan re-review | model profile UX | deferred-with-owner | Config / Service owner；后续 model profile UX WU | WU-CLI-01 只在当前 model / hint 可明确映射时支持 `--thinking` / `--no-thinking`，否则 unsupported | `--thinking` / `--no-thinking` 在当前模型 schema 中不是独立布尔开关。 |
 | WU-CLI-01-RR-06 | WU-CLI-01 plan re-review / S5 review | Fins cancel responsiveness | deferred-with-owner | Fins runtime owner；CLI runtime / cross-platform signal adapter owner；CLI-01-S5 / S6 implementation validation 或后续跨平台 cancel WU | CLI 第一次 SIGINT 发 durable cancel，第二次 SIGINT 允许本地退出并打印 job id；实现时验证长事务 cancel checkpoint；若需要 Windows ProactorEventLoop 等无 `add_signal_handler` 平台支持，另设 signal adapter contract | Fins job cancel 是协作式，部分长事务可能不及时检查 cancel request；无 `add_signal_handler` 平台无法提供同等 durable cancel UX。 |
 | WU-CLI-01-RR-07 | WU-CLI-01 plan re-review | Fins upload action parity | deferred-with-owner | Fins owner；CLI-01-S5 implementation slice | 只有当前 upload runtime 支持时放行 `upload_filing --action delete`，否则执行时报 unsupported | `upload_filing --action delete` 当前是否被 Fins upload runtime 支持需实现时验证。 |
@@ -536,6 +536,53 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - `git diff --check`：clean。
 - Accepted implementation commit: `48a97942`。
 - 下一步：进入 CLI-01-S6 implementation gate。
+
+### CLI-01-S6 Implementation Gate
+
+- Implementation report: `docs/reviews/wu-cli-01-s6-implementation-codex.md`。
+- 实现范围：`upload_filings_from` 本地目录扫描与批量上传脚本生成；不启动 ingestion job，不创建 Host Run，不写 Host EventLog。
+- 总控复核：
+  - S6 目标是把旧 `upload_filings_from` 的用户可见业务语义迁移到当前 Fins typed helper；不是搬迁旧识别 helper 或旧目录规则。
+  - `dayu.fins.upload_batch` 是 Fins boundary 内的 typed plan 真源，返回 `UploadBatchPlanResult` / `UploadBatchPlanEntry` 结构化条目，不返回 shell text。
+  - CLI 只把 argparse 结果转换为 `UploadBatchPlanRequest`，并把结构化 entries 渲染为 `dayu-cli upload_filing ...` / `dayu-cli upload_material ...` 脚本。
+  - S6 未修改 parser / main / output；未新增 Service helper，避免扩大 `dayu.service` 对 Fins import boundary。
+  - 新 helper 不导入 Host / Engine / Service / Fins storage；只扫描调用方显式传入的本地源目录。
+  - 文件识别采用保守 Fins typed rule：可上传后缀普通文件、常见 filing form token、用户传入 `--material-forms` token；无法识别则跳过，全部跳过时 exit 1。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_command.py tests/cli/test_fins_commands.py -q`：28 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli tests/fins/test_upload_batch.py -q`：89 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_command.py --cov=dayu.fins.upload_batch --cov=dayu.cli.commands.fins --cov-report=term-missing -q`：15 passed；`dayu/fins/upload_batch.py` 96%。
+  - `source .venv/bin/activate && pytest tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py --cov=dayu.cli.commands.fins --cov-report=term-missing -q`：22 passed；`dayu/cli/commands/fins.py` 90%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- Review artifacts: `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`、`docs/reviews/wu-cli-01-s6-implementation-review-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`。
+- 总控裁决：pass-with-fix。
+- Accepted findings：
+  - S6-RV-F02：upload suffix allowlist 在 Fins batch plan 与 CLI direct upload precheck 中重复定义，应收敛到 Fins public constant，CLI 复用。
+  - S6-RV-F05：空 `--from` 错误路径缺测试。
+  - S6-RV-F06：`material_forms` 空字符串错误路径缺测试。
+  - S6-RV-F07：`source_dir` 是普通文件错误路径缺测试。
+- Rejected findings：
+  - `_optional_stripped_text` 抽取：当前重复面跨 S3/S4/S5 既有 CLI path，抽到 runtime 会扩大本 slice；后续若需要统一 CLI text normalization，应单独立项。
+  - async wrapper 内同步扫描、action cast、command name 常量比较、output 具体错误文本断言：均不构成当前 correctness / boundary finding。
+- Fix artifact: `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`。
+- Fix summary：
+  - `FINS_UPLOAD_FILE_SUFFIXES` 已提升为 Fins public constant，batch plan 与 CLI direct upload precheck 复用同一后缀真源。
+  - 已补空 `--from`、`material_forms=("",)`、`source_dir` 为普通文件三条错误路径测试。
+- Fix validation：
+  - `source .venv/bin/activate && pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_command.py tests/cli/test_fins_commands.py -q`：31 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_command.py tests/cli/test_fins_commands.py --cov=dayu.fins.upload_batch --cov=dayu.cli.commands.fins --cov-report=term-missing -q`：31 passed；`dayu/fins/upload_batch.py` 97%，`dayu/cli/commands/fins.py` 90%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- Re-review artifacts: `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`、`docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`。
+- Controller re-review adjudication: `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md`。
+- 总控裁决：pass。
+- Closed findings：
+  - upload suffix allowlist 已收敛为 `FINS_UPLOAD_FILE_SUFFIXES` Fins public constant，batch plan 与 CLI direct upload precheck 同源。
+  - 空 `--from`、`material_forms=("",)`、`source_dir` 为普通文件三条错误路径测试已补齐。
+  - Fix 未扩大到 rejected findings，未修改 recognition rule、CLI async/sync 边界或 S7 scope。
+- 下一步：进入 CLI-01-S6 accepted slice commit gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
