@@ -121,6 +121,7 @@ class ParsedCliArgs(argparse.Namespace):
     forms: list[str] | None
     start: str | None
     end: str | None
+    reset: bool
     overwrite: bool
     rebuild: bool
     infer: bool
@@ -226,6 +227,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.forms = None
     namespace.start = None
     namespace.end = None
+    namespace.reset = False
     namespace.overwrite = False
     namespace.rebuild = False
     namespace.infer = False

@@ -136,14 +136,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Product entrypoint implementation backlog |
 | gate | implementation |
-| implementation status | CLI-01-S6 accepted; ready for CLI-01-S7 |
+| implementation status | CLI-01-S7 re-review pass; ready for accepted slice commit |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S7 |
+| next entry point | accepted slice commit：提交 CLI-01-S7 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; CLI-01-S6 `0f08a13c`; accepted plan commit `de99831f` |
-| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md` |
+| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
 | blocking open questions | none |
@@ -584,6 +584,82 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - Fix 未扩大到 rejected findings，未修改 recognition rule、CLI async/sync 边界或 S7 scope。
 - Accepted implementation commit: `0f08a13c`。
 - 下一步：进入 CLI-01-S7 implementation gate。
+
+### CLI-01-S7 Implementation Gate
+
+- Implementation report: `docs/reviews/wu-cli-01-s7-implementation-codex.md`。
+- 实现范围：`dayu-cli init` current-schema workspace bootstrap；创建 workspace root，复制当前 `dayu/config`
+  配置文件与 `prompts/` assets 到 `workspace/config`，支持 `--overwrite` 与硬编码 reset 白名单。
+- 总控复核：
+  - S7 目标是迁移旧 `init` 的用户可见 bootstrap 业务语义，并适配当前 `ConfigLoader` schema；不是迁移旧
+    provider interactive、旧 workspace migrations、旧 `llm_models.json` / `run.json` 或旧实现结构。
+  - `init` 只做 filesystem bootstrap；不打开 Host，不创建 Fins job，不访问 Service helper，不读取 Fins storage。
+  - `--reset` 只删除 `<workspace>/config/`、`<workspace>/.dayu/host/`、
+    `<workspace>/.dayu/artifacts/`、`<workspace>/.dayu/web_tools_storage_states/`；删除前对全部白名单路径做
+    symlink 与 workspace containment 预检，任一不安全则 exit 2 且不删除。
+  - 配置复制使用逐文件 temp + `os.replace`；目标文件存在时默认失败，`--overwrite` 才替换。
+  - README 更新限于 `dayu/config/README.md` 与 `tests/README.md` 当前职责范围。
+- Controller validation：
+  - `source .venv/bin/activate && pytest tests/cli/test_init_command.py tests/cli/test_arg_parsing.py tests/runtime/test_config_loader.py -q`：74 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli -q`：93 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli/test_init_command.py tests/cli/test_arg_parsing.py --cov=dayu.cli.commands.init --cov=dayu.cli.main --cov-report=term-missing -q`：34 passed；`dayu/cli/commands/init.py` 88%，`dayu/cli/main.py` 95%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- Controller follow-up review focus：
+  - 裁决重点是旧 `init` 业务逻辑是否适配当前 config schema 与 CLI public behavior，而不是旧实现是否被搬运。
+  - 明确检查 reset 白名单、symlink / parent symlink escape、用户数据保留、旧 schema 不生成、SIGINT 130 与部分复制语义。
+  - 明确检查 S7 是否越界进入 Host / Service / Fins / migration / provider writeback。
+- 下一步：进入 CLI-01-S7 implementation review gate。
+
+### CLI-01-S7 Review Gate 裁决
+
+- Review artifacts: `docs/reviews/wu-cli-01-s7-implementation-review-mimo.md`、`docs/reviews/wu-cli-01-s7-implementation-review-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s7-implementation-review-controller-adjudication.md`。
+- 总控裁决：pass-with-fix。
+- 审查通过项：
+  - S7 迁移的是旧 `init` 的用户可见 bootstrap 业务语义，并适配当前 `ConfigLoader` schema；未搬迁旧
+    provider interactive、旧 migrations 或旧 schema。
+  - `init` 只做 filesystem bootstrap；未打开 Host、未创建 Host Run、未触达 Fins job、未读取 Fins storage。
+  - reset 白名单、symlink / parent symlink containment、用户数据保留、旧 schema 不生成、ConfigLoader 加载、
+    SIGINT 130、README 触发边界均通过 review。
+- Accepted findings：
+  - S7-RV-F02：`reset` 未在 `ParsedCliArgs` 默认 namespace 中显式初始化，typed CLI namespace 与 runner 读取属性不一致。
+- Rejected findings：
+  - S7-RV-F01：prompts 子目录同名 legacy filename 误伤风险当前无触发；当前 fail-closed 防御不影响 current assets。
+  - S7-RV-F03：`workspace/config` 为普通文件时已安全失败 exit 1；错误消息精细化不影响当前 bootstrap 或 data-loss 防线。
+- 下一步：AgentCodex fix gate。
+
+### CLI-01-S7 Fix Gate
+
+- Fix artifact: `docs/reviews/wu-cli-01-s7-implementation-fix-codex.md`。
+- Fix summary：
+  - `ParsedCliArgs` 已补充 `reset: bool`。
+  - `_new_default_namespace()` 已设置 `namespace.reset = False`。
+  - `tests/cli/test_arg_parsing.py` 已补充 default namespace / parser path 测试，验证 `reset` 默认为 `False`。
+  - 未处理 rejected findings S7-RV-F01 / S7-RV-F03，未扩大实现范围。
+- Fix validation：
+  - `source .venv/bin/activate && pytest tests/cli/test_arg_parsing.py tests/cli/test_init_command.py -q`：35 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli -q`：94 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S7 implementation re-review gate。
+
+### CLI-01-S7 Re-Review Gate 裁决
+
+- Re-review artifacts: `docs/reviews/wu-cli-01-s7-implementation-rereview-mimo.md`、`docs/reviews/wu-cli-01-s7-implementation-rereview-ds.md`。
+- Controller re-review adjudication: `docs/reviews/wu-cli-01-s7-implementation-rereview-controller-adjudication.md`。
+- 总控裁决：pass。
+- Closed findings：
+  - S7-RV-F02：`ParsedCliArgs.reset: bool`、`namespace.reset = False` 与 default namespace / parser path 测试均已补齐。
+- 新 findings：无。
+- Rejected findings 状态：
+  - S7-RV-F01 / S7-RV-F03 保持 rejected；fix 未提供新直接证据证明其变成当前阻塞问题。
+- Controller validation：
+  - `source .venv/bin/activate && pytest tests/cli/test_arg_parsing.py tests/cli/test_init_command.py -q`：35 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli -q`：94 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：accepted slice commit；随后进入 WU-CLI-01 aggregate deepreview gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 

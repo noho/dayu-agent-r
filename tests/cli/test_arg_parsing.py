@@ -16,6 +16,7 @@ from dayu.cli.arg_parsing import (
     EXCLUDED_COMMAND_NAMES,
     ParsedCliArgs,
     build_parser,
+    parse_cli_args,
 )
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
@@ -182,21 +183,31 @@ def test_excluded_commands_exit_with_usage_error(command_name: str) -> None:
 
 
 def test_placeholder_runner_returns_not_implemented(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """验证已注册命令被分发时返回清晰的 not-implemented 结果。
 
     :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
     :raises AssertionError: 退出码或错误文本不符合占位契约时抛出。
     """
 
-    exit_code = cli_main.main(("init",))
+    args = ParsedCliArgs()
+    args.command_name = "future_command"
+    monkeypatch.setattr(cli_main, "parse_cli_args", lambda _argv: args)
+    monkeypatch.setitem(
+        cli_main.COMMAND_RUNNERS,
+        "future_command",
+        cli_main.run_not_implemented_command,
+    )
+
+    exit_code = cli_main.main(("future_command",))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_NOT_IMPLEMENTED
     assert "尚未实现" in captured.err
-    assert "init" in captured.err
+    assert "future_command" in captured.err
 
 
 def test_main_reports_missing_command_runner(
@@ -291,3 +302,18 @@ def test_parse_args_accepts_global_options_before_and_after_command() -> None:
 
     assert before_command.workspace_root == "workspace-a"
     assert after_command.workspace_root == "workspace-b"
+
+
+def test_default_namespace_initializes_reset_false() -> None:
+    """验证默认 CLI namespace 显式提供 ``reset=False``。
+
+    :returns: ``None``。
+    :raises AssertionError: ``reset`` 默认值或真实 parser 行为不符合契约时抛出。
+    """
+
+    init_args = parse_cli_args(("init",))
+    prompt_args = parse_cli_args(("prompt", "hello"))
+
+    assert init_args.reset is False
+    assert init_args.overwrite is False
+    assert prompt_args.reset is False

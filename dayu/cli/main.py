@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from dayu.cli.arg_parsing import (
     CLI_COMMAND_NAMES,
     COMMAND_DOWNLOAD,
+    COMMAND_INIT,
     COMMAND_INTERACTIVE,
     COMMAND_PROCESS,
     COMMAND_PROCESS_FILING,
@@ -25,6 +26,7 @@ from dayu.cli.arg_parsing import (
 )
 from dayu.cli.commands import run_not_implemented_command
 from dayu.cli.commands.fins import run_fins_direct_command
+from dayu.cli.commands.init import run_init_command
 from dayu.cli.commands.interactive import run_interactive_command
 from dayu.cli.commands.prompt import run_prompt_command
 from dayu.cli.exit_codes import (
@@ -41,6 +43,7 @@ MISSING_RUNNER_DIAGNOSTIC_TEMPLATE: str = (
 COMMAND_RUNNERS: dict[str, CommandRunner] = {
     command_name: run_not_implemented_command for command_name in CLI_COMMAND_NAMES
 }
+COMMAND_RUNNERS[COMMAND_INIT] = run_init_command
 COMMAND_RUNNERS[COMMAND_INTERACTIVE] = run_interactive_command
 COMMAND_RUNNERS[COMMAND_PROMPT] = run_prompt_command
 COMMAND_RUNNERS[COMMAND_DOWNLOAD] = run_fins_direct_command
