@@ -54,6 +54,7 @@ from dayu.service.entrypoint_runtime import (
     ensure_or_create_entrypoint_session,
     prepare_entrypoint_runtime,
     submit_entrypoint_turn_and_wait,
+    _close_watcher,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
@@ -80,16 +81,19 @@ class _FakeHostEventIterator:
     """测试用可关闭 HostEvent iterator。"""
 
     closed_count: int
+    _close_error: BaseException | None
     _queue: asyncio.Queue[HostEvent | _StopSignal | _RaiseSignal]
 
-    def __init__(self) -> None:
+    def __init__(self, *, close_error: BaseException | None = None) -> None:
         """初始化测试 watcher。
 
+        :param close_error: ``aclose`` 应抛出的测试异常；``None`` 表示正常关闭。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
         self.closed_count = 0
+        self._close_error = close_error
         self._queue = asyncio.Queue()
 
     def __aiter__(self) -> AsyncIterator[HostEvent]:
@@ -139,10 +143,12 @@ class _FakeHostEventIterator:
         """关闭测试 watcher。
 
         :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
+        :raises BaseException: 配置了 ``close_error`` 时抛出该异常。
         """
 
         self.closed_count += 1
+        if self._close_error is not None:
+            raise self._close_error
         await self._queue.put(_StopSignal())
 
 
@@ -833,6 +839,44 @@ async def test_cancel_entrypoint_run_continues_wait_when_cancel_loses_terminal_r
     ]
 
 
+@pytest.mark.asyncio
+async def test_close_watcher_cancels_and_awaits_drain_when_aclose_is_cancelled() -> None:
+    """watcher aclose 被取消时仍必须 cancel 并回收 drain task。"""
+
+    watcher = _FakeHostEventIterator(close_error=asyncio.CancelledError())
+    drain_cancel_observed = asyncio.Event()
+    drain_task = asyncio.create_task(_wait_until_cancelled(drain_cancel_observed))
+    await asyncio.sleep(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _close_watcher(watcher=watcher, drain_task=drain_task)
+
+    assert watcher.closed_count == 1
+    assert drain_cancel_observed.is_set()
+    assert drain_task.done()
+    assert drain_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_close_watcher_cancels_and_awaits_drain_when_aclose_fails() -> None:
+    """watcher aclose 普通异常应透传，且 drain task 仍被回收。"""
+
+    close_error = RuntimeError("watcher close failed")
+    watcher = _FakeHostEventIterator(close_error=close_error)
+    drain_cancel_observed = asyncio.Event()
+    drain_task = asyncio.create_task(_wait_until_cancelled(drain_cancel_observed))
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="watcher close failed") as exc_info:
+        await _close_watcher(watcher=watcher, drain_task=drain_task)
+
+    assert exc_info.value is close_error
+    assert watcher.closed_count == 1
+    assert drain_cancel_observed.is_set()
+    assert drain_task.done()
+    assert drain_task.cancelled()
+
+
 def test_entrypoint_runtime_does_not_import_engine_internals() -> None:
     """entrypoint runtime 不应导入 Engine 内部或 CLI-only 模块。"""
 
@@ -848,6 +892,22 @@ def test_entrypoint_runtime_does_not_import_engine_internals() -> None:
 
     assert "dayu.engine" not in imported_modules
     assert "dayu.cli" not in imported_modules
+
+
+async def _wait_until_cancelled(cancel_observed: asyncio.Event) -> None:
+    """等待 task 被取消，并记录取消已被 drain task 观察到。
+
+    :param cancel_observed: 记录取消观察结果的事件。
+    :returns: ``None``。
+    :raises asyncio.CancelledError: 当前 task 被取消时透传。
+    """
+
+    blocker = asyncio.Event()
+    try:
+        await blocker.wait()
+    except asyncio.CancelledError:
+        cancel_observed.set()
+        raise
 
 
 async def _prepare_runtime(tmp_path: Path) -> EntrypointRuntimeResult:

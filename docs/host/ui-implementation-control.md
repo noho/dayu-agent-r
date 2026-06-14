@@ -136,15 +136,15 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Product entrypoint implementation backlog |
 | gate | review |
-| implementation status | CLI-01-S7 accepted; ready for aggregate deepreview |
+| implementation status | aggregate deepreview re-review pass; ready for accepted deepreview commit |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | aggregate deepreview gate：AgentMiMo / AgentDS 对 WU-CLI-01 全部 accepted slices 做 aggregate deepreview |
+| next entry point | accepted deepreview commit：提交 WU-CLI-01 aggregate deepreview |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; CLI-01-S6 `0f08a13c`; CLI-01-S7 `35db913e`; accepted plan commit `de99831f` |
 | review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-controller-adjudication.md` |
-| aggregate review artifacts | none |
+| aggregate review artifacts | `docs/reviews/wu-cli-01-aggregate-deepreview-mimo.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-ds.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-controller-adjudication.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-fix-codex.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-mimo.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-ds.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-controller-adjudication.md` |
 | draft PR status | not-started |
 | blocking open questions | none |
 
@@ -196,6 +196,8 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | WU-CLI-01-RR-06 | WU-CLI-01 plan re-review / S5 review | Fins cancel responsiveness | deferred-with-owner | Fins runtime owner；CLI runtime / cross-platform signal adapter owner；CLI-01-S5 / S6 implementation validation 或后续跨平台 cancel WU | CLI 第一次 SIGINT 发 durable cancel，第二次 SIGINT 允许本地退出并打印 job id；实现时验证长事务 cancel checkpoint；若需要 Windows ProactorEventLoop 等无 `add_signal_handler` 平台支持，另设 signal adapter contract | Fins job cancel 是协作式，部分长事务可能不及时检查 cancel request；无 `add_signal_handler` 平台无法提供同等 durable cancel UX。 |
 | WU-CLI-01-RR-07 | WU-CLI-01 plan re-review | Fins upload action parity | deferred-with-owner | Fins owner；CLI-01-S5 implementation slice | 只有当前 upload runtime 支持时放行 `upload_filing --action delete`，否则执行时报 unsupported | `upload_filing --action delete` 当前是否被 Fins upload runtime 支持需实现时验证。 |
 | WU-CLI-01-RR-08 | WU-CLI-01 S5 review | CLI output UX | deferred-with-owner | CLI / Fins product owner；后续 CLI output polishing 或 S6 后统一 direct command result display | 当前 S5 成功输出 job id，后续按 direct command 业务摘要需求决定是否展示 `result_summary` 可读摘要 | `SUCCEEDED` direct command 输出未展示 Fins `result_summary`；不阻塞 S5 boundary / cancel / request mapping。 |
+| WU-CLI-01-RR-09 | WU-CLI-01 aggregate deepreview | CLI signal cleanup hardening | deferred-with-owner | CLI hardening follow-up；可并入 WU-CLI-01-RR-06 后续 signal / cancel adapter work | 后续若统一 CLI signal adapter，覆盖 `install()` 成功后到 `finally` 建立前的极端异常 cleanup；当前不阻塞业务语义迁移 | `sigint_monitor.install()` 在 try 块外，极端异常下可能泄漏 signal handler。 |
+| WU-CLI-01-RR-10 | WU-CLI-01 aggregate deepreview | Service terminal observation hardening | deferred-with-owner | Service / CLI hardening follow-up | 后续明确 CLI cancel wait 的 caller-owned timeout 兑现策略，或在 Service terminal observation helper 中增加 bounded wait contract | `cancel_entrypoint_run_and_wait` 初始已终态 + outbox 长期 lagged 时可能等待过久；当前用户仍可本地中断，不阻塞本 WU。 |
 
 ## 当前 Work Units
 
@@ -661,6 +663,65 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - `git diff --check`：clean。
 - Accepted implementation commit: `35db913e`。
 - 下一步：进入 WU-CLI-01 aggregate deepreview gate。
+
+### WU-CLI-01 Aggregate Deepreview Gate 裁决
+
+- Aggregate review artifacts: `docs/reviews/wu-cli-01-aggregate-deepreview-mimo.md`、`docs/reviews/wu-cli-01-aggregate-deepreview-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-aggregate-deepreview-controller-adjudication.md`。
+- 总控裁决：pass-with-fix。
+- 审查通过项：
+  - WU-CLI-01 整体迁移的是旧 CLI / Fins 命令业务语义、用户可见行为、参数面和 cancel 语义，并适配当前
+    Service boundary、Fins runtime 与 Host public contracts / API；未搬迁旧实现结构。
+  - CLI 保持 UI adapter 边界；prompt / interactive 经 Service assembly 与 Host public API；Fins direct commands
+    经 approved Service / Fins boundary；`upload_filings_from` 只生成 typed batch plan script；`init` 只做 current-schema
+    filesystem bootstrap。
+  - 未发现 Host / Engine internal、Fins storage、旧 write / host management / provider interactive / migrations 越界。
+- Accepted findings：
+  - AGG-RV-F01：`_close_watcher` 在 cancellation 穿透 cleanup 时无法保证 drain task 回收，需要修复。
+- Deferred findings：
+  - AGG-RV-F02：`sigint_monitor.install()` 在 try 块外；登记为 `WU-CLI-01-RR-09`，后续 CLI signal hardening 处理。
+  - AGG-RV-F03：cancel wait caller-owned timeout 兑现策略；登记为 `WU-CLI-01-RR-10`，后续 Service / CLI hardening 处理。
+- Rejected findings / observations：
+  - AGG-RV-F04 `_optional_stripped_text` 重复与空白文本语义差异：当前按命令业务语义区分，不作为本 WU fix。
+  - MiMo maintainability observations（SIGINT monitor / workspace helper / CLI usage error class 重复）：不构成当前 correctness
+    或 boundary defect，不在本 WU 末尾做横切 cleanup。
+- 下一步：AgentCodex aggregate fix gate。
+
+### WU-CLI-01 Aggregate Deepreview Fix Gate
+
+- Fix artifact: `docs/reviews/wu-cli-01-aggregate-deepreview-fix-codex.md`。
+- Fix summary：
+  - `_close_watcher(...)` 已改为 `try/finally`：无论 `watcher.aclose()` 成功、普通异常或
+    `asyncio.CancelledError`，都会 cancel 并 await 回收 drain task。
+  - cleanup 只吞掉 drain task cancel 后产生的 `asyncio.CancelledError`，不吞掉 watcher close 的普通异常或取消。
+  - 新增测试覆盖 watcher `aclose()` 抛 `asyncio.CancelledError` 与普通异常时 drain task 仍被 cancel / awaited。
+  - 未处理 AGG-RV-F02 / AGG-RV-F03 deferred findings，未处理 AGG-RV-F04 或 MiMo maintainability observations。
+- Controller validation：
+  - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py -q`：20 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py -q`：56 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 WU-CLI-01 aggregate deepreview re-review gate。
+
+### WU-CLI-01 Aggregate Deepreview Re-Review Gate 裁决
+
+- Re-review artifacts: `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-mimo.md`、`docs/reviews/wu-cli-01-aggregate-deepreview-rereview-ds.md`。
+- Controller re-review adjudication: `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-controller-adjudication.md`。
+- 总控裁决：pass。
+- Closed findings：
+  - AGG-RV-F01：`_close_watcher(...)` 已保证 watcher close 成功、失败或 cancellation 中断时均 cancel 并 await
+    回收 drain task，且不吞掉 watcher close 原始异常 / cancellation。
+- 新 findings：无阻塞 finding。
+- Deferred / rejected 状态：
+  - AGG-RV-F02 保持 deferred-with-owner，已登记 `WU-CLI-01-RR-09`。
+  - AGG-RV-F03 保持 deferred-with-owner，已登记 `WU-CLI-01-RR-10`。
+  - AGG-RV-F04 与 MiMo maintainability observations 保持 rejected-with-reason。
+- Controller validation：
+  - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py -q`：20 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py -q`：56 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：accepted deepreview commit；随后进入 ready-to-open-draft-PR gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 

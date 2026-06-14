@@ -537,15 +537,18 @@ async def _close_watcher(*, watcher: ClosableHostEventIterator, drain_task: asyn
     :param watcher: 待关闭 watcher。
     :param drain_task: watcher drain task。
     :returns: ``None``。
+    :raises asyncio.CancelledError: watcher ``aclose`` 被取消时透传。
     :raises Exception: watcher ``aclose`` 失败时向上抛出。
     """
 
-    await watcher.aclose()
-    drain_task.cancel()
     try:
-        await drain_task
-    except asyncio.CancelledError:
-        return
+        await watcher.aclose()
+    finally:
+        drain_task.cancel()
+        try:
+            await drain_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _wait_for_terminal(
