@@ -1087,6 +1087,62 @@ def test_memory_snapshot_integrity_classifies_storage_read_failure(
         assert issues[0].snapshot_id is None
 
 
+def test_memory_snapshot_integrity_classifies_row_identity_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Memory snapshot integrity scan 识别单行 identity 字段读取失败。"""
+
+    def _rows_with_missing_identity(
+        transaction: HostTransaction,
+    ) -> tuple[HostRow, ...]:
+        """模拟 scan 返回缺少 identity 字段的畸形 row。
+
+        :param transaction: Host durable transaction。
+        :returns: 缺少 ``session_id`` 的 snapshot row。
+        """
+
+        del transaction
+        return (
+            HostRow(
+                columns=(
+                    "snapshot_id",
+                    "consumer_id",
+                    "checkpoint_event_sequence",
+                    "policy_digest",
+                    "snapshot_digest",
+                    "snapshot_json",
+                ),
+                values=(
+                    "snapshot-identity-corrupt",
+                    CONVERSATION_MEMORY_CONSUMER_ID,
+                    1,
+                    "sha256:policy",
+                    "sha256:snapshot",
+                    "{}",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        durable_memory_module,
+        "_memory_snapshot_integrity_rows",
+        _rows_with_missing_identity,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED
+        )
+        assert issues[0].message.startswith(
+            "memory snapshot row identity read failed:"
+        )
+        assert issues[0].snapshot_id is None
+
+
 def _write_integrity_compact_snapshot(
     store: HostDurableStore,
     *,
