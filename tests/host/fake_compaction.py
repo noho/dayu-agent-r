@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -456,13 +455,53 @@ def _json_object(value: JsonValue, *, field_name: str) -> Mapping[str, JsonValue
 
     :param value: JSON value。
     :param field_name: 字段名。
-    :returns: JSON object。
-    :raises TypeError: value 不是 object 时抛出。
+    :returns: 已完成 key / value 校验的 JSON object。
+    :raises TypeError: value 不是 object，或 object 内存在非 JSON 值时抛出。
     """
 
     if not isinstance(value, Mapping):
         raise TypeError(f"{field_name} must be object")
-    return cast(Mapping[str, JsonValue], value)
+    return _validated_json_object(value, field_name=field_name)
+
+
+def _validated_json_object(
+    value: Mapping[str, JsonValue], *, field_name: str
+) -> Mapping[str, JsonValue]:
+    """递归校验 JSON object 的 key 与 value。
+
+    :param value: JSON object。
+    :param field_name: 字段名。
+    :returns: 复制后的 JSON object。
+    :raises TypeError: key 不是字符串，或 value 不是 JSON 值时抛出。
+    """
+
+    validated: dict[str, JsonValue] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{field_name} key must be string")
+        validated[key] = _validated_json_value(item, field_name=f"{field_name}.{key}")
+    return validated
+
+
+def _validated_json_value(value: JsonValue, *, field_name: str) -> JsonValue:
+    """递归校验 JSON value。
+
+    :param value: JSON value。
+    :param field_name: 字段名。
+    :returns: 已校验的 JSON value。
+    :raises TypeError: value 不是 JSON 标量、数组或对象时抛出。
+    """
+
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, list):
+        return [
+            _validated_json_value(item, field_name=f"{field_name}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, Mapping):
+        return _validated_json_object(value, field_name=field_name)
+    raise TypeError(f"{field_name} must be JSON value")
 
 
 def _json_string(source: Mapping[str, JsonValue], field_name: str) -> str:
