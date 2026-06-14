@@ -10,14 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path
-from types import FrameType
 from typing import Final, TypeVar
 
+from dayu.cli.agent_entrypoint import (
+    CliSigintMonitor,
+    optional_stripped_text,
+    package_config_root,
+    resolve_explicit_config_dir,
+    resolve_workspace_root,
+    service_run_overrides_from_args,
+    unsupported_execution_option_names,
+)
 from dayu.cli.arg_parsing import COMMAND_INTERACTIVE, ParsedCliArgs
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
@@ -61,13 +67,9 @@ DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
 CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: Final[str] = "fins_default_subject"
 CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
 INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
-_BASE_OPTION: Final[str] = "--base"
-_CONFIG_DIR_OPTION: Final[str] = "--config"
 _TICKER_OPTION: Final[str] = "--ticker"
 _MODEL_NAME_OPTION: Final[str] = "--model-name"
 _LABEL_OPTION: Final[str] = "--label"
-_FALLBACK_MODE_OPTION: Final[str] = "--fallback-mode"
-_FALLBACK_PROMPT_OPTION: Final[str] = "--fallback-prompt"
 _INTERACTIVE_OPERATION_CREATE_SESSION: Final[str] = "create_session"
 _INTERACTIVE_OPERATION_SUBMIT_FOLLOWUP: Final[str] = "submit_followup"
 _INTERACTIVE_OPERATION_CANCEL_RUN: Final[str] = "cancel_run"
@@ -77,90 +79,6 @@ _TaskResult = TypeVar("_TaskResult")
 
 class CliInteractiveUsageError(ValueError):
     """interactive 命令用法错误。"""
-
-
-class _InteractiveSigintMonitor:
-    """interactive 运行阶段的 SIGINT 观察器。
-
-    观察器只在单轮 Run pending / running 阶段安装事件循环 signal handler。
-    输入态 Ctrl-C 仍沿用 Python 默认 ``KeyboardInterrupt`` 语义。
-    """
-
-    count: int
-    _event: asyncio.Event
-    _loop: asyncio.AbstractEventLoop | None
-    _installed: bool
-
-    def __init__(self) -> None:
-        """初始化 SIGINT monitor。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.count = 0
-        self._event = asyncio.Event()
-        self._loop = None
-        self._installed = False
-
-    def install(self) -> None:
-        """在当前事件循环安装 SIGINT handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常；不支持 loop signal handler 时保留
-            默认 ``KeyboardInterrupt`` 行为。
-        """
-
-        loop = asyncio.get_running_loop()
-        try:
-            loop.add_signal_handler(signal.SIGINT, self.notify)
-        except (NotImplementedError, RuntimeError):
-            self._installed = False
-            self._loop = None
-            return
-        self._installed = True
-        self._loop = loop
-
-    def close(self) -> None:
-        """移除当前 monitor 安装的 SIGINT handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        if self._installed and self._loop is not None:
-            self._loop.remove_signal_handler(signal.SIGINT)
-        self._installed = False
-        self._loop = None
-
-    def notify(
-        self,
-        _signal_number: int | None = None,
-        _frame: FrameType | None = None,
-    ) -> None:
-        """记录一次 SIGINT。
-
-        :param _signal_number: ``signal.signal`` 风格 handler 兼容参数。
-        :param _frame: ``signal.signal`` 风格 handler 兼容参数。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.count += 1
-        self._event.set()
-
-    async def wait_next(self, observed_count: int) -> int:
-        """等待下一次 SIGINT。
-
-        :param observed_count: 调用方已经观察到的 SIGINT 计数。
-        :returns: 新的 SIGINT 计数。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
-        """
-
-        while self.count <= observed_count:
-            await self._event.wait()
-            self._event.clear()
-        return self.count
 
 
 class _AcceptedRunState:
@@ -271,12 +189,20 @@ async def _run_interactive_command_async(
     """
 
     _raise_for_unsupported_execution_options(args)
-    workspace_root = _resolve_workspace_root(args.workspace_root)
-    explicit_config_dir = _resolve_explicit_config_dir(
+    workspace_root = resolve_workspace_root(
+        args.workspace_root,
+        error_factory=CliInteractiveUsageError,
+    )
+    explicit_config_dir = resolve_explicit_config_dir(
         config_dir=args.config_dir,
         workspace_root=workspace_root,
+        error_factory=CliInteractiveUsageError,
     )
-    ticker = _optional_stripped_text(args.ticker, field_name=_TICKER_OPTION)
+    ticker = optional_stripped_text(
+        args.ticker,
+        field_name=_TICKER_OPTION,
+        error_factory=CliInteractiveUsageError,
+    )
     invocation = new_cli_invocation(
         command_name=COMMAND_INTERACTIVE,
         scenario=CLI_INTERACTIVE_SCENARIO,
@@ -286,14 +212,15 @@ async def _run_interactive_command_async(
     runtime = await prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
-            package_config_root=_package_config_root(),
+            package_config_root=package_config_root(),
             explicit_config_dir=explicit_config_dir,
             scene_id=CLI_INTERACTIVE_SCENARIO,
             context_slot_values=_interactive_context_slot_values(ticker=ticker),
             assembly_overrides=ServiceAssemblyOverrides(
-                model_id=_optional_stripped_text(
+                model_id=optional_stripped_text(
                     args.model_name,
                     field_name=_MODEL_NAME_OPTION,
+                    error_factory=CliInteractiveUsageError,
                 )
             ),
             env=os.environ,
@@ -310,9 +237,12 @@ async def _run_interactive_command_async(
             runtime=runtime,
             invocation=invocation,
             session_id=session_id,
-            run_overrides=_service_run_overrides_from_args(args),
+            run_overrides=service_run_overrides_from_args(
+                args,
+                error_factory=CliInteractiveUsageError,
+            ),
             input_reader=input_reader,
-            sigint_monitor_factory=_InteractiveSigintMonitor,
+            sigint_monitor_factory=CliSigintMonitor,
         )
 
 
@@ -389,7 +319,7 @@ async def _run_interactive_repl(
     session_id: str,
     run_overrides: ServiceRunOverrides,
     input_reader: Callable[[str], str],
-    sigint_monitor_factory: Callable[[], _InteractiveSigintMonitor],
+    sigint_monitor_factory: Callable[[], CliSigintMonitor],
 ) -> int:
     """运行 interactive REPL。
 
@@ -440,7 +370,7 @@ async def _submit_interactive_turn_handling_sigint(
     turn_index: int,
     user_prompt: str,
     run_overrides: ServiceRunOverrides,
-    sigint_monitor: _InteractiveSigintMonitor,
+    sigint_monitor: CliSigintMonitor,
 ) -> EntrypointRunTerminalResult | None:
     """提交 interactive turn，并在 SIGINT 时按 Host cancel 语义收口。
 
@@ -528,7 +458,7 @@ async def _cancel_interactive_turn_after_first_sigint(
     turn_index: int,
     accepted_run: _AcceptedRunState,
     submit_task: asyncio.Task[EntrypointRunTerminalResult],
-    sigint_monitor: _InteractiveSigintMonitor,
+    sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
 ) -> EntrypointRunTerminalResult | None:
     """第一次 SIGINT 后等待 run id 并发起 Host cancel。
@@ -577,7 +507,7 @@ async def _wait_for_run_id_or_local_exit(
     *,
     accepted_run: _AcceptedRunState,
     submit_task: asyncio.Task[EntrypointRunTerminalResult],
-    sigint_monitor: _InteractiveSigintMonitor,
+    sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
 ) -> _RunIdWaitOutcome:
     """第一次 SIGINT 早于 run id 时等待 run id 或第二次 SIGINT。
@@ -618,7 +548,7 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
     invocation: CliInvocation,
     turn_index: int,
     run_id: str,
-    sigint_monitor: _InteractiveSigintMonitor,
+    sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
 ) -> EntrypointRunTerminalResult | None:
     """发起 Host cancel，并在第二次 SIGINT 时本地退出。
@@ -678,76 +608,11 @@ def _raise_for_unsupported_execution_options(args: ParsedCliArgs) -> None:
     :raises CliInteractiveUsageError: 任一 unsupported option 被用户显式使用时抛出。
     """
 
-    unsupported = _unsupported_execution_option_names(args)
+    unsupported = unsupported_execution_option_names(args)
     if unsupported:
         raise CliInteractiveUsageError(
             f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}"
         )
-
-
-def _unsupported_execution_option_names(args: ParsedCliArgs) -> tuple[str, ...]:
-    """返回用户显式使用但当前 S4 不支持的旧执行选项名。
-
-    :param args: interactive 命令参数。
-    :returns: unsupported option 名称元组。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    names: list[str] = []
-    if args.thinking is not None:
-        names.append("--thinking/--no-thinking")
-    if args.web_provider is not None:
-        names.append("--web-provider")
-    if args.debug_sse:
-        names.append("--debug-sse")
-    if args.debug_tool_delta:
-        names.append("--debug-tool-delta")
-    if args.debug_sse_sample_rate is not None:
-        names.append("--debug-sse-sample-rate")
-    if args.debug_sse_throttle_sec is not None:
-        names.append("--debug-sse-throttle-sec")
-    if args.enable_tool_trace:
-        names.append("--enable-tool-trace")
-    if args.tool_trace_dir is not None:
-        names.append("--tool-trace-dir")
-    if args.max_duplicate_tool_calls is not None:
-        names.append("--max-duplicate-tool-calls")
-    if args.duplicate_tool_hint_prompt is not None:
-        names.append("--duplicate-tool-hint-prompt")
-    if args.doc_limits_json is not None:
-        names.append("--doc-limits-json")
-    if args.fins_limits_json is not None:
-        names.append("--fins-limits-json")
-    return tuple(names)
-
-
-def _service_run_overrides_from_args(args: ParsedCliArgs) -> ServiceRunOverrides:
-    """把 interactive 可映射执行参数转换为 ServiceRunOverrides。
-
-    :param args: interactive 命令参数。
-    :returns: ServiceRunOverrides。
-    :raises CliInteractiveUsageError: 数值或枚举 override 非法时抛出。
-    """
-
-    try:
-        return ServiceRunOverrides(
-            temperature=args.temperature,
-            tool_execution_timeout_seconds=args.tool_timeout_seconds,
-            max_iterations=args.max_iterations,
-            fallback_mode=_optional_stripped_text(
-                args.fallback_mode,
-                field_name=_FALLBACK_MODE_OPTION,
-            ),
-            fallback_prompt=_optional_stripped_text(
-                args.fallback_prompt,
-                field_name=_FALLBACK_PROMPT_OPTION,
-            ),
-            max_consecutive_failed_tool_batches=(
-                args.max_consecutive_failed_tool_batches
-            ),
-        )
-    except ValueError as exc:
-        raise CliInteractiveUsageError(str(exc)) from exc
 
 
 def _interactive_context_slot_values(*, ticker: str | None) -> dict[str, JsonValue]:
@@ -766,77 +631,6 @@ def _interactive_context_slot_values(*, ticker: str | None) -> dict[str, JsonVal
     }
 
 
-def _resolve_workspace_root(value: str) -> Path:
-    """解析 CLI workspace root。
-
-    :param value: argparse 解析到的 workspace root 文本。
-    :returns: 解析后的绝对路径。
-    :raises CliInteractiveUsageError: workspace root 为空时抛出。
-    """
-
-    stripped = _require_cli_text(value, field_name=_BASE_OPTION)
-    return Path(stripped).expanduser().resolve(strict=False)
-
-
-def _resolve_explicit_config_dir(
-    *, config_dir: str | None, workspace_root: Path
-) -> Path | None:
-    """解析并校验显式 ``--config`` 目录。
-
-    :param config_dir: 用户显式传入的配置目录；未提供时为 ``None``。
-    :param workspace_root: 已解析的 workspace root。
-    :returns: 解析后的显式配置目录；未提供时为 ``None``。
-    :raises CliInteractiveUsageError: 路径为空、逃逸 workspace 或不是目录时抛出。
-    """
-
-    if config_dir is None:
-        return None
-    stripped = _require_cli_text(config_dir, field_name=_CONFIG_DIR_OPTION)
-    raw_path = Path(stripped).expanduser()
-    candidate = raw_path if raw_path.is_absolute() else workspace_root / raw_path
-    resolved = candidate.resolve(strict=False)
-    try:
-        resolved.relative_to(workspace_root)
-    except ValueError as exc:
-        raise CliInteractiveUsageError(
-            f"{_CONFIG_DIR_OPTION} must stay inside workspace root: {resolved}"
-        ) from exc
-    if not resolved.is_dir():
-        raise CliInteractiveUsageError(
-            f"{_CONFIG_DIR_OPTION} is not a directory: {resolved}"
-        )
-    return resolved
-
-
-def _optional_stripped_text(value: str | None, *, field_name: str) -> str | None:
-    """校验并裁剪可选 CLI 文本。
-
-    :param value: 待校验文本。
-    :param field_name: 错误消息字段名。
-    :returns: 裁剪后的文本；未提供时返回 ``None``。
-    :raises CliInteractiveUsageError: 文本为空或仅包含空白时抛出。
-    """
-
-    if value is None:
-        return None
-    return _require_cli_text(value, field_name=field_name)
-
-
-def _require_cli_text(value: str, *, field_name: str) -> str:
-    """校验 CLI 文本参数非空并裁剪。
-
-    :param value: 待校验文本。
-    :param field_name: 错误消息字段名。
-    :returns: 裁剪后的文本。
-    :raises CliInteractiveUsageError: 文本为空或仅包含空白时抛出。
-    """
-
-    stripped = value.strip()
-    if stripped == "":
-        raise CliInteractiveUsageError(f"{field_name} must not be empty")
-    return stripped
-
-
 def _read_user_input(prompt: str) -> str:
     """读取一行 interactive 用户输入。
 
@@ -847,16 +641,6 @@ def _read_user_input(prompt: str) -> str:
     """
 
     return input(prompt)
-
-
-def _package_config_root() -> Path:
-    """返回包内默认配置根目录。
-
-    :returns: ``dayu/config`` 绝对路径。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return Path(__file__).resolve().parents[2] / "config"
 
 
 __all__: tuple[str, ...] = (

@@ -13,6 +13,7 @@ import pytest
 
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
+from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -386,7 +387,7 @@ class _KeyboardInterruptInputReader:
         raise KeyboardInterrupt
 
 
-class _AutoSigintMonitor(interactive_command._InteractiveSigintMonitor):
+class _AutoSigintMonitor(CliSigintMonitor):
     """测试用一次 SIGINT monitor。"""
 
     def install(self) -> None:
@@ -409,7 +410,7 @@ class _AutoSigintMonitor(interactive_command._InteractiveSigintMonitor):
         return self.count
 
 
-class _SecondSigintAfterCancelMonitor(interactive_command._InteractiveSigintMonitor):
+class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
     """测试用第二次 SIGINT monitor。"""
 
     host: _FakeHost
@@ -945,7 +946,7 @@ def test_interactive_reports_all_unsupported_old_execution_flags(
 async def test_interactive_sigint_monitor_waits_for_notification() -> None:
     """SIGINT monitor wait_next 应等待 notify 并返回新计数。"""
 
-    monitor = interactive_command._InteractiveSigintMonitor()
+    monitor = CliSigintMonitor()
     wait_task = asyncio.create_task(monitor.wait_next(0))
 
     await asyncio.sleep(0)
@@ -1054,7 +1055,7 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
     return await interactive_command.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
-            package_config_root=interactive_command._package_config_root(),
+            package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="interactive",
             context_slot_values={
@@ -1080,7 +1081,7 @@ def _input_reader(values: tuple[str, ...]) -> Callable[[str], str]:
     return _InputReader(values)
 
 
-class _ImmediateSecondSigintMonitor(interactive_command._InteractiveSigintMonitor):
+class _ImmediateSecondSigintMonitor(CliSigintMonitor):
     """测试用立即第二次 SIGINT monitor。"""
 
     def install(self) -> None:
@@ -1102,7 +1103,7 @@ class _ImmediateSecondSigintMonitor(interactive_command._InteractiveSigintMonito
         return self.count
 
 
-class _NeverSigintMonitor(interactive_command._InteractiveSigintMonitor):
+class _NeverSigintMonitor(CliSigintMonitor):
     """测试用永不触发的 SIGINT monitor。"""
 
     def install(self) -> None:

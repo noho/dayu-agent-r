@@ -86,7 +86,7 @@ def _normalize_system_exit_code(exc: SystemExit) -> int:
 
     :param exc: argparse 或下游代码抛出的 ``SystemExit``。
     :returns: 规范化后的进程退出码。
-    :raises ValueError: 本函数不主动抛出；异常输入按失败退出码处理。
+    :raises Exception: 本函数不主动抛出异常；非整数载荷按失败退出码处理。
     """
 
     code = exc.code

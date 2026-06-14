@@ -135,17 +135,18 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Product entrypoint implementation backlog |
-| gate | review |
-| implementation status | draft PR opened; ready for PR review |
+| gate | PR review |
+| implementation status | PR re-review pass; ready for accepted PR review commit |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | PR review gate：review draft PR 141 |
+| next entry point | accepted PR review commit：提交 PR-RV-F01 / PR-RV-F03 fix |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; CLI-01-S6 `0f08a13c`; CLI-01-S7 `35db913e`; accepted plan commit `de99831f` |
 | review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-codex.md`; `docs/reviews/wu-cli-01-s4-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s4-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s5-implementation-codex.md`; `docs/reviews/wu-cli-01-s5-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s5-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s5-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s6-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s6-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s7-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s7-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | `docs/reviews/wu-cli-01-aggregate-deepreview-mimo.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-ds.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-controller-adjudication.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-fix-codex.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-mimo.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-ds.md`; `docs/reviews/wu-cli-01-aggregate-deepreview-rereview-controller-adjudication.md` |
 | draft PR status | opened: https://github.com/noho/dayu-agent-r/pull/141 |
+| PR review artifacts | `docs/reviews/pr-141-review-20260614-183414.md`; `docs/reviews/pr-141-review-ds.md`; `docs/reviews/pr-141-review-controller-adjudication.md`; `docs/reviews/pr-141-fix-codex.md`; `docs/reviews/pr-141-rereview-mimo.md`; `docs/reviews/pr-141-rereview-ds.md`; `docs/reviews/pr-141-rereview-controller-adjudication.md` |
 | blocking open questions | none |
 
 状态约定：
@@ -730,6 +731,63 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
 - Draft PR: https://github.com/noho/dayu-agent-r/pull/141。
 - PR title: `WU-CLI-01 CLI entrypoint integration`。
 - 下一步：进入 PR review gate。
+
+### PR Review Gate 裁决
+
+- PR review artifacts: `docs/reviews/pr-141-review-20260614-183414.md`、`docs/reviews/pr-141-review-ds.md`。
+- Controller adjudication: `docs/reviews/pr-141-review-controller-adjudication.md`。
+- 总控裁决：pass-with-fix。
+- 审查通过项：
+  - PR 整体架构正确，严格遵循 `UI -> Service -> Host -> Engine` 分层边界。
+  - CLI 作为 UI adapter 通过 Service assembly 和 Host public API 触达 Host；Fins direct commands 通过 approved Service / Fins boundary 触达 Fins runtime；`init` 只做 current-schema filesystem bootstrap。
+  - 未发现 Host / Engine internal、Fins storage、旧 write / host management / provider interactive / migrations 越界。
+  - HostCallContext 字段与当前 `dayu.host.api` 契约一致；cancel 幂等性设计正确。
+  - `_close_watcher` aggregate deepreview 修复（AGG-RV-F01）已正确实现。
+  - PR body 准确描述已实现内容，未把 future work 写成已完成。
+  - README 变更描述的是已实现的 Service / Fins / CLI 边界，未写入未来计划。
+  - CI checks: `no checks reported`（draft PR 未配置 CI）。
+- Accepted findings：
+  - PR-RV-F01：`prompt.py` / `interactive.py` 存在 7 个重复私有函数 + 3 个重复 SIGINT monitor 实现，违反编码硬约束"重复逻辑必须抽取"。
+  - PR-RV-F03：`_normalize_system_exit_code` docstring 中 `:raises ValueError` 声明误导。
+- Deferred findings：
+  - PR-RV-F02：`SigintMonitor.install()` 平台降级时无诊断日志。归入 WU-CLI-01-RR-06 后续 signal adapter work。
+- 下一步：AgentCodex fix gate（修复 PR-RV-F01 / PR-RV-F03）。
+
+### PR Fix Gate
+
+- Fix artifact: `docs/reviews/pr-141-fix-codex.md`。
+- Fix summary：
+  - 新增 `dayu/cli/agent_entrypoint.py`，在 CLI UI adapter 层内抽取 prompt / interactive 共享 helper：
+    `CliSigintMonitor`、workspace / config 解析、文本校验、unsupported legacy option 检测、`ServiceRunOverrides` 映射与
+    package config root。
+  - `prompt.py` / `interactive.py` 复用共享 helper，保留各自 command-specific Session、turn、REPL 与 cancel 控制流。
+  - `_normalize_system_exit_code` docstring 已移除误导性的 `ValueError` 表述。
+  - 未处理 PR-RV-F02，未触碰 Service / runtime / Host / Engine / Fins storage。
+- Controller validation：
+  - `source .venv/bin/activate && pytest tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q`：62 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli -q`：94 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 PR re-review gate。
+
+### PR Re-Review Gate 裁决
+
+- Re-review artifacts: `docs/reviews/pr-141-rereview-mimo.md`、`docs/reviews/pr-141-rereview-ds.md`。
+- Controller re-review adjudication: `docs/reviews/pr-141-rereview-controller-adjudication.md`。
+- 总控裁决：pass。
+- Closed findings：
+  - PR-RV-F01：prompt / interactive 共享 Agent entrypoint helper 已抽取到 `dayu/cli/agent_entrypoint.py`，重复函数与
+   重复 SIGINT monitor 定义已移除。
+  - PR-RV-F03：`_normalize_system_exit_code` docstring 已修正，不再误导为可能抛出 `ValueError`。
+- 新 findings：无。
+- Deferred status：
+  - PR-RV-F02 保持 deferred-with-owner，归入 `WU-CLI-01-RR-06`。
+- Controller validation：
+  - `source .venv/bin/activate && pytest tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q`：62 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli -q`：94 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：accepted PR review commit；随后 push 到 PR 141。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 

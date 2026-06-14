@@ -14,6 +14,7 @@ import pytest
 
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
+from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -357,7 +358,7 @@ class _FakeOpenHostContext:
         return None
 
 
-class _AutoSigintMonitor(prompt_command._PromptSigintMonitor):
+class _AutoSigintMonitor(CliSigintMonitor):
     """测试用自动 SIGINT monitor。"""
 
     def install(self) -> None:
@@ -394,7 +395,7 @@ class _AutoSigintMonitor(prompt_command._PromptSigintMonitor):
         return self.count
 
 
-class _ImmediateSigintMonitor(prompt_command._PromptSigintMonitor):
+class _ImmediateSigintMonitor(CliSigintMonitor):
     """测试用立即 SIGINT monitor。"""
 
     def install(self) -> None:
@@ -581,7 +582,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
     runtime = await prompt_command.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
-            package_config_root=prompt_command._package_config_root(),
+            package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
@@ -781,7 +782,7 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
     runtime = await prompt_command.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
-            package_config_root=prompt_command._package_config_root(),
+            package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
@@ -819,7 +820,7 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
 async def test_prompt_sigint_monitor_waits_for_notification() -> None:
     """SIGINT monitor wait_next 应等待 notify 并返回新计数。"""
 
-    monitor = prompt_command._PromptSigintMonitor()
+    monitor = CliSigintMonitor()
     wait_task = asyncio.create_task(monitor.wait_next(0))
 
     await asyncio.sleep(0)
