@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：
+运行当前契约、CLI、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/documents tests/fins tests/tools tests/host tests/runtime tests/service tests/engine -q
+pytest tests/contracts tests/cli tests/documents tests/fins tests/tools tests/host tests/runtime tests/service tests/engine -q
 ```
 
 运行类型检查：
@@ -36,6 +36,7 @@ pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 
 ```bash
 pytest tests/contracts -q
+pytest tests/cli -q
 pytest tests/documents -q
 pytest tests/fins -q
 pytest tests/tools -q
@@ -77,6 +78,13 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 ```
 
 ## 当前测试分层
+
+### `tests/cli/`
+
+CLI UI adapter 测试，当前覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
+用法错误、placeholder runner 的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及
+`python -m dayu.cli --help` 入口。CLI 测试不得启动 Host / Fins 业务路径；涉及真实执行语义时应进入后续 Service /
+Host public API slice。
 
 ### `tests/runtime/`
 

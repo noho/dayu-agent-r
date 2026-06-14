@@ -136,14 +136,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Product entrypoint implementation backlog |
 | gate | implementation |
-| implementation status | in-progress |
+| implementation status | CLI-01-S1 accepted; ready for CLI-01-S2 |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 WU-CLI-01 |
+| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S2 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | none；accepted plan commit `de99831f` |
-| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md` |
+| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
 | blocking open questions | none |
@@ -264,6 +264,65 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
 - 总控裁决：plan re-review pass，12 个 accepted findings 均已关闭；本轮坚持迁移旧 CLI 业务语义与用户可见行为，并适配当前 Host public contracts / API，不迁移旧代码实现。
 - Accepted plan commit: `de99831f`。
 - 下一步：进入 implementation gate。
+
+### CLI-01-S1 Implementation Gate
+
+- Implementation report: `docs/reviews/wu-cli-01-s1-implementation-codex.md`。
+- 实现范围：CLI package skeleton、parser factory、scoped command help、exit code mapping 与 placeholder command runner。
+- 总控复核：改动未进入 Host / Fins 业务执行；未注册 `write`、`host`、`sessions`、`runs`、`cancel`、`conv`；`interactive --help` 包含 optional `--ticker`。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/cli -q`：24 passed。
+  - `source .venv/bin/activate && pytest tests/cli --cov=dayu.cli --cov-report=term-missing -q`：24 passed，总覆盖率 98%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S1 implementation review gate。
+
+### CLI-01-S1 Implementation Review Gate
+
+- Review artifacts: `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`、`docs/reviews/wu-cli-01-s1-implementation-review-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`。
+- 总控裁决：pass-with-fix。
+- 审查通过项：
+  - S1 范围边界：CLI package skeleton、parser、help、exit contract，未进入 Host/Fins 业务执行。
+  - 命令注册范围：只注册计划要求的 10 个命令，未注册 `write`/`host`/`sessions`/`runs`/`cancel`/`conv`。
+  - `interactive --help` 包含 optional `--ticker`。
+  - `main(argv)` 只做 parse/dispatch/exit mapping；argparse help=0、usage/unknown=2、KeyboardInterrupt=130。
+  - AGENTS.md 编码约束：中文 docstring、严格类型签名、无 Any/object/hasattr/getattr 逃逸、无兼容 wrapper、无反向依赖。
+  - tests 覆盖 S1 success signal（24 passed，覆盖率 98%），README 更新符合 tests/README 约束。
+  - pyproject console script `dayu-cli` import 验证通过，`python -m dayu.cli` 正确。
+  - pyright 类型检查：0 errors。
+- Accepted findings:
+  - S1-IMPL-F01：`dayu/cli/arg_parsing.py` 多个函数签名直接暴露 `argparse._SubParsersAction[...]` 私有类型。
+  - S1-IMPL-F02：`dayu/cli/main.py` 在 `COMMAND_RUNNERS` 缺失 runner 时静默返回 `EXIT_FAILURE`，缺少 stderr 诊断。
+- 下一步：AgentCodex fix gate。
+
+### CLI-01-S1 Fix Gate
+
+- Fix report: `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`。
+- 修复范围：
+  - S1-IMPL-F01：新增 `CommandSubparserRegistry` Protocol，收敛 argparse subparser registry 类型；新增范围内不再暴露 `_SubParsersAction` 私有类型名。
+  - S1-IMPL-F02：runner 缺失时输出 stderr 内部诊断，并补充 `test_main_reports_missing_command_runner`。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/cli -q`：25 passed。
+  - `source .venv/bin/activate && pytest tests/cli --cov=dayu.cli --cov-report=term-missing -q`：25 passed，总覆盖率 99%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S1 implementation re-review gate。
+
+### CLI-01-S1 Re-Review Gate 裁决
+
+- Re-review artifacts: `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`、`docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`。
+- 总控裁决：pass。
+- Closed findings:
+  - S1-IMPL-F01：`CommandSubparserRegistry` Protocol 已隔离 argparse subparser registry，新增范围内 `_SubParsersAction` 零残留，且无 `Any` / `object` 逃逸。
+  - S1-IMPL-F02：runner 缺失路径输出 stderr 内部诊断，测试覆盖退出码与诊断文本。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/cli -q`：25 passed。
+  - `source .venv/bin/activate && pytest tests/cli --cov=dayu.cli --cov-report=term-missing -q`：25 passed，总覆盖率 99%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：提交 CLI-01-S1 accepted implementation commit，然后进入 CLI-01-S2 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
