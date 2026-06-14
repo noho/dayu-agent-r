@@ -69,7 +69,7 @@ flowchart TD
 ## 稳定边界
 
 - `UI` 当前是外部调用者角色，不是 `dayu/` 下的实现包。它只通过 Service / Host public view 发起动作和订阅结果，不写 Host truth。
-- `dayu.service` 是 Host 外部 composition boundary。它把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`。
+- `dayu.service` 是 Host 外部 composition boundary。它把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`，并提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up terminal observation、cancel request 构造和 watcher failure 诊断。
 - `dayu.host` 是宿主治理真源。它拥有 Session / Run / Attempt / EventLog、admission、dispatch、cancel、steer、wait-resume、retry、replay、ToolRuntime、context governance、Conversation Memory、projection、outbox、purge 和 startup recovery。
 - `dayu.engine` 是单次 run 执行边界。它不导入 Host，不读取 Host durable store，不管理 Session / Run / Attempt，不发现工具，不持有工具权限或财报业务语义。
 - `dayu.contracts` 是 Dayu Agent 公共契约包。它承载层中立数据与协议，不承载 Host / Engine 状态机、Service 流程、UI 展示语义或 Fins 业务事实。
@@ -95,7 +95,7 @@ flowchart TD
 
 ### Service 装配
 
-Service 从 `dayu.runtime.location` 解析 workspace 与包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 生成 Host public typed inputs。Host 不接收 raw config patch、profile id 或隐式 lookup。
+Service 从 `dayu.runtime.location` 解析 workspace 与包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 或 `compose_submit_followup_request_with_overrides(...)` 生成 Host public typed inputs。Host 不接收 raw config patch、profile id 或隐式 lookup。面向 product entrypoint 的共享 Service helper 在 submit 前 attach `watch_session_events(session_id)`；cancel helper 用 public `get_run(...)` 判断已终态 Run 并跳过取消，非终态则在 `cancel_run(...)` 前 attach watcher；terminal fallback 只使用 `get_run(...)` 与 `read_outbox_terminal_items(...)`。
 
 ### 普通 follow-up
 

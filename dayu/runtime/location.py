@@ -30,19 +30,32 @@ class RuntimeLocations:
 
 
 def resolve_runtime_locations(
-    *, project_root: Path, package_config_root: Path
+    *,
+    project_root: Path,
+    package_config_root: Path,
+    explicit_config_overlay_dir: Path | None = None,
 ) -> RuntimeLocations:
     """解析 runtime assembly 默认位置。
 
     :param project_root: 项目根目录；workspace 覆盖目录固定为其下
         ``workspace/config``。
     :param package_config_root: 包内默认配置根目录。
+    :param explicit_config_overlay_dir: 调用方显式指定的配置覆盖目录；
+        ``None`` 表示沿用默认 ``workspace/config`` 探测行为。
     :returns: runtime assembly 位置解析结果。
-    :raises RuntimeLocationError: 包内 prompt 或 manifest 默认资产不存在时抛出。
+    :raises RuntimeLocationError: 显式配置覆盖路径不是目录，或包内 prompt /
+        manifest 默认资产不存在时抛出。
     """
 
-    workspace_config = project_root / "workspace" / "config"
-    config_overlay_dir = workspace_config if workspace_config.exists() else None
+    if explicit_config_overlay_dir is None:
+        workspace_config = project_root / "workspace" / "config"
+        config_overlay_dir = workspace_config if workspace_config.exists() else None
+    else:
+        _require_directory(
+            explicit_config_overlay_dir,
+            label="explicit config overlay dir",
+        )
+        config_overlay_dir = explicit_config_overlay_dir
     package_prompt_root = package_config_root / "prompts"
     package_manifest_root = package_prompt_root / "manifests"
     _require_directory(package_prompt_root, label="package prompt asset root")

@@ -136,14 +136,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Product entrypoint implementation backlog |
 | gate | implementation |
-| implementation status | CLI-01-S1 accepted; ready for CLI-01-S2 |
+| implementation status | CLI-01-S2 accepted; ready for CLI-01-S3 |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S2 |
+| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S3 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`；accepted plan commit `de99831f` |
-| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md` |
+| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
 | blocking open questions | none |
@@ -324,6 +324,64 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - `git diff --check`：clean。
 - Accepted implementation commit: `52db520c`。
 - 下一步：进入 CLI-01-S2 implementation gate。
+
+### CLI-01-S2 Implementation Gate
+
+- Implementation report: `docs/reviews/wu-cli-01-s2-implementation-codex.md`。
+- 实现范围：runtime location 显式 config overlay、`host_assembly` per-run override sibling helper、可复用 `dayu.service.entrypoint_runtime` Service boundary。
+- 总控复核：S2 未实现 prompt / interactive CLI command、Fins direct command 或 init；新增 Service helper 不解析 CLI 参数、不写 stdout/stderr、不安装 signal handler。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/runtime/test_runtime_location.py tests/service/test_host_assembly.py tests/service/test_entrypoint_runtime.py -q`：64 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py --cov=dayu.service.entrypoint_runtime --cov-report=term-missing -q`：11 passed，`entrypoint_runtime.py` 覆盖率 95%。
+  - `source .venv/bin/activate && pytest tests/runtime/test_runtime_location.py --cov=dayu.runtime.location --cov-report=term-missing -q`：8 passed，`location.py` 覆盖率 100%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S2 implementation review gate。
+
+### CLI-01-S2 Review Gate 裁决
+
+- Review artifacts: `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`、`docs/reviews/wu-cli-01-s2-implementation-review-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`。
+- 总控裁决：pass-with-fix。
+- Accepted findings:
+  - S2-IMPL-F01：`cancel_entrypoint_run_and_wait(...)` 在 `get_run` 与 watcher attach / `cancel_run` 之间存在 terminal race。
+  - S2-IMPL-F02：watcher drain failure 被静默忽略，且 watcher failure -> outbox fallback 路径无测试覆盖。
+  - S2-IMPL-F03：`ensure_or_create_entrypoint_session(...)` 参数校验错误路径无测试覆盖。
+  - S2-IMPL-F04：`_wait_for_terminal(...)` 无内部超时，caller 责任未写清。
+- Deferred finding：`_attach_watcher` 的 `cast(ClosableHostEventIterator, ...)` 属于 Host public contract typing refinement，当前不阻塞 S2；如需消除，应另行设计 Host `watch_session_events` 返回类型。
+- 下一步：AgentCodex fix gate。
+
+### CLI-01-S2 Fix Gate
+
+- Fix report: `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`。
+- 修复范围：
+  - S2-IMPL-F01：初始 `get_run(...)` 已终态时跳过 `cancel_run(...)`；`cancel_run(...)` 与终态竞争失败时继续通过 public observation / outbox fallback 获取 terminal。
+  - S2-IMPL-F02：watcher drain failure 进入 observation state；fallback terminal result 或 observation error 携带 watcher failure 诊断；新增 watcher failure -> outbox fallback 测试。
+  - S2-IMPL-F03：补齐 `ensure_or_create_entrypoint_session(...)` 四类参数校验错误路径测试。
+  - S2-IMPL-F04：docstring / README 明确 Service helper 不持有内部 timeout，调用方负责 task cancellation、`asyncio.wait_for(...)` 或显式 cancel。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/runtime/test_runtime_location.py tests/service/test_host_assembly.py tests/service/test_entrypoint_runtime.py -q`：71 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py --cov=dayu.service.entrypoint_runtime --cov-report=term-missing -q`：18 passed，`entrypoint_runtime.py` 覆盖率 97%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S2 implementation re-review gate。
+
+### CLI-01-S2 Re-Review Gate 裁决
+
+- Re-review artifacts: `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`、`docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`。
+- 总控裁决：pass。
+- Closed findings:
+  - S2-IMPL-F01：initial `get_run(...)` 已终态时跳过 `cancel_run(...)`；`cancel_run(...)` 与终态竞争失败时继续 public terminal observation / outbox fallback。
+  - S2-IMPL-F02：watcher failure 不再静默丢弃，diagnostic 进入 terminal result / observation error，且有 watcher failure -> outbox fallback 测试。
+  - S2-IMPL-F03：`ensure_or_create_entrypoint_session(...)` 四类参数校验错误路径测试已补齐。
+  - S2-IMPL-F04：submit / cancel wait helper docstring 和 README 均明确 caller-owned timeout contract。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/runtime/test_runtime_location.py tests/service/test_host_assembly.py tests/service/test_entrypoint_runtime.py -q`：71 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py --cov=dayu.service.entrypoint_runtime --cov-report=term-missing -q`：18 passed，`entrypoint_runtime.py` 覆盖率 97%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：提交 CLI-01-S2 accepted implementation commit，然后进入 CLI-01-S3 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 

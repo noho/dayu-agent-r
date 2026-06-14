@@ -62,6 +62,7 @@ from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
     ServiceDiscoveredTools,
     ServiceOpenHostAssemblyRequest,
+    ServiceRunOverrides,
     _agent_fallback_mode_from_config,
     _compactor_agent_policy_from_scene_inputs,
     _compactor_prompts_from_scene_inputs,
@@ -76,6 +77,7 @@ from dayu.service.host_assembly import (
     assemble_effective_tool_provider_configs,
     compose_open_host_options,
     compose_submit_followup_request,
+    compose_submit_followup_request_with_overrides,
     discover_service_tools,
 )
 
@@ -354,6 +356,98 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
 
     assert request.system_prompt == scene_inputs.system_prompt
     assert request.tool_names == frozenset({"record_smoke_fact"})
+
+
+def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
+    tmp_path: Path,
+) -> None:
+    """per-run override 必须进入 Host public typed fields。"""
+
+    _write_tool_discovery_overlay(tmp_path)
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config, workspace_root=tmp_path
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "service-assembly-test",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    host_assembly = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=config,
+            locations=locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    request = compose_submit_followup_request_with_overrides(
+        context=_host_context("service-request-override"),
+        session_id="session-1",
+        client_request_id="service-request-override",
+        scene_inputs=scene_inputs,
+        user_prompt="请总结。",
+        tool_names=scene_inputs.tool_selection.tool_names,
+        behavior=FollowupBehavior.QUEUE,
+        target_run_id=None,
+        host_assembly=host_assembly,
+        run_overrides=ServiceRunOverrides(
+            temperature=0.17,
+            tool_execution_timeout_seconds=3.5,
+            max_iterations=7,
+            fallback_mode="raise_error",
+            fallback_prompt="请停止工具调用并说明失败原因。",
+            max_consecutive_failed_tool_batches=4,
+        ),
+    )
+
+    assert request.runner_options is not None
+    assert request.runner_options.temperature == 0.17
+    assert (
+        request.runner_options.top_p
+        == host_assembly.ordinary_selection.runner_option_hint.top_p
+    )
+    assert request.agent_policy is not None
+    assert request.agent_policy.max_iterations == 7
+    assert request.agent_policy.tool_execution_timeout_seconds == 3.5
+    assert request.agent_policy.fallback_mode is AgentFallbackMode.RAISE_ERROR
+    assert request.agent_policy.fallback_prompt == "请停止工具调用并说明失败原因。"
+    assert request.agent_policy.max_consecutive_failed_tool_batches == 4
+    assert (
+        request.agent_policy.continuation_max_attempts
+        == host_assembly.options.ordinary_run_baseline.agent_policy.continuation_max_attempts
+    )
+
+
+def test_service_run_overrides_reject_invalid_values() -> None:
+    """ServiceRunOverrides 必须在进入 Host request 前拒绝非法字段。"""
+
+    with pytest.raises(ValueError, match="max_iterations"):
+        ServiceRunOverrides(max_iterations=0)
+    with pytest.raises(ValueError, match="fallback_mode"):
+        ServiceRunOverrides(fallback_mode="unsupported")
 
 
 def test_compactor_prompt_scene_requires_one_system_fragment() -> None:
