@@ -1188,27 +1188,4 @@ def _string_tuple(value: JsonValue, field_path: str, *, max_items: int) -> tuple
     return tuple(strings)
 
 
-def _bounded_known_refs(
-    refs: tuple[str, ...],
-    *,
-    allowed_refs: tuple[str, ...],
-    field_name: str,
-) -> tuple[str, ...]:
-    """校验 refs 只引用 Host request 中已知 refs。
-
-    :param refs: 待校验 refs。
-    :param allowed_refs: 允许引用的 refs。
-    :param field_name: 错误字段名。
-    :returns: 原 refs。
-    :raises ValueError: 出现未知 ref 时抛出。
-    """
-
-    allowed = frozenset(allowed_refs)
-    for ref in refs:
-        if ref not in allowed:
-            raise ValueError(f"{field_name} contains unknown ref: {ref}")
-    return refs
-
-
-
 __all__ = ["LLMCompactionProposalError", "LLMContextCompactor"]
