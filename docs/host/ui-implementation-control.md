@@ -135,18 +135,18 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Product entrypoint implementation backlog |
-| gate | discussion-ready |
+| gate | accepted-plan |
 | implementation status | not-started |
-| active work unit | none selected |
+| active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | discussion：确认默认下一条、对应 GitHub Issue 状态和代码现状；随后进入 plan / implementation / review |
+| next entry point | accepted plan commit；完成后进入 implementation gate，由 AgentCodex 按 accepted plan 实施 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
-| plan artifacts | none |
+| plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | none |
-| review artifacts | none |
+| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
-| blocking open questions | none；如果用户不接受默认顺序，需要先指定 active work unit |
+| blocking open questions | none |
 
 状态约定：
 
@@ -188,7 +188,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 
 | ID | 来源 | 类型 | 状态 | Owner / Destination | 下一步 | 记录 |
 |---|---|---|---|---|---|---|
-| none | - | - | closed | - | - | 当前没有未分配 residual risk 或遗留问题。 |
+| WU-CLI-01-RR-01 | WU-CLI-01 plan re-review | behavior parity | deferred-with-owner | Fins owner；后续 Fins alias inference WU / GitHub Issue #83 intentional deviation | WU-CLI-01 解析保留 `--infer`，执行时报 unsupported；后续单独定义 approved Fins alias inference boundary | 旧 `--infer` alias inference 当前无 approved Fins boundary，download / upload 与旧 CLI 行为不完全一致。 |
+| WU-CLI-01-RR-02 | WU-CLI-01 plan re-review | behavior parity | deferred-with-owner | Fins / tooling owner；后续 CI snapshot contract WU | WU-CLI-01 解析保留 `--ci`，执行时报 unsupported；后续定义 process snapshot public contract | 旧 `--ci` process snapshot 当前无公共 contract。 |
+| WU-CLI-01-RR-03 | WU-CLI-01 plan re-review | Host observability | deferred-with-owner | Host / Service owner；后续 observability / per-run governance WU | WU-CLI-01 对旧 debug / trace / duplicate governance flags fail fast；后续若需要再设计 Host public per-run contract | 旧 debug / trace / duplicate governance flags 无当前 Host public per-run contract。 |
+| WU-CLI-01-RR-04 | WU-CLI-01 plan re-review | Fins batch parity | deferred-with-owner | Fins owner；CLI-01-S6 implementation slice | 在 Fins boundary 建 typed batch plan helper；若无法自洽，降级并登记 deviation | `upload_filings_from` 的旧文件识别规则可能依赖旧 Fins helper。 |
+| WU-CLI-01-RR-05 | WU-CLI-01 plan re-review | model profile UX | deferred-with-owner | Config / Service owner；后续 model profile UX WU | WU-CLI-01 只在当前 model / hint 可明确映射时支持 `--thinking` / `--no-thinking`，否则 unsupported | `--thinking` / `--no-thinking` 在当前模型 schema 中不是独立布尔开关。 |
+| WU-CLI-01-RR-06 | WU-CLI-01 plan re-review | Fins cancel responsiveness | deferred-with-owner | Fins runtime owner；CLI-01-S5 / S6 implementation validation | CLI 第一次 SIGINT 发 durable cancel，第二次 SIGINT 允许本地退出并打印 job id；实现时验证长事务 cancel checkpoint | Fins job cancel 是协作式，部分长事务可能不及时检查 cancel request。 |
+| WU-CLI-01-RR-07 | WU-CLI-01 plan re-review | Fins upload action parity | deferred-with-owner | Fins owner；CLI-01-S5 implementation slice | 只有当前 upload runtime 支持时放行 `upload_filing --action delete`，否则执行时报 unsupported | `upload_filing --action delete` 当前是否被 Fins upload runtime 支持需实现时验证。 |
 
 ## 当前 Work Units
 
@@ -225,6 +231,38 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
 - CLI entrypoint works through Service assembly and Host public API。
 - CLI tests 覆盖代表性 commands、options、help output，以及至少一个 real Host open / follow-up path，可使用 mocked dependencies。
 - intentional deviations from `dayu-agent` CLI behavior 均被记录并解释。
+
+### 本轮 scope 裁决
+
+本轮纳入旧 `dayu-cli` 用户命令面中的：
+
+- `init`。
+- `prompt`。
+- `interactive`。
+- Fins 直接数据命令：`download`、`upload_filing`、`upload_material`、`upload_filings_from`、`process`、`process_filing`、`process_material`。
+
+本轮不纳入：
+
+- `write` workflow。
+- 差异化 Host 管理命令，包括 `host`、`sessions`、`runs`、`cancel`、`conv` 等需要按当前 Host public API 重新裁决的管理面。
+- Web / GUI / WeChat / render entrypoint。
+
+架构裁决：
+
+- CLI 是当前 UI adapter，不是 Service 真源；CLI interactive 所需的会话打开、follow-up、terminal observation、cancel 与错误映射能力，应沉淀在可复用的 Service 边界中，未来 WeChat / GUI 可以复用同一 Service 语义，而不是复制 CLI 专用编排。
+- `prompt` 与 `interactive` 必须通过 `ConfigLoader -> ScenePrepare -> ToolsDiscovery -> Service assembly -> Host public API` 触达 Host。
+- Fins 直接数据命令不伪装成 Host run，必须走 approved Service / Fins boundary，禁止散落直接读取 Fins storage。
+- Fins 直接数据命令必须支持 cancel；具体 cancel contract、触发方式、进程 / 信号处理、job cancel 映射和验证边界由 plan gate 基于现有 Fins ingestion runtime 与 service boundary 细化。
+- slice 数量与切分边界由 plan gate 基于可验证闭环、上下文承载能力和代码依赖边界决定。
+
+### Plan Gate 裁决
+
+- Plan artifact: `docs/host/wu-cli-01-cli-entrypoint-plan.md`。
+- Plan review artifacts: `docs/reviews/plan-review-20260614-130113.md`、`docs/reviews/wu-cli-01-plan-review-ds.md`、`docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`。
+- Plan fix artifact: `docs/reviews/wu-cli-01-plan-fix-codex.md`。
+- Plan re-review artifacts: `docs/reviews/wu-cli-01-plan-rereview-mimo.md`、`docs/reviews/wu-cli-01-plan-rereview-ds.md`、`docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`。
+- 总控裁决：plan re-review pass，12 个 accepted findings 均已关闭；本轮坚持迁移旧 CLI 业务语义与用户可见行为，并适配当前 Host public contracts / API，不迁移旧代码实现。
+- 下一步：创建 accepted plan commit，然后进入 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
