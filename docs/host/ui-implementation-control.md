@@ -135,14 +135,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Product entrypoint implementation backlog |
-| gate | accepted-plan |
-| implementation status | not-started |
+| gate | implementation |
+| implementation status | in-progress |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | accepted plan commit；完成后进入 implementation gate，由 AgentCodex 按 accepted plan 实施 |
+| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 WU-CLI-01 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
-| implementation commits | none |
+| implementation commits | none；accepted plan commit `de99831f` |
 | review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
@@ -262,7 +262,8 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
 - Plan fix artifact: `docs/reviews/wu-cli-01-plan-fix-codex.md`。
 - Plan re-review artifacts: `docs/reviews/wu-cli-01-plan-rereview-mimo.md`、`docs/reviews/wu-cli-01-plan-rereview-ds.md`、`docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`。
 - 总控裁决：plan re-review pass，12 个 accepted findings 均已关闭；本轮坚持迁移旧 CLI 业务语义与用户可见行为，并适配当前 Host public contracts / API，不迁移旧代码实现。
-- 下一步：创建 accepted plan commit，然后进入 implementation gate。
+- Accepted plan commit: `de99831f`。
+- 下一步：进入 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
