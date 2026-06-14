@@ -27,6 +27,8 @@ from dayu.host.terminal_summary_payload import (
     terminal_summary_content_text_from_payload,
 )
 
+_OVERLONG_TEXT = "终态回答" * 4096
+
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造测试用 durable store options。
@@ -173,6 +175,178 @@ def test_disallowed_summary_text_type_does_not_trigger_strict_error() -> None:
         )
         is None
     )
+
+
+def test_overlong_allowed_text_is_preserved_by_source_selection() -> None:
+    """source-selection helper 保留长文本，caller 自行负责截断。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 截断允许文本时抛出。
+    """
+
+    assert (
+        assistant_final_answer_text_from_run_payload(
+            {"final_answer": _OVERLONG_TEXT},
+            text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+        )
+        == _OVERLONG_TEXT
+    )
+    assert (
+        terminal_summary_content_text_from_payload(
+            {"content": _OVERLONG_TEXT},
+            text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+        )
+        == _OVERLONG_TEXT
+    )
+
+
+def test_continuity_resolver_prefers_run_final_answer_over_artifact(
+    tmp_path: Path,
+) -> None:
+    """continuity resolver 优先使用 RUN_SUCCEEDED.final_answer。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: resolver 错误使用 artifact content 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> str | None:
+            """写入 terminal artifact 并读取 continuity 文本。
+
+            :param transaction: Host transaction。
+            :returns: continuity 文本。
+            """
+
+            descriptor = PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-terminal-summary-preference",
+                    payload_id="sqlite-terminal-summary-preference",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={"content": "artifact fallback answer"},
+                ),
+            )
+            return assistant_final_answer_continuity_text(
+                transaction,
+                {
+                    "final_answer": "inline final answer",
+                    "terminal_summary_ref": descriptor.payload_ref,
+                    "terminal_summary_digest": descriptor.payload_digest,
+                },
+                text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+            )
+
+        assert store.transaction_runner.run_write(operation) == "inline final answer"
+
+
+def test_continuity_resolver_requires_complete_terminal_descriptor(
+    tmp_path: Path,
+) -> None:
+    """terminal summary descriptor 缺任一侧时不读取 fallback。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: resolver 错误读取裸 content 或 summary_text 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[str | None, str | None]:
+            """读取缺失 descriptor 的 continuity 文本。
+
+            :param transaction: Host transaction。
+            :returns: 只有 ref 或只有 digest 时的读取结果。
+            """
+
+            only_ref = assistant_final_answer_continuity_text(
+                transaction,
+                {
+                    "content": "裸 content 不应读取",
+                    "summary_text": "summary 不应读取",
+                    "terminal_summary_ref": "payload-terminal-summary-missing",
+                },
+                text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+            )
+            only_digest = assistant_final_answer_continuity_text(
+                transaction,
+                {
+                    "content": "裸 content 不应读取",
+                    "summary_text": "summary 不应读取",
+                    "terminal_summary_digest": "sha256:missing",
+                },
+                text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+            )
+            return only_ref, only_digest
+
+        assert store.transaction_runner.run_read(operation) == (None, None)
+
+
+def test_continuity_resolver_rejects_malformed_terminal_descriptor(
+    tmp_path: Path,
+) -> None:
+    """terminal summary descriptor 字段类型非法时抛出 durable error。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: resolver 未拒绝 malformed descriptor 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """读取 malformed descriptor。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostDurableError: descriptor 字段类型非法时抛出。
+            """
+
+            assistant_final_answer_continuity_text(
+                transaction,
+                {
+                    "terminal_summary_ref": 123,
+                    "terminal_summary_digest": "sha256:missing",
+                },
+                text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+            )
+
+        with pytest.raises(HostDurableError, match="terminal_summary_ref"):
+            store.transaction_runner.run_read(operation)
+
+
+def test_continuity_resolver_rejects_malformed_terminal_digest(
+    tmp_path: Path,
+) -> None:
+    """terminal summary digest 字段类型非法时抛出 durable error。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: resolver 未拒绝 malformed digest 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """读取 malformed digest descriptor。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostDurableError: digest 字段类型非法时抛出。
+            """
+
+            assistant_final_answer_continuity_text(
+                transaction,
+                {
+                    "terminal_summary_ref": "payload-terminal-summary",
+                    "terminal_summary_digest": 123,
+                },
+                text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
+            )
+
+        with pytest.raises(HostDurableError, match="terminal_summary_digest"):
+            store.transaction_runner.run_read(operation)
 
 
 def test_continuity_resolver_reads_digest_checked_terminal_content(

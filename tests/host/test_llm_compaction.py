@@ -6,7 +6,7 @@ import inspect
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import TypeGuard
 
 import pytest
 
@@ -40,6 +40,8 @@ from dayu.host.compaction import (
     ConversationCompactOutputVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
+    MAX_VNEXT_ANSWER_ANCHOR_ITEMS,
+    MAX_VNEXT_FACT_ITEMS,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
@@ -178,7 +180,7 @@ def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None
     candidate = parse_conversation_compact_output_vnext(
         compact_input,
         fake_compaction_proposal_from_material_json(
-            cast(Mapping[str, JsonValue], compact_input.to_json())
+            _compact_input_json(compact_input)
         ),
     )
 
@@ -223,6 +225,209 @@ def test_parse_conversation_compact_output_vnext_fails_closed_for_old_schema() -
         )
 
 
+def test_parse_conversation_compact_output_vnext_rejects_malformed_json() -> None:
+    """vNext parser 对 malformed JSON fail closed。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回预期 proposal 失败诊断时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="not valid JSON"):
+        parse_conversation_compact_output_vnext(compact_input, "{bad")
+
+
+def test_parse_conversation_compact_output_vnext_rejects_top_level_non_object() -> None:
+    """vNext parser 对 top-level 非 object proposal fail closed。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 top-level proposal object 诊断时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="proposal must be object"):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps([], sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_missing_required_key_path() -> None:
+    """vNext parser 对缺失必需顶层字段返回字段路径。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回缺失字段诊断时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    del proposal["diagnostics"]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="missing required key: diagnostics",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_field_type_path() -> None:
+    """vNext parser 对普通字段类型错误返回完整字段路径。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回字段类型错误路径时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["session_summary"] = {
+        "summary_text": 1,
+        "source_labels": ["T1"],
+    }
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="session_summary.summary_text",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_nested_array_type_path() -> None:
+    """vNext parser 对嵌套数组类型错误返回完整字段路径。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回嵌套数组路径时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["answer_anchors"] = [
+        {
+            "anchor_title": "现金流结论",
+            "anchor_items": "bad",
+            "answer_source_labels": ["A1"],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"answer_anchors\[0\]\.anchor_items",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_array_item_type_path() -> None:
+    """vNext parser 对数组元素类型错误返回完整元素路径。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回数组元素路径时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["diagnostics"] = [
+        {
+            "code": "invalid_source",
+            "text": "诊断说明",
+            "source_labels": [1],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"diagnostics\[0\]\.source_labels\[0\]",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_top_level_array_overlimit() -> None:
+    """vNext parser 对顶层数组超限返回顶层字段路径。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回顶层数组超限路径时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    facts: list[JsonValue] = []
+    for _ in range(MAX_VNEXT_FACT_ITEMS + 1):
+        facts.append(_fact_json())
+    proposal["evidence_backed_facts"] = facts
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="evidence_backed_facts",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_nested_array_overlimit() -> None:
+    """vNext parser 对嵌套数组超限返回完整字段路径。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回嵌套数组超限路径时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    anchor_items: list[JsonValue] = []
+    for index in range(MAX_VNEXT_ANSWER_ANCHOR_ITEMS + 1):
+        anchor_items.append(
+            {
+                "display_text": f"锚点 {index}",
+                "ordinal": index,
+            }
+        )
+    proposal["answer_anchors"] = [
+        {
+            "anchor_title": "现金流结论",
+            "anchor_items": anchor_items,
+            "answer_source_labels": ["A1"],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"answer_anchors\[0\]\.anchor_items",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
 def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() -> None:
     """vNext parser 禁止 LLM candidate 引用 current input anchor。"""
 
@@ -236,6 +441,258 @@ def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() 
     }
 
     with pytest.raises(LLMCompactionProposalError, match="current input anchor"):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_fact_evidence_kind_path() -> None:
+    """vNext parser 对 fact evidence_kind 返回完整嵌套字段路径与非法值。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 evidence_kind 路径和非法枚举值时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["evidence_backed_facts"] = [
+        {
+            "claim_text": "经营现金流同比增长",
+            "evidence_labels": ["E1"],
+            "evidence_kind": "bad_evidence_kind",
+            "source_labels": [],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"evidence_backed_facts\[0\]\.evidence_kind.*bad_evidence_kind",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_forward_intent_type_enum_value() -> None:
+    """vNext parser 对 forward_intents.intent_type 返回完整路径与非法值。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 intent_type 路径和非法枚举值时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["forward_intents"] = [
+        {
+            "intent_type": "bad_intent_type",
+            "text": "继续分析",
+            "status": "pending",
+            "source_labels": ["T1"],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"forward_intents\[0\]\.intent_type.*bad_intent_type",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_forward_status_enum_value() -> None:
+    """vNext parser 对 forward_intents.status 返回完整路径与非法值。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 status 路径和非法枚举值时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["forward_intents"] = [
+        {
+            "intent_type": "next_step_note",
+            "text": "继续分析",
+            "status": "bad_status",
+            "source_labels": ["T1"],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"forward_intents\[0\]\.status.*bad_status",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_reference_reason_enum_value() -> None:
+    """vNext parser 对 reference_continuity_items.reason 返回完整路径与非法值。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 reason 路径和非法枚举值时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["reference_continuity_items"] = [
+        {
+            "text": "保留本地引用",
+            "reason": "bad_reason",
+            "source_labels": ["T1"],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"reference_continuity_items\[0\]\.reason.*bad_reason",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_rejects_unknown_label() -> None:
+    """vNext parser 拒绝语法合理但当前 input 不存在的 source label。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 unknown source label 诊断时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["diagnostics"] = [
+        {
+            "code": "unknown_label",
+            "text": "未知标签",
+            "source_labels": ["Z99"],
+        }
+    ]
+
+    with pytest.raises(LLMCompactionProposalError, match="unknown source label"):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_rejects_stale_label() -> None:
+    """vNext parser 拒绝形似历史 prompt-local label 的 stale source label。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 stale source label 诊断时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["diagnostics"] = [
+        {
+            "code": "stale_label",
+            "text": "过期标签",
+            "source_labels": ["E99"],
+        }
+    ]
+
+    with pytest.raises(LLMCompactionProposalError, match="stale source label"):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_rejects_cross_section_label() -> None:
+    """vNext parser 拒绝跨 section 的 source label 引用。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 cross-section label 诊断时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["evidence_backed_facts"] = [
+        {
+            "claim_text": "经营现金流同比增长",
+            "evidence_labels": ["A1"],
+            "evidence_kind": "accepted_evidence_material",
+            "source_labels": [],
+        }
+    ]
+
+    with pytest.raises(LLMCompactionProposalError, match="cross-section label"):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_reports_anchor_ordinal_path() -> None:
+    """vNext parser 对 answer anchor 子项 ordinal 返回完整嵌套字段路径。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回 ordinal 完整路径时抛出。
+    """
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["answer_anchors"] = [
+        {
+            "anchor_title": "现金流结论",
+            "anchor_items": [
+                {"display_text": "经营现金流同比增长", "ordinal": 0},
+                {"display_text": "第二条锚点", "ordinal": -1},
+            ],
+            "answer_source_labels": ["A1"],
+        }
+    ]
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match=r"answer_anchors\[0\]\.anchor_items\[1\]\.ordinal",
+    ):
+        parse_conversation_compact_output_vnext(
+            compact_input,
+            json.dumps(proposal, sort_keys=True),
+        )
+
+
+def test_parse_conversation_compact_output_vnext_wraps_candidate_safety_net() -> None:
+    """vNext parser 将 candidate safety-net 拒绝包装为公开 proposal 失败类型。"""
+
+    compact_input = conversation_compact_input_vnext_from_material_pack(
+        _request().material_pack
+    )
+    proposal = _proposal_json(compact_input)
+    proposal["session_summary"] = {
+        "summary_text": "缺少支撑标签的摘要",
+        "source_labels": [],
+    }
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="compactor vNext proposal schema invalid",
+    ):
         parse_conversation_compact_output_vnext(
             compact_input,
             json.dumps(proposal, sort_keys=True),
@@ -268,7 +725,7 @@ async def test_llm_context_compactor_compact_uses_vnext_material(
         )
         return _final(
             fake_compaction_proposal_from_material_json(
-                cast(Mapping[str, JsonValue], compact_input.to_json())
+                _compact_input_json(compact_input)
             )
         )
 
@@ -336,16 +793,42 @@ def _proposal_json(compact_input: ConversationCompactInputVNext) -> dict[str, Js
 
     :param compact_input: vNext compact input。
     :returns: vNext proposal dict。
-    :raises TypeError: fake proposal 不是 JSON object 时抛出。
+    :raises json.JSONDecodeError: fake proposal 不是合法 JSON 时抛出。
+    :raises AssertionError: fake proposal 不是 JSON object 时抛出。
     """
 
     raw = fake_compaction_proposal_from_material_json(
-        cast(Mapping[str, JsonValue], compact_input.to_json())
+        _compact_input_json(compact_input)
     )
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise TypeError("proposal must be object")
-    return cast(dict[str, JsonValue], parsed)
+    parsed: JsonValue = json.loads(raw)
+    return dict(_required_mapping(parsed, field_name="proposal"))
+
+
+def _compact_input_json(
+    compact_input: ConversationCompactInputVNext,
+) -> Mapping[str, JsonValue]:
+    """返回 vNext compact input 的 JSON object 视图。
+
+    :param compact_input: vNext compact input。
+    :returns: compact input JSON object。
+    :raises AssertionError: compact input 序列化结果不是 JSON object 时抛出。
+    """
+
+    return _required_mapping(compact_input.to_json(), field_name="compact_input")
+
+
+def _fact_json() -> dict[str, JsonValue]:
+    """构造测试用最小合法 fact proposal JSON。
+
+    :returns: 最小合法 fact proposal JSON object。
+    """
+
+    return {
+        "claim_text": "经营现金流同比增长",
+        "evidence_labels": ["E1"],
+        "evidence_kind": "accepted_evidence_material",
+        "source_labels": ["E1"],
+    }
 
 
 def _material_json_from_compactor_prompt(prompt: str) -> Mapping[str, JsonValue]:
@@ -357,7 +840,7 @@ def _material_json_from_compactor_prompt(prompt: str) -> Mapping[str, JsonValue]
     :raises json.JSONDecodeError: prompt 中 material JSON 非法时抛出。
     """
 
-    parsed = cast(JsonValue, json.loads(_material_json_text_from_prompt(prompt)))
+    parsed: JsonValue = json.loads(_material_json_text_from_prompt(prompt))
     return _required_mapping(parsed, field_name="material_json")
 
 
@@ -386,8 +869,18 @@ def _required_mapping(value: JsonValue, *, field_name: str) -> Mapping[str, Json
     :raises AssertionError: value 不是 JSON object 时抛出。
     """
 
-    assert isinstance(value, Mapping), field_name
-    return cast(Mapping[str, JsonValue], value)
+    assert _is_json_mapping(value), field_name
+    return value
+
+
+def _is_json_mapping(value: JsonValue) -> TypeGuard[Mapping[str, JsonValue]]:
+    """判断 JSON value 是否为 JSON object。
+
+    :param value: 待判断 JSON value。
+    :returns: ``value`` 是 JSON object 时返回 ``True``，否则返回 ``False``。
+    """
+
+    return isinstance(value, Mapping)
 
 
 def _prompt_schema_pipe_values(field_name: str) -> tuple[str, ...]:

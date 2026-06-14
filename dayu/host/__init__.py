@@ -105,6 +105,7 @@ from dayu.host.storage_maintenance import (
     HostStorageMaintenanceRequest,
     HostStorageMaintenanceResult,
     HostStorageUsageReport,
+    MemorySnapshotIntegrityIssue,
     report_storage_usage,
     run_storage_maintenance,
 )
@@ -159,6 +160,7 @@ __all__ = [
     "HostStorageMaintenanceRequest",
     "HostStorageMaintenanceResult",
     "HostStorageUsageReport",
+    "MemorySnapshotIntegrityIssue",
     "HostStreamCursor",
     "HostTerminalStatus",
     "HostWalCheckpointMode",

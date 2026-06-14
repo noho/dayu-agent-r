@@ -1,4 +1,18 @@
-"""Host assistant final answer continuity resolver。"""
+"""Host assistant final-answer continuity 文本解析器。
+
+本模块解析 ``RUN_SUCCEEDED`` 的 assistant final-answer continuity 文本。解析顺序为：
+先读取 inline ``final_answer``，缺失或空白时再通过 terminal summary descriptor
+读取并校验 artifact ``content``。artifact ``content`` 只是成功终态 continuity 的
+fallback，不是通用 terminal summary、失败诊断、取消原因、lost 诊断、episode
+summary 或 evidence-backed fact 来源。
+
+consumer 边界固定如下：compaction material 使用本 strict continuity resolver 并允许
+digest-checked artifact fallback；Conversation Memory selected recent window 直接消费
+inline ``final_answer`` 且保持 lenient；durable projection / run-input adapter 可以先把
+descriptor-backed terminal artifact ``content`` hydrate 成 transient ``final_answer``，
+再交给 memory consumer。本模块不负责文本截断，长度治理属于调用方的展示、存储或上下文
+预算边界。
+"""
 
 from __future__ import annotations
 
@@ -24,13 +38,16 @@ def assistant_final_answer_continuity_text(
     *,
     text_policy: PayloadTextReadPolicy,
 ) -> str | None:
-    """读取 assistant final answer continuity 文本。
+    """读取 assistant final-answer continuity 文本。
 
     读取顺序固定为 ``RUN_SUCCEEDED.final_answer``，再按
     ``terminal_summary_ref`` / ``terminal_summary_digest`` 读取并校验 terminal
     summary artifact，只接受 artifact payload 的 ``content``。裸
     ``RUN_SUCCEEDED.content``、``summary_text`` 或 nested ``summary`` 均不是
-    assistant final answer 来源。
+    assistant final-answer 来源。terminal summary artifact ``content`` 只在
+    ``RUN_SUCCEEDED`` continuity 路径中作为 fallback；失败、取消和 lost 终态的
+    diagnostic 文本不能通过本 resolver 变成 assistant final answer。本 resolver
+    不截断过长文本。
 
     :param transaction: 当前 Host durable transaction。
     :param run_payload: ``RUN_SUCCEEDED`` payload。
@@ -70,6 +87,9 @@ def _optional_descriptor_text(
     payload: Mapping[str, JsonValue], *, field_name: str
 ) -> str | None:
     """读取可选 terminal summary descriptor 文本字段。
+
+    descriptor 只是 artifact 引用标签和 digest 校验材料，不是业务事实或 assistant
+    final-answer 文本。字段缺失或空白代表没有可用 fallback descriptor。
 
     :param payload: ``RUN_SUCCEEDED`` payload。
     :param field_name: descriptor 字段名。

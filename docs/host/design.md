@@ -1198,7 +1198,7 @@ Run 读取与结果边界：
 - P10.5 不定义 public payload reader、`read_payload(ref)` 或 `get_run_result(...)`；普通 Service 不得为了展示 final answer 读取内部 payload 表。若后续需要大结果分页或多版本 replay result，必须作为新的 read-model public contract 单独讨论，且不能成为事实真源。
 - Session timeline 仍通过 `get_session` snapshot 或后续 read-model API 暴露；它不能替代 Host event stream 的 live watch 语义，也不能替代 Outbox 的离线 terminal 投递职责。
 - `report_storage_usage` 是 operator-facing 只读诊断入口。它只读取 durable SQLite row count、SQLite payload logical bytes、artifact descriptor logical bytes、orphan SQLite payload 诊断计数以及 DB / WAL 文件 `stat`。它不写 EventLog，不改变 Session / Run / Attempt 状态，不扫描 artifact root，不执行 checkpoint，也不删除文件或 row。artifact descriptor logical bytes 只是 descriptor 记录的 logical sum，不代表内容寻址 artifact 的物理文件占用。
-- `run_storage_maintenance` 是 operator-facing 显式 maintenance 入口。它基于 `payload_descriptors` 中的 `artifact_ref` 相对路径收集引用集合，只扫描 artifact root 下 `sha256/` 内容寻址 namespace，返回超过 grace window 的 orphan artifact 候选、`sha256/` 已发布 artifact 物理字节和、同一次 usage report，并可用独立 SQLite connection 执行 WAL checkpoint。默认 dry-run 不删除文件；`reclaim_orphan_artifacts=True` 时，只回收候选扫描证明为 orphan、且删除前 recheck 仍未被 descriptor 引用的 `sha256/` artifact 物理文件。maintenance 不删除任何 SQLite row，不处理 audit JSONL / tool-trace JSONL，不执行 `VACUUM`，也不启动 scheduler。recheck 与 unlink 之间仍有极短 TOCTOU 窗口；默认 grace、content-addressed artifact 可重写性和 containment-guarded delete 用于降低风险。SQLite orphan payload row 只报告不回收；SQLite space reclamation / VACUUM 继续归 Issue 76。
+- `run_storage_maintenance` 是 operator-facing 显式 maintenance 入口。它基于 `payload_descriptors` 中的 `artifact_ref` 相对路径收集引用集合，只扫描 artifact root 下 `sha256/` 内容寻址 namespace，返回超过 grace window 的 orphan artifact 候选、`sha256/` 已发布 artifact 物理字节和、同一次 usage report、memory snapshot integrity issues，并可用独立 SQLite connection 执行 WAL checkpoint。memory snapshot integrity issues 只报告 `invalid_json`、`schema_mismatch`、`digest_mismatch`、`unsupported_item_kind` 或 `storage_read_failed` 分类、短错误摘要和 row identity，不内联 snapshot JSON、prompt、tool payload 或大内容。默认 dry-run 不删除文件；`reclaim_orphan_artifacts=True` 时，只回收候选扫描证明为 orphan、且删除前 recheck 仍未被 descriptor 引用的 `sha256/` artifact 物理文件。maintenance 不删除任何 SQLite row，不 quarantine / rebuild / overwrite memory snapshot，不处理 audit JSONL / tool-trace JSONL，不执行 `VACUUM`，也不启动 scheduler。recheck 与 unlink 之间仍有极短 TOCTOU 窗口；默认 grace、content-addressed artifact 可重写性和 containment-guarded delete 用于降低风险。SQLite orphan payload row 只报告不回收；SQLite space reclamation / VACUUM 继续归 Issue 76。
 
 接口分层：
 
@@ -3025,7 +3025,7 @@ Projection 规则：
 - accepted evidence 存在但 compactor 没有产出合法 fact candidate 时，Host 只记录 diagnostic，不合成 fallback fact。
 - assistant final answer、用户输入、session summary、answer anchor、reference continuity item、User Profile、Forward Intent 都不能自动升级成 `evidence_backed_fact`。
 
-Snapshot 与 projection checkpoint 必须在同一 durable store transaction 提交；checkpoint 不得先于 snapshot 落库。RunInputBuilder 消费 snapshot 时必须记录 snapshot cursor；若 snapshot 缺失、损坏或 lag 超过 policy 阈值，Host 进入 projection catch-up / rebuild / retry path。这不是 Run crash recovery，不得触发 Run 状态迁移，也不得把 Run 推入 `RECOVERING`。
+Snapshot 与 projection checkpoint 必须在同一 durable store transaction 提交；checkpoint 不得先于 snapshot 落库。RunInputBuilder 消费 snapshot 时必须记录 snapshot cursor；若 snapshot 缺失、损坏或 lag 超过 policy 阈值，Host 进入 projection catch-up / rebuild / retry path。这不是 Run crash recovery，不得触发 Run 状态迁移，也不得把 Run 推入 `RECOVERING`。Operator-facing storage maintenance 可以只读分类 damaged snapshot row，分类结果用于诊断，不是 repair authorization；自动 overwrite、quarantine 或 rebuild 必须另行通过显式 maintenance / operator policy 设计，不能静默发生在 command path。
 
 ### 24.5 五类 Session Semantic Memory
 

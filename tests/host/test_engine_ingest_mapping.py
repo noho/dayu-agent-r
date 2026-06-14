@@ -458,6 +458,12 @@ def test_empty_final_answer_closes_failed_without_run_succeeded(
         payload = _payload(result.events[0])
         assert payload["error_code"] == "empty_final_answer"
         assert payload["recoverable"] is False
+        assert "content" not in payload
+        assert "final_answer" not in payload
+        run_payload = _payload(result.events[1])
+        assert run_payload["error_code"] == "empty_final_answer"
+        assert "content" not in run_payload
+        assert "final_answer" not in run_payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.FAILED
         assert attempt_status == AttemptStatus.FAILED

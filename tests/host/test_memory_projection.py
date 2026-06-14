@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Mapping
 from dataclasses import fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from dayu.contracts.json_value import JsonValue
 from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_FAILED
+from dayu.host.durable import memory as durable_memory_module
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.connection import HostDurableStore
+from dayu.host.durable.codec import canonical_json_dumps
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -17,6 +25,8 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.memory import (
     ConversationMemoryProjectionConsumer,
+    MemorySnapshotIntegrityFailureKind,
+    inspect_memory_snapshot_integrity,
     read_latest_memory_snapshot,
     read_memory_snapshot,
     write_memory_snapshot_with_checkpoint,
@@ -32,12 +42,16 @@ from dayu.host.durable.payload import (
     SQLitePayloadWriteRequest,
 )
 from dayu.host.durable.projection import read_projection_checkpoint
-from dayu.host.durable.schema import TABLE_HOST_MEMORY_ITEMS
-from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.schema import (
+    TABLE_HOST_MEMORY_ITEMS,
+    TABLE_HOST_MEMORY_SNAPSHOTS,
+)
+from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
     MemoryDiagnosticReason,
+    MemoryIncludedReason,
     MemoryProjectionEvent,
     MemoryProjectionPolicy,
     SelectedRecentWindowRole,
@@ -298,6 +312,8 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
         SelectedRecentWindowRole.ASSISTANT,
         SelectedRecentWindowRole.EVIDENCE,
     )
+    assistant_item = snapshot.trace_memory.selected_recent_window[1]
+    assert assistant_item.included_reason is MemoryIncludedReason.SELECTED_RECENT_WINDOW
     assert snapshot.session_summary_memory.summary_text is None
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
     assert snapshot.answer_anchor_memory.anchors == ()
@@ -380,10 +396,10 @@ def test_run_succeeded_payload_refs_do_not_materialize_assistant_window() -> Non
     assert snapshot.trace_memory.selected_recent_window == ()
 
 
-def test_projection_consumer_hydrates_terminal_content_as_final_answer(
+def test_durable_projection_hydrates_terminal_content_as_selected_recent_window(
     tmp_path: Path,
 ) -> None:
-    """durable projection 只把 digest-checked terminal content 合并为 final_answer。"""
+    """durable projection adapter hydrate terminal content 后进入 continuity。"""
 
     policy = _policy()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -453,9 +469,46 @@ def test_projection_consumer_hydrates_terminal_content_as_final_answer(
         )
 
         assert latest is not None
-        assert latest.snapshot.trace_memory.selected_recent_window[0].text == (
-            "artifact final answer"
-        )
+        selected = latest.snapshot.trace_memory.selected_recent_window
+        assert len(selected) == 1
+        assert selected[0].text == "artifact final answer"
+        assert selected[0].included_reason is MemoryIncludedReason.SELECTED_RECENT_WINDOW
+        assert latest.snapshot.evidence_fact_memory.evidence_backed_facts == ()
+
+
+def test_memory_direct_consumer_does_not_follow_terminal_descriptor() -> None:
+    """直接 memory consumer 不跟随 terminal summary descriptor。
+
+    Durable projection / run-input adapter 负责把 digest-checked terminal content
+    合并成 transient ``final_answer``；纯 consumer 只读取 inline final_answer。
+
+    :returns: ``None``。
+    :raises AssertionError: direct consumer 错误跟随 descriptor 时抛出。
+    """
+
+    policy = _policy()
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "run-descriptor-only",
+                "RUN_SUCCEEDED",
+                {
+                    "terminal_summary_ref": "payload-terminal-final-answer",
+                    "terminal_summary_digest": "sha256:terminal-final-answer",
+                    "content": "裸 content 不应进入 assistant window",
+                    "summary_text": "summary 不应进入 assistant window",
+                },
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.trace_memory.selected_recent_window == ()
+    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:
@@ -821,3 +874,502 @@ def test_empty_snapshot_uses_stable_id_and_vnext_empty_views() -> None:
     assert snapshot.trace_memory.selected_recent_window == ()
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
     assert snapshot.snapshot_digest == calculate_memory_snapshot_digest(snapshot)
+
+
+def test_memory_snapshot_integrity_empty_and_valid_rows_return_no_issues(
+    tmp_path: Path,
+) -> None:
+    """Memory snapshot integrity classifier 对空库和有效 row 返回空诊断。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        empty_issues = store.transaction_runner.run_read(
+            inspect_memory_snapshot_integrity
+        )
+        snapshot = _write_integrity_compact_snapshot(store)
+        valid_issues = store.transaction_runner.run_read(
+            inspect_memory_snapshot_integrity
+        )
+        read_back = store.transaction_runner.run_read(
+            lambda transaction: read_memory_snapshot(
+                transaction,
+                snapshot.snapshot_id,
+            )
+        )
+
+        assert empty_issues == ()
+        assert valid_issues == ()
+        assert read_back is not None
+
+
+def test_memory_snapshot_integrity_classifies_invalid_json(tmp_path: Path) -> None:
+    """Memory snapshot integrity classifier 识别非法 JSON。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        snapshot = _write_integrity_compact_snapshot(store)
+        _replace_snapshot_json(store, snapshot.snapshot_id, "{not-json")
+
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert issues[0].failure_kind is MemorySnapshotIntegrityFailureKind.INVALID_JSON
+        assert issues[0].snapshot_id == snapshot.snapshot_id
+
+
+def test_memory_snapshot_integrity_classifies_schema_mismatch(tmp_path: Path) -> None:
+    """Memory snapshot integrity classifier 识别 schema-mismatched JSON。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        snapshot = _write_integrity_compact_snapshot(store)
+        _replace_snapshot_json(
+            store,
+            snapshot.snapshot_id,
+            canonical_json_dumps({"schema_version": "conversation_memory_snapshot_v1"}),
+        )
+
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.SCHEMA_MISMATCH
+        )
+        assert issues[0].snapshot_id == snapshot.snapshot_id
+
+
+def test_memory_snapshot_integrity_classifies_manual_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    """手动 SQL 篡改合法 JSON 内容时归类为 digest mismatch。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        snapshot = _write_integrity_compact_snapshot(store)
+        corrupted_json = _snapshot_json_with_changed_built_at(snapshot)
+        _replace_snapshot_json(store, snapshot.snapshot_id, corrupted_json)
+
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH
+        )
+        assert issues[0].snapshot_id == snapshot.snapshot_id
+
+
+def test_memory_snapshot_integrity_classifies_row_digest_column_mismatch(
+    tmp_path: Path,
+) -> None:
+    """手动 SQL 篡改 snapshot_digest 列时归类为 digest mismatch。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        snapshot = _write_integrity_compact_snapshot(store)
+        _replace_snapshot_digest(store, snapshot.snapshot_id, "sha256:manual-corrupt")
+
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH
+        )
+        assert issues[0].snapshot_id == snapshot.snapshot_id
+
+
+def test_memory_snapshot_integrity_classifies_unsupported_old_item_kind(
+    tmp_path: Path,
+) -> None:
+    """旧 durable verified_fact item kind 被分类并继续使普通读路径 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        snapshot = _write_integrity_compact_snapshot(store)
+        _insert_old_verified_fact_item(store, snapshot)
+
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        with pytest.raises(HostDurableError, match="verified_fact"):
+            store.transaction_runner.run_read(
+                lambda transaction: read_memory_snapshot(
+                    transaction,
+                    snapshot.snapshot_id,
+                )
+            )
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
+        )
+        assert issues[0].snapshot_id == snapshot.snapshot_id
+
+
+def test_memory_snapshot_integrity_classifies_unknown_item_kind(tmp_path: Path) -> None:
+    """未知 durable memory item kind 被分类为 unsupported item kind。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        snapshot = _write_integrity_compact_snapshot(store)
+        _insert_unsupported_memory_item_kind(store, snapshot, "mystery_memory_kind")
+
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.UNSUPPORTED_ITEM_KIND
+        )
+        assert issues[0].snapshot_id == snapshot.snapshot_id
+
+
+def test_memory_snapshot_integrity_reports_mixed_damaged_rows(
+    tmp_path: Path,
+) -> None:
+    """Memory snapshot integrity classifier 对多个 damaged rows 返回全部诊断。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        first_snapshot = _write_integrity_compact_snapshot(
+            store,
+            event_id="compact-1",
+            claim_text="收入增长。",
+        )
+        second_snapshot = _write_integrity_compact_snapshot(
+            store,
+            event_id="compact-2",
+            claim_text="利润提升。",
+            session_id="session-2",
+            event_sequence=2,
+        )
+        _replace_snapshot_json(store, first_snapshot.snapshot_id, "{not-json")
+        _replace_snapshot_json(
+            store,
+            second_snapshot.snapshot_id,
+            _snapshot_json_with_changed_built_at(second_snapshot),
+        )
+
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert {issue.failure_kind for issue in issues} == {
+            MemorySnapshotIntegrityFailureKind.INVALID_JSON,
+            MemorySnapshotIntegrityFailureKind.DIGEST_MISMATCH,
+        }
+
+
+def test_memory_snapshot_integrity_classifies_storage_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Memory snapshot integrity scan 读取失败时返回 storage_read_failed。"""
+
+    def _raise_storage_read_failed(
+        transaction: HostTransaction,
+    ) -> tuple[HostRow, ...]:
+        """模拟 SQLite scan failure。
+
+        :param transaction: Host durable transaction。
+        :returns: 不返回；始终抛出 SQLite 错误。
+        :raises sqlite3.OperationalError: 始终抛出。
+        """
+
+        del transaction
+        raise sqlite3.OperationalError("forced snapshot scan failure")
+
+    monkeypatch.setattr(
+        durable_memory_module,
+        "_memory_snapshot_integrity_rows",
+        _raise_storage_read_failed,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED
+        )
+        assert issues[0].snapshot_id is None
+
+
+def test_memory_snapshot_integrity_classifies_row_identity_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Memory snapshot integrity scan 识别单行 identity 字段读取失败。"""
+
+    def _rows_with_missing_identity(
+        transaction: HostTransaction,
+    ) -> tuple[HostRow, ...]:
+        """模拟 scan 返回缺少 identity 字段的畸形 row。
+
+        :param transaction: Host durable transaction。
+        :returns: 缺少 ``session_id`` 的 snapshot row。
+        """
+
+        del transaction
+        return (
+            HostRow(
+                columns=(
+                    "snapshot_id",
+                    "consumer_id",
+                    "checkpoint_event_sequence",
+                    "policy_digest",
+                    "snapshot_digest",
+                    "snapshot_json",
+                ),
+                values=(
+                    "snapshot-identity-corrupt",
+                    CONVERSATION_MEMORY_CONSUMER_ID,
+                    1,
+                    "sha256:policy",
+                    "sha256:snapshot",
+                    "{}",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        durable_memory_module,
+        "_memory_snapshot_integrity_rows",
+        _rows_with_missing_identity,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        issues = store.transaction_runner.run_read(inspect_memory_snapshot_integrity)
+
+        assert len(issues) == 1
+        assert (
+            issues[0].failure_kind
+            is MemorySnapshotIntegrityFailureKind.STORAGE_READ_FAILED
+        )
+        assert issues[0].message.startswith(
+            "memory snapshot row identity read failed:"
+        )
+        assert issues[0].snapshot_id is None
+
+
+def _write_integrity_compact_snapshot(
+    store: HostDurableStore,
+    *,
+    event_id: str = "compact-1",
+    claim_text: str = "收入增长。",
+    session_id: str = _SESSION_ID,
+    event_sequence: int = 1,
+) -> ConversationMemorySnapshotVNext:
+    """写入测试用 compact event 与 memory snapshot。
+
+    :param store: Host durable store。
+    :param event_id: compact event id。
+    :param claim_text: compact fact claim 文本。
+    :param session_id: snapshot 所属 session id。
+    :param event_sequence: compact event sequence。
+    :returns: 已写入的 memory snapshot。
+    """
+
+    payload = _accepted_compact_payload(facts=[_fact(claim_text)])
+    store.transaction_runner.run_write(
+        lambda transaction: append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=_RUN_ID,
+                attempt_id=_ATTEMPT_ID,
+                execution_id=_EXECUTION_ID,
+                event_type=CONTEXT_COMPACTED,
+                occurred_at=_OCCURRED_AT,
+                actor="pytest",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=payload,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+    )
+    projection_event = MemoryProjectionEvent(
+        event_sequence=event_sequence,
+        event_id=event_id,
+        event_class=EventClass.CANONICAL_FACT.value,
+        event_type=CONTEXT_COMPACTED,
+        session_id=session_id,
+        run_id=_RUN_ID,
+        attempt_id=_ATTEMPT_ID,
+        execution_id=_EXECUTION_ID,
+        occurred_at=_NOW,
+        payload_ref=None,
+        payload_digest=None,
+        payload=payload,
+    )
+    snapshot = project_conversation_memory_event(
+        previous_snapshot=None,
+        event=projection_event,
+        policy=_policy(),
+        built_at=_NOW,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+    )
+    store.transaction_runner.run_write(
+        lambda transaction: write_memory_snapshot_with_checkpoint(
+            transaction,
+            snapshot,
+            now=_NOW,
+        )
+    )
+    return snapshot
+
+
+def _replace_snapshot_json(
+    store: HostDurableStore,
+    snapshot_id: str,
+    snapshot_json: str,
+) -> None:
+    """直接替换 snapshot JSON 以模拟手动 durable corruption。
+
+    :param store: Host durable store。
+    :param snapshot_id: snapshot id。
+    :param snapshot_json: 替换后的 JSON 文本。
+    :returns: ``None``。
+    """
+
+    store.transaction_runner.run_write(
+        lambda transaction: transaction.execute(
+            f"""
+            UPDATE {TABLE_HOST_MEMORY_SNAPSHOTS}
+            SET snapshot_json = ?
+            WHERE snapshot_id = ?
+            """,
+            (snapshot_json, snapshot_id),
+        )
+    )
+
+
+def _replace_snapshot_digest(
+    store: HostDurableStore,
+    snapshot_id: str,
+    snapshot_digest: str,
+) -> None:
+    """直接替换 snapshot digest 列以模拟手动 durable corruption。
+
+    :param store: Host durable store。
+    :param snapshot_id: snapshot id。
+    :param snapshot_digest: 替换后的 digest 文本。
+    :returns: ``None``。
+    """
+
+    store.transaction_runner.run_write(
+        lambda transaction: transaction.execute(
+            f"""
+            UPDATE {TABLE_HOST_MEMORY_SNAPSHOTS}
+            SET snapshot_digest = ?
+            WHERE snapshot_id = ?
+            """,
+            (snapshot_digest, snapshot_id),
+        )
+    )
+
+
+def _snapshot_json_with_changed_built_at(
+    snapshot: ConversationMemorySnapshotVNext,
+) -> str:
+    """返回保留旧 digest 但内容已变更的 snapshot JSON。
+
+    :param snapshot: 原始 snapshot。
+    :returns: digest mismatch JSON 文本。
+    """
+
+    snapshot_value = conversation_memory_snapshot_to_json_value(snapshot)
+    if not isinstance(snapshot_value, Mapping):
+        raise AssertionError("snapshot JSON value must be an object")
+    corrupted_value: dict[str, JsonValue] = dict(snapshot_value)
+    corrupted_value["built_at"] = "2026-05-17T00:00:00.000000Z"
+    return canonical_json_dumps(corrupted_value)
+
+
+def _insert_old_verified_fact_item(
+    store: HostDurableStore,
+    snapshot: ConversationMemorySnapshotVNext,
+) -> None:
+    """插入旧 verified_fact item kind 以模拟旧库或手工损坏。
+
+    :param store: Host durable store。
+    :param snapshot: 已存在的 memory snapshot。
+    :returns: ``None``。
+    """
+
+    _insert_unsupported_memory_item_kind(store, snapshot, "verified_fact")
+
+
+def _insert_unsupported_memory_item_kind(
+    store: HostDurableStore,
+    snapshot: ConversationMemorySnapshotVNext,
+    item_kind: str,
+) -> None:
+    """插入不受支持的 item kind 以模拟旧库或手工损坏。
+
+    :param store: Host durable store。
+    :param snapshot: 已存在的 memory snapshot。
+    :param item_kind: 待插入的 item kind。
+    :returns: ``None``。
+    """
+
+    store.transaction_runner.run_write(
+        lambda transaction: _insert_unsupported_memory_item_kind_in_transaction(
+            transaction,
+            snapshot,
+            item_kind,
+        )
+    )
+
+
+def _insert_unsupported_memory_item_kind_in_transaction(
+    transaction: HostTransaction,
+    snapshot: ConversationMemorySnapshotVNext,
+    item_kind: str,
+) -> None:
+    """在当前 transaction 中插入不受支持的 item kind。
+
+    :param transaction: Host durable transaction。
+    :param snapshot: 已存在的 memory snapshot。
+    :param item_kind: 待插入的 item kind。
+    :returns: ``None``。
+    """
+
+    transaction.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        transaction.execute(
+            f"""
+            INSERT INTO {TABLE_HOST_MEMORY_ITEMS} (
+              item_id,
+              snapshot_id,
+              session_id,
+              item_kind,
+              claim_status,
+              event_id,
+              event_sequence,
+              producer_kind,
+              producer_name,
+              payload_ref,
+              payload_digest,
+              item_json,
+              included_reason,
+              excluded_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "old-verified-fact-item",
+                snapshot.snapshot_id,
+                snapshot.session_id,
+                item_kind,
+                "evidence_backed",
+                snapshot.cursor.checkpoint_event_id,
+                snapshot.cursor.checkpoint_event_sequence,
+                "tool",
+                "pytest",
+                None,
+                None,
+                "{}",
+                None,
+                None,
+            ),
+        )
+    finally:
+        transaction.execute("PRAGMA ignore_check_constraints = OFF")

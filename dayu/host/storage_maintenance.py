@@ -22,6 +22,10 @@ from dayu.host.durable.maintenance import (
     HostWalCheckpointResult,
     run_host_wal_checkpoint,
 )
+from dayu.host.durable.memory import (
+    MemorySnapshotIntegrityIssue,
+    inspect_memory_snapshot_integrity,
+)
 from dayu.host.durable.storage_lifecycle import (
     DurableArtifactFileError,
     HostStorageUsageReport,
@@ -147,6 +151,8 @@ class HostStorageMaintenanceResult:
     :param orphan_artifact_candidates: 已证明无 descriptor 引用且超过 grace 的候选路径。
     :param reclaimed_artifact_paths: opt-in 回收时已删除的路径；dry-run 时为空。
     :param file_errors: 文件级错误；dry-run 或无删除错误时为空。
+    :param memory_snapshot_integrity_issues: memory snapshot durable row
+        integrity 只读诊断；无损坏时为空。
     :param wal_checkpoint: WAL checkpoint 诊断；请求关闭 checkpoint 时为 ``None``。
     :raises TypeError: 字段类型不符合契约时抛出。
     :raises ValueError: 整数字段为负数时抛出。
@@ -157,6 +163,7 @@ class HostStorageMaintenanceResult:
     orphan_artifact_candidates: tuple[str, ...]
     reclaimed_artifact_paths: tuple[str, ...]
     file_errors: tuple[HostStorageMaintenanceFileError, ...]
+    memory_snapshot_integrity_issues: tuple[MemorySnapshotIntegrityIssue, ...]
     wal_checkpoint: HostWalCheckpointResult | None
 
     def __post_init__(self) -> None:
@@ -187,6 +194,10 @@ class HostStorageMaintenanceResult:
                     "HostStorageMaintenanceResult.file_errors must contain "
                     "HostStorageMaintenanceFileError"
                 )
+        _require_memory_snapshot_integrity_issue_tuple(
+            self.memory_snapshot_integrity_issues,
+            field_name="HostStorageMaintenanceResult.memory_snapshot_integrity_issues",
+        )
         if self.wal_checkpoint is not None and not isinstance(
             self.wal_checkpoint,
             HostWalCheckpointResult,
@@ -208,6 +219,10 @@ class HostStorageMaintenanceResult:
             "orphan_artifact_candidates": list(self.orphan_artifact_candidates),
             "reclaimed_artifact_paths": list(self.reclaimed_artifact_paths),
             "file_errors": [error.json_value() for error in self.file_errors],
+            "memory_snapshot_integrity_issues": [
+                issue.json_value()
+                for issue in self.memory_snapshot_integrity_issues
+            ],
             "wal_checkpoint": _wal_checkpoint_json_value(self.wal_checkpoint),
         }
 
@@ -295,6 +310,9 @@ def run_storage_maintenance(
         orphan_artifact_candidates=candidates,
         reclaimed_artifact_paths=reclaim_result.reclaimed_paths,
         file_errors=_maintenance_file_errors(reclaim_result.file_errors),
+        memory_snapshot_integrity_issues=(
+            read_state.memory_snapshot_integrity_issues
+        ),
         wal_checkpoint=wal_checkpoint,
     )
 
@@ -324,10 +342,12 @@ class _StorageMaintenanceReadState:
 
     :param usage: storage usage report。
     :param referenced_artifact_paths: 当前 descriptor 引用的 artifact 相对路径集合。
+    :param memory_snapshot_integrity_issues: memory snapshot integrity 只读诊断。
     """
 
     usage: HostStorageUsageReport
     referenced_artifact_paths: frozenset[str]
+    memory_snapshot_integrity_issues: tuple[MemorySnapshotIntegrityIssue, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +369,9 @@ class _ReadStorageMaintenanceStateOperation:
         return _StorageMaintenanceReadState(
             usage=read_storage_usage(transaction, db_path=self.db_path),
             referenced_artifact_paths=collect_referenced_artifact_paths(transaction),
+            memory_snapshot_integrity_issues=inspect_memory_snapshot_integrity(
+                transaction
+            ),
         )
 
 
@@ -562,6 +585,26 @@ def _require_string_tuple(value: tuple[str, ...], *, field_name: str) -> None:
             raise TypeError(f"{field_name} must contain str")
 
 
+def _require_memory_snapshot_integrity_issue_tuple(
+    value: tuple[MemorySnapshotIntegrityIssue, ...],
+    *,
+    field_name: str,
+) -> None:
+    """校验字段为 memory snapshot integrity issue 元组。
+
+    :param value: 待校验值。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是 issue 元组时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, MemorySnapshotIntegrityIssue):
+            raise TypeError(f"{field_name} must contain MemorySnapshotIntegrityIssue")
+
+
 def _require_non_empty_text(value: str, *, field_name: str) -> None:
     """校验字段为非空字符串。
 
@@ -581,6 +624,7 @@ __all__ = [
     "HostStorageMaintenanceRequest",
     "HostStorageMaintenanceResult",
     "HostStorageUsageReport",
+    "MemorySnapshotIntegrityIssue",
     "report_storage_usage",
     "run_storage_maintenance",
 ]

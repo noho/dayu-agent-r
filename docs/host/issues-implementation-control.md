@@ -143,12 +143,12 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | WU-TOOLS-01-F01-03 and WU-OBS-SIGNALS-01 completed by control-doc裁决；WU-RET-00 draft PR pass; PR 139 is open draft and updated to latest accepted review commit |
-| active work unit | WU-RET-00 |
+| implementation status | WU-CM-05 / WU-CM-06 / WU-CM-08 / WU-CM-09 completed；draft PR #140 passed final PR review；final closeout recorded |
+| active work unit | none |
 | default next work unit | WU-OBS-00 |
-| next entry point | after PR 139 merge: WU-OBS-00 discussion gate |
+| next entry point | after PR #140 merge, enter WU-OBS-00 discussion gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
 
 状态约定：
@@ -223,10 +223,10 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-WAIT-02 | pending | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | production poller loop |
 | WU-WAIT-03 | pending | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
-| WU-CM-05 | deferred | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | deferred behind #81 |
-| WU-CM-06 | deferred | Terminal summary text policy convergence | GitHub Issue #94 / #81 child | deferred behind #81 |
-| WU-CM-08 | deferred | Compaction material readability and smoke maintenance | GitHub Issue #95 / #81 child | #81 子任务，测试可维护性 cleanup |
-| WU-CM-09 | deferred | Durable memory snapshot corruption policy | GitHub Issue #41 | deferred behind #81；post-#81 durable memory hardening / operator repair policy |
+| WU-CM-05 | completed | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `492e5620` |
+| WU-CM-06 | completed | Terminal summary text policy convergence | GitHub Issue #94 / #81 child | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `246cd1c3` |
+| WU-CM-08 | completed | Compaction material readability and smoke maintenance | GitHub Issue #95 / #81 child | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `366d8df1` |
+| WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
@@ -866,7 +866,7 @@ research 已写入 GitHub Issue #89；本条后续按 callback adapter -> common
 
 ### 状态
 
-GitHub Issue #93，作为 GitHub Issue #81 的后续子任务；deferred behind #81。#81 会调整 Conversation Memory 与 compact JSON 的目标 shape；本条不应抢先实施。
+GitHub Issue #93，作为 GitHub Issue #81 的后续子任务。#81 已关闭，本条 deferred 前置条件已解除；用户指定恢复推进。Plan artifact 已生成并完成 fix：`docs/host/host-issues/wu-cm-05-llm-compaction-proposal-typed-parsing-plan.md`。Plan review artifacts：`docs/reviews/plan-review-20260612-140624.md`、`docs/reviews/plan-review-20260612-140644.md`；plan re-review artifacts：`docs/reviews/plan-review-20260612-141710.md`、`docs/reviews/plan-review-20260612-141946.md`。AgentMiMo / AgentDS re-review 均为 pass，accepted findings 全部已修复；accepted plan commit `153c43e3`。WU-CM-05-S1 implementation report：`docs/reviews/wu-cm-05-s1-implementation-report.md`。Code review artifacts：`docs/reviews/code-review-20260612-143526.md`、`docs/reviews/code-review-20260612-143730.md`；controller decision：`docs/reviews/wu-cm-05-s1-code-review-controller.md`。WU-CM-05-S1 accepted slice commit `7f2ce2c5`。WU-CM-05-S2 implementation report：`docs/reviews/wu-cm-05-s2-implementation-report.md`。S2 code review artifacts：`docs/reviews/code-review-20260612-144954.md`、`docs/reviews/code-review-20260612-145145.md`；S2 fix re-review artifacts：`docs/reviews/code-review-20260612-145931.md`、`docs/reviews/code-review-20260612-145954.md`。AgentDS / AgentMiMo re-review 均为 PASS，accepted finding 已修复；WU-CM-05-S2 accepted slice commit `da8cda65`。WU-CM-05-S3 implementation report：`docs/reviews/wu-cm-05-s3-implementation-report.md`。S3 code review artifacts：`docs/reviews/code-review-20260612-151038.md`、`docs/reviews/code-review-20260612-151142.md`；S3 fix re-review artifacts：`docs/reviews/code-review-20260612-151919.md`、`docs/reviews/code-review-20260612-151955.md`。AgentMiMo / AgentDS re-review 均为 PASS，accepted docstring fix 已修复；WU-CM-05-S3 accepted slice commit `f3a3c0e3`。Aggregate deepreview artifacts：`docs/reviews/code-review-20260612-152820.md`、`docs/reviews/code-review-20260612-153234.md`；AgentDS / AgentMiMo aggregate deepreview 均为 PASS。Controller validation：`pytest tests/host/test_llm_compaction.py -q` 37 passed；`pytest tests/host/test_compaction_contract.py -q` 13 passed；`python -m pyright dayu/ tests/ utils/` 0 errors。Post-closeout cleanup 已为 `tests/host/fake_compaction.py` 补齐 JSON object 递归校验并移除测试 helper `cast(...)` residual。
 
 ### 目标
 
@@ -890,7 +890,7 @@ GitHub Issue #93，作为 GitHub Issue #81 的后续子任务；deferred behind 
 
 ### 状态
 
-GitHub Issue #94，作为 GitHub Issue #81 的后续子任务；deferred behind #81。terminal summary、assistant conclusion、episode summary、answer anchor 与 continuity 的语义边界会受 #81 Conversation Memory 整体优化影响。
+GitHub Issue #94，作为 GitHub Issue #81 的后续子任务。#81 已关闭，本条 deferred 前置条件已解除；用户指定恢复推进。Plan artifact：`docs/host/host-issues/wu-cm-06-terminal-summary-text-policy-plan.md`。Plan review artifacts：`docs/reviews/plan-review-20260612-154220.md`、`docs/reviews/plan-review-20260612-154418.md`；plan re-review artifacts：`docs/reviews/plan-review-20260612-154915.md`、`docs/reviews/plan-review-20260612-154942.md`；focused plan re-review artifacts：`docs/reviews/plan-review-20260612-155743.md`、`docs/reviews/plan-review-20260612-155955.md`。Implementation preflight found and corrected a plan evidence issue: memory consumer is inline-only, while durable projection / run-input adapters may hydrate descriptor-backed terminal artifact `content` into transient `final_answer` before memory consumption. AgentDS / AgentMiMo focused re-review 均为 PASS；controller editorial fix removed ambiguity and fixed Slice 1 read API policy tests to create `tests/host/test_read_api_terminal_policy.py` explicitly. Corrected plan commit `e9ca9288`。WU-CM-06-S1 implementation report：`docs/reviews/wu-cm-06-s1-implementation-report.md`。S1 code review artifacts：`docs/reviews/code-review-20260612-160858.md`、`docs/reviews/code-review-20260612-161139.md`；accepted low findings fixed: durable projection hydration test naming and malformed `terminal_summary_digest` coverage。S1 fix re-review artifacts：`docs/reviews/code-review-20260612-162004.md`、`docs/reviews/code-review-20260612-162045.md`；AgentDS / AgentMiMo re-review 均为 PASS。WU-CM-06-S1 accepted slice commit `c46993d0`。WU-CM-06-S2 implementation report：`docs/reviews/wu-cm-06-s2-implementation-report.md`。S2 code review artifacts：`docs/reviews/code-review-20260612-162954.md`、`docs/reviews/code-review-20260612-163025.md`；AgentMiMo / AgentDS review 均为 PASS。WU-CM-06-S2 accepted slice commit `956c5840`。Aggregate deepreview artifacts：`docs/reviews/code-review-20260612-163719.md`、`docs/reviews/code-review-20260612-164013.md`；AgentDS / AgentMiMo aggregate deepreview 均为 PASS。Controller validation：`pytest tests/host/test_terminal_summary_payload.py tests/host/test_read_api_terminal_policy.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py -q` 95 passed；`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` clean。Residual risks: caller-side overlong truncation remains explicitly out of WU-CM-06 scope and owned by caller budget/display tests；private helper / integration imports in tests are nonblocking test-scope coupling；compaction evidence explicit naming / integration coverage remains low severity because strict resolver behavior is function-tested and current docstring is not contradictory。无阻断 residual risk。WU-CM-06 accepted deepreview commit `246cd1c3`。terminal summary、assistant conclusion、episode summary、answer anchor 与 continuity 的语义边界已在现有 Host 代码中部分落地，本条以 policy matrix tests 和必要 docstring 收敛为主，不重新设计 terminal taxonomy。
 
 ### 目标
 
@@ -900,7 +900,7 @@ GitHub Issue #94，作为 GitHub Issue #81 的后续子任务；deferred behind 
 
 ### 非目标
 
-- 不在 #81 前抢先实现。
+- 不重新设计 #81 已落地的 Conversation Memory 语义。
 - 不把 terminal summary 变成事实引用源。
 - 不改变 Run terminal taxonomy。
 - 不让 compact / episode summary 冒充 terminal summary 或 final answer。
@@ -916,7 +916,7 @@ GitHub Issue #94，作为 GitHub Issue #81 的后续子任务；deferred behind 
 
 ### 状态
 
-GitHub Issue #95，作为 GitHub Issue #81 的子任务；定位为测试可维护性和 compaction material readability cleanup，不负责裁决 Conversation Memory 语义模型。
+GitHub Issue #95，作为 GitHub Issue #81 的子任务；#81 已关闭，本条前置条件已解除，用户指定恢复推进。Issue #95 当前为 OPEN。Preflight 结论：动机成立，但 issue body 中 `stable_input` / `history_input` / `evidence_input` 是旧命名；当前设计真源和代码使用 `previous_compacted_view`、`trace_material`、`evidence_material`、`answer_material`、`current_input_anchor`。本条定位为测试可维护性和 compaction material readability cleanup，不负责裁决 Conversation Memory 语义模型。Plan artifact：`docs/host/host-issues/wu-cm-08-compaction-material-readability-smoke-plan.md`。Plan review artifacts：`docs/reviews/plan-review-20260612-164857.md`、`docs/reviews/plan-review-20260612-165055.md`；accepted findings fixed by plan amendment。Plan re-review artifacts：`docs/reviews/plan-review-20260612-165449.md`、`docs/reviews/plan-review-20260612-191500.md`；AgentMiMo / AgentDS re-review 均为 PASS。Accepted plan commit `fce2fca0`。WU-CM-08-S1 implementation report：`docs/reviews/wu-cm-08-s1-implementation-report.md`；validation `pytest tests/host/test_compact_material.py -q` 35 passed，`python -m pyright dayu/ tests/ utils/` 0 errors，`git diff --check` clean。S1 code review artifacts：`docs/reviews/code-review-20260612-170451.md`、`docs/reviews/code-review-20260612-090406.md`；AgentMiMo / AgentDS review 均为 PASS。WU-CM-08-S1 accepted slice commit `bd3515d1`。WU-CM-08-S2 implementation report：`docs/reviews/wu-cm-08-s2-implementation-report.md`；validation `pytest tests/host/test_public_compact_smoke.py -q` 11 passed, 1 skipped，`python -m pyright dayu/ tests/ utils/` 0 errors，`git diff --check` clean。S2 code review artifacts：`docs/reviews/code-review-20260612-171737.md`、`docs/reviews/code-review-20260612-200000.md`；AgentMiMo / AgentDS review 均为 PASS。WU-CM-08-S2 accepted slice commit `5cb68505`。Aggregate deepreview artifacts：`docs/reviews/code-review-20260612-172729.md`、`docs/reviews/code-review-20260612-202833.md`；AgentMiMo / AgentDS aggregate deepreview 均为 PASS；blocking findings 0；validation `pytest tests/host/test_compact_material.py tests/host/test_public_compact_smoke.py -q` 46 passed, 1 skipped；`python -m pyright dayu/ tests/ utils/` 0 errors；AgentDS 额外验证相关 7 个测试文件 178 passed, 1 skipped；`compact_material.py` coverage 87%。Residual risks: `collect_selected_compaction_request_evidence_inputs` internal function name is not LLM-facing；AgentMiMo 提出的 helper 可复用性、defensive type check 深度、control-doc 引用完整性均为低严重度非阻断观察。无阻断 residual risk。Accepted deepreview commit `366d8df1`。
 
 ### 目标
 
@@ -940,7 +940,24 @@ GitHub Issue #95，作为 GitHub Issue #81 的子任务；定位为测试可维�
 
 ### 状态
 
-GitHub Issue #41 当前为 OPEN，已标注 deferred behind #81。当前代码已经具备 P8.5 的保守行为：读到 corrupt / schema-mismatched / digest-mismatched memory snapshot 时 fail closed，进入 typed repair-required 或 projection failure / WARNING，不会自动覆盖损坏 row。本条不在 #81 前实施；#81 完成后再基于 post-#81 memory snapshot contract 设计 quarantine、operator repair command 或自动 rebuild / overwrite policy。
+GitHub Issue #41 当前为 OPEN，原状态为 deferred behind #81；#81 已关闭，用户指定恢复推进。Preflight 结论：动机成立，但当前代码已经具备 P8.5 的保守行为，读到 corrupt / schema-mismatched / digest-mismatched memory snapshot 时 fail closed，进入 typed repair-required 或 projection failure / WARNING，不会自动覆盖损坏 row。本 WU 不修“静默吞错”，也不让 memory snapshot 成为 truth；真实缺口是 post-#81 operator-facing corruption policy、分类诊断与显式维护入口。Plan artifact：`docs/host/host-issues/wu-cm-09-durable-memory-snapshot-corruption-policy-plan.md`。Plan review artifacts：`docs/reviews/plan-review-20260612-173823.md`、`docs/reviews/plan-review-20260612-173831.md`；AgentMiMo / AgentDS review 均为 PASS-WITH-FINDINGS，无 blocker。Findings amendment：types / classifier 改为 `dayu.host.durable.memory` owner，明确 manual corruption 归入五类 failure kind，明确 `storage_read_failed` monkeypatch 目标，补充 result `__post_init__` 校验、baseline validation 与测试组织。Focused plan re-review artifacts：`docs/reviews/plan-review-20260612-174631.md`、`docs/reviews/plan-review-20260612-174632.md`；AgentMiMo / AgentDS re-review 均为 PASS，3/3 findings 已关闭，无 blocker。Accepted plan commit `e20a8a19`。WU-CM-09-S1 implementation report：`docs/reviews/wu-cm-09-s1-implementation-report.md`；validation `pytest tests/host/test_memory_projection.py -q` 26 passed，`pytest --cov=dayu.host.durable.memory --cov-report=term-missing tests/host/test_memory_projection.py -q` 26 passed / `dayu/host/durable/memory.py` 80%，`python -m pyright dayu/ tests/ utils/` 0 errors，`git diff --check` clean。S1 code review artifacts：`docs/reviews/code-review-20260612-180244.md`、`docs/reviews/code-review-20260612-180250.md`；AgentMiMo / AgentDS review 均为 PASS，low findings fixed before accepted slice commit。S1 focused code re-review artifacts：`docs/reviews/code-review-20260612-180748.md`、`docs/reviews/code-review-20260612-180754.md`；AgentMiMo / AgentDS re-review 均为 PASS。WU-CM-09-S1 accepted slice commit `a9f77611`。WU-CM-09-S2 implementation report：`docs/reviews/wu-cm-09-s2-implementation-report.md`；validation `pytest tests/host/test_storage_maintenance.py tests/host/test_package_exports.py -q` 25 passed，`pytest --cov=dayu.host.storage_maintenance --cov-report=term-missing tests/host/test_storage_maintenance.py -q` 12 passed / `dayu/host/storage_maintenance.py` 88%，`python -m pyright dayu/ tests/ utils/` 0 errors，`git diff --check` clean。S2 code review artifacts：`docs/reviews/code-review-20260612-181714.md`、`docs/reviews/code-review-20260612-181556.md`；AgentMiMo / AgentDS review 均为 PASS。WU-CM-09-S2 accepted slice commit `77c32c32`。WU-CM-09-S3 implementation report：`docs/reviews/wu-cm-09-s3-implementation-report.md`；validation `pytest tests/host/test_memory_projection.py tests/host/test_storage_maintenance.py tests/host/test_package_exports.py -q` 51 passed，`python -m pyright dayu/ tests/ utils/` 0 errors，`git diff --check` clean。S3 code review artifacts：`docs/reviews/code-review-20260612-182602.md`、`docs/reviews/code-review-20260612-182356.md`；AgentMiMo / AgentDS review 均为 PASS。Aggregate deepreview artifacts：`docs/reviews/code-review-20260612-183208.md`、`docs/reviews/code-review-20260612-183054.md`；AgentMiMo / AgentDS aggregate deepreview 均为 PASS，blocking findings 0；validation `pytest tests/host/test_memory_projection.py tests/host/test_storage_maintenance.py tests/host/test_package_exports.py -q` 51 passed；`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` clean。WU-CM-09 accepted deepreview commit `3e98565d`。Post-closeout cleanup 已补充 identity read failure defensive branch focused test；scan failure、row identity failure 与 row-level corruption classes 均已覆盖。无阻断 residual risk。当前处于 completed gate。
+
+### 当前 gate artifacts
+
+- plan: `docs/host/host-issues/wu-cm-09-durable-memory-snapshot-corruption-policy-plan.md`
+- plan review: `docs/reviews/plan-review-20260612-173823.md`; `docs/reviews/plan-review-20260612-173831.md`
+- plan re-review: `docs/reviews/plan-review-20260612-174631.md`; `docs/reviews/plan-review-20260612-174632.md`
+- plan re-review conclusion: AgentMiMo / AgentDS 均为 PASS; blocking findings 0; accepted findings 3/3 closed by amendment
+- accepted plan commit: `e20a8a19`
+- aggregate deepreview: `docs/reviews/code-review-20260612-183208.md`; `docs/reviews/code-review-20260612-183054.md`
+- aggregate deepreview conclusion: PASS; blocking findings 0; validation `pytest tests/host/test_memory_projection.py tests/host/test_storage_maintenance.py tests/host/test_package_exports.py -q` 51 passed; `python -m pyright dayu/ tests/ utils/` 0 errors
+- accepted deepreview commit: `3e98565d`
+- draft PR: https://github.com/noho/dayu-agent-r/pull/140
+- PR review: `docs/reviews/pr-review-20260614-mimo.md`; `docs/reviews/pr-review-20260614-ds.md`
+- PR review fix: `docs/reviews/pr-review-fix-20260614.md`
+- PR review re-review: `docs/reviews/pr-review-rereview-20260614-ds.md`
+- accepted PR review commit: `306b9011`
+- final closeout: `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`
 
 ### 设计与代码核对
 
@@ -949,7 +966,7 @@ GitHub Issue #41 当前为 OPEN，已标注 deferred behind #81。当前代码�
 - `write_memory_snapshot(...)` 写入前调用 `_validate_snapshot_digest(...)`，并在写入后读回校验。
 - `read_memory_snapshot(...)`、`read_latest_memory_snapshot(...)` 与 `read_latest_memory_snapshot_at_or_before(...)` 会解析 snapshot JSON、恢复 typed snapshot、校验 digest，并校验 durable item kind。
 - `tests/host/test_run_input_builder.py` 已覆盖 snapshot 缺失和损坏时进入 `MemoryProjectionRepairRequired`，且不改 Run / Attempt / EventLog。
-- `tests/host/test_memory_projection.py` 已覆盖旧 `verified_facts` key、旧 durable `verified_fact` item kind fail closed，以及 projection catch-up 遇到 damaged snapshot 时保留 projection failure row。
+- `dayu/host/durable/memory.py` 已在 `_validate_snapshot_item_kinds(...)` 中拒绝旧 durable `verified_fact` item kind；WU-CM-09-S1 需补齐对应 integrity classification / fail-closed 测试，不能把当前未确认测试覆盖当作已完成事实。
 
 ### 目标
 
