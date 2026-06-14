@@ -135,11 +135,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Product entrypoint implementation backlog |
-| gate | review |
-| implementation status | aggregate deepreview re-review pass; ready for accepted deepreview commit |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-CLI-01 local gates accepted; ready to open draft PR |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | accepted deepreview commit：提交 WU-CLI-01 aggregate deepreview |
+| next entry point | draft PR gate：push branch and create draft PR |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; CLI-01-S3 `4b28bbe5`; CLI-01-S4 `b784ff5b`; CLI-01-S5 `48a97942`; CLI-01-S6 `0f08a13c`; CLI-01-S7 `35db913e`; accepted plan commit `de99831f` |
@@ -721,7 +721,8 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py -q`：56 passed，3 条 edgar deprecation warnings。
   - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
   - `git diff --check`：clean。
-- 下一步：accepted deepreview commit；随后进入 ready-to-open-draft-PR gate。
+- Accepted deepreview commit: `9b4a4407`。
+- 下一步：进入 ready-to-open-draft-PR gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 
