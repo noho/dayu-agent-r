@@ -82,9 +82,11 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 ### `tests/cli/`
 
 CLI UI adapter 测试，当前覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
-用法错误、placeholder runner 的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及
-`python -m dayu.cli --help` 入口。CLI 测试不得启动 Host / Fins 业务路径；涉及真实执行语义时应进入后续 Service /
-Host public API slice。
+用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及
+`python -m dayu.cli --help` 入口。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、stable
+Host slot key、unsupported 旧执行参数 fail fast、真实 `prompt.json` required context slots、mock Host public
+open/follow-up terminal path、fast terminal、outbox fallback、FAILED terminal 输出和 SIGINT 后 Host public cancel request。
+CLI 测试不得启动真实 Host / Fins 业务路径；涉及 Host 状态机时使用 Service helper 与 mocked Host public API。
 
 ### `tests/runtime/`
 

@@ -72,6 +72,10 @@ class EntrypointRuntimeError(RuntimeError):
     """entrypoint runtime Service helper 观察 Host 终态失败时抛出的错误。"""
 
 
+RunAcceptedCallback = Callable[[str], None]
+"""Host 接受 Run 后通知调用方 accepted_run_id 的回调类型。"""
+
+
 class EntrypointTerminalSource(StrEnum):
     """entrypoint runtime 观察到 Run 终态的来源。
 
@@ -372,6 +376,7 @@ async def submit_entrypoint_turn_and_wait(
     request: EntrypointTurnRequest,
     scene_inputs: PreparedSceneInputs,
     host_assembly: ServiceOpenHostAssemblyResult,
+    on_run_accepted: RunAcceptedCallback | None = None,
     poll_interval_seconds: float = DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> EntrypointRunTerminalResult:
@@ -381,6 +386,8 @@ async def submit_entrypoint_turn_and_wait(
     :param request: 单轮 entrypoint turn 请求。
     :param scene_inputs: ScenePrepare 输出。
     :param host_assembly: Host opener assembly 结果。
+    :param on_run_accepted: Host 接受本轮 Run 后的可选通知回调；用于 UI
+        adapter 在等待终态期间发起 typed cancel。
     :param poll_interval_seconds: watcher 暂无 terminal 时的 public read 轮询间隔。
     :param sleep: 可注入 sleep coroutine，便于测试。
     :returns: Run terminal 观察结果。
@@ -410,6 +417,8 @@ async def submit_entrypoint_turn_and_wait(
             run_overrides=request.run_overrides,
         )
         followup = await host.submit_followup(request.session_id, submit_request)
+        if on_run_accepted is not None:
+            on_run_accepted(followup.accepted_run_id)
         return await _wait_for_terminal(
             host,
             session_id=request.session_id,

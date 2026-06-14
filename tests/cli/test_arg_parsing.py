@@ -191,12 +191,12 @@ def test_placeholder_runner_returns_not_implemented(
     :raises AssertionError: 退出码或错误文本不符合占位契约时抛出。
     """
 
-    exit_code = cli_main.main(("prompt", "请分析收入变化"))
+    exit_code = cli_main.main(("interactive",))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_NOT_IMPLEMENTED
     assert "尚未实现" in captured.err
-    assert "prompt" in captured.err
+    assert "interactive" in captured.err
 
 
 def test_main_reports_missing_command_runner(

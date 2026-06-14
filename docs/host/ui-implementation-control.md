@@ -136,14 +136,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Product entrypoint implementation backlog |
 | gate | implementation |
-| implementation status | CLI-01-S2 accepted; ready for CLI-01-S3 |
+| implementation status | CLI-01-S3 accepted; ready for CLI-01-S4 |
 | active work unit | WU-CLI-01 |
 | default next work unit | WU-CLI-01 |
-| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S3 |
+| next entry point | implementation gate：AgentCodex 按 accepted plan 实施 CLI-01-S4 |
 | design source | 由 phaseflow 调用参数提供；本文档只维护 product entrypoint 实施总控状态 |
 | plan artifacts | `docs/host/wu-cli-01-cli-entrypoint-plan.md` |
 | implementation commits | CLI-01-S1 `52db520c`; CLI-01-S2 `52bc7032`; accepted plan commit `de99831f` |
-| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md` |
+| review artifacts | `docs/reviews/plan-review-20260614-130113.md`; `docs/reviews/wu-cli-01-plan-review-ds.md`; `docs/reviews/wu-cli-01-plan-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-plan-fix-codex.md`; `docs/reviews/wu-cli-01-plan-rereview-mimo.md`; `docs/reviews/wu-cli-01-plan-rereview-ds.md`; `docs/reviews/wu-cli-01-plan-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s1-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s1-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-review-controller-adjudication.md`; `docs/reviews/wu-cli-01-s2-implementation-fix-codex.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-mimo.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-ds.md`; `docs/reviews/wu-cli-01-s2-implementation-rereview-controller-adjudication.md`; `docs/reviews/wu-cli-01-s3-implementation-codex.md`; `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`; `docs/reviews/wu-cli-01-s3-implementation-review-ds.md`; `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md` |
 | aggregate review artifacts | none |
 | draft PR status | not-started |
 | blocking open questions | none |
@@ -383,6 +383,42 @@ GitHub Issue #83。CLI entrypoint 需要通过 Service assembly 与 Host public 
   - `git diff --check`：clean。
 - Accepted implementation commit: `52bc7032`。
 - 下一步：进入 CLI-01-S3 implementation gate。
+
+### CLI-01-S3 Implementation Gate
+
+- Implementation report: `docs/reviews/wu-cli-01-s3-implementation-codex.md`。
+- 实现范围：`dayu-cli prompt` one-shot command，经 `ConfigLoader -> ScenePrepare -> ToolsDiscovery -> Service assembly -> Host public API` 提交单轮 Agent Run，并输出 Host terminal final answer / error / cancelled status。
+- 总控复核：
+  - S3 目标是迁移旧 `prompt` 的用户可见业务语义，并适配当前 Host public contract / API；不是迁移旧代码实现。
+  - CLI adapter 只构造 Service / Host public DTO；未直接构造 Engine request，未读取 Host durable internals，未访问 Fins storage。
+  - `--ticker` 映射为 prompt scene required context slot 与 Host business object context；未提供 ticker 时使用明确默认业务主体文本。
+  - `--label` 映射为 Host session slot key；无 label 时创建 fresh session。
+  - `--model-name` 与可映射执行参数通过 Service assembly override / run override 进入 Host public submit request；无当前 typed public contract 的旧执行参数 fail fast。
+  - SIGINT 在 Host accepted Run 后构造 typed `CancelRunRequest` 并等待同一 Run terminal；accepted 前只做本地中断退出。
+- 验证：
+  - `source .venv/bin/activate && pytest tests/cli/test_prompt_command.py tests/service/test_entrypoint_runtime_prompt_path.py tests/cli/test_arg_parsing.py tests/service/test_entrypoint_runtime.py -q`：62 passed，3 条 edgar deprecation warnings。
+  - `source .venv/bin/activate && pytest tests/cli/test_prompt_command.py tests/cli/test_arg_parsing.py --cov=dayu.cli.commands.prompt --cov=dayu.cli.host_context --cov=dayu.cli.output --cov=dayu.cli.arg_parsing --cov-report=term-missing -q`：41 passed，总覆盖率 95%；`dayu/cli/arg_parsing.py` 100%，`dayu/cli/commands/prompt.py` 91%，`dayu/cli/host_context.py` 98%，`dayu/cli/output.py` 80%。
+  - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+  - `git diff --check`：clean。
+- 下一步：进入 CLI-01-S3 implementation review gate。
+
+### CLI-01-S3 Review Gate 裁决
+
+- Review artifacts: `docs/reviews/wu-cli-01-s3-implementation-review-mimo.md`、`docs/reviews/wu-cli-01-s3-implementation-review-ds.md`。
+- Controller adjudication: `docs/reviews/wu-cli-01-s3-implementation-review-controller-adjudication.md`。
+- 总控裁决：pass。
+- 审查通过项：
+  - `prompt` 只通过 ConfigLoader、ScenePrepare、ToolsDiscovery、Service assembly 与 Host public API，未直接构造 Engine request，未读取 Host durable internals，未访问 Fins storage。
+  - CLI / Service 边界清晰：CLI 负责参数、signal、stdout/stderr、exit code；Service helper 不解析 CLI、不安装 signal handler、不写终端，后续 WeChat / GUI 可复用。
+  - `--ticker`、`--label`、`--model-name`、可映射 execution overrides 与 unsupported legacy flags 均符合 accepted plan。
+  - SIGINT cancel 语义符合 plan：Run accepted 前本地退出 130；accepted 后发 typed Host cancel 并等待同一 Run terminal；重复 SIGINT 不产生重复 cancel。
+  - `on_run_accepted` callback 未破坏 S2 watcher attach-before-submit、terminal observation、caller-owned timeout contract。
+  - AGENTS.md 编码约束、README 更新、测试覆盖率与 pyright 均通过。
+- Non-blocking observations：
+  - `render_prompt_terminal_result` 的 CANCELLED / LOST / SUCCEEDED-without-answer 防御分支可在后续触碰 CLI output 时补直接单测；当前 `dayu/cli/output.py` 覆盖率 80%，满足单文件覆盖率门槛，且不影响 S3 Host public path 正确性。
+  - 不支持 `loop.add_signal_handler` 的事件循环环境会降级为默认 `KeyboardInterrupt`；当前目标运行环境不是 Windows ProactorEventLoop，如未来需要跨平台 typed cancel，再单独设计 signal / cancellation adapter contract。
+- Accepted implementation commit: pending local commit。
+- 下一步：进入 CLI-01-S4 implementation gate。
 
 ## WU-WEB-01 Web Entrypoint Integration Through Service Assembly
 

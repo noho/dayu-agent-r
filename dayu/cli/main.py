@@ -9,8 +9,14 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Sequence
 
-from dayu.cli.arg_parsing import CLI_COMMAND_NAMES, ParsedCliArgs, parse_cli_args
+from dayu.cli.arg_parsing import (
+    CLI_COMMAND_NAMES,
+    COMMAND_PROMPT,
+    ParsedCliArgs,
+    parse_cli_args,
+)
 from dayu.cli.commands import run_not_implemented_command
+from dayu.cli.commands.prompt import run_prompt_command
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -25,6 +31,7 @@ MISSING_RUNNER_DIAGNOSTIC_TEMPLATE: str = (
 COMMAND_RUNNERS: dict[str, CommandRunner] = {
     command_name: run_not_implemented_command for command_name in CLI_COMMAND_NAMES
 }
+COMMAND_RUNNERS[COMMAND_PROMPT] = run_prompt_command
 
 
 def main(argv: Sequence[str] | None = None) -> int:

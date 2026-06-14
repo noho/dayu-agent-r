@@ -87,13 +87,36 @@ class CommandSubparserRegistry(Protocol):
 class ParsedCliArgs(argparse.Namespace):
     """Dayu CLI 解析结果命名空间。
 
-    argparse 会在运行时写入各命令参数；S1 的分发层只依赖 ``command_name``。
+    argparse 会在运行时写入各命令参数；命令 runner 只读取自身命令注册过的
+    字段。
     """
 
     command_name: str
     workspace_root: str
     config_dir: str | None
     log_level: str
+    prompt: str
+    ticker: str | None
+    label: str | None
+    model_name: str | None
+    thinking: bool | None
+    web_provider: str | None
+    temperature: float | None
+    debug_sse: bool
+    debug_tool_delta: bool
+    debug_sse_sample_rate: float | None
+    debug_sse_throttle_sec: float | None
+    tool_timeout_seconds: float | None
+    enable_tool_trace: bool
+    tool_trace_dir: str | None
+    max_iterations: int | None
+    fallback_mode: str | None
+    fallback_prompt: str | None
+    max_consecutive_failed_tool_batches: int | None
+    max_duplicate_tool_calls: int | None
+    duplicate_tool_hint_prompt: str | None
+    doc_limits_json: str | None
+    fins_limits_json: str | None
 
 
 def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
@@ -288,7 +311,7 @@ def _register_prompt_command(
         command_name=COMMAND_PROMPT,
         help_text="提交一次性财报分析问题。",
     )
-    parser.add_argument("prompt", help="本轮用户问题。")
+    parser.add_argument("prompt", type=_non_empty_prompt, help="本轮用户问题。")
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
     _add_agent_execution_arguments(parser)
@@ -395,6 +418,19 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--doc-limits-json", help="保留的文档工具限制 JSON。")
     parser.add_argument("--fins-limits-json", help="保留的财报工具限制 JSON。")
+
+
+def _non_empty_prompt(value: str) -> str:
+    """校验 positional prompt 不是空白文本。
+
+    :param value: argparse 收到的原始 prompt 参数。
+    :returns: 原始 prompt 文本。
+    :raises argparse.ArgumentTypeError: prompt 为空或仅包含空白时抛出。
+    """
+
+    if value.strip() == "":
+        raise argparse.ArgumentTypeError("prompt must not be empty")
+    return value
 
 
 def _register_download_command(

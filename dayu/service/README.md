@@ -17,7 +17,7 @@
 
 `discover_service_tools(...)` 返回的 `ServiceDiscoveredTools` 会携带本次 discovery 实际使用的 effective provider configs。`compose_open_host_options(...)` 复用这份结果绑定 Host tooling / wait adapter，避免工具闭包和等待适配器从两份 raw config 各自推断运行时参数。
 
-`entrypoint_runtime` 的 terminal observation 只使用 Host public API：submit 路径先 attach `watch_session_events(session_id)` 再提交 Run；cancel 路径先通过 `get_run(...)` 读取 public snapshot，已终态时跳过 `cancel_run(...)` 并走 outbox terminal fallback，非终态时在 `cancel_run(...)` 前 attach watcher。Service 不读取 Host durable internals，终态来源会明确标记为 live event 或 outbox read；watcher drain 失败会进入 terminal result 或 observation error 的诊断消息。
+`entrypoint_runtime` 的 terminal observation 只使用 Host public API：submit 路径先 attach `watch_session_events(session_id)` 再提交 Run，并可在 Host 接受 Run 后把 `accepted_run_id` 通知调用方用于运行中取消；cancel 路径先通过 `get_run(...)` 读取 public snapshot，已终态时跳过 `cancel_run(...)` 并走 outbox terminal fallback，非终态时在 `cancel_run(...)` 前 attach watcher。Service 不读取 Host durable internals，终态来源会明确标记为 live event 或 outbox read；watcher drain 失败会进入 terminal result 或 observation error 的诊断消息。
 
 `entrypoint_runtime` 的 submit / cancel wait helper 不持有内部 timeout。调用方负责通过 task cancellation、`asyncio.wait_for(...)` 或显式 cancel 请求控制等待生命周期。
 
