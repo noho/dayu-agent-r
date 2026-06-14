@@ -142,13 +142,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | ready-to-open-draft-PR |
-| implementation status | WU-CM-05 / WU-CM-06 / WU-CM-08 / WU-CM-09 completed；ready for final branch review or draft PR gate |
+| gate | draft-PR-pass |
+| implementation status | WU-CM-05 / WU-CM-06 / WU-CM-08 / WU-CM-09 completed；draft PR #140 passed final PR review；final closeout recorded |
 | active work unit | none |
 | default next work unit | WU-OBS-00 |
-| next entry point | final branch review / draft PR gate |
+| next entry point | after PR #140 merge, enter WU-OBS-00 discussion gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
 
 状态约定：
@@ -201,6 +201,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
+| WU-CM-05-R1 | deferred-with-owner | Future Conversation Memory test-helper cleanup | `tests/host/fake_compaction.py` 保留一个 pre-existing test helper `cast(...)`；非生产路径，不阻塞 PR #140，后续测试辅助类型清理时处理。 |
+| WU-CM-09-R1 | deferred-with-owner | Future Host durable maintenance hardening | identity read failure defensive branch 未单独覆盖；direct scan failure 与 row-level corruption 分类已覆盖，若后续需要 schema-corruption harness，再补充该防御分支测试。 |
 
 ## 当前 Work Units
 
@@ -952,6 +954,12 @@ GitHub Issue #41 当前为 OPEN，原状态为 deferred behind #81；#81 已关�
 - aggregate deepreview: `docs/reviews/code-review-20260612-183208.md`; `docs/reviews/code-review-20260612-183054.md`
 - aggregate deepreview conclusion: PASS; blocking findings 0; validation `pytest tests/host/test_memory_projection.py tests/host/test_storage_maintenance.py tests/host/test_package_exports.py -q` 51 passed; `python -m pyright dayu/ tests/ utils/` 0 errors
 - accepted deepreview commit: `3e98565d`
+- draft PR: https://github.com/noho/dayu-agent-r/pull/140
+- PR review: `docs/reviews/pr-review-20260614-mimo.md`; `docs/reviews/pr-review-20260614-ds.md`
+- PR review fix: `docs/reviews/pr-review-fix-20260614.md`
+- PR review re-review: `docs/reviews/pr-review-rereview-20260614-ds.md`
+- accepted PR review commit: `306b9011`
+- final closeout: `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`
 
 ### 设计与代码核对
 
