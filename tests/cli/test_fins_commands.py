@@ -34,6 +34,18 @@ from dayu.service.fins_direct import (
 )
 
 
+def _raise_on_cli_exception_log(message: str, *args: str | int | None) -> None:
+    """测试防线：CLI 不应对 Service 已负责的失败重复记录 ERROR。
+
+    :param message: logging exception 格式字符串。
+    :param args: logging exception 格式化参数。
+    :returns: 正常路径不会返回。
+    :raises AssertionError: 调用方触发 CLI duplicate ERROR log 时抛出。
+    """
+
+    raise AssertionError(f"unexpected CLI exception log: {message!r} {args!r}")
+
+
 class _FakeFinsDirectService:
     """CLI 测试用 FinsDirectCommandService 替身。"""
 
@@ -365,6 +377,60 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     )
     assert "Fins job succeeded" in captured.out
     assert "processed_count=1" in captured.out
+    assert "Fins direct event received" not in captured.out
+    assert "Fins direct event detail" not in captured.out
+    assert captured.err == ""
+
+
+def test_fins_direct_default_log_does_not_pollute_progress_output(
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """默认 INFO 日志不得把 progress 诊断写进用户 UI 输出。"""
+
+    exit_code = cli_main.main(("download", "--ticker", "AAPL"))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert "Fins job progress" in captured.out
+    assert "Fins direct command start" not in captured.out
+    assert "Fins direct event received" not in captured.out
+    assert "Fins direct event detail" not in captured.out
+    assert captured.err == ""
+
+
+def test_fins_direct_verbose_log_outputs_execution_skeleton(
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--verbose`` 应输出执行骨架日志，同时 progress 仍走 UI print。"""
+
+    exit_code = cli_main.main(("download", "--ticker", "AAPL", "--verbose"))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert "Fins job progress" in captured.out
+    assert "Fins direct command start" in captured.out
+    assert "Fins direct event received" in captured.out
+    assert "Fins direct event detail" not in captured.out
+    assert captured.err == ""
+
+
+def test_fins_direct_debug_log_outputs_event_details(
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--debug`` 应输出 event sequence 与 payload keys 等诊断。"""
+
+    exit_code = cli_main.main(("download", "--ticker", "AAPL", "--debug"))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert "Fins job progress" in captured.out
+    assert "Fins direct event detail" in captured.out
+    assert "sequence=1" in captured.out
+    assert "payload_key_count=2" in captured.out
+    assert "payload_keys=('step', 'ticker')" in captured.out
     assert captured.err == ""
 
 
@@ -677,6 +743,54 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
 
 
 @pytest.mark.asyncio
+async def test_cli_stream_failure_propagates_without_duplicate_error_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Service stream failure 必须向上传播，CLI 不重复记录 ERROR。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: CLI 记录 duplicate ERROR 或异常未传播时抛出。
+    """
+
+    class _FailingStreamService(_FakeFinsDirectService):
+        async def stream_job_events_until_terminal(
+            self,
+            handle: FinsDirectJobHandle,
+            *,
+            after_sequence: int = 0,
+        ) -> AsyncIterator[FinsDirectJobEvent]:
+            """模拟 Service event stream 失败。
+
+            :param handle: Fins direct job handle。
+            :param after_sequence: 起始 event sequence。
+            :returns: 正常路径不会产出事件。
+            :raises RuntimeError: 始终抛出以模拟 Service stream failure。
+            """
+
+            assert after_sequence == 0
+            self.stream_calls.append(handle.job_id)
+            raise RuntimeError("stream boom")
+            yield _progress_event(handle)
+
+    service = _FailingStreamService()
+    handle = _handle(command_name="download", ticker="AAPL")
+    monkeypatch.setattr(
+        fins_command._LOGGER,
+        "exception",
+        _raise_on_cli_exception_log,
+    )
+
+    with pytest.raises(RuntimeError, match="stream boom"):
+        await fins_command._consume_fins_direct_events(
+            service=cast(fins_command.FinsDirectCommandService, service),
+            handle=handle,
+        )
+
+    assert service.stream_calls == ["job-1"]
+
+
+@pytest.mark.asyncio
 async def test_sigint_after_job_id_requests_cancel_and_waits_terminal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -705,6 +819,74 @@ async def test_sigint_after_job_id_requests_cancel_and_waits_terminal(
     assert result.exit_code == FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT
     assert service.cancel_requests == ["job-1"]
     assert "job-1" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_cli_cancel_failure_propagates_without_duplicate_error_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Service cancel failure 必须向上传播，CLI 不重复记录 ERROR。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: CLI 记录 duplicate ERROR 或异常未传播时抛出。
+    """
+
+    class _CancelFailingService(_FakeFinsDirectService):
+        async def stream_job_events_until_terminal(
+            self,
+            handle: FinsDirectJobHandle,
+            *,
+            after_sequence: int = 0,
+        ) -> AsyncIterator[FinsDirectJobEvent]:
+            """产出首个 progress 后保持运行，等待 cancel failure 路径。
+
+            :param handle: Fins direct job handle。
+            :param after_sequence: 起始 event sequence。
+            :returns: Fins direct job event 异步迭代器。
+            :raises asyncio.CancelledError: 测试收口取消 stream task 时透传。
+            """
+
+            assert after_sequence == 0
+            self.stream_calls.append(handle.job_id)
+            self.wait_started.set()
+            yield _progress_event(handle)
+            await asyncio.Event().wait()
+
+        def request_cancel(self, job_id: str) -> None:
+            """模拟 Service cancel request failure。
+
+            :param job_id: Fins ingestion job id。
+            :returns: 正常路径不会返回。
+            :raises RuntimeError: 始终抛出以模拟 Service cancel failure。
+            """
+
+            self.cancel_requests.append(job_id)
+            raise RuntimeError("cancel boom")
+
+    service = _CancelFailingService()
+    handle = _handle(command_name="download", ticker="AAPL")
+    monitor = fins_command._FinsSigintMonitor()
+    monkeypatch.setattr(
+        fins_command._LOGGER,
+        "exception",
+        _raise_on_cli_exception_log,
+    )
+
+    wait_task = asyncio.create_task(
+        fins_command._wait_for_terminal_handling_sigint(
+            service=cast(fins_command.FinsDirectCommandService, service),
+            handle=handle,
+            sigint_monitor=monitor,
+        )
+    )
+    await service.wait_started.wait()
+    monitor.notify()
+
+    with pytest.raises(RuntimeError, match="cancel boom"):
+        await wait_task
+
+    assert service.cancel_requests == ["job-1"]
 
 
 @pytest.mark.asyncio

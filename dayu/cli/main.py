@@ -34,6 +34,7 @@ from dayu.cli.exit_codes import (
     EXIT_KEYBOARD_INTERRUPT,
     EXIT_SUCCESS,
 )
+import dayu.runtime.log as runtime_log
 
 CommandRunner = Callable[[ParsedCliArgs], int]
 MISSING_RUNNER_DIAGNOSTIC_TEMPLATE: str = (
@@ -65,6 +66,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         args = parse_cli_args(argv)
+        runtime_log.set_level_from_flags(
+            log_level=args.log_level,
+            debug=False,
+            verbose=False,
+            info=False,
+            quiet=False,
+        )
         runner = COMMAND_RUNNERS.get(args.command_name)
         if runner is None:
             print(

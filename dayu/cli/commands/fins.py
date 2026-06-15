@@ -9,6 +9,7 @@ Fins storage，也不把 direct job 伪装成 Host Run。
 from __future__ import annotations
 
 import asyncio
+import logging
 import shlex
 import signal
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Final, cast
 
+import dayu.runtime.log as runtime_log
 from dayu.cli.arg_parsing import (
     COMMAND_DOWNLOAD,
     COMMAND_PROCESS,
@@ -51,6 +53,7 @@ from dayu.fins.upload_batch import (
 )
 from dayu.service.fins_direct import (
     FinsDirectCommandService,
+    FinsDirectJobEvent,
     FinsDirectJobHandle,
     FinsDirectTerminalResult,
     FinsDirectUsageError,
@@ -74,6 +77,7 @@ _UPLOAD_PATH_NOT_FILE_TEMPLATE: Final[str] = "upload path is not a file: {path}"
 _UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = (
     "upload file suffix is not allowed: {path}"
 )
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
 class CliFinsUsageError(ValueError):
@@ -213,12 +217,24 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     :raises Exception: Service 或 runtime 执行失败时向上抛出。
     """
 
+    runtime_log.log_verbose(
+        _LOGGER,
+        "Fins direct command start; command=%s",
+        args.command_name,
+    )
     if args.command_name == COMMAND_UPLOAD_FILINGS_FROM:
         return _run_upload_filings_from(args)
     _raise_for_unsupported_flags(args)
     workspace_root = _resolve_workspace_root(args.workspace_root)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     handle = _start_direct_job(args=args, service=service)
+    runtime_log.log_verbose(
+        _LOGGER,
+        "Fins direct job started; command=%s job_id=%s initial_status=%s",
+        handle.start_request.command_name,
+        handle.job_id,
+        handle.initial_status.value,
+    )
     terminal = await _wait_for_terminal_handling_sigint(
         service=service,
         handle=handle,
@@ -559,6 +575,12 @@ async def _wait_for_terminal_handling_sigint(
                     event_task.cancel()
                     render_fins_direct_local_exit_after_cancel(handle.job_id)
                     return None
+                runtime_log.log_verbose(
+                    _LOGGER,
+                    "Fins direct cancel requested; job_id=%s sigint_count=%s",
+                    handle.job_id,
+                    observed_count,
+                )
                 service.request_cancel(handle.job_id)
                 cancel_requested = True
                 render_fins_direct_cancel_requested(handle.job_id)
@@ -587,11 +609,47 @@ async def _consume_fins_direct_events(
     """
 
     async for event in service.stream_job_events_until_terminal(handle):
+        _log_fins_direct_event_received(event)
         render_fins_direct_event(event)
         if event.terminal_result is not None:
+            runtime_log.log_verbose(
+                _LOGGER,
+                "Fins direct terminal closeout; command=%s job_id=%s status=%s exit_code=%s",
+                event.command_name,
+                event.job_id,
+                event.terminal_result.status.value,
+                event.terminal_result.exit_code,
+            )
             return event.terminal_result
     raise RuntimeError(
         f"Fins direct event stream ended without terminal result: {handle.job_id}"
+    )
+
+
+def _log_fins_direct_event_received(event: FinsDirectJobEvent) -> None:
+    """记录 Fins direct event 的有界诊断信息。
+
+    :param event: Service event stream 投影出的 Fins direct job event。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    runtime_log.log_verbose(
+        _LOGGER,
+        "Fins direct event received; command=%s job_id=%s event=%s",
+        event.command_name,
+        event.job_id,
+        event.event_label,
+    )
+    _LOGGER.debug(
+        "Fins direct event detail; job_id=%s sequence=%s event=%s status=%s "
+        "payload_key_count=%s payload_keys=%s",
+        event.job_id,
+        event.sequence,
+        event.event_label,
+        None if event.status is None else event.status.value,
+        len(event.payload),
+        runtime_log.bounded_payload_keys(event.payload),
     )
 
 

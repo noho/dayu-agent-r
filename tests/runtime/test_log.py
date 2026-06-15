@@ -12,9 +12,12 @@ from collections.abc import Iterator
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.runtime.log import (
     LogLevel,
+    bounded_payload_keys,
     configure,
+    log_verbose,
     set_level_from_flags,
 )
 from dayu.runtime.log_levels import (
@@ -273,6 +276,51 @@ def test_set_level_from_flags_info_default() -> None:
         quiet=False,
     )
     assert resolved is LogLevel.INFO
+
+
+def test_log_verbose_uses_call_site_logger(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """层中立 VERBOSE helper 必须保留调用点 logger 名称。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 输出 logger 名称或消息不符合预期时抛出。
+    """
+
+    configure(level=LogLevel.VERBOSE)
+    logger = logging.getLogger("dayu.runtime_log_helper.case")
+
+    log_verbose(logger, "helper-message=%s", "ok")
+
+    captured = capsys.readouterr()
+    assert "helper-message=ok" in captured.out
+    assert "dayu.runtime_log_helper.case" in captured.out
+
+
+def test_bounded_payload_keys_exposes_only_sorted_keys() -> None:
+    """payload key helper 只返回有界 key，不暴露 payload value。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 暴露 value、未排序或未限制 key 数量时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "z": "secret-value",
+        "a": "first",
+        "m": 1,
+        "b": True,
+        "c": None,
+        "d": "value-d",
+        "e": "value-e",
+        "f": "value-f",
+        "g": "value-g",
+    }
+
+    keys = bounded_payload_keys(payload)
+
+    assert keys == ("a", "b", "c", "d", "e", "f", "g", "m")
+    assert "secret-value" not in keys
 
 
 def test_set_level_from_flags_invalid_log_level_raises() -> None:

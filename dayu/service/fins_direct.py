@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
 
+import dayu.runtime.log as runtime_log
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
@@ -333,6 +334,12 @@ class FinsDirectCommandService:
         :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
         """
 
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct command start; command=%s ticker=%s",
+            "download",
+            ticker,
+        )
         start = self._runtime.start_download(
             FinsDownloadRequest(
                 ticker=ticker,
@@ -344,11 +351,13 @@ class FinsDirectCommandService:
             ),
             cancellation_token=cancellation_token,
         )
-        return _job_handle(
+        handle = _job_handle(
             start,
             command_name="download",
             ticker=ticker,
         )
+        _log_job_started(handle)
+        return handle
 
     def start_preprocess(
         self,
@@ -374,6 +383,12 @@ class FinsDirectCommandService:
         :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
         """
 
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct command start; command=%s ticker=%s",
+            command_name,
+            ticker,
+        )
         start = self._runtime.start_preprocess(
             FinsPreprocessRequest(
                 ticker=ticker,
@@ -384,7 +399,9 @@ class FinsDirectCommandService:
             ),
             cancellation_token=cancellation_token,
         )
-        return _job_handle(start, command_name=command_name, ticker=ticker)
+        handle = _job_handle(start, command_name=command_name, ticker=ticker)
+        _log_job_started(handle)
+        return handle
 
     def start_upload_filing(
         self,
@@ -420,6 +437,12 @@ class FinsDirectCommandService:
         :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
         """
 
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct command start; command=%s ticker=%s",
+            "upload_filing",
+            ticker,
+        )
         request = FinsUploadFilingRequest(
             ticker=ticker,
             source_kind=SourceKind.FILING,
@@ -435,7 +458,9 @@ class FinsDirectCommandService:
             overwrite=overwrite,
         )
         start = self._runtime.start_upload(request, cancellation_token=cancellation_token)
-        return _job_handle(start, command_name="upload_filing", ticker=ticker)
+        handle = _job_handle(start, command_name="upload_filing", ticker=ticker)
+        _log_job_started(handle)
+        return handle
 
     def start_upload_material(
         self,
@@ -479,6 +504,12 @@ class FinsDirectCommandService:
         :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
         """
 
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct command start; command=%s ticker=%s",
+            "upload_material",
+            ticker,
+        )
         request = FinsUploadMaterialRequest(
             ticker=ticker,
             source_kind=SourceKind.MATERIAL,
@@ -498,7 +529,9 @@ class FinsDirectCommandService:
             overwrite=overwrite,
         )
         start = self._runtime.start_upload(request, cancellation_token=cancellation_token)
-        return _job_handle(start, command_name="upload_material", ticker=ticker)
+        handle = _job_handle(start, command_name="upload_material", ticker=ticker)
+        _log_job_started(handle)
+        return handle
 
     async def wait_for_terminal(self, job_id: str) -> FinsDirectTerminalResult:
         """等待 job 进入终态。
@@ -534,14 +567,23 @@ class FinsDirectCommandService:
 
         cursor = after_sequence
         while True:
-            events = self._runtime.read_job_events(
-                handle.job_id,
-                after_sequence=cursor,
-                limit=FINS_DIRECT_JOB_EVENT_READ_LIMIT,
-            )
+            try:
+                events = self._runtime.read_job_events(
+                    handle.job_id,
+                    after_sequence=cursor,
+                    limit=FINS_DIRECT_JOB_EVENT_READ_LIMIT,
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "Fins direct job event read failed; job_id=%s after_sequence=%s",
+                    handle.job_id,
+                    cursor,
+                )
+                raise
             if events:
                 for event in events:
                     cursor = event.sequence
+                    _log_runtime_event_received(event, handle=handle)
                     projected = _job_event(
                         event,
                         handle=handle,
@@ -549,11 +591,27 @@ class FinsDirectCommandService:
                     )
                     yield projected
                     if projected.terminal_result is not None:
+                        runtime_log.log_verbose(
+                            _LOGGER,
+                            "Fins direct terminal closeout; command=%s job_id=%s "
+                            "status=%s exit_code=%s",
+                            projected.command_name,
+                            projected.job_id,
+                            projected.terminal_result.status.value,
+                            projected.terminal_result.exit_code,
+                        )
                         return
                 continue
 
             await self._sleep(self.poll_interval_seconds)
-            record = self._runtime.read_job(handle.job_id)
+            try:
+                record = self._runtime.read_job(handle.job_id)
+            except Exception:
+                _LOGGER.exception(
+                    "Fins direct terminal fallback read failed; job_id=%s",
+                    handle.job_id,
+                )
+                raise
             if _is_terminal_status(record.status):
                 terminal_result = _terminal_result(record)
                 _LOGGER.warning(
@@ -578,7 +636,16 @@ class FinsDirectCommandService:
         :raises Exception: job 不存在或取消落盘失败时由 runtime 抛出。
         """
 
-        return self._runtime.request_cancel(job_id)
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct cancel requested; job_id=%s",
+            job_id,
+        )
+        try:
+            return self._runtime.request_cancel(job_id)
+        except Exception:
+            _LOGGER.exception("Fins direct cancel request failed; job_id=%s", job_id)
+            raise
 
     def _terminal_result_for_event(
         self,
@@ -764,6 +831,55 @@ def _synthetic_terminal_job_event(
         message="job terminal record observed without terminal event",
         payload={},
         terminal_result=terminal_result,
+    )
+
+
+def _log_job_started(handle: FinsDirectJobHandle) -> None:
+    """记录 direct job 启动后的有界诊断。
+
+    :param handle: Service 返回给 product entrypoint 的 job handle。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    runtime_log.log_verbose(
+        _LOGGER,
+        "Fins direct job started; command=%s job_id=%s initial_status=%s",
+        handle.start_request.command_name,
+        handle.job_id,
+        handle.initial_status.value,
+    )
+
+
+def _log_runtime_event_received(
+    event: FinsIngestionJobEventRecord,
+    *,
+    handle: FinsDirectJobHandle,
+) -> None:
+    """记录 runtime event 到 Service event 投影前的有界诊断。
+
+    :param event: Fins ingestion runtime event record。
+    :param handle: direct job handle，用于补齐 command 诊断。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    runtime_log.log_verbose(
+        _LOGGER,
+        "Fins direct event received; command=%s job_id=%s event_type=%s",
+        handle.start_request.command_name,
+        event.job_id,
+        event.event_type.value,
+    )
+    _LOGGER.debug(
+        "Fins direct runtime event detail; job_id=%s sequence=%s event_type=%s "
+        "source_event_type=%s payload_key_count=%s payload_keys=%s",
+        event.job_id,
+        event.sequence,
+        event.event_type.value,
+        event.source_event_type,
+        len(event.payload),
+        runtime_log.bounded_payload_keys(event.payload),
     )
 
 
