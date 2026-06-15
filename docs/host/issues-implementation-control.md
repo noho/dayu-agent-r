@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | ready-to-open-draft-PR |
-| implementation status | WU-CLI-FINS-OBS-01 completed locally; accepted commits S1 `3787f43d`, S2 `123a7db8`, S3 `4164b4da`, S4 `e597d8e8`, S5 `8d93dc68`, S6 `2d4679af`, aggregate fix `804b3b7d`; closeout complete |
+| gate | draft-PR-pass |
+| implementation status | WU-CLI-FINS-OBS-01 completed locally; accepted commits S1 `3787f43d`, S2 `123a7db8`, S3 `4164b4da`, S4 `e597d8e8`, S5 `8d93dc68`, S6 `2d4679af`, aggregate fix `804b3b7d`; draft PR #143 opened |
 | active work unit | WU-CLI-FINS-OBS-01 |
 | default next work unit | WU-CLI-FINS-OBS-01 |
-| next entry point | draft PR gate for WU-CLI-FINS-OBS-01 |
+| next entry point | WU-CLI-FINS-OBS-01 draft PR #143 review/merge decision; default next work unit remains WU-OBS-00 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -207,7 +207,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | ready-to-open-draft-PR | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Local gates complete; closeout `docs/reviews/wu-cli-fins-obs-01-closeout-20260615-212045.md`; draft PR gate next |
+| WU-CLI-FINS-OBS-01 | draft-PR-pass | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Draft PR #143 opened: https://github.com/noho/dayu-agent-r/pull/143 |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -341,6 +341,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - aggregate fix accepted commit: `804b3b7d`
 - final local validation: `pytest tests/fins/test_fins_ingestion_runtime.py tests/service/test_fins_direct.py tests/cli/test_arg_parsing.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/runtime/test_log.py -q` 210 passed, 3 warnings; `pyright dayu/fins/ingestion_events.py dayu/fins/ingestion_runtime.py dayu/service/fins_direct.py dayu/cli/main.py dayu/cli/commands/fins.py dayu/cli/output.py dayu/runtime/log.py tests/fins/test_fins_ingestion_runtime.py tests/service/test_fins_direct.py tests/cli/test_arg_parsing.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/runtime/test_log.py` 0 errors
 - closeout: `docs/reviews/wu-cli-fins-obs-01-closeout-20260615-212045.md`
+- draft PR: #143 https://github.com/noho/dayu-agent-r/pull/143
 
 ## WU-OBS-00 Tool Trace Analyzer
 
