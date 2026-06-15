@@ -1769,6 +1769,73 @@ def test_job_event_store_concurrent_append_allocates_unique_monotonic_sequences(
     assert [event.sequence for event in events] == list(range(1, append_count + 2))
 
 
+def test_job_event_sidecar_skips_corrupted_rows_and_append_continues(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """sidecar 坏行应被跳过，后续 append 仍按有效事件分配 sequence。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    event_path = _job_event_file(workspace_root, start.job_id)
+    leaked_payload_value = "SHOULD_NOT_APPEAR_IN_WARNING"
+    original_text = event_path.read_text(encoding="utf-8")
+    event_path.write_text(
+        f'{original_text}{{"payload":"{leaked_payload_value}"\n'
+        f'["{leaked_payload_value}"]\n',
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
+        appended = ingestion.job_store.append_job_event(
+            start.job_id,
+            FinsIngestionJobEventAppend(
+                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+                status=None,
+                event_type=FinsIngestionJobEventType.PROGRESS,
+                source_event_type="test.progress",
+                source_kind=None,
+                document_id=None,
+                message="测试进度事件",
+                payload={"step": "after_corruption"},
+                emitted_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        events = ingestion.read_job_events(start.job_id)
+
+    assert appended.sequence == 2
+    assert [event.sequence for event in events] == [1, 2]
+    assert [event.event_type for event in events] == [
+        FinsIngestionJobEventType.JOB_QUEUED,
+        FinsIngestionJobEventType.PROGRESS,
+    ]
+    assert "fins.ingestion.job_event_sidecar_row_skipped" in caplog.text
+    assert "sidecar_kind=fins_ingestion_job_event" in caplog.text
+    assert "sidecar_suffix=.events.jsonl" in caplog.text
+    assert "line_number=2" in caplog.text
+    assert "line_number=3" in caplog.text
+    assert "error_summary=malformed_or_invalid_event_row" in caplog.text
+    assert leaked_payload_value not in caplog.text
+    assert start.job_id not in caplog.text
+
+
+def test_job_event_sidecar_still_rejects_non_monotonic_valid_records(tmp_path: Path) -> None:
+    """坏行跳过不得放宽有效 event record 的 sequence 单调性校验。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    event_path = _job_event_file(workspace_root, start.job_id)
+    queued_event_text = event_path.read_text(encoding="utf-8")
+    event_path.write_text(f"{queued_event_text}{queued_event_text}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sequence 未递增"):
+        ingestion.read_job_events(start.job_id)
+
+
 def test_job_event_append_rejects_non_json_compatible_payload(tmp_path: Path) -> None:
     """event append payload 非 JSON-compatible 时应 fail fast。"""
 

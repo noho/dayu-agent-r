@@ -27,6 +27,7 @@ from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
     FINS_DIRECT_EXIT_SUCCESS,
+    FINS_DIRECT_SYNTHETIC_TERMINAL_EVENT_LABEL,
     FinsDirectJobEvent,
     FinsDirectJobHandle,
     FinsDirectStartRequest,
@@ -60,17 +61,20 @@ class _FakeFinsDirectService:
     cancel_seen: asyncio.Event
     terminal_status: FinsIngestionJobStatus
     wait_for_cancel_before_terminal: bool
+    use_synthetic_terminal_fallback: bool
 
     def __init__(
         self,
         *,
         terminal_status: FinsIngestionJobStatus = FinsIngestionJobStatus.SUCCEEDED,
         wait_for_cancel_before_terminal: bool = False,
+        use_synthetic_terminal_fallback: bool = False,
     ) -> None:
         """初始化 fake service。
 
         :param terminal_status: wait_for_terminal 返回的终态。
         :param wait_for_cancel_before_terminal: 是否等待 request_cancel 后才返回终态。
+        :param use_synthetic_terminal_fallback: 是否产出 Service 合成终态事件。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -86,6 +90,7 @@ class _FakeFinsDirectService:
         self.cancel_seen = asyncio.Event()
         self.terminal_status = terminal_status
         self.wait_for_cancel_before_terminal = wait_for_cancel_before_terminal
+        self.use_synthetic_terminal_fallback = use_synthetic_terminal_fallback
 
     def start_download(
         self,
@@ -305,6 +310,20 @@ class _FakeFinsDirectService:
             and self.wait_for_cancel_before_terminal
         ):
             await self.cancel_seen.wait()
+        if self.use_synthetic_terminal_fallback:
+            terminal_result = _terminal(job_id=handle.job_id, status=self.terminal_status)
+            yield FinsDirectJobEvent(
+                job_id=handle.job_id,
+                sequence=2,
+                command_name=handle.start_request.command_name,
+                ticker=handle.start_request.ticker,
+                status=terminal_result.status,
+                event_label=FINS_DIRECT_SYNTHETIC_TERMINAL_EVENT_LABEL,
+                message="job terminal record observed without terminal event",
+                payload={},
+                terminal_result=terminal_result,
+            )
+            return
         yield _terminal_event(handle=handle, status=self.terminal_status)
 
     def request_cancel(self, job_id: str) -> None:
@@ -379,6 +398,27 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     assert "processed_count=1" in captured.out
     assert "Fins direct event received" not in captured.out
     assert "Fins direct event detail" not in captured.out
+    assert captured.err == ""
+
+
+def test_live_fins_command_renders_synthetic_terminal_fallback_and_exit_code(
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI 必须渲染 Service 合成终态 fallback event 并使用 terminal exit code。"""
+
+    fake_service.use_synthetic_terminal_fallback = True
+
+    exit_code = cli_main.main(("download", "--ticker", "AAPL"))
+
+    captured = capsys.readouterr()
+    assert exit_code == FINS_DIRECT_EXIT_SUCCESS
+    assert fake_service.stream_calls == ["job-1"]
+    assert fake_service.wait_calls == []
+    assert "Fins job progress" in captured.out
+    assert "Fins job succeeded" in captured.out
+    assert 'event="job_terminal_fallback"' in captured.out
+    assert "processed_count=1" in captured.out
     assert captured.err == ""
 
 

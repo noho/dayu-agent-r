@@ -76,7 +76,7 @@ _NORMALIZED_MARKET_VALUES: Final[frozenset[NormalizedTickerMarket]] = frozenset(
 _NORMALIZED_EXCHANGE_VALUES: Final[frozenset[NormalizedTickerExchange]] = frozenset(
     cast(tuple[NormalizedTickerExchange, ...], get_args(NormalizedTickerExchange))
 )
-_LOGGER: logging.Logger = logging.getLogger(__name__)
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 _KEY_JOB_ID: Final[str] = "job_id"
 _KEY_OPERATION_KIND: Final[str] = "operation_kind"
@@ -101,6 +101,11 @@ _KEY_DOCUMENT_ID: Final[str] = "document_id"
 _KEY_MESSAGE: Final[str] = "message"
 _KEY_PAYLOAD: Final[str] = "payload"
 _KEY_EMITTED_AT: Final[str] = "emitted_at"
+_JOB_EVENT_SIDECAR_KIND: Final[str] = "fins_ingestion_job_event"
+_JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT: Final[
+    str
+] = "fins.ingestion.job_event_sidecar_row_skipped"
+_JOB_EVENT_SIDECAR_ROW_SKIPPED_SUMMARY: Final[str] = "malformed_or_invalid_event_row"
 _DEFAULT_JOB_EVENT_READ_LIMIT: Final[int] = 100
 _MAX_JOB_EVENT_READ_LIMIT: Final[int] = 1000
 _PROGRESS_DOWNLOAD_STARTED: Final[str] = "download.started"
@@ -1525,19 +1530,42 @@ class FsFinsIngestionJobStore:
 
         Raises:
             OSError: 文件读取失败时抛出。
-            ValueError: event sidecar 内容非法时抛出。
+            ValueError: 有效 event record 的 sequence 非单调递增时抛出。
         """
 
         records: list[FinsIngestionJobEventRecord] = []
+        last_sequence = 0
         with event_path.open("r", encoding="utf-8") as stream:
             for line_number, line in enumerate(stream, start=1):
                 stripped = line.strip()
                 if not stripped:
                     continue
-                payload = cast(JsonValue, json.loads(stripped))
+                try:
+                    payload = cast(JsonValue, json.loads(stripped))
+                except json.JSONDecodeError as exc:
+                    _warn_malformed_event_sidecar_row(
+                        line_number=line_number,
+                        error_type=type(exc).__name__,
+                    )
+                    continue
                 if not isinstance(payload, Mapping):
-                    raise ValueError(f"Fins ingestion job event 第 {line_number} 行不是 JSON 映射")
-                records.append(_event_record_from_json(cast(Mapping[str, JsonValue], payload)))
+                    _warn_malformed_event_sidecar_row(
+                        line_number=line_number,
+                        error_type=type(payload).__name__,
+                    )
+                    continue
+                try:
+                    record = _event_record_from_json(cast(Mapping[str, JsonValue], payload))
+                except ValueError as exc:
+                    _warn_malformed_event_sidecar_row(
+                        line_number=line_number,
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                if record.sequence <= last_sequence:
+                    raise ValueError("Fins ingestion job event sequence 未递增")
+                records.append(record)
+                last_sequence = record.sequence
         return tuple(records)
 
     def _read_record_locked(self, job_id: str) -> FinsIngestionJobRecord:
@@ -4012,6 +4040,32 @@ def _assert_bounded_summary(summary: Mapping[str, JsonValue], field_name: str) -
     encoded = json.dumps(summary, ensure_ascii=False, sort_keys=True)
     if len(encoded) > _MAX_SUMMARY_JSON_CHARS:
         raise ValueError(f"{field_name} 超出大小上限")
+
+
+def _warn_malformed_event_sidecar_row(*, line_number: int, error_type: str) -> None:
+    """记录 event sidecar 单行坏数据被跳过的有界 warning。
+
+    Args:
+        line_number: sidecar 文件中的行号。
+        error_type: 解析或校验失败类型名；不得包含 payload 值。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    _LOGGER.warning(
+        "%s sidecar_kind=%s sidecar_suffix=%s line_number=%s "
+        "error_type=%s error_summary=%s",
+        _JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT,
+        _JOB_EVENT_SIDECAR_KIND,
+        _JOB_EVENT_FILE_SUFFIX,
+        line_number,
+        error_type,
+        _JOB_EVENT_SIDECAR_ROW_SKIPPED_SUMMARY,
+    )
 
 
 def _event_record_to_json(record: FinsIngestionJobEventRecord) -> dict[str, JsonValue]:
