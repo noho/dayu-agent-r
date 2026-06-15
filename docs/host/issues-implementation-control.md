@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final closeout |
-| implementation status | WU-CM-05 / WU-CM-06 / WU-CM-08 / WU-CM-09 final closeout completed；draft PR #140 passed final PR review；final closeout artifact `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md` |
-| active work unit | none |
+| gate | accepted plan commit |
+| implementation status | WU-CLI-FINS-OBS-01 plan re-review PASS；accepted plan commit `7cfcec6b` |
+| active work unit | WU-CLI-FINS-OBS-01 |
 | default next work unit | WU-CLI-FINS-OBS-01 |
-| next entry point | enter WU-CLI-FINS-OBS-01 goal confirmation / discussion gate |
+| next entry point | enter WU-CLI-FINS-OBS-01 implementation gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -207,7 +207,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | discussion-ready | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | 当前总控仅记录，不实施；下一轮总控可从 goal confirmation / plan gate 进入 |
+| WU-CLI-FINS-OBS-01 | planning | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | plan re-review PASS；accepted plan commit `7cfcec6b` |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -289,6 +289,18 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - `prompt` / `interactive` 的终态输出必须保持正常；若本条裁决不实现运行中 Agent progress / content streaming，plan 必须说明直接代码证据、设计依据、用户影响和后续 owner。
 - Ctrl+C 仍触发 durable Fins job cancel；二次 Ctrl+C 或本地退出必须保留 job id 供用户追踪。
 - 测试覆盖 CLI 输出审计、Service event stream、cancel、日志装配和禁止 CLI 直接 import `dayu.fins.storage` 的边界约束。
+
+### 当前 gate artifacts
+
+- plan: `docs/host/wu-cli-fins-obs-01-fins-direct-live-events-plan.md`
+- plan status: ready
+- plan review: `docs/reviews/plan-review-20260615-154655.md`; `docs/reviews/plan-review-20260615-180157.md`
+- plan review adjudication: `docs/reviews/wu-cli-fins-obs-01-plan-review-adjudication-20260615-180440.md`
+- accepted findings requiring plan fix: DS-001 / MiMo-001, DS-002 / MiMo-002, DS-003 / MiMo-003, MiMo-004, DS-004 / MiMo-005, DS-005 / MiMo-006, DS-006 / MiMo-007, MiMo-008
+- plan review fix: `docs/reviews/wu-cli-fins-obs-01-plan-review-fix-codex.md`
+- plan re-review: `docs/reviews/plan-review-20260615-181139.md`; `docs/reviews/plan-review-20260615-181200.md`
+- plan re-review conclusion: PASS; accepted findings fixed 8/8; remaining blockers none
+- accepted plan commit: `7cfcec6b`
 
 ## WU-OBS-00 Tool Trace Analyzer
 
