@@ -103,6 +103,38 @@ _KEY_PAYLOAD: Final[str] = "payload"
 _KEY_EMITTED_AT: Final[str] = "emitted_at"
 _DEFAULT_JOB_EVENT_READ_LIMIT: Final[int] = 100
 _MAX_JOB_EVENT_READ_LIMIT: Final[int] = 1000
+_PROGRESS_DOWNLOAD_STARTED: Final[str] = "download.started"
+_PROGRESS_DOWNLOAD_COMPLETED: Final[str] = "download.completed"
+_PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES: Final[str] = "download.completed_with_failures"
+_PROGRESS_UPLOAD_STARTED: Final[str] = "upload.started"
+_PROGRESS_UPLOAD_COMPLETED: Final[str] = "upload.completed"
+_PROGRESS_UPLOAD_COMPLETED_WITH_FAILURES: Final[str] = "upload.completed_with_failures"
+_PROGRESS_PREPROCESS_SELECTED: Final[str] = "preprocess.selected"
+_PROGRESS_PREPROCESS_DOCUMENT_STARTED: Final[str] = "preprocess.document_started"
+_PROGRESS_PREPROCESS_DOCUMENT_PROCESSED: Final[str] = "preprocess.document_processed"
+_PROGRESS_PREPROCESS_DOCUMENT_SKIPPED: Final[str] = "preprocess.document_skipped"
+_PROGRESS_PREPROCESS_DOCUMENT_FAILED: Final[str] = "preprocess.document_failed"
+_PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED: Final[str] = "preprocess.document_not_supported"
+_PROGRESS_PREPROCESS_COMPLETED: Final[str] = "preprocess.completed"
+_PAYLOAD_TICKER: Final[str] = "ticker"
+_PAYLOAD_MARKET: Final[str] = "market"
+_PAYLOAD_SOURCE: Final[str] = "source"
+_PAYLOAD_SOURCE_KIND: Final[str] = "source_kind"
+_PAYLOAD_FORM_TYPES: Final[str] = "form_types"
+_PAYLOAD_ACTION: Final[str] = "action"
+_PAYLOAD_FILE_COUNT: Final[str] = "file_count"
+_PAYLOAD_SELECTED_COUNT: Final[str] = "selected_count"
+_PAYLOAD_PROCESSED_COUNT: Final[str] = "processed_count"
+_PAYLOAD_SKIPPED_COUNT: Final[str] = "skipped_count"
+_PAYLOAD_FAILED_COUNT: Final[str] = "failed_count"
+_PAYLOAD_DISCOVERED_COUNT: Final[str] = "discovered_count"
+_PAYLOAD_DOWNLOADED_COUNT: Final[str] = "downloaded_count"
+_PAYLOAD_REJECTED_COUNT: Final[str] = "rejected_count"
+_PAYLOAD_WRITTEN_DOCUMENT_COUNT: Final[str] = "written_document_count"
+_PAYLOAD_NOT_SUPPORTED_COUNT: Final[str] = "not_supported_count"
+_PAYLOAD_DOCUMENT_INDEX: Final[str] = "document_index"
+_PAYLOAD_DOCUMENT_TOTAL: Final[str] = "document_total"
+_PAYLOAD_UPLOAD_STATUS: Final[str] = "upload_status"
 
 
 class FinsIngestionOperationKind(str, Enum):
@@ -2032,12 +2064,26 @@ class FinsIngestionRuntime:
                     ).to_json_summary(),
                 )
                 return
+            self._emit_progress_event(
+                record,
+                source_event_type=_PROGRESS_UPLOAD_STARTED,
+                message="上传已开始",
+                document_id=_upload_request_document_id(request),
+                payload=_upload_request_progress_payload(record, request),
+            )
             summary = self.upload_runner.run_upload(
                 request,
                 cancellation_checker=_RuntimeJobCancellationChecker(
                     job_store=self.job_store,
                     job_id=job_id,
                 ),
+            )
+            self._emit_progress_event(
+                record,
+                source_event_type=_upload_completed_progress_type(summary),
+                message=_upload_completed_progress_message(summary),
+                document_id=summary.document_id or _upload_request_document_id(request),
+                payload=_upload_summary_progress_payload(record, request, summary),
             )
             latest = self.job_store.read_job(job_id)
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
@@ -2111,15 +2157,38 @@ class FinsIngestionRuntime:
             document_ids=request.document_ids,
             form_types=request.form_types,
         )
+        self._emit_progress_event(
+            record,
+            source_event_type=_PROGRESS_PREPROCESS_SELECTED,
+            message="预处理已选择源文档",
+            document_id=None,
+            payload=_preprocess_selected_progress_payload(
+                record,
+                request,
+                selected_count=len(document_ids),
+            ),
+        )
         processed_ids: list[str] = []
         skipped_ids: list[str] = []
         failed_ids: list[str] = []
         not_supported_ids: list[str] = []
 
-        for document_id in document_ids:
+        for document_index, document_id in enumerate(document_ids, start=1):
             latest = self.job_store.read_job(record.job_id)
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
                 break
+            self._emit_progress_event(
+                record,
+                source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_STARTED,
+                message="预处理源文档已开始",
+                document_id=document_id,
+                payload=_preprocess_document_progress_payload(
+                    record,
+                    request,
+                    document_index=document_index,
+                    document_total=len(document_ids),
+                ),
+            )
             try:
                 outcome = self._preprocess_one_document(
                     ticker=ticker,
@@ -2129,16 +2198,64 @@ class FinsIngestionRuntime:
                 )
             except _PreprocessNotSupportedError:
                 not_supported_ids.append(document_id)
+                self._emit_progress_event(
+                    record,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED,
+                    message="预处理源文档不支持",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        record,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
                 continue
             except Exception:
                 failed_ids.append(document_id)
+                self._emit_progress_event(
+                    record,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_FAILED,
+                    message="预处理源文档失败",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        record,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
                 continue
             if outcome == "processed":
                 processed_ids.append(document_id)
+                self._emit_progress_event(
+                    record,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_PROCESSED,
+                    message="预处理源文档已完成",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        record,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
             else:
                 skipped_ids.append(document_id)
+                self._emit_progress_event(
+                    record,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_SKIPPED,
+                    message="预处理源文档已跳过",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        record,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
 
-        return FinsPreprocessResultSummary(
+        summary = FinsPreprocessResultSummary(
             selected_count=len(document_ids),
             processed_count=len(processed_ids),
             skipped_count=len(skipped_ids) + len(not_supported_ids),
@@ -2148,6 +2265,14 @@ class FinsIngestionRuntime:
             failed_document_ids=tuple(failed_ids),
             not_supported_document_ids=tuple(not_supported_ids),
         )
+        self._emit_progress_event(
+            record,
+            source_event_type=_PROGRESS_PREPROCESS_COMPLETED,
+            message="预处理请求已完成",
+            document_id=None,
+            payload=_preprocess_summary_progress_payload(record, request, summary),
+        )
+        return summary
 
     def _execute_download_request(
         self,
@@ -2185,11 +2310,26 @@ class FinsIngestionRuntime:
                 job_id=record.job_id,
             ),
         )
+        self._emit_progress_event(
+            record,
+            source_event_type=_PROGRESS_DOWNLOAD_STARTED,
+            message="下载已开始",
+            document_id=None,
+            payload=_download_request_progress_payload(record, adapter_request),
+        )
         adapter_result = adapter.download(adapter_request)
         if adapter_result.persisted_summary is not None:
             if adapter_result.documents or adapter_result.rejected_artifacts:
                 raise ValueError("adapter persisted_summary 不得与 documents/rejected_artifacts 同时返回")
-            return _bounded_download_summary(adapter_result.persisted_summary)
+            summary = _bounded_download_summary(adapter_result.persisted_summary)
+            self._emit_progress_event(
+                record,
+                source_event_type=_download_completed_progress_type(summary),
+                message=_download_completed_progress_message(summary),
+                document_id=None,
+                payload=_download_summary_progress_payload(record, adapter_request, summary),
+            )
+            return summary
         downloaded_ids: list[str] = []
         skipped_count = 0
         rejected_count = 0
@@ -2218,7 +2358,7 @@ class FinsIngestionRuntime:
             )
             rejected_count += 1
 
-        return FinsDownloadResultSummary(
+        summary = FinsDownloadResultSummary(
             discovered_count=_non_negative_count(adapter_result.discovered_count, "discovered_count"),
             downloaded_count=len(downloaded_ids),
             skipped_count=skipped_count,
@@ -2226,6 +2366,14 @@ class FinsIngestionRuntime:
             failed_count=_non_negative_count(adapter_result.failed_count, "failed_count"),
             written_document_ids=tuple(downloaded_ids),
         )
+        self._emit_progress_event(
+            record,
+            source_event_type=_download_completed_progress_type(summary),
+            message=_download_completed_progress_message(summary),
+            document_id=None,
+            payload=_download_summary_progress_payload(record, adapter_request, summary),
+        )
+        return summary
 
     def _select_download_adapter(
         self,
@@ -2766,6 +2914,62 @@ class FinsIngestionRuntime:
             message=_terminal_event_message(record.status),
             payload={},
         )
+
+    def _emit_progress_event(
+        self,
+        record: FinsIngestionJobRecord,
+        *,
+        source_event_type: str,
+        message: str,
+        document_id: str | None,
+        payload: dict[str, JsonValue],
+    ) -> None:
+        """追加 runtime-owned progress event，失败时记录 bounded WARN 并继续。
+
+        Args:
+            record: 事件对应的 running job record 快照。
+            source_event_type: runtime 内部进度标签，只用于消费方展示分类。
+            message: 有界进度说明。
+            document_id: 可选业务文档 ID；不得放本地文件路径。
+            payload: 有界 JSON-compatible 业务摘要。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        try:
+            self.job_store.append_job_event(
+                record.job_id,
+                FinsIngestionJobEventAppend(
+                    operation_kind=record.operation_kind,
+                    status=record.status,
+                    event_type=FinsIngestionJobEventType.PROGRESS,
+                    source_event_type=source_event_type,
+                    source_kind=record.source_kind,
+                    document_id=document_id,
+                    message=message,
+                    payload=payload,
+                    emitted_at=_utc_now(),
+                ),
+            )
+        except Exception as exc:
+            payload_keys = ",".join(sorted(payload.keys()))
+            _LOGGER.warning(
+                "fins.ingestion.job_event_append_failed "
+                "job_id=%s operation_kind=%s event_type=%s source_event_type=%s "
+                "payload_key_count=%s payload_keys=%s error_type=%s error_summary=%s",
+                record.job_id,
+                record.operation_kind.value,
+                FinsIngestionJobEventType.PROGRESS.value,
+                _bounded_log_text(source_event_type),
+                len(payload),
+                _bounded_log_text(payload_keys),
+                type(exc).__name__,
+                "event_append_failed",
+            )
 
     def _append_job_event_warn(
         self,
@@ -3365,6 +3569,339 @@ def _bounded_download_summary(summary: FinsDownloadResultSummary) -> FinsDownloa
             reject_path_separators=False,
         ),
     )
+
+
+def _download_request_progress_payload(
+    record: FinsIngestionJobRecord,
+    request: FinsSourceDownloadAdapterRequest,
+) -> dict[str, JsonValue]:
+    """构建下载 started progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 传给同步下载 adapter 的请求。
+
+    Returns:
+        有界、业务可读且不含路径或正文的 progress payload。
+
+    Raises:
+        ValueError: 字段越界时抛出。
+    """
+
+    return {
+        _PAYLOAD_TICKER: record.normalized_ticker,
+        _PAYLOAD_MARKET: record.market,
+        _PAYLOAD_SOURCE: _bounded_text(request.source, _PAYLOAD_SOURCE),
+        _PAYLOAD_FORM_TYPES: list(
+            _bounded_text_tuple(
+                request.form_types,
+                _PAYLOAD_FORM_TYPES,
+                reject_path_separators=False,
+            )
+        ),
+    }
+
+
+def _download_summary_progress_payload(
+    record: FinsIngestionJobRecord,
+    request: FinsSourceDownloadAdapterRequest,
+    summary: FinsDownloadResultSummary,
+) -> dict[str, JsonValue]:
+    """构建下载 completed progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 传给同步下载 adapter 的请求。
+        summary: 有界下载结果摘要。
+
+    Returns:
+        只包含 ticker、source、form 与计数的 progress payload。
+
+    Raises:
+        ValueError: 摘要字段越界时抛出。
+    """
+
+    bounded = _bounded_download_summary(summary)
+    payload = _download_request_progress_payload(record, request)
+    payload.update(
+        {
+            _PAYLOAD_DISCOVERED_COUNT: bounded.discovered_count,
+            _PAYLOAD_DOWNLOADED_COUNT: bounded.downloaded_count,
+            _PAYLOAD_SKIPPED_COUNT: bounded.skipped_count,
+            _PAYLOAD_REJECTED_COUNT: bounded.rejected_count,
+            _PAYLOAD_FAILED_COUNT: bounded.failed_count,
+            _PAYLOAD_WRITTEN_DOCUMENT_COUNT: len(bounded.written_document_ids),
+        }
+    )
+    return payload
+
+
+def _download_completed_progress_type(summary: FinsDownloadResultSummary) -> str:
+    """根据下载摘要选择 completed progress 标签。
+
+    Args:
+        summary: 下载结果摘要。
+
+    Returns:
+        有失败计数时返回 completed_with_failures，否则返回 completed。
+
+    Raises:
+        无。
+    """
+
+    if summary.failed_count > 0:
+        return _PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES
+    return _PROGRESS_DOWNLOAD_COMPLETED
+
+
+def _download_completed_progress_message(summary: FinsDownloadResultSummary) -> str:
+    """根据下载摘要选择用户可读 progress 说明。
+
+    Args:
+        summary: 下载结果摘要。
+
+    Returns:
+        下载完成或带失败完成的简短说明。
+
+    Raises:
+        无。
+    """
+
+    if summary.failed_count > 0:
+        return "下载已完成，存在失败候选"
+    return "下载已完成"
+
+
+def _upload_request_document_id(request: FinsUploadRequest) -> str | None:
+    """从上传请求提取可用于 progress 的业务文档 ID。
+
+    Args:
+        request: 上传请求。
+
+    Returns:
+        material 请求中的显式 document_id；filing 请求返回 ``None``。
+
+    Raises:
+        ValueError: 文档 ID 越界时抛出。
+    """
+
+    if isinstance(request, FinsUploadMaterialRequest):
+        return _optional_bounded_text(
+            request.document_id,
+            "upload_document_id",
+            reject_path_separators=False,
+        )
+    if isinstance(request, FinsUploadFilingRequest):
+        return None
+    assert_never(request)
+
+
+def _upload_request_progress_payload(
+    record: FinsIngestionJobRecord,
+    request: FinsUploadRequest,
+) -> dict[str, JsonValue]:
+    """构建 upload started progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 上传请求。
+
+    Returns:
+        只包含 ticker、source_kind、action 与文件数量的 payload。
+
+    Raises:
+        ValueError: 请求字段越界时抛出。
+    """
+
+    _validate_upload_file_count(request.files)
+    return {
+        _PAYLOAD_TICKER: record.normalized_ticker,
+        _PAYLOAD_MARKET: record.market,
+        _PAYLOAD_SOURCE_KIND: request.source_kind.value,
+        _PAYLOAD_ACTION: _normalize_upload_action(request.action),
+        _PAYLOAD_FILE_COUNT: len(request.files),
+    }
+
+
+def _upload_summary_progress_payload(
+    record: FinsIngestionJobRecord,
+    request: FinsUploadRequest,
+    summary: FinsUploadResultSummary,
+) -> dict[str, JsonValue]:
+    """构建 upload completed progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 上传请求。
+        summary: 上传结果摘要。
+
+    Returns:
+        有界上传 progress payload，不包含本地文件名或路径。
+
+    Raises:
+        ValueError: 请求或结果字段越界时抛出。
+    """
+
+    payload = _upload_request_progress_payload(record, request)
+    payload[_PAYLOAD_UPLOAD_STATUS] = _bounded_text(
+        summary.status,
+        _PAYLOAD_UPLOAD_STATUS,
+        reject_path_separators=False,
+    )
+    if summary.document_id is not None:
+        payload[_KEY_DOCUMENT_ID] = _bounded_text(
+            summary.document_id,
+            _KEY_DOCUMENT_ID,
+            reject_path_separators=False,
+        )
+    return payload
+
+
+def _upload_completed_progress_type(summary: FinsUploadResultSummary) -> str:
+    """根据上传摘要选择 completed progress 标签。
+
+    Args:
+        summary: 上传结果摘要。
+
+    Returns:
+        failed 状态返回 completed_with_failures，否则返回 completed。
+
+    Raises:
+        无。
+    """
+
+    if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
+        return _PROGRESS_UPLOAD_COMPLETED_WITH_FAILURES
+    return _PROGRESS_UPLOAD_COMPLETED
+
+
+def _upload_completed_progress_message(summary: FinsUploadResultSummary) -> str:
+    """根据上传摘要选择用户可读 progress 说明。
+
+    Args:
+        summary: 上传结果摘要。
+
+    Returns:
+        上传完成或带失败完成的简短说明。
+
+    Raises:
+        无。
+    """
+
+    if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
+        return "上传已完成，存在失败"
+    return "上传已完成"
+
+
+def _preprocess_selected_progress_payload(
+    record: FinsIngestionJobRecord,
+    request: FinsPreprocessRequest,
+    *,
+    selected_count: int,
+) -> dict[str, JsonValue]:
+    """构建 preprocess selected progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 预处理请求。
+        selected_count: 已选择文档数量。
+
+    Returns:
+        有界 progress payload。
+
+    Raises:
+        ValueError: 请求字段或计数字段非法时抛出。
+    """
+
+    return {
+        _PAYLOAD_TICKER: record.normalized_ticker,
+        _PAYLOAD_MARKET: record.market,
+        _PAYLOAD_SOURCE_KIND: request.source_kind.value,
+        _PAYLOAD_FORM_TYPES: list(
+            _bounded_text_tuple(
+                request.form_types,
+                _PAYLOAD_FORM_TYPES,
+                reject_path_separators=False,
+            )
+        ),
+        _PAYLOAD_SELECTED_COUNT: _non_negative_count(selected_count, _PAYLOAD_SELECTED_COUNT),
+    }
+
+
+def _preprocess_document_progress_payload(
+    record: FinsIngestionJobRecord,
+    request: FinsPreprocessRequest,
+    *,
+    document_index: int,
+    document_total: int,
+) -> dict[str, JsonValue]:
+    """构建单文档 preprocess progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 预处理请求。
+        document_index: 当前文档从 1 开始的序号。
+        document_total: 总文档数量。
+
+    Returns:
+        有界 progress payload。
+
+    Raises:
+        ValueError: 计数字段非法时抛出。
+    """
+
+    payload = _preprocess_selected_progress_payload(
+        record,
+        request,
+        selected_count=document_total,
+    )
+    payload[_PAYLOAD_DOCUMENT_INDEX] = _non_negative_count(document_index, _PAYLOAD_DOCUMENT_INDEX)
+    payload[_PAYLOAD_DOCUMENT_TOTAL] = _non_negative_count(document_total, _PAYLOAD_DOCUMENT_TOTAL)
+    return payload
+
+
+def _preprocess_summary_progress_payload(
+    record: FinsIngestionJobRecord,
+    request: FinsPreprocessRequest,
+    summary: FinsPreprocessResultSummary,
+) -> dict[str, JsonValue]:
+    """构建 preprocess completed progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 预处理请求。
+        summary: 预处理结果摘要。
+
+    Returns:
+        只包含选择信息和计数的 progress payload。
+
+    Raises:
+        ValueError: 摘要字段非法时抛出。
+    """
+
+    payload = _preprocess_selected_progress_payload(
+        record,
+        request,
+        selected_count=summary.selected_count,
+    )
+    payload.update(
+        {
+            _PAYLOAD_PROCESSED_COUNT: _non_negative_count(
+                summary.processed_count,
+                _PAYLOAD_PROCESSED_COUNT,
+            ),
+            _PAYLOAD_SKIPPED_COUNT: _non_negative_count(
+                summary.skipped_count,
+                _PAYLOAD_SKIPPED_COUNT,
+            ),
+            _PAYLOAD_FAILED_COUNT: _non_negative_count(
+                summary.failed_count,
+                _PAYLOAD_FAILED_COUNT,
+            ),
+            _PAYLOAD_NOT_SUPPORTED_COUNT: len(summary.not_supported_document_ids),
+        }
+    )
+    return payload
 
 
 def _build_processed_sections(processor: DocumentProcessor) -> list[dict[str, JsonValue]]:

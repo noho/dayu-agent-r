@@ -207,10 +207,25 @@ class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
 class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
     """测试用 persisted-summary 下载 adapter。"""
 
-    def __init__(self) -> None:
-        """初始化请求记录。"""
+    def __init__(self, summary: FinsDownloadResultSummary | None = None) -> None:
+        """初始化请求记录。
+
+        Args:
+            summary: 可选的固定下载摘要；为空时使用默认 skipped 摘要。
+
+        Returns:
+            无。
+        """
 
         self.requests: list[FinsSourceDownloadAdapterRequest] = []
+        self.summary = summary or FinsDownloadResultSummary(
+            discovered_count=1,
+            downloaded_count=0,
+            skipped_count=1,
+            rejected_count=0,
+            failed_count=0,
+            written_document_ids=(),
+        )
 
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """记录请求并返回已持久化摘要。
@@ -226,17 +241,7 @@ class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
         """
 
         self.requests.append(request)
-        return FinsSourceDownloadAdapterResult(
-            discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=0,
-                skipped_count=1,
-                rejected_count=0,
-                failed_count=0,
-                written_document_ids=(),
-            ),
-        )
+        return FinsSourceDownloadAdapterResult(discovered_count=1, persisted_summary=self.summary)
 
 
 class _FakeUploadRunner(FinsUploadRunner):
@@ -854,6 +859,7 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
     start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="FAKE", form_types=("10-K",)))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
+    progress_events = _progress_events(ingestion, start.job_id)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     source_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-fake-10k", SourceKind.FILING)
     handle = runtime.source_repository.get_source_handle("AAPL", "aapl-fake-10k", SourceKind.FILING)
@@ -870,6 +876,105 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
     assert content == b"# Fake 10-K\n\nRevenue increased."
     assert adapter.requests[0].normalized_ticker.canonical == "AAPL"
     assert adapter.requests[0].normalized_ticker.market == "US"
+    assert [event.source_event_type for event in progress_events] == [
+        "download.started",
+        "download.completed",
+    ]
+    assert progress_events[0].payload["ticker"] == "AAPL"
+    assert progress_events[0].payload["source"] == "fake"
+    assert progress_events[0].payload["form_types"] == ["10-K"]
+    assert progress_events[1].payload["downloaded_count"] == 1
+    assert progress_events[1].payload["written_document_count"] == 1
+
+
+def test_start_download_production_adapter_boundary_emits_progress_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """production 下载 adapter 同步调用边界应产生 started/completed PROGRESS event。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    def fake_sec_download(
+        adapter: SecDownloadAdapter,
+        request: FinsSourceDownloadAdapterRequest,
+    ) -> FinsSourceDownloadAdapterResult:
+        """替换 production SEC adapter 的网络下载，只保留同步调用边界。
+
+        Args:
+            adapter: 被替换的 SEC adapter 实例。
+            request: runtime 传入的下载请求。
+
+        Returns:
+            有界 persisted summary。
+
+        Raises:
+            无。
+        """
+
+        del adapter
+        assert request.source == "sec"
+        return FinsSourceDownloadAdapterResult(
+            discovered_count=1,
+            persisted_summary=FinsDownloadResultSummary(
+                discovered_count=1,
+                downloaded_count=1,
+                written_document_ids=("aapl-production-10k",),
+            ),
+        )
+
+    monkeypatch.setattr(SecDownloadAdapter, "download", fake_sec_download)
+
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="sec"))
+    record = _wait_terminal(ingestion, start.job_id)
+    progress_events = _progress_events(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert [event.source_event_type for event in progress_events] == [
+        "download.started",
+        "download.completed",
+    ]
+    assert progress_events[0].payload["ticker"] == "AAPL"
+    assert progress_events[0].payload["source"] == "sec"
+    assert progress_events[1].payload["downloaded_count"] == 1
+    assert progress_events[1].payload["written_document_count"] == 1
+
+
+def test_start_download_failed_count_emits_completed_with_failures_progress(tmp_path: Path) -> None:
+    """下载摘要含失败计数时应产生 completed_with_failures progress。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _PersistedSummaryDownloadAdapter(
+        FinsDownloadResultSummary(
+            discovered_count=2,
+            downloaded_count=1,
+            skipped_count=0,
+            rejected_count=0,
+            failed_count=1,
+            written_document_ids=("aapl-partial-10k",),
+        )
+    )
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("persisted", "US"): adapter},
+    )
+
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="persisted"))
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+    progress_events = _progress_events(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert [event.source_event_type for event in progress_events] == [
+        "download.started",
+        "download.completed_with_failures",
+    ]
+    assert progress_events[1].message == "下载已完成，存在失败候选"
+    assert progress_events[1].payload["failed_count"] == 1
+    assert progress_events[1].payload["downloaded_count"] == 1
 
 
 def test_start_download_unsupported_source_writes_failed_terminal_record(tmp_path: Path) -> None:
@@ -1243,6 +1348,7 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     )
     executor.run_all()
     record = runtime.read_job(start.job_id)
+    progress_events = _progress_events(runtime, start.job_id)
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert record.result_summary["source_kind"] == "material"
@@ -1258,6 +1364,62 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert isinstance(runner.requests[0], FinsUploadMaterialRequest)
     assert runner.requests[0].action == "auto"
     assert runner.cancellation_checks == [False]
+    assert [event.source_event_type for event in progress_events] == [
+        "upload.started",
+        "upload.completed",
+    ]
+    assert progress_events[0].document_id == "aapl-investor-day"
+    assert progress_events[0].payload["source_kind"] == "material"
+    assert progress_events[0].payload["file_count"] == 1
+    assert progress_events[1].document_id == "aapl-investor-day"
+    assert progress_events[1].payload["upload_status"] == "uploaded"
+
+
+def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_path: Path) -> None:
+    """上传摘要为 failed 状态时应产生 completed_with_failures progress。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runner = _FakeUploadRunner(
+        FinsUploadResultSummary(
+            source_kind=SourceKind.MATERIAL,
+            document_id="aapl-investor-day",
+            internal_document_id="aapl-investor-day-internal",
+            status="failed",
+            uploaded_files=(),
+            primary_document=None,
+            deleted=False,
+            skip_reason="fixture failure",
+            document_version=None,
+            source_fingerprint=None,
+        )
+    )
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
+
+    start = runtime.start_upload(
+        FinsUploadMaterialRequest(
+            ticker="AAPL",
+            action="auto",
+            files=(tmp_path / "primary.pdf",),
+            form_type="8-K",
+            material_name="Investor Day",
+            document_id="aapl-investor-day",
+            internal_document_id="aapl-investor-day-internal",
+        )
+    )
+    executor.run_all()
+    record = runtime.read_job(start.job_id)
+    progress_events = _progress_events(runtime, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["status"] == "failed"
+    assert [event.source_event_type for event in progress_events] == [
+        "upload.started",
+        "upload.completed_with_failures",
+    ]
+    assert progress_events[1].message == "上传已完成，存在失败"
+    assert progress_events[1].document_id == "aapl-investor-day"
+    assert progress_events[1].payload["upload_status"] == "failed"
 
 
 def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path: Path) -> None:
@@ -1295,6 +1457,7 @@ def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path
         )
     )
     record = _wait_terminal(ingestion, start.job_id)
+    progress_events = _progress_events(ingestion, start.job_id)
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert record.result_summary["source_kind"] == "filing"
@@ -1304,6 +1467,13 @@ def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path
     meta = ingestion.source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
     assert meta["ingest_method"] == "upload"
     assert meta["primary_document"] == "aapl-10q_docling.json"
+    assert [event.source_event_type for event in progress_events] == [
+        "upload.started",
+        "upload.completed",
+    ]
+    assert progress_events[0].payload["source_kind"] == "filing"
+    assert progress_events[0].payload["file_count"] == 1
+    assert progress_events[1].payload["upload_status"] == "ok"
 
 
 def test_default_runtime_start_upload_cn_material_uses_production_runner(tmp_path: Path) -> None:
@@ -1484,13 +1654,15 @@ def test_job_events_record_queued_running_and_terminal_sequence(tmp_path: Path) 
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert [event.event_type for event in queued_events] == [FinsIngestionJobEventType.JOB_QUEUED]
-    assert [event.sequence for event in events] == [1, 2, 3]
+    assert [event.sequence for event in events] == [1, 2, 3, 4, 5]
     assert [event.event_type for event in events] == [
         FinsIngestionJobEventType.JOB_QUEUED,
         FinsIngestionJobEventType.JOB_RUNNING,
+        FinsIngestionJobEventType.PROGRESS,
+        FinsIngestionJobEventType.PROGRESS,
         FinsIngestionJobEventType.JOB_SUCCEEDED,
     ]
-    assert [event.sequence for event in after_first] == [2, 3]
+    assert [event.sequence for event in after_first] == [2, 3, 4, 5]
 
 
 def test_request_cancel_records_cancel_requested_and_terminal_cancel_events(tmp_path: Path) -> None:
@@ -1679,6 +1851,8 @@ def test_non_terminal_event_append_failure_warns_and_job_still_succeeds(
     assert record.result_summary["downloaded_count"] == 1
     assert [event.event_type for event in events] == [
         FinsIngestionJobEventType.JOB_QUEUED,
+        FinsIngestionJobEventType.PROGRESS,
+        FinsIngestionJobEventType.PROGRESS,
         FinsIngestionJobEventType.JOB_SUCCEEDED,
     ]
     assert "fins.ingestion.job_event_append_failed" in caplog.text
@@ -1747,11 +1921,87 @@ def test_terminal_event_append_failure_warns_without_rolling_back_terminal_recor
     assert [event.event_type for event in events] == [
         FinsIngestionJobEventType.JOB_QUEUED,
         FinsIngestionJobEventType.JOB_RUNNING,
+        FinsIngestionJobEventType.PROGRESS,
+        FinsIngestionJobEventType.PROGRESS,
     ]
     assert "fins.ingestion.job_event_append_failed" in caplog.text
     assert f"job_id={start.job_id}" in caplog.text
     assert "event_type=job_succeeded" in caplog.text
     assert "error_type=OSError" in caplog.text
+
+
+def test_progress_event_append_failure_warns_and_job_still_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """PROGRESS event append 失败时应 WARN，且不得改变 upload 业务终态。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runner = _FakeUploadRunner(
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            document_id="aapl-2024-10k",
+            status="uploaded",
+        )
+    )
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        upload_runner=runner,
+    )
+    start = ingestion.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
+
+    def raise_for_progress_event(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """仅在 PROGRESS event append 时模拟 sidecar 写入失败。
+
+        Args:
+            store: 被替换方法所属 job store。
+            job_id: opaque job id。
+            event: 待追加事件。
+
+        Returns:
+            非 PROGRESS event 的真实追加结果。
+
+        Raises:
+            OSError: PROGRESS event append 时抛出。
+        """
+
+        if event.event_type is FinsIngestionJobEventType.PROGRESS:
+            raise OSError("event sidecar unavailable")
+        return original_append(store, job_id, event)
+
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "append_job_event",
+        raise_for_progress_event,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
+        executor.run_all()
+
+    record = ingestion.read_job(start.job_id)
+    events = ingestion.read_job_events(start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["document_id"] == "aapl-2024-10k"
+    assert [event.event_type for event in events] == [
+        FinsIngestionJobEventType.JOB_QUEUED,
+        FinsIngestionJobEventType.JOB_RUNNING,
+        FinsIngestionJobEventType.JOB_SUCCEEDED,
+    ]
+    assert "fins.ingestion.job_event_append_failed" in caplog.text
+    assert f"job_id={start.job_id}" in caplog.text
+    assert "event_type=progress" in caplog.text
+    assert "source_event_type=upload.started" in caplog.text
+    assert "error_type=OSError" in caplog.text
+    assert "event sidecar unavailable" not in caplog.text
 
 
 def test_save_cancelled_does_not_overwrite_current_terminal_record(tmp_path: Path) -> None:
@@ -1854,6 +2104,7 @@ def test_start_preprocess_processes_source_document_to_processed_repository(tmp_
         )
     )
     record = _wait_terminal(ingestion, start.job_id)
+    progress_events = _progress_events(ingestion, start.job_id)
     processed_meta = runtime.processed_repository.get_processed_meta("AAPL", "aapl-2024-10k")
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
@@ -1863,6 +2114,16 @@ def test_start_preprocess_processes_source_document_to_processed_repository(tmp_
     assert processed_meta["document_id"] == "aapl-2024-10k"
     assert int(processed_meta["section_count"]) > 0
     assert processed_meta["parser_version"] != ""
+    assert [event.source_event_type for event in progress_events] == [
+        "preprocess.selected",
+        "preprocess.document_started",
+        "preprocess.document_processed",
+        "preprocess.completed",
+    ]
+    assert progress_events[0].payload["selected_count"] == 1
+    assert progress_events[1].document_id == "aapl-2024-10k"
+    assert progress_events[2].document_id == "aapl-2024-10k"
+    assert progress_events[3].payload["processed_count"] == 1
 
 
 def test_start_preprocess_whole_ticker_applies_limit_after_form_filter(tmp_path: Path) -> None:
@@ -1901,11 +2162,20 @@ def test_start_preprocess_skips_existing_processed_document_without_rebuild(tmp_
 
     second = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
     record = _wait_terminal(ingestion, second.job_id)
+    progress_events = _progress_events(ingestion, second.job_id)
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert record.result_summary["processed_count"] == 0
     assert record.result_summary["skipped_count"] == 1
     assert record.result_summary["skipped_document_ids"] == ["aapl-2024-10k"]
+    assert [event.source_event_type for event in progress_events] == [
+        "preprocess.selected",
+        "preprocess.document_started",
+        "preprocess.document_skipped",
+        "preprocess.completed",
+    ]
+    assert progress_events[2].document_id == "aapl-2024-10k"
+    assert progress_events[3].payload["skipped_count"] == 1
 
 
 def test_start_preprocess_rebuild_updates_existing_processed_document(tmp_path: Path) -> None:
@@ -2131,6 +2401,58 @@ def test_start_preprocess_missing_document_fails_terminal_record(tmp_path: Path)
     assert "源文档不存在" in str(record.failure_summary["message"])
 
 
+def test_start_preprocess_general_exception_emits_document_failed_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单文档预处理出现一般异常时应产生 document_failed progress。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    def fail_preprocess_document(
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        rebuild_processed: bool,
+    ) -> str:
+        """模拟处理器执行期一般异常。
+
+        Args:
+            ticker: 标准化 ticker。
+            document_id: 源文档 ID。
+            source_kind: 源文档类型。
+            rebuild_processed: 是否重建 processed 产物。
+
+        Returns:
+            不返回；总是抛出异常。
+
+        Raises:
+            RuntimeError: 始终抛出，用于触发一般异常分支。
+        """
+
+        del ticker, document_id, source_kind, rebuild_processed
+        raise RuntimeError("processor crashed")
+
+    monkeypatch.setattr(ingestion, "_preprocess_one_document", fail_preprocess_document)
+
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+    record = _wait_terminal(ingestion, start.job_id)
+    progress_events = _progress_events(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.FAILED
+    assert record.result_summary["failed_document_ids"] == ["aapl-2024-10k"]
+    assert [event.source_event_type for event in progress_events] == [
+        "preprocess.selected",
+        "preprocess.document_started",
+        "preprocess.document_failed",
+        "preprocess.completed",
+    ]
+    assert progress_events[2].message == "预处理源文档失败"
+    assert progress_events[2].document_id == "aapl-2024-10k"
+
+
 def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp_path: Path) -> None:
     """无可用处理器时应记录 not_supported 文档并按无可处理文档失败。"""
 
@@ -2147,12 +2469,21 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
 
     start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
     record = _wait_terminal(ingestion, start.job_id)
+    progress_events = _progress_events(ingestion, start.job_id)
 
     assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["selected_count"] == 1
     assert record.result_summary["processed_count"] == 0
     assert record.result_summary["not_supported_document_ids"] == ["aapl-2024-10k"]
     assert "没有任何请求文档完成预处理" in str(record.failure_summary["message"])
+    assert [event.source_event_type for event in progress_events] == [
+        "preprocess.selected",
+        "preprocess.document_started",
+        "preprocess.document_not_supported",
+        "preprocess.completed",
+    ]
+    assert progress_events[2].message == "预处理源文档不支持"
+    assert progress_events[2].document_id == "aapl-2024-10k"
 
 
 def test_save_failed_from_exception_logs_secondary_job_store_failure(
@@ -2407,6 +2738,32 @@ def _wait_terminal(
             return record
         time.sleep(0.02)
     raise AssertionError(f"job 未进入终态: {job_id}")
+
+
+def _progress_events(
+    ingestion: ingestion_runtime.FinsIngestionRuntime,
+    job_id: str,
+) -> tuple[FinsIngestionJobEventRecord, ...]:
+    """读取指定 job 的 PROGRESS events。
+
+    Args:
+        ingestion: ingestion runtime。
+        job_id: opaque job id。
+
+    Returns:
+        按 sequence 升序排列的 PROGRESS event 元组。
+
+    Raises:
+        FileNotFoundError: job id 不存在时由 runtime 抛出。
+        OSError: event sidecar 读取失败时由 runtime 抛出。
+        ValueError: event sidecar 内容非法时由 runtime 抛出。
+    """
+
+    return tuple(
+        event
+        for event in ingestion.read_job_events(job_id, after_sequence=0, limit=1000)
+        if event.event_type is FinsIngestionJobEventType.PROGRESS
+    )
 
 
 def _build_fins_workspace(
