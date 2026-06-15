@@ -63,8 +63,9 @@ GitHub Issues
 - 已并入 umbrella issue 或 child issue 的 work unit。
 - 必须等待其它 issue 完成后才能实施的依赖型 work unit。
 - 已裁决过期失效，但仍需要在总控中保留留痕，避免后续误实施的 work unit。
+- 经用户明确裁决要求纳入本文档留痕的 immediate residual work unit；这类条目必须在 Owner / Destination 中标明无 GitHub Issue，并记录用户裁决依据、进入条件和非目标。
 
-本文档不管理未建立 GitHub Issue 且可独立推进的 work unit。若某个 work unit 后续获得新的 GitHub Issue owner / destination，必须先在本文档中新增或更新对应条目，再按本文档状态进入 discussion / plan / implementation gate。
+除用户明确裁决的 immediate residual 记录项外，本文档不管理未建立 GitHub Issue 且可独立推进的 work unit。若某个 work unit 后续获得新的 GitHub Issue owner / destination，必须先在本文档中新增或更新对应条目，再按本文档状态进入 discussion / plan / implementation gate。
 
 ## 工作流
 
@@ -142,13 +143,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-CM-05 / WU-CM-06 / WU-CM-08 / WU-CM-09 completed；draft PR #140 passed final PR review；final closeout recorded |
+| gate | final closeout |
+| implementation status | WU-CM-05 / WU-CM-06 / WU-CM-08 / WU-CM-09 final closeout completed；draft PR #140 passed final PR review；final closeout artifact `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md` |
 | active work unit | none |
-| default next work unit | WU-OBS-00 |
-| next entry point | after PR #140 merge, enter WU-OBS-00 discussion gate |
+| default next work unit | WU-CLI-FINS-OBS-01 |
+| next entry point | enter WU-CLI-FINS-OBS-01 goal confirmation / discussion gate |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
 
 状态约定：
@@ -206,6 +207,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
+| WU-CLI-FINS-OBS-01 | discussion-ready | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | 当前总控仅记录，不实施；下一轮总控可从 goal confirmation / plan gate 进入 |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -223,12 +225,70 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-WAIT-02 | pending | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | production poller loop |
 | WU-WAIT-03 | pending | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
-| WU-CM-05 | completed | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `492e5620` |
-| WU-CM-06 | completed | Terminal summary text policy convergence | GitHub Issue #94 / #81 child | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `246cd1c3` |
-| WU-CM-08 | completed | Compaction material readability and smoke maintenance | GitHub Issue #95 / #81 child | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `366d8df1` |
-| WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；aggregate deepreview passed；accepted deepreview commit `3e98565d` |
+| WU-CM-05 | completed | LLM compaction proposal typed parsing | GitHub Issue #93 / #81 child | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `492e5620` |
+| WU-CM-06 | completed | Terminal summary text policy convergence | GitHub Issue #94 / #81 child | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `246cd1c3` |
+| WU-CM-08 | completed | Compaction material readability and smoke maintenance | GitHub Issue #95 / #81 child | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `366d8df1` |
+| WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+
+## WU-CLI-FINS-OBS-01 Fins Direct CLI Live Event Stream / Log / UI Print
+
+### 状态
+
+本条是用户裁决纳入本文档留痕的 immediate residual work unit，不创建 GitHub Issue。本轮总控只记录 work unit，不进入 plan、implementation、review、commit、push 或 PR gate。下一轮新总控实施时，应从 goal confirmation 继续，先核对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/README.md` 的日志与可观测性约束，以及 OLD / NEW 代码事实。
+
+### 用户裁决
+
+- 不需要创建 GitHub Issue。
+- 不在当前总控推进实施。
+- `download`、`process`、`upload_filing`、`upload_material`、`process_filing`、`process_material` 全部必须恢复 live event stream。
+- 除 Fins direct commands 外，还必须核对所有其它 CLI commands 的 log 与 UI print 是否正常；正常的命令记录直接证据，不正常的命令纳入本条修复或明确转入后续 owner。
+- 需要同时处理两个 residual：log / UI print 缺失，以及 Fins direct event stream 迁移缺失。
+
+### 设计与代码核对
+
+- `docs/host/design.md` 固定 `UI -> Service -> Host -> Engine` 分层边界：UI 负责展示、输入收集、流式订阅和用户动作触发；Service 负责业务入口、身份解析、场景装配和调用 Host。Fins direct command 不应伪装成 Host run，也不得让 CLI 绕过 Service / Fins boundary。
+- `docs/engine/design.md` 固定 stream 术语边界：Fins direct live event stream 不是 `EngineEvent stream`，也不是 `Host event stream`；不得在设计或实现中混称。
+- `dayu/README.md` 的“日志与可观测性”固定日志职责：日志用于诊断系统执行过程，不承担 UI 输出、审计真源、tool trace、EventLog canonical fact 或 projection checkpoint 职责。
+- NEW `dayu/cli/main.py` 已解析 `--log-level`、`--debug`、`--verbose`、`--quiet`，但当前 CLI main 未完成日志装配，导致普通 CLI 命令缺少符合 README 语义的 dayu 日志输出。
+- NEW `dayu/cli/commands/fins.py` 对 Fins direct 命令启动 job 后只等待 `FinsDirectCommandService.wait_for_terminal()`，运行中没有面向用户的 progress print；Ctrl+C 后才输出 cancel 文案。
+- NEW `dayu/service/fins_direct.py` 的 `wait_for_terminal()` 当前仅周期性 `read_job()` 直到终态，无法向 CLI / 未来 WeChat / GUI 提供 live progress 事件。
+- NEW `dayu/cli/commands/init.py` 已在 reset、success、usage error、operation error 和 copy failure 路径输出用户可见文本；下一轮实施前应通过测试确认 init 的 UI print 仍正常，而不是把 init 误归入 Fins live stream 缺口。
+- NEW `dayu/cli/commands/prompt.py` 与 `dayu/cli/commands/interactive.py` 均通过 `dayu/cli/output.py` 输出终态 final answer / failure / cancel 文本；但 `dayu/service/entrypoint_runtime.py` 当前只用 `watch_session_events()` 和 outbox read 等待 terminal，不向 CLI 投影运行中 progress 或 content delta。下一轮 plan 必须裁决这是否属于本条 UI print 缺口、应在本条修复，还是仅作为非 Fins Agent command 的后续 streaming/UI work。
+- NEW `dayu/cli/commands/fins.py` 的 `upload_filings_from` 当前生成并打印 batch script，不启动 live Fins job；下一轮 plan 必须把它作为其它 CLI command 输出审计项，而不是错误地要求它恢复 live job stream。
+- OLD `/Users/leo/workspace/dayu-agent` 的 Fins CLI 路径存在 `FinsEvent` live event stream，CLI 消费 `PROGRESS` / `RESULT` 事件并输出进度；NEW 底层 Fins pipeline 仍保留 `DownloadEvent` / `download_stream` 等事件能力，但 direct job adapter 路径把运行中事件压成终态 summary。
+
+### 目标
+
+- 为 Fins direct commands 恢复 live event stream，覆盖 `download`、`process`、`upload_filing`、`upload_material`、`process_filing`、`process_material`。
+- 审计全部 CLI commands 的 log 与 UI print 路径，至少覆盖 `init`、`prompt`、`interactive`、`download`、`upload_filing`、`upload_material`、`upload_filings_from`、`process`、`process_filing`、`process_material`；对每个命令记录“正常 / 本条修复 / 后续 owner”的裁决依据。
+- 在 Service / Fins boundary 提供可复用的事件消费或订阅接口，使 CLI 只是一个 UI consumer，未来 WeChat / GUI 可以复用同一 Service 能力。
+- 恢复 CLI 日志装配，使 `--log-level`、`--debug`、`--verbose`、`--quiet` 符合 `dayu/README.md` 的日志级别语义。
+- 明确区分 log 与 UI print：运行中 progress / result summary 是 UI 输出；诊断路径、执行骨架、错误上下文是日志。
+- 保留 Fins direct command 的 cancel 语义：用户中断后必须 durable `request_cancel(job_id)`，并且本地退出或继续等待的行为要有明确、可测试的用户可见输出。
+
+### 非目标
+
+- 不全量搬迁 OLD `dayu-agent` CLI 实现。
+- 不把 Fins direct commands 改造成 Host run、Host wait 或 Host event stream。
+- 不让 CLI、Service 或 Host 绕过 `dayu.fins.storage` 直接散落读取财报 storage。
+- 不引入无当前需求支撑的通用跨进程 event bus、WebSocket 框架或平台化观察者系统。
+- 不修改 Engine stream 术语或 Engine public contract。
+- 不在本条恢复 `write` workflow 或旧 Fins workflow 全量实现。
+- 不把 `upload_filings_from` 改造成 live job stream；它若继续只是脚本生成命令，验收重点是正常 UI print 和日志装配。
+- 不在没有 goal confirmation / plan 裁决的情况下，把 `prompt` / `interactive` 的模型 token/content streaming 扩大成本条必做项；本条必须先基于现有 Host public event 能力和用户可见需求裁决是否纳入。
+
+### 验收信号
+
+- 运行 `dayu-cli download --ticker CME` 后，在下载进行中能持续看到用户可见进度输出；不需要等待 Ctrl+C 或终态才看到信息。
+- `download`、`process`、`upload_filing`、`upload_material`、`process_filing`、`process_material` 都通过同一类 Service / Fins boundary 暴露 live event stream，而不是各命令在 CLI 中复制底层 storage 或 pipeline 逻辑。
+- 终态成功、失败、取消均有用户可见输出；输出不得依赖日志级别才能看见。
+- `--verbose` / `--debug` 能显示符合 README 语义的诊断日志；默认日志不淹没 UI progress，不输出 provider secret、完整业务 payload、财报原文或大段 tool result。
+- `init`、`prompt`、`interactive`、`upload_filings_from` 等非 live Fins job 命令的 UI print 经代码核对与测试分类：已正常的命令有测试或直接证据；不正常的命令已在本条修复，或被明确转入有 owner 的后续 work unit。
+- `prompt` / `interactive` 的终态输出必须保持正常；若本条裁决不实现运行中 Agent progress / content streaming，plan 必须说明直接代码证据、设计依据、用户影响和后续 owner。
+- Ctrl+C 仍触发 durable Fins job cancel；二次 Ctrl+C 或本地退出必须保留 job id 供用户追踪。
+- 测试覆盖 CLI 输出审计、Service event stream、cancel、日志装配和禁止 CLI 直接 import `dayu.fins.storage` 的边界约束。
 
 ## WU-OBS-00 Tool Trace Analyzer
 
