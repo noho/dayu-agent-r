@@ -132,6 +132,10 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 
 三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 只有显式配置非空绝对路径集合 `allowed_upload_roots` 时才注册 `start_fins_upload`；为空时返回空工具集。上传工具只接受这些根目录下的本地文件。工具调用只启动 durable Fins job 并返回 `ToolAwaitingOutcome`，不轮询 job、不直接 resolve Host wait。
 
+### Batch upload plan
+
+`dayu.fins.upload_batch` 提供本地批量上传计划生成能力。它接收 `UploadBatchPlanRequest`，扫描调用方显式传入的本地源目录，并返回 `UploadBatchPlanResult` 与结构化 `UploadBatchPlanEntry` 条目。该 helper 通过公开常量 `FINS_UPLOAD_FILE_SUFFIXES` 固定 upload 输入后缀真源，只识别可作为 upload 输入的普通文件，并基于文件名中的 filing form token 或调用方传入的 `material_forms` 生成 `upload_filing` / `upload_material` 计划；它不启动 ingestion job、不读取 Fins storage、不创建 Host Run，也不输出 shell 文本。
+
 ### Ingestion runtime 与 wait adapter
 
 `dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载、预处理与上传的 typed runtime foundation：

@@ -9,6 +9,12 @@ Dayu runtime assembly 配置分两层：
 1. 包内默认配置：`dayu/config/`
 2. 工作区覆盖配置：`workspace/config/`
 
+`dayu-cli init --base <workspace>` 会创建目标 workspace，并把当前包内默认配置文件和 `prompts/`
+资产复制到 `<workspace>/config/`。该命令只生成当前 schema 所需的 `models.json`、
+`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json`
+和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会写入明文 API key。
+目标配置文件已存在时默认失败，传 `--overwrite` 才会替换。
+
 `dayu.runtime.location.resolve_runtime_locations` 负责把项目根目录解析为 runtime assembly 位置：`workspace/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
 `dayu.runtime.config_loader.ConfigLoader` 默认加载包内配置；调用方可以显式传入 workspace 配置目录。ConfigLoader 不解析环境变量，不替换 secret，不脱敏，也不 import Host、Engine、Service、UI、Fins 或具体业务工具包。

@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：
+运行当前契约、CLI、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/documents tests/fins tests/tools tests/host tests/runtime tests/service tests/engine -q
+pytest tests/contracts tests/cli tests/documents tests/fins tests/tools tests/host tests/runtime tests/service tests/engine -q
 ```
 
 运行类型检查：
@@ -36,6 +36,7 @@ pytest -o addopts="" -m stress tests/host/test_host_production_stress.py -q
 
 ```bash
 pytest tests/contracts -q
+pytest tests/cli -q
 pytest tests/documents -q
 pytest tests/fins -q
 pytest tests/tools -q
@@ -78,6 +79,24 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 ## 当前测试分层
 
+### `tests/cli/`
+
+CLI UI adapter 测试，当前覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
+用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及 `init`
+对 current schema workspace config / prompts 的 bootstrap、existing file / overwrite、reset 硬编码白名单、symlink
+escape fail-fast、旧配置文件不生成、生成配置可由 `ConfigLoader` 加载和复制阶段 SIGINT 130；
+`python -m dayu.cli --help` 入口。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、stable
+Host slot key、unsupported 旧执行参数 fail fast、真实 `prompt.json` required context slots、mock Host public
+open/follow-up terminal path、fast terminal、outbox fallback、FAILED terminal 输出和 SIGINT 后 Host public cancel request；
+`interactive` 命令测试覆盖 label / new-session session binding、真实 `interactive.json` required context slots、两轮同
+Session、每轮独立 watcher attach/close、fast terminal、FAILED / CANCELLED 继续输入、LOST fatal、运行态 SIGINT cancel、
+第二次 SIGINT 本地 130、显式 config 错误和 unsupported 旧执行参数 fail fast。Fins direct command 测试覆盖
+`download`、`upload_filing`、`upload_material`、`process`、`process_filing`、`process_material` 的 CLI 参数到
+`FinsDirectCommandService` 显式方法参数转换、upload file 存在性与 allowlist 前置校验、`--infer` / `--ci`
+fail fast、`upload_filings_from` 的本地目录扫描、filing / material 识别、脚本 quoting、`--output` 写入、错误码和扫描期 SIGINT 130、terminal exit mapping、SIGINT 后
+`request_cancel(job_id)` 与第二次 SIGINT 本地 130，以及 CLI 不直接 import `dayu.fins.storage`。
+CLI 测试不得启动真实 Host / Fins 业务路径；涉及 Host 状态机时使用 Service helper 与 mocked Host public API。
+
 ### `tests/runtime/`
 
 运行时基础设施测试，覆盖 `dayu.runtime` 的层中立边界、取消 helper、diagnostic 文本 helper、digest helper 与日志装配：
@@ -95,7 +114,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 - digest：覆盖层中立 UTF-8 文本 digest 的稳定 `sha256:<hex>` 输出形态。
 - logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 - config loader：覆盖 `models.json`、`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json` 的 typed view 加载、workspace 同 id 整条替换、合法单继承链、missing / self / circular / multi / invalid `extends` 错误路径、catalog record 内重复 id 字段 fail fast、execution profile 上下文窗口分档校验、工具重复治理 decision allowlist、旧 execution profile 字段与旧 runner hint `max_tokens` fail fast、host runtime lane 引用校验和旧配置文件不读取。
-- runtime location：覆盖 `workspace/config` 存在与不存在时的 `config_overlay_dir`，workspace prompt assets 优先级，以及包内 prompt / manifest 默认资产缺失时 fail fast。
+- runtime location：覆盖 `workspace/config` 存在与不存在时的 `config_overlay_dir`，显式 config overlay 目录存在 / 缺失 / 非目录边界，workspace prompt assets 优先级，以及包内 prompt / manifest 默认资产缺失时 fail fast。
 - tool call projection：覆盖 current `ToolCallable` 共享参数投影与 outcome 构造 helper，包括 schema default、类型收窄、unknown / missing / enum / range / array item 参数失败、固定 `invalid_argument` failure、completed / failed outcome metadata，以及 Host cancellation token 对应的 `ToolCancelledOutcome(host_cancelled)`。
 - scene prepare：覆盖单 scene 装配、system prompt 输出、fragment refs / source refs / digest、required context slot、未知 / 非字符串 placeholder、双花括号字面量保留、单继承、可选或继承的 model hints、旧 `conversation` / 泛化 `runtime` / 旧 model 字段 fail fast、typed agent policy override、fragment id / order 冲突、fragment path containment、missing required fragment fail-closed，以及 `all` / `none` / `select` 工具选择的 names、tags、并集、未知工具和空匹配语义。
 - tools discovery：覆盖显式 import path / package entry point provider 解析、禁用 provider 跳过、provider identity / source refs / 空工具输出 fail-fast、重复 provider / 工具名、reserved framework tool name 防线，以及 source refs 内容摘要规范化。
@@ -108,9 +127,11 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime typed config、locations、工具发现、prepared scene、显式 override 与 env/secret mapping 映射为 Host public typed inputs：
 
-- host assembly：覆盖 `host_runtime.json` 的 SQLite write retry、payload inline threshold、worker startup timeout 等 construction tuning 被映射进 `OpenHostOptions`，execution profile 的工具重复治理 policy 被映射进 `HostToolingOptions`，provider secret 占位符在 Service helper 中解析，prompt asset path / 工具发现 source refs / provider location 边界 fail-fast，compactor scene 必填 AgentPolicy 字段校验，以及 per-run helper 直接使用 `PreparedSceneInputs.system_prompt` 生成 `SubmitFollowupRequest`。
+- host assembly：覆盖 `host_runtime.json` 的 SQLite write retry、payload inline threshold、worker startup timeout 等 construction tuning 被映射进 `OpenHostOptions`，execution profile 的工具重复治理 policy 被映射进 `HostToolingOptions`，provider secret 占位符在 Service helper 中解析，prompt asset path / 工具发现 source refs / provider location 边界 fail-fast，compactor scene 必填 AgentPolicy 字段校验，per-run helper 直接使用 `PreparedSceneInputs.system_prompt` 生成 `SubmitFollowupRequest`，以及 `ServiceRunOverrides` 到完整 `RunnerCallOptions` / `AgentPolicy` 的 typed override 合并。
+- entrypoint runtime：覆盖 reusable Agent entrypoint Service boundary 的 runtime 准备、Session ensure/create、session helper 参数校验、submit 前 watcher attach、fast terminal race、无关 terminal 过滤、watcher failure 诊断后 outbox fallback、`get_run` + outbox fallback、`OutboxTerminalCursor` / `seen_terminal_event_ids` / `limit=50`、`CAUGHT_UP` 分页、`LAGGED` 重试、`FAILED` 与 caught-up-without-match 错误、watcher close、cancel 已终态跳过 `cancel_run(...)`、cancel 与终态竞争失败后继续 public terminal fallback，以及 `CancelRunRequest(context, client_request_id, reason, mode)` 构造；interactive path 覆盖真实 `interactive.json` required slots 和连续两轮独立 terminal wait state。
+- Fins direct：覆盖 reusable Fins direct Service boundary 的 download / preprocess typed request 构造、upload wrapper 到 `FinsIngestionRuntime.start_upload(...)` union API、默认 1.0 秒 poll interval、非终态 sleep、SUCCEEDED / FAILED / CANCELLED exit mapping、durable `request_cancel(job_id)` 和非法 poll interval fail fast。
 - Fins awaiting assembly：覆盖 Service 基于启用 provider 的显式 provider id、import path、source id 与 provider config 识别 Fins download / preprocess / upload awaiting providers，为 `HostToolingOptions` 绑定 wait adapter registry，并在 workspace root 不一致或重复 wait binding 时于 `open_host` 前 fail fast。
-- import boundary / weak typing guard：阻止 Service 导入 Config、UI 或 Fins 非 assembly 边界；当前只允许 Service composition helper 导入 `dayu.fins.ingestion` 来装配 Fins wait adapter，并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
+- import boundary / weak typing guard：阻止 Service 导入 Config、UI 或 Fins 非 assembly 边界；当前只允许 Service composition helper 导入 `dayu.fins.ingestion` 装配 Fins wait adapter，以及 `dayu.service.fins_direct` 导入 Fins runtime / request / enum public boundary，并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
 
 ### `tests/contracts/`
 

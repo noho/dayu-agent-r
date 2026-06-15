@@ -8,6 +8,7 @@ Host public API，不读取 Fins storage，也不把 raw config fragment 传入 
 
 from __future__ import annotations
 
+import math
 import pathlib
 import re
 from collections.abc import Mapping, Sequence
@@ -138,6 +139,64 @@ class ServiceAssemblyOverrides:
     execution_profile_id: str | None = None
     model_id: str | None = None
     runner_option_hint_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceRunOverrides:
+    """Service 单次 Run 显式 override。
+
+    :param temperature: Runner 调用温度；``None`` 表示使用当前 assembly baseline。
+    :param tool_execution_timeout_seconds: 工具执行握手超时秒数；``None`` 表示
+        使用当前 AgentPolicy baseline。
+    :param max_iterations: Agent loop 最大迭代数；``None`` 表示使用 baseline。
+    :param fallback_mode: Agent fallback 模式；``None`` 表示使用 baseline。
+    :param fallback_prompt: Agent fallback prompt；``None`` 表示使用 baseline。
+    :param max_consecutive_failed_tool_batches: 连续失败工具批次阈值；``None``
+        表示使用 baseline。
+    """
+
+    temperature: float | None = None
+    tool_execution_timeout_seconds: float | None = None
+    max_iterations: int | None = None
+    fallback_mode: str | None = None
+    fallback_prompt: str | None = None
+    max_consecutive_failed_tool_batches: int | None = None
+
+    def __post_init__(self) -> None:
+        """校验单次 Run override 字段。
+
+        :returns: ``None``。
+        :raises ValueError: 数值字段非法、fallback 模式非法或 prompt 为空时抛出。
+        """
+
+        _require_optional_finite_float(
+            self.temperature,
+            field_name="ServiceRunOverrides.temperature",
+        )
+        _require_optional_positive_float(
+            self.tool_execution_timeout_seconds,
+            field_name="ServiceRunOverrides.tool_execution_timeout_seconds",
+        )
+        _require_optional_positive_int(
+            self.max_iterations,
+            field_name="ServiceRunOverrides.max_iterations",
+        )
+        if self.fallback_mode is not None:
+            try:
+                _agent_fallback_mode_from_config(self.fallback_mode)
+            except ValueError as exc:
+                raise ValueError(
+                    "ServiceRunOverrides.fallback_mode has unsupported value: "
+                    f"{self.fallback_mode}"
+                ) from exc
+        _require_optional_non_empty_text(
+            self.fallback_prompt,
+            field_name="ServiceRunOverrides.fallback_prompt",
+        )
+        _require_optional_positive_int(
+            self.max_consecutive_failed_tool_batches,
+            field_name="ServiceRunOverrides.max_consecutive_failed_tool_batches",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,6 +530,59 @@ def compose_submit_followup_request(
         agent_policy=None,
         behavior=behavior,
         target_run_id=target_run_id,
+    )
+
+
+def compose_submit_followup_request_with_overrides(
+    *,
+    context: HostCallContext,
+    session_id: str,
+    client_request_id: str,
+    scene_inputs: PreparedSceneInputs,
+    user_prompt: str,
+    tool_names: frozenset[str] | None,
+    behavior: FollowupBehavior,
+    target_run_id: str | None,
+    host_assembly: ServiceOpenHostAssemblyResult,
+    run_overrides: ServiceRunOverrides,
+) -> SubmitFollowupRequest:
+    """把 Service 本轮输入与单次 Run override 映射为 follow-up 请求。
+
+    :param context: Host 调用上下文。
+    :param session_id: Session id。
+    :param client_request_id: 幂等请求 id。
+    :param scene_inputs: ``ScenePrepare`` 输出。
+    :param user_prompt: 本轮用户输入。
+    :param tool_names: 本轮工具选择；``None`` 表示全量，空集合表示禁用。
+    :param behavior: Host followup 行为。
+    :param target_run_id: 目标 Run id；无目标时为 ``None``。
+    :param host_assembly: 当前 Host opener assembly 结果。
+    :param run_overrides: 本轮可映射的显式 override。
+    :returns: 带完整 ``runner_options`` 与 ``agent_policy`` 的
+        SubmitFollowupRequest。
+    :raises ValueError: override 字段非法时由底层校验抛出。
+    """
+
+    base_request = compose_submit_followup_request(
+        context=context,
+        session_id=session_id,
+        client_request_id=client_request_id,
+        scene_inputs=scene_inputs,
+        user_prompt=user_prompt,
+        tool_names=tool_names,
+        behavior=behavior,
+        target_run_id=target_run_id,
+    )
+    return replace(
+        base_request,
+        runner_options=_runner_options_with_run_overrides(
+            host_assembly=host_assembly,
+            run_overrides=run_overrides,
+        ),
+        agent_policy=_agent_policy_with_run_overrides(
+            host_assembly=host_assembly,
+            run_overrides=run_overrides,
+        ),
     )
 
 
@@ -1053,6 +1165,27 @@ def _runner_options_from_hint(
     )
 
 
+def _runner_options_with_run_overrides(
+    *,
+    host_assembly: ServiceOpenHostAssemblyResult,
+    run_overrides: ServiceRunOverrides,
+) -> RunnerCallOptions:
+    """按本轮 override 生成完整 RunnerCallOptions。
+
+    :param host_assembly: 当前 Host opener assembly 结果。
+    :param run_overrides: 单次 Run 显式 override。
+    :returns: 完整 RunnerCallOptions。
+    :raises ValueError: override 字段非法时由 dataclass 校验抛出。
+    """
+
+    baseline = _runner_options_from_hint(
+        host_assembly.ordinary_selection.runner_option_hint
+    )
+    if run_overrides.temperature is None:
+        return baseline
+    return replace(baseline, temperature=run_overrides.temperature)
+
+
 def _agent_policy_defaults_from_config(
     profile: AgentPolicyConfig,
 ) -> AgentPolicyDefaults:
@@ -1072,6 +1205,53 @@ def _agent_policy_defaults_from_config(
         fallback_prompt=profile.fallback_prompt,
         continuation_prompt=profile.continuation_prompt,
         max_consecutive_failed_tool_batches=(profile.max_consecutive_failed_tool_batches),
+    )
+
+
+def _agent_policy_with_run_overrides(
+    *,
+    host_assembly: ServiceOpenHostAssemblyResult,
+    run_overrides: ServiceRunOverrides,
+) -> AgentPolicy:
+    """按本轮 override 生成完整 AgentPolicy。
+
+    :param host_assembly: 当前 Host opener assembly 结果。
+    :param run_overrides: 单次 Run 显式 override。
+    :returns: 完整 AgentPolicy。
+    :raises ValueError: fallback mode 或 AgentPolicy 字段非法时抛出。
+    """
+
+    baseline = _agent_policy_from_merged(host_assembly.agent_policy_config)
+    fallback_mode = (
+        baseline.fallback_mode
+        if run_overrides.fallback_mode is None
+        else _agent_fallback_mode_from_config(run_overrides.fallback_mode)
+    )
+    return AgentPolicy(
+        max_iterations=(
+            baseline.max_iterations
+            if run_overrides.max_iterations is None
+            else run_overrides.max_iterations
+        ),
+        continuation_max_attempts=baseline.continuation_max_attempts,
+        allow_tool_calls=baseline.allow_tool_calls,
+        tool_execution_timeout_seconds=(
+            baseline.tool_execution_timeout_seconds
+            if run_overrides.tool_execution_timeout_seconds is None
+            else run_overrides.tool_execution_timeout_seconds
+        ),
+        fallback_mode=fallback_mode,
+        fallback_prompt=(
+            baseline.fallback_prompt
+            if run_overrides.fallback_prompt is None
+            else run_overrides.fallback_prompt
+        ),
+        continuation_prompt=baseline.continuation_prompt,
+        max_consecutive_failed_tool_batches=(
+            baseline.max_consecutive_failed_tool_batches
+            if run_overrides.max_consecutive_failed_tool_batches is None
+            else run_overrides.max_consecutive_failed_tool_batches
+        ),
     )
 
 
@@ -1104,6 +1284,47 @@ def _agent_fallback_mode_from_config(value: str) -> AgentFallbackMode:
     """
 
     return AgentFallbackMode(value)
+
+
+def _require_optional_finite_float(value: float | None, *, field_name: str) -> None:
+    """校验可选浮点数字段为有限数。
+
+    :param value: 待校验值。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises ValueError: 值不是有限数时抛出。
+    """
+
+    if value is not None and not math.isfinite(value):
+        raise ValueError(f"{field_name} must be finite")
+
+
+def _require_optional_positive_float(value: float | None, *, field_name: str) -> None:
+    """校验可选浮点数字段为有限正数。
+
+    :param value: 待校验值。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises ValueError: 值不是有限正数时抛出。
+    """
+
+    if value is None:
+        return
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be finite and > 0")
+
+
+def _require_optional_positive_int(value: int | None, *, field_name: str) -> None:
+    """校验可选整数字段为正整数。
+
+    :param value: 待校验值。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises ValueError: 值不是正整数时抛出。
+    """
+
+    if value is not None and value < 1:
+        raise ValueError(f"{field_name} must be >= 1")
 
 
 def _memory_projection_policy_from_config(
