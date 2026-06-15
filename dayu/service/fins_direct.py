@@ -9,8 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
@@ -18,6 +19,7 @@ from typing import Final, Protocol
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_events import FinsIngestionJobEventRecord, FinsIngestionJobEventType
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
     FinsIngestionJobRecord,
@@ -31,13 +33,21 @@ from dayu.fins.service_runtime import DefaultFinsRuntime
 
 DEFAULT_FINS_DIRECT_POLL_INTERVAL_SECONDS: Final[float] = 1.0
 MAX_FINS_DIRECT_POLL_INTERVAL_SECONDS: Final[float] = 60.0
+FINS_DIRECT_JOB_EVENT_READ_LIMIT: Final[int] = 100
+FINS_DIRECT_SYNTHETIC_TERMINAL_EVENT_LABEL: Final[str] = "job_terminal_fallback"
 FINS_DIRECT_EXIT_SUCCESS: Final[int] = 0
 FINS_DIRECT_EXIT_FAILURE: Final[int] = 1
 FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT: Final[int] = 130
 
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
 
 class FinsDirectUsageError(ValueError):
     """Fins direct Service 参数错误。"""
+
+
+class FinsDirectRuntimeStateError(RuntimeError):
+    """Fins direct runtime 持久化状态不一致。"""
 
 
 class FinsDirectIngestionRuntime(Protocol):
@@ -96,6 +106,24 @@ class FinsDirectIngestionRuntime(Protocol):
 
         :param job_id: Fins ingestion job id。
         :returns: 当前持久化 job record。
+        :raises Exception: job 不存在或读取失败时由具体实现抛出。
+        """
+
+        ...
+
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = FINS_DIRECT_JOB_EVENT_READ_LIMIT,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """读取 job event sidecar 中的事件。
+
+        :param job_id: Fins ingestion job id。
+        :param after_sequence: 只读取 sequence 大于该值的事件。
+        :param limit: 单次最多读取事件数量。
+        :returns: 按 sequence 升序排列的事件。
         :raises Exception: job 不存在或读取失败时由具体实现抛出。
         """
 
@@ -170,6 +198,33 @@ class FinsDirectTerminalResult:
     exit_code: int
     result_summary: Mapping[str, JsonValue]
     failure_summary: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class FinsDirectJobEvent:
+    """Fins direct job 的 Service-facing 事件。
+
+    Attributes:
+        job_id: Fins ingestion job id。
+        sequence: 当前 job 内递增的事件游标；合成 terminal fallback 使用本地下一游标。
+        command_name: 用户可见 direct command 名称。
+        ticker: 当前 direct request 的 canonical ticker 文本。
+        status: 事件发生时的 job 状态；普通 progress 可为空。
+        event_label: 用户界面可展示的事件标签。
+        message: 有界、用户可读事件说明。
+        payload: 有界 JSON-compatible 业务摘要。
+        terminal_result: terminal event 对应的 direct terminal result；非终态为空。
+    """
+
+    job_id: str
+    sequence: int
+    command_name: str
+    ticker: str
+    status: FinsIngestionJobStatus | None
+    event_label: str
+    message: str
+    payload: Mapping[str, JsonValue]
+    terminal_result: FinsDirectTerminalResult | None
 
 
 class FinsDirectCommandService:
@@ -459,6 +514,62 @@ class FinsDirectCommandService:
                 return _terminal_result(record)
             await self._sleep(self.poll_interval_seconds)
 
+    async def stream_job_events_until_terminal(
+        self,
+        handle: FinsDirectJobHandle,
+        *,
+        after_sequence: int = 0,
+    ) -> AsyncIterator[FinsDirectJobEvent]:
+        """订阅 Fins direct job event，直到 terminal event 或 terminal fallback。
+
+        :param handle: job 启动后返回的 Service handle。
+        :param after_sequence: 只读取 sequence 大于该值的事件。
+        :returns: Fins direct job event 异步迭代器。
+        :raises FinsDirectUsageError: after_sequence 为负数时抛出。
+        :raises Exception: event 或 job record 读取失败时由 runtime 抛出。
+        """
+
+        if after_sequence < 0:
+            raise FinsDirectUsageError("after_sequence must not be negative")
+
+        cursor = after_sequence
+        while True:
+            events = self._runtime.read_job_events(
+                handle.job_id,
+                after_sequence=cursor,
+                limit=FINS_DIRECT_JOB_EVENT_READ_LIMIT,
+            )
+            if events:
+                for event in events:
+                    cursor = event.sequence
+                    projected = _job_event(
+                        event,
+                        handle=handle,
+                        terminal_result=self._terminal_result_for_event(event),
+                    )
+                    yield projected
+                    if projected.terminal_result is not None:
+                        return
+                continue
+
+            await self._sleep(self.poll_interval_seconds)
+            record = self._runtime.read_job(handle.job_id)
+            if _is_terminal_status(record.status):
+                terminal_result = _terminal_result(record)
+                _LOGGER.warning(
+                    "Fins direct job terminal record observed without terminal event; "
+                    "job_id=%s status=%s reason=%s",
+                    handle.job_id,
+                    record.status.value,
+                    "missing_terminal_event",
+                )
+                yield _synthetic_terminal_job_event(
+                    handle=handle,
+                    sequence=cursor + 1,
+                    terminal_result=terminal_result,
+                )
+                return
+
     def request_cancel(self, job_id: str) -> FinsIngestionJobRecord:
         """请求取消 Fins ingestion job。
 
@@ -468,6 +579,29 @@ class FinsDirectCommandService:
         """
 
         return self._runtime.request_cancel(job_id)
+
+    def _terminal_result_for_event(
+        self,
+        event: FinsIngestionJobEventRecord,
+    ) -> FinsDirectTerminalResult | None:
+        """按 terminal job event 读取 job record 并构造终态结果。
+
+        :param event: Fins ingestion job event record。
+        :returns: terminal event 返回终态结果；非 terminal event 返回 ``None``。
+        :raises Exception: terminal event 对应 job record 读取失败时由 runtime 抛出。
+        :raises FinsDirectRuntimeStateError: terminal event 对应的 job record 尚未进入终态时抛出。
+        """
+
+        if not _is_terminal_event_type(event.event_type):
+            return None
+        record = self._runtime.read_job(event.job_id)
+        if not _is_terminal_status(record.status):
+            raise FinsDirectRuntimeStateError(
+                "terminal job event observed before terminal job record; "
+                f"job_id={event.job_id} event_sequence={event.sequence} "
+                f"event_type={event.event_type.value} record_status={record.status.value}"
+            )
+        return _terminal_result(record)
 
 
 def _validate_poll_interval_seconds(value: float) -> None:
@@ -549,14 +683,102 @@ def _terminal_result(record: FinsIngestionJobRecord) -> FinsDirectTerminalResult
     )
 
 
+def _job_event(
+    event: FinsIngestionJobEventRecord,
+    *,
+    handle: FinsDirectJobHandle,
+    terminal_result: FinsDirectTerminalResult | None,
+) -> FinsDirectJobEvent:
+    """把 Fins runtime event 投影为 Service-facing direct event。
+
+    :param event: Fins ingestion job event record。
+    :param handle: direct job handle，用于补齐 command 与 ticker。
+    :param terminal_result: terminal event 对应的终态结果。
+    :returns: Fins direct job event。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return FinsDirectJobEvent(
+        job_id=event.job_id,
+        sequence=event.sequence,
+        command_name=handle.start_request.command_name,
+        ticker=handle.start_request.ticker,
+        status=event.status,
+        event_label=_event_label(event),
+        message=event.message,
+        payload=event.payload,
+        terminal_result=terminal_result,
+    )
+
+
+def _event_label(event: FinsIngestionJobEventRecord) -> str:
+    """选择对 UI 友好的事件标签。
+
+    :param event: Fins ingestion job event record。
+    :returns: source event type 优先；为空时返回 Fins job event type。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if event.source_event_type:
+        return event.source_event_type
+    return event.event_type.value
+
+
+def _is_terminal_event_type(event_type: FinsIngestionJobEventType) -> bool:
+    """判断事件类型是否表示 job terminal 状态已保存。
+
+    :param event_type: Fins job event type。
+    :returns: terminal status event 返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return event_type in {
+        FinsIngestionJobEventType.JOB_SUCCEEDED,
+        FinsIngestionJobEventType.JOB_FAILED,
+        FinsIngestionJobEventType.JOB_CANCELLED,
+    }
+
+
+def _synthetic_terminal_job_event(
+    *,
+    handle: FinsDirectJobHandle,
+    sequence: int,
+    terminal_result: FinsDirectTerminalResult,
+) -> FinsDirectJobEvent:
+    """构造 terminal event sidecar 缺失时的合成终态事件。
+
+    :param handle: direct job handle。
+    :param sequence: 合成事件游标。
+    :param terminal_result: 从 job record 读取出的终态结果。
+    :returns: 合成的 Fins direct terminal event。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return FinsDirectJobEvent(
+        job_id=handle.job_id,
+        sequence=sequence,
+        command_name=handle.start_request.command_name,
+        ticker=handle.start_request.ticker,
+        status=terminal_result.status,
+        event_label=FINS_DIRECT_SYNTHETIC_TERMINAL_EVENT_LABEL,
+        message="job terminal record observed without terminal event",
+        payload={},
+        terminal_result=terminal_result,
+    )
+
+
 __all__: tuple[str, ...] = (
     "DEFAULT_FINS_DIRECT_POLL_INTERVAL_SECONDS",
     "FINS_DIRECT_EXIT_FAILURE",
     "FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT",
     "FINS_DIRECT_EXIT_SUCCESS",
+    "FINS_DIRECT_JOB_EVENT_READ_LIMIT",
+    "FINS_DIRECT_SYNTHETIC_TERMINAL_EVENT_LABEL",
     "FinsDirectCommandService",
     "FinsDirectIngestionRuntime",
+    "FinsDirectJobEvent",
     "FinsDirectJobHandle",
+    "FinsDirectRuntimeStateError",
     "FinsDirectRuntimeRequest",
     "FinsDirectStartRequest",
     "FinsDirectTerminalResult",
