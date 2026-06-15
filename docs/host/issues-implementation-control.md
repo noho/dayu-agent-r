@@ -144,7 +144,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | review |
-| implementation status | WU-CLI-FINS-OBS-01 Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da`; Slice S4 accepted commit `e597d8e8`; Slice S5 accepted commit `8d93dc68`; Slice S6 review PASS and accepted; aggregate deepreview ready |
+| implementation status | WU-CLI-FINS-OBS-01 Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da`; Slice S4 accepted commit `e597d8e8`; Slice S5 accepted commit `8d93dc68`; Slice S6 accepted commit `2d4679af`; aggregate deepreview ready |
 | active work unit | WU-CLI-FINS-OBS-01 |
 | default next work unit | WU-CLI-FINS-OBS-01 |
 | next entry point | aggregate deepreview / work-unit closeout for WU-CLI-FINS-OBS-01 |
@@ -207,7 +207,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | review | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da`; Slice S4 accepted commit `e597d8e8`; Slice S5 accepted commit `8d93dc68`; Slice S6 review PASS and accepted; aggregate deepreview ready |
+| WU-CLI-FINS-OBS-01 | review | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da`; Slice S4 accepted commit `e597d8e8`; Slice S5 accepted commit `8d93dc68`; Slice S6 accepted commit `2d4679af`; aggregate deepreview ready |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -329,6 +329,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - slice 6 code review: `docs/reviews/wu-cli-fins-obs-01-s6-review-mimo-20260615-204936.md`; `docs/reviews/wu-cli-fins-obs-01-s6-review-ds-20260615-204936.md`
 - slice 6 code review adjudication: `docs/reviews/wu-cli-fins-obs-01-s6-review-adjudication-20260615-205433.md`
 - slice 6 review conclusion: PASS; remaining blockers none
+- slice 6 accepted commit: `2d4679af`
 
 ## WU-OBS-00 Tool Trace Analyzer
 
