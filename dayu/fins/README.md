@@ -522,11 +522,12 @@ start_download / start_preprocess / start_upload
 
 ## 事件流
 
-Fins 不产出 `EngineEvent stream` 或 `Host event stream`。Fins 对 Agent 的可观察输出只有三类：
+Fins 不产出 `EngineEvent stream` 或 `Host event stream`，也不写 Host EventLog。Fins 对 Agent / Service direct 调用方的可观察输出包括：
 
 - read tools 的普通 `ToolExecutionOutcome`。
 - download / preprocess / upload start tools 的 `ToolAwaitingOutcome(EXTERNAL_JOB)`。
 - wait adapter poll 时把 Fins job terminal record 映射成 Host resolve outcome。
+- direct job 调用方通过 `read_job_events(...)` 读取的 Fins job event sidecar；这些事件只服务 Service / UI 观察，不是 Host durable truth。
 
 Fins job record 是 Fins 自有治理记录；只有经 Host wait adapter 和 Host ingest / resolve 路径接受后，才会影响 Host Run / Attempt 状态。Download、preprocess 与 upload awaiting tools 都使用同一个 Fins wait adapter key，由 Service assembly 根据启用的 provider 显式绑定。
 
