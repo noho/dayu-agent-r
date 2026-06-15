@@ -144,7 +144,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | accepted plan commit |
-| implementation status | WU-CLI-FINS-OBS-01 plan re-review PASS；accepted plan commit `7cfcec6b` |
+| implementation status | WU-CLI-FINS-OBS-01 plan re-review PASS；accepted plan commit `f9cb56de` |
 | active work unit | WU-CLI-FINS-OBS-01 |
 | default next work unit | WU-CLI-FINS-OBS-01 |
 | next entry point | enter WU-CLI-FINS-OBS-01 implementation gate |
@@ -207,7 +207,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | planning | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | plan re-review PASS；accepted plan commit `7cfcec6b` |
+| WU-CLI-FINS-OBS-01 | planning | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | plan re-review PASS；accepted plan commit `f9cb56de` |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -300,7 +300,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - plan review fix: `docs/reviews/wu-cli-fins-obs-01-plan-review-fix-codex.md`
 - plan re-review: `docs/reviews/plan-review-20260615-181139.md`; `docs/reviews/plan-review-20260615-181200.md`
 - plan re-review conclusion: PASS; accepted findings fixed 8/8; remaining blockers none
-- accepted plan commit: `7cfcec6b`
+- accepted plan commit: `f9cb56de`
 
 ## WU-OBS-00 Tool Trace Analyzer
 
