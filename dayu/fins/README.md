@@ -144,6 +144,7 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `start_preprocess(FinsPreprocessRequest, *, cancellation_token: CancellationToken | None = None) -> FinsIngestionJobStart`
 - `start_upload(FinsUploadRequest, *, cancellation_token: CancellationToken | None = None) -> FinsIngestionJobStart`
 - `read_job(job_id) -> FinsIngestionJobRecord`
+- `read_job_events(job_id, *, after_sequence=0, limit=100) -> tuple[FinsIngestionJobEventRecord, ...]`
 - `request_cancel(job_id) -> FinsIngestionJobRecord`
 
 `dayu.fins.ingestion.wait_adapter` 提供 Host wait-resume integration：
@@ -264,6 +265,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 - `FinsSourceDownloadAdapter` / `FinsSourceDownloadAdapterRequest` / `FinsSourceDownloadAdapterResult`：下载来源 adapter 协议。
 - `FinsUploadRunner` / `FinsJobCancellationChecker` / `FinsUploadResultSummary`：上传 runner 边界、协作式取消检查器与有界结果摘要。
 - `FinsIngestionJobRecord` / `FinsIngestionJobStatus` / `FinsIngestionOperationKind` / `FinsIngestionJobStart`：ingestion durable job 契约。
+- `dayu.fins.ingestion_events`：ingestion job event 的 canonical 公共入口，导出 `FinsIngestionJobEventAppend`、`FinsIngestionJobEventRecord`、`FinsIngestionJobEventType` 与有界 payload 校验 helper。
 - `FinsIngestionStartCancelledError`：可选启动取消 token 在 durable job 创建前命中时的 runtime 异常。
 - `FinsIngestionJobStore` / `FsFinsIngestionJobStore`：ingestion job record 存储协议与文件系统实现。
 - `FinancialDataProcessor` / `FinancialStatementResult` / `XbrlFactsResult`：财务报表与 XBRL 查询能力协议。
@@ -368,7 +370,7 @@ Fins workspace 规则固定如下：
 - Fins provider effective spec 的 `workspace_root` 必须是非空绝对路径；provider 不从 cwd 或环境变量推断。
 - 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools`、`financial-upload-tools` 均为 enabled 且 raw config 中 `workspace_root=null`；Service assembly 会注入运行时 workspace。upload provider 额外默认 `allowed_upload_roots=[]`，因此默认不注册上传工具。
 - Service assembly 为 Fins awaiting providers 构造 wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess / upload provider 使用同一个绝对 `workspace_root`。
-- ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，只保存 job governance records，不保存财报正文、processed payload、raw download payload 或 upload 本地文件路径。
+- ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，保存 job governance records 与每个 job 的 event sidecar，不保存财报正文、processed payload、raw download payload 或 upload 本地文件路径。
 
 ## 主要组件
 
@@ -403,6 +405,8 @@ Read、download、preprocess、upload 是四个独立 provider：
 ### Ingestion runtime
 
 `FinsIngestionRuntime` 负责 download / preprocess / upload durable job 的创建、后台执行、取消请求、终态收口和 job record 读取。下载 pipeline 通过 `FinsSourceDownloadAdapter` 返回待持久化文档，或在 adapter 内通过仓储完成 source / blob / rejected filing artifact 写入并返回有界已持久化摘要；预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository；upload job 通过 `FinsUploadRunner` 边界执行上传业务，runtime 自身只负责 job lifecycle 和有界摘要。
+
+每个 ingestion job 可追加一个 JSONL event sidecar，路径与 job record 同属 `<workspace_root>/.dayu/fins_ingestion/jobs`。`read_job_events(...)` 按 job 内单调递增 `sequence` 游标读取事件。`JOB_QUEUED`、`JOB_RUNNING`、`JOB_SUCCEEDED`、`JOB_FAILED`、`JOB_CANCELLED` 是 job record 已保存后的状态观察；job record 仍是状态真源。`PROGRESS` 与 `CANCEL_REQUESTED` 是观察 / 进度信号，不能被当作 job 状态转换。event payload 是有界 JSON-compatible 摘要，不应携带绝对路径、财报正文或 provider raw payload；event sidecar 追加失败只记录 bounded WARN，不回滚已保存 job record。
 
 当前 `DefaultFinsRuntime` 内置三个 production download adapter：`source="sec"` 与 `source="auto"` 且 market 为 `US` 时走 SEC 下载；`source="cninfo"` 与 `source="auto"` 且 market 为 `CN` 时走巨潮下载；`source="hkexnews"` 与 `source="auto"` 且 market 为 `HK` 时走披露易下载。没有匹配 adapter 时，download job 会进入明确的 failed 终态，不伪造成功。
 

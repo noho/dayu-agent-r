@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import io
+import json
 import logging
 import os
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,11 @@ from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
+from dayu.fins.ingestion_events import (
+    FinsIngestionJobEventAppend,
+    FinsIngestionJobEventRecord,
+    FinsIngestionJobEventType,
+)
 from dayu.fins.domain.document_models import (
     CompanyMeta,
     SourceDocumentUpsertRequest,
@@ -359,6 +365,7 @@ class _ClaimRaceJobStore:
         """
 
         self._record: ingestion_runtime.FinsIngestionJobRecord | None = None
+        self._events: list[FinsIngestionJobEventRecord] = []
         self.read_race_triggered = False
         self.claim_race_triggered = False
         self.claim_running_calls = 0
@@ -628,6 +635,65 @@ class _ClaimRaceJobStore:
         )
         self._record = updated
         return updated
+
+    def append_job_event(
+        self,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """追加测试 job event。
+
+        Args:
+            job_id: opaque job id。
+            event: 无 sequence 的事件追加输入。
+
+        Returns:
+            已追加且带 sequence 的事件。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        self._require_record(job_id)
+        record = FinsIngestionJobEventRecord(
+            job_id=job_id,
+            sequence=len(self._events) + 1,
+            operation_kind=event.operation_kind,
+            status=event.status,
+            event_type=event.event_type,
+            source_event_type=event.source_event_type,
+            source_kind=event.source_kind,
+            document_id=event.document_id,
+            message=event.message,
+            payload=event.payload,
+            emitted_at=event.emitted_at,
+        )
+        self._events.append(record)
+        return record
+
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """读取测试 job events。
+
+        Args:
+            job_id: opaque job id。
+            after_sequence: 只返回 sequence 大于该值的事件。
+            limit: 本次最多返回事件数量。
+
+        Returns:
+            满足游标条件的事件元组。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+        """
+
+        self._require_record(job_id)
+        return tuple(event for event in self._events if event.sequence > after_sequence)[:limit]
 
     def _require_record(self, job_id: str) -> ingestion_runtime.FinsIngestionJobRecord:
         """读取并校验当前测试 job record。
@@ -1397,6 +1463,297 @@ def test_request_cancel_marks_active_job_and_keeps_terminal_job_terminal(tmp_pat
     assert after_terminal_cancel.result_summary == {"processed_count": 0}
 
 
+def test_job_events_record_queued_running_and_terminal_sequence(tmp_path: Path) -> None:
+    """job 创建、running claim 与终态保存应产生单调递增状态事件。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _FakeDownloadAdapter()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("fake", "US"): adapter},
+    )
+
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    queued_events = ingestion.read_job_events(start.job_id)
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+    events = ingestion.read_job_events(start.job_id, after_sequence=0, limit=100)
+    after_first = ingestion.read_job_events(start.job_id, after_sequence=1, limit=100)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert [event.event_type for event in queued_events] == [FinsIngestionJobEventType.JOB_QUEUED]
+    assert [event.sequence for event in events] == [1, 2, 3]
+    assert [event.event_type for event in events] == [
+        FinsIngestionJobEventType.JOB_QUEUED,
+        FinsIngestionJobEventType.JOB_RUNNING,
+        FinsIngestionJobEventType.JOB_SUCCEEDED,
+    ]
+    assert [event.sequence for event in after_first] == [2, 3]
+
+
+def test_request_cancel_records_cancel_requested_and_terminal_cancel_events(tmp_path: Path) -> None:
+    """request_cancel 应记录 CANCEL_REQUESTED，后台取消收口应记录 JOB_CANCELLED。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+
+    start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
+    cancelling = ingestion.request_cancel(start.job_id)
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+    events = ingestion.read_job_events(start.job_id)
+
+    assert cancelling.status is FinsIngestionJobStatus.CANCELLING
+    assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert [event.sequence for event in events] == [1, 2, 3]
+    assert [event.event_type for event in events] == [
+        FinsIngestionJobEventType.JOB_QUEUED,
+        FinsIngestionJobEventType.CANCEL_REQUESTED,
+        FinsIngestionJobEventType.JOB_CANCELLED,
+    ]
+
+
+def test_job_event_sidecar_omits_paths_payload_bodies_and_raw_provider_payloads(tmp_path: Path) -> None:
+    """event sidecar 不应包含绝对路径、完整文件路径、财报正文或 provider raw payload。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runner = _FakeUploadRunner(
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            document_id="aapl-2024-10k",
+            status="uploaded",
+        )
+    )
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
+    upload_file = tmp_path / "raw" / "aapl-10k.pdf"
+    upload_file.parent.mkdir(parents=True)
+    upload_file.write_text("Annual recurring revenue increased raw provider payload", encoding="utf-8")
+
+    start = ingestion.start_upload(FinsUploadFilingRequest(ticker="AAPL", files=(upload_file,)))
+    executor.run_all()
+    event_text = _job_event_file(workspace_root, start.job_id).read_text(encoding="utf-8")
+
+    assert str(workspace_root) not in event_text
+    assert str(upload_file) not in event_text
+    assert "aapl-10k.pdf" not in event_text
+    assert "Annual recurring revenue increased" not in event_text
+    assert "raw provider payload" not in event_text
+    assert "raw_provider_payload" not in event_text
+    assert "provider_raw_payload" not in event_text
+
+
+def test_job_event_store_concurrent_append_allocates_unique_monotonic_sequences(tmp_path: Path) -> None:
+    """并发 append 使用同一 store lock 后 sequence 不应重复或倒退。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    append_count = 40
+
+    def append_progress(index: int) -> int:
+        """追加一个测试 progress event 并返回 sequence。
+
+        Args:
+            index: 测试事件序号。
+
+        Returns:
+            已分配 sequence。
+
+        Raises:
+            FileNotFoundError: job id 不存在时由 store 抛出。
+            OSError: event sidecar 写入失败时由 store 抛出。
+            ValueError: event payload 非法时由 store 抛出。
+        """
+
+        event = ingestion.job_store.append_job_event(
+            start.job_id,
+            FinsIngestionJobEventAppend(
+                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+                status=None,
+                event_type=FinsIngestionJobEventType.PROGRESS,
+                source_event_type="test",
+                source_kind=None,
+                document_id=None,
+                message="测试进度事件",
+                payload={"index": index},
+                emitted_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        return event.sequence
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        sequences = tuple(pool.map(append_progress, range(append_count)))
+
+    events = ingestion.read_job_events(start.job_id, after_sequence=0, limit=100)
+
+    assert len(sequences) == append_count
+    assert len(set(sequences)) == append_count
+    assert sorted(sequences) == list(range(2, append_count + 2))
+    assert [event.sequence for event in events] == list(range(1, append_count + 2))
+
+
+def test_job_event_append_rejects_non_json_compatible_payload(tmp_path: Path) -> None:
+    """event append payload 非 JSON-compatible 时应 fail fast。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+
+    with pytest.raises(ValueError, match="不是 JSON-compatible"):
+        ingestion.job_store.append_job_event(
+            start.job_id,
+            FinsIngestionJobEventAppend(
+                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+                status=None,
+                event_type=FinsIngestionJobEventType.PROGRESS,
+                source_event_type="test",
+                source_kind=None,
+                document_id=None,
+                message="非法 payload",
+                payload=cast(dict[str, JsonValue], {"bad": {"not-json"}}),
+                emitted_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            ),
+        )
+
+
+def test_non_terminal_event_append_failure_warns_and_job_still_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """non-terminal event append 失败时应 WARN，且 job 仍可正常进入成功终态。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _FakeDownloadAdapter()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("fake", "US"): adapter},
+    )
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
+
+    def raise_for_running_event(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """仅在 JOB_RUNNING event append 时模拟 sidecar 写入失败。
+
+        Args:
+            store: 被替换方法所属 job store。
+            job_id: opaque job id。
+            event: 待追加事件。
+
+        Returns:
+            非 JOB_RUNNING event 的真实追加结果。
+
+        Raises:
+            OSError: JOB_RUNNING event append 时抛出。
+        """
+
+        if event.event_type is FinsIngestionJobEventType.JOB_RUNNING:
+            raise OSError("event sidecar unavailable")
+        return original_append(store, job_id, event)
+
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "append_job_event",
+        raise_for_running_event,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
+        executor.run_all()
+
+    record = ingestion.read_job(start.job_id)
+    events = ingestion.read_job_events(start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["downloaded_count"] == 1
+    assert [event.event_type for event in events] == [
+        FinsIngestionJobEventType.JOB_QUEUED,
+        FinsIngestionJobEventType.JOB_SUCCEEDED,
+    ]
+    assert "fins.ingestion.job_event_append_failed" in caplog.text
+    assert f"job_id={start.job_id}" in caplog.text
+    assert "event_type=job_running" in caplog.text
+    assert "error_type=OSError" in caplog.text
+    assert "error_summary=event_append_failed" in caplog.text
+    assert "event sidecar unavailable" not in caplog.text
+
+
+def test_terminal_event_append_failure_warns_without_rolling_back_terminal_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """terminal event append 失败时应 WARN，且不回滚已保存 terminal job record。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _FakeDownloadAdapter()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("fake", "US"): adapter},
+    )
+    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
+
+    def raise_for_terminal_event(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """仅在 terminal event append 时模拟 sidecar 写入失败。
+
+        Args:
+            store: 被替换方法所属 job store。
+            job_id: opaque job id。
+            event: 待追加事件。
+
+        Returns:
+            非 terminal event 的真实追加结果。
+
+        Raises:
+            OSError: terminal event append 时抛出。
+        """
+
+        if event.event_type is FinsIngestionJobEventType.JOB_SUCCEEDED:
+            raise OSError("event sidecar unavailable")
+        return original_append(store, job_id, event)
+
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "append_job_event",
+        raise_for_terminal_event,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
+        executor.run_all()
+
+    record = ingestion.read_job(start.job_id)
+    events = ingestion.read_job_events(start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["downloaded_count"] == 1
+    assert [event.event_type for event in events] == [
+        FinsIngestionJobEventType.JOB_QUEUED,
+        FinsIngestionJobEventType.JOB_RUNNING,
+    ]
+    assert "fins.ingestion.job_event_append_failed" in caplog.text
+    assert f"job_id={start.job_id}" in caplog.text
+    assert "event_type=job_succeeded" in caplog.text
+    assert "error_type=OSError" in caplog.text
+
+
 def test_save_cancelled_does_not_overwrite_current_terminal_record(tmp_path: Path) -> None:
     """_save_cancelled 应读取 store 当前状态，不能用旧 active record 覆盖终态。"""
 
@@ -1917,6 +2274,23 @@ def _job_file(workspace_root: Path, job_id: str) -> Path:
     """
 
     return workspace_root / ".dayu" / "fins_ingestion" / "jobs" / f"{job_id}.json"
+
+
+def _job_event_file(workspace_root: Path, job_id: str) -> Path:
+    """返回 S1 约定的 job event sidecar 路径。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        job_id: opaque job id。
+
+    Returns:
+        job event JSONL 文件路径。
+
+    Raises:
+        无。
+    """
+
+    return workspace_root / ".dayu" / "fins_ingestion" / "jobs" / f"{job_id}.events.jsonl"
 
 
 def _build_ingestion_runtime(

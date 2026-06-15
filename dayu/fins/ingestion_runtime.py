@@ -39,6 +39,12 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_events import (
+    FinsIngestionJobEventAppend,
+    FinsIngestionJobEventRecord,
+    FinsIngestionJobEventType,
+    validate_bounded_job_event_payload,
+)
 from dayu.fins.storage import (
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
@@ -54,6 +60,7 @@ _DEFAULT_DOWNLOAD_SOURCE: Final[str] = "auto"
 _DOWNLOAD_INGEST_METHOD: Final[str] = "download"
 _DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
 _JOB_ID_PREFIX: Final[str] = "finsjob_"
+_JOB_EVENT_FILE_SUFFIX: Final[str] = ".events.jsonl"
 _JOB_FILE_SUFFIX: Final[str] = ".json"
 _LOCK_FILE_NAME: Final[str] = ".store.lock"
 _JOBS_DIR_PARTS: Final[tuple[str, str, str]] = (".dayu", "fins_ingestion", "jobs")
@@ -87,6 +94,15 @@ _KEY_REQUEST_SUMMARY: Final[str] = "request_summary"
 _KEY_RESULT_SUMMARY: Final[str] = "result_summary"
 _KEY_FAILURE_SUMMARY: Final[str] = "failure_summary"
 _KEY_CANCELLATION_REQUESTED: Final[str] = "cancellation_requested"
+_KEY_SEQUENCE: Final[str] = "sequence"
+_KEY_EVENT_TYPE: Final[str] = "event_type"
+_KEY_SOURCE_EVENT_TYPE: Final[str] = "source_event_type"
+_KEY_DOCUMENT_ID: Final[str] = "document_id"
+_KEY_MESSAGE: Final[str] = "message"
+_KEY_PAYLOAD: Final[str] = "payload"
+_KEY_EMITTED_AT: Final[str] = "emitted_at"
+_DEFAULT_JOB_EVENT_READ_LIMIT: Final[int] = 100
+_MAX_JOB_EVENT_READ_LIMIT: Final[int] = 1000
 
 
 class FinsIngestionOperationKind(str, Enum):
@@ -882,6 +898,51 @@ class FinsIngestionJobStore(Protocol):
         """
         ...
 
+    def append_job_event(
+        self,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """追加 job event 并分配单调递增 sequence。
+
+        Args:
+            job_id: opaque job id。
+            event: 无 sequence 的事件追加输入。
+
+        Returns:
+            已持久化且包含 sequence 的事件 record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、event 字段或 payload 非法时抛出。
+        """
+        ...
+
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """按 sequence 游标读取 job event。
+
+        Args:
+            job_id: opaque job id。
+            after_sequence: 只返回 sequence 大于该值的事件；``0`` 表示读取全部。
+            limit: 本次最多返回事件数量。
+
+        Returns:
+            按 sequence 升序排列的事件元组。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读取失败时抛出。
+            ValueError: job id、游标、limit 或 event 内容非法时抛出。
+        """
+        ...
+
 
 class FinsIngestionExecutor(Protocol):
     """Fins ingestion 后台执行器协议。"""
@@ -1279,6 +1340,93 @@ class FsFinsIngestionJobStore:
             self._write_record_locked(updated)
             return updated
 
+    def append_job_event(
+        self,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """追加 job event 并分配单调递增 sequence。
+
+        Args:
+            job_id: opaque job id。
+            event: 无 sequence 的事件追加输入。
+
+        Returns:
+            已持久化且包含 sequence 的事件 record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、event 字段或 payload 非法时抛出。
+        """
+
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
+            self._read_record_locked(job_id)
+            event_path = self._job_events_path(job_id)
+            sequence = self._last_event_sequence_locked(event_path) + 1
+            record = FinsIngestionJobEventRecord(
+                job_id=job_id,
+                sequence=sequence,
+                operation_kind=event.operation_kind,
+                status=event.status,
+                event_type=event.event_type,
+                source_event_type=event.source_event_type,
+                source_kind=event.source_kind,
+                document_id=event.document_id,
+                message=event.message,
+                payload=event.payload,
+                emitted_at=event.emitted_at,
+            )
+            payload = _event_record_to_json(record)
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            with event_path.open("a", encoding="utf-8") as stream:
+                stream.write(encoded)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(self.root_dir)
+            return record
+
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """按 sequence 游标读取 job event。
+
+        Args:
+            job_id: opaque job id。
+            after_sequence: 只返回 sequence 大于该值的事件；``0`` 表示读取全部。
+            limit: 本次最多返回事件数量。
+
+        Returns:
+            按 sequence 升序排列的事件元组。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
+            OSError: 文件系统读取失败时抛出。
+            ValueError: job id、游标、limit 或 event 内容非法时抛出。
+        """
+
+        _validate_event_read_window(after_sequence=after_sequence, limit=limit)
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
+            self._read_record_locked(job_id)
+            event_path = self._job_events_path(job_id)
+            if not event_path.exists():
+                return ()
+            events: list[FinsIngestionJobEventRecord] = []
+            for record in self._iter_event_records_locked(event_path):
+                if record.sequence <= after_sequence:
+                    continue
+                events.append(record)
+                if len(events) >= limit:
+                    break
+            return tuple(events)
+
     def _job_path(self, job_id: str) -> Path:
         """构造单个 job record 路径。
 
@@ -1294,6 +1442,71 @@ class FsFinsIngestionJobStore:
 
         _validate_job_id(job_id)
         return self.root_dir / f"{job_id}{_JOB_FILE_SUFFIX}"
+
+    def _job_events_path(self, job_id: str) -> Path:
+        """构造单个 job event sidecar 路径。
+
+        Args:
+            job_id: opaque job id。
+
+        Returns:
+            job event JSONL 路径。
+
+        Raises:
+            ValueError: job id 非法时抛出。
+        """
+
+        _validate_job_id(job_id)
+        return self.root_dir / f"{job_id}{_JOB_EVENT_FILE_SUFFIX}"
+
+    def _last_event_sequence_locked(self, event_path: Path) -> int:
+        """在持锁状态读取 event sidecar 最后一条 sequence。
+
+        Args:
+            event_path: job event JSONL 路径。
+
+        Returns:
+            最后一条事件 sequence；sidecar 不存在时返回 ``0``。
+
+        Raises:
+            OSError: 文件读取失败时抛出。
+            ValueError: event sidecar 内容非法时抛出。
+        """
+
+        last_sequence = 0
+        if not event_path.exists():
+            return last_sequence
+        for record in self._iter_event_records_locked(event_path):
+            if record.sequence <= last_sequence:
+                raise ValueError("Fins ingestion job event sequence 未递增")
+            last_sequence = record.sequence
+        return last_sequence
+
+    def _iter_event_records_locked(self, event_path: Path) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """在持锁状态读取 event sidecar 全部事件。
+
+        Args:
+            event_path: job event JSONL 路径。
+
+        Returns:
+            event record 元组。
+
+        Raises:
+            OSError: 文件读取失败时抛出。
+            ValueError: event sidecar 内容非法时抛出。
+        """
+
+        records: list[FinsIngestionJobEventRecord] = []
+        with event_path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                payload = cast(JsonValue, json.loads(stripped))
+                if not isinstance(payload, Mapping):
+                    raise ValueError(f"Fins ingestion job event 第 {line_number} 行不是 JSON 映射")
+                records.append(_event_record_from_json(cast(Mapping[str, JsonValue], payload)))
+        return tuple(records)
 
     def _read_record_locked(self, job_id: str) -> FinsIngestionJobRecord:
         """在持锁状态读取 job record。
@@ -1592,6 +1805,35 @@ class FinsIngestionRuntime:
 
         return self.job_store.read_job(job_id)
 
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = _DEFAULT_JOB_EVENT_READ_LIMIT,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """按 sequence 游标读取 ingestion job events。
+
+        Args:
+            job_id: opaque job id。
+            after_sequence: 只返回 sequence 大于该值的事件；``0`` 表示读取全部。
+            limit: 本次最多返回事件数量。
+
+        Returns:
+            按 sequence 升序排列的事件元组。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: job store 读取失败时抛出。
+            ValueError: job id、游标、limit 或 event 内容非法时抛出。
+        """
+
+        return self.job_store.read_job_events(
+            job_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
     def request_cancel(self, job_id: str) -> FinsIngestionJobRecord:
         """请求取消 ingestion job。
 
@@ -1607,7 +1849,15 @@ class FinsIngestionRuntime:
             ValueError: job id 或 record 内容非法时抛出。
         """
 
-        return self.job_store.request_cancel(job_id, updated_at=_utc_now())
+        record = self.job_store.request_cancel(job_id, updated_at=_utc_now())
+        if record.status is FinsIngestionJobStatus.CANCELLING and record.cancellation_requested:
+            self._append_job_event_warn(
+                record,
+                event_type=FinsIngestionJobEventType.CANCEL_REQUESTED,
+                message="已记录取消请求",
+                payload={},
+            )
+        return record
 
     def _create_queued_record_with_start_lock(
         self,
@@ -1657,6 +1907,12 @@ class FinsIngestionRuntime:
             cancellation_requested=False,
         )
         persisted = self.job_store.create_job(record)
+        self._append_job_event_warn(
+            persisted,
+            event_type=FinsIngestionJobEventType.JOB_QUEUED,
+            message="job 已进入队列",
+            payload={},
+        )
         return _job_start_from_record(persisted)
 
     def _run_preprocess_job(self, *, job_id: str, request: FinsPreprocessRequest) -> None:
@@ -1807,11 +2063,26 @@ class FinsIngestionRuntime:
         """
 
         now = _utc_now()
-        return self.job_store.claim_running_or_cancelled(
+        record = self.job_store.claim_running_or_cancelled(
             job_id,
             started_at=now,
             updated_at=now,
         )
+        if record.status is FinsIngestionJobStatus.RUNNING:
+            self._append_job_event_warn(
+                record,
+                event_type=FinsIngestionJobEventType.JOB_RUNNING,
+                message="job 已开始执行",
+                payload={},
+            )
+        elif record.status is FinsIngestionJobStatus.CANCELLED:
+            self._append_job_event_warn(
+                record,
+                event_type=FinsIngestionJobEventType.JOB_CANCELLED,
+                message="job 已取消",
+                payload={},
+            )
+        return record
 
     def _execute_preprocess_request(
         self,
@@ -2342,11 +2613,13 @@ class FinsIngestionRuntime:
 
         _assert_bounded_summary(result_summary, "result_summary")
         now = _utc_now()
-        return self.job_store.save_succeeded_or_cancelled(
+        saved = self.job_store.save_succeeded_or_cancelled(
             record.job_id,
             result_summary=result_summary,
             finished_at=now,
         )
+        self._append_terminal_job_event_warn(saved)
+        return saved
 
     def _save_cancelled(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
         """保存 cancelled 终态。
@@ -2362,7 +2635,9 @@ class FinsIngestionRuntime:
         """
 
         now = _utc_now()
-        return self.job_store.save_cancelled_if_active(record.job_id, finished_at=now)
+        saved = self.job_store.save_cancelled_if_active(record.job_id, finished_at=now)
+        self._append_terminal_job_event_warn(saved)
+        return saved
 
     def _save_failed(
         self,
@@ -2397,12 +2672,14 @@ class FinsIngestionRuntime:
         final_result = result_summary or dict(_EMPTY_SUMMARY)
         _assert_bounded_summary(final_result, "result_summary")
         now = _utc_now()
-        return self.job_store.save_failed_or_cancelled_if_active(
+        saved = self.job_store.save_failed_or_cancelled_if_active(
             record.job_id,
             failure_summary=failure_summary,
             result_summary=final_result,
             finished_at=now,
         )
+        self._append_terminal_job_event_warn(saved)
+        return saved
 
     def _save_download_unsupported(self, job_id: str, message: str) -> None:
         """把 unsupported-source 下载结果保存为 failed 终态。
@@ -2466,6 +2743,82 @@ class FinsIngestionRuntime:
                 exc_info=True,
             )
             return
+
+    def _append_terminal_job_event_warn(self, record: FinsIngestionJobRecord) -> None:
+        """为 terminal job record 追加 terminal event，失败只记录 WARN。
+
+        Args:
+            record: 已保存的 job record。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        event_type = _terminal_event_type_from_status(record.status)
+        if event_type is None:
+            return
+        self._append_job_event_warn(
+            record,
+            event_type=event_type,
+            message=_terminal_event_message(record.status),
+            payload={},
+        )
+
+    def _append_job_event_warn(
+        self,
+        record: FinsIngestionJobRecord,
+        *,
+        event_type: FinsIngestionJobEventType,
+        message: str,
+        payload: dict[str, JsonValue],
+    ) -> None:
+        """追加 job event，失败时记录 bounded WARN 并保持 job record 不变。
+
+        Args:
+            record: 事件对应的 job record 快照。
+            event_type: 事件类型。
+            message: 有界事件说明。
+            payload: 有界 JSON-compatible 事件摘要。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        try:
+            self.job_store.append_job_event(
+                record.job_id,
+                FinsIngestionJobEventAppend(
+                    operation_kind=record.operation_kind,
+                    status=record.status,
+                    event_type=event_type,
+                    source_event_type=None,
+                    source_kind=record.source_kind,
+                    document_id=None,
+                    message=message,
+                    payload=payload,
+                    emitted_at=_utc_now(),
+                ),
+            )
+        except Exception as exc:
+            payload_keys = ",".join(sorted(payload.keys()))
+            _LOGGER.warning(
+                "fins.ingestion.job_event_append_failed "
+                "job_id=%s operation_kind=%s event_type=%s payload_key_count=%s "
+                "payload_keys=%s error_type=%s error_summary=%s",
+                record.job_id,
+                record.operation_kind.value,
+                event_type.value,
+                len(payload),
+                _bounded_log_text(payload_keys),
+                type(exc).__name__,
+                "event_append_failed",
+            )
 
 
 def _new_job_id() -> str:
@@ -3124,6 +3477,120 @@ def _assert_bounded_summary(summary: Mapping[str, JsonValue], field_name: str) -
         raise ValueError(f"{field_name} 超出大小上限")
 
 
+def _event_record_to_json(record: FinsIngestionJobEventRecord) -> dict[str, JsonValue]:
+    """把 job event record 转换为 JSON-compatible 字典。
+
+    Args:
+        record: job event record。
+
+    Returns:
+        JSON-compatible 字典。
+
+    Raises:
+        ValueError: record 字段非法时抛出。
+    """
+
+    _validate_job_id(record.job_id)
+    _validate_event_sequence(record.sequence)
+    payload = validate_bounded_job_event_payload(record.payload, _KEY_PAYLOAD)
+    return {
+        _KEY_JOB_ID: record.job_id,
+        _KEY_SEQUENCE: record.sequence,
+        _KEY_OPERATION_KIND: record.operation_kind.value,
+        _KEY_STATUS: record.status.value if record.status is not None else None,
+        _KEY_EVENT_TYPE: record.event_type.value,
+        _KEY_SOURCE_EVENT_TYPE: _optional_bounded_text(
+            record.source_event_type,
+            _KEY_SOURCE_EVENT_TYPE,
+            reject_path_separators=False,
+        ),
+        _KEY_SOURCE_KIND: record.source_kind.value if record.source_kind is not None else None,
+        _KEY_DOCUMENT_ID: _optional_bounded_text(
+            record.document_id,
+            _KEY_DOCUMENT_ID,
+            reject_path_separators=False,
+        ),
+        _KEY_MESSAGE: _bounded_text(record.message, _KEY_MESSAGE, reject_path_separators=False),
+        _KEY_PAYLOAD: payload,
+        _KEY_EMITTED_AT: _bounded_text(record.emitted_at, _KEY_EMITTED_AT, reject_path_separators=False),
+    }
+
+
+def _event_record_from_json(payload: Mapping[str, JsonValue]) -> FinsIngestionJobEventRecord:
+    """从 JSON-compatible 字典恢复 job event record。
+
+    Args:
+        payload: JSON-compatible 字典。
+
+    Returns:
+        job event record。
+
+    Raises:
+        ValueError: 字段缺失或类型非法时抛出。
+    """
+
+    job_id = _required_str(payload, _KEY_JOB_ID)
+    _validate_job_id(job_id)
+    sequence = _required_int(payload, _KEY_SEQUENCE)
+    _validate_event_sequence(sequence)
+    source_kind_text = _optional_str(payload, _KEY_SOURCE_KIND)
+    status_text = _optional_str(payload, _KEY_STATUS)
+    record = FinsIngestionJobEventRecord(
+        job_id=job_id,
+        sequence=sequence,
+        operation_kind=FinsIngestionOperationKind(_required_str(payload, _KEY_OPERATION_KIND)),
+        status=FinsIngestionJobStatus(status_text) if status_text is not None else None,
+        event_type=FinsIngestionJobEventType(_required_str(payload, _KEY_EVENT_TYPE)),
+        source_event_type=_optional_str(payload, _KEY_SOURCE_EVENT_TYPE),
+        source_kind=SourceKind(source_kind_text) if source_kind_text is not None else None,
+        document_id=_optional_str(payload, _KEY_DOCUMENT_ID),
+        message=_required_str(payload, _KEY_MESSAGE),
+        payload=_required_json_object(payload, _KEY_PAYLOAD),
+        emitted_at=_required_str(payload, _KEY_EMITTED_AT),
+    )
+    _event_record_to_json(record)
+    return record
+
+
+def _validate_event_sequence(sequence: int) -> None:
+    """校验事件 sequence。
+
+    Args:
+        sequence: 待校验 sequence。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: sequence 小于 1 时抛出。
+    """
+
+    if sequence < 1:
+        raise ValueError("Fins ingestion job event sequence 必须从 1 开始")
+
+
+def _validate_event_read_window(*, after_sequence: int, limit: int) -> None:
+    """校验 event 读取窗口。
+
+    Args:
+        after_sequence: 读取游标。
+        limit: 本次最多返回事件数量。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 游标或 limit 非法时抛出。
+    """
+
+    if after_sequence < 0:
+        raise ValueError("after_sequence 不能为负数")
+    if limit < 1:
+        raise ValueError("limit 必须为正数")
+    if limit > _MAX_JOB_EVENT_READ_LIMIT:
+        raise ValueError("limit 超出 Fins ingestion job event 读取上限")
+
+
 def _record_to_json(record: FinsIngestionJobRecord) -> dict[str, JsonValue]:
     """把 job record 转换为 JSON-compatible 字典。
 
@@ -3293,6 +3760,26 @@ def _required_bool(payload: Mapping[str, JsonValue], key: str) -> bool:
     return value
 
 
+def _required_int(payload: Mapping[str, JsonValue], key: str) -> int:
+    """读取必填整数字段。
+
+    Args:
+        payload: JSON-compatible 字典。
+        key: 字段名。
+
+    Returns:
+        整数字段值。
+
+    Raises:
+        ValueError: 字段缺失或类型错误时抛出。
+    """
+
+    value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Fins ingestion job record 字段 {key} 不是整数")
+    return value
+
+
 def _required_json_object(payload: Mapping[str, JsonValue], key: str) -> dict[str, JsonValue]:
     """读取必填 JSON 映射字段。
 
@@ -3311,6 +3798,71 @@ def _required_json_object(payload: Mapping[str, JsonValue], key: str) -> dict[st
     if not isinstance(value, Mapping):
         raise ValueError(f"Fins ingestion job record 字段 {key} 不是 JSON 映射")
     return dict(cast(Mapping[str, JsonValue], value))
+
+
+def _terminal_event_type_from_status(
+    status: FinsIngestionJobStatus,
+) -> FinsIngestionJobEventType | None:
+    """把 terminal job status 映射为 terminal event type。
+
+    Args:
+        status: job record 状态。
+
+    Returns:
+        terminal 状态对应的事件类型；非 terminal 状态返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if status is FinsIngestionJobStatus.SUCCEEDED:
+        return FinsIngestionJobEventType.JOB_SUCCEEDED
+    if status is FinsIngestionJobStatus.FAILED:
+        return FinsIngestionJobEventType.JOB_FAILED
+    if status is FinsIngestionJobStatus.CANCELLED:
+        return FinsIngestionJobEventType.JOB_CANCELLED
+    return None
+
+
+def _terminal_event_message(status: FinsIngestionJobStatus) -> str:
+    """返回 terminal event 的用户可读说明。
+
+    Args:
+        status: job record 状态。
+
+    Returns:
+        有界说明文本。
+
+    Raises:
+        无。
+    """
+
+    if status is FinsIngestionJobStatus.SUCCEEDED:
+        return "job 已成功完成"
+    if status is FinsIngestionJobStatus.FAILED:
+        return "job 已失败"
+    if status is FinsIngestionJobStatus.CANCELLED:
+        return "job 已取消"
+    return "job 状态未终结"
+
+
+def _bounded_log_text(value: str) -> str:
+    """返回适合 WARN 日志的一行有界文本。
+
+    Args:
+        value: 原始文本。
+
+    Returns:
+        移除换行并截断后的文本。
+
+    Raises:
+        无。
+    """
+
+    normalized = " ".join(value.split())
+    if len(normalized) <= _MAX_TEXT_CHARS:
+        return normalized
+    return normalized[:_MAX_TEXT_CHARS]
 
 
 def _market_from_text(value: str) -> NormalizedTickerMarket:
