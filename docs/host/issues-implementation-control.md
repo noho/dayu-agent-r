@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-CLI-FINS-OBS-01 Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da` |
+| gate | re-review |
+| implementation status | WU-CLI-FINS-OBS-01 Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da`; Slice S4 fixes `S4-FIX-01` / `S4-FIX-02` ready for scoped re-review |
 | active work unit | WU-CLI-FINS-OBS-01 |
 | default next work unit | WU-CLI-FINS-OBS-01 |
-| next entry point | enter WU-CLI-FINS-OBS-01 Slice S4 implementation gate |
+| next entry point | AgentDS and AgentMiMo to re-review Slice S4 accepted fixes |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -207,7 +207,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | implementation | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da`; next Slice S4 |
+| WU-CLI-FINS-OBS-01 | re-review | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Slice S1 accepted commit `3787f43d`; Slice S2 accepted commit `123a7db8`; Slice S3 accepted commit `4164b4da`; Slice S4 fixes `S4-FIX-01` / `S4-FIX-02` ready for scoped re-review |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |

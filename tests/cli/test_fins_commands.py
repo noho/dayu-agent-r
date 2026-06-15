@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -18,12 +19,15 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
+from dayu.cli.output import render_fins_direct_event
+from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import FinsIngestionJobStatus
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
     FINS_DIRECT_EXIT_SUCCESS,
+    FinsDirectJobEvent,
     FinsDirectJobHandle,
     FinsDirectStartRequest,
     FinsDirectTerminalResult,
@@ -38,6 +42,8 @@ class _FakeFinsDirectService:
     upload_filing_requests: list[_UploadFilingCall]
     upload_material_requests: list[_UploadMaterialCall]
     cancel_requests: list[str]
+    wait_calls: list[str]
+    stream_calls: list[str]
     wait_started: asyncio.Event
     cancel_seen: asyncio.Event
     terminal_status: FinsIngestionJobStatus
@@ -62,6 +68,8 @@ class _FakeFinsDirectService:
         self.upload_filing_requests = []
         self.upload_material_requests = []
         self.cancel_requests = []
+        self.wait_calls = []
+        self.stream_calls = []
         self.wait_started = asyncio.Event()
         self.cancel_seen = asyncio.Event()
         self.terminal_status = terminal_status
@@ -253,6 +261,7 @@ class _FakeFinsDirectService:
         :raises asyncio.CancelledError: 等待任务被取消时透传。
         """
 
+        self.wait_calls.append(job_id)
         self.wait_started.set()
         if (
             self.terminal_status is FinsIngestionJobStatus.CANCELLED
@@ -260,6 +269,31 @@ class _FakeFinsDirectService:
         ):
             await self.cancel_seen.wait()
         return _terminal(job_id=job_id, status=self.terminal_status)
+
+    async def stream_job_events_until_terminal(
+        self,
+        handle: FinsDirectJobHandle,
+        *,
+        after_sequence: int = 0,
+    ) -> AsyncIterator[FinsDirectJobEvent]:
+        """产出 fake progress 和 terminal event。
+
+        :param handle: Fins direct job handle。
+        :param after_sequence: 起始 event sequence。
+        :returns: Fins direct job event 异步迭代器。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        assert after_sequence == 0
+        self.stream_calls.append(handle.job_id)
+        self.wait_started.set()
+        yield _progress_event(handle)
+        if (
+            self.terminal_status is FinsIngestionJobStatus.CANCELLED
+            and self.wait_for_cancel_before_terminal
+        ):
+            await self.cancel_seen.wait()
+        yield _terminal_event(handle=handle, status=self.terminal_status)
 
     def request_cancel(self, job_id: str) -> None:
         """记录 cancel 请求。
@@ -298,6 +332,102 @@ def fake_service(
 
     monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", factory)
     return service
+
+
+@pytest.mark.parametrize(
+    "command_name",
+    (
+        "download",
+        "process",
+        "upload_filing",
+        "upload_material",
+        "process_filing",
+        "process_material",
+    ),
+)
+def test_live_fins_commands_render_progress_and_terminal_summary(
+    command_name: str,
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """六个 Fins direct live commands 都必须消费 Service event stream 并输出摘要。"""
+
+    exit_code = cli_main.main(_live_command_argv(command_name, tmp_path))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert fake_service.stream_calls == ["job-1"]
+    assert fake_service.wait_calls == []
+    assert "Fins job progress" in captured.out
+    assert "message=\"download live progress\"" in captured.out or (
+        "live progress" in captured.out
+    )
+    assert "Fins job succeeded" in captured.out
+    assert "processed_count=1" in captured.out
+    assert captured.err == ""
+
+
+def test_fins_progress_payload_redacts_embedded_absolute_paths(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """progress message 和 payload 里的嵌入绝对路径必须脱敏。"""
+
+    event = _progress_event(
+        _handle(command_name="download", ticker="AAPL"),
+        message="path=/tmp/a",
+        payload={"detail": "key=/Users/a/b"},
+    )
+
+    render_fins_direct_event(event)
+
+    captured = capsys.readouterr()
+    assert "/tmp/a" not in captured.out
+    assert "/Users/a/b" not in captured.out
+    assert "<redacted>" in captured.out
+    assert captured.err == ""
+
+
+def test_fins_terminal_summary_redacts_embedded_absolute_paths(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """terminal success summary 里的嵌入绝对路径必须脱敏。"""
+
+    handle = _handle(command_name="download", ticker="AAPL")
+    event = _terminal_event(
+        handle=handle,
+        status=FinsIngestionJobStatus.SUCCEEDED,
+        result_summary={"detail": "path=/tmp/a", "source": "key=/Users/a/b"},
+    )
+
+    render_fins_direct_event(event)
+
+    captured = capsys.readouterr()
+    assert "/tmp/a" not in captured.out
+    assert "/Users/a/b" not in captured.out
+    assert "<redacted>" in captured.out
+    assert captured.err == ""
+
+
+def test_fins_failure_message_redacts_embedded_windows_absolute_path(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """failure message 里的嵌入 Windows 绝对路径必须脱敏。"""
+
+    handle = _handle(command_name="download", ticker="AAPL")
+    event = _terminal_event(
+        handle=handle,
+        status=FinsIngestionJobStatus.FAILED,
+        failure_summary={"message": r"error=C:\tmp\a"},
+    )
+
+    render_fins_direct_event(event)
+
+    captured = capsys.readouterr()
+    assert "C:" not in captured.err
+    assert r"C:\tmp\a" not in captured.err
+    assert "<redacted>" in captured.err
+    assert captured.out == ""
 
 
 def test_download_command_maps_args_to_service(
@@ -509,6 +639,7 @@ def test_unsupported_flags_and_s6_command_fail_fast(
 
 def test_terminal_failed_and_cancelled_status_exit_mapping(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """CLI 必须使用 Service terminal result 的退出码映射。"""
 
@@ -528,6 +659,9 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
         ),
     )
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
+    failed_output = capsys.readouterr()
+    assert "Fins job failure" in failed_output.err
+    assert "failed" in failed_output.err
 
     monkeypatch.setattr(
         fins_command,
@@ -538,6 +672,8 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
         ),
     )
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_KEYBOARD_INTERRUPT
+    cancelled_output = capsys.readouterr()
+    assert "Fins job cancelled" in cancelled_output.err
 
 
 @pytest.mark.asyncio
@@ -578,16 +714,24 @@ async def test_second_sigint_after_cancel_exits_locally(
     """第二次 SIGINT 必须本地 130，并打印 job id。"""
 
     class _NeverTerminalService(_FakeFinsDirectService):
-        async def wait_for_terminal(self, job_id: str) -> FinsDirectTerminalResult:
-            """等待直到测试取消 task。
+        async def stream_job_events_until_terminal(
+            self,
+            handle: FinsDirectJobHandle,
+            *,
+            after_sequence: int = 0,
+        ) -> AsyncIterator[FinsDirectJobEvent]:
+            """产出 progress 后等待直到测试取消 task。
 
-            :param job_id: Fins ingestion job id。
-            :returns: 正常路径不会返回。
+            :param handle: Fins direct job handle。
+            :param after_sequence: 起始 event sequence。
+            :returns: Fins direct job event 异步迭代器。
             :raises asyncio.CancelledError: 测试触发本地退出时透传。
             """
 
-            del job_id
+            assert after_sequence == 0
+            self.stream_calls.append(handle.job_id)
             self.wait_started.set()
+            yield _progress_event(handle)
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
@@ -789,15 +933,118 @@ def _handle(*, command_name: str, ticker: str) -> FinsDirectJobHandle:
     )
 
 
+def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
+    """构造 live command 参数。
+
+    :param command_name: 用户可见命令名。
+    :param tmp_path: pytest 临时目录。
+    :returns: CLI argv。
+    :raises ValueError: 未知命令名时抛出。
+    """
+
+    if command_name == "download":
+        return ("download", "--ticker", "AAPL", "--forms", "10-K")
+    if command_name == "process":
+        return ("process", "--ticker", "AAPL", "--document-id", "doc-1")
+    if command_name == "process_filing":
+        return ("process_filing", "--ticker", "AAPL", "--document-id", "doc-1")
+    if command_name == "process_material":
+        return ("process_material", "--ticker", "AAPL", "--document-id", "doc-1")
+    if command_name == "upload_filing":
+        upload_file = tmp_path / "filing.pdf"
+        upload_file.write_text("filing", encoding="utf-8")
+        return ("upload_filing", "--ticker", "AAPL", "--files", str(upload_file))
+    if command_name == "upload_material":
+        upload_file = tmp_path / "material.pdf"
+        upload_file.write_text("material", encoding="utf-8")
+        return ("upload_material", "--ticker", "AAPL", "--files", str(upload_file))
+    raise ValueError(f"unknown live command: {command_name}")
+
+
+def _progress_event(
+    handle: FinsDirectJobHandle,
+    *,
+    message: str | None = None,
+    payload: dict[str, JsonValue] | None = None,
+) -> FinsDirectJobEvent:
+    """构造 fake progress event。
+
+    :param handle: Fins direct job handle。
+    :param message: 可选进度消息。
+    :param payload: 可选进度 payload。
+    :returns: fake progress event。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return FinsDirectJobEvent(
+        job_id=handle.job_id,
+        sequence=1,
+        command_name=handle.start_request.command_name,
+        ticker=handle.start_request.ticker,
+        status=FinsIngestionJobStatus.RUNNING,
+        event_label="progress",
+        message=(
+            f"{handle.start_request.command_name} live progress"
+            if message is None
+            else message
+        ),
+        payload=(
+            {"ticker": handle.start_request.ticker, "step": "started"}
+            if payload is None
+            else payload
+        ),
+        terminal_result=None,
+    )
+
+
+def _terminal_event(
+    *,
+    handle: FinsDirectJobHandle,
+    status: FinsIngestionJobStatus,
+    result_summary: dict[str, JsonValue] | None = None,
+    failure_summary: dict[str, JsonValue] | None = None,
+) -> FinsDirectJobEvent:
+    """构造 fake terminal event。
+
+    :param handle: Fins direct job handle。
+    :param status: terminal status。
+    :param result_summary: 可选成功摘要。
+    :param failure_summary: 可选失败摘要。
+    :returns: fake terminal event。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return FinsDirectJobEvent(
+        job_id=handle.job_id,
+        sequence=2,
+        command_name=handle.start_request.command_name,
+        ticker=handle.start_request.ticker,
+        status=status,
+        event_label=f"job_{status.value}",
+        message=f"{status.value} terminal",
+        payload={},
+        terminal_result=_terminal(
+            job_id=handle.job_id,
+            status=status,
+            result_summary=result_summary,
+            failure_summary=failure_summary,
+        ),
+    )
+
+
 def _terminal(
     *,
     job_id: str,
     status: FinsIngestionJobStatus,
+    result_summary: dict[str, JsonValue] | None = None,
+    failure_summary: dict[str, JsonValue] | None = None,
 ) -> FinsDirectTerminalResult:
     """构造 fake terminal result。
 
     :param job_id: Fins ingestion job id。
     :param status: Fins ingestion terminal status。
+    :param result_summary: 可选成功摘要。
+    :param failure_summary: 可选失败摘要。
     :returns: fake terminal result。
     :raises Exception: 不主动抛出异常。
     """
@@ -812,6 +1059,14 @@ def _terminal(
         job_id=job_id,
         status=status,
         exit_code=exit_code,
-        result_summary={},
-        failure_summary={"message": "failed"} if status is FinsIngestionJobStatus.FAILED else {},
+        result_summary=(
+            {"processed_count": 1, "ok": True}
+            if result_summary is None and status is FinsIngestionJobStatus.SUCCEEDED
+            else ({} if result_summary is None else result_summary)
+        ),
+        failure_summary=(
+            {"message": "failed"}
+            if failure_summary is None and status is FinsIngestionJobStatus.FAILED
+            else ({} if failure_summary is None else failure_summary)
+        ),
     )

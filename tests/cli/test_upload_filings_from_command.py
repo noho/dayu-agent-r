@@ -69,6 +69,7 @@ def test_upload_filings_from_writes_quoted_script_to_stdout(
     assert shlex_quoted(str(material.resolve())) in captured.out
     assert "--fiscal-year 2024" in captured.out
     assert "--company-name 'Apple Inc.'" in captured.out
+    assert "Fins job" not in captured.out
 
 
 def test_upload_filings_from_respects_non_recursive_scan(
@@ -93,6 +94,7 @@ def test_upload_filings_from_respects_non_recursive_scan(
     assert output.count("dayu-cli upload_filing") == 1
     assert "10-K" in output
     assert "10-Q" not in output
+    assert "Fins job" not in output
 
 
 def test_upload_filings_from_recursive_scan_includes_nested_files(
@@ -124,6 +126,7 @@ def test_upload_filings_from_recursive_scan_includes_nested_files(
     assert output.count("dayu-cli upload_filing") == 2
     assert "10-K" in output
     assert "10-Q" in output
+    assert "Fins job" not in output
 
 
 def test_upload_filings_from_writes_output_file(
@@ -154,6 +157,7 @@ def test_upload_filings_from_writes_output_file(
     captured = capsys.readouterr()
     assert exit_code == EXIT_SUCCESS
     assert captured.out == ""
+    assert captured.err == ""
     assert "dayu-cli upload_filing" in output_file.read_text(encoding="utf-8")
 
 
@@ -177,7 +181,9 @@ def test_upload_filings_from_missing_source_dir_exits_usage_error(
     )
 
     assert exit_code == EXIT_USAGE_ERROR
-    assert "source dir does not exist" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "source dir does not exist" in captured.err
+    assert "Fins job" not in captured.err
 
 
 def test_upload_filings_from_empty_source_dir_exits_usage_error(
@@ -193,7 +199,9 @@ def test_upload_filings_from_empty_source_dir_exits_usage_error(
     )
 
     assert exit_code == EXIT_USAGE_ERROR
-    assert "--from must not be empty" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "--from must not be empty" in captured.err
+    assert "Fins job" not in captured.err
 
 
 def test_upload_filings_from_no_recognizable_files_exits_failure(
@@ -213,7 +221,9 @@ def test_upload_filings_from_no_recognizable_files_exits_failure(
     )
 
     assert exit_code == EXIT_FAILURE
-    assert "no recognizable filing or material files" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "no recognizable filing or material files" in captured.err
+    assert "Fins job" not in captured.err
 
 
 def test_upload_filings_from_output_write_failure_exits_failure(
@@ -241,7 +251,9 @@ def test_upload_filings_from_output_write_failure_exits_failure(
     )
 
     assert exit_code == EXIT_FAILURE
-    assert "dayu-cli upload_filings_from:" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "dayu-cli upload_filings_from:" in captured.err
+    assert "Fins job" not in captured.err
 
 
 def test_upload_filings_from_keyboard_interrupt_exits_130(

@@ -36,8 +36,8 @@ from dayu.cli.exit_codes import (
 from dayu.cli.output import (
     render_cli_error,
     render_fins_direct_cancel_requested,
+    render_fins_direct_event,
     render_fins_direct_local_exit_after_cancel,
-    render_fins_direct_terminal_result,
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.upload_batch import (
@@ -226,7 +226,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     )
     if terminal is None:
         return EXIT_KEYBOARD_INTERRUPT
-    return render_fins_direct_terminal_result(terminal)
+    return terminal.exit_code
 
 
 def _run_upload_filings_from(args: ParsedCliArgs) -> int:
@@ -538,23 +538,25 @@ async def _wait_for_terminal_handling_sigint(
     """
 
     sigint_monitor.install()
-    wait_task = asyncio.create_task(service.wait_for_terminal(handle.job_id))
+    event_task = asyncio.create_task(
+        _consume_fins_direct_events(service=service, handle=handle)
+    )
     observed_count = sigint_monitor.count
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_count))
     cancel_requested = False
     try:
         while True:
             await asyncio.wait(
-                (wait_task, sigint_task),
+                (event_task, sigint_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if wait_task.done():
+            if event_task.done():
                 sigint_task.cancel()
-                return await wait_task
+                return await event_task
             if sigint_task.done():
                 observed_count = sigint_task.result()
                 if cancel_requested:
-                    wait_task.cancel()
+                    event_task.cancel()
                     render_fins_direct_local_exit_after_cancel(handle.job_id)
                     return None
                 service.request_cancel(handle.job_id)
@@ -566,8 +568,31 @@ async def _wait_for_terminal_handling_sigint(
     finally:
         sigint_monitor.close()
         sigint_task.cancel()
-        if not wait_task.done():
-            wait_task.cancel()
+        if not event_task.done():
+            event_task.cancel()
+
+
+async def _consume_fins_direct_events(
+    *,
+    service: FinsDirectCommandService,
+    handle: FinsDirectJobHandle,
+) -> FinsDirectTerminalResult:
+    """消费 Service event stream 并输出 Fins direct job 事件。
+
+    :param service: Fins direct Service helper。
+    :param handle: 已启动 direct job handle。
+    :returns: event stream 产出的 terminal result。
+    :raises RuntimeError: event stream 结束但没有 terminal result 时抛出。
+    :raises Exception: Service stream 或输出失败时向上抛出。
+    """
+
+    async for event in service.stream_job_events_until_terminal(handle):
+        render_fins_direct_event(event)
+        if event.terminal_result is not None:
+            return event.terminal_result
+    raise RuntimeError(
+        f"Fins direct event stream ended without terminal result: {handle.job_id}"
+    )
 
 
 def _raise_for_unsupported_flags(args: ParsedCliArgs) -> None:

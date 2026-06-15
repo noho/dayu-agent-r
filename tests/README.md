@@ -92,9 +92,11 @@ open/follow-up terminal path、fast terminal、outbox fallback、FAILED terminal
 Session、每轮独立 watcher attach/close、fast terminal、FAILED / CANCELLED 继续输入、LOST fatal、运行态 SIGINT cancel、
 第二次 SIGINT 本地 130、显式 config 错误和 unsupported 旧执行参数 fail fast。Fins direct command 测试覆盖
 `download`、`upload_filing`、`upload_material`、`process`、`process_filing`、`process_material` 的 CLI 参数到
-`FinsDirectCommandService` 显式方法参数转换、upload file 存在性与 allowlist 前置校验、`--infer` / `--ci`
-fail fast、`upload_filings_from` 的本地目录扫描、filing / material 识别、脚本 quoting、`--output` 写入、错误码和扫描期 SIGINT 130、terminal exit mapping、SIGINT 后
-`request_cancel(job_id)` 与第二次 SIGINT 本地 130，以及 CLI 不直接 import `dayu.fins.storage`。
+`FinsDirectCommandService` 显式方法参数转换、Service event stream 消费、progress / terminal summary
+stdout/stderr 投影、CLI 输出中嵌入绝对路径脱敏、upload file 存在性与 allowlist 前置校验、`--infer` / `--ci` fail fast、
+`upload_filings_from` 的本地目录扫描、filing / material 识别、脚本 quoting、`--output` 写入、错误码、扫描期
+SIGINT 130、确认不启动 live event stream、terminal exit mapping、SIGINT 后 `request_cancel(job_id)` 与第二次
+SIGINT 本地 130，以及 CLI 不直接 import `dayu.fins.storage`。
 CLI 测试不得启动真实 Host / Fins 业务路径；涉及 Host 状态机时使用 Service helper 与 mocked Host public API。
 
 ### `tests/runtime/`
