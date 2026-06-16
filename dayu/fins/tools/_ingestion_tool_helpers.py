@@ -13,31 +13,41 @@ from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSnapshot, ToolAwaitSpec
 from dayu.contracts.tool_outcome import ToolAwaitingOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultMeta
-from dayu.fins.ingestion_runtime import FinsIngestionJobStart
+from dayu.fins.ingestion.observation_handle import (
+    FinsObservationHandle,
+    observation_handle_id_to_resume_token,
+)
 
 
-def _awaiting_outcome_from_job_start(start: FinsIngestionJobStart) -> ToolAwaitingOutcome:
-    """把已持久化 job start 转换为等待 outcome。
+def _awaiting_outcome_from_observation_handle(
+    handle: FinsObservationHandle,
+) -> ToolAwaitingOutcome:
+    """把 lightweight observation handle 转换为等待 outcome。
 
     Args:
-        start: runtime 返回的已持久化 job start。
+        handle: runtime 返回的 process-local observation handle。
 
     Returns:
-        外部 job 等待 outcome。
+        外部等待 outcome。
 
     Raises:
-        ValueError: job id 为空时由等待契约抛出。
+        ValueError: handle token 非法时由等待契约抛出。
     """
 
     captured_at = datetime.now(timezone.utc)
+    resume_token = observation_handle_id_to_resume_token(handle)
     return ToolAwaitingOutcome(
         await_spec=ToolAwaitSpec(
             await_kind=ToolAwaitKind.EXTERNAL_JOB,
             deadline=None,
-            resume_token=start.job_id,
+            resume_token=resume_token,
         ),
         snapshot=ToolAwaitSnapshot(
-            snapshot_id=f"fins-ingestion-start-{start.job_id}",
+            snapshot_id=(
+                "fins-observation-start-"
+                f"{handle.operation_kind.value}-"
+                f"{captured_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+            ),
             captured_at=captured_at,
         ),
     )

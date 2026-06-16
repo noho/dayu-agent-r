@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from collections.abc import Iterator
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.runtime.log import (
     LogLevel,
+    bounded_payload_keys,
     configure,
+    log_verbose,
     set_level_from_flags,
 )
 from dayu.runtime.log_levels import (
@@ -28,7 +32,7 @@ from dayu.runtime.log_levels import (
 
 _NAMESPACE = "dayu"
 _MARKER_ATTR = "_dayu_runtime_log_marker"
-_MARKER_VALUE = "dayu.runtime.log:stdout"
+_MARKER_VALUE = "dayu.runtime.log:diagnostic"
 
 
 @pytest.fixture(autouse=True)
@@ -275,6 +279,52 @@ def test_set_level_from_flags_info_default() -> None:
     assert resolved is LogLevel.INFO
 
 
+def test_log_verbose_uses_call_site_logger(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """层中立 VERBOSE helper 必须保留调用点 logger 名称。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 输出 logger 名称或消息不符合预期时抛出。
+    """
+
+    configure(level=LogLevel.VERBOSE)
+    logger = logging.getLogger("dayu.runtime_log_helper.case")
+
+    log_verbose(logger, "helper-message=%s", "ok")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "helper-message=ok" in captured.err
+    assert "dayu.runtime_log_helper.case" in captured.err
+
+
+def test_bounded_payload_keys_exposes_only_sorted_keys() -> None:
+    """payload key helper 只返回有界 key，不暴露 payload value。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 暴露 value、未排序或未限制 key 数量时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "z": "secret-value",
+        "a": "first",
+        "m": 1,
+        "b": True,
+        "c": None,
+        "d": "value-d",
+        "e": "value-e",
+        "f": "value-f",
+        "g": "value-g",
+    }
+
+    keys = bounded_payload_keys(payload)
+
+    assert keys == ("a", "b", "c", "d", "e", "f", "g", "m")
+    assert "secret-value" not in keys
+
+
 def test_set_level_from_flags_invalid_log_level_raises() -> None:
     """非法 log_level 字符串抛 ValueError。"""
 
@@ -288,22 +338,41 @@ def test_set_level_from_flags_invalid_log_level_raises() -> None:
         )
 
 
-def test_logger_emits_to_stdout(
+def test_logger_emits_to_stderr_by_default(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """configure 后 dayu.* logger 应按 OLD 统一 prefix 写到 stdout。"""
+    """configure 后 dayu.* logger 应按统一 prefix 写到 stderr。"""
 
     configure(level=LogLevel.INFO)
     logging.getLogger("dayu.test.subsystem").info("hello-runtime-log")
 
     captured = capsys.readouterr()
-    assert "hello-runtime-log" in captured.out
-    assert "dayu.test.subsystem" in captured.out
+    assert captured.out == ""
+    assert "hello-runtime-log" in captured.err
+    assert "dayu.test.subsystem" in captured.err
     assert re.search(
         r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] "
         r"\[INFO\] \[dayu\.test\.subsystem\] hello-runtime-log$",
-        captured.out.strip(),
+        captured.err.strip(),
     )
+
+
+def test_configure_stream_override_keeps_diagnostics_redirectable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """调用方显式传入 stream 时，诊断日志应写入该流。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 日志没有写入指定流时抛出。
+    """
+
+    configure(level=LogLevel.INFO, stream=sys.stdout)
+    logging.getLogger("dayu.test.override").info("override-runtime-log")
+
+    captured = capsys.readouterr()
+    assert "override-runtime-log" in captured.out
+    assert captured.err == ""
 
 
 def test_configure_disables_propagate_so_caplog_default_misses(

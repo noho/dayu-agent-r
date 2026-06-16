@@ -6,11 +6,14 @@ import argparse
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import TextIO
 
 import pytest
 
 from dayu.cli.__main__ import run_module
 import dayu.cli.main as cli_main
+import dayu.runtime.log as runtime_log
 from dayu.cli.arg_parsing import (
     CLI_COMMAND_NAMES,
     EXCLUDED_COMMAND_NAMES,
@@ -77,6 +80,18 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _LogAssemblyCall:
+    """CLI main 日志装配调用记录。"""
+
+    log_level: str | None
+    debug: bool
+    verbose: bool
+    info: bool
+    quiet: bool
+    stream: TextIO | None
+
+
 def _capture_help(
     capsys: pytest.CaptureFixture[str], argv: Sequence[str]
 ) -> str:
@@ -104,6 +119,17 @@ def _raise_keyboard_interrupt(_args: ParsedCliArgs) -> int:
     """
 
     raise KeyboardInterrupt
+
+
+def _return_success(_args: ParsedCliArgs) -> int:
+    """测试用命令 runner，直接返回成功。
+
+    :param _args: 已解析的 CLI 参数。
+    :returns: 成功退出码。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EXIT_SUCCESS
 
 
 def test_top_level_help_registers_scoped_commands(
@@ -195,6 +221,7 @@ def test_placeholder_runner_returns_not_implemented(
 
     args = ParsedCliArgs()
     args.command_name = "future_command"
+    args.log_level = "info"
     monkeypatch.setattr(cli_main, "parse_cli_args", lambda _argv: args)
     monkeypatch.setitem(
         cli_main.COMMAND_RUNNERS,
@@ -245,6 +272,85 @@ def test_main_maps_keyboard_interrupt(
     monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _raise_keyboard_interrupt)
 
     assert cli_main.main(("prompt", "请分析收入变化")) == EXIT_KEYBOARD_INTERRUPT
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_log_level"),
+    (
+        (("prompt", "hello"), "info"),
+        (("prompt", "hello", "--debug"), "debug"),
+        (("prompt", "hello", "--verbose"), "verbose"),
+        (("prompt", "hello", "--quiet"), "error"),
+        (("prompt", "hello", "--log-level", "warn"), "warn"),
+    ),
+)
+def test_main_configures_runtime_log_from_parsed_cli_flags(
+    argv: tuple[str, ...],
+    expected_log_level: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI main 必须把默认值或显式日志参数交给 runtime log helper。
+
+    :param argv: 待执行的 CLI 参数。
+    :param expected_log_level: argparse 归一后的日志级别字符串。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: main 未调用 runtime helper 或在 main 内改写参数时抛出。
+    """
+
+    calls: list[_LogAssemblyCall] = []
+
+    def spy_set_level_from_flags(
+        *,
+        log_level: str | None,
+        debug: bool,
+        verbose: bool,
+        info: bool,
+        quiet: bool,
+        stream: TextIO | None = None,
+    ) -> runtime_log.LogLevel:
+        """记录 main 传入 runtime log helper 的参数。
+
+        :param log_level: argparse 已解析的日志级别字符串。
+        :param debug: runtime helper 的 debug flag。
+        :param verbose: runtime helper 的 verbose flag。
+        :param info: runtime helper 的 info flag。
+        :param quiet: runtime helper 的 quiet flag。
+        :param stream: runtime helper 的诊断日志输出流。
+        :returns: 测试用日志级别。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        calls.append(
+            _LogAssemblyCall(
+                log_level=log_level,
+                debug=debug,
+                verbose=verbose,
+                info=info,
+                quiet=quiet,
+                stream=stream,
+            )
+        )
+        return runtime_log.LogLevel.INFO
+
+    monkeypatch.setattr(
+        cli_main.runtime_log,
+        "set_level_from_flags",
+        spy_set_level_from_flags,
+    )
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _return_success)
+
+    assert cli_main.main(argv) == EXIT_SUCCESS
+    assert calls == [
+        _LogAssemblyCall(
+            log_level=expected_log_level,
+            debug=False,
+            verbose=False,
+            info=False,
+            quiet=False,
+            stream=sys.stderr,
+        )
+    ]
 
 
 def test_python_module_help_runs() -> None:

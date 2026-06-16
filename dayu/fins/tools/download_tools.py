@@ -1,8 +1,8 @@
 """Fins 下载 awaiting tool 定义。
 
-本模块把 Fins shared ingestion runtime 的下载 start 入口适配为当前
-``ToolDefinition``。工具只启动 durable job 并返回等待 outcome，不轮询
-job 完成状态，也不暴露 Host 内部治理字段或 job record 文件路径。
+本模块把 Fins shared ingestion runtime 的下载 observation 入口适配为当前
+``ToolDefinition``。工具只启动外部长事务并返回等待 outcome，不轮询完成
+状态，也不暴露 Host 内部治理字段或本地 observation 记录。
 """
 
 from __future__ import annotations
@@ -24,12 +24,11 @@ from dayu.contracts.tool_result import ToolResultMeta
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
-    FinsIngestionJobStatus,
     FinsIngestionRuntime,
     FinsIngestionStartCancelledError,
 )
 from dayu.fins.tools._ingestion_tool_helpers import (
-    _awaiting_outcome_from_job_start,
+    _awaiting_outcome_from_observation_handle,
     _failed_outcome,
     _optional_bool,
     _optional_nullable_text,
@@ -43,12 +42,14 @@ _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_download_start_failed"
 _DEFAULT_SOURCE: Final[str] = "auto"
 _CANCELLED_MESSAGE: Final[str] = "Fins download start was cancelled."
-_CANCELLED_HINT: Final[str] = "Continue without this Fins download job unless the user asks to retry."
+_CANCELLED_HINT: Final[str] = (
+    "Continue without this Fins download operation unless the user asks to retry."
+)
 
 
 @dataclass(frozen=True)
 class FinsDownloadToolCallable:
-    """启动 Fins 下载 job 的工具 callable。
+    """启动 Fins 下载 observation 的工具 callable。
 
     Attributes:
         runtime: Fins shared ingestion runtime。
@@ -68,7 +69,7 @@ class FinsDownloadToolCallable:
             context: 批式工具执行上下文；本工具只观察取消 token。
 
         Returns:
-            参数或启动失败时返回 ``ToolFailedOutcome``；durable job 创建成功后
+            参数或启动失败时返回 ``ToolFailedOutcome``；observation 创建成功后
             返回 ``ToolAwaitingOutcome``；启动边界观察到取消时返回
             ``ToolCancelledOutcome``。
 
@@ -82,9 +83,10 @@ class FinsDownloadToolCallable:
             return _cancelled_outcome(started_at)
         try:
             request = _download_request_from_arguments(call.arguments)
-            start = self.runtime.start_download(request, cancellation_token=cancellation_token)
-            if start.status in {FinsIngestionJobStatus.CANCELLING, FinsIngestionJobStatus.CANCELLED}:
-                return _cancelled_outcome(started_at)
+            handle = self.runtime.start_observed_download(
+                request,
+                cancellation_token=cancellation_token,
+            )
         except FinsIngestionStartCancelledError:
             return _cancelled_outcome(started_at)
         except ValueError as exc:
@@ -100,7 +102,7 @@ class FinsDownloadToolCallable:
                 tool_name=DOWNLOAD_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="下载任务启动失败，未能保存任务记录。",
+                message="下载任务启动失败，未进入等待状态。",
                 hint="请稍后重试，或让系统维护者检查 Fins workspace 存储权限。",
             )
         except Exception:
@@ -111,7 +113,7 @@ class FinsDownloadToolCallable:
                 message="下载任务启动失败，未进入等待状态。",
                 hint="请确认 Fins workspace 存储目录存在且有写入权限，或联系系统管理员。",
             )
-        return _awaiting_outcome_from_job_start(start)
+        return _awaiting_outcome_from_observation_handle(handle)
 
 
 def _cancelled_outcome(started_at: datetime) -> ToolCancelledOutcome:
@@ -160,10 +162,10 @@ def build_fins_download_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
             function=ToolFunctionSchema(
                 name=DOWNLOAD_TOOL_NAME,
                 description=(
-                    "Start a financial filing download job for one company. "
+                    "Start a financial filing download operation for one company. "
                     "The tool returns immediately with an external-job wait state "
-                    "after the job is durably recorded; it does not wait for the "
-                    "download to finish. Use this when source filings must be "
+                    "after a lightweight observation handle is registered; it does "
+                    "not wait for the download to finish. Use this when source filings must be "
                     "ingested into the Fins workspace before reading or processing."
                 ),
                 parameters=_download_parameters_schema(),

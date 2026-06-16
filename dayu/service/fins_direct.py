@@ -1,39 +1,49 @@
-"""Fins direct job 的 Service 边界。
+"""Fins direct command 的 Service 流式边界。
 
-本模块为 CLI、未来 GUI 或内部任务入口提供共享的 Fins direct job 语义：
-构造 typed Fins ingestion request、启动 job、轮询终态、请求 durable cancel，
-并把终态映射为 product entrypoint 可消费的退出码。它不解析 CLI 参数，
-不处理 stdout/stderr，也不读取 Fins storage。
+本模块为 CLI、未来 GUI 或内部 product entrypoint 提供共享的 Fins direct
+执行语义：构造 typed Fins ingestion request，并把 runtime direct stream 作为
+``AsyncIterator[FinsEvent]`` 暴露给调用方。它不解析 CLI 参数，不处理
+stdout/stderr，不读取 Fins storage，也不暴露后台 job id、sidecar cursor 或
+durable cancel API。
 """
 
 from __future__ import annotations
 
-import asyncio
-import math
-from collections.abc import Awaitable, Callable, Mapping
+import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, Protocol
 
+import dayu.runtime.log as runtime_log
 from dayu.contracts.cancellation import CancellationToken
-from dayu.contracts.json_value import JsonValue
+from dayu.fins.direct_events import (
+    FINS_RESULT_EXIT_CANCELLED,
+    FINS_RESULT_EXIT_FAILURE,
+    FINS_RESULT_EXIT_SUCCESS,
+    FinsErrorKind,
+    FinsEvent,
+    FinsEventType,
+    FinsOperationKind,
+    FinsResultStatus,
+    FinsResultSummary,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
-    FinsIngestionJobRecord,
-    FinsIngestionJobStart,
-    FinsIngestionJobStatus,
     FinsPreprocessRequest,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
+    FinsUploadRequest,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
 
-DEFAULT_FINS_DIRECT_POLL_INTERVAL_SECONDS: Final[float] = 1.0
-MAX_FINS_DIRECT_POLL_INTERVAL_SECONDS: Final[float] = 60.0
-FINS_DIRECT_EXIT_SUCCESS: Final[int] = 0
-FINS_DIRECT_EXIT_FAILURE: Final[int] = 1
-FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT: Final[int] = 130
+FINS_DIRECT_EXIT_SUCCESS: Final[int] = FINS_RESULT_EXIT_SUCCESS
+FINS_DIRECT_EXIT_FAILURE: Final[int] = FINS_RESULT_EXIT_FAILURE
+FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT: Final[int] = FINS_RESULT_EXIT_CANCELLED
+
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
 class FinsDirectUsageError(ValueError):
@@ -43,70 +53,50 @@ class FinsDirectUsageError(ValueError):
 class FinsDirectIngestionRuntime(Protocol):
     """Fins direct command 需要的 ingestion runtime 协议。"""
 
-    def start_download(
+    def download(
         self,
         request: FinsDownloadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinsIngestionJobStart:
-        """启动下载 job。
+    ) -> AsyncIterator[FinsEvent]:
+        """执行下载 direct stream。
 
         :param request: 下载请求。
-        :param cancellation_token: 可选启动边界取消 token。
-        :returns: job 启动结果。
-        :raises Exception: runtime 启动失败时由具体实现抛出。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: runtime 执行失败时由具体实现抛出。
         """
 
         ...
 
-    def start_preprocess(
+    def preprocess(
         self,
         request: FinsPreprocessRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinsIngestionJobStart:
-        """启动预处理 job。
+    ) -> AsyncIterator[FinsEvent]:
+        """执行预处理 direct stream。
 
         :param request: 预处理请求。
-        :param cancellation_token: 可选启动边界取消 token。
-        :returns: job 启动结果。
-        :raises Exception: runtime 启动失败时由具体实现抛出。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: runtime 执行失败时由具体实现抛出。
         """
 
         ...
 
-    def start_upload(
+    def upload(
         self,
-        request: FinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: FinsUploadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinsIngestionJobStart:
-        """启动上传 job。
+    ) -> AsyncIterator[FinsEvent]:
+        """执行上传 direct stream。
 
         :param request: filing 或 material 上传请求。
-        :param cancellation_token: 可选启动边界取消 token。
-        :returns: job 启动结果。
-        :raises Exception: runtime 启动失败时由具体实现抛出。
-        """
-
-        ...
-
-    def read_job(self, job_id: str) -> FinsIngestionJobRecord:
-        """读取 job record。
-
-        :param job_id: Fins ingestion job id。
-        :returns: 当前持久化 job record。
-        :raises Exception: job 不存在或读取失败时由具体实现抛出。
-        """
-
-        ...
-
-    def request_cancel(self, job_id: str) -> FinsIngestionJobRecord:
-        """请求取消 job。
-
-        :param job_id: Fins ingestion job id。
-        :returns: 更新后的 job record。
-        :raises Exception: job 不存在或取消请求落盘失败时由具体实现抛出。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: runtime 执行失败时由具体实现抛出。
         """
 
         ...
@@ -125,136 +115,58 @@ class FinsDirectRuntimeRequest:
     runtime: DefaultFinsRuntime | FinsDirectIngestionRuntime | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class FinsDirectStartRequest:
-    """Fins direct job 启动诊断信息。
-
-    Attributes:
-        command_name: 用户可见 direct command 名称。
-        ticker: 当前请求使用的 canonical ticker 文本。
-    """
-
-    command_name: str
-    ticker: str
-
-
-@dataclass(frozen=True, slots=True)
-class FinsDirectJobHandle:
-    """Fins direct job 启动后的 Service handle。
-
-    Attributes:
-        job_id: Fins ingestion job id。
-        initial_status: 启动后 job 初始状态。
-        start_request: 启动该 job 的 direct command 诊断信息。
-    """
-
-    job_id: str
-    initial_status: FinsIngestionJobStatus
-    start_request: FinsDirectStartRequest
-
-
-@dataclass(frozen=True, slots=True)
-class FinsDirectTerminalResult:
-    """Fins direct job 终态结果。
-
-    Attributes:
-        job_id: Fins ingestion job id。
-        status: Fins ingestion job 终态。
-        exit_code: direct command 应映射的 CLI 退出码。
-        result_summary: job 业务结果摘要。
-        failure_summary: job 失败摘要。
-    """
-
-    job_id: str
-    status: FinsIngestionJobStatus
-    exit_code: int
-    result_summary: Mapping[str, JsonValue]
-    failure_summary: Mapping[str, JsonValue]
-
-
 class FinsDirectCommandService:
     """Fins direct command 的共享 Service helper。"""
 
     _runtime: FinsDirectIngestionRuntime
-    poll_interval_seconds: float
-    _sleep: Callable[[float], Awaitable[None]]
 
     def __init__(
         self,
         runtime: DefaultFinsRuntime | FinsDirectIngestionRuntime,
-        *,
-        poll_interval_seconds: float = DEFAULT_FINS_DIRECT_POLL_INTERVAL_SECONDS,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """初始化 Fins direct command service。
 
         :param runtime: 默认 Fins runtime 或已取得的 ingestion runtime。
-        :param poll_interval_seconds: 轮询非终态 job 的等待秒数。
-        :param sleep: 可注入的异步 sleep 函数，供测试验证轮询。
         :returns: ``None``。
-        :raises FinsDirectUsageError: poll interval 非法时抛出。
+        :raises Exception: 不主动抛出异常。
         """
 
-        _validate_poll_interval_seconds(poll_interval_seconds)
         if isinstance(runtime, DefaultFinsRuntime):
             self._runtime = runtime.get_ingestion_runtime()
         else:
             self._runtime = runtime
-        self.poll_interval_seconds = poll_interval_seconds
-        self._sleep = sleep
 
     @classmethod
     def from_runtime_request(
         cls,
         request: FinsDirectRuntimeRequest,
-        *,
-        poll_interval_seconds: float = DEFAULT_FINS_DIRECT_POLL_INTERVAL_SECONDS,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> "FinsDirectCommandService":
         """按 runtime request 创建 service。
 
         :param request: Fins direct runtime 装配请求。
-        :param poll_interval_seconds: 轮询非终态 job 的等待秒数。
-        :param sleep: 可注入的异步 sleep 函数。
         :returns: Fins direct command service。
         :raises OSError: 默认 runtime 创建失败时由底层仓储实现抛出。
-        :raises FinsDirectUsageError: poll interval 非法时抛出。
         """
 
         runtime = request.runtime
         if runtime is None:
             runtime = DefaultFinsRuntime.create(workspace_root=request.workspace_root)
-        return cls(
-            runtime,
-            poll_interval_seconds=poll_interval_seconds,
-            sleep=sleep,
-        )
+        return cls(runtime)
 
     @classmethod
-    def from_workspace_root(
-        cls,
-        workspace_root: Path,
-        *,
-        poll_interval_seconds: float = DEFAULT_FINS_DIRECT_POLL_INTERVAL_SECONDS,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> "FinsDirectCommandService":
+    def from_workspace_root(cls, workspace_root: Path) -> "FinsDirectCommandService":
         """按 workspace root 创建默认 service。
 
         :param workspace_root: Fins 工作区根目录。
-        :param poll_interval_seconds: 轮询非终态 job 的等待秒数。
-        :param sleep: 可注入的异步 sleep 函数。
         :returns: Fins direct command service。
         :raises OSError: 默认 runtime 创建失败时由底层仓储实现抛出。
-        :raises FinsDirectUsageError: poll interval 非法时抛出。
         """
 
         return cls.from_runtime_request(
             FinsDirectRuntimeRequest(workspace_root=workspace_root),
-            poll_interval_seconds=poll_interval_seconds,
-            sleep=sleep,
         )
 
-    def start_download(
+    def download(
         self,
         *,
         ticker: str,
@@ -264,8 +176,8 @@ class FinsDirectCommandService:
         overwrite_existing: bool = False,
         rebuild_processed: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinsDirectJobHandle:
-        """启动 Fins 下载 direct job。
+    ) -> AsyncIterator[FinsEvent]:
+        """执行 Fins 下载 direct stream。
 
         :param ticker: canonical ticker 文本。
         :param form_types: 表单过滤条件。
@@ -273,65 +185,126 @@ class FinsDirectCommandService:
         :param filed_before: 可选最晚 filing 日期。
         :param overwrite_existing: 是否覆盖已有 source document。
         :param rebuild_processed: 是否请求重建 processed 产物。
-        :param cancellation_token: 可选启动边界取消 token。
-        :returns: direct job handle。
-        :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
-        start = self._runtime.start_download(
-            FinsDownloadRequest(
-                ticker=ticker,
-                form_types=form_types,
-                filed_after=filed_after,
-                filed_before=filed_before,
-                overwrite_existing=overwrite_existing,
-                rebuild_processed=rebuild_processed,
-            ),
-            cancellation_token=cancellation_token,
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct command stream opened; command=%s ticker=%s",
+            FinsOperationKind.DOWNLOAD.value,
+            ticker,
         )
-        return _job_handle(
-            start,
-            command_name="download",
+        request = FinsDownloadRequest(
             ticker=ticker,
+            form_types=form_types,
+            filed_after=filed_after,
+            filed_before=filed_before,
+            overwrite_existing=overwrite_existing,
+            rebuild_processed=rebuild_processed,
+        )
+        return _ensure_result_event(
+            self._runtime.download(request, cancellation_token=cancellation_token),
+            operation_kind=FinsOperationKind.DOWNLOAD,
+            ticker=ticker,
+            filing_kind=None,
+            document_label=None,
         )
 
-    def start_preprocess(
+    def process(
         self,
         *,
-        command_name: str,
         ticker: str,
         source_kind: SourceKind,
         document_ids: tuple[str, ...] = (),
         form_types: tuple[str, ...] = (),
         rebuild_processed: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinsDirectJobHandle:
-        """启动 Fins 预处理 direct job。
+    ) -> AsyncIterator[FinsEvent]:
+        """执行通用 Fins 预处理 direct stream。
 
-        :param command_name: 用户可见命令名，用于 handle 诊断。
         :param ticker: canonical ticker 文本。
         :param source_kind: 预处理源文档类别。
         :param document_ids: 可选源文档 ID。
         :param form_types: 可选表单过滤。
         :param rebuild_processed: 是否允许重建 processed 产物。
-        :param cancellation_token: 可选启动边界取消 token。
-        :returns: direct job handle。
-        :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
-        start = self._runtime.start_preprocess(
-            FinsPreprocessRequest(
-                ticker=ticker,
-                source_kind=source_kind,
-                document_ids=document_ids,
-                form_types=form_types,
-                rebuild_processed=rebuild_processed,
-            ),
+        return self._preprocess(
+            operation_kind=FinsOperationKind.PREPROCESS,
+            ticker=ticker,
+            source_kind=source_kind,
+            document_ids=document_ids,
+            form_types=form_types,
+            rebuild_processed=rebuild_processed,
             cancellation_token=cancellation_token,
         )
-        return _job_handle(start, command_name=command_name, ticker=ticker)
 
-    def start_upload_filing(
+    def process_filing(
+        self,
+        *,
+        ticker: str,
+        document_ids: tuple[str, ...] = (),
+        form_types: tuple[str, ...] = (),
+        rebuild_processed: bool = False,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行 filing 预处理 direct stream。
+
+        :param ticker: canonical ticker 文本。
+        :param document_ids: 可选 filing 源文档 ID。
+        :param form_types: 可选表单过滤。
+        :param rebuild_processed: 是否允许重建 processed 产物。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
+        """
+
+        return self._preprocess(
+            operation_kind=FinsOperationKind.PROCESS_FILING,
+            ticker=ticker,
+            source_kind=SourceKind.FILING,
+            document_ids=document_ids,
+            form_types=form_types,
+            rebuild_processed=rebuild_processed,
+            cancellation_token=cancellation_token,
+        )
+
+    def process_material(
+        self,
+        *,
+        ticker: str,
+        document_ids: tuple[str, ...] = (),
+        form_types: tuple[str, ...] = (),
+        rebuild_processed: bool = False,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行 material 预处理 direct stream。
+
+        :param ticker: canonical ticker 文本。
+        :param document_ids: 可选 material 源文档 ID。
+        :param form_types: 可选表单过滤。
+        :param rebuild_processed: 是否允许重建 processed 产物。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
+        """
+
+        return self._preprocess(
+            operation_kind=FinsOperationKind.PROCESS_MATERIAL,
+            ticker=ticker,
+            source_kind=SourceKind.MATERIAL,
+            document_ids=document_ids,
+            form_types=form_types,
+            rebuild_processed=rebuild_processed,
+            cancellation_token=cancellation_token,
+        )
+
+    def upload_filing(
         self,
         *,
         ticker: str,
@@ -346,8 +319,8 @@ class FinsDirectCommandService:
         ticker_aliases: tuple[str, ...] = (),
         overwrite: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinsDirectJobHandle:
-        """启动 filing 上传 direct job。
+    ) -> AsyncIterator[FinsEvent]:
+        """执行 filing 上传 direct stream。
 
         :param ticker: canonical ticker 文本。
         :param action: 上传动作。
@@ -360,9 +333,9 @@ class FinsDirectCommandService:
         :param company_name: 可选公司名称。
         :param ticker_aliases: ticker 别名，仅传给支持该字段的 upload request。
         :param overwrite: 是否允许覆盖已有文档。
-        :param cancellation_token: 可选启动边界取消 token。
-        :returns: direct job handle。
-        :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
         request = FinsUploadFilingRequest(
@@ -379,10 +352,15 @@ class FinsDirectCommandService:
             ticker_aliases=ticker_aliases,
             overwrite=overwrite,
         )
-        start = self._runtime.start_upload(request, cancellation_token=cancellation_token)
-        return _job_handle(start, command_name="upload_filing", ticker=ticker)
+        return _ensure_result_event(
+            self._runtime.upload(request, cancellation_token=cancellation_token),
+            operation_kind=FinsOperationKind.UPLOAD_FILING,
+            ticker=ticker,
+            filing_kind="filing",
+            document_label=None,
+        )
 
-    def start_upload_material(
+    def upload_material(
         self,
         *,
         ticker: str,
@@ -401,8 +379,8 @@ class FinsDirectCommandService:
         ticker_aliases: tuple[str, ...] = (),
         overwrite: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinsDirectJobHandle:
-        """启动 material 上传 direct job。
+    ) -> AsyncIterator[FinsEvent]:
+        """执行 material 上传 direct stream。
 
         :param ticker: canonical ticker 文本。
         :param action: 上传动作。
@@ -419,9 +397,9 @@ class FinsDirectCommandService:
         :param company_name: 可选公司名称。
         :param ticker_aliases: ticker 别名，仅传给支持该字段的 upload request。
         :param overwrite: 是否允许覆盖已有文档。
-        :param cancellation_token: 可选启动边界取消 token。
-        :returns: direct job handle。
-        :raises Exception: request 构造或 runtime 启动失败时由底层抛出。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
         request = FinsUploadMaterialRequest(
@@ -442,123 +420,139 @@ class FinsDirectCommandService:
             ticker_aliases=ticker_aliases,
             overwrite=overwrite,
         )
-        start = self._runtime.start_upload(request, cancellation_token=cancellation_token)
-        return _job_handle(start, command_name="upload_material", ticker=ticker)
-
-    async def wait_for_terminal(self, job_id: str) -> FinsDirectTerminalResult:
-        """等待 job 进入终态。
-
-        :param job_id: Fins ingestion job id。
-        :returns: direct terminal result。
-        :raises Exception: job 读取失败时由 runtime 抛出。
-        """
-
-        while True:
-            record = self._runtime.read_job(job_id)
-            if _is_terminal_status(record.status):
-                return _terminal_result(record)
-            await self._sleep(self.poll_interval_seconds)
-
-    def request_cancel(self, job_id: str) -> FinsIngestionJobRecord:
-        """请求取消 Fins ingestion job。
-
-        :param job_id: Fins ingestion job id。
-        :returns: 更新后的 job record。
-        :raises Exception: job 不存在或取消落盘失败时由 runtime 抛出。
-        """
-
-        return self._runtime.request_cancel(job_id)
-
-
-def _validate_poll_interval_seconds(value: float) -> None:
-    """校验 poll interval。
-
-    :param value: 轮询间隔秒数。
-    :returns: ``None``。
-    :raises FinsDirectUsageError: 值不是有限正数或超过上限时抛出。
-    """
-
-    if not math.isfinite(value) or value <= 0.0:
-        raise FinsDirectUsageError("poll_interval_seconds must be finite and positive")
-    if value > MAX_FINS_DIRECT_POLL_INTERVAL_SECONDS:
-        raise FinsDirectUsageError("poll_interval_seconds must not exceed 60 seconds")
-
-
-def _job_handle(
-    start: FinsIngestionJobStart,
-    *,
-    command_name: str,
-    ticker: str,
-) -> FinsDirectJobHandle:
-    """把 runtime start result 转成 direct job handle。
-
-    :param start: runtime 返回的 job start。
-    :param command_name: 用户可见命令名。
-    :param ticker: direct request 使用的 ticker 文本。
-    :returns: direct job handle。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return FinsDirectJobHandle(
-        job_id=start.job_id,
-        initial_status=start.status,
-        start_request=FinsDirectStartRequest(
-            command_name=command_name,
+        return _ensure_result_event(
+            self._runtime.upload(request, cancellation_token=cancellation_token),
+            operation_kind=FinsOperationKind.UPLOAD_MATERIAL,
             ticker=ticker,
+            filing_kind=form_type,
+            document_label=material_name,
+        )
+
+    def _preprocess(
+        self,
+        *,
+        operation_kind: FinsOperationKind,
+        ticker: str,
+        source_kind: SourceKind,
+        document_ids: tuple[str, ...],
+        form_types: tuple[str, ...],
+        rebuild_processed: bool,
+        cancellation_token: CancellationToken | None,
+    ) -> AsyncIterator[FinsEvent]:
+        """构造预处理请求并返回 direct stream。
+
+        :param operation_kind: Service direct command 对应的业务操作类型。
+        :param ticker: canonical ticker 文本。
+        :param source_kind: 预处理源文档类别。
+        :param document_ids: 可选源文档 ID。
+        :param form_types: 可选表单过滤。
+        :param rebuild_processed: 是否允许重建 processed 产物。
+        :param cancellation_token: 可选 operation-scoped 取消 token。
+        :returns: Fins direct 事件异步迭代器。
+        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
+        """
+
+        runtime_log.log_verbose(
+            _LOGGER,
+            "Fins direct command stream opened; command=%s ticker=%s",
+            operation_kind.value,
+            ticker,
+        )
+        request = FinsPreprocessRequest(
+            ticker=ticker,
+            source_kind=source_kind,
+            document_ids=document_ids,
+            form_types=form_types,
+            rebuild_processed=rebuild_processed,
+        )
+        return _ensure_result_event(
+            self._runtime.preprocess(request, cancellation_token=cancellation_token),
+            operation_kind=operation_kind,
+            ticker=ticker,
+            filing_kind=None,
+            document_label=None,
+        )
+
+
+async def _ensure_result_event(
+    events: AsyncIterator[FinsEvent],
+    *,
+    operation_kind: FinsOperationKind,
+    ticker: str | None,
+    filing_kind: str | None,
+    document_label: str | None,
+) -> AsyncIterator[FinsEvent]:
+    """保证 direct stream 正常结束时存在唯一 RESULT。
+
+    :param events: runtime 返回的 direct event stream。
+    :param operation_kind: 当前 Service direct 操作类型。
+    :param ticker: 当前 ticker 文本。
+    :param filing_kind: 可选财报类型短标签。
+    :param document_label: 可选文档短标签。
+    :returns: Fins direct 事件异步迭代器。
+    :raises FinsDirectUsageError: runtime 产出重复 RESULT 时抛出。
+    :raises Exception: runtime stream 迭代失败时原样透传。
+    """
+
+    result_seen = False
+    async for event in events:
+        if event.event_type is FinsEventType.RESULT:
+            if result_seen:
+                raise FinsDirectUsageError("Fins direct stream produced multiple RESULT events")
+            result_seen = True
+        yield event
+    if not result_seen:
+        yield _missing_result_event(
+            operation_kind=operation_kind,
+            ticker=ticker,
+            filing_kind=filing_kind,
+            document_label=document_label,
+        )
+
+
+def _missing_result_event(
+    *,
+    operation_kind: FinsOperationKind,
+    ticker: str | None,
+    filing_kind: str | None,
+    document_label: str | None,
+) -> FinsEvent:
+    """构造 producer 未产出 RESULT 时的明确失败事件。
+
+    :param operation_kind: 当前 Service direct 操作类型。
+    :param ticker: 当前 ticker 文本。
+    :param filing_kind: 可选财报类型短标签。
+    :param document_label: 可选文档短标签。
+    :returns: failure RESULT 事件。
+    :raises ValueError: 构造出的事件违反 direct contract 时抛出。
+    """
+
+    return FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=operation_kind,
+        message="Fins direct stream ended without result",
+        emitted_at=datetime.now(timezone.utc),
+        ticker=ticker,
+        filing_kind=filing_kind,
+        document_label=document_label,
+        progress=None,
+        result=FinsResultSummary(
+            status=FinsResultStatus.FAILURE,
+            exit_code=FINS_DIRECT_EXIT_FAILURE,
+            title="Fins direct operation failed",
+            details=(),
+            error_kind=FinsErrorKind.EXECUTION,
+            error_message="Fins direct stream ended without result",
         ),
     )
 
 
-def _is_terminal_status(status: FinsIngestionJobStatus) -> bool:
-    """判断 Fins job 状态是否为终态。
-
-    :param status: Fins ingestion job 状态。
-    :returns: 终态返回 ``True``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return status in {
-        FinsIngestionJobStatus.SUCCEEDED,
-        FinsIngestionJobStatus.FAILED,
-        FinsIngestionJobStatus.CANCELLED,
-    }
-
-
-def _terminal_result(record: FinsIngestionJobRecord) -> FinsDirectTerminalResult:
-    """把 job record 终态映射为 direct terminal result。
-
-    :param record: 已进入终态的 job record。
-    :returns: direct terminal result。
-    :raises FinsDirectUsageError: 非终态 record 传入时抛出。
-    """
-
-    if record.status is FinsIngestionJobStatus.SUCCEEDED:
-        exit_code = FINS_DIRECT_EXIT_SUCCESS
-    elif record.status is FinsIngestionJobStatus.FAILED:
-        exit_code = FINS_DIRECT_EXIT_FAILURE
-    elif record.status is FinsIngestionJobStatus.CANCELLED:
-        exit_code = FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT
-    else:
-        raise FinsDirectUsageError(f"job is not terminal: {record.status.value}")
-    return FinsDirectTerminalResult(
-        job_id=record.job_id,
-        status=record.status,
-        exit_code=exit_code,
-        result_summary=record.result_summary,
-        failure_summary=record.failure_summary,
-    )
-
-
 __all__: tuple[str, ...] = (
-    "DEFAULT_FINS_DIRECT_POLL_INTERVAL_SECONDS",
     "FINS_DIRECT_EXIT_FAILURE",
     "FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT",
     "FINS_DIRECT_EXIT_SUCCESS",
     "FinsDirectCommandService",
     "FinsDirectIngestionRuntime",
-    "FinsDirectJobHandle",
     "FinsDirectRuntimeRequest",
-    "FinsDirectStartRequest",
-    "FinsDirectTerminalResult",
     "FinsDirectUsageError",
 )

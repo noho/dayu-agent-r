@@ -8,25 +8,40 @@ adapter、tool provider 或 CLI。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
+from queue import Empty, Full, Queue
 from threading import Lock, Thread
-from typing import Final, Protocol, assert_never, cast, get_args
+from typing import TYPE_CHECKING, Final, Protocol, assert_never, cast, get_args
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
+from dayu.fins.direct_events import (
+    FINS_RESULT_EXIT_CANCELLED,
+    FINS_RESULT_EXIT_FAILURE,
+    FINS_RESULT_EXIT_SUCCESS,
+    FinsErrorKind,
+    FinsEvent,
+    FinsEventDetail,
+    FinsEventType,
+    FinsOperationKind,
+    FinsProgress,
+    FinsResultStatus,
+    FinsResultSummary,
+)
 from dayu.fins.domain.document_models import (
     DocumentMeta,
     FileObjectMeta,
@@ -39,6 +54,18 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_events import (
+    FinsIngestionJobEventAppend,
+    FinsIngestionJobEventRecord,
+    FinsIngestionJobEventType,
+    validate_bounded_job_event_payload,
+)
+from dayu.fins.ingestion.observation_handle import (
+    FINS_OBSERVATION_HANDLE_ID_PREFIX,
+    FinsObservationHandle,
+    FinsObservationSnapshot,
+    FinsObservationStatus,
+)
 from dayu.fins.storage import (
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
@@ -54,6 +81,7 @@ _DEFAULT_DOWNLOAD_SOURCE: Final[str] = "auto"
 _DOWNLOAD_INGEST_METHOD: Final[str] = "download"
 _DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
 _JOB_ID_PREFIX: Final[str] = "finsjob_"
+_JOB_EVENT_FILE_SUFFIX: Final[str] = ".events.jsonl"
 _JOB_FILE_SUFFIX: Final[str] = ".json"
 _LOCK_FILE_NAME: Final[str] = ".store.lock"
 _JOBS_DIR_PARTS: Final[tuple[str, str, str]] = (".dayu", "fins_ingestion", "jobs")
@@ -69,7 +97,7 @@ _NORMALIZED_MARKET_VALUES: Final[frozenset[NormalizedTickerMarket]] = frozenset(
 _NORMALIZED_EXCHANGE_VALUES: Final[frozenset[NormalizedTickerExchange]] = frozenset(
     cast(tuple[NormalizedTickerExchange, ...], get_args(NormalizedTickerExchange))
 )
-_LOGGER: logging.Logger = logging.getLogger(__name__)
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 _KEY_JOB_ID: Final[str] = "job_id"
 _KEY_OPERATION_KIND: Final[str] = "operation_kind"
@@ -87,6 +115,63 @@ _KEY_REQUEST_SUMMARY: Final[str] = "request_summary"
 _KEY_RESULT_SUMMARY: Final[str] = "result_summary"
 _KEY_FAILURE_SUMMARY: Final[str] = "failure_summary"
 _KEY_CANCELLATION_REQUESTED: Final[str] = "cancellation_requested"
+_KEY_SEQUENCE: Final[str] = "sequence"
+_KEY_EVENT_TYPE: Final[str] = "event_type"
+_KEY_SOURCE_EVENT_TYPE: Final[str] = "source_event_type"
+_KEY_DOCUMENT_ID: Final[str] = "document_id"
+_KEY_MESSAGE: Final[str] = "message"
+_KEY_PAYLOAD: Final[str] = "payload"
+_KEY_EMITTED_AT: Final[str] = "emitted_at"
+_JOB_EVENT_SIDECAR_KIND: Final[str] = "fins_ingestion_job_event"
+_JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT: Final[
+    str
+] = "fins.ingestion.job_event_sidecar_row_skipped"
+_JOB_EVENT_SIDECAR_ROW_SKIPPED_SUMMARY: Final[str] = "malformed_or_invalid_event_row"
+_DEFAULT_JOB_EVENT_READ_LIMIT: Final[int] = 100
+_MAX_JOB_EVENT_READ_LIMIT: Final[int] = 1000
+_OBSERVATION_RETRY_AFTER_SECONDS: Final[float] = 1.0
+_PROGRESS_DOWNLOAD_STARTED: Final[str] = "download.started"
+_PROGRESS_DOWNLOAD_PREPARING: Final[str] = "download.preparing"
+_PROGRESS_DOWNLOAD_COMPLETED: Final[str] = "download.completed"
+_PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES: Final[str] = "download.completed_with_failures"
+_PROGRESS_UPLOAD_PREPARING: Final[str] = "upload.preparing"
+_PROGRESS_UPLOAD_STARTED: Final[str] = "upload.started"
+_PROGRESS_UPLOAD_COMPLETED: Final[str] = "upload.completed"
+_PROGRESS_UPLOAD_COMPLETED_WITH_FAILURES: Final[str] = "upload.completed_with_failures"
+_PROGRESS_PREPROCESS_PREPARING: Final[str] = "preprocess.preparing"
+_PROGRESS_PREPROCESS_SELECTED: Final[str] = "preprocess.selected"
+_PROGRESS_PREPROCESS_DOCUMENT_STARTED: Final[str] = "preprocess.document_started"
+_PROGRESS_PREPROCESS_DOCUMENT_PROCESSED: Final[str] = "preprocess.document_processed"
+_PROGRESS_PREPROCESS_DOCUMENT_SKIPPED: Final[str] = "preprocess.document_skipped"
+_PROGRESS_PREPROCESS_DOCUMENT_FAILED: Final[str] = "preprocess.document_failed"
+_PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED: Final[str] = "preprocess.document_not_supported"
+_PROGRESS_PREPROCESS_COMPLETED: Final[str] = "preprocess.completed"
+_PAYLOAD_TICKER: Final[str] = "ticker"
+_PAYLOAD_MARKET: Final[str] = "market"
+_PAYLOAD_SOURCE: Final[str] = "source"
+_PAYLOAD_SOURCE_KIND: Final[str] = "source_kind"
+_PAYLOAD_FORM_TYPES: Final[str] = "form_types"
+_PAYLOAD_ACTION: Final[str] = "action"
+_PAYLOAD_FILE_COUNT: Final[str] = "file_count"
+_PAYLOAD_SELECTED_COUNT: Final[str] = "selected_count"
+_PAYLOAD_PROCESSED_COUNT: Final[str] = "processed_count"
+_PAYLOAD_SKIPPED_COUNT: Final[str] = "skipped_count"
+_PAYLOAD_FAILED_COUNT: Final[str] = "failed_count"
+_PAYLOAD_DISCOVERED_COUNT: Final[str] = "discovered_count"
+_PAYLOAD_DOWNLOADED_COUNT: Final[str] = "downloaded_count"
+_PAYLOAD_REJECTED_COUNT: Final[str] = "rejected_count"
+_PAYLOAD_WRITTEN_DOCUMENT_COUNT: Final[str] = "written_document_count"
+_PAYLOAD_NOT_SUPPORTED_COUNT: Final[str] = "not_supported_count"
+_PAYLOAD_DOCUMENT_INDEX: Final[str] = "document_index"
+_PAYLOAD_DOCUMENT_TOTAL: Final[str] = "document_total"
+_PAYLOAD_UPLOAD_STATUS: Final[str] = "upload_status"
+_DIRECT_EVENT_QUEUE_MAX_SIZE: Final[int] = 32
+_DIRECT_QUEUE_GET_TIMEOUT_SECONDS: Final[float] = 0.05
+_DIRECT_QUEUE_PUT_TIMEOUT_SECONDS: Final[float] = 0.05
+_DIRECT_CANCELLED_MESSAGE: Final[str] = "操作已取消"
+_DIRECT_FAILURE_TITLE: Final[str] = "操作失败"
+_DIRECT_SUCCESS_TITLE: Final[str] = "操作完成"
+_DIRECT_ERROR_TEXT_FALLBACK: Final[str] = "执行失败"
 
 
 class FinsIngestionOperationKind(str, Enum):
@@ -882,6 +967,51 @@ class FinsIngestionJobStore(Protocol):
         """
         ...
 
+    def append_job_event(
+        self,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """追加 job event 并分配单调递增 sequence。
+
+        Args:
+            job_id: opaque job id。
+            event: 无 sequence 的事件追加输入。
+
+        Returns:
+            已持久化且包含 sequence 的事件 record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、event 字段或 payload 非法时抛出。
+        """
+        ...
+
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """按 sequence 游标读取 job event。
+
+        Args:
+            job_id: opaque job id。
+            after_sequence: 只返回 sequence 大于该值的事件；``0`` 表示读取全部。
+            limit: 本次最多返回事件数量。
+
+        Returns:
+            按 sequence 升序排列的事件元组。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读取失败时抛出。
+            ValueError: job id、游标、limit 或 event 内容非法时抛出。
+        """
+        ...
+
 
 class FinsIngestionExecutor(Protocol):
     """Fins ingestion 后台执行器协议。"""
@@ -955,6 +1085,227 @@ class _RuntimeJobCancellationChecker:
             FinsIngestionJobStatus.CANCELLING,
             FinsIngestionJobStatus.CANCELLED,
         }
+
+
+@dataclass
+class _DirectStreamCancellationState:
+    """direct stream 单次执行的本地取消状态。"""
+
+    _lock: Lock
+    _cancelled: bool = False
+
+    @classmethod
+    def create(cls) -> "_DirectStreamCancellationState":
+        """创建取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            direct stream 本地取消状态。
+
+        Raises:
+            无。
+        """
+
+        return cls(_lock=Lock())
+
+    def request_cancel(self) -> None:
+        """请求取消当前 direct stream。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        """读取当前是否已请求取消。
+
+        Args:
+            无。
+
+        Returns:
+            已请求取消时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            return self._cancelled
+
+
+@dataclass(frozen=True)
+class _DirectCancellationChecker:
+    """operation-scoped direct stream 取消检查器。"""
+
+    cancellation_token: CancellationToken | None
+    cancellation_state: _DirectStreamCancellationState
+
+    def __call__(self) -> bool:
+        """检查 direct stream 是否已取消。
+
+        Args:
+            无。
+
+        Returns:
+            本地 stream 被关闭或外部 token 已取消时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        if self.cancellation_state.is_cancelled():
+            return True
+        return self.cancellation_token is not None and self.cancellation_token.is_cancelled()
+
+
+@dataclass(frozen=True)
+class _DirectStreamProducerDone:
+    """direct stream producer 完成哨兵。"""
+
+
+_DirectStreamQueueItem = FinsEvent | _DirectStreamProducerDone
+
+
+@dataclass
+class _FinsObservedOperationRecord:
+    """process-local awaiting observation record。
+
+    该对象是 registry 内部可变快照；除创建阶段外，所有字段读取和变更都
+    必须在所属 runtime 的 ``_observation_lock`` 保护下完成。
+
+    Attributes:
+        handle: tool awaiting 使用的轻量 observation handle。
+        queue: 后台 producer 投递 direct progress/result 的本地队列。
+        cancellation_state: operation-scoped best-effort 取消状态。
+        status: 最近一次已归纳的 observation 状态。
+        result: 终态业务摘要；未终态时为空。
+        message: 最近一次业务可读 observation 消息。
+    """
+
+    handle: FinsObservationHandle
+    queue: Queue[_DirectStreamQueueItem]
+    cancellation_state: _DirectStreamCancellationState
+    status: FinsObservationStatus
+    result: FinsResultSummary | None
+    message: str
+
+
+@dataclass(frozen=True)
+class _FinsIngestionExecutionContext:
+    """单次 ingestion 业务执行上下文。
+
+    ``job_record`` 非空时表示 legacy awaiting job path；``direct_queue`` 非空时
+    表示当前进程内 direct stream path。二者共享业务 helper，但事件与取消真源
+    分别收口，避免 direct path 依赖 durable job store。
+    """
+
+    operation_kind: FinsIngestionOperationKind
+    direct_operation_kind: FinsOperationKind
+    normalized_ticker: str
+    market: NormalizedTickerMarket
+    exchange: NormalizedTickerExchange | None
+    source: str | None
+    source_kind: SourceKind | None
+    cancellation_checker: FinsJobCancellationChecker
+    job_record: FinsIngestionJobRecord | None
+    direct_queue: Queue[_DirectStreamQueueItem] | None
+    cancellation_state: _DirectStreamCancellationState | None
+
+
+@dataclass(frozen=True)
+class _DirectDownloadProducer:
+    """direct download producer 绑定参数。"""
+
+    runtime: "FinsIngestionRuntime"
+    normalized: NormalizedTicker
+    request: FinsDownloadRequest
+
+    def __call__(self, context: _FinsIngestionExecutionContext) -> None:
+        """执行 direct download producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            _UnsupportedDownloadSourceError: 没有匹配下载 adapter 时抛出。
+            ValueError: adapter 返回字段非法时抛出。
+            OSError: 仓储读写失败时抛出。
+        """
+
+        self.runtime._produce_direct_download(
+            context=context,
+            normalized=self.normalized,
+            request=self.request,
+        )
+
+
+@dataclass(frozen=True)
+class _DirectPreprocessProducer:
+    """direct preprocess producer 绑定参数。"""
+
+    runtime: "FinsIngestionRuntime"
+    request: FinsPreprocessRequest
+
+    def __call__(self, context: _FinsIngestionExecutionContext) -> None:
+        """执行 direct preprocess producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            FileNotFoundError: ticker 或源文档不存在时抛出。
+            ValueError: 请求或处理结果非法时抛出。
+            OSError: 仓储读写失败时抛出。
+        """
+
+        self.runtime._produce_direct_preprocess(
+            context=context,
+            request=self.request,
+        )
+
+
+@dataclass(frozen=True)
+class _DirectUploadProducer:
+    """direct upload producer 绑定参数。"""
+
+    runtime: "FinsIngestionRuntime"
+    request: FinsUploadRequest
+
+    def __call__(self, context: _FinsIngestionExecutionContext) -> None:
+        """执行 direct upload producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 上传 runner 失败时抛出。
+            ValueError: 请求字段或结果字段非法时抛出。
+            OSError: 仓储读写失败时抛出。
+        """
+
+        self.runtime._produce_direct_upload(
+            context=context,
+            request=self.request,
+        )
 
 
 @dataclass(frozen=True)
@@ -1279,6 +1630,93 @@ class FsFinsIngestionJobStore:
             self._write_record_locked(updated)
             return updated
 
+    def append_job_event(
+        self,
+        job_id: str,
+        event: FinsIngestionJobEventAppend,
+    ) -> FinsIngestionJobEventRecord:
+        """追加 job event 并分配单调递增 sequence。
+
+        Args:
+            job_id: opaque job id。
+            event: 无 sequence 的事件追加输入。
+
+        Returns:
+            已持久化且包含 sequence 的事件 record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: job id、event 字段或 payload 非法时抛出。
+        """
+
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
+            self._read_record_locked(job_id)
+            event_path = self._job_events_path(job_id)
+            sequence = self._last_event_sequence_locked(event_path) + 1
+            record = FinsIngestionJobEventRecord(
+                job_id=job_id,
+                sequence=sequence,
+                operation_kind=event.operation_kind,
+                status=event.status,
+                event_type=event.event_type,
+                source_event_type=event.source_event_type,
+                source_kind=event.source_kind,
+                document_id=event.document_id,
+                message=event.message,
+                payload=event.payload,
+                emitted_at=event.emitted_at,
+            )
+            payload = _event_record_to_json(record)
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            with event_path.open("a", encoding="utf-8") as stream:
+                stream.write(encoded)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(self.root_dir)
+            return record
+
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """按 sequence 游标读取 job event。
+
+        Args:
+            job_id: opaque job id。
+            after_sequence: 只返回 sequence 大于该值的事件；``0`` 表示读取全部。
+            limit: 本次最多返回事件数量。
+
+        Returns:
+            按 sequence 升序排列的事件元组。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
+            OSError: 文件系统读取失败时抛出。
+            ValueError: job id、游标、limit 或 event 内容非法时抛出。
+        """
+
+        _validate_event_read_window(after_sequence=after_sequence, limit=limit)
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
+            self._read_record_locked(job_id)
+            event_path = self._job_events_path(job_id)
+            if not event_path.exists():
+                return ()
+            events: list[FinsIngestionJobEventRecord] = []
+            for record in self._iter_event_records_locked(event_path):
+                if record.sequence <= after_sequence:
+                    continue
+                events.append(record)
+                if len(events) >= limit:
+                    break
+            return tuple(events)
+
     def _job_path(self, job_id: str) -> Path:
         """构造单个 job record 路径。
 
@@ -1294,6 +1732,94 @@ class FsFinsIngestionJobStore:
 
         _validate_job_id(job_id)
         return self.root_dir / f"{job_id}{_JOB_FILE_SUFFIX}"
+
+    def _job_events_path(self, job_id: str) -> Path:
+        """构造单个 job event sidecar 路径。
+
+        Args:
+            job_id: opaque job id。
+
+        Returns:
+            job event JSONL 路径。
+
+        Raises:
+            ValueError: job id 非法时抛出。
+        """
+
+        _validate_job_id(job_id)
+        return self.root_dir / f"{job_id}{_JOB_EVENT_FILE_SUFFIX}"
+
+    def _last_event_sequence_locked(self, event_path: Path) -> int:
+        """在持锁状态读取 event sidecar 最后一条 sequence。
+
+        Args:
+            event_path: job event JSONL 路径。
+
+        Returns:
+            最后一条事件 sequence；sidecar 不存在时返回 ``0``。
+
+        Raises:
+            OSError: 文件读取失败时抛出。
+            ValueError: event sidecar 内容非法时抛出。
+        """
+
+        last_sequence = 0
+        if not event_path.exists():
+            return last_sequence
+        for record in self._iter_event_records_locked(event_path):
+            if record.sequence <= last_sequence:
+                raise ValueError("Fins ingestion job event sequence 未递增")
+            last_sequence = record.sequence
+        return last_sequence
+
+    def _iter_event_records_locked(self, event_path: Path) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """在持锁状态读取 event sidecar 全部事件。
+
+        Args:
+            event_path: job event JSONL 路径。
+
+        Returns:
+            event record 元组。
+
+        Raises:
+            OSError: 文件读取失败时抛出。
+            ValueError: 有效 event record 的 sequence 非单调递增时抛出。
+        """
+
+        records: list[FinsIngestionJobEventRecord] = []
+        last_sequence = 0
+        with event_path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    payload = cast(JsonValue, json.loads(stripped))
+                except json.JSONDecodeError as exc:
+                    _warn_malformed_event_sidecar_row(
+                        line_number=line_number,
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                if not isinstance(payload, Mapping):
+                    _warn_malformed_event_sidecar_row(
+                        line_number=line_number,
+                        error_type=type(payload).__name__,
+                    )
+                    continue
+                try:
+                    record = _event_record_from_json(cast(Mapping[str, JsonValue], payload))
+                except ValueError as exc:
+                    _warn_malformed_event_sidecar_row(
+                        line_number=line_number,
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                if record.sequence <= last_sequence:
+                    raise ValueError("Fins ingestion job event sequence 未递增")
+                records.append(record)
+                last_sequence = record.sequence
+        return tuple(records)
 
     def _read_record_locked(self, job_id: str) -> FinsIngestionJobRecord:
         """在持锁状态读取 job record。
@@ -1364,6 +1890,8 @@ class FinsIngestionRuntime:
     download_adapters: Mapping[tuple[str, NormalizedTickerMarket], FinsSourceDownloadAdapter]
     upload_runner: FinsUploadRunner | None
     _start_lock: Lock
+    _observation_lock: Lock
+    _observations: dict[str, _FinsObservedOperationRecord]
 
     @classmethod
     def create(
@@ -1410,6 +1938,753 @@ class FinsIngestionRuntime:
             download_adapters=dict(download_adapters or {}),
             upload_runner=upload_runner,
             _start_lock=Lock(),
+            _observation_lock=Lock(),
+            _observations={},
+        )
+
+    async def download(
+        self,
+        request: FinsDownloadRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行下载 direct stream。
+
+        Args:
+            request: 下载请求。
+            cancellation_token: 可选 operation-scoped 取消 token。
+
+        Returns:
+            Fins direct 事件异步迭代器。
+
+        Raises:
+            ValueError: ticker、来源或请求字段非法时抛出。
+            OSError: 仓储读写失败时由底层实现抛出。
+        """
+
+        normalized = ticker_normalization.normalize_ticker(request.ticker)
+        source = _normalize_download_source(request.source)
+        async for event in self._run_direct_stream(
+            operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+            direct_operation_kind=FinsOperationKind.DOWNLOAD,
+            normalized=normalized,
+            source=source,
+            source_kind=None,
+            cancellation_token=cancellation_token,
+            producer=_DirectDownloadProducer(
+                runtime=self,
+                normalized=normalized,
+                request=replace(request, source=source),
+            ),
+        ):
+            yield event
+
+    async def preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行预处理 direct stream。
+
+        Args:
+            request: 预处理请求。
+            cancellation_token: 可选 operation-scoped 取消 token。
+
+        Returns:
+            Fins direct 事件异步迭代器。
+
+        Raises:
+            FileNotFoundError: ticker 或源文档不存在时抛出。
+            ValueError: ticker 或请求字段非法时抛出。
+            OSError: 仓储读写失败时由底层实现抛出。
+        """
+
+        normalized = ticker_normalization.normalize_ticker(request.ticker)
+        async for event in self._run_direct_stream(
+            operation_kind=FinsIngestionOperationKind.PREPROCESS,
+            direct_operation_kind=FinsOperationKind.PREPROCESS,
+            normalized=normalized,
+            source=None,
+            source_kind=request.source_kind,
+            cancellation_token=cancellation_token,
+            producer=_DirectPreprocessProducer(
+                runtime=self,
+                request=request,
+            ),
+        ):
+            yield event
+
+    async def upload(
+        self,
+        request: FinsUploadRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行上传 direct stream。
+
+        Args:
+            request: 上传请求。
+            cancellation_token: 可选 operation-scoped 取消 token。
+
+        Returns:
+            Fins direct 事件异步迭代器。
+
+        Raises:
+            ValueError: ticker、source_kind、action 或上传请求字段非法时抛出。
+            OSError: 仓储读写失败时由底层实现抛出。
+        """
+
+        normalized = ticker_normalization.normalize_ticker(request.ticker)
+        normalized_request = _normalize_upload_request(request)
+        async for event in self._run_direct_stream(
+            operation_kind=FinsIngestionOperationKind.UPLOAD,
+            direct_operation_kind=_direct_upload_operation_kind(normalized_request),
+            normalized=normalized,
+            source=None,
+            source_kind=normalized_request.source_kind,
+            cancellation_token=cancellation_token,
+            producer=_DirectUploadProducer(
+                runtime=self,
+                request=normalized_request,
+            ),
+        ):
+            yield event
+
+    def start_observed_download(
+        self,
+        request: FinsDownloadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """启动 process-local 可观察下载 operation。
+
+        Args:
+            request: 下载请求。
+            cancellation_token: operation-scoped 取消 token。
+
+        Returns:
+            只供 Host wait adapter 后续观察 completion 的 lightweight handle。
+
+        Raises:
+            FinsIngestionStartCancelledError: 启动前观察到取消时抛出。
+            ValueError: ticker、来源或请求字段非法时抛出。
+            RuntimeError: 后台执行器无法启动 operation 时抛出。
+        """
+
+        _raise_if_start_cancelled(cancellation_token)
+        normalized = ticker_normalization.normalize_ticker(request.ticker)
+        source = _normalize_download_source(request.source)
+        return self._start_observed_stream(
+            direct_operation_kind=FinsOperationKind.DOWNLOAD,
+            operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+            normalized=normalized,
+            source=source,
+            source_kind=None,
+            cancellation_token=cancellation_token,
+            producer=_DirectDownloadProducer(
+                runtime=self,
+                normalized=normalized,
+                request=replace(request, source=source),
+            ),
+        )
+
+    def start_observed_preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """启动 process-local 可观察预处理 operation。
+
+        Args:
+            request: 预处理请求。
+            cancellation_token: operation-scoped 取消 token。
+
+        Returns:
+            只供 Host wait adapter 后续观察 completion 的 lightweight handle。
+
+        Raises:
+            FinsIngestionStartCancelledError: 启动前观察到取消时抛出。
+            ValueError: ticker 或请求字段非法时抛出。
+            RuntimeError: 后台执行器无法启动 operation 时抛出。
+        """
+
+        _raise_if_start_cancelled(cancellation_token)
+        normalized = ticker_normalization.normalize_ticker(request.ticker)
+        return self._start_observed_stream(
+            direct_operation_kind=FinsOperationKind.PREPROCESS,
+            operation_kind=FinsIngestionOperationKind.PREPROCESS,
+            normalized=normalized,
+            source=None,
+            source_kind=request.source_kind,
+            cancellation_token=cancellation_token,
+            producer=_DirectPreprocessProducer(runtime=self, request=request),
+        )
+
+    def start_observed_upload(
+        self,
+        request: FinsUploadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """启动 process-local 可观察上传 operation。
+
+        Args:
+            request: 上传请求。
+            cancellation_token: operation-scoped 取消 token。
+
+        Returns:
+            只供 Host wait adapter 后续观察 completion 的 lightweight handle。
+
+        Raises:
+            FinsIngestionStartCancelledError: 启动前观察到取消时抛出。
+            ValueError: ticker、source_kind、action 或上传字段非法时抛出。
+            RuntimeError: 后台执行器无法启动 operation 时抛出。
+        """
+
+        _raise_if_start_cancelled(cancellation_token)
+        normalized = ticker_normalization.normalize_ticker(request.ticker)
+        normalized_request = _normalize_upload_request(request)
+        return self._start_observed_stream(
+            direct_operation_kind=_direct_upload_operation_kind(normalized_request),
+            operation_kind=FinsIngestionOperationKind.UPLOAD,
+            normalized=normalized,
+            source=None,
+            source_kind=normalized_request.source_kind,
+            cancellation_token=cancellation_token,
+            producer=_DirectUploadProducer(runtime=self, request=normalized_request),
+        )
+
+    async def poll_observation(
+        self,
+        handle: FinsObservationHandle,
+    ) -> FinsObservationSnapshot:
+        """读取 process-local observation 当前快照。
+
+        Args:
+            handle: lightweight observation handle。
+
+        Returns:
+            当前 observation snapshot；当前进程找不到 handle 时返回 LOST。
+
+        Raises:
+            无。process-local registry 缺失按 LOST 收口。
+        """
+
+        return self._observation_snapshot(handle)
+
+    async def cancel_observation(
+        self,
+        handle: FinsObservationHandle,
+    ) -> FinsObservationSnapshot:
+        """请求取消 observed operation。
+
+        Args:
+            handle: lightweight observation handle。
+
+        Returns:
+            取消请求后的 observation snapshot；找不到 handle 时返回 LOST。
+
+        Raises:
+            无。取消是 best-effort，不承诺中断不可取消的 blocking call。
+        """
+
+        with self._observation_lock:
+            record = self._observations.get(handle.handle_id)
+            if record is None:
+                return _lost_observation_snapshot(handle)
+            if record.status not in {
+                FinsObservationStatus.SUCCEEDED,
+                FinsObservationStatus.FAILED,
+                FinsObservationStatus.CANCELLED,
+                FinsObservationStatus.LOST,
+            }:
+                record.cancellation_state.request_cancel()
+                record.message = "Cancellation requested for this operation."
+            return self._observation_snapshot_locked(record)
+
+    async def abandon_observation(self, handle: FinsObservationHandle) -> None:
+        """释放 process-local observation record。
+
+        Args:
+            handle: lightweight observation handle。
+
+        Returns:
+            无。
+
+        Raises:
+            无。abandon 只清理本地 observation 记录并 best-effort 请求取消，
+            不删除已经写入 Fins storage 的业务产物。
+        """
+
+        with self._observation_lock:
+            record = self._observations.pop(handle.handle_id, None)
+            if record is not None:
+                record.cancellation_state.request_cancel()
+
+    def _start_observed_stream(
+        self,
+        *,
+        direct_operation_kind: FinsOperationKind,
+        operation_kind: FinsIngestionOperationKind,
+        normalized: NormalizedTicker,
+        source: str | None,
+        source_kind: SourceKind | None,
+        cancellation_token: CancellationToken,
+        producer: Callable[[_FinsIngestionExecutionContext], None],
+    ) -> FinsObservationHandle:
+        """启动 observed stream producer 并注册 process-local observation。
+
+        Args:
+            direct_operation_kind: 用户可读 operation kind。
+            operation_kind: runtime 内部 operation kind。
+            normalized: 已归一化 ticker。
+            source: 可选下载来源。
+            source_kind: 可选源文档类型。
+            cancellation_token: operation-scoped 取消 token。
+            producer: 复用 direct path 的同步业务 producer。
+
+        Returns:
+            lightweight observation handle。
+
+        Raises:
+            RuntimeError: 后台执行器拒绝任务时抛出。
+        """
+
+        handle = _new_observation_handle(direct_operation_kind)
+        queue: Queue[_DirectStreamQueueItem] = Queue(maxsize=_DIRECT_EVENT_QUEUE_MAX_SIZE)
+        cancellation_state = _DirectStreamCancellationState.create()
+        context = _FinsIngestionExecutionContext(
+            operation_kind=operation_kind,
+            direct_operation_kind=direct_operation_kind,
+            normalized_ticker=normalized.canonical,
+            market=normalized.market,
+            exchange=normalized.exchange,
+            source=source,
+            source_kind=source_kind,
+            cancellation_checker=_DirectCancellationChecker(
+                cancellation_token=cancellation_token,
+                cancellation_state=cancellation_state,
+            ),
+            job_record=None,
+            direct_queue=queue,
+            cancellation_state=cancellation_state,
+        )
+        record = _FinsObservedOperationRecord(
+            handle=handle,
+            queue=queue,
+            cancellation_state=cancellation_state,
+            status=FinsObservationStatus.PENDING,
+            result=None,
+            message="Observation is pending.",
+        )
+        with self._observation_lock:
+            self._observations[handle.handle_id] = record
+        try:
+            self.executor.submit(
+                handle.handle_id,
+                lambda: self._run_direct_stream_producer(context, producer),
+            )
+        except Exception:
+            with self._observation_lock:
+                self._observations.pop(handle.handle_id, None)
+            raise
+        return handle
+
+    def _observation_snapshot(
+        self,
+        handle: FinsObservationHandle,
+    ) -> FinsObservationSnapshot:
+        """读取并刷新 observation snapshot。
+
+        Args:
+            handle: lightweight observation handle。
+
+        Returns:
+            当前 observation snapshot。
+
+        Raises:
+            无。
+        """
+
+        with self._observation_lock:
+            record = self._observations.get(handle.handle_id)
+            if record is None:
+                return _lost_observation_snapshot(handle)
+            return self._observation_snapshot_locked(record)
+
+    def _observation_snapshot_locked(
+        self,
+        record: _FinsObservedOperationRecord,
+    ) -> FinsObservationSnapshot:
+        """在持有 observation lock 时刷新并返回 snapshot。
+
+        Args:
+            record: process-local observation record。
+
+        Returns:
+            当前 observation snapshot。
+
+        Raises:
+            无。
+        """
+
+        self._drain_observation_queue(record)
+        return FinsObservationSnapshot(
+            handle=record.handle,
+            status=record.status,
+            message=record.message,
+            result=record.result,
+            error_kind=_observation_error_kind(record.status, record.result),
+            retry_after_seconds=_observation_retry_after(record.status),
+        )
+
+    def _drain_observation_queue(self, record: _FinsObservedOperationRecord) -> None:
+        """归纳 observed producer 已投递的 direct events。
+
+        Args:
+            record: process-local observation record。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        while True:
+            try:
+                item = record.queue.get_nowait()
+            except Empty:
+                break
+            if isinstance(item, _DirectStreamProducerDone):
+                if record.result is None and record.status not in {
+                    FinsObservationStatus.FAILED,
+                    FinsObservationStatus.CANCELLED,
+                    FinsObservationStatus.SUCCEEDED,
+                }:
+                    record.status = FinsObservationStatus.FAILED
+                    record.message = "Observation finished without a result."
+                    record.result = _observation_failure_result(record.message)
+                continue
+            if item.event_type is FinsEventType.PROGRESS:
+                if record.result is None:
+                    record.status = FinsObservationStatus.RUNNING
+                    record.message = _safe_observation_message(item.message)
+                continue
+            if item.result is not None:
+                record.result = item.result
+                record.status = _observation_status_from_result(item.result.status)
+                record.message = _safe_observation_message(item.message)
+
+    async def _run_direct_stream(
+        self,
+        *,
+        operation_kind: FinsIngestionOperationKind,
+        direct_operation_kind: FinsOperationKind,
+        normalized: NormalizedTicker,
+        source: str | None,
+        source_kind: SourceKind | None,
+        cancellation_token: CancellationToken | None,
+        producer: Callable[[_FinsIngestionExecutionContext], None],
+    ) -> AsyncIterator[FinsEvent]:
+        """在线程桥中执行同步 ingestion helper 并产出 direct events。
+
+        Args:
+            operation_kind: runtime 内部操作类型。
+            direct_operation_kind: 用户可见 direct 操作类型。
+            normalized: 已归一化 ticker。
+            source: 可选下载来源。
+            source_kind: 可选源文档类型。
+            cancellation_token: operation-scoped 取消 token。
+            producer: 同步业务 producer。
+
+        Returns:
+            Fins direct 事件异步迭代器。
+
+        Raises:
+            无。producer 异常会转换成 ``RESULT(status=FAILURE)``。
+        """
+
+        queue: Queue[_DirectStreamQueueItem] = Queue(maxsize=_DIRECT_EVENT_QUEUE_MAX_SIZE)
+        cancellation_state = _DirectStreamCancellationState.create()
+        context = _FinsIngestionExecutionContext(
+            operation_kind=operation_kind,
+            direct_operation_kind=direct_operation_kind,
+            normalized_ticker=normalized.canonical,
+            market=normalized.market,
+            exchange=normalized.exchange,
+            source=source,
+            source_kind=source_kind,
+            cancellation_checker=_DirectCancellationChecker(
+                cancellation_token=cancellation_token,
+                cancellation_state=cancellation_state,
+            ),
+            job_record=None,
+            direct_queue=queue,
+            cancellation_state=cancellation_state,
+        )
+        thread = Thread(
+            target=self._run_direct_stream_producer,
+            name=f"fins-direct-{operation_kind.value}",
+            args=(context, producer),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            result_seen = False
+            while True:
+                item = await asyncio.to_thread(
+                    _direct_queue_get,
+                    queue,
+                    thread,
+                )
+                if item is None:
+                    continue
+                if isinstance(item, _DirectStreamProducerDone):
+                    break
+                if item.event_type is FinsEventType.RESULT:
+                    if result_seen:
+                        continue
+                    result_seen = True
+                yield item
+                if result_seen:
+                    break
+            if not result_seen:
+                yield _direct_missing_result_event(context)
+        finally:
+            cancellation_state.request_cancel()
+
+    def _run_direct_stream_producer(
+        self,
+        context: _FinsIngestionExecutionContext,
+        producer: Callable[[_FinsIngestionExecutionContext], None],
+    ) -> None:
+        """执行 direct stream 同步 producer。
+
+        Args:
+            context: 单次 direct stream 执行上下文。
+            producer: 同步业务 producer。
+
+        Returns:
+            无。
+
+        Raises:
+            无。异常会转成失败 RESULT。
+        """
+
+        try:
+            producer(context)
+        except Exception as exc:
+            self._emit_direct_result(
+                context,
+                status=FinsResultStatus.FAILURE,
+                title=_DIRECT_FAILURE_TITLE,
+                details=(),
+                error_kind=_classify_direct_error(exc),
+                error_message=_safe_direct_error_message(exc),
+            )
+        finally:
+            _put_direct_queue(context, _DirectStreamProducerDone())
+
+    def _produce_direct_download(
+        self,
+        *,
+        context: _FinsIngestionExecutionContext,
+        normalized: NormalizedTicker,
+        request: FinsDownloadRequest,
+    ) -> None:
+        """执行 direct download producer。
+
+        Args:
+            context: direct 执行上下文。
+            normalized: 已归一化 ticker。
+            request: 已规范化 source 的下载请求。
+
+        Returns:
+            无。
+
+        Raises:
+            _UnsupportedDownloadSourceError: 没有匹配下载 adapter 时抛出。
+            ValueError: adapter 返回字段非法时抛出。
+            OSError: 仓储读写失败时抛出。
+        """
+
+        self._emit_context_progress(
+            context,
+            source_event_type=_PROGRESS_DOWNLOAD_PREPARING,
+            message="下载准备中",
+            document_id=None,
+            payload={
+                _PAYLOAD_TICKER: context.normalized_ticker,
+                _PAYLOAD_MARKET: context.market,
+                _PAYLOAD_SOURCE: request.source,
+            },
+        )
+        summary = self._execute_download_request(context, normalized, request)
+        if context.cancellation_checker():
+            self._emit_direct_cancelled_result(context)
+            return
+        if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
+            self._emit_direct_result(
+                context,
+                status=FinsResultStatus.FAILURE,
+                title="下载失败",
+                details=_download_result_details(summary),
+                error_kind=FinsErrorKind.PROVIDER,
+                error_message="下载请求未写入任何源文档",
+            )
+            return
+        self._emit_direct_result(
+            context,
+            status=FinsResultStatus.SUCCESS,
+            title=_DIRECT_SUCCESS_TITLE,
+            details=_download_result_details(summary),
+            error_kind=None,
+            error_message=None,
+        )
+
+    def _produce_direct_preprocess(
+        self,
+        *,
+        context: _FinsIngestionExecutionContext,
+        request: FinsPreprocessRequest,
+    ) -> None:
+        """执行 direct preprocess producer。
+
+        Args:
+            context: direct 执行上下文。
+            request: 预处理请求。
+
+        Returns:
+            无。
+
+        Raises:
+            FileNotFoundError: ticker 或源文档不存在时抛出。
+            ValueError: 请求或处理结果非法时抛出。
+            OSError: 仓储读写失败时抛出。
+        """
+
+        self._emit_context_progress(
+            context,
+            source_event_type=_PROGRESS_PREPROCESS_PREPARING,
+            message="预处理准备中",
+            document_id=None,
+            payload={
+                _PAYLOAD_TICKER: context.normalized_ticker,
+                _PAYLOAD_MARKET: context.market,
+                _PAYLOAD_SOURCE_KIND: request.source_kind.value,
+            },
+        )
+        summary = self._execute_preprocess_request(context, request)
+        if context.cancellation_checker():
+            self._emit_direct_cancelled_result(context)
+            return
+        if (
+            summary.processed_count == 0
+            and (
+                summary.selected_count == 0
+                or summary.failed_count > 0
+                or len(summary.not_supported_document_ids) > 0
+            )
+        ):
+            self._emit_direct_result(
+                context,
+                status=FinsResultStatus.FAILURE,
+                title="预处理失败",
+                details=_preprocess_result_details(summary),
+                error_kind=FinsErrorKind.EXECUTION,
+                error_message="没有任何请求文档完成预处理",
+            )
+            return
+        self._emit_direct_result(
+            context,
+            status=FinsResultStatus.SUCCESS,
+            title=_DIRECT_SUCCESS_TITLE,
+            details=_preprocess_result_details(summary),
+            error_kind=None,
+            error_message=None,
+        )
+
+    def _produce_direct_upload(
+        self,
+        *,
+        context: _FinsIngestionExecutionContext,
+        request: FinsUploadRequest,
+    ) -> None:
+        """执行 direct upload producer。
+
+        Args:
+            context: direct 执行上下文。
+            request: 已归一化上传请求。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 上传 runner 失败时抛出。
+            ValueError: 请求字段或结果字段非法时抛出。
+            OSError: 仓储读写失败时抛出。
+        """
+
+        self._emit_context_progress(
+            context,
+            source_event_type=_PROGRESS_UPLOAD_PREPARING,
+            message="上传准备中",
+            document_id=_upload_request_document_id(request),
+            payload=_upload_context_request_progress_payload(context, request),
+        )
+        if self.upload_runner is None:
+            self._emit_direct_result(
+                context,
+                status=FinsResultStatus.FAILURE,
+                title="上传失败",
+                details=_upload_result_details(
+                    FinsUploadResultSummary(
+                        source_kind=request.source_kind,
+                        status=_UPLOAD_RESULT_STATUS_FAILED,
+                    )
+                ),
+                error_kind=FinsErrorKind.EXECUTION,
+                error_message=_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE,
+            )
+            return
+        self._emit_context_progress(
+            context,
+            source_event_type=_PROGRESS_UPLOAD_STARTED,
+            message="上传已开始",
+            document_id=_upload_request_document_id(request),
+            payload=_upload_context_request_progress_payload(context, request),
+        )
+        summary = self.upload_runner.run_upload(
+            request,
+            cancellation_checker=context.cancellation_checker,
+        )
+        self._emit_context_progress(
+            context,
+            source_event_type=_upload_completed_progress_type(summary),
+            message=_upload_completed_progress_message(summary),
+            document_id=summary.document_id or _upload_request_document_id(request),
+            payload=_upload_context_summary_progress_payload(context, request, summary),
+        )
+        if context.cancellation_checker():
+            self._emit_direct_cancelled_result(context)
+            return
+        if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
+            self._emit_direct_result(
+                context,
+                status=FinsResultStatus.FAILURE,
+                title="上传失败",
+                details=_upload_result_details(summary),
+                error_kind=FinsErrorKind.EXECUTION,
+                error_message="上传运行时返回失败状态",
+            )
+            return
+        self._emit_direct_result(
+            context,
+            status=FinsResultStatus.SUCCESS,
+            title=_DIRECT_SUCCESS_TITLE,
+            details=_upload_result_details(summary),
+            error_kind=None,
+            error_message=None,
         )
 
     def start_download(
@@ -1592,6 +2867,35 @@ class FinsIngestionRuntime:
 
         return self.job_store.read_job(job_id)
 
+    def read_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = _DEFAULT_JOB_EVENT_READ_LIMIT,
+    ) -> tuple[FinsIngestionJobEventRecord, ...]:
+        """按 sequence 游标读取 ingestion job events。
+
+        Args:
+            job_id: opaque job id。
+            after_sequence: 只返回 sequence 大于该值的事件；``0`` 表示读取全部。
+            limit: 本次最多返回事件数量。
+
+        Returns:
+            按 sequence 升序排列的事件元组。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: job store 读取失败时抛出。
+            ValueError: job id、游标、limit 或 event 内容非法时抛出。
+        """
+
+        return self.job_store.read_job_events(
+            job_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
     def request_cancel(self, job_id: str) -> FinsIngestionJobRecord:
         """请求取消 ingestion job。
 
@@ -1607,7 +2911,15 @@ class FinsIngestionRuntime:
             ValueError: job id 或 record 内容非法时抛出。
         """
 
-        return self.job_store.request_cancel(job_id, updated_at=_utc_now())
+        record = self.job_store.request_cancel(job_id, updated_at=_utc_now())
+        if record.status is FinsIngestionJobStatus.CANCELLING and record.cancellation_requested:
+            self._append_job_event_warn(
+                record,
+                event_type=FinsIngestionJobEventType.CANCEL_REQUESTED,
+                message="已记录取消请求",
+                payload={},
+            )
+        return record
 
     def _create_queued_record_with_start_lock(
         self,
@@ -1657,6 +2969,12 @@ class FinsIngestionRuntime:
             cancellation_requested=False,
         )
         persisted = self.job_store.create_job(record)
+        self._append_job_event_warn(
+            persisted,
+            event_type=FinsIngestionJobEventType.JOB_QUEUED,
+            message="job 已进入队列",
+            payload={},
+        )
         return _job_start_from_record(persisted)
 
     def _run_preprocess_job(self, *, job_id: str, request: FinsPreprocessRequest) -> None:
@@ -1677,7 +2995,11 @@ class FinsIngestionRuntime:
             record = self._mark_job_running_or_cancelled(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return
-            summary = self._execute_preprocess_request(record, request)
+            context = self._job_execution_context(
+                record,
+                direct_operation_kind=FinsOperationKind.PREPROCESS,
+            )
+            summary = self._execute_preprocess_request(context, request)
             latest = self.job_store.read_job(job_id)
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
                 self._save_cancelled(latest)
@@ -1725,7 +3047,11 @@ class FinsIngestionRuntime:
             record = self._mark_job_running_or_cancelled(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return
-            summary = self._execute_download_request(record, normalized, request)
+            context = self._job_execution_context(
+                record,
+                direct_operation_kind=FinsOperationKind.DOWNLOAD,
+            )
+            summary = self._execute_download_request(context, normalized, request)
             latest = self.job_store.read_job(job_id)
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
                 self._save_cancelled(latest)
@@ -1776,12 +3102,27 @@ class FinsIngestionRuntime:
                     ).to_json_summary(),
                 )
                 return
+            context = self._job_execution_context(
+                record,
+                direct_operation_kind=_direct_upload_operation_kind(request),
+            )
+            self._emit_context_progress(
+                context,
+                source_event_type=_PROGRESS_UPLOAD_STARTED,
+                message="上传已开始",
+                document_id=_upload_request_document_id(request),
+                payload=_upload_context_request_progress_payload(context, request),
+            )
             summary = self.upload_runner.run_upload(
                 request,
-                cancellation_checker=_RuntimeJobCancellationChecker(
-                    job_store=self.job_store,
-                    job_id=job_id,
-                ),
+                cancellation_checker=context.cancellation_checker,
+            )
+            self._emit_context_progress(
+                context,
+                source_event_type=_upload_completed_progress_type(summary),
+                message=_upload_completed_progress_message(summary),
+                document_id=summary.document_id or _upload_request_document_id(request),
+                payload=_upload_context_summary_progress_payload(context, request, summary),
             )
             latest = self.job_store.read_job(job_id)
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
@@ -1807,21 +3148,72 @@ class FinsIngestionRuntime:
         """
 
         now = _utc_now()
-        return self.job_store.claim_running_or_cancelled(
+        record = self.job_store.claim_running_or_cancelled(
             job_id,
             started_at=now,
             updated_at=now,
         )
+        if record.status is FinsIngestionJobStatus.RUNNING:
+            self._append_job_event_warn(
+                record,
+                event_type=FinsIngestionJobEventType.JOB_RUNNING,
+                message="job 已开始执行",
+                payload={},
+            )
+        elif record.status is FinsIngestionJobStatus.CANCELLED:
+            self._append_job_event_warn(
+                record,
+                event_type=FinsIngestionJobEventType.JOB_CANCELLED,
+                message="job 已取消",
+                payload={},
+            )
+        return record
+
+    def _job_execution_context(
+        self,
+        record: FinsIngestionJobRecord,
+        *,
+        direct_operation_kind: FinsOperationKind,
+    ) -> _FinsIngestionExecutionContext:
+        """由 legacy job record 构造共享业务执行上下文。
+
+        Args:
+            record: 已进入 running 的 job record。
+            direct_operation_kind: 对应 direct 业务操作类型，仅用于共享 helper 语义。
+
+        Returns:
+            绑定 job-store 取消检查与 sidecar progress sink 的执行上下文。
+
+        Raises:
+            无。
+        """
+
+        return _FinsIngestionExecutionContext(
+            operation_kind=record.operation_kind,
+            direct_operation_kind=direct_operation_kind,
+            normalized_ticker=record.normalized_ticker,
+            market=record.market,
+            exchange=record.exchange,
+            source=record.source,
+            source_kind=record.source_kind,
+            cancellation_checker=_RuntimeJobCancellationChecker(
+                job_store=self.job_store,
+                job_id=record.job_id,
+            ),
+            job_record=record,
+            direct_queue=None,
+            cancellation_state=None,
+        )
 
     def _execute_preprocess_request(
         self,
-        record: FinsIngestionJobRecord,
+        context: _FinsIngestionExecutionContext,
         request: FinsPreprocessRequest,
     ) -> FinsPreprocessResultSummary:
         """执行单个预处理请求。
 
         Args:
-            record: 已进入 running 的 job record。
+            context: 单次业务执行上下文。
             request: 原始预处理请求。
 
         Returns:
@@ -1833,22 +3225,44 @@ class FinsIngestionRuntime:
             OSError: 仓储读取或写入失败时抛出。
         """
 
-        ticker = record.normalized_ticker
+        ticker = context.normalized_ticker
         document_ids = self._select_preprocess_documents(
             ticker=ticker,
             source_kind=request.source_kind,
             document_ids=request.document_ids,
             form_types=request.form_types,
         )
+        self._emit_context_progress(
+            context,
+            source_event_type=_PROGRESS_PREPROCESS_SELECTED,
+            message="预处理已选择源文档",
+            document_id=None,
+            payload=_preprocess_selected_progress_payload(
+                context,
+                request,
+                selected_count=len(document_ids),
+            ),
+        )
         processed_ids: list[str] = []
         skipped_ids: list[str] = []
         failed_ids: list[str] = []
         not_supported_ids: list[str] = []
 
-        for document_id in document_ids:
-            latest = self.job_store.read_job(record.job_id)
-            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+        for document_index, document_id in enumerate(document_ids, start=1):
+            if context.cancellation_checker():
                 break
+            self._emit_context_progress(
+                context,
+                source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_STARTED,
+                message="预处理源文档已开始",
+                document_id=document_id,
+                payload=_preprocess_document_progress_payload(
+                    context,
+                    request,
+                    document_index=document_index,
+                    document_total=len(document_ids),
+                ),
+            )
             try:
                 outcome = self._preprocess_one_document(
                     ticker=ticker,
@@ -1858,16 +3272,64 @@ class FinsIngestionRuntime:
                 )
             except _PreprocessNotSupportedError:
                 not_supported_ids.append(document_id)
+                self._emit_context_progress(
+                    context,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED,
+                    message="预处理源文档不支持",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        context,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
                 continue
             except Exception:
                 failed_ids.append(document_id)
+                self._emit_context_progress(
+                    context,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_FAILED,
+                    message="预处理源文档失败",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        context,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
                 continue
             if outcome == "processed":
                 processed_ids.append(document_id)
+                self._emit_context_progress(
+                    context,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_PROCESSED,
+                    message="预处理源文档已完成",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        context,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
             else:
                 skipped_ids.append(document_id)
+                self._emit_context_progress(
+                    context,
+                    source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_SKIPPED,
+                    message="预处理源文档已跳过",
+                    document_id=document_id,
+                    payload=_preprocess_document_progress_payload(
+                        context,
+                        request,
+                        document_index=document_index,
+                        document_total=len(document_ids),
+                    ),
+                )
 
-        return FinsPreprocessResultSummary(
+        summary = FinsPreprocessResultSummary(
             selected_count=len(document_ids),
             processed_count=len(processed_ids),
             skipped_count=len(skipped_ids) + len(not_supported_ids),
@@ -1877,10 +3339,18 @@ class FinsIngestionRuntime:
             failed_document_ids=tuple(failed_ids),
             not_supported_document_ids=tuple(not_supported_ids),
         )
+        self._emit_context_progress(
+            context,
+            source_event_type=_PROGRESS_PREPROCESS_COMPLETED,
+            message="预处理请求已完成",
+            document_id=None,
+            payload=_preprocess_summary_progress_payload(context, request, summary),
+        )
+        return summary
 
     def _execute_download_request(
         self,
-        record: FinsIngestionJobRecord,
+        context: _FinsIngestionExecutionContext,
         normalized: NormalizedTicker,
         request: FinsDownloadRequest,
     ) -> FinsDownloadResultSummary:
@@ -1909,23 +3379,34 @@ class FinsIngestionRuntime:
             filed_before=_optional_bounded_text(request.filed_before, "filed_before"),
             overwrite_existing=request.overwrite_existing,
             rebuild_processed=request.rebuild_processed,
-            cancellation_checker=_RuntimeJobCancellationChecker(
-                job_store=self.job_store,
-                job_id=record.job_id,
-            ),
+            cancellation_checker=context.cancellation_checker,
+        )
+        self._emit_context_progress(
+            context,
+            source_event_type=_PROGRESS_DOWNLOAD_STARTED,
+            message="下载已开始",
+            document_id=None,
+            payload=_download_context_request_progress_payload(context, adapter_request),
         )
         adapter_result = adapter.download(adapter_request)
         if adapter_result.persisted_summary is not None:
             if adapter_result.documents or adapter_result.rejected_artifacts:
                 raise ValueError("adapter persisted_summary 不得与 documents/rejected_artifacts 同时返回")
-            return _bounded_download_summary(adapter_result.persisted_summary)
+            summary = _bounded_download_summary(adapter_result.persisted_summary)
+            self._emit_context_progress(
+                context,
+                source_event_type=_download_completed_progress_type(summary),
+                message=_download_completed_progress_message(summary),
+                document_id=None,
+                payload=_download_context_summary_progress_payload(context, adapter_request, summary),
+            )
+            return summary
         downloaded_ids: list[str] = []
         skipped_count = 0
         rejected_count = 0
 
         for document in adapter_result.documents:
-            latest = self.job_store.read_job(record.job_id)
-            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+            if context.cancellation_checker():
                 break
             if self._store_downloaded_document(
                 ticker=normalized.canonical,
@@ -1938,8 +3419,7 @@ class FinsIngestionRuntime:
                 skipped_count += 1
 
         for artifact in adapter_result.rejected_artifacts:
-            latest = self.job_store.read_job(record.job_id)
-            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+            if context.cancellation_checker():
                 break
             self._store_rejected_filing_artifact(
                 ticker=normalized.canonical,
@@ -1947,7 +3427,7 @@ class FinsIngestionRuntime:
             )
             rejected_count += 1
 
-        return FinsDownloadResultSummary(
+        summary = FinsDownloadResultSummary(
             discovered_count=_non_negative_count(adapter_result.discovered_count, "discovered_count"),
             downloaded_count=len(downloaded_ids),
             skipped_count=skipped_count,
@@ -1955,6 +3435,14 @@ class FinsIngestionRuntime:
             failed_count=_non_negative_count(adapter_result.failed_count, "failed_count"),
             written_document_ids=tuple(downloaded_ids),
         )
+        self._emit_context_progress(
+            context,
+            source_event_type=_download_completed_progress_type(summary),
+            message=_download_completed_progress_message(summary),
+            document_id=None,
+            payload=_download_context_summary_progress_payload(context, adapter_request, summary),
+        )
+        return summary
 
     def _select_download_adapter(
         self,
@@ -2342,11 +3830,13 @@ class FinsIngestionRuntime:
 
         _assert_bounded_summary(result_summary, "result_summary")
         now = _utc_now()
-        return self.job_store.save_succeeded_or_cancelled(
+        saved = self.job_store.save_succeeded_or_cancelled(
             record.job_id,
             result_summary=result_summary,
             finished_at=now,
         )
+        self._append_terminal_job_event_warn(saved)
+        return saved
 
     def _save_cancelled(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
         """保存 cancelled 终态。
@@ -2362,7 +3852,9 @@ class FinsIngestionRuntime:
         """
 
         now = _utc_now()
-        return self.job_store.save_cancelled_if_active(record.job_id, finished_at=now)
+        saved = self.job_store.save_cancelled_if_active(record.job_id, finished_at=now)
+        self._append_terminal_job_event_warn(saved)
+        return saved
 
     def _save_failed(
         self,
@@ -2397,12 +3889,14 @@ class FinsIngestionRuntime:
         final_result = result_summary or dict(_EMPTY_SUMMARY)
         _assert_bounded_summary(final_result, "result_summary")
         now = _utc_now()
-        return self.job_store.save_failed_or_cancelled_if_active(
+        saved = self.job_store.save_failed_or_cancelled_if_active(
             record.job_id,
             failure_summary=failure_summary,
             result_summary=final_result,
             finished_at=now,
         )
+        self._append_terminal_job_event_warn(saved)
+        return saved
 
     def _save_download_unsupported(self, job_id: str, message: str) -> None:
         """把 unsupported-source 下载结果保存为 failed 终态。
@@ -2467,6 +3961,660 @@ class FinsIngestionRuntime:
             )
             return
 
+    def _append_terminal_job_event_warn(self, record: FinsIngestionJobRecord) -> None:
+        """为 terminal job record 追加 terminal event，失败只记录 WARN。
+
+        Args:
+            record: 已保存的 job record。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        event_type = _terminal_event_type_from_status(record.status)
+        if event_type is None:
+            return
+        self._append_job_event_warn(
+            record,
+            event_type=event_type,
+            message=_terminal_event_message(record.status),
+            payload={},
+        )
+
+    def _emit_progress_event(
+        self,
+        record: FinsIngestionJobRecord,
+        *,
+        source_event_type: str,
+        message: str,
+        document_id: str | None,
+        payload: dict[str, JsonValue],
+    ) -> None:
+        """追加 runtime-owned progress event，失败时记录 bounded WARN 并继续。
+
+        Args:
+            record: 事件对应的 running job record 快照。
+            source_event_type: runtime 内部进度标签，只用于消费方展示分类。
+            message: 有界进度说明。
+            document_id: 可选业务文档 ID；不得放本地文件路径。
+            payload: 有界 JSON-compatible 业务摘要。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        try:
+            self.job_store.append_job_event(
+                record.job_id,
+                FinsIngestionJobEventAppend(
+                    operation_kind=record.operation_kind,
+                    status=record.status,
+                    event_type=FinsIngestionJobEventType.PROGRESS,
+                    source_event_type=source_event_type,
+                    source_kind=record.source_kind,
+                    document_id=document_id,
+                    message=message,
+                    payload=payload,
+                    emitted_at=_utc_now(),
+                ),
+            )
+        except Exception as exc:
+            payload_keys = ",".join(sorted(payload.keys()))
+            _LOGGER.warning(
+                "fins.ingestion.job_event_append_failed "
+                "job_id=%s operation_kind=%s event_type=%s source_event_type=%s "
+                "payload_key_count=%s payload_keys=%s error_type=%s error_summary=%s",
+                record.job_id,
+                record.operation_kind.value,
+                FinsIngestionJobEventType.PROGRESS.value,
+                _bounded_log_text(source_event_type),
+                len(payload),
+                _bounded_log_text(payload_keys),
+                type(exc).__name__,
+                "event_append_failed",
+            )
+
+    def _emit_context_progress(
+        self,
+        context: _FinsIngestionExecutionContext,
+        *,
+        source_event_type: str,
+        message: str,
+        document_id: str | None,
+        payload: dict[str, JsonValue],
+    ) -> None:
+        """按执行上下文投递 progress。
+
+        Args:
+            context: legacy job 或 direct stream 执行上下文。
+            source_event_type: runtime 内部进度标签。
+            message: 用户可读进度说明。
+            document_id: 可选业务文档 ID。
+            payload: 有界业务摘要。
+
+        Returns:
+            无。
+
+        Raises:
+            无。legacy sidecar 失败只记录 WARN；direct queue 关闭时停止投递。
+        """
+
+        if context.job_record is not None:
+            self._emit_progress_event(
+                context.job_record,
+                source_event_type=source_event_type,
+                message=message,
+                document_id=document_id,
+                payload=payload,
+            )
+            return
+        event = _direct_progress_event(
+            context=context,
+            source_event_type=source_event_type,
+            message=message,
+            document_id=document_id,
+            payload=payload,
+        )
+        _put_direct_queue(context, event)
+
+    def _emit_direct_result(
+        self,
+        context: _FinsIngestionExecutionContext,
+        *,
+        status: FinsResultStatus,
+        title: str,
+        details: tuple[FinsEventDetail, ...],
+        error_kind: FinsErrorKind | None,
+        error_message: str | None,
+    ) -> None:
+        """向 direct stream 投递唯一终态 RESULT。
+
+        Args:
+            context: direct stream 执行上下文。
+            status: 终态状态。
+            title: 结果标题。
+            details: 有界业务摘要详情。
+            error_kind: 可选失败分类。
+            error_message: 可选失败说明。
+
+        Returns:
+            无。
+
+        Raises:
+            无。legacy job context 不投递 direct RESULT。
+        """
+
+        if context.direct_queue is None:
+            return
+        exit_code = _direct_exit_code(status)
+        event = FinsEvent(
+            event_type=FinsEventType.RESULT,
+            operation_kind=context.direct_operation_kind,
+            message=title,
+            emitted_at=datetime.now(timezone.utc),
+            ticker=context.normalized_ticker,
+            filing_kind=_direct_filing_kind(context.source_kind),
+            document_label=None,
+            progress=None,
+            result=FinsResultSummary(
+                status=status,
+                exit_code=exit_code,
+                title=title,
+                details=details,
+                error_kind=error_kind,
+                error_message=error_message,
+            ),
+        )
+        _put_direct_queue(context, event)
+
+    def _emit_direct_cancelled_result(self, context: _FinsIngestionExecutionContext) -> None:
+        """向 direct stream 投递取消 RESULT。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._emit_direct_result(
+            context,
+            status=FinsResultStatus.CANCELLED,
+            title=_DIRECT_CANCELLED_MESSAGE,
+            details=(),
+            error_kind=FinsErrorKind.CANCELLED,
+            error_message=_DIRECT_CANCELLED_MESSAGE,
+        )
+
+    def _append_job_event_warn(
+        self,
+        record: FinsIngestionJobRecord,
+        *,
+        event_type: FinsIngestionJobEventType,
+        message: str,
+        payload: dict[str, JsonValue],
+    ) -> None:
+        """追加 job event，失败时记录 bounded WARN 并保持 job record 不变。
+
+        Args:
+            record: 事件对应的 job record 快照。
+            event_type: 事件类型。
+            message: 有界事件说明。
+            payload: 有界 JSON-compatible 事件摘要。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        try:
+            self.job_store.append_job_event(
+                record.job_id,
+                FinsIngestionJobEventAppend(
+                    operation_kind=record.operation_kind,
+                    status=record.status,
+                    event_type=event_type,
+                    source_event_type=None,
+                    source_kind=record.source_kind,
+                    document_id=None,
+                    message=message,
+                    payload=payload,
+                    emitted_at=_utc_now(),
+                ),
+            )
+        except Exception as exc:
+            payload_keys = ",".join(sorted(payload.keys()))
+            _LOGGER.warning(
+                "fins.ingestion.job_event_append_failed "
+                "job_id=%s operation_kind=%s event_type=%s payload_key_count=%s "
+                "payload_keys=%s error_type=%s error_summary=%s",
+                record.job_id,
+                record.operation_kind.value,
+                event_type.value,
+                len(payload),
+                _bounded_log_text(payload_keys),
+                type(exc).__name__,
+                "event_append_failed",
+            )
+
+
+def _direct_queue_get(
+    queue: Queue[_DirectStreamQueueItem],
+    thread: Thread,
+) -> _DirectStreamQueueItem | None:
+    """从 direct stream queue 读取一项。
+
+    Args:
+        queue: direct stream producer queue。
+        thread: producer 线程。
+
+    Returns:
+        queue item；超时但 producer 仍存活时返回 ``None``；producer 退出且
+        queue 空时返回完成哨兵。
+
+    Raises:
+        无。
+    """
+
+    try:
+        return queue.get(timeout=_DIRECT_QUEUE_GET_TIMEOUT_SECONDS)
+    except Empty:
+        if thread.is_alive():
+            return None
+        return _DirectStreamProducerDone()
+
+
+def _put_direct_queue(
+    context: _FinsIngestionExecutionContext,
+    item: _DirectStreamQueueItem,
+) -> bool:
+    """向 direct stream queue 投递事件。
+
+    Args:
+        context: direct stream 执行上下文。
+        item: 待投递 queue item。
+
+    Returns:
+        成功投递返回 ``True``；stream 已关闭或没有 direct queue 时返回 ``False``。
+
+    Raises:
+        无。
+    """
+
+    queue = context.direct_queue
+    if queue is None:
+        return False
+    while True:
+        cancellation_state = context.cancellation_state
+        if cancellation_state is not None and cancellation_state.is_cancelled():
+            # consumer 已结束时丢弃后续事件，避免同步 producer 卡在无人读取的队列上。
+            return False
+        try:
+            queue.put(item, timeout=_DIRECT_QUEUE_PUT_TIMEOUT_SECONDS)
+            return True
+        except Full:
+            continue
+
+
+def _direct_missing_result_event(context: _FinsIngestionExecutionContext) -> FinsEvent:
+    """构造 producer 静默结束时的 direct failure RESULT。
+
+    Args:
+        context: direct stream 执行上下文。
+
+    Returns:
+        表示 runtime 未产出终态的失败 RESULT。
+
+    Raises:
+        无。
+    """
+
+    return FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=context.direct_operation_kind,
+        message=_DIRECT_FAILURE_TITLE,
+        emitted_at=datetime.now(timezone.utc),
+        ticker=context.normalized_ticker,
+        filing_kind=_direct_filing_kind(context.source_kind),
+        document_label=None,
+        progress=None,
+        result=FinsResultSummary(
+            status=FinsResultStatus.FAILURE,
+            exit_code=FINS_RESULT_EXIT_FAILURE,
+            title=_DIRECT_FAILURE_TITLE,
+            details=(),
+            error_kind=FinsErrorKind.EXECUTION,
+            error_message=_DIRECT_ERROR_TEXT_FALLBACK,
+        ),
+    )
+
+
+def _direct_progress_event(
+    *,
+    context: _FinsIngestionExecutionContext,
+    source_event_type: str,
+    message: str,
+    document_id: str | None,
+    payload: Mapping[str, JsonValue],
+) -> FinsEvent:
+    """构造用户可见 direct progress event。
+
+    Args:
+        context: direct stream 执行上下文。
+        source_event_type: runtime 进度阶段。
+        message: 用户可读进度说明。
+        document_id: 可选业务文档 ID。
+        payload: 有界业务摘要。
+
+    Returns:
+        Fins direct progress event。
+
+    Raises:
+        ValueError: 投影文本不满足 direct event 泄漏保护时抛出。
+    """
+
+    completed_units, total_units = _direct_progress_units(source_event_type, payload)
+    return FinsEvent(
+        event_type=FinsEventType.PROGRESS,
+        operation_kind=context.direct_operation_kind,
+        message=message,
+        emitted_at=datetime.now(timezone.utc),
+        ticker=context.normalized_ticker,
+        filing_kind=_direct_filing_kind(context.source_kind),
+        document_label=_direct_document_label(document_id),
+        progress=FinsProgress(
+            stage=source_event_type,
+            completed_units=completed_units,
+            total_units=total_units,
+        ),
+        result=None,
+    )
+
+
+def _direct_progress_units(
+    source_event_type: str,
+    payload: Mapping[str, JsonValue],
+) -> tuple[int | None, int | None]:
+    """从 progress payload 提取用户可见工作单元计数。
+
+    Args:
+        source_event_type: runtime 进度阶段。
+        payload: 有界业务摘要。
+
+    Returns:
+        ``(completed_units, total_units)``。
+
+    Raises:
+        无。
+    """
+
+    if source_event_type == _PROGRESS_PREPROCESS_SELECTED:
+        selected = _optional_payload_int(payload, _PAYLOAD_SELECTED_COUNT)
+        return (0, selected)
+    if source_event_type in {
+        _PROGRESS_PREPROCESS_DOCUMENT_STARTED,
+        _PROGRESS_PREPROCESS_DOCUMENT_PROCESSED,
+        _PROGRESS_PREPROCESS_DOCUMENT_SKIPPED,
+        _PROGRESS_PREPROCESS_DOCUMENT_FAILED,
+        _PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED,
+    }:
+        index = _optional_payload_int(payload, _PAYLOAD_DOCUMENT_INDEX)
+        total = _optional_payload_int(payload, _PAYLOAD_DOCUMENT_TOTAL)
+        return (index, total)
+    if source_event_type == _PROGRESS_PREPROCESS_COMPLETED:
+        processed = _optional_payload_int(payload, _PAYLOAD_PROCESSED_COUNT)
+        selected = _optional_payload_int(payload, _PAYLOAD_SELECTED_COUNT)
+        return (processed, selected)
+    if source_event_type in {
+        _PROGRESS_DOWNLOAD_COMPLETED,
+        _PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES,
+    }:
+        downloaded = _optional_payload_int(payload, _PAYLOAD_DOWNLOADED_COUNT)
+        discovered = _optional_payload_int(payload, _PAYLOAD_DISCOVERED_COUNT)
+        return (downloaded, discovered)
+    if source_event_type in {
+        _PROGRESS_UPLOAD_COMPLETED,
+        _PROGRESS_UPLOAD_COMPLETED_WITH_FAILURES,
+    }:
+        return (1, 1)
+    return (None, None)
+
+
+def _optional_payload_int(payload: Mapping[str, JsonValue], key: str) -> int | None:
+    """从 payload 读取可选整数。
+
+    Args:
+        payload: JSON-compatible payload。
+        key: 字段名。
+
+    Returns:
+        整数值或 ``None``。
+
+    Raises:
+        无。
+    """
+
+    value = payload.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _direct_document_label(document_id: str | None) -> str | None:
+    """构造 direct event 的文档短标签。
+
+    Args:
+        document_id: 可选业务文档 ID。
+
+    Returns:
+        文档短标签；为空时返回 ``None``。
+
+    Raises:
+        ValueError: 文档 ID 非法时抛出。
+    """
+
+    if document_id is None:
+        return None
+    return _bounded_text(document_id, "direct_document_label", reject_path_separators=False)
+
+
+def _direct_filing_kind(source_kind: SourceKind | None) -> str | None:
+    """把 source kind 投影为 direct event 短标签。
+
+    Args:
+        source_kind: 可选源文档类别。
+
+    Returns:
+        用户可理解的短标签。
+
+    Raises:
+        无。
+    """
+
+    if source_kind is None:
+        return None
+    return source_kind.value
+
+
+def _direct_upload_operation_kind(request: FinsUploadRequest) -> FinsOperationKind:
+    """按上传请求类型选择 direct operation kind。
+
+    Args:
+        request: 上传请求。
+
+    Returns:
+        filing 或 material 上传操作类型。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(request, FinsUploadFilingRequest):
+        return FinsOperationKind.UPLOAD_FILING
+    if isinstance(request, FinsUploadMaterialRequest):
+        return FinsOperationKind.UPLOAD_MATERIAL
+    assert_never(request)
+
+
+def _direct_exit_code(status: FinsResultStatus) -> int:
+    """返回 direct result status 对应退出码。
+
+    Args:
+        status: direct 终态状态。
+
+    Returns:
+        固定退出码。
+
+    Raises:
+        无。
+    """
+
+    if status is FinsResultStatus.SUCCESS:
+        return FINS_RESULT_EXIT_SUCCESS
+    if status is FinsResultStatus.FAILURE:
+        return FINS_RESULT_EXIT_FAILURE
+    if status is FinsResultStatus.CANCELLED:
+        return FINS_RESULT_EXIT_CANCELLED
+    assert_never(status)
+
+
+def _download_result_details(summary: FinsDownloadResultSummary) -> tuple[FinsEventDetail, ...]:
+    """构造下载 direct result 详情。
+
+    Args:
+        summary: 下载结果摘要。
+
+    Returns:
+        有界业务可读详情。
+
+    Raises:
+        ValueError: 摘要字段非法时抛出。
+    """
+
+    bounded = _bounded_download_summary(summary)
+    return (
+        FinsEventDetail("discovered", str(bounded.discovered_count)),
+        FinsEventDetail("downloaded", str(bounded.downloaded_count)),
+        FinsEventDetail("skipped", str(bounded.skipped_count)),
+        FinsEventDetail("rejected", str(bounded.rejected_count)),
+        FinsEventDetail("failed", str(bounded.failed_count)),
+        FinsEventDetail("written documents", str(len(bounded.written_document_ids))),
+    )
+
+
+def _preprocess_result_details(summary: FinsPreprocessResultSummary) -> tuple[FinsEventDetail, ...]:
+    """构造预处理 direct result 详情。
+
+    Args:
+        summary: 预处理结果摘要。
+
+    Returns:
+        有界业务可读详情。
+
+    Raises:
+        ValueError: 摘要字段非法时抛出。
+    """
+
+    json_summary = summary.to_json_summary()
+    return (
+        FinsEventDetail("selected", str(json_summary["selected_count"])),
+        FinsEventDetail("processed", str(json_summary["processed_count"])),
+        FinsEventDetail("skipped", str(json_summary["skipped_count"])),
+        FinsEventDetail("failed", str(json_summary["failed_count"])),
+        FinsEventDetail("not supported", str(len(summary.not_supported_document_ids))),
+    )
+
+
+def _upload_result_details(summary: FinsUploadResultSummary) -> tuple[FinsEventDetail, ...]:
+    """构造上传 direct result 详情。
+
+    Args:
+        summary: 上传结果摘要。
+
+    Returns:
+        有界业务可读详情。
+
+    Raises:
+        ValueError: 摘要字段非法时抛出。
+    """
+
+    json_summary = summary.to_json_summary()
+    details = [
+        FinsEventDetail("source kind", str(json_summary["source_kind"])),
+        FinsEventDetail("status", str(json_summary["status"])),
+    ]
+    document_id = json_summary.get("document_id")
+    if isinstance(document_id, str) and document_id:
+        details.append(FinsEventDetail("document", document_id))
+    uploaded_files = json_summary.get("uploaded_files")
+    if isinstance(uploaded_files, list):
+        details.append(FinsEventDetail("uploaded files", str(len(uploaded_files))))
+    return tuple(details)
+
+
+def _classify_direct_error(exc: Exception) -> FinsErrorKind:
+    """把 runtime 异常归类为 direct error kind。
+
+    Args:
+        exc: runtime 异常。
+
+    Returns:
+        direct 失败分类。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(exc, _UnsupportedDownloadSourceError | ValueError | FileNotFoundError):
+        return FinsErrorKind.USER_INPUT
+    if isinstance(exc, OSError):
+        return FinsErrorKind.STORAGE
+    if isinstance(exc, RuntimeError):
+        return FinsErrorKind.EXECUTION
+    return FinsErrorKind.UNKNOWN
+
+
+def _safe_direct_error_message(exc: Exception) -> str:
+    """构造不会泄漏路径、job id 或 raw payload 的 direct 错误说明。
+
+    Args:
+        exc: runtime 异常。
+
+    Returns:
+        有界错误说明。
+
+    Raises:
+        无。
+    """
+
+    message = " ".join((str(exc) or type(exc).__name__).split())
+    lowered = message.lower()
+    if (
+        not message
+        or "/" in message
+        or "\\" in message
+        or "finsjob_" in message
+        or "job_id" in lowered
+        or "cursor" in lowered
+        or "raw payload" in lowered
+        or "provider payload" in lowered
+    ):
+        return f"{_DIRECT_ERROR_TEXT_FALLBACK}: {type(exc).__name__}"
+    if len(message) > _MAX_TEXT_CHARS:
+        return message[:_MAX_TEXT_CHARS]
+    return message
+
 
 def _new_job_id() -> str:
     """生成新的 opaque job id。
@@ -2482,6 +4630,172 @@ def _new_job_id() -> str:
     """
 
     return f"{_JOB_ID_PREFIX}{uuid.uuid4().hex}"
+
+
+def _new_observation_handle(operation_kind: FinsOperationKind) -> FinsObservationHandle:
+    """生成新的 process-local observation handle。
+
+    Args:
+        operation_kind: Fins 业务操作类型。
+
+    Returns:
+        lightweight observation handle。
+
+    Raises:
+        ValueError: handle 字段非法时由契约构造抛出。
+    """
+
+    return FinsObservationHandle(
+        handle_id=f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}{uuid.uuid4().hex}",
+        operation_kind=operation_kind,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def _lost_observation_snapshot(handle: FinsObservationHandle) -> FinsObservationSnapshot:
+    """构造 process-local observation 丢失快照。
+
+    Args:
+        handle: Host wait record 中保存的 lightweight handle。
+
+    Returns:
+        LOST observation snapshot。
+
+    Raises:
+        ValueError: snapshot 字段非法时由契约构造抛出。
+    """
+
+    return FinsObservationSnapshot(
+        handle=handle,
+        status=FinsObservationStatus.LOST,
+        message="Observation is no longer available.",
+        result=None,
+        error_kind=FinsErrorKind.UNKNOWN,
+        retry_after_seconds=None,
+    )
+
+
+def _observation_status_from_result(status: FinsResultStatus) -> FinsObservationStatus:
+    """把 direct result status 映射为 observation status。
+
+    Args:
+        status: Fins direct result status。
+
+    Returns:
+        observation terminal status。
+
+    Raises:
+        AssertionError: status 枚举出现未覆盖值时抛出。
+    """
+
+    if status is FinsResultStatus.SUCCESS:
+        return FinsObservationStatus.SUCCEEDED
+    if status is FinsResultStatus.FAILURE:
+        return FinsObservationStatus.FAILED
+    if status is FinsResultStatus.CANCELLED:
+        return FinsObservationStatus.CANCELLED
+    assert_never(status)
+
+
+def _observation_retry_after(status: FinsObservationStatus) -> float | None:
+    """返回 observation 非终态重试建议。
+
+    Args:
+        status: observation 状态。
+
+    Returns:
+        非终态返回正有限秒数，终态返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if status in {FinsObservationStatus.PENDING, FinsObservationStatus.RUNNING}:
+        return _OBSERVATION_RETRY_AFTER_SECONDS
+    return None
+
+
+def _observation_error_kind(
+    status: FinsObservationStatus,
+    result: FinsResultSummary | None,
+) -> FinsErrorKind | None:
+    """返回 observation snapshot 的错误分类。
+
+    Args:
+        status: observation 状态。
+        result: 可选 terminal result。
+
+    Returns:
+        失败、取消或 lost 的错误分类；其他状态返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if result is not None and result.error_kind is not None:
+        return result.error_kind
+    if status is FinsObservationStatus.CANCELLED:
+        return FinsErrorKind.CANCELLED
+    if status in {FinsObservationStatus.FAILED, FinsObservationStatus.LOST}:
+        return FinsErrorKind.UNKNOWN
+    return None
+
+
+def _observation_failure_result(message: str) -> FinsResultSummary:
+    """构造 observation producer 异常收口失败摘要。
+
+    Args:
+        message: 有界失败说明。
+
+    Returns:
+        Fins result summary。
+
+    Raises:
+        ValueError: result 字段非法时由契约构造抛出。
+    """
+
+    return FinsResultSummary(
+        status=FinsResultStatus.FAILURE,
+        exit_code=FINS_RESULT_EXIT_FAILURE,
+        title=_DIRECT_FAILURE_TITLE,
+        details=(),
+        error_kind=FinsErrorKind.EXECUTION,
+        error_message=message,
+    )
+
+
+def _safe_observation_message(message: str) -> str:
+    """构造 observation snapshot 使用的安全短消息。
+
+    Args:
+        message: runtime event 原始消息。
+
+    Returns:
+        不包含路径、job/cursor/token 等片段的短消息。
+
+    Raises:
+        无。
+    """
+
+    normalized = " ".join(message.split())
+    lowered = normalized.lower()
+    if (
+        normalized == ""
+        or "/" in normalized
+        or "\\" in normalized
+        or "job" in lowered
+        or "sequence" in lowered
+        or "cursor" in lowered
+        or "resume" in lowered
+        or "token" in lowered
+        or "tool_call" in lowered
+        or "storage" in lowered
+        or ".dayu" in lowered
+    ):
+        return "Observation status updated."
+    if len(normalized) > _MAX_TEXT_CHARS:
+        return normalized[:_MAX_TEXT_CHARS]
+    return normalized
 
 
 def _validate_job_id(job_id: str) -> None:
@@ -3014,6 +5328,339 @@ def _bounded_download_summary(summary: FinsDownloadResultSummary) -> FinsDownloa
     )
 
 
+def _download_context_request_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsSourceDownloadAdapterRequest,
+) -> dict[str, JsonValue]:
+    """构建下载 started progress payload。
+
+    Args:
+        context: 单次业务执行上下文。
+        request: 传给同步下载 adapter 的请求。
+
+    Returns:
+        有界、业务可读且不含路径或正文的 progress payload。
+
+    Raises:
+        ValueError: 字段越界时抛出。
+    """
+
+    return {
+        _PAYLOAD_TICKER: context.normalized_ticker,
+        _PAYLOAD_MARKET: context.market,
+        _PAYLOAD_SOURCE: _bounded_text(request.source, _PAYLOAD_SOURCE),
+        _PAYLOAD_FORM_TYPES: list(
+            _bounded_text_tuple(
+                request.form_types,
+                _PAYLOAD_FORM_TYPES,
+                reject_path_separators=False,
+            )
+        ),
+    }
+
+
+def _download_context_summary_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsSourceDownloadAdapterRequest,
+    summary: FinsDownloadResultSummary,
+) -> dict[str, JsonValue]:
+    """构建下载 completed progress payload。
+
+    Args:
+        record: 当前 job record。
+        request: 传给同步下载 adapter 的请求。
+        summary: 有界下载结果摘要。
+
+    Returns:
+        只包含 ticker、source、form 与计数的 progress payload。
+
+    Raises:
+        ValueError: 摘要字段越界时抛出。
+    """
+
+    bounded = _bounded_download_summary(summary)
+    payload = _download_context_request_progress_payload(context, request)
+    payload.update(
+        {
+            _PAYLOAD_DISCOVERED_COUNT: bounded.discovered_count,
+            _PAYLOAD_DOWNLOADED_COUNT: bounded.downloaded_count,
+            _PAYLOAD_SKIPPED_COUNT: bounded.skipped_count,
+            _PAYLOAD_REJECTED_COUNT: bounded.rejected_count,
+            _PAYLOAD_FAILED_COUNT: bounded.failed_count,
+            _PAYLOAD_WRITTEN_DOCUMENT_COUNT: len(bounded.written_document_ids),
+        }
+    )
+    return payload
+
+
+def _download_completed_progress_type(summary: FinsDownloadResultSummary) -> str:
+    """根据下载摘要选择 completed progress 标签。
+
+    Args:
+        summary: 下载结果摘要。
+
+    Returns:
+        有失败计数时返回 completed_with_failures，否则返回 completed。
+
+    Raises:
+        无。
+    """
+
+    if summary.failed_count > 0:
+        return _PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES
+    return _PROGRESS_DOWNLOAD_COMPLETED
+
+
+def _download_completed_progress_message(summary: FinsDownloadResultSummary) -> str:
+    """根据下载摘要选择用户可读 progress 说明。
+
+    Args:
+        summary: 下载结果摘要。
+
+    Returns:
+        下载完成或带失败完成的简短说明。
+
+    Raises:
+        无。
+    """
+
+    if summary.failed_count > 0:
+        return "下载已完成，存在失败候选"
+    return "下载已完成"
+
+
+def _upload_request_document_id(request: FinsUploadRequest) -> str | None:
+    """从上传请求提取可用于 progress 的业务文档 ID。
+
+    Args:
+        request: 上传请求。
+
+    Returns:
+        material 请求中的显式 document_id；filing 请求返回 ``None``。
+
+    Raises:
+        ValueError: 文档 ID 越界时抛出。
+    """
+
+    if isinstance(request, FinsUploadMaterialRequest):
+        return _optional_bounded_text(
+            request.document_id,
+            "upload_document_id",
+            reject_path_separators=False,
+        )
+    if isinstance(request, FinsUploadFilingRequest):
+        return None
+    assert_never(request)
+
+
+def _upload_context_request_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsUploadRequest,
+) -> dict[str, JsonValue]:
+    """构建 upload started progress payload。
+
+    Args:
+        context: 单次业务执行上下文。
+        request: 上传请求。
+
+    Returns:
+        只包含 ticker、source_kind、action 与文件数量的 payload。
+
+    Raises:
+        ValueError: 请求字段越界时抛出。
+    """
+
+    _validate_upload_file_count(request.files)
+    return {
+        _PAYLOAD_TICKER: context.normalized_ticker,
+        _PAYLOAD_MARKET: context.market,
+        _PAYLOAD_SOURCE_KIND: request.source_kind.value,
+        _PAYLOAD_ACTION: _normalize_upload_action(request.action),
+        _PAYLOAD_FILE_COUNT: len(request.files),
+    }
+
+
+def _upload_context_summary_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsUploadRequest,
+    summary: FinsUploadResultSummary,
+) -> dict[str, JsonValue]:
+    """构建 upload completed progress payload。
+
+    Args:
+        context: 单次业务执行上下文。
+        request: 上传请求。
+        summary: 上传结果摘要。
+
+    Returns:
+        有界上传 progress payload，不包含本地文件名或路径。
+
+    Raises:
+        ValueError: 请求或结果字段越界时抛出。
+    """
+
+    payload = _upload_context_request_progress_payload(context, request)
+    payload[_PAYLOAD_UPLOAD_STATUS] = _bounded_text(
+        summary.status,
+        _PAYLOAD_UPLOAD_STATUS,
+        reject_path_separators=False,
+    )
+    if summary.document_id is not None:
+        payload[_KEY_DOCUMENT_ID] = _bounded_text(
+            summary.document_id,
+            _KEY_DOCUMENT_ID,
+            reject_path_separators=False,
+        )
+    return payload
+
+
+def _upload_completed_progress_type(summary: FinsUploadResultSummary) -> str:
+    """根据上传摘要选择 completed progress 标签。
+
+    Args:
+        summary: 上传结果摘要。
+
+    Returns:
+        failed 状态返回 completed_with_failures，否则返回 completed。
+
+    Raises:
+        无。
+    """
+
+    if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
+        return _PROGRESS_UPLOAD_COMPLETED_WITH_FAILURES
+    return _PROGRESS_UPLOAD_COMPLETED
+
+
+def _upload_completed_progress_message(summary: FinsUploadResultSummary) -> str:
+    """根据上传摘要选择用户可读 progress 说明。
+
+    Args:
+        summary: 上传结果摘要。
+
+    Returns:
+        上传完成或带失败完成的简短说明。
+
+    Raises:
+        无。
+    """
+
+    if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
+        return "上传已完成，存在失败"
+    return "上传已完成"
+
+
+def _preprocess_selected_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsPreprocessRequest,
+    *,
+    selected_count: int,
+) -> dict[str, JsonValue]:
+    """构建 preprocess selected progress payload。
+
+    Args:
+        context: 单次业务执行上下文。
+        request: 预处理请求。
+        selected_count: 已选择文档数量。
+
+    Returns:
+        有界 progress payload。
+
+    Raises:
+        ValueError: 请求字段或计数字段非法时抛出。
+    """
+
+    return {
+        _PAYLOAD_TICKER: context.normalized_ticker,
+        _PAYLOAD_MARKET: context.market,
+        _PAYLOAD_SOURCE_KIND: request.source_kind.value,
+        _PAYLOAD_FORM_TYPES: list(
+            _bounded_text_tuple(
+                request.form_types,
+                _PAYLOAD_FORM_TYPES,
+                reject_path_separators=False,
+            )
+        ),
+        _PAYLOAD_SELECTED_COUNT: _non_negative_count(selected_count, _PAYLOAD_SELECTED_COUNT),
+    }
+
+
+def _preprocess_document_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsPreprocessRequest,
+    *,
+    document_index: int,
+    document_total: int,
+) -> dict[str, JsonValue]:
+    """构建单文档 preprocess progress payload。
+
+    Args:
+        context: 单次业务执行上下文。
+        request: 预处理请求。
+        document_index: 当前文档从 1 开始的序号。
+        document_total: 总文档数量。
+
+    Returns:
+        有界 progress payload。
+
+    Raises:
+        ValueError: 计数字段非法时抛出。
+    """
+
+    payload = _preprocess_selected_progress_payload(
+        context,
+        request,
+        selected_count=document_total,
+    )
+    payload[_PAYLOAD_DOCUMENT_INDEX] = _non_negative_count(document_index, _PAYLOAD_DOCUMENT_INDEX)
+    payload[_PAYLOAD_DOCUMENT_TOTAL] = _non_negative_count(document_total, _PAYLOAD_DOCUMENT_TOTAL)
+    return payload
+
+
+def _preprocess_summary_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsPreprocessRequest,
+    summary: FinsPreprocessResultSummary,
+) -> dict[str, JsonValue]:
+    """构建 preprocess completed progress payload。
+
+    Args:
+        context: 单次业务执行上下文。
+        request: 预处理请求。
+        summary: 预处理结果摘要。
+
+    Returns:
+        只包含选择信息和计数的 progress payload。
+
+    Raises:
+        ValueError: 摘要字段非法时抛出。
+    """
+
+    payload = _preprocess_selected_progress_payload(
+        context,
+        request,
+        selected_count=summary.selected_count,
+    )
+    payload.update(
+        {
+            _PAYLOAD_PROCESSED_COUNT: _non_negative_count(
+                summary.processed_count,
+                _PAYLOAD_PROCESSED_COUNT,
+            ),
+            _PAYLOAD_SKIPPED_COUNT: _non_negative_count(
+                summary.skipped_count,
+                _PAYLOAD_SKIPPED_COUNT,
+            ),
+            _PAYLOAD_FAILED_COUNT: _non_negative_count(
+                summary.failed_count,
+                _PAYLOAD_FAILED_COUNT,
+            ),
+            _PAYLOAD_NOT_SUPPORTED_COUNT: len(summary.not_supported_document_ids),
+        }
+    )
+    return payload
+
+
 def _build_processed_sections(processor: DocumentProcessor) -> list[dict[str, JsonValue]]:
     """构建 processed sections payload。
 
@@ -3122,6 +5769,146 @@ def _assert_bounded_summary(summary: Mapping[str, JsonValue], field_name: str) -
     encoded = json.dumps(summary, ensure_ascii=False, sort_keys=True)
     if len(encoded) > _MAX_SUMMARY_JSON_CHARS:
         raise ValueError(f"{field_name} 超出大小上限")
+
+
+def _warn_malformed_event_sidecar_row(*, line_number: int, error_type: str) -> None:
+    """记录 event sidecar 单行坏数据被跳过的有界 warning。
+
+    Args:
+        line_number: sidecar 文件中的行号。
+        error_type: 解析或校验失败类型名；不得包含 payload 值。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    _LOGGER.warning(
+        "%s sidecar_kind=%s sidecar_suffix=%s line_number=%s "
+        "error_type=%s error_summary=%s",
+        _JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT,
+        _JOB_EVENT_SIDECAR_KIND,
+        _JOB_EVENT_FILE_SUFFIX,
+        line_number,
+        error_type,
+        _JOB_EVENT_SIDECAR_ROW_SKIPPED_SUMMARY,
+    )
+
+
+def _event_record_to_json(record: FinsIngestionJobEventRecord) -> dict[str, JsonValue]:
+    """把 job event record 转换为 JSON-compatible 字典。
+
+    Args:
+        record: job event record。
+
+    Returns:
+        JSON-compatible 字典。
+
+    Raises:
+        ValueError: record 字段非法时抛出。
+    """
+
+    _validate_job_id(record.job_id)
+    _validate_event_sequence(record.sequence)
+    payload = validate_bounded_job_event_payload(record.payload, _KEY_PAYLOAD)
+    return {
+        _KEY_JOB_ID: record.job_id,
+        _KEY_SEQUENCE: record.sequence,
+        _KEY_OPERATION_KIND: record.operation_kind.value,
+        _KEY_STATUS: record.status.value if record.status is not None else None,
+        _KEY_EVENT_TYPE: record.event_type.value,
+        _KEY_SOURCE_EVENT_TYPE: _optional_bounded_text(
+            record.source_event_type,
+            _KEY_SOURCE_EVENT_TYPE,
+            reject_path_separators=False,
+        ),
+        _KEY_SOURCE_KIND: record.source_kind.value if record.source_kind is not None else None,
+        _KEY_DOCUMENT_ID: _optional_bounded_text(
+            record.document_id,
+            _KEY_DOCUMENT_ID,
+            reject_path_separators=False,
+        ),
+        _KEY_MESSAGE: _bounded_text(record.message, _KEY_MESSAGE, reject_path_separators=False),
+        _KEY_PAYLOAD: payload,
+        _KEY_EMITTED_AT: _bounded_text(record.emitted_at, _KEY_EMITTED_AT, reject_path_separators=False),
+    }
+
+
+def _event_record_from_json(payload: Mapping[str, JsonValue]) -> FinsIngestionJobEventRecord:
+    """从 JSON-compatible 字典恢复 job event record。
+
+    Args:
+        payload: JSON-compatible 字典。
+
+    Returns:
+        job event record。
+
+    Raises:
+        ValueError: 字段缺失或类型非法时抛出。
+    """
+
+    job_id = _required_str(payload, _KEY_JOB_ID)
+    _validate_job_id(job_id)
+    sequence = _required_int(payload, _KEY_SEQUENCE)
+    _validate_event_sequence(sequence)
+    source_kind_text = _optional_str(payload, _KEY_SOURCE_KIND)
+    status_text = _optional_str(payload, _KEY_STATUS)
+    record = FinsIngestionJobEventRecord(
+        job_id=job_id,
+        sequence=sequence,
+        operation_kind=FinsIngestionOperationKind(_required_str(payload, _KEY_OPERATION_KIND)),
+        status=FinsIngestionJobStatus(status_text) if status_text is not None else None,
+        event_type=FinsIngestionJobEventType(_required_str(payload, _KEY_EVENT_TYPE)),
+        source_event_type=_optional_str(payload, _KEY_SOURCE_EVENT_TYPE),
+        source_kind=SourceKind(source_kind_text) if source_kind_text is not None else None,
+        document_id=_optional_str(payload, _KEY_DOCUMENT_ID),
+        message=_required_str(payload, _KEY_MESSAGE),
+        payload=_required_json_object(payload, _KEY_PAYLOAD),
+        emitted_at=_required_str(payload, _KEY_EMITTED_AT),
+    )
+    _event_record_to_json(record)
+    return record
+
+
+def _validate_event_sequence(sequence: int) -> None:
+    """校验事件 sequence。
+
+    Args:
+        sequence: 待校验 sequence。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: sequence 小于 1 时抛出。
+    """
+
+    if sequence < 1:
+        raise ValueError("Fins ingestion job event sequence 必须从 1 开始")
+
+
+def _validate_event_read_window(*, after_sequence: int, limit: int) -> None:
+    """校验 event 读取窗口。
+
+    Args:
+        after_sequence: 读取游标。
+        limit: 本次最多返回事件数量。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 游标或 limit 非法时抛出。
+    """
+
+    if after_sequence < 0:
+        raise ValueError("after_sequence 不能为负数")
+    if limit < 1:
+        raise ValueError("limit 必须为正数")
+    if limit > _MAX_JOB_EVENT_READ_LIMIT:
+        raise ValueError("limit 超出 Fins ingestion job event 读取上限")
 
 
 def _record_to_json(record: FinsIngestionJobRecord) -> dict[str, JsonValue]:
@@ -3293,6 +6080,26 @@ def _required_bool(payload: Mapping[str, JsonValue], key: str) -> bool:
     return value
 
 
+def _required_int(payload: Mapping[str, JsonValue], key: str) -> int:
+    """读取必填整数字段。
+
+    Args:
+        payload: JSON-compatible 字典。
+        key: 字段名。
+
+    Returns:
+        整数字段值。
+
+    Raises:
+        ValueError: 字段缺失或类型错误时抛出。
+    """
+
+    value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Fins ingestion job record 字段 {key} 不是整数")
+    return value
+
+
 def _required_json_object(payload: Mapping[str, JsonValue], key: str) -> dict[str, JsonValue]:
     """读取必填 JSON 映射字段。
 
@@ -3311,6 +6118,71 @@ def _required_json_object(payload: Mapping[str, JsonValue], key: str) -> dict[st
     if not isinstance(value, Mapping):
         raise ValueError(f"Fins ingestion job record 字段 {key} 不是 JSON 映射")
     return dict(cast(Mapping[str, JsonValue], value))
+
+
+def _terminal_event_type_from_status(
+    status: FinsIngestionJobStatus,
+) -> FinsIngestionJobEventType | None:
+    """把 terminal job status 映射为 terminal event type。
+
+    Args:
+        status: job record 状态。
+
+    Returns:
+        terminal 状态对应的事件类型；非 terminal 状态返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if status is FinsIngestionJobStatus.SUCCEEDED:
+        return FinsIngestionJobEventType.JOB_SUCCEEDED
+    if status is FinsIngestionJobStatus.FAILED:
+        return FinsIngestionJobEventType.JOB_FAILED
+    if status is FinsIngestionJobStatus.CANCELLED:
+        return FinsIngestionJobEventType.JOB_CANCELLED
+    return None
+
+
+def _terminal_event_message(status: FinsIngestionJobStatus) -> str:
+    """返回 terminal event 的用户可读说明。
+
+    Args:
+        status: job record 状态。
+
+    Returns:
+        有界说明文本。
+
+    Raises:
+        无。
+    """
+
+    if status is FinsIngestionJobStatus.SUCCEEDED:
+        return "job 已成功完成"
+    if status is FinsIngestionJobStatus.FAILED:
+        return "job 已失败"
+    if status is FinsIngestionJobStatus.CANCELLED:
+        return "job 已取消"
+    return "job 状态未终结"
+
+
+def _bounded_log_text(value: str) -> str:
+    """返回适合 WARN 日志的一行有界文本。
+
+    Args:
+        value: 原始文本。
+
+    Returns:
+        移除换行并截断后的文本。
+
+    Raises:
+        无。
+    """
+
+    normalized = " ".join(value.split())
+    if len(normalized) <= _MAX_TEXT_CHARS:
+        return normalized
+    return normalized[:_MAX_TEXT_CHARS]
 
 
 def _market_from_text(value: str) -> NormalizedTickerMarket:

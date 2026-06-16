@@ -5,8 +5,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, TypeGuard
@@ -25,19 +25,42 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.fins.ingestion_runtime import (
+    FinsDownloadRequest,
     FinsIngestionExecutor,
-    FinsIngestionJobRecord,
-    FinsIngestionJobStatus,
-    FinsIngestionOperationKind,
     FinsIngestionRuntime,
-    FsFinsIngestionJobStore,
+    FinsPreprocessRequest,
+    FinsUploadRequest,
 )
 from dayu.fins.ingestion import (
+    FINS_OBSERVATION_HANDLE_ID_PREFIX,
+    FinsObservationHandle,
+    FinsObservationPollError,
+    FinsObservationPollErrorKind,
+    FinsObservationResolutionKind,
+    FinsObservationRuntime,
+    FinsObservationSnapshot,
+    FinsObservationStatus,
+    observation_handle_id_to_resume_token,
+    observation_poll_error_resolution_kind,
+    observation_status_resolution_kind,
+    parse_observation_handle_id_token,
+)
+from dayu.fins.ingestion.wait_adapter import (
     FINS_INGESTION_WAIT_ADAPTER_KEY,
+    FINS_UPLOAD_AWAITING_TOOL_NAME,
     FinsIngestionWaitPollAdapter,
     build_fins_wait_adapter_registry,
 )
-from dayu.fins.ingestion.wait_adapter import FINS_UPLOAD_AWAITING_TOOL_NAME
+from dayu.fins.direct_events import (
+    FINS_RESULT_EXIT_CANCELLED,
+    FINS_RESULT_EXIT_FAILURE,
+    FINS_RESULT_EXIT_SUCCESS,
+    FinsErrorKind,
+    FinsEventDetail,
+    FinsOperationKind,
+    FinsResultStatus,
+    FinsResultSummary,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
@@ -90,16 +113,250 @@ _FORBIDDEN_LLM_ERROR_FRAGMENTS: Final[tuple[str, ...]] = (
     "Fins ingestion " + "runtime",
 )
 _FORBIDDEN_CANCELLED_MESSAGE_FRAGMENTS: Final[tuple[str, ...]] = ("host", "Host")
-_TERMINAL_JOB_STATUSES = frozenset(
-    {
-        FinsIngestionJobStatus.SUCCEEDED,
-        FinsIngestionJobStatus.FAILED,
-        FinsIngestionJobStatus.CANCELLED,
-    }
-)
-_JOB_WAIT_TIMEOUT_SECONDS = 5.0
-_JOB_WAIT_POLL_SECONDS = 0.02
 _WAIT_RECORD_TIME = "2026-01-01T00:00:00Z"
+_OBSERVATION_TIME: Final[datetime] = datetime(2026, 6, 16, tzinfo=timezone.utc)
+_OBSERVATION_HANDLE_ID: Final[str] = (
+    f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaaaaaa"
+)
+
+
+def test_observation_handle_resume_token_is_opaque_handle_id() -> None:
+    """observation resume token 必须只承载 opaque handle id。"""
+
+    handle = _observation_handle()
+
+    token = observation_handle_id_to_resume_token(handle)
+
+    assert token == _OBSERVATION_HANDLE_ID
+    assert parse_observation_handle_id_token(token) == _OBSERVATION_HANDLE_ID
+    assert "job" not in token
+    assert "sequence" not in token
+    assert "cursor" not in token
+    assert "/" not in token
+
+
+@pytest.mark.parametrize(
+    "token",
+    (
+        "",
+        "finsjob_1234567890abcdef1234567890abcdef",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}gggggggggggggggg",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}jobaaaaaaaaaaaaaaaa",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}cursoraaaaaaaaaaaa",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaa/path",
+    ),
+)
+def test_observation_handle_corrupt_token_maps_to_lost(token: str) -> None:
+    """corrupt token 必须能被 wait adapter 分类为 LOST。"""
+
+    with pytest.raises(ValueError):
+        parse_observation_handle_id_token(token)
+
+    assert (
+        observation_poll_error_resolution_kind(
+            FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE
+        )
+        is FinsObservationResolutionKind.LOST
+    )
+
+
+def test_process_local_missing_observation_maps_to_lost() -> None:
+    """process-local observation source 找不到 handle 时必须分类为 LOST。"""
+
+    assert (
+        observation_poll_error_resolution_kind(
+            FinsObservationPollErrorKind.PERMANENT_NOT_FOUND
+        )
+        is FinsObservationResolutionKind.LOST
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        (FinsObservationStatus.PENDING, FinsObservationResolutionKind.PENDING),
+        (FinsObservationStatus.RUNNING, FinsObservationResolutionKind.PENDING),
+        (FinsObservationStatus.SUCCEEDED, FinsObservationResolutionKind.COMPLETED),
+        (FinsObservationStatus.FAILED, FinsObservationResolutionKind.FAILED),
+        (FinsObservationStatus.CANCELLED, FinsObservationResolutionKind.CANCELLED),
+        (FinsObservationStatus.LOST, FinsObservationResolutionKind.LOST),
+    ),
+)
+def test_observation_status_resolution_mapping_is_fixed(
+    status: FinsObservationStatus,
+    expected: FinsObservationResolutionKind,
+) -> None:
+    """observation status 到 wait resolution 的映射必须固定。"""
+
+    assert observation_status_resolution_kind(status) is expected
+
+
+def test_observation_snapshot_terminal_and_retry_after_contract() -> None:
+    """observation snapshot 必须区分 terminal result 与 retry-after。"""
+
+    terminal = FinsObservationSnapshot(
+        handle=_observation_handle(),
+        status=FinsObservationStatus.SUCCEEDED,
+        message="download completed",
+        result=_observation_result(FinsResultStatus.SUCCESS),
+        error_kind=None,
+        retry_after_seconds=None,
+    )
+    pending = FinsObservationSnapshot(
+        handle=_observation_handle(),
+        status=FinsObservationStatus.RUNNING,
+        message="download running",
+        result=None,
+        error_kind=None,
+        retry_after_seconds=0.5,
+    )
+
+    assert terminal.result is not None
+    assert pending.retry_after_seconds == 0.5
+    with pytest.raises(ValueError, match="terminal observation snapshot"):
+        FinsObservationSnapshot(
+            handle=_observation_handle(),
+            status=FinsObservationStatus.FAILED,
+            message="download failed",
+            result=None,
+            error_kind=FinsErrorKind.EXECUTION,
+            retry_after_seconds=None,
+        )
+    with pytest.raises(ValueError, match="non-terminal observation snapshot"):
+        FinsObservationSnapshot(
+            handle=_observation_handle(),
+            status=FinsObservationStatus.RUNNING,
+            message="download running",
+            result=_observation_result(FinsResultStatus.SUCCESS),
+            error_kind=None,
+            retry_after_seconds=None,
+        )
+
+
+def test_observation_contract_rejects_job_cursor_and_storage_text() -> None:
+    """observation contract 不允许暴露 job、sequence、cursor 或 storage path。"""
+
+    with pytest.raises(ValueError):
+        FinsObservationHandle(
+            handle_id=f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}jobaaaaaaaaaaaaaaaa",
+            operation_kind=FinsOperationKind.DOWNLOAD,
+            created_at=_OBSERVATION_TIME,
+        )
+    with pytest.raises(ValueError):
+        FinsObservationSnapshot(
+            handle=_observation_handle(),
+            status=FinsObservationStatus.LOST,
+            message="cursor /tmp/fins evidence missing",
+            result=None,
+            error_kind=FinsErrorKind.UNKNOWN,
+            retry_after_seconds=None,
+        )
+
+
+def _observation_handle() -> FinsObservationHandle:
+    """构造测试用 lightweight observation handle。
+
+    :returns: Fins observation handle。
+    :raises ValueError: 构造字段违反 contract 时抛出。
+    """
+
+    return FinsObservationHandle(
+        handle_id=_OBSERVATION_HANDLE_ID,
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        created_at=_OBSERVATION_TIME,
+    )
+
+
+def _observation_handle_with_id(hex_suffix: str) -> FinsObservationHandle:
+    """按指定 hex suffix 构造 observation handle。
+
+    :param hex_suffix: handle id 的十六进制 suffix。
+    :returns: Fins observation handle。
+    :raises ValueError: handle 字段违反 contract 时抛出。
+    """
+
+    return FinsObservationHandle(
+        handle_id=f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}{hex_suffix}",
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        created_at=_OBSERVATION_TIME,
+    )
+
+
+def _observation_snapshot(
+    handle: FinsObservationHandle,
+    status: FinsObservationStatus,
+) -> FinsObservationSnapshot:
+    """构造测试用 observation snapshot。
+
+    :param handle: observation handle。
+    :param status: 目标 observation 状态。
+    :returns: Fins observation snapshot。
+    :raises ValueError: snapshot 字段非法时抛出。
+    """
+
+    terminal_statuses = {
+        FinsObservationStatus.SUCCEEDED,
+        FinsObservationStatus.FAILED,
+        FinsObservationStatus.CANCELLED,
+    }
+    result_status = _result_status_from_observation_status(status)
+    return FinsObservationSnapshot(
+        handle=handle,
+        status=status,
+        message=f"{status.value} observation",
+        result=_observation_result(result_status) if status in terminal_statuses else None,
+        error_kind=FinsErrorKind.EXECUTION if status is FinsObservationStatus.FAILED else None,
+        retry_after_seconds=0.5
+        if status in {FinsObservationStatus.PENDING, FinsObservationStatus.RUNNING}
+        else None,
+    )
+
+
+def _result_status_from_observation_status(
+    status: FinsObservationStatus,
+) -> FinsResultStatus:
+    """把 observation terminal 状态转成 result status。
+
+    :param status: observation 状态。
+    :returns: result status。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if status is FinsObservationStatus.CANCELLED:
+        return FinsResultStatus.CANCELLED
+    if status is FinsObservationStatus.FAILED:
+        return FinsResultStatus.FAILURE
+    return FinsResultStatus.SUCCESS
+
+
+def _observation_result(status: FinsResultStatus) -> FinsResultSummary:
+    """构造测试用 Fins observation terminal result。
+
+    :param status: result status。
+    :returns: Fins result summary。
+    :raises ValueError: status 到 exit code 映射非法时抛出。
+    """
+
+    if status is FinsResultStatus.SUCCESS:
+        exit_code = FINS_RESULT_EXIT_SUCCESS
+        error_kind = None
+        error_message = None
+    elif status is FinsResultStatus.CANCELLED:
+        exit_code = FINS_RESULT_EXIT_CANCELLED
+        error_kind = FinsErrorKind.CANCELLED
+        error_message = "cancelled"
+    else:
+        exit_code = FINS_RESULT_EXIT_FAILURE
+        error_kind = FinsErrorKind.EXECUTION
+        error_message = "failed"
+    return FinsResultSummary(
+        status=status,
+        exit_code=exit_code,
+        title="Observation result",
+        details=(FinsEventDetail(label="ticker", value="AAPL"),),
+        error_kind=error_kind,
+        error_message=error_message,
+    )
 
 
 class _OpenCancellationToken:
@@ -164,24 +421,112 @@ class _CancelledCancellationToken:
         return datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-class _OSErrorCreateJobStore(FsFinsIngestionJobStore):
-    """测试用 job store，在创建 job 时模拟持久化失败。"""
+@dataclass
+class _FakeObservationRuntime(FinsObservationRuntime):
+    """测试用 process-local observation runtime。
 
-    def create_job(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
-        """模拟任务记录创建失败。
+    :param snapshots: handle id 到 snapshot 的映射。
+    :param poll_errors: handle id 到 poll 分类异常的映射。
+    """
 
-        Args:
-            record: 待创建的 job record。
+    snapshots: dict[str, FinsObservationSnapshot]
+    poll_errors: dict[str, FinsObservationPollError] | None = None
+    cancelled_handles: tuple[str, ...] = ()
+    abandoned_handles: tuple[str, ...] = ()
 
-        Returns:
-            不返回。
+    def start_observed_download(
+        self,
+        request: FinsDownloadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """启动下载 observation。
 
-        Raises:
-            OSError: 始终抛出，用于覆盖工具启动失败分支。
+        :param request: 下载请求。
+        :param cancellation_token: operation-scoped 取消 token。
+        :returns: observation handle。
+        :raises NotImplementedError: 本 fake 不覆盖启动路径。
         """
 
-        del record
-        raise OSError("job store unavailable")
+        del request, cancellation_token
+        raise NotImplementedError("fake runtime does not start download observations")
+
+    def start_observed_preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """启动预处理 observation。
+
+        :param request: 预处理请求。
+        :param cancellation_token: operation-scoped 取消 token。
+        :returns: observation handle。
+        :raises NotImplementedError: 本 fake 不覆盖启动路径。
+        """
+
+        del request, cancellation_token
+        raise NotImplementedError("fake runtime does not start preprocess observations")
+
+    def start_observed_upload(
+        self,
+        request: FinsUploadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """启动上传 observation。
+
+        :param request: 上传请求。
+        :param cancellation_token: operation-scoped 取消 token。
+        :returns: observation handle。
+        :raises NotImplementedError: 本 fake 不覆盖启动路径。
+        """
+
+        del request, cancellation_token
+        raise NotImplementedError("fake runtime does not start upload observations")
+
+    async def poll_observation(
+        self,
+        handle: FinsObservationHandle,
+    ) -> FinsObservationSnapshot:
+        """读取 fake observation 快照。
+
+        :param handle: observation handle。
+        :returns: snapshot。
+        :raises FinsObservationPollError: handle 缺失或配置为错误时抛出。
+        """
+
+        if self.poll_errors is not None and handle.handle_id in self.poll_errors:
+            raise self.poll_errors[handle.handle_id]
+        snapshot = self.snapshots.get(handle.handle_id)
+        if snapshot is None:
+            raise FinsObservationPollError(
+                FinsObservationPollErrorKind.PERMANENT_NOT_FOUND,
+                "Observation is no longer available.",
+            )
+        return snapshot
+
+    async def cancel_observation(
+        self,
+        handle: FinsObservationHandle,
+    ) -> FinsObservationSnapshot:
+        """记录 fake cancellation。
+
+        :param handle: observation handle。
+        :returns: cancellation 后的 snapshot。
+        :raises FinsObservationPollError: handle 缺失时抛出。
+        """
+
+        self.cancelled_handles = self.cancelled_handles + (handle.handle_id,)
+        return await self.poll_observation(handle)
+
+    async def abandon_observation(self, handle: FinsObservationHandle) -> None:
+        """记录并删除 fake observation。
+
+        :param handle: observation handle。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.abandoned_handles = self.abandoned_handles + (handle.handle_id,)
+        self.snapshots.pop(handle.handle_id, None)
 
 
 class _RuntimeErrorExecutor:
@@ -203,6 +548,27 @@ class _RuntimeErrorExecutor:
 
         del job_id, operation
         raise RuntimeError("executor unavailable")
+
+
+class _OSErrorExecutor:
+    """测试用后台执行器，在提交 observation 时模拟系统错误。"""
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """模拟后台提交系统错误。
+
+        Args:
+            job_id: opaque operation id。
+            operation: 原始后台任务函数。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 始终抛出，用于覆盖工具 OSError 启动失败分支。
+        """
+
+        del job_id, operation
+        raise OSError("executor unavailable")
 
 
 def test_tools_discovery_discovers_read_download_preprocess_and_upload_independently(
@@ -353,7 +719,7 @@ def test_upload_provider_rejects_relative_allowed_upload_roots(tmp_path: Path) -
 
 
 def test_download_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
-    """下载工具应在 durable job 创建后返回 EXTERNAL_JOB awaiting outcome。"""
+    """下载工具应返回基于 lightweight observation handle 的 awaiting outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
     definition = download_provider.discover_tools(
@@ -373,15 +739,17 @@ def test_download_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> 
 
     assert isinstance(outcome, ToolAwaitingOutcome)
     assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    record = runtime.read_job(outcome.await_spec.resume_token)
-    assert record.operation_kind is FinsIngestionOperationKind.DOWNLOAD
-    assert record.normalized_ticker == "AAPL"
-    # Production download 是长事务；工具测试只验证 start 边界与 durable job 创建。
+    assert parse_observation_handle_id_token(outcome.await_spec.resume_token)
+    assert outcome.await_spec.resume_token.startswith(FINS_OBSERVATION_HANDLE_ID_PREFIX)
+    assert "job" not in outcome.await_spec.resume_token
+    assert "cursor" not in outcome.await_spec.resume_token
+    assert "sidecar" not in outcome.await_spec.resume_token
+    assert outcome.snapshot is not None
+    assert "finsjob_" not in outcome.snapshot.snapshot_id
 
 
 def test_preprocess_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
-    """预处理工具应在 durable job 创建后返回 EXTERNAL_JOB awaiting outcome。"""
+    """预处理工具应返回基于 lightweight observation handle 的 awaiting outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
     definition = preprocess_provider.discover_tools(
@@ -401,15 +769,16 @@ def test_preprocess_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -
 
     assert isinstance(outcome, ToolAwaitingOutcome)
     assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    record = runtime.read_job(outcome.await_spec.resume_token)
-    assert record.operation_kind is FinsIngestionOperationKind.PREPROCESS
-    assert record.normalized_ticker == "AAPL"
-    _wait_ingestion_job_terminal(runtime, outcome.await_spec.resume_token)
+    assert parse_observation_handle_id_token(outcome.await_spec.resume_token)
+    assert outcome.await_spec.resume_token.startswith(FINS_OBSERVATION_HANDLE_ID_PREFIX)
+    assert "job" not in outcome.await_spec.resume_token
+    assert "cursor" not in outcome.await_spec.resume_token
+    assert outcome.snapshot is not None
+    assert "finsjob_" not in outcome.snapshot.snapshot_id
 
 
 def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
-    """上传工具应在 durable job 创建后返回 EXTERNAL_JOB awaiting outcome。"""
+    """上传工具应返回基于 lightweight observation handle 的 awaiting outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
     upload_root = _build_upload_root(tmp_path)
@@ -439,16 +808,16 @@ def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> No
 
     assert isinstance(outcome, ToolAwaitingOutcome)
     assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    record = runtime.read_job(outcome.await_spec.resume_token)
-    assert record.operation_kind is FinsIngestionOperationKind.UPLOAD
-    assert record.normalized_ticker == "AAPL"
-    assert record.source_kind is SourceKind.FILING
-    _wait_ingestion_job_terminal(runtime, outcome.await_spec.resume_token)
+    assert parse_observation_handle_id_token(outcome.await_spec.resume_token)
+    assert outcome.await_spec.resume_token.startswith(FINS_OBSERVATION_HANDLE_ID_PREFIX)
+    assert "job" not in outcome.await_spec.resume_token
+    assert "cursor" not in outcome.await_spec.resume_token
+    assert outcome.snapshot is not None
+    assert "finsjob_" not in outcome.snapshot.snapshot_id
 
 
-def test_tool_argument_error_returns_failed_outcome_before_job_creation(tmp_path: Path) -> None:
-    """工具参数错误必须返回失败 outcome，且不得创建 durable job。"""
+def test_tool_argument_error_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
+    """工具参数错误必须返回失败 outcome，且不得启动 observation。"""
 
     workspace_root = _build_workspace(tmp_path)
     definition = download_provider.discover_tools(
@@ -472,8 +841,8 @@ def test_tool_argument_error_returns_failed_outcome_before_job_creation(tmp_path
     assert not tuple(job_dir.glob("*.json"))
 
 
-def test_upload_tool_path_error_returns_failed_outcome_before_job_creation(tmp_path: Path) -> None:
-    """上传路径越界必须在 durable job 创建前返回失败 outcome。"""
+def test_upload_tool_path_error_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
+    """上传路径越界必须在 observation 启动前返回失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
     allowed_root = _build_upload_root(tmp_path)
@@ -509,8 +878,8 @@ def test_upload_tool_path_error_returns_failed_outcome_before_job_creation(tmp_p
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
-def test_upload_tool_empty_file_returns_failed_outcome_before_job_creation(tmp_path: Path) -> None:
-    """上传空文件必须在 durable job 创建前返回失败 outcome。"""
+def test_upload_tool_empty_file_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
+    """上传空文件必须在 observation 启动前返回失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
     allowed_root = _build_upload_root(tmp_path)
@@ -583,7 +952,7 @@ def test_upload_tool_delete_rejects_unnecessary_files_before_job_creation(tmp_pa
 
 
 def test_download_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
-    """下载工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+    """下载工具 start 前收到取消 token 时应取消且不启动 observation。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
@@ -602,7 +971,7 @@ def test_download_tool_cancelled_before_start_returns_cancelled_without_job(tmp_
 
 
 def test_preprocess_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
-    """预处理工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+    """预处理工具 start 前收到取消 token 时应取消且不启动 observation。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
@@ -621,7 +990,7 @@ def test_preprocess_tool_cancelled_before_start_returns_cancelled_without_job(tm
 
 
 def test_upload_tool_cancelled_before_start_returns_cancelled_without_job(tmp_path: Path) -> None:
-    """上传工具 start 前收到取消 token 时应取消且不创建 durable job。"""
+    """上传工具 start 前收到取消 token 时应取消且不启动 observation。"""
 
     workspace_root = _build_workspace(tmp_path)
     upload_root = _build_upload_root(tmp_path)
@@ -655,27 +1024,27 @@ def test_awaiting_tool_callables_consume_context_and_bridge_token_to_runtime() -
     _assert_context_token_bridge(
         source_path=_DOWNLOAD_TOOLS_PATH,
         class_name="FinsDownloadToolCallable",
-        start_method="start_download",
+        start_method="start_observed_download",
     )
     _assert_context_token_bridge(
         source_path=_PREPROCESS_TOOLS_PATH,
         class_name="FinsPreprocessToolCallable",
-        start_method="start_preprocess",
+        start_method="start_observed_preprocess",
     )
     _assert_context_token_bridge(
         source_path=_UPLOAD_TOOLS_PATH,
         class_name="FinsUploadToolCallable",
-        start_method="start_upload",
+        start_method="start_observed_upload",
     )
 
 
 def test_download_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """下载工具遇到 start_download OSError 时应返回 start-failed 失败 outcome。"""
+    """下载工具遇到 observation start OSError 时应返回 start-failed 失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
-    runtime = _runtime_with_job_store(
+    runtime = _runtime_with_executor(
         workspace_root=workspace_root,
-        job_store=_OSErrorCreateJobStore(root_dir=_job_store_root(workspace_root)),
+        executor=_OSErrorExecutor(),
     )
 
     outcome = asyncio.run(
@@ -712,12 +1081,12 @@ def test_download_tool_unexpected_start_exception_returns_start_failed_outcome(t
 
 
 def test_preprocess_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """预处理工具遇到 start_preprocess OSError 时应返回 start-failed 失败 outcome。"""
+    """预处理工具遇到 observation start OSError 时应返回 start-failed 失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
-    runtime = _runtime_with_job_store(
+    runtime = _runtime_with_executor(
         workspace_root=workspace_root,
-        job_store=_OSErrorCreateJobStore(root_dir=_job_store_root(workspace_root)),
+        executor=_OSErrorExecutor(),
     )
 
     outcome = asyncio.run(
@@ -754,13 +1123,13 @@ def test_preprocess_tool_unexpected_start_exception_returns_start_failed_outcome
 
 
 def test_upload_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """上传工具遇到 start_upload OSError 时应返回 start-failed 失败 outcome。"""
+    """上传工具遇到 observation start OSError 时应返回 start-failed 失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
     upload_root = _build_upload_root(tmp_path)
-    runtime = _runtime_with_job_store(
+    runtime = _runtime_with_executor(
         workspace_root=workspace_root,
-        job_store=_OSErrorCreateJobStore(root_dir=_job_store_root(workspace_root)),
+        executor=_OSErrorExecutor(),
     )
 
     outcome = asyncio.run(
@@ -947,30 +1316,48 @@ def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> N
         raise AssertionError("重复 Fins wait adapter binding 未失败")
 
 
-def test_fins_wait_poll_adapter_maps_terminal_and_missing_jobs(
-    tmp_path: Path,
-) -> None:
-    """Fins poll adapter 应把 job 状态映射为 Host wait resolve outcome。"""
+def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
+    """Fins poll adapter 应把 lightweight observation 状态映射为 Host outcome。"""
 
-    workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-    succeeded = _persist_job(runtime, "00000000000000000000000000000001", FinsIngestionJobStatus.SUCCEEDED)
-    failed = _persist_job(runtime, "00000000000000000000000000000002", FinsIngestionJobStatus.FAILED)
-    cancelled = _persist_job(runtime, "00000000000000000000000000000003", FinsIngestionJobStatus.CANCELLED)
-    queued = _persist_job(runtime, "00000000000000000000000000000004", FinsIngestionJobStatus.QUEUED)
-    running = _persist_job(runtime, "00000000000000000000000000000005", FinsIngestionJobStatus.RUNNING)
-    cancelling = _persist_job(runtime, "00000000000000000000000000000006", FinsIngestionJobStatus.CANCELLING)
-
-    succeeded_poll = adapter.poll_wait(_wait_record(succeeded.job_id, DOWNLOAD_TOOL_NAME))
-    failed_poll = adapter.poll_wait(_wait_record(failed.job_id, DOWNLOAD_TOOL_NAME))
-    cancelled_poll = adapter.poll_wait(_wait_record(cancelled.job_id, PREPROCESS_TOOL_NAME))
-    queued_poll = adapter.poll_wait(_wait_record(queued.job_id, PREPROCESS_TOOL_NAME))
-    running_poll = adapter.poll_wait(_wait_record(running.job_id, DOWNLOAD_TOOL_NAME))
-    cancelling_poll = adapter.poll_wait(_wait_record(cancelling.job_id, PREPROCESS_TOOL_NAME))
-    missing_poll = adapter.poll_wait(
-        _wait_record("finsjob_00000000000000000000000000009999", DOWNLOAD_TOOL_NAME)
+    succeeded = _observation_handle_with_id("bbbbbbbbbbbbbbbb")
+    failed = _observation_handle_with_id("cccccccccccccccc")
+    cancelled = _observation_handle_with_id("dddddddddddddddd")
+    pending = _observation_handle_with_id("eeeeeeeeeeeeeeee")
+    running = _observation_handle_with_id("ffffffffffffffff")
+    lost = _observation_handle_with_id("1111111111111111")
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            succeeded.handle_id: _observation_snapshot(
+                succeeded,
+                FinsObservationStatus.SUCCEEDED,
+            ),
+            failed.handle_id: _observation_snapshot(
+                failed,
+                FinsObservationStatus.FAILED,
+            ),
+            cancelled.handle_id: _observation_snapshot(
+                cancelled,
+                FinsObservationStatus.CANCELLED,
+            ),
+            pending.handle_id: _observation_snapshot(
+                pending,
+                FinsObservationStatus.PENDING,
+            ),
+            running.handle_id: _observation_snapshot(
+                running,
+                FinsObservationStatus.RUNNING,
+            ),
+            lost.handle_id: _observation_snapshot(lost, FinsObservationStatus.LOST),
+        }
     )
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    succeeded_poll = adapter.poll_wait(_wait_record(succeeded.handle_id, DOWNLOAD_TOOL_NAME))
+    failed_poll = adapter.poll_wait(_wait_record(failed.handle_id, DOWNLOAD_TOOL_NAME))
+    cancelled_poll = adapter.poll_wait(_wait_record(cancelled.handle_id, PREPROCESS_TOOL_NAME))
+    pending_poll = adapter.poll_wait(_wait_record(pending.handle_id, PREPROCESS_TOOL_NAME))
+    running_poll = adapter.poll_wait(_wait_record(running.handle_id, DOWNLOAD_TOOL_NAME))
+    lost_poll = adapter.poll_wait(_wait_record(lost.handle_id, DOWNLOAD_TOOL_NAME))
 
     assert isinstance(succeeded_poll, WaitPollReady)
     assert isinstance(succeeded_poll.outcome, ResolveWaitCompletedOutcome)
@@ -978,188 +1365,110 @@ def test_fins_wait_poll_adapter_maps_terminal_and_missing_jobs(
     assert isinstance(failed_poll.outcome, ResolveWaitFailedOutcome)
     assert isinstance(cancelled_poll, WaitPollReady)
     assert isinstance(cancelled_poll.outcome, ResolveWaitCancelledOutcome)
-    assert isinstance(queued_poll, WaitPollNotReady)
+    assert isinstance(pending_poll, WaitPollNotReady)
     assert isinstance(running_poll, WaitPollNotReady)
-    assert isinstance(cancelling_poll, WaitPollNotReady)
+    assert isinstance(lost_poll, WaitPollLost)
+    assert isinstance(lost_poll.outcome, ResolveWaitLostOutcome)
+    value = succeeded_poll.outcome.result.value
+    assert isinstance(value, Mapping)
+    assert value["operation"] == "download"
+    assert "job_id" not in value
+
+
+def test_fins_wait_poll_adapter_corrupt_and_missing_handles_are_lost() -> None:
+    """corrupt token 或缺失 handle 必须 resolve LOST，不得无限 pending。"""
+
+    missing = _observation_handle_with_id("9999999999999999")
+    adapter = FinsIngestionWaitPollAdapter(runtime=_FakeObservationRuntime(snapshots={}))
+
+    corrupt_poll = adapter.poll_wait(_wait_record("finsjob_00000000000000000000000000000007", DOWNLOAD_TOOL_NAME))
+    missing_poll = adapter.poll_wait(_wait_record(missing.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(corrupt_poll, WaitPollLost)
+    assert isinstance(corrupt_poll.outcome, ResolveWaitLostOutcome)
     assert isinstance(missing_poll, WaitPollLost)
+    assert isinstance(missing_poll.outcome, ResolveWaitLostOutcome)
 
 
-def test_fins_wait_poll_adapter_maps_corrupt_job_evidence_to_lost(
-    tmp_path: Path,
-) -> None:
-    """poll_wait 遇到损坏 job evidence 时应返回 lost，而不是抛给 poller。"""
+def test_fins_wait_poll_adapter_transient_unavailable_is_bounded_not_ready() -> None:
+    """transient unavailable 初期保持 not-ready，超过窗口后收口 LOST。"""
 
-    workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-    job_id = "finsjob_00000000000000000000000000000007"
-    _write_corrupt_job_evidence(workspace_root, job_id)
-
-    poll = adapter.poll_wait(_wait_record(job_id, DOWNLOAD_TOOL_NAME))
-
-    assert isinstance(poll, WaitPollLost)
-    assert isinstance(poll.outcome, ResolveWaitLostOutcome)
-
-
-def test_fins_wait_poll_adapter_abandon_marks_job_cancellation_requested(
-    tmp_path: Path,
-) -> None:
-    """abandon_wait 应请求取消 Fins job，不删除 job record。"""
-
-    workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-    record = _persist_job(
-        runtime,
-        "00000000000000000000000000000005",
-        FinsIngestionJobStatus.RUNNING,
+    handle = _observation_handle_with_id("abababababababab")
+    runtime = _FakeObservationRuntime(
+        snapshots={},
+        poll_errors={
+            handle.handle_id: FinsObservationPollError(
+                FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE,
+                "Observation temporarily unavailable.",
+            )
+        },
     )
-
-    adapter.abandon_wait(_wait_record(record.job_id, DOWNLOAD_TOOL_NAME))
-
-    updated = runtime.read_job(record.job_id)
-    assert updated.cancellation_requested is True
-    assert updated.status is FinsIngestionJobStatus.CANCELLING
-
-
-def test_fins_wait_poll_adapter_abandon_without_external_job_ref_is_noop(
-    tmp_path: Path,
-) -> None:
-    """abandon_wait 缺少 external_job_ref 时不应抛错或修改 Fins job。"""
-
-    workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-    record = _persist_job(
-        runtime,
-        "00000000000000000000000000000008",
-        FinsIngestionJobStatus.RUNNING,
-    )
 
-    adapter.abandon_wait(
+    not_ready = adapter.poll_wait(
         _wait_record(
-            record.job_id,
+            handle.handle_id,
             DOWNLOAD_TOOL_NAME,
-            include_external_job_ref=False,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+    )
+    expired = adapter.poll_wait(
+        _wait_record(
+            handle.handle_id,
+            DOWNLOAD_TOOL_NAME,
+            created_at="2020-01-01T00:00:00Z",
         )
     )
 
-    unchanged = runtime.read_job(record.job_id)
-    assert unchanged.cancellation_requested is False
-    assert unchanged.status is FinsIngestionJobStatus.RUNNING
+    assert isinstance(not_ready, WaitPollNotReady)
+    assert isinstance(expired, WaitPollLost)
 
 
-def test_fins_wait_poll_adapter_abandon_missing_job_evidence_is_noop(
-    tmp_path: Path,
-) -> None:
-    """abandon_wait 遇到缺失 job evidence 时不应抛错。"""
+def test_fins_wait_poll_adapter_abandon_cancels_and_cleans_observation() -> None:
+    """abandon_wait 应 best-effort cancel 并清理 observation record。"""
 
-    workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    handle = _observation_handle_with_id("cdcdcdcdcdcdcdcd")
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
+        }
+    )
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
 
-    adapter.abandon_wait(
-        _wait_record("finsjob_00000000000000000000000000009998", DOWNLOAD_TOOL_NAME)
-    )
+    adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+    poll = adapter.poll_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert runtime.cancelled_handles == (handle.handle_id,)
+    assert runtime.abandoned_handles == (handle.handle_id,)
+    assert isinstance(poll, WaitPollLost)
 
 
-def test_fins_wait_poll_adapter_abandon_corrupt_job_evidence_is_noop(
-    tmp_path: Path,
-) -> None:
-    """abandon_wait 遇到损坏 job evidence 时不应抛错或删除 evidence 文件。"""
+def test_fins_wait_poll_adapter_abandon_corrupt_token_is_noop() -> None:
+    """abandon_wait 遇到 corrupt token 时不应调用 observation runtime。"""
 
-    workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    runtime = _FakeObservationRuntime(snapshots={})
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
-    job_id = "finsjob_00000000000000000000000000000009"
-    corrupt_path = _write_corrupt_job_evidence(workspace_root, job_id)
 
-    adapter.abandon_wait(_wait_record(job_id, DOWNLOAD_TOOL_NAME))
+    adapter.abandon_wait(_wait_record("finsjob_00000000000000000000000000000009", DOWNLOAD_TOOL_NAME))
 
-    assert corrupt_path.exists()
-
-
-def _persist_job(
-    runtime: FinsIngestionRuntime,
-    job_id_suffix: str,
-    status: FinsIngestionJobStatus,
-) -> FinsIngestionJobRecord:
-    """持久化指定状态的测试 job record。
-
-    Args:
-        runtime: 测试使用的 Fins 摄取运行时。
-        job_id_suffix: 32 位十六进制 job id suffix。
-        status: 目标 job 状态。
-
-    Returns:
-        已持久化 job record。
-
-    Raises:
-        OSError: job store 写入失败时抛出。
-        ValueError: record 字段非法时抛出。
-    """
-
-    record = _job_record(job_id=f"finsjob_{job_id_suffix}", status=status)
-    return runtime.job_store.create_job(record)
-
-
-def _job_record(
-    *,
-    job_id: str,
-    status: FinsIngestionJobStatus,
-) -> FinsIngestionJobRecord:
-    """构造测试用 Fins ingestion job record。
-
-    Args:
-        job_id: opaque job id。
-        status: job 状态。
-
-    Returns:
-        Fins ingestion job record。
-
-    Raises:
-        无。
-    """
-
-    terminal = status in _TERMINAL_JOB_STATUSES
-    now = _timestamp()
-    return FinsIngestionJobRecord(
-        job_id=job_id,
-        operation_kind=FinsIngestionOperationKind.DOWNLOAD,
-        normalized_ticker="AAPL",
-        market="US",
-        exchange=None,
-        source="auto",
-        source_kind=None,
-        status=status,
-        created_at=now,
-        updated_at=now,
-        started_at=now,
-        finished_at=now if terminal else None,
-        request_summary={"ticker": "AAPL"},
-        result_summary={"written_document_ids": ["aapl-2024-10k"]}
-        if status is FinsIngestionJobStatus.SUCCEEDED
-        else {},
-        failure_summary={"message": "download failed"}
-        if status is FinsIngestionJobStatus.FAILED
-        else {},
-        cancellation_requested=status
-        in {FinsIngestionJobStatus.CANCELLING, FinsIngestionJobStatus.CANCELLED},
-    )
+    assert runtime.cancelled_handles == ()
+    assert runtime.abandoned_handles == ()
 
 
 def _wait_record(
-    job_id: str,
+    resume_token: str,
     tool_name: str,
     *,
     include_external_job_ref: bool = True,
+    created_at: str = _WAIT_RECORD_TIME,
 ) -> WaitRecordRow:
     """构造测试用 Host wait record。
 
     Args:
-        job_id: Fins external job id。
+        resume_token: Fins observation resume token。
         tool_name: 原始 awaiting 工具名。
         include_external_job_ref: 是否带 external job ref。
+        created_at: wait record 创建时间。
 
     Returns:
         Host wait record row。
@@ -1171,13 +1480,13 @@ def _wait_record(
     external_job_ref = (
         ExternalJobRef(
             adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-            external_job_id=job_id,
+            external_job_id=resume_token,
         )
         if include_external_job_ref
         else None
     )
     return WaitRecordRow(
-        wait_id=f"wait-{job_id}",
+        wait_id=f"wait-{resume_token}",
         session_id="session-fins",
         run_id="run-fins",
         attempt_id="attempt-fins",
@@ -1187,56 +1496,23 @@ def _wait_record(
         adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
         await_kind=ToolAwaitKind.EXTERNAL_JOB.value,
         resume_policy=WaitResumePolicy.POLL,
-        resume_token=job_id,
+        resume_token=resume_token,
         snapshot_ref=None,
         external_job_ref=external_job_ref,
-        accept_idempotency_key=f"accept-{job_id}",
+        accept_idempotency_key=f"accept-{resume_token}",
         resolve_idempotency_key=None,
         resolve_semantic_digest=None,
         deadline_at=None,
         expires_at=None,
         status=WaitRecordStatus.WAITING,
-        created_event_id=f"event-created-{job_id}",
+        created_event_id=f"event-created-{resume_token}",
         created_event_sequence=1,
-        updated_event_id=f"event-updated-{job_id}",
+        updated_event_id=f"event-updated-{resume_token}",
         updated_event_sequence=1,
-        created_at=_WAIT_RECORD_TIME,
+        created_at=created_at,
         updated_at=_WAIT_RECORD_TIME,
         terminal_at=None,
     )
-
-
-def _timestamp() -> str:
-    """返回测试用 UTC 时间戳。
-
-    Returns:
-        UTC ISO8601 字符串。
-
-    Raises:
-        无。
-    """
-
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _write_corrupt_job_evidence(workspace_root: Path, job_id: str) -> Path:
-    """写入损坏的 Fins job evidence 文件。
-
-    Args:
-        workspace_root: Fins workspace root。
-        job_id: opaque job id。
-
-    Returns:
-        损坏 evidence 文件路径。
-
-    Raises:
-        OSError: 目录或文件写入失败时抛出。
-    """
-
-    path = _job_store_root(workspace_root) / f"{job_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{not-json", encoding="utf-8")
-    return path
 
 
 def _build_workspace(tmp_path: Path) -> Path:
@@ -1273,35 +1549,6 @@ def _job_store_root(workspace_root: Path) -> Path:
     return workspace_root / ".dayu" / "fins_ingestion" / "jobs"
 
 
-def _runtime_with_job_store(
-    *,
-    workspace_root: Path,
-    job_store: FsFinsIngestionJobStore,
-) -> FinsIngestionRuntime:
-    """使用指定 job store 构造 ingestion runtime。
-
-    Args:
-        workspace_root: Fins workspace root。
-        job_store: 测试注入的 job store。
-
-    Returns:
-        Fins ingestion 运行时。
-
-    Raises:
-        OSError: 默认 Fins runtime 初始化失败时抛出。
-    """
-
-    base_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
-    return FinsIngestionRuntime.create(
-        source_repository=base_runtime.source_repository,
-        blob_repository=base_runtime.blob_repository,
-        filing_maintenance_repository=base_runtime.filing_maintenance_repository,
-        processed_repository=base_runtime.processed_repository,
-        processor_registry=base_runtime.processor_registry,
-        job_store=job_store,
-    )
-
-
 def _runtime_with_executor(
     *,
     workspace_root: Path,
@@ -1330,32 +1577,6 @@ def _runtime_with_executor(
         job_store=base_runtime.ingestion_job_store,
         executor=executor,
     )
-
-
-def _wait_ingestion_job_terminal(
-    runtime: FinsIngestionRuntime,
-    job_id: str,
-) -> FinsIngestionJobRecord:
-    """等待 ingestion job 进入终态。
-
-    Args:
-        runtime: 与工具共用 workspace 的 ingestion runtime。
-        job_id: opaque job id。
-
-    Returns:
-        终态 job record。
-
-    Raises:
-        AssertionError: 超时未进入终态时抛出。
-    """
-
-    deadline = time.monotonic() + _JOB_WAIT_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        record = runtime.read_job(job_id)
-        if record.status in _TERMINAL_JOB_STATUSES:
-            return record
-        time.sleep(_JOB_WAIT_POLL_SECONDS)
-    raise AssertionError(f"job 未进入终态: {job_id}")
 
 
 def _write_split_fins_provider_overlay(

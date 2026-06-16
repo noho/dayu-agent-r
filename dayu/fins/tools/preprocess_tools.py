@@ -1,8 +1,8 @@
 """Fins 预处理 awaiting tool 定义。
 
-本模块把 Fins shared ingestion runtime 的预处理 start 入口适配为当前
-``ToolDefinition``。工具只启动 durable job 并返回等待 outcome，不实现
-状态查询、取消轮询或 Host wait adapter。
+本模块把 Fins shared ingestion runtime 的预处理 observation 入口适配为当前
+``ToolDefinition``。工具只启动外部长事务并返回等待 outcome，不实现状态
+查询、取消轮询或 Host wait adapter。
 """
 
 from __future__ import annotations
@@ -24,13 +24,12 @@ from dayu.contracts.tool_result import ToolResultMeta
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
-    FinsIngestionJobStatus,
     FinsIngestionRuntime,
     FinsIngestionStartCancelledError,
     FinsPreprocessRequest,
 )
 from dayu.fins.tools._ingestion_tool_helpers import (
-    _awaiting_outcome_from_job_start,
+    _awaiting_outcome_from_observation_handle,
     _failed_outcome,
     _optional_bool,
     _optional_text_tuple,
@@ -42,12 +41,14 @@ _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_preprocess_start_failed"
 _DEFAULT_SOURCE_KIND: Final[SourceKind] = SourceKind.FILING
 _CANCELLED_MESSAGE: Final[str] = "Fins preprocess start was cancelled."
-_CANCELLED_HINT: Final[str] = "Continue without this Fins preprocess job unless the user asks to retry."
+_CANCELLED_HINT: Final[str] = (
+    "Continue without this Fins preprocess operation unless the user asks to retry."
+)
 
 
 @dataclass(frozen=True)
 class FinsPreprocessToolCallable:
-    """启动 Fins 预处理 job 的工具 callable。
+    """启动 Fins 预处理 observation 的工具 callable。
 
     Attributes:
         runtime: Fins shared ingestion runtime。
@@ -67,7 +68,7 @@ class FinsPreprocessToolCallable:
             context: 批式工具执行上下文；本工具只观察取消 token。
 
         Returns:
-            参数或启动失败时返回 ``ToolFailedOutcome``；durable job 创建成功后
+            参数或启动失败时返回 ``ToolFailedOutcome``；observation 创建成功后
             返回 ``ToolAwaitingOutcome``；启动边界观察到取消时返回
             ``ToolCancelledOutcome``。
 
@@ -81,9 +82,10 @@ class FinsPreprocessToolCallable:
             return _cancelled_outcome(started_at)
         try:
             request = _preprocess_request_from_arguments(call.arguments)
-            start = self.runtime.start_preprocess(request, cancellation_token=cancellation_token)
-            if start.status in {FinsIngestionJobStatus.CANCELLING, FinsIngestionJobStatus.CANCELLED}:
-                return _cancelled_outcome(started_at)
+            handle = self.runtime.start_observed_preprocess(
+                request,
+                cancellation_token=cancellation_token,
+            )
         except FinsIngestionStartCancelledError:
             return _cancelled_outcome(started_at)
         except ValueError as exc:
@@ -99,7 +101,7 @@ class FinsPreprocessToolCallable:
                 tool_name=PREPROCESS_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="预处理任务启动失败，未能保存任务记录。",
+                message="预处理任务启动失败，未进入等待状态。",
                 hint="请稍后重试，或让系统维护者检查 Fins workspace 存储权限。",
             )
         except Exception:
@@ -110,7 +112,7 @@ class FinsPreprocessToolCallable:
                 message="预处理任务启动失败，未进入等待状态。",
                 hint="请确认 Fins workspace 存储目录存在且有写入权限，或联系系统管理员。",
             )
-        return _awaiting_outcome_from_job_start(start)
+        return _awaiting_outcome_from_observation_handle(handle)
 
 
 def _cancelled_outcome(started_at: datetime) -> ToolCancelledOutcome:
@@ -159,10 +161,10 @@ def build_fins_preprocess_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
             function=ToolFunctionSchema(
                 name=PREPROCESS_TOOL_NAME,
                 description=(
-                    "Start a financial document preprocess job for source documents "
+                    "Start a financial document preprocess operation for source documents "
                     "already stored in the Fins workspace. The tool returns "
-                    "immediately with an external-job wait state after the job is "
-                    "durably recorded; it does not wait for processing to finish."
+                    "immediately with an external-job wait state after a lightweight "
+                    "observation handle is registered; it does not wait for processing to finish."
                 ),
                 parameters=_preprocess_parameters_schema(),
             ),

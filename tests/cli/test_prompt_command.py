@@ -498,6 +498,48 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert submit_request.context.operation_context.business_object_id == "AAPL"
 
 
+@pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))
+def test_prompt_verbose_debug_diagnostics_do_not_pollute_stdout(
+    log_flag: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt verbose/debug 诊断不得写入 stdout 用户结果通道。
+
+    :param log_flag: 待验证的全局日志 flag。
+    :param tmp_path: pytest 临时目录夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: stdout 被诊断日志污染时抛出。
+    """
+
+    fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(
+        (
+            log_flag,
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请总结收入变化",
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.strip() == "prompt answer"
+    assert "[VERBOSE]" not in captured.out
+    assert "[DEBUG]" not in captured.out
+
+
 def test_prompt_command_without_ticker_uses_default_context_slots(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

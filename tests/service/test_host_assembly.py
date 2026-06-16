@@ -25,7 +25,7 @@ from dayu.contracts import (
     ToolSchema,
 )
 from dayu.engine import AgentFallbackMode, AgentPolicy
-from dayu.fins.ingestion import FINS_INGESTION_WAIT_ADAPTER_KEY
+from dayu.fins.ingestion.wait_adapter import FINS_INGESTION_WAIT_ADAPTER_KEY
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
