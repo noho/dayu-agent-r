@@ -10,7 +10,7 @@
 - `dayu.service.host_assembly.compose_submit_followup_request(...)`：把 prepared scene 的 `system_prompt` 与本轮用户输入组合为 `SubmitFollowupRequest`。
 - `dayu.service.host_assembly.compose_submit_followup_request_with_overrides(...)`：在同一 assembly 真源内把可映射的单次 Run override 合并为完整 `runner_options` 与 `agent_policy`。
 - `dayu.service.entrypoint_runtime`：为 product entrypoint 提供 reusable Agent runtime helper，覆盖 runtime 准备、Session ensure/create、submit 前 live watcher attach、terminal observation outbox fallback、cancel request 构造与 watcher failure 诊断；该模块不解析 CLI 参数，不处理 stdout/stderr，也不安装 signal handler。
-- `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct job helper，覆盖 download / preprocess / upload 的 typed request 构造、job start、job event observation、poll terminal fallback、durable cancel request 与 terminal exit mapping；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
+- `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、`AsyncIterator[FinsEvent]` 透传、terminal result 收口和 operation-scoped cancellation；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
 
 `compose_open_host_options(request)` 会把选中的 execution profile 映射为 Host typed inputs：`tool_truncation_policy` 决定 ToolRuntime 截断默认值，`tool_duplicate_governance_policy` 决定 `HostToolingOptions.duplicate_governance_policy`，`agent_policy` 决定 ordinary run baseline 的 Agent loop policy。
 
@@ -22,7 +22,7 @@
 
 `entrypoint_runtime` 的 submit / cancel wait helper 不持有内部 timeout。调用方负责通过 task cancellation、`asyncio.wait_for(...)` 或显式 cancel 请求控制等待生命周期。
 
-`fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.start_upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest`，不要求 runtime 存在 `start_upload_filing(...)` / `start_upload_material(...)` 方法。调用方拿到 job handle 后可以通过 `stream_job_events_until_terminal(...)` 消费 Fins job event；若 terminal event sidecar 缺失但 job record 已终态，Service 会记录 bounded WARN 并合成 terminal event，避免 UI 悬挂。调用方收到用户中断时应调用 `request_cancel(job_id)` 并继续观察终态；第二次中断可以选择本地退出但必须保留 job id 供用户追踪。
+`fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest` 并消费 direct event stream，不要求 runtime 存在 `upload_filing(...)` / `upload_material(...)` 方法。调用方通过 `async for` 消费 `PROGRESS` 与唯一 terminal `RESULT`；若 runtime stream 正常结束但未产出 `RESULT`，Service 会合成清晰 failure result，避免 UI 悬挂。调用方收到用户中断时关闭当前 stream / 取消当前 task，并通过 operation-scoped cancellation 传播；Service direct API 不暴露 job id、event sidecar、cursor 或 `request_cancel(job_id)`。
 
 边界约束：
 
