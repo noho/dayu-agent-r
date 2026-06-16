@@ -28,6 +28,7 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
+    ListSessionsResult,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItem,
@@ -35,6 +36,7 @@ from dayu.host.api import (
     OutboxTerminalItemState,
     ReadOutboxTerminalItemsRequest,
     RunSnapshot,
+    SessionListItem,
     SessionSnapshot,
 )
 from dayu.host.command import HostCommandHandle
@@ -57,6 +59,8 @@ from dayu.host.durable.schema import (
     TABLE_SQLITE_PAYLOADS,
 )
 from dayu.host.durable.state import (
+    SessionWithSlotRows,
+    read_all_sessions_with_slots,
     read_run_by_id,
     read_session_by_id,
     read_session_slot_by_session_id,
@@ -96,6 +100,17 @@ def get_session(host: HostCommandHandle, session_id: str) -> SessionSnapshot:
     """
 
     return host._run_read(_GetSessionOperation(session_id=session_id))
+
+
+def list_sessions(host: HostCommandHandle) -> ListSessionsResult:
+    """读取全部未 purge Session 的 public 列表摘要。
+
+    :param host: Host command handle。
+    :returns: durable truth 生成的 Session 列表结果。
+    :raises HostApiError: handle 已关闭或 durable 读取失败时抛出。
+    """
+
+    return host._run_read(_ListSessionsOperation())
 
 
 def get_run(host: HostCommandHandle, run_id: str) -> RunSnapshot:
@@ -263,6 +278,90 @@ class _GetSessionOperation:
             session,
             read_session_slot_by_session_id(transaction, self.session_id),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _ListSessionsOperation:
+    """list_sessions read transaction body。"""
+
+    def __call__(self, transaction: HostTransaction) -> ListSessionsResult:
+        """执行 list_sessions 只读事务。
+
+        :param transaction: 当前 Host transaction。
+        :returns: Session 列表结果。
+        :raises HostDurableError: durable timestamp 或 row 字段无效时抛出。
+        """
+
+        rows = read_all_sessions_with_slots(transaction)
+        return ListSessionsResult(
+            sessions=tuple(
+                _session_list_item_from_rows(transaction, row) for row in rows
+            )
+        )
+
+
+def _session_list_item_from_rows(
+    transaction: HostTransaction,
+    rows: SessionWithSlotRows,
+) -> SessionListItem:
+    """把 durable Session/slot rows 转换为 public list item。
+
+    :param transaction: 当前 Host transaction。
+    :param rows: Session row 与当前 slot row。
+    :returns: public Session list item。
+    :raises HostDurableError: durable timestamp 或 row 字段无效时抛出。
+    """
+
+    snapshot = session_snapshot_from_rows(transaction, rows.session, rows.slot)
+    return SessionListItem(
+        session_id=snapshot.session_id,
+        status=snapshot.status,
+        slot=snapshot.slot,
+        active_run_id=snapshot.active_run_id,
+        queued_run_ids=snapshot.queued_run_ids,
+        timeline_cursor=snapshot.timeline_cursor,
+        created_at=_parse_session_row_timestamp(
+            rows.session.created_at,
+            field_name="created_at",
+        ),
+        closed_at=_parse_optional_session_row_timestamp(
+            rows.session.closed_at,
+            field_name="closed_at",
+        ),
+    )
+
+
+def _parse_session_row_timestamp(value: str, *, field_name: str) -> datetime:
+    """解析 Session row timestamp。
+
+    :param value: durable 固定 UTC timestamp 文本。
+    :param field_name: timestamp 字段名。
+    :returns: timezone-aware UTC ``datetime``。
+    :raises HostDurableError: timestamp 格式或日期值非法时抛出。
+    """
+
+    try:
+        return parse_utc_timestamp(value)
+    except ValueError as exc:
+        raise HostDurableError(
+            f"session row timestamp is invalid: {field_name}"
+        ) from exc
+
+
+def _parse_optional_session_row_timestamp(
+    value: str | None, *, field_name: str
+) -> datetime | None:
+    """解析 optional Session row timestamp。
+
+    :param value: durable 固定 UTC timestamp 文本；缺失时为 ``None``。
+    :param field_name: timestamp 字段名。
+    :returns: timezone-aware UTC ``datetime`` 或 ``None``。
+    :raises HostDurableError: timestamp 格式或日期值非法时抛出。
+    """
+
+    if value is None:
+        return None
+    return _parse_session_row_timestamp(value, field_name=field_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1062,4 +1161,4 @@ def _required_payload_bool(
     return value
 
 
-__all__ = ["get_run", "get_session"]
+__all__ = ["get_run", "get_session", "list_sessions"]

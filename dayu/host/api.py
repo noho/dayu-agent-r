@@ -2264,6 +2264,94 @@ class SessionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionListItem:
+    """Session 列表项。
+
+    本类型是 ``list_sessions`` 的只读摘要，不扩展单 Session snapshot 契约。
+
+    :param session_id: Session id。
+    :param status: Session 当前状态。
+    :param slot: 当前绑定 slot；匿名 Session 为 ``None``。
+    :param active_run_id: 当前 active Run id；无 active Run 时为 ``None``。
+    :param queued_run_ids: 已持久化但未启动的 queued Run id。
+    :param timeline_cursor: Session timeline 当前游标。
+    :param created_at: Session 创建时间，必须是 timezone-aware UTC ``datetime``。
+    :param closed_at: Session 关闭时间；未关闭时为 ``None``。
+    :returns: 不适用；dataclass 构造成功后得到不可变列表项实例。
+    :raises TypeError: 时间、状态、slot、cursor 或队列字段类型非法时抛出。
+    :raises ValueError: id 为空、queued Run id 为空或时间不是 UTC 时抛出。
+    """
+
+    session_id: str
+    status: SessionStatus
+    slot: SessionSlotRef | None
+    active_run_id: str | None
+    queued_run_ids: tuple[str, ...]
+    timeline_cursor: HostStreamCursor
+    created_at: datetime
+    closed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        """校验 Session 列表项字段。
+
+        :returns: 无返回值。
+        :raises TypeError: 时间、状态、slot、cursor 或队列字段类型非法时抛出。
+        :raises ValueError: id 为空、queued Run id 为空或时间不是 UTC 时抛出。
+        """
+
+        _require_non_empty(self.session_id, field_name="SessionListItem.session_id")
+        if not isinstance(self.status, SessionStatus):
+            raise TypeError("SessionListItem.status must be SessionStatus")
+        if self.slot is not None and not isinstance(self.slot, SessionSlotRef):
+            raise TypeError("SessionListItem.slot must be SessionSlotRef")
+        _require_optional_non_empty(
+            self.active_run_id, field_name="SessionListItem.active_run_id"
+        )
+        if not isinstance(self.queued_run_ids, tuple):
+            raise TypeError("SessionListItem.queued_run_ids must be tuple")
+        for run_id in self.queued_run_ids:
+            _require_non_empty(
+                run_id, field_name="SessionListItem.queued_run_ids"
+            )
+        if not isinstance(self.timeline_cursor, HostStreamCursor):
+            raise TypeError(
+                "SessionListItem.timeline_cursor must be HostStreamCursor"
+            )
+        _require_utc_datetime(self.created_at, field_name="SessionListItem.created_at")
+        if self.closed_at is not None:
+            _require_utc_datetime(
+                self.closed_at, field_name="SessionListItem.closed_at"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ListSessionsResult:
+    """Session 列表读取结果。
+
+    :param sessions: 按 ``created_at DESC, session_id ASC`` 排序的 Session 列表项。
+    :returns: 不适用；dataclass 构造成功后得到不可变读取结果实例。
+    :raises TypeError: ``sessions`` 不是列表项元组时抛出。
+    """
+
+    sessions: tuple[SessionListItem, ...]
+
+    def __post_init__(self) -> None:
+        """校验 Session 列表读取结果。
+
+        :returns: 无返回值。
+        :raises TypeError: ``sessions`` 不是列表项元组时抛出。
+        """
+
+        if not isinstance(self.sessions, tuple):
+            raise TypeError("ListSessionsResult.sessions must be tuple")
+        for session in self.sessions:
+            if not isinstance(session, SessionListItem):
+                raise TypeError(
+                    "ListSessionsResult.sessions must contain SessionListItem"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class RunSnapshot:
     """Run read model 快照。
 
@@ -3151,6 +3239,16 @@ class Host(Protocol):
 
         ...
 
+    async def list_sessions(self) -> ListSessionsResult:
+        """读取全部未 purge Session 的列表摘要。
+
+        :returns: durable truth 生成的 Session 列表结果。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        ...
+
     async def get_run(self, run_id: str) -> RunSnapshot:
         """读取 Run snapshot。
 
@@ -3395,6 +3493,7 @@ __all__ = [
     "HostPayloadRef",
     "HostStreamCursor",
     "HostTerminalStatus",
+    "ListSessionsResult",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",
     "LocalWorkerHandle",
@@ -3421,6 +3520,7 @@ __all__ = [
     "RetryRunRequest",
     "RunSnapshot",
     "RunStatus",
+    "SessionListItem",
     "SessionSlotRef",
     "SessionSnapshot",
     "SessionStatus",

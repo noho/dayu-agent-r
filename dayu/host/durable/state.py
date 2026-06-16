@@ -209,6 +209,18 @@ class SessionSlotRow:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionWithSlotRows:
+    """Session row 及其当前 slot row 的只读组合。
+
+    :param session: ``host_sessions`` durable row。
+    :param slot: 当前绑定到该 Session 的 slot row；匿名 Session 为 ``None``。
+    """
+
+    session: SessionRow
+    slot: SessionSlotRow | None
+
+
+@dataclass(frozen=True, slots=True)
 class RunRow:
     """``host_runs`` durable row。
 
@@ -940,6 +952,80 @@ def session_slot_row_from_host_row(row: HostRow) -> SessionSlotRow:
     )
 
 
+def _session_with_slot_rows_from_host_row(row: HostRow) -> SessionWithSlotRows:
+    """把 Session/slot left join row 转换为强类型组合。
+
+    :param row: ``HostTransaction`` 查询返回的 joined row。
+    :returns: ``SessionWithSlotRows``。
+    :raises HostDurableError: join row 字段类型或 left join 形状无效时抛出。
+    """
+
+    return SessionWithSlotRows(
+        session=session_row_from_host_row(row),
+        slot=_slot_row_from_session_list_host_row(row),
+    )
+
+
+def _slot_row_from_session_list_host_row(row: HostRow) -> SessionSlotRow | None:
+    """从 Session list left join row 中解码可空 slot row。
+
+    :param row: ``HostTransaction`` 查询返回的 joined row。
+    :returns: ``SessionSlotRow`` 或 ``None``。
+    :raises HostRowDecodeError: slot alias 缺列或字段类型非法时抛出。
+    :raises HostDurableError: slot 字段只有部分为空时抛出。
+    """
+
+    row_name = TABLE_HOST_SESSION_SLOTS
+    scope = _decode_optional_text(row, row_name=row_name, column="slot_scope")
+    slot_key = _decode_optional_text(row, row_name=row_name, column="slot_slot_key")
+    session_id = _decode_optional_text(
+        row, row_name=row_name, column="slot_session_id"
+    )
+    bound_event_id = _decode_optional_text(
+        row, row_name=row_name, column="slot_bound_event_id"
+    )
+    bound_event_sequence = _decode_optional_int(
+        row,
+        row_name=row_name,
+        column="slot_bound_event_sequence",
+    )
+    metadata_json = _decode_optional_text(
+        row, row_name=row_name, column="slot_metadata_json"
+    )
+    updated_at = _decode_optional_text(
+        row, row_name=row_name, column="slot_updated_at"
+    )
+    slot_values = (
+        scope,
+        slot_key,
+        session_id,
+        bound_event_id,
+        bound_event_sequence,
+        metadata_json,
+        updated_at,
+    )
+    if all(value is None for value in slot_values):
+        return None
+    if any(value is None for value in slot_values):
+        raise HostDurableError("session slot left join row is incomplete")
+    assert scope is not None
+    assert slot_key is not None
+    assert session_id is not None
+    assert bound_event_id is not None
+    assert bound_event_sequence is not None
+    assert metadata_json is not None
+    assert updated_at is not None
+    return SessionSlotRow(
+        scope=scope,
+        slot_key=slot_key,
+        session_id=session_id,
+        bound_event_id=bound_event_id,
+        bound_event_sequence=bound_event_sequence,
+        metadata_json=metadata_json,
+        updated_at=updated_at,
+    )
+
+
 def run_row_from_host_row(row: HostRow) -> RunRow:
     """把通用 HostRow 转换为 RunRow。
 
@@ -1195,6 +1281,57 @@ def read_session_by_id(transaction: HostTransaction, session_id: str) -> Session
     if row is None:
         return None
     return session_row_from_host_row(row)
+
+
+def read_all_sessions_with_slots(
+    transaction: HostTransaction,
+) -> tuple[SessionWithSlotRows, ...]:
+    """读取全部未 purge Session 及其当前 slot row。
+
+    本函数只读取 durable state 表，不读取 projection，不追加 EventLog。已
+    purge Session 已从 ``host_sessions`` 删除，因此不会出现在结果中。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :returns: 按 ``created_at DESC, session_id ASC`` 排序的 Session/slot 组合。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          session.session_id,
+          session.status,
+          session.metadata_json,
+          session.created_event_id,
+          session.created_event_sequence,
+          session.closed_event_id,
+          session.closed_event_sequence,
+          session.created_at,
+          session.closed_at,
+          slot.scope AS slot_scope,
+          slot.slot_key AS slot_slot_key,
+          slot.session_id AS slot_session_id,
+          slot.bound_event_id AS slot_bound_event_id,
+          slot.bound_event_sequence AS slot_bound_event_sequence,
+          slot.metadata_json AS slot_metadata_json,
+          slot.updated_at AS slot_updated_at
+        FROM {TABLE_HOST_SESSIONS} AS session
+        LEFT JOIN {TABLE_HOST_SESSION_SLOTS} AS slot
+          ON slot.rowid = (
+            SELECT current_slot.rowid
+            FROM {TABLE_HOST_SESSION_SLOTS} AS current_slot
+            WHERE current_slot.session_id = session.session_id
+            ORDER BY current_slot.updated_at DESC,
+              current_slot.scope ASC,
+              current_slot.slot_key ASC
+            LIMIT 1
+          )
+        ORDER BY session.created_at DESC, session.session_id ASC
+        """,
+        (),
+    )
+    return tuple(_session_with_slot_rows_from_host_row(row) for row in rows)
 
 
 def read_session_slot(transaction: HostTransaction, scope: str, slot_key: str) -> SessionSlotRow | None:

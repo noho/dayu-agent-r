@@ -47,6 +47,7 @@ from dayu.host.api import (
     HostPayloadRef,
     HostStreamCursor,
     HostTerminalStatus,
+    ListSessionsResult,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
@@ -73,6 +74,7 @@ from dayu.host.api import (
     RetryRunRequest,
     RunSnapshot,
     RunStatus,
+    SessionListItem,
     SessionSlotRef,
     SessionSnapshot,
     SessionStatus,
@@ -96,7 +98,7 @@ from dayu.host.command import (
     retry_run,
     submit_followup,
 )
-from dayu.host.read_api import get_run, get_session
+from dayu.host.read_api import get_run, get_session, list_sessions
 from dayu.host.open_host import open_host
 from dayu.host.durable.maintenance import HostWalCheckpointMode, HostWalCheckpointResult
 from dayu.host.storage_maintenance import (
@@ -163,6 +165,7 @@ __all__ = [
     "MemorySnapshotIntegrityIssue",
     "HostStreamCursor",
     "HostTerminalStatus",
+    "ListSessionsResult",
     "HostWalCheckpointMode",
     "HostWalCheckpointResult",
     "LocalEngineWorker",
@@ -192,6 +195,7 @@ __all__ = [
     "RetryRunRequest",
     "RunSnapshot",
     "RunStatus",
+    "SessionListItem",
     "SessionSlotRef",
     "SessionSnapshot",
     "SessionStatus",
@@ -211,6 +215,7 @@ __all__ = [
     "ensure_session",
     "get_run",
     "get_session",
+    "list_sessions",
     "open_host",
     "purge_session",
     "replay_run",
