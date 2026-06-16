@@ -34,10 +34,30 @@ from dayu.fins.ingestion_runtime import (
 )
 from dayu.fins.ingestion import (
     FINS_INGESTION_WAIT_ADAPTER_KEY,
+    FINS_OBSERVATION_HANDLE_ID_PREFIX,
+    FinsObservationHandle,
+    FinsObservationPollErrorKind,
+    FinsObservationResolutionKind,
+    FinsObservationSnapshot,
+    FinsObservationStatus,
     FinsIngestionWaitPollAdapter,
     build_fins_wait_adapter_registry,
+    observation_handle_id_to_resume_token,
+    observation_poll_error_resolution_kind,
+    observation_status_resolution_kind,
+    parse_observation_handle_id_token,
 )
 from dayu.fins.ingestion.wait_adapter import FINS_UPLOAD_AWAITING_TOOL_NAME
+from dayu.fins.direct_events import (
+    FINS_RESULT_EXIT_CANCELLED,
+    FINS_RESULT_EXIT_FAILURE,
+    FINS_RESULT_EXIT_SUCCESS,
+    FinsErrorKind,
+    FinsEventDetail,
+    FinsOperationKind,
+    FinsResultStatus,
+    FinsResultSummary,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
@@ -100,6 +120,187 @@ _TERMINAL_JOB_STATUSES = frozenset(
 _JOB_WAIT_TIMEOUT_SECONDS = 5.0
 _JOB_WAIT_POLL_SECONDS = 0.02
 _WAIT_RECORD_TIME = "2026-01-01T00:00:00Z"
+_OBSERVATION_TIME: Final[datetime] = datetime(2026, 6, 16, tzinfo=timezone.utc)
+_OBSERVATION_HANDLE_ID: Final[str] = (
+    f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaaaaaa"
+)
+
+
+def test_observation_handle_resume_token_is_opaque_handle_id() -> None:
+    """observation resume token 必须只承载 opaque handle id。"""
+
+    handle = _observation_handle()
+
+    token = observation_handle_id_to_resume_token(handle)
+
+    assert token == _OBSERVATION_HANDLE_ID
+    assert parse_observation_handle_id_token(token) == _OBSERVATION_HANDLE_ID
+    assert "job" not in token
+    assert "sequence" not in token
+    assert "cursor" not in token
+    assert "/" not in token
+
+
+@pytest.mark.parametrize(
+    "token",
+    (
+        "",
+        "finsjob_1234567890abcdef1234567890abcdef",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}gggggggggggggggg",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}jobaaaaaaaaaaaaaaaa",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}cursoraaaaaaaaaaaa",
+        f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaa/path",
+    ),
+)
+def test_observation_handle_corrupt_token_maps_to_lost(token: str) -> None:
+    """corrupt token 必须能被 wait adapter 分类为 LOST。"""
+
+    with pytest.raises(ValueError):
+        parse_observation_handle_id_token(token)
+
+    assert (
+        observation_poll_error_resolution_kind(
+            FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE
+        )
+        is FinsObservationResolutionKind.LOST
+    )
+
+
+def test_process_local_missing_observation_maps_to_lost() -> None:
+    """process-local observation source 找不到 handle 时必须分类为 LOST。"""
+
+    assert (
+        observation_poll_error_resolution_kind(
+            FinsObservationPollErrorKind.PERMANENT_NOT_FOUND
+        )
+        is FinsObservationResolutionKind.LOST
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        (FinsObservationStatus.PENDING, FinsObservationResolutionKind.PENDING),
+        (FinsObservationStatus.RUNNING, FinsObservationResolutionKind.PENDING),
+        (FinsObservationStatus.SUCCEEDED, FinsObservationResolutionKind.COMPLETED),
+        (FinsObservationStatus.FAILED, FinsObservationResolutionKind.FAILED),
+        (FinsObservationStatus.CANCELLED, FinsObservationResolutionKind.CANCELLED),
+        (FinsObservationStatus.LOST, FinsObservationResolutionKind.LOST),
+    ),
+)
+def test_observation_status_resolution_mapping_is_fixed(
+    status: FinsObservationStatus,
+    expected: FinsObservationResolutionKind,
+) -> None:
+    """observation status 到 wait resolution 的映射必须固定。"""
+
+    assert observation_status_resolution_kind(status) is expected
+
+
+def test_observation_snapshot_terminal_and_retry_after_contract() -> None:
+    """observation snapshot 必须区分 terminal result 与 retry-after。"""
+
+    terminal = FinsObservationSnapshot(
+        handle=_observation_handle(),
+        status=FinsObservationStatus.SUCCEEDED,
+        message="download completed",
+        result=_observation_result(FinsResultStatus.SUCCESS),
+        error_kind=None,
+        retry_after_seconds=None,
+    )
+    pending = FinsObservationSnapshot(
+        handle=_observation_handle(),
+        status=FinsObservationStatus.RUNNING,
+        message="download running",
+        result=None,
+        error_kind=None,
+        retry_after_seconds=0.5,
+    )
+
+    assert terminal.result is not None
+    assert pending.retry_after_seconds == 0.5
+    with pytest.raises(ValueError, match="terminal observation snapshot"):
+        FinsObservationSnapshot(
+            handle=_observation_handle(),
+            status=FinsObservationStatus.FAILED,
+            message="download failed",
+            result=None,
+            error_kind=FinsErrorKind.EXECUTION,
+            retry_after_seconds=None,
+        )
+    with pytest.raises(ValueError, match="non-terminal observation snapshot"):
+        FinsObservationSnapshot(
+            handle=_observation_handle(),
+            status=FinsObservationStatus.RUNNING,
+            message="download running",
+            result=_observation_result(FinsResultStatus.SUCCESS),
+            error_kind=None,
+            retry_after_seconds=None,
+        )
+
+
+def test_observation_contract_rejects_job_cursor_and_storage_text() -> None:
+    """observation contract 不允许暴露 job、sequence、cursor 或 storage path。"""
+
+    with pytest.raises(ValueError):
+        FinsObservationHandle(
+            handle_id=f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}jobaaaaaaaaaaaaaaaa",
+            operation_kind=FinsOperationKind.DOWNLOAD,
+            created_at=_OBSERVATION_TIME,
+        )
+    with pytest.raises(ValueError):
+        FinsObservationSnapshot(
+            handle=_observation_handle(),
+            status=FinsObservationStatus.LOST,
+            message="cursor /tmp/fins evidence missing",
+            result=None,
+            error_kind=FinsErrorKind.UNKNOWN,
+            retry_after_seconds=None,
+        )
+
+
+def _observation_handle() -> FinsObservationHandle:
+    """构造测试用 lightweight observation handle。
+
+    :returns: Fins observation handle。
+    :raises ValueError: 构造字段违反 contract 时抛出。
+    """
+
+    return FinsObservationHandle(
+        handle_id=_OBSERVATION_HANDLE_ID,
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        created_at=_OBSERVATION_TIME,
+    )
+
+
+def _observation_result(status: FinsResultStatus) -> FinsResultSummary:
+    """构造测试用 Fins observation terminal result。
+
+    :param status: result status。
+    :returns: Fins result summary。
+    :raises ValueError: status 到 exit code 映射非法时抛出。
+    """
+
+    if status is FinsResultStatus.SUCCESS:
+        exit_code = FINS_RESULT_EXIT_SUCCESS
+        error_kind = None
+        error_message = None
+    elif status is FinsResultStatus.CANCELLED:
+        exit_code = FINS_RESULT_EXIT_CANCELLED
+        error_kind = FinsErrorKind.CANCELLED
+        error_message = "cancelled"
+    else:
+        exit_code = FINS_RESULT_EXIT_FAILURE
+        error_kind = FinsErrorKind.EXECUTION
+        error_message = "failed"
+    return FinsResultSummary(
+        status=status,
+        exit_code=exit_code,
+        title="Observation result",
+        details=(FinsEventDetail(label="ticker", value="AAPL"),),
+        error_kind=error_kind,
+        error_message=error_message,
+    )
 
 
 class _OpenCancellationToken:

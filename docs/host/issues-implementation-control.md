@@ -205,8 +205,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-OBS-01-R3 | deferred-with-owner | Future CLI/Fins UI output redaction policy work unit | UI progress / summary 输出 redaction policy 仍需保守处理；放宽前必须单独审计 path / raw / body / content 泄漏风险。 |
 | WU-CLI-FINS-OBS-01-R5 | deferred-with-owner | Future Agent command streaming / UI work unit | `prompt` / `interactive` 的运行中 token/content streaming 不在本 WU 范围；本 WU 仅保护终态 final answer / failure / cancel 输出。 |
 | WU-CLI-FINS-OBS-01-R6 | open | WU-CLI-FINS-OBS-01 Slice A/C review gates | Slice A 和 Slice C 仍共享 `dayu/fins/ingestion_runtime.py` 的 allowed file；Slice A 只能固定 `FinsEvent` contract、Service direct boundary 和 Service-facing runtime protocol，真实 runtime implementation 必须留给 Slice C。 |
-| WU-CLI-FINS-OBS-01-R7 | open | WU-CLI-FINS-OBS-01 Slice D0 review gate | Slice D0 是 lightweight observation handle contract-only checkpoint；review 必须阻止它扩大成 runtime / wait adapter implementation。 |
+| WU-CLI-FINS-OBS-01-R7 | closed | WU-CLI-FINS-OBS-01 Slice D0 review gate | Slice D0 review confirmed the implementation stayed contract-only and did not expand into runtime / wait adapter implementation. |
 | WU-CLI-FINS-OBS-01-R8 | open | WU-CLI-FINS-OBS-01 Slice C/D implementation and review gates | 默认 process-local observation registry 的并发安全需要在实现时证明；若 runtime / wait adapter / blocking bridge 跨线程或跨 task 访问 registry，必须有明确同步策略和测试。 |
+| WU-CLI-FINS-OBS-01-R9 | open | WU-CLI-FINS-OBS-01 Slice D implementation and review gates | D0 only fixed neutral `TRANSIENT_UNAVAILABLE -> PENDING` and corrupt-token/missing-handle LOST mapping. Slice D wait adapter implementation must add bounded retry / max wait protection for repeated transient unavailable and end-to-end corrupt resume token -> LOST coverage. |
 
 ## 当前 Work Units
 
@@ -347,7 +348,7 @@ Stop conditions：
 - replacement plan fix: integrated into `docs/host/wu-cli-fins-obs-01-replacement-plan.md` by AgentCodex
 - replacement plan re-review: `docs/reviews/plan-rereview-20260616-102509-mimo.md`; `docs/reviews/plan-rereview-20260616-102606-ds.md`
 - replacement plan re-review conclusion: AgentMiMo `pass`; AgentDS `pass-with-risks`; all high / medium findings fixed; no new material issues; nonblocking residual risks tracked as `WU-CLI-FINS-OBS-01-R6` / `R7` / `R8`
-- implementation status: Slice A/B accepted; next slice is Slice D0 lightweight observation handle contract-only checkpoint
+- implementation status: Slice A/B/D0 accepted; next slice is Slice C Fins runtime core execution convergence
 - Slice A implementation: `docs/reviews/wu-cli-fins-obs-01-slice-a-implementation-codex.md`
 - Slice B implementation: `docs/reviews/wu-cli-fins-obs-01-slice-b-implementation-codex.md`
 - Slice A/B validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 129 passed, 3 warnings; targeted `pyright` 0 errors
@@ -358,6 +359,14 @@ Stop conditions：
 - Slice A/B re-review conclusion: PASS from both AgentMiMo and AgentDS; no blocking findings; nonblocking observations are deferred to existing Slice C / Slice E scope or defense-in-depth cleanup; post-review logger isolation follow-up was also checked by both reviewers and remains PASS
 - Slice A/B post-review validation fix: added `tests/conftest.py` logger isolation because combined CLI -> Fins runtime test order exposed leaked `dayu` logger handlers bound to closed pytest capture streams; `tests/README.md` records this test infrastructure fact
 - Slice A/B final validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py tests/fins/test_fins_ingestion_runtime.py -q` 184 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; import check passed; `git diff --check` clean
+- Slice D0 implementation: `docs/reviews/wu-cli-fins-obs-01-slice-d0-implementation-codex.md`
+- Slice D0 validation: `pytest tests/fins/test_fins_ingestion_tools.py -q` 48 passed, 3 warnings; targeted `pyright` 0 errors
+- Slice D0 code review: `docs/reviews/wu-cli-fins-obs-01-slice-d0-review-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-slice-d0-review-ds-20260616.md`
+- Slice D0 review conclusion: AgentMiMo `PASS`; AgentDS `PASS-WITH-FINDINGS`; no blocking findings
+- Slice D0 accepted findings requiring fix: DS-D0-01 handle id alphabet ambiguity; fixed by narrowing observation handle ids to hex-only `[a-f0-9]`
+- Slice D0 review fix: `docs/reviews/wu-cli-fins-obs-01-slice-d0-review-fix-codex.md`
+- Slice D0 review follow-up: both AgentMiMo and AgentDS appended follow-up PASS sections confirming DS-D0-01 fixed, `WU-CLI-FINS-OBS-01-R7` closed, and `WU-CLI-FINS-OBS-01-R9` correctly tracks Slice D retry guard / corrupt-token E2E LOST coverage
+- Slice D0 final validation: `pytest tests/fins/test_fins_ingestion_tools.py tests/fins/test_fins_ingestion_runtime.py -q` 103 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; import check passed; `git diff --check` clean
 
 ### Superseded PR #143 durable sidecar artifacts
 
