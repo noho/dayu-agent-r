@@ -144,12 +144,12 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | completed |
-| implementation status | WU-CLI-SESSION-01 completed; aggregate deepreview PASS; draft PR #146 https://github.com/noho/dayu-agent-r/pull/146; artifacts `docs/reviews/deepreview-wu-cli-session-01-aggregate-ds-20260616.md`, `docs/reviews/deepreview-wu-cli-session-01-aggregate-mimo-20260616.md`; adjudication `docs/reviews/deepreview-wu-cli-session-01-aggregate-adjudication-20260616.md`; aggregate validation passed: `pytest tests/host/test_public_session_api.py tests/host/test_package_exports.py tests/cli/test_arg_parsing.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_session_command.py -q` 120 passed, `python -m pyright dayu/ tests/ utils/` 0 errors, `git diff --check` clean |
+| implementation status | WU-CLI-SESSION-01 final closeout completed; draft PR #146 https://github.com/noho/dayu-agent-r/pull/146; final closeout `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; PR review accepted commit `c7f79f03` |
 | active work unit | WU-CLI-SESSION-01 |
 | default next work unit | WU-OBS-00 |
-| next entry point | WU-CLI-SESSION-01 completed; next work unit selection |
+| next entry point | WU-CLI-SESSION-01 final-closeout complete; next work unit selection after user merge / issue decision |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
 
 状态约定：
@@ -209,7 +209,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|---|
 | WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
-| WU-CLI-SESSION-01 | pending | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Default prompt / interactive stays fresh anonymous session without `--label`; `--label` remains ensure-by-label; remove obsolete `interactive --new-session`; add explicit resume / list / purge commands later |
+| WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 not closed because external issue closure requires separate user authorization and PR #146 remains draft/open |
 | WU-CLI-ACTIVITY-01 | pending | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Runs after WU-CLI-SESSION-01; show collapsible/hideable activity summaries for prompt / interactive without exposing hidden chain-of-thought; do not use logging as UI |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -234,6 +234,46 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+
+## WU-CLI-SESSION-01 CLI Session Management
+
+### 状态
+
+本 work unit 已完成 final closeout。PR #146 已创建并推送到 `github/wu-cli-session-01`；GitHub Issue #145 暂未关闭，因为外部 issue 修改 / 关闭需要用户额外授权，且 PR #146 仍是 draft/open。
+
+### Current gate artifacts
+
+- plan: `docs/host/host-issues/wu-cli-session-01-cli-session-management-plan.md`
+- plan accepted commit: `653c9966`
+- slice accepted commits: S1 `8175b8cb`; S2 `f66d76e9`; S3 `cc76ff31`; S4 `07cc3010`; S5 `00b82bbb`; S6 `fc92286b`
+- aggregate deepreview: `docs/reviews/deepreview-wu-cli-session-01-aggregate-ds-20260616.md`; `docs/reviews/deepreview-wu-cli-session-01-aggregate-mimo-20260616.md`
+- aggregate adjudication: `docs/reviews/deepreview-wu-cli-session-01-aggregate-adjudication-20260616.md`
+- aggregate accepted commit: `1ac06623`
+- draft PR record commit: `5152028b`
+- PR review: `docs/reviews/pr-146-review-wu-cli-session-01-mimo-20260616-222711.md`; `docs/reviews/pr-146-review-wu-cli-session-01-ds-20260616.md`
+- PR review adjudication: `docs/reviews/pr-146-review-wu-cli-session-01-adjudication-20260616.md`
+- PR review accepted commit: `c7f79f03`
+- final closeout: `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`
+- final validation: `pytest tests/host/test_public_session_api.py tests/host/test_package_exports.py tests/cli/test_arg_parsing.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_session_command.py -q` 120 passed, 3 third-party edgar deprecation warnings; `python -m pyright dayu/ tests/ utils/` 0 errors; `git diff --check` clean
+
+### Final scope decision
+
+- `resume`、`list`、`purge` 均为本 work unit 已实施内容，不是后续项。
+- Host 正式新增 public `list_sessions` API；该 API 是 Host public read contract，不是 CLI 私有临时 helper。
+- `interactive --new-session` 已从 CLI surface 删除。
+- `session resume` 只对已有 OPEN Session 执行，不 create / ensure Session，不使用 Host wait-resume 语义。
+- `session purge` 不自动 close / cancel；Host purge precondition 是最终治理真源。
+
+### Residual risk reconciliation
+
+当前没有阻塞 final closeout 的 residual risk。
+
+已分类的非阻塞风险：
+
+- `list_sessions` 无分页 / 无 query contract：deferred-with-owner；未来真实 Session cardinality 或外部 API consumer 需要时进入 Host session-list scale / pagination hardening。
+- CLI list 文本表不做列宽裁剪：deferred-with-owner；未来由 CLI UX refinement 根据 operator feedback 处理。
+- `session.py` 依赖 prompt / interactive sibling module 的 existing-session 窄入口：deferred-with-owner；未来 CLI command-entrypoint refactor 或 WU-CLI-ACTIVITY-01 若改变 prompt / interactive execution ownership 时处理。
+- Draft PR 无 reported CI checks：non-blocking；本地验证为本 gate controller truth，pre-merge gate / repository branch protection 继续承担外部检查。
 
 ## WU-CLI-FINS-OBS-01 Fins Direct CLI Live Event Stream / Log / UI Print
 
