@@ -42,12 +42,7 @@ _FINS_EVENT_CANCELLED_PREFIX: Final[str] = "Fins cancelled"
 _FINS_EVENT_SUCCEEDED_PREFIX: Final[str] = "Fins succeeded"
 _FINS_SUMMARY_MAX_ITEMS: Final[int] = 8
 _FINS_TEXT_MAX_CHARS: Final[int] = 120
-_FINS_REDACTED_TEXT: Final[str] = "<redacted>"
 _FINS_TRUNCATED_SUFFIX: Final[str] = "..."
-_ABSOLUTE_PATH_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?P<prefix>^|[\s=,:;(\[{\"'])"
-    r"(?P<path>(?:/(?!/)[^\s,;)\]}\"']+|[A-Za-z]:[\\/][^\s,;)\]}\"']+))"
-)
 
 
 def render_prompt_terminal_result(
@@ -299,7 +294,7 @@ def _safe_summary_key(key: str) -> str:
 
 
 def _bounded_json_text(value: str) -> str:
-    """把文本脱敏、截断并编码为短 JSON 字符串。
+    """把文本截断并编码为短 JSON 字符串。
 
     :param value: 原始文本。
     :returns: JSON 字符串文本。
@@ -317,44 +312,14 @@ def _safe_text_value(value: str) -> str:
     """生成适合 CLI 展示的有界文本值。
 
     :param value: 原始文本。
-    :returns: 脱敏、截断后的文本。
+    :returns: 截断后的文本。
     :raises Exception: 不主动抛出异常。
     """
 
-    if _looks_like_absolute_path(value):
-        return _FINS_REDACTED_TEXT
-    redacted = _ABSOLUTE_PATH_PATTERN.sub(_redact_absolute_path_match, value)
-    if len(redacted) <= _FINS_TEXT_MAX_CHARS:
-        return redacted
-    return redacted[: _FINS_TEXT_MAX_CHARS - len(_FINS_TRUNCATED_SUFFIX)] + (
+    if len(value) <= _FINS_TEXT_MAX_CHARS:
+        return value
+    return value[: _FINS_TEXT_MAX_CHARS - len(_FINS_TRUNCATED_SUFFIX)] + (
         _FINS_TRUNCATED_SUFFIX
-    )
-
-
-def _redact_absolute_path_match(match: re.Match[str]) -> str:
-    """保留路径前的分隔符并替换绝对路径文本。
-
-    :param match: 正则匹配到的绝对路径片段。
-    :returns: 已保留原分隔符的脱敏文本。
-    :raises IndexError: 正则分组缺失时由 ``Match.group`` 透传。
-    """
-
-    return f"{match.group('prefix')}{_FINS_REDACTED_TEXT}"
-
-
-def _looks_like_absolute_path(value: str) -> bool:
-    """判断文本整体是否像绝对文件路径。
-
-    :param value: 原始文本。
-    :returns: 像绝对路径时返回 ``True``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    stripped = value.strip()
-    return stripped.startswith("/") or (
-        len(stripped) > 2
-        and stripped[1] == ":"
-        and stripped[2] in {"/", "\\"}
     )
 
 

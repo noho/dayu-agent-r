@@ -45,16 +45,21 @@ Warnings are third-party `edgar` deprecation warnings already observed in prior 
 
 Remaining active residuals:
 
-- `WU-CLI-FINS-OBS-01-R3`：deferred to future CLI/Fins UI output redaction policy work unit。
-- `WU-CLI-FINS-OBS-01-R5`：deferred to future Agent command streaming / UI work unit。
-- `WU-CLI-FINS-OBS-01-R10`：deferred to future production poller / wait backoff work unit；当前 lightweight process-local observation contract 下可接受。
+- None after `WU-CLI-FINS-DIAG-01`.
 
 Closed and removed from the active residual table:
 
+- `WU-CLI-FINS-OBS-01-R3`：`WU-CLI-FINS-DIAG-01` 已确认当前项目真正敏感项仅限 `dayu/config/models.json` 引用的 API key；CLI/Fins output 不再把路径、document label、provider diagnostic summary 或业务摘要默认当 secret 脱敏，仍保留有界展示。
+- `WU-CLI-FINS-OBS-01-R5`：`WU-CLI-FINS-DIAG-01` 已把 runtime/CLI diagnostic logs 移到 stderr，stdout 保持为用户 UI / command result 通道；prompt / interactive 用户可见 activity stream 仍转入 GitHub Issue #144。
 - `WU-CLI-FINS-OBS-01-R6`：Slice A/B 与 Slice C review 已确认 direct event / runtime direct boundary 没有 reintroduce job sidecar。
 - `WU-CLI-FINS-OBS-01-R7`：Slice D0 review 已确认 observation handle contract-only checkpoint 未越界扩张。
 - `WU-CLI-FINS-OBS-01-R8`：Slice D review 已确认 process-local observation registry concurrency 由 `_observation_lock` 保护。
 - `WU-CLI-FINS-OBS-01-R9`：Slice D review 已确认 wait adapter 的 `TRANSIENT_UNAVAILABLE` bounded pending 与 corrupt / missing handle LOST recovery。
+- `WU-CLI-FINS-OBS-01-R10`：代码复核与用户裁决确认该项不是 active residual；observed path 使用进程内 `Queue(maxsize=32)` 和 process-local poll，同进程内存进出消费只形成有界背压保护，不构成需要 production poller/backoff work unit 追踪的独立风险。
+
+Transferred follow-up:
+
+- CLI session management transferred to GitHub Issue #145. Future work should remove obsolete `interactive --new-session`, keep fresh anonymous sessions as the default when `--label` is absent, keep ensure-by-label semantics for `--label`, and add explicit `resume` / `list` / `purge`.
 
 ## Next Entry
 

@@ -443,43 +443,102 @@ def test_fins_direct_verbose_log_outputs_execution_skeleton(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--verbose`` 应输出执行骨架日志，同时 progress 仍走 UI print。"""
+    """``--verbose`` 应把执行骨架诊断写到 stderr，progress 仍走 stdout。"""
 
     exit_code = cli_main.main(("download", "--ticker", "AAPL", "--verbose"))
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_SUCCESS
     assert "Fins progress" in captured.out
-    assert "Fins direct command start" in captured.out
-    assert "Fins direct event received" in captured.out
-    assert "Fins direct event detail" not in captured.out
-    assert captured.err == ""
+    assert "Fins direct command start" not in captured.out
+    assert "Fins direct event received" not in captured.out
+    assert "[VERBOSE]" not in captured.out
+    assert "Fins direct command start" in captured.err
+    assert "Fins direct event received" in captured.err
+    assert "message='download live progress'" in captured.err
+    assert "document='AAPL 10-K FY2024'" in captured.err
+    assert "stage=download" in captured.err
+    assert "Fins direct event detail" not in captured.err
 
 
 def test_fins_direct_debug_log_outputs_event_details(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--debug`` 应输出 event type 诊断，不输出 job sequence。"""
+    """``--debug`` 应把有界 event 详情写到 stderr，不输出内部治理标识。"""
 
     exit_code = cli_main.main(("download", "--ticker", "AAPL", "--debug"))
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_SUCCESS
     assert "Fins progress" in captured.out
-    assert "Fins direct event detail" in captured.out
-    assert "event_type=progress" in captured.out
-    assert "sequence=" not in captured.out
-    assert "job_id=" not in captured.out
-    assert captured.err == ""
+    assert "Fins direct event detail" not in captured.out
+    assert "[DEBUG]" not in captured.out
+    assert "Fins direct event detail" in captured.err
+    assert "event_type=progress" in captured.err
+    assert "filing_kind=10-K" in captured.err
+    assert "completed_units=1" in captured.err
+    assert "total_units=2" in captured.err
+    assert "status=success" in captured.err
+    assert "title='Download finished'" in captured.err
+    assert "exit_code=0" in captured.err
+    assert "details=processed_count=1" in captured.err
+    assert "sequence=" not in captured.err
+    assert "job_id=" not in captured.err
+    assert "cursor" not in captured.err
+    assert "artifact" not in captured.err
 
 
-def test_output_redacts_embedded_absolute_paths() -> None:
-    """CLI output 层保留绝对路径脱敏防线。"""
+def test_fins_direct_debug_diagnostic_details_are_bounded() -> None:
+    """DEBUG 诊断 details 必须限制条目数，避免日志体量失控。
 
-    assert cli_output._safe_text_value("path=/tmp/a") == "path=<redacted>"
-    assert cli_output._safe_text_value("key=/Users/a/b") == "key=<redacted>"
-    assert cli_output._safe_text_value(r"error=C:\tmp\a") == "error=<redacted>"
+    :returns: ``None``。
+    :raises AssertionError: detail 条目未被限制时抛出。
+    """
+
+    event = FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        message="download finished",
+        emitted_at=_NOW,
+        ticker="AAPL",
+        filing_kind="10-K",
+        document_label="AAPL 10-K FY2024",
+        progress=None,
+        result=FinsResultSummary(
+            status=FinsResultStatus.SUCCESS,
+            exit_code=FINS_DIRECT_EXIT_SUCCESS,
+            title="Download finished",
+            details=(
+                FinsEventDetail(label="d0", value="v0"),
+                FinsEventDetail(label="d1", value="v1"),
+                FinsEventDetail(label="d2", value="v2"),
+                FinsEventDetail(label="d3", value="v3"),
+                FinsEventDetail(label="d4", value="v4"),
+            ),
+            error_kind=None,
+            error_message=None,
+        ),
+    )
+
+    diagnostic = " ".join(fins_command._fins_event_debug_diagnostic_parts(event))
+
+    assert "details=d0=v0,d1=v1,d2=v2,d3=v3" in diagnostic
+    assert "d4=v4" not in diagnostic
+
+
+def test_output_keeps_absolute_paths_visible_and_bounded() -> None:
+    """CLI output 层不把路径当 secret，但仍限制展示长度。"""
+
+    long_value = "/Users/example/" + ("nested/" * 40)
+
+    assert cli_output._safe_text_value("/tmp/a") == "/tmp/a"
+    assert cli_output._safe_text_value("path=/Users/a/b") == "path=/Users/a/b"
+    assert cli_output._safe_text_value(r"error=C:\tmp\a") == r"error=C:\tmp\a"
+    rendered = cli_output._safe_text_value(long_value)
+    assert rendered.startswith("/Users/example/nested/")
+    assert rendered.endswith("...")
+    assert len(rendered) == 120
 
 
 def test_download_command_maps_args_to_service(
@@ -1067,8 +1126,8 @@ def _progress_event(operation_kind: FinsOperationKind) -> FinsEvent:
         message="download live progress",
         emitted_at=_NOW,
         ticker="AAPL",
-        filing_kind=None,
-        document_label=None,
+        filing_kind="10-K",
+        document_label="AAPL 10-K FY2024",
         progress=FinsProgress(stage="download", completed_units=1, total_units=2),
         result=None,
     )
@@ -1103,8 +1162,8 @@ def _result_event(
         message="download finished",
         emitted_at=_NOW,
         ticker="AAPL",
-        filing_kind=None,
-        document_label=None,
+        filing_kind="10-K",
+        document_label="AAPL 10-K FY2024",
         progress=None,
         result=FinsResultSummary(
             status=status,

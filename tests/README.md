@@ -89,16 +89,16 @@ CLI UI adapter 测试，当前覆盖 `dayu.cli` 的 parser factory、scoped comm
 对 current schema workspace config / prompts 的 bootstrap、existing file / overwrite、reset 硬编码白名单、symlink
 escape fail-fast、旧配置文件不生成、生成配置可由 `ConfigLoader` 加载和复制阶段 SIGINT 130；
 `python -m dayu.cli --help` 入口，并覆盖 CLI main 把默认 log level、`--debug` / `--verbose` / `--quiet` / `--log-level`
-解析结果交给 `dayu.runtime.log.set_level_from_flags(...)` 装配日志。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、stable
+解析结果和 stderr 诊断流交给 `dayu.runtime.log.set_level_from_flags(...)` 装配日志。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、stable
 Host slot key、unsupported 旧执行参数 fail fast、真实 `prompt.json` required context slots、mock Host public
 open/follow-up terminal path、fast terminal、outbox fallback、FAILED terminal 输出和 SIGINT 后 Host public cancel request；
 `interactive` 命令测试覆盖 label / new-session session binding、真实 `interactive.json` required context slots、两轮同
 Session、每轮独立 watcher attach/close、fast terminal、FAILED / CANCELLED 继续输入、LOST fatal、运行态 SIGINT cancel、
-第二次 SIGINT 本地 130、显式 config 错误和 unsupported 旧执行参数 fail fast。Fins direct command 测试覆盖
+第二次 SIGINT 本地 130、显式 config 错误、unsupported 旧执行参数 fail fast，以及 `--verbose` / `--debug` 诊断不污染 stdout 用户结果通道。Fins direct command 测试覆盖
 `download`、`upload_filing`、`upload_material`、`process`、`process_filing`、`process_material` 的 CLI 参数到
 `FinsDirectCommandService` 显式方法参数转换、Service event stream 消费、progress / terminal summary
-stdout/stderr 投影、CLI 输出中嵌入绝对路径脱敏、upload file 存在性与 allowlist 前置校验、`--infer` / `--ci` fail fast、
-默认日志不污染 progress 输出、`--verbose` 执行骨架日志与 `--debug` event detail 诊断、
+stdout/stderr 投影、CLI 输出中绝对路径可见但受长度控制、upload file 存在性与 allowlist 前置校验、`--infer` / `--ci` fail fast、
+默认日志不污染 progress 输出、`--verbose` 执行骨架日志与 `--debug` event detail 诊断写入 stderr 且 stdout 保持用户 UI、
 Service stream / cancel failure 向上传播且 CLI 不重复记录同一 ERROR、
 `upload_filings_from` 的本地目录扫描、filing / material 识别、脚本 quoting、`--output` 写入、错误码、扫描期
 SIGINT 130、确认不启动 live event stream、terminal exit mapping、SIGINT 到 operation-scoped async cancellation、
@@ -120,7 +120,7 @@ CLI 测试不得启动真实 Host / Fins 业务路径；涉及 Host 状态机时
 - filelock：覆盖同步 file lock wrapper 的 parent directory 创建策略、禁用创建时的结构化错误、context manager 正常与异常路径 release、release 幂等、non-blocking timeout 包装，以及第三方 `filelock` import 只能出现在 `dayu.runtime.filelock` 的边界。
 - diagnostic text：覆盖层中立 diagnostic 文本中的 Bearer / API key / authorization / password / secret / token 敏感值检测、局部 value 脱敏、marker 字面替换、有界截断、空字符串 no-op、普通 token/header 诊断不误判，以及先脱敏再截断不泄漏原值。
 - digest：覆盖层中立 UTF-8 文本 digest 的稳定 `sha256:<hex>` 输出形态。
-- logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、层中立 verbose / bounded payload key helper、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
+- logging：验证 `dayu.runtime.log` 的 logger 装配、默认 stderr 诊断流、显式 stream override、CLI 风格级别解析、层中立 verbose / bounded payload key helper、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 - config loader：覆盖 `models.json`、`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json` 的 typed view 加载、workspace 同 id 整条替换、合法单继承链、missing / self / circular / multi / invalid `extends` 错误路径、catalog record 内重复 id 字段 fail fast、execution profile 上下文窗口分档校验、工具重复治理 decision allowlist、旧 execution profile 字段与旧 runner hint `max_tokens` fail fast、host runtime lane 引用校验和旧配置文件不读取。
 - runtime location：覆盖 `workspace/config` 存在与不存在时的 `config_overlay_dir`，显式 config overlay 目录存在 / 缺失 / 非目录边界，workspace prompt assets 优先级，以及包内 prompt / manifest 默认资产缺失时 fail fast。
 - tool call projection：覆盖 current `ToolCallable` 共享参数投影与 outcome 构造 helper，包括 schema default、类型收窄、unknown / missing / enum / range / array item 参数失败、固定 `invalid_argument` failure、completed / failed outcome metadata，以及 Host cancellation token 对应的 `ToolCancelledOutcome(host_cancelled)`。

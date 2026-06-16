@@ -72,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             verbose=False,
             info=False,
             quiet=False,
+            stream=sys.stderr,
         )
         runner = COMMAND_RUNNERS.get(args.command_name)
         if runner is None:

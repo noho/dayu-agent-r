@@ -214,6 +214,8 @@ Fins public 使用边界不在 `dayu.fins` 包根导出，当前包根 `__all__`
 
 日志用于诊断系统执行过程，不承担 UI 输出、审计真源、tool trace 热 / 冷数据、EventLog canonical fact 或 projection checkpoint 职责。需要稳定查询、审计、恢复或投递的事实必须进入对应 typed EventLog / projection / audit / tool trace 机制。
 
+`dayu.runtime.log` 默认把 `dayu.*` 诊断日志写入 stderr，并保留显式 stream override；CLI composition root 显式使用 stderr 作为诊断通道，stdout 保持为命令结果和用户 UI 输出通道。
+
 | 级别 | 用途 |
 | --- | --- |
 | `DEBUG` | 执行细节，例如有界策略分支、事件分类、计数、cursor、CAS 结果和 diagnostic refs。不得输出大 prompt、大 tool result、delta 全量、provider secret、完整业务 payload 或财报原文。 |

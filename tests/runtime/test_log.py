@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from collections.abc import Iterator
 
 import pytest
@@ -31,7 +32,7 @@ from dayu.runtime.log_levels import (
 
 _NAMESPACE = "dayu"
 _MARKER_ATTR = "_dayu_runtime_log_marker"
-_MARKER_VALUE = "dayu.runtime.log:stdout"
+_MARKER_VALUE = "dayu.runtime.log:diagnostic"
 
 
 @pytest.fixture(autouse=True)
@@ -294,8 +295,9 @@ def test_log_verbose_uses_call_site_logger(
     log_verbose(logger, "helper-message=%s", "ok")
 
     captured = capsys.readouterr()
-    assert "helper-message=ok" in captured.out
-    assert "dayu.runtime_log_helper.case" in captured.out
+    assert captured.out == ""
+    assert "helper-message=ok" in captured.err
+    assert "dayu.runtime_log_helper.case" in captured.err
 
 
 def test_bounded_payload_keys_exposes_only_sorted_keys() -> None:
@@ -336,22 +338,41 @@ def test_set_level_from_flags_invalid_log_level_raises() -> None:
         )
 
 
-def test_logger_emits_to_stdout(
+def test_logger_emits_to_stderr_by_default(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """configure 后 dayu.* logger 应按 OLD 统一 prefix 写到 stdout。"""
+    """configure 后 dayu.* logger 应按统一 prefix 写到 stderr。"""
 
     configure(level=LogLevel.INFO)
     logging.getLogger("dayu.test.subsystem").info("hello-runtime-log")
 
     captured = capsys.readouterr()
-    assert "hello-runtime-log" in captured.out
-    assert "dayu.test.subsystem" in captured.out
+    assert captured.out == ""
+    assert "hello-runtime-log" in captured.err
+    assert "dayu.test.subsystem" in captured.err
     assert re.search(
         r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] "
         r"\[INFO\] \[dayu\.test\.subsystem\] hello-runtime-log$",
-        captured.out.strip(),
+        captured.err.strip(),
     )
+
+
+def test_configure_stream_override_keeps_diagnostics_redirectable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """调用方显式传入 stream 时，诊断日志应写入该流。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 日志没有写入指定流时抛出。
+    """
+
+    configure(level=LogLevel.INFO, stream=sys.stdout)
+    logging.getLogger("dayu.test.override").info("override-runtime-log")
+
+    captured = capsys.readouterr()
+    assert "override-runtime-log" in captured.out
+    assert captured.err == ""
 
 
 def test_configure_disables_propagate_so_caplog_default_misses(

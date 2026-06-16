@@ -144,7 +144,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | final closeout |
-| implementation status | WU-CLI-FINS-OBS-01 replacement implementation completed locally; aggregate deepreview BF-1 fixed and re-reviewed; no blocking findings remain |
+| implementation status | WU-CLI-FINS-OBS-01 replacement implementation completed locally; WU-CLI-FINS-DIAG-01 completed locally and closed R3/R5; no blocking findings remain |
 | active work unit | none |
 | default next work unit | WU-OBS-00 |
 | next entry point | Select next work unit; default backlog entry is WU-OBS-00 GitHub Issue / dependency / code scope discussion |
@@ -202,15 +202,15 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
-| WU-CLI-FINS-OBS-01-R3 | deferred-with-owner | Future CLI/Fins UI output redaction policy work unit | UI progress / summary 输出 redaction policy 仍需保守处理；放宽前必须单独审计 path / raw / body / content 泄漏风险。 |
-| WU-CLI-FINS-OBS-01-R5 | deferred-with-owner | Future Agent command streaming / UI work unit | `prompt` / `interactive` 的运行中 token/content streaming 不在本 WU 范围；本 WU 仅保护终态 final answer / failure / cancel 输出。 |
-| WU-CLI-FINS-OBS-01-R10 | deferred-with-owner | Future production poller / wait backoff work unit | Current process-local observation source uses a bounded direct-event queue; a very slow or absent poller can backpressure a highly chatty observed producer. This is acceptable for the current lightweight local observation contract; future production poller/backoff work should consider coalescing progress snapshots instead of event buffering. |
 
 ## 当前 Work Units
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; remaining residuals R3/R5/R10 deferred with owners |
+| WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
+| WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
+| WU-CLI-SESSION-01 | pending | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Default prompt / interactive stays fresh anonymous session without `--label`; `--label` remains ensure-by-label; remove obsolete `interactive --new-session`; add explicit resume / list / purge commands later |
+| WU-CLI-ACTIVITY-01 | pending | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Runs after WU-CLI-SESSION-01; show collapsible/hideable activity summaries for prompt / interactive without exposing hidden chain-of-thought; do not use logging as UI |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -380,7 +380,7 @@ Stop conditions：
 - Slice D accepted review fix: `_FinsObservedOperationRecord` docstring now states the `_observation_lock` invariant for mutable registry snapshots
 - Slice D review fix: `docs/reviews/wu-cli-fins-obs-01-slice-d-review-fix-codex.md`
 - Slice D re-review: `docs/reviews/wu-cli-fins-obs-01-slice-d-rereview-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-slice-d-rereview-ds-20260616.md`
-- Slice D re-review conclusion: PASS from both AgentMiMo and AgentDS; `WU-CLI-FINS-OBS-01-R8` and `WU-CLI-FINS-OBS-01-R9` closed; slow-poller bounded queue backpressure transferred to `WU-CLI-FINS-OBS-01-R10`
+- Slice D re-review conclusion: PASS from both AgentMiMo and AgentDS; `WU-CLI-FINS-OBS-01-R8` and `WU-CLI-FINS-OBS-01-R9` closed; slow-poller bounded queue backpressure was initially tracked as `WU-CLI-FINS-OBS-01-R10`
 - Slice E implementation: `docs/reviews/wu-cli-fins-obs-01-slice-e-implementation-codex.md`
 - Slice E validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_ingestion_tools.py tests/service/test_host_assembly.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 281 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; `git diff --check` clean
 - Slice E code review: `docs/reviews/wu-cli-fins-obs-01-slice-e-review-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-slice-e-review-ds-20260616.md`
@@ -398,7 +398,17 @@ Stop conditions：
 - final closeout: `docs/reviews/wu-cli-fins-obs-01-final-closeout-20260616.md`
 - final closeout accepted local commit: `f83fd497`
 - final local validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_ingestion_tools.py tests/service/test_host_assembly.py tests/service/test_import_boundary.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 282 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; `git diff --check` clean
-- residual reconciliation: closed R6/R7/R8/R9 removed from active residual table; remaining R3/R5/R10 are deferred-with-owner and non-blocking
+- residual reconciliation: closed R6/R7/R8/R9/R10 removed from active residual table; R3/R5 closed by WU-CLI-FINS-DIAG-01 and removed from active residual table
+- diagnostic output plan: `docs/host/wu-cli-fins-diagnostic-output-plan.md`
+- diagnostic output plan review: `docs/reviews/wu-cli-fins-diagnostic-output-plan-review-ds-20260616.md`; `docs/reviews/plan-review-20260616-150120.md`
+- diagnostic output plan fix: `docs/reviews/wu-cli-fins-diagnostic-output-plan-fix-codex-20260616.md`
+- diagnostic output plan fix re-review: `docs/reviews/wu-cli-fins-diagnostic-output-plan-fix-rereview-ds-20260616.md`; `docs/reviews/wu-cli-fins-diagnostic-output-plan-fix-rereview-mimo-20260616.md`
+- diagnostic output implementation: `docs/reviews/wu-cli-fins-diagnostic-output-implementation-codex-20260616.md`
+- diagnostic output implementation review: `docs/reviews/wu-cli-fins-diagnostic-output-implementation-review-ds-20260616.md`; `docs/reviews/wu-cli-fins-diagnostic-output-implementation-review-mimo-20260616.md`
+- diagnostic output review fix: `docs/reviews/wu-cli-fins-diagnostic-output-review-fix-controller-20260616.md`
+- diagnostic output review fix re-review: `docs/reviews/wu-cli-fins-diagnostic-output-review-fix-rereview-ds-20260616.md`; `docs/reviews/wu-cli-fins-diagnostic-output-review-fix-rereview-mimo-20260616.md`
+- diagnostic output final validation: `pytest tests/runtime/test_log.py tests/cli/test_arg_parsing.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_fins_commands.py -q` 121 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; `git diff --check` clean
+- diagnostic output final closeout: `docs/reviews/wu-cli-fins-diagnostic-output-final-closeout-20260616.md`
 
 ### Superseded PR #143 durable sidecar artifacts
 

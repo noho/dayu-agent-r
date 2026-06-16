@@ -7,6 +7,7 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TextIO
 
 import pytest
 
@@ -88,6 +89,7 @@ class _LogAssemblyCall:
     verbose: bool
     info: bool
     quiet: bool
+    stream: TextIO | None
 
 
 def _capture_help(
@@ -305,6 +307,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
         verbose: bool,
         info: bool,
         quiet: bool,
+        stream: TextIO | None = None,
     ) -> runtime_log.LogLevel:
         """记录 main 传入 runtime log helper 的参数。
 
@@ -313,6 +316,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
         :param verbose: runtime helper 的 verbose flag。
         :param info: runtime helper 的 info flag。
         :param quiet: runtime helper 的 quiet flag。
+        :param stream: runtime helper 的诊断日志输出流。
         :returns: 测试用日志级别。
         :raises Exception: 不主动抛出异常。
         """
@@ -324,6 +328,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
                 verbose=verbose,
                 info=info,
                 quiet=quiet,
+                stream=stream,
             )
         )
         return runtime_log.LogLevel.INFO
@@ -343,6 +348,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
             verbose=False,
             info=False,
             quiet=False,
+            stream=sys.stderr,
         )
     ]
 

@@ -86,6 +86,9 @@ _UPLOAD_PATH_NOT_FILE_TEMPLATE: Final[str] = "upload path is not a file: {path}"
 _UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = (
     "upload file suffix is not allowed: {path}"
 )
+_FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
+_FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
+_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
@@ -737,16 +740,157 @@ def _log_fins_direct_event_received(event: FinsEvent) -> None:
 
     runtime_log.log_verbose(
         _LOGGER,
-        "Fins direct event received; operation=%s event_type=%s",
-        event.operation_kind.value,
-        event.event_type.value,
+        "Fins direct event received; %s",
+        " ".join(_fins_event_verbose_diagnostic_parts(event)),
     )
     _LOGGER.debug(
-        "Fins direct event detail; operation=%s event_type=%s result_status=%s",
-        event.operation_kind.value,
-        event.event_type.value,
-        None if event.result is None else event.result.status.value,
+        "Fins direct event detail; %s",
+        " ".join(_fins_event_debug_diagnostic_parts(event)),
     )
+
+
+def _fins_event_verbose_diagnostic_parts(event: FinsEvent) -> tuple[str, ...]:
+    """生成 VERBOSE 级别 Fins event 诊断片段。
+
+    :param event: Service direct stream 产出的 Fins direct event。
+    :returns: 有界、业务可读的 ``key=value`` 片段。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts: list[str] = [
+        f"operation={event.operation_kind.value}",
+        f"event_type={event.event_type.value}",
+    ]
+    _append_optional_diagnostic_part(parts, "ticker", event.ticker)
+    _append_optional_diagnostic_part(parts, "document", event.document_label)
+    if event.progress is not None:
+        _append_optional_diagnostic_part(parts, "stage", event.progress.stage)
+    if event.result is not None:
+        parts.append(f"status={event.result.status.value}")
+    _append_optional_diagnostic_part(parts, "message", event.message)
+    return tuple(parts)
+
+
+def _fins_event_debug_diagnostic_parts(event: FinsEvent) -> tuple[str, ...]:
+    """生成 DEBUG 级别 Fins event 诊断片段。
+
+    :param event: Service direct stream 产出的 Fins direct event。
+    :returns: 有界、业务可读的 ``key=value`` 片段。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts: list[str] = [
+        f"operation={event.operation_kind.value}",
+        f"event_type={event.event_type.value}",
+    ]
+    _append_optional_diagnostic_part(parts, "filing_kind", event.filing_kind)
+    if event.progress is not None:
+        _append_optional_int_diagnostic_part(
+            parts,
+            "completed_units",
+            event.progress.completed_units,
+        )
+        _append_optional_int_diagnostic_part(
+            parts,
+            "total_units",
+            event.progress.total_units,
+        )
+    if event.result is not None:
+        parts.append(f"status={event.result.status.value}")
+        _append_optional_diagnostic_part(parts, "title", event.result.title)
+        if event.result.error_kind is not None:
+            parts.append(f"error_kind={event.result.error_kind.value}")
+        parts.append(f"exit_code={event.result.exit_code}")
+        _append_result_details_diagnostic_parts(parts, event.result.details)
+    return tuple(parts)
+
+
+def _append_optional_diagnostic_part(
+    parts: list[str],
+    key: str,
+    value: str | None,
+) -> None:
+    """追加可选文本诊断片段。
+
+    :param parts: 待追加的片段列表。
+    :param key: 诊断字段名。
+    :param value: 可选字段值。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None or value.strip() == "":
+        return
+    parts.append(f"{key}={_quoted_diagnostic_text(value)}")
+
+
+def _append_optional_int_diagnostic_part(
+    parts: list[str],
+    key: str,
+    value: int | None,
+) -> None:
+    """追加可选整数诊断片段。
+
+    :param parts: 待追加的片段列表。
+    :param key: 诊断字段名。
+    :param value: 可选整数值。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return
+    parts.append(f"{key}={value}")
+
+
+def _append_result_details_diagnostic_parts(
+    parts: list[str],
+    details: tuple[FinsEventDetail, ...],
+) -> None:
+    """追加有界 result details 诊断片段。
+
+    :param parts: 待追加的片段列表。
+    :param details: Fins direct result details。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    rendered: list[str] = []
+    for detail in details:
+        if len(rendered) >= _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS:
+            break
+        rendered.append(
+            f"{_bounded_diagnostic_text(detail.label)}="
+            f"{_quoted_diagnostic_text(detail.value)}"
+        )
+    if rendered:
+        parts.append(f"details={','.join(rendered)}")
+
+
+def _quoted_diagnostic_text(value: str) -> str:
+    """把诊断文本渲染为有界 shell 风格 token。
+
+    :param value: 原始诊断文本。
+    :returns: 适合日志中单行展示的有界 token。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return shlex.quote(_bounded_diagnostic_text(value))
+
+
+def _bounded_diagnostic_text(value: str) -> str:
+    """截断诊断文本，避免日志输出体积失控。
+
+    :param value: 原始诊断文本。
+    :returns: 长度受限的诊断文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if len(value) <= _FINS_DIAGNOSTIC_TEXT_MAX_CHARS:
+        return value
+    return value[
+        : _FINS_DIAGNOSTIC_TEXT_MAX_CHARS - len(_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX)
+    ] + _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX
 
 
 def _missing_result_event() -> FinsEvent:

@@ -14,7 +14,7 @@ stdlib logger，避免把模块归属收敛到 runtime。
   pytest ``caplog``（caplog 默认抓 root；当 ``configure()`` 设置
   ``propagate=False`` 后，调用方需要显式
   ``caplog.set_level(level, logger="dayu")`` 才能抓到）。
-- 自有 stdout handler 通过 ``_HANDLER_MARKER_ATTR`` 标记，重复
+- 自有 diagnostic handler 通过 ``_HANDLER_MARKER_ATTR`` 标记，重复
   :func:`configure` 调用先移除自有 marker handler 再重新安装，保证
   幂等且不堆叠。
 - ``configure_root=True`` 才允许配置 root logger；默认 ``False``。
@@ -28,7 +28,7 @@ import logging
 import sys
 from collections.abc import Mapping
 from enum import IntEnum
-from typing import Final, TypeAlias
+from typing import Final, TextIO, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
 from dayu.runtime.log_levels import (
@@ -42,7 +42,7 @@ from dayu.runtime.log_levels import (
 
 _NAMESPACE_LOGGER_NAME: Final[str] = "dayu"
 _HANDLER_MARKER_ATTR: Final[str] = "_dayu_runtime_log_marker"
-_HANDLER_MARKER_VALUE: Final[str] = "dayu.runtime.log:stdout"
+_HANDLER_MARKER_VALUE: Final[str] = "dayu.runtime.log:diagnostic"
 _LOG_FORMAT: Final[str] = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 _LOG_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
 _VERBOSE_LEVEL_NAME: Final[str] = "VERBOSE"
@@ -102,6 +102,7 @@ def configure(
     third_party_overrides: Mapping[str, LogLevel] | None = None,
     configure_root: bool = False,
     suppress_default_third_party: bool = True,
+    stream: TextIO | None = None,
 ) -> None:
     """装配 Dayu 日志输出。
 
@@ -109,25 +110,27 @@ def configure(
     :param third_party_overrides: 第三方 logger 的级别映射；仅设置 level，
         不安装 handler；为 ``None`` 表示不调整。
     :param configure_root: 是否同时配置 root logger（默认 ``False``）。
-        仅在调用方明确需要让非 ``dayu.*`` 的库日志也输出到 stdout 时启用。
+        仅在调用方明确需要让非 ``dayu.*`` 的库日志也输出到诊断流时启用。
     :param suppress_default_third_party: 是否对默认第三方 logger（aiohttp /
         asyncio / urllib3 等）设置为 WARNING。迁移自 OLD 行为，避免在
         DEBUG 下被淹没；``third_party_overrides`` 中的同名 logger 会
         **覆盖**该默认。
+    :param stream: 诊断日志输出流；``None`` 表示使用当前 ``sys.stderr``。
     :returns: 无返回值。
     """
 
+    effective_stream = sys.stderr if stream is None else stream
     namespace_logger = logging.getLogger(_NAMESPACE_LOGGER_NAME)
     _reset_marker_handlers(namespace_logger)
     namespace_logger.setLevel(int(level))
     namespace_logger.propagate = False
-    namespace_logger.addHandler(_build_marker_handler(level))
+    namespace_logger.addHandler(_build_marker_handler(level, effective_stream))
 
     if configure_root:
         root_logger = logging.getLogger()
         _reset_marker_handlers(root_logger)
         root_logger.setLevel(int(level))
-        root_logger.addHandler(_build_marker_handler(level))
+        root_logger.addHandler(_build_marker_handler(level, effective_stream))
 
     if suppress_default_third_party:
         for name in _DEFAULT_THIRD_PARTY_SUPPRESSIONS:
@@ -145,6 +148,7 @@ def set_level_from_flags(
     verbose: bool,
     info: bool,
     quiet: bool,
+    stream: TextIO | None = None,
 ) -> LogLevel:
     """根据 CLI 风格的 flag 集合解析最终级别并调用 :func:`configure`。
 
@@ -162,6 +166,7 @@ def set_level_from_flags(
     :param verbose: 是否启用 ``--verbose``。
     :param info: 是否启用 ``--info``。
     :param quiet: 是否启用 ``--quiet``。
+    :param stream: 诊断日志输出流；``None`` 表示使用当前 ``sys.stderr``。
     :returns: 最终生效的 :class:`LogLevel`。
 
     :raises ValueError: 当 ``log_level`` 非合法 :class:`LogLevel` 名时抛出。
@@ -174,7 +179,7 @@ def set_level_from_flags(
         info=info,
         quiet=quiet,
     )
-    configure(level=resolved)
+    configure(level=resolved, stream=stream)
     return resolved
 
 
@@ -240,14 +245,15 @@ def _resolve_level(
     return LogLevel.INFO
 
 
-def _build_marker_handler(level: LogLevel) -> logging.Handler:
-    """构造带 marker 的 stdout handler。
+def _build_marker_handler(level: LogLevel, stream: TextIO) -> logging.Handler:
+    """构造带 marker 的诊断日志 handler。
 
     :param level: 该 handler 的级别。
+    :param stream: 诊断日志输出流。
     :returns: 已 setLevel + setFormatter + 打 marker 的 handler。
     """
 
-    handler = logging.StreamHandler(stream=sys.stdout)
+    handler = logging.StreamHandler(stream=stream)
     handler.setLevel(int(level))
     handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT))
     setattr(handler, _HANDLER_MARKER_ATTR, _HANDLER_MARKER_VALUE)
