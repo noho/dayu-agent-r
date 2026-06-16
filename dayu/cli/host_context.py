@@ -17,6 +17,8 @@ CLI_PROMPT_COMMAND: str = "prompt"
 CLI_PROMPT_OPERATION_KIND: str = "cli_prompt"
 CLI_INTERACTIVE_COMMAND: str = "interactive"
 CLI_INTERACTIVE_OPERATION_KIND: str = "cli_interactive"
+CLI_SESSION_COMMAND: str = "session"
+CLI_SESSION_OPERATION_KIND: str = "cli_session"
 CLI_BUSINESS_DOMAIN: str = "fins"
 CLI_TICKER_OBJECT_TYPE: str = "ticker"
 CLI_PROMPT_SCENARIO: str = "prompt"
@@ -129,6 +131,20 @@ def interactive_create_session_client_request_id(invocation: CliInvocation) -> s
     return (
         f"dayu-cli:{invocation.command_name}:{invocation.invocation_id}:"
         "session:create"
+    )
+
+
+def session_purge_client_request_id(invocation: CliInvocation) -> str:
+    """构造 session purge 幂等 id。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :returns: Host purge-session client_request_id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        f"dayu-cli:{invocation.command_name}:{invocation.invocation_id}:"
+        "session:purge"
     )
 
 
@@ -246,6 +262,26 @@ def build_interactive_host_context(
     )
 
 
+def build_session_host_context(
+    invocation: CliInvocation,
+    *,
+    operation: str,
+) -> HostCallContext:
+    """构造 session 命令调用 Host public API 的上下文。
+
+    :param invocation: 当前 CLI invocation 身份。
+    :param operation: 当前 Host API 操作短名。
+    :returns: HostCallContext。
+    :raises ValueError: operation 为空时抛出。
+    """
+
+    return _build_host_context(
+        invocation,
+        operation=operation,
+        operation_kind=CLI_SESSION_OPERATION_KIND,
+    )
+
+
 def _build_host_context(
     invocation: CliInvocation,
     *,
@@ -350,12 +386,14 @@ __all__: tuple[str, ...] = (
     "CLI_INTERACTIVE_SCENARIO",
     "CLI_PROMPT_COMMAND",
     "CLI_PROMPT_SCENARIO",
+    "CLI_SESSION_COMMAND",
     "CLI_SIGINT_REASON",
     "CliInvocation",
     "INTERACTIVE_SESSION_SCOPE",
     "PROMPT_SESSION_SCOPE",
     "build_interactive_host_context",
     "build_prompt_host_context",
+    "build_session_host_context",
     "interactive_cancel_client_request_id",
     "interactive_create_session_client_request_id",
     "interactive_slot_key",
@@ -365,4 +403,5 @@ __all__: tuple[str, ...] = (
     "prompt_create_session_client_request_id",
     "prompt_slot_key",
     "prompt_submit_client_request_id",
+    "session_purge_client_request_id",
 )

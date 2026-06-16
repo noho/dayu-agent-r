@@ -31,6 +31,12 @@ COMMAND_UPLOAD_FILINGS_FROM: str = "upload_filings_from"
 COMMAND_PROCESS: str = "process"
 COMMAND_PROCESS_FILING: str = "process_filing"
 COMMAND_PROCESS_MATERIAL: str = "process_material"
+COMMAND_SESSION: str = "session"
+SESSION_ACTION_LIST: str = "list"
+SESSION_ACTION_RESUME: str = "resume"
+SESSION_ACTION_PURGE: str = "purge"
+SESSION_LABEL_KIND_CHOICES: tuple[str, ...] = ("prompt", "interactive")
+SESSION_RESUME_MODE_CHOICES: tuple[str, ...] = ("prompt", "interactive")
 
 CLI_COMMAND_NAMES: tuple[str, ...] = (
     COMMAND_INIT,
@@ -43,6 +49,7 @@ CLI_COMMAND_NAMES: tuple[str, ...] = (
     COMMAND_PROCESS,
     COMMAND_PROCESS_FILING,
     COMMAND_PROCESS_MATERIAL,
+    COMMAND_SESSION,
 )
 EXCLUDED_COMMAND_NAMES: tuple[str, ...] = (
     "write",
@@ -78,6 +85,34 @@ class CommandSubparserRegistry(Protocol):
         :param description: 子命令 help 中展示的说明文本。
         :param parents: 子解析器需要复用的父解析器集合。
         :returns: 新增命令对应的子解析器。
+        :raises ValueError: argparse 参数注册失败时透传底层异常。
+        """
+
+        ...
+
+
+class SessionActionSubparserRegistry(Protocol):
+    """``session`` 二级动作解析器注册器协议。
+
+    本协议只暴露本模块注册二级 action 需要的 ``add_parser`` 形状，避免把
+    argparse 内部泛型类型带进命令注册函数。
+    """
+
+    def add_parser(
+        self,
+        name: str,
+        *,
+        help: str,
+        description: str,
+        parents: Sequence[argparse.ArgumentParser],
+    ) -> argparse.ArgumentParser:
+        """注册并返回 ``session`` action 子解析器。
+
+        :param name: action 名称。
+        :param help: ``session --help`` 中展示的 action 摘要。
+        :param description: action help 中展示的说明文本。
+        :param parents: action 子解析器复用的父解析器集合。
+        :returns: 新增 action 对应的子解析器。
         :raises ValueError: argparse 参数注册失败时透传底层异常。
         """
 
@@ -140,6 +175,13 @@ class ParsedCliArgs(argparse.Namespace):
     output: str | None
     recursive: bool
     material_forms: list[str] | None
+    session_action: str | None
+    session_id: str | None
+    kind: str | None
+    mode: str | None
+    session_prompt: str | None
+    yes: bool
+    reason: str | None
 
 
 def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
@@ -174,6 +216,7 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     _register_process_command(subparsers, global_parent)
     _register_process_filing_command(subparsers, global_parent)
     _register_process_material_command(subparsers, global_parent)
+    _register_session_command(subparsers, global_parent)
     return parser
 
 
@@ -245,6 +288,13 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.output = None
     namespace.recursive = False
     namespace.material_forms = None
+    namespace.session_action = None
+    namespace.session_id = None
+    namespace.kind = None
+    namespace.mode = None
+    namespace.session_prompt = None
+    namespace.yes = False
+    namespace.reason = None
     return namespace
 
 
@@ -405,6 +455,169 @@ def _register_interactive_command(
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
     _add_agent_execution_arguments(parser)
+
+
+def _register_session_command(
+    subparsers: CommandSubparserRegistry,
+    global_parent: argparse.ArgumentParser,
+) -> None:
+    """注册 ``session`` 命令及其二级 action 参数。
+
+    :param subparsers: 顶层 subparsers 注册器。
+    :param global_parent: 包含全局参数的父解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    parser = _add_command_parser(
+        subparsers,
+        global_parent,
+        command_name=COMMAND_SESSION,
+        help_text="查看或清理 CLI Session。",
+    )
+    action_subparsers = cast(
+        SessionActionSubparserRegistry,
+        parser.add_subparsers(
+            dest="session_action",
+            metavar="SESSION_COMMAND",
+            required=True,
+        ),
+    )
+    _register_session_list_action(action_subparsers, global_parent)
+    _register_session_resume_action(action_subparsers, global_parent)
+    _register_session_purge_action(action_subparsers, global_parent)
+
+
+def _add_session_action_parser(
+    subparsers: SessionActionSubparserRegistry,
+    global_parent: argparse.ArgumentParser,
+    *,
+    action_name: str,
+    help_text: str,
+) -> argparse.ArgumentParser:
+    """注册 ``session`` 二级 action 解析器。
+
+    :param subparsers: ``session`` action subparsers 注册器。
+    :param global_parent: 包含全局参数的父解析器。
+    :param action_name: action 名称。
+    :param help_text: action 摘要。
+    :returns: 新增 action 对应的子解析器。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    parser = subparsers.add_parser(
+        action_name,
+        help=help_text,
+        description=help_text,
+        parents=[global_parent],
+    )
+    parser.set_defaults(command_name=COMMAND_SESSION, session_action=action_name)
+    return parser
+
+
+def _register_session_list_action(
+    subparsers: SessionActionSubparserRegistry,
+    global_parent: argparse.ArgumentParser,
+) -> None:
+    """注册 ``session list`` action。
+
+    :param subparsers: ``session`` action subparsers 注册器。
+    :param global_parent: 包含全局参数的父解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    _add_session_action_parser(
+        subparsers,
+        global_parent,
+        action_name=SESSION_ACTION_LIST,
+        help_text="列出当前 Host 中可见的 CLI Session。",
+    )
+
+
+def _register_session_resume_action(
+    subparsers: SessionActionSubparserRegistry,
+    global_parent: argparse.ArgumentParser,
+) -> None:
+    """注册 ``session resume`` parser surface。
+
+    S4 只冻结 parser shape；实际 resume 执行由后续 slice 接管。
+
+    :param subparsers: ``session`` action subparsers 注册器。
+    :param global_parent: 包含全局参数的父解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    parser = _add_session_action_parser(
+        subparsers,
+        global_parent,
+        action_name=SESSION_ACTION_RESUME,
+        help_text="恢复一个已有 Session 并提交下一轮输入。",
+    )
+    _add_session_selector_arguments(parser)
+    parser.add_argument(
+        "--mode",
+        choices=SESSION_RESUME_MODE_CHOICES,
+        required=True,
+        help="恢复后使用的 CLI 输入模式。",
+    )
+    parser.add_argument(
+        "session_prompt",
+        nargs="?",
+        type=_non_empty_prompt,
+        help="prompt 模式下一轮用户问题。",
+    )
+    _add_agent_execution_arguments(parser)
+
+
+def _register_session_purge_action(
+    subparsers: SessionActionSubparserRegistry,
+    global_parent: argparse.ArgumentParser,
+) -> None:
+    """注册 ``session purge`` action。
+
+    :param subparsers: ``session`` action subparsers 注册器。
+    :param global_parent: 包含全局参数的父解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    parser = _add_session_action_parser(
+        subparsers,
+        global_parent,
+        action_name=SESSION_ACTION_PURGE,
+        help_text="清理已关闭且所有 Run 已终态的 Session。",
+    )
+    _add_session_selector_arguments(parser)
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="确认执行 purge；CLI 不会自动 close 或 cancel。",
+    )
+    parser.add_argument(
+        "--reason",
+        help="可选 purge reason；未提供时使用 CLI 默认 reason。",
+    )
+
+
+def _add_session_selector_arguments(parser: argparse.ArgumentParser) -> None:
+    """为 session action 追加共享 selector 参数。
+
+    :param parser: 目标 action 解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    selector_group = parser.add_mutually_exclusive_group(required=True)
+    selector_group.add_argument("--session-id", help="Host Session id。")
+    selector_group.add_argument("--label", help="CLI Session label。")
+    parser.add_argument(
+        "--kind",
+        choices=SESSION_LABEL_KIND_CHOICES,
+        help="label 所属 CLI Session 类型。",
+    )
 
 
 def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
