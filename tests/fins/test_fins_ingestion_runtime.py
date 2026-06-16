@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -22,6 +22,7 @@ from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
+from dayu.fins.direct_events import FinsEvent, FinsEventType, FinsOperationKind, FinsResultStatus
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
     FinsIngestionJobEventRecord,
@@ -242,6 +243,34 @@ class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
 
         self.requests.append(request)
         return FinsSourceDownloadAdapterResult(discovered_count=1, persisted_summary=self.summary)
+
+
+class _CancellationAwareDownloadAdapter(FinsSourceDownloadAdapter):
+    """测试用会观察取消检查器的下载 adapter。"""
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """执行两次取消检查后返回 persisted summary。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            固定 persisted summary。
+
+        Raises:
+            无。
+        """
+
+        request.cancellation_checker()
+        request.cancellation_checker()
+        return FinsSourceDownloadAdapterResult(
+            discovered_count=1,
+            persisted_summary=FinsDownloadResultSummary(
+                discovered_count=1,
+                downloaded_count=1,
+                written_document_ids=("aapl-cancel-aware-10k",),
+            ),
+        )
 
 
 class _FakeUploadRunner(FinsUploadRunner):
@@ -887,6 +916,132 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
     assert progress_events[1].payload["written_document_count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_direct_download_stream_writes_storage_and_does_not_create_job_record(
+    tmp_path: Path,
+) -> None:
+    """direct download 应产出 progress/result，并且不创建 durable job record。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _FakeDownloadAdapter()
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("fake", "US"): adapter},
+    )
+
+    events = await _collect_direct_events(
+        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="FAKE", form_types=("10-K",)))
+    )
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    source_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-fake-10k", SourceKind.FILING)
+    handle = runtime.source_repository.get_source_handle("AAPL", "aapl-fake-10k", SourceKind.FILING)
+    content = runtime.blob_repository.read_file_bytes(handle, "aapl-fake-10k.md")
+    jobs_dir = workspace_root / ".dayu" / "fins_ingestion" / "jobs"
+
+    assert executor.operations == []
+    assert [event.event_type for event in events].count(FinsEventType.RESULT) == 1
+    assert events[0].event_type is FinsEventType.PROGRESS
+    assert events[-1].event_type is FinsEventType.RESULT
+    assert events[-1].result is not None
+    assert events[-1].result.status is FinsResultStatus.SUCCESS
+    assert events[-1].result.exit_code == 0
+    assert source_meta["ingest_method"] == "download"
+    assert content == b"# Fake 10-K\n\nRevenue increased."
+    assert tuple(jobs_dir.glob("*.json")) == ()
+    assert tuple(jobs_dir.glob("*.jsonl")) == ()
+
+
+@pytest.mark.asyncio
+async def test_direct_download_unsupported_source_returns_failure_result(tmp_path: Path) -> None:
+    """direct download adapter 失败应收口为 FAILURE RESULT，不得静默结束。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    events = await _collect_direct_events(
+        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="unknown"))
+    )
+
+    assert events[0].event_type is FinsEventType.PROGRESS
+    assert events[-1].event_type is FinsEventType.RESULT
+    assert events[-1].result is not None
+    assert events[-1].result.status is FinsResultStatus.FAILURE
+    assert events[-1].result.exit_code == 1
+    assert events[-1].result.error_message is not None
+    assert "不支持的下载来源" in events[-1].result.error_message
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_missing_result_returns_failure_result(tmp_path: Path) -> None:
+    """direct producer 静默结束时 runtime 自身应补齐失败 RESULT。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    normalized = ticker_normalization.normalize_ticker("AAPL")
+
+    def quiet_producer(context: ingestion_runtime._FinsIngestionExecutionContext) -> None:
+        """模拟未产出 RESULT 的 producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del context
+
+    events = await _collect_direct_events(
+        ingestion._run_direct_stream(
+            operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+            direct_operation_kind=FinsOperationKind.DOWNLOAD,
+            normalized=normalized,
+            source="fake",
+            source_kind=SourceKind.FILING,
+            cancellation_token=None,
+            producer=quiet_producer,
+        )
+    )
+
+    assert [event.event_type for event in events] == [FinsEventType.RESULT]
+    assert events[-1].result is not None
+    assert events[-1].result.status is FinsResultStatus.FAILURE
+    assert events[-1].result.exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path: Path) -> None:
+    """direct download 取消应使用 operation-scoped token/checker 并返回 cancelled RESULT。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("cancel", "US"): _CancellationAwareDownloadAdapter()},
+    )
+    token = _CancelOnSecondCheckToken()
+
+    events = await _collect_direct_events(
+        ingestion.download(
+            FinsDownloadRequest(ticker="AAPL", source="cancel"),
+            cancellation_token=token,
+        )
+    )
+
+    assert executor.operations == []
+    assert token.check_count >= 2
+    assert events[-1].event_type is FinsEventType.RESULT
+    assert events[-1].result is not None
+    assert events[-1].result.status is FinsResultStatus.CANCELLED
+    assert events[-1].result.exit_code == 130
+
+
 def test_start_download_production_adapter_boundary_emits_progress_events(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1373,6 +1528,43 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert progress_events[0].payload["file_count"] == 1
     assert progress_events[1].document_id == "aapl-investor-day"
     assert progress_events[1].payload["upload_status"] == "uploaded"
+
+
+@pytest.mark.asyncio
+async def test_direct_upload_stream_omits_paths_job_ids_and_raw_payload_text(tmp_path: Path) -> None:
+    """direct upload 用户事件不得暴露路径、job id、raw payload 或正文。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    runner = _FakeUploadRunner(
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            document_id="aapl-2024-10k",
+            status="uploaded",
+            uploaded_files=("primary.pdf",),
+            primary_document="primary.pdf",
+        )
+    )
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=_HoldingExecutor(),
+        upload_runner=runner,
+    )
+    upload_file = tmp_path / "raw" / "aapl-10k.pdf"
+    upload_file.parent.mkdir(parents=True)
+    upload_file.write_text("Annual recurring revenue increased raw provider payload", encoding="utf-8")
+
+    events = await _collect_direct_events(
+        ingestion.upload(FinsUploadFilingRequest(ticker="AAPL", files=(upload_file,)))
+    )
+    event_text = repr(events)
+
+    assert events[-1].result is not None
+    assert events[-1].result.status is FinsResultStatus.SUCCESS
+    assert str(tmp_path) not in event_text
+    assert "aapl-10k.pdf" not in event_text
+    assert "finsjob_" not in event_text
+    assert "raw provider payload" not in event_text
+    assert "Annual recurring revenue increased" not in event_text
 
 
 def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_path: Path) -> None:
@@ -2831,6 +3023,25 @@ def _progress_events(
         for event in ingestion.read_job_events(job_id, after_sequence=0, limit=1000)
         if event.event_type is FinsIngestionJobEventType.PROGRESS
     )
+
+
+async def _collect_direct_events(events: AsyncIterator[FinsEvent]) -> tuple[FinsEvent, ...]:
+    """收集 direct stream 事件。
+
+    Args:
+        events: Fins direct async event stream。
+
+    Returns:
+        已收集事件元组。
+
+    Raises:
+        Exception: stream 迭代失败时原样抛出。
+    """
+
+    collected: list[FinsEvent] = []
+    async for event in events:
+        collected.append(event)
+    return tuple(collected)
 
 
 def _build_fins_workspace(

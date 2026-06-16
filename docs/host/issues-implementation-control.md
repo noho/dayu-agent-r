@@ -144,10 +144,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-CLI-FINS-OBS-01 replacement plan accepted; PR #143 durable sidecar premise superseded; next gate starts Slice A from `docs/host/wu-cli-fins-obs-01-replacement-plan.md` |
+| implementation status | WU-CLI-FINS-OBS-01 Slice A/B/D0/C accepted; next gate is Slice D lightweight observation handle migration from `docs/host/wu-cli-fins-obs-01-replacement-plan.md` |
 | active work unit | WU-CLI-FINS-OBS-01 |
 | default next work unit | WU-CLI-FINS-OBS-01 |
-| next entry point | WU-CLI-FINS-OBS-01 Slice A implementation: establish direct `FinsEvent` typed contract and Service `AsyncIterator[FinsEvent]` boundary; then proceed through Slice B, D0, C, D, and E from the accepted replacement plan |
+| next entry point | WU-CLI-FINS-OBS-01 Slice D implementation: migrate Fins tool awaiting / wait adapter to lightweight observation handle while keeping `ToolAwaitingOutcome(EXTERNAL_JOB)` non-blocking and avoiding durable Fins job records / sidecar for observation |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -204,7 +204,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 | WU-CLI-FINS-OBS-01-R3 | deferred-with-owner | Future CLI/Fins UI output redaction policy work unit | UI progress / summary 输出 redaction policy 仍需保守处理；放宽前必须单独审计 path / raw / body / content 泄漏风险。 |
 | WU-CLI-FINS-OBS-01-R5 | deferred-with-owner | Future Agent command streaming / UI work unit | `prompt` / `interactive` 的运行中 token/content streaming 不在本 WU 范围；本 WU 仅保护终态 final answer / failure / cancel 输出。 |
-| WU-CLI-FINS-OBS-01-R6 | open | WU-CLI-FINS-OBS-01 Slice A/C review gates | Slice A 和 Slice C 仍共享 `dayu/fins/ingestion_runtime.py` 的 allowed file；Slice A 只能固定 `FinsEvent` contract、Service direct boundary 和 Service-facing runtime protocol，真实 runtime implementation 必须留给 Slice C。 |
+| WU-CLI-FINS-OBS-01-R6 | closed | WU-CLI-FINS-OBS-01 Slice A/C review gates | Slice A/B implementation and Slice C review confirmed the boundary: Slice A fixed the `FinsEvent` / Service direct contract, while Slice C implemented runtime direct stream without back-editing CLI/Service semantics or reintroducing job sidecar. |
 | WU-CLI-FINS-OBS-01-R7 | closed | WU-CLI-FINS-OBS-01 Slice D0 review gate | Slice D0 review confirmed the implementation stayed contract-only and did not expand into runtime / wait adapter implementation. |
 | WU-CLI-FINS-OBS-01-R8 | open | WU-CLI-FINS-OBS-01 Slice C/D implementation and review gates | 默认 process-local observation registry 的并发安全需要在实现时证明；若 runtime / wait adapter / blocking bridge 跨线程或跨 task 访问 registry，必须有明确同步策略和测试。 |
 | WU-CLI-FINS-OBS-01-R9 | open | WU-CLI-FINS-OBS-01 Slice D implementation and review gates | D0 only fixed neutral `TRANSIENT_UNAVAILABLE -> PENDING` and corrupt-token/missing-handle LOST mapping. Slice D wait adapter implementation must add bounded retry / max wait protection for repeated transient unavailable and end-to-end corrupt resume token -> LOST coverage. |
@@ -213,7 +213,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | implementation | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement plan accepted; implement Slice A first from `docs/host/wu-cli-fins-obs-01-replacement-plan.md` |
+| WU-CLI-FINS-OBS-01 | implementation | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Slice A/B/D0/C accepted; implement Slice D lightweight observation handle migration next from `docs/host/wu-cli-fins-obs-01-replacement-plan.md` |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -348,7 +348,7 @@ Stop conditions：
 - replacement plan fix: integrated into `docs/host/wu-cli-fins-obs-01-replacement-plan.md` by AgentCodex
 - replacement plan re-review: `docs/reviews/plan-rereview-20260616-102509-mimo.md`; `docs/reviews/plan-rereview-20260616-102606-ds.md`
 - replacement plan re-review conclusion: AgentMiMo `pass`; AgentDS `pass-with-risks`; all high / medium findings fixed; no new material issues; nonblocking residual risks tracked as `WU-CLI-FINS-OBS-01-R6` / `R7` / `R8`
-- implementation status: Slice A/B/D0 accepted; next slice is Slice C Fins runtime core execution convergence
+- implementation status: Slice A/B/D0/C accepted; next slice is Slice D Fins tool awaiting / wait adapter lightweight observation migration
 - Slice A implementation: `docs/reviews/wu-cli-fins-obs-01-slice-a-implementation-codex.md`
 - Slice B implementation: `docs/reviews/wu-cli-fins-obs-01-slice-b-implementation-codex.md`
 - Slice A/B validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 129 passed, 3 warnings; targeted `pyright` 0 errors
@@ -367,6 +367,15 @@ Stop conditions：
 - Slice D0 review fix: `docs/reviews/wu-cli-fins-obs-01-slice-d0-review-fix-codex.md`
 - Slice D0 review follow-up: both AgentMiMo and AgentDS appended follow-up PASS sections confirming DS-D0-01 fixed, `WU-CLI-FINS-OBS-01-R7` closed, and `WU-CLI-FINS-OBS-01-R9` correctly tracks Slice D retry guard / corrupt-token E2E LOST coverage
 - Slice D0 final validation: `pytest tests/fins/test_fins_ingestion_tools.py tests/fins/test_fins_ingestion_runtime.py -q` 103 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; import check passed; `git diff --check` clean
+- Slice C implementation: `docs/reviews/wu-cli-fins-obs-01-slice-c-implementation-codex.md`
+- Slice C validation: `pytest tests/fins/test_fins_ingestion_runtime.py -q` 59 passed, 3 warnings; targeted `pyright` 0 errors; `git diff --check` clean
+- Slice C code review: `docs/reviews/wu-cli-fins-obs-01-slice-c-review-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-slice-c-review-ds-20260616.md`
+- Slice C review conclusion: AgentMiMo `PASS`; AgentDS `PASS-WITH-FINDINGS`; no blocking findings
+- Slice C accepted findings requiring fix: DS-C01 runtime direct stream should synthesize a failure RESULT if a producer exits without a RESULT; DS-C02 `_put_direct_queue` cancel branch should document intentional event discard after consumer exit
+- Slice C review fix: `docs/reviews/wu-cli-fins-obs-01-slice-c-review-fix-codex.md`
+- Slice C re-review: `docs/reviews/wu-cli-fins-obs-01-slice-c-rereview-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-slice-c-rereview-ds-20260616.md`
+- Slice C re-review conclusion: PASS from both AgentMiMo and AgentDS; direct runtime now guarantees no silent end, does not create durable job records or job event sidecar, and keeps the sync adapter bridge bounded/internal
+- Slice C final validation: `pytest tests/fins/test_fins_ingestion_runtime.py -q` 60 passed, 3 warnings; `pyright dayu/fins/ingestion_runtime.py dayu/fins/service_runtime.py tests/fins/test_fins_ingestion_runtime.py` 0 errors; `git diff --check` clean
 
 ### Superseded PR #143 durable sidecar artifacts
 
