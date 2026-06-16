@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-CLI-FINS-OBS-01 Slice A/B/D0/C/D/E accepted; next gate is aggregate deepreview before final closeout |
-| active work unit | WU-CLI-FINS-OBS-01 |
-| default next work unit | WU-CLI-FINS-OBS-01 |
-| next entry point | WU-CLI-FINS-OBS-01 aggregate deepreview: review accepted replacement implementation across direct stream, CLI output/cancel, runtime direct execution, lightweight observation awaiting, README/test synchronization and residual risks |
+| gate | final closeout |
+| implementation status | WU-CLI-FINS-OBS-01 replacement implementation completed locally; aggregate deepreview BF-1 fixed and re-reviewed; no blocking findings remain |
+| active work unit | none |
+| default next work unit | WU-OBS-00 |
+| next entry point | Select next work unit; default backlog entry is WU-OBS-00 GitHub Issue / dependency / code scope discussion |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -204,17 +204,13 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 | WU-CLI-FINS-OBS-01-R3 | deferred-with-owner | Future CLI/Fins UI output redaction policy work unit | UI progress / summary 输出 redaction policy 仍需保守处理；放宽前必须单独审计 path / raw / body / content 泄漏风险。 |
 | WU-CLI-FINS-OBS-01-R5 | deferred-with-owner | Future Agent command streaming / UI work unit | `prompt` / `interactive` 的运行中 token/content streaming 不在本 WU 范围；本 WU 仅保护终态 final answer / failure / cancel 输出。 |
-| WU-CLI-FINS-OBS-01-R6 | closed | WU-CLI-FINS-OBS-01 Slice A/C review gates | Slice A/B implementation and Slice C review confirmed the boundary: Slice A fixed the `FinsEvent` / Service direct contract, while Slice C implemented runtime direct stream without back-editing CLI/Service semantics or reintroducing job sidecar. |
-| WU-CLI-FINS-OBS-01-R7 | closed | WU-CLI-FINS-OBS-01 Slice D0 review gate | Slice D0 review confirmed the implementation stayed contract-only and did not expand into runtime / wait adapter implementation. |
-| WU-CLI-FINS-OBS-01-R8 | closed | WU-CLI-FINS-OBS-01 Slice D review gate | Slice D implementation and AgentMiMo / AgentDS review confirmed process-local observation registry concurrency is guarded by `_observation_lock`; tools / wait adapter access observation through typed runtime APIs and no longer consume job store state. |
-| WU-CLI-FINS-OBS-01-R9 | closed | WU-CLI-FINS-OBS-01 Slice D review gate | Slice D wait adapter implements bounded `TRANSIENT_UNAVAILABLE` handling via max pending window and covers corrupt / missing observation handles resolving LOST; AgentMiMo / AgentDS review both PASS. |
 | WU-CLI-FINS-OBS-01-R10 | deferred-with-owner | Future production poller / wait backoff work unit | Current process-local observation source uses a bounded direct-event queue; a very slow or absent poller can backpressure a highly chatty observed producer. This is acceptable for the current lightweight local observation contract; future production poller/backoff work should consider coalescing progress snapshots instead of event buffering. |
 
 ## 当前 Work Units
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | review | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Slice A/B/D0/C/D/E accepted; run aggregate deepreview before final closeout |
+| WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; remaining residuals R3/R5/R10 deferred with owners |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -243,7 +239,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-本条是用户裁决纳入本文档留痕的 immediate residual work unit，不创建 GitHub Issue。PR #143 已打开，但 2026-06-16 用户指出并经代码核对确认两个设计更正：CLI direct live events 没有 durable job 需求，正确模型是普通 `AsyncIterator[FinsEvent]`；Fins tool awaiting 返回 `ToolAwaitingOutcome(EXTERNAL_JOB)` 的方向成立，但把 awaiting observation handle 实现成 Fins 核心 durable job system 过重。因此 PR #143 的 durable sidecar plan / slice 记录不再作为当前实施真源。2026-06-16 replacement plan gate 已完成并通过 re-review；后续 implementation 必须以 `docs/host/wu-cli-fins-obs-01-replacement-plan.md` 为当前 plan 真源。
+本条是用户裁决纳入本文档留痕的 immediate residual work unit，不创建 GitHub Issue。PR #143 已打开，但 2026-06-16 用户指出并经代码核对确认两个设计更正：CLI direct live events 没有 durable job 需求，正确模型是普通 `AsyncIterator[FinsEvent]`；Fins tool awaiting 返回 `ToolAwaitingOutcome(EXTERNAL_JOB)` 的方向成立，但把 awaiting observation handle 实现成 Fins 核心 durable job system 过重。因此 PR #143 的 durable sidecar plan / slice 记录不再作为当前实施真源。2026-06-16 replacement plan gate 已完成并通过 re-review；replacement implementation 已按 `docs/host/wu-cli-fins-obs-01-replacement-plan.md` 完成 final closeout。
 
 ### 用户裁决
 
@@ -349,7 +345,7 @@ Stop conditions：
 - replacement plan fix: integrated into `docs/host/wu-cli-fins-obs-01-replacement-plan.md` by AgentCodex
 - replacement plan re-review: `docs/reviews/plan-rereview-20260616-102509-mimo.md`; `docs/reviews/plan-rereview-20260616-102606-ds.md`
 - replacement plan re-review conclusion: AgentMiMo `pass`; AgentDS `pass-with-risks`; all high / medium findings fixed; no new material issues; nonblocking residual risks tracked as `WU-CLI-FINS-OBS-01-R6` / `R7` / `R8`
-- implementation status: Slice A/B/D0/C/D/E accepted; next gate is aggregate deepreview before final closeout
+- implementation status: final closeout completed; Slice A/B/D0/C/D/E accepted, aggregate deepreview BF-1 fixed and re-reviewed, no blocking findings remain
 - Slice A implementation: `docs/reviews/wu-cli-fins-obs-01-slice-a-implementation-codex.md`
 - Slice B implementation: `docs/reviews/wu-cli-fins-obs-01-slice-b-implementation-codex.md`
 - Slice A/B validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 129 passed, 3 warnings; targeted `pyright` 0 errors
@@ -393,6 +389,15 @@ Stop conditions：
 - Slice E review fix: `docs/reviews/wu-cli-fins-obs-01-slice-e-review-fix-codex.md`
 - Slice E re-review: `docs/reviews/wu-cli-fins-obs-01-slice-e-rereview-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-slice-e-rereview-ds-20260616.md`
 - Slice E re-review conclusion: PASS from both AgentMiMo and AgentDS; no blocking findings
+- aggregate deepreview: `docs/reviews/wu-cli-fins-obs-01-aggregate-deepreview-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-aggregate-deepreview-ds-20260616.md`
+- aggregate deepreview conclusion: AgentDS PASS; AgentMiMo found BF-1 blocking import-boundary test drift for `dayu.fins.direct_events`; all other direct stream / lightweight observation / runtime boundary / README / residual-risk checks passed
+- aggregate fix: `docs/reviews/wu-cli-fins-obs-01-aggregate-fix-codex-20260616.md`
+- aggregate fix validation: `pytest tests/service/test_import_boundary.py -q` 1 passed; BF-1 fixed by adding the precise Service import-boundary allowlist entry `dayu.fins.direct_events` and syncing `tests/README.md`
+- aggregate fix re-review: `docs/reviews/wu-cli-fins-obs-01-aggregate-fix-rereview-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-aggregate-fix-rereview-ds-20260616.md`
+- aggregate fix re-review conclusion: PASS from both AgentMiMo and AgentDS; BF-1 closed, `dayu.fins` prefix remains forbidden except explicit public boundary allowlist, no new findings
+- final closeout: `docs/reviews/wu-cli-fins-obs-01-final-closeout-20260616.md`
+- final local validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_ingestion_tools.py tests/service/test_host_assembly.py tests/service/test_import_boundary.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 282 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; `git diff --check` clean
+- residual reconciliation: closed R6/R7/R8/R9 removed from active residual table; remaining R3/R5/R10 are deferred-with-owner and non-blocking
 
 ### Superseded PR #143 durable sidecar artifacts
 

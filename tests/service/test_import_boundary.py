@@ -13,6 +13,7 @@ SERVICE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.fins",
 )
 SERVICE_ALLOWED_IMPORTS: tuple[str, ...] = (
+    "dayu.fins.direct_events",
     "dayu.fins.domain.enums",
     "dayu.fins.ingestion",
     "dayu.fins.ingestion_runtime",
