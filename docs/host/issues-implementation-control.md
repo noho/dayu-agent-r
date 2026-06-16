@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final closeout |
-| implementation status | WU-CLI-FINS-OBS-01 replacement implementation completed locally; WU-CLI-FINS-DIAG-01 completed locally and closed R3/R5; no blocking findings remain |
-| active work unit | none |
+| gate | implementation |
+| implementation status | WU-CLI-SESSION-01 plan accepted; plan artifact `docs/host/host-issues/wu-cli-session-01-cli-session-management-plan.md`; review artifacts `docs/reviews/plan-review-wu-cli-session-01-ds-20260616.md`, `docs/reviews/plan-review-wu-cli-session-01-mimo-20260616.md`; adjudication `docs/reviews/plan-review-wu-cli-session-01-adjudication-20260616.md`; fix report `docs/reviews/wu-cli-session-01-plan-fix-codex-20260616.md`; re-review artifacts `docs/reviews/plan-rereview-wu-cli-session-01-ds-20260616.md`, `docs/reviews/plan-rereview-wu-cli-session-01-mimo-20260616.md`; AgentDS / AgentMiMo re-review PASS; accepted plan local commit pending |
+| active work unit | WU-CLI-SESSION-01 |
 | default next work unit | WU-OBS-00 |
-| next entry point | Select next work unit; default backlog entry is WU-OBS-00 GitHub Issue / dependency / code scope discussion |
+| next entry point | Create accepted plan commit, then dispatch WU-CLI-SESSION-01 implementation Slice S1 to AgentCodex |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
