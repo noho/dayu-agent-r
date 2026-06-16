@@ -347,6 +347,17 @@ Stop conditions：
 - replacement plan fix: integrated into `docs/host/wu-cli-fins-obs-01-replacement-plan.md` by AgentCodex
 - replacement plan re-review: `docs/reviews/plan-rereview-20260616-102509-mimo.md`; `docs/reviews/plan-rereview-20260616-102606-ds.md`
 - replacement plan re-review conclusion: AgentMiMo `pass`; AgentDS `pass-with-risks`; all high / medium findings fixed; no new material issues; nonblocking residual risks tracked as `WU-CLI-FINS-OBS-01-R6` / `R7` / `R8`
+- implementation status: Slice A/B accepted; next slice is Slice D0 lightweight observation handle contract-only checkpoint
+- Slice A implementation: `docs/reviews/wu-cli-fins-obs-01-slice-a-implementation-codex.md`
+- Slice B implementation: `docs/reviews/wu-cli-fins-obs-01-slice-b-implementation-codex.md`
+- Slice A/B validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 129 passed, 3 warnings; targeted `pyright` 0 errors
+- Slice A/B code review: `docs/reviews/code-review-20260616-111036-mimo.md`; `docs/reviews/code-review-20260616-111112-ds.md`
+- Slice A/B accepted findings requiring fix: MiMo R1/R2 SIGINT cancel race test and terminal result preservation; DS-001 user-visible `Fins job summary` terminology; DS-002 `_FinsSigintMonitor` docstring terminology
+- Slice A/B review fix: `docs/reviews/wu-cli-fins-obs-01-slice-ab-review-fix-codex.md`
+- Slice A/B re-review: `docs/reviews/wu-cli-fins-obs-01-slice-ab-rereview-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-slice-ab-rereview-ds-20260616.md`
+- Slice A/B re-review conclusion: PASS from both AgentMiMo and AgentDS; no blocking findings; nonblocking observations are deferred to existing Slice C / Slice E scope or defense-in-depth cleanup; post-review logger isolation follow-up was also checked by both reviewers and remains PASS
+- Slice A/B post-review validation fix: added `tests/conftest.py` logger isolation because combined CLI -> Fins runtime test order exposed leaked `dayu` logger handlers bound to closed pytest capture streams; `tests/README.md` records this test infrastructure fact
+- Slice A/B final validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py tests/fins/test_fins_ingestion_runtime.py -q` 184 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; import check passed; `git diff --check` clean
 
 ### Superseded PR #143 durable sidecar artifacts
 

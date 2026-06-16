@@ -12,6 +12,9 @@ source .venv/bin/activate
 
 当前类型检查配置覆盖 `dayu/`、`tests/`、`utils/`，并排除 `workspace/`、缓存目录、隐藏目录与 `.venv/`。
 
+`tests/conftest.py` 提供全局测试隔离夹具：每个测试结束后恢复 `dayu` namespace logger 的 handler、level、
+propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避免 CLI 入口日志装配把 pytest 捕获流泄漏给后续测试。
+
 ## 常用命令
 
 运行当前契约、CLI、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：

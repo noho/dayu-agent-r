@@ -1,9 +1,9 @@
 """``dayu-cli`` Fins direct commands 实现。
 
 本模块是 CLI UI adapter：负责把 argparse 结果转换为
-``FinsDirectCommandService`` 的显式方法参数，并处理 SIGINT 到 durable
-Fins job cancel 的映射。CLI 不直接调用 Fins ingestion runtime，不读取
-Fins storage，也不把 direct job 伪装成 Host Run。
+``FinsDirectCommandService`` 的显式 direct stream 方法参数，并处理 SIGINT
+到当前 async stream cancellation 的映射。CLI 不直接调用 Fins ingestion
+runtime，不读取 Fins storage，也不把 direct operation 伪装成 Host Run。
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ import asyncio
 import logging
 import shlex
 import signal
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
 from typing import Final, cast
@@ -41,6 +42,17 @@ from dayu.cli.output import (
     render_fins_direct_event,
     render_fins_direct_local_exit_after_cancel,
 )
+from dayu.fins.direct_events import (
+    FINS_RESULT_EXIT_CANCELLED,
+    FINS_RESULT_EXIT_FAILURE,
+    FinsErrorKind,
+    FinsEvent,
+    FinsEventDetail,
+    FinsEventType,
+    FinsOperationKind,
+    FinsResultStatus,
+    FinsResultSummary,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.upload_batch import (
     FINS_UPLOAD_FILE_SUFFIXES,
@@ -53,9 +65,6 @@ from dayu.fins.upload_batch import (
 )
 from dayu.service.fins_direct import (
     FinsDirectCommandService,
-    FinsDirectJobEvent,
-    FinsDirectJobHandle,
-    FinsDirectTerminalResult,
     FinsDirectUsageError,
 )
 
@@ -97,8 +106,68 @@ class CliTickerInput:
     aliases: tuple[str, ...]
 
 
+class _CliFinsCancellationToken:
+    """CLI direct operation 取消 token。"""
+
+    _cancelled: bool
+    _reason: str | None
+    _requested_at: datetime | None
+
+    def __init__(self) -> None:
+        """初始化取消 token。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._cancelled = False
+        self._reason = None
+        self._requested_at = None
+
+    def request_cancel(self, reason: str) -> None:
+        """请求取消当前 direct operation。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self._cancelled:
+            return
+        self._cancelled = True
+        self._reason = reason
+        self._requested_at = datetime.now(timezone.utc)
+
+    def is_cancelled(self) -> bool:
+        """返回当前是否已取消。
+
+        :returns: 已请求取消返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 取消原因；未取消时返回 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._reason
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 请求取消的 UTC 时间；未取消时返回 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._requested_at
+
+
 class _FinsSigintMonitor:
-    """Fins direct job 运行阶段的 SIGINT 观察器。"""
+    """Fins direct operation 运行阶段的 SIGINT 观察器。"""
 
     count: int
     _event: asyncio.Event
@@ -227,21 +296,23 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     _raise_for_unsupported_flags(args)
     workspace_root = _resolve_workspace_root(args.workspace_root)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
-    handle = _start_direct_job(args=args, service=service)
+    cancellation_token = _CliFinsCancellationToken()
+    stream = _open_direct_stream(
+        args=args,
+        service=service,
+        cancellation_token=cancellation_token,
+    )
     runtime_log.log_verbose(
         _LOGGER,
-        "Fins direct job started; command=%s job_id=%s initial_status=%s",
-        handle.start_request.command_name,
-        handle.job_id,
-        handle.initial_status.value,
+        "Fins direct stream opened; command=%s",
+        args.command_name,
     )
     terminal = await _wait_for_terminal_handling_sigint(
-        service=service,
-        handle=handle,
+        events=stream,
+        cancellation_token=cancellation_token,
         sigint_monitor=_FinsSigintMonitor(),
+        command_name=args.command_name,
     )
-    if terminal is None:
-        return EXIT_KEYBOARD_INTERRUPT
     return terminal.exit_code
 
 
@@ -351,74 +422,97 @@ def _append_optional_entry_metadata(
         parts.extend(("--company-name", entry.company_name))
 
 
-def _start_direct_job(
+def _open_direct_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
-) -> FinsDirectJobHandle:
-    """按命令名启动 direct job。
+    cancellation_token: _CliFinsCancellationToken,
+) -> AsyncIterator[FinsEvent]:
+    """按命令名打开 direct event stream。
 
     :param args: argparse 已解析的 Fins direct 命令参数。
     :param service: Fins direct Service helper。
-    :returns: direct job handle。
+    :param cancellation_token: 当前 operation 的取消 token。
+    :returns: Fins direct 事件异步迭代器。
     :raises CliFinsUsageError: 命令或用户输入非法时抛出。
-    :raises Exception: Service 启动 job 失败时向上抛出。
+    :raises Exception: Service 打开 stream 失败时向上抛出。
     """
 
     if args.command_name == COMMAND_DOWNLOAD:
-        return _start_download(args=args, service=service)
+        return _download_stream(args=args, service=service, cancellation_token=cancellation_token)
     if args.command_name == COMMAND_UPLOAD_FILING:
-        return _start_upload_filing(args=args, service=service)
+        return _upload_filing_stream(
+            args=args,
+            service=service,
+            cancellation_token=cancellation_token,
+        )
     if args.command_name == COMMAND_UPLOAD_MATERIAL:
-        return _start_upload_material(args=args, service=service)
+        return _upload_material_stream(
+            args=args,
+            service=service,
+            cancellation_token=cancellation_token,
+        )
     if args.command_name == COMMAND_PROCESS:
-        return _start_process(args=args, service=service)
+        return _process_stream(args=args, service=service, cancellation_token=cancellation_token)
     if args.command_name == COMMAND_PROCESS_FILING:
-        return _start_process_filing(args=args, service=service)
+        return _process_filing_stream(
+            args=args,
+            service=service,
+            cancellation_token=cancellation_token,
+        )
     if args.command_name == COMMAND_PROCESS_MATERIAL:
-        return _start_process_material(args=args, service=service)
+        return _process_material_stream(
+            args=args,
+            service=service,
+            cancellation_token=cancellation_token,
+        )
     raise CliFinsUsageError(f"unsupported fins direct command: {args.command_name}")
 
 
-def _start_download(
+def _download_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
-) -> FinsDirectJobHandle:
-    """启动 download direct job。
+    cancellation_token: _CliFinsCancellationToken,
+) -> AsyncIterator[FinsEvent]:
+    """打开 download direct stream。
 
     :param args: argparse 已解析的 download 参数。
     :param service: Fins direct Service helper。
-    :returns: direct job handle。
+    :param cancellation_token: 当前 operation 的取消 token。
+    :returns: Fins direct 事件异步迭代器。
     :raises CliFinsUsageError: ticker 或 forms 输入非法时抛出。
     """
 
     ticker = _parse_ticker_csv(args.ticker)
-    return service.start_download(
+    return service.download(
         ticker=ticker.canonical,
         form_types=_normalized_text_tuple(args.forms, field_name="--forms"),
         filed_after=_optional_stripped_text(args.start),
         filed_before=_optional_stripped_text(args.end),
         overwrite_existing=args.overwrite,
         rebuild_processed=args.rebuild,
+        cancellation_token=cancellation_token,
     )
 
 
-def _start_upload_filing(
+def _upload_filing_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
-) -> FinsDirectJobHandle:
-    """启动 upload_filing direct job。
+    cancellation_token: _CliFinsCancellationToken,
+) -> AsyncIterator[FinsEvent]:
+    """打开 upload_filing direct stream。
 
     :param args: argparse 已解析的 upload_filing 参数。
     :param service: Fins direct Service helper。
-    :returns: direct job handle。
+    :param cancellation_token: 当前 operation 的取消 token。
+    :returns: Fins direct 事件异步迭代器。
     :raises CliFinsUsageError: ticker 或文件路径非法时抛出。
     """
 
     ticker = _parse_ticker_csv(args.ticker)
-    return service.start_upload_filing(
+    return service.upload_filing(
         ticker=ticker.canonical,
         action=args.action,
         files=_validated_upload_files(args.files),
@@ -430,25 +524,28 @@ def _start_upload_filing(
         company_name=_optional_stripped_text(args.company_name),
         ticker_aliases=ticker.aliases,
         overwrite=args.overwrite,
+        cancellation_token=cancellation_token,
     )
 
 
-def _start_upload_material(
+def _upload_material_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
-) -> FinsDirectJobHandle:
-    """启动 upload_material direct job。
+    cancellation_token: _CliFinsCancellationToken,
+) -> AsyncIterator[FinsEvent]:
+    """打开 upload_material direct stream。
 
     :param args: argparse 已解析的 upload_material 参数。
     :param service: Fins direct Service helper。
-    :returns: direct job handle。
+    :param cancellation_token: 当前 operation 的取消 token。
+    :returns: Fins direct 事件异步迭代器。
     :raises CliFinsUsageError: ticker、forms 或文件路径非法时抛出。
     """
 
     ticker = _parse_ticker_csv(args.ticker)
     form_type = _single_optional_form(args.forms)
-    return service.start_upload_material(
+    return service.upload_material(
         ticker=ticker.canonical,
         action=args.action,
         files=_validated_upload_files(args.files),
@@ -464,102 +561,106 @@ def _start_upload_material(
         company_name=_optional_stripped_text(args.company_name),
         ticker_aliases=ticker.aliases,
         overwrite=args.overwrite,
+        cancellation_token=cancellation_token,
     )
 
 
-def _start_process(
+def _process_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
-) -> FinsDirectJobHandle:
-    """启动 process direct job。
+    cancellation_token: _CliFinsCancellationToken,
+) -> AsyncIterator[FinsEvent]:
+    """打开 process direct stream。
 
     :param args: argparse 已解析的 process 参数。
     :param service: Fins direct Service helper。
-    :returns: direct job handle。
+    :param cancellation_token: 当前 operation 的取消 token。
+    :returns: Fins direct 事件异步迭代器。
     :raises CliFinsUsageError: ticker 或 document id 输入非法时抛出。
     """
 
     ticker = _parse_ticker_csv(args.ticker)
-    return service.start_preprocess(
-        command_name=COMMAND_PROCESS,
+    return service.process(
         ticker=ticker.canonical,
         source_kind=SourceKind.FILING,
         document_ids=_document_ids_from_arg(args.document_id),
         rebuild_processed=args.overwrite,
+        cancellation_token=cancellation_token,
     )
 
 
-def _start_process_filing(
+def _process_filing_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
-) -> FinsDirectJobHandle:
-    """启动 process_filing direct job。
+    cancellation_token: _CliFinsCancellationToken,
+) -> AsyncIterator[FinsEvent]:
+    """打开 process_filing direct stream。
 
     :param args: argparse 已解析的 process_filing 参数。
     :param service: Fins direct Service helper。
-    :returns: direct job handle。
+    :param cancellation_token: 当前 operation 的取消 token。
+    :returns: Fins direct 事件异步迭代器。
     :raises CliFinsUsageError: ticker 或 document id 输入非法时抛出。
     """
 
     ticker = _parse_ticker_csv(args.ticker)
     document_id = _required_single_document_id(args.document_id)
-    return service.start_preprocess(
-        command_name=COMMAND_PROCESS_FILING,
+    return service.process_filing(
         ticker=ticker.canonical,
-        source_kind=SourceKind.FILING,
         document_ids=(document_id,),
         rebuild_processed=args.overwrite,
+        cancellation_token=cancellation_token,
     )
 
 
-def _start_process_material(
+def _process_material_stream(
     *,
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
-) -> FinsDirectJobHandle:
-    """启动 process_material direct job。
+    cancellation_token: _CliFinsCancellationToken,
+) -> AsyncIterator[FinsEvent]:
+    """打开 process_material direct stream。
 
     :param args: argparse 已解析的 process_material 参数。
     :param service: Fins direct Service helper。
-    :returns: direct job handle。
+    :param cancellation_token: 当前 operation 的取消 token。
+    :returns: Fins direct 事件异步迭代器。
     :raises CliFinsUsageError: ticker 或 document id 输入非法时抛出。
     """
 
     ticker = _parse_ticker_csv(args.ticker)
     document_id = _required_single_document_id(args.document_id)
-    return service.start_preprocess(
-        command_name=COMMAND_PROCESS_MATERIAL,
+    return service.process_material(
         ticker=ticker.canonical,
-        source_kind=SourceKind.MATERIAL,
         document_ids=(document_id,),
         rebuild_processed=args.overwrite,
+        cancellation_token=cancellation_token,
     )
 
 
 async def _wait_for_terminal_handling_sigint(
     *,
-    service: FinsDirectCommandService,
-    handle: FinsDirectJobHandle,
+    events: AsyncIterator[FinsEvent],
+    cancellation_token: _CliFinsCancellationToken,
     sigint_monitor: _FinsSigintMonitor,
-) -> FinsDirectTerminalResult | None:
-    """等待 direct job 终态并处理运行中 SIGINT。
+    command_name: str,
+) -> FinsResultSummary:
+    """等待 direct stream 终态并处理运行中 SIGINT。
 
-    :param service: Fins direct Service helper。
-    :param handle: 已启动 direct job handle。
+    :param events: Fins direct event stream。
+    :param cancellation_token: 当前 operation 的取消 token。
     :param sigint_monitor: SIGINT 观察器。
-    :returns: terminal result；第二次 SIGINT 本地退出时返回 ``None``。
-    :raises Exception: wait 或 cancel runtime 失败时向上抛出。
+    :param command_name: 用户可见命令名，用于诊断。
+    :returns: direct stream 终态摘要。
+    :raises Exception: stream 消费失败时向上抛出。
     """
 
     sigint_monitor.install()
-    event_task = asyncio.create_task(
-        _consume_fins_direct_events(service=service, handle=handle)
-    )
+    event_task = asyncio.create_task(_consume_fins_direct_events(events))
     observed_count = sigint_monitor.count
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_count))
-    cancel_requested = False
     try:
         while True:
             await asyncio.wait(
@@ -571,22 +672,23 @@ async def _wait_for_terminal_handling_sigint(
                 return await event_task
             if sigint_task.done():
                 observed_count = sigint_task.result()
-                if cancel_requested:
-                    event_task.cancel()
-                    render_fins_direct_local_exit_after_cancel(handle.job_id)
-                    return None
                 runtime_log.log_verbose(
                     _LOGGER,
-                    "Fins direct cancel requested; job_id=%s sigint_count=%s",
-                    handle.job_id,
+                    "Fins direct stream cancel requested; command=%s sigint_count=%s",
+                    command_name,
                     observed_count,
                 )
-                service.request_cancel(handle.job_id)
-                cancel_requested = True
-                render_fins_direct_cancel_requested(handle.job_id)
-                sigint_task = asyncio.create_task(
-                    sigint_monitor.wait_next(observed_count)
-                )
+                cancellation_token.request_cancel("keyboard_interrupt")
+                event_task.cancel()
+                render_fins_direct_cancel_requested()
+                try:
+                    terminal_result = await event_task
+                except asyncio.CancelledError:
+                    pass
+                else:
+                    return terminal_result
+                render_fins_direct_local_exit_after_cancel()
+                return _cancelled_result_summary()
     finally:
         sigint_monitor.close()
         sigint_task.cancel()
@@ -595,61 +697,99 @@ async def _wait_for_terminal_handling_sigint(
 
 
 async def _consume_fins_direct_events(
-    *,
-    service: FinsDirectCommandService,
-    handle: FinsDirectJobHandle,
-) -> FinsDirectTerminalResult:
-    """消费 Service event stream 并输出 Fins direct job 事件。
+    events: AsyncIterator[FinsEvent],
+) -> FinsResultSummary:
+    """消费 Service event stream 并输出 Fins direct 事件。
 
-    :param service: Fins direct Service helper。
-    :param handle: 已启动 direct job handle。
-    :returns: event stream 产出的 terminal result。
+    :param events: Fins direct event stream。
+    :returns: event stream 产出的 terminal result summary。
     :raises RuntimeError: event stream 结束但没有 terminal result 时抛出。
     :raises Exception: Service stream 或输出失败时向上抛出。
     """
 
-    async for event in service.stream_job_events_until_terminal(handle):
+    async for event in events:
         _log_fins_direct_event_received(event)
         render_fins_direct_event(event)
-        if event.terminal_result is not None:
+        if event.result is not None:
             runtime_log.log_verbose(
                 _LOGGER,
-                "Fins direct terminal closeout; command=%s job_id=%s status=%s exit_code=%s",
-                event.command_name,
-                event.job_id,
-                event.terminal_result.status.value,
-                event.terminal_result.exit_code,
+                "Fins direct terminal closeout; operation=%s status=%s exit_code=%s",
+                event.operation_kind.value,
+                event.result.status.value,
+                event.result.exit_code,
             )
-            return event.terminal_result
-    raise RuntimeError(
-        f"Fins direct event stream ended without terminal result: {handle.job_id}"
-    )
+            return event.result
+    missing_result = _missing_result_event()
+    render_fins_direct_event(missing_result)
+    result = missing_result.result
+    if result is None:
+        raise RuntimeError("missing-result event did not contain result")
+    return result
 
 
-def _log_fins_direct_event_received(event: FinsDirectJobEvent) -> None:
+def _log_fins_direct_event_received(event: FinsEvent) -> None:
     """记录 Fins direct event 的有界诊断信息。
 
-    :param event: Service event stream 投影出的 Fins direct job event。
+    :param event: Service direct stream 产出的 Fins direct event。
     :returns: ``None``。
     :raises Exception: 不主动抛出异常。
     """
 
     runtime_log.log_verbose(
         _LOGGER,
-        "Fins direct event received; command=%s job_id=%s event=%s",
-        event.command_name,
-        event.job_id,
-        event.event_label,
+        "Fins direct event received; operation=%s event_type=%s",
+        event.operation_kind.value,
+        event.event_type.value,
     )
     _LOGGER.debug(
-        "Fins direct event detail; job_id=%s sequence=%s event=%s status=%s "
-        "payload_key_count=%s payload_keys=%s",
-        event.job_id,
-        event.sequence,
-        event.event_label,
-        None if event.status is None else event.status.value,
-        len(event.payload),
-        runtime_log.bounded_payload_keys(event.payload),
+        "Fins direct event detail; operation=%s event_type=%s result_status=%s",
+        event.operation_kind.value,
+        event.event_type.value,
+        None if event.result is None else event.result.status.value,
+    )
+
+
+def _missing_result_event() -> FinsEvent:
+    """构造 direct stream 无 RESULT 时的 failure event。
+
+    :returns: failure RESULT 事件。
+    :raises ValueError: 构造出的事件违反 direct contract 时抛出。
+    """
+
+    return FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=FinsOperationKind.PREPROCESS,
+        message="Fins direct stream ended without result",
+        emitted_at=datetime.now(timezone.utc),
+        ticker=None,
+        filing_kind=None,
+        document_label=None,
+        progress=None,
+        result=FinsResultSummary(
+            status=FinsResultStatus.FAILURE,
+            exit_code=FINS_RESULT_EXIT_FAILURE,
+            title="Fins direct operation failed",
+            details=(),
+            error_kind=FinsErrorKind.EXECUTION,
+            error_message="Fins direct stream ended without result",
+        ),
+    )
+
+
+def _cancelled_result_summary() -> FinsResultSummary:
+    """构造 CLI 本地取消终态摘要。
+
+    :returns: cancelled result summary。
+    :raises ValueError: 构造出的摘要违反 direct contract 时抛出。
+    """
+
+    return FinsResultSummary(
+        status=FinsResultStatus.CANCELLED,
+        exit_code=FINS_RESULT_EXIT_CANCELLED,
+        title="Fins direct operation cancelled",
+        details=(FinsEventDetail(label="reason", value="keyboard_interrupt"),),
+        error_kind=FinsErrorKind.CANCELLED,
+        error_message="cancelled",
     )
 
 

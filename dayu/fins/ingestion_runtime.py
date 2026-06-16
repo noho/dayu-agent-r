@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -27,6 +27,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
+from dayu.fins.direct_events import FinsEvent
 from dayu.fins.domain.document_models import (
     DocumentMeta,
     FileObjectMeta,
@@ -180,6 +181,10 @@ class _UnsupportedDownloadSourceError(RuntimeError):
 
 class FinsIngestionStartCancelledError(RuntimeError):
     """启动 ingestion job 前观察到调用方取消。"""
+
+
+class FinsDirectStreamNotImplementedError(NotImplementedError):
+    """Fins direct stream runtime 尚未实现。"""
 
 
 @dataclass(frozen=True)
@@ -1684,6 +1689,90 @@ class FinsIngestionRuntime:
             upload_runner=upload_runner,
             _start_lock=Lock(),
         )
+
+    async def download(
+        self,
+        request: FinsDownloadRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行下载 direct stream。
+
+        Slice A 只固定 Service-facing protocol shape；真实 direct stream runtime
+        execution、progress 产出、协作取消与旧 job store 收敛属于 Slice C。
+
+        Args:
+            request: 下载请求。
+            cancellation_token: 可选 operation-scoped 取消 token。
+
+        Returns:
+            Fins direct 事件异步迭代器。
+
+        Raises:
+            FinsDirectStreamNotImplementedError: 当前 slice 尚未实现真实 runtime stream。
+        """
+
+        del request, cancellation_token
+        raise FinsDirectStreamNotImplementedError(
+            "Fins direct download stream is implemented in Slice C"
+        )
+        yield
+
+    async def preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行预处理 direct stream。
+
+        Slice A 只固定 Service-facing protocol shape；真实 direct stream runtime
+        execution、progress 产出、协作取消与旧 job store 收敛属于 Slice C。
+
+        Args:
+            request: 预处理请求。
+            cancellation_token: 可选 operation-scoped 取消 token。
+
+        Returns:
+            Fins direct 事件异步迭代器。
+
+        Raises:
+            FinsDirectStreamNotImplementedError: 当前 slice 尚未实现真实 runtime stream。
+        """
+
+        del request, cancellation_token
+        raise FinsDirectStreamNotImplementedError(
+            "Fins direct preprocess stream is implemented in Slice C"
+        )
+        yield
+
+    async def upload(
+        self,
+        request: FinsUploadRequest,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """执行上传 direct stream。
+
+        Slice A 只固定 Service-facing protocol shape；真实 direct stream runtime
+        execution、progress 产出、协作取消与旧 job store 收敛属于 Slice C。
+
+        Args:
+            request: 上传请求。
+            cancellation_token: 可选 operation-scoped 取消 token。
+
+        Returns:
+            Fins direct 事件异步迭代器。
+
+        Raises:
+            FinsDirectStreamNotImplementedError: 当前 slice 尚未实现真实 runtime stream。
+        """
+
+        del request, cancellation_token
+        raise FinsDirectStreamNotImplementedError(
+            "Fins direct upload stream is implemented in Slice C"
+        )
+        yield
 
     def start_download(
         self,

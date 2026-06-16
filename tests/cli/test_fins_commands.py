@@ -6,6 +6,7 @@ import ast
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
@@ -13,86 +14,87 @@ import pytest
 
 import dayu.cli.commands.fins as fins_command
 import dayu.cli.main as cli_main
+import dayu.cli.output as cli_output
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
-from dayu.cli.output import render_fins_direct_event
-from dayu.contracts.json_value import JsonValue
+from dayu.fins.direct_events import (
+    FinsErrorKind,
+    FinsEvent,
+    FinsEventDetail,
+    FinsEventType,
+    FinsOperationKind,
+    FinsProgress,
+    FinsResultStatus,
+    FinsResultSummary,
+)
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.ingestion_runtime import FinsIngestionJobStatus
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
     FINS_DIRECT_EXIT_SUCCESS,
-    FINS_DIRECT_SYNTHETIC_TERMINAL_EVENT_LABEL,
-    FinsDirectJobEvent,
-    FinsDirectJobHandle,
-    FinsDirectStartRequest,
-    FinsDirectTerminalResult,
 )
 
-
-def _raise_on_cli_exception_log(message: str, *args: str | int | None) -> None:
-    """测试防线：CLI 不应对 Service 已负责的失败重复记录 ERROR。
-
-    :param message: logging exception 格式字符串。
-    :param args: logging exception 格式化参数。
-    :returns: 正常路径不会返回。
-    :raises AssertionError: 调用方触发 CLI duplicate ERROR log 时抛出。
-    """
-
-    raise AssertionError(f"unexpected CLI exception log: {message!r} {args!r}")
+_NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
 
 
 class _FakeFinsDirectService:
     """CLI 测试用 FinsDirectCommandService 替身。"""
 
     download_requests: list[_DownloadCall]
-    preprocess_requests: list[_PreprocessCall]
+    process_requests: list[_ProcessCall]
+    process_filing_requests: list[_ProcessSpecificCall]
+    process_material_requests: list[_ProcessSpecificCall]
     upload_filing_requests: list[_UploadFilingCall]
     upload_material_requests: list[_UploadMaterialCall]
-    cancel_requests: list[str]
-    wait_calls: list[str]
-    stream_calls: list[str]
-    wait_started: asyncio.Event
-    cancel_seen: asyncio.Event
-    terminal_status: FinsIngestionJobStatus
-    wait_for_cancel_before_terminal: bool
-    use_synthetic_terminal_fallback: bool
+    events: tuple[FinsEvent, ...]
+    stream_error: Exception | None
+    stream_calls: list[FinsOperationKind]
+    cancellation_tokens: list[fins_command._CliFinsCancellationToken | None]
+    first_event_yielded: asyncio.Event
+    release_stream: asyncio.Event
+    pause_after_first_event: bool
+    closed_streams: int
 
     def __init__(
         self,
         *,
-        terminal_status: FinsIngestionJobStatus = FinsIngestionJobStatus.SUCCEEDED,
-        wait_for_cancel_before_terminal: bool = False,
-        use_synthetic_terminal_fallback: bool = False,
+        events: tuple[FinsEvent, ...] | None = None,
+        stream_error: Exception | None = None,
+        pause_after_first_event: bool = False,
     ) -> None:
         """初始化 fake service。
 
-        :param terminal_status: wait_for_terminal 返回的终态。
-        :param wait_for_cancel_before_terminal: 是否等待 request_cancel 后才返回终态。
-        :param use_synthetic_terminal_fallback: 是否产出 Service 合成终态事件。
+        :param events: stream 需要产出的事件；为空时使用 progress + success。
+        :param stream_error: 可选 stream 末尾异常。
+        :param pause_after_first_event: 是否在首个事件后暂停，供取消测试使用。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
         self.download_requests = []
-        self.preprocess_requests = []
+        self.process_requests = []
+        self.process_filing_requests = []
+        self.process_material_requests = []
         self.upload_filing_requests = []
         self.upload_material_requests = []
-        self.cancel_requests = []
-        self.wait_calls = []
+        self.events = (
+            (_progress_event(FinsOperationKind.DOWNLOAD), _result_event())
+            if events is None
+            else events
+        )
+        self.stream_error = stream_error
         self.stream_calls = []
-        self.wait_started = asyncio.Event()
-        self.cancel_seen = asyncio.Event()
-        self.terminal_status = terminal_status
-        self.wait_for_cancel_before_terminal = wait_for_cancel_before_terminal
-        self.use_synthetic_terminal_fallback = use_synthetic_terminal_fallback
+        self.cancellation_tokens = []
+        self.first_event_yielded = asyncio.Event()
+        self.release_stream = asyncio.Event()
+        self.pause_after_first_event = pause_after_first_event
+        self.closed_streams = 0
 
-    def start_download(
+    def download(
         self,
         *,
         ticker: str,
@@ -101,8 +103,9 @@ class _FakeFinsDirectService:
         filed_before: str | None = None,
         overwrite_existing: bool = False,
         rebuild_processed: bool = False,
-    ) -> FinsDirectJobHandle:
-        """记录 download start 参数。
+        cancellation_token: fins_command._CliFinsCancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """记录 download 参数并返回 fake stream。
 
         :param ticker: canonical ticker。
         :param form_types: 表单过滤条件。
@@ -110,7 +113,8 @@ class _FakeFinsDirectService:
         :param filed_before: 最晚 filing 日期。
         :param overwrite_existing: 是否覆盖已有文档。
         :param rebuild_processed: 是否重建 processed 产物。
-        :returns: fake job handle。
+        :param cancellation_token: CLI operation 取消 token。
+        :returns: Fins direct event stream。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -124,33 +128,32 @@ class _FakeFinsDirectService:
                 rebuild_processed=rebuild_processed,
             )
         )
-        return _handle(command_name="download", ticker=ticker)
+        return self._stream(FinsOperationKind.DOWNLOAD, cancellation_token)
 
-    def start_preprocess(
+    def process(
         self,
         *,
-        command_name: str,
         ticker: str,
         source_kind: SourceKind,
         document_ids: tuple[str, ...] = (),
         form_types: tuple[str, ...] = (),
         rebuild_processed: bool = False,
-    ) -> FinsDirectJobHandle:
-        """记录 preprocess start 参数。
+        cancellation_token: fins_command._CliFinsCancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """记录 process 参数并返回 fake stream。
 
-        :param command_name: 用户可见命令名。
         :param ticker: canonical ticker。
         :param source_kind: 源文档类型。
         :param document_ids: 源文档 ID。
         :param form_types: 表单过滤。
         :param rebuild_processed: 是否重建 processed 产物。
-        :returns: fake job handle。
+        :param cancellation_token: CLI operation 取消 token。
+        :returns: Fins direct event stream。
         :raises Exception: 不主动抛出异常。
         """
 
-        self.preprocess_requests.append(
-            _PreprocessCall(
-                command_name=command_name,
+        self.process_requests.append(
+            _ProcessCall(
                 ticker=ticker,
                 source_kind=source_kind,
                 document_ids=document_ids,
@@ -158,9 +161,69 @@ class _FakeFinsDirectService:
                 rebuild_processed=rebuild_processed,
             )
         )
-        return _handle(command_name=command_name, ticker=ticker)
+        return self._stream(FinsOperationKind.PREPROCESS, cancellation_token)
 
-    def start_upload_filing(
+    def process_filing(
+        self,
+        *,
+        ticker: str,
+        document_ids: tuple[str, ...] = (),
+        form_types: tuple[str, ...] = (),
+        rebuild_processed: bool = False,
+        cancellation_token: fins_command._CliFinsCancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """记录 process_filing 参数并返回 fake stream。
+
+        :param ticker: canonical ticker。
+        :param document_ids: filing 源文档 ID。
+        :param form_types: 表单过滤。
+        :param rebuild_processed: 是否重建 processed 产物。
+        :param cancellation_token: CLI operation 取消 token。
+        :returns: Fins direct event stream。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.process_filing_requests.append(
+            _ProcessSpecificCall(
+                ticker=ticker,
+                document_ids=document_ids,
+                form_types=form_types,
+                rebuild_processed=rebuild_processed,
+            )
+        )
+        return self._stream(FinsOperationKind.PROCESS_FILING, cancellation_token)
+
+    def process_material(
+        self,
+        *,
+        ticker: str,
+        document_ids: tuple[str, ...] = (),
+        form_types: tuple[str, ...] = (),
+        rebuild_processed: bool = False,
+        cancellation_token: fins_command._CliFinsCancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """记录 process_material 参数并返回 fake stream。
+
+        :param ticker: canonical ticker。
+        :param document_ids: material 源文档 ID。
+        :param form_types: 表单过滤。
+        :param rebuild_processed: 是否重建 processed 产物。
+        :param cancellation_token: CLI operation 取消 token。
+        :returns: Fins direct event stream。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.process_material_requests.append(
+            _ProcessSpecificCall(
+                ticker=ticker,
+                document_ids=document_ids,
+                form_types=form_types,
+                rebuild_processed=rebuild_processed,
+            )
+        )
+        return self._stream(FinsOperationKind.PROCESS_MATERIAL, cancellation_token)
+
+    def upload_filing(
         self,
         *,
         ticker: str,
@@ -174,8 +237,9 @@ class _FakeFinsDirectService:
         company_name: str | None = None,
         ticker_aliases: tuple[str, ...] = (),
         overwrite: bool = False,
-    ) -> FinsDirectJobHandle:
-        """记录 upload_filing start 参数。
+        cancellation_token: fins_command._CliFinsCancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """记录 upload_filing 参数并返回 fake stream。
 
         :param ticker: canonical ticker。
         :param action: 上传动作。
@@ -188,7 +252,8 @@ class _FakeFinsDirectService:
         :param company_name: 可选公司名称。
         :param ticker_aliases: ticker aliases。
         :param overwrite: 是否覆盖已有文档。
-        :returns: fake job handle。
+        :param cancellation_token: CLI operation 取消 token。
+        :returns: Fins direct event stream。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -207,9 +272,9 @@ class _FakeFinsDirectService:
                 overwrite=overwrite,
             )
         )
-        return _handle(command_name="upload_filing", ticker=ticker)
+        return self._stream(FinsOperationKind.UPLOAD_FILING, cancellation_token)
 
-    def start_upload_material(
+    def upload_material(
         self,
         *,
         ticker: str,
@@ -227,8 +292,9 @@ class _FakeFinsDirectService:
         company_name: str | None = None,
         ticker_aliases: tuple[str, ...] = (),
         overwrite: bool = False,
-    ) -> FinsDirectJobHandle:
-        """记录 upload_material start 参数。
+        cancellation_token: fins_command._CliFinsCancellationToken | None = None,
+    ) -> AsyncIterator[FinsEvent]:
+        """记录 upload_material 参数并返回 fake stream。
 
         :param ticker: canonical ticker。
         :param action: 上传动作。
@@ -245,7 +311,8 @@ class _FakeFinsDirectService:
         :param company_name: 可选公司名称。
         :param ticker_aliases: ticker aliases。
         :param overwrite: 是否覆盖已有文档。
-        :returns: fake job handle。
+        :param cancellation_token: CLI operation 取消 token。
+        :returns: Fins direct event stream。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -268,80 +335,38 @@ class _FakeFinsDirectService:
                 overwrite=overwrite,
             )
         )
-        return _handle(command_name="upload_material", ticker=ticker)
+        return self._stream(FinsOperationKind.UPLOAD_MATERIAL, cancellation_token)
 
-    async def wait_for_terminal(self, job_id: str) -> FinsDirectTerminalResult:
-        """返回 fake terminal result。
-
-        :param job_id: Fins ingestion job id。
-        :returns: fake terminal result。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
-        """
-
-        self.wait_calls.append(job_id)
-        self.wait_started.set()
-        if (
-            self.terminal_status is FinsIngestionJobStatus.CANCELLED
-            and self.wait_for_cancel_before_terminal
-        ):
-            await self.cancel_seen.wait()
-        return _terminal(job_id=job_id, status=self.terminal_status)
-
-    async def stream_job_events_until_terminal(
+    async def _stream(
         self,
-        handle: FinsDirectJobHandle,
-        *,
-        after_sequence: int = 0,
-    ) -> AsyncIterator[FinsDirectJobEvent]:
-        """产出 fake progress 和 terminal event。
+        operation_kind: FinsOperationKind,
+        cancellation_token: fins_command._CliFinsCancellationToken | None,
+    ) -> AsyncIterator[FinsEvent]:
+        """产出 fake stream。
 
-        :param handle: Fins direct job handle。
-        :param after_sequence: 起始 event sequence。
-        :returns: Fins direct job event 异步迭代器。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        :param operation_kind: 当前操作类型。
+        :param cancellation_token: CLI operation 取消 token。
+        :returns: Fins direct event stream。
+        :raises Exception: stream_error 不为空时在事件后抛出。
         """
 
-        assert after_sequence == 0
-        self.stream_calls.append(handle.job_id)
-        self.wait_started.set()
-        yield _progress_event(handle)
-        if (
-            self.terminal_status is FinsIngestionJobStatus.CANCELLED
-            and self.wait_for_cancel_before_terminal
-        ):
-            await self.cancel_seen.wait()
-        if self.use_synthetic_terminal_fallback:
-            terminal_result = _terminal(job_id=handle.job_id, status=self.terminal_status)
-            yield FinsDirectJobEvent(
-                job_id=handle.job_id,
-                sequence=2,
-                command_name=handle.start_request.command_name,
-                ticker=handle.start_request.ticker,
-                status=terminal_result.status,
-                event_label=FINS_DIRECT_SYNTHETIC_TERMINAL_EVENT_LABEL,
-                message="job terminal record observed without terminal event",
-                payload={},
-                terminal_result=terminal_result,
-            )
-            return
-        yield _terminal_event(handle=handle, status=self.terminal_status)
-
-    def request_cancel(self, job_id: str) -> None:
-        """记录 cancel 请求。
-
-        :param job_id: Fins ingestion job id。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.cancel_requests.append(job_id)
-        self.cancel_seen.set()
+        self.stream_calls.append(operation_kind)
+        self.cancellation_tokens.append(cancellation_token)
+        try:
+            for index, event in enumerate(self.events):
+                yield event
+                if index == 0:
+                    self.first_event_yielded.set()
+                    if self.pause_after_first_event:
+                        await self.release_stream.wait()
+            if self.stream_error is not None:
+                raise self.stream_error
+        finally:
+            self.closed_streams += 1
 
 
 @pytest.fixture()
-def fake_service(
-    monkeypatch: pytest.MonkeyPatch,
-) -> _FakeFinsDirectService:
+def fake_service(monkeypatch: pytest.MonkeyPatch) -> _FakeFinsDirectService:
     """安装 fake Fins direct service factory。
 
     :param monkeypatch: pytest monkeypatch 夹具。
@@ -382,43 +407,19 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """六个 Fins direct live commands 都必须消费 Service event stream 并输出摘要。"""
+    """六个 Fins direct commands 都必须消费 direct event stream 并输出摘要。"""
 
     exit_code = cli_main.main(_live_command_argv(command_name, tmp_path))
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_SUCCESS
-    assert fake_service.stream_calls == ["job-1"]
-    assert fake_service.wait_calls == []
-    assert "Fins job progress" in captured.out
-    assert "message=\"download live progress\"" in captured.out or (
-        "live progress" in captured.out
-    )
-    assert "Fins job succeeded" in captured.out
-    assert "processed_count=1" in captured.out
+    assert fake_service.stream_calls
+    assert "Fins progress" in captured.out
+    assert "message=\"download live progress\"" in captured.out
+    assert "Fins succeeded" in captured.out
+    assert "processed_count=\"1\"" in captured.out
     assert "Fins direct event received" not in captured.out
     assert "Fins direct event detail" not in captured.out
-    assert captured.err == ""
-
-
-def test_live_fins_command_renders_synthetic_terminal_fallback_and_exit_code(
-    fake_service: _FakeFinsDirectService,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """CLI 必须渲染 Service 合成终态 fallback event 并使用 terminal exit code。"""
-
-    fake_service.use_synthetic_terminal_fallback = True
-
-    exit_code = cli_main.main(("download", "--ticker", "AAPL"))
-
-    captured = capsys.readouterr()
-    assert exit_code == FINS_DIRECT_EXIT_SUCCESS
-    assert fake_service.stream_calls == ["job-1"]
-    assert fake_service.wait_calls == []
-    assert "Fins job progress" in captured.out
-    assert "Fins job succeeded" in captured.out
-    assert 'event="job_terminal_fallback"' in captured.out
-    assert "processed_count=1" in captured.out
     assert captured.err == ""
 
 
@@ -432,10 +433,9 @@ def test_fins_direct_default_log_does_not_pollute_progress_output(
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_SUCCESS
-    assert "Fins job progress" in captured.out
+    assert "Fins progress" in captured.out
     assert "Fins direct command start" not in captured.out
     assert "Fins direct event received" not in captured.out
-    assert "Fins direct event detail" not in captured.out
     assert captured.err == ""
 
 
@@ -449,7 +449,7 @@ def test_fins_direct_verbose_log_outputs_execution_skeleton(
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_SUCCESS
-    assert "Fins job progress" in captured.out
+    assert "Fins progress" in captured.out
     assert "Fins direct command start" in captured.out
     assert "Fins direct event received" in captured.out
     assert "Fins direct event detail" not in captured.out
@@ -460,86 +460,32 @@ def test_fins_direct_debug_log_outputs_event_details(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--debug`` 应输出 event sequence 与 payload keys 等诊断。"""
+    """``--debug`` 应输出 event type 诊断，不输出 job sequence。"""
 
     exit_code = cli_main.main(("download", "--ticker", "AAPL", "--debug"))
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_SUCCESS
-    assert "Fins job progress" in captured.out
+    assert "Fins progress" in captured.out
     assert "Fins direct event detail" in captured.out
-    assert "sequence=1" in captured.out
-    assert "payload_key_count=2" in captured.out
-    assert "payload_keys=('step', 'ticker')" in captured.out
+    assert "event_type=progress" in captured.out
+    assert "sequence=" not in captured.out
+    assert "job_id=" not in captured.out
     assert captured.err == ""
 
 
-def test_fins_progress_payload_redacts_embedded_absolute_paths(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """progress message 和 payload 里的嵌入绝对路径必须脱敏。"""
+def test_output_redacts_embedded_absolute_paths() -> None:
+    """CLI output 层保留绝对路径脱敏防线。"""
 
-    event = _progress_event(
-        _handle(command_name="download", ticker="AAPL"),
-        message="path=/tmp/a",
-        payload={"detail": "key=/Users/a/b"},
-    )
-
-    render_fins_direct_event(event)
-
-    captured = capsys.readouterr()
-    assert "/tmp/a" not in captured.out
-    assert "/Users/a/b" not in captured.out
-    assert "<redacted>" in captured.out
-    assert captured.err == ""
-
-
-def test_fins_terminal_summary_redacts_embedded_absolute_paths(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """terminal success summary 里的嵌入绝对路径必须脱敏。"""
-
-    handle = _handle(command_name="download", ticker="AAPL")
-    event = _terminal_event(
-        handle=handle,
-        status=FinsIngestionJobStatus.SUCCEEDED,
-        result_summary={"detail": "path=/tmp/a", "source": "key=/Users/a/b"},
-    )
-
-    render_fins_direct_event(event)
-
-    captured = capsys.readouterr()
-    assert "/tmp/a" not in captured.out
-    assert "/Users/a/b" not in captured.out
-    assert "<redacted>" in captured.out
-    assert captured.err == ""
-
-
-def test_fins_failure_message_redacts_embedded_windows_absolute_path(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """failure message 里的嵌入 Windows 绝对路径必须脱敏。"""
-
-    handle = _handle(command_name="download", ticker="AAPL")
-    event = _terminal_event(
-        handle=handle,
-        status=FinsIngestionJobStatus.FAILED,
-        failure_summary={"message": r"error=C:\tmp\a"},
-    )
-
-    render_fins_direct_event(event)
-
-    captured = capsys.readouterr()
-    assert "C:" not in captured.err
-    assert r"C:\tmp\a" not in captured.err
-    assert "<redacted>" in captured.err
-    assert captured.out == ""
+    assert cli_output._safe_text_value("path=/tmp/a") == "path=<redacted>"
+    assert cli_output._safe_text_value("key=/Users/a/b") == "key=<redacted>"
+    assert cli_output._safe_text_value(r"error=C:\tmp\a") == "error=<redacted>"
 
 
 def test_download_command_maps_args_to_service(
     fake_service: _FakeFinsDirectService,
 ) -> None:
-    """download CLI 参数必须转换为 Service 显式方法参数。"""
+    """download CLI 参数必须转换为 Service direct stream 方法参数。"""
 
     exit_code = cli_main.main(
         (
@@ -570,16 +516,18 @@ def test_download_command_maps_args_to_service(
     ]
 
 
-def test_upload_filing_command_maps_args_and_validates_files(
+def test_upload_commands_map_args_and_validate_files(
     tmp_path: Path,
     fake_service: _FakeFinsDirectService,
 ) -> None:
-    """upload_filing CLI 必须走 Service wrapper 并传入 ticker aliases。"""
+    """upload_filing/material CLI 必须调用 Service direct stream 方法。"""
 
-    upload_file = tmp_path / "filing.pdf"
-    upload_file.write_text("filing", encoding="utf-8")
+    filing_file = tmp_path / "filing.pdf"
+    material_file = tmp_path / "material.html"
+    filing_file.write_text("filing", encoding="utf-8")
+    material_file.write_text("<html></html>", encoding="utf-8")
 
-    exit_code = cli_main.main(
+    assert cli_main.main(
         (
             "upload_filing",
             "--ticker",
@@ -587,7 +535,7 @@ def test_upload_filing_command_maps_args_and_validates_files(
             "--action",
             "update",
             "--files",
-            str(upload_file),
+            str(filing_file),
             "--fiscal-year",
             "2024",
             "--fiscal-period",
@@ -601,14 +549,30 @@ def test_upload_filing_command_maps_args_and_validates_files(
             "Apple",
             "--overwrite",
         )
-    )
+    ) == EXIT_SUCCESS
+    assert cli_main.main(
+        (
+            "upload_material",
+            "--ticker",
+            "MSFT,Microsoft",
+            "--forms",
+            "8-K",
+            "--material-name",
+            "Investor Day",
+            "--files",
+            str(material_file),
+            "--document-id",
+            "doc-1",
+            "--internal-document-id",
+            "internal-1",
+        )
+    ) == EXIT_SUCCESS
 
-    assert exit_code == EXIT_SUCCESS
     assert fake_service.upload_filing_requests == [
         _UploadFilingCall(
             ticker="AAPL",
             action="update",
-            files=(upload_file.resolve(),),
+            files=(filing_file.resolve(),),
             fiscal_year=2024,
             fiscal_period="FY",
             amended=True,
@@ -619,41 +583,11 @@ def test_upload_filing_command_maps_args_and_validates_files(
             overwrite=True,
         )
     ]
-
-
-def test_upload_material_command_maps_single_form(
-    tmp_path: Path,
-    fake_service: _FakeFinsDirectService,
-) -> None:
-    """upload_material 当前 request 只接收单个 form_type。"""
-
-    upload_file = tmp_path / "material.html"
-    upload_file.write_text("<html></html>", encoding="utf-8")
-
-    exit_code = cli_main.main(
-        (
-            "upload_material",
-            "--ticker",
-            "MSFT,Microsoft",
-            "--forms",
-            "8-K",
-            "--material-name",
-            "Investor Day",
-            "--files",
-            str(upload_file),
-            "--document-id",
-            "doc-1",
-            "--internal-document-id",
-            "internal-1",
-        )
-    )
-
-    assert exit_code == EXIT_SUCCESS
     assert fake_service.upload_material_requests == [
         _UploadMaterialCall(
             ticker="MSFT",
             action="create",
-            files=(upload_file.resolve(),),
+            files=(material_file.resolve(),),
             form_type="8-K",
             material_name="Investor Day",
             document_id="doc-1",
@@ -670,10 +604,10 @@ def test_upload_material_command_maps_single_form(
     ]
 
 
-def test_process_commands_map_to_preprocess_service(
+def test_process_commands_map_to_service(
     fake_service: _FakeFinsDirectService,
 ) -> None:
-    """process / process_filing / process_material 必须映射到 preprocess。"""
+    """process / process_filing / process_material 必须映射到 direct stream 方法。"""
 
     assert cli_main.main(
         (
@@ -694,31 +628,30 @@ def test_process_commands_map_to_preprocess_service(
         ("process_material", "--ticker", "AAPL", "--document-id", "material-1")
     ) == EXIT_SUCCESS
 
-    assert fake_service.preprocess_requests == [
-        _PreprocessCall(
-            command_name="process",
+    assert fake_service.process_requests == [
+        _ProcessCall(
             ticker="AAPL",
             source_kind=SourceKind.FILING,
             document_ids=("doc-1", "doc-2", "doc-3"),
             form_types=(),
             rebuild_processed=True,
-        ),
-        _PreprocessCall(
-            command_name="process_filing",
+        )
+    ]
+    assert fake_service.process_filing_requests == [
+        _ProcessSpecificCall(
             ticker="AAPL",
-            source_kind=SourceKind.FILING,
             document_ids=("filing-1",),
             form_types=(),
             rebuild_processed=False,
-        ),
-        _PreprocessCall(
-            command_name="process_material",
+        )
+    ]
+    assert fake_service.process_material_requests == [
+        _ProcessSpecificCall(
             ticker="AAPL",
-            source_kind=SourceKind.MATERIAL,
             document_ids=("material-1",),
             form_types=(),
             rebuild_processed=False,
-        ),
+        )
     ]
 
 
@@ -727,33 +660,31 @@ def test_process_commands_map_to_preprocess_service(
     (
         ("download", "--ticker", "AAPL", "--infer"),
         ("process", "--ticker", "AAPL", "--ci"),
-        ("upload_filings_from", "--ticker", "AAPL", "--from", "input"),
     ),
 )
-def test_unsupported_flags_and_s6_command_fail_fast(
+def test_unsupported_flags_fail_fast(
     argv: tuple[str, ...],
     fake_service: _FakeFinsDirectService,
 ) -> None:
-    """--infer、--ci 和 S6 command 执行必须 fail fast。"""
+    """--infer 和 --ci 必须 fail fast。"""
 
     exit_code = cli_main.main(argv)
 
     assert exit_code == EXIT_USAGE_ERROR
-    assert fake_service.download_requests == []
-    assert fake_service.preprocess_requests == []
+    assert fake_service.stream_calls == []
 
 
 def test_terminal_failed_and_cancelled_status_exit_mapping(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """CLI 必须使用 Service terminal result 的退出码映射。"""
+    """CLI 必须使用 FinsResultSummary 的退出码映射。"""
 
     failed_service = _FakeFinsDirectService(
-        terminal_status=FinsIngestionJobStatus.FAILED
+        events=(_result_event(status=FinsResultStatus.FAILURE),)
     )
     cancelled_service = _FakeFinsDirectService(
-        terminal_status=FinsIngestionJobStatus.CANCELLED
+        events=(_result_event(status=FinsResultStatus.CANCELLED),)
     )
 
     monkeypatch.setattr(
@@ -766,7 +697,7 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
     )
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
     failed_output = capsys.readouterr()
-    assert "Fins job failure" in failed_output.err
+    assert "Fins failure" in failed_output.err
     assert "failed" in failed_output.err
 
     monkeypatch.setattr(
@@ -779,214 +710,140 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
     )
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_KEYBOARD_INTERRUPT
     cancelled_output = capsys.readouterr()
-    assert "Fins job cancelled" in cancelled_output.err
+    assert "Fins cancelled" in cancelled_output.err
 
 
-@pytest.mark.asyncio
-async def test_cli_stream_failure_propagates_without_duplicate_error_log(
+def test_stream_without_result_returns_failure(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Service stream failure 必须向上传播，CLI 不重复记录 ERROR。
-
-    :param monkeypatch: pytest monkeypatch 夹具。
-    :returns: ``None``。
-    :raises AssertionError: CLI 记录 duplicate ERROR 或异常未传播时抛出。
-    """
-
-    class _FailingStreamService(_FakeFinsDirectService):
-        async def stream_job_events_until_terminal(
-            self,
-            handle: FinsDirectJobHandle,
-            *,
-            after_sequence: int = 0,
-        ) -> AsyncIterator[FinsDirectJobEvent]:
-            """模拟 Service event stream 失败。
-
-            :param handle: Fins direct job handle。
-            :param after_sequence: 起始 event sequence。
-            :returns: 正常路径不会产出事件。
-            :raises RuntimeError: 始终抛出以模拟 Service stream failure。
-            """
-
-            assert after_sequence == 0
-            self.stream_calls.append(handle.job_id)
-            raise RuntimeError("stream boom")
-            yield _progress_event(handle)
-
-    service = _FailingStreamService()
-    handle = _handle(command_name="download", ticker="AAPL")
-    monkeypatch.setattr(
-        fins_command._LOGGER,
-        "exception",
-        _raise_on_cli_exception_log,
-    )
-
-    with pytest.raises(RuntimeError, match="stream boom"):
-        await fins_command._consume_fins_direct_events(
-            service=cast(fins_command.FinsDirectCommandService, service),
-            handle=handle,
-        )
-
-    assert service.stream_calls == ["job-1"]
-
-
-@pytest.mark.asyncio
-async def test_sigint_after_job_id_requests_cancel_and_waits_terminal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """第一次 SIGINT 必须 request_cancel(job_id) 并继续等待 terminal。"""
+    """direct stream 无 RESULT 时 CLI 必须失败收口。"""
+
+    service = _FakeFinsDirectService(events=(_progress_event(FinsOperationKind.DOWNLOAD),))
+    monkeypatch.setattr(
+        fins_command,
+        "FINS_DIRECT_SERVICE_FACTORY",
+        lambda _workspace_root: cast(
+            fins_command.FinsDirectCommandService,
+            service,
+        ),
+    )
+
+    assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
+
+    captured = capsys.readouterr()
+    assert "Fins failure" in captured.err
+    assert "ended without result" in captured.err
+
+
+def test_stream_failure_propagates_to_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """stream 异常必须转为 CLI failure，不伪造成 terminal fallback。"""
 
     service = _FakeFinsDirectService(
-        terminal_status=FinsIngestionJobStatus.CANCELLED,
-        wait_for_cancel_before_terminal=True,
+        events=(_progress_event(FinsOperationKind.DOWNLOAD),),
+        stream_error=RuntimeError("stream boom"),
     )
-    handle = _handle(command_name="download", ticker="AAPL")
+    monkeypatch.setattr(
+        fins_command,
+        "FINS_DIRECT_SERVICE_FACTORY",
+        lambda _workspace_root: cast(
+            fins_command.FinsDirectCommandService,
+            service,
+        ),
+    )
+
+    assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
+
+    captured = capsys.readouterr()
+    assert "stream boom" in captured.err
+    assert "job_id" not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_sigint_cancels_stream_task_without_job_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """第一次 SIGINT 必须取消当前 stream task，不调用 job cancel 语义。"""
+
+    service = _FakeFinsDirectService(
+        events=(_progress_event(FinsOperationKind.DOWNLOAD), _result_event()),
+        pause_after_first_event=True,
+    )
+    token = fins_command._CliFinsCancellationToken()
     monitor = fins_command._FinsSigintMonitor()
 
     wait_task = asyncio.create_task(
         fins_command._wait_for_terminal_handling_sigint(
-            service=cast(fins_command.FinsDirectCommandService, service),
-            handle=handle,
+            events=service.download(ticker="AAPL", cancellation_token=token),
+            cancellation_token=token,
             sigint_monitor=monitor,
+            command_name="download",
         )
     )
-    await service.wait_started.wait()
+    await service.first_event_yielded.wait()
     monitor.notify()
 
     result = await wait_task
 
-    assert result is not None
+    assert result.status is FinsResultStatus.CANCELLED
     assert result.exit_code == FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT
-    assert service.cancel_requests == ["job-1"]
-    assert "job-1" in capsys.readouterr().err
+    assert token.is_cancelled()
+    assert service.closed_streams == 1
+    captured = capsys.readouterr()
+    assert "Fins operation cancel requested" in captured.err
+    assert "job_id" not in captured.err
 
 
 @pytest.mark.asyncio
-async def test_cli_cancel_failure_propagates_without_duplicate_error_log(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Service cancel failure 必须向上传播，CLI 不重复记录 ERROR。
+async def test_cancel_race_does_not_override_terminal_result() -> None:
+    """取消注入后 stream 返回 terminal RESULT 时不得覆盖最终结果。"""
 
-    :param monkeypatch: pytest monkeypatch 夹具。
-    :returns: ``None``。
-    :raises AssertionError: CLI 记录 duplicate ERROR 或异常未传播时抛出。
-    """
+    async def terminal_stream_after_cancel() -> AsyncIterator[FinsEvent]:
+        """取消注入后仍返回已经形成的 terminal result。
 
-    class _CancelFailingService(_FakeFinsDirectService):
-        async def stream_job_events_until_terminal(
-            self,
-            handle: FinsDirectJobHandle,
-            *,
-            after_sequence: int = 0,
-        ) -> AsyncIterator[FinsDirectJobEvent]:
-            """产出首个 progress 后保持运行，等待 cancel failure 路径。
+        :returns: Fins direct event stream。
+        :raises asyncio.CancelledError: 测试失败路径中透传取消。
+        """
 
-            :param handle: Fins direct job handle。
-            :param after_sequence: 起始 event sequence。
-            :returns: Fins direct job event 异步迭代器。
-            :raises asyncio.CancelledError: 测试收口取消 stream task 时透传。
-            """
-
-            assert after_sequence == 0
-            self.stream_calls.append(handle.job_id)
-            self.wait_started.set()
-            yield _progress_event(handle)
+        yield _progress_event(FinsOperationKind.DOWNLOAD)
+        try:
             await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            yield _result_event(status=FinsResultStatus.SUCCESS)
+            return
 
-        def request_cancel(self, job_id: str) -> None:
-            """模拟 Service cancel request failure。
+        yield _result_event(status=FinsResultStatus.SUCCESS)
 
-            :param job_id: Fins ingestion job id。
-            :returns: 正常路径不会返回。
-            :raises RuntimeError: 始终抛出以模拟 Service cancel failure。
-            """
-
-            self.cancel_requests.append(job_id)
-            raise RuntimeError("cancel boom")
-
-    service = _CancelFailingService()
-    handle = _handle(command_name="download", ticker="AAPL")
-    monitor = fins_command._FinsSigintMonitor()
-    monkeypatch.setattr(
-        fins_command._LOGGER,
-        "exception",
-        _raise_on_cli_exception_log,
-    )
-
-    wait_task = asyncio.create_task(
-        fins_command._wait_for_terminal_handling_sigint(
-            service=cast(fins_command.FinsDirectCommandService, service),
-            handle=handle,
-            sigint_monitor=monitor,
-        )
-    )
-    await service.wait_started.wait()
-    monitor.notify()
-
-    with pytest.raises(RuntimeError, match="cancel boom"):
-        await wait_task
-
-    assert service.cancel_requests == ["job-1"]
-
-
-@pytest.mark.asyncio
-async def test_second_sigint_after_cancel_exits_locally(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """第二次 SIGINT 必须本地 130，并打印 job id。"""
-
-    class _NeverTerminalService(_FakeFinsDirectService):
-        async def stream_job_events_until_terminal(
-            self,
-            handle: FinsDirectJobHandle,
-            *,
-            after_sequence: int = 0,
-        ) -> AsyncIterator[FinsDirectJobEvent]:
-            """产出 progress 后等待直到测试取消 task。
-
-            :param handle: Fins direct job handle。
-            :param after_sequence: 起始 event sequence。
-            :returns: Fins direct job event 异步迭代器。
-            :raises asyncio.CancelledError: 测试触发本地退出时透传。
-            """
-
-            assert after_sequence == 0
-            self.stream_calls.append(handle.job_id)
-            self.wait_started.set()
-            yield _progress_event(handle)
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-    service = _NeverTerminalService()
-    handle = _handle(command_name="download", ticker="AAPL")
+    token = fins_command._CliFinsCancellationToken()
     monitor = fins_command._FinsSigintMonitor()
 
     wait_task = asyncio.create_task(
         fins_command._wait_for_terminal_handling_sigint(
-            service=cast(fins_command.FinsDirectCommandService, service),
-            handle=handle,
+            events=terminal_stream_after_cancel(),
+            cancellation_token=token,
             sigint_monitor=monitor,
+            command_name="download",
         )
     )
-    await service.wait_started.wait()
-    monitor.notify()
     await asyncio.sleep(0)
     monitor.notify()
 
     result = await wait_task
 
-    assert result is None
-    assert service.cancel_requests == ["job-1"]
-    assert "job-1" in capsys.readouterr().err
+    assert result.status is FinsResultStatus.SUCCESS
+    assert token.is_cancelled()
 
 
-def test_keyboard_interrupt_before_job_id_exits_130(
+def test_keyboard_interrupt_before_stream_exits_130(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """job id 产生前 KeyboardInterrupt 不做 durable cancel。"""
+    """stream 打开前 KeyboardInterrupt 必须返回 130。"""
 
     class _InterruptingService(_FakeFinsDirectService):
-        def start_download(
+        def download(
             self,
             *,
             ticker: str,
@@ -995,8 +852,9 @@ def test_keyboard_interrupt_before_job_id_exits_130(
             filed_before: str | None = None,
             overwrite_existing: bool = False,
             rebuild_processed: bool = False,
-        ) -> FinsDirectJobHandle:
-            """模拟启动边界中断。
+            cancellation_token: fins_command._CliFinsCancellationToken | None = None,
+        ) -> AsyncIterator[FinsEvent]:
+            """模拟打开 stream 前中断。
 
             :param ticker: canonical ticker。
             :param form_types: 表单过滤条件。
@@ -1004,12 +862,13 @@ def test_keyboard_interrupt_before_job_id_exits_130(
             :param filed_before: 最晚 filing 日期。
             :param overwrite_existing: 是否覆盖已有文档。
             :param rebuild_processed: 是否重建 processed 产物。
+            :param cancellation_token: CLI operation 取消 token。
             :returns: 正常路径不会返回。
-            :raises KeyboardInterrupt: 始终抛出以模拟 job id 前中断。
+            :raises KeyboardInterrupt: 始终抛出。
             """
 
             del ticker, form_types, filed_after, filed_before
-            del overwrite_existing, rebuild_processed
+            del overwrite_existing, rebuild_processed, cancellation_token
             raise KeyboardInterrupt
 
     service = _InterruptingService()
@@ -1023,7 +882,7 @@ def test_keyboard_interrupt_before_job_id_exits_130(
     )
 
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_KEYBOARD_INTERRUPT
-    assert service.cancel_requests == []
+    assert service.stream_calls == []
 
 
 def test_upload_file_allowlist_fail_fast(
@@ -1047,6 +906,27 @@ def test_upload_file_allowlist_fail_fast(
 
     assert exit_code == EXIT_USAGE_ERROR
     assert fake_service.upload_filing_requests == []
+
+
+def test_upload_filings_from_does_not_start_live_stream(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """upload_filings_from 只生成脚本，不启动 Fins direct stream。"""
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "AAPL 10-K 2024.pdf").write_text("filing", encoding="utf-8")
+
+    assert cli_main.main(
+        ("upload_filings_from", "--ticker", "AAPL", "--from", str(source_dir))
+    ) == EXIT_SUCCESS
+
+    captured = capsys.readouterr()
+    assert "dayu-cli upload_filing" in captured.out
+    assert "Fins progress" not in captured.out
+    assert fake_service.stream_calls == []
 
 
 def test_cli_does_not_import_fins_storage_directly() -> None:
@@ -1087,12 +967,21 @@ class _DownloadCall:
 
 
 @dataclass(frozen=True, slots=True)
-class _PreprocessCall:
-    """preprocess service call 记录。"""
+class _ProcessCall:
+    """process service call 记录。"""
 
-    command_name: str
     ticker: str
     source_kind: SourceKind
+    document_ids: tuple[str, ...]
+    form_types: tuple[str, ...]
+    rebuild_processed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessSpecificCall:
+    """process_filing/material service call 记录。"""
+
+    ticker: str
     document_ids: tuple[str, ...]
     form_types: tuple[str, ...]
     rebuild_processed: bool
@@ -1136,25 +1025,6 @@ class _UploadMaterialCall:
     overwrite: bool
 
 
-def _handle(*, command_name: str, ticker: str) -> FinsDirectJobHandle:
-    """构造 fake direct job handle。
-
-    :param command_name: 用户可见命令名。
-    :param ticker: canonical ticker。
-    :returns: fake direct job handle。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return FinsDirectJobHandle(
-        job_id="job-1",
-        initial_status=FinsIngestionJobStatus.QUEUED,
-        start_request=FinsDirectStartRequest(
-            command_name=command_name,
-            ticker=ticker,
-        ),
-    )
-
-
 def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
     """构造 live command 参数。
 
@@ -1183,112 +1053,65 @@ def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
     raise ValueError(f"unknown live command: {command_name}")
 
 
-def _progress_event(
-    handle: FinsDirectJobHandle,
-    *,
-    message: str | None = None,
-    payload: dict[str, JsonValue] | None = None,
-) -> FinsDirectJobEvent:
+def _progress_event(operation_kind: FinsOperationKind) -> FinsEvent:
     """构造 fake progress event。
 
-    :param handle: Fins direct job handle。
-    :param message: 可选进度消息。
-    :param payload: 可选进度 payload。
+    :param operation_kind: 操作类型。
     :returns: fake progress event。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: 事件违反 direct contract 时抛出。
     """
 
-    return FinsDirectJobEvent(
-        job_id=handle.job_id,
-        sequence=1,
-        command_name=handle.start_request.command_name,
-        ticker=handle.start_request.ticker,
-        status=FinsIngestionJobStatus.RUNNING,
-        event_label="progress",
-        message=(
-            f"{handle.start_request.command_name} live progress"
-            if message is None
-            else message
-        ),
-        payload=(
-            {"ticker": handle.start_request.ticker, "step": "started"}
-            if payload is None
-            else payload
-        ),
-        terminal_result=None,
+    return FinsEvent(
+        event_type=FinsEventType.PROGRESS,
+        operation_kind=operation_kind,
+        message="download live progress",
+        emitted_at=_NOW,
+        ticker="AAPL",
+        filing_kind=None,
+        document_label=None,
+        progress=FinsProgress(stage="download", completed_units=1, total_units=2),
+        result=None,
     )
 
 
-def _terminal_event(
+def _result_event(
     *,
-    handle: FinsDirectJobHandle,
-    status: FinsIngestionJobStatus,
-    result_summary: dict[str, JsonValue] | None = None,
-    failure_summary: dict[str, JsonValue] | None = None,
-) -> FinsDirectJobEvent:
-    """构造 fake terminal event。
+    status: FinsResultStatus = FinsResultStatus.SUCCESS,
+) -> FinsEvent:
+    """构造 fake result event。
 
-    :param handle: Fins direct job handle。
-    :param status: terminal status。
-    :param result_summary: 可选成功摘要。
-    :param failure_summary: 可选失败摘要。
-    :returns: fake terminal event。
-    :raises Exception: 不主动抛出异常。
+    :param status: result status。
+    :returns: fake result event。
+    :raises ValueError: 事件违反 direct contract 时抛出。
     """
 
-    return FinsDirectJobEvent(
-        job_id=handle.job_id,
-        sequence=2,
-        command_name=handle.start_request.command_name,
-        ticker=handle.start_request.ticker,
-        status=status,
-        event_label=f"job_{status.value}",
-        message=f"{status.value} terminal",
-        payload={},
-        terminal_result=_terminal(
-            job_id=handle.job_id,
-            status=status,
-            result_summary=result_summary,
-            failure_summary=failure_summary,
-        ),
-    )
-
-
-def _terminal(
-    *,
-    job_id: str,
-    status: FinsIngestionJobStatus,
-    result_summary: dict[str, JsonValue] | None = None,
-    failure_summary: dict[str, JsonValue] | None = None,
-) -> FinsDirectTerminalResult:
-    """构造 fake terminal result。
-
-    :param job_id: Fins ingestion job id。
-    :param status: Fins ingestion terminal status。
-    :param result_summary: 可选成功摘要。
-    :param failure_summary: 可选失败摘要。
-    :returns: fake terminal result。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if status is FinsIngestionJobStatus.SUCCEEDED:
+    if status is FinsResultStatus.SUCCESS:
         exit_code = FINS_DIRECT_EXIT_SUCCESS
-    elif status is FinsIngestionJobStatus.CANCELLED:
+        error_kind = None
+        error_message = None
+    elif status is FinsResultStatus.CANCELLED:
         exit_code = FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT
+        error_kind = FinsErrorKind.CANCELLED
+        error_message = "cancelled"
     else:
         exit_code = FINS_DIRECT_EXIT_FAILURE
-    return FinsDirectTerminalResult(
-        job_id=job_id,
-        status=status,
-        exit_code=exit_code,
-        result_summary=(
-            {"processed_count": 1, "ok": True}
-            if result_summary is None and status is FinsIngestionJobStatus.SUCCEEDED
-            else ({} if result_summary is None else result_summary)
-        ),
-        failure_summary=(
-            {"message": "failed"}
-            if failure_summary is None and status is FinsIngestionJobStatus.FAILED
-            else ({} if failure_summary is None else failure_summary)
+        error_kind = FinsErrorKind.EXECUTION
+        error_message = "failed"
+    return FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        message="download finished",
+        emitted_at=_NOW,
+        ticker="AAPL",
+        filing_kind=None,
+        document_label=None,
+        progress=None,
+        result=FinsResultSummary(
+            status=status,
+            exit_code=exit_code,
+            title="Download finished",
+            details=(FinsEventDetail(label="processed_count", value="1"),),
+            error_kind=error_kind,
+            error_message=error_message,
         ),
     )
