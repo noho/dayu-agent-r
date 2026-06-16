@@ -341,7 +341,7 @@ Stop conditions：
 
 - replacement plan: `docs/host/wu-cli-fins-obs-01-replacement-plan.md`
 - replacement plan status: accepted; implementation next
-- replacement accepted plan commit: `6df0f719`
+- replacement accepted plan commit: `637d36a5`
 - replacement plan review: `docs/reviews/plan-review-20260616-100941.md`; `docs/reviews/plan-review-20260616-101040.md`
 - replacement plan review conclusion: both `pass-with-risks`; accepted blockers were lightweight observation handle underspecification, async bridge / cancellation underspecification, Slice A/C and C/D sequencing gaps, wait adapter recovery gap, and test coverage gaps
 - replacement plan fix: integrated into `docs/host/wu-cli-fins-obs-01-replacement-plan.md` by AgentCodex
