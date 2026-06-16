@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.direct_events import (
@@ -21,11 +21,13 @@ from dayu.fins.direct_events import (
     FinsOperationKind,
     FinsResultSummary,
 )
-from dayu.fins.ingestion_runtime import (
-    FinsDownloadRequest,
-    FinsPreprocessRequest,
-    FinsUploadRequest,
-)
+
+if TYPE_CHECKING:
+    from dayu.fins.ingestion_runtime import (
+        FinsDownloadRequest,
+        FinsPreprocessRequest,
+        FinsUploadRequest,
+    )
 
 FINS_OBSERVATION_HANDLE_ID_PREFIX: Final[str] = "finsobs_"
 """Fins lightweight observation handle id 的稳定前缀。"""
@@ -68,6 +70,33 @@ class FinsObservationPollErrorKind(str, Enum):
     TRANSIENT_UNAVAILABLE = "transient_unavailable"
     PERMANENT_NOT_FOUND = "permanent_not_found"
     PERMANENT_CORRUPT_HANDLE = "permanent_corrupt_handle"
+
+
+class FinsObservationPollError(Exception):
+    """Fins observation poll 的分类异常。
+
+    :param error_kind: 可映射到 Host wait resolution 的 poll 错误分类。
+    :param message: 有界、业务可读诊断消息。
+    """
+
+    error_kind: FinsObservationPollErrorKind
+    message: str
+
+    def __init__(self, error_kind: FinsObservationPollErrorKind, message: str) -> None:
+        """初始化 poll 分类异常。
+
+        :param error_kind: poll 错误分类。
+        :param message: 诊断消息。
+        :returns: ``None``。
+        :raises ValueError: 消息为空、过长或包含禁止内容时抛出。
+        """
+
+        if not isinstance(error_kind, FinsObservationPollErrorKind):
+            raise ValueError("error_kind must be FinsObservationPollErrorKind")
+        _validate_message(message)
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.message = message
 
 
 class FinsObservationResolutionKind(str, Enum):
@@ -358,6 +387,7 @@ def _validate_retry_after(
 __all__ = [
     "FINS_OBSERVATION_HANDLE_ID_PREFIX",
     "FinsObservationHandle",
+    "FinsObservationPollError",
     "FinsObservationPollErrorKind",
     "FinsObservationResolutionKind",
     "FinsObservationRuntime",

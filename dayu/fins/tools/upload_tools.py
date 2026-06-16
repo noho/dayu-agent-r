@@ -1,8 +1,8 @@
 """Fins 上传 awaiting tool 定义。
 
-本模块把 Fins shared ingestion runtime 的上传 start 入口适配为当前
+本模块把 Fins shared ingestion runtime 的上传 observation 入口适配为当前
 ``ToolDefinition``。工具只负责参数解析、本地上传路径 allowlist 校验和
-durable job 启动，不复制 SEC/CN/HK 上传业务规则，也不等待 Docling 或仓储
+外部长事务启动，不复制 SEC/CN/HK 上传业务规则，也不等待 Docling 或仓储
 长事务完成。
 """
 
@@ -25,7 +25,6 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultMeta
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
 from dayu.fins.ingestion_runtime import (
-    FinsIngestionJobStatus,
     FinsIngestionRuntime,
     FinsIngestionStartCancelledError,
     FinsUploadFilingRequest,
@@ -33,7 +32,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadRequest,
 )
 from dayu.fins.tools._ingestion_tool_helpers import (
-    _awaiting_outcome_from_job_start,
+    _awaiting_outcome_from_observation_handle,
     _failed_outcome,
     _optional_bool,
     _optional_int,
@@ -56,14 +55,16 @@ _UPLOAD_ACTION_DELETE: Final[str] = "delete"
 _UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"auto", "create", "update", "delete"})
 _UPLOAD_KINDS: Final[frozenset[str]] = frozenset({_UPLOAD_KIND_FILING, _UPLOAD_KIND_MATERIAL})
 _CANCELLED_MESSAGE: Final[str] = "Fins upload start was cancelled."
-_CANCELLED_HINT: Final[str] = "Continue without this Fins upload job unless the user asks to retry."
+_CANCELLED_HINT: Final[str] = (
+    "Continue without this Fins upload operation unless the user asks to retry."
+)
 
 UploadKind: TypeAlias = Literal["filing", "material"]
 
 
 @dataclass(frozen=True)
 class FinsUploadToolCallable:
-    """启动 Fins 上传 job 的工具 callable。
+    """启动 Fins 上传 observation 的工具 callable。
 
     Attributes:
         runtime: Fins shared ingestion runtime。
@@ -85,7 +86,7 @@ class FinsUploadToolCallable:
             context: 批式工具执行上下文；本工具只观察取消 token。
 
         Returns:
-            参数、路径或启动失败时返回 ``ToolFailedOutcome``；durable job 创建
+            参数、路径或启动失败时返回 ``ToolFailedOutcome``；observation 创建
             成功后返回 ``ToolAwaitingOutcome``；启动边界观察到取消时返回
             ``ToolCancelledOutcome``。
 
@@ -102,9 +103,10 @@ class FinsUploadToolCallable:
                 call.arguments,
                 allowed_upload_roots=self.allowed_upload_roots,
             )
-            start = self.runtime.start_upload(request, cancellation_token=cancellation_token)
-            if start.status in {FinsIngestionJobStatus.CANCELLING, FinsIngestionJobStatus.CANCELLED}:
-                return _cancelled_outcome(started_at)
+            handle = self.runtime.start_observed_upload(
+                request,
+                cancellation_token=cancellation_token,
+            )
         except FinsIngestionStartCancelledError:
             return _cancelled_outcome(started_at)
         except ValueError as exc:
@@ -120,7 +122,7 @@ class FinsUploadToolCallable:
                 tool_name=UPLOAD_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="上传任务启动失败，未能保存任务记录。",
+                message="上传任务启动失败，未进入等待状态。",
                 hint="请稍后重试，或让系统维护者检查 Fins workspace 存储权限。",
             )
         except Exception:
@@ -131,7 +133,7 @@ class FinsUploadToolCallable:
                 message="上传任务启动失败，未进入等待状态。",
                 hint="请确认 Fins workspace 存储目录存在且有写入权限，或联系系统管理员。",
             )
-        return _awaiting_outcome_from_job_start(start)
+        return _awaiting_outcome_from_observation_handle(handle)
 
 
 def build_fins_upload_tool(
@@ -160,10 +162,10 @@ def build_fins_upload_tool(
             function=ToolFunctionSchema(
                 name=UPLOAD_TOOL_NAME,
                 description=(
-                    "Start a financial filing or material upload job for one company. "
-                    "The tool returns immediately after the upload job is durably "
-                    "recorded; it does not wait for file conversion or storage writes "
-                    "to finish. Use only for local files that the user has asked to "
+                    "Start a financial filing or material upload operation for one company. "
+                    "The tool returns immediately with an external-job wait state after "
+                    "a lightweight observation handle is registered; it does not wait "
+                    "for file conversion or storage writes to finish. Use only for local files that the user has asked to "
                     "ingest into the Fins workspace."
                 ),
                 parameters=_upload_parameters_schema(),
