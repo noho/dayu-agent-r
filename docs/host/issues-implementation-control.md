@@ -396,6 +396,7 @@ Stop conditions：
 - aggregate fix re-review: `docs/reviews/wu-cli-fins-obs-01-aggregate-fix-rereview-mimo-20260616.md`; `docs/reviews/wu-cli-fins-obs-01-aggregate-fix-rereview-ds-20260616.md`
 - aggregate fix re-review conclusion: PASS from both AgentMiMo and AgentDS; BF-1 closed, `dayu.fins` prefix remains forbidden except explicit public boundary allowlist, no new findings
 - final closeout: `docs/reviews/wu-cli-fins-obs-01-final-closeout-20260616.md`
+- final closeout accepted local commit: `f83fd497`
 - final local validation: `pytest tests/service/test_fins_direct.py tests/cli/test_fins_commands.py tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_ingestion_tools.py tests/service/test_host_assembly.py tests/service/test_import_boundary.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_arg_parsing.py -q` 282 passed, 3 warnings; `pyright dayu/ tests/ utils/` 0 errors; `git diff --check` clean
 - residual reconciliation: closed R6/R7/R8/R9 removed from active residual table; remaining R3/R5/R10 are deferred-with-owner and non-blocking
 

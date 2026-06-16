@@ -16,7 +16,7 @@ Aggregate deepreview 中 AgentMiMo 发现的 BF-1 已修复并通过两路 re-re
 - `11fd5e97`：Slice C，Fins direct ingestion runtime。
 - `0b25416d`：Slice D，Fins awaiting tools / wait adapter 迁移到 lightweight observation。
 - `044a966d`：Slice E，README / tests / control doc 同步。
-- final closeout commit：pending at artifact creation time。
+- `f83fd497`：aggregate deepreview BF-1 fix、re-review artifacts、control-doc final closeout 与 residual reconciliation。
 
 ## Aggregate Review
 
