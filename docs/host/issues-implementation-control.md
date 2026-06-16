@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-CLI-FINS-OBS-01 completed locally; accepted commits S1 `3787f43d`, S2 `123a7db8`, S3 `4164b4da`, S4 `e597d8e8`, S5 `8d93dc68`, S6 `2d4679af`, aggregate fix `804b3b7d`; draft PR #143 opened |
+| gate | planning |
+| implementation status | WU-CLI-FINS-OBS-01 PR #143 paused; 2026-06-16 design correction recorded: CLI direct live events should be plain `AsyncIterator[FinsEvent]`, and Fins tool awaiting may return `ToolAwaitingOutcome(EXTERNAL_JOB)` without making core Fins ingestion runtime a durable job system |
 | active work unit | WU-CLI-FINS-OBS-01 |
 | default next work unit | WU-CLI-FINS-OBS-01 |
-| next entry point | WU-CLI-FINS-OBS-01 draft PR #143 review/merge decision; default next work unit remains WU-OBS-00 |
+| next entry point | WU-CLI-FINS-OBS-01 replacement goal confirmation and plan gate: discard PR #143 durable job sidecar premise, plan CLI direct `AsyncIterator[FinsEvent]`, and plan lightweight tool awaiting observation handle instead of core Fins durable job system; default next work unit remains WU-OBS-00 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | none |
@@ -202,17 +202,14 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
-| WU-CLI-FINS-OBS-01-R1 | deferred-with-owner | Future Fins fine-grained pipeline event streaming work unit | 当前 WU 只落地 runtime-owned coarse progress events；若后续实现 adapter / runner 细粒度 stream consumption，必须重新评估 event sidecar 写入频率、读取性能和 README 边界。 |
-| WU-CLI-FINS-OBS-01-R2 | deferred-with-owner | Future Fins event sidecar scalability work unit | `_last_event_sequence_locked` 仍按有效 sidecar rows O(N) 扫描；当前 coarse event volume 有界且 correctness 已覆盖，高频事件或数千级 event/job 前再优化。 |
-| WU-CLI-FINS-OBS-01-R3 | deferred-with-owner | Future CLI/Fins UI output redaction policy work unit | `_is_summary_key_allowed` 维持保守屏蔽策略，可能过度隐藏部分业务 key；放宽前必须单独审计 path / raw / body / content 泄漏风险。 |
-| WU-CLI-FINS-OBS-01-R4 | deferred-with-owner | Future CLI/Fins direct cancel responsiveness work unit | CLI SIGINT 路径内 `request_cancel(job_id)` 仍是同步调用；若要放入 executor、加超时或恢复默认 SIGINT fallback，需要单独裁决 cancel 并发语义。 |
+| WU-CLI-FINS-OBS-01-R3 | deferred-with-owner | Future CLI/Fins UI output redaction policy work unit | UI progress / summary 输出 redaction policy 仍需保守处理；放宽前必须单独审计 path / raw / body / content 泄漏风险。 |
 | WU-CLI-FINS-OBS-01-R5 | deferred-with-owner | Future Agent command streaming / UI work unit | `prompt` / `interactive` 的运行中 token/content streaming 不在本 WU 范围；本 WU 仅保护终态 final answer / failure / cancel 输出。 |
 
 ## 当前 Work Units
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-CLI-FINS-OBS-01 | draft-PR-pass | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Draft PR #143 opened: https://github.com/noho/dayu-agent-r/pull/143 |
+| WU-CLI-FINS-OBS-01 | planning | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Draft PR #143 paused; next gate must create a replacement plan for two design corrections together: CLI direct `AsyncIterator[FinsEvent]`, and lightweight tool awaiting handle instead of core Fins durable job system |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -241,7 +238,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-本条是用户裁决纳入本文档留痕的 immediate residual work unit，不创建 GitHub Issue。本轮总控只记录 work unit，不进入 plan、implementation、review、commit、push 或 PR gate。下一轮新总控实施时，应从 goal confirmation 继续，先核对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/README.md` 的日志与可观测性约束，以及 OLD / NEW 代码事实。
+本条是用户裁决纳入本文档留痕的 immediate residual work unit，不创建 GitHub Issue。PR #143 已打开，但 2026-06-16 用户指出并经代码核对确认两个设计更正：CLI direct live events 没有 durable job 需求，正确模型是普通 `AsyncIterator[FinsEvent]`；Fins tool awaiting 返回 `ToolAwaitingOutcome(EXTERNAL_JOB)` 的方向成立，但把 awaiting observation handle 实现成 Fins 核心 durable job system 过重。因此当前 PR #143 不再按 `draft-PR-pass` 进入合并决策；下一步不得直接沿用既有 plan / slice / sidecar 实现做局部 fix，必须先回到 goal confirmation 和 replacement plan gate，一起移除 CLI direct 上错误引入的 durable job event sidecar 设计，并重新收敛 Fins ingestion runtime 与 tool awaiting 的边界。
 
 ### 用户裁决
 
@@ -256,27 +253,67 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - `docs/host/design.md` 固定 `UI -> Service -> Host -> Engine` 分层边界：UI 负责展示、输入收集、流式订阅和用户动作触发；Service 负责业务入口、身份解析、场景装配和调用 Host。Fins direct command 不应伪装成 Host run，也不得让 CLI 绕过 Service / Fins boundary。
 - `docs/engine/design.md` 固定 stream 术语边界：Fins direct live event stream 不是 `EngineEvent stream`，也不是 `Host event stream`；不得在设计或实现中混称。
 - `dayu/README.md` 的“日志与可观测性”固定日志职责：日志用于诊断系统执行过程，不承担 UI 输出、审计真源、tool trace、EventLog canonical fact 或 projection checkpoint 职责。
+- OLD `/Users/leo/workspace/dayu-agent/dayu/services/fins_service.py` 的 `FinsService.execute(...)` 返回 `FinsResult | AsyncIterator[FinsEvent]`；流式路径直接 `async for event in result: yield event`，没有 `job_id`、event sidecar 或 durable cursor。
+- OLD `/Users/leo/workspace/dayu-agent/tests/cli/test_fins_commands.py` 的 `_consume_fins_stream` 测试直接消费 `AsyncIterator[FinsEvent]`，通过 `PROGRESS` / `RESULT` 事件完成 CLI live progress 与最终结果返回。
+- WU-TOOLS-01-F01 引入 Fins durable job 的直接动机是 tool awaiting：LLM tool 不应阻塞在 download / upload / preprocess 长事务里，因此工具返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，Host wait adapter 后续观察 completion。这个 awaiting 方向成立，但不要求 Fins 核心 ingestion runtime 自己成为 durable job system。
+- Fins ingestion 的业务真源是 `dayu.fins.storage` 中的 source / processed / upload 产物和有界结果摘要；Fins job record 只能作为 awaiting observation handle，不能被提升为财报处理事实真源，也不应污染 CLI direct。
 - NEW `dayu/cli/main.py` 已解析 `--log-level`、`--debug`、`--verbose`、`--quiet`，但当前 CLI main 未完成日志装配，导致普通 CLI 命令缺少符合 README 语义的 dayu 日志输出。
 - NEW `dayu/cli/commands/fins.py` 对 Fins direct 命令启动 job 后只等待 `FinsDirectCommandService.wait_for_terminal()`，运行中没有面向用户的 progress print；Ctrl+C 后才输出 cancel 文案。
 - NEW `dayu/service/fins_direct.py` 的 `wait_for_terminal()` 当前仅周期性 `read_job()` 直到终态，无法向 CLI / 未来 WeChat / GUI 提供 live progress 事件。
 - NEW `dayu/cli/commands/init.py` 已在 reset、success、usage error、operation error 和 copy failure 路径输出用户可见文本；下一轮实施前应通过测试确认 init 的 UI print 仍正常，而不是把 init 误归入 Fins live stream 缺口。
 - NEW `dayu/cli/commands/prompt.py` 与 `dayu/cli/commands/interactive.py` 均通过 `dayu/cli/output.py` 输出终态 final answer / failure / cancel 文本；但 `dayu/service/entrypoint_runtime.py` 当前只用 `watch_session_events()` 和 outbox read 等待 terminal，不向 CLI 投影运行中 progress 或 content delta。下一轮 plan 必须裁决这是否属于本条 UI print 缺口、应在本条修复，还是仅作为非 Fins Agent command 的后续 streaming/UI work。
 - NEW `dayu/cli/commands/fins.py` 的 `upload_filings_from` 当前生成并打印 batch script，不启动 live Fins job；下一轮 plan 必须把它作为其它 CLI command 输出审计项，而不是错误地要求它恢复 live job stream。
-- OLD `/Users/leo/workspace/dayu-agent` 的 Fins CLI 路径存在 `FinsEvent` live event stream，CLI 消费 `PROGRESS` / `RESULT` 事件并输出进度；NEW 底层 Fins pipeline 仍保留 `DownloadEvent` / `download_stream` 等事件能力，但 direct job adapter 路径把运行中事件压成终态 summary。
+- NEW 底层 Fins pipeline 仍保留 `DownloadEvent` / `download_stream` 等事件能力，但 direct job adapter 路径把运行中事件压成终态 summary。下一步修正应优先恢复 Service 暴露 `AsyncIterator[FinsEvent]` 的简单边界，而不是在 CLI direct 上补 durable job event sidecar。
+
+### 2026-06-16 架构更正裁决
+
+- CLI direct 裁决：`download` / `process` / `upload_filing` / `upload_material` / `process_filing` / `process_material` 是一次性本地命令，没有 durable job、cross-restart resume 或后台追踪需求。它们应通过 Service / Fins boundary 消费普通 `AsyncIterator[FinsEvent]`，使用 `PROGRESS` 输出运行中进度，使用 `RESULT` 收口最终结果；取消走当前执行的 async cancellation / cancel checker / KeyboardInterrupt 传播。
+- Tool awaiting 裁决：`ToolAwaitingOutcome(EXTERNAL_JOB)` 仍是正确方向，因为 Engine tool handshake 不应等待长事务完成。但 awaiting 需要的是可观察、可 poll 的轻量 handle，不是 Fins 核心 runtime 的 durable job 状态机。Host wait adapter 可以用轻量 await ref 观察业务产物、执行结果或 runtime-local operation 状态；只有在明确需要跨进程 / 跨重启恢复未完成 ingestion 时，才单独设计 durable operation ledger。
+- Fins runtime 裁决：Fins ingestion runtime 应优先表达业务执行、事件流和 storage 产物写入；`dayu.fins.storage` 中的财报产物和有界 result summary 才是业务真源。当前 durable job record / job store / per-job cancel / job event sidecar 组合对 CLI direct 和基础 runtime 都过重，下一轮修正必须把它收敛到 tool awaiting 所需的最小 observation handle，或在没有必要时移除。
+
+### 下一轮 Phaseflow Handoff Hints
+
+下次以 `$phaseflow docs/host/design.md docs/host/issues-implementation-control.md` 恢复时，controller 必须把本条当作 replacement planning，而不是 PR #143 的普通 fix。原因是现有 `docs/host/wu-cli-fins-obs-01-fins-direct-live-events-plan.md`、PR #143 slice 记录和当前实现都以 durable Fins job event sidecar 为核心前提；该前提已经被 2026-06-16 裁决否定。
+
+Goal confirmation 必须重新核对以下直接代码事实：
+
+- `dayu/cli/commands/fins.py`：当前 CLI direct 仍是 `start_* -> FinsDirectJobHandle -> stream_job_events_until_terminal(...)`；SIGINT 仍映射到 `service.request_cancel(handle.job_id)`。这些是要移除的 durable job coupling，不是要保留的行为。
+- `dayu/service/fins_direct.py`：当前 Service protocol 仍暴露 `FinsIngestionJobStart`、`read_job(...)`、`read_job_events(...)` 和 `request_cancel(...)`；replacement plan 应把 CLI-facing boundary 改为普通 `AsyncIterator[FinsEvent]`，避免 CLI 或 Service direct path 依赖 sidecar cursor。
+- `dayu/fins/ingestion_runtime.py`：当前 `start_download` / `start_preprocess` / `start_upload` 先创建 durable queued job record 再提交后台 executor，并暴露 `read_job` / `read_job_events` / `request_cancel`。replacement plan 必须裁决哪些能力属于 tool awaiting 最小 observation handle，哪些应从 core runtime 移除或降级。
+- `dayu/fins/ingestion/wait_adapter.py`、`dayu/fins/tools/*_tools.py`、`dayu/service/host_assembly.py`：tool awaiting 仍必须快速返回 `ToolAwaitingOutcome(EXTERNAL_JOB)` 并让 Host wait adapter 后续观察 completion；不能把这个裁决误读成删除 awaiting。
+- `tests/cli/test_fins_commands.py`、`tests/service/test_fins_direct.py`、`tests/fins/test_fins_ingestion_runtime.py`、`tests/fins/test_fins_ingestion_tools.py`、`tests/service/test_host_assembly.py`：现有测试大量证明 durable job / sidecar 行为。replacement plan 必须明确哪些测试要改写为 `AsyncIterator[FinsEvent]` 语义，哪些 awaiting tool / wait adapter 测试仍保留但改为轻量 handle 语义。
+
+Replacement plan 建议按依赖边界切 slice，避免一次性大爆炸：
+
+- Slice A：定义 Fins direct `FinsEvent` contract / Service async iterator boundary，恢复 CLI direct progress/result/cancel 语义；先不触碰 Host wait adapter。
+- Slice B：重写 CLI direct command 消费路径和输出测试，确认六个 direct 命令不再需要 `job_id`、`read_job_events`、event sidecar 或 durable cancel。
+- Slice C：收敛 Fins ingestion runtime 的 core execution API，区分 direct execution stream、business result summary 和 awaiting observation handle；删除或降级不再必要的 job event sidecar。
+- Slice D：调整 Fins tool awaiting / wait adapter，使 `ToolAwaitingOutcome(EXTERNAL_JOB)` 保持非阻塞，但 await ref 轻量化；若 plan 认为仍需任何 durable row，必须先给出 cross-process / cross-restart 恢复需求和最小 schema 理由。
+- Slice E：README / design / tests 同步，清除 `dayu/README.md`、`dayu/service/README.md`、`dayu/fins/README.md`、`tests/README.md` 中把 CLI direct 或 core Fins runtime 描述成 durable job system 的文字。
+
+Stop conditions：
+
+- 如果 plan 需要修改 Host durable schema、EventLog、Run / Attempt 状态机、Engine `ToolExecutor` contract 或 `ToolAwaitingOutcome` union，必须停止并回到设计真源讨论；当前裁决不要求这些 Host / Engine 公共契约变更。
+- 如果有人主张保留 Fins durable job store，必须说明它服务的明确需求是 tool awaiting observation、cross-process observation 还是 cross-restart recovery；不能用 CLI direct 或“以后可能有用”作为理由。
+- 如果 direct CLI 修正必须依赖 sidecar JSONL、per-job sequence、`request_cancel(job_id)` 或 terminal fallback synthetic event，说明 plan 仍在沿用被否定前提，必须退回重写。
+- 如果 awaiting handle 轻量化会导致 Host wait adapter 无法 poll/resolve 当前 tool awaiting path，必须在 plan gate 暴露为 blocker，不能在 implementation 中临时拼接。
 
 ### 目标
 
 - 为 Fins direct commands 恢复 live event stream，覆盖 `download`、`process`、`upload_filing`、`upload_material`、`process_filing`、`process_material`。
 - 审计全部 CLI commands 的 log 与 UI print 路径，至少覆盖 `init`、`prompt`、`interactive`、`download`、`upload_filing`、`upload_material`、`upload_filings_from`、`process`、`process_filing`、`process_material`；对每个命令记录“正常 / 本条修复 / 后续 owner”的裁决依据。
-- 在 Service / Fins boundary 提供可复用的事件消费或订阅接口，使 CLI 只是一个 UI consumer，未来 WeChat / GUI 可以复用同一 Service 能力。
+- 在 Service / Fins boundary 提供可复用的普通 `AsyncIterator[FinsEvent]` 事件接口，使 CLI 只是一个 UI consumer，未来 WeChat / GUI 可以复用同一 Service 能力。
+- 为 tool awaiting 保留非阻塞启动语义：工具仍可快速返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，但 awaiting handle 必须轻量，不把 Fins runtime 核心执行模型固定成 durable job store。
 - 恢复 CLI 日志装配，使 `--log-level`、`--debug`、`--verbose`、`--quiet` 符合 `dayu/README.md` 的日志级别语义。
 - 明确区分 log 与 UI print：运行中 progress / result summary 是 UI 输出；诊断路径、执行骨架、错误上下文是日志。
-- 保留 Fins direct command 的 cancel 语义：用户中断后必须 durable `request_cancel(job_id)`，并且本地退出或继续等待的行为要有明确、可测试的用户可见输出。
+- 保留 Fins direct command 的普通 CLI cancel 语义：用户中断后应通过 async task cancellation / cancel checker / KeyboardInterrupt 传播停止当前执行，并且本地退出行为要有明确、可测试的用户可见输出。
 
 ### 非目标
 
 - 不全量搬迁 OLD `dayu-agent` CLI 实现。
 - 不把 Fins direct commands 改造成 Host run、Host wait 或 Host event stream。
+- 不把 CLI direct live events 改造成 durable Fins job、job event sidecar、per-job event sequence 或 Host wait adapter。
+- 不把 `ToolAwaitingOutcome(EXTERNAL_JOB)` 等同于 Fins 核心 durable job system；awaiting 可以保留，但 durable operation ledger 只有在明确 cross-restart / cross-process 恢复需求成立时才允许单独设计。
 - 不让 CLI、Service 或 Host 绕过 `dayu.fins.storage` 直接散落读取财报 storage。
 - 不引入无当前需求支撑的通用跨进程 event bus、WebSocket 框架或平台化观察者系统。
 - 不修改 Engine stream 术语或 Engine public contract。
@@ -287,12 +324,13 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 ### 验收信号
 
 - 运行 `dayu-cli download --ticker CME` 后，在下载进行中能持续看到用户可见进度输出；不需要等待 Ctrl+C 或终态才看到信息。
-- `download`、`process`、`upload_filing`、`upload_material`、`process_filing`、`process_material` 都通过同一类 Service / Fins boundary 暴露 live event stream，而不是各命令在 CLI 中复制底层 storage 或 pipeline 逻辑。
+- `download`、`process`、`upload_filing`、`upload_material`、`process_filing`、`process_material` 都通过同一类 Service / Fins boundary 暴露 `AsyncIterator[FinsEvent]` live event stream，而不是各命令在 CLI 中复制底层 storage 或 pipeline 逻辑。
+- Fins tool awaiting 仍能非阻塞返回 awaiting outcome，但其 observation handle 不要求 Fins runtime 维护 durable job record / job event sidecar；若实现保留任何 durable row，plan 必须给出明确 cross-restart / cross-process 需求证据。
 - 终态成功、失败、取消均有用户可见输出；输出不得依赖日志级别才能看见。
 - `--verbose` / `--debug` 能显示符合 README 语义的诊断日志；默认日志不淹没 UI progress，不输出 provider secret、完整业务 payload、财报原文或大段 tool result。
 - `init`、`prompt`、`interactive`、`upload_filings_from` 等非 live Fins job 命令的 UI print 经代码核对与测试分类：已正常的命令有测试或直接证据；不正常的命令已在本条修复，或被明确转入有 owner 的后续 work unit。
 - `prompt` / `interactive` 的终态输出必须保持正常；若本条裁决不实现运行中 Agent progress / content streaming，plan 必须说明直接代码证据、设计依据、用户影响和后续 owner。
-- Ctrl+C 仍触发 durable Fins job cancel；二次 Ctrl+C 或本地退出必须保留 job id 供用户追踪。
+- Ctrl+C 触发当前 CLI 执行的普通取消路径；取消不要求 durable `job_id`，也不把本地退出伪装成后台 job 终态。
 - 测试覆盖 CLI 输出审计、Service event stream、cancel、日志装配和禁止 CLI 直接 import `dayu.fins.storage` 的边界约束。
 
 ### 当前 gate artifacts
@@ -347,6 +385,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - final local validation: `pytest tests/fins/test_fins_ingestion_runtime.py tests/service/test_fins_direct.py tests/cli/test_arg_parsing.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/runtime/test_log.py -q` 210 passed, 3 warnings; `pyright dayu/fins/ingestion_events.py dayu/fins/ingestion_runtime.py dayu/service/fins_direct.py dayu/cli/main.py dayu/cli/commands/fins.py dayu/cli/output.py dayu/runtime/log.py tests/fins/test_fins_ingestion_runtime.py tests/service/test_fins_direct.py tests/cli/test_arg_parsing.py tests/cli/test_fins_commands.py tests/cli/test_upload_filings_from_command.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/runtime/test_log.py` 0 errors
 - closeout: `docs/reviews/wu-cli-fins-obs-01-closeout-20260615-212045.md`
 - draft PR: #143 https://github.com/noho/dayu-agent-r/pull/143
+- 2026-06-16 control-doc decision: PR #143 durable job event sidecar premise is invalid for CLI direct; additionally, Fins tool awaiting may keep `ToolAwaitingOutcome(EXTERNAL_JOB)` but must not force core Fins ingestion runtime into an over-heavy durable job system. Next fix gate must handle both corrections together before merge decision.
 
 ## WU-OBS-00 Tool Trace Analyzer
 
