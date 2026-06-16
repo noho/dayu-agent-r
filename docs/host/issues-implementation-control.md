@@ -202,6 +202,11 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
+| WU-CLI-FINS-OBS-01-R1 | deferred-with-owner | Future Fins fine-grained pipeline event streaming work unit | 当前 WU 只落地 runtime-owned coarse progress events；若后续实现 adapter / runner 细粒度 stream consumption，必须重新评估 event sidecar 写入频率、读取性能和 README 边界。 |
+| WU-CLI-FINS-OBS-01-R2 | deferred-with-owner | Future Fins event sidecar scalability work unit | `_last_event_sequence_locked` 仍按有效 sidecar rows O(N) 扫描；当前 coarse event volume 有界且 correctness 已覆盖，高频事件或数千级 event/job 前再优化。 |
+| WU-CLI-FINS-OBS-01-R3 | deferred-with-owner | Future CLI/Fins UI output redaction policy work unit | `_is_summary_key_allowed` 维持保守屏蔽策略，可能过度隐藏部分业务 key；放宽前必须单独审计 path / raw / body / content 泄漏风险。 |
+| WU-CLI-FINS-OBS-01-R4 | deferred-with-owner | Future CLI/Fins direct cancel responsiveness work unit | CLI SIGINT 路径内 `request_cancel(job_id)` 仍是同步调用；若要放入 executor、加超时或恢复默认 SIGINT fallback，需要单独裁决 cancel 并发语义。 |
+| WU-CLI-FINS-OBS-01-R5 | deferred-with-owner | Future Agent command streaming / UI work unit | `prompt` / `interactive` 的运行中 token/content streaming 不在本 WU 范围；本 WU 仅保护终态 final answer / failure / cancel 输出。 |
 
 ## 当前 Work Units
 

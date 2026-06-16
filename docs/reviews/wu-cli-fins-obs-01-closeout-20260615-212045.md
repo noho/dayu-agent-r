@@ -44,6 +44,8 @@
 - CLI synchronous cancel request inside SIGINT handling remains deferred. Fixing it would alter cancel concurrency semantics and should be handled by a dedicated cancel responsiveness work unit if needed.
 - Prompt / interactive token/content streaming remains outside this work unit by accepted scope; prompt / interactive terminal output was preserved and tested.
 
+These items are mirrored in `docs/host/issues-implementation-control.md` as `WU-CLI-FINS-OBS-01-R1` through `WU-CLI-FINS-OBS-01-R5`.
+
 ## Closeout Decision
 
 All accepted slice findings and aggregate findings are closed. No unowned blocker remains for this work unit. Proceed to draft PR gate.
