@@ -92,8 +92,8 @@ escape fail-fast、旧配置文件不生成、生成配置可由 `ConfigLoader` 
 解析结果和 stderr 诊断流交给 `dayu.runtime.log.set_level_from_flags(...)` 装配日志。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、stable
 Host slot key、unsupported 旧执行参数 fail fast、真实 `prompt.json` required context slots、mock Host public
 open/follow-up terminal path、fast terminal、outbox fallback、FAILED terminal 输出和 SIGINT 后 Host public cancel request；
-`interactive` 命令测试覆盖 label / new-session session binding、真实 `interactive.json` required context slots、两轮同
-Session、每轮独立 watcher attach/close、fast terminal、FAILED / CANCELLED 继续输入、LOST fatal、运行态 SIGINT cancel、
+`interactive` 命令测试覆盖默认 fresh anonymous Session、label session binding、`--new-session` 用法错误、真实
+`interactive.json` required context slots、两轮同 Session、每轮独立 watcher attach/close、fast terminal、FAILED / CANCELLED 继续输入、LOST fatal、运行态 SIGINT cancel、
 第二次 SIGINT 本地 130、显式 config 错误、unsupported 旧执行参数 fail fast，以及 `--verbose` / `--debug` 诊断不污染 stdout 用户结果通道。Fins direct command 测试覆盖
 `download`、`upload_filing`、`upload_material`、`process`、`process_filing`、`process_material` 的 CLI 参数到
 `FinsDirectCommandService` 显式方法参数转换、Service event stream 消费、progress / terminal summary

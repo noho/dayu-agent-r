@@ -39,7 +39,6 @@ from dayu.cli.host_context import (
     build_interactive_host_context,
     interactive_cancel_client_request_id,
     interactive_create_session_client_request_id,
-    interactive_process_slot_key,
     interactive_slot_key,
     interactive_submit_client_request_id,
     new_cli_invocation,
@@ -274,23 +273,6 @@ async def _ensure_interactive_session(
             scope=INTERACTIVE_SESSION_SCOPE,
             slot_key=slot_key,
             metadata=(),
-        )
-        return session.session_id
-    if args.new_session:
-        session = await ensure_or_create_entrypoint_session(
-            host,
-            create_new=True,
-            bind_slot=True,
-            scope=INTERACTIVE_SESSION_SCOPE,
-            slot_key=interactive_process_slot_key(invocation),
-            metadata=(),
-            create_context=build_interactive_host_context(
-                invocation,
-                operation=_INTERACTIVE_OPERATION_CREATE_SESSION,
-            ),
-            create_client_request_id=interactive_create_session_client_request_id(
-                invocation
-            ),
         )
         return session.session_id
     session = await ensure_or_create_entrypoint_session(

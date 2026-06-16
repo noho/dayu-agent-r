@@ -564,32 +564,6 @@ def test_interactive_verbose_debug_diagnostics_do_not_pollute_stdout(
     assert "[DEBUG]" not in captured.out
 
 
-def test_interactive_new_session_creates_bound_process_session(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``--new-session`` 应走 create_session(bind_slot=True)。"""
-
-    fake_host = _FakeHost()
-    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
-    monkeypatch.setattr(
-        interactive_command,
-        "open_host",
-        lambda _options: _FakeOpenHostContext(fake_host),
-    )
-    monkeypatch.setattr(interactive_command, "_read_user_input", _input_reader(()))
-
-    exit_code = cli_main.main(
-        ("interactive", "--base", str(tmp_path), "--new-session")
-    )
-
-    assert exit_code == EXIT_SUCCESS
-    assert fake_host.create_requests[0].bind_slot is True
-    assert fake_host.create_requests[0].scope == "cli.interactive"
-    assert fake_host.create_requests[0].slot_key is not None
-    assert fake_host.create_requests[0].slot_key.startswith("cli.interactive.")
-
-
 def test_interactive_input_keyboard_interrupt_exits_without_run_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -722,6 +696,10 @@ def test_interactive_two_turns_use_same_session_and_independent_watchers(
         "watch:session-1",
         "submit:session-1",
     ]
+    assert len(fake_host.create_requests) == 1
+    assert fake_host.create_requests[0].bind_slot is False
+    assert fake_host.create_requests[0].scope is None
+    assert fake_host.create_requests[0].slot_key is None
     assert [watcher.closed_count for watcher in fake_host.watchers] == [1, 1]
     first_submit = fake_host.submit_requests[0]
     second_submit = fake_host.submit_requests[1]

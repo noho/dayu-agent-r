@@ -98,7 +98,6 @@ class ParsedCliArgs(argparse.Namespace):
     prompt: str
     ticker: str | None
     label: str | None
-    new_session: bool
     model_name: str | None
     thinking: bool | None
     web_provider: str | None
@@ -204,7 +203,6 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.log_level = DEFAULT_LOG_LEVEL
     namespace.ticker = None
     namespace.label = None
-    namespace.new_session = False
     namespace.model_name = None
     namespace.thinking = None
     namespace.web_provider = None
@@ -405,13 +403,7 @@ def _register_interactive_command(
         help_text="进入多轮财报分析交互模式。",
     )
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
-    label_group = parser.add_mutually_exclusive_group()
-    label_group.add_argument("--label", help="复用或绑定的本地会话标签。")
-    label_group.add_argument(
-        "--new-session",
-        action="store_true",
-        help="为指定标签创建新会话。",
-    )
+    parser.add_argument("--label", help="复用或绑定的本地会话标签。")
     _add_agent_execution_arguments(parser)
 
 

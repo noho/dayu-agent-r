@@ -104,17 +104,6 @@ def interactive_slot_key(label: str) -> str:
     return f"{INTERACTIVE_SLOT_KEY_PREFIX}{stripped_label}"
 
 
-def interactive_process_slot_key(invocation: CliInvocation) -> str:
-    """构造 interactive 当前进程新会话使用的临时 slot key。
-
-    :param invocation: 当前 CLI invocation 身份。
-    :returns: 形如 ``cli.interactive.<invocation_id>`` 的进程本地 slot key。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return f"{INTERACTIVE_SLOT_KEY_PREFIX}{invocation.invocation_id}"
-
-
 def prompt_create_session_client_request_id(invocation: CliInvocation) -> str:
     """构造 prompt create-session 幂等 id。
 
@@ -369,7 +358,6 @@ __all__: tuple[str, ...] = (
     "build_prompt_host_context",
     "interactive_cancel_client_request_id",
     "interactive_create_session_client_request_id",
-    "interactive_process_slot_key",
     "interactive_slot_key",
     "interactive_submit_client_request_id",
     "new_cli_invocation",

@@ -43,7 +43,6 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "interactive": (
         "--ticker",
         "--label",
-        "--new-session",
         "--model-name",
         "--temperature",
     ),
@@ -184,6 +183,34 @@ def test_interactive_help_contains_optional_ticker(
     help_text = _capture_help(capsys, ("interactive",))
 
     assert "--ticker" in help_text
+
+
+def test_interactive_help_omits_removed_new_session_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """验证 ``interactive --help`` 不再暴露过时 ``--new-session``。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: help 仍包含过时 flag 时抛出。
+    """
+
+    help_text = _capture_help(capsys, ("interactive",))
+
+    assert "--new-session" not in help_text
+
+
+def test_interactive_new_session_flag_exits_with_usage_error() -> None:
+    """验证 ``interactive --new-session`` 已从 parser surface 删除。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未按 unknown argument 返回用法错误时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(("interactive", "--new-session"))
+
+    assert raised.value.code == EXIT_USAGE_ERROR
 
 
 def test_missing_command_exits_with_usage_error() -> None:
