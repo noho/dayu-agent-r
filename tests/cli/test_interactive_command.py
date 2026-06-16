@@ -14,6 +14,7 @@ import pytest
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
 from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
+from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -410,6 +411,39 @@ class _AutoSigintMonitor(CliSigintMonitor):
         return self.count
 
 
+class _NoopSigintMonitor(CliSigintMonitor):
+    """测试用不触发 SIGINT monitor。"""
+
+    def install(self) -> None:
+        """测试中不安装真实 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    def close(self) -> None:
+        """测试中无需恢复 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    async def wait_next(self, observed_count: int) -> int:
+        """一直等待下一次 SIGINT，直到调用方取消等待任务。
+
+        :param observed_count: 已观察到的 SIGINT 计数。
+        :returns: 正常路径不会返回。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        await asyncio.Event().wait()
+        return observed_count
+
+
 class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
     """测试用第二次 SIGINT monitor。"""
 
@@ -516,6 +550,71 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert fake_host.ensure_requests[0].scope == "cli.interactive"
     assert fake_host.ensure_requests[0].slot_key == "cli.interactive.earnings"
     assert fake_host.create_requests == []
+
+
+@pytest.mark.asyncio
+async def test_interactive_existing_session_execution_does_not_create_or_ensure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interactive existing-session 入口只能在指定 Session 上运行 REPL。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: helper 调用了 create / ensure 或多轮 Session 不一致时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+    )
+    fake_host = _FakeHost(
+        submit_statuses=(
+            HostTerminalStatus.SUCCEEDED,
+            HostTerminalStatus.SUCCEEDED,
+        )
+    )
+
+    exit_code = await interactive_command._execute_interactive_on_existing_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        input_reader=_input_reader(("第一轮", "第二轮")),
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.splitlines() == ["answer for run-1", "answer for run-2"]
+    assert fake_host.ensure_requests == []
+    assert fake_host.create_requests == []
+    assert fake_host.calls == [
+        "watch:session-existing",
+        "submit:session-existing",
+        "watch:session-existing",
+        "submit:session-existing",
+    ]
+    assert [request.user_prompt for request in fake_host.submit_requests] == [
+        "第一轮",
+        "第二轮",
+    ]
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))

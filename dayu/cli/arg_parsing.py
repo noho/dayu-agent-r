@@ -556,6 +556,7 @@ def _register_session_resume_action(
         help_text="恢复一个已有 Session 并提交下一轮输入。",
     )
     _add_session_selector_arguments(parser)
+    parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument(
         "--mode",
         choices=SESSION_RESUME_MODE_CHOICES,

@@ -1,8 +1,9 @@
 """``dayu-cli session`` 命令实现。
 
-本模块是 CLI UI adapter：只通过 Host public API 读取 Session 列表或请求
-purge，不读取 durable internals，不自动 close / cancel，也不承载 Host 状态机
-判断。
+本模块是 CLI UI adapter：只通过 Host public API 解析已有 Session、读取
+Session 列表或请求 purge。resume 执行会路由到 prompt / interactive 的
+existing-session 窄入口；本模块不复制 submit/watch/cancel 业务路径，不读取
+durable internals，不自动 close / cancel，也不承载 Host 状态机判断。
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from dayu.cli.agent_entrypoint import (
+    CliSigintMonitor,
     optional_stripped_text,
     package_config_root,
     resolve_explicit_config_dir,
@@ -28,11 +30,21 @@ from dayu.cli.arg_parsing import (
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
-    EXIT_NOT_IMPLEMENTED,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
+from dayu.cli.commands.interactive import (
+    CliInteractiveUsageError,
+    _execute_interactive_on_existing_session,
+    _prepare_interactive_existing_session_execution,
+)
+from dayu.cli.commands.prompt import (
+    CliCommandUsageError,
+    _execute_prompt_on_existing_session,
+    _prepare_prompt_existing_session_execution,
+)
 from dayu.cli.host_context import (
+    CLI_INTERACTIVE_SCENARIO,
     CLI_PROMPT_SCENARIO,
     CliInvocation,
     build_session_host_context,
@@ -52,6 +64,7 @@ from dayu.host.api import (
     HostApiErrorCode,
     PurgeSessionRequest,
     SessionSlotRef,
+    SessionStatus,
 )
 from dayu.host.open_host import open_host
 from dayu.runtime.location import RuntimeLocationError
@@ -71,9 +84,12 @@ _SESSION_CONTEXT_SCENARIO: Final[str] = "session"
 _SESSION_ID_OPTION: Final[str] = "--session-id"
 _LABEL_OPTION: Final[str] = "--label"
 _KIND_OPTION: Final[str] = "--kind"
+_MODE_OPTION: Final[str] = "--mode"
 _REASON_OPTION: Final[str] = "--reason"
 _PURGE_OPERATION: Final[str] = "purge_session"
 _HOST_ERROR_TEMPLATE: Final[str] = "host_code={code} host_message={message}"
+_RESUME_MODE_PROMPT: Final[str] = "prompt"
+_RESUME_MODE_INTERACTIVE: Final[str] = "interactive"
 
 
 class CliSessionUsageError(ValueError):
@@ -94,6 +110,20 @@ class _PurgeTarget:
     resolved_from_label: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _ExistingSessionTarget:
+    """一次 resume 操作已经解析出的目标。
+
+    :param session_id: 最终用于提交 follow-up 的 Session id。
+    :param selector: 用户原始 selector 的可读摘要。
+    :param resolved_from_label: 目标是否经 label selector 反解得到。
+    """
+
+    session_id: str
+    selector: str
+    resolved_from_label: bool
+
+
 def run_session_command(args: ParsedCliArgs) -> int:
     """执行 ``dayu-cli session`` 命令。
 
@@ -102,11 +132,11 @@ def run_session_command(args: ParsedCliArgs) -> int:
     :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
     """
 
-    if args.session_action == SESSION_ACTION_RESUME:
-        render_cli_error("dayu-cli session resume: not implemented")
-        return EXIT_NOT_IMPLEMENTED
     try:
         return asyncio.run(_run_session_command_async(args))
+    except (CliCommandUsageError, CliInteractiveUsageError) as exc:
+        render_cli_error(f"dayu-cli session resume: {exc}")
+        return EXIT_USAGE_ERROR
     except CliSessionUsageError as exc:
         render_cli_error(f"dayu-cli session: {exc}")
         return EXIT_USAGE_ERROR
@@ -135,6 +165,8 @@ async def _run_session_command_async(args: ParsedCliArgs) -> int:
     :raises Exception: runtime assembly 或 Host opener 失败时向上抛出。
     """
 
+    if args.session_action == SESSION_ACTION_RESUME:
+        return await _run_session_resume(args)
     invocation = new_cli_invocation(
         command_name=COMMAND_SESSION,
         scenario=_SESSION_CONTEXT_SCENARIO,
@@ -200,6 +232,63 @@ async def _run_session_list(host: Host) -> int:
     return EXIT_SUCCESS
 
 
+async def _run_session_resume(args: ParsedCliArgs) -> int:
+    """执行 ``session resume``。
+
+    :param args: argparse 已解析的 session 命令参数。
+    :returns: CLI 退出码。
+    :raises CliSessionUsageError: selector、mode 或 prompt 参数非法时抛出。
+    :raises CliCommandUsageError: prompt 兼容执行参数非法时抛出。
+    :raises CliInteractiveUsageError: interactive 兼容执行参数非法时抛出。
+    :raises Exception: runtime assembly、Host public API 或输出失败时向上抛出。
+    """
+
+    mode = _require_resume_mode(args.mode)
+    if mode == _RESUME_MODE_PROMPT:
+        user_prompt = _require_resume_prompt(args)
+        prepared = await _prepare_prompt_existing_session_execution(
+            args,
+            command_name=COMMAND_SESSION,
+            scenario=CLI_PROMPT_SCENARIO,
+            user_prompt=user_prompt,
+        )
+        async with open_host(prepared.runtime.host_assembly.options) as host:
+            target = await _resolve_existing_session_target(host=host, args=args)
+            try:
+                return await _execute_prompt_on_existing_session(
+                    host=host,
+                    prepared=prepared,
+                    session_id=target.session_id,
+                    sigint_monitor=CliSigintMonitor(),
+                )
+            except HostApiError as exc:
+                render_cli_error(_resume_host_error_message(target=target, error=exc))
+                return _exit_code_for_host_error(
+                    exc,
+                    resolved_from_label=target.resolved_from_label,
+                )
+    _reject_interactive_resume_prompt(args)
+    prepared_interactive = await _prepare_interactive_existing_session_execution(
+        args,
+        command_name=COMMAND_SESSION,
+        scenario=CLI_INTERACTIVE_SCENARIO,
+    )
+    async with open_host(prepared_interactive.runtime.host_assembly.options) as host:
+        target = await _resolve_existing_session_target(host=host, args=args)
+        try:
+            return await _execute_interactive_on_existing_session(
+                host=host,
+                prepared=prepared_interactive,
+                session_id=target.session_id,
+            )
+        except HostApiError as exc:
+            render_cli_error(_resume_host_error_message(target=target, error=exc))
+            return _exit_code_for_host_error(
+                exc,
+                resolved_from_label=target.resolved_from_label,
+            )
+
+
 async def _run_session_purge(
     *,
     host: Host,
@@ -238,6 +327,67 @@ async def _run_session_purge(
         )
     render_session_purge_result(result)
     return EXIT_SUCCESS
+
+
+async def _resolve_existing_session_target(
+    *,
+    host: Host,
+    args: ParsedCliArgs,
+) -> _ExistingSessionTarget:
+    """把 resume selector 解析为当前存在且 OPEN 的 Host Session。
+
+    :param host: Host public handle。
+    :param args: argparse 已解析的 session 命令参数。
+    :returns: 已解析的 existing Session 目标。
+    :raises CliSessionUsageError: selector 非法、目标缺失或目标 CLOSED 时抛出。
+    :raises HostApiError: 非 NOT_FOUND 的 Host 读取错误向上抛出。
+    """
+
+    session_id = optional_stripped_text(
+        args.session_id,
+        field_name=_SESSION_ID_OPTION,
+        error_factory=CliSessionUsageError,
+    )
+    if session_id is not None:
+        try:
+            snapshot = await host.get_session(session_id)
+        except HostApiError as exc:
+            if exc.code is HostApiErrorCode.NOT_FOUND:
+                raise CliSessionUsageError(f"session not found: {session_id}") from exc
+            raise
+        if snapshot.status is not SessionStatus.OPEN:
+            raise CliSessionUsageError(
+                f"session is closed and cannot be resumed: {session_id}"
+            )
+        return _ExistingSessionTarget(
+            session_id=session_id,
+            selector=f"{_SESSION_ID_OPTION} {session_id}",
+            resolved_from_label=False,
+        )
+    label = optional_stripped_text(
+        args.label,
+        field_name=_LABEL_OPTION,
+        error_factory=CliSessionUsageError,
+    )
+    if label is None:
+        raise CliSessionUsageError("session resume requires a selector")
+    kind = _require_label_kind(args.kind)
+    slot = slot_ref_for_cli_label(kind, label)
+    result = await host.list_sessions()
+    for item in result.sessions:
+        if item.slot == slot:
+            if item.status is not SessionStatus.OPEN:
+                raise CliSessionUsageError(
+                    f"session is closed and cannot be resumed: {item.session_id}"
+                )
+            return _ExistingSessionTarget(
+                session_id=item.session_id,
+                selector=f"{_LABEL_OPTION} {label} {_KIND_OPTION} {kind.value}",
+                resolved_from_label=True,
+            )
+    raise CliSessionUsageError(
+        f"no session found for label {label!r} kind {kind.value!r}"
+    )
 
 
 async def _resolve_purge_target(
@@ -306,6 +456,56 @@ async def _resolve_session_id_for_slot(
     return None
 
 
+def _require_resume_mode(value: str | None) -> str:
+    """校验 session resume mode。
+
+    :param value: argparse 解析到的 ``--mode`` 值。
+    :returns: resume mode 字符串。
+    :raises CliSessionUsageError: ``--mode`` 缺失或非法时抛出。
+    """
+
+    mode = optional_stripped_text(
+        value,
+        field_name=_MODE_OPTION,
+        error_factory=CliSessionUsageError,
+    )
+    if mode in (_RESUME_MODE_PROMPT, _RESUME_MODE_INTERACTIVE):
+        return mode
+    raise CliSessionUsageError("--mode must be prompt or interactive")
+
+
+def _require_resume_prompt(args: ParsedCliArgs) -> str:
+    """读取 prompt mode resume 的 positional prompt。
+
+    :param args: argparse 已解析的 session 命令参数。
+    :returns: 本轮用户 prompt。
+    :raises CliSessionUsageError: prompt 缺失或为空白时抛出。
+    """
+
+    prompt = optional_stripped_text(
+        args.session_prompt,
+        field_name="prompt",
+        error_factory=CliSessionUsageError,
+    )
+    if prompt is None:
+        raise CliSessionUsageError("session resume --mode prompt requires prompt")
+    return prompt
+
+
+def _reject_interactive_resume_prompt(args: ParsedCliArgs) -> None:
+    """拒绝 interactive mode resume 携带 positional prompt。
+
+    :param args: argparse 已解析的 session 命令参数。
+    :returns: ``None``。
+    :raises CliSessionUsageError: interactive mode 携带 prompt 时抛出。
+    """
+
+    if args.session_prompt is not None:
+        raise CliSessionUsageError(
+            "session resume --mode interactive does not accept prompt"
+        )
+
+
 def _require_label_kind(value: str | None) -> CliSessionLabelKind:
     """校验并转换 label selector kind。
 
@@ -366,6 +566,26 @@ def _purge_host_error_message(
     return (
         "dayu-cli session purge: "
         f"selector={target.selector} session_id={target.session_id} {host_context}"
+    )
+
+
+def _resume_host_error_message(
+    *,
+    target: _ExistingSessionTarget,
+    error: HostApiError,
+) -> str:
+    """把 resume submit 阶段 HostApiError 映射成用户可读错误。
+
+    :param target: 已解析 resume 目标。
+    :param error: Host public API 结构化错误。
+    :returns: stderr 错误文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        "dayu-cli session resume: "
+        f"selector={target.selector} session_id={target.session_id} "
+        f"{_host_error_context(error)}"
     )
 
 

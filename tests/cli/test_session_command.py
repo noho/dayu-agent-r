@@ -7,15 +7,19 @@ from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from types import TracebackType
+from collections.abc import Callable
 from typing import cast
 
 import pytest
 
 import dayu.cli.commands.session as session_command
+import dayu.cli.commands.prompt as prompt_command
+import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
+from dayu.cli.agent_entrypoint import CliSigintMonitor
+from dayu.cli.arg_parsing import ParsedCliArgs
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
-    EXIT_NOT_IMPLEMENTED,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
@@ -27,21 +31,28 @@ from dayu.cli.session_identity import (
     slot_ref_for_cli_label,
 )
 from dayu.host.api import (
+    FollowupBehavior,
+    FollowupSnapshot,
     Host,
     HostApiError,
     HostApiErrorCode,
+    HostCallContext,
     HostStreamCursor,
     ListSessionsResult,
     PurgeSessionRequest,
     PurgeSessionResult,
+    SessionSnapshot,
     SessionListItem,
     SessionSlotRef,
     SessionStatus,
+    SubmitFollowupRequest,
+    RunStatus,
 )
 from dayu.service.entrypoint_runtime import (
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
 )
+from dayu.service.host_assembly import ServiceRunOverrides
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +74,16 @@ class _FakeRuntimeCapture:
     """测试用 runtime request capture。"""
 
     requests: list[EntrypointRuntimeRequest]
+
+
+@dataclass(slots=True)
+class _FakeResumeCapture:
+    """测试用 resume helper 调用记录。"""
+
+    prompt_prepare_calls: list[str]
+    interactive_prepare_calls: list[str]
+    prompt_execute_sessions: list[str]
+    interactive_execute_sessions: list[str]
 
 
 class _FakeHostContext:
@@ -111,8 +132,11 @@ class _FakeSessionHost:
     list_result: ListSessionsResult
     purge_result: PurgeSessionResult
     purge_error: HostApiError | None
+    get_session_status: SessionStatus
+    submit_error: HostApiError | None
     calls: list[str]
     purge_requests: list[tuple[str, PurgeSessionRequest]]
+    submit_requests: list[tuple[str, SubmitFollowupRequest]]
     close_cancel_calls: int
 
     def __init__(
@@ -121,12 +145,16 @@ class _FakeSessionHost:
         list_result: ListSessionsResult,
         purge_result: PurgeSessionResult | None = None,
         purge_error: HostApiError | None = None,
+        get_session_status: SessionStatus = SessionStatus.OPEN,
+        submit_error: HostApiError | None = None,
     ) -> None:
         """初始化 fake Host。
 
         :param list_result: ``list_sessions`` 返回值。
         :param purge_result: ``purge_session`` 成功返回值。
         :param purge_error: ``purge_session`` 需要抛出的 Host 错误。
+        :param get_session_status: ``get_session`` 返回的 Session status。
+        :param submit_error: ``submit_followup`` 需要抛出的 Host 错误。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -139,8 +167,11 @@ class _FakeSessionHost:
             deleted_counts_digest="sha256:hidden",
         )
         self.purge_error = purge_error
+        self.get_session_status = get_session_status
+        self.submit_error = submit_error
         self.calls = []
         self.purge_requests = []
+        self.submit_requests = []
         self.close_cancel_calls = 0
 
     async def list_sessions(self) -> ListSessionsResult:
@@ -152,6 +183,44 @@ class _FakeSessionHost:
 
         self.calls.append("list_sessions")
         return self.list_result
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """返回预设状态的 Session snapshot 并记录调用。
+
+        :param session_id: 目标 Session id。
+        :returns: Session snapshot。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append(f"get_session:{session_id}")
+        return _session_snapshot(session_id=session_id, status=self.get_session_status)
+
+    async def submit_followup(
+        self,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """记录 submit_followup 请求并返回或抛出预设结果。
+
+        :param session_id: 目标 Session id。
+        :param request: SubmitFollowupRequest。
+        :returns: FollowupSnapshot。
+        :raises HostApiError: 测试配置要求模拟 Host 失败时抛出。
+        """
+
+        self.calls.append(f"submit:{session_id}")
+        self.submit_requests.append((session_id, request))
+        if self.submit_error is not None:
+            raise self.submit_error
+        return FollowupSnapshot(
+            accepted_input_ref="input-ref",
+            behavior=FollowupBehavior.QUEUE,
+            accepted_run_id=f"run-{len(self.submit_requests)}",
+            accepted_run_status=RunStatus.RUNNING,
+            command_watermark=HostStreamCursor(event_sequence=456),
+            queued_run_id=None,
+            target_run_id=None,
+        )
 
     async def purge_session(
         self,
@@ -173,6 +242,24 @@ class _FakeSessionHost:
         return self.purge_result
 
     async def close_session(self) -> None:
+        """记录禁止路径调用。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_cancel_calls += 1
+
+    async def ensure_session(self) -> None:
+        """记录禁止路径调用。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_cancel_calls += 1
+
+    async def create_session(self) -> None:
         """记录禁止路径调用。
 
         :returns: ``None``。
@@ -629,15 +716,23 @@ def test_session_purge_by_label_toctou_error_includes_selector_and_host_context(
     assert host.calls == ["list_sessions", "purge:session-A"]
 
 
-def test_session_resume_execution_is_left_not_implemented(
+def test_session_resume_prompt_by_session_id_resolves_and_submits_without_create(
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """S4 只冻结 ``session resume`` parser shape，不实现执行。
+    """prompt resume by session id 必须 get_session 后在同一 Session submit。
 
     :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
     :returns: ``None``。
-    :raises AssertionError: resume 执行没有停留在 not implemented 时抛出。
+    :raises AssertionError: resume selector 或 submit 路径不符合契约时抛出。
     """
+
+    host = _FakeSessionHost(list_result=ListSessionsResult(sessions=()))
+    _install_fake_open_host(monkeypatch, host)
+    resume_capture = _install_fake_resume_execution(monkeypatch)
 
     exit_code = cli_main.main(
         (
@@ -647,13 +742,226 @@ def test_session_resume_execution_is_left_not_implemented(
             "session-1",
             "--mode",
             "prompt",
+            "--base",
+            str(tmp_path),
             "hello",
         )
     )
     captured = capsys.readouterr()
 
-    assert exit_code == EXIT_NOT_IMPLEMENTED
-    assert "not implemented" in captured.err
+    assert exit_code == EXIT_SUCCESS
+    assert captured.err == ""
+    assert host.calls == ["get_session:session-1", "submit:session-1"]
+    assert host.close_cancel_calls == 0
+    assert host.submit_requests[0][1].user_prompt == "hello"
+    assert resume_capture.prompt_prepare_calls == ["hello"]
+    assert resume_capture.prompt_execute_sessions == ["session-1"]
+
+
+def test_session_resume_interactive_by_label_resolves_and_reuses_session(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """interactive resume by label 必须 list resolve 后多轮复用同一 Session。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: label 解析或 interactive 路由不符合契约时抛出。
+    """
+
+    host = _FakeSessionHost(
+        list_result=ListSessionsResult(
+            sessions=(
+                _session_list_item(
+                    session_id="session-A",
+                    slot=SessionSlotRef(
+                        scope="cli.interactive",
+                        slot_key="cli.interactive.proj.v1",
+                    ),
+                ),
+            )
+        )
+    )
+    _install_fake_open_host(monkeypatch, host)
+    resume_capture = _install_fake_resume_execution(monkeypatch)
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--label",
+            "proj.v1",
+            "--kind",
+            "interactive",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.err == ""
+    assert host.calls == [
+        "list_sessions",
+        "submit:session-A",
+        "submit:session-A",
+    ]
+    assert [session_id for session_id, _request in host.submit_requests] == [
+        "session-A",
+        "session-A",
+    ]
+    assert host.close_cancel_calls == 0
+    assert resume_capture.interactive_prepare_calls == ["interactive"]
+    assert resume_capture.interactive_execute_sessions == ["session-A"]
+
+
+def test_session_resume_closed_session_returns_usage_error_without_submit(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """resume 解析到 CLOSED Session 时必须返回用户错误且不 submit。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: CLOSED Session 没有 fail fast 时抛出。
+    """
+
+    host = _FakeSessionHost(
+        list_result=ListSessionsResult(sessions=()),
+        get_session_status=SessionStatus.CLOSED,
+    )
+    _install_fake_open_host(monkeypatch, host)
+    _install_fake_resume_execution(monkeypatch)
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-closed",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "hello",
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "closed" in captured.err
+    assert host.calls == ["get_session:session-closed"]
+    assert host.submit_requests == []
+
+
+def test_session_resume_missing_label_returns_usage_error_without_create(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """resume by missing label 必须返回用户错误且不 create / ensure。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: missing label 触发创建或提交时抛出。
+    """
+
+    host = _FakeSessionHost(list_result=ListSessionsResult(sessions=()))
+    _install_fake_open_host(monkeypatch, host)
+    _install_fake_resume_execution(monkeypatch)
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--label",
+            "missing",
+            "--kind",
+            "prompt",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "hello",
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "no session found" in captured.err
+    assert host.calls == ["list_sessions"]
+    assert host.submit_requests == []
+    assert host.close_cancel_calls == 0
+
+
+def test_session_resume_by_label_toctou_error_includes_selector_and_host_context(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """resume by label submit TOCTOU 错误必须包含 selector、session id 和 Host 错误。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: TOCTOU 错误上下文不完整时抛出。
+    """
+
+    host = _FakeSessionHost(
+        list_result=ListSessionsResult(
+            sessions=(
+                _session_list_item(
+                    session_id="session-A",
+                    slot=SessionSlotRef(
+                        scope="cli.prompt",
+                        slot_key="cli.prompt.proj.v1",
+                    ),
+                ),
+            )
+        ),
+        submit_error=HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="session closed before submit",
+            retryable=False,
+        ),
+    )
+    _install_fake_open_host(monkeypatch, host)
+    _install_fake_resume_execution(monkeypatch)
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--label",
+            "proj.v1",
+            "--kind",
+            "prompt",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "hello",
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "--label proj.v1 --kind prompt" in captured.err
+    assert "session-A" in captured.err
+    assert "invalid_state" in captured.err
+    assert "session closed before submit" in captured.err
+    assert host.calls == ["list_sessions", "submit:session-A"]
 
 
 def _session_list_item(
@@ -690,6 +998,253 @@ def _session_list_item(
     )
 
 
+def _session_snapshot(
+    *,
+    session_id: str,
+    status: SessionStatus,
+) -> SessionSnapshot:
+    """构造测试用 Session snapshot。
+
+    :param session_id: Session id。
+    :param status: Session status。
+    :returns: Session snapshot。
+    :raises ValueError: 构造出的 public DTO 字段非法时抛出。
+    """
+
+    return SessionSnapshot(
+        session_id=session_id,
+        status=status,
+        slot=None,
+        active_run_id=None,
+        queued_run_ids=(),
+        timeline_cursor=HostStreamCursor(event_sequence=321),
+    )
+
+
+def _submit_request(
+    *,
+    context: HostCallContext,
+    session_id: str,
+    user_prompt: str,
+) -> SubmitFollowupRequest:
+    """构造 fake resume execution 使用的 submit request。
+
+    :param context: Host call context。
+    :param session_id: 目标 Session id。
+    :param user_prompt: 本轮用户 prompt。
+    :returns: SubmitFollowupRequest。
+    :raises ValueError: request 字段非法时抛出。
+    """
+
+    return SubmitFollowupRequest(
+        context=context,
+        session_id=session_id,
+        client_request_id=f"test-submit-{len(user_prompt)}",
+        system_prompt=None,
+        user_prompt=user_prompt,
+        tool_names=frozenset(),
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
+        behavior=FollowupBehavior.QUEUE,
+        target_run_id=None,
+    )
+
+
+def _install_fake_open_host(
+    monkeypatch: pytest.MonkeyPatch,
+    host: _FakeSessionHost,
+) -> None:
+    """安装 session command 测试用 Host opener fake。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param host: fake Host。
+    :returns: ``None``。
+    :raises Exception: monkeypatch 设置失败时透传。
+    """
+
+    def fake_open_host(_options: str) -> _FakeHostContext:
+        """返回 fake Host context manager。
+
+        :param _options: fake runtime options。
+        :returns: fake Host async context manager。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return _FakeHostContext(host)
+
+    monkeypatch.setattr(session_command, "open_host", fake_open_host)
+
+
+def _install_fake_resume_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _FakeResumeCapture:
+    """安装 session resume 测试用 prompt / interactive existing-session fake。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: resume helper 调用记录。
+    :raises Exception: monkeypatch 设置失败时透传。
+    """
+
+    capture = _FakeResumeCapture(
+        prompt_prepare_calls=[],
+        interactive_prepare_calls=[],
+        prompt_execute_sessions=[],
+        interactive_execute_sessions=[],
+    )
+
+    async def fake_prepare_prompt_existing_session_execution(
+        args: ParsedCliArgs,
+        *,
+        command_name: str,
+        scenario: str,
+        user_prompt: str,
+    ) -> prompt_command._PreparedPromptExistingSessionExecution:
+        """返回 fake prompt existing-session 准备结果。
+
+        :param args: session resume 参数。
+        :param command_name: 当前 CLI command 名称。
+        :param scenario: prompt scene id。
+        :param user_prompt: 本轮用户 prompt。
+        :returns: fake prompt prepared execution。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        capture.prompt_prepare_calls.append(user_prompt)
+        return prompt_command._PreparedPromptExistingSessionExecution(
+            runtime=cast(
+                EntrypointRuntimeResult,
+                _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
+            ),
+            invocation=session_command.new_cli_invocation(
+                command_name=command_name,
+                scenario=scenario,
+                display_user="本地 CLI 用户",
+                ticker=args.ticker,
+            ),
+            user_prompt=user_prompt,
+            run_overrides=ServiceRunOverrides(),
+        )
+
+    async def fake_execute_prompt_on_existing_session(
+        *,
+        host: Host,
+        prepared: prompt_command._PreparedPromptExistingSessionExecution,
+        session_id: str,
+        sigint_monitor: CliSigintMonitor,
+    ) -> int:
+        """在 fake Host 上提交一轮 prompt。
+
+        :param host: fake Host。
+        :param prepared: fake prompt prepared execution。
+        :param session_id: 目标 Session id。
+        :param sigint_monitor: prompt SIGINT monitor。
+        :returns: CLI 成功退出码。
+        :raises HostApiError: fake Host 配置 submit 失败时抛出。
+        """
+
+        sigint_monitor.close()
+        capture.prompt_execute_sessions.append(session_id)
+        await host.submit_followup(
+            session_id,
+            _submit_request(
+                context=prompt_command.build_prompt_host_context(
+                    prepared.invocation,
+                    operation="submit_followup",
+                ),
+                session_id=session_id,
+                user_prompt=prepared.user_prompt,
+            ),
+        )
+        return EXIT_SUCCESS
+
+    async def fake_prepare_interactive_existing_session_execution(
+        args: ParsedCliArgs,
+        *,
+        command_name: str,
+        scenario: str,
+    ) -> interactive_command._PreparedInteractiveExistingSessionExecution:
+        """返回 fake interactive existing-session 准备结果。
+
+        :param args: session resume 参数。
+        :param command_name: 当前 CLI command 名称。
+        :param scenario: interactive scene id。
+        :returns: fake interactive prepared execution。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        capture.interactive_prepare_calls.append(args.mode or "")
+        return interactive_command._PreparedInteractiveExistingSessionExecution(
+            runtime=cast(
+                EntrypointRuntimeResult,
+                _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
+            ),
+            invocation=session_command.new_cli_invocation(
+                command_name=command_name,
+                scenario=scenario,
+                display_user="本地 CLI 用户",
+                ticker=args.ticker,
+            ),
+            run_overrides=ServiceRunOverrides(),
+        )
+
+    async def fake_execute_interactive_on_existing_session(
+        *,
+        host: Host,
+        prepared: interactive_command._PreparedInteractiveExistingSessionExecution,
+        session_id: str,
+        input_reader: Callable[[str], str] | None = None,
+        sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
+    ) -> int:
+        """在 fake Host 上提交两轮 interactive 输入。
+
+        :param host: fake Host。
+        :param prepared: fake interactive prepared execution。
+        :param session_id: 目标 Session id。
+        :param input_reader: 未使用的输入读取器。
+        :param sigint_monitor_factory: 未使用的 SIGINT monitor 工厂。
+        :returns: CLI 成功退出码。
+        :raises HostApiError: fake Host 配置 submit 失败时抛出。
+        """
+
+        capture.interactive_execute_sessions.append(session_id)
+        for user_prompt in ("first interactive turn", "second interactive turn"):
+            await host.submit_followup(
+                session_id,
+                _submit_request(
+                    context=interactive_command.build_interactive_host_context(
+                        prepared.invocation,
+                        operation="submit_followup",
+                    ),
+                    session_id=session_id,
+                    user_prompt=user_prompt,
+                ),
+            )
+        return EXIT_SUCCESS
+
+    monkeypatch.setattr(
+        session_command,
+        "_prepare_prompt_existing_session_execution",
+        fake_prepare_prompt_existing_session_execution,
+    )
+    monkeypatch.setattr(
+        session_command,
+        "_execute_prompt_on_existing_session",
+        fake_execute_prompt_on_existing_session,
+    )
+    monkeypatch.setattr(
+        session_command,
+        "_prepare_interactive_existing_session_execution",
+        fake_prepare_interactive_existing_session_execution,
+    )
+    monkeypatch.setattr(
+        session_command,
+        "_execute_interactive_on_existing_session",
+        fake_execute_interactive_on_existing_session,
+    )
+    return capture
+
+
 def _install_fake_session_runtime(
     monkeypatch: pytest.MonkeyPatch,
     host: _FakeSessionHost,
@@ -720,22 +1275,12 @@ def _install_fake_session_runtime(
             _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
         )
 
-    def fake_open_host(_options: str) -> _FakeHostContext:
-        """返回 fake Host context manager。
-
-        :param _options: fake runtime options。
-        :returns: fake Host async context manager。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return _FakeHostContext(host)
-
     monkeypatch.setattr(
         session_command,
         "prepare_entrypoint_runtime",
         fake_prepare_entrypoint_runtime,
     )
-    monkeypatch.setattr(session_command, "open_host", fake_open_host)
+    _install_fake_open_host(monkeypatch, host)
     return capture
 
 

@@ -15,6 +15,7 @@ import pytest
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
 from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
+from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -429,6 +430,39 @@ class _ImmediateSigintMonitor(CliSigintMonitor):
         return self.count
 
 
+class _NoopSigintMonitor(CliSigintMonitor):
+    """测试用不触发 SIGINT monitor。"""
+
+    def install(self) -> None:
+        """测试中不安装真实 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    def close(self) -> None:
+        """测试中无需恢复 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    async def wait_next(self, observed_count: int) -> int:
+        """一直等待下一次 SIGINT，直到调用方取消等待任务。
+
+        :param observed_count: 已观察到的 SIGINT 计数。
+        :returns: 正常路径不会返回。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        await asyncio.Event().wait()
+        return observed_count
+
+
 def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -496,6 +530,59 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert submit_request.agent_policy is not None
     assert submit_request.context.request_id != submit_request.client_request_id
     assert submit_request.context.operation_context.business_object_id == "AAPL"
+
+
+@pytest.mark.asyncio
+async def test_prompt_existing_session_execution_does_not_create_or_ensure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt existing-session 入口只能在指定 Session 上 submit。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: helper 调用了 create / ensure 或 submit 目标错误时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请继续分析",
+        )
+    )
+    prepared = await prompt_command._prepare_prompt_existing_session_execution(
+        args,
+        command_name="session",
+        scenario="prompt",
+        user_prompt="请继续分析",
+    )
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED)
+    )
+
+    exit_code = await prompt_command._execute_prompt_on_existing_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        sigint_monitor=_NoopSigintMonitor(),
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert fake_host.ensure_requests == []
+    assert fake_host.create_requests == []
+    assert fake_host.calls == ["watch:session-existing", "submit:session-existing"]
+    assert fake_host.submit_requests[0].user_prompt == "请继续分析"
+    assert fake_host.submit_requests[0].behavior is FollowupBehavior.QUEUE
+    assert fake_host.submit_requests[0].target_run_id is None
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))

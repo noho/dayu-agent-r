@@ -80,6 +80,20 @@ class CliInteractiveUsageError(ValueError):
     """interactive 命令用法错误。"""
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedInteractiveExistingSessionExecution:
+    """在已有 Session 上运行 interactive REPL 所需的准备结果。
+
+    :param runtime: entrypoint runtime assembly 结果。
+    :param invocation: 当前 CLI invocation 身份。
+    :param run_overrides: 本命令所有 turn 复用的运行时 override。
+    """
+
+    runtime: EntrypointRuntimeResult
+    invocation: CliInvocation
+    run_overrides: ServiceRunOverrides
+
+
 class _AcceptedRunState:
     """interactive 单轮 submit 后 accepted Run id 的本地状态。"""
 
@@ -187,6 +201,42 @@ async def _run_interactive_command_async(
     :raises Exception: runtime assembly 或 Host public API 失败时向上抛出。
     """
 
+    prepared = await _prepare_interactive_existing_session_execution(
+        args,
+        command_name=COMMAND_INTERACTIVE,
+        scenario=CLI_INTERACTIVE_SCENARIO,
+    )
+    async with open_host(prepared.runtime.host_assembly.options) as host:
+        session_id = await _ensure_interactive_session(
+            host=host,
+            args=args,
+            invocation=prepared.invocation,
+        )
+        return await _execute_interactive_on_existing_session(
+            host=host,
+            prepared=prepared,
+            session_id=session_id,
+            input_reader=input_reader,
+            sigint_monitor_factory=CliSigintMonitor,
+        )
+
+
+async def _prepare_interactive_existing_session_execution(
+    args: ParsedCliArgs,
+    *,
+    command_name: str,
+    scenario: str,
+) -> _PreparedInteractiveExistingSessionExecution:
+    """准备在已有 Session 上运行 interactive REPL 所需的 runtime 与调用身份。
+
+    :param args: argparse 已解析的 interactive 兼容命令参数。
+    :param command_name: 当前 CLI command 名称。
+    :param scenario: interactive scene id。
+    :returns: 已准备的 interactive existing-session 执行输入。
+    :raises CliInteractiveUsageError: 用户输入参数非法时抛出。
+    :raises Exception: runtime assembly 失败时向上抛出。
+    """
+
     _raise_for_unsupported_execution_options(args)
     workspace_root = resolve_workspace_root(
         args.workspace_root,
@@ -203,8 +253,8 @@ async def _run_interactive_command_async(
         error_factory=CliInteractiveUsageError,
     )
     invocation = new_cli_invocation(
-        command_name=COMMAND_INTERACTIVE,
-        scenario=CLI_INTERACTIVE_SCENARIO,
+        command_name=command_name,
+        scenario=scenario,
         display_user=DEFAULT_BASE_USER,
         ticker=ticker,
     )
@@ -213,7 +263,7 @@ async def _run_interactive_command_async(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
             explicit_config_dir=explicit_config_dir,
-            scene_id=CLI_INTERACTIVE_SCENARIO,
+            scene_id=scenario,
             context_slot_values=_interactive_context_slot_values(ticker=ticker),
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=optional_stripped_text(
@@ -225,24 +275,48 @@ async def _run_interactive_command_async(
             env=os.environ,
         )
     )
-    async with open_host(runtime.host_assembly.options) as host:
-        session_id = await _ensure_interactive_session(
-            host=host,
-            args=args,
-            invocation=invocation,
-        )
-        return await _run_interactive_repl(
-            host=host,
-            runtime=runtime,
-            invocation=invocation,
-            session_id=session_id,
-            run_overrides=service_run_overrides_from_args(
-                args,
-                error_factory=CliInteractiveUsageError,
-            ),
-            input_reader=input_reader,
-            sigint_monitor_factory=CliSigintMonitor,
-        )
+    return _PreparedInteractiveExistingSessionExecution(
+        runtime=runtime,
+        invocation=invocation,
+        run_overrides=service_run_overrides_from_args(
+            args,
+            error_factory=CliInteractiveUsageError,
+        ),
+    )
+
+
+async def _execute_interactive_on_existing_session(
+    *,
+    host: Host,
+    prepared: _PreparedInteractiveExistingSessionExecution,
+    session_id: str,
+    input_reader: Callable[[str], str] | None = None,
+    sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
+) -> int:
+    """在已解析的已有 Session 上运行 interactive REPL。
+
+    :param host: Host public handle。
+    :param prepared: interactive existing-session 执行准备结果。
+    :param session_id: 已存在且调用方已选择的 Host Session id。
+    :param input_reader: 输入态读取一行用户文本的函数；``None`` 表示使用标准输入。
+    :param sigint_monitor_factory: 单轮 SIGINT monitor 工厂；``None`` 表示创建默认 monitor。
+    :returns: CLI 退出码。
+    :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
+    """
+
+    effective_input_reader = _read_user_input if input_reader is None else input_reader
+    effective_sigint_monitor_factory = (
+        CliSigintMonitor if sigint_monitor_factory is None else sigint_monitor_factory
+    )
+    return await _run_interactive_repl(
+        host=host,
+        runtime=prepared.runtime,
+        invocation=prepared.invocation,
+        session_id=session_id,
+        run_overrides=prepared.run_overrides,
+        input_reader=effective_input_reader,
+        sigint_monitor_factory=effective_sigint_monitor_factory,
+    )
 
 
 async def _ensure_interactive_session(
