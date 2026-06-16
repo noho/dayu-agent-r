@@ -182,9 +182,9 @@ Engine 契约只描述一次 run 的执行输入、Runner 调用、工具批次�
 
 ### Host public contract
 
-Host public contract 以 `open_host(options)` 返回的异步 `Host` handle 为普通入口。核心类型包括 `OpenHostOptions`、`OrdinaryRunExecutionBaseline`、`CompactorRunnerBaseline`、`HostToolingOptions`、Session / Run request 与 snapshot、`FollowupBehavior`、`CancelMode`、wait resolution request / outcome、outbox read / drain request、`HostEvent`、`HostFinalAnswerView`、`HostApiError`、`OperationContext` 和本地 worker typed boundary。
+Host public contract 以 `open_host(options)` 返回的异步 `Host` handle 为普通入口。核心类型包括 `OpenHostOptions`、`OrdinaryRunExecutionBaseline`、`CompactorRunnerBaseline`、`HostToolingOptions`、Session / Run request 与 snapshot、Session 列表读取结果、`FollowupBehavior`、`CancelMode`、wait resolution request / outcome、outbox read / drain request、`HostEvent`、`HostFinalAnswerView`、`HostApiError`、`OperationContext` 和本地 worker typed boundary。
 
-Host contract 的稳定语义是 durable command 和 typed read view。`submit_followup`、`cancel_run`、`resolve_wait`、`retry_run`、`replay_run`、`close_session`、`purge_session` 等 command 都先进入 Host admission 或对应治理入口；低层 durable store、command handle factory、scheduler、projection runner、ToolRuntime factory 和 state mutator 不是普通 Service-facing contract。
+Host contract 的稳定语义是 durable command 和 typed read view。`submit_followup`、`cancel_run`、`resolve_wait`、`retry_run`、`replay_run`、`close_session`、`purge_session` 等 command 都先进入 Host admission 或对应治理入口；`get_session`、`list_sessions`、`get_run`、outbox read 和 storage usage report 等读取入口只返回 Host durable truth 或明确的派生 read view，不触发执行。低层 durable store、command handle factory、scheduler、projection runner、ToolRuntime factory 和 state mutator 不是普通 Service-facing contract。
 
 ### Service / runtime assembly contract
 
