@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | planning |
-| implementation status | WU-CLI-ACTIVITY-01 plan review / re-review passed; accepted plan commit pending |
+| gate | implementation |
+| implementation status | WU-CLI-ACTIVITY-01 Slice A implementation, fix, re-review, full pyright, and affected tests passed; accepted slice commit pending |
 | active work unit | WU-CLI-ACTIVITY-01 |
 | default next work unit | WU-OBS-00 |
-| next entry point | Create accepted plan commit for WU-CLI-ACTIVITY-01, then enter implementation Slice A |
+| next entry point | Create accepted Slice A commit, then enter implementation Slice B |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01. |
@@ -210,7 +210,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
 | WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 closed on 2026-06-17 after user authorization |
-| WU-CLI-ACTIVITY-01 | planning | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Plan artifact fixed after review in `docs/host/host-issues/wu-cli-activity-01-activity-composer-plan.md`; BQ-1 resolved by user裁决 allowing event-related contract changes; plan re-review passed; accepted plan commit pending. |
+| WU-CLI-ACTIVITY-01 | review | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Accepted plan commit `012fee0a`; Slice A implementation completed; code review in progress. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -248,7 +248,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - plan review adjudication: `docs/reviews/plan-review-wu-cli-activity-01-adjudication-20260617-125229.md`
 - plan re-review: `docs/reviews/plan-review-20260617-130417.md` (AgentMiMo); `docs/reviews/plan-review-20260617-130248.md` (AgentDS)
 - plan gate validation: `git diff --check` clean; untracked plan artifact whitespace check clean via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cli-activity-01-activity-composer-plan.md` with expected nonzero no-index exit and no whitespace output
-- accepted plan commit: pending
+- accepted plan commit: `012fee0a`
 
 ### Accepted plan scope
 
@@ -258,6 +258,16 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - Slice D: Interactive composer with multiline input, history search, external editor, and early prompt_toolkit compatibility validation.
 - Slice E: Interactive running activity and cancel integration.
 - Slice F: README/doc checks, affected tests, coverage, pyright, and validation cleanup.
+
+### Slice A status
+
+- implementation artifact: `docs/reviews/wu-cli-activity-01-slice-a-implementation-codex.md`
+- code review: `docs/reviews/code-review-20260617-132628.md` (AgentMiMo); `docs/reviews/code-review-20260617-132508.md` (AgentDS)
+- code review adjudication: `docs/reviews/code-review-wu-cli-activity-01-slice-a-adjudication-20260617-132855.md`
+- fix artifact: `docs/reviews/wu-cli-activity-01-slice-a-fix-codex.md`
+- re-review: `docs/reviews/code-review-wu-cli-activity-01-slice-a-re-review-20260617-133529.md` (AgentMiMo); `docs/reviews/code-review-20260617-133606.md` (AgentDS)
+- validation: `pytest tests/host/test_public_host_event.py tests/host/test_public_open_host_options.py tests/host/test_package_exports.py tests/host/test_host_activity_event_projection.py tests/host/test_watch_session_events.py tests/host/test_context_compact_events.py tests/cli/test_interactive_command.py tests/cli/test_prompt_command.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_interactive_path.py tests/service/test_entrypoint_runtime_prompt_path.py -q` passed with 149 passed and 3 third-party edgar deprecation warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
+- accepted slice commit: pending
 
 ### Residual risks
 

@@ -12,11 +12,16 @@ import pytest
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
-from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.host import (
     AttemptDispatchSnapshot,
     CompactorRunnerBaseline,
     HostEvent,
+    HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
     EnsureSessionRequest,
@@ -312,7 +317,10 @@ def test_host_event_terminal_final_answer_contract() -> None:
         event_sequence=1,
         session_id="session-1",
         run_id="run-1",
+        event_class=HostEventClass.CANONICAL_FACT,
+        event_type="RUN_SUCCEEDED",
         kind=HostEventKind.SUCCEEDED,
+        activity=None,
         dedupe_key="event-1",
         terminal_status=HostTerminalStatus.SUCCEEDED,
         final_answer=final_answer,
@@ -327,7 +335,10 @@ def test_host_event_terminal_final_answer_contract() -> None:
             event_sequence=2,
             session_id="session-1",
             run_id="run-2",
+            event_class=HostEventClass.CANONICAL_FACT,
+            event_type="RUN_SUCCEEDED",
             kind=HostEventKind.SUCCEEDED,
+            activity=None,
             dedupe_key="event-2",
             terminal_status=HostTerminalStatus.SUCCEEDED,
             final_answer=None,

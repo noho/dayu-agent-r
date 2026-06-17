@@ -10,7 +10,6 @@ import dayu.host.context_fallback as context_fallback
 import dayu.host.memory as memory
 import dayu.host.read_api as read_api
 
-
 EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
     {
         "AttemptDispatchSnapshot",
@@ -42,6 +41,11 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostApiErrorCode",
         "HostApiErrorDetail",
         "Host",
+        "HostActivityCounts",
+        "HostActivityKind",
+        "HostActivitySeverity",
+        "HostActivityStatus",
+        "HostActivityView",
         "HostCallContext",
         "HostClosedError",
         "HostEvent",
@@ -331,9 +335,9 @@ def test_host_all_matches_current_public_contracts() -> None:
     """``dayu.host.__all__`` 匹配当前 public contract。"""
 
     actual = frozenset(host.__all__)
-    assert actual == EXPECTED_HOST_EXPORTS, (
-        f"missing={EXPECTED_HOST_EXPORTS - actual}; extra={actual - EXPECTED_HOST_EXPORTS}"
-    )
+    assert (
+        actual == EXPECTED_HOST_EXPORTS
+    ), f"missing={EXPECTED_HOST_EXPORTS - actual}; extra={actual - EXPECTED_HOST_EXPORTS}"
 
 
 def test_memory_module_all_matches_typed_contract_boundary() -> None:

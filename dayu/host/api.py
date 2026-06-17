@@ -203,9 +203,7 @@ def _require_sha256_digest(value: str, *, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a sha256 digest")
 
 
-def _require_optional_sha256_digest(
-    value: str | None, *, field_name: str
-) -> None:
+def _require_optional_sha256_digest(value: str | None, *, field_name: str) -> None:
     """校验可选字符串存在时为 Host 标准 sha256 digest。
 
     :param value: 待校验 digest 或 ``None``。
@@ -457,7 +455,9 @@ class ResolveWaitCompletedOutcome:
         """
 
         if not isinstance(self.result, ToolResultSuccess):
-            raise TypeError("ResolveWaitCompletedOutcome.result must be ToolResultSuccess")
+            raise TypeError(
+                "ResolveWaitCompletedOutcome.result must be ToolResultSuccess"
+            )
         if self.payload_ref is not None and not isinstance(
             self.payload_ref, HostPayloadRef
         ):
@@ -489,7 +489,9 @@ class ResolveWaitFailedOutcome:
         if self.payload_ref is not None and not isinstance(
             self.payload_ref, HostPayloadRef
         ):
-            raise TypeError("ResolveWaitFailedOutcome.payload_ref must be HostPayloadRef")
+            raise TypeError(
+                "ResolveWaitFailedOutcome.payload_ref must be HostPayloadRef"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,13 +618,9 @@ class AttemptDispatchSnapshot:
         _require_non_empty(self.run_id, field_name="run_id")
         _require_non_empty(self.attempt_id, field_name="attempt_id")
         _require_non_empty(self.execution_id, field_name="execution_id")
-        _require_non_empty(
-            self.dispatch_record_id, field_name="dispatch_record_id"
-        )
+        _require_non_empty(self.dispatch_record_id, field_name="dispatch_record_id")
         _require_non_empty(self.execution_target, field_name="execution_target")
-        _require_non_empty(
-            self.policy_snapshot_ref, field_name="policy_snapshot_ref"
-        )
+        _require_non_empty(self.policy_snapshot_ref, field_name="policy_snapshot_ref")
         if not isinstance(self.cancellation_token, CancellationToken):
             raise TypeError("cancellation_token must implement CancellationToken")
 
@@ -787,9 +785,8 @@ class HostLocalExecutionOptions:
             field_name="HostLocalExecutionOptions.lane_capacity",
         )
         if self.lane_default_timeout_seconds is not None:
-            if (
-                isinstance(self.lane_default_timeout_seconds, bool)
-                or not isinstance(self.lane_default_timeout_seconds, int | float)
+            if isinstance(self.lane_default_timeout_seconds, bool) or not isinstance(
+                self.lane_default_timeout_seconds, int | float
             ):
                 raise TypeError(
                     "HostLocalExecutionOptions.lane_default_timeout_seconds "
@@ -806,21 +803,15 @@ class HostLocalExecutionOptions:
         )
         _require_positive_float(
             self.lane_heartbeat_interval_seconds,
-            field_name=(
-                "HostLocalExecutionOptions.lane_heartbeat_interval_seconds"
-            ),
+            field_name=("HostLocalExecutionOptions.lane_heartbeat_interval_seconds"),
         )
         _require_positive_float(
             self.worker_startup_timeout_seconds,
-            field_name=(
-                "HostLocalExecutionOptions.worker_startup_timeout_seconds"
-            ),
+            field_name=("HostLocalExecutionOptions.worker_startup_timeout_seconds"),
         )
         _require_positive_float(
             self.dispatch_poll_interval_seconds,
-            field_name=(
-                "HostLocalExecutionOptions.dispatch_poll_interval_seconds"
-            ),
+            field_name=("HostLocalExecutionOptions.dispatch_poll_interval_seconds"),
         )
         if not isinstance(self.runner_spec, RunnerSpec):
             raise TypeError("HostLocalExecutionOptions.runner_spec must be RunnerSpec")
@@ -829,11 +820,11 @@ class HostLocalExecutionOptions:
                 "HostLocalExecutionOptions.runner_options must be RunnerCallOptions"
             )
         if not isinstance(self.agent_policy, AgentPolicy):
-            raise TypeError("HostLocalExecutionOptions.agent_policy must be AgentPolicy")
-        if self.worker_factory is None:
             raise TypeError(
-                "HostLocalExecutionOptions.worker_factory must be non-None"
+                "HostLocalExecutionOptions.agent_policy must be AgentPolicy"
             )
+        if self.worker_factory is None:
+            raise TypeError("HostLocalExecutionOptions.worker_factory must be non-None")
         if self.context_budget_policy is not None and not isinstance(
             self.context_budget_policy, ContextBudgetPolicy
         ):
@@ -845,8 +836,7 @@ class HostLocalExecutionOptions:
             self.compactor_runner_spec, RunnerSpec
         ):
             raise TypeError(
-                "HostLocalExecutionOptions.compactor_runner_spec must be "
-                "RunnerSpec"
+                "HostLocalExecutionOptions.compactor_runner_spec must be " "RunnerSpec"
             )
         if self.compactor_runner_options is not None and not isinstance(
             self.compactor_runner_options, RunnerCallOptions
@@ -960,8 +950,7 @@ class CompactorRunnerBaseline:
 
         if not isinstance(self.compactor_runner_spec, RunnerSpec):
             raise TypeError(
-                "CompactorRunnerBaseline.compactor_runner_spec must be "
-                "RunnerSpec"
+                "CompactorRunnerBaseline.compactor_runner_spec must be " "RunnerSpec"
             )
         if not isinstance(self.compactor_runner_options, RunnerCallOptions):
             raise TypeError(
@@ -970,8 +959,7 @@ class CompactorRunnerBaseline:
             )
         if not isinstance(self.compactor_agent_policy, AgentPolicy):
             raise TypeError(
-                "CompactorRunnerBaseline.compactor_agent_policy must be "
-                "AgentPolicy"
+                "CompactorRunnerBaseline.compactor_agent_policy must be " "AgentPolicy"
             )
         _require_non_empty(
             self.compactor_system_prompt,
@@ -988,8 +976,7 @@ class CompactorRunnerBaseline:
         _require_bool(
             self.compact_artifact_create_parent_dirs,
             field_name=(
-                "CompactorRunnerBaseline."
-                "compact_artifact_create_parent_dirs"
+                "CompactorRunnerBaseline." "compact_artifact_create_parent_dirs"
             ),
         )
 
@@ -1066,9 +1053,7 @@ class OpenHostOptions:
         """
 
         _require_path(self.db_path, field_name="OpenHostOptions.db_path")
-        _require_path(
-            self.artifact_root, field_name="OpenHostOptions.artifact_root"
-        )
+        _require_path(self.artifact_root, field_name="OpenHostOptions.artifact_root")
         _require_bool(
             self.create_parent_dirs,
             field_name="OpenHostOptions.create_parent_dirs",
@@ -1083,9 +1068,7 @@ class OpenHostOptions:
         )
         _require_positive_float(
             self.sqlite_write_retry_initial_delay_seconds,
-            field_name=(
-                "OpenHostOptions.sqlite_write_retry_initial_delay_seconds"
-            ),
+            field_name=("OpenHostOptions.sqlite_write_retry_initial_delay_seconds"),
         )
         _require_positive_float(
             self.sqlite_write_retry_backoff_multiplier,
@@ -1099,17 +1082,14 @@ class OpenHostOptions:
             self.payload_inline_threshold_bytes,
             field_name="OpenHostOptions.payload_inline_threshold_bytes",
         )
-        _require_path(
-            self.lane_db_path, field_name="OpenHostOptions.lane_db_path"
-        )
+        _require_path(self.lane_db_path, field_name="OpenHostOptions.lane_db_path")
         _require_non_empty(self.lane_name, field_name="OpenHostOptions.lane_name")
         _require_positive_int(
             self.lane_capacity, field_name="OpenHostOptions.lane_capacity"
         )
         if self.lane_default_timeout_seconds is not None:
-            if (
-                isinstance(self.lane_default_timeout_seconds, bool)
-                or not isinstance(self.lane_default_timeout_seconds, int | float)
+            if isinstance(self.lane_default_timeout_seconds, bool) or not isinstance(
+                self.lane_default_timeout_seconds, int | float
             ):
                 raise TypeError(
                     "OpenHostOptions.lane_default_timeout_seconds must be float"
@@ -1140,9 +1120,7 @@ class OpenHostOptions:
             self.dispatch_poll_interval_seconds,
             field_name="OpenHostOptions.dispatch_poll_interval_seconds",
         )
-        if not isinstance(
-            self.ordinary_run_baseline, OrdinaryRunExecutionBaseline
-        ):
+        if not isinstance(self.ordinary_run_baseline, OrdinaryRunExecutionBaseline):
             raise TypeError(
                 "OpenHostOptions.ordinary_run_baseline must be "
                 "OrdinaryRunExecutionBaseline"
@@ -1159,8 +1137,7 @@ class OpenHostOptions:
             self.context_budget_policy, ContextBudgetPolicy
         ):
             raise TypeError(
-                "OpenHostOptions.context_budget_policy must be "
-                "ContextBudgetPolicy"
+                "OpenHostOptions.context_budget_policy must be " "ContextBudgetPolicy"
             )
         if self.compactor_runner_baseline is not None and not isinstance(
             self.compactor_runner_baseline, CompactorRunnerBaseline
@@ -1342,9 +1319,7 @@ class HostCallContext:
 
         _require_non_empty(self.actor, field_name="HostCallContext.actor")
         _require_non_empty(self.source, field_name="HostCallContext.source")
-        _require_non_empty(
-            self.request_id, field_name="HostCallContext.request_id"
-        )
+        _require_non_empty(self.request_id, field_name="HostCallContext.request_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1516,9 +1491,7 @@ class HostCommandHandleOptions:
             self.host_handle_id,
             field_name="HostCommandHandleOptions.host_handle_id",
         )
-        _require_path(
-            self.db_path, field_name="HostCommandHandleOptions.db_path"
-        )
+        _require_path(self.db_path, field_name="HostCommandHandleOptions.db_path")
         _require_path(
             self.artifact_root,
             field_name="HostCommandHandleOptions.artifact_root",
@@ -1529,42 +1502,33 @@ class HostCommandHandleOptions:
         )
         _require_positive_float(
             self.sqlite_busy_timeout_seconds,
-            field_name=(
-                "HostCommandHandleOptions.sqlite_busy_timeout_seconds"
-            ),
+            field_name=("HostCommandHandleOptions.sqlite_busy_timeout_seconds"),
         )
         _require_non_negative_int(
             self.sqlite_write_busy_retry_count,
-            field_name=(
-                "HostCommandHandleOptions.sqlite_write_busy_retry_count"
-            ),
+            field_name=("HostCommandHandleOptions.sqlite_write_busy_retry_count"),
         )
         _require_positive_float(
             self.sqlite_write_retry_initial_delay_seconds,
             field_name=(
-                "HostCommandHandleOptions."
-                "sqlite_write_retry_initial_delay_seconds"
+                "HostCommandHandleOptions." "sqlite_write_retry_initial_delay_seconds"
             ),
         )
         _require_positive_float(
             self.sqlite_write_retry_backoff_multiplier,
             field_name=(
-                "HostCommandHandleOptions."
-                "sqlite_write_retry_backoff_multiplier"
+                "HostCommandHandleOptions." "sqlite_write_retry_backoff_multiplier"
             ),
         )
         _require_positive_float(
             self.sqlite_write_retry_max_delay_seconds,
             field_name=(
-                "HostCommandHandleOptions."
-                "sqlite_write_retry_max_delay_seconds"
+                "HostCommandHandleOptions." "sqlite_write_retry_max_delay_seconds"
             ),
         )
         _require_positive_int(
             self.payload_inline_threshold_bytes,
-            field_name=(
-                "HostCommandHandleOptions.payload_inline_threshold_bytes"
-            ),
+            field_name=("HostCommandHandleOptions.payload_inline_threshold_bytes"),
         )
         _validate_command_context_budget_fields(self)
 
@@ -1640,8 +1604,7 @@ def _command_hard_threshold_tokens(
         _require_positive_int(
             options.context_budget_hard_threshold_tokens,
             field_name=(
-                "HostCommandHandleOptions."
-                "context_budget_hard_threshold_tokens"
+                "HostCommandHandleOptions." "context_budget_hard_threshold_tokens"
             ),
         )
         if options.context_budget_hard_threshold_tokens > input_budget_tokens:
@@ -1658,8 +1621,7 @@ def _command_hard_threshold_tokens(
     _require_non_negative_int(
         minimum_protection_tokens,
         field_name=(
-            "HostCommandHandleOptions."
-            "context_budget_minimum_protection_tokens"
+            "HostCommandHandleOptions." "context_budget_minimum_protection_tokens"
         ),
     )
     if minimum_protection_tokens >= input_budget_tokens:
@@ -1693,9 +1655,7 @@ class EnsureSessionRequest:
         """
 
         _require_non_empty(self.scope, field_name="EnsureSessionRequest.scope")
-        _require_non_empty(
-            self.slot_key, field_name="EnsureSessionRequest.slot_key"
-        )
+        _require_non_empty(self.slot_key, field_name="EnsureSessionRequest.slot_key")
         _require_metadata_entries(
             self.metadata, field_name="EnsureSessionRequest.metadata"
         )
@@ -1742,9 +1702,7 @@ class CreateSessionRequest:
                 self.slot_key, field_name="CreateSessionRequest.slot_key"
             )
             if self.scope is None or self.slot_key is None:
-                raise ValueError(
-                    "CreateSessionRequest scope and slot_key are required"
-                )
+                raise ValueError("CreateSessionRequest scope and slot_key are required")
         else:
             _require_optional_non_empty(
                 self.scope, field_name="CreateSessionRequest.scope"
@@ -1783,9 +1741,7 @@ class CloseSessionRequest:
             self.client_request_id,
             field_name="CloseSessionRequest.client_request_id",
         )
-        _require_non_empty(
-            self.reason, field_name="CloseSessionRequest.reason"
-        )
+        _require_non_empty(self.reason, field_name="CloseSessionRequest.reason")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1814,9 +1770,7 @@ class PurgeSessionRequest:
             self.client_request_id,
             field_name="PurgeSessionRequest.client_request_id",
         )
-        _require_non_empty(
-            self.reason, field_name="PurgeSessionRequest.reason"
-        )
+        _require_non_empty(self.reason, field_name="PurgeSessionRequest.reason")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1847,9 +1801,7 @@ class StartRunRequest:
         :raises ValueError: id 或必填字符串为空时抛出。
         """
 
-        _require_non_empty(
-            self.session_id, field_name="StartRunRequest.session_id"
-        )
+        _require_non_empty(self.session_id, field_name="StartRunRequest.session_id")
         _require_non_empty(
             self.client_request_id,
             field_name="StartRunRequest.client_request_id",
@@ -1858,9 +1810,7 @@ class StartRunRequest:
             self.execution_target,
             field_name="StartRunRequest.execution_target",
         )
-        _require_non_empty(
-            self.queue_policy, field_name="StartRunRequest.queue_policy"
-        )
+        _require_non_empty(self.queue_policy, field_name="StartRunRequest.queue_policy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1923,12 +1873,8 @@ class CancelSessionRunsRequest:
             self.client_request_id,
             field_name="CancelSessionRunsRequest.client_request_id",
         )
-        _require_non_empty(
-            self.reason, field_name="CancelSessionRunsRequest.reason"
-        )
-        _require_graceful_cancel(
-            self.mode, field_name="CancelSessionRunsRequest.mode"
-        )
+        _require_non_empty(self.reason, field_name="CancelSessionRunsRequest.reason")
+        _require_graceful_cancel(self.mode, field_name="CancelSessionRunsRequest.mode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2007,17 +1953,11 @@ class SubmitFollowupRequest:
             self.target_run_id,
             field_name="SubmitFollowupRequest.target_run_id",
         )
-        if (
-            self.behavior == FollowupBehavior.STEER
-            and self.target_run_id is None
-        ):
+        if self.behavior == FollowupBehavior.STEER and self.target_run_id is None:
             raise ValueError(
                 "SubmitFollowupRequest.target_run_id is required for steer"
             )
-        if (
-            self.behavior == FollowupBehavior.QUEUE
-            and self.target_run_id is not None
-        ):
+        if self.behavior == FollowupBehavior.QUEUE and self.target_run_id is not None:
             raise ValueError(
                 "SubmitFollowupRequest.target_run_id must be None for queue"
             )
@@ -2041,9 +1981,7 @@ def _validate_submit_followup_tool_names(
     for tool_name in tool_names:
         if not isinstance(tool_name, str):
             raise TypeError("SubmitFollowupRequest.tool_names entries must be str")
-        _require_non_empty(
-            tool_name, field_name="SubmitFollowupRequest.tool_names"
-        )
+        _require_non_empty(tool_name, field_name="SubmitFollowupRequest.tool_names")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2251,16 +2189,12 @@ class SessionSnapshot:
         :raises ValueError: Session id、active run id 或 queued run id 为空时抛出。
         """
 
-        _require_non_empty(
-            self.session_id, field_name="SessionSnapshot.session_id"
-        )
+        _require_non_empty(self.session_id, field_name="SessionSnapshot.session_id")
         _require_optional_non_empty(
             self.active_run_id, field_name="SessionSnapshot.active_run_id"
         )
         for run_id in self.queued_run_ids:
-            _require_non_empty(
-                run_id, field_name="SessionSnapshot.queued_run_ids"
-            )
+            _require_non_empty(run_id, field_name="SessionSnapshot.queued_run_ids")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2310,13 +2244,9 @@ class SessionListItem:
         if not isinstance(self.queued_run_ids, tuple):
             raise TypeError("SessionListItem.queued_run_ids must be tuple")
         for run_id in self.queued_run_ids:
-            _require_non_empty(
-                run_id, field_name="SessionListItem.queued_run_ids"
-            )
+            _require_non_empty(run_id, field_name="SessionListItem.queued_run_ids")
         if not isinstance(self.timeline_cursor, HostStreamCursor):
-            raise TypeError(
-                "SessionListItem.timeline_cursor must be HostStreamCursor"
-            )
+            raise TypeError("SessionListItem.timeline_cursor must be HostStreamCursor")
         _require_utc_datetime(self.created_at, field_name="SessionListItem.created_at")
         if self.closed_at is not None:
             _require_utc_datetime(
@@ -2386,9 +2316,7 @@ class RunSnapshot:
         """
 
         _require_non_empty(self.run_id, field_name="RunSnapshot.run_id")
-        _require_non_empty(
-            self.session_id, field_name="RunSnapshot.session_id"
-        )
+        _require_non_empty(self.session_id, field_name="RunSnapshot.session_id")
         _require_optional_non_empty(
             self.current_attempt_id,
             field_name="RunSnapshot.current_attempt_id",
@@ -2397,13 +2325,9 @@ class RunSnapshot:
             self.source_run_id, field_name="RunSnapshot.source_run_id"
         )
         if self.source_run_id is None and self.source_run_relation is not None:
-            raise ValueError(
-                "RunSnapshot.source_run_relation requires source_run_id"
-            )
+            raise ValueError("RunSnapshot.source_run_relation requires source_run_id")
         if self.source_run_id is not None and self.source_run_relation is None:
-            raise ValueError(
-                "RunSnapshot.source_run_id requires source_run_relation"
-            )
+            raise ValueError("RunSnapshot.source_run_id requires source_run_relation")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2498,9 +2422,7 @@ class PurgeSessionResult:
         :raises ValueError: Session id 为空，或可选引用存在但为空时抛出。
         """
 
-        _require_non_empty(
-            self.session_id, field_name="PurgeSessionResult.session_id"
-        )
+        _require_non_empty(self.session_id, field_name="PurgeSessionResult.session_id")
         _require_optional_non_empty(
             self.purge_tombstone_ref,
             field_name="PurgeSessionResult.purge_tombstone_ref",
@@ -2550,15 +2472,9 @@ class HostEventView:
         _require_non_empty(self.event_id, field_name="HostEventView.event_id")
         if not isinstance(self.event_class, HostEventClass):
             raise ValueError("HostEventView.event_class must be HostEventClass")
-        _require_non_empty(
-            self.event_type, field_name="HostEventView.event_type"
-        )
-        _require_non_empty(
-            self.session_id, field_name="HostEventView.session_id"
-        )
-        _require_optional_non_empty(
-            self.run_id, field_name="HostEventView.run_id"
-        )
+        _require_non_empty(self.event_type, field_name="HostEventView.event_type")
+        _require_non_empty(self.session_id, field_name="HostEventView.session_id")
+        _require_optional_non_empty(self.run_id, field_name="HostEventView.run_id")
         _require_optional_non_empty(
             self.payload_ref, field_name="HostEventView.payload_ref"
         )
@@ -2598,6 +2514,131 @@ class HostEventKind(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     LOST = "lost"
+
+
+class HostActivityKind(StrEnum):
+    """Host public activity 展示语义分类。
+
+    成员只表达 UI / Service 可展示的安全 activity 类型，不等同于
+    EventLog ``event_class`` 或 ``event_type``。
+    """
+
+    RUN_LIFECYCLE = "run_lifecycle"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    TOOL_BATCH = "tool_batch"
+    TOOL_AWAITING = "tool_awaiting"
+    CONTEXT_COMPACTION = "context_compaction"
+    PROVIDER_DIAGNOSTIC = "provider_diagnostic"
+
+
+class HostActivityStatus(StrEnum):
+    """Host public activity 展示状态。
+
+    成员描述单条 activity 对调用方的展示进度，不替代 Run / Attempt 状态机。
+    """
+
+    STARTED = "started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    WAITING = "waiting"
+    INFO = "info"
+
+
+class HostActivitySeverity(StrEnum):
+    """Host public activity 展示严重级别。
+
+    成员只用于 UI / Service 选择展示强度，不表达 durable failure truth。
+    """
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class HostActivityCounts:
+    """Host public activity 的固定计数字段。
+
+    :param total: 总数量，必须是非负整数。
+    :param completed: 已完成数量，必须是非负整数。
+    :param failed: 失败数量，必须是非负整数。
+    :param cancelled: 已取消数量，必须是非负整数。
+    """
+
+    total: int
+    completed: int
+    failed: int
+    cancelled: int
+
+    def __post_init__(self) -> None:
+        """校验计数字段。
+
+        :returns: ``None``。
+        :raises TypeError: 任一字段不是严格整数时抛出。
+        :raises ValueError: 任一字段小于零时抛出。
+        """
+
+        _require_non_negative_int(self.total, field_name="HostActivityCounts.total")
+        _require_non_negative_int(
+            self.completed, field_name="HostActivityCounts.completed"
+        )
+        _require_non_negative_int(self.failed, field_name="HostActivityCounts.failed")
+        _require_non_negative_int(
+            self.cancelled, field_name="HostActivityCounts.cancelled"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HostActivityView:
+    """Host public event 的安全 activity 展示视图。
+
+    :param kind: activity 展示语义分类。
+    :param status: activity 展示状态。
+    :param title: 简短标题，必须非空。
+    :param summary: 有界补充摘要；无摘要时为 ``None``。
+    :param severity: 展示严重级别。
+    :param tool_name: 稳定工具名；非工具 activity 为 ``None``。
+    :param tool_display_name: Host-owned 工具展示名；缺失时为 ``None``。
+    :param counts: 固定计数视图；无计数时为 ``None``。
+    """
+
+    kind: HostActivityKind
+    status: HostActivityStatus
+    title: str
+    summary: str | None
+    severity: HostActivitySeverity
+    tool_name: str | None
+    tool_display_name: str | None
+    counts: HostActivityCounts | None
+
+    def __post_init__(self) -> None:
+        """校验 activity 展示视图字段。
+
+        :returns: ``None``。
+        :raises TypeError: enum 或 counts 字段类型非法时抛出。
+        :raises ValueError: 文本字段为空时抛出。
+        """
+
+        if not isinstance(self.kind, HostActivityKind):
+            raise TypeError("HostActivityView.kind must be HostActivityKind")
+        if not isinstance(self.status, HostActivityStatus):
+            raise TypeError("HostActivityView.status must be HostActivityStatus")
+        _require_non_empty(self.title, field_name="HostActivityView.title")
+        _require_optional_non_empty(self.summary, field_name="HostActivityView.summary")
+        if not isinstance(self.severity, HostActivitySeverity):
+            raise TypeError("HostActivityView.severity must be HostActivitySeverity")
+        _require_optional_non_empty(
+            self.tool_name, field_name="HostActivityView.tool_name"
+        )
+        _require_optional_non_empty(
+            self.tool_display_name,
+            field_name="HostActivityView.tool_display_name",
+        )
+        if self.counts is not None and not isinstance(self.counts, HostActivityCounts):
+            raise TypeError("HostActivityView.counts must be HostActivityCounts")
 
 
 class HostTerminalStatus(StrEnum):
@@ -2672,20 +2713,14 @@ class HostFinalAnswerView:
 
         if not isinstance(self.content, str):
             raise TypeError("HostFinalAnswerView.content must be str")
-        _require_bool(
-            self.filtered, field_name="HostFinalAnswerView.filtered"
-        )
-        _require_bool(
-            self.degraded, field_name="HostFinalAnswerView.degraded"
-        )
+        _require_bool(self.filtered, field_name="HostFinalAnswerView.filtered")
+        _require_bool(self.degraded, field_name="HostFinalAnswerView.degraded")
         _require_optional_non_empty(
             self.finish_reason,
             field_name="HostFinalAnswerView.finish_reason",
         )
         if self.terminal_status != HostTerminalStatus.SUCCEEDED:
-            raise ValueError(
-                "HostFinalAnswerView.terminal_status must be succeeded"
-            )
+            raise ValueError("HostFinalAnswerView.terminal_status must be succeeded")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2773,17 +2808,13 @@ class OutboxTerminalItem:
             self.event_sequence,
             field_name="OutboxTerminalItem.event_sequence",
         )
-        _require_non_empty(
-            self.session_id, field_name="OutboxTerminalItem.session_id"
-        )
+        _require_non_empty(self.session_id, field_name="OutboxTerminalItem.session_id")
         _require_non_empty(self.run_id, field_name="OutboxTerminalItem.run_id")
         if not isinstance(self.terminal_status, HostTerminalStatus):
             raise TypeError(
                 "OutboxTerminalItem.terminal_status must be HostTerminalStatus"
             )
-        _require_non_empty(
-            self.dedupe_key, field_name="OutboxTerminalItem.dedupe_key"
-        )
+        _require_non_empty(self.dedupe_key, field_name="OutboxTerminalItem.dedupe_key")
         if self.dedupe_key != self.terminal_event_id:
             raise ValueError(
                 "OutboxTerminalItem.dedupe_key must equal terminal_event_id"
@@ -2977,7 +3008,10 @@ class HostEvent:
     :param event_sequence: Host durable store 分配的全局单调事件序列。
     :param session_id: 关联 Session id。
     :param run_id: 关联 Run id；事件不绑定 Run 时为 ``None``。
+    :param event_class: EventLog row 的 public 事件分类。
+    :param event_type: EventLog row 的 public 事件类型标签。
     :param kind: Service-facing event 类型。
+    :param activity: 安全 activity 展示视图；无可展示 activity 时为 ``None``。
     :param dedupe_key: 调用方去重使用的稳定键。
     :param terminal_status: terminal event 状态；非终态事件为 ``None``。
     :param final_answer: 成功终态事件内联的最终回答视图；非成功终态为
@@ -2991,7 +3025,10 @@ class HostEvent:
     event_sequence: int
     session_id: str
     run_id: str | None
+    event_class: HostEventClass
+    event_type: str
     kind: HostEventKind
+    activity: HostActivityView | None
     dedupe_key: str
     terminal_status: HostTerminalStatus | None
     final_answer: HostFinalAnswerView | None
@@ -3012,8 +3049,15 @@ class HostEvent:
         )
         _require_non_empty(self.session_id, field_name="HostEvent.session_id")
         _require_optional_non_empty(self.run_id, field_name="HostEvent.run_id")
+        if not isinstance(self.event_class, HostEventClass):
+            raise TypeError("HostEvent.event_class must be HostEventClass")
+        _require_non_empty(self.event_type, field_name="HostEvent.event_type")
         if not isinstance(self.kind, HostEventKind):
             raise ValueError("HostEvent.kind must be HostEventKind")
+        if self.activity is not None and not isinstance(
+            self.activity, HostActivityView
+        ):
+            raise TypeError("HostEvent.activity must be HostActivityView")
         _require_non_empty(self.dedupe_key, field_name="HostEvent.dedupe_key")
         _require_optional_non_empty(
             self.error_message, field_name="HostEvent.error_message"
@@ -3116,8 +3160,7 @@ def _validate_outbox_read_page_fields(
     _require_positive_int(limit, field_name=f"{request_name}.limit")
     if limit > HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT:
         raise ValueError(
-            f"{request_name}.limit must be <= "
-            f"{HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT}"
+            f"{request_name}.limit must be <= " f"{HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT}"
         )
     if len(seen_terminal_event_ids) > HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT:
         raise ValueError(
@@ -3202,9 +3245,7 @@ class Host(Protocol):
     store、scheduler、registry、dispatch row、wakeup port 或 ToolRuntime 内部对象。
     """
 
-    async def ensure_session(
-        self, request: EnsureSessionRequest
-    ) -> SessionSnapshot:
+    async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
 
         :param request: ensure session 请求。
@@ -3215,9 +3256,7 @@ class Host(Protocol):
 
         ...
 
-    async def create_session(
-        self, request: CreateSessionRequest
-    ) -> SessionSnapshot:
+    async def create_session(self, request: CreateSessionRequest) -> SessionSnapshot:
         """显式创建 Session。
 
         :param request: create session 请求。
@@ -3306,9 +3345,7 @@ class Host(Protocol):
 
         ...
 
-    async def retry_run(
-        self, run_id: str, request: RetryRunRequest
-    ) -> RunSnapshot:
+    async def retry_run(self, run_id: str, request: RetryRunRequest) -> RunSnapshot:
         """重试源 Run。
 
         :param run_id: 源 Run id。
@@ -3320,9 +3357,7 @@ class Host(Protocol):
 
         ...
 
-    async def replay_run(
-        self, run_id: str, request: ReplayRunRequest
-    ) -> RunSnapshot:
+    async def replay_run(self, run_id: str, request: ReplayRunRequest) -> RunSnapshot:
         """基于源 Run 创建结构化 replay Run。
 
         :param run_id: 源 Run id。
@@ -3348,9 +3383,7 @@ class Host(Protocol):
 
         ...
 
-    async def cancel_run(
-        self, run_id: str, request: CancelRunRequest
-    ) -> RunSnapshot:
+    async def cancel_run(self, run_id: str, request: CancelRunRequest) -> RunSnapshot:
         """取消单个 Run。
 
         :param run_id: 目标 Run id。
@@ -3485,6 +3518,11 @@ __all__ = [
     "HostCallContext",
     "Host",
     "HostClosedError",
+    "HostActivityCounts",
+    "HostActivityKind",
+    "HostActivitySeverity",
+    "HostActivityStatus",
+    "HostActivityView",
     "HostEvent",
     "HostEventClass",
     "HostEventKind",

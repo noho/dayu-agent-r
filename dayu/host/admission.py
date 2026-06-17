@@ -19,7 +19,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_declaration import ToolBundle
+from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_schema import ToolSchema
 from dayu.host.api import (
     AttemptStatus,
@@ -889,13 +889,17 @@ def create_host_admission_service(
 
     return HostAdmissionService(
         transaction_runner=transaction_runner,
-        event_log_store=event_log_store if event_log_store is not None else EventLogStore(),
+        event_log_store=(
+            event_log_store if event_log_store is not None else EventLogStore()
+        ),
         idempotency_store=(
             idempotency_store if idempotency_store is not None else IdempotencyStore()
         ),
         clock=clock if clock is not None else UtcAdmissionClock(),
         id_factory=id_factory if id_factory is not None else UuidAdmissionIdFactory(),
-        wakeup_port=wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort(),
+        wakeup_port=(
+            wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort()
+        ),
         projection_catchup_port=(
             projection_catchup_port
             if projection_catchup_port is not None
@@ -926,9 +930,11 @@ def _log_run_admission_result(operation: str, result: RunAdmissionResult) -> Non
         result.run.run_id,
         result.run.status.value,
         None if result.attempt is None else result.attempt.attempt_id,
-        None
-        if result.dispatch_record is None
-        else result.dispatch_record.dispatch_record_id,
+        (
+            None
+            if result.dispatch_record is None
+            else result.dispatch_record.dispatch_record_id
+        ),
         result.created,
         result.queued,
         result.idempotent_replay,
@@ -1172,9 +1178,7 @@ class _SubmitFollowupSteerOperation:
             _raise_if_digest_conflict(existing, semantic_digest)
             return _idempotent_steer_result(transaction, existing)
         target_run = _require_steer_target_run(transaction, self.request)
-        current_attempt = _require_current_attempt_for_steer(
-            transaction, target_run
-        )
+        current_attempt = _require_current_attempt_for_steer(transaction, target_run)
         now = self.clock.now()
         effective_facts = _resolve_followup_effective_facts(
             self.request,
@@ -1478,9 +1482,7 @@ class _PromoteNextQueuedRunOperation:
                 message="Promotion result is incomplete",
                 retryable=False,
             )
-        pending_dispatch = _pending_dispatch_from_row(
-            transition_result.dispatch_record
-        )
+        pending_dispatch = _pending_dispatch_from_row(transition_result.dispatch_record)
         return PromotionResult(
             promoted_run=transition_result.promoted_run,
             attempt=transition_result.attempt,
@@ -1823,9 +1825,11 @@ class _CancelRunOperation:
             IdempotencyResultRef(
                 result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
                 result_ref=run.run_id,
-                created_event_id=cancel_request_event_id
-                if cancel_request_sequence is not None
-                else None,
+                created_event_id=(
+                    cancel_request_event_id
+                    if cancel_request_sequence is not None
+                    else None
+                ),
                 created_event_sequence=cancel_request_sequence,
             ),
         )
@@ -2103,9 +2107,7 @@ class _CancelSessionRunsOperation:
             return self._cancel_active_target(transaction, target.run)
         return self._cancel_predispatch_target(transaction, target.run)
 
-    def _cancel_queued_target(
-        self, transaction: HostTransaction, run: RunRow
-    ) -> str:
+    def _cancel_queued_target(self, transaction: HostTransaction, run: RunRow) -> str:
         """取消一个 queued Run。
 
         :param transaction: 当前 Host transaction。
@@ -2170,9 +2172,7 @@ class _CancelSessionRunsOperation:
         _raise_for_session_cancel_transition_status(result)
         return cancel_request_event_id
 
-    def _cancel_active_target(
-        self, transaction: HostTransaction, run: RunRow
-    ) -> str:
+    def _cancel_active_target(self, transaction: HostTransaction, run: RunRow) -> str:
         """请求取消一个 active worker Run。
 
         :param transaction: 当前 Host transaction。
@@ -2203,9 +2203,7 @@ class _CancelSessionRunsOperation:
         _raise_for_session_cancel_transition_status(result)
         return cancel_request_event_id
 
-    def _cancel_waiting_target(
-        self, transaction: HostTransaction, run: RunRow
-    ) -> str:
+    def _cancel_waiting_target(self, transaction: HostTransaction, run: RunRow) -> str:
         """取消一个 WAITING Run。
 
         :param transaction: 当前 Host transaction。
@@ -2288,7 +2286,9 @@ class _CloseoutAttemptTerminalOperation:
     clock: AdmissionClock
     id_factory: AdmissionIdFactory
 
-    def __call__(self, transaction: HostTransaction) -> _TerminalCloseoutTransactionResult:
+    def __call__(
+        self, transaction: HostTransaction
+    ) -> _TerminalCloseoutTransactionResult:
         """执行 terminal closeout transaction。
 
         :param transaction: 当前 Host transaction。
@@ -3034,9 +3034,7 @@ def _append_user_input_event(
         event_id=event_id,
     )
     event_payload = (
-        payload
-        if descriptor is None
-        else _referenced_user_input_event_payload(request)
+        payload if descriptor is None else _referenced_user_input_event_payload(request)
     )
     return event_log_store.append_event(
         transaction,
@@ -3536,9 +3534,7 @@ def _effective_tool_set_json(
         if tooling_options is None
         else tooling_options.business_tool_bundle.definitions
     )
-    known_names = frozenset(
-        definition.name for definition in business_definitions
-    )
+    known_names = frozenset(definition.name for definition in business_definitions)
     if requested_tool_names is None:
         effective_names = known_names
         selector = _TOOL_SELECTION_ALL
@@ -3555,9 +3551,7 @@ def _effective_tool_set_json(
             )
         effective_names = requested_tool_names
         selector = (
-            _TOOL_SELECTION_NONE
-            if not requested_tool_names
-            else _TOOL_SELECTION_SUBSET
+            _TOOL_SELECTION_NONE if not requested_tool_names else _TOOL_SELECTION_SUBSET
         )
     selected_schemas = tuple(
         definition.to_tool_schema()
@@ -3587,9 +3581,31 @@ def _effective_tool_set_json(
         "effective_business_tool_names": _sorted_text_json_array(effective_names),
         "business_bundle_digest": _tool_definitions_digest(business_definitions),
         "effective_schema_digest": schema_digest,
+        "effective_tool_display_names": _effective_tool_display_names_json(
+            business_definitions, effective_names
+        ),
         "source_refs": source_refs_json,
     }
     return tool_set
+
+
+def _effective_tool_display_names_json(
+    definitions: tuple[ToolDefinition, ...], effective_names: frozenset[str]
+) -> JsonValue:
+    """构造 selected tools 的 Host-owned display name snapshot。
+
+    :param definitions: construction-time business tool definitions。
+    :param effective_names: 本次 Run 选中的稳定工具名集合。
+    :returns: 工具名到展示名的 JSON mapping；缺少 display metadata 的工具不写入。
+    :raises: 无主动抛出。
+    """
+
+    display_names: dict[str, JsonValue] = {}
+    for definition in definitions:
+        if definition.name not in effective_names or definition.display is None:
+            continue
+        display_names[definition.name] = definition.display.name
+    return display_names
 
 
 def _no_tool_effective_tool_set_json() -> JsonValue:
@@ -3601,13 +3617,13 @@ def _no_tool_effective_tool_set_json() -> JsonValue:
     empty_schemas: tuple[ToolSchema, ...] = ()
     empty_schema_digest = _tool_schemas_digest(empty_schemas)
     return {
-        "tool_snapshot_ref": _TOOL_SNAPSHOT_REF_PREFIX
-        + empty_schema_digest,
+        "tool_snapshot_ref": _TOOL_SNAPSHOT_REF_PREFIX + empty_schema_digest,
         "selector": _TOOL_SELECTION_NONE,
         "requested_business_tool_names": [],
         "effective_business_tool_names": [],
         "business_bundle_digest": _tool_definitions_digest(()),
         "effective_schema_digest": empty_schema_digest,
+        "effective_tool_display_names": {},
         "source_refs": [],
     }
 
@@ -3708,9 +3724,7 @@ def _sorted_text_json_array(values: frozenset[str]) -> list[JsonValue]:
     return [value for value in sorted(values)]
 
 
-def _require_open_session(
-    transaction: HostTransaction, session_id: str
-) -> None:
+def _require_open_session(transaction: HostTransaction, session_id: str) -> None:
     """读取并校验 Session 为 open。
 
     :param transaction: 当前 Host transaction。
@@ -3893,9 +3907,7 @@ def _source_input_payload(
             message="Source Run input event is missing",
             retryable=False,
         )
-    return event_payload_object(
-        transaction, event, payload_label="USER_INPUT_ACCEPTED"
-    )
+    return event_payload_object(transaction, event, payload_label="USER_INPUT_ACCEPTED")
 
 
 def _require_existing_session(
@@ -3937,9 +3949,7 @@ def _idempotency_scope(
     )
 
 
-def _raise_if_digest_conflict(
-    record: IdempotencyRecord, semantic_digest: str
-) -> None:
+def _raise_if_digest_conflict(record: IdempotencyRecord, semantic_digest: str) -> None:
     """校验既有幂等记录 digest 是否一致。
 
     :param record: 既有幂等记录。
@@ -4702,9 +4712,7 @@ def _followup_queue_semantic_digest(
                 else _sorted_text_json_array(request.tool_names)
             ),
             "runner_spec": _optional_runner_spec_json(request.runner_spec),
-            "runner_options": _optional_runner_options_json(
-                request.runner_options
-            ),
+            "runner_options": _optional_runner_options_json(request.runner_options),
             "agent_policy": _optional_agent_policy_json(request.agent_policy),
             "behavior": FollowupBehavior.QUEUE.value,
             "caller_semantic_digest": caller_semantic_digest,
@@ -4738,9 +4746,7 @@ def _followup_steer_semantic_digest(
                 else _sorted_text_json_array(request.tool_names)
             ),
             "runner_spec": _optional_runner_spec_json(request.runner_spec),
-            "runner_options": _optional_runner_options_json(
-                request.runner_options
-            ),
+            "runner_options": _optional_runner_options_json(request.runner_options),
             "agent_policy": _optional_agent_policy_json(request.agent_policy),
             "behavior": FollowupBehavior.STEER.value,
             "target_run_id": request.target_run_id,
@@ -4926,14 +4932,12 @@ def _call_context_json_value(context: HostCallContext) -> JsonValue:
         "authorization_claims": _authorization_claims_json_value(
             context.authorization_claims
         ),
-        "operation_context": _operation_context_json_value(
-            context.operation_context
-        ),
+        "operation_context": _operation_context_json_value(context.operation_context),
     }
 
 
 def _authorization_claims_json_value(
-    claims: tuple[AuthorizationClaim, ...]
+    claims: tuple[AuthorizationClaim, ...],
 ) -> JsonValue:
     """把授权声明转为 JSON 值。
 

@@ -31,6 +31,7 @@ from dayu.host.api import (
     FollowupSnapshot,
     Host,
     HostEvent,
+    HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
     HostStreamCursor,
@@ -1047,7 +1048,10 @@ def _terminal_event(*, status: HostTerminalStatus) -> HostEvent:
         event_sequence=2,
         session_id="session-1",
         run_id="run-1",
+        event_class=HostEventClass.CANONICAL_FACT,
+        event_type=_event_type(status),
         kind=_event_kind(status),
+        activity=None,
         dedupe_key="terminal-run-1-2",
         terminal_status=status,
         final_answer=final_answer,
@@ -1116,4 +1120,23 @@ def _event_kind(status: HostTerminalStatus) -> HostEventKind:
         return HostEventKind.CANCELLED
     if status is HostTerminalStatus.LOST:
         return HostEventKind.LOST
+    raise AssertionError(f"unexpected terminal status: {status}")
+
+
+def _event_type(status: HostTerminalStatus) -> str:
+    """把 terminal status 映射为 EventLog event_type。
+
+    :param status: terminal status。
+    :returns: EventLog event_type。
+    :raises AssertionError: 未覆盖状态时抛出。
+    """
+
+    if status is HostTerminalStatus.SUCCEEDED:
+        return "RUN_SUCCEEDED"
+    if status is HostTerminalStatus.FAILED:
+        return "RUN_FAILED"
+    if status is HostTerminalStatus.CANCELLED:
+        return "RUN_CANCELLED"
+    if status is HostTerminalStatus.LOST:
+        return "RUN_LOST"
     raise AssertionError(f"unexpected terminal status: {status}")
