@@ -14,9 +14,9 @@ import pytest
 
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
-from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
 from dayu.cli.arg_parsing import parse_cli_args
@@ -997,12 +997,12 @@ def test_interactive_two_turns_use_same_session_and_independent_watchers(
     assert first_submit.context.request_id != second_submit.context.request_id
 
 
-def test_interactive_tty_activity_finishes_before_next_prompt(
+def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """interactive 每轮 activity 应写 stderr，final answer 顺序保持 stdout 清晰。"""
+    """interactive activity 应进入 run view buffer，final answer 保持 stdout 清晰。"""
 
     fake_host = _FakeHost(
         submit_statuses=(
@@ -1010,6 +1010,9 @@ def test_interactive_tty_activity_finishes_before_next_prompt(
             HostTerminalStatus.SUCCEEDED,
         ),
         submit_activities=(True, True),
+    )
+    run_view = TerminalInteractiveRunView(
+        options=InteractiveRunViewOptions(enabled=True),
     )
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
     monkeypatch.setattr(
@@ -1024,8 +1027,8 @@ def test_interactive_tty_activity_finishes_before_next_prompt(
     )
     monkeypatch.setattr(
         interactive_command,
-        "new_cli_activity_renderer",
-        lambda: CliActivityRenderer(options=CliActivityRendererOptions(visible=True, enabled=True)),
+        "new_interactive_run_view",
+        lambda: run_view,
     )
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
@@ -1033,8 +1036,10 @@ def test_interactive_tty_activity_finishes_before_next_prompt(
 
     assert exit_code == EXIT_SUCCESS
     assert captured.out.splitlines() == ["answer for run-1", "answer for run-2"]
-    assert captured.err.count("Activity:") == 2
-    assert "工具批次完成" in captured.err
+    assert "Activity:" not in captured.err
+    assert len(run_view.activity_lines) == 2
+    assert all("工具批次完成" in line for line in run_view.activity_lines)
+    assert run_view.transcript_lines == ("answer for run-1", "answer for run-2")
 
 
 def test_interactive_skips_blank_input_before_submit(
@@ -1187,9 +1192,9 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         run_statuses=(RunStatus.RUNNING,),
     )
     stderr = io.StringIO()
-    renderer = CliActivityRenderer(
+    run_view = TerminalInteractiveRunView(
         stderr=stderr,
-        options=CliActivityRendererOptions(visible=True, enabled=True),
+        options=InteractiveRunViewOptions(enabled=True),
     )
     key_monitor = _FakeRunningKeyMonitor(
         (RunningKeyAction.CANCEL_RUN,),
@@ -1205,7 +1210,7 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         user_prompt="请总结收入变化",
         run_overrides=interactive_command.ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
-        activity_renderer=renderer,
+        run_view=run_view,
         key_monitor=key_monitor,
     )
 
@@ -1213,7 +1218,54 @@ async def test_interactive_esc_requests_cancel_after_run_id(
     assert result.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-    assert "Activity: cancel requested" in stderr.getvalue()
+    assert "Interactive: cancel requested" in stderr.getvalue()
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_interactive_ctrl_t_switches_run_view_without_cancel(
+    tmp_path: Path,
+) -> None:
+    """interactive 运行态 Ctrl+T 应切换 run view，且不得触发 Host cancel。"""
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    invocation = interactive_command.new_cli_invocation(
+        command_name="interactive",
+        scenario="interactive",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost(
+        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+        submit_activities=(True,),
+    )
+    stderr = io.StringIO()
+    run_view = TerminalInteractiveRunView(
+        stderr=stderr,
+        options=InteractiveRunViewOptions(enabled=True),
+    )
+    key_monitor = _FakeRunningKeyMonitor((RunningKeyAction.TOGGLE_ACTIVITY,))
+
+    result = await interactive_command._submit_interactive_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        turn_index=1,
+        user_prompt="请总结收入变化",
+        run_overrides=interactive_command.ServiceRunOverrides(),
+        sigint_monitor=_NoopSigintMonitor(),
+        run_view=run_view,
+        key_monitor=key_monitor,
+    )
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.SUCCEEDED
+    assert fake_host.cancel_requests == []
+    assert run_view.activity_lines
+    assert "[Interactive activity]" in stderr.getvalue()
+    assert "Activity hidden" not in stderr.getvalue()
     assert key_monitor.started_count == 1
     assert key_monitor.closed_count == 1
 

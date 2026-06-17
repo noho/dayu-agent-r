@@ -174,6 +174,17 @@ def new_cli_activity_renderer(*, stderr: TextIO | None = None) -> CliActivityRen
     return CliActivityRenderer(stderr=stderr)
 
 
+def format_cli_activity_line(activity: EntrypointActivity) -> str:
+    """构造默认 CLI activity 展示行。
+
+    :param activity: Service activity DTO。
+    :returns: 有界单行 activity 展示文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _activity_line(_ACTIVITY_PREFIX, activity)
+
+
 def _activity_line(prefix: str, activity: EntrypointActivity) -> str:
     """构造单行 activity 展示文本。
 
@@ -229,5 +240,6 @@ def _bounded_text(value: str) -> str:
 __all__: tuple[str, ...] = (
     "CliActivityRenderer",
     "CliActivityRendererOptions",
+    "format_cli_activity_line",
     "new_cli_activity_renderer",
 )
