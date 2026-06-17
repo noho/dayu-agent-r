@@ -24,7 +24,13 @@ from dayu.cli.agent_entrypoint import (
     service_run_overrides_from_args,
     unsupported_execution_option_names,
 )
+from dayu.cli.activity import CliActivityRenderer, new_cli_activity_renderer
 from dayu.cli.arg_parsing import COMMAND_INTERACTIVE, ParsedCliArgs
+from dayu.cli.composer import (
+    InputReaderComposer,
+    InteractiveComposer,
+    new_interactive_composer,
+)
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -44,6 +50,12 @@ from dayu.cli.host_context import (
     new_cli_invocation,
 )
 from dayu.cli.output import render_cli_error, render_interactive_terminal_result
+from dayu.cli.run_keys import (
+    NoopRunningKeyMonitor,
+    RunningKeyAction,
+    RunningKeyMonitor,
+    new_running_key_monitor,
+)
 from dayu.contracts import JsonValue
 from dayu.host.api import CancelMode, FollowupBehavior, Host
 from dayu.host.open_host import open_host
@@ -154,9 +166,7 @@ class _LocalExitRequested:
     """等待 run id 期间用户第二次 SIGINT 请求本地退出。"""
 
 
-_RunIdWaitOutcome = (
-    _RunIdAccepted | _SubmitCompletedWhileWaitingForRunId | _LocalExitRequested
-)
+_RunIdWaitOutcome = _RunIdAccepted | _SubmitCompletedWhileWaitingForRunId | _LocalExitRequested
 
 
 def run_interactive_command(args: ParsedCliArgs) -> int:
@@ -171,7 +181,6 @@ def run_interactive_command(args: ParsedCliArgs) -> int:
         return asyncio.run(
             _run_interactive_command_async(
                 args,
-                input_reader=_read_user_input,
             )
         )
     except CliInteractiveUsageError as exc:
@@ -190,12 +199,14 @@ def run_interactive_command(args: ParsedCliArgs) -> int:
 async def _run_interactive_command_async(
     args: ParsedCliArgs,
     *,
-    input_reader: Callable[[str], str],
+    input_reader: Callable[[str], str] | None = None,
+    composer: InteractiveComposer | None = None,
 ) -> int:
     """异步执行 interactive command 主流程。
 
     :param args: argparse 已解析的 interactive 命令参数。
-    :param input_reader: 输入态读取一行用户文本的函数。
+    :param input_reader: 非 TTY 或测试路径使用的输入函数；``None`` 表示默认输入函数。
+    :param composer: 可注入 composer；``None`` 表示按 TTY policy 创建。
     :returns: CLI 退出码。
     :raises CliInteractiveUsageError: 用户输入参数非法时抛出。
     :raises Exception: runtime assembly 或 Host public API 失败时向上抛出。
@@ -217,6 +228,7 @@ async def _run_interactive_command_async(
             prepared=prepared,
             session_id=session_id,
             input_reader=input_reader,
+            composer=composer,
             sigint_monitor_factory=CliSigintMonitor,
         )
 
@@ -291,7 +303,9 @@ async def _execute_interactive_on_existing_session(
     prepared: _PreparedInteractiveExistingSessionExecution,
     session_id: str,
     input_reader: Callable[[str], str] | None = None,
+    composer: InteractiveComposer | None = None,
     sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
+    key_monitor_factory: Callable[[], RunningKeyMonitor] | None = None,
 ) -> int:
     """在已解析的已有 Session 上运行 interactive REPL。
 
@@ -299,23 +313,26 @@ async def _execute_interactive_on_existing_session(
     :param prepared: interactive existing-session 执行准备结果。
     :param session_id: 已存在且调用方已选择的 Host Session id。
     :param input_reader: 输入态读取一行用户文本的函数；``None`` 表示使用标准输入。
+    :param composer: 输入态 composer；``None`` 表示按 TTY policy 创建。
     :param sigint_monitor_factory: 单轮 SIGINT monitor 工厂；``None`` 表示创建默认 monitor。
+    :param key_monitor_factory: 单轮运行态按键 monitor 工厂；``None`` 表示默认 TTY policy。
     :returns: CLI 退出码。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
     effective_input_reader = _read_user_input if input_reader is None else input_reader
-    effective_sigint_monitor_factory = (
-        CliSigintMonitor if sigint_monitor_factory is None else sigint_monitor_factory
-    )
+    effective_composer = new_interactive_composer(input_reader=effective_input_reader) if composer is None else composer
+    effective_sigint_monitor_factory = CliSigintMonitor if sigint_monitor_factory is None else sigint_monitor_factory
+    effective_key_monitor_factory = new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
     return await _run_interactive_repl(
         host=host,
         runtime=prepared.runtime,
         invocation=prepared.invocation,
         session_id=session_id,
         run_overrides=prepared.run_overrides,
-        input_reader=effective_input_reader,
+        composer=effective_composer,
         sigint_monitor_factory=effective_sigint_monitor_factory,
+        key_monitor_factory=effective_key_monitor_factory,
     )
 
 
@@ -360,9 +377,7 @@ async def _ensure_interactive_session(
             invocation,
             operation=_INTERACTIVE_OPERATION_CREATE_SESSION,
         ),
-        create_client_request_id=interactive_create_session_client_request_id(
-            invocation
-        ),
+        create_client_request_id=interactive_create_session_client_request_id(invocation),
     )
     return session.session_id
 
@@ -374,8 +389,10 @@ async def _run_interactive_repl(
     invocation: CliInvocation,
     session_id: str,
     run_overrides: ServiceRunOverrides,
-    input_reader: Callable[[str], str],
     sigint_monitor_factory: Callable[[], CliSigintMonitor],
+    key_monitor_factory: Callable[[], RunningKeyMonitor] | None = None,
+    composer: InteractiveComposer | None = None,
+    input_reader: Callable[[str], str] | None = None,
 ) -> int:
     """运行 interactive REPL。
 
@@ -384,16 +401,24 @@ async def _run_interactive_repl(
     :param invocation: 当前 CLI invocation 身份。
     :param session_id: 目标 Host Session id。
     :param run_overrides: 本命令所有 turn 复用的运行时 override。
-    :param input_reader: 输入态读取一行用户文本的函数。
     :param sigint_monitor_factory: 单轮 SIGINT monitor 工厂。
+    :param key_monitor_factory: 单轮运行态按键 monitor 工厂；``None`` 表示默认 TTY policy。
+    :param composer: 输入态 composer；``None`` 时使用 input reader adapter。
+    :param input_reader: 旧式输入函数；仅在 ``composer`` 为 ``None`` 时使用。
     :returns: CLI 退出码。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
     turn_index = 1
+    effective_composer = (
+        composer
+        if composer is not None
+        else InputReaderComposer(_read_user_input if input_reader is None else input_reader)
+    )
+    effective_key_monitor_factory = new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
     while True:
         try:
-            user_prompt = input_reader(INTERACTIVE_INPUT_PROMPT)
+            user_prompt = effective_composer.read(INTERACTIVE_INPUT_PROMPT)
         except EOFError:
             return EXIT_SUCCESS
         stripped_prompt = user_prompt.strip()
@@ -408,6 +433,8 @@ async def _run_interactive_repl(
             user_prompt=stripped_prompt,
             run_overrides=run_overrides,
             sigint_monitor=sigint_monitor_factory(),
+            activity_renderer=new_cli_activity_renderer(),
+            key_monitor=effective_key_monitor_factory(),
         )
         if terminal is None:
             return EXIT_KEYBOARD_INTERRUPT
@@ -427,6 +454,8 @@ async def _submit_interactive_turn_handling_sigint(
     user_prompt: str,
     run_overrides: ServiceRunOverrides,
     sigint_monitor: CliSigintMonitor,
+    activity_renderer: CliActivityRenderer | None = None,
+    key_monitor: RunningKeyMonitor | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """提交 interactive turn，并在 SIGINT 时按 Host cancel 语义收口。
 
@@ -438,13 +467,18 @@ async def _submit_interactive_turn_handling_sigint(
     :param user_prompt: 本轮用户输入。
     :param run_overrides: 本轮可映射执行 override。
     :param sigint_monitor: 本轮运行阶段 SIGINT monitor。
+    :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
+    :param key_monitor: 运行态 TTY 按键 monitor；``None`` 表示 no-op。
     :returns: Host terminal result；第二次 SIGINT 本地退出时返回 ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
     accepted_run = _AcceptedRunState()
+    renderer = activity_renderer
+    monitor = NoopRunningKeyMonitor() if key_monitor is None else key_monitor
     sigint_monitor.install()
     observed_sigint_count = sigint_monitor.count
+    monitor.start()
     submit_task = asyncio.create_task(
         submit_entrypoint_turn_and_wait(
             host,
@@ -467,29 +501,54 @@ async def _submit_interactive_turn_handling_sigint(
             scene_inputs=runtime.scene_inputs,
             host_assembly=runtime.host_assembly,
             on_run_accepted=accepted_run.record,
+            on_activity=None if renderer is None else renderer.record,
         )
     )
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+    key_task = asyncio.create_task(monitor.wait_next())
     try:
-        done, _pending = await asyncio.wait(
-            (submit_task, sigint_task),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if submit_task in done:
-            return await submit_task
-        first_sigint_count = await sigint_task
-        return await _cancel_interactive_turn_after_first_sigint(
-            host=host,
-            invocation=invocation,
-            turn_index=turn_index,
-            accepted_run=accepted_run,
-            submit_task=submit_task,
-            sigint_monitor=sigint_monitor,
-            observed_sigint_count=first_sigint_count,
-        )
+        while True:
+            done, _pending = await asyncio.wait(
+                (submit_task, sigint_task, key_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if submit_task in done:
+                return await submit_task
+            if key_task in done:
+                action = await key_task
+                if action is RunningKeyAction.TOGGLE_ACTIVITY:
+                    if renderer is not None:
+                        renderer.toggle_visible()
+                    key_task = asyncio.create_task(monitor.wait_next())
+                    continue
+                return await _cancel_interactive_turn_after_first_sigint(
+                    host=host,
+                    invocation=invocation,
+                    turn_index=turn_index,
+                    accepted_run=accepted_run,
+                    submit_task=submit_task,
+                    sigint_monitor=sigint_monitor,
+                    observed_sigint_count=observed_sigint_count,
+                    activity_renderer=renderer,
+                )
+            first_sigint_count = await sigint_task
+            return await _cancel_interactive_turn_after_first_sigint(
+                host=host,
+                invocation=invocation,
+                turn_index=turn_index,
+                accepted_run=accepted_run,
+                submit_task=submit_task,
+                sigint_monitor=sigint_monitor,
+                observed_sigint_count=first_sigint_count,
+                activity_renderer=renderer,
+            )
     finally:
+        if renderer is not None:
+            renderer.close()
+        monitor.close()
         sigint_monitor.close()
         await _cancel_and_await_task(sigint_task)
+        await _cancel_and_await_task(key_task)
 
 
 async def _cancel_and_await_task(task: asyncio.Task[_TaskResult]) -> None:
@@ -516,6 +575,7 @@ async def _cancel_interactive_turn_after_first_sigint(
     submit_task: asyncio.Task[EntrypointRunTerminalResult],
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
+    activity_renderer: CliActivityRenderer | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """第一次 SIGINT 后等待 run id 并发起 Host cancel。
 
@@ -526,6 +586,7 @@ async def _cancel_interactive_turn_after_first_sigint(
     :param submit_task: 正在运行的 submit / terminal wait task。
     :param sigint_monitor: 本轮 SIGINT monitor。
     :param observed_sigint_count: 第一次 SIGINT 后的计数。
+    :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
     :returns: cancel 后的 terminal result；第二次 SIGINT 本地退出时返回
         ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
@@ -549,6 +610,8 @@ async def _cancel_interactive_turn_after_first_sigint(
     submit_task.cancel()
     with suppress(asyncio.CancelledError):
         await submit_task
+    if activity_renderer is not None:
+        activity_renderer.render_cancel_requested()
     return await _cancel_run_waiting_for_terminal_or_second_sigint(
         host=host,
         invocation=invocation,
@@ -556,6 +619,7 @@ async def _cancel_interactive_turn_after_first_sigint(
         run_id=run_id,
         sigint_monitor=sigint_monitor,
         observed_sigint_count=observed_sigint_count,
+        activity_renderer=activity_renderer,
     )
 
 
@@ -577,9 +641,7 @@ async def _wait_for_run_id_or_local_exit(
     """
 
     run_id_task = asyncio.create_task(accepted_run.wait_run_id())
-    second_sigint_task = asyncio.create_task(
-        sigint_monitor.wait_next(observed_sigint_count)
-    )
+    second_sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
     try:
         done, _pending = await asyncio.wait(
             (submit_task, run_id_task, second_sigint_task),
@@ -606,6 +668,7 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
     run_id: str,
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
+    activity_renderer: CliActivityRenderer | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """发起 Host cancel，并在第二次 SIGINT 时本地退出。
 
@@ -615,6 +678,7 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
     :param run_id: 待取消 Run id。
     :param sigint_monitor: 本轮 SIGINT monitor。
     :param observed_sigint_count: 第一次 SIGINT 后的计数。
+    :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
     :returns: cancel terminal result；第二次 SIGINT 本地退出时返回 ``None``。
     :raises Exception: cancel 或 terminal observation 失败时向上抛出。
     """
@@ -638,9 +702,7 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
             ),
         )
     )
-    second_sigint_task = asyncio.create_task(
-        sigint_monitor.wait_next(observed_sigint_count)
-    )
+    second_sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
     try:
         done, _pending = await asyncio.wait(
             (cancel_task, second_sigint_task),
@@ -648,6 +710,8 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
         )
         if cancel_task in done:
             return await cancel_task
+        if activity_renderer is not None:
+            activity_renderer.render_local_exit_after_cancel()
         cancel_task.cancel()
         with suppress(asyncio.CancelledError):
             await cancel_task
@@ -666,9 +730,7 @@ def _raise_for_unsupported_execution_options(args: ParsedCliArgs) -> None:
 
     unsupported = unsupported_execution_option_names(args)
     if unsupported:
-        raise CliInteractiveUsageError(
-            f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}"
-        )
+        raise CliInteractiveUsageError(f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}")
 
 
 def _interactive_context_slot_values(*, ticker: str | None) -> dict[str, JsonValue]:
@@ -680,9 +742,7 @@ def _interactive_context_slot_values(*, ticker: str | None) -> dict[str, JsonVal
     """
 
     return {
-        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: (
-            ticker if ticker is not None else DEFAULT_FINS_SUBJECT
-        ),
+        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: (ticker if ticker is not None else DEFAULT_FINS_SUBJECT),
         CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER,
     }
 

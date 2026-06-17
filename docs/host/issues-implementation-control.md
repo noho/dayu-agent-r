@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-CLI-ACTIVITY-01 Slice B implementation, fix, re-review, full pyright, and affected tests passed; accepted slice commit pending |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-CLI-ACTIVITY-01 local implementation / review / fix / re-review / validation completed; final closeout pending |
 | active work unit | WU-CLI-ACTIVITY-01 |
 | default next work unit | WU-OBS-00 |
-| next entry point | Create accepted Slice B commit, then enter implementation Slice C |
+| next entry point | Record final closeout and create draft PR when requested |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01. |
@@ -210,7 +210,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
 | WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 closed on 2026-06-17 after user authorization |
-| WU-CLI-ACTIVITY-01 | implementation | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Accepted plan commit `012fee0a`; Slice A accepted commit `992a641d`; Slice B review / fix / re-review passed; accepted Slice B commit pending. |
+| WU-CLI-ACTIVITY-01 | ready-to-open-draft-PR | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Accepted plan commit `012fee0a`; Slice A accepted commit `992a641d`; Slice B accepted commit `152292da`; CLI slices C/D/E/F implementation, review, fix, re-review and validation completed; final closeout pending. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -277,15 +277,25 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - fix artifact: `docs/reviews/wu-cli-activity-01-slice-b-fix-codex.md`
 - re-review: `docs/reviews/code-review-wu-cli-activity-01-slice-b-rereview-mimo-20260617-140637.md` (AgentMiMo); `docs/reviews/code-review-wu-cli-activity-01-slice-b-rereview-ds-20260617-140637.md` (AgentDS)
 - validation: `pytest tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py -q` passed with 32 passed and 3 third-party edgar deprecation warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
+- accepted slice commit: `152292da`
+
+### CLI slices C/D/E/F status
+
+- implementation artifact: `docs/reviews/wu-cli-activity-01-cli-implementation-codex.md`
+- initial fix artifact: `docs/reviews/wu-cli-activity-01-cli-fix-codex.md`
+- code review: `docs/reviews/code-review-wu-cli-activity-01-cli-mimo-20260617-145226.md` (AgentMiMo); `docs/reviews/code-review-wu-cli-activity-01-cli-ds-20260617-145226.md` (AgentDS)
+- review fix artifact: `docs/reviews/wu-cli-activity-01-cli-review-fix-codex.md`
+- targeted re-review: `docs/reviews/code-review-wu-cli-activity-01-cli-rereview-mimo-20260617-151159.md` (AgentMiMo); `docs/reviews/code-review-wu-cli-activity-01-cli-rereview-ds-20260617-151159.md` (AgentDS)
+- validation: `pytest tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py -q` passed with 97 passed and 3 third-party edgar deprecation warnings; `pytest tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py --cov=dayu.cli.activity --cov=dayu.cli.composer --cov=dayu.cli.run_keys --cov-fail-under=80 -q` passed with 17 passed and total coverage 89.53%; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
 - accepted slice commit: pending
 
 ### Residual risks
 
-- `RR-ACT-01`: Host admission must extend `USER_INPUT_ACCEPTED.effective_tool_set` payload shape with Host-owned `effective_tool_display_names`; no durable schema migration is allowed.
-- `RR-ACT-02`: prompt_toolkit key binding may vary by terminal; Slice D must validate before broad REPL rewiring.
-- `RR-ACT-03`: dynamic stderr renderer may interact poorly with terminal width / final answer rendering; renderer close / flush must precede terminal rendering.
-- `RR-ACT-04`: local exit after repeated Ctrl+C must not forge Host facts; real terminal remains observable later.
-- `RR-ACT-05`: cancel / terminal race must prefer already received terminal result over repeated Ctrl+C.
+- `RR-ACT-01` closed by Slice A: Host admission records Host-owned `effective_tool_display_names` without durable schema migration.
+- `RR-ACT-02` closed by CLI implementation and tests: prompt_toolkit composer key bindings for Ctrl+J / Ctrl+R / Ctrl+X Ctrl+E are isolated in CLI and covered by `tests/cli/test_interactive_composer.py`.
+- `RR-ACT-03` closed by CLI implementation and tests: activity renderer is TTY-gated, stderr-only, line-oriented, and closed before terminal rendering; prompt / interactive tests cover stdout cleanliness.
+- `RR-ACT-04` closed by CLI fix and tests: repeated Ctrl+C local exit returns local 130 without forging Host terminal facts.
+- `RR-ACT-05` closed by CLI fix and tests: prompt cancel terminal race prefers terminal when cancel terminal arrives before the second Ctrl+C local exit.
 
 ## WU-CLI-SESSION-01 CLI Session Management
 

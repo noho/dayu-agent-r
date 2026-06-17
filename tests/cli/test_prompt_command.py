@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,11 @@ from dayu.host.api import (
     FollowupBehavior,
     FollowupSnapshot,
     Host,
+    HostActivityCounts,
+    HostActivityKind,
+    HostActivitySeverity,
+    HostActivityStatus,
+    HostActivityView,
     HostEvent,
     HostEventClass,
     HostEventKind,
@@ -51,6 +57,8 @@ from dayu.host.api import (
 )
 from dayu.service.entrypoint_runtime import EntrypointRuntimeRequest
 from dayu.service.entrypoint_runtime import EntrypointRuntimeResult
+from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
+from dayu.cli.run_keys import RunningKeyAction
 
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
@@ -132,26 +140,32 @@ class _FakeHost:
     cancel_requests: list[CancelRunRequest]
     read_outbox_requests: list[ReadOutboxTerminalItemsRequest]
     _submit_terminal: HostEvent | None
+    _submit_events: tuple[HostEvent, ...]
     _cancel_terminal: HostEvent | None
     _outbox_item: OutboxTerminalItem | None
     _run_statuses: tuple[RunStatus, ...]
     _run_status_index: int
+    block_cancel_after_record: bool
 
     def __init__(
         self,
         *,
         submit_terminal: HostEvent | None,
+        submit_events: tuple[HostEvent, ...] = (),
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         outbox_item: OutboxTerminalItem | None = None,
         cancel_terminal: HostEvent | None = None,
+        block_cancel_after_record: bool = False,
     ) -> None:
         """初始化 fake Host。
 
         :param submit_terminal: submit 返回前推入的 terminal event；``None``
             表示 watcher 不产生 terminal。
+        :param submit_events: submit 返回前推入的非终态 Host events。
         :param run_statuses: ``get_run`` 依次返回的状态。
         :param outbox_item: outbox fallback 返回的 terminal item。
         :param cancel_terminal: cancel 返回前推入的 terminal event。
+        :param block_cancel_after_record: 是否在记录 cancel 后阻塞。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -164,10 +178,12 @@ class _FakeHost:
         self.cancel_requests = []
         self.read_outbox_requests = []
         self._submit_terminal = submit_terminal
+        self._submit_events = submit_events
         self._cancel_terminal = cancel_terminal
         self._outbox_item = outbox_item
         self._run_statuses = run_statuses
         self._run_status_index = 0
+        self.block_cancel_after_record = block_cancel_after_record
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 请求。
@@ -212,9 +228,7 @@ class _FakeHost:
         self.watchers.append(watcher)
         return watcher
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """记录 submit_followup 请求。
 
         :param session_id: 目标 Session id。
@@ -225,8 +239,11 @@ class _FakeHost:
 
         self.calls.append(f"submit:{session_id}")
         self.submit_requests.append(request)
+        for event in self._submit_events:
+            await self.watchers[-1].push(event)
         if self._submit_terminal is not None:
             await self.watchers[-1].push(self._submit_terminal)
+        if self._submit_events or self._submit_terminal is not None:
             await asyncio.sleep(0)
         return FollowupSnapshot(
             accepted_input_ref="input-1",
@@ -287,7 +304,7 @@ class _FakeHost:
         :param run_id: 目标 Run id。
         :param request: CancelRunRequest。
         :returns: RunSnapshot。
-        :raises Exception: 不主动抛出异常。
+        :raises asyncio.CancelledError: 测试设置阻塞且 task 被取消时透传。
         """
 
         self.calls.append(f"cancel:{run_id}")
@@ -295,15 +312,15 @@ class _FakeHost:
         if self._cancel_terminal is not None:
             await self.watchers[-1].push(self._cancel_terminal)
             await asyncio.sleep(0)
+        if self.block_cancel_after_record:
+            await asyncio.Event().wait()
         return _run_snapshot(run_id=run_id, status=RunStatus.CANCELLING)
 
 
 class _BlockingSubmitHost(_FakeHost):
     """submit_followup 永不接受 Run 的 fake Host。"""
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """阻塞 submit，用于测试 Run accepted 前 SIGINT。
 
         :param session_id: 目标 Session id。
@@ -316,6 +333,66 @@ class _BlockingSubmitHost(_FakeHost):
         self.submit_requests.append(request)
         await asyncio.Event().wait()
         raise AssertionError("blocking submit should be cancelled")
+
+
+class _DelayedTerminalHost(_FakeHost):
+    """submit accepted 后延迟推送 terminal 的 fake Host。"""
+
+    _terminal_delay_ticks: int
+
+    def __init__(
+        self,
+        *,
+        submit_terminal: HostEvent,
+        terminal_delay_ticks: int,
+    ) -> None:
+        """初始化 delayed terminal fake Host。
+
+        :param submit_terminal: 延迟推送到 watcher 的 terminal event。
+        :param terminal_delay_ticks: 推送 terminal 前等待的 event loop tick 数。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(
+            submit_terminal=submit_terminal,
+            run_statuses=(RunStatus.RUNNING,),
+        )
+        self._terminal_delay_ticks = terminal_delay_ticks
+
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
+        """记录 submit 并在后台延迟推送 terminal。
+
+        :param session_id: 目标 Session id。
+        :param request: SubmitFollowupRequest。
+        :returns: FollowupSnapshot。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append(f"submit:{session_id}")
+        self.submit_requests.append(request)
+        asyncio.create_task(self._push_terminal_after_delay())
+        return FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.QUEUE,
+            accepted_run_id="run-1",
+            accepted_run_status=RunStatus.RUNNING,
+            command_watermark=HostStreamCursor(event_sequence=1),
+            queued_run_id=None,
+            target_run_id=None,
+        )
+
+    async def _push_terminal_after_delay(self) -> None:
+        """等待预设 tick 后推送 terminal。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        for _tick_index in range(self._terminal_delay_ticks):
+            await asyncio.sleep(0)
+        if self._submit_terminal is not None:
+            await self.watchers[-1].push(self._submit_terminal)
 
 
 class _FakeOpenHostContext:
@@ -464,6 +541,119 @@ class _NoopSigintMonitor(CliSigintMonitor):
         return observed_count
 
 
+class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
+    """测试用第二次 SIGINT monitor。"""
+
+    host: _FakeHost
+
+    def __init__(self, host: _FakeHost) -> None:
+        """初始化 monitor。
+
+        :param host: fake Host。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.host = host
+
+    def install(self) -> None:
+        """测试中不安装真实 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    def close(self) -> None:
+        """测试中无需恢复 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    async def wait_next(self, observed_count: int) -> int:
+        """第一次等待触发 Ctrl+C，第二次等待 cancel 记录后再触发。
+
+        :param observed_count: 已观察到的 SIGINT 计数。
+        :returns: 新的 SIGINT 计数。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        if observed_count == 0:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.notify()
+            return self.count
+        while not self.host.cancel_requests:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.notify()
+        return self.count
+
+
+class _FakeRunningKeyMonitor:
+    """测试用运行态按键 monitor。"""
+
+    started_count: int
+    closed_count: int
+    _actions: asyncio.Queue[RunningKeyAction]
+    _delay_ticks: int
+
+    def __init__(
+        self,
+        actions: tuple[RunningKeyAction, ...],
+        *,
+        delay_ticks: int = 0,
+    ) -> None:
+        """初始化 fake monitor。
+
+        :param actions: 依次返回的运行态按键动作。
+        :param delay_ticks: 返回每个动作前等待的 event loop tick 数。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.started_count = 0
+        self.closed_count = 0
+        self._actions = asyncio.Queue()
+        self._delay_ticks = delay_ticks
+        for action in actions:
+            self._actions.put_nowait(action)
+
+    def start(self) -> None:
+        """记录 monitor 启动。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.started_count += 1
+
+    async def wait_next(self) -> RunningKeyAction:
+        """返回下一条预设按键动作。
+
+        :returns: 运行态按键动作。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        for _tick_index in range(self._delay_ticks):
+            await asyncio.sleep(0)
+        return await self._actions.get()
+
+    def close(self) -> None:
+        """记录 monitor 关闭。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.closed_count += 1
+
+
 def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -566,9 +756,7 @@ async def test_prompt_existing_session_execution_does_not_create_or_ensure(
         scenario="prompt",
         user_prompt="请继续分析",
     )
-    fake_host = _FakeHost(
-        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED)
-    )
+    fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
 
     exit_code = await prompt_command._execute_prompt_on_existing_session(
         host=cast(Host, fake_host),
@@ -656,9 +844,7 @@ def test_prompt_command_without_ticker_uses_default_context_slots(
         lambda _options: _FakeOpenHostContext(fake_host),
     )
 
-    exit_code = cli_main.main(
-        ("prompt", "--base", str(workspace_root), "请总结收入变化")
-    )
+    exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "请总结收入变化"))
 
     assert exit_code == EXIT_SUCCESS
     assert capsys.readouterr().out.strip() == "prompt answer"
@@ -690,16 +876,46 @@ def test_prompt_command_uses_outbox_fallback_when_live_terminal_missing(
         lambda _options: _FakeOpenHostContext(fake_host),
     )
 
-    exit_code = cli_main.main(
-        ("prompt", "--base", str(workspace_root), "请总结收入变化")
-    )
+    exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "请总结收入变化"))
 
     assert exit_code == EXIT_SUCCESS
     assert capsys.readouterr().out.strip() == "prompt answer"
-    assert fake_host.read_outbox_requests[0].after == OutboxTerminalCursor(
-        event_sequence=0
-    )
+    assert fake_host.read_outbox_requests[0].after == OutboxTerminalCursor(event_sequence=0)
     assert fake_host.read_outbox_requests[0].limit == 50
+
+
+def test_prompt_tty_activity_writes_stderr_and_final_answer_stays_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TTY activity renderer 应写 stderr，final answer 仍只写 stdout。"""
+
+    workspace_root = tmp_path
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(_activity_event(),),
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "new_cli_activity_renderer",
+        lambda: CliActivityRenderer(options=CliActivityRendererOptions(visible=True, enabled=True)),
+    )
+
+    exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "请总结收入变化"))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.strip() == "prompt answer"
+    assert "Activity:" in captured.err
+    assert "工具批次完成" in captured.err
+    assert "记录烟测事实" in captured.err
 
 
 @pytest.mark.asyncio
@@ -719,9 +935,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
                 "fins_default_subject": "AAPL",
                 "base_user": "本地 CLI 用户",
             },
-            assembly_overrides=prompt_command.ServiceAssemblyOverrides(
-                model_id=_MODEL_ID
-            ),
+            assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
@@ -754,11 +968,175 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
     assert cancel_request.reason == "cli_sigint"
     assert cancel_request.mode is CancelMode.GRACEFUL
     assert cancel_request.client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-    assert cancel_request.context.operation_context.operation_name == (
-        "dayu_cli.prompt.cancel_run"
-    )
+    assert cancel_request.context.operation_context.operation_name == ("dayu_cli.prompt.cancel_run")
     assert fake_host.calls[0:2] == ["watch:session-1", "submit:session-1"]
     assert fake_host.calls[-2:] == ["watch:session-1", "cancel:run-1"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_ctrl_t_toggles_running_activity_without_cancel(
+    tmp_path: Path,
+) -> None:
+    """运行态 Ctrl+T 应切换 activity 可见性，且不发 Host cancel。"""
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    invocation = prompt_command.new_cli_invocation(
+        command_name="prompt",
+        scenario="prompt",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _DelayedTerminalHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        terminal_delay_ticks=4,
+    )
+    key_monitor = _FakeRunningKeyMonitor((RunningKeyAction.TOGGLE_ACTIVITY,))
+    renderer = CliActivityRenderer(
+        stderr=io.StringIO(),
+        options=CliActivityRendererOptions(visible=True, enabled=False),
+    )
+
+    result = await prompt_command._submit_prompt_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        user_prompt="请总结收入变化",
+        run_overrides=prompt_command.ServiceRunOverrides(),
+        sigint_monitor=_NoopSigintMonitor(),
+        activity_renderer=renderer,
+        key_monitor=key_monitor,
+    )
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.SUCCEEDED
+    assert renderer.visible is False
+    assert fake_host.cancel_requests == []
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_esc_requests_cancel_after_run_id(
+    tmp_path: Path,
+) -> None:
+    """运行态 Esc 应请求取消当前 accepted Run。"""
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    invocation = prompt_command.new_cli_invocation(
+        command_name="prompt",
+        scenario="prompt",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    stderr = io.StringIO()
+    renderer = CliActivityRenderer(
+        stderr=stderr,
+        options=CliActivityRendererOptions(visible=True, enabled=True),
+    )
+    key_monitor = _FakeRunningKeyMonitor(
+        (RunningKeyAction.CANCEL_RUN,),
+        delay_ticks=2,
+    )
+    fake_host = _FakeHost(
+        submit_terminal=None,
+        run_statuses=(RunStatus.RUNNING,),
+        cancel_terminal=_terminal_event(status=HostTerminalStatus.CANCELLED),
+    )
+
+    result = await prompt_command._submit_prompt_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        user_prompt="请总结收入变化",
+        run_overrides=prompt_command.ServiceRunOverrides(),
+        sigint_monitor=_NoopSigintMonitor(),
+        activity_renderer=renderer,
+        key_monitor=key_monitor,
+    )
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert len(fake_host.cancel_requests) == 1
+    assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
+    assert "Activity: cancel requested" in stderr.getvalue()
+    assert key_monitor.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_second_sigint_exits_after_cancel_request(
+    tmp_path: Path,
+) -> None:
+    """prompt 运行态第二次 Ctrl+C 应在 cancel terminal 前本地退出。"""
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    invocation = prompt_command.new_cli_invocation(
+        command_name="prompt",
+        scenario="prompt",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost(
+        submit_terminal=None,
+        run_statuses=(RunStatus.RUNNING,),
+        block_cancel_after_record=True,
+    )
+    stderr = io.StringIO()
+    renderer = CliActivityRenderer(
+        stderr=stderr,
+        options=CliActivityRendererOptions(visible=True, enabled=True),
+    )
+
+    result = await prompt_command._submit_prompt_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        user_prompt="请总结收入变化",
+        run_overrides=prompt_command.ServiceRunOverrides(),
+        sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
+        activity_renderer=renderer,
+    )
+
+    assert result is None
+    assert len(fake_host.cancel_requests) == 1
+    assert "Activity: cancel requested" in stderr.getvalue()
+    assert "local process exiting" in stderr.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_prompt_cancel_terminal_wins_over_second_sigint(
+    tmp_path: Path,
+) -> None:
+    """prompt cancel terminal 与第二次 Ctrl+C 竞争时应返回 terminal。"""
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    invocation = prompt_command.new_cli_invocation(
+        command_name="prompt",
+        scenario="prompt",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost(
+        submit_terminal=None,
+        run_statuses=(RunStatus.RUNNING,),
+        cancel_terminal=_terminal_event(status=HostTerminalStatus.CANCELLED),
+    )
+
+    result = await prompt_command._submit_prompt_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        user_prompt="请总结收入变化",
+        run_overrides=prompt_command.ServiceRunOverrides(),
+        sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
+    )
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert len(fake_host.cancel_requests) == 1
 
 
 @pytest.mark.parametrize(
@@ -847,9 +1225,7 @@ def test_prompt_empty_label_exits_with_usage_error(
         lambda _options: _FakeOpenHostContext(fake_host),
     )
 
-    exit_code = cli_main.main(
-        ("prompt", "--base", str(tmp_path), "--label", " ", "请总结收入变化")
-    )
+    exit_code = cli_main.main(("prompt", "--base", str(tmp_path), "--label", " ", "请总结收入变化"))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
@@ -919,9 +1295,7 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
                 "fins_default_subject": "AAPL",
                 "base_user": "本地 CLI 用户",
             },
-            assembly_overrides=prompt_command.ServiceAssemblyOverrides(
-                model_id=_MODEL_ID
-            ),
+            assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
@@ -975,9 +1349,7 @@ def test_prompt_terminal_failed_outputs_error(
         lambda _options: _FakeOpenHostContext(fake_host),
     )
 
-    exit_code = cli_main.main(
-        ("prompt", "--base", str(workspace_root), "请总结收入变化")
-    )
+    exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "请总结收入变化"))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_FAILURE
@@ -1001,6 +1373,30 @@ def _session_snapshot(*, session_id: str, slot: SessionSlotRef | None) -> Sessio
         active_run_id=None,
         queued_run_ids=(),
         timeline_cursor=HostStreamCursor(event_sequence=0),
+    )
+
+
+async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResult:
+    """准备 prompt 测试 runtime。
+
+    :param workspace_root: 测试 workspace root。
+    :returns: EntrypointRuntimeResult。
+    :raises Exception: runtime assembly 失败时向上透传。
+    """
+
+    return await prompt_command.prepare_entrypoint_runtime(
+        EntrypointRuntimeRequest(
+            workspace_root=workspace_root,
+            package_config_root=package_config_root(),
+            explicit_config_dir=None,
+            scene_id="prompt",
+            context_slot_values={
+                "fins_default_subject": "AAPL",
+                "base_user": "本地 CLI 用户",
+            },
+            assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
     )
 
 
@@ -1057,6 +1453,39 @@ def _terminal_event(*, status: HostTerminalStatus) -> HostEvent:
         final_answer=final_answer,
         error_message=error_message,
         cancel_reason=cancel_reason,
+    )
+
+
+def _activity_event() -> HostEvent:
+    """构造 Host activity event。
+
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id="activity-run-1-1",
+        event_sequence=1,
+        session_id="session-1",
+        run_id="run-1",
+        event_class=HostEventClass.PREVIEW,
+        event_type="TOOL_CALLS_BATCH_DONE",
+        kind=HostEventKind.PROGRESS,
+        activity=HostActivityView(
+            kind=HostActivityKind.TOOL_BATCH,
+            status=HostActivityStatus.COMPLETED,
+            title="工具批次完成",
+            summary="完成 1 个工具调用。",
+            severity=HostActivitySeverity.INFO,
+            tool_name="record_smoke_fact",
+            tool_display_name="记录烟测事实",
+            counts=HostActivityCounts(total=1, completed=1, failed=0, cancelled=0),
+        ),
+        dedupe_key="activity-run-1-1",
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
     )
 
 
