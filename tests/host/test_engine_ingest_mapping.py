@@ -25,6 +25,7 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
+    ContentCompleteData,
     ContentDeltaData,
     EngineEvent,
     EngineEventData,
@@ -33,6 +34,7 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    ReasoningDeltaData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RunCancelledData,
     RunFailedData,
@@ -1010,16 +1012,26 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
             _candidate(
                 seeded,
                 worker_event_index=51,
-                data=ContentDeltaData(iteration_id="iter-stale", delta="old"),
-                event_type=EngineEventType.CONTENT_DELTA,
+                data=ContentCompleteData(
+                    iteration_id="iter-stale",
+                    content="old",
+                    reasoning_content=None,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.CONTENT_COMPLETED,
             )
         )
         accepted = ingestor.ingest(
             _candidate(
                 current,
                 worker_event_index=1,
-                data=ContentDeltaData(iteration_id="iter-current", delta="new"),
-                event_type=EngineEventType.CONTENT_DELTA,
+                data=ContentCompleteData(
+                    iteration_id="iter-current",
+                    content="new",
+                    reasoning_content=None,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.CONTENT_COMPLETED,
             )
         )
 
@@ -1027,7 +1039,32 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
         assert _payload(stale.events[0])["reason"] == "stale_execution_id"
         assert accepted.status == EngineIngestStatus.ACCEPTED
         assert accepted.events[0].attempt_id == current.attempt_id
-        assert _payload(accepted.events[0])["delta"] == "new"
+        assert _payload(accepted.events[0])["has_content"] is True
+
+
+def test_stale_transient_delta_is_rejected_before_no_row_short_circuit(
+    tmp_path: Path,
+) -> None:
+    """旧 Attempt 的 transient delta 仍先经过 durable identity governance。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _steer_to_new_running_attempt(store.transaction_runner, seeded)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        result = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=52,
+                data=ContentDeltaData(iteration_id="iter-stale", delta="old"),
+                event_type=EngineEventType.CONTENT_DELTA,
+            )
+        )
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
+        assert _payload(result.events[0])["reason"] == "stale_execution_id"
+        assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
 
 
 @pytest.mark.asyncio
@@ -2013,26 +2050,65 @@ def test_tool_call_requested_and_result_accepted_are_preview(
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_tool_batch_and_delta_events_stay_preview_not_canonical(
+def test_delta_events_are_accepted_without_event_log_rows(
     tmp_path: Path,
 ) -> None:
-    """Engine batch-ready、batch-done 与 tool delta 不能绕过 accept path。"""
+    """Engine content、reasoning 与 tool-call delta 默认不写主 EventLog。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
-        delta = _candidate(
-            seeded,
-            worker_event_index=13,
-            data=ToolCallDeltaData(
-                iteration_id="iter-tool",
-                tool_call_index=0,
-                tool_call_id="tool-call-1",
-                name_delta="lookup",
-                arguments_delta='{"ticker":"MSFT"}',
+        candidates = (
+            _candidate(
+                seeded,
+                worker_event_index=11,
+                data=ContentDeltaData(iteration_id="iter-delta", delta="content"),
+                event_type=EngineEventType.CONTENT_DELTA,
             ),
-            event_type=EngineEventType.TOOL_CALL_DELTA,
+            _candidate(
+                seeded,
+                worker_event_index=12,
+                data=ReasoningDeltaData(
+                    iteration_id="iter-delta",
+                    delta="reasoning",
+                ),
+                event_type=EngineEventType.REASONING_DELTA,
+            ),
+            _candidate(
+                seeded,
+                worker_event_index=13,
+                data=ToolCallDeltaData(
+                    iteration_id="iter-tool",
+                    tool_call_index=0,
+                    tool_call_id="tool-call-1",
+                    name_delta="lookup",
+                    arguments_delta='{"ticker":"MSFT"}',
+                ),
+                event_type=EngineEventType.TOOL_CALL_DELTA,
+            ),
         )
+
+        results = tuple(ingestor.ingest(candidate) for candidate in candidates)
+
+        assert [result.status for result in results] == [
+            EngineIngestStatus.ACCEPTED,
+            EngineIngestStatus.ACCEPTED,
+            EngineIngestStatus.ACCEPTED,
+        ]
+        assert [result.events for result in results] == [(), (), ()]
+        assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
+        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
+        assert _event_count(store.transaction_runner, "TOOL_CALL_DELTA") == 0
+
+
+def test_tool_batch_events_stay_preview_not_canonical(
+    tmp_path: Path,
+) -> None:
+    """Engine batch-ready 与 batch-done 不能绕过 accept path。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
         ready = _candidate(
             seeded,
             worker_event_index=14,
@@ -2062,15 +2138,13 @@ def test_tool_batch_and_delta_events_stay_preview_not_canonical(
             event_type=EngineEventType.TOOL_CALLS_BATCH_DONE,
         )
 
-        results = tuple(ingestor.ingest(item) for item in (delta, ready, done))
+        results = tuple(ingestor.ingest(item) for item in (ready, done))
 
         assert [result.events[0].event_class for result in results] == [
             EventClass.PREVIEW,
             EventClass.PREVIEW,
-            EventClass.PREVIEW,
         ]
         assert [result.events[0].event_type for result in results] == [
-            "TOOL_CALL_DELTA",
             "TOOL_CALLS_BATCH_READY",
             "TOOL_CALLS_BATCH_DONE",
         ]
@@ -2112,6 +2186,44 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         assert result.status == EngineIngestStatus.REJECTED
         assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
         assert _payload(result.events[0])["reason"] == "terminal_already_closed"
+
+
+def test_late_transient_delta_is_rejected_before_no_row_short_circuit(
+    tmp_path: Path,
+) -> None:
+    """终态后的 transient delta 仍先经过 late-event governance。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        first = _candidate(
+            seeded,
+            worker_event_index=13,
+            data=FinalAnswerData(
+                content="done",
+                filtered=False,
+                degraded=False,
+                finish_reason=FinishReason.STOP,
+            ),
+            event_type=EngineEventType.FINAL_ANSWER,
+        )
+        late = _candidate(
+            seeded,
+            worker_event_index=14,
+            data=ReasoningDeltaData(
+                iteration_id="iter-late",
+                delta="late reasoning",
+            ),
+            event_type=EngineEventType.REASONING_DELTA,
+        )
+
+        ingestor.ingest(first)
+        result = ingestor.ingest(late)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
+        assert _payload(result.events[0])["reason"] == "terminal_already_closed"
+        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
 
 
 def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None:
@@ -2305,12 +2417,12 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
         ),
     ),
 )
-def test_preview_event_rejects_missing_or_wrong_data(
+def test_transient_delta_event_rejects_missing_or_wrong_data(
     tmp_path: Path,
     worker_event_index: int,
     data: EngineEventData,
 ) -> None:
-    """preview event 必须同时匹配 event type 与 data 类型。"""
+    """transient delta event 必须同时匹配 event type 与 data 类型。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -2332,8 +2444,10 @@ def test_preview_event_rejects_missing_or_wrong_data(
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
 
 
-def test_preview_event_accepts_matching_type_and_data(tmp_path: Path) -> None:
-    """匹配 data 类型的 preview event 仍正常写入 preview payload。"""
+def test_transient_delta_event_accepts_matching_type_without_row(
+    tmp_path: Path,
+) -> None:
+    """匹配 data 类型的 transient delta event 返回 accepted 但不写 row。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -2349,8 +2463,8 @@ def test_preview_event_accepts_matching_type_and_data(tmp_path: Path) -> None:
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.ACCEPTED
-        assert result.events[0].event_class == EventClass.PREVIEW
-        assert _payload(result.events[0])["delta"] == "hello"
+        assert result.events == ()
+        assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
 
 
 def test_iteration_started_links_prepared_runner_call_manifest(

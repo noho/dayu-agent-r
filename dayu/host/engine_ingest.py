@@ -214,6 +214,7 @@ _DELTA_ENGINE_EVENT_TYPES = frozenset(
     {
         EngineEventType.CONTENT_DELTA,
         EngineEventType.REASONING_DELTA,
+        EngineEventType.TOOL_CALL_DELTA,
     }
 )
 _EVENT_SOURCE = "host.engine_ingest"
@@ -924,6 +925,8 @@ class EngineEventIngestor:
         """
 
         event = context.candidate.engine_event
+        if _is_transient_delta_event(event):
+            return _accepted_no_event_result()
         if event.type == EngineEventType.FINAL_ANSWER and isinstance(
             event.data, FinalAnswerData
         ):
@@ -4674,17 +4677,8 @@ def _is_preview_event(event: EngineEvent) -> bool:
         event.type == EngineEventType.ITERATION_STARTED
         and isinstance(event.data, IterationStartedData)
     ) or (
-        event.type == EngineEventType.CONTENT_DELTA
-        and isinstance(event.data, ContentDeltaData)
-    ) or (
-        event.type == EngineEventType.REASONING_DELTA
-        and isinstance(event.data, ReasoningDeltaData)
-    ) or (
         event.type == EngineEventType.CONTENT_COMPLETED
         and isinstance(event.data, ContentCompleteData)
-    ) or (
-        event.type == EngineEventType.TOOL_CALL_DELTA
-        and isinstance(event.data, ToolCallDeltaData)
     ) or (
         event.type == EngineEventType.TOOL_CALLS_BATCH_READY
         and isinstance(event.data, ToolCallsBatchReadyData)
@@ -4700,6 +4694,26 @@ def _is_preview_event(event: EngineEvent) -> bool:
     ) or (
         event.type == EngineEventType.ITERATION_COMPLETED
         and isinstance(event.data, IterationCompletedData)
+    )
+
+
+def _is_transient_delta_event(event: EngineEvent) -> bool:
+    """判断 Engine event 是否属于默认不持久化的即时 delta。
+
+    :param event: Engine event。
+    :returns: type 与 data 均匹配 transient delta 契约时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        event.type == EngineEventType.CONTENT_DELTA
+        and isinstance(event.data, ContentDeltaData)
+    ) or (
+        event.type == EngineEventType.REASONING_DELTA
+        and isinstance(event.data, ReasoningDeltaData)
+    ) or (
+        event.type == EngineEventType.TOOL_CALL_DELTA
+        and isinstance(event.data, ToolCallDeltaData)
     )
 
 
@@ -4725,23 +4739,11 @@ def _preview_payload(
         raise HostDurableError(
             "iteration started preview requires runner-call link resolution"
         )
-    elif isinstance(data, ContentDeltaData):
-        common["iteration_id"] = data.iteration_id
-        common["delta"] = data.delta
-    elif isinstance(data, ReasoningDeltaData):
-        common["iteration_id"] = data.iteration_id
-        common["delta"] = data.delta
     elif isinstance(data, ContentCompleteData):
         common["iteration_id"] = data.iteration_id
         common["has_content"] = data.content is not None
         common["has_reasoning_content"] = data.reasoning_content is not None
         common["finish_reason"] = data.finish_reason.value
-    elif isinstance(data, ToolCallDeltaData):
-        common["iteration_id"] = data.iteration_id
-        common["tool_call_index"] = data.tool_call_index
-        common["tool_call_id"] = data.tool_call_id
-        common["has_name_delta"] = data.name_delta is not None
-        common["has_arguments_delta"] = data.arguments_delta is not None
     elif isinstance(data, ToolCallsBatchReadyData):
         common["iteration_id"] = data.iteration_id
         common["tool_call_count"] = len(data.tool_calls)
@@ -6077,6 +6079,22 @@ def _event_rows_result(rows: tuple[EventLogRow, ...]) -> EngineIngestResult:
     return EngineIngestResult(
         status=EngineIngestStatus.ACCEPTED,
         events=rows,
+        terminal_closeout=False,
+        promotion_triggered=False,
+        reason=None,
+    )
+
+
+def _accepted_no_event_result() -> EngineIngestResult:
+    """构造无 EventLog row 的接受结果。
+
+    :returns: 表示已接受但无 durable Host event 的 ingest result。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EngineIngestResult(
+        status=EngineIngestStatus.ACCEPTED,
+        events=(),
         terminal_closeout=False,
         promotion_triggered=False,
         reason=None,
