@@ -130,6 +130,7 @@ class ParsedCliArgs(argparse.Namespace):
     workspace_root: str
     config_dir: str | None
     log_level: str
+    log_file: str | None
     prompt: str
     ticker: str | None
     label: str | None
@@ -244,6 +245,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.workspace_root = DEFAULT_WORKSPACE
     namespace.config_dir = None
     namespace.log_level = DEFAULT_LOG_LEVEL
+    namespace.log_file = None
     namespace.ticker = None
     namespace.label = None
     namespace.model_name = None
@@ -325,6 +327,12 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         choices=LOG_LEVEL_CHOICES,
         default=argparse.SUPPRESS,
         help="日志等级。",
+    )
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        default=argparse.SUPPRESS,
+        help="把诊断日志追加写入指定文件。",
     )
     parser.add_argument(
         "--debug",

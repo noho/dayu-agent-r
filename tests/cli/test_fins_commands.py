@@ -461,6 +461,77 @@ def test_fins_direct_verbose_log_outputs_execution_skeleton(
     assert "Fins direct event detail" not in captured.err
 
 
+def test_fins_direct_verbose_log_file_keeps_user_ui_on_stdout(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--log-file`` 只接收 Fins direct 诊断，不接收用户 UI 输出。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param fake_service: fake Fins direct service。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 诊断日志与用户 UI 通道混淆时抛出。
+    """
+
+    log_file = tmp_path / "dayu.log"
+
+    exit_code = cli_main.main(
+        (
+            "download",
+            "--ticker",
+            "AAPL",
+            "--verbose",
+            "--log-file",
+            str(log_file),
+        )
+    )
+
+    captured = capsys.readouterr()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert exit_code == EXIT_SUCCESS
+    assert "Fins progress" in captured.out
+    assert "Fins succeeded" in captured.out
+    assert "Fins direct command start" not in captured.out
+    assert "Fins direct command start" not in captured.err
+    assert "Fins direct event received" not in captured.err
+    assert "Fins direct command start" in log_text
+    assert "Fins direct event received" in log_text
+    assert "message='download live progress'" in log_text
+    assert "Fins progress" not in log_text
+    assert "Fins succeeded" not in log_text
+
+
+def test_fins_direct_default_log_file_keeps_verbose_diagnostics_suppressed(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """默认 INFO level 下 ``--log-file`` 不提升 Fins direct 诊断级别。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param fake_service: fake Fins direct service。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: ``--log-file`` 改变日志级别时抛出。
+    """
+
+    log_file = tmp_path / "dayu.log"
+
+    exit_code = cli_main.main(
+        ("download", "--ticker", "AAPL", "--log-file", str(log_file))
+    )
+
+    captured = capsys.readouterr()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert exit_code == EXIT_SUCCESS
+    assert "Fins progress" in captured.out
+    assert "Fins direct command start" not in captured.err
+    assert "Fins direct command start" not in log_text
+    assert "Fins direct event received" not in log_text
+
+
 def test_fins_direct_debug_log_omits_empty_event_detail(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],

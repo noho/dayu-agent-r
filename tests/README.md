@@ -89,7 +89,7 @@ CLI UI adapter 测试，当前覆盖 `dayu.cli` 的 parser factory、scoped comm
 对 current schema workspace config / prompts 的 bootstrap、existing file / overwrite、reset 硬编码白名单、symlink
 escape fail-fast、旧配置文件不生成、生成配置可由 `ConfigLoader` 加载和复制阶段 SIGINT 130；
 `python -m dayu.cli --help` 入口，并覆盖 CLI main 把默认 log level、`--debug` / `--verbose` / `--quiet` / `--log-level`
-解析结果和 stderr 诊断流交给 `dayu.runtime.log.set_level_from_flags(...)` 装配日志。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、stable
+解析结果和 stderr 或全局 `--log-file` 诊断流交给 `dayu.runtime.log.set_level_from_flags(...)` 装配日志，且覆盖日志文件打开失败、连续调用恢复 stderr、恢复 stderr 失败仍关闭日志文件，以及异常 / `KeyboardInterrupt` 路径恢复 stderr handler 后再关闭文件。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、stable
 Host slot key、unsupported 旧执行参数 fail fast、真实 `prompt.json` required context slots、mock Host public
 open/follow-up terminal path、fast terminal、outbox fallback、TTY activity stderr 渲染、FAILED terminal 输出和 SIGINT 后 Host public cancel request；
 `interactive` 命令测试覆盖默认 fresh anonymous Session、label session binding、existing-session startup reconnect 在首条输入前执行、startup terminal 渲染后 cursor 前进、`--new-session` 用法错误、真实
@@ -98,7 +98,7 @@ open/follow-up terminal path、fast terminal、outbox fallback、TTY activity st
 `download`、`upload_filing`、`upload_material`、`process`、`process_filing`、`process_material` 的 CLI 参数到
 `FinsDirectCommandService` 显式方法参数转换、Service event stream 消费、progress / terminal summary
 stdout/stderr 投影、CLI 输出中绝对路径可见但受长度控制、upload file 存在性与 allowlist 前置校验、`--infer` / `--ci` fail fast、
-默认日志不污染 progress 输出、`--verbose` 执行骨架日志与 `--debug` event detail 诊断写入 stderr 且 stdout 保持用户 UI、
+默认日志不污染 progress 输出、`--verbose` 执行骨架日志与 `--debug` event detail 诊断写入 stderr，`--log-file` 只迁移诊断日志且 stdout/stderr 用户 UI 保持原通道、
 Service stream / cancel failure 向上传播且 CLI 不重复记录同一 ERROR、
 `upload_filings_from` 的本地目录扫描、filing / material 识别、脚本 quoting、`--output` 写入、错误码、扫描期
 SIGINT 130、确认不启动 live event stream、terminal exit mapping、SIGINT 到 operation-scoped async cancellation、

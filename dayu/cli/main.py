@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Sequence
+from typing import TextIO
 
 from dayu.cli.arg_parsing import (
     CLI_COMMAND_NAMES,
@@ -35,6 +36,7 @@ from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
     EXIT_SUCCESS,
+    EXIT_USAGE_ERROR,
 )
 import dayu.runtime.log as runtime_log
 
@@ -42,6 +44,8 @@ CommandRunner = Callable[[ParsedCliArgs], int]
 MISSING_RUNNER_DIAGNOSTIC_TEMPLATE: str = (
     "dayu-cli: 内部错误：命令 '{command_name}' 缺少注册 runner。"
 )
+LOG_FILE_EMPTY_DIAGNOSTIC: str = "dayu-cli: --log-file: path must not be empty."
+LOG_FILE_OPEN_FAILED_TEMPLATE: str = "dayu-cli: --log-file: cannot open '{path}': {error}"
 
 COMMAND_RUNNERS: dict[str, CommandRunner] = {
     command_name: run_not_implemented_command for command_name in CLI_COMMAND_NAMES
@@ -67,30 +71,75 @@ def main(argv: Sequence[str] | None = None) -> int:
     :raises OSError: 命令占位执行写 stderr 失败时由底层输出函数透传。
     """
 
+    opened_log_stream: TextIO | None = None
+    log_level_for_cleanup: str | None = None
     try:
-        args = parse_cli_args(argv)
-        runtime_log.set_level_from_flags(
-            log_level=args.log_level,
-            debug=False,
-            verbose=False,
-            info=False,
-            quiet=False,
-            stream=sys.stderr,
-        )
-        runner = COMMAND_RUNNERS.get(args.command_name)
-        if runner is None:
-            print(
-                MISSING_RUNNER_DIAGNOSTIC_TEMPLATE.format(
-                    command_name=args.command_name
-                ),
-                file=sys.stderr,
+        try:
+            args = parse_cli_args(argv)
+            log_level_for_cleanup = args.log_level
+            if args.log_file is not None:
+                opened_log_stream = _open_log_file(args.log_file)
+                if opened_log_stream is None:
+                    return EXIT_USAGE_ERROR
+            log_stream = sys.stderr if opened_log_stream is None else opened_log_stream
+            runtime_log.set_level_from_flags(
+                log_level=args.log_level,
+                debug=False,
+                verbose=False,
+                info=False,
+                quiet=False,
+                stream=log_stream,
             )
-            return EXIT_FAILURE
-        return runner(args)
+            runner = COMMAND_RUNNERS.get(args.command_name)
+            if runner is None:
+                print(
+                    MISSING_RUNNER_DIAGNOSTIC_TEMPLATE.format(
+                        command_name=args.command_name
+                    ),
+                    file=sys.stderr,
+                )
+                return EXIT_FAILURE
+            return runner(args)
+        finally:
+            if opened_log_stream is not None:
+                try:
+                    runtime_log.set_level_from_flags(
+                        log_level=log_level_for_cleanup,
+                        debug=False,
+                        verbose=False,
+                        info=False,
+                        quiet=False,
+                        stream=sys.stderr,
+                    )
+                finally:
+                    opened_log_stream.close()
     except KeyboardInterrupt:
         return EXIT_KEYBOARD_INTERRUPT
     except SystemExit as exc:
         return _normalize_system_exit_code(exc)
+
+
+def _open_log_file(log_file: str) -> TextIO | None:
+    """打开 CLI 诊断日志文件。
+
+    :param log_file: 用户传入的日志文件路径。
+    :returns: 已打开的文本写入流；输入非法或打开失败时返回 ``None``。
+    :raises Exception: 本函数不主动抛出文件打开异常；打开失败通过
+        usage diagnostic 与 ``None`` 返回值表达。
+    """
+
+    log_file_path = log_file.strip()
+    if log_file_path == "":
+        print(LOG_FILE_EMPTY_DIAGNOSTIC, file=sys.stderr)
+        return None
+    try:
+        return open(log_file_path, mode="a", encoding="utf-8")
+    except OSError as exc:
+        print(
+            LOG_FILE_OPEN_FAILED_TEMPLATE.format(path=log_file_path, error=exc),
+            file=sys.stderr,
+        )
+        return None
 
 
 def _normalize_system_exit_code(exc: SystemExit) -> int:
