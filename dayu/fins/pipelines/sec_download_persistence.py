@@ -7,7 +7,7 @@ from dayu.contracts.json_value import JsonValue
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from functools import partial
-from typing import BinaryIO, Optional, Protocol, TypeVar
+from typing import BinaryIO, Final, Optional, Protocol, TypeVar
 
 from dayu.fins.domain.document_models import (
     FileObjectMeta,
@@ -63,6 +63,7 @@ class RejectedArtifactFilingRecord(Protocol):
 
 
 _AwaitableResult = TypeVar("_AwaitableResult")
+_DOWNLOADER_EVENT_FILE_DOWNLOAD_STARTED: Final[str] = "file_download_started"
 
 
 async def _maybe_await(value: Awaitable[_AwaitableResult] | _AwaitableResult) -> _AwaitableResult:
@@ -240,6 +241,8 @@ async def persist_rejected_filing_artifact(
             existing_files={},
             primary_document=filing.primary_document,
         ):
+            if event.event_type == _DOWNLOADER_EVENT_FILE_DOWNLOAD_STARTED:
+                continue
             file_results.append(build_file_result_from_downloader_event(event))
     else:
         legacy_results = await _maybe_await(

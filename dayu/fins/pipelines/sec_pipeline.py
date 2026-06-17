@@ -151,10 +151,10 @@ _SEC_STATUS_DOWNLOADED: Final[str] = "downloaded"
 _SEC_STATUS_REJECTED: Final[str] = "rejected"
 _SEC_STATUS_SKIPPED: Final[str] = "skipped"
 _SEC_REASON_6K_FILTERED: Final[str] = "6k_filtered"
-_ADAPTER_PROGRESS_FILE_STARTED: Final[str] = "download.file_started"
-_ADAPTER_PROGRESS_FILE_COMPLETED: Final[str] = "download.file_completed"
-_ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
-_ADAPTER_PROGRESS_FILE_FAILED: Final[str] = "download.file_failed"
+_ADAPTER_PROGRESS_FILING_STARTED: Final[str] = "download.filing_started"
+_ADAPTER_PROGRESS_FILING_COMPLETED: Final[str] = "download.filing_completed"
+_ADAPTER_PROGRESS_FILING_SKIPPED: Final[str] = "download.filing_skipped"
+_ADAPTER_PROGRESS_FILING_FAILED: Final[str] = "download.filing_failed"
 
 
 class SecPipelineSummary(TypedDict):
@@ -386,7 +386,7 @@ def _emit_adapter_download_progress(
     event: DownloadEvent,
     progress_sink: FinsDownloadProgressSink | None,
 ) -> None:
-    """把 SEC pipeline 文件事件投影为 runtime 下载进度。
+    """把 SEC pipeline filing 事件投影为 runtime 下载进度。
 
     Args:
         event: SEC pipeline 下载事件。
@@ -401,43 +401,31 @@ def _emit_adapter_download_progress(
 
     if progress_sink is None:
         return
-    if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED:
+    if event.event_type == DownloadEventType.FILING_STARTED:
         progress_sink(
             FinsDownloadProgressEvent(
-                stage=_ADAPTER_PROGRESS_FILE_STARTED,
+                stage=_ADAPTER_PROGRESS_FILING_STARTED,
                 message="开始下载",
                 document_id=event.document_id,
-                file_name=_payload_text(event.payload, "name"),
             )
         )
         return
-    if event.event_type == DownloadEventType.FILE_DOWNLOADED:
+    if event.event_type == DownloadEventType.FILING_COMPLETED:
+        status = _payload_text(event.payload, "status")
         progress_sink(
             FinsDownloadProgressEvent(
-                stage=_ADAPTER_PROGRESS_FILE_COMPLETED,
-                message="完成下载",
+                stage=_ADAPTER_PROGRESS_FILING_SKIPPED if status == "skipped" else _ADAPTER_PROGRESS_FILING_COMPLETED,
+                message="跳过下载" if status == "skipped" else "完成下载",
                 document_id=event.document_id,
-                file_name=_payload_text(event.payload, "name"),
             )
         )
         return
-    if event.event_type == DownloadEventType.FILE_SKIPPED:
+    if event.event_type == DownloadEventType.FILING_FAILED:
         progress_sink(
             FinsDownloadProgressEvent(
-                stage=_ADAPTER_PROGRESS_FILE_SKIPPED,
-                message="跳过下载",
-                document_id=event.document_id,
-                file_name=_payload_text(event.payload, "name"),
-            )
-        )
-        return
-    if event.event_type == DownloadEventType.FILE_FAILED:
-        progress_sink(
-            FinsDownloadProgressEvent(
-                stage=_ADAPTER_PROGRESS_FILE_FAILED,
+                stage=_ADAPTER_PROGRESS_FILING_FAILED,
                 message="下载失败",
                 document_id=event.document_id,
-                file_name=_payload_text(event.payload, "name"),
             )
         )
 

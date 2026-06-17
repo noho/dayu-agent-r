@@ -569,6 +569,7 @@ async def submit_entrypoint_turn_and_wait(
             queue=queue,
             state=state,
             on_activity=on_activity,
+            allow_outbox_terminal_fallback=False,
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
@@ -608,12 +609,14 @@ async def cancel_entrypoint_run_and_wait(
             run_id=request.run_id,
             queue=queue,
             state=state,
+            allow_outbox_terminal_fallback=True,
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
     watcher = _attach_watcher(host, run_snapshot.session_id)
     queue: asyncio.Queue[HostEvent | _WatcherFailure] = asyncio.Queue()
     drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
+    allow_outbox_terminal_fallback = False
     try:
         try:
             await host.cancel_run(
@@ -629,12 +632,14 @@ async def cancel_entrypoint_run_and_wait(
             latest_run_snapshot = await host.get_run(request.run_id)
             if not _is_terminal_run_status(latest_run_snapshot.status):
                 raise
+            allow_outbox_terminal_fallback = True
         return await _wait_for_terminal(
             host,
             session_id=run_snapshot.session_id,
             run_id=request.run_id,
             queue=queue,
             state=state,
+            allow_outbox_terminal_fallback=allow_outbox_terminal_fallback,
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
@@ -681,18 +686,21 @@ async def _close_watcher(*, watcher: ClosableHostEventIterator, drain_task: asyn
     :param watcher: 待关闭 watcher。
     :param drain_task: watcher drain task。
     :returns: ``None``。
-    :raises asyncio.CancelledError: watcher ``aclose`` 被取消时透传。
+    :raises asyncio.CancelledError: watcher ``aclose`` 或 drain task 被取消时透传。
     :raises Exception: watcher ``aclose`` 失败时向上抛出。
     """
 
     try:
-        await watcher.aclose()
-    finally:
-        drain_task.cancel()
+        if not drain_task.done():
+            drain_task.cancel()
         try:
             await drain_task
         except asyncio.CancelledError:
             pass
+    finally:
+        # 对 async generator watcher，必须先停止正在执行的 drain task，再调用
+        # aclose；否则会触发 "asynchronous generator is already running"。
+        await watcher.aclose()
 
 
 async def _wait_for_terminal(
@@ -703,6 +711,7 @@ async def _wait_for_terminal(
     queue: asyncio.Queue[HostEvent | _WatcherFailure],
     state: _TerminalObservationState,
     on_activity: EntrypointActivityCallback | None = None,
+    allow_outbox_terminal_fallback: bool,
     poll_interval_seconds: float,
     sleep: Callable[[float], Awaitable[None]],
 ) -> EntrypointRunTerminalResult:
@@ -714,6 +723,9 @@ async def _wait_for_terminal(
     :param queue: watcher drain queue。
     :param state: 本轮本地观察状态。
     :param on_activity: 可选 activity 回调。
+    :param allow_outbox_terminal_fallback: 是否允许在未观察到 live terminal 时读取
+        Outbox terminal。该路径只用于可能错过 terminal 的补读场景；已 attach
+        submit 路径不得把 Outbox 当作通用 final answer 读取接口。
     :param poll_interval_seconds: public read 轮询间隔。
     :param sleep: 可注入 sleep coroutine。
     :returns: Run terminal 观察结果。
@@ -733,7 +745,12 @@ async def _wait_for_terminal(
         if live_terminal is not None:
             return live_terminal
         run_snapshot = await host.get_run(run_id)
-        if _is_terminal_run_status(run_snapshot.status):
+        if _is_terminal_run_status(
+            run_snapshot.status
+        ) and _should_read_outbox_terminal(
+            state=state,
+            allow_outbox_terminal_fallback=allow_outbox_terminal_fallback,
+        ):
             outbox_terminal = await _read_outbox_terminal(
                 host,
                 session_id=session_id,
@@ -743,6 +760,22 @@ async def _wait_for_terminal(
             if outbox_terminal is not None:
                 return outbox_terminal
         await sleep(poll_interval_seconds)
+
+
+def _should_read_outbox_terminal(
+    *,
+    state: _TerminalObservationState,
+    allow_outbox_terminal_fallback: bool,
+) -> bool:
+    """判断当前等待路径是否允许读取 Outbox terminal。
+
+    :param state: 本轮本地观察状态。
+    :param allow_outbox_terminal_fallback: 调用路径是否显式允许 Outbox 补读。
+    :returns: 允许读取 Outbox terminal 时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return allow_outbox_terminal_fallback or state.watcher_failure_message is not None
 
 
 def _drain_available_watcher_items(

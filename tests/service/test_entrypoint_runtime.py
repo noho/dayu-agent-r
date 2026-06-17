@@ -50,6 +50,7 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.service.entrypoint_runtime import (
+    ClosableHostEventIterator,
     EntrypointActivity,
     EntrypointActivityKind,
     EntrypointActivitySeverity,
@@ -365,6 +366,45 @@ class _SleepRecorder:
         """
 
         self.calls.append(seconds)
+        await asyncio.sleep(0)
+
+
+class _SleepAndPushTerminal:
+    """测试用 sleep coroutine，在第一次 sleep 时推送 live terminal。"""
+
+    calls: list[float]
+    _host: _FakeHost
+    _event: HostEvent
+    _pushed: bool
+
+    def __init__(self, *, host: _FakeHost, event: HostEvent) -> None:
+        """初始化 sleep 推送器。
+
+        :param host: 接收 watcher 的 fake Host。
+        :param event: 第一次 sleep 时推送的 terminal event。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls = []
+        self._host = host
+        self._event = event
+        self._pushed = False
+
+    async def __call__(self, seconds: float) -> None:
+        """记录 sleep 秒数，并在首次调用时推送 terminal。
+
+        :param seconds: sleep 秒数。
+        :returns: ``None``。
+        :raises AssertionError: watcher 尚未 attach 时抛出。
+        """
+
+        self.calls.append(seconds)
+        if not self._pushed:
+            self._pushed = True
+            if len(self._host.watchers) == 0:
+                raise AssertionError("watcher must be attached before sleep")
+            await self._host.watchers[-1].push(self._event)
         await asyncio.sleep(0)
 
 
@@ -770,15 +810,16 @@ async def test_submit_entrypoint_turn_filters_unrelated_activity(
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_uses_outbox_when_live_terminal_missing(
+async def test_submit_entrypoint_turn_waits_live_terminal_when_run_snapshot_is_terminal(
     tmp_path: Path,
 ) -> None:
-    """get_run 已终态但 watcher 未给 terminal 时必须用 public outbox 补读。"""
+    """submit 已 attach 时，get_run 先见终态也必须等待 live terminal。"""
 
     runtime = await _prepare_runtime(tmp_path)
     outbox_item = _outbox_item(event_sequence=5, run_id="run-1")
+    terminal_event = _terminal_event(event_sequence=6, run_id="run-1")
     fake_host = _FakeHost(
-        run_statuses=(RunStatus.SUCCEEDED,),
+        run_statuses=(RunStatus.SUCCEEDED, RunStatus.SUCCEEDED),
         outbox_batches=(
             _outbox_batch(
                 items=(outbox_item,),
@@ -787,20 +828,20 @@ async def test_submit_entrypoint_turn_uses_outbox_when_live_terminal_missing(
             ),
         ),
     )
+    sleep = _SleepAndPushTerminal(host=fake_host, event=terminal_event)
 
     result = await submit_entrypoint_turn_and_wait(
         cast(Host, fake_host),
         request=_turn_request(),
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
+        sleep=sleep,
     )
 
-    assert result.source is EntrypointTerminalSource.OUTBOX_READ
-    assert result.terminal_event_id == "terminal-run-1-5"
-    read_request = fake_host.read_outbox_requests[0]
-    assert read_request.after == OutboxTerminalCursor(event_sequence=0)
-    assert read_request.seen_terminal_event_ids == ()
-    assert read_request.limit == 50
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.terminal_event_id == "terminal-run-1-6"
+    assert fake_host.read_outbox_requests == []
+    assert sleep.calls == [0.05]
 
 
 @pytest.mark.asyncio
@@ -848,12 +889,9 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_reads_outbox_pages_until_target(
-    tmp_path: Path,
-) -> None:
-    """outbox fallback 必须按 has_more 分页推进直到命中目标 Run。"""
+async def test_cancel_entrypoint_run_reads_outbox_pages_until_target() -> None:
+    """未 attach 补读路径必须按 has_more 分页推进直到命中目标 Run。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_batches=(
@@ -871,11 +909,9 @@ async def test_submit_entrypoint_turn_reads_outbox_pages_until_target(
         ),
     )
 
-    result = await submit_entrypoint_turn_and_wait(
+    result = await cancel_entrypoint_run_and_wait(
         cast(Host, fake_host),
-        request=_turn_request(),
-        scene_inputs=runtime.scene_inputs,
-        host_assembly=runtime.host_assembly,
+        request=_cancel_request(),
     )
 
     assert result.run_id == "run-1"
@@ -884,12 +920,9 @@ async def test_submit_entrypoint_turn_reads_outbox_pages_until_target(
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_retries_when_outbox_lagged(
-    tmp_path: Path,
-) -> None:
-    """outbox LAGGED 且未命中时不能视为完整，必须继续轮询。"""
+async def test_cancel_entrypoint_run_retries_when_outbox_lagged() -> None:
+    """补读路径下 outbox LAGGED 且未命中时必须继续轮询。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     sleep = _SleepRecorder()
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED, RunStatus.SUCCEEDED),
@@ -907,11 +940,9 @@ async def test_submit_entrypoint_turn_retries_when_outbox_lagged(
         ),
     )
 
-    result = await submit_entrypoint_turn_and_wait(
+    result = await cancel_entrypoint_run_and_wait(
         cast(Host, fake_host),
-        request=_turn_request(),
-        scene_inputs=runtime.scene_inputs,
-        host_assembly=runtime.host_assembly,
+        request=_cancel_request(),
         sleep=sleep,
     )
 
@@ -920,12 +951,9 @@ async def test_submit_entrypoint_turn_retries_when_outbox_lagged(
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_raises_on_outbox_projection_failed(
-    tmp_path: Path,
-) -> None:
-    """outbox projection FAILED 必须转为 Service error。"""
+async def test_cancel_entrypoint_run_raises_on_outbox_projection_failed() -> None:
+    """补读路径下 outbox projection FAILED 必须转为 Service error。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_batches=(
@@ -940,21 +968,16 @@ async def test_submit_entrypoint_turn_raises_on_outbox_projection_failed(
     )
 
     with pytest.raises(EntrypointRuntimeError, match="projection_failed"):
-        await submit_entrypoint_turn_and_wait(
+        await cancel_entrypoint_run_and_wait(
             cast(Host, fake_host),
-            request=_turn_request(),
-            scene_inputs=runtime.scene_inputs,
-            host_assembly=runtime.host_assembly,
+            request=_cancel_request(),
         )
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_raises_when_caught_up_without_match(
-    tmp_path: Path,
-) -> None:
-    """Run 已终态且 outbox 追平仍无目标 terminal 时必须报 contract error。"""
+async def test_cancel_entrypoint_run_raises_when_caught_up_without_match() -> None:
+    """补读路径已追平仍无目标 terminal 时必须报 contract error。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_batches=(
@@ -967,11 +990,9 @@ async def test_submit_entrypoint_turn_raises_when_caught_up_without_match(
     )
 
     with pytest.raises(EntrypointRuntimeError, match="caught up without"):
-        await submit_entrypoint_turn_and_wait(
+        await cancel_entrypoint_run_and_wait(
             cast(Host, fake_host),
-            request=_turn_request(),
-            scene_inputs=runtime.scene_inputs,
-            host_assembly=runtime.host_assembly,
+            request=_cancel_request(),
         )
 
 
@@ -1095,6 +1116,42 @@ async def test_close_watcher_cancels_and_awaits_drain_when_aclose_is_cancelled()
 
     assert watcher.closed_count == 1
     assert drain_cancel_observed.is_set()
+    assert drain_task.done()
+    assert drain_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_close_watcher_cancels_drain_before_closing_async_generator() -> None:
+    """真实 async generator watcher 关闭前必须先停止 drain task。"""
+
+    generator_entered = asyncio.Event()
+    generator_closed = asyncio.Event()
+    keep_running = asyncio.Event()
+
+    async def host_event_stream() -> AsyncIterator[HostEvent]:
+        """模拟 Host watch_session_events 返回的 async generator。"""
+
+        try:
+            generator_entered.set()
+            await keep_running.wait()
+            yield _terminal_event(run_id="run-1", event_sequence=1)
+        finally:
+            generator_closed.set()
+
+    watcher = host_event_stream()
+
+    async def drain() -> None:
+        """持续消费 watcher，直到被取消。"""
+
+        async for _event in watcher:
+            pass
+
+    drain_task = asyncio.create_task(drain())
+    await generator_entered.wait()
+
+    await _close_watcher(watcher=cast(ClosableHostEventIterator, watcher), drain_task=drain_task)
+
+    assert generator_closed.is_set()
     assert drain_task.done()
     assert drain_task.cancelled()
 
