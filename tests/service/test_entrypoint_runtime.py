@@ -23,6 +23,11 @@ from dayu.host.api import (
     Host,
     HostApiError,
     HostApiErrorCode,
+    HostActivityCounts,
+    HostActivityKind,
+    HostActivitySeverity,
+    HostActivityStatus,
+    HostActivityView,
     HostCallContext,
     HostEvent,
     HostEventClass,
@@ -45,6 +50,10 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.service.entrypoint_runtime import (
+    EntrypointActivity,
+    EntrypointActivityKind,
+    EntrypointActivitySeverity,
+    EntrypointActivityStatus,
     EntrypointCancelRequest,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
@@ -538,6 +547,229 @@ async def test_submit_entrypoint_turn_filters_unrelated_terminal(
 
 
 @pytest.mark.asyncio
+async def test_submit_entrypoint_turn_emits_host_public_activity(
+    tmp_path: Path,
+) -> None:
+    """submit helper 应把目标 Run 的 Host public activity 投影给 callback。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="activity-tool-call",
+            ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.terminal_event_id == "terminal-run-1-3"
+    assert len(activities) == 1
+    activity = activities[0]
+    assert activity.kind is EntrypointActivityKind.TOOL_BATCH
+    assert activity.status is EntrypointActivityStatus.COMPLETED
+    assert activity.run_id == "run-1"
+    assert activity.event_sequence == 2
+    assert activity.dedupe_key == "activity-tool-call"
+    assert activity.title == "工具批次完成"
+    assert activity.summary == "完成 2 个工具调用。"
+    assert activity.severity is EntrypointActivitySeverity.INFO
+    assert activity.tool_name == "record_smoke_fact"
+    assert activity.tool_display_name == "记录烟测事实"
+    assert activity.counts is not None
+    assert activity.counts.total == 2
+    assert activity.counts.completed == 2
+    assert activity.counts.failed == 0
+    assert activity.counts.cancelled == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_deduplicates_activity_by_dedupe_key(
+    tmp_path: Path,
+) -> None:
+    """重复 dedupe key 的 progress activity 不得重复 callback。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="activity-duplicate",
+            ),
+            _activity_event(
+                event_sequence=3,
+                run_id="run-1",
+                dedupe_key="activity-duplicate",
+            ),
+            _terminal_event(event_sequence=4, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.run_id == "run-1"
+    assert [activity.dedupe_key for activity in activities] == ["activity-duplicate"]
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_non_terminal_dedupe_key_does_not_hide_terminal(
+    tmp_path: Path,
+) -> None:
+    """非终态事件与 terminal 共用 dedupe key 时仍必须返回 terminal。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    shared_dedupe_key = "shared-progress-terminal-dedupe"
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key=shared_dedupe_key,
+            ),
+            _terminal_event(
+                event_sequence=3,
+                run_id="run-1",
+                dedupe_key=shared_dedupe_key,
+            ),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+    )
+
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.run_id == "run-1"
+    assert result.terminal_event_id == "terminal-run-1-3"
+    assert result.dedupe_key == shared_dedupe_key
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_activity_callback_exception_propagates(
+    tmp_path: Path,
+) -> None:
+    """on_activity callback 抛错时应向调用方传播，不被 watcher wait 吞掉。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="activity-callback-error",
+            ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    def raise_from_activity(activity: EntrypointActivity) -> None:
+        """测试 activity callback 异常传播。
+
+        :param activity: Service activity。
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        raise RuntimeError(f"activity callback failed: {activity.dedupe_key}")
+
+    with pytest.raises(RuntimeError, match="activity callback failed: activity-callback-error"):
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=raise_from_activity,
+        )
+
+    assert fake_host.watchers[0].closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_suppresses_progress_without_activity(
+    tmp_path: Path,
+) -> None:
+    """无 Host public activity 的 progress 不得生成伪工具展示。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _progress_without_activity(event_sequence=2, run_id="run-1"),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.run_id == "run-1"
+    assert activities == []
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_filters_unrelated_activity(
+    tmp_path: Path,
+) -> None:
+    """同 Session 其它 Run 的 activity 不得进入当前 turn callback。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="other-run",
+                dedupe_key="activity-other-run",
+            ),
+            _activity_event(
+                event_sequence=3,
+                run_id="run-1",
+                dedupe_key="activity-current-run",
+            ),
+            _terminal_event(event_sequence=4, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.run_id == "run-1"
+    assert [activity.dedupe_key for activity in activities] == ["activity-current-run"]
+
+
+@pytest.mark.asyncio
 async def test_submit_entrypoint_turn_uses_outbox_when_live_terminal_missing(
     tmp_path: Path,
 ) -> None:
@@ -578,6 +810,7 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
     """watcher 失败后必须带诊断并仍可通过 public outbox 返回终态。"""
 
     runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
     outbox_item = _outbox_item(event_sequence=9, run_id="run-1")
     fake_host = _FakeHost(
         submit_watcher_errors=(RuntimeError("watch stream disconnected"),),
@@ -596,6 +829,7 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
         request=_turn_request(),
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
     )
 
     assert result.source is EntrypointTerminalSource.OUTBOX_READ
@@ -604,6 +838,13 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
     assert "RuntimeError" in result.watcher_failure_message
     assert "watch stream disconnected" in result.watcher_failure_message
     assert fake_host.read_outbox_requests[0].after == OutboxTerminalCursor(event_sequence=0)
+    assert len(activities) == 1
+    assert activities[0].kind is EntrypointActivityKind.WATCHER_DIAGNOSTIC
+    assert activities[0].severity is EntrypointActivitySeverity.WARNING
+    assert activities[0].run_id is None
+    assert activities[0].event_sequence is None
+    assert activities[0].dedupe_key == "entrypoint_watcher_failure"
+    assert activities[0].summary == "RuntimeError: watch stream disconnected"
 
 
 @pytest.mark.asyncio
@@ -1081,12 +1322,14 @@ def _terminal_event(
     event_sequence: int,
     run_id: str,
     terminal_status: HostTerminalStatus = HostTerminalStatus.SUCCEEDED,
+    dedupe_key: str | None = None,
 ) -> HostEvent:
     """构造测试 terminal HostEvent。
 
     :param event_sequence: event sequence。
     :param run_id: Run id。
     :param terminal_status: terminal 状态。
+    :param dedupe_key: Host public dedupe key；``None`` 表示使用默认 terminal key。
     :returns: HostEvent。
     :raises Exception: 不主动抛出异常。
     """
@@ -1104,11 +1347,83 @@ def _terminal_event(
         event_type=_event_type_for_terminal_status(terminal_status),
         kind=kind,
         activity=None,
-        dedupe_key=f"terminal-{run_id}-{event_sequence}",
+        dedupe_key=dedupe_key if dedupe_key is not None else f"terminal-{run_id}-{event_sequence}",
         terminal_status=terminal_status,
         final_answer=final_answer,
         error_message=("run failed" if terminal_status is HostTerminalStatus.FAILED else None),
         cancel_reason=("cli_sigint" if terminal_status is HostTerminalStatus.CANCELLED else None),
+    )
+
+
+def _activity_event(
+    *,
+    event_sequence: int,
+    run_id: str,
+    dedupe_key: str,
+) -> HostEvent:
+    """构造带 Host public activity 的 progress HostEvent。
+
+    :param event_sequence: event sequence。
+    :param run_id: Run id。
+    :param dedupe_key: Host public dedupe key。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"activity-{run_id}-{event_sequence}",
+        event_sequence=event_sequence,
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.DIAGNOSTIC,
+        event_type="IGNORED_BY_SERVICE_UI_BRANCHING",
+        kind=HostEventKind.PROGRESS,
+        activity=HostActivityView(
+            kind=HostActivityKind.TOOL_BATCH,
+            status=HostActivityStatus.COMPLETED,
+            title="工具批次完成",
+            summary="完成 2 个工具调用。",
+            severity=HostActivitySeverity.INFO,
+            tool_name="record_smoke_fact",
+            tool_display_name="记录烟测事实",
+            counts=HostActivityCounts(
+                total=2,
+                completed=2,
+                failed=0,
+                cancelled=0,
+            ),
+        ),
+        dedupe_key=dedupe_key,
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _progress_without_activity(*, event_sequence: int, run_id: str) -> HostEvent:
+    """构造没有 public activity 的 progress HostEvent。
+
+    :param event_sequence: event sequence。
+    :param run_id: Run id。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"progress-{run_id}-{event_sequence}",
+        event_sequence=event_sequence,
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.PREVIEW,
+        event_type="CONTENT_DELTA",
+        kind=HostEventKind.PROGRESS,
+        activity=None,
+        dedupe_key=f"progress-{run_id}-{event_sequence}",
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
     )
 
 

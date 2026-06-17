@@ -23,6 +23,10 @@ from dayu.host.api import (
     FollowupBehavior,
     Host,
     HostApiError,
+    HostActivityCounts,
+    HostActivityKind,
+    HostActivitySeverity,
+    HostActivityStatus,
     HostCallContext,
     HostEvent,
     HostFinalAnswerView,
@@ -58,6 +62,9 @@ from dayu.service.host_assembly import (
 DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS: Final[float] = 0.05
 _OUTBOX_TERMINAL_READ_LIMIT: Final[int] = 50
 _WATCHER_FAILURE_DIAGNOSTIC_PREFIX: Final[str] = "watcher drain failed"
+_WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY: Final[str] = "entrypoint_watcher_failure"
+_WATCHER_FAILURE_ACTIVITY_TITLE: Final[str] = "运行事件流诊断"
+_WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT: Final[int] = 240
 _TERMINAL_RUN_STATUSES: Final[frozenset[RunStatus]] = frozenset(
     {
         RunStatus.SUCCEEDED,
@@ -74,6 +81,138 @@ class EntrypointRuntimeError(RuntimeError):
 
 RunAcceptedCallback = Callable[[str], None]
 """Host 接受 Run 后通知调用方 accepted_run_id 的回调类型。"""
+
+
+class EntrypointActivityKind(StrEnum):
+    """entrypoint activity 展示语义分类。
+
+    成员表达 Service 传给 UI adapter 的安全展示类型，不等同于 Host
+    EventLog ``event_class`` 或 ``event_type``。
+    """
+
+    RUN_LIFECYCLE = "run_lifecycle"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    TOOL_BATCH = "tool_batch"
+    TOOL_AWAITING = "tool_awaiting"
+    CONTEXT_COMPACTION = "context_compaction"
+    PROVIDER_DIAGNOSTIC = "provider_diagnostic"
+    WATCHER_DIAGNOSTIC = "watcher_diagnostic"
+
+
+class EntrypointActivityStatus(StrEnum):
+    """entrypoint activity 展示状态。
+
+    成员只描述单条 activity 对调用方的展示进度，不替代 Host Run
+    状态机或 terminal 结果。
+    """
+
+    STARTED = "started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    WAITING = "waiting"
+    INFO = "info"
+
+
+class EntrypointActivitySeverity(StrEnum):
+    """entrypoint activity 展示严重级别。
+
+    成员用于 UI adapter 选择展示强度，不表达 durable failure truth。
+    """
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class EntrypointActivityCounts:
+    """entrypoint activity 的固定计数字段。
+
+    :param total: 总数量，必须是非负整数。
+    :param completed: 已完成数量，必须是非负整数。
+    :param failed: 失败数量，必须是非负整数。
+    :param cancelled: 已取消数量，必须是非负整数。
+    """
+
+    total: int
+    completed: int
+    failed: int
+    cancelled: int
+
+    def __post_init__(self) -> None:
+        """校验计数字段。
+
+        :returns: ``None``。
+        :raises TypeError: 任一字段不是严格整数时抛出。
+        :raises ValueError: 任一字段小于零时抛出。
+        """
+
+        _require_non_negative_int(self.total, field_name="EntrypointActivityCounts.total")
+        _require_non_negative_int(self.completed, field_name="EntrypointActivityCounts.completed")
+        _require_non_negative_int(self.failed, field_name="EntrypointActivityCounts.failed")
+        _require_non_negative_int(self.cancelled, field_name="EntrypointActivityCounts.cancelled")
+
+
+@dataclass(frozen=True, slots=True)
+class EntrypointActivity:
+    """entrypoint runtime 传给 UI adapter 的安全 activity。
+
+    :param kind: activity 展示语义分类。
+    :param status: activity 展示状态。
+    :param run_id: 关联 Run id；不绑定 Run 的本地诊断为 ``None``。
+    :param event_sequence: Host event sequence；本地诊断为 ``None``。
+    :param dedupe_key: activity 去重键。
+    :param title: 简短标题，必须非空。
+    :param summary: 有界补充摘要；无摘要时为 ``None``。
+    :param severity: 展示严重级别。
+    :param tool_name: 稳定工具名；非工具 activity 为 ``None``。
+    :param tool_display_name: Host-owned 工具展示名；缺失时为 ``None``。
+    :param counts: 固定计数视图；无计数时为 ``None``。
+    """
+
+    kind: EntrypointActivityKind
+    status: EntrypointActivityStatus
+    run_id: str | None
+    event_sequence: int | None
+    dedupe_key: str
+    title: str
+    summary: str | None
+    severity: EntrypointActivitySeverity
+    tool_name: str | None
+    tool_display_name: str | None
+    counts: EntrypointActivityCounts | None
+
+    def __post_init__(self) -> None:
+        """校验 activity 字段。
+
+        :returns: ``None``。
+        :raises TypeError: enum、sequence 或 counts 字段类型非法时抛出。
+        :raises ValueError: 文本字段为空或 sequence 小于零时抛出。
+        """
+
+        if not isinstance(self.kind, EntrypointActivityKind):
+            raise TypeError("EntrypointActivity.kind must be EntrypointActivityKind")
+        if not isinstance(self.status, EntrypointActivityStatus):
+            raise TypeError("EntrypointActivity.status must be EntrypointActivityStatus")
+        _require_optional_non_empty(self.run_id, field_name="EntrypointActivity.run_id")
+        if self.event_sequence is not None:
+            _require_non_negative_int(self.event_sequence, field_name="EntrypointActivity.event_sequence")
+        _require_non_empty(self.dedupe_key, field_name="EntrypointActivity.dedupe_key")
+        _require_non_empty(self.title, field_name="EntrypointActivity.title")
+        _require_optional_non_empty(self.summary, field_name="EntrypointActivity.summary")
+        if not isinstance(self.severity, EntrypointActivitySeverity):
+            raise TypeError("EntrypointActivity.severity must be EntrypointActivitySeverity")
+        _require_optional_non_empty(self.tool_name, field_name="EntrypointActivity.tool_name")
+        _require_optional_non_empty(self.tool_display_name, field_name="EntrypointActivity.tool_display_name")
+        if self.counts is not None and not isinstance(self.counts, EntrypointActivityCounts):
+            raise TypeError("EntrypointActivity.counts must be EntrypointActivityCounts")
+
+
+EntrypointActivityCallback = Callable[[EntrypointActivity], None]
+"""entrypoint runtime activity 通知回调类型。"""
 
 
 class EntrypointTerminalSource(StrEnum):
@@ -249,6 +388,7 @@ class _TerminalObservationState:
     seen_event_ids: set[str]
     seen_terminal_event_ids: set[str]
     seen_dedupe_keys: set[str]
+    seen_activity_dedupe_keys: set[str]
     outbox_cursor: OutboxTerminalCursor | None
     watcher_failure_message: str | None
 
@@ -377,6 +517,7 @@ async def submit_entrypoint_turn_and_wait(
     scene_inputs: PreparedSceneInputs,
     host_assembly: ServiceOpenHostAssemblyResult,
     on_run_accepted: RunAcceptedCallback | None = None,
+    on_activity: EntrypointActivityCallback | None = None,
     poll_interval_seconds: float = DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> EntrypointRunTerminalResult:
@@ -388,6 +529,8 @@ async def submit_entrypoint_turn_and_wait(
     :param host_assembly: Host opener assembly 结果。
     :param on_run_accepted: Host 接受本轮 Run 后的可选通知回调；用于 UI
         adapter 在等待终态期间发起 typed cancel。
+    :param on_activity: 可选 activity 回调；只接收 Host public activity 投影和
+        Service 本地有界诊断。
     :param poll_interval_seconds: watcher 暂无 terminal 时的 public read 轮询间隔。
     :param sleep: 可注入 sleep coroutine，便于测试。
     :returns: Run terminal 观察结果。
@@ -425,6 +568,7 @@ async def submit_entrypoint_turn_and_wait(
             run_id=followup.accepted_run_id,
             queue=queue,
             state=state,
+            on_activity=on_activity,
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
         )
@@ -558,6 +702,7 @@ async def _wait_for_terminal(
     run_id: str,
     queue: asyncio.Queue[HostEvent | _WatcherFailure],
     state: _TerminalObservationState,
+    on_activity: EntrypointActivityCallback | None = None,
     poll_interval_seconds: float,
     sleep: Callable[[float], Awaitable[None]],
 ) -> EntrypointRunTerminalResult:
@@ -568,6 +713,7 @@ async def _wait_for_terminal(
     :param run_id: 目标 Run id。
     :param queue: watcher drain queue。
     :param state: 本轮本地观察状态。
+    :param on_activity: 可选 activity 回调。
     :param poll_interval_seconds: public read 轮询间隔。
     :param sleep: 可注入 sleep coroutine。
     :returns: Run terminal 观察结果。
@@ -582,6 +728,7 @@ async def _wait_for_terminal(
             queue=queue,
             state=state,
             run_id=run_id,
+            on_activity=on_activity,
         )
         if live_terminal is not None:
             return live_terminal
@@ -603,14 +750,16 @@ def _drain_available_watcher_items(
     queue: asyncio.Queue[HostEvent | _WatcherFailure],
     state: _TerminalObservationState,
     run_id: str,
+    on_activity: EntrypointActivityCallback | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """消费当前 queue 中已到达的 watcher item。
 
     :param queue: watcher drain queue。
     :param state: 本轮本地观察状态。
     :param run_id: 目标 Run id。
+    :param on_activity: 可选 activity 回调。
     :returns: 命中的 terminal result；没有命中时返回 ``None``。
-    :raises Exception: 不主动抛出异常。
+    :raises Exception: ``on_activity`` callback 抛出的异常会向调用方透传。
     """
 
     while True:
@@ -620,6 +769,11 @@ def _drain_available_watcher_items(
             return None
         if isinstance(item, _WatcherFailure):
             _record_watcher_failure(state=state, error=item.error)
+            _emit_watcher_failure_activity(
+                state=state,
+                error=item.error,
+                on_activity=on_activity,
+            )
             continue
         terminal = _terminal_result_from_live_event(
             item,
@@ -628,6 +782,212 @@ def _drain_available_watcher_items(
         )
         if terminal is not None:
             return terminal
+        _emit_entrypoint_activity_from_host_event(
+            event=item,
+            state=state,
+            run_id=run_id,
+            on_activity=on_activity,
+        )
+
+
+def _emit_entrypoint_activity_from_host_event(
+    *,
+    event: HostEvent,
+    state: _TerminalObservationState,
+    run_id: str,
+    on_activity: EntrypointActivityCallback | None,
+) -> None:
+    """把非终态 Host public activity 投影给 Service activity callback。
+
+    :param event: Host public event。
+    :param state: 本轮本地观察状态。
+    :param run_id: 当前等待的目标 Run id。
+    :param on_activity: 可选 activity 回调。
+    :returns: ``None``。
+    :raises Exception: callback 抛出的异常会向调用方透传。
+    """
+
+    if on_activity is None or event.terminal_status is not None or event.activity is None:
+        return
+    if event.run_id != run_id:
+        return
+    if event.dedupe_key in state.seen_activity_dedupe_keys:
+        return
+    state.seen_activity_dedupe_keys.add(event.dedupe_key)
+    on_activity(_entrypoint_activity_from_host_event(event))
+
+
+def _entrypoint_activity_from_host_event(event: HostEvent) -> EntrypointActivity:
+    """把 Host public activity view 转为 entrypoint activity。
+
+    :param event: Host public event，必须携带 ``activity``。
+    :returns: entrypoint activity。
+    :raises ValueError: event 未携带 activity 时抛出。
+    """
+
+    activity = event.activity
+    if activity is None:
+        raise ValueError("HostEvent.activity is required")
+    return EntrypointActivity(
+        kind=_entrypoint_activity_kind_from_host(activity.kind),
+        status=_entrypoint_activity_status_from_host(activity.status),
+        run_id=event.run_id,
+        event_sequence=event.event_sequence,
+        dedupe_key=event.dedupe_key,
+        title=activity.title,
+        summary=activity.summary,
+        severity=_entrypoint_activity_severity_from_host(activity.severity),
+        tool_name=activity.tool_name,
+        tool_display_name=activity.tool_display_name,
+        counts=_entrypoint_activity_counts_from_host(activity.counts),
+    )
+
+
+def _entrypoint_activity_kind_from_host(kind: HostActivityKind) -> EntrypointActivityKind:
+    """把 Host activity kind 映射为 Service activity kind。
+
+    :param kind: Host public activity kind。
+    :returns: Service entrypoint activity kind。
+    :raises AssertionError: 出现未覆盖的 Host activity kind 时抛出。
+    """
+
+    if kind is HostActivityKind.RUN_LIFECYCLE:
+        return EntrypointActivityKind.RUN_LIFECYCLE
+    if kind is HostActivityKind.TOOL_CALL:
+        return EntrypointActivityKind.TOOL_CALL
+    if kind is HostActivityKind.TOOL_RESULT:
+        return EntrypointActivityKind.TOOL_RESULT
+    if kind is HostActivityKind.TOOL_BATCH:
+        return EntrypointActivityKind.TOOL_BATCH
+    if kind is HostActivityKind.TOOL_AWAITING:
+        return EntrypointActivityKind.TOOL_AWAITING
+    if kind is HostActivityKind.CONTEXT_COMPACTION:
+        return EntrypointActivityKind.CONTEXT_COMPACTION
+    if kind is HostActivityKind.PROVIDER_DIAGNOSTIC:
+        return EntrypointActivityKind.PROVIDER_DIAGNOSTIC
+    raise AssertionError(f"unexpected HostActivityKind: {kind}")
+
+
+def _entrypoint_activity_status_from_host(
+    status: HostActivityStatus,
+) -> EntrypointActivityStatus:
+    """把 Host activity status 映射为 Service activity status。
+
+    :param status: Host public activity status。
+    :returns: Service entrypoint activity status。
+    :raises AssertionError: 出现未覆盖的 Host activity status 时抛出。
+    """
+
+    if status is HostActivityStatus.STARTED:
+        return EntrypointActivityStatus.STARTED
+    if status is HostActivityStatus.IN_PROGRESS:
+        return EntrypointActivityStatus.IN_PROGRESS
+    if status is HostActivityStatus.COMPLETED:
+        return EntrypointActivityStatus.COMPLETED
+    if status is HostActivityStatus.FAILED:
+        return EntrypointActivityStatus.FAILED
+    if status is HostActivityStatus.CANCELLED:
+        return EntrypointActivityStatus.CANCELLED
+    if status is HostActivityStatus.WAITING:
+        return EntrypointActivityStatus.WAITING
+    if status is HostActivityStatus.INFO:
+        return EntrypointActivityStatus.INFO
+    raise AssertionError(f"unexpected HostActivityStatus: {status}")
+
+
+def _entrypoint_activity_severity_from_host(
+    severity: HostActivitySeverity,
+) -> EntrypointActivitySeverity:
+    """把 Host activity severity 映射为 Service activity severity。
+
+    :param severity: Host public activity severity。
+    :returns: Service entrypoint activity severity。
+    :raises AssertionError: 出现未覆盖的 Host activity severity 时抛出。
+    """
+
+    if severity is HostActivitySeverity.INFO:
+        return EntrypointActivitySeverity.INFO
+    if severity is HostActivitySeverity.WARNING:
+        return EntrypointActivitySeverity.WARNING
+    if severity is HostActivitySeverity.ERROR:
+        return EntrypointActivitySeverity.ERROR
+    raise AssertionError(f"unexpected HostActivitySeverity: {severity}")
+
+
+def _entrypoint_activity_counts_from_host(
+    counts: HostActivityCounts | None,
+) -> EntrypointActivityCounts | None:
+    """把 Host activity counts 映射为 Service activity counts。
+
+    :param counts: Host public activity counts；无计数时为 ``None``。
+    :returns: Service entrypoint activity counts 或 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if counts is None:
+        return None
+    return EntrypointActivityCounts(
+        total=counts.total,
+        completed=counts.completed,
+        failed=counts.failed,
+        cancelled=counts.cancelled,
+    )
+
+
+def _emit_watcher_failure_activity(
+    *,
+    state: _TerminalObservationState,
+    error: Exception,
+    on_activity: EntrypointActivityCallback | None,
+) -> None:
+    """把 watcher failure 转为有界本地诊断 activity。
+
+    :param state: 本轮本地观察状态。
+    :param error: watcher drain 捕获的异常。
+    :param on_activity: 可选 activity 回调。
+    :returns: ``None``。
+    :raises Exception: callback 抛出的异常会向调用方透传。
+    """
+
+    if on_activity is None:
+        return
+    if _WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY in state.seen_activity_dedupe_keys:
+        return
+    state.seen_activity_dedupe_keys.add(_WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY)
+    on_activity(
+        EntrypointActivity(
+            kind=EntrypointActivityKind.WATCHER_DIAGNOSTIC,
+            status=EntrypointActivityStatus.INFO,
+            run_id=None,
+            event_sequence=None,
+            dedupe_key=_WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY,
+            title=_WATCHER_FAILURE_ACTIVITY_TITLE,
+            summary=_bounded_watcher_failure_activity_summary(error),
+            severity=EntrypointActivitySeverity.WARNING,
+            tool_name=None,
+            tool_display_name=None,
+            counts=None,
+        )
+    )
+
+
+def _bounded_watcher_failure_activity_summary(error: Exception) -> str:
+    """生成有界 watcher failure activity 摘要。
+
+    :param error: watcher drain 捕获的异常。
+    :returns: 有界诊断摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    message = str(error)
+    error_type = type(error).__name__
+    if message:
+        summary = f"{error_type}: {message}"
+    else:
+        summary = error_type
+    if len(summary) <= _WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT:
+        return summary
+    return summary[: _WATCHER_FAILURE_ACTIVITY_SUMMARY_LIMIT - 3] + "..."
 
 
 def _terminal_result_from_live_event(
@@ -649,14 +1009,15 @@ def _terminal_result_from_live_event(
         state.last_observed_event_sequence,
         event.event_sequence,
     )
+    if event.terminal_status is None:
+        return None
     duplicate = event.event_id in state.seen_event_ids or event.dedupe_key in state.seen_dedupe_keys
     state.seen_event_ids.add(event.event_id)
-    if event.terminal_status is not None:
-        state.seen_terminal_event_ids.add(event.event_id)
+    state.seen_terminal_event_ids.add(event.event_id)
     if duplicate:
         return None
     state.seen_dedupe_keys.add(event.dedupe_key)
-    if event.run_id != run_id or event.terminal_status is None:
+    if event.run_id != run_id:
         return None
     return EntrypointRunTerminalResult(
         source=EntrypointTerminalSource.LIVE_EVENT,
@@ -853,9 +1214,57 @@ def _new_terminal_observation_state() -> _TerminalObservationState:
         seen_event_ids=set(),
         seen_terminal_event_ids=set(),
         seen_dedupe_keys=set(),
+        seen_activity_dedupe_keys=set(),
         outbox_cursor=None,
         watcher_failure_message=None,
     )
+
+
+def _require_non_empty(value: str, *, field_name: str) -> None:
+    """校验字符串非空。
+
+    :param value: 待校验字符串。
+    :param field_name: 错误消息中的字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是字符串时抛出。
+    :raises ValueError: 值为空字符串时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be str")
+    if value == "":
+        raise ValueError(f"{field_name} must be non-empty")
+
+
+def _require_optional_non_empty(value: str | None, *, field_name: str) -> None:
+    """校验可选字符串为空或非空字符串。
+
+    :param value: 待校验字符串或 ``None``。
+    :param field_name: 错误消息中的字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是字符串且不为 ``None`` 时抛出。
+    :raises ValueError: 值为空字符串时抛出。
+    """
+
+    if value is None:
+        return
+    _require_non_empty(value, field_name=field_name)
+
+
+def _require_non_negative_int(value: int, *, field_name: str) -> None:
+    """校验值为非负严格整数。
+
+    :param value: 待校验整数。
+    :param field_name: 错误消息中的字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是严格整数时抛出。
+    :raises ValueError: 值小于零时抛出。
+    """
+
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be int")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
 
 
 def _require_positive_poll_interval(value: float) -> None:
