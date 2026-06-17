@@ -144,13 +144,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | ready-to-open-draft-PR |
-| implementation status | WU-CLI-ACTIVITY-01 final closeout completed locally; post-closeout interactive composer async fix applied; draft PR gate ready when requested |
-| active work unit | WU-CLI-ACTIVITY-01 |
+| implementation status | WU-CLI-INTERACTIVE-RESUME-01 final closeout completed locally; implementation/review gates passed; draft PR gate ready when requested |
+| active work unit | WU-CLI-INTERACTIVE-RESUME-01 |
 | default next work unit | WU-OBS-00 |
 | next entry point | Create draft PR when requested; otherwise proceed to default next work unit |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01. |
+| blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01; WU-CLI-INTERACTIVE-RESUME-01 did not modify Host / Engine public API or contracts. |
 
 状态约定：
 
@@ -202,6 +202,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
+| WU-CLI-INTERACTIVE-RESUME-01-R1 | deferred-with-owner | Future CLI client-state / multi-client isolation WU | 当前按 workspace-local CLI terminal cursor 处理；若需要多个本地 CLI 客户端互不遮蔽 terminal backfill，应引入 per-client cursor identity。 |
+| WU-CLI-INTERACTIVE-RESUME-01-R2 | deferred-with-owner | Future CLI UX / error-handling WU | `session resume --mode interactive` 的 startup `EntrypointRuntimeError` 仍沿现有 CLI runtime error 路径传播；后续可统一渲染为结构化 CLI 错误。 |
 
 ## 当前 Work Units
 
@@ -211,6 +213,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
 | WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 closed on 2026-06-17 after user authorization |
 | WU-CLI-ACTIVITY-01 | ready-to-open-draft-PR | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Final closeout completed in `docs/reviews/wu-cli-activity-01-final-closeout-20260617.md`; accepted commits: plan `012fee0a`, Slice A `992a641d`, Slice B `152292da`, CLI `1a6f4bb2`; post-closeout async composer fix recorded in `docs/reviews/wu-cli-activity-01-interactive-composer-async-fix.md`; aggregate deepreview non-blocking. |
+| WU-CLI-INTERACTIVE-RESUME-01 | ready-to-open-draft-PR | prompt / interactive existing-session startup resume semantics | 用户裁决；无 GitHub Issue | Final closeout completed locally: prompt does no startup backfill or unfinished-run wait/replay but records displayed terminal cursor; interactive existing-session entrypoints run watcher-first attach/reconnect before REPL, session-scoped Outbox backfill, idle-tail closure, active / queued barrier, and async CLI cursor store. Implementation review PASS from AgentMiMo / AgentDS; validation: `tests/service -q` 110 passed, affected CLI subset 74 passed, `pyright dayu/ tests/ utils/` 0 errors. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -303,6 +306,42 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - `RR-ACT-03` closed by CLI implementation and tests: activity renderer is TTY-gated, stderr-only, line-oriented, and closed before terminal rendering; prompt / interactive tests cover stdout cleanliness.
 - `RR-ACT-04` closed by CLI fix and tests: repeated Ctrl+C local exit returns local 130 without forging Host terminal facts.
 - `RR-ACT-05` closed by CLI fix and tests: prompt cancel terminal race prefers terminal when cancel terminal arrives before the second Ctrl+C local exit.
+
+## WU-CLI-INTERACTIVE-RESUME-01 Prompt / Interactive Existing-Session Startup
+
+### 状态
+
+本 work unit 已完成本地 final closeout。语义裁决为：`prompt` 不执行离线 terminal backfill，也不等待 / 重放历史未完成 Run；`interactive` existing-session 入口在进入 REPL 前执行 attach / reconnect startup barrier，处理 selected Session 的离线 terminal、active Run 与 queued-only 状态。
+
+### Gate artifacts
+
+- initial plan: `docs/reviews/wu-cli-interactive-resume-01-plan-codex-20260617.md`
+- plan reviews: `docs/reviews/plan-review-20260617-183641.md`; `docs/reviews/plan-review-20260617-183910.md`
+- plan adjudication: `docs/reviews/wu-cli-interactive-resume-01-plan-adjudication-20260617.md`
+- revised plan: `docs/reviews/wu-cli-interactive-resume-01-plan-fix-codex-20260617.md`
+- idle-tail fix artifact: `docs/reviews/wu-cli-interactive-resume-01-idle-tail-fix-codex-20260617.md`
+- implementation reviews: `docs/reviews/wu-cli-interactive-resume-01-implementation-review-mimo-20260617.md`; `docs/reviews/wu-cli-interactive-resume-01-implementation-review-20260617.md`
+
+### Implementation summary
+
+- Service 新增 `startup_reconnect_entrypoint_session(...)`，使用 watcher-first 顺序：先 attach `watch_session_events(session_id)` 并启动 drain task，再执行 session-scoped Outbox backfill。
+- Startup backfill 不按 `run_id` 过滤；`CAUGHT_UP` 且无新 terminal 是正常 idle，不复用 run-scoped terminal fallback 的异常语义。
+- idle snapshot 后增加 tail closure：再次 session-scoped Outbox backfill 并 drain watcher queue，发现 terminal 或首次 watcher failure 时重新读取 Session snapshot，避免 terminal 已提交但尚未进入 watcher queue 的窗口。
+- interactive existing-session 入口在首条输入前执行 startup barrier；active Run 先观察 terminal，queued-only 按 bounded promotion wait，耗尽后结构化失败，不静默进入 REPL。
+- prompt existing-session 入口不读 cursor、不补读旧 terminal、不等待旧 active / queued；仅在本次 terminal 成功渲染后推进 CLI terminal cursor。
+- CLI terminal cursor 是 workspace-local UI state，通过 `asyncio.to_thread()` 包裹同步 JSON / file lock / atomic replace；腐坏 JSON 与非法字段 fail fast。
+
+### Validation
+
+- `source .venv/bin/activate && pytest tests/service -q` passed: 110 passed, 3 third-party edgar deprecation warnings.
+- `source .venv/bin/activate && pytest tests/cli/test_session_terminal_cursor.py tests/cli/test_interactive_command.py tests/cli/test_prompt_command.py tests/cli/test_session_command.py -q` passed: 74 passed, 3 third-party edgar deprecation warnings. This CLI subset is slow; final run completed in 360.44s.
+- `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/` passed: 0 errors, 0 warnings.
+
+### Residual risks
+
+- `WU-CLI-INTERACTIVE-RESUME-01-R1` deferred: workspace-local cursor is shared by local CLI clients; per-client cursor identity belongs to future CLI client-state / multi-client isolation work.
+- `WU-CLI-INTERACTIVE-RESUME-01-R2` deferred: startup `EntrypointRuntimeError` follows existing CLI runtime error propagation; future CLI UX / error-handling work may render it as a structured command error.
+- Rendering success followed by cursor write crash can duplicate terminal on next startup; accepted by design because no terminal loss is preferred over false acknowledgement.
 
 ## WU-CLI-SESSION-01 CLI Session Management
 

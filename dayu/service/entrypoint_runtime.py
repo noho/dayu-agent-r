@@ -60,6 +60,9 @@ from dayu.service.host_assembly import (
 )
 
 DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+ENTRYPOINT_STARTUP_OUTBOX_LAGGED_MAX_ATTEMPTS: Final[int] = 3
+ENTRYPOINT_STARTUP_PROMOTION_MAX_ATTEMPTS: Final[int] = 20
 _OUTBOX_TERMINAL_READ_LIMIT: Final[int] = 50
 _WATCHER_FAILURE_DIAGNOSTIC_PREFIX: Final[str] = "watcher drain failed"
 _WATCHER_FAILURE_ACTIVITY_DEDUPE_KEY: Final[str] = "entrypoint_watcher_failure"
@@ -340,6 +343,75 @@ class EntrypointRunTerminalResult:
     error_message: str | None
     cancel_reason: str | None
     watcher_failure_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EntrypointStartupReconnectRequest:
+    """interactive 已有 Session startup reconnect 请求。
+
+    :param context: Host 调用上下文，用于表达本次 startup 的责任链。
+    :param session_id: 已选择的 Host Session id。
+    :param terminal_cursor: CLI 已成功展示的 terminal 水位。
+    :param seen_terminal_event_ids: CLI 已成功展示的 terminal event id 窗口。
+    :param poll_interval_seconds: active Run terminal 观察轮询间隔。
+    :param outbox_lagged_max_attempts: Outbox projection 落后时的最大重试次数。
+    :param promotion_poll_interval_seconds: queued Run promotion 轮询间隔。
+    :param promotion_max_attempts: queued-only promotion 最大等待次数。
+    """
+
+    context: HostCallContext
+    session_id: str
+    terminal_cursor: OutboxTerminalCursor
+    seen_terminal_event_ids: frozenset[str]
+    poll_interval_seconds: float
+    outbox_lagged_max_attempts: int
+    promotion_poll_interval_seconds: float
+    promotion_max_attempts: int
+
+    def __post_init__(self) -> None:
+        """校验 startup reconnect 请求。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字符串为空、轮询参数或 seen ids 非法时抛出。
+        """
+
+        if not isinstance(self.context, HostCallContext):
+            raise TypeError("EntrypointStartupReconnectRequest.context must be HostCallContext")
+        _require_non_empty(self.session_id, field_name="EntrypointStartupReconnectRequest.session_id")
+        if not isinstance(self.terminal_cursor, OutboxTerminalCursor):
+            raise TypeError("EntrypointStartupReconnectRequest.terminal_cursor must be OutboxTerminalCursor")
+        if not isinstance(self.seen_terminal_event_ids, frozenset):
+            raise TypeError("EntrypointStartupReconnectRequest.seen_terminal_event_ids must be frozenset")
+        for terminal_event_id in self.seen_terminal_event_ids:
+            _require_non_empty(
+                terminal_event_id,
+                field_name="EntrypointStartupReconnectRequest.seen_terminal_event_ids",
+            )
+        _require_positive_poll_interval(self.poll_interval_seconds)
+        _require_non_negative_int(
+            self.outbox_lagged_max_attempts,
+            field_name="EntrypointStartupReconnectRequest.outbox_lagged_max_attempts",
+        )
+        _require_positive_poll_interval(self.promotion_poll_interval_seconds)
+        _require_non_negative_int(
+            self.promotion_max_attempts,
+            field_name="EntrypointStartupReconnectRequest.promotion_max_attempts",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EntrypointStartupReconnectResult:
+    """interactive startup reconnect 结果。
+
+    :param terminal_results: CLI 进入输入态前必须先展示的 terminal 结果。
+    :param next_terminal_cursor: 本次 startup 已观察到的 terminal 水位。
+    :param seen_terminal_event_ids: 本次 startup 合并后的 terminal event id 集合。
+    """
+
+    terminal_results: tuple[EntrypointRunTerminalResult, ...]
+    next_terminal_cursor: OutboxTerminalCursor
+    seen_terminal_event_ids: frozenset[str]
 
 
 class ClosableHostEventIterator(Protocol):
@@ -645,6 +717,221 @@ async def cancel_entrypoint_run_and_wait(
         )
     finally:
         await _close_watcher(watcher=watcher, drain_task=drain_task)
+
+
+async def startup_reconnect_entrypoint_session(
+    host: Host,
+    *,
+    request: EntrypointStartupReconnectRequest,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> EntrypointStartupReconnectResult:
+    """为 interactive 已有 Session 执行 watcher-first startup reconnect。
+
+    :param host: Host public Protocol handle。
+    :param request: startup reconnect 请求。
+    :param sleep: 可注入 sleep coroutine，便于测试。
+    :returns: startup 阶段需要 CLI 展示的 terminal 结果与新 cursor。
+    :raises EntrypointRuntimeError: Outbox projection 失败、LAGGED 重试耗尽或
+        queued-only promotion 等待耗尽时抛出。
+    :raises HostApiError: Host public API 调用失败时由 Host 抛出。
+    """
+
+    watcher = _attach_watcher(host, request.session_id)
+    queue: asyncio.Queue[HostEvent | _WatcherFailure] = asyncio.Queue()
+    drain_task = asyncio.create_task(_drain_host_events(watcher, queue))
+    state = _new_terminal_observation_state(
+        terminal_cursor=request.terminal_cursor,
+        seen_terminal_event_ids=request.seen_terminal_event_ids,
+    )
+    terminal_results: list[EntrypointRunTerminalResult] = []
+    try:
+        terminal_results.extend(
+            await _read_session_outbox_terminal_backfill(
+                host,
+                session_id=request.session_id,
+                state=state,
+                outbox_lagged_max_attempts=request.outbox_lagged_max_attempts,
+                poll_interval_seconds=request.poll_interval_seconds,
+                sleep=sleep,
+            )
+        )
+        terminal_results.extend(
+            _drain_available_startup_terminal_items(queue=queue, state=state)
+        )
+        await _observe_startup_active_and_queued_runs(
+            host,
+            request=request,
+            queue=queue,
+            state=state,
+            terminal_results=terminal_results,
+            sleep=sleep,
+        )
+        return EntrypointStartupReconnectResult(
+            terminal_results=tuple(terminal_results),
+            next_terminal_cursor=OutboxTerminalCursor(
+                event_sequence=state.last_observed_event_sequence
+            ),
+            seen_terminal_event_ids=frozenset(state.seen_terminal_event_ids),
+        )
+    finally:
+        await _close_watcher(watcher=watcher, drain_task=drain_task)
+
+
+async def _observe_startup_active_and_queued_runs(
+    host: Host,
+    *,
+    request: EntrypointStartupReconnectRequest,
+    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    state: _TerminalObservationState,
+    terminal_results: list[EntrypointRunTerminalResult],
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    """观察 startup barrier 中的 active / queued Run 直到 Session idle。
+
+    :param host: Host public Protocol handle。
+    :param request: startup reconnect 请求。
+    :param queue: watcher drain queue。
+    :param state: 本轮本地观察状态。
+    :param terminal_results: 已收集 terminal 结果列表。
+    :param sleep: 可注入 sleep coroutine。
+    :returns: ``None``。
+    :raises EntrypointRuntimeError: queued-only promotion 等待耗尽时抛出。
+    """
+
+    while True:
+        terminal_results.extend(
+            _drain_available_startup_terminal_items(queue=queue, state=state)
+        )
+        snapshot = await host.get_session(request.session_id)
+        if snapshot.active_run_id is not None:
+            terminal_results.append(
+                await _wait_for_terminal(
+                    host,
+                    session_id=request.session_id,
+                    run_id=snapshot.active_run_id,
+                    queue=queue,
+                    state=state,
+                    allow_outbox_terminal_fallback=True,
+                    poll_interval_seconds=request.poll_interval_seconds,
+                    sleep=sleep,
+                )
+            )
+            continue
+        if snapshot.queued_run_ids:
+            promoted = await _wait_for_startup_promotion(
+                host,
+                session_id=request.session_id,
+                promotion_max_attempts=request.promotion_max_attempts,
+                promotion_poll_interval_seconds=request.promotion_poll_interval_seconds,
+                sleep=sleep,
+            )
+            terminal_results.extend(
+                _drain_available_startup_terminal_items(queue=queue, state=state)
+            )
+            if promoted.active_run_id is None:
+                raise EntrypointRuntimeError(
+                    "Session 仍有未开始的 queued Run，未进入输入态: "
+                    f"session_id={request.session_id}, queued_run_count={len(promoted.queued_run_ids)}"
+                )
+            terminal_results.append(
+                await _wait_for_terminal(
+                    host,
+                    session_id=request.session_id,
+                    run_id=promoted.active_run_id,
+                    queue=queue,
+                    state=state,
+                    allow_outbox_terminal_fallback=True,
+                    poll_interval_seconds=request.poll_interval_seconds,
+                    sleep=sleep,
+                )
+            )
+            continue
+        if await _close_startup_idle_tail(
+            host,
+            request=request,
+            queue=queue,
+            state=state,
+            terminal_results=terminal_results,
+            sleep=sleep,
+        ):
+            continue
+        return
+
+
+async def _close_startup_idle_tail(
+    host: Host,
+    *,
+    request: EntrypointStartupReconnectRequest,
+    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    state: _TerminalObservationState,
+    terminal_results: list[EntrypointRunTerminalResult],
+    sleep: Callable[[float], Awaitable[None]],
+) -> bool:
+    """在 idle snapshot 后关闭 startup terminal tail。
+
+    :param host: Host public Protocol handle。
+    :param request: startup reconnect 请求。
+    :param queue: watcher drain queue。
+    :param state: 本轮本地观察状态。
+    :param terminal_results: 已收集 terminal 结果列表。
+    :param sleep: 可注入 sleep coroutine。
+    :returns: 发现 terminal 或首次 watcher failure、需要重新读取 Session snapshot 时返回 ``True``。
+    :raises EntrypointRuntimeError: Outbox projection 失败或 LAGGED 重试耗尽时抛出。
+    """
+
+    tail_outbox_results = await _read_session_outbox_terminal_backfill(
+        host,
+        session_id=request.session_id,
+        state=state,
+        outbox_lagged_max_attempts=request.outbox_lagged_max_attempts,
+        poll_interval_seconds=request.poll_interval_seconds,
+        sleep=sleep,
+    )
+    terminal_results.extend(tail_outbox_results)
+    watcher_failure_before_drain = state.watcher_failure_message
+    tail_live_results = _drain_available_startup_terminal_items(
+        queue=queue,
+        state=state,
+    )
+    terminal_results.extend(tail_live_results)
+    watcher_failed_during_tail = (
+        watcher_failure_before_drain is None
+        and state.watcher_failure_message is not None
+    )
+    return bool(tail_outbox_results or tail_live_results or watcher_failed_during_tail)
+
+
+async def _wait_for_startup_promotion(
+    host: Host,
+    *,
+    session_id: str,
+    promotion_max_attempts: int,
+    promotion_poll_interval_seconds: float,
+    sleep: Callable[[float], Awaitable[None]],
+) -> SessionSnapshot:
+    """等待 queued-only Session promotion 出 active Run。
+
+    :param host: Host public Protocol handle。
+    :param session_id: 目标 Session id。
+    :param promotion_max_attempts: 最大轮询次数。
+    :param promotion_poll_interval_seconds: 每次轮询间隔。
+    :param sleep: 可注入 sleep coroutine。
+    :returns: 最新 Session snapshot。
+    :raises EntrypointRuntimeError: 重试耗尽仍没有 active Run 时抛出。
+    """
+
+    latest = await host.get_session(session_id)
+    for _attempt in range(promotion_max_attempts):
+        if latest.active_run_id is not None or not latest.queued_run_ids:
+            return latest
+        await sleep(promotion_poll_interval_seconds)
+        latest = await host.get_session(session_id)
+    if latest.active_run_id is not None or not latest.queued_run_ids:
+        return latest
+    raise EntrypointRuntimeError(
+        "Session 仍有未开始的 queued Run，未进入输入态: "
+        f"session_id={session_id}, queued_run_count={len(latest.queued_run_ids)}"
+    )
 
 
 def _attach_watcher(host: Host, session_id: str) -> ClosableHostEventIterator:
@@ -1086,6 +1373,185 @@ def _record_watcher_failure(*, state: _TerminalObservationState, error: Exceptio
         state.watcher_failure_message = f"{_WATCHER_FAILURE_DIAGNOSTIC_PREFIX}: {error_type}"
 
 
+async def _read_session_outbox_terminal_backfill(
+    host: Host,
+    *,
+    session_id: str,
+    state: _TerminalObservationState,
+    outbox_lagged_max_attempts: int,
+    poll_interval_seconds: float,
+    sleep: Callable[[float], Awaitable[None]],
+) -> tuple[EntrypointRunTerminalResult, ...]:
+    """读取 selected Session 下所有增量 terminal outbox items。
+
+    :param host: Host public Protocol handle。
+    :param session_id: 目标 Session id。
+    :param state: 本轮本地观察状态。
+    :param outbox_lagged_max_attempts: projection ``LAGGED`` 时的最大重试次数。
+    :param poll_interval_seconds: LAGGED 重试等待间隔。
+    :param sleep: 可注入 sleep coroutine。
+    :returns: session-scoped terminal 结果。
+    :raises EntrypointRuntimeError: projection failed 或 LAGGED 重试耗尽时抛出。
+    """
+
+    lagged_attempts = 0
+    results: list[EntrypointRunTerminalResult] = []
+    while True:
+        if state.outbox_cursor is None:
+            state.outbox_cursor = OutboxTerminalCursor(
+                event_sequence=state.last_observed_event_sequence
+            )
+        batch = await host.read_outbox_terminal_items(
+            session_id,
+            ReadOutboxTerminalItemsRequest(
+                after=state.outbox_cursor,
+                seen_terminal_event_ids=tuple(sorted(state.seen_terminal_event_ids)),
+                limit=_OUTBOX_TERMINAL_READ_LIMIT,
+            ),
+        )
+        if batch.projection_status is OutboxProjectionStatus.FAILED:
+            raise EntrypointRuntimeError(
+                _observation_error_message(
+                    state=state,
+                    message=(
+                        "outbox terminal projection failed during startup: "
+                        f"{batch.projection_error_code}: "
+                        f"{batch.projection_error_message}"
+                    ),
+                )
+            )
+        results.extend(
+            _scan_session_outbox_terminal_items(
+                items=batch.items,
+                state=state,
+            )
+        )
+        state.outbox_cursor = batch.next_cursor
+        if batch.has_more:
+            continue
+        if batch.projection_status is OutboxProjectionStatus.CAUGHT_UP:
+            return tuple(results)
+        if lagged_attempts >= outbox_lagged_max_attempts:
+            raise EntrypointRuntimeError(
+                _observation_error_message(
+                    state=state,
+                    message=(
+                        "outbox terminal projection lagged during startup: "
+                        f"session_id={session_id}, attempts={lagged_attempts}"
+                    ),
+                )
+            )
+        lagged_attempts += 1
+        await sleep(poll_interval_seconds)
+
+
+def _scan_session_outbox_terminal_items(
+    *,
+    items: tuple[OutboxTerminalItem, ...],
+    state: _TerminalObservationState,
+) -> tuple[EntrypointRunTerminalResult, ...]:
+    """扫描 session-scoped outbox terminal items。
+
+    :param items: Host public outbox terminal items。
+    :param state: 本轮本地观察状态。
+    :returns: 未重复的 terminal 结果。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    results: list[EntrypointRunTerminalResult] = []
+    for item in items:
+        state.last_observed_event_sequence = max(
+            state.last_observed_event_sequence,
+            item.event_sequence,
+        )
+        duplicate = (
+            item.terminal_event_id in state.seen_terminal_event_ids
+            or item.dedupe_key in state.seen_dedupe_keys
+        )
+        # Outbox 是 terminal 投递真源；即使与 live dedupe，也要记录其 terminal id。
+        state.seen_terminal_event_ids.add(item.terminal_event_id)
+        if duplicate:
+            continue
+        state.seen_dedupe_keys.add(item.dedupe_key)
+        results.append(
+            _terminal_result_from_outbox_item(
+                item,
+                watcher_failure_message=state.watcher_failure_message,
+            )
+        )
+    return tuple(results)
+
+
+def _drain_available_startup_terminal_items(
+    *,
+    queue: asyncio.Queue[HostEvent | _WatcherFailure],
+    state: _TerminalObservationState,
+) -> tuple[EntrypointRunTerminalResult, ...]:
+    """消费 startup watcher queue 中已到达的 terminal events。
+
+    :param queue: watcher drain queue。
+    :param state: 本轮本地观察状态。
+    :returns: 未重复的 terminal 结果。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    results: list[EntrypointRunTerminalResult] = []
+    while True:
+        try:
+            item = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return tuple(results)
+        if isinstance(item, _WatcherFailure):
+            _record_watcher_failure(state=state, error=item.error)
+            continue
+        terminal = _startup_terminal_result_from_live_event(item, state=state)
+        if terminal is not None:
+            results.append(terminal)
+
+
+def _startup_terminal_result_from_live_event(
+    event: HostEvent,
+    *,
+    state: _TerminalObservationState,
+) -> EntrypointRunTerminalResult | None:
+    """把 startup live HostEvent 转为 session-scoped terminal result。
+
+    :param event: Host public event。
+    :param state: 本轮本地观察状态。
+    :returns: 未重复 terminal result；非 terminal 或重复时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    state.last_observed_event_sequence = max(
+        state.last_observed_event_sequence,
+        event.event_sequence,
+    )
+    if event.terminal_status is None or event.run_id is None:
+        return None
+    duplicate = (
+        event.event_id in state.seen_terminal_event_ids
+        or event.dedupe_key in state.seen_dedupe_keys
+    )
+    state.seen_event_ids.add(event.event_id)
+    state.seen_terminal_event_ids.add(event.event_id)
+    if duplicate:
+        return None
+    state.seen_dedupe_keys.add(event.dedupe_key)
+    return EntrypointRunTerminalResult(
+        source=EntrypointTerminalSource.LIVE_EVENT,
+        session_id=event.session_id,
+        run_id=event.run_id,
+        terminal_event_id=event.event_id,
+        event_sequence=event.event_sequence,
+        terminal_status=event.terminal_status,
+        dedupe_key=event.dedupe_key,
+        final_answer=event.final_answer,
+        error_message=event.error_message,
+        cancel_reason=event.cancel_reason,
+        watcher_failure_message=state.watcher_failure_message,
+    )
+
+
 async def _read_outbox_terminal(
     host: Host,
     *,
@@ -1235,20 +1701,28 @@ def _is_terminal_run_status(status: RunStatus) -> bool:
     return status in _TERMINAL_RUN_STATUSES
 
 
-def _new_terminal_observation_state() -> _TerminalObservationState:
+def _new_terminal_observation_state(
+    *,
+    terminal_cursor: OutboxTerminalCursor | None = None,
+    seen_terminal_event_ids: frozenset[str] = frozenset(),
+) -> _TerminalObservationState:
     """创建单次 terminal observation 状态。
 
+    :param terminal_cursor: 调用方已成功展示的 terminal 水位；``None`` 表示从
+        0 开始观察。
+    :param seen_terminal_event_ids: 调用方已成功展示的 terminal event ids。
     :returns: 初始 observation state。
     :raises Exception: 不主动抛出异常。
     """
 
+    initial_sequence = 0 if terminal_cursor is None else terminal_cursor.event_sequence
     return _TerminalObservationState(
-        last_observed_event_sequence=0,
+        last_observed_event_sequence=initial_sequence,
         seen_event_ids=set(),
-        seen_terminal_event_ids=set(),
+        seen_terminal_event_ids=set(seen_terminal_event_ids),
         seen_dedupe_keys=set(),
         seen_activity_dedupe_keys=set(),
-        outbox_cursor=None,
+        outbox_cursor=terminal_cursor,
         watcher_failure_message=None,
     )
 

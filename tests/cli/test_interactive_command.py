@@ -17,6 +17,7 @@ import dayu.cli.main as cli_main
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -56,8 +57,11 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.service.entrypoint_runtime import (
+    EntrypointRunTerminalResult,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
+    EntrypointStartupReconnectRequest,
+    EntrypointStartupReconnectResult,
     EntrypointTerminalSource,
 )
 
@@ -270,6 +274,17 @@ class _FakeHost:
         status = self._run_statuses[status_index]
         self._run_status_index += 1
         return _run_snapshot(run_id=run_id, status=status)
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """返回 idle SessionSnapshot 供 startup barrier 结束。
+
+        :param session_id: 目标 Session id。
+        :returns: SessionSnapshot。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append(f"get_session:{session_id}")
+        return _session_snapshot(session_id=session_id, slot=None)
 
     async def read_outbox_terminal_items(
         self,
@@ -678,6 +693,10 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
     assert fake_host.create_requests == []
     assert fake_host.calls == [
         "watch:session-existing",
+        "read_outbox:session-existing",
+        "get_session:session-existing",
+        "read_outbox:session-existing",
+        "watch:session-existing",
         "submit:session-existing",
         "watch:session-existing",
         "submit:session-existing",
@@ -686,6 +705,108 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         "第一轮",
         "第二轮",
     ]
+
+
+@pytest.mark.asyncio
+async def test_interactive_existing_session_runs_startup_before_first_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """existing-session interactive 必须在读取第一条输入前执行 startup。"""
+
+    events: list[str] = []
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+    )
+    fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
+
+    async def fake_startup_reconnect(
+        host: Host,
+        *,
+        request: EntrypointStartupReconnectRequest,
+    ) -> EntrypointStartupReconnectResult:
+        """记录 startup 调用并返回一条离线 terminal。
+
+        :param host: Host public handle。
+        :param request: startup reconnect 请求。
+        :returns: startup reconnect result。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        events.append(f"startup:{request.session_id}")
+        return EntrypointStartupReconnectResult(
+            terminal_results=(
+                EntrypointRunTerminalResult(
+                    source=EntrypointTerminalSource.OUTBOX_READ,
+                    session_id=request.session_id,
+                    run_id="run-startup",
+                    terminal_event_id="terminal-startup",
+                    event_sequence=5,
+                    terminal_status=HostTerminalStatus.SUCCEEDED,
+                    dedupe_key="terminal-startup",
+                    final_answer=_final_answer(run_id="run-startup"),
+                    error_message=None,
+                    cancel_reason=None,
+                    watcher_failure_message=None,
+                ),
+            ),
+            next_terminal_cursor=OutboxTerminalCursor(event_sequence=5),
+            seen_terminal_event_ids=frozenset({"terminal-startup"}),
+        )
+
+    def input_reader(prompt: str) -> str:
+        """记录输入读取顺序。
+
+        :param prompt: 输入提示文本。
+        :returns: 第一轮用户输入。
+        :raises EOFError: 第二次读取时表示输入结束。
+        """
+
+        events.append(f"input:{prompt}")
+        if events.count(f"input:{prompt}") > 1:
+            raise EOFError
+        return "第一轮"
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "startup_reconnect_entrypoint_session",
+        fake_startup_reconnect,
+    )
+
+    exit_code = await interactive_command._execute_interactive_on_existing_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        input_reader=input_reader,
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == EXIT_SUCCESS
+    assert events[:2] == ["startup:session-existing", "input:dayu> "]
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=5)
+    assert cursor_record.seen_terminal_event_ids == (
+        "terminal-startup",
+        "terminal-run-1",
+    )
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))
@@ -1154,6 +1275,7 @@ async def test_interactive_repl_returns_130_on_second_sigint(
     exit_code = await interactive_command._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
+        workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
         run_overrides=interactive_command.ServiceRunOverrides(),

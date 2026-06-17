@@ -13,6 +13,7 @@ import os
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final, TypeVar
 
 from dayu.cli.agent_entrypoint import (
@@ -56,19 +57,29 @@ from dayu.cli.run_keys import (
     RunningKeyMonitor,
     new_running_key_monitor,
 )
+from dayu.cli.session_terminal_cursor import (
+    advance_cli_terminal_cursor,
+    read_cli_terminal_cursor,
+)
 from dayu.contracts import JsonValue
 from dayu.host.api import CancelMode, FollowupBehavior, Host
 from dayu.host.open_host import open_host
 from dayu.runtime.location import RuntimeLocationError
 from dayu.service.entrypoint_runtime import (
+    DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS,
+    DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
+    ENTRYPOINT_STARTUP_OUTBOX_LAGGED_MAX_ATTEMPTS,
+    ENTRYPOINT_STARTUP_PROMOTION_MAX_ATTEMPTS,
     EntrypointCancelRequest,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
     EntrypointRunTerminalResult,
+    EntrypointStartupReconnectRequest,
     EntrypointTurnRequest,
     cancel_entrypoint_run_and_wait,
     ensure_or_create_entrypoint_session,
     prepare_entrypoint_runtime,
+    startup_reconnect_entrypoint_session,
     submit_entrypoint_turn_and_wait,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
@@ -82,6 +93,7 @@ _TICKER_OPTION: Final[str] = "--ticker"
 _MODEL_NAME_OPTION: Final[str] = "--model-name"
 _LABEL_OPTION: Final[str] = "--label"
 _INTERACTIVE_OPERATION_CREATE_SESSION: Final[str] = "create_session"
+_INTERACTIVE_OPERATION_STARTUP_RECONNECT: Final[str] = "startup_reconnect"
 _INTERACTIVE_OPERATION_SUBMIT_FOLLOWUP: Final[str] = "submit_followup"
 _INTERACTIVE_OPERATION_CANCEL_RUN: Final[str] = "cancel_run"
 _UNSUPPORTED_OPTION_PREFIX: Final[str] = "unsupported option"
@@ -97,11 +109,13 @@ class _PreparedInteractiveExistingSessionExecution:
     """在已有 Session 上运行 interactive REPL 所需的准备结果。
 
     :param runtime: entrypoint runtime assembly 结果。
+    :param workspace_root: 当前 workspace 根目录。
     :param invocation: 当前 CLI invocation 身份。
     :param run_overrides: 本命令所有 turn 复用的运行时 override。
     """
 
     runtime: EntrypointRuntimeResult
+    workspace_root: Path
     invocation: CliInvocation
     run_overrides: ServiceRunOverrides
 
@@ -227,6 +241,7 @@ async def _run_interactive_command_async(
             host=host,
             prepared=prepared,
             session_id=session_id,
+            run_startup_reconnect=args.label is not None,
             input_reader=input_reader,
             composer=composer,
             sigint_monitor_factory=CliSigintMonitor,
@@ -289,6 +304,7 @@ async def _prepare_interactive_existing_session_execution(
     )
     return _PreparedInteractiveExistingSessionExecution(
         runtime=runtime,
+        workspace_root=workspace_root,
         invocation=invocation,
         run_overrides=service_run_overrides_from_args(
             args,
@@ -306,6 +322,7 @@ async def _execute_interactive_on_existing_session(
     composer: InteractiveComposer | None = None,
     sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
     key_monitor_factory: Callable[[], RunningKeyMonitor] | None = None,
+    run_startup_reconnect: bool = True,
 ) -> int:
     """在已解析的已有 Session 上运行 interactive REPL。
 
@@ -316,6 +333,7 @@ async def _execute_interactive_on_existing_session(
     :param composer: 输入态 composer；``None`` 表示按 TTY policy 创建。
     :param sigint_monitor_factory: 单轮 SIGINT monitor 工厂；``None`` 表示创建默认 monitor。
     :param key_monitor_factory: 单轮运行态按键 monitor 工厂；``None`` 表示默认 TTY policy。
+    :param run_startup_reconnect: 是否在输入态前执行已有 Session startup reconnect。
     :returns: CLI 退出码。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
@@ -324,9 +342,18 @@ async def _execute_interactive_on_existing_session(
     effective_composer = new_interactive_composer(input_reader=effective_input_reader) if composer is None else composer
     effective_sigint_monitor_factory = CliSigintMonitor if sigint_monitor_factory is None else sigint_monitor_factory
     effective_key_monitor_factory = new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
+    if run_startup_reconnect:
+        startup_exit_code = await _run_existing_session_startup_reconnect(
+            host=host,
+            prepared=prepared,
+            session_id=session_id,
+        )
+        if startup_exit_code != EXIT_SUCCESS:
+            return startup_exit_code
     return await _run_interactive_repl(
         host=host,
         runtime=prepared.runtime,
+        workspace_root=prepared.workspace_root,
         invocation=prepared.invocation,
         session_id=session_id,
         run_overrides=prepared.run_overrides,
@@ -334,6 +361,56 @@ async def _execute_interactive_on_existing_session(
         sigint_monitor_factory=effective_sigint_monitor_factory,
         key_monitor_factory=effective_key_monitor_factory,
     )
+
+
+async def _run_existing_session_startup_reconnect(
+    *,
+    host: Host,
+    prepared: _PreparedInteractiveExistingSessionExecution,
+    session_id: str,
+) -> int:
+    """在 interactive 输入态前执行已有 Session startup reconnect。
+
+    :param host: Host public handle。
+    :param prepared: interactive existing-session 执行准备结果。
+    :param session_id: 已存在且调用方已选择的 Host Session id。
+    :returns: CLI 退出码；成功完成 startup barrier 时返回 ``EXIT_SUCCESS``。
+    :raises Exception: cursor store、Host public API 或 startup helper 失败时向上抛出。
+    """
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=prepared.workspace_root,
+        session_id=session_id,
+    )
+    startup = await startup_reconnect_entrypoint_session(
+        host,
+        request=EntrypointStartupReconnectRequest(
+            context=build_interactive_host_context(
+                prepared.invocation,
+                operation=_INTERACTIVE_OPERATION_STARTUP_RECONNECT,
+            ),
+            session_id=session_id,
+            terminal_cursor=cursor_record.terminal_cursor,
+            seen_terminal_event_ids=frozenset(cursor_record.seen_terminal_event_ids),
+            poll_interval_seconds=DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
+            outbox_lagged_max_attempts=ENTRYPOINT_STARTUP_OUTBOX_LAGGED_MAX_ATTEMPTS,
+            promotion_poll_interval_seconds=(
+                DEFAULT_ENTRYPOINT_STARTUP_PROMOTION_POLL_INTERVAL_SECONDS
+            ),
+            promotion_max_attempts=ENTRYPOINT_STARTUP_PROMOTION_MAX_ATTEMPTS,
+        ),
+    )
+    for terminal in startup.terminal_results:
+        render_exit_code = render_interactive_terminal_result(terminal)
+        if render_exit_code != EXIT_SUCCESS:
+            return render_exit_code
+        await advance_cli_terminal_cursor(
+            workspace_root=prepared.workspace_root,
+            session_id=session_id,
+            terminal_event_id=terminal.terminal_event_id,
+            event_sequence=terminal.event_sequence,
+        )
+    return EXIT_SUCCESS
 
 
 async def _ensure_interactive_session(
@@ -386,6 +463,7 @@ async def _run_interactive_repl(
     *,
     host: Host,
     runtime: EntrypointRuntimeResult,
+    workspace_root: Path,
     invocation: CliInvocation,
     session_id: str,
     run_overrides: ServiceRunOverrides,
@@ -398,6 +476,7 @@ async def _run_interactive_repl(
 
     :param host: Host public handle。
     :param runtime: entrypoint runtime assembly 结果。
+    :param workspace_root: 当前 workspace 根目录。
     :param invocation: 当前 CLI invocation 身份。
     :param session_id: 目标 Host Session id。
     :param run_overrides: 本命令所有 turn 复用的运行时 override。
@@ -441,6 +520,12 @@ async def _run_interactive_repl(
         render_exit_code = render_interactive_terminal_result(terminal)
         if render_exit_code != EXIT_SUCCESS:
             return render_exit_code
+        await advance_cli_terminal_cursor(
+            workspace_root=workspace_root,
+            session_id=session_id,
+            terminal_event_id=terminal.terminal_event_id,
+            event_sequence=terminal.event_sequence,
+        )
         turn_index += 1
 
 

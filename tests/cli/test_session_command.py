@@ -1116,6 +1116,7 @@ def _install_fake_resume_execution(
                 EntrypointRuntimeResult,
                 _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
             ),
+            workspace_root=Path(args.workspace_root or "."),
             invocation=session_command.new_cli_invocation(
                 command_name=command_name,
                 scenario=scenario,
@@ -1179,6 +1180,7 @@ def _install_fake_resume_execution(
                 EntrypointRuntimeResult,
                 _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
             ),
+            workspace_root=Path(args.workspace_root or "."),
             invocation=session_command.new_cli_invocation(
                 command_name=command_name,
                 scenario=scenario,

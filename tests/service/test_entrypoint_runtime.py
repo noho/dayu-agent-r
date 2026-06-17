@@ -59,11 +59,13 @@ from dayu.service.entrypoint_runtime import (
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
     EntrypointRuntimeError,
+    EntrypointStartupReconnectRequest,
     EntrypointTerminalSource,
     EntrypointTurnRequest,
     cancel_entrypoint_run_and_wait,
     ensure_or_create_entrypoint_session,
     prepare_entrypoint_runtime,
+    startup_reconnect_entrypoint_session,
     submit_entrypoint_turn_and_wait,
     _close_watcher,
 )
@@ -179,8 +181,12 @@ class _FakeHost:
     _cancel_error: HostApiError | None
     _run_statuses: tuple[RunStatus, ...]
     _outbox_batches: tuple[OutboxTerminalItemsBatch, ...]
+    _session_snapshots: tuple[SessionSnapshot, ...]
+    _session_get_watcher_errors: tuple[Exception, ...]
     _run_status_index: int
     _outbox_index: int
+    _session_snapshot_index: int
+    _session_get_watcher_error_index: int
 
     def __init__(
         self,
@@ -191,6 +197,8 @@ class _FakeHost:
         cancel_error: HostApiError | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         outbox_batches: tuple[OutboxTerminalItemsBatch, ...] = (),
+        session_snapshots: tuple[SessionSnapshot, ...] = (),
+        session_get_watcher_errors: tuple[Exception, ...] = (),
     ) -> None:
         """初始化测试 Host。
 
@@ -200,6 +208,8 @@ class _FakeHost:
         :param cancel_error: cancel_run 应抛出的 Host API 错误。
         :param run_statuses: get_run 依次返回的 RunStatus。
         :param outbox_batches: read_outbox_terminal_items 依次返回的批次。
+        :param session_snapshots: get_session 依次返回的 SessionSnapshot。
+        :param session_get_watcher_errors: get_session 返回后推入 startup watcher 的异常。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -217,8 +227,12 @@ class _FakeHost:
         self._cancel_error = cancel_error
         self._run_statuses = run_statuses
         self._outbox_batches = outbox_batches
+        self._session_snapshots = session_snapshots
+        self._session_get_watcher_errors = session_get_watcher_errors
         self._run_status_index = 0
         self._outbox_index = 0
+        self._session_snapshot_index = 0
+        self._session_get_watcher_error_index = 0
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 调用并返回测试 Session。
@@ -297,6 +311,30 @@ class _FakeHost:
         status = self._run_statuses[status_index]
         self._run_status_index += 1
         return _run_snapshot(run_id=run_id, status=status)
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """按预设返回 Session snapshot。
+
+        :param session_id: 目标 Session id。
+        :returns: SessionSnapshot。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append(f"get_session:{session_id}")
+        if not self._session_snapshots:
+            return _session_snapshot(session_id=session_id, slot_key=None)
+        snapshot_index = min(
+            self._session_snapshot_index,
+            len(self._session_snapshots) - 1,
+        )
+        self._session_snapshot_index += 1
+        if self._session_get_watcher_error_index < len(self._session_get_watcher_errors):
+            await self.watchers[-1].fail(
+                self._session_get_watcher_errors[self._session_get_watcher_error_index]
+            )
+            self._session_get_watcher_error_index += 1
+            await asyncio.sleep(0)
+        return self._session_snapshots[snapshot_index]
 
     async def read_outbox_terminal_items(
         self,
@@ -845,6 +883,373 @@ async def test_submit_entrypoint_turn_waits_live_terminal_when_run_snapshot_is_t
 
 
 @pytest.mark.asyncio
+async def test_startup_reconnect_attaches_watcher_before_session_outbox_backfill() -> None:
+    """interactive startup 必须 watcher-first 后读取 session-scoped outbox。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(
+                    _outbox_item(event_sequence=2, run_id="run-1"),
+                    _outbox_item(event_sequence=3, run_id="run-2"),
+                ),
+                next_sequence=3,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        )
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-1",
+        "run-2",
+    ]
+    assert result.next_terminal_cursor == OutboxTerminalCursor(event_sequence=3)
+    assert fake_host.calls[:2] == ["watch:session-1", "read_outbox:session-1"]
+    assert fake_host.read_outbox_requests[0].after == OutboxTerminalCursor(event_sequence=0)
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_treats_caught_up_empty_backfill_as_idle_success() -> None:
+    """startup session backfill 追平且无新 terminal 时应正常进入 idle success。"""
+
+    fake_host = _FakeHost()
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert result.terminal_results == ()
+    assert fake_host.calls == [
+        "watch:session-1",
+        "read_outbox:session-1",
+        "get_session:session-1",
+        "read_outbox:session-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_reads_idle_tail_outbox_before_returning() -> None:
+    """idle snapshot 后必须补读 tail outbox，避免 terminal 在输入态前丢失。"""
+
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=7, run_id="run-tail"),),
+                next_sequence=7,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(),
+                next_sequence=7,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-tail"
+    ]
+    assert result.next_terminal_cursor == OutboxTerminalCursor(event_sequence=7)
+    assert [request.after for request in fake_host.read_outbox_requests] == [
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=7),
+    ]
+    assert fake_host.calls == [
+        "watch:session-1",
+        "read_outbox:session-1",
+        "get_session:session-1",
+        "read_outbox:session-1",
+        "get_session:session-1",
+        "read_outbox:session-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_rechecks_idle_tail_after_watcher_failure() -> None:
+    """tail drain 首次发现 watcher failure 后必须再用 outbox 关闭缺口。"""
+
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        session_get_watcher_errors=(RuntimeError("startup watcher stopped"),),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=11, run_id="run-after-failure"),),
+                next_sequence=11,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(),
+                next_sequence=11,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-after-failure"
+    ]
+    assert result.terminal_results[0].watcher_failure_message is not None
+    assert "RuntimeError" in result.terminal_results[0].watcher_failure_message
+    assert [request.after for request in fake_host.read_outbox_requests] == [
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=11),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_deduplicates_seen_terminal_ids() -> None:
+    """startup backfill 必须按 CLI seen terminal ids 去重。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=2, run_id="run-1"),),
+                next_sequence=2,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        )
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(
+            seen_terminal_event_ids=frozenset({"terminal-run-1-2"}),
+        ),
+    )
+
+    assert result.terminal_results == ()
+    assert fake_host.read_outbox_requests[0].seen_terminal_event_ids == (
+        "terminal-run-1-2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_retries_lagged_by_parameter() -> None:
+    """startup backfill 的 LAGGED 重试次数必须由请求参数控制。"""
+
+    sleep = _SleepRecorder()
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.LAGGED,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=4, run_id="run-1"),),
+                next_sequence=4,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        )
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(outbox_lagged_max_attempts=1),
+        sleep=sleep,
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == ["run-1"]
+    assert sleep.calls == [0.05]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_lagged_retry_exhaustion_fails() -> None:
+    """startup backfill 的 LAGGED 重试耗尽必须结构化失败。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.LAGGED,
+            ),
+        )
+    )
+
+    with pytest.raises(EntrypointRuntimeError, match="projection lagged"):
+        await startup_reconnect_entrypoint_session(
+            cast(Host, fake_host),
+            request=_startup_request(outbox_lagged_max_attempts=0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_projection_failed_fails() -> None:
+    """startup backfill 遇到 projection FAILED 必须失败而不是进入 REPL。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.FAILED,
+                projection_error_code="projection_failed",
+                projection_error_message="projection stopped",
+            ),
+        )
+    )
+
+    with pytest.raises(EntrypointRuntimeError, match="projection_failed"):
+        await startup_reconnect_entrypoint_session(
+            cast(Host, fake_host),
+            request=_startup_request(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_observes_existing_active_run_terminal() -> None:
+    """startup 发现 active Run 时必须先观察 terminal 再进入 idle。"""
+
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                active_run_id="run-active",
+            ),
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=8, run_id="run-active"),),
+                next_sequence=8,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-active"
+    ]
+    assert "get_run:run-active" in fake_host.calls
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_waits_for_queued_promotion_then_observes_terminal() -> None:
+    """queued-only startup 应等待 promotion，promoted 后观察 terminal。"""
+
+    sleep = _SleepRecorder()
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                queued_run_ids=("run-queued",),
+            ),
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                queued_run_ids=("run-queued",),
+            ),
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                active_run_id="run-queued",
+            ),
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=9, run_id="run-queued"),),
+                next_sequence=9,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(promotion_max_attempts=2),
+        sleep=sleep,
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-queued"
+    ]
+    assert sleep.calls == [0.05]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_queued_only_exhaustion_fails_before_input() -> None:
+    """queued-only bounded wait 耗尽时必须失败，不允许静默进入输入态。"""
+
+    sleep = _SleepRecorder()
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                queued_run_ids=("run-queued",),
+            ),
+        )
+    )
+
+    with pytest.raises(EntrypointRuntimeError, match="queued Run"):
+        await startup_reconnect_entrypoint_session(
+            cast(Host, fake_host),
+            request=_startup_request(promotion_max_attempts=1),
+            sleep=sleep,
+        )
+
+    assert sleep.calls == [0.05]
+
+
+@pytest.mark.asyncio
 async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
     tmp_path: Path,
 ) -> None:
@@ -1305,6 +1710,33 @@ def _cancel_request() -> EntrypointCancelRequest:
     )
 
 
+def _startup_request(
+    *,
+    seen_terminal_event_ids: frozenset[str] = frozenset(),
+    outbox_lagged_max_attempts: int = 3,
+    promotion_max_attempts: int = 3,
+) -> EntrypointStartupReconnectRequest:
+    """构造默认 startup reconnect request。
+
+    :param seen_terminal_event_ids: 已展示 terminal id 集合。
+    :param outbox_lagged_max_attempts: outbox LAGGED 最大重试次数。
+    :param promotion_max_attempts: queued promotion 最大轮询次数。
+    :returns: startup reconnect request。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EntrypointStartupReconnectRequest(
+        context=_host_context("startup-context"),
+        session_id="session-1",
+        terminal_cursor=OutboxTerminalCursor(event_sequence=0),
+        seen_terminal_event_ids=seen_terminal_event_ids,
+        poll_interval_seconds=0.05,
+        outbox_lagged_max_attempts=outbox_lagged_max_attempts,
+        promotion_poll_interval_seconds=0.05,
+        promotion_max_attempts=promotion_max_attempts,
+    )
+
+
 def _host_context(request_id: str) -> HostCallContext:
     """构造测试 HostCallContext。
 
@@ -1330,11 +1762,19 @@ def _host_context(request_id: str) -> HostCallContext:
     )
 
 
-def _session_snapshot(*, session_id: str, slot_key: str | None) -> SessionSnapshot:
+def _session_snapshot(
+    *,
+    session_id: str,
+    slot_key: str | None,
+    active_run_id: str | None = None,
+    queued_run_ids: tuple[str, ...] = (),
+) -> SessionSnapshot:
     """构造测试 SessionSnapshot。
 
     :param session_id: Session id。
     :param slot_key: slot key。
+    :param active_run_id: 当前 active Run id。
+    :param queued_run_ids: 当前 queued Run ids。
     :returns: SessionSnapshot。
     :raises Exception: 不主动抛出异常。
     """
@@ -1346,8 +1786,8 @@ def _session_snapshot(*, session_id: str, slot_key: str | None) -> SessionSnapsh
         session_id=session_id,
         status=SessionStatus.OPEN,
         slot=slot,
-        active_run_id=None,
-        queued_run_ids=(),
+        active_run_id=active_run_id,
+        queued_run_ids=queued_run_ids,
         timeline_cursor=HostStreamCursor(event_sequence=0),
     )
 

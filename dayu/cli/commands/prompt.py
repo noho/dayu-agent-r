@@ -12,6 +12,7 @@ import asyncio
 import os
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final, TypeVar
 
 from dayu.cli.agent_entrypoint import (
@@ -28,6 +29,7 @@ from dayu.cli.arg_parsing import COMMAND_PROMPT, ParsedCliArgs
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
+    EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
 from dayu.cli.host_context import (
@@ -49,6 +51,7 @@ from dayu.cli.run_keys import (
     RunningKeyMonitor,
     new_running_key_monitor,
 )
+from dayu.cli.session_terminal_cursor import advance_cli_terminal_cursor
 from dayu.contracts import JsonValue
 from dayu.host.api import (
     CancelMode,
@@ -94,12 +97,14 @@ class _PreparedPromptExistingSessionExecution:
     """在已有 Session 上执行 prompt turn 所需的准备结果。
 
     :param runtime: entrypoint runtime assembly 结果。
+    :param workspace_root: 当前 workspace 根目录。
     :param invocation: 当前 CLI invocation 身份。
     :param user_prompt: 本轮用户 prompt。
     :param run_overrides: 本轮可映射执行 override。
     """
 
     runtime: EntrypointRuntimeResult
+    workspace_root: Path
     invocation: CliInvocation
     user_prompt: str
     run_overrides: ServiceRunOverrides
@@ -240,6 +245,7 @@ async def _prepare_prompt_existing_session_execution(
     )
     return _PreparedPromptExistingSessionExecution(
         runtime=runtime,
+        workspace_root=workspace_root,
         invocation=invocation,
         user_prompt=user_prompt,
         run_overrides=service_run_overrides_from_args(
@@ -279,7 +285,15 @@ async def _execute_prompt_on_existing_session(
     )
     if terminal is None:
         return EXIT_KEYBOARD_INTERRUPT
-    return render_prompt_terminal_result(terminal)
+    render_exit_code = render_prompt_terminal_result(terminal)
+    if render_exit_code == EXIT_SUCCESS:
+        await advance_cli_terminal_cursor(
+            workspace_root=prepared.workspace_root,
+            session_id=session_id,
+            terminal_event_id=terminal.terminal_event_id,
+            event_sequence=terminal.event_sequence,
+        )
+    return render_exit_code
 
 
 async def _ensure_prompt_session(

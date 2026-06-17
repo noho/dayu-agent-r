@@ -59,6 +59,7 @@ from dayu.service.entrypoint_runtime import EntrypointRuntimeRequest
 from dayu.service.entrypoint_runtime import EntrypointRuntimeResult
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
@@ -769,9 +770,16 @@ async def test_prompt_existing_session_execution_does_not_create_or_ensure(
     assert fake_host.ensure_requests == []
     assert fake_host.create_requests == []
     assert fake_host.calls == ["watch:session-existing", "submit:session-existing"]
+    assert fake_host.read_outbox_requests == []
     assert fake_host.submit_requests[0].user_prompt == "请继续分析"
     assert fake_host.submit_requests[0].behavior is FollowupBehavior.QUEUE
     assert fake_host.submit_requests[0].target_run_id is None
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=2)
+    assert cursor_record.seen_terminal_event_ids == ("terminal-run-1-2",)
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))
