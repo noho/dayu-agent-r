@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import cast
@@ -149,6 +149,117 @@ class EventLogRow:
 
 
 @dataclass(frozen=True, slots=True)
+class EventLogReadClassFilter:
+    """单个 EventLog class 的读取过滤条件。
+
+    :param event_class: 目标 EventLog class。
+    :param event_types: ``None`` 表示读取该 class 下全部 event type；否则为非空 event type 元组。
+    """
+
+    event_class: EventClass
+    event_types: tuple[str, ...] | None
+
+    def __post_init__(self) -> None:
+        """校验读取 class filter。
+
+        :returns: ``None``。
+        :raises HostDurableError: event class 或 event type 配置无效时抛出。
+        """
+
+        if not isinstance(self.event_class, EventClass):
+            raise HostDurableError("EventLog read event_class filter is invalid")
+        if self.event_types is None:
+            return
+        if len(self.event_types) == 0:
+            raise HostDurableError("EventLog read event_types filter cannot be empty")
+        seen: set[str] = set()
+        for event_type in self.event_types:
+            _require_non_empty_text(
+                event_type, field_name="event_log_read_filter.event_type"
+            )
+            if event_type in seen:
+                raise HostDurableError("EventLog read event_type filter is duplicated")
+            seen.add(event_type)
+
+
+@dataclass(frozen=True, slots=True)
+class EventLogReadFilter:
+    """EventLog 读取过滤条件。
+
+    :param class_filters: 一个或多个 class filter；多个 filter 之间为 OR 关系。
+    """
+
+    class_filters: tuple[EventLogReadClassFilter, ...]
+
+    def __post_init__(self) -> None:
+        """校验 EventLog read filter。
+
+        :returns: ``None``。
+        :raises HostDurableError: filter 为空或重复声明同一 EventClass 时抛出。
+        """
+
+        if len(self.class_filters) == 0:
+            raise HostDurableError("EventLog read filter cannot be empty")
+        seen: set[EventClass] = set()
+        for class_filter in self.class_filters:
+            if not isinstance(class_filter, EventLogReadClassFilter):
+                raise HostDurableError("EventLog read class filter is invalid")
+            if class_filter.event_class in seen:
+                raise HostDurableError("EventLog read event_class filter is duplicated")
+            seen.add(class_filter.event_class)
+
+
+@dataclass(frozen=True, slots=True)
+class FilteredEventLogPage:
+    """filter-aware EventLog read page。
+
+    :param rows: 命中过滤条件的 EventLog rows，按 ``event_sequence`` 升序排列。
+    :param covered_event_sequence: 本次读取已证明覆盖到的全局 cursor。
+    :param covered_event_id: covered cursor 对应的真实 EventLog id；未推进时为 ``None``。
+    :param cursor: init-only 原始读取 cursor，用于校验 covered cursor 是否真实推进。
+    """
+
+    rows: tuple[EventLogRow, ...]
+    covered_event_sequence: int
+    covered_event_id: str | None
+    cursor: InitVar[int] = _MIN_EVENT_CURSOR
+
+    def __post_init__(self, cursor: int) -> None:
+        """校验 filtered page 不变量。
+
+        :param cursor: init-only 原始读取 cursor。
+        :returns: ``None``。
+        :raises HostDurableError: covered cursor 或 rows 不符合 durable 语义时抛出。
+        """
+
+        if cursor < _MIN_EVENT_CURSOR:
+            raise HostDurableError("filtered EventLog cursor is invalid")
+        if self.covered_event_sequence < _MIN_EVENT_CURSOR:
+            raise HostDurableError("filtered EventLog covered cursor is invalid")
+        if self.covered_event_sequence < cursor:
+            raise HostDurableError("filtered EventLog covered cursor moved backwards")
+        _require_optional_non_empty_text(
+            self.covered_event_id, field_name="covered_event_id"
+        )
+        has_covered_row = len(self.rows) > 0 or self.covered_event_sequence > cursor
+        if has_covered_row and self.covered_event_id is None:
+            raise HostDurableError("filtered EventLog covered event_id is required")
+        previous_sequence = _MIN_EVENT_CURSOR
+        for row in self.rows:
+            if not isinstance(row, EventLogRow):
+                raise HostDurableError("filtered EventLog page row is invalid")
+            if row.event_sequence <= previous_sequence:
+                raise HostDurableError("filtered EventLog page rows are unordered")
+            previous_sequence = row.event_sequence
+        if len(self.rows) > 0:
+            last_sequence = self.rows[-1].event_sequence
+            if self.covered_event_sequence < last_sequence:
+                raise HostDurableError(
+                    "filtered EventLog covered cursor is behind returned rows"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class EventPayloadTextEqualsFilter:
     """EventLog inline payload 文本字段等值过滤条件。
 
@@ -247,6 +358,37 @@ class EventLogStore:
         """
 
         return read_events_after(transaction, cursor, limit=limit)
+
+    def read_events_after_matching(
+        self,
+        transaction: HostTransaction,
+        cursor: int,
+        *,
+        event_filter: EventLogReadFilter,
+        limit: int,
+        max_event_sequence: int | None = None,
+        session_id: str | None = None,
+    ) -> FilteredEventLogPage:
+        """按 filter 读取 cursor 后的 EventLog page，并返回 covered cursor。
+
+        :param transaction: 调用方提供的 Host durable transaction。
+        :param cursor: 已消费的全局 ``event_sequence``。
+        :param event_filter: EventLog class/type 过滤条件。
+        :param limit: 最大返回匹配 row 数，必须为正数。
+        :param max_event_sequence: 可选最大覆盖 EventLog sequence。
+        :param session_id: 可选 session 范围过滤。
+        :returns: filter-aware EventLog page。
+        :raises HostDurableError: 输入字段无效时抛出。
+        """
+
+        return read_events_after_matching(
+            transaction,
+            cursor,
+            event_filter=event_filter,
+            limit=limit,
+            max_event_sequence=max_event_sequence,
+            session_id=session_id,
+        )
 
     def read_latest_run_event_by_type(
         self,
@@ -498,6 +640,106 @@ def read_events_after(
     return tuple(_event_log_row_from_host_row(row) for row in rows)
 
 
+def read_events_after_matching(
+    transaction: HostTransaction,
+    cursor: int,
+    *,
+    event_filter: EventLogReadFilter,
+    limit: int,
+    max_event_sequence: int | None = None,
+    session_id: str | None = None,
+) -> FilteredEventLogPage:
+    """按 filter 读取 ``cursor`` 后的 EventLog rows，并返回 covered cursor。
+
+    ``covered_event_sequence`` 表示本次读取已经证明可跳过到的最大真实
+    EventLog row。若没有可推进的真实 row，则返回调用方传入的 ``cursor`` 与
+    ``covered_event_id=None``。当 ``max_event_sequence`` 小于 ``cursor`` 时，
+    读取窗口为空，同样返回 ``cursor`` 与 ``covered_event_id=None``。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param cursor: 已消费的全局 ``event_sequence``；必须大于等于零。
+    :param event_filter: durable-neutral EventLog class/type 读取过滤条件。
+    :param limit: 最大返回匹配 row 数；必须为正数。
+    :param max_event_sequence: 可选最大 EventLog sequence 覆盖边界。
+    :param session_id: 可选 session 范围过滤。
+    :returns: filter-aware EventLog page。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_filtered_read_inputs(
+        cursor,
+        event_filter=event_filter,
+        limit=limit,
+        max_event_sequence=max_event_sequence,
+        session_id=session_id,
+    )
+    boundary_row = _read_latest_covered_event_row(
+        transaction,
+        cursor,
+        max_event_sequence=max_event_sequence,
+        session_id=session_id,
+    )
+    if boundary_row is None:
+        return FilteredEventLogPage(
+            rows=(),
+            covered_event_sequence=cursor,
+            covered_event_id=None,
+            cursor=cursor,
+        )
+    filter_sql, filter_params = _event_log_read_filter_sql(event_filter)
+    session_sql, session_params = _event_log_session_filter_sql(session_id)
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          event_sequence,
+          event_id,
+          event_body_digest,
+          event_class,
+          session_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          event_type,
+          occurred_at,
+          actor,
+          source,
+          client_request_id,
+          idempotency_key,
+          policy_decision_json,
+          reason_json,
+          payload_json,
+          payload_ref,
+          payload_digest,
+          appended_at
+        FROM {TABLE_EVENT_LOG}
+        WHERE event_sequence > ?
+          AND event_sequence <= ?
+          {session_sql}
+          AND ({filter_sql})
+        ORDER BY event_sequence ASC
+        LIMIT ?
+        """,
+        (
+            cursor,
+            boundary_row.event_sequence,
+            *session_params,
+            *filter_params,
+            limit,
+        ),
+    )
+    matching_rows = tuple(_event_log_row_from_host_row(row) for row in rows)
+    if len(matching_rows) >= limit:
+        covered_row = matching_rows[-1]
+    else:
+        covered_row = boundary_row
+    return FilteredEventLogPage(
+        rows=matching_rows,
+        covered_event_sequence=covered_row.event_sequence,
+        covered_event_id=covered_row.event_id,
+        cursor=cursor,
+    )
+
+
 def read_latest_run_event_by_type(
     transaction: HostTransaction,
     *,
@@ -724,6 +966,135 @@ def _payload_mapping_from_text(payload_json: str) -> Mapping[str, JsonValue]:
     if not isinstance(value, Mapping):
         raise HostDurableError("EventLog payload_json must be a JSON mapping")
     return cast(Mapping[str, JsonValue], value)
+
+
+def _validate_filtered_read_inputs(
+    cursor: int,
+    *,
+    event_filter: EventLogReadFilter,
+    limit: int,
+    max_event_sequence: int | None,
+    session_id: str | None,
+) -> None:
+    """校验 filter-aware EventLog read 输入。
+
+    :param cursor: 已消费的全局 ``event_sequence``。
+    :param event_filter: EventLog class/type 过滤条件。
+    :param limit: 最大返回匹配 row 数。
+    :param max_event_sequence: 可选最大覆盖 EventLog sequence。
+    :param session_id: 可选 session 范围过滤。
+    :returns: ``None``。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    if cursor < _MIN_EVENT_CURSOR:
+        raise HostDurableError("EventLog cursor must be non-negative")
+    if limit < _MIN_READ_LIMIT:
+        raise HostDurableError("EventLog read limit must be positive")
+    if not isinstance(event_filter, EventLogReadFilter):
+        raise HostDurableError("EventLog read filter is invalid")
+    if (
+        max_event_sequence is not None
+        and max_event_sequence < _MIN_EVENT_CURSOR
+    ):
+        raise HostDurableError("EventLog max_event_sequence is invalid")
+    _require_optional_non_empty_text(session_id, field_name="session_id")
+
+
+def _read_latest_covered_event_row(
+    transaction: HostTransaction,
+    cursor: int,
+    *,
+    max_event_sequence: int | None,
+    session_id: str | None,
+) -> EventLogRow | None:
+    """读取 covered cursor 对应的最新真实 EventLog row。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param cursor: 已消费的全局 ``event_sequence``。
+    :param max_event_sequence: 可选最大覆盖 EventLog sequence。
+    :param session_id: 可选 session 范围过滤。
+    :returns: cursor 后、边界内的最新真实 row；不存在时返回 ``None``。
+    :raises HostDurableError: durable row 类型或 enum 值不符合 schema 预期时抛出。
+    """
+
+    max_sequence_sql = ""
+    max_sequence_params: tuple[int, ...] = ()
+    if max_event_sequence is not None:
+        max_sequence_sql = "AND event_sequence <= ?"
+        max_sequence_params = (max_event_sequence,)
+    session_sql, session_params = _event_log_session_filter_sql(session_id)
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          event_sequence,
+          event_id,
+          event_body_digest,
+          event_class,
+          session_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          event_type,
+          occurred_at,
+          actor,
+          source,
+          client_request_id,
+          idempotency_key,
+          policy_decision_json,
+          reason_json,
+          payload_json,
+          payload_ref,
+          payload_digest,
+          appended_at
+        FROM {TABLE_EVENT_LOG}
+        WHERE event_sequence > ?
+          {max_sequence_sql}
+          {session_sql}
+        ORDER BY event_sequence DESC
+        LIMIT 1
+        """,
+        (cursor, *max_sequence_params, *session_params),
+    )
+    if row is None:
+        return None
+    return _event_log_row_from_host_row(row)
+
+
+def _event_log_session_filter_sql(session_id: str | None) -> tuple[str, tuple[str, ...]]:
+    """生成 session 过滤 SQL 片段。
+
+    :param session_id: 可选 session 标识。
+    :returns: SQL 片段与绑定参数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if session_id is None:
+        return "", ()
+    return "AND session_id = ?", (session_id,)
+
+
+def _event_log_read_filter_sql(
+    event_filter: EventLogReadFilter,
+) -> tuple[str, tuple[str, ...]]:
+    """把 EventLogReadFilter 转换为 SQL 条件。
+
+    :param event_filter: EventLog class/type 过滤条件。
+    :returns: 不含 ``WHERE`` 的 SQL 条件与绑定参数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    clauses: list[str] = []
+    params: list[str] = []
+    for class_filter in event_filter.class_filters:
+        params.append(class_filter.event_class.value)
+        if class_filter.event_types is None:
+            clauses.append("event_class = ?")
+            continue
+        placeholders = ", ".join("?" for _event_type in class_filter.event_types)
+        clauses.append(f"(event_class = ? AND event_type IN ({placeholders}))")
+        params.extend(class_filter.event_types)
+    return " OR ".join(clauses), tuple(params)
 
 
 def _require_text_tuple(value: tuple[str, ...], *, field_name: str) -> None:
