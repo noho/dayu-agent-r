@@ -13,6 +13,15 @@
 本文档面向读者：
 - 最终使用者。
 
+## Agent更新约束【必须遵守】
+
+- 本文档是最终用户使用手册，只写用户完成安装、初始化、配置、下载 / 上传财报、提问、交互式分析、写报告、渲染输出、查看日志与排障所需的当前可用操作。
+- 更新本文档时必须先核对当前 CLI / Web / WeChat 入口、参数解析、用户可见输出和对应实现；代码真源高于设计文档和历史说明。
+- 本文档可以写面向用户的命令、参数、工作区文件位置、输出文件位置、日志定位方式、常见错误和排障步骤。
+- 不写 Host / Engine / Service / Runtime / Fins 内部架构、公共契约细节、状态机、测试清单、代码阅读顺序、review / work unit 过程状态或开发者迁移计划。
+- 不写未来计划、未落地能力或内部治理术语；若必须提到尚未实现的用户入口，只能作为用户可见限制简短说明。
+- 涉及开发者架构、包边界或代码阅读路径时，链接到 `dayu/README.md` 或对应子包 README，不在本文档展开。
+
 如果你要参与开发，而不是只使用系统：
 - Engine 手册：[dayu/engine/README.md](dayu/engine/README.md)
 - 配置手册：[dayu/config/README.md](dayu/config/README.md)
@@ -279,6 +288,7 @@ dayu-cli <subcommand> [参数]
 | `--config` | 全部主命令 | 配置目录，默认 `workspace/config` |
 | `--ticker` | `prompt` `write` | 股票代码；传入后会把该 `ticker` 作为当前研究对象 |
 | `--log-level` | 全部主命令 | 直接指定日志级别，可选 `debug`、`verbose`、`info`、`warn`、`error`、`critical` |
+| `--log-file` | 全部主命令 | 指定诊断日志文件；未提供时默认写入系统临时目录下的 `dayu-cli-*.log` |
 | `--debug` | 全部主命令 | 把日志级别设为 `DEBUG` |
 | `--verbose` | 全部主命令 | 把日志级别设为 `VERBOSE` |
 | `--info` | 全部主命令 | 把日志级别设为 `INFO` |
@@ -292,8 +302,17 @@ dayu-cli <subcommand> [参数]
 
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。
+- CLI 的用户可见输出和诊断日志默认分离：回答、进度、错误提示仍走 stdout / stderr；Python logging 诊断默认写入系统临时目录下的 `dayu-cli-*.log`。需要固定日志位置时使用 `--log-file <path>`，它只改变诊断日志位置，不改变用户可见输出通道。
+- 全局参数可以写在子命令前，也可以写在子命令后。例如 `dayu-cli --debug prompt "问题"` 和 `dayu-cli prompt "问题" --debug` 等价；`--log-file` 也同理。
 - `prompt`、`interactive`、`write` 还支持更多 Agent 运行参数，例如 `--tool-timeout-seconds`、`--max-iterations`、`--doc-limits-json`、`--fins-limits-json`；需要时可用 `dayu-cli <subcommand> --help` 查看完整列表。
 - `interactive` 默认会续接本地绑定的同一个多轮会话；如果上一次回答还没完整回显到终端，重启 CLI 会先把那次回答补完，再进入新的输入循环。
+
+日志示例：
+
+```bash
+dayu-cli prompt "总结苹果最新财报中的主要风险" --debug --log-file workspace/tmp/prompt.log
+dayu-cli download --ticker AAPL --verbose --log-file workspace/tmp/download.log
+```
 
 ### 2.2 Web 入口（Streamlit）
 

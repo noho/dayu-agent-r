@@ -103,6 +103,7 @@ README 的写作边界、读者对象和内容约束由各 README 内的 `Agent�
 - `dayu/fins/` 修改 -> 检查并按需更新 `dayu/fins/README.md`
 - `dayu/config/` 修改 -> 检查并按需更新 `dayu/config/README.md`
 - `tests/` 修改 -> 检查并按需更新 `tests/README.md`
+- 用户可见安装、初始化、CLI / Web / WeChat 入口、命令参数、默认输出通道、日志定位方式、工作区文件位置、最终用户工作流或排障方式变化 -> 检查并按需更新根目录 `README.md`
 - 涉及分层关系、装配方式、`UI / Service / Host / Agent` 边界变化 -> 检查并按需更新 `dayu/README.md`
 
 ## 目录约束

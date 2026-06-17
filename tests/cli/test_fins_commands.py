@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 
 import pytest
 
@@ -440,25 +440,31 @@ def test_fins_direct_default_log_does_not_pollute_progress_output(
 
 
 def test_fins_direct_verbose_log_outputs_execution_skeleton(
+    tmp_path: Path,
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--verbose`` 应把执行骨架诊断写到 stderr，progress 仍走 stdout。"""
+    """``--verbose`` 应把执行骨架诊断写到默认日志文件，progress 仍走 stdout。"""
 
+    log_file = _redirect_default_log_file(monkeypatch=monkeypatch, tmp_path=tmp_path)
     exit_code = cli_main.main(("download", "--ticker", "AAPL", "--verbose"))
 
     captured = capsys.readouterr()
+    log_text = log_file.read_text(encoding="utf-8")
     assert exit_code == EXIT_SUCCESS
     assert "Fins progress" in captured.out
     assert "Fins direct command start" not in captured.out
     assert "Fins direct event received" not in captured.out
     assert "[VERBOSE]" not in captured.out
-    assert "Fins direct command start" in captured.err
-    assert "Fins direct event received" in captured.err
-    assert "message='download live progress'" in captured.err
-    assert "document='AAPL 10-K FY2024'" in captured.err
-    assert "stage=download" in captured.err
-    assert "Fins direct event detail" not in captured.err
+    assert "Fins direct command start" not in captured.err
+    assert "Fins direct event received" not in captured.err
+    assert "Fins direct command start" in log_text
+    assert "Fins direct event received" in log_text
+    assert "message='download live progress'" in log_text
+    assert "document='AAPL 10-K FY2024'" in log_text
+    assert "stage=download" in log_text
+    assert "Fins direct event detail" not in log_text
 
 
 def test_fins_direct_verbose_log_file_keeps_user_ui_on_stdout(
@@ -533,48 +539,58 @@ def test_fins_direct_default_log_file_keeps_verbose_diagnostics_suppressed(
 
 
 def test_fins_direct_debug_log_omits_empty_event_detail(
+    tmp_path: Path,
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--debug`` 不输出只有 operation/event_type 的空泛 event detail。"""
+    """``--debug`` 不记录只有 operation/event_type 的空泛 event detail。"""
 
     fake_service.events = (_empty_progress_event(), _result_event())
+    log_file = _redirect_default_log_file(monkeypatch=monkeypatch, tmp_path=tmp_path)
 
     exit_code = cli_main.main(("download", "--ticker", "AAPL", "--debug"))
 
     captured = capsys.readouterr()
+    log_text = log_file.read_text(encoding="utf-8")
     assert exit_code == EXIT_SUCCESS
-    assert "Fins direct event received" in captured.err
-    assert "Fins direct event detail; operation=download event_type=progress" not in captured.err
-    assert "Fins direct event detail; operation=download event_type=result" in captured.err
+    assert "Fins direct event received" not in captured.err
+    assert "Fins direct event received" in log_text
+    assert "Fins direct event detail; operation=download event_type=progress" not in log_text
+    assert "Fins direct event detail; operation=download event_type=result" in log_text
 
 
 def test_fins_direct_debug_log_outputs_event_details(
+    tmp_path: Path,
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--debug`` 应把有界 event 详情写到 stderr，不输出内部治理标识。"""
+    """``--debug`` 应把有界 event 详情写到默认日志文件，不输出内部治理标识。"""
 
+    log_file = _redirect_default_log_file(monkeypatch=monkeypatch, tmp_path=tmp_path)
     exit_code = cli_main.main(("download", "--ticker", "AAPL", "--debug"))
 
     captured = capsys.readouterr()
+    log_text = log_file.read_text(encoding="utf-8")
     assert exit_code == EXIT_SUCCESS
     assert "Fins progress" in captured.out
     assert "Fins direct event detail" not in captured.out
     assert "[DEBUG]" not in captured.out
-    assert "Fins direct event detail" in captured.err
-    assert "event_type=progress" in captured.err
-    assert "filing_kind=10-K" in captured.err
-    assert "completed_units=1" in captured.err
-    assert "total_units=2" in captured.err
-    assert "status=success" in captured.err
-    assert "title='Download finished'" in captured.err
-    assert "exit_code=0" in captured.err
-    assert "details=processed_count=1" in captured.err
-    assert "sequence=" not in captured.err
-    assert "job_id=" not in captured.err
-    assert "cursor" not in captured.err
-    assert "artifact" not in captured.err
+    assert "Fins direct event detail" not in captured.err
+    assert "Fins direct event detail" in log_text
+    assert "event_type=progress" in log_text
+    assert "filing_kind=10-K" in log_text
+    assert "completed_units=1" in log_text
+    assert "total_units=2" in log_text
+    assert "status=success" in log_text
+    assert "title='Download finished'" in log_text
+    assert "exit_code=0" in log_text
+    assert "details=processed_count=1" in log_text
+    assert "sequence=" not in log_text
+    assert "job_id=" not in log_text
+    assert "cursor" not in log_text
+    assert "artifact" not in log_text
 
 
 def test_fins_direct_debug_diagnostic_details_are_bounded() -> None:
@@ -1198,6 +1214,34 @@ def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
         upload_file.write_text("material", encoding="utf-8")
         return ("upload_material", "--ticker", "AAPL", "--files", str(upload_file))
     raise ValueError(f"unknown live command: {command_name}")
+
+
+def _redirect_default_log_file(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
+    """把 CLI 默认日志文件重定向到 pytest 临时目录。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: pytest 临时目录。
+    :returns: 默认日志文件路径。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    log_file = tmp_path / "dayu-default.log"
+
+    def open_default_log_file() -> TextIO:
+        """打开测试用默认日志文件。
+
+        :returns: 已打开的日志文件流。
+        :raises OSError: 文件打开失败时由 ``open`` 透传。
+        """
+
+        return open(log_file, mode="a", encoding="utf-8")
+
+    monkeypatch.setattr(cli_main, "_open_default_log_file", open_default_log_file)
+    return log_file
 
 
 def _progress_event(operation_kind: FinsOperationKind) -> FinsEvent:

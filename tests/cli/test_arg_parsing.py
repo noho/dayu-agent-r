@@ -400,7 +400,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
     expected_log_level: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CLI main 必须把默认值或显式日志参数交给 runtime log helper。
+    """CLI main 必须把默认日志参数交给 runtime log helper 与临时文件。
 
     :param argv: 待执行的 CLI 参数。
     :param expected_log_level: argparse 归一后的日志级别字符串。
@@ -410,6 +410,8 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
     """
 
     calls: list[_LogAssemblyCall] = []
+    events: list[str] = []
+    log_stream = _TrackingLogStream(events)
 
     def spy_set_level_from_flags(
         *,
@@ -449,19 +451,29 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
         "set_level_from_flags",
         spy_set_level_from_flags,
     )
+    monkeypatch.setattr(cli_main, "_open_default_log_file", lambda: log_stream)
     monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _return_success)
 
     assert cli_main.main(argv) == EXIT_SUCCESS
-    assert calls == [
-        _LogAssemblyCall(
-            log_level=expected_log_level,
-            debug=False,
-            verbose=False,
-            info=False,
-            quiet=False,
-            stream=sys.stderr,
-        )
-    ]
+    assert len(calls) == 2
+    assert calls[0] == _LogAssemblyCall(
+        log_level=expected_log_level,
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        stream=log_stream,
+    )
+    assert calls[1] == _LogAssemblyCall(
+        log_level=expected_log_level,
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        stream=sys.stderr,
+    )
+    assert events == ["close"]
+    assert log_stream.closed
 
 
 def test_main_configures_runtime_log_file_stream(
@@ -539,18 +551,40 @@ def test_main_configures_runtime_log_file_stream(
     )
 
 
-def test_main_restores_stderr_for_consecutive_log_file_and_stderr_calls(
+def test_open_default_log_file_creates_persistent_temp_file() -> None:
+    """默认日志文件必须创建为可回查的持久临时文件。
+
+    :returns: ``None``。
+    :raises AssertionError: 临时日志文件不可写或关闭后不存在时抛出。
+    """
+
+    stream = cli_main._open_default_log_file()
+    assert stream is not None
+    log_path = Path(stream.name)
+    try:
+        stream.write("default diagnostic\n")
+        stream.close()
+        assert log_path.exists()
+        assert log_path.read_text(encoding="utf-8") == "default diagnostic\n"
+    finally:
+        if not stream.closed:
+            stream.close()
+        if log_path.exists():
+            log_path.unlink()
+
+
+def test_main_uses_separate_log_files_for_explicit_and_default_calls(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """连续调用时日志文件 handler 不得污染后续默认 stderr 调用。
+    """连续调用时显式日志文件不得污染后续默认临时日志文件。
 
     :param tmp_path: pytest 临时目录夹具。
     :param capsys: pytest 标准输出捕获夹具。
     :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
-    :raises AssertionError: 第二次调用不能写 stderr 或继续写日志文件时抛出。
+    :raises AssertionError: 第二次调用写入 stderr 或继续写显式日志文件时抛出。
     """
 
     monkeypatch.setitem(
@@ -559,6 +593,18 @@ def test_main_restores_stderr_for_consecutive_log_file_and_stderr_calls(
         _log_prompt_and_return_success,
     )
     log_file = tmp_path / "dayu.log"
+    default_log_file = tmp_path / "dayu-default.log"
+
+    def open_default_log_file() -> TextIO:
+        """打开测试用默认日志文件。
+
+        :returns: 已打开的默认日志文件流。
+        :raises OSError: 文件打开失败时由 ``open`` 透传。
+        """
+
+        return open(default_log_file, mode="a", encoding="utf-8")
+
+    monkeypatch.setattr(cli_main, "_open_default_log_file", open_default_log_file)
 
     assert (
         cli_main.main(
@@ -578,10 +624,13 @@ def test_main_restores_stderr_for_consecutive_log_file_and_stderr_calls(
 
     captured = capsys.readouterr()
     log_content = log_file.read_text(encoding="utf-8")
+    default_log_content = default_log_file.read_text(encoding="utf-8")
     assert _FIRST_LOG_FILE_DIAGNOSTIC in log_content
     assert _SECOND_STDERR_DIAGNOSTIC not in log_content
+    assert _FIRST_LOG_FILE_DIAGNOSTIC not in default_log_content
+    assert _SECOND_STDERR_DIAGNOSTIC in default_log_content
     assert _FIRST_LOG_FILE_DIAGNOSTIC not in captured.err
-    assert _SECOND_STDERR_DIAGNOSTIC in captured.err
+    assert _SECOND_STDERR_DIAGNOSTIC not in captured.err
 
 
 def test_main_restores_stderr_before_closing_log_file_on_unexpected_exception(

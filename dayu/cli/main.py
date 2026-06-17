@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from typing import TextIO
 
@@ -46,6 +48,11 @@ MISSING_RUNNER_DIAGNOSTIC_TEMPLATE: str = (
 )
 LOG_FILE_EMPTY_DIAGNOSTIC: str = "dayu-cli: --log-file: path must not be empty."
 LOG_FILE_OPEN_FAILED_TEMPLATE: str = "dayu-cli: --log-file: cannot open '{path}': {error}"
+AUTO_LOG_FILE_OPEN_FAILED_TEMPLATE: str = (
+    "dayu-cli: cannot create default temporary log file: {error}"
+)
+AUTO_LOG_FILE_PREFIX: str = "dayu-cli-"
+AUTO_LOG_FILE_SUFFIX: str = ".log"
 
 COMMAND_RUNNERS: dict[str, CommandRunner] = {
     command_name: run_not_implemented_command for command_name in CLI_COMMAND_NAMES
@@ -81,7 +88,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 opened_log_stream = _open_log_file(args.log_file)
                 if opened_log_stream is None:
                     return EXIT_USAGE_ERROR
-            log_stream = sys.stderr if opened_log_stream is None else opened_log_stream
+            else:
+                opened_log_stream = _open_default_log_file()
+                if opened_log_stream is None:
+                    return EXIT_FAILURE
+            log_stream = opened_log_stream
             runtime_log.set_level_from_flags(
                 log_level=args.log_level,
                 debug=False,
@@ -139,6 +150,26 @@ def _open_log_file(log_file: str) -> TextIO | None:
             LOG_FILE_OPEN_FAILED_TEMPLATE.format(path=log_file_path, error=exc),
             file=sys.stderr,
         )
+        return None
+
+
+def _open_default_log_file() -> TextIO | None:
+    """打开默认 CLI 诊断日志临时文件。
+
+    :returns: 已打开的文本写入流；临时文件创建失败时返回 ``None``。
+    :raises Exception: 本函数不主动抛出文件创建异常；创建失败通过
+        diagnostic 与 ``None`` 返回值表达。
+    """
+
+    try:
+        file_descriptor, log_file_path = tempfile.mkstemp(
+            prefix=AUTO_LOG_FILE_PREFIX,
+            suffix=AUTO_LOG_FILE_SUFFIX,
+        )
+        os.close(file_descriptor)
+        return open(log_file_path, mode="a", encoding="utf-8")
+    except OSError as exc:
+        print(AUTO_LOG_FILE_OPEN_FAILED_TEMPLATE.format(error=exc), file=sys.stderr)
         return None
 
 

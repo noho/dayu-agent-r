@@ -334,7 +334,7 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         "--log-file",
         dest="log_file",
         default=argparse.SUPPRESS,
-        help="把诊断日志追加写入指定文件。",
+        help="把诊断日志追加写入指定文件；未提供时写入系统临时目录 dayu-cli-*.log。",
     )
     parser.add_argument(
         "--debug",
