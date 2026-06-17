@@ -62,7 +62,7 @@ from dayu.host.memory import (
     default_memory_projection_policy,
     digest_memory_projection_policy,
 )
-from dayu.host.memory_repair import ConversationMemoryProjectionCatchupPort
+from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
@@ -638,10 +638,10 @@ def test_tool_fact_accept_logs_ids_without_tool_payload(
         assert "{\"payload\":" not in caplog.text
 
 
-def test_tool_fact_accept_concrete_memory_catchup_does_not_project_fact(
+def test_tool_fact_accept_then_direct_memory_catchup_does_not_project_fact(
     tmp_path: Path,
 ) -> None:
-    """TOOL_RESULT_ACCEPTED commit 后 concrete catch-up 不直接写入 fact。
+    """TOOL_RESULT_ACCEPTED commit 后直接 catch-up 不直接写入 fact。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -653,15 +653,18 @@ def test_tool_fact_accept_concrete_memory_catchup_does_not_project_fact(
         seeded = _seed_active_run(store.transaction_runner)
         accept_port = DefaultHostToolFactAcceptPort(
             transaction_runner=store.transaction_runner,
-            projection_catchup_port=ConversationMemoryProjectionCatchupPort(
-                transaction_runner=store.transaction_runner,
-                policy=policy,
-                batch_size=8,
-            ),
         )
 
         result = accept_port.accept_tool_fact(
             _completed_candidate(seeded, tool_call_id="tool-call-memory-catchup")
+        )
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert result.tool_result_event_ref is not None
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=8,
+            max_event_sequence=result.tool_result_event_ref.event_sequence,
         )
         snapshot = store.transaction_runner.run_read(
             lambda transaction: read_latest_memory_snapshot(
@@ -672,8 +675,6 @@ def test_tool_fact_accept_concrete_memory_catchup_does_not_project_fact(
             )
         )
 
-        assert isinstance(result, ToolFactAcceptedAck)
-        assert result.tool_result_event_ref is not None
         assert snapshot is not None
         assert snapshot.snapshot.evidence_fact_memory.evidence_backed_facts == ()
         assert snapshot.snapshot.cursor.checkpoint_event_id == (

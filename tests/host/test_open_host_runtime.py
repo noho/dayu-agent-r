@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import pathlib
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
@@ -46,10 +45,9 @@ from dayu.host import (
     SubmitFollowupRequest,
     open_host,
 )
-from dayu.host.api import HostInput
-from dayu.host.api import AuthorizationClaim
+from dayu.host.api import AuthorizationClaim, HostInput, HostLocalExecutionOptions
 from dayu.host.command import HostCommandHandle
-from dayu.host.dispatch import HostDispatchScheduler
+from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -59,28 +57,18 @@ from dayu.host.durable.options import (
 from dayu.host.durable.outbox import read_outbox_terminal_items_after
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.context_policy import default_context_budget_policy
-from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
-from dayu.host.memory_repair import (
-    ConversationMemoryProjectionRepairResult,
-    MemoryProjectionCatchupBudget,
-    MemoryProjectionRepairPurpose,
-)
+from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
     _CompositeProjectionCatchupPort,
-    _MemoryProjectionCatchupPort,
     _PublicHostHandle,
     _command_options_from_open_host_options,
     _local_execution_options_from_open_host_options,
 )
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
-from dayu.host.projection import ProjectionConsumerId
 from dayu.host.recovery import StartupRecoveryScanner
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
-_OPEN_HOST_MODULE = importlib.import_module("dayu.host.open_host")
-
-
 class _FinalAnswerHandle:
     """测试用立即产出 final answer 的 worker handle。"""
 
@@ -598,69 +586,67 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
     assert catch_up_calls == 1
 
 
-def test_open_host_memory_projection_port_uses_best_effort_budget(
+@pytest.mark.asyncio
+async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """open_host memory projection after-commit port 使用 bounded best-effort 预算。"""
+    """open_host after-commit 热路径不再注入 conversation memory catch-up。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
 
     options = _options(tmp_path, _FinalAnswerWorkerFactory())
-    calls: list[MemoryProjectionCatchupBudget | None] = []
+    observed_ports: list[ProjectionCatchupPort | None] = []
+    original_open = HostDispatchScheduler.open
 
-    def record_catch_up(
-        transaction_runner: HostTransactionRunner,
+    async def record_scheduler_open(
+        cls: type[HostDispatchScheduler],
         *,
-        policy: MemoryProjectionPolicy,
-        batch_size: int,
-        budget: MemoryProjectionCatchupBudget | None = None,
-        consumer_id: str = "host.memory.session.v1",
-        max_event_sequence: int | None = None,
-    ) -> ConversationMemoryProjectionRepairResult:
-        """记录 open_host memory catch-up port 注入的预算。
+        transaction_runner: HostTransactionRunner,
+        local_execution: HostLocalExecutionOptions,
+        host_handle_id: str,
+        active_registry: ActiveWorkerRegistry | None = None,
+        projection_catchup_port: ProjectionCatchupPort | None = None,
+    ) -> HostDispatchScheduler:
+        """记录 scheduler open 时的 projection port 并委托真实 open。
 
-        :param transaction_runner: durable transaction runner。
-        :param policy: memory projection policy。
-        :param batch_size: batch size。
-        :param budget: Host 内部单次总预算。
-        :param consumer_id: memory projection consumer id。
-        :param max_event_sequence: 最大 event sequence。
-        :returns: 空 repair result。
+        :param cls: scheduler class。
+        :param transaction_runner: Host transaction runner。
+        :param local_execution: 本地执行配置。
+        :param host_handle_id: Host handle id。
+        :param active_registry: active worker registry。
+        :param projection_catchup_port: commit 后 projection catch-up port。
+        :returns: 已打开 scheduler。
         """
 
-        del transaction_runner, policy, batch_size, max_event_sequence
-        calls.append(budget)
-        return ConversationMemoryProjectionRepairResult(
-            consumer_id=ProjectionConsumerId(consumer_id),
-            reset_checkpoint=False,
-            started_cursor=0,
-            finished_cursor=0,
-            events_scanned=0,
-            events_matched=0,
-            events_applied=0,
-            duplicates=0,
-            failures=0,
+        observed_ports.append(projection_catchup_port)
+        return await original_open.__func__(
+            cls,
+            transaction_runner=transaction_runner,
+            local_execution=local_execution,
+            host_handle_id=host_handle_id,
+            active_registry=active_registry,
+            projection_catchup_port=projection_catchup_port,
         )
 
     monkeypatch.setattr(
-        _OPEN_HOST_MODULE,
-        "catch_up_conversation_memory_projection",
-        record_catch_up,
+        HostDispatchScheduler,
+        "open",
+        classmethod(record_scheduler_open),
     )
-    with open_host_durable_store(_durable_options_from_open_options(options)) as store:
-        port = _MemoryProjectionCatchupPort(durable_store=store, options=options)
-        port.catch_up_projection()
 
-    assert len(calls) == 1
-    assert calls[0] is not None
-    assert calls[0].purpose is MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT
-    assert calls[0].max_batches == 1
-    assert calls[0].max_scanned_events == options.memory_projection_catchup_batch_size
+    async with open_host(options):
+        pass
+
+    assert observed_ports == [None]
 
 
 @pytest.mark.asyncio
 async def test_open_host_dispatch_memory_catchup_reaches_required_cursor(
     tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """dispatch 前 required memory catch-up 会追到 required cursor 后接受 worker。"""
 
@@ -668,45 +654,6 @@ async def test_open_host_dispatch_memory_catchup_reaches_required_cursor(
     options = replace(
         _options(tmp_path, factory),
         memory_projection_catchup_batch_size=1,
-    )
-
-    def skip_after_commit_memory_catch_up(
-        transaction_runner: HostTransactionRunner,
-        *,
-        policy: MemoryProjectionPolicy,
-        batch_size: int,
-        budget: MemoryProjectionCatchupBudget | None = None,
-        consumer_id: str = "host.memory.session.v1",
-        max_event_sequence: int | None = None,
-    ) -> ConversationMemoryProjectionRepairResult:
-        """让测试只覆盖 dispatch 前 required catch-up。
-
-        :param transaction_runner: durable transaction runner。
-        :param policy: memory projection policy。
-        :param batch_size: batch size。
-        :param budget: Host 内部单次总预算。
-        :param consumer_id: memory projection consumer id。
-        :param max_event_sequence: 最大 event sequence。
-        :returns: 空 repair result。
-        """
-
-        del transaction_runner, policy, batch_size, budget, max_event_sequence
-        return ConversationMemoryProjectionRepairResult(
-            consumer_id=ProjectionConsumerId(consumer_id),
-            reset_checkpoint=False,
-            started_cursor=0,
-            finished_cursor=0,
-            events_scanned=0,
-            events_matched=0,
-            events_applied=0,
-            duplicates=0,
-            failures=0,
-        )
-
-    monkeypatch.setattr(
-        _OPEN_HOST_MODULE,
-        "catch_up_conversation_memory_projection",
-        skip_after_commit_memory_catch_up,
     )
 
     async with open_host(options) as host:

@@ -84,7 +84,7 @@ from dayu.host.memory import (
     default_memory_projection_policy,
     digest_memory_projection_policy,
 )
-from dayu.host.memory_repair import ConversationMemoryProjectionCatchupPort
+from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.projection import ProjectionCatchupPort
 
@@ -1000,10 +1000,10 @@ def test_start_run_survives_after_commit_projection_catchup_failure(
         assert projection.calls == 1
 
 
-def test_start_run_concrete_memory_catchup_projects_user_input(
+def test_start_run_then_direct_memory_catchup_projects_user_input(
     tmp_path: Path,
 ) -> None:
-    """注入 concrete catch-up port 后 start_run 会追平用户输入 memory。
+    """start_run 提交用户输入后直接 catch-up 会投影用户输入 memory。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -1013,14 +1013,7 @@ def test_start_run_concrete_memory_catchup_projects_user_input(
     policy = default_memory_projection_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        service = _service(
-            store.transaction_runner,
-            projection_catchup=ConversationMemoryProjectionCatchupPort(
-                transaction_runner=store.transaction_runner,
-                policy=policy,
-                batch_size=8,
-            ),
-        )
+        service = _service(store.transaction_runner)
 
         result = service.start_run(
             _start_request(
@@ -1028,6 +1021,12 @@ def test_start_run_concrete_memory_catchup_projects_user_input(
                 client_request_id="start-memory-catch-up",
             ),
             caller_semantic_digest=_CALLER_DIGEST,
+        )
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=8,
+            max_event_sequence=result.run.input_event_sequence,
         )
         snapshot = store.transaction_runner.run_read(
             lambda transaction: read_latest_memory_snapshot(
