@@ -72,11 +72,18 @@ class _StopSignal:
     """测试 watcher 停止信号。"""
 
 
+@dataclass(frozen=True, slots=True)
+class _RaiseSignal:
+    """测试 watcher 异常信号。"""
+
+    error: Exception
+
+
 class _FakeHostEventIterator:
     """测试用 Host event iterator。"""
 
     closed_count: int
-    _queue: asyncio.Queue[HostEvent | _StopSignal]
+    _queue: asyncio.Queue[HostEvent | _StopSignal | _RaiseSignal]
 
     def __init__(self) -> None:
         """初始化 fake watcher。
@@ -107,6 +114,8 @@ class _FakeHostEventIterator:
         item = await self._queue.get()
         if isinstance(item, _StopSignal):
             raise StopAsyncIteration
+        if isinstance(item, _RaiseSignal):
+            raise item.error
         return item
 
     async def push(self, event: HostEvent) -> None:
@@ -118,6 +127,16 @@ class _FakeHostEventIterator:
         """
 
         await self._queue.put(event)
+
+    async def fail(self, error: Exception) -> None:
+        """推入 watcher drain 应观察到的异常。
+
+        :param error: watcher drain 应观察到的异常。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        await self._queue.put(_RaiseSignal(error=error))
 
     async def aclose(self) -> None:
         """关闭 watcher。
@@ -142,6 +161,7 @@ class _FakeHost:
     read_outbox_requests: list[ReadOutboxTerminalItemsRequest]
     _submit_terminal: HostEvent | None
     _submit_events: tuple[HostEvent, ...]
+    _submit_watcher_errors: tuple[Exception, ...]
     _cancel_terminal: HostEvent | None
     _outbox_item: OutboxTerminalItem | None
     _run_statuses: tuple[RunStatus, ...]
@@ -153,6 +173,7 @@ class _FakeHost:
         *,
         submit_terminal: HostEvent | None,
         submit_events: tuple[HostEvent, ...] = (),
+        submit_watcher_errors: tuple[Exception, ...] = (),
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         outbox_item: OutboxTerminalItem | None = None,
         cancel_terminal: HostEvent | None = None,
@@ -163,6 +184,7 @@ class _FakeHost:
         :param submit_terminal: submit 返回前推入的 terminal event；``None``
             表示 watcher 不产生 terminal。
         :param submit_events: submit 返回前推入的非终态 Host events。
+        :param submit_watcher_errors: submit 返回前推入 watcher 的异常。
         :param run_statuses: ``get_run`` 依次返回的状态。
         :param outbox_item: outbox fallback 返回的 terminal item。
         :param cancel_terminal: cancel 返回前推入的 terminal event。
@@ -180,6 +202,7 @@ class _FakeHost:
         self.read_outbox_requests = []
         self._submit_terminal = submit_terminal
         self._submit_events = submit_events
+        self._submit_watcher_errors = submit_watcher_errors
         self._cancel_terminal = cancel_terminal
         self._outbox_item = outbox_item
         self._run_statuses = run_statuses
@@ -242,9 +265,11 @@ class _FakeHost:
         self.submit_requests.append(request)
         for event in self._submit_events:
             await self.watchers[-1].push(event)
+        for error in self._submit_watcher_errors:
+            await self.watchers[-1].fail(error)
         if self._submit_terminal is not None:
             await self.watchers[-1].push(self._submit_terminal)
-        if self._submit_events or self._submit_terminal is not None:
+        if self._submit_events or self._submit_watcher_errors or self._submit_terminal is not None:
             await asyncio.sleep(0)
         return FollowupSnapshot(
             accepted_input_ref="input-1",
@@ -663,7 +688,10 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     """prompt 命令应经 Service helper 提交并输出 live final answer。"""
 
     workspace_root = tmp_path
-    fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(_activity_event(),),
+    )
     captured_requests: list[EntrypointRuntimeRequest] = []
     real_prepare = prompt_command.prepare_entrypoint_runtime
 
@@ -757,7 +785,10 @@ async def test_prompt_existing_session_execution_does_not_create_or_ensure(
         scenario="prompt",
         user_prompt="请继续分析",
     )
-    fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(_activity_event(),),
+    )
 
     exit_code = await prompt_command._execute_prompt_on_existing_session(
         host=cast(Host, fake_host),
@@ -799,7 +830,10 @@ def test_prompt_verbose_debug_diagnostics_do_not_pollute_stdout(
     :raises AssertionError: stdout 被诊断日志污染时抛出。
     """
 
-    fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(_activity_event(),),
+    )
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
     monkeypatch.setattr(
         prompt_command,
@@ -822,6 +856,7 @@ def test_prompt_verbose_debug_diagnostics_do_not_pollute_stdout(
     assert captured.out.strip() == "prompt answer"
     assert "[VERBOSE]" not in captured.out
     assert "[DEBUG]" not in captured.out
+    assert "Activity:" not in captured.err
 
 
 def test_prompt_command_without_ticker_uses_default_context_slots(
@@ -864,16 +899,17 @@ def test_prompt_command_without_ticker_uses_default_context_slots(
     assert fake_host.submit_requests[0].context.operation_context.business_object_id is None
 
 
-def test_prompt_command_uses_outbox_fallback_when_live_terminal_missing(
+def test_prompt_command_uses_outbox_fallback_when_watcher_fails(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """watcher 无 terminal 时 prompt command 应通过 public outbox fallback 输出。"""
+    """watcher 断线时 prompt command 应通过 public outbox fallback 输出。"""
 
     workspace_root = tmp_path
     fake_host = _FakeHost(
         submit_terminal=None,
+        submit_watcher_errors=(RuntimeError("watch stream disconnected"),),
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_item=_outbox_item(),
     )
@@ -892,12 +928,12 @@ def test_prompt_command_uses_outbox_fallback_when_live_terminal_missing(
     assert fake_host.read_outbox_requests[0].limit == 50
 
 
-def test_prompt_tty_activity_writes_stderr_and_final_answer_stays_stdout(
+def test_prompt_default_no_detail_suppresses_activity_and_keeps_final_answer_stdout(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TTY activity renderer 应写 stderr，final answer 仍只写 stdout。"""
+    """prompt 默认不注册 activity renderer，final answer 仍只写 stdout。"""
 
     workspace_root = tmp_path
     fake_host = _FakeHost(
@@ -910,13 +946,39 @@ def test_prompt_tty_activity_writes_stderr_and_final_answer_stays_stdout(
         "open_host",
         lambda _options: _FakeOpenHostContext(fake_host),
     )
-    monkeypatch.setattr(
-        prompt_command,
-        "new_cli_activity_renderer",
-        lambda: CliActivityRenderer(options=CliActivityRendererOptions(visible=True, enabled=True)),
-    )
 
     exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "请总结收入变化"))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.strip() == "prompt answer"
+    assert "Activity:" not in captured.err
+    assert "工具批次完成" not in captured.err
+    assert "记录烟测事实" not in captured.err
+
+
+def test_prompt_detail_outputs_activity_for_non_tty_and_keeps_final_answer_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式 ``--detail`` 应在非 TTY 捕获流下输出 activity。"""
+
+    workspace_root = tmp_path
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(_activity_event(),),
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(
+        ("prompt", "--base", str(workspace_root), "--detail", "请总结收入变化")
+    )
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_SUCCESS
@@ -924,6 +986,49 @@ def test_prompt_tty_activity_writes_stderr_and_final_answer_stays_stdout(
     assert "Activity:" in captured.err
     assert "工具批次完成" in captured.err
     assert "记录烟测事实" in captured.err
+    assert "[VERBOSE]" not in captured.err
+    assert "[DEBUG]" not in captured.err
+
+
+def test_prompt_detail_activity_does_not_enter_log_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--detail`` activity 属于 UI 输出，不写入 ``--log-file``。"""
+
+    workspace_root = tmp_path
+    log_file = tmp_path / "dayu.log"
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(_activity_event(),),
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(
+        (
+            "prompt",
+            "--base",
+            str(workspace_root),
+            "--detail",
+            "--log-file",
+            str(log_file),
+            "请总结收入变化",
+        )
+    )
+    captured = capsys.readouterr()
+    log_content = log_file.read_text(encoding="utf-8")
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.strip() == "prompt answer"
+    assert "Activity:" in captured.err
+    assert "Activity:" not in log_content
+    assert "工具批次完成" not in log_content
 
 
 @pytest.mark.asyncio

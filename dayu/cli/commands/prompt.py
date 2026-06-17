@@ -24,7 +24,7 @@ from dayu.cli.agent_entrypoint import (
     service_run_overrides_from_args,
     unsupported_execution_option_names,
 )
-from dayu.cli.activity import CliActivityRenderer, new_cli_activity_renderer
+from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.arg_parsing import COMMAND_PROMPT, ParsedCliArgs
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
@@ -184,6 +184,7 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
             prepared=prepared,
             session_id=session_id,
             sigint_monitor=CliSigintMonitor(),
+            detail=args.detail,
         )
 
 
@@ -261,6 +262,7 @@ async def _execute_prompt_on_existing_session(
     prepared: _PreparedPromptExistingSessionExecution,
     session_id: str,
     sigint_monitor: CliSigintMonitor,
+    detail: bool = False,
 ) -> int:
     """在已解析的已有 Session 上执行 prompt turn。
 
@@ -268,6 +270,7 @@ async def _execute_prompt_on_existing_session(
     :param prepared: prompt existing-session 执行准备结果。
     :param session_id: 已存在且调用方已选择的 Host Session id。
     :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
+    :param detail: 是否显示运行态 activity stream。
     :returns: CLI 退出码。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
@@ -280,7 +283,7 @@ async def _execute_prompt_on_existing_session(
         user_prompt=prepared.user_prompt,
         run_overrides=prepared.run_overrides,
         sigint_monitor=sigint_monitor,
-        activity_renderer=new_cli_activity_renderer(),
+        activity_renderer=_new_detail_activity_renderer() if detail else None,
         key_monitor=new_running_key_monitor(),
     )
     if terminal is None:
@@ -294,6 +297,21 @@ async def _execute_prompt_on_existing_session(
             event_sequence=terminal.event_sequence,
         )
     return render_exit_code
+
+
+def _new_detail_activity_renderer() -> CliActivityRenderer:
+    """创建 ``--detail`` 模式使用的 activity renderer。
+
+    :returns: 强制可见且启用的 CLI activity renderer。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return CliActivityRenderer(
+        options=CliActivityRendererOptions(
+            visible=True,
+            enabled=True,
+        )
+    )
 
 
 async def _ensure_prompt_session(

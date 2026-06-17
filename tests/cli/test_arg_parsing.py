@@ -38,6 +38,8 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "prompt",
         "--ticker",
         "--label",
+        "--detail",
+        "--no-detail",
         "--model-name",
         "--temperature",
         "--tool-timeout-seconds",
@@ -901,3 +903,60 @@ def test_default_namespace_initializes_reset_false() -> None:
     assert init_args.reset is False
     assert init_args.overwrite is False
     assert prompt_args.reset is False
+    assert prompt_args.detail is False
+
+
+def test_prompt_detail_defaults_to_no_detail() -> None:
+    """验证 prompt 默认不显示运行态细节。
+
+    :returns: ``None``。
+    :raises AssertionError: ``detail`` 默认值不符合契约时抛出。
+    """
+
+    args = parse_cli_args(("prompt", "hello"))
+
+    assert args.detail is False
+    assert args.log_level == "info"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_detail", "expected_log_level"),
+    (
+        (("prompt", "hello", "--detail"), True, "info"),
+        (("prompt", "hello", "--no-detail"), False, "info"),
+        (("prompt", "hello", "--verbose"), False, "verbose"),
+        (("prompt", "hello", "--debug"), False, "debug"),
+        (("prompt", "hello", "--detail", "--verbose"), True, "verbose"),
+    ),
+)
+def test_prompt_detail_flags_are_orthogonal_to_log_level(
+    argv: tuple[str, ...],
+    expected_detail: bool,
+    expected_log_level: str,
+) -> None:
+    """验证 prompt detail flag 与日志等级互不隐式联动。
+
+    :param argv: 待解析的 CLI 参数。
+    :param expected_detail: 预期 detail 值。
+    :param expected_log_level: 预期日志等级。
+    :returns: ``None``。
+    :raises AssertionError: 解析结果不符合契约时抛出。
+    """
+
+    args = parse_cli_args(argv)
+
+    assert args.detail is expected_detail
+    assert args.log_level == expected_log_level
+
+
+def test_prompt_detail_flags_are_mutually_exclusive() -> None:
+    """验证 ``--detail`` 与 ``--no-detail`` 互斥。
+
+    :returns: ``None``。
+    :raises AssertionError: argparse 未拒绝互斥参数时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(("prompt", "hello", "--detail", "--no-detail"))
+
+    assert raised.value.code == EXIT_USAGE_ERROR
