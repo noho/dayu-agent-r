@@ -5,12 +5,15 @@ from __future__ import annotations
 from io import StringIO
 from typing import cast
 
+import pytest
+from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.key_bindings import KeyBindings, KeyHandlerCallable
 from prompt_toolkit.keys import Keys
 
 from dayu.cli.composer import (
     InputReaderComposer,
+    PromptToolkitInteractiveComposer,
     build_interactive_key_bindings,
     new_interactive_composer,
 )
@@ -129,7 +132,60 @@ class _FakeKeyEvent:
         self.app = app
 
 
-def test_new_interactive_composer_uses_input_reader_for_non_tty() -> None:
+class _FakePromptSession:
+    """测试用 prompt_toolkit PromptSession 替身。"""
+
+    prompt_async_calls: list[tuple[str, bool, bool]]
+
+    def __init__(self) -> None:
+        """初始化 fake prompt session。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.prompt_async_calls = []
+
+    async def prompt_async(
+        self,
+        prompt: str,
+        *,
+        multiline: bool,
+        handle_sigint: bool,
+    ) -> str:
+        """记录异步 prompt 调用。
+
+        :param prompt: 输入提示文本。
+        :param multiline: prompt_toolkit multiline 参数。
+        :param handle_sigint: prompt_toolkit SIGINT 处理参数。
+        :returns: 测试输入文本。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.prompt_async_calls.append((prompt, multiline, handle_sigint))
+        return "异步输入"
+
+    def prompt(
+        self,
+        prompt: str,
+        *,
+        multiline: bool,
+        handle_sigint: bool,
+    ) -> str:
+        """同步 prompt 不应被 async composer 调用。
+
+        :param prompt: 输入提示文本。
+        :param multiline: prompt_toolkit multiline 参数。
+        :param handle_sigint: prompt_toolkit SIGINT 处理参数。
+        :returns: 正常路径不会返回。
+        :raises AssertionError: 始终抛出，防止回归到同步 prompt。
+        """
+
+        raise AssertionError("PromptToolkitInteractiveComposer must use prompt_async")
+
+
+@pytest.mark.asyncio
+async def test_new_interactive_composer_uses_input_reader_for_non_tty() -> None:
     """非 TTY 输入应保留 input reader adapter。"""
 
     composer = new_interactive_composer(
@@ -138,7 +194,21 @@ def test_new_interactive_composer_uses_input_reader_for_non_tty() -> None:
     )
 
     assert isinstance(composer, InputReaderComposer)
-    assert composer.read("dayu> ") == "用户输入"
+    assert await composer.read("dayu> ") == "用户输入"
+
+
+@pytest.mark.asyncio
+async def test_prompt_toolkit_composer_uses_prompt_async() -> None:
+    """TTY composer 必须使用 prompt_async，避免嵌套 asyncio.run。"""
+
+    fake_session = _FakePromptSession()
+    composer = PromptToolkitInteractiveComposer()
+    composer._session = cast(PromptSession[str], fake_session)
+
+    result = await composer.read("dayu> ")
+
+    assert result == "异步输入"
+    assert fake_session.prompt_async_calls == [("dayu> ", False, False)]
 
 
 def test_interactive_key_bindings_cover_multiline_history_and_editor() -> None:

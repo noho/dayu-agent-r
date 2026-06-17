@@ -21,7 +21,7 @@ _EDITOR_FAILURE_PREFIX: Final[str] = "Editor failed"
 class InteractiveComposer(Protocol):
     """interactive 输入态 composer 窄协议。"""
 
-    def read(self, prompt: str) -> str:
+    async def read(self, prompt: str) -> str:
         """读取一次用户输入。
 
         :param prompt: 输入提示文本。
@@ -48,7 +48,7 @@ class InputReaderComposer:
 
         self._input_reader = input_reader
 
-    def read(self, prompt: str) -> str:
+    async def read(self, prompt: str) -> str:
         """读取一次用户输入。
 
         :param prompt: 输入提示文本。
@@ -80,7 +80,7 @@ class PromptToolkitInteractiveComposer:
             enable_open_in_editor=True,
         )
 
-    def read(self, prompt: str) -> str:
+    async def read(self, prompt: str) -> str:
         """读取一次 interactive 用户输入。
 
         :param prompt: 输入提示文本。
@@ -89,7 +89,11 @@ class PromptToolkitInteractiveComposer:
         :raises KeyboardInterrupt: 用户在空 draft 中请求中断时抛出。
         """
 
-        return self._session.prompt(prompt, multiline=False, handle_sigint=False)
+        return await self._session.prompt_async(
+            prompt,
+            multiline=False,
+            handle_sigint=False,
+        )
 
 
 def build_interactive_key_bindings(*, stderr: TextIO | None = None) -> KeyBindings:

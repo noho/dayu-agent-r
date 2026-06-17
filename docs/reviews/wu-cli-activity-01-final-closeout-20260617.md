@@ -14,6 +14,7 @@
 - Slice A Host public activity event contract: `992a641d`
 - Slice B Service activity callback: `152292da`
 - CLI slices C/D/E/F activity renderer, composer, run keys, docs/tests: `1a6f4bb2`
+- Post-closeout interactive composer async fix: recorded in this follow-up.
 
 ## Delivered
 
@@ -43,6 +44,23 @@
   - Result: 0 errors.
 - `git diff --check`
   - Result: clean.
+
+## Post-Closeout Fix
+
+- Fix artifact: `docs/reviews/wu-cli-activity-01-interactive-composer-async-fix.md`
+- Root cause: TTY composer used synchronous `PromptSession.prompt(...)` inside
+  the already running CLI event loop.
+- Fix: composer read API is now async and the prompt_toolkit path awaits
+  `PromptSession.prompt_async(...)`.
+- Validation after fix:
+  - `pytest tests/cli/test_interactive_composer.py tests/cli/test_interactive_command.py tests/cli/test_prompt_command.py tests/cli/test_activity_renderer.py tests/cli/test_run_keys.py -q`
+    - Result: 66 passed, 3 third-party edgar deprecation warnings.
+  - `pytest tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py --cov=dayu.cli.activity --cov=dayu.cli.composer --cov=dayu.cli.run_keys --cov-fail-under=80 -q`
+    - Result: 18 passed; total coverage 90.25%.
+  - `python -m pyright dayu/ tests/ utils/`
+    - Result: 0 errors.
+  - `git diff --check`
+    - Result: clean.
 
 ## Residual Risk
 

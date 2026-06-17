@@ -144,7 +144,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | ready-to-open-draft-PR |
-| implementation status | WU-CLI-ACTIVITY-01 final closeout completed locally; draft PR gate ready when requested |
+| implementation status | WU-CLI-ACTIVITY-01 final closeout completed locally; post-closeout interactive composer async fix applied; draft PR gate ready when requested |
 | active work unit | WU-CLI-ACTIVITY-01 |
 | default next work unit | WU-OBS-00 |
 | next entry point | Create draft PR when requested; otherwise proceed to default next work unit |
@@ -210,7 +210,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
 | WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 closed on 2026-06-17 after user authorization |
-| WU-CLI-ACTIVITY-01 | ready-to-open-draft-PR | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Final closeout completed in `docs/reviews/wu-cli-activity-01-final-closeout-20260617.md`; accepted commits: plan `012fee0a`, Slice A `992a641d`, Slice B `152292da`, CLI `1a6f4bb2`; aggregate deepreview non-blocking. |
+| WU-CLI-ACTIVITY-01 | ready-to-open-draft-PR | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Final closeout completed in `docs/reviews/wu-cli-activity-01-final-closeout-20260617.md`; accepted commits: plan `012fee0a`, Slice A `992a641d`, Slice B `152292da`, CLI `1a6f4bb2`; post-closeout async composer fix recorded in `docs/reviews/wu-cli-activity-01-interactive-composer-async-fix.md`; aggregate deepreview non-blocking. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -294,6 +294,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - aggregate deepreview: `docs/reviews/deepreview-wu-cli-activity-01-aggregate-mimo-20260617-153030.md` (AgentMiMo, non-blocking with CLI subagent limitation noted); `docs/reviews/deepreview-wu-cli-activity-01-aggregate-ds-20260617-151950.md` (AgentDS, non-blocking)
 - final validation: `pytest tests/host/test_public_host_event.py tests/host/test_public_open_host_options.py tests/host/test_package_exports.py tests/host/test_host_activity_event_projection.py tests/host/test_watch_session_events.py tests/host/test_context_compact_events.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py -q` passed with 179 passed and 3 third-party edgar deprecation warnings; `pytest tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py --cov=dayu.cli.activity --cov=dayu.cli.composer --cov=dayu.cli.run_keys --cov-fail-under=80 -q` passed with 17 passed and total coverage 89.53%; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
 - final closeout: `docs/reviews/wu-cli-activity-01-final-closeout-20260617.md`
+- post-closeout fix: `docs/reviews/wu-cli-activity-01-interactive-composer-async-fix.md`; validation `pytest tests/cli/test_interactive_composer.py tests/cli/test_interactive_command.py tests/cli/test_prompt_command.py tests/cli/test_activity_renderer.py tests/cli/test_run_keys.py -q` passed with 66 passed and 3 third-party edgar deprecation warnings; `pytest tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py --cov=dayu.cli.activity --cov=dayu.cli.composer --cov=dayu.cli.run_keys --cov-fail-under=80 -q` passed with 18 passed and total coverage 90.25%; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
 
 ### Residual risks
 

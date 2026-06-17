@@ -418,7 +418,7 @@ async def _run_interactive_repl(
     effective_key_monitor_factory = new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
     while True:
         try:
-            user_prompt = effective_composer.read(INTERACTIVE_INPUT_PROMPT)
+            user_prompt = await effective_composer.read(INTERACTIVE_INPUT_PROMPT)
         except EOFError:
             return EXIT_SUCCESS
         stripped_prompt = user_prompt.strip()
