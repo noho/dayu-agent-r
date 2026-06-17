@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | completed |
-| implementation status | WU-CLI-SESSION-01 final closeout completed; draft PR #146 https://github.com/noho/dayu-agent-r/pull/146; final closeout `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; PR review accepted commit `c7f79f03` |
-| active work unit | WU-CLI-SESSION-01 |
+| gate | planning |
+| implementation status | WU-CLI-ACTIVITY-01 plan review / re-review passed; accepted plan commit pending |
+| active work unit | WU-CLI-ACTIVITY-01 |
 | default next work unit | WU-OBS-00 |
-| next entry point | WU-CLI-SESSION-01 final-closeout complete; next work unit selection after user merge / issue decision |
+| next entry point | Create accepted plan commit for WU-CLI-ACTIVITY-01, then enter implementation Slice A |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | none |
+| blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01. |
 
 状态约定：
 
@@ -210,7 +210,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
 | WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 closed on 2026-06-17 after user authorization |
-| WU-CLI-ACTIVITY-01 | pending | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Runs after WU-CLI-SESSION-01; show collapsible/hideable activity summaries for prompt / interactive without exposing hidden chain-of-thought; do not use logging as UI |
+| WU-CLI-ACTIVITY-01 | planning | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Plan artifact fixed after review in `docs/host/host-issues/wu-cli-activity-01-activity-composer-plan.md`; BQ-1 resolved by user裁决 allowing event-related contract changes; plan re-review passed; accepted plan commit pending. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -234,6 +234,38 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+
+## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
+
+### 状态
+
+本 work unit 已完成 plan review / re-review。BQ-1 已由用户裁决解除：本 WU 允许修改 event 相关 contracts。Plan 方向为 contract-first：先扩展 Host public `HostEvent` activity projection，再由 Service / CLI 消费该 public activity view；CLI 不读取 Host durable internals、Tool Trace、payload ref / digest、logging 或 ToolBundle。
+
+### Current gate artifacts
+
+- plan: `docs/host/host-issues/wu-cli-activity-01-activity-composer-plan.md`
+- plan review: `docs/reviews/plan-review-20260617-124817.md` (AgentMiMo); `docs/reviews/plan-review-20260617-124923.md` (AgentDS)
+- plan review adjudication: `docs/reviews/plan-review-wu-cli-activity-01-adjudication-20260617-125229.md`
+- plan re-review: `docs/reviews/plan-review-20260617-130417.md` (AgentMiMo); `docs/reviews/plan-review-20260617-130248.md` (AgentDS)
+- plan gate validation: `git diff --check` clean; untracked plan artifact whitespace check clean via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cli-activity-01-activity-composer-plan.md` with expected nonzero no-index exit and no whitespace output
+- accepted plan commit: pending
+
+### Accepted plan scope
+
+- Slice A: Host public activity event contract; `HostEvent` keeps coarse `HostEventKind` and adds existing `HostEventClass`, EventLog row `event_type`, and safe `HostActivityView`.
+- Slice B: Service activity callback consumes Host public activity, without parsing durable internals.
+- Slice C: Prompt activity renderer, visibility toggle, and running-state cancel behavior.
+- Slice D: Interactive composer with multiline input, history search, external editor, and early prompt_toolkit compatibility validation.
+- Slice E: Interactive running activity and cancel integration.
+- Slice F: README/doc checks, affected tests, coverage, pyright, and validation cleanup.
+
+### Residual risks
+
+- `RR-ACT-01`: Host admission must extend `USER_INPUT_ACCEPTED.effective_tool_set` payload shape with Host-owned `effective_tool_display_names`; no durable schema migration is allowed.
+- `RR-ACT-02`: prompt_toolkit key binding may vary by terminal; Slice D must validate before broad REPL rewiring.
+- `RR-ACT-03`: dynamic stderr renderer may interact poorly with terminal width / final answer rendering; renderer close / flush must precede terminal rendering.
+- `RR-ACT-04`: local exit after repeated Ctrl+C must not forge Host facts; real terminal remains observable later.
+- `RR-ACT-05`: cancel / terminal race must prefer already received terminal result over repeated Ctrl+C.
 
 ## WU-CLI-SESSION-01 CLI Session Management
 
