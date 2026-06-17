@@ -79,7 +79,7 @@ Non-blocking risks with owner / destination:
 
 - Draft PR: PR-146 https://github.com/noho/dayu-agent-r/pull/146
 - GitHub Issue owner: issue-145.
-- Issue closeout: issue-145 was not closed in this gate because external issue modification / closure requires separate user authorization and PR-146 is still draft/open.
+- Issue closeout: issue-145 was closed on 2026-06-17 after explicit user authorization.
 
 ## Next Entry Point
 
