@@ -461,6 +461,23 @@ def test_fins_direct_verbose_log_outputs_execution_skeleton(
     assert "Fins direct event detail" not in captured.err
 
 
+def test_fins_direct_debug_log_omits_empty_event_detail(
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--debug`` 不输出只有 operation/event_type 的空泛 event detail。"""
+
+    fake_service.events = (_empty_progress_event(), _result_event())
+
+    exit_code = cli_main.main(("download", "--ticker", "AAPL", "--debug"))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert "Fins direct event received" in captured.err
+    assert "Fins direct event detail; operation=download event_type=progress" not in captured.err
+    assert "Fins direct event detail; operation=download event_type=result" in captured.err
+
+
 def test_fins_direct_debug_log_outputs_event_details(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
@@ -1129,6 +1146,26 @@ def _progress_event(operation_kind: FinsOperationKind) -> FinsEvent:
         filing_kind="10-K",
         document_label="AAPL 10-K FY2024",
         progress=FinsProgress(stage="download", completed_units=1, total_units=2),
+        result=None,
+    )
+
+
+def _empty_progress_event() -> FinsEvent:
+    """构造没有额外诊断字段的 fake progress event。
+
+    :returns: fake progress event。
+    :raises ValueError: 事件违反 direct contract 时抛出。
+    """
+
+    return FinsEvent(
+        event_type=FinsEventType.PROGRESS,
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        message="progress tick",
+        emitted_at=_NOW,
+        ticker=None,
+        filing_kind=None,
+        document_label=None,
+        progress=FinsProgress(stage="poll", completed_units=None, total_units=None),
         result=None,
     )
 

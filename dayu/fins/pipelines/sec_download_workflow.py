@@ -7,7 +7,7 @@ from dayu.contracts.json_value import JsonValue
 import datetime as dt
 import inspect
 import time
-from typing import AsyncIterator, Awaitable, Callable, Optional, Protocol, TypeVar, cast
+from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
 
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -15,6 +15,11 @@ from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.storage import FilingMaintenanceRepositoryProtocol, SourceDocumentRepositoryProtocol
 from dayu.fins._log import Log
+
+_FILING_STATUS_DOWNLOADED: Final[str] = "downloaded"
+_FILING_STATUS_SKIPPED: Final[str] = "skipped"
+_FILING_STATUS_FAILED: Final[str] = "failed"
+_FILING_REASON_6K_FILTERED: Final[str] = "6k_filtered"
 
 
 class _DownloadWorkflowDownloader(Protocol):
@@ -488,11 +493,18 @@ async def run_download_stream_impl(
             module=host.MODULE,
         )
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    rejected_count = sum(1 for item in filing_results if _is_rejected_filing_result(item))
+    skipped_count = sum(
+        1
+        for item in filing_results
+        if item["status"] == _FILING_STATUS_SKIPPED and not _is_rejected_filing_result(item)
+    )
     summary = {
         "total": len(filing_results),
-        "downloaded": sum(1 for item in filing_results if item["status"] == "downloaded"),
-        "skipped": sum(1 for item in filing_results if item["status"] == "skipped"),
-        "failed": sum(1 for item in filing_results if item["status"] == "failed"),
+        "downloaded": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_DOWNLOADED),
+        "skipped": skipped_count,
+        "rejected": rejected_count,
+        "failed": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_FAILED),
         "elapsed_ms": elapsed_ms,
         "reused_downloads": 0,
         "converted": 0,
@@ -501,7 +513,8 @@ async def run_download_stream_impl(
         (
             "美股下载完成: "
             f"ticker={normalized_ticker} total={summary['total']} downloaded={summary['downloaded']} "
-            f"skipped={summary['skipped']} failed={summary['failed']} elapsed_ms={summary['elapsed_ms']}"
+            f"skipped={summary['skipped']} rejected={summary['rejected']} "
+            f"failed={summary['failed']} elapsed_ms={summary['elapsed_ms']}"
         ),
         module=host.MODULE,
     )
@@ -527,3 +540,23 @@ async def run_download_stream_impl(
         ticker=normalized_ticker,
         payload={"result": final_result},
     )
+
+
+def _is_rejected_filing_result(item: dict[str, JsonValue]) -> bool:
+    """判断 filing 结果是否代表 rejected artifact。
+
+    Args:
+        item: SEC filing 下载结果。
+
+    Returns:
+        6-K 预筛未命中并写入 rejected artifact 时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    if item["status"] != _FILING_STATUS_SKIPPED:
+        return False
+    skip_reason = str(item.get("skip_reason", "")).strip()
+    reason_code = str(item.get("reason_code", "")).strip()
+    return skip_reason == _FILING_REASON_6K_FILTERED or reason_code == _FILING_REASON_6K_FILTERED

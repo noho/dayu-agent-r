@@ -163,6 +163,7 @@ class SecPipelineSummary(TypedDict):
     total: int
     downloaded: int
     skipped: int
+    rejected: int
     failed: int
     elapsed_ms: int
     reused_downloads: int

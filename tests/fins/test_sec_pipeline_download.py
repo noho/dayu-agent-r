@@ -5,6 +5,7 @@ from __future__ import annotations
 from dayu.contracts.json_value import JsonValue
 
 import json
+import logging
 from collections.abc import Callable, Mapping
 from io import BytesIO
 from pathlib import Path
@@ -1163,11 +1164,15 @@ def test_sec_pipeline_download_resolves_foreign_issuer_from_submissions(tmp_path
     assert company_meta["market"] == "US"
 
 
-def test_sec_pipeline_filters_6k_excluded(tmp_path: Path) -> None:
+def test_sec_pipeline_filters_6k_excluded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """验证 6-K 命中排除规则时跳过落盘。
 
     Args:
         tmp_path: 临时目录。
+        caplog: 日志捕获夹具。
 
     Returns:
         无。
@@ -1223,9 +1228,16 @@ def test_sec_pipeline_filters_6k_excluded(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
+    caplog.set_level(logging.INFO, logger="dayu.fins.FINS.SEC_PIPELINE")
+
     result = pipeline.download(ticker="TCOM", overwrite=False)
 
-    assert result["summary"]["skipped"] == 1
+    assert result["summary"]["skipped"] == 0
+    assert result["summary"]["rejected"] == 1
+    assert (
+        "美股下载完成: ticker=TCOM total=1 downloaded=0 skipped=0 rejected=1 failed=0"
+        in caplog.text
+    )
     assert downloader.download_files_called is True
     meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
     assert not meta_path.exists()
@@ -1311,7 +1323,7 @@ def test_sec_download_adapter_counts_6k_filtered_as_rejected_in_persisted_summar
     summary = result.persisted_summary
     assert summary is not None
     assert summary.rejected_count == 1
-    assert summary.skipped_count == 1
+    assert summary.skipped_count == 0
     assert summary.downloaded_count == 0
 
 
