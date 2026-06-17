@@ -14,6 +14,7 @@ import pytest
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
 from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
+from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -410,6 +411,39 @@ class _AutoSigintMonitor(CliSigintMonitor):
         return self.count
 
 
+class _NoopSigintMonitor(CliSigintMonitor):
+    """测试用不触发 SIGINT monitor。"""
+
+    def install(self) -> None:
+        """测试中不安装真实 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    def close(self) -> None:
+        """测试中无需恢复 OS signal handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    async def wait_next(self, observed_count: int) -> int:
+        """一直等待下一次 SIGINT，直到调用方取消等待任务。
+
+        :param observed_count: 已观察到的 SIGINT 计数。
+        :returns: 正常路径不会返回。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        await asyncio.Event().wait()
+        return observed_count
+
+
 class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
     """测试用第二次 SIGINT monitor。"""
 
@@ -518,6 +552,71 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert fake_host.create_requests == []
 
 
+@pytest.mark.asyncio
+async def test_interactive_existing_session_execution_does_not_create_or_ensure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interactive existing-session 入口只能在指定 Session 上运行 REPL。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: helper 调用了 create / ensure 或多轮 Session 不一致时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+    )
+    fake_host = _FakeHost(
+        submit_statuses=(
+            HostTerminalStatus.SUCCEEDED,
+            HostTerminalStatus.SUCCEEDED,
+        )
+    )
+
+    exit_code = await interactive_command._execute_interactive_on_existing_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        input_reader=_input_reader(("第一轮", "第二轮")),
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.splitlines() == ["answer for run-1", "answer for run-2"]
+    assert fake_host.ensure_requests == []
+    assert fake_host.create_requests == []
+    assert fake_host.calls == [
+        "watch:session-existing",
+        "submit:session-existing",
+        "watch:session-existing",
+        "submit:session-existing",
+    ]
+    assert [request.user_prompt for request in fake_host.submit_requests] == [
+        "第一轮",
+        "第二轮",
+    ]
+
+
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))
 def test_interactive_verbose_debug_diagnostics_do_not_pollute_stdout(
     log_flag: str,
@@ -562,32 +661,6 @@ def test_interactive_verbose_debug_diagnostics_do_not_pollute_stdout(
     assert captured.out.strip() == "answer for run-1"
     assert "[VERBOSE]" not in captured.out
     assert "[DEBUG]" not in captured.out
-
-
-def test_interactive_new_session_creates_bound_process_session(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``--new-session`` 应走 create_session(bind_slot=True)。"""
-
-    fake_host = _FakeHost()
-    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
-    monkeypatch.setattr(
-        interactive_command,
-        "open_host",
-        lambda _options: _FakeOpenHostContext(fake_host),
-    )
-    monkeypatch.setattr(interactive_command, "_read_user_input", _input_reader(()))
-
-    exit_code = cli_main.main(
-        ("interactive", "--base", str(tmp_path), "--new-session")
-    )
-
-    assert exit_code == EXIT_SUCCESS
-    assert fake_host.create_requests[0].bind_slot is True
-    assert fake_host.create_requests[0].scope == "cli.interactive"
-    assert fake_host.create_requests[0].slot_key is not None
-    assert fake_host.create_requests[0].slot_key.startswith("cli.interactive.")
 
 
 def test_interactive_input_keyboard_interrupt_exits_without_run_requests(
@@ -722,6 +795,10 @@ def test_interactive_two_turns_use_same_session_and_independent_watchers(
         "watch:session-1",
         "submit:session-1",
     ]
+    assert len(fake_host.create_requests) == 1
+    assert fake_host.create_requests[0].bind_slot is False
+    assert fake_host.create_requests[0].scope is None
+    assert fake_host.create_requests[0].slot_key is None
     assert [watcher.closed_count for watcher in fake_host.watchers] == [1, 1]
     first_submit = fake_host.submit_requests[0]
     second_submit = fake_host.submit_requests[1]

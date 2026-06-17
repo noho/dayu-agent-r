@@ -69,6 +69,7 @@ Host 与其它层的稳定边界如下：
 - `ensure_session(request)`：按 `(scope, slot_key)` 原子确保当前 Session。
 - `create_session(request)`：显式创建新 Session，可选择重绑定 slot。
 - `get_session(session_id)`：读取 Session snapshot。
+- `list_sessions()`：读取全部未 purge Session 的 durable 列表摘要。
 - `get_run(run_id)`：读取 Run snapshot。
 - `submit_followup(session_id, request)`：提交普通 queue 或 steer follow-up。
 - `retry_run(run_id, request)`：基于失败源 Run 创建关联的新 Run。
@@ -85,7 +86,7 @@ Host 与其它层的稳定边界如下：
 - `watch_session_events(session_id)`：创建 live HostEvent 订阅；订阅从当前 live cursor 开始，不提供离线 replay cursor。
 - `close()`：关闭当前 opener runtime，向 active worker 传播 lifecycle cancel；该操作不写用户 cancel / failed terminal facts。
 
-包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
+包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
 `OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up batch size 与 truncation manager 开关。
 
@@ -202,6 +203,7 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 ### Host 专属契约
 
 - `SessionSnapshot` / `SessionStatus` / `SessionSlotRef`：Session 生命周期与 slot 绑定视图。
+- `SessionListItem` / `ListSessionsResult`：全部未 purge Session 的 durable 列表摘要视图。
 - `RunSnapshot` / `RunStatus` / `FollowupSnapshot` / `SourceRunRelation`：用户可见 Run 生命周期与 retry / replay 来源关系。
 - `AttemptDispatchSnapshot` / `AttemptStatus`：Host 派发给 worker 的 Attempt 执行快照。
 - request dataclass：`EnsureSessionRequest`、`CreateSessionRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`ResolveWaitRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、outbox read / drain request。
@@ -291,7 +293,7 @@ dayu.host
 
 ## 稳定边界
 
-Host 稳定边界是 durable command、typed request / snapshot、HostEvent view、outbox terminal item 与 `open_host(options)` construction-time typed inputs。
+Host 稳定边界是 durable command、typed request / snapshot、HostEvent view、outbox terminal item 与 `open_host(options)` construction-time typed inputs。`list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
 
 Host 不负责：
 

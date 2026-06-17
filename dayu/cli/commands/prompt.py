@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Final
 
 from dayu.cli.agent_entrypoint import (
@@ -80,6 +81,22 @@ class CliCommandUsageError(ValueError):
     """CLI 命令用法错误。"""
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedPromptExistingSessionExecution:
+    """在已有 Session 上执行 prompt turn 所需的准备结果。
+
+    :param runtime: entrypoint runtime assembly 结果。
+    :param invocation: 当前 CLI invocation 身份。
+    :param user_prompt: 本轮用户 prompt。
+    :param run_overrides: 本轮可映射执行 override。
+    """
+
+    runtime: EntrypointRuntimeResult
+    invocation: CliInvocation
+    user_prompt: str
+    run_overrides: ServiceRunOverrides
+
+
 class _AcceptedRunState:
     """prompt submit 后当前 accepted Run id 的本地状态。"""
 
@@ -137,6 +154,44 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
     :raises Exception: runtime assembly 或 Host public API 失败时向上抛出。
     """
 
+    prepared = await _prepare_prompt_existing_session_execution(
+        args,
+        command_name=COMMAND_PROMPT,
+        scenario=CLI_PROMPT_SCENARIO,
+        user_prompt=args.prompt,
+    )
+    async with open_host(prepared.runtime.host_assembly.options) as host:
+        session_id = await _ensure_prompt_session(
+            host=host,
+            args=args,
+            invocation=prepared.invocation,
+        )
+        return await _execute_prompt_on_existing_session(
+            host=host,
+            prepared=prepared,
+            session_id=session_id,
+            sigint_monitor=CliSigintMonitor(),
+        )
+
+
+async def _prepare_prompt_existing_session_execution(
+    args: ParsedCliArgs,
+    *,
+    command_name: str,
+    scenario: str,
+    user_prompt: str,
+) -> _PreparedPromptExistingSessionExecution:
+    """准备在已有 Session 上执行 prompt turn 所需的 runtime 与调用身份。
+
+    :param args: argparse 已解析的 prompt 兼容命令参数。
+    :param command_name: 当前 CLI command 名称。
+    :param scenario: prompt scene id。
+    :param user_prompt: 本轮用户 prompt。
+    :returns: 已准备的 prompt existing-session 执行输入。
+    :raises CliCommandUsageError: 用户输入参数非法时抛出。
+    :raises Exception: runtime assembly 失败时向上抛出。
+    """
+
     _raise_for_unsupported_execution_options(args)
     workspace_root = resolve_workspace_root(
         args.workspace_root,
@@ -153,8 +208,8 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
         error_factory=CliCommandUsageError,
     )
     invocation = new_cli_invocation(
-        command_name=COMMAND_PROMPT,
-        scenario=CLI_PROMPT_SCENARIO,
+        command_name=command_name,
+        scenario=scenario,
         display_user=DEFAULT_BASE_USER,
         ticker=ticker,
     )
@@ -163,7 +218,7 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
             explicit_config_dir=explicit_config_dir,
-            scene_id=CLI_PROMPT_SCENARIO,
+            scene_id=scenario,
             context_slot_values=_prompt_context_slot_values(ticker=ticker),
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=optional_stripped_text(
@@ -175,24 +230,43 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
             env=os.environ,
         )
     )
-    async with open_host(runtime.host_assembly.options) as host:
-        session_id = await _ensure_prompt_session(
-            host=host,
-            args=args,
-            invocation=invocation,
-        )
-        terminal = await _submit_prompt_turn_handling_sigint(
-            host=host,
-            runtime=runtime,
-            invocation=invocation,
-            session_id=session_id,
-            user_prompt=args.prompt,
-            run_overrides=service_run_overrides_from_args(
-                args,
-                error_factory=CliCommandUsageError,
-            ),
-            sigint_monitor=CliSigintMonitor(),
-        )
+    return _PreparedPromptExistingSessionExecution(
+        runtime=runtime,
+        invocation=invocation,
+        user_prompt=user_prompt,
+        run_overrides=service_run_overrides_from_args(
+            args,
+            error_factory=CliCommandUsageError,
+        ),
+    )
+
+
+async def _execute_prompt_on_existing_session(
+    *,
+    host: Host,
+    prepared: _PreparedPromptExistingSessionExecution,
+    session_id: str,
+    sigint_monitor: CliSigintMonitor,
+) -> int:
+    """在已解析的已有 Session 上执行 prompt turn。
+
+    :param host: Host public handle。
+    :param prepared: prompt existing-session 执行准备结果。
+    :param session_id: 已存在且调用方已选择的 Host Session id。
+    :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
+    :returns: CLI 退出码。
+    :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
+    """
+
+    terminal = await _submit_prompt_turn_handling_sigint(
+        host=host,
+        runtime=prepared.runtime,
+        invocation=prepared.invocation,
+        session_id=session_id,
+        user_prompt=prepared.user_prompt,
+        run_overrides=prepared.run_overrides,
+        sigint_monitor=sigint_monitor,
+    )
     if terminal is None:
         return EXIT_KEYBOARD_INTERRUPT
     return render_prompt_terminal_result(terminal)

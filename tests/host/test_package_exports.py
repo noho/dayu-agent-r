@@ -52,6 +52,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostPayloadRef",
         "HostStreamCursor",
         "HostTerminalStatus",
+        "ListSessionsResult",
         "LocalEngineWorker",
         "LocalEngineWorkerFactory",
         "LocalWorkerHandle",
@@ -78,6 +79,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "RetryRunRequest",
         "RunSnapshot",
         "RunStatus",
+        "SessionListItem",
         "SessionSlotRef",
         "SessionSnapshot",
         "SessionStatus",
@@ -109,6 +111,7 @@ EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
         "ensure_session",
         "get_run",
         "get_session",
+        "list_sessions",
         "open_host",
         "purge_session",
         "replay_run",
@@ -378,6 +381,7 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
             "ensure_session",
             "get_run",
             "get_session",
+            "list_sessions",
             "purge_session",
             "read_outbox_terminal_items",
             "report_storage_usage",
@@ -401,7 +405,9 @@ def test_host_protocol_exposes_public_handle_methods() -> None:
 def test_read_api_all_keeps_service_facing_read_boundary() -> None:
     """``dayu.host.read_api.__all__`` 不重新公开 run-level stream。"""
 
-    assert frozenset(read_api.__all__) == frozenset({"get_run", "get_session"})
+    assert frozenset(read_api.__all__) == frozenset(
+        {"get_run", "get_session", "list_sessions"}
+    )
 
 
 def test_exported_symbols_are_same_objects_as_api_symbols() -> None:

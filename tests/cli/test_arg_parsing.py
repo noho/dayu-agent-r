@@ -43,7 +43,6 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "interactive": (
         "--ticker",
         "--label",
-        "--new-session",
         "--model-name",
         "--temperature",
     ),
@@ -77,6 +76,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "process": ("--ticker", "--document-id", "--overwrite", "--ci"),
     "process_filing": ("--ticker", "--document-id", "--overwrite", "--ci"),
     "process_material": ("--ticker", "--document-id", "--overwrite", "--ci"),
+    "session": ("list", "resume", "purge"),
 }
 
 
@@ -184,6 +184,57 @@ def test_interactive_help_contains_optional_ticker(
     help_text = _capture_help(capsys, ("interactive",))
 
     assert "--ticker" in help_text
+
+
+def test_interactive_help_omits_removed_new_session_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """验证 ``interactive --help`` 不再暴露过时 ``--new-session``。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: help 仍包含过时 flag 时抛出。
+    """
+
+    help_text = _capture_help(capsys, ("interactive",))
+
+    assert "--new-session" not in help_text
+
+
+def test_interactive_new_session_flag_exits_with_usage_error() -> None:
+    """验证 ``interactive --new-session`` 已从 parser surface 删除。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 未按 unknown argument 返回用法错误时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(("interactive", "--new-session"))
+
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_session_action_help_contains_fixed_parser_shape(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """验证 ``session`` 二级命令 help 冻结 list/resume/purge surface。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: help 缺少 S4 固定 parser surface 时抛出。
+    """
+
+    purge_help = _capture_help(capsys, ("session", "purge"))
+    resume_help = _capture_help(capsys, ("session", "resume"))
+
+    assert "--session-id" in purge_help
+    assert "--label" in purge_help
+    assert "--kind" in purge_help
+    assert "--yes" in purge_help
+    assert "--session-id" in resume_help
+    assert "--label" in resume_help
+    assert "--kind" in resume_help
+    assert "--mode" in resume_help
 
 
 def test_missing_command_exits_with_usage_error() -> None:

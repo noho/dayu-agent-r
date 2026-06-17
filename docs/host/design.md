@@ -358,11 +358,14 @@ CLOSED
 - `ensure_session(scope, slot_key)` 可以返回当前 slot Session，snapshot 标记为 `CLOSED`。
 - `create_session` 仍允许创建新 Session；UI / Service 若要继续聊天，应显式调用 `create_session(bind_slot=true, scope, slot_key)` 创建并重绑定新 Session。
 - `get_session`、`get_run` 仍允许读取；Host 内部 diagnostic EventLog 补读仍可用于排查。
+- `list_sessions` 仍允许读取全部未 purge Session 的 durable 列表摘要；它不是 projection，不触发 projection catch-up，不启动执行，也不改变 Session / Run / Attempt 状态。
 - `cancel_run` 仍允许取消已有 Run。
 - `resolve_wait` 仍允许让已有 `WAITING` Run 继续收口。
 - `retry_run` / `replay_run` 默认拒绝在 closed Session 内创建关联新 Run，除非显式 policy 把新 Run 创建到其它 Session。
 
 已有 active Run 继续按 Host 状态机治理到终态；close 前已 durable accepted 的非终态 Run 继续按原状态机完成。`QUEUED` Run 可在 active slot 释放后 promotion；`WAITING` Run 可在 `resolve_wait` 后 resume；`RECOVERING` Run 可继续 recovery dispatch；`RUNNING` / `CANCELLING` Run 继续收口到 terminal。Host opener close 可停止当前 handle 持有的本地执行环境，但不等于用户 cancel；若调用方希望表达用户停止意图，必须显式调用 `cancel_run` 或 `cancel_session_runs`。
+
+CLI `session resume` 与 Host wait-resume 是两个不同术语。CLI resume 只是 UI / Service adapter 选择一个已有 `OPEN` Session，再提交新的 `submit_followup(queue)` 输入；它不恢复旧 Agent、Runner、Engine generator 或 Attempt，也不解析 Host wait record。Host wait-resume 只指 `resolve_wait` 接收外部等待结果后，让同一个 `WAITING` Run 创建新的 resume Attempt 并继续收口。
 
 `clear_session` 不进入第一版普通公共接口。需要清理、遗忘或重置时，必须分别设计 close / new session / memory forget / purge 等有明确审计语义的接口。
 
@@ -970,6 +973,7 @@ async with open_host(options) as host:
 ensure_session(host, request) -> SessionSnapshot
 create_session(host, request) -> SessionSnapshot
 get_session(host, session_id) -> SessionSnapshot
+list_sessions(host) -> ListSessionsResult
 close_session(host, session_id, request) -> SessionSnapshot
 purge_session(host, session_id, request) -> PurgeSessionResult
 
@@ -1003,6 +1007,7 @@ Phase 4 public function behavior matrix：
 | `ensure_session` | 完整实现 | 只依赖 Phase 1-3 durable store、slot binding 与 session lifecycle。 |
 | `create_session` | 完整实现 | 只依赖 Phase 1-3 durable store、slot binding 与 session lifecycle。 |
 | `get_session` | 完整实现 | 从 durable truth / minimal read path 构造 snapshot，不触发 projection worker。 |
+| `list_sessions` | 完整实现 | 从 durable truth 读取全部未 purge Session 的列表摘要，不触发 projection worker 或执行。 |
 | `close_session` | 完整实现 | 关闭新输入入口；不 cancel、不 purge。 |
 | `submit_followup(queue)` | 完整实现 | 在同一 admission transaction 内吸收 active Run 竞态；结果用 `accepted_run_id` + `accepted_run_status` 表达。 |
 | `get_run` | 完整实现 | 从 durable Run / Attempt truth 构造 snapshot。 |
@@ -1202,7 +1207,7 @@ Run 读取与结果边界：
 
 接口分层：
 
-- `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`report_storage_usage`、`run_storage_maintenance`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是普通 Service-facing 稳定公共能力。
+- `ensure_session`、`create_session`、`get_session`、`list_sessions`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`report_storage_usage`、`run_storage_maintenance`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是普通 Service-facing 稳定公共能力。
 - `stream_run_events` 不进入 P10.5 普通 Service-facing public contract；现有实现若保留，只能作为 Host 内部 diagnostic / detail read path。未来若要公开 run-scoped diagnostic read API，必须另行讨论 public contract，且不能直接暴露内部 `HostEventView`。
 - `cancel_session_runs` 是客户端退出 / supervisor shutdown 的便利公共能力；它只取消指定 Session 下未终态 Run，不表达客户端拥有的 Session 集合。
 - `ensure_session` 表示“给我这个 slot 的当前会话，必要时创建并绑定”。
@@ -1211,7 +1216,7 @@ Run 读取与结果边界：
 - `retry_run`、`replay_run` 是 Host control API；UI / Service 可以暴露，但必须保留 `retry(run)` / `replay(run)` 的函数式语义、Host 幂等与状态机。
 - `resolve_wait` 是 Host 内部 / adapter API；poller、callback handler、manual admin 入口都必须走它，不能各自写 Run 状态。
 - P10.5 ordinary local multi-turn public contract 只冻结并验证 `WAITING` / wait record / `resolve_wait(...)` 的 public resume path：调用方或 tool adapter 已经通过 poll、callback 或 manual 操作拿到外部结果后，调用 Host public `resolve_wait(...)`，Host 通过 after-commit wakeup 创建 resume Attempt、推进 dispatch，并在 session-level `watch_session_events(...)` 中暴露后续 terminal HostEvent。生产级 callback endpoint、callback auth / replay、poller 后台 loop、backoff / in-flight fencing 与 external job physical cancel / revoke 不属于 P10.5 阻塞项；它们是后续生产集成 / scale owner，不能改变 `resolve_wait(...)` 作为唯一等待结果治理入口的边界。
-- 读取 Session timeline 通过 `get_session` 的 snapshot、session-level Host event stream 或后续 read-model API 暴露；它必须从 EventLog / projection 读取，不触发执行。离线 / 未 attach 客户端的 final answer 通知通过 Outbox terminal delivery queue 读取，不通过 session live watch 追补完整中间过程。
+- 读取 Session timeline 通过 `get_session` 的 snapshot、session-level Host event stream 或后续 read-model API 暴露；它必须从 EventLog / projection 读取，不触发执行。读取 Session 列表通过 `list_sessions` 暴露，它直接来自 durable Session / slot / Run state truth，不是 projection，也不触发 projection catch-up 或执行。离线 / 未 attach 客户端的 final answer 通知通过 Outbox terminal delivery queue 读取，不通过 session live watch 追补完整中间过程。
 
 Snapshot 最小语义：
 

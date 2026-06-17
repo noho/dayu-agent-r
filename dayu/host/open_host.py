@@ -37,6 +37,7 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     HostEvent,
     HostLocalExecutionOptions,
+    ListSessionsResult,
     OutboxTerminalItemsBatch,
     OpenHostOptions,
     PurgeSessionRequest,
@@ -84,6 +85,7 @@ from dayu.host.outbox import (
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import get_run as _get_run
 from dayu.host.read_api import get_session as _get_session
+from dayu.host.read_api import list_sessions as _list_sessions
 from dayu.host.read_api import (
     drain_outbox_terminal_items as _drain_outbox_terminal_items,
 )
@@ -363,6 +365,16 @@ class _PublicHostHandle:
 
         self._raise_if_closed()
         return _get_session(self._command_handle, session_id)
+
+    async def list_sessions(self) -> ListSessionsResult:
+        """读取全部未 purge Session 的列表摘要。
+
+        :returns: durable truth 生成的 Session 列表结果。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        """
+
+        self._raise_if_closed()
+        return _list_sessions(self._command_handle)
 
     async def get_run(self, run_id: str) -> RunSnapshot:
         """读取 Run snapshot。

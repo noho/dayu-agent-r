@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from datetime import datetime
 from typing import Final, TextIO
 
 from dayu.cli.exit_codes import (
@@ -16,6 +17,7 @@ from dayu.cli.exit_codes import (
     EXIT_KEYBOARD_INTERRUPT,
     EXIT_SUCCESS,
 )
+from dayu.cli.session_identity import display_identity_from_slot
 from dayu.fins.direct_events import (
     FinsEvent,
     FinsEventDetail,
@@ -23,9 +25,29 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.host.api import HostTerminalStatus
+from dayu.host.api import (
+    HostTerminalStatus,
+    ListSessionsResult,
+    PurgeSessionResult,
+    SessionListItem,
+)
 from dayu.service.entrypoint_runtime import EntrypointRunTerminalResult
 
+_EMPTY_CELL: Final[str] = "-"
+_SESSION_LIST_EMPTY_MESSAGE: Final[str] = "No sessions."
+_SESSION_LIST_HEADER: Final[str] = "\t".join(
+    (
+        "SESSION_ID",
+        "STATUS",
+        "KIND",
+        "LABEL",
+        "ACTIVE_RUN",
+        "QUEUED",
+        "CREATED_AT",
+        "CLOSED_AT",
+    )
+)
+_PURGE_TOMBSTONE_PREFIX_CHARS: Final[int] = 12
 _FAILED_FALLBACK_MESSAGE: str = "Host run failed without error message."
 _LOST_FALLBACK_MESSAGE: str = "Host run lost without error message."
 _CANCELLED_FALLBACK_MESSAGE: str = "Host run cancelled."
@@ -127,6 +149,54 @@ def render_cli_error(message: str, *, stderr: TextIO | None = None) -> None:
     """
 
     print(message, file=sys.stderr if stderr is None else stderr)
+
+
+def render_session_list(
+    result: ListSessionsResult,
+    *,
+    stdout: TextIO | None = None,
+) -> None:
+    """输出 CLI Session 列表。
+
+    :param result: Host public ``list_sessions`` 读取结果。
+    :param stdout: 标准输出流；``None`` 表示使用当前 ``sys.stdout``。
+    :returns: ``None``。
+    :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
+    """
+
+    effective_stdout = sys.stdout if stdout is None else stdout
+    if result.sessions == ():
+        print(_SESSION_LIST_EMPTY_MESSAGE, file=effective_stdout)
+        return
+    print(_SESSION_LIST_HEADER, file=effective_stdout)
+    for item in result.sessions:
+        print(_session_list_row(item), file=effective_stdout)
+
+
+def render_session_purge_result(
+    result: PurgeSessionResult,
+    *,
+    stdout: TextIO | None = None,
+) -> None:
+    """输出 CLI Session purge 成功结果。
+
+    :param result: Host public ``purge_session`` 结果。
+    :param stdout: 标准输出流；``None`` 表示使用当前 ``sys.stdout``。
+    :returns: ``None``。
+    :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
+    """
+
+    effective_stdout = sys.stdout if stdout is None else stdout
+    if result.purged:
+        print(
+            (
+                f"Purged session {result.session_id} "
+                f"(tombstone: {_purge_tombstone_prefix(result.purge_tombstone_ref)}...)"
+            ),
+            file=effective_stdout,
+        )
+        return
+    print(f"Session {result.session_id} was not purged.", file=effective_stdout)
 
 
 def render_fins_direct_event(
@@ -247,6 +317,71 @@ def _fins_event_line(
     return " ".join(parts)
 
 
+def _session_list_row(item: SessionListItem) -> str:
+    """把 Session list item 转成 CLI 列表行。
+
+    :param item: Host public Session list item。
+    :returns: tab 分隔的 Session 列表行。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    identity = display_identity_from_slot(item.slot)
+    return "\t".join(
+        (
+            item.session_id,
+            item.status.value,
+            identity.kind.value,
+            identity.label,
+            _optional_text_cell(item.active_run_id),
+            str(len(item.queued_run_ids)),
+            _format_session_datetime(item.created_at),
+            _format_session_datetime(item.closed_at),
+        )
+    )
+
+
+def _optional_text_cell(value: str | None) -> str:
+    """把可空文本转为 CLI table cell。
+
+    :param value: 可空文本。
+    :returns: 非空文本或 ``-``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return _EMPTY_CELL
+    return value
+
+
+def _format_session_datetime(value: datetime | None) -> str:
+    """把 Session datetime 转为 CLI table cell。
+
+    :param value: UTC datetime 或 ``None``。
+    :returns: ISO-8601 UTC 文本或 ``-``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return _EMPTY_CELL
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _purge_tombstone_prefix(value: str | None) -> str:
+    """生成 purge tombstone 展示前缀。
+
+    :param value: Host public purge tombstone ref。
+    :returns: 去空白后的最多 12 字符前缀；缺失时返回 ``-``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return _EMPTY_CELL
+    stripped = value.strip()
+    if stripped == "":
+        return _EMPTY_CELL
+    return stripped[:_PURGE_TOMBSTONE_PREFIX_CHARS]
+
+
 def _print_result_details(result: FinsResultSummary, stream: TextIO) -> None:
     """输出 result details 摘要行。
 
@@ -343,4 +478,6 @@ __all__: tuple[str, ...] = (
     "render_fins_direct_event",
     "render_fins_direct_local_exit_after_cancel",
     "render_prompt_terminal_result",
+    "render_session_list",
+    "render_session_purge_result",
 )
