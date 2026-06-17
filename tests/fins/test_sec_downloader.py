@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 from collections.abc import Awaitable
 from io import BytesIO
+from io import StringIO
 from itertools import repeat
 from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Optional, TypeVar
@@ -15,6 +16,7 @@ from typing import AsyncIterator, BinaryIO, Optional, TypeVar
 import httpx
 import pytest
 
+import dayu.runtime.log as runtime_log
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
     DEFAULT_MAX_RETRIES,
@@ -29,6 +31,7 @@ from dayu.fins.downloaders.sec_downloader import (
     _SEC_THROTTLE_BACKOFF_SECONDS,
     _SEC_THROTTLE_MAX_RETRIES,
     _SEC_THROTTLE_RECOVERY_SECONDS,
+    _SecThrottleReservation,
     _await_if_needed,
     _parse_browse_edgar_atom,
     _parse_browse_edgar_href,
@@ -703,12 +706,19 @@ def test_download_files_stream_304_downloaded_and_failed(
         return events
 
     events = _run(_collect())
-    assert [event.event_type for event in events] == ["file_skipped", "file_downloaded", "file_failed"]
+    assert [event.event_type for event in events] == [
+        "file_download_started",
+        "file_skipped",
+        "file_download_started",
+        "file_downloaded",
+        "file_download_started",
+        "file_failed",
+    ]
     assert store_stub.calls == [("b.htm", b"payload-b")]
-    assert events[0].reason_code == "not_modified"
-    assert "未修改" in str(events[0].reason_message)
-    assert events[2].reason_code == "empty_response"
-    assert events[2].reason_message == "下载失败，未返回内容"
+    assert events[1].reason_code == "not_modified"
+    assert "未修改" in str(events[1].reason_message)
+    assert events[5].reason_code == "empty_response"
+    assert events[5].reason_message == "下载失败，未返回内容"
 
 
 def test_download_files_stream_http_error_with_overwrite_false(
@@ -779,12 +789,17 @@ def test_download_files_stream_http_error_with_overwrite_false(
 
     events = _run(_collect())
     # 验证第一个文件下载成功，第二个文件因HTTP错误而失败
-    assert [event.event_type for event in events] == ["file_downloaded", "file_failed"]
+    assert [event.event_type for event in events] == [
+        "file_download_started",
+        "file_downloaded",
+        "file_download_started",
+        "file_failed",
+    ]
     assert store_stub.calls == [("normal.htm", b"payload-normal")]
     # 验证错误信息被正确记录
-    assert "503 Service Unavailable" in str(events[1].error or "")
-    assert events[1].reason_code == "download_error"
-    assert "503 Service Unavailable" in str(events[1].reason_message)
+    assert "503 Service Unavailable" in str(events[3].error or "")
+    assert events[3].reason_code == "download_error"
+    assert "503 Service Unavailable" in str(events[3].reason_message)
 
 
 def test_download_files_aggregates_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -995,11 +1010,16 @@ def test_download_files_stream_overwrite_with_failure(tmp_path: Path, monkeypatc
         return events
 
     events = _run(_collect())
-    assert [item.event_type for item in events] == ["file_downloaded", "file_failed"]
+    assert [item.event_type for item in events] == [
+        "file_download_started",
+        "file_downloaded",
+        "file_download_started",
+        "file_failed",
+    ]
     assert store_stub.calls == [("ok.htm", b"ok")]
-    assert events[1].error == "network down"
-    assert events[1].reason_code == "download_error"
-    assert events[1].reason_message == "network down"
+    assert events[3].error == "network down"
+    assert events[3].reason_code == "download_error"
+    assert events[3].reason_message == "network down"
 
 
 def test_download_files_stream_zero_byte_overwrite_false(
@@ -1066,12 +1086,17 @@ def test_download_files_stream_zero_byte_overwrite_false(
         return events
 
     events = _run(_collect())
-    assert [e.event_type for e in events] == ["file_failed", "file_downloaded"]
+    assert [e.event_type for e in events] == [
+        "file_download_started",
+        "file_failed",
+        "file_download_started",
+        "file_downloaded",
+    ]
     # 0 字节文件不应落盘
     assert store_stub.calls == [("normal.htm", b"content")]
-    assert "0 字节" in str(events[0].error or "")
-    assert events[0].reason_code == "empty_content"
-    assert "0 字节" in str(events[0].reason_message)
+    assert "0 字节" in str(events[1].error or "")
+    assert events[1].reason_code == "empty_content"
+    assert "0 字节" in str(events[1].reason_message)
 
 
 def test_download_files_stream_zero_byte_overwrite_true(
@@ -1133,12 +1158,17 @@ def test_download_files_stream_zero_byte_overwrite_true(
         return events
 
     events = _run(_collect())
-    assert [e.event_type for e in events] == ["file_failed", "file_downloaded"]
+    assert [e.event_type for e in events] == [
+        "file_download_started",
+        "file_failed",
+        "file_download_started",
+        "file_downloaded",
+    ]
     # 0 字节文件不应落盘
     assert store_stub.calls == [("normal.htm", b"content")]
-    assert "0 字节" in str(events[0].error or "")
-    assert events[0].reason_code == "empty_content"
-    assert "0 字节" in str(events[0].reason_message)
+    assert "0 字节" in str(events[1].error or "")
+    assert events[1].reason_code == "empty_content"
+    assert "0 字节" in str(events[1].reason_message)
 
 
 def test_download_files_stream_zero_byte_primary_aborts_remaining(
@@ -1213,10 +1243,10 @@ def test_download_files_stream_zero_byte_primary_aborts_remaining(
         return events
 
     events = _run(_collect())
-    # 只有一个 file_failed 事件（primary），后续文件全部中止，不产生任何事件
-    assert [e.event_type for e in events] == ["file_failed"]
-    assert events[0].name == "futu-20201231x20f.htm"
-    assert events[0].reason_code == "empty_content"
+    # 只有 primary 的 started + failed 事件，后续文件全部中止，不产生任何事件
+    assert [e.event_type for e in events] == ["file_download_started", "file_failed"]
+    assert events[1].name == "futu-20201231x20f.htm"
+    assert events[1].reason_code == "empty_content"
     # 后续文件不应被下载（_http_download 只被调用一次）
     assert len(download_calls) == 1
     # 没有任何文件落盘
@@ -1378,7 +1408,15 @@ def test_http_private_methods_retry_and_failure(tmp_path: Path, monkeypatch: pyt
     _sleep_calls: list[float] = []
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
     downloader._sleep_seconds = 0.2
-    monkeypatch.setattr(downloader, "_reserve_global_request_slot", lambda min_interval: 0.0)
+    monkeypatch.setattr(
+        downloader,
+        "_reserve_global_request_slot",
+        lambda min_interval: _SecThrottleReservation(
+            shared_wait_seconds=0.0,
+            min_interval_seconds=min_interval,
+            cooldown_hit=False,
+        ),
+    )
     # 用 stub 替换 sec_downloader 模块内的 time.monotonic，使 elapsed = 0，
     # 从而 wait = sleep_seconds = 0.2，避免依赖宿主机时钟粒度造成 flaky。
     import dayu.fins.downloaders.sec_downloader as _sd
@@ -1390,6 +1428,138 @@ def test_http_private_methods_retry_and_failure(tmp_path: Path, monkeypatch: pyt
     # _rate_limit 应等待 max(0.12, 0.2) - 0 = 0.2 秒（精确，因 monotonic 已 stub）
     assert _sleep_calls[0] == pytest.approx(0.2, abs=1e-9)
     assert _sleep_calls[1] == 0.8
+    _run(downloader.close())
+
+
+def test_sec_request_debug_logs_success_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 DEBUG 级别记录成功 SEC HTTP 请求的限流与响应诊断。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    log_stream = StringIO()
+    runtime_log.configure(level=runtime_log.LogLevel.DEBUG, stream=log_stream)
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    def _fake_reserve(min_interval: float) -> _SecThrottleReservation:
+        return _SecThrottleReservation(
+            shared_wait_seconds=1.25,
+            min_interval_seconds=min_interval,
+            cooldown_hit=True,
+        )
+
+    class _Client:
+        """返回成功 JSON 响应的 HTTP 客户端桩。"""
+
+        async def get(self, **kwargs: JsonValue) -> httpx.Response:
+            del kwargs
+            request = httpx.Request("GET", "https://example.com/api.json")
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        async def head(self, **kwargs: JsonValue) -> httpx.Response:
+            del kwargs
+            request = httpx.Request("HEAD", "https://example.com/api.json")
+            return httpx.Response(200, request=request)
+
+        async def aclose(self) -> None:
+            """关闭客户端桩。"""
+
+            return None
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
+    monkeypatch.setattr(downloader, "_reserve_global_request_slot", _fake_reserve)
+    downloader._client = _Client()  # type: ignore[assignment]
+
+    assert _run(downloader._http_get_json("https://example.com/api.json")) == {"ok": True}
+
+    log_text = log_stream.getvalue()
+    assert "SEC request reserved: method=GET url=https://example.com/api.json" in log_text
+    assert "SEC response received: method=GET url=https://example.com/api.json" in log_text
+    assert "status_code=200" in log_text
+    assert "attempt=1" in log_text
+    assert "shared_throttle_wait_seconds=1.250000" in log_text
+    assert "effective_min_interval_seconds=0.120000" in log_text
+    assert "cooldown_hit=True" in log_text
+    assert sleep_calls == [1.25]
+    _run(downloader.close())
+
+
+def test_sec_request_diagnostics_do_not_log_below_debug(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """验证非 DEBUG 级别不输出 SEC 逐请求诊断。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+        capsys: pytest 标准输出捕获 fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    log_stream = StringIO()
+    runtime_log.configure(level=runtime_log.LogLevel.VERBOSE, stream=log_stream)
+
+    def _fake_reserve(min_interval: float) -> _SecThrottleReservation:
+        return _SecThrottleReservation(
+            shared_wait_seconds=0.0,
+            min_interval_seconds=min_interval,
+            cooldown_hit=False,
+        )
+
+    class _Client:
+        """返回成功 JSON 响应的 HTTP 客户端桩。"""
+
+        async def get(self, **kwargs: JsonValue) -> httpx.Response:
+            del kwargs
+            request = httpx.Request("GET", "https://example.com/api.json")
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        async def head(self, **kwargs: JsonValue) -> httpx.Response:
+            del kwargs
+            request = httpx.Request("HEAD", "https://example.com/api.json")
+            return httpx.Response(200, request=request)
+
+        async def aclose(self) -> None:
+            """关闭客户端桩。"""
+
+            return None
+
+    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
+    monkeypatch.setattr(downloader, "_reserve_global_request_slot", _fake_reserve)
+    downloader._client = _Client()  # type: ignore[assignment]
+
+    assert _run(downloader._http_get_json("https://example.com/api.json")) == {"ok": True}
+
+    captured = capsys.readouterr()
+    assert "SEC request reserved" not in log_stream.getvalue()
+    assert "SEC response received" not in log_stream.getvalue()
+    assert captured.out == ""
+    assert captured.err == ""
     _run(downloader.close())
 
 
@@ -1562,6 +1732,8 @@ def test_throttle_retry_on_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     """
 
     call_count = 0
+    log_stream = StringIO()
+    runtime_log.configure(level=runtime_log.LogLevel.WARN, stream=log_stream)
     _dummy_request = httpx.Request("GET", "https://example.com/api.json")
 
     async def _mock_get(**kwargs: JsonValue) -> httpx.Response:
@@ -1590,6 +1762,7 @@ def test_throttle_retry_on_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert call_count == 3
     # 确保 503 触发了 10 分钟恢复窗口
     assert any(s >= 600.0 for s in sleep_calls)
+    assert "SEC 限流 503: url=https://example.com/api.json" in log_stream.getvalue()
     state = _load_sec_throttle_state(downloader._throttle_state_path)
     assert state.cooldown_until > 0
 

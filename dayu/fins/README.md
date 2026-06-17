@@ -446,7 +446,7 @@ Read、download、preprocess、upload 是四个独立 provider：
 
 `FinsIngestionRuntime` 负责 download / preprocess / upload 的业务执行、direct event stream、awaiting observation 和 legacy job-store helper。下载 pipeline 通过 `FinsSourceDownloadAdapter` 返回待持久化文档，或在 adapter 内通过仓储完成 source / blob / rejected filing artifact 写入并返回有界已持久化摘要；预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository；upload 通过 `FinsUploadRunner` 边界执行上传业务。runtime 的业务真源是仓储产物与有界 result summary，不是 Host EventLog，也不是 CLI-facing job id。
 
-Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 返回 `AsyncIterator[FinsEvent]`。`PROGRESS` 表示运行中进度，唯一 terminal `RESULT` 携带 `FinsResultSummary`，成功、失败和取消都必须有明确终态；stream 正常结束但 producer 未产出 result 时会收口为 failure result。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
+Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 返回 `AsyncIterator[FinsEvent]`。`PROGRESS` 表示运行中进度，唯一 terminal `RESULT` 携带 `FinsResultSummary`，成功、失败和取消都必须有明确终态；stream 正常结束但 producer 未产出 result 时会收口为 failure result。Download direct stream 的文件级进度来自 source-specific downloader / pipeline 事件，再由 adapter 通过 runtime progress sink 投影为 direct progress；CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断文件进度。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
 
 Legacy job helpers 仍保留 `start_*`、`read_job(...)`、`read_job_events(...)` 和 `request_cancel(...)`。每个 legacy ingestion job 可追加 JSONL event sidecar，路径与 job record 同属 `<workspace_root>/.dayu/fins_ingestion/jobs`。该路径是 legacy runtime foundation，不是 Service direct 或 awaiting tool 的公共观察边界。
 
@@ -705,7 +705,7 @@ Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` �
 
 扩展 processor 时，实现 `DocumentProcessor` 所需能力或明确的财报能力协议，并在 `build_fins_processor_registry()` 中以可解释优先级注册。表单专项处理器应保持 BS 主路径与 SecProcessor 回退路径的职责边界。
 
-扩展下载来源时，实现 `FinsSourceDownloadAdapter`，并通过 `FinsIngestionRuntime.create(download_adapters=...)` 注入 `(source, market)` adapter 映射。Adapter 可以返回 typed downloaded documents / rejected artifacts 交给 runtime 持久化；若迁移的 source workflow 已在 adapter 内通过仓储完成持久化，则必须返回有界 persisted summary，且不得再同时返回 documents / rejected artifacts。
+扩展下载来源时，实现 `FinsSourceDownloadAdapter`，并通过 `FinsIngestionRuntime.create(download_adapters=...)` 注入 `(source, market)` adapter 映射。Adapter 可以返回 typed downloaded documents / rejected artifacts 交给 runtime 持久化；若迁移的 source workflow 已在 adapter 内通过仓储完成持久化，则必须返回有界 persisted summary，且不得再同时返回 documents / rejected artifacts。需要用户可见文件进度时，adapter 必须消费来源 pipeline 的真实事件，并通过 request 中的 progress sink 上报 `FinsDownloadProgressEvent`；上层 UI 不承担事件推断职责。
 
 扩展 preprocess / process 时，保持 source repository -> processor registry -> processed repository 的闭环；不要在 CLI、tools、CI 或测试夹具中复制独立处理逻辑。
 

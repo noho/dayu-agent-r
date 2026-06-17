@@ -28,6 +28,8 @@ from dayu.fins.downloaders.sec_downloader import (
     SecDownloader,
 )
 from dayu.fins.ingestion_runtime import (
+    FinsDownloadProgressEvent,
+    FinsDownloadProgressSink,
     FinsDownloadResultSummary,
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
@@ -149,6 +151,10 @@ _SEC_STATUS_DOWNLOADED: Final[str] = "downloaded"
 _SEC_STATUS_REJECTED: Final[str] = "rejected"
 _SEC_STATUS_SKIPPED: Final[str] = "skipped"
 _SEC_REASON_6K_FILTERED: Final[str] = "6k_filtered"
+_ADAPTER_PROGRESS_FILE_STARTED: Final[str] = "download.file_started"
+_ADAPTER_PROGRESS_FILE_COMPLETED: Final[str] = "download.file_completed"
+_ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
+_ADAPTER_PROGRESS_FILE_FAILED: Final[str] = "download.file_failed"
 
 
 class SecPipelineSummary(TypedDict):
@@ -347,11 +353,16 @@ def _run_async_download_sync(coro: Coroutine[None, None, SecPipelineDownloadResu
     raise RuntimeError("检测到正在运行的事件循环，请改用 stream 异步接口")
 
 
-async def collect_download_result_from_events(events: AsyncIterator[DownloadEvent]) -> SecPipelineDownloadResult:
+async def collect_download_result_from_events(
+    events: AsyncIterator[DownloadEvent],
+    *,
+    progress_sink: FinsDownloadProgressSink | None = None,
+) -> SecPipelineDownloadResult:
     """从下载事件流收集最终结果。
 
     Args:
         events: SEC 下载事件流。
+        progress_sink: 可选 runtime 进度回调。
 
     Returns:
         ``PIPELINE_COMPLETED`` 事件携带的结果字典。
@@ -361,12 +372,93 @@ async def collect_download_result_from_events(events: AsyncIterator[DownloadEven
     """
 
     async for event in events:
+        _emit_adapter_download_progress(event, progress_sink)
         if event.event_type == DownloadEventType.PIPELINE_COMPLETED:
             result = event.payload.get("result")
             if isinstance(result, dict):
                 return cast(SecPipelineDownloadResult, result)
             raise RuntimeError("SEC 下载完成事件缺少结果 payload")
     raise RuntimeError("SEC 下载事件流未产生完成事件")
+
+
+def _emit_adapter_download_progress(
+    event: DownloadEvent,
+    progress_sink: FinsDownloadProgressSink | None,
+) -> None:
+    """把 SEC pipeline 文件事件投影为 runtime 下载进度。
+
+    Args:
+        event: SEC pipeline 下载事件。
+        progress_sink: runtime adapter 进度回调。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 回调拒绝非法进度字段时抛出。
+    """
+
+    if progress_sink is None:
+        return
+    if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_FILE_STARTED,
+                message="开始下载",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.FILE_DOWNLOADED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_FILE_COMPLETED,
+                message="完成下载",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.FILE_SKIPPED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_FILE_SKIPPED,
+                message="跳过下载",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.FILE_FAILED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_FILE_FAILED,
+                message="下载失败",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+
+
+def _payload_text(payload: Mapping[str, JsonValue], key: str) -> str | None:
+    """从 pipeline event payload 读取短文本。
+
+    Args:
+        payload: pipeline event payload。
+        key: 字段名。
+
+    Returns:
+        非空文本或 ``None``。
+
+    Raises:
+        无。
+    """
+
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    return None
 
 
 class SecPipeline:
@@ -1739,14 +1831,19 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
 
         if request.normalized_ticker.market != "US":
             raise ValueError(f"SEC 下载仅支持 US market，当前 market={request.normalized_ticker.market}")
-        result = self._pipeline.download(
-            ticker=request.normalized_ticker.canonical,
-            form_type=_form_type_from_adapter_request(request.form_types),
-            start_date=request.filed_after,
-            end_date=request.filed_before,
-            overwrite=request.overwrite_existing,
-            rebuild=False,
-            cancel_checker=request.cancellation_checker,
+        result = _run_async_download_sync(
+            collect_download_result_from_events(
+                self._pipeline.download_stream(
+                    ticker=request.normalized_ticker.canonical,
+                    form_type=_form_type_from_adapter_request(request.form_types),
+                    start_date=request.filed_after,
+                    end_date=request.filed_before,
+                    overwrite=request.overwrite_existing,
+                    rebuild=False,
+                    cancel_checker=request.cancellation_checker,
+                ),
+                progress_sink=request.progress_sink,
+            )
         )
         return FinsSourceDownloadAdapterResult(
             discovered_count=_summary_int(result, "total"),

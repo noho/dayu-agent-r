@@ -387,7 +387,9 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
         DownloadEventType.PIPELINE_STARTED,
         DownloadEventType.COMPANY_RESOLVED,
         DownloadEventType.FILING_STARTED,
+        DownloadEventType.FILE_DOWNLOAD_STARTED,
         DownloadEventType.FILE_DOWNLOADED,
+        DownloadEventType.CONVERSION_STARTED,
         DownloadEventType.FILING_COMPLETED,
         DownloadEventType.PIPELINE_COMPLETED,
     ]

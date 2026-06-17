@@ -190,6 +190,15 @@ async def run_cn_download_single_filing_stream(
         overwrite=overwrite,
     )
     if reusable_pdf is None:
+        yield DownloadEvent(
+            event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
+            ticker=ticker,
+            document_id=document_id,
+            payload={
+                "name": pdf_filename,
+                "stage": "pdf_download_started",
+            },
+        )
         try:
             asset = await asyncio.to_thread(
                 _download_report_pdf_with_gate,
@@ -201,6 +210,18 @@ async def run_cn_download_single_filing_stream(
         except CnDownloadCancelledError:
             raise
         except Exception as exc:
+            yield DownloadEvent(
+                event_type=DownloadEventType.FILE_FAILED,
+                ticker=ticker,
+                document_id=document_id,
+                payload={
+                    "name": pdf_filename,
+                    "stage": "pdf_download_failed",
+                    "status": "failed",
+                    "reason_code": "pdf_download_failed",
+                    "reason_message": str(exc),
+                },
+            )
             failed = _build_filing_result(
                 document_id=document_id,
                 status="failed",
@@ -222,6 +243,18 @@ async def run_cn_download_single_filing_stream(
             pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
         except Exception as exc:
             _unlink_temp_pdf(pdf_path, module=module)
+            yield DownloadEvent(
+                event_type=DownloadEventType.FILE_FAILED,
+                ticker=ticker,
+                document_id=document_id,
+                payload={
+                    "name": pdf_filename,
+                    "stage": "pdf_read_failed",
+                    "status": "failed",
+                    "reason_code": "pdf_read_failed",
+                    "reason_message": str(exc),
+                },
+            )
             failed = _build_filing_result(
                 document_id=document_id,
                 status="failed",
@@ -382,6 +415,16 @@ async def run_cn_download_single_filing_stream(
 
     _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     if reusable_docling is None:
+        yield DownloadEvent(
+            event_type=DownloadEventType.CONVERSION_STARTED,
+            ticker=ticker,
+            document_id=document_id,
+            payload={
+                "name": docling_filename,
+                "source_name": pdf_filename,
+                "stage": "docling_conversion_started",
+            },
+        )
         try:
             Log.info(
                 f"开始 Docling 转换: ticker={ticker} document_id={document_id} "

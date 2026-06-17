@@ -412,13 +412,27 @@ async def run_download_single_filing_stream(
             existing_files=existing_files,
             primary_document=filing.primary_document,
         ):
+            if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED.value:
+                yield DownloadEvent(
+                    event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
+                    ticker=ticker,
+                    document_id=document_id,
+                    payload={
+                        "name": event.name,
+                        "source_url": event.source_url,
+                        "http_etag": event.http_etag,
+                        "http_last_modified": event.http_last_modified,
+                        "http_status": event.http_status,
+                    },
+                )
+                continue
             mapped_result = build_file_result_from_downloader_event(event)
             file_results.append(mapped_result)
             yield DownloadEvent(
                 event_type=DownloadEventType(event.event_type),
                 ticker=ticker,
                 document_id=document_id,
-            payload=build_download_file_event_payload(mapped_result),
+                payload=build_download_file_event_payload(mapped_result),
             )
     else:
         download_files = cast(

@@ -112,6 +112,14 @@ class StreamStubDownloader(SecDownloader):
 
         del overwrite, existing_files, primary_document
         descriptor = remote_files[0]
+        yield DownloaderEvent(
+            event_type="file_download_started",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=descriptor.http_status,
+        )
         file_meta = store_file(descriptor.name, BytesIO(b"payload"))
         yield DownloaderEvent(
             event_type="file_downloaded",
@@ -175,6 +183,14 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
             "sample_htm.xml": b"<xbrl></xbrl>",
         }
         for descriptor in remote_files:
+            yield DownloaderEvent(
+                event_type="file_download_started",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=descriptor.http_status,
+            )
             file_meta = store_file(descriptor.name, BytesIO(payload_by_name[descriptor.name]))
             yield DownloaderEvent(
                 event_type="file_downloaded",
@@ -227,6 +243,7 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     assert event_types[0] == "pipeline_started"
     assert "company_resolved" in event_types
     assert "filing_started" in event_types
+    assert "file_download_started" in event_types
     assert "file_downloaded" in event_types
     assert "filing_completed" in event_types
     assert event_types[-1] == "pipeline_completed"

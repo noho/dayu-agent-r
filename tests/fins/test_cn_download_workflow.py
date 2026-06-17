@@ -426,7 +426,9 @@ def test_cn_download_workflow_commits_pdf_and_docling(tmp_path: Path) -> None:
         DownloadEventType.PIPELINE_STARTED,
         DownloadEventType.COMPANY_RESOLVED,
         DownloadEventType.FILING_STARTED,
+        DownloadEventType.FILE_DOWNLOAD_STARTED,
         DownloadEventType.FILE_DOWNLOADED,
+        DownloadEventType.CONVERSION_STARTED,
         DownloadEventType.FILING_COMPLETED,
         DownloadEventType.PIPELINE_COMPLETED,
     ]
