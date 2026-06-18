@@ -27,6 +27,7 @@ from dayu.host.compact_material import (
     build_pre_dispatch_compact_material_view,
     check_compact_memory_snapshot_cursor,
     conversation_compact_input_vnext_from_material_pack,
+    degrade_previous_compacted_view_for_recovery,
     prompt_local_evidence_map,
     run_input_material_block,
     select_compact_segment,
@@ -378,6 +379,133 @@ def test_proactive_segment_recent_floor_rejects_missing_turn_group_id() -> None:
             material_blocks=blocks,
             selected_recent_window_turn_floor=1,
         )
+
+
+def test_recovery_segment_selection_enforces_fallback_item_cap() -> None:
+    """S4 tier 1/3 selection 按 fallback item cap whole-drop。"""
+
+    blocks = (
+        _history_block("history-a", event_sequence=1, text="history a"),
+        _history_block("history-b", event_sequence=2, text="history b"),
+        _current_block("current", event_sequence=3, text="current user"),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=1024,
+        max_selected_item_count=1,
+    )
+
+    assert selection.selected_block_ids == ("history-a",)
+    assert selection.excluded_reason_codes["history-b"] == "budget_limit"
+
+
+def test_recovery_segment_selection_does_not_use_later_block_to_evade_char_cap() -> None:
+    """S4 strict cap 首个 block 超预算后不选择更晚小 block 绕过顺序。"""
+
+    blocks = (
+        _history_block("history-large", event_sequence=1, text="large material"),
+        _history_block("history-small", event_sequence=2, text="x"),
+        _current_block("current", event_sequence=3, text="current user"),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=3,
+        max_selected_item_count=2,
+    )
+
+    assert selection.selected_block_ids == ()
+    assert selection.excluded_reason_codes["history-large"] == "budget_limit"
+    assert selection.excluded_reason_codes["history-small"] == "budget_limit"
+
+
+def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() -> None:
+    """Tier 2 只保留最高优先级 section，文本 byte-exact 不改写。"""
+
+    previous = (
+        _previous_compact_block(
+            label="P5",
+            kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+            text="summary must drop whole",
+        ),
+        _previous_compact_block(
+            label="P3",
+            kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
+            text="answer must drop whole",
+        ),
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="fact must stay byte exact",
+        ),
+        _previous_compact_block(
+            label="P4",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="second fact must stay byte exact",
+        ),
+        _previous_compact_block(
+            label="P2",
+            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+            text="reference must drop whole",
+        ),
+    )
+
+    degraded = degrade_previous_compacted_view_for_recovery(previous)
+
+    assert tuple(block.block_label for block in degraded) == ("P1", "P4")
+    assert tuple(block.text for block in degraded) == (
+        "fact must stay byte exact",
+        "second fact must stay byte exact",
+    )
+
+
+def test_degrade_previous_compacted_view_sorts_source_sequences_descending() -> None:
+    """Tier 2 同 section 全有 source sequence 时按最大 sequence 降序。"""
+
+    previous = (
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="older fact remains exact",
+            canonical_source_refs=("eventlog-seq:10",),
+        ),
+        _previous_compact_block(
+            label="P2",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="newer fact remains exact",
+            canonical_source_refs=("eventlog-seq:30",),
+        ),
+        _previous_compact_block(
+            label="P3",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="middle fact remains exact",
+            canonical_source_refs=("eventlog-seq:20",),
+        ),
+        _previous_compact_block(
+            label="P4",
+            kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+            text="lower priority summary drops whole",
+            canonical_source_refs=("eventlog-seq:40",),
+        ),
+    )
+
+    degraded = degrade_previous_compacted_view_for_recovery(previous)
+
+    assert tuple(block.block_label for block in degraded) == ("P2", "P3", "P1")
+    assert tuple(block.text for block in degraded) == (
+        "newer fact remains exact",
+        "middle fact remains exact",
+        "older fact remains exact",
+    )
 
 
 def test_reactive_segment_uses_frozen_overflow_material_list() -> None:
@@ -1914,12 +2042,14 @@ def _previous_compact_block(
     label: str,
     kind: CompactMaterialBlockKind,
     text: str,
+    canonical_source_refs: tuple[str, ...] = ("event-explicit-compact",),
 ) -> CompactMaterialBlock:
     """构造测试用 explicit previous compact block。
 
     :param label: prompt-local label。
     :param kind: block kind。
     :param text: block text。
+    :param canonical_source_refs: canonical source refs。
     :returns: CompactMaterialBlock。
     """
 
@@ -1930,7 +2060,7 @@ def _previous_compact_block(
         text=text,
         size_units=len(text),
         source_labels=(),
-        canonical_source_refs=("event-explicit-compact",),
+        canonical_source_refs=canonical_source_refs,
         content_digest=sha256_digest_json({"text": text}),
     )
 

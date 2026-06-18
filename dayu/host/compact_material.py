@@ -166,6 +166,13 @@ _BLOCK_KIND_ORDER = {
     CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE: 2,
     CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR: 3,
 }
+_RECOVERY_PREVIOUS_VIEW_KIND_PRIORITY = (
+    CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+    CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+    CompactMaterialBlockKind.ANSWER_ANCHOR,
+    CompactMaterialBlockKind.FORWARD_INTENT,
+    CompactMaterialBlockKind.SESSION_SUMMARY,
+)
 
 
 class CompactMaterialBuildError(ValueError):
@@ -883,6 +890,7 @@ def select_compact_segment(
     material_blocks: tuple[RunInputMaterialBlock, ...],
     selected_recent_window_turn_floor: int = 0,
     max_selected_size_units: int | None = None,
+    max_selected_item_count: int | None = None,
 ) -> CompactSegmentSelection:
     """按确定性规则选择 compact segment。
 
@@ -893,6 +901,7 @@ def select_compact_segment(
     :param material_blocks: ordinary input 或 frozen overflow material list。
     :param selected_recent_window_turn_floor: 需要保护的 selected recent-window turn 数量。
     :param max_selected_size_units: 可选 selected segment 尺寸上限。
+    :param max_selected_item_count: 可选 selected segment item 数量上限。
     :returns: CompactSegmentSelection。
     :raises TypeError: 参数类型非法时抛出。
     :raises ValueError: 参数值非法时抛出。
@@ -906,6 +915,7 @@ def select_compact_segment(
         material_blocks=material_blocks,
         selected_recent_window_turn_floor=selected_recent_window_turn_floor,
         max_selected_size_units=max_selected_size_units,
+        max_selected_item_count=max_selected_item_count,
     )
     protected_recent_ids = _protected_recent_turn_group_block_ids(
         material_blocks,
@@ -914,7 +924,11 @@ def select_compact_segment(
     selected: list[str] = []
     excluded_reasons: dict[str, str] = {}
     selected_units = 0
+    budget_blocked = False
     for block in _sorted_material_blocks(material_blocks, memory_snapshot_cursor=memory_snapshot_cursor):
+        if budget_blocked:
+            excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+            continue
         reason = _block_exclusion_reason(block, protected_recent_ids)
         if reason is not None:
             excluded_reasons[block.block_id] = reason
@@ -922,9 +936,15 @@ def select_compact_segment(
         if (
             max_selected_size_units is not None
             and selected_units + block.size_units > max_selected_size_units
-            and len(selected) > 0
+            and (len(selected) > 0 or max_selected_item_count is not None)
         ):
             excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+            if max_selected_item_count is not None:
+                budget_blocked = True
+            continue
+        if max_selected_item_count is not None and len(selected) >= max_selected_item_count:
+            excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+            budget_blocked = True
             continue
         selected.append(block.block_id)
         selected_units += block.size_units
@@ -962,6 +982,35 @@ def select_compact_segment(
         selection_digest=sha256_digest_json(digest_input),
         excluded_reason_codes=excluded_reasons,
     )
+
+
+def degrade_previous_compacted_view_for_recovery(
+    previous_compacted_view: tuple[CompactMaterialBlock, ...]
+) -> tuple[CompactMaterialBlock, ...]:
+    """按 S4 recovery 优先级对 latest accepted compacted view 做 whole-drop 降级。
+
+    该 helper 只保留最高优先级的非空 semantic section，并按确定性顺序返回
+    原始 block；不会截断、改写、重写摘要或合成新的 semantic memory。
+
+    :param previous_compacted_view: latest accepted compacted view blocks。
+    :returns: 降级后的 previous compacted view blocks；无可保留项时为空元组。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: 参数值非法时抛出。
+    """
+
+    _require_compact_material_block_tuple(
+        previous_compacted_view,
+        "previous_compacted_view",
+    )
+    for kind in _RECOVERY_PREVIOUS_VIEW_KIND_PRIORITY:
+        candidates = tuple(
+            (index, block)
+            for index, block in enumerate(previous_compacted_view)
+            if block.kind is kind
+        )
+        if len(candidates) > 0:
+            return tuple(block for _index, block in _sort_recovery_previous_blocks(candidates))
+    return ()
 
 
 def build_compact_material_pack(
@@ -1451,6 +1500,7 @@ def _validate_selection_inputs(
     material_blocks: tuple[RunInputMaterialBlock, ...],
     selected_recent_window_turn_floor: int,
     max_selected_size_units: int | None,
+    max_selected_item_count: int | None,
 ) -> None:
     """校验 segment selection 输入。
 
@@ -1461,6 +1511,7 @@ def _validate_selection_inputs(
     :param material_blocks: material blocks。
     :param selected_recent_window_turn_floor: protected selected recent-window turn floor。
     :param max_selected_size_units: 可选选择预算。
+    :param max_selected_item_count: 可选选择 item 数量上限。
     :returns: ``None``。
     :raises TypeError: 参数类型非法时抛出。
     :raises ValueError: 参数值非法时抛出。
@@ -1478,6 +1529,91 @@ def _validate_selection_inputs(
         raise ValueError("selected_recent_window_turn_floor must be non-negative")
     if max_selected_size_units is not None and max_selected_size_units < 0:
         raise ValueError("max_selected_size_units must be non-negative")
+    if max_selected_item_count is not None and max_selected_item_count < 0:
+        raise ValueError("max_selected_item_count must be non-negative")
+
+
+def _sort_recovery_previous_blocks(
+    indexed_blocks: tuple[tuple[int, CompactMaterialBlock], ...]
+) -> tuple[tuple[int, CompactMaterialBlock], ...]:
+    """按 S4 Decision 5 排序 previous compacted view recovery items。
+
+    若所有候选 item 都带可解析 source EventLog sequence，则按最大 sequence
+    降序；否则回退到原 material 顺序升序，再按稳定 block label 升序。
+
+    :param indexed_blocks: 原始 material index 与 previous compact block。
+    :returns: 排序后的 indexed blocks。
+    """
+
+    sequences = tuple(
+        _max_recovery_source_event_sequence(block)
+        for _index, block in indexed_blocks
+    )
+    if len(sequences) == len(indexed_blocks) and all(sequence is not None for sequence in sequences):
+        return tuple(
+            sorted(
+                indexed_blocks,
+                key=lambda item: (
+                    -_required_recovery_source_event_sequence(item[1]),
+                    item[0],
+                    item[1].block_label,
+                ),
+            )
+        )
+    return tuple(sorted(indexed_blocks, key=lambda item: (item[0], item[1].block_label)))
+
+
+def _max_recovery_source_event_sequence(block: CompactMaterialBlock) -> int | None:
+    """从 canonical source refs 中读取最大 EventLog sequence。
+
+    当前 compacted semantic block 的 canonical refs 通常是 event id 而非
+    sequence。只有 ref 自身以 ``eventlog-seq:`` 显式携带 sequence 时才使用；
+    否则返回 ``None`` 并让排序回退到 material 顺序。
+
+    :param block: previous compacted view block。
+    :returns: 最大 source EventLog sequence；不可解析时为 ``None``。
+    """
+
+    sequences: list[int] = []
+    for ref in block.canonical_source_refs:
+        sequence = _recovery_source_event_sequence(ref)
+        if sequence is None:
+            return None
+        sequences.append(sequence)
+    if len(sequences) == 0:
+        return None
+    return max(sequences)
+
+
+def _required_recovery_source_event_sequence(block: CompactMaterialBlock) -> int:
+    """读取已确认存在的 recovery source EventLog sequence。
+
+    :param block: previous compacted view block。
+    :returns: 最大 source EventLog sequence。
+    :raises ValueError: block 缺少可解析 sequence 时抛出。
+    """
+
+    sequence = _max_recovery_source_event_sequence(block)
+    if sequence is None:
+        raise ValueError("recovery source event sequence is missing")
+    return sequence
+
+
+def _recovery_source_event_sequence(ref: str) -> int | None:
+    """解析 recovery source sequence ref。
+
+    :param ref: canonical source ref。
+    :returns: ``eventlog-seq:<n>`` 中的非负 sequence；不匹配时为 ``None``。
+    :raises ValueError: sequence ref 为负数时抛出。
+    """
+
+    prefix = "eventlog-seq:"
+    if not ref.startswith(prefix):
+        return None
+    value = int(ref.removeprefix(prefix))
+    if value < 0:
+        raise ValueError("recovery source event sequence must be non-negative")
+    return value
 
 
 def _sorted_material_blocks(

@@ -56,13 +56,23 @@ from dayu.host.api import (
     RunStatus,
 )
 from dayu.host.compaction import (
+    AnswerAnchorCandidateVNext,
+    AnswerAnchorChildVNext,
     CompactMaterialBlockKind,
     CompactMaterialSection,
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactCandidateDiagnosticVNext,
+    CompactQualityCheckResultVNext,
     CompactionRequest,
     ContextCompactor,
     ConversationCompactOutputVNext,
+    EvidenceBackedFactCandidateVNext,
+    FactEvidenceKindVNext,
+    ForwardIntentCandidateVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityCandidateVNext,
+    ReferenceContinuityReasonVNext,
     SessionSummaryCandidateVNext,
 )
 from dayu.host.compact_material import (
@@ -83,6 +93,7 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    build_context_compacted_payload,
     build_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import (
@@ -664,12 +675,12 @@ class _MinimalSummaryCompactor(_RequestCapturingCompactor):
         :raises AssertionError: 测试输入缺少 trace material 时抛出。
         """
 
-        trace_item = prepared_input.compact_input.trace_material[0]
+        source_label = _first_citable_compact_input_label(prepared_input)
         return ConversationCompactOutputVNext(
             schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
             session_summary=SessionSummaryCandidateVNext(
                 summary_text="rolled",
-                source_labels=(trace_item.source_label,),
+                source_labels=(source_label,),
             ),
             evidence_backed_facts=(),
             answer_anchors=(),
@@ -677,6 +688,132 @@ class _MinimalSummaryCompactor(_RequestCapturingCompactor):
             reference_continuity_items=(),
             diagnostics=(),
         )
+
+
+class _RecoveryScenarioCompactor(_PreparedManifestProactiveCompactor):
+    """按调用序号控制 S4 recovery 成败的 proactive 测试 compactor。"""
+
+    def __init__(
+        self,
+        *,
+        accept_call: int,
+        transaction_runner: HostTransactionRunner | None = None,
+        stale_after_call: int | None = None,
+    ) -> None:
+        """初始化 recovery 场景 compactor。
+
+        :param accept_call: 第几次 compactor call 返回 accepted candidate。
+        :param transaction_runner: 可选 durable runner；提供后可在指定 call 后制造 stale。
+        :param stale_after_call: 指定 call 返回前把源 Run 置为 stale。
+        :returns: ``None``。
+        """
+
+        super().__init__()
+        self._accept_call = accept_call
+        self._transaction_runner = transaction_runner
+        self._stale_after_call = stale_after_call
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """按调用序号失败或返回最小 accepted summary。
+
+        :param prepared_input: 已准备且可记录 manifest 的 proposal input。
+        :returns: accepted compact candidate。
+        :raises RuntimeError: 当前 call 不应 accepted 时抛出。
+        """
+
+        self.calls += 1
+        if self._stale_after_call == self.calls:
+            _fail_unstarted_for_stale_test(
+                self._transaction_runner,
+                self._latest_prepared_request(),
+            )
+        if self.calls != self._accept_call:
+            raise RuntimeError("recovery scenario proposal failed")
+        label = _first_citable_compact_input_label(prepared_input)
+        return ConversationCompactOutputVNext(
+            schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+            session_summary=SessionSummaryCandidateVNext(
+                summary_text=f"recovery summary {self.calls}",
+                source_labels=(label,),
+            ),
+            evidence_backed_facts=(),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity_items=(),
+            diagnostics=(),
+        )
+
+
+def _first_citable_compact_input_label(
+    prepared_input: CompactorProposalRunInput,
+) -> str:
+    """读取测试 compact input 中第一个可引用 source label。
+
+    :param prepared_input: prepared compactor input。
+    :returns: 第一个可引用 source label。
+    :raises AssertionError: compact input 没有可引用材料时抛出。
+    """
+
+    compact_input = prepared_input.compact_input
+    previous_view = compact_input.previous_compacted_view
+    if previous_view is not None:
+        for item in previous_view.evidence_backed_facts:
+            return item.source_label
+        for item in previous_view.reference_continuity_items:
+            return item.source_label
+        for item in previous_view.answer_anchors:
+            return item.source_label
+        for item in previous_view.forward_intents:
+            return item.source_label
+    for item in compact_input.trace_material:
+        return item.source_label
+    for item in compact_input.evidence_material:
+        return item.source_label
+    for item in compact_input.answer_material:
+        return item.source_label
+    raise AssertionError("compact input has no citable label")
+
+
+def _fail_unstarted_for_stale_test(
+    transaction_runner: HostTransactionRunner | None,
+    request: CompactionRequest,
+) -> None:
+    """把测试 Run 置为 failed，制造 compaction stale state。
+
+    :param transaction_runner: Host transaction runner。
+    :param request: 当前 compaction request。
+    :returns: ``None``。
+    :raises AssertionError: transaction runner 缺失或 Run 缺失时抛出。
+    """
+
+    if transaction_runner is None:
+        raise AssertionError("transaction runner is required")
+
+    def _operation(transaction: HostTransaction) -> None:
+        run = read_run_by_id(transaction, request.run_id)
+        assert run is not None
+        fail_unstarted_run_in_transaction(
+            transaction,
+            EventLogStore(),
+            FailUnstartedRunInput(
+                run_id=request.run_id,
+                expected_status=run.status,
+                run_failed_event_id=(
+                    f"event-stale-run-failed-{request.run_id}-{request.digest()}"
+                ),
+                occurred_at=datetime.now(UTC),
+                actor="pytest",
+                source="pytest",
+                reason="stale-test",
+                error_code="stale_test",
+                message="stale test",
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
 
 
 class _CloseFailingHandle(_FakeHandle):
@@ -3095,6 +3232,7 @@ async def test_durable_run_cancellation_token_fails_closed_on_retry_exhausted() 
     token = _DurableRunCancellationToken(
         transaction_runner=_RetryExhaustedReadRunner(),
         run_id="run-durable-unavailable",
+        session_id="session-durable-unavailable",
         expected_status=RunStatus.ACCEPTED,
         expected_input_event_sequence=1,
     )
@@ -4554,6 +4692,348 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
             assert rejected_payload["failure_category"] == ("quality_check_rejected")
             _assert_rejected_payload_has_proposal_manifest(rejected_payload)
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_recovery_tier1_uses_fallback_caps(
+    tmp_path: Path,
+) -> None:
+    """normal compact 失败后 tier 1 用 fallback caps 重建 input 并 accepted。"""
+
+    compactor = _RecoveryScenarioCompactor(accept_call=2)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tier1-old-a",
+            event_id="event-tier1-old-a",
+            display_text="old material a",
+        )
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tier1-old-b",
+            event_id="event-tier1-old-b",
+            display_text="old material b",
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-recovery-tier1",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_fallback_cap_memory_policy(),
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert compactor.calls == 2
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 0
+            compacted_payload = _event_payload(
+                _latest_event_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+            )
+            assert compacted_payload["accepted_attempt_number"] == 2
+            assert len(compactor.prepared_requests) == 2
+            tier1_request = compactor.prepared_requests[1]
+            assert len(tier1_request.segment_selection.selected_block_ids) == 1
+            assert tuple(block.text for block in tier1_request.material_pack.trace_material) == (
+                "old material a",
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_recovery_tier2_degrades_previous_view(
+    tmp_path: Path,
+) -> None:
+    """tier 1 失败后 tier 2 whole-drop previous view 并 deterministic accepted。"""
+
+    compactor = _RecoveryScenarioCompactor(accept_call=3)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_previous_compacted_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tier2-previous",
+            event_id="event-tier2-previous-compact",
+        )
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tier2-delta",
+            event_id="event-tier2-delta",
+            display_text="tier2 delta material",
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-recovery-tier2",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_fallback_cap_memory_policy(),
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert compactor.calls == 3
+            assert len(
+                _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+            ) == 1
+            compacted_payload = _event_payload(
+                _latest_event_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+            )
+            assert compacted_payload["accepted_attempt_number"] == 3
+            tier2_request = compactor.prepared_requests[2]
+            assert tuple(
+                block.kind for block in tier2_request.material_pack.previous_compacted_view
+            ) == (CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,)
+            assert tuple(
+                block.text for block in tier2_request.material_pack.previous_compacted_view
+            ) == (
+                "fact=claim_text=previous evidence fact must stay exact; "
+                "evidence_refs=E1; evidence_kind=accepted_evidence_material",
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_recovery_tier3_uses_delta_only(
+    tmp_path: Path,
+) -> None:
+    """tier 1/2 失败后 tier 3 清空 previous view 并 accepted。"""
+
+    compactor = _RecoveryScenarioCompactor(accept_call=4)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_previous_compacted_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tier3-previous",
+            event_id="event-tier3-previous-compact",
+        )
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tier3-delta",
+            event_id="event-tier3-delta",
+            display_text="tier3 delta material",
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-recovery-tier3",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_fallback_cap_memory_policy(),
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert compactor.calls == 4
+            assert len(
+                _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+            ) == 1
+            compacted_payload = _event_payload(
+                _latest_event_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+            )
+            assert compacted_payload["accepted_attempt_number"] == 4
+            tier3_request = compactor.prepared_requests[3]
+            assert tier3_request.material_pack.previous_compacted_view == ()
+            assert tuple(block.text for block in tier3_request.material_pack.trace_material) == (
+                "tier3 delta material",
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_recovery_stale_before_tier_attempt_discards(
+    tmp_path: Path,
+) -> None:
+    """normal 失败后 state 已 stale 时不进入 recovery compact commit。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        compactor = _RecoveryScenarioCompactor(
+            accept_call=2,
+            transaction_runner=store.transaction_runner,
+            stale_after_call=1,
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-recovery-stale-before",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert compactor.calls == 1
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_recovery_stale_during_tier_proposal_discards(
+    tmp_path: Path,
+) -> None:
+    """tier proposal 执行期间 state stale 时不写 CONTEXT_COMPACTED。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        compactor = _RecoveryScenarioCompactor(
+            accept_call=2,
+            transaction_runner=store.transaction_runner,
+            stale_after_call=2,
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-recovery-stale-after",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert compactor.calls == 2
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallback(
+    tmp_path: Path,
+) -> None:
+    """normal 与 tier 1-3 全失败后只写一次 failed 并进入 tier 4 dispatch。"""
+
+    factory = _FakeWorkerFactory()
+    compactor = _RecoveryScenarioCompactor(accept_call=99)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_previous_compacted_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-all-fail-previous",
+            event_id="event-all-fail-previous-compact",
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-recovery-all-fail",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            assert (await scheduler.drain_once()).dispatched == 1
+
+            assert compactor.calls == 4
+            assert (
+                len(
+                    _events_for_run_by_type(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTED,
+                    )
+                )
+                == 0
+            )
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+            assert len(factory.accepted_requests) == 1
         finally:
             await scheduler.close()
 
@@ -6086,6 +6566,114 @@ def _append_user_input(
         return event.row.event_sequence
 
     return transaction_runner.run_write(_operation)
+
+
+def _append_previous_compacted_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str,
+    event_id: str,
+) -> None:
+    """追加测试用 latest accepted ``CONTEXT_COMPACTED`` fact。
+
+    :param transaction_runner: transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param event_id: compacted event id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTED,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=build_context_compacted_payload(
+                    operation_id="operation-previous-compact",
+                    accepted_attempt_number=1,
+                    compact_artifact_ref="artifact:previous-compact",
+                    compact_artifact_digest=_CALL_CONTEXT_DIGEST,
+                    accepted_candidate=_previous_compacted_candidate(),
+                    quality_check_result=CompactQualityCheckResultVNext(
+                        accepted=True,
+                        rejection_reasons=(),
+                    ),
+                    budget_after_compact=16,
+                    prompt_local_label_mapping_refs=("label-map:previous",),
+                    source_boundary_refs=("source-boundary:previous",),
+                    accepted_evidence_mapping_refs=("evidence:previous",),
+                    projection_signal="project_memory",
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _previous_compacted_candidate() -> ConversationCompactOutputVNext:
+    """构造含全 section 的 latest accepted compact candidate。
+
+    :returns: ConversationCompactOutputVNext。
+    """
+
+    return ConversationCompactOutputVNext(
+        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text="previous session summary must drop whole",
+            source_labels=("T1",),
+        ),
+        evidence_backed_facts=(
+            EvidenceBackedFactCandidateVNext(
+                claim_text="previous evidence fact must stay exact",
+                evidence_labels=("E1",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+            ),
+        ),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="previous answer anchor must drop whole",
+                anchor_items=(
+                    AnswerAnchorChildVNext(
+                        display_text="previous answer item",
+                        ordinal=1,
+                    ),
+                ),
+                answer_source_labels=("A1",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="previous forward intent must drop whole",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="previous reference must drop whole",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("T1",),
+            ),
+        ),
+        diagnostics=(),
+    )
 
 
 def _append_corrupted_tool_result_material(
