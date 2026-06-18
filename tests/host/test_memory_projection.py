@@ -171,6 +171,8 @@ def _event(
     event_id: str,
     event_type: str,
     payload: dict[str, JsonValue],
+    *,
+    run_id: str | None = _RUN_ID,
 ) -> MemoryProjectionEvent:
     """构造 memory projection event。
 
@@ -178,6 +180,7 @@ def _event(
     :param event_id: event id。
     :param event_type: event type。
     :param payload: canonical payload。
+    :param run_id: Host Run id。
     :returns: memory projection event。
     """
 
@@ -187,7 +190,7 @@ def _event(
         event_class=EventClass.CANONICAL_FACT.value,
         event_type=event_type,
         session_id=_SESSION_ID,
-        run_id=_RUN_ID,
+        run_id=run_id,
         attempt_id=_ATTEMPT_ID,
         execution_id=_EXECUTION_ID,
         occurred_at=_NOW,
@@ -325,6 +328,136 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
     assert snapshot.answer_anchor_memory.anchors == ()
     assert snapshot.forward_intent_memory.intents == ()
+
+
+def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
+    """selected recent window floor 保护最近 Run group 的全部 eligible material。"""
+
+    policy = MemoryProjectionPolicy(
+        context_window_size=8192,
+        selected_recent_window_item_cap=2,
+        selected_recent_window_char_cap=4096,
+        selected_recent_window_turn_floor=2,
+        fallback_selected_recent_window_item_cap=2,
+        fallback_selected_recent_window_char_cap=2048,
+        evidence_fact_item_cap=4,
+        evidence_fact_char_cap=2048,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=4,
+        answer_anchor_char_cap=1024,
+        forward_intent_item_cap=4,
+        forward_intent_char_cap=1024,
+        reference_continuity_item_cap=4,
+        reference_continuity_char_cap=1024,
+        reference_continuity_item_floor=0,
+        max_lag_events_for_inline_delta=4,
+        max_delta_repair_events=16,
+        policy_ref="test-memory-vnext",
+    )
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "user-old",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "old user"},
+                run_id="run-old",
+            ),
+            _event(
+                2,
+                "answer-old",
+                "RUN_SUCCEEDED",
+                {"final_answer": "old answer"},
+                run_id="run-old",
+            ),
+            _event(
+                3,
+                "user-mid",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "mid user"},
+                run_id="run-mid",
+            ),
+            _event(
+                4,
+                "answer-mid",
+                "RUN_SUCCEEDED",
+                {"final_answer": "mid answer"},
+                run_id="run-mid",
+            ),
+            _event(
+                5,
+                "tool-mid",
+                "TOOL_RESULT_ACCEPTED",
+                {"display_text": "mid evidence"},
+                run_id="run-mid",
+            ),
+            _event(
+                6,
+                "user-new",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "new user"},
+                run_id="run-new",
+            ),
+            _event(
+                7,
+                "answer-new",
+                "RUN_SUCCEEDED",
+                {"final_answer": "new answer"},
+                run_id="run-new",
+            ),
+            _event(
+                8,
+                "tool-new",
+                "TOOL_RESULT_ACCEPTED",
+                {"display_text": "new evidence"},
+                run_id="run-new",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    selected = snapshot.trace_memory.selected_recent_window
+    assert tuple(item.run_id for item in selected) == (
+        "run-mid",
+        "run-mid",
+        "run-mid",
+        "run-new",
+        "run-new",
+        "run-new",
+    )
+    assert tuple(item.text for item in selected) == (
+        "mid user",
+        "mid answer",
+        "工具结果已接受；原始工具响应不可用。",
+        "new user",
+        "new answer",
+        "工具结果已接受；原始工具响应不可用。",
+    )
+
+
+def test_selected_recent_window_floor_rejects_missing_run_id() -> None:
+    """floor 依赖的 eligible item 缺 run_id 时不静默跳过。"""
+
+    with pytest.raises(ValueError, match="missing run_id"):
+        build_conversation_memory_snapshot_from_events(
+            events=(
+                _event(
+                    1,
+                    "user-missing-run",
+                    "USER_INPUT_ACCEPTED",
+                    {"display_text": "missing run"},
+                    run_id=None,
+                ),
+            ),
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=_policy(),
+            built_at=_NOW,
+        )
 
 
 def test_accepted_compact_materializes_vnext_memory_sections() -> None:

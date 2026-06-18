@@ -882,7 +882,7 @@ def select_compact_segment(
         selected_recent_window_turn_floor=selected_recent_window_turn_floor,
         max_selected_size_units=max_selected_size_units,
     )
-    protected_recent_ids = _protected_recent_raw_block_ids(
+    protected_recent_ids = _protected_recent_turn_group_block_ids(
         material_blocks,
         selected_recent_window_turn_floor,
     )
@@ -1495,45 +1495,90 @@ def _block_event_sequence(block: RunInputMaterialBlock, memory_snapshot_cursor: 
     return _NO_EVENT_SEQUENCE
 
 
-def _protected_recent_raw_block_ids(
+def _protected_recent_turn_group_block_ids(
     blocks: tuple[RunInputMaterialBlock, ...], selected_recent_window_turn_floor: int
 ) -> frozenset[str]:
-    """计算 protected recent raw floor 对应 block ids。
+    """计算 protected recent turn-group floor 对应 block ids。
 
     :param blocks: material blocks。
     :param selected_recent_window_turn_floor: selected recent-window turn 保底数量。
     :returns: protected block id 集合。
+    :raises ValueError: floor 依赖的 eligible block 缺少 turn_group_id 时抛出。
     """
 
-    explicit = [block.block_id for block in blocks if block.protected_recent_raw_turn and _is_raw_turn_block(block)]
+    explicit = [
+        block.block_id
+        for block in blocks
+        if block.protected_recent_raw_turn and is_turn_group_material_block(block)
+    ]
     if selected_recent_window_turn_floor == 0:
         return frozenset(explicit)
-    raw_blocks = sorted(
-        (block for block in blocks if _is_raw_turn_block(block)),
-        key=lambda block: (
-            _NO_EVENT_SEQUENCE if block.event_sequence is None else block.event_sequence,
-            block.event_sub_index,
-            block.block_id,
-        ),
-        reverse=True,
+    protected_turn_group_ids = protected_recent_turn_group_ids_for_material_blocks(
+        blocks,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
     )
     protected = [
-        block.block_id for block in raw_blocks[:selected_recent_window_turn_floor]
+        block.block_id
+        for block in blocks
+        if block.turn_group_id in protected_turn_group_ids
+        and is_turn_group_material_block(block)
     ]
     protected.extend(explicit)
     return frozenset(protected)
 
 
-def _is_raw_turn_block(block: RunInputMaterialBlock) -> bool:
-    """判断 block 是否为 raw turn continuity。
+def protected_recent_turn_group_ids_for_material_blocks(
+    blocks: tuple[RunInputMaterialBlock, ...],
+    *,
+    selected_recent_window_turn_floor: int,
+    missing_turn_group_message: str = "eligible material block is missing turn_group_id",
+) -> frozenset[str]:
+    """返回最近 N 个 Host Run turn group id。
+
+    :param blocks: material blocks。
+    :param selected_recent_window_turn_floor: 需要保护的 turn group 数。
+    :param missing_turn_group_message: eligible block 缺 group 时使用的错误消息。
+    :returns: 需要保护的 turn_group_id 集合。
+    :raises ValueError: floor 依赖的 eligible block 缺少 turn_group_id 时抛出。
+    """
+
+    eligible = tuple(block for block in blocks if is_turn_group_material_block(block))
+    missing = tuple(block.block_id for block in eligible if block.turn_group_id is None)
+    if len(missing) > 0:
+        raise ValueError(missing_turn_group_message)
+    latest_by_group: dict[str, tuple[int, int, int]] = {}
+    for index, block in enumerate(eligible):
+        if block.turn_group_id is None:
+            continue
+        event_sequence = (
+            _NO_EVENT_SEQUENCE if block.event_sequence is None else block.event_sequence
+        )
+        candidate = (event_sequence, block.event_sub_index, index)
+        current = latest_by_group.get(block.turn_group_id)
+        if current is None or candidate > current:
+            latest_by_group[block.turn_group_id] = candidate
+    ordered = tuple(
+        turn_group_id
+        for turn_group_id, _latest in sorted(
+            latest_by_group.items(),
+            key=lambda pair: (pair[1][0], pair[1][1], pair[1][2], pair[0]),
+            reverse=True,
+        )
+    )
+    return frozenset(ordered[:selected_recent_window_turn_floor])
+
+
+def is_turn_group_material_block(block: RunInputMaterialBlock) -> bool:
+    """判断 block 是否属于 Host Run turn group recent material。
 
     :param block: material block。
-    :returns: raw user / assistant turn 返回 ``True``。
+    :returns: user / assistant / accepted evidence block 返回 ``True``。
     """
 
     return block.kind in (
         CompactMaterialBlockKind.USER_INPUT,
         CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+        CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
     )
 
 

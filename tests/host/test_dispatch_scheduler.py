@@ -14,6 +14,7 @@ from typing import TypeVar, cast
 import pytest
 
 import dayu.host.dispatch as host_dispatch
+import dayu.host.engine_ingest as host_engine_ingest
 from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
@@ -56,6 +57,7 @@ from dayu.host.api import (
 )
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
+    CompactMaterialSection,
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactCandidateDiagnosticVNext,
     CompactionRequest,
@@ -67,9 +69,15 @@ from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     build_pre_dispatch_compact_material_view,
     conversation_compact_input_vnext_from_material_pack,
+    run_input_material_block,
 )
 from dayu.host.compaction_operation import CompactorProposalRunInput
-from dayu.host.context_budget import ContextBudgetDecision
+from dayu.host.context_budget import (
+    BudgetEstimateInput,
+    BudgetTextFragment,
+    ContextBudgetDecision,
+    estimate_context_budget,
+)
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
@@ -106,6 +114,7 @@ from dayu.host.dispatch import (
 )
 from dayu.host.engine_ingest import (
     EngineIngestResult,
+    EngineIngestStatus,
     EngineEventIngestor,
     LocalEngineEnvelope,
 )
@@ -4626,16 +4635,28 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
     factory = _FakeWorkerFactory()
     compact_artifact_root = tmp_path / "compact-artifacts"
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-compact-failure-old",
+            event_id="event-input-run-compact-failure-old",
+            display_text="older fallback material that cap must drop",
+            client_request_id="client-run-compact-failure-old",
+            idempotency_key="idem-run-compact-failure-old",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-compact-failure",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         scheduler = await _open_scheduler(
             tmp_path,
             store,
             factory,
             context_budget_policy=_soft_compact_policy(),
+            memory_projection_policy=_fallback_cap_memory_policy(),
             compact_artifact_root=compact_artifact_root,
         )
         try:
@@ -4665,6 +4686,14 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             assert isinstance(payload["fallback_input_window"], Mapping)
             assert payload["fallback_input_window"]["current_input_ref"] == (
                 f"event-input-{seeded.run_id}"
+            )
+            assert payload["fallback_input_window"]["selected_block_ids"] == [
+                f"current:event-input-{seeded.run_id}"
+            ]
+            assert "eventlog:user:event-input-run-compact-failure-old" in (
+                _required_json_text_tuple(
+                    payload["fallback_input_window"]["dropped_block_ids"]
+                )
             )
             assert isinstance(payload["fallback_budget_result"], Mapping)
             assert payload["fallback_budget_result"]["status"] == "within_hard_budget"
@@ -5099,6 +5128,122 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
             await scheduler.close()
 
 
+def test_reactive_fallback_decision_uses_memory_policy_caps(tmp_path: Path) -> None:
+    """reactive fallback production helper 使用 MemoryProjectionPolicy fallback caps。"""
+
+    run, attempt, dispatch_record = _seed_current_run_rows(tmp_path)
+    candidate = host_engine_ingest.EngineEventCandidate(
+        envelope=LocalEngineEnvelope(
+            session_id=run.session_id,
+            run_id=run.run_id,
+            attempt_id=attempt.attempt_id,
+            execution_id=attempt.execution_id,
+            dispatch_record_id=dispatch_record.dispatch_record_id,
+            worker_kind=WorkerKind.LOCAL,
+            execution_target=dispatch_record.execution_target,
+            local_worker_id="local-worker-test",
+            cancellation_token=_HostCancellationToken(),
+        ),
+        worker_event_index=1,
+        engine_event=EngineEvent(
+            occurred_at=_NOW,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+            data=ContextCompactionRequestedData(
+                iteration_id="iter-reactive",
+                budget_state=None,
+                reason="provider_overflow",
+                provider_request_id="req-reactive",
+            ),
+            metadata=None,
+        ),
+        observed_at=_NOW,
+    )
+    context = host_engine_ingest._ValidatedCandidate(
+        candidate=candidate,
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+    )
+    policy = _soft_compact_policy(
+        context_window_size=500,
+        soft_threshold_tokens=300,
+        hard_threshold_tokens=420,
+    )
+    memory_policy = _fallback_cap_memory_policy()
+    pending = host_engine_ingest._ReactiveCompactPending(
+        result_prefix=EngineIngestResult(
+            status=EngineIngestStatus.ACCEPTED,
+            events=(),
+            terminal_closeout=False,
+            promotion_triggered=False,
+            reason=None,
+            stop_worker_stream=True,
+        ),
+        context=context,
+        expected_input_event_sequence=context.run.input_event_sequence,
+        display_text="dispatch prompt",
+        frozen_material_blocks=(
+            run_input_material_block(
+                block_id="eventlog:user:event-input-run-dispatch-old",
+                section=CompactMaterialSection.TRACE_MATERIAL,
+                kind=CompactMaterialBlockKind.USER_INPUT,
+                text="older reactive fallback material that cap must drop",
+                canonical_source_refs=("event-input-run-dispatch-old",),
+                event_sequence=1,
+                turn_group_id="run-dispatch-old",
+            ),
+            run_input_material_block(
+                block_id="current:event-input-dispatch",
+                section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                text="dispatch prompt",
+                canonical_source_refs=("event-input-dispatch",),
+                event_sequence=2,
+                turn_group_id="run-dispatch",
+            ),
+        ),
+        previous_compacted_view=(),
+        frozen_material_list_digest="digest:frozen",
+        frozen_material_refs=("event-input-run-dispatch-old", "event-input-dispatch"),
+        operation_id="event-reactive-request",
+        estimate=estimate_context_budget(
+            policy,
+            BudgetEstimateInput(
+                session_id=context.run.session_id,
+                run_id=context.run.run_id,
+                message_fragments=(
+                    BudgetTextFragment(
+                        fragment_ref="current:event-input-dispatch",
+                        text="dispatch prompt",
+                    ),
+                ),
+                current_prompt_ref="event-input-dispatch",
+            ),
+        ),
+        decision=ContextBudgetDecision.COMPACT_SOFT_THRESHOLD,
+        policy=policy,
+        memory_projection_policy=memory_policy,
+        selected_recent_window_turn_floor=(
+            memory_policy.selected_recent_window_turn_floor
+        ),
+    )
+
+    decision = host_engine_ingest._reactive_fallback_decision(
+        pending=pending,
+        failure_reason="test_failure",
+    )
+
+    assert decision.action == "dispatch"
+    assert decision.input_window["selected_block_ids"] == [
+        "current:event-input-dispatch"
+    ]
+    assert "eventlog:user:event-input-run-dispatch-old" in (
+        _required_json_text_tuple(decision.input_window["dropped_block_ids"])
+    )
+
+
 @pytest.mark.asyncio
 async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
     tmp_path: Path,
@@ -5295,6 +5440,7 @@ async def _open_scheduler(
     context_budget_policy: ContextBudgetPolicy | None = None,
     context_compactor: ContextCompactor | None = None,
     compact_artifact_root: Path | None = None,
+    memory_projection_policy: MemoryProjectionPolicy | None = None,
     host_handle_id: str = "host-test",
     host_instance_identity: HostInstanceIdentity | None = None,
 ) -> HostDispatchScheduler:
@@ -5313,6 +5459,7 @@ async def _open_scheduler(
     :param context_budget_policy: 可选 pre-start context budget policy。
     :param context_compactor: 可选 context compactor。
     :param compact_artifact_root: 可选 compact artifact 根目录。
+    :param memory_projection_policy: 可选 memory projection policy。
     :param host_handle_id: scheduler 使用的 Host handle id。
     :param host_instance_identity: 可选 Host instance 身份；用于测试 handle
         与 instance id 不同的 owner 写入路径。
@@ -5337,6 +5484,11 @@ async def _open_scheduler(
         context_budget_policy=context_budget_policy,
         context_compactor=context_compactor,
         compact_artifact_root=compact_artifact_root,
+        memory_projection_policy=(
+            memory_projection_policy
+            if memory_projection_policy is not None
+            else default_memory_projection_policy()
+        ),
     )
     if host_instance_identity is None:
         return await HostDispatchScheduler.open(
@@ -5634,20 +5786,26 @@ def _seed_accepted_run(
     *,
     run_id: str,
     display_text: str,
+    session_id: str | None = None,
 ) -> _AcceptedSeededRun:
     """创建 pre-start accepted Run，不创建 Attempt 或 dispatch。
 
     :param store: durable store。
     :param run_id: Run id。
     :param display_text: 当前用户输入文本。
+    :param session_id: 可选已有 Session id。
     :returns: accepted Run 摘要。
     """
 
-    session_id = _ensure_session_id(store.transaction_runner)
+    actual_session_id = (
+        _ensure_session_id(store.transaction_runner)
+        if session_id is None
+        else session_id
+    )
     input_event_id = f"event-input-{run_id}"
     input_event_sequence = _append_user_input(
         store.transaction_runner,
-        session_id=session_id,
+        session_id=actual_session_id,
         run_id=run_id,
         event_id=input_event_id,
         display_text=display_text,
@@ -5660,7 +5818,7 @@ def _seed_accepted_run(
             transaction,
             EventLogStore(),
             CreateAcceptedRunInput(
-                session_id=session_id,
+                session_id=actual_session_id,
                 run_id=run_id,
                 client_request_id=f"client-{run_id}",
                 input_event_id=input_event_id,
@@ -5679,7 +5837,7 @@ def _seed_accepted_run(
         assert result.run.status == RunStatus.ACCEPTED
 
     store.transaction_runner.run_write(_operation)
-    return _AcceptedSeededRun(session_id=session_id, run_id=run_id)
+    return _AcceptedSeededRun(session_id=actual_session_id, run_id=run_id)
 
 
 def _soft_compact_policy(
@@ -5715,6 +5873,36 @@ def _soft_compact_policy(
         max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         max_compaction_attempts_per_operation=(max_compaction_attempts_per_operation),
         policy_ref="test-soft-compact-policy",
+    )
+
+
+def _fallback_cap_memory_policy() -> MemoryProjectionPolicy:
+    """构造验证 production fallback caps 接线的 memory policy。
+
+    :returns: fallback item cap 收紧到 current-only 的 memory policy。
+    """
+
+    return MemoryProjectionPolicy(
+        context_window_size=8192,
+        selected_recent_window_item_cap=8,
+        selected_recent_window_char_cap=4096,
+        selected_recent_window_turn_floor=0,
+        fallback_selected_recent_window_item_cap=1,
+        fallback_selected_recent_window_char_cap=4096,
+        evidence_fact_item_cap=16,
+        evidence_fact_char_cap=4096,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=8,
+        answer_anchor_char_cap=2048,
+        forward_intent_item_cap=8,
+        forward_intent_char_cap=2048,
+        reference_continuity_item_cap=8,
+        reference_continuity_char_cap=2048,
+        reference_continuity_item_floor=0,
+        max_lag_events_for_inline_delta=100,
+        max_delta_repair_events=16,
+        policy_ref="test-fallback-cap-memory-policy",
     )
 
 
@@ -5954,6 +6142,21 @@ def _pending_dispatch(seeded: _SeededRun) -> PendingDispatchRecord:
         execution_target="target-dispatch",
         worker_kind=WorkerKind.LOCAL,
     )
+
+
+def _seed_current_run_rows(tmp_path: Path) -> tuple[RunRow, AttemptRow, DispatchRecordRow]:
+    """在临时 store 中创建 current Run 并返回 durable rows。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Run、Attempt 与 DispatchRecord rows。
+    """
+
+    result: tuple[RunRow, AttemptRow, DispatchRecordRow] | None = None
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        result = _read_rows(store.transaction_runner, seeded)
+    assert result is not None
+    return result
 
 
 def _read_rows(
@@ -6756,3 +6959,19 @@ def _require_text(value: str | None) -> str:
 
     assert value is not None
     return value
+
+
+def _required_json_text_tuple(value: JsonValue) -> tuple[str, ...]:
+    """从 JSON 值中读取字符串 tuple。
+
+    :param value: JSON 值。
+    :returns: 字符串 tuple。
+    :raises AssertionError: 值不是字符串数组时抛出。
+    """
+
+    assert isinstance(value, list)
+    result: list[str] = []
+    for item in value:
+        assert isinstance(item, str)
+        result.append(item)
+    return tuple(result)

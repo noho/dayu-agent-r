@@ -1986,6 +1986,7 @@ class HostDispatchScheduler:
         )
         return build_recent_window_fallback_selection(
             policy=policy,
+            memory_policy=self._local_execution.memory_projection_policy,
             session_id=run.session_id,
             run_id=run.run_id,
             material_blocks=material_blocks,

@@ -13,8 +13,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.compact_material import RunInputMaterialBlock
-from dayu.host.compaction import CompactMaterialBlockKind, CompactMaterialSection
+from dayu.host.compact_material import (
+    RunInputMaterialBlock,
+    is_turn_group_material_block,
+    protected_recent_turn_group_ids_for_material_blocks,
+)
+from dayu.host.compaction import CompactMaterialSection
 from dayu.host.context_budget import (
     BudgetEstimate,
     BudgetEstimateInput,
@@ -29,6 +33,7 @@ from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.payload_resolution import event_payload_object
 
 FALLBACK_ACTION_DISPATCH = "dispatch"
@@ -333,6 +338,7 @@ class EventLogContextFallbackProvider:
 def build_recent_window_fallback_selection(
     *,
     policy: ContextBudgetPolicy,
+    memory_policy: MemoryProjectionPolicy | None = None,
     session_id: str,
     run_id: str,
     material_blocks: tuple[RunInputMaterialBlock, ...],
@@ -344,11 +350,14 @@ def build_recent_window_fallback_selection(
     """按 deterministic recent-window policy 选择 fallback input view。
 
     选择顺序为：固定 current input anchor、stable / compact represented
-    context、recent raw turn floor；若必保留集合未超过 hard budget，再按
-    reverse chronological raw turn block order 追加最近 raw turn，直到下一
-    block 会触发 hard threshold 或 material 耗尽。
+    context、recent turn-group floor；若必保留集合未超过 hard budget，再按
+    reverse chronological turn-group block order 整块追加最近 material。floor
+    不受 fallback item / char caps 裁剪；非 floor block 同时受 fallback caps
+    与 hard budget 保护。
 
     :param policy: context budget policy。
+    :param memory_policy: memory projection policy；传入时使用 fallback selected
+        recent window caps 限制非 floor 追加。
     :param session_id: Session id。
     :param run_id: Run id。
     :param material_blocks: ordinary material blocks。
@@ -363,9 +372,16 @@ def build_recent_window_fallback_selection(
     if selected_recent_window_turn_floor < 0:
         raise ValueError("selected_recent_window_turn_floor must be non-negative")
     current = _current_input_block(material_blocks, current_input_ref=current_input_ref)
-    raw_blocks = _reverse_chronological_raw_blocks(material_blocks)
+    raw_blocks = _reverse_chronological_turn_group_blocks(
+        material_blocks,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+    )
+    floor_group_ids = protected_recent_turn_group_ids_for_material_blocks(
+        raw_blocks,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+    )
     floor_ids = frozenset(
-        block.block_id for block in raw_blocks[:selected_recent_window_turn_floor]
+        block.block_id for block in raw_blocks if block.turn_group_id in floor_group_ids
     )
     selected_ids = _required_block_ids(
         material_blocks,
@@ -385,6 +401,13 @@ def build_recent_window_fallback_selection(
         for block in raw_blocks:
             if block.block_id in selected_ids:
                 continue
+            if not _fallback_caps_allow_append(
+                selected_blocks=_blocks_by_material_order(material_blocks, selected_ids),
+                candidate=block,
+                memory_policy=memory_policy,
+            ):
+                blocked_next_block_id = block.block_id
+                break
             candidate_ids = frozenset((*selected_ids, block.block_id))
             candidate_blocks = _blocks_by_material_order(material_blocks, candidate_ids)
             candidate_budget = estimate_recent_window_fallback_budget(
@@ -561,18 +584,31 @@ def _required_block_ids(
     return frozenset(selected)
 
 
-def _reverse_chronological_raw_blocks(
+def _reverse_chronological_turn_group_blocks(
     blocks: tuple[RunInputMaterialBlock, ...],
+    *,
+    selected_recent_window_turn_floor: int,
 ) -> tuple[RunInputMaterialBlock, ...]:
-    """按 reverse chronological material order 返回 raw turn blocks。
+    """按 reverse chronological material order 返回 turn-group blocks。
 
     :param blocks: material blocks。
-    :returns: raw turn blocks。
+    :param selected_recent_window_turn_floor: 需要保护的 turn group 数。
+    :returns: turn-group blocks。
+    :raises ValueError: floor 依赖的 eligible block 缺少 turn_group_id 时抛出。
     """
 
+    eligible = tuple(block for block in blocks if is_turn_group_material_block(block))
+    if selected_recent_window_turn_floor > 0:
+        protected_recent_turn_group_ids_for_material_blocks(
+            eligible,
+            selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+            missing_turn_group_message=(
+                "eligible fallback material block is missing turn_group_id"
+            ),
+        )
     return tuple(
         sorted(
-            (block for block in blocks if _is_raw_turn_block(block)),
+            eligible,
             key=lambda block: (
                 _NO_EVENT_SEQUENCE if block.event_sequence is None else block.event_sequence,
                 block.event_sub_index,
@@ -580,6 +616,31 @@ def _reverse_chronological_raw_blocks(
             ),
             reverse=True,
         )
+    )
+
+
+def _fallback_caps_allow_append(
+    *,
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+    candidate: RunInputMaterialBlock,
+    memory_policy: MemoryProjectionPolicy | None,
+) -> bool:
+    """判断 fallback selected window caps 是否允许整块追加。
+
+    :param selected_blocks: 当前已选 blocks。
+    :param candidate: 待追加 block。
+    :param memory_policy: memory projection policy；``None`` 表示旧调用点未提供 caps。
+    :returns: caps 允许追加时返回 ``True``。
+    """
+
+    if memory_policy is None:
+        return True
+    if len(selected_blocks) + 1 > memory_policy.fallback_selected_recent_window_item_cap:
+        return False
+    selected_chars = sum(block.size_units for block in selected_blocks)
+    return (
+        selected_chars + candidate.size_units
+        <= memory_policy.fallback_selected_recent_window_char_cap
     )
 
 
@@ -616,20 +677,7 @@ def _raw_turn_count(blocks: tuple[RunInputMaterialBlock, ...]) -> int:
     :returns: raw turn 数量。
     """
 
-    return sum(1 for block in blocks if _is_raw_turn_block(block))
-
-
-def _is_raw_turn_block(block: RunInputMaterialBlock) -> bool:
-    """判断 block 是否为 raw user / assistant turn。
-
-    :param block: material block。
-    :returns: raw turn 返回 ``True``。
-    """
-
-    return block.kind in (
-        CompactMaterialBlockKind.USER_INPUT,
-        CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
-    )
+    return sum(1 for block in blocks if is_turn_group_material_block(block))
 
 
 def _optional_mapping(

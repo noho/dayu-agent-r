@@ -264,8 +264,18 @@ def test_proactive_segment_excludes_current_anchor_and_recent_raw_floor() -> Non
     """Proactive selection 不能压缩当前 anchor 与 recent raw floor。"""
 
     blocks = (
-        _history_block("history-old", event_sequence=1, text="old user"),
-        _history_block("history-recent", event_sequence=3, text="recent user"),
+        _history_block(
+            "history-old",
+            event_sequence=1,
+            text="old user",
+            turn_group_id="run-old",
+        ),
+        _history_block(
+            "history-recent",
+            event_sequence=3,
+            text="recent user",
+            turn_group_id="run-recent",
+        ),
         _current_block("current", event_sequence=4, text="current user"),
     )
 
@@ -284,6 +294,90 @@ def test_proactive_segment_excludes_current_anchor_and_recent_raw_floor() -> Non
         selection.excluded_reason_codes["history-recent"]
         == "protected_recent_raw_floor"
     )
+
+
+def test_proactive_segment_recent_floor_uses_turn_groups() -> None:
+    """Recent floor 按 Host Run group 保护多 block，而不是 raw block count。"""
+
+    blocks = (
+        _history_block(
+            "run-old-user",
+            event_sequence=1,
+            text="old user",
+            turn_group_id="run-old",
+        ),
+        _history_block(
+            "run-mid-user",
+            event_sequence=2,
+            text="mid user",
+            turn_group_id="run-mid",
+        ),
+        _evidence_block(
+            "run-mid-evidence",
+            event_sequence=3,
+            text="mid evidence",
+            turn_group_id="run-mid",
+        ),
+        _history_block(
+            "run-new-user",
+            event_sequence=4,
+            text="new user",
+            turn_group_id="run-new",
+        ),
+        _history_block(
+            "run-new-answer",
+            event_sequence=5,
+            text="new answer",
+            kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            turn_group_id="run-new",
+        ),
+        _current_block("current", event_sequence=6, text="current user"),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=6,
+        memory_snapshot_cursor=5,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        selected_recent_window_turn_floor=2,
+    )
+
+    assert selection.selected_block_ids == ("run-old-user",)
+    assert selection.excluded_reason_codes["run-mid-user"] == "protected_recent_raw_floor"
+    assert (
+        selection.excluded_reason_codes["run-mid-evidence"]
+        == "protected_recent_raw_floor"
+    )
+    assert selection.excluded_reason_codes["run-new-user"] == "protected_recent_raw_floor"
+    assert (
+        selection.excluded_reason_codes["run-new-answer"]
+        == "protected_recent_raw_floor"
+    )
+
+
+def test_proactive_segment_recent_floor_rejects_missing_turn_group_id() -> None:
+    """floor 依赖的 eligible block 缺 turn_group_id 时不静默跳过。"""
+
+    blocks = (
+        _history_block(
+            "history-missing-group",
+            event_sequence=1,
+            text="missing group",
+            turn_group_id=None,
+        ),
+        _current_block("current", event_sequence=2, text="current user"),
+    )
+
+    with pytest.raises(ValueError, match="missing turn_group_id"):
+        select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            memory_snapshot_cursor=1,
+            policy_digest=_POLICY_DIGEST,
+            material_blocks=blocks,
+            selected_recent_window_turn_floor=1,
+        )
 
 
 def test_reactive_segment_uses_frozen_overflow_material_list() -> None:
@@ -1726,6 +1820,8 @@ def _history_block(
     event_sequence: int,
     text: str,
     already_represented: bool = False,
+    kind: CompactMaterialBlockKind = CompactMaterialBlockKind.USER_INPUT,
+    turn_group_id: str | None = "run:test",
 ) -> RunInputMaterialBlock:
     """构造 history material block。
 
@@ -1733,16 +1829,19 @@ def _history_block(
     :param event_sequence: event sequence。
     :param text: 文本。
     :param already_represented: 是否已被代表。
+    :param kind: material kind。
+    :param turn_group_id: Host Run turn group id。
     :returns: RunInputMaterialBlock。
     """
 
     return run_input_material_block(
         block_id=block_id,
         section=CompactMaterialSection.TRACE_MATERIAL,
-        kind=CompactMaterialBlockKind.USER_INPUT,
+        kind=kind,
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
         already_represented=already_represented,
     )
 
@@ -1755,6 +1854,7 @@ def _evidence_block(
     payload_refs: tuple[str, ...] = ("payload:test",),
     artifact_refs: tuple[str, ...] = (),
     source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
+    turn_group_id: str | None = "run:test",
 ) -> RunInputMaterialBlock:
     """构造 evidence material block。
 
@@ -1764,6 +1864,7 @@ def _evidence_block(
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
     :param source_locator_refs: source locator refs。
+    :param turn_group_id: Host Run turn group id。
     :returns: RunInputMaterialBlock。
     """
 
@@ -1774,6 +1875,7 @@ def _evidence_block(
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
         accepted_evidence_id=f"evidence:{block_id}",
         tool_result_event_ref=f"tool-result:{block_id}",
         tool_call_event_ref=f"tool-call:{block_id}",

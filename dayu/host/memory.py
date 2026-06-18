@@ -1976,14 +1976,14 @@ def _limit_selected_recent_window(
     :param items: 候选 items。
     :param policy: memory policy。
     :returns: 裁剪后的 items。
+    :raises ValueError: floor 依赖的 eligible item 缺少 run_id 时抛出。
     """
 
-    protected = tuple(
-        item
-        for item in items
-        if item.role
-        in (SelectedRecentWindowRole.USER, SelectedRecentWindowRole.ASSISTANT)
-    )[-policy.selected_recent_window_turn_floor :]
+    protected_run_ids = _protected_recent_run_ids(
+        items,
+        selected_recent_window_turn_floor=policy.selected_recent_window_turn_floor,
+    )
+    protected = tuple(item for item in items if item.run_id in protected_run_ids)
     protected_ids = {item.item_id for item in protected}
     selected_reversed: list[SelectedRecentWindowItem] = list(reversed(protected))
     used = sum(item.size_units.units for item in selected_reversed)
@@ -1998,6 +1998,58 @@ def _limit_selected_recent_window(
         used += item.size_units.units
     selected_ids = {item.item_id for item in selected_reversed}
     return tuple(item for item in items if item.item_id in selected_ids)
+
+
+def _protected_recent_run_ids(
+    items: tuple[SelectedRecentWindowItem, ...],
+    *,
+    selected_recent_window_turn_floor: int,
+) -> frozenset[str]:
+    """返回最近 N 个 Host Run turn group id。
+
+    :param items: selected recent window 候选 items。
+    :param selected_recent_window_turn_floor: 需要保护的 turn group 数。
+    :returns: 需要保护的 run_id 集合。
+    :raises ValueError: floor 依赖的 eligible item 缺少 run_id 时抛出。
+    """
+
+    if selected_recent_window_turn_floor == 0:
+        return frozenset()
+    eligible = tuple(item for item in items if _is_selected_recent_turn_item(item))
+    missing = tuple(item.item_id for item in eligible if item.run_id is None)
+    if len(missing) > 0:
+        raise ValueError("selected recent window item is missing run_id")
+    latest_by_run: dict[str, tuple[int, int]] = {}
+    for index, item in enumerate(eligible):
+        if item.run_id is None:
+            continue
+        current = latest_by_run.get(item.run_id)
+        candidate = (item.event_sequence, index)
+        if current is None or candidate > current:
+            latest_by_run[item.run_id] = candidate
+    ordered = tuple(
+        run_id
+        for run_id, _latest in sorted(
+            latest_by_run.items(),
+            key=lambda pair: (pair[1][0], pair[1][1], pair[0]),
+            reverse=True,
+        )
+    )
+    return frozenset(ordered[:selected_recent_window_turn_floor])
+
+
+def _is_selected_recent_turn_item(item: SelectedRecentWindowItem) -> bool:
+    """判断 item 是否属于 Host Run turn group recent material。
+
+    :param item: selected recent window item。
+    :returns: 属于 user / assistant / evidence recent material 时返回 ``True``。
+    """
+
+    return item.role in (
+        SelectedRecentWindowRole.USER,
+        SelectedRecentWindowRole.ASSISTANT,
+        SelectedRecentWindowRole.EVIDENCE,
+    )
 
 
 def _limit_facts(

@@ -838,6 +838,7 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
             CompactMaterialBlockKind.USER_INPUT,
             "older raw turn",
             event_sequence=1,
+            turn_group_id="run-old",
         ),
         _material_block(
             "history:blocked",
@@ -845,6 +846,7 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
             CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             "x" * 180,
             event_sequence=3,
+            turn_group_id="run-blocked",
         ),
         _material_block(
             "history:recent",
@@ -852,6 +854,7 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
             CompactMaterialBlockKind.USER_INPUT,
             "recent raw turn",
             event_sequence=4,
+            turn_group_id="run-recent",
         ),
         _material_block(
             "current:event-current",
@@ -865,6 +868,7 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
 
     first = build_recent_window_fallback_selection(
         policy=policy,
+        memory_policy=_memory_policy(),
         session_id="session-fallback",
         run_id="run-fallback",
         material_blocks=blocks,
@@ -875,6 +879,7 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
     )
     second = build_recent_window_fallback_selection(
         policy=policy,
+        memory_policy=_memory_policy(),
         session_id="session-fallback",
         run_id="run-fallback",
         material_blocks=blocks,
@@ -898,6 +903,330 @@ def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None
     assert first.blocked_next_block_id == "history:blocked"
     assert first.to_window_payload()["selected_raw_turn_count"] == 1
     assert budget.hard_budget_passed is True
+
+
+def test_recent_window_fallback_floor_preserves_turn_group_blocks_over_caps() -> None:
+    """fallback floor 按 turn group 保留全部 eligible blocks，且不受 caps 裁剪。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=500,
+        soft_threshold_tokens=300,
+        hard_threshold_tokens=420,
+        policy_ref="test-fallback-policy",
+    )
+    memory_policy = MemoryProjectionPolicy(
+        context_window_size=8192,
+        selected_recent_window_item_cap=4,
+        selected_recent_window_char_cap=4096,
+        selected_recent_window_turn_floor=1,
+        fallback_selected_recent_window_item_cap=1,
+        fallback_selected_recent_window_char_cap=10,
+        evidence_fact_item_cap=16,
+        evidence_fact_char_cap=2048,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=4,
+        answer_anchor_char_cap=1024,
+        forward_intent_item_cap=4,
+        forward_intent_char_cap=1024,
+        reference_continuity_item_cap=4,
+        reference_continuity_char_cap=1024,
+        reference_continuity_item_floor=0,
+        max_lag_events_for_inline_delta=4,
+        max_delta_repair_events=16,
+        policy_ref="run-input-builder-test",
+    )
+    blocks = (
+        _material_block(
+            "old:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "old",
+            event_sequence=1,
+            turn_group_id="run-old",
+        ),
+        _material_block(
+            "new:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "new user",
+            event_sequence=2,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "new:answer",
+            CompactMaterialSection.ANSWER_MATERIAL,
+            CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            "new answer",
+            event_sequence=3,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "new:evidence",
+            CompactMaterialSection.EVIDENCE_MATERIAL,
+            CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+            "new evidence",
+            event_sequence=4,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=5,
+            source_ref="event-current",
+        ),
+    )
+
+    selection = build_recent_window_fallback_selection(
+        policy=policy,
+        memory_policy=memory_policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=5,
+        selected_recent_window_turn_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+
+    assert selection.selected_block_ids == (
+        "new:user",
+        "new:answer",
+        "new:evidence",
+        "current:event-current",
+    )
+    assert "old:user" in selection.dropped_block_ids
+
+
+def test_recent_window_fallback_caps_stop_without_later_backfill() -> None:
+    """fallback caps 拒绝下一 whole block 后不选择更旧 block 规避顺序。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=500,
+        soft_threshold_tokens=300,
+        hard_threshold_tokens=420,
+        policy_ref="test-fallback-policy",
+    )
+    memory_policy = _memory_policy(
+        selected_recent_window_char_cap=120,
+        fallback_selected_recent_window_char_cap=120,
+    )
+    blocks = (
+        _material_block(
+            "old:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "old",
+            event_sequence=1,
+            turn_group_id="run-old",
+        ),
+        _material_block(
+            "mid:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "m" * 150,
+            event_sequence=2,
+            turn_group_id="run-mid",
+        ),
+        _material_block(
+            "new:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "new",
+            event_sequence=3,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=4,
+            source_ref="event-current",
+        ),
+    )
+
+    selection = build_recent_window_fallback_selection(
+        policy=policy,
+        memory_policy=memory_policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=4,
+        selected_recent_window_turn_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+
+    assert selection.selected_block_ids == ("new:user", "current:event-current")
+    assert selection.blocked_next_block_id == "mid:user"
+    assert "old:user" in selection.dropped_block_ids
+
+
+def test_recent_window_fallback_hard_budget_rolls_back_appended_block() -> None:
+    """追加 block 超 hard budget 时整块回滚并停止。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=140,
+        soft_threshold_tokens=90,
+        hard_threshold_tokens=105,
+        policy_ref="test-fallback-policy",
+    )
+    memory_policy = _memory_policy(
+        selected_recent_window_char_cap=4096,
+        fallback_selected_recent_window_char_cap=4096,
+    )
+    blocks = (
+        _material_block(
+            "old:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "old",
+            event_sequence=1,
+            turn_group_id="run-old",
+        ),
+        _material_block(
+            "mid:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "m" * 2000,
+            event_sequence=2,
+            turn_group_id="run-mid",
+        ),
+        _material_block(
+            "new:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "new",
+            event_sequence=3,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=4,
+            source_ref="event-current",
+        ),
+    )
+
+    selection = build_recent_window_fallback_selection(
+        policy=policy,
+        memory_policy=memory_policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=4,
+        selected_recent_window_turn_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+
+    assert selection.selected_block_ids == ("new:user", "current:event-current")
+    assert selection.blocked_next_block_id == "mid:user"
+    budget = estimate_recent_window_fallback_budget(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        selection_blocks=selection.selected_blocks,
+        current_input_ref="event-current",
+    )
+    assert budget.hard_budget_passed is True
+
+
+def test_recent_window_fallback_floor_only_over_hard_budget_is_fail_closed_input() -> None:
+    """floor-only 超 hard budget 时 selection 不裁剪 floor，预算结果由调用方 fail closed。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=90,
+        soft_threshold_tokens=50,
+        hard_threshold_tokens=70,
+        policy_ref="test-fallback-policy",
+    )
+    blocks = (
+        _material_block(
+            "new:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "n" * 210,
+            event_sequence=1,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=2,
+            source_ref="event-current",
+        ),
+    )
+
+    selection = build_recent_window_fallback_selection(
+        policy=policy,
+        memory_policy=_memory_policy(),
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=2,
+        selected_recent_window_turn_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+    budget = estimate_recent_window_fallback_budget(
+        policy=policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        selection_blocks=selection.selected_blocks,
+        current_input_ref="event-current",
+    )
+
+    assert selection.selected_block_ids == ("new:user", "current:event-current")
+    assert budget.hard_budget_passed is False
+
+
+def test_recent_window_fallback_rejects_missing_turn_group_id_for_floor() -> None:
+    """floor 依赖的 eligible fallback block 缺 turn_group_id 时不静默跳过。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=500,
+        soft_threshold_tokens=300,
+        hard_threshold_tokens=420,
+        policy_ref="test-fallback-policy",
+    )
+    blocks = (
+        _material_block(
+            "missing:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "missing",
+            event_sequence=1,
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=2,
+            source_ref="event-current",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="missing turn_group_id"):
+        build_recent_window_fallback_selection(
+            policy=policy,
+            memory_policy=_memory_policy(),
+            session_id="session-fallback",
+            run_id="run-fallback",
+            material_blocks=blocks,
+            current_input_ref="event-current",
+            input_cursor=2,
+            selected_recent_window_turn_floor=1,
+            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        )
 
 
 def test_recent_window_fallback_estimate_covers_normal_empty_stable_and_over_budget() -> None:
@@ -1987,12 +2316,14 @@ def _memory_policy(
     *,
     max_lag_events_for_inline_delta: int = 4,
     selected_recent_window_char_cap: int = 4096,
+    fallback_selected_recent_window_char_cap: int = 1024,
     evidence_fact_char_cap: int = 2048,
 ) -> MemoryProjectionPolicy:
     """构造 RunInputBuilder memory provider 测试 policy。
 
     :param max_lag_events_for_inline_delta: inline repair 最大滞后事件数。
     :param selected_recent_window_char_cap: selected recent window 字符上限。
+    :param fallback_selected_recent_window_char_cap: fallback recent window 字符上限。
     :param evidence_fact_char_cap: evidence fact 字符上限。
     :returns: memory projection policy。
     """
@@ -2003,7 +2334,7 @@ def _memory_policy(
         selected_recent_window_char_cap=selected_recent_window_char_cap,
         selected_recent_window_turn_floor=2,
         fallback_selected_recent_window_item_cap=4,
-        fallback_selected_recent_window_char_cap=1024,
+        fallback_selected_recent_window_char_cap=fallback_selected_recent_window_char_cap,
         evidence_fact_item_cap=16,
         evidence_fact_char_cap=evidence_fact_char_cap,
         evidence_fact_floor=1,
@@ -2051,6 +2382,7 @@ def _material_block(
     *,
     event_sequence: int | None,
     source_ref: str | None = None,
+    turn_group_id: str | None = None,
 ) -> RunInputMaterialBlock:
     """构造测试用 material block。
 
@@ -2060,9 +2392,26 @@ def _material_block(
     :param text: block 文本。
     :param event_sequence: event sequence。
     :param source_ref: canonical source ref；不传时使用 block id。
+    :param turn_group_id: Host Run turn group id。
     :returns: RunInputMaterialBlock。
     """
 
+    if kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        return run_input_material_block(
+            block_id=block_id,
+            section=section,
+            kind=kind,
+            text=text,
+            canonical_source_refs=(block_id if source_ref is None else source_ref,),
+            event_sequence=event_sequence,
+            turn_group_id=turn_group_id,
+            accepted_evidence_id=f"evidence:{block_id}",
+            tool_result_event_ref=f"tool-result:{block_id}",
+            tool_call_event_ref=f"tool-call:{block_id}",
+            readable_tool_name="read_tool",
+            readable_query_text="query",
+            readable_source_text="source",
+        )
     return run_input_material_block(
         block_id=block_id,
         section=section,
@@ -2070,6 +2419,7 @@ def _material_block(
         text=text,
         canonical_source_refs=(block_id if source_ref is None else source_ref,),
         event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
     )
 
 

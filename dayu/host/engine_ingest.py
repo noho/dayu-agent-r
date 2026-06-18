@@ -501,6 +501,7 @@ class _ReactiveCompactPending:
     :param estimate: reactive compact 前估算。
     :param decision: reactive compact 前预算决策。
     :param policy: reactive context budget policy。
+    :param memory_projection_policy: reactive fallback selected window policy。
     :param selected_recent_window_turn_floor: fallback selected recent-window turn floor。
     """
 
@@ -516,6 +517,7 @@ class _ReactiveCompactPending:
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
     policy: ContextBudgetPolicy
+    memory_projection_policy: MemoryProjectionPolicy
     selected_recent_window_turn_floor: int
 
 
@@ -1399,6 +1401,7 @@ class EngineEventIngestor:
             estimate=estimate,
             decision=decision,
             policy=policy,
+            memory_projection_policy=self._memory_projection_policy,
             selected_recent_window_turn_floor=(
                 self._memory_projection_policy.selected_recent_window_turn_floor
             ),
@@ -3748,6 +3751,7 @@ def _reactive_fallback_decision(
     try:
         selection = build_recent_window_fallback_selection(
             policy=pending.policy,
+            memory_policy=pending.memory_projection_policy,
             session_id=pending.context.run.session_id,
             run_id=pending.context.run.run_id,
             material_blocks=pending.frozen_material_blocks,
