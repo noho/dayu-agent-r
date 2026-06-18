@@ -86,13 +86,9 @@ _INITIAL_REASON_TRACE = "initial_trace_material"
 _INITIAL_REASON_EVIDENCE = "initial_evidence_material"
 _INITIAL_REASON_PREVIOUS = "initial_previous_compacted_view"
 _INITIAL_REASON_ANSWER = "initial_answer_material"
-CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS = 1200
-"""Current input anchor 允许直接暴露给 LLM 的最大字符数。"""
-
 EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS = 4096
 """单个 evidence block 直接暴露给 LLM 前的确定性 chunk 字符上限。"""
 
-_CURRENT_INPUT_TRUNCATED_MARKER = "\n[truncated_current_input_anchor]"
 _NO_EVENT_SEQUENCE = 0
 _DEFAULT_EVENT_SUB_INDEX = 0
 _REASON_SELECTED = "selected"
@@ -218,6 +214,7 @@ class RunInputMaterialBlock:
     :param canonical_source_refs: canonical source refs。
     :param content_digest: 完整内容 digest。
     :param event_sequence: 来源 EventLog sequence；stable memory block 可为 ``None``。
+    :param turn_group_id: Host admitted user Run id；stable semantic block 可为 ``None``。
     :param event_sub_index: 同一 event 内的稳定子序。
     :param source_labels: prompt-local source labels。
     :param already_represented: 是否已被 accepted compact output / stable fact 充分代表。
@@ -241,6 +238,7 @@ class RunInputMaterialBlock:
     canonical_source_refs: tuple[str, ...]
     content_digest: str
     event_sequence: int | None
+    turn_group_id: str | None = None
     event_sub_index: int = _DEFAULT_EVENT_SUB_INDEX
     source_labels: tuple[PromptLocalMaterialLabel, ...] = ()
     already_represented: bool = False
@@ -278,6 +276,7 @@ class RunInputMaterialBlock:
         _require_non_empty_text(self.content_digest, "RunInputMaterialBlock.content_digest")
         if self.event_sequence is not None and self.event_sequence < 0:
             raise ValueError("RunInputMaterialBlock.event_sequence must be non-negative")
+        _require_optional_text(self.turn_group_id, "RunInputMaterialBlock.turn_group_id")
         if self.event_sub_index < 0:
             raise ValueError("RunInputMaterialBlock.event_sub_index must be non-negative")
         _require_string_tuple(self.source_labels, "RunInputMaterialBlock.source_labels")
@@ -781,6 +780,7 @@ def run_input_material_block(
     text: str,
     canonical_source_refs: tuple[str, ...],
     event_sequence: int | None,
+    turn_group_id: str | None = None,
     event_sub_index: int = _DEFAULT_EVENT_SUB_INDEX,
     source_labels: tuple[PromptLocalMaterialLabel, ...] = (),
     already_represented: bool = False,
@@ -803,6 +803,7 @@ def run_input_material_block(
     :param text: 原始或已规范化文本。
     :param canonical_source_refs: canonical source refs。
     :param event_sequence: 来源 EventLog sequence；stable block 可为 ``None``。
+    :param turn_group_id: Host admitted user Run id；stable semantic block 可为 ``None``。
     :param event_sub_index: 同 event 内稳定子序。
     :param source_labels: prompt-local source labels。
     :param already_represented: 是否已被 compact output / stable fact 代表。
@@ -831,6 +832,7 @@ def run_input_material_block(
         canonical_source_refs=canonical_source_refs,
         content_digest=_text_digest(normalized),
         event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
         event_sub_index=event_sub_index,
         source_labels=source_labels,
         already_represented=already_represented,
@@ -1988,6 +1990,7 @@ def _user_input_delta_block(
         text=_required_json_text(payload, _PAYLOAD_FIELD_DISPLAY_TEXT),
         canonical_source_refs=(row.event_id,),
         event_sequence=row.event_sequence,
+        turn_group_id=row.run_id,
     )
 
 
@@ -2022,6 +2025,7 @@ def _assistant_answer_delta_block(
         text=answer_text,
         canonical_source_refs=(row.event_id,),
         event_sequence=row.event_sequence,
+        turn_group_id=row.run_id,
     )
 
 
@@ -2090,6 +2094,7 @@ def _accepted_tool_evidence_delta_blocks(
             text=raw_text,
             canonical_source_refs=(envelope.evidence_id,),
             event_sequence=row.event_sequence,
+            turn_group_id=row.run_id,
             accepted_evidence_id=envelope.evidence_id,
             tool_result_event_ref=row.event_id,
             tool_call_event_ref=tool_call_event_ref,
@@ -2359,20 +2364,13 @@ def _current_input_anchor(current_input_ref: str, current_input_text: str) -> Cu
     :returns: CurrentInputAnchor。
     """
 
-    normalized = normalized_material_text(current_input_text)
-    if len(normalized) <= CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS:
-        anchor_text = normalized
-        truncated = False
-    else:
-        prefix_len = CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS - len(_CURRENT_INPUT_TRUNCATED_MARKER)
-        anchor_text = normalized[:prefix_len].rstrip() + _CURRENT_INPUT_TRUNCATED_MARKER
-        truncated = True
+    anchor_text = normalized_material_text(current_input_text)
     return CurrentInputAnchor(
         anchor_label=current_input_anchor_label(),
         anchor_text=anchor_text,
-        truncated=truncated,
+        truncated=False,
         canonical_source_refs=(current_input_ref,),
-        content_digest=_text_digest(normalized),
+        content_digest=_text_digest(anchor_text),
     )
 
 
@@ -3426,7 +3424,6 @@ def _require_non_empty_text(value: str | None, field_name: str) -> None:
 
 
 __all__ = [
-    "CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS",
     "EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS",
     "CompactMaterialBuildError",
     "CompactMaterialSourceBoundary",

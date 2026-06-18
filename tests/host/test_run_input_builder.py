@@ -812,6 +812,7 @@ def test_run_input_builder_exposes_shared_material_block_source(
         assert blocks[0].kind is CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR
         assert blocks[0].text == "current prompt"
         assert blocks[0].canonical_source_refs == ("event-current-input",)
+        assert blocks[0].turn_group_id == seeded.run_id
 
 
 def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None:

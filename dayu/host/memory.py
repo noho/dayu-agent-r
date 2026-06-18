@@ -1253,7 +1253,11 @@ def project_conversation_memory_event(
     elif event.event_type == _EVENT_TYPE_CONTEXT_COMPACTED:
         accepted = _accepted_candidate_mapping(event.payload)
         latest_compaction_event_ref = event.event_id
-        session_summary = _session_summary_from_accepted_event(event, policy)
+        session_summary, summary_diagnostics = _session_summary_from_accepted_event(
+            event,
+            policy,
+        )
+        diagnostics = diagnostics + summary_diagnostics
         new_facts, fact_diagnostics = _facts_from_accepted_event(event, policy)
         diagnostics = diagnostics + fact_diagnostics
         facts = _merge_facts(facts, new_facts)
@@ -1710,36 +1714,37 @@ def _accepted_candidate_mapping(
 
 def _session_summary_from_accepted_event(
     event: MemoryProjectionEvent, policy: MemoryProjectionPolicy
-) -> SessionSummaryMemoryView:
+) -> tuple[SessionSummaryMemoryView, tuple[MemoryDiagnostic, ...]]:
     """从 accepted compact event 物化 Session Summary Memory。
 
     :param event: CONTEXT_COMPACTED event。
     :param policy: memory policy。
-    :returns: session summary view。
+    :returns: session summary view 与 diagnostics。
     """
 
     candidate = _accepted_candidate_mapping(event.payload)
     value = _required_value(candidate, _PAYLOAD_FIELD_SESSION_SUMMARY)
     if value is None:
-        return SessionSummaryMemoryView(
-            summary_text=None,
-            source_refs=(),
-            event_id=None,
-            event_sequence=None,
-            size_units=MemorySizeUnits(0),
-        )
+        return _empty_session_summary_memory(), ()
     summary = _as_mapping(value, _PAYLOAD_FIELD_SESSION_SUMMARY)
-    text = _bounded_text(
-        _required_str(summary, _PAYLOAD_FIELD_SUMMARY_TEXT),
-        policy.session_summary_char_cap,
-    )
+    text = _required_str(summary, _PAYLOAD_FIELD_SUMMARY_TEXT)
+    if len(text) > policy.session_summary_char_cap:
+        item_id = _item_id(event, "session_summary")
+        return _empty_session_summary_memory(), (
+            _budget_diagnostic(
+                event_sequence=event.event_sequence,
+                item_id=item_id,
+                policy_digest=digest_memory_projection_policy(policy),
+                message="session summary dropped by memory policy",
+            ),
+        )
     return SessionSummaryMemoryView(
         summary_text=text,
         source_refs=_required_text_tuple(summary, _PAYLOAD_FIELD_SOURCE_LABELS),
         event_id=event.event_id,
         event_sequence=event.event_sequence,
         size_units=estimate_memory_size_units(text),
-    )
+    ), ()
 
 
 def _facts_from_accepted_event(
@@ -1800,26 +1805,37 @@ def _facts_from_accepted_event(
         _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF,
     )
     facts: list[EvidenceBackedFactView] = []
+    diagnostics: list[MemoryDiagnostic] = []
+    policy_digest = digest_memory_projection_policy(policy)
     for index, fact in enumerate(fact_values):
-        claim_text = _bounded_text(
-            _required_str(fact, _PAYLOAD_FIELD_CLAIM_TEXT),
-            policy.evidence_fact_char_cap,
-        )
+        claim_text = _required_str(fact, _PAYLOAD_FIELD_CLAIM_TEXT)
+        item_id = _item_id(event, f"evidence_fact:{index + 1}")
+        if len(claim_text) > policy.evidence_fact_char_cap:
+            diagnostics.append(
+                _budget_diagnostic(
+                    event_sequence=event.event_sequence,
+                    item_id=item_id,
+                    policy_digest=policy_digest,
+                    message="evidence fact dropped by memory policy",
+                )
+            )
+            continue
         labels = _required_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
         if len(labels) == 0:
             return (
                 (),
-                (
+                tuple(diagnostics)
+                + (
                     _fact_candidate_invalid_diagnostic(
                         event,
-                        policy_digest=digest_memory_projection_policy(policy),
+                        policy_digest=policy_digest,
                         message="fact candidate has no evidence label",
                     ),
                 ),
             )
         facts.append(
             EvidenceBackedFactView(
-                item_id=_item_id(event, f"evidence_fact:{index + 1}"),
+                item_id=item_id,
                 claim_text=claim_text,
                 evidence_kind=MemoryEvidenceBackedFactKind.DERIVED_FROM_EVIDENCE,
                 evidence_refs=evidence_refs,
@@ -1832,7 +1848,22 @@ def _facts_from_accepted_event(
                 size_units=estimate_memory_size_units(claim_text),
             )
         )
-    return tuple(facts), ()
+    return tuple(facts), tuple(diagnostics)
+
+
+def _empty_session_summary_memory() -> SessionSummaryMemoryView:
+    """构造空 Session Summary Memory view。
+
+    :returns: 空 session summary view。
+    """
+
+    return SessionSummaryMemoryView(
+        summary_text=None,
+        source_refs=(),
+        event_id=None,
+        event_sequence=None,
+        size_units=MemorySizeUnits(0),
+    )
 
 
 def _answer_anchors_from_accepted_event(
@@ -2931,19 +2962,6 @@ def _user_visible_text(event: MemoryProjectionEvent) -> str:
     if display_text is not None:
         return display_text
     return _USER_INPUT_TEXT_UNAVAILABLE
-
-
-def _bounded_text(text: str, char_cap: int) -> str:
-    """按字符上限裁剪文本。
-
-    :param text: 原始文本。
-    :param char_cap: 字符上限。
-    :returns: 裁剪后文本。
-    """
-
-    if len(text) <= char_cap:
-        return text
-    return text[:char_cap]
 
 
 def _normalized_text(text: str) -> str:

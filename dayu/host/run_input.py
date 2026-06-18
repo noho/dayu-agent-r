@@ -1440,6 +1440,7 @@ def build_accepted_tool_evidence_material_blocks(
         selected_evidence_block_refs=selected_refs,
     )
     sequence_by_event_id = {row.event_id: row.event_sequence for row in rows}
+    run_id_by_event_id = {row.event_id: row.run_id for row in rows}
     represented = frozenset(represented_evidence_refs)
     blocks: list[RunInputMaterialBlock] = []
     for index, material in enumerate(inputs.evidence_materials):
@@ -1457,6 +1458,7 @@ def build_accepted_tool_evidence_material_blocks(
                 text=material.raw_result_text,
                 canonical_source_refs=(material.canonical_source_ref,),
                 event_sequence=sequence_by_event_id[material.tool_result_event_ref],
+                turn_group_id=run_id_by_event_id[material.tool_result_event_ref],
                 event_sub_index=index,
                 accepted_evidence_id=material.accepted_evidence_id,
                 tool_result_event_ref=material.tool_result_event_ref,
@@ -2478,6 +2480,7 @@ def build_run_input_material_blocks(
             text=current_facts.user_prompt,
             canonical_source_refs=(current_facts.user_input_event.event_id,),
             event_sequence=current_facts.user_input_event.event_sequence,
+            turn_group_id=current_facts.run.run_id,
         )
     )
     return tuple(blocks)

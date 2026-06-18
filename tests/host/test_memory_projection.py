@@ -679,7 +679,7 @@ def test_accepted_tool_evidence_rejects_result_preview() -> None:
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:
-    """Evidence facts 超过 section cap 时截断并记录 budget diagnostic。"""
+    """Evidence facts 超过 section item cap 时整体丢弃并记录 budget diagnostic。"""
 
     policy = replace(_policy(), evidence_fact_item_cap=1, evidence_fact_floor=0)
     snapshot = build_conversation_memory_snapshot_from_events(
@@ -706,6 +706,100 @@ def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() 
         fact.claim_text
         for fact in snapshot.evidence_fact_memory.evidence_backed_facts
     ) == ("新 fact 应被保留。",)
+    assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
+        diagnostic.reason for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_accepted_compact_drops_oversized_fact_without_prefix_text() -> None:
+    """超出 fact char cap 的 compact fact 整体丢弃，不返回前缀文本。"""
+
+    policy = replace(_policy(), evidence_fact_char_cap=8, evidence_fact_floor=0)
+    long_claim = "这是一条超过上限且不能被前缀截断的完整事实。"
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-oversized-fact",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(facts=[_fact(long_claim)]),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
+    assert long_claim[: policy.evidence_fact_char_cap] not in tuple(
+        fact.claim_text for fact in snapshot.evidence_fact_memory.evidence_backed_facts
+    )
+    assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
+        diagnostic.reason for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_accepted_compact_preserves_budget_diagnostic_before_invalid_fact() -> None:
+    """oversized fact 后续遇到 invalid fact 时保留已记录 budget diagnostic。"""
+
+    policy = replace(_policy(), evidence_fact_char_cap=8, evidence_fact_floor=0)
+    invalid_fact = _fact("无标签")
+    invalid_fact["evidence_labels"] = []
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-oversized-then-invalid-fact",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(
+                    facts=[
+                        _fact("这是一条超过上限的完整事实。"),
+                        invalid_fact,
+                    ]
+                ),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
+    assert tuple(diagnostic.reason for diagnostic in snapshot.diagnostics) == (
+        MemoryDiagnosticReason.BUDGET_LIMIT_REACHED,
+        MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID,
+    )
+
+
+def test_accepted_compact_drops_oversized_summary_without_prefix_text() -> None:
+    """超出 summary char cap 的 compact summary 整体丢弃，不返回前缀文本。"""
+
+    policy = replace(_policy(), session_summary_char_cap=8)
+    long_summary = "用户需要完整保留的长 summary，不能静默截断。"
+    payload = _accepted_compact_payload()
+    candidate = cast(dict[str, JsonValue], payload["accepted_candidate"])
+    candidate["session_summary"] = {
+        "summary_text": long_summary,
+        "source_labels": ["u1"],
+    }
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-oversized-summary",
+                CONTEXT_COMPACTED,
+                payload,
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.session_summary_memory.summary_text is None
     assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
         diagnostic.reason for diagnostic in snapshot.diagnostics
     )

@@ -957,10 +957,38 @@ def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
     )
     assert evidence_map["E1.1"].accepted_evidence_id == "evidence:evidence-large"
     assert evidence_map["E1.2"].accepted_evidence_id == "evidence:evidence-large"
+    assert evidence_map["E1.1"].canonical_source_refs == ("event:evidence-large",)
+    assert evidence_map["E1.2"].canonical_source_refs == ("event:evidence-large",)
+    assert evidence_map["E1.1"].payload_refs == ("payload:evidence-large",)
+    assert evidence_map["E1.2"].payload_refs == ("payload:evidence-large",)
     assert evidence_map["E1.1"].chunk_parent_label == "E1"
     assert evidence_map["E1.2"].chunk_parent_label == "E1"
     assert evidence_map["E1.1"].chunk_ordinal == 1
     assert evidence_map["E1.2"].chunk_ordinal == 2
+
+
+def test_current_input_anchor_keeps_whole_text_without_private_cap() -> None:
+    """current input anchor 不再按私有字符上限截断。"""
+
+    long_current_input = "current " + ("segment " * 400)
+    pack = build_compact_material_pack(
+        selected_segment=select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=1,
+            memory_snapshot_cursor=None,
+            policy_digest=_POLICY_DIGEST,
+            material_blocks=(),
+        ),
+        material_blocks=(),
+        memory_snapshot=None,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current-long",
+        current_input_text=long_current_input,
+    )
+
+    expected = " ".join(long_current_input.split())
+    assert pack.current_input_anchor.anchor_text == expected
+    assert pack.current_input_anchor.truncated is False
 
 
 def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp_path: Path) -> None:
@@ -981,6 +1009,7 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
                 event_id="event-user-old",
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "old user question"},
+                run_id="run-old",
             )
             answer = _append_event(
                 transaction,
@@ -988,11 +1017,13 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
                 event_id="event-answer-old",
                 event_type="RUN_SUCCEEDED",
                 payload={"final_answer": "old assistant answer"},
+                run_id="run-old",
             )
             evidence = _append_tool_result_event(
                 transaction,
                 event_log,
                 event_id="event-tool-result-old",
+                run_id="run-old",
             )
             current = _append_event(
                 transaction,
@@ -1000,6 +1031,7 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
                 event_id="event-current-input",
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "current user question"},
+                run_id="run:event-current-input",
             )
             assert user.event_sequence < answer.event_sequence < evidence.event_sequence
             return _run_row(current)
@@ -1034,6 +1066,11 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
             CompactMaterialBlockKind.USER_INPUT,
             CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+        )
+        assert tuple(block.turn_group_id for block in view.material_blocks) == (
+            "run-old",
+            "run-old",
+            "run-old",
         )
         assert "current user question" not in tuple(
             block.text for block in view.material_blocks
@@ -1823,6 +1860,7 @@ def _append_event(
     event_id: str,
     event_type: str,
     payload: JsonValue,
+    run_id: str | None = None,
 ) -> EventLogRow:
     """向测试 EventLog 追加 canonical fact。
 
@@ -1831,6 +1869,7 @@ def _append_event(
     :param event_id: event id。
     :param event_type: event type。
     :param payload: inline payload JSON。
+    :param run_id: 可选 Host Run id。
     :returns: appended EventLog row。
     """
 
@@ -1840,7 +1879,7 @@ def _append_event(
             event_id=event_id,
             event_class=EventClass.CANONICAL_FACT,
             session_id=_SESSION_ID,
-            run_id=None,
+            run_id=run_id,
             attempt_id=None,
             execution_id=None,
             event_type=event_type,
@@ -1865,6 +1904,7 @@ def _append_tool_call_requested_event(
     event_id: str,
     tool_call_id: str,
     semantic_query_text: str,
+    run_id: str | None = None,
 ) -> EventLogRow:
     """追加带完整 request atom 的 TOOL_CALL_REQUESTED。
 
@@ -1873,6 +1913,7 @@ def _append_tool_call_requested_event(
     :param event_id: event id。
     :param tool_call_id: tool call id。
     :param semantic_query_text: 业务可读 query 文本。
+    :param run_id: 可选 Host Run id。
     :returns: appended EventLog row。
     """
 
@@ -1886,6 +1927,7 @@ def _append_tool_call_requested_event(
         event_log,
         event_id=event_id,
         event_type="TOOL_CALL_REQUESTED",
+        run_id=run_id,
         payload={
             "tool_call_id": tool_call_id,
             "tool_name": "fins.search",
@@ -1916,6 +1958,7 @@ def _append_tool_result_event(
     tool_call_requested_event_ref: str | None = None,
     tool_call_id: str | None = None,
     normalized_arguments_digest: str = _DIGEST,
+    run_id: str | None = None,
 ) -> EventLogRow:
     """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
 
@@ -1925,6 +1968,7 @@ def _append_tool_result_event(
     :param tool_call_requested_event_ref: 可选 TOOL_CALL_REQUESTED event ref。
     :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
     :param normalized_arguments_digest: envelope 参数 digest。
+    :param run_id: 可选 Host Run id。
     :returns: appended EventLog row。
     """
 
@@ -1939,6 +1983,7 @@ def _append_tool_result_event(
         event_log,
         event_id=event_id,
         event_type="TOOL_RESULT_ACCEPTED",
+        run_id=run_id,
         payload={
             "accepted_evidence_envelope": (
                 accepted_evidence_envelope_to_json_value(envelope)
