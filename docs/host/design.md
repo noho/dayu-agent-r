@@ -2814,7 +2814,7 @@ current input anchor 单独传入 `assemble(...)`，不得被当作历史 materi
 
 `selected_recent_window` 不是第六类 Semantic Memory。它是 `post_compact_delta_material` 的 bounded recent context view，可以包含 user input、assistant final answer、user-visible run outcome material 与 readable evidence material；`trace_memory.reference_continuity_items` 才是 compact 后属于 Trace Memory 的 semantic item。把 selected recent window 当成独立 semantic memory 会混淆 compacted view 与 post-compact delta material，也会让 fallback 漂移成另一套 memory 系统。
 
-`memory_projection_policy` 是 Host 内部 LLM-facing memory / material 产量的唯一 policy owner，至少覆盖 `selected_recent_window_policy`、`fallback_selected_recent_window_policy`、`protected_recent_floor_policy`、`semantic_memory_section_caps`、`projection_repair_policy` / parser safety guard policy。JSON 配置是否保持 flat 属于实现形态，不是本设计真源要固定的要求；但 Host 内部不得用 DTO 私有 cap、renderer 私有截断值或零散常量作为另一套 LLM-facing material 产量真源。
+`memory_projection_policy` 是 Host 内部 LLM-facing memory / material 产量的唯一 policy owner，至少覆盖 `selected_recent_window_policy`、`fallback_selected_recent_window_policy`、`protected_recent_floor_policy`、`semantic_memory_section_caps` 与 `projection_repair_policy`。JSON 配置是否保持 flat 属于实现形态，不是本设计真源要固定的要求；但 Host 内部不得用 DTO 私有 cap、renderer 私有截断值或零散常量作为另一套 LLM-facing material 产量真源。
 
 Compact material 的真源是 Host durable EventLog、payload descriptor 与 artifact。构造 compact input 时，Host 必须从这些真源读取 latest accepted compact event、post-compact delta canonical material 与当前 input anchor；不得依赖 Conversation Memory projection checkpoint 作为 compact input 是否可构造的前置真源。Conversation Memory projection 是 accepted compact 之后的 read model 物化路径，不是 compact operation 的材料所有者。
 

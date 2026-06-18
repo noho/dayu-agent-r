@@ -40,8 +40,6 @@ from dayu.host.compaction import (
     ConversationCompactOutputVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
-    MAX_VNEXT_ANSWER_ANCHOR_ITEMS,
-    MAX_VNEXT_FACT_ITEMS,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
@@ -68,6 +66,8 @@ _UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "conversation_compact_output_v1"
 _INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
 _INTERNAL_COMPACT_INPUT_TYPE_NAME = "ConversationCompactInputVNext"
+_LARGE_COMPACT_FACT_COUNT = 80
+_LARGE_ANSWER_ANCHOR_CHILD_COUNT = 40
 
 
 def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
@@ -381,11 +381,11 @@ def test_parse_conversation_compact_output_vnext_reports_array_item_type_path() 
         )
 
 
-def test_parse_conversation_compact_output_vnext_reports_top_level_array_overlimit() -> None:
-    """vNext parser 对顶层数组超限返回顶层字段路径。
+def test_parse_conversation_compact_output_vnext_accepts_large_top_level_array() -> None:
+    """vNext parser 接受较大的顶层 compact material 数组。
 
     :returns: ``None``。
-    :raises AssertionError: parser 未返回顶层数组超限路径时抛出。
+    :raises AssertionError: parser 错误拒绝较大的顶层数组时抛出。
     """
 
     compact_input = conversation_compact_input_vnext_from_material_pack(
@@ -393,25 +393,23 @@ def test_parse_conversation_compact_output_vnext_reports_top_level_array_overlim
     )
     proposal = _proposal_json(compact_input)
     facts: list[JsonValue] = []
-    for _ in range(MAX_VNEXT_FACT_ITEMS + 1):
+    for _ in range(_LARGE_COMPACT_FACT_COUNT):
         facts.append(_fact_json())
     proposal["evidence_backed_facts"] = facts
 
-    with pytest.raises(
-        LLMCompactionProposalError,
-        match="evidence_backed_facts",
-    ):
-        parse_conversation_compact_output_vnext(
-            compact_input,
-            json.dumps(proposal, sort_keys=True),
-        )
+    parsed = parse_conversation_compact_output_vnext(
+        compact_input,
+        json.dumps(proposal, sort_keys=True),
+    )
+
+    assert len(parsed.evidence_backed_facts) == _LARGE_COMPACT_FACT_COUNT
 
 
-def test_parse_conversation_compact_output_vnext_reports_nested_array_overlimit() -> None:
-    """vNext parser 对嵌套数组超限返回完整字段路径。
+def test_parse_conversation_compact_output_vnext_accepts_large_nested_array() -> None:
+    """vNext parser 接受较大的嵌套 compact material 数组。
 
     :returns: ``None``。
-    :raises AssertionError: parser 未返回嵌套数组超限路径时抛出。
+    :raises AssertionError: parser 错误拒绝较大的嵌套数组时抛出。
     """
 
     compact_input = conversation_compact_input_vnext_from_material_pack(
@@ -419,7 +417,7 @@ def test_parse_conversation_compact_output_vnext_reports_nested_array_overlimit(
     )
     proposal = _proposal_json(compact_input)
     anchor_items: list[JsonValue] = []
-    for index in range(MAX_VNEXT_ANSWER_ANCHOR_ITEMS + 1):
+    for index in range(_LARGE_ANSWER_ANCHOR_CHILD_COUNT):
         anchor_items.append(
             {
                 "display_text": f"锚点 {index}",
@@ -434,14 +432,13 @@ def test_parse_conversation_compact_output_vnext_reports_nested_array_overlimit(
         }
     ]
 
-    with pytest.raises(
-        LLMCompactionProposalError,
-        match=r"answer_anchors\[0\]\.anchor_items",
-    ):
-        parse_conversation_compact_output_vnext(
-            compact_input,
-            json.dumps(proposal, sort_keys=True),
-        )
+    parsed = parse_conversation_compact_output_vnext(
+        compact_input,
+        json.dumps(proposal, sort_keys=True),
+    )
+
+    assert len(parsed.answer_anchors) == 1
+    assert len(parsed.answer_anchors[0].anchor_items) == _LARGE_ANSWER_ANCHOR_CHILD_COUNT
 
 
 def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() -> None:

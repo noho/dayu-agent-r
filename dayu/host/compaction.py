@@ -37,43 +37,6 @@ CONVERSATION_COMPACT_OUTPUT_SCHEMA_NAME_VNEXT = CONVERSATION_COMPACT_OUTPUT_SCHE
 CONVERSATION_COMPACT_GOAL_ROLL_FORWARD_SESSION_MEMORY = "roll_forward_session_memory"
 """vNext compact instruction 固定业务目标。"""
 
-MAX_VNEXT_SESSION_SUMMARY_CHARS = 2400
-"""vNext session summary 字符数上限。"""
-
-MAX_VNEXT_FACT_CLAIM_TEXT_CHARS = 2000
-"""vNext evidence-backed fact claim_text 字符数上限。"""
-
-MAX_VNEXT_ANSWER_ANCHOR_TEXT_CHARS = 1600
-"""vNext answer anchor 文本字段字符数上限。"""
-
-MAX_VNEXT_FORWARD_INTENT_TEXT_CHARS = 1200
-"""vNext forward intent 文本字段字符数上限。"""
-
-MAX_VNEXT_REFERENCE_CONTINUITY_TEXT_CHARS = 1200
-"""vNext reference continuity 文本字段字符数上限。"""
-
-MAX_VNEXT_DIAGNOSTIC_TEXT_CHARS = 1200
-"""vNext diagnostic text 字符数上限。"""
-
-MAX_VNEXT_SOURCE_LABELS_PER_ITEM = 16
-"""vNext 单个 candidate source labels 数量上限。"""
-
-MAX_VNEXT_FACT_ITEMS = 64
-"""vNext fact candidates 数量上限。"""
-
-MAX_VNEXT_ANSWER_ANCHOR_ITEMS = 32
-"""vNext answer anchors 数量上限。"""
-
-MAX_VNEXT_FORWARD_INTENT_ITEMS = 32
-"""vNext forward intents 数量上限。"""
-
-MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS = 32
-"""vNext reference continuity items 数量上限。"""
-
-MAX_VNEXT_DIAGNOSTIC_ITEMS = 32
-"""vNext diagnostics 数量上限。"""
-
-
 class CompactMaterialSection(StrEnum):
     """vNext compact material pack 的 LLM-facing section。"""
 
@@ -725,15 +688,11 @@ class ReadableFactItemVNext:
         """校验可读 fact。
 
         :returns: ``None``。
-        :raises ValueError: 文本为空或超长时抛出。
+        :raises ValueError: 文本为空时抛出。
         """
 
         _require_non_empty(self.source_label, field_name="ReadableFactItemVNext.source_label")
-        _require_bounded_non_empty_text(
-            self.claim_text,
-            field_name="ReadableFactItemVNext.claim_text",
-            max_chars=MAX_VNEXT_FACT_CLAIM_TEXT_CHARS,
-        )
+        _require_non_empty(self.claim_text, field_name="ReadableFactItemVNext.claim_text")
         _require_optional_non_empty(self.source_note, field_name="ReadableFactItemVNext.source_note")
 
     def to_json(self) -> JsonValue:
@@ -767,11 +726,7 @@ class ReadableAnswerAnchorItemVNext:
         :raises ValueError: 文本为空或序号非法时抛出。
         """
 
-        _require_bounded_non_empty_text(
-            self.display_text,
-            field_name="ReadableAnswerAnchorItemVNext.display_text",
-            max_chars=MAX_VNEXT_ANSWER_ANCHOR_TEXT_CHARS,
-        )
+        _require_non_empty(self.display_text, field_name="ReadableAnswerAnchorItemVNext.display_text")
         if self.ordinal is not None:
             _require_non_negative_int(self.ordinal, field_name="ReadableAnswerAnchorItemVNext.ordinal")
 
@@ -806,11 +761,7 @@ class ReadableAnswerAnchorVNext:
         """
 
         _require_non_empty(self.source_label, field_name="ReadableAnswerAnchorVNext.source_label")
-        _require_bounded_non_empty_text(
-            self.anchor_title,
-            field_name="ReadableAnswerAnchorVNext.anchor_title",
-            max_chars=MAX_VNEXT_ANSWER_ANCHOR_TEXT_CHARS,
-        )
+        _require_non_empty(self.anchor_title, field_name="ReadableAnswerAnchorVNext.anchor_title")
         _require_readable_answer_anchor_item_tuple(
             self.anchor_items,
             field_name="ReadableAnswerAnchorVNext.anchor_items",
@@ -858,11 +809,7 @@ class ReadableForwardIntentVNext:
             raise TypeError("ReadableForwardIntentVNext.intent_type is invalid")
         if not isinstance(self.status, ForwardIntentStatusVNext):
             raise TypeError("ReadableForwardIntentVNext.status is invalid")
-        _require_bounded_non_empty_text(
-            self.text,
-            field_name="ReadableForwardIntentVNext.text",
-            max_chars=MAX_VNEXT_FORWARD_INTENT_TEXT_CHARS,
-        )
+        _require_non_empty(self.text, field_name="ReadableForwardIntentVNext.text")
 
     def to_json(self) -> JsonValue:
         """转换为 JSON object。
@@ -902,11 +849,7 @@ class ReadableReferenceContinuityItemVNext:
         _require_non_empty(self.source_label, field_name="ReadableReferenceContinuityItemVNext.source_label")
         if not isinstance(self.reason, ReferenceContinuityReasonVNext):
             raise TypeError("ReadableReferenceContinuityItemVNext.reason is invalid")
-        _require_bounded_non_empty_text(
-            self.text,
-            field_name="ReadableReferenceContinuityItemVNext.text",
-            max_chars=MAX_VNEXT_REFERENCE_CONTINUITY_TEXT_CHARS,
-        )
+        _require_non_empty(self.text, field_name="ReadableReferenceContinuityItemVNext.text")
 
     def to_json(self) -> JsonValue:
         """转换为 JSON object。
@@ -943,15 +886,11 @@ class CompactReadableViewVNext:
 
         :returns: ``None``。
         :raises TypeError: 子项类型非法时抛出。
-        :raises ValueError: 文本为空或超长时抛出。
+        :raises ValueError: 文本为空时抛出。
         """
 
         if self.session_summary is not None:
-            _require_bounded_non_empty_text(
-                self.session_summary,
-                field_name="CompactReadableViewVNext.session_summary",
-                max_chars=MAX_VNEXT_SESSION_SUMMARY_CHARS,
-            )
+            _require_non_empty(self.session_summary, field_name="CompactReadableViewVNext.session_summary")
         _require_readable_fact_tuple(self.evidence_backed_facts, field_name="CompactReadableViewVNext.evidence_backed_facts")
         _require_readable_answer_anchor_tuple(self.answer_anchors, field_name="CompactReadableViewVNext.answer_anchors")
         _require_readable_forward_intent_tuple(self.forward_intents, field_name="CompactReadableViewVNext.forward_intents")
@@ -999,11 +938,7 @@ class TraceReadableItemVNext:
         _require_non_empty(self.source_label, field_name="TraceReadableItemVNext.source_label")
         if not isinstance(self.trace_kind, TraceReadableKindVNext):
             raise TypeError("TraceReadableItemVNext.trace_kind is invalid")
-        _require_bounded_non_empty_text(
-            self.text,
-            field_name="TraceReadableItemVNext.text",
-            max_chars=MAX_VNEXT_REFERENCE_CONTINUITY_TEXT_CHARS,
-        )
+        _require_non_empty(self.text, field_name="TraceReadableItemVNext.text")
 
     def to_json(self) -> JsonValue:
         """转换为 JSON object。
@@ -1078,15 +1013,11 @@ class AnswerReadableItemVNext:
         """校验 answer material item。
 
         :returns: ``None``。
-        :raises ValueError: 文本为空或超长时抛出。
+        :raises ValueError: 文本为空时抛出。
         """
 
         _require_non_empty(self.source_label, field_name="AnswerReadableItemVNext.source_label")
-        _require_bounded_non_empty_text(
-            self.answer_text,
-            field_name="AnswerReadableItemVNext.answer_text",
-            max_chars=MAX_VNEXT_ANSWER_ANCHOR_TEXT_CHARS,
-        )
+        _require_non_empty(self.answer_text, field_name="AnswerReadableItemVNext.answer_text")
 
     def to_json(self) -> JsonValue:
         """转换为 JSON object。
@@ -1228,16 +1159,10 @@ class SessionSummaryCandidateVNext:
         :raises ValueError: 文本或 source labels 非法时抛出。
         """
 
-        _require_bounded_non_empty_text(
-            self.summary_text,
-            field_name="SessionSummaryCandidateVNext.summary_text",
-            max_chars=MAX_VNEXT_SESSION_SUMMARY_CHARS,
-        )
-        _require_bounded_string_tuple(
+        _require_non_empty(self.summary_text, field_name="SessionSummaryCandidateVNext.summary_text")
+        _require_non_empty_unique_string_tuple(
             self.source_labels,
             field_name="SessionSummaryCandidateVNext.source_labels",
-            max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
-            require_non_empty=True,
         )
 
     def to_json(self) -> JsonValue:
@@ -1275,24 +1200,16 @@ class EvidenceBackedFactCandidateVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        _require_bounded_non_empty_text(
-            self.claim_text,
-            field_name="EvidenceBackedFactCandidateVNext.claim_text",
-            max_chars=MAX_VNEXT_FACT_CLAIM_TEXT_CHARS,
-        )
-        _require_bounded_string_tuple(
+        _require_non_empty(self.claim_text, field_name="EvidenceBackedFactCandidateVNext.claim_text")
+        _require_non_empty_unique_string_tuple(
             self.evidence_labels,
             field_name="EvidenceBackedFactCandidateVNext.evidence_labels",
-            max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
-            require_non_empty=True,
         )
         if not isinstance(self.evidence_kind, FactEvidenceKindVNext):
             raise TypeError("EvidenceBackedFactCandidateVNext.evidence_kind is invalid")
-        _require_bounded_string_tuple(
+        _require_unique_string_tuple(
             self.source_labels,
             field_name="EvidenceBackedFactCandidateVNext.source_labels",
-            max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
-            require_non_empty=False,
         )
 
     def to_json(self) -> JsonValue:
@@ -1327,11 +1244,7 @@ class AnswerAnchorChildVNext:
         :raises ValueError: 文本或序号非法时抛出。
         """
 
-        _require_bounded_non_empty_text(
-            self.display_text,
-            field_name="AnswerAnchorChildVNext.display_text",
-            max_chars=MAX_VNEXT_ANSWER_ANCHOR_TEXT_CHARS,
-        )
+        _require_non_empty(self.display_text, field_name="AnswerAnchorChildVNext.display_text")
         if self.ordinal is not None:
             _require_non_negative_int(self.ordinal, field_name="AnswerAnchorChildVNext.ordinal")
 
@@ -1365,21 +1278,15 @@ class AnswerAnchorCandidateVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        _require_bounded_non_empty_text(
-            self.anchor_title,
-            field_name="AnswerAnchorCandidateVNext.anchor_title",
-            max_chars=MAX_VNEXT_ANSWER_ANCHOR_TEXT_CHARS,
-        )
+        _require_non_empty(self.anchor_title, field_name="AnswerAnchorCandidateVNext.anchor_title")
         _require_answer_anchor_child_tuple(
             self.anchor_items,
             field_name="AnswerAnchorCandidateVNext.anchor_items",
             require_non_empty=True,
         )
-        _require_bounded_string_tuple(
+        _require_non_empty_unique_string_tuple(
             self.answer_source_labels,
             field_name="AnswerAnchorCandidateVNext.answer_source_labels",
-            max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
-            require_non_empty=True,
         )
 
     def to_json(self) -> JsonValue:
@@ -1422,16 +1329,10 @@ class ForwardIntentCandidateVNext:
             raise TypeError("ForwardIntentCandidateVNext.intent_type is invalid")
         if not isinstance(self.status, ForwardIntentStatusVNext):
             raise TypeError("ForwardIntentCandidateVNext.status is invalid")
-        _require_bounded_non_empty_text(
-            self.text,
-            field_name="ForwardIntentCandidateVNext.text",
-            max_chars=MAX_VNEXT_FORWARD_INTENT_TEXT_CHARS,
-        )
-        _require_bounded_string_tuple(
+        _require_non_empty(self.text, field_name="ForwardIntentCandidateVNext.text")
+        _require_non_empty_unique_string_tuple(
             self.source_labels,
             field_name="ForwardIntentCandidateVNext.source_labels",
-            max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
-            require_non_empty=True,
         )
 
     def to_json(self) -> JsonValue:
@@ -1469,18 +1370,12 @@ class ReferenceContinuityCandidateVNext:
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
-        _require_bounded_non_empty_text(
-            self.text,
-            field_name="ReferenceContinuityCandidateVNext.text",
-            max_chars=MAX_VNEXT_REFERENCE_CONTINUITY_TEXT_CHARS,
-        )
+        _require_non_empty(self.text, field_name="ReferenceContinuityCandidateVNext.text")
         if not isinstance(self.reason, ReferenceContinuityReasonVNext):
             raise TypeError("ReferenceContinuityCandidateVNext.reason is invalid")
-        _require_bounded_string_tuple(
+        _require_non_empty_unique_string_tuple(
             self.source_labels,
             field_name="ReferenceContinuityCandidateVNext.source_labels",
-            max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
-            require_non_empty=True,
         )
 
     def to_json(self) -> JsonValue:
@@ -1517,16 +1412,10 @@ class CompactCandidateDiagnosticVNext:
         """
 
         _require_non_empty(self.code, field_name="CompactCandidateDiagnosticVNext.code")
-        _require_bounded_non_empty_text(
-            self.text,
-            field_name="CompactCandidateDiagnosticVNext.text",
-            max_chars=MAX_VNEXT_DIAGNOSTIC_TEXT_CHARS,
-        )
-        _require_bounded_string_tuple(
+        _require_non_empty(self.text, field_name="CompactCandidateDiagnosticVNext.text")
+        _require_unique_string_tuple(
             self.source_labels,
             field_name="CompactCandidateDiagnosticVNext.source_labels",
-            max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
-            require_non_empty=False,
         )
 
     def to_json(self) -> JsonValue:
@@ -2133,48 +2022,23 @@ def _require_unique_string_tuple(value: tuple[str, ...], *, field_name: str) -> 
         raise ValueError(f"{field_name} items must be unique")
 
 
-def _require_bounded_string_tuple(
+def _require_non_empty_unique_string_tuple(
     value: tuple[str, ...],
     *,
     field_name: str,
-    max_items: int,
-    require_non_empty: bool,
 ) -> None:
-    """校验字符串 tuple 数量边界。
+    """校验字符串 tuple 非空且元素不重复。
 
     :param value: 待校验 tuple。
     :param field_name: 错误字段名。
-    :param max_items: 最大元素数量。
-    :param require_non_empty: 是否要求至少一个元素。
     :returns: ``None``。
     :raises TypeError: 字段或元素类型非法时抛出。
-    :raises ValueError: 元素为空、数量非法或重复时抛出。
+    :raises ValueError: 元素为空、重复或 tuple 为空时抛出。
     """
 
     _require_unique_string_tuple(value, field_name=field_name)
-    if require_non_empty and len(value) == 0:
+    if len(value) == 0:
         raise ValueError(f"{field_name} must be non-empty")
-    if len(value) > max_items:
-        raise ValueError(f"{field_name} exceeds maximum item count")
-
-
-def _require_bounded_non_empty_text(value: str, *, field_name: str, max_chars: int) -> None:
-    """校验有界非空文本。
-
-    :param value: 待校验文本。
-    :param field_name: 错误字段名。
-    :param max_chars: 最大字符数。
-    :returns: ``None``。
-    :raises TypeError: 文本类型非法时抛出。
-    :raises ValueError: 文本为空或超长时抛出。
-    """
-
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be str")
-    if value.strip() == "":
-        raise ValueError(f"{field_name} must be non-empty")
-    if len(value) > max_chars:
-        raise ValueError(f"{field_name} exceeds maximum length")
 
 
 def _require_json_mapping(value: Mapping[str, JsonValue], *, field_name: str) -> None:
@@ -2494,13 +2358,10 @@ def _require_fact_candidate_vnext_tuple(value: tuple[EvidenceBackedFactCandidate
     :param value: 待校验 tuple。
     :returns: ``None``。
     :raises TypeError: 字段或元素类型非法时抛出。
-    :raises ValueError: 数量超过上限时抛出。
     """
 
     if not isinstance(value, tuple):
         raise TypeError("ConversationCompactOutputVNext.evidence_backed_facts must be tuple")
-    if len(value) > MAX_VNEXT_FACT_ITEMS:
-        raise ValueError("ConversationCompactOutputVNext.evidence_backed_facts exceeds maximum item count")
     for item in value:
         if not isinstance(item, EvidenceBackedFactCandidateVNext):
             raise TypeError("ConversationCompactOutputVNext.evidence_backed_facts items are invalid")
@@ -2512,13 +2373,10 @@ def _require_answer_anchor_candidate_tuple(value: tuple[AnswerAnchorCandidateVNe
     :param value: 待校验 tuple。
     :returns: ``None``。
     :raises TypeError: 字段或元素类型非法时抛出。
-    :raises ValueError: 数量超过上限时抛出。
     """
 
     if not isinstance(value, tuple):
         raise TypeError("ConversationCompactOutputVNext.answer_anchors must be tuple")
-    if len(value) > MAX_VNEXT_ANSWER_ANCHOR_ITEMS:
-        raise ValueError("ConversationCompactOutputVNext.answer_anchors exceeds maximum item count")
     for item in value:
         if not isinstance(item, AnswerAnchorCandidateVNext):
             raise TypeError("ConversationCompactOutputVNext.answer_anchors items are invalid")
@@ -2530,13 +2388,10 @@ def _require_forward_intent_candidate_tuple(value: tuple[ForwardIntentCandidateV
     :param value: 待校验 tuple。
     :returns: ``None``。
     :raises TypeError: 字段或元素类型非法时抛出。
-    :raises ValueError: 数量超过上限时抛出。
     """
 
     if not isinstance(value, tuple):
         raise TypeError("ConversationCompactOutputVNext.forward_intents must be tuple")
-    if len(value) > MAX_VNEXT_FORWARD_INTENT_ITEMS:
-        raise ValueError("ConversationCompactOutputVNext.forward_intents exceeds maximum item count")
     for item in value:
         if not isinstance(item, ForwardIntentCandidateVNext):
             raise TypeError("ConversationCompactOutputVNext.forward_intents items are invalid")
@@ -2548,13 +2403,10 @@ def _require_reference_candidate_tuple(value: tuple[ReferenceContinuityCandidate
     :param value: 待校验 tuple。
     :returns: ``None``。
     :raises TypeError: 字段或元素类型非法时抛出。
-    :raises ValueError: 数量超过上限时抛出。
     """
 
     if not isinstance(value, tuple):
         raise TypeError("ConversationCompactOutputVNext.reference_continuity_items must be tuple")
-    if len(value) > MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS:
-        raise ValueError("ConversationCompactOutputVNext.reference_continuity_items exceeds maximum item count")
     for item in value:
         if not isinstance(item, ReferenceContinuityCandidateVNext):
             raise TypeError("ConversationCompactOutputVNext.reference_continuity_items items are invalid")
@@ -2566,13 +2418,10 @@ def _require_diagnostic_vnext_tuple(value: tuple[CompactCandidateDiagnosticVNext
     :param value: 待校验 tuple。
     :returns: ``None``。
     :raises TypeError: 字段或元素类型非法时抛出。
-    :raises ValueError: 数量超过上限时抛出。
     """
 
     if not isinstance(value, tuple):
         raise TypeError("ConversationCompactOutputVNext.diagnostics must be tuple")
-    if len(value) > MAX_VNEXT_DIAGNOSTIC_ITEMS:
-        raise ValueError("ConversationCompactOutputVNext.diagnostics exceeds maximum item count")
     for item in value:
         if not isinstance(item, CompactCandidateDiagnosticVNext):
             raise TypeError("ConversationCompactOutputVNext.diagnostics items are invalid")
@@ -2956,11 +2805,6 @@ __all__ = [
     "ForwardIntentCandidateVNext",
     "ForwardIntentStatusVNext",
     "ForwardIntentTypeVNext",
-    "MAX_VNEXT_ANSWER_ANCHOR_ITEMS",
-    "MAX_VNEXT_DIAGNOSTIC_ITEMS",
-    "MAX_VNEXT_FACT_ITEMS",
-    "MAX_VNEXT_FORWARD_INTENT_ITEMS",
-    "MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS",
     "PromptLocalEvidenceMap",
     "PromptLocalMaterialLabel",
     "PromptLocalProvenanceEntry",

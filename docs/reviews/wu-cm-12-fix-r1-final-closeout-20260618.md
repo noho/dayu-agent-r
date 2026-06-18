@@ -70,30 +70,19 @@ Audit target: code constants still present in production code, not defined as fi
 | `max_evidence_blocks` | production code | Deleted | No production match in `dayu/**/*.py`; private accepted-evidence retrieval count parameter is removed. |
 | `_evidence_chunks`, `_EvidenceChunk`, `evidence_chunk_label` | production code | Deleted | No production match in `dayu/**/*.py`; no dead default chunk helper remains. |
 | `DEFAULT_MEMORY_*` policy defaults | `dayu/host/memory.py` | Retained as code fallback defaults for policy fields | These are not independent material production constants. They populate `MemoryProjectionPolicy` when no configured policy is supplied; the same policy fields are defined in `execution_profiles.json` `memory_projection_policy`. User review accepted this default fallback category. |
-| `MAX_VNEXT_SESSION_SUMMARY_CHARS` | `dayu/host/compaction.py` | Retained as parser safety guard | This bounds LLM-generated compact output candidate text at accept barrier. It does not truncate EventLog-derived input material or rendered compact input material. |
-| `MAX_VNEXT_FACT_CLAIM_TEXT_CHARS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation, not source material selection or rendering. |
-| `MAX_VNEXT_ANSWER_ANCHOR_TEXT_CHARS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
-| `MAX_VNEXT_FORWARD_INTENT_TEXT_CHARS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
-| `MAX_VNEXT_REFERENCE_CONTINUITY_TEXT_CHARS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
-| `MAX_VNEXT_DIAGNOSTIC_TEXT_CHARS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
-| `MAX_VNEXT_SOURCE_LABELS_PER_ITEM` | `dayu/host/compaction.py` | Retained as parser safety guard | Limits candidate provenance label count during output parsing; not a material production cap. |
-| `MAX_VNEXT_FACT_ITEMS` | `dayu/host/compaction.py` | Retained as parser safety guard | Limits LLM-generated candidate item count at accept barrier; memory projection output caps still come from `MemoryProjectionPolicy`. |
-| `MAX_VNEXT_ANSWER_ANCHOR_ITEMS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
-| `MAX_VNEXT_FORWARD_INTENT_ITEMS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
-| `MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
-| `MAX_VNEXT_DIAGNOSTIC_ITEMS` | `dayu/host/compaction.py` | Retained as parser safety guard | Same category: output candidate validation. |
+| `MAX_VNEXT_*` compact output text / item / label caps | production code | Deleted | No production match in `dayu/**/*.py`; compact output parser / DTO no longer rejects material by private compact output text, item, or label-count caps. Model/provider output-size limits remain the outer bound, while Host parser keeps schema, type, non-empty, uniqueness and provenance validation. |
 | `_POST_COMPACT_BASE_MESSAGE_COUNT` | `dayu/host/compaction_operation.py`, `dayu/host/llm_compaction.py` | Retained but not material production | Fixed message-envelope count for compact budget estimation. It does not select, truncate, summarize, preview, or drop LLM-facing material. |
 | `_MAX_SAFE_EXCEPTION_MESSAGE_CHARS` | `dayu/host/compaction_operation.py` | Retained but not material production | Diagnostic exception text safety bound for logs / repair diagnostics; not EventLog-derived memory or compact material. |
 | `_DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE` | `dayu/host/engine_ingest.py` | Retained but not LLM-facing material production | Projection maintenance batch size; not RunInput / compact material production. |
 | `_LABEL_CHUNK_SEPARATOR`, `_FIRST_ORDINAL`, `_CURRENT_ANCHOR_ORDINAL` | `dayu/host/compact_material.py` | Retained but not production volume caps | Prompt-local label grammar and deterministic ordinal constants. They preserve provenance labels and do not control material amount. |
 
-Conclusion: no remaining production code constant acts as a private field-length cap, lossy preview / summary cap, default evidence chunk cap, or accepted-evidence row cap for EventLog-derived LLM-facing material outside `memory_projection_policy`.
+Conclusion: no remaining production code constant acts as a private field-length cap, lossy preview / summary cap, default evidence chunk cap, accepted-evidence row cap, or compact output parser item / text cap for EventLog-derived LLM-facing material outside `memory_projection_policy`.
 
 ## Residual Risks
 
 - `WU-CM-12-S4-R1`: reactive compact recovery tier 1-3 remains deferred to WU-CM-13 and is not a reason to retain private material guards.
 - `WU-CM-12-PR-R1`: future cleanup should decide whether `dayu/host/compaction_evidence.py` is still needed after FIX-R1 or should be deleted / documented.
-- `WU-CM-12-PR-R2`: future governance may document or align defensive-depth asymmetry between parser safety guards and memory projection caps.
+- `WU-CM-12-PR-R2`: closed by deleting compact output `MAX_VNEXT_*` parser safety guards.
 - `WU-CM-12-PR-R3`: future diagnostics work may decide whether to persist recovery-tier rejected attempts individually.
 
 ## Notes For PR Description
