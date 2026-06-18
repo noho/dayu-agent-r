@@ -371,11 +371,11 @@ class EventLogContextFallbackProvider:
         if fallback_window_digest(window) != digest:
             raise HostDurableError("fallback input digest mismatch")
         window_current_ref = _optional_text(window, _FIELD_CURRENT_INPUT_REF)
+        if window_current_ref is None:
+            raise HostDurableError("fallback current_input_ref is missing")
         if window_current_ref != current_input_ref:
             raise HostDurableError("fallback current_input_ref mismatch")
         actual_current_input_ref = window_current_ref
-        if actual_current_input_ref is None:
-            raise HostDurableError("fallback current_input_ref is missing")
         trigger_source = _required_text(window, _FIELD_TRIGGER_SOURCE)
         material_blocks: tuple[RunInputMaterialBlock, ...] | None = None
         if trigger_source == ContextCompactionTriggerSource.PROACTIVE.value:

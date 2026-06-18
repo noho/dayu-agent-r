@@ -1258,6 +1258,201 @@ def test_recent_window_fallback_caps_stop_without_later_backfill() -> None:
     assert "old:user" in selection.dropped_block_ids
 
 
+def test_recent_window_fallback_item_cap_rejects_append() -> None:
+    """fallback item cap 到达上限后拒绝追加下一 whole block。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=500,
+        soft_threshold_tokens=300,
+        hard_threshold_tokens=420,
+        policy_ref="test-fallback-policy",
+    )
+    memory_policy = _memory_policy(
+        fallback_selected_recent_window_item_cap=2,
+        fallback_selected_recent_window_char_cap=4096,
+    )
+    blocks = (
+        _material_block(
+            "old:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "old",
+            event_sequence=1,
+            turn_group_id="run-old",
+        ),
+        _material_block(
+            "mid:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "mid",
+            event_sequence=2,
+            turn_group_id="run-mid",
+        ),
+        _material_block(
+            "new:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "new",
+            event_sequence=3,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=4,
+            source_ref="event-current",
+        ),
+    )
+
+    selection = build_recent_window_fallback_selection(
+        policy=policy,
+        memory_policy=memory_policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=4,
+        selected_recent_window_turn_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+
+    assert selection.selected_block_ids == ("new:user", "current:event-current")
+    assert selection.blocked_next_block_id == "mid:user"
+    assert "old:user" in selection.dropped_block_ids
+
+
+def test_recent_window_fallback_char_cap_rejects_append() -> None:
+    """fallback char cap 到达上限后拒绝追加下一 whole block。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=500,
+        soft_threshold_tokens=300,
+        hard_threshold_tokens=420,
+        policy_ref="test-fallback-policy",
+    )
+    memory_policy = _memory_policy(
+        fallback_selected_recent_window_item_cap=8,
+        fallback_selected_recent_window_char_cap=10,
+    )
+    blocks = (
+        _material_block(
+            "old:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "old",
+            event_sequence=1,
+            turn_group_id="run-old",
+        ),
+        _material_block(
+            "mid:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "mid",
+            event_sequence=2,
+            turn_group_id="run-mid",
+        ),
+        _material_block(
+            "new:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "new",
+            event_sequence=3,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=4,
+            source_ref="event-current",
+        ),
+    )
+
+    selection = build_recent_window_fallback_selection(
+        policy=policy,
+        memory_policy=memory_policy,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=4,
+        selected_recent_window_turn_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+
+    assert selection.selected_block_ids == ("new:user", "current:event-current")
+    assert selection.blocked_next_block_id == "mid:user"
+    assert "old:user" in selection.dropped_block_ids
+
+
+def test_recent_window_fallback_without_memory_policy_allows_uncapped_append() -> None:
+    """memory_policy 为 None 时保留旧调用点无 caps 追加语义。"""
+
+    policy = context_budget_policy_from_threshold_tokens(
+        context_window_size=500,
+        soft_threshold_tokens=300,
+        hard_threshold_tokens=420,
+        policy_ref="test-fallback-policy",
+    )
+    blocks = (
+        _material_block(
+            "old:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "old",
+            event_sequence=1,
+            turn_group_id="run-old",
+        ),
+        _material_block(
+            "mid:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "mid",
+            event_sequence=2,
+            turn_group_id="run-mid",
+        ),
+        _material_block(
+            "new:user",
+            CompactMaterialSection.TRACE_MATERIAL,
+            CompactMaterialBlockKind.USER_INPUT,
+            "new",
+            event_sequence=3,
+            turn_group_id="run-new",
+        ),
+        _material_block(
+            "current:event-current",
+            CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            "current",
+            event_sequence=4,
+            source_ref="event-current",
+        ),
+    )
+
+    selection = build_recent_window_fallback_selection(
+        policy=policy,
+        memory_policy=None,
+        session_id="session-fallback",
+        run_id="run-fallback",
+        material_blocks=blocks,
+        current_input_ref="event-current",
+        input_cursor=4,
+        selected_recent_window_turn_floor=1,
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+    )
+
+    assert selection.selected_block_ids == (
+        "old:user",
+        "mid:user",
+        "new:user",
+        "current:event-current",
+    )
+    assert selection.blocked_next_block_id is None
+
+
 def test_recent_window_fallback_hard_budget_rolls_back_appended_block() -> None:
     """追加 block 超 hard budget 时整块回滚并停止。"""
 
@@ -1608,6 +1803,7 @@ def test_fallback_context_messages_render_all_and_only_selected_blocks() -> None
     (
         ("missing_window", "active fallback input window is missing"),
         ("digest_mismatch", "fallback input digest mismatch"),
+        ("missing_current_ref", "fallback current_input_ref is missing"),
         ("current_ref_mismatch", "fallback current_input_ref mismatch"),
         ("missing_material_digest", "selected_material_view_digest"),
         ("blank_material_digest", "selected_material_view_digest"),
@@ -2839,6 +3035,7 @@ def _memory_policy(
     *,
     max_lag_events_for_inline_delta: int = 4,
     selected_recent_window_char_cap: int = 4096,
+    fallback_selected_recent_window_item_cap: int = 4,
     fallback_selected_recent_window_char_cap: int = 1024,
     evidence_fact_char_cap: int = 2048,
 ) -> MemoryProjectionPolicy:
@@ -2846,6 +3043,7 @@ def _memory_policy(
 
     :param max_lag_events_for_inline_delta: inline repair 最大滞后事件数。
     :param selected_recent_window_char_cap: selected recent window 字符上限。
+    :param fallback_selected_recent_window_item_cap: fallback recent window item 上限。
     :param fallback_selected_recent_window_char_cap: fallback recent window 字符上限。
     :param evidence_fact_char_cap: evidence fact 字符上限。
     :returns: memory projection policy。
@@ -2856,7 +3054,7 @@ def _memory_policy(
         selected_recent_window_item_cap=8,
         selected_recent_window_char_cap=selected_recent_window_char_cap,
         selected_recent_window_turn_floor=2,
-        fallback_selected_recent_window_item_cap=4,
+        fallback_selected_recent_window_item_cap=fallback_selected_recent_window_item_cap,
         fallback_selected_recent_window_char_cap=fallback_selected_recent_window_char_cap,
         evidence_fact_item_cap=16,
         evidence_fact_char_cap=evidence_fact_char_cap,
@@ -3084,7 +3282,9 @@ def _context_fallback_failed_payload(case_name: str) -> dict[str, JsonValue]:
         "selected_raw_turn_count": 0,
         "selected_material_view_digest": _DIGEST_A,
     }
-    if case_name == "current_ref_mismatch":
+    if case_name == "missing_current_ref":
+        del window["current_input_ref"]
+    elif case_name == "current_ref_mismatch":
         window["current_input_ref"] = "event-other-input"
     elif case_name == "missing_material_digest":
         del window["selected_material_view_digest"]
