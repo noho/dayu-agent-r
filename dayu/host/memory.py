@@ -15,7 +15,11 @@ from typing import Protocol, TypeAlias, TypeVar
 from dayu.contracts.json_value import JsonValue
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
-from dayu.host.terminal_summary_payload import (
+from dayu.host.evidence import (
+    accepted_evidence_envelope_from_payload,
+    accepted_tool_raw_outcome_text_from_payload,
+)
+from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
 )
@@ -74,6 +78,7 @@ _PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
 _PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
 _PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_USER_INPUT_TEXT_UNAVAILABLE = "用户输入文本不可用。"
 _PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
 _PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
@@ -1649,11 +1654,7 @@ def _selected_evidence_item(event: MemoryProjectionEvent) -> SelectedRecentWindo
     :returns: selected evidence item。
     """
 
-    text = _optional_payload_str(event.payload, _PAYLOAD_FIELD_DISPLAY_TEXT)
-    if text is None:
-        text = _optional_payload_str(event.payload, _PAYLOAD_FIELD_CONTENT)
-    if text is None:
-        text = _ref_summary_text(event)
+    text = _selected_evidence_text(event)
     return SelectedRecentWindowItem(
         item_id=_item_id(event, "selected_evidence"),
         role=SelectedRecentWindowRole.EVIDENCE,
@@ -1666,6 +1667,26 @@ def _selected_evidence_item(event: MemoryProjectionEvent) -> SelectedRecentWindo
         excluded_reason=None,
         size_units=estimate_memory_size_units(text),
     )
+
+
+def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
+    """读取 LLM-facing recent evidence 文本。
+
+    :param event: ``TOOL_RESULT_ACCEPTED`` projection event。
+    :returns: 工具结果的业务可读文本或无内部引用的 limited-signal 文本。
+    :raises ValueError: accepted evidence envelope 或旧 result preview 非法时抛出。
+    """
+
+    envelope = accepted_evidence_envelope_from_payload(
+        event.payload,
+        producer_event_ref=event.event_id,
+    )
+    if envelope is not None:
+        raw_text = accepted_tool_raw_outcome_text_from_payload(event.payload)
+        if raw_text is not None:
+            return raw_text
+        raise ValueError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
+    return "工具结果已接受；原始工具响应不可用。"
 
 
 def _accepted_candidate_mapping(
@@ -2903,25 +2924,13 @@ def _user_visible_text(event: MemoryProjectionEvent) -> str:
     """读取用户可见文本。
 
     :param event: projection event。
-    :returns: 用户可见文本或 ref 摘要。
+    :returns: 用户可见文本；缺失时返回不含内部治理标识的占位文本。
     """
 
     display_text = _optional_payload_str(event.payload, _PAYLOAD_FIELD_DISPLAY_TEXT)
     if display_text is not None:
         return display_text
-    return _ref_summary_text(event)
-
-
-def _ref_summary_text(event: MemoryProjectionEvent) -> str:
-    """构造中立 ref 摘要。
-
-    :param event: projection event。
-    :returns: ref 摘要。
-    """
-
-    if event.payload_ref is not None and event.payload_digest is not None:
-        return f"payload_ref={event.payload_ref}; payload_digest={event.payload_digest}"
-    return f"event_ref={event.event_id}"
+    return _USER_INPUT_TEXT_UNAVAILABLE
 
 
 def _bounded_text(text: str, char_cap: int) -> str:

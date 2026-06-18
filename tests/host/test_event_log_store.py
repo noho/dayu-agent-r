@@ -15,10 +15,14 @@ from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
+    EventLogReadClassFilter,
+    EventLogReadFilter,
     EventLogStore,
+    FilteredEventLogPage,
     append_event,
     read_event_by_id,
     read_events_after,
+    read_events_after_matching,
 )
 from dayu.host.durable.errors import (
     HostDurableError,
@@ -392,6 +396,317 @@ def test_read_events_after_uses_global_cursor_order(tmp_path: Path) -> None:
 
         store.transaction_runner.run_write(write_events)
         assert store.transaction_runner.run_write(read_events) == ("event-2", "event-3")
+
+
+def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
+    tmp_path: Path,
+) -> None:
+    """filtered read 按 class/type 匹配，并在未填满 page 时覆盖到 latest。"""
+
+    event_filter = EventLogReadFilter(
+        (
+            EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("TYPE_A",)),
+            EventLogReadClassFilter(EventClass.PREVIEW, None),
+            EventLogReadClassFilter(EventClass.DIAGNOSTIC, ("DIAG_A",)),
+        )
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[tuple[str, ...], int, str]:
+            """追加混合事件并执行 filtered read。
+
+            :param transaction: Host transaction。
+            :returns: 匹配 event id、covered sequence 与 covered event id。
+            """
+
+            append_event(
+                transaction,
+                _request(
+                    "event-1",
+                    event_class=EventClass.CANONICAL_FACT,
+                    event_type="TYPE_A",
+                ),
+            )
+            append_event(
+                transaction,
+                _request(
+                    "event-2",
+                    event_class=EventClass.CANONICAL_FACT,
+                    event_type="TYPE_B",
+                ),
+            )
+            append_event(
+                transaction,
+                _request(
+                    "event-3",
+                    event_class=EventClass.PREVIEW,
+                    event_type="PREVIEW_B",
+                ),
+            )
+            append_event(
+                transaction,
+                _request(
+                    "event-4",
+                    event_class=EventClass.DIAGNOSTIC,
+                    event_type="DIAG_A",
+                ),
+            )
+            append_event(
+                transaction,
+                _request(
+                    "event-5",
+                    event_class=EventClass.PROJECTION_SIGNAL,
+                    event_type="SIGNAL_A",
+                ),
+            )
+            page = read_events_after_matching(
+                transaction,
+                0,
+                event_filter=event_filter,
+                limit=10,
+            )
+            covered_event_id = page.covered_event_id
+            assert covered_event_id is not None
+            return (
+                tuple(row.event_id for row in page.rows),
+                page.covered_event_sequence,
+                covered_event_id,
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            ("event-1", "event-3", "event-4"),
+            5,
+            "event-5",
+        )
+
+
+def test_read_events_after_matching_limit_covers_last_matching_row(
+    tmp_path: Path,
+) -> None:
+    """matching rows 填满 page 时 covered cursor 停在最后一个匹配 row。"""
+
+    event_filter = EventLogReadFilter(
+        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("TYPE_A",)),)
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[tuple[str, ...], int, str]:
+            """追加超过 page 的匹配事件并执行 filtered read。
+
+            :param transaction: Host transaction。
+            :returns: 匹配 event id、covered sequence 与 covered event id。
+            :raises AssertionError: covered cursor 断言失败时抛出。
+            """
+
+            append_event(transaction, _request("event-1", event_type="TYPE_A"))
+            append_event(transaction, _request("event-2", event_type="TYPE_A"))
+            append_event(transaction, _request("event-3", event_type="TYPE_B"))
+            page = read_events_after_matching(
+                transaction,
+                0,
+                event_filter=event_filter,
+                limit=2,
+            )
+            covered_event_id = page.covered_event_id
+            assert covered_event_id is not None
+            return (
+                tuple(row.event_id for row in page.rows),
+                page.covered_event_sequence,
+                covered_event_id,
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            ("event-1", "event-2"),
+            2,
+            "event-2",
+        )
+
+
+def test_filtered_event_log_page_requires_covered_event_id_for_real_cursor(
+    tmp_path: Path,
+) -> None:
+    """filtered page 覆盖真实 row 时必须携带对应 event id。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """构造真实 row 并验证 filtered page 不变量。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises AssertionError: filtered page 不变量断言失败时抛出。
+            """
+
+            row = append_event(transaction, _request("event-1")).row
+            with pytest.raises(HostDurableError):
+                FilteredEventLogPage(
+                    rows=(row,),
+                    covered_event_sequence=row.event_sequence,
+                    covered_event_id=None,
+                )
+            with pytest.raises(HostDurableError):
+                FilteredEventLogPage(
+                    rows=(),
+                    covered_event_sequence=row.event_sequence,
+                    covered_event_id=None,
+                )
+
+        store.transaction_runner.run_write(operation)
+
+
+def test_read_events_after_matching_session_scope_limits_rows_and_covered_cursor(
+    tmp_path: Path,
+) -> None:
+    """session_id 过滤同时约束返回 rows 与 covered cursor。"""
+
+    event_filter = EventLogReadFilter(
+        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("TYPE_A",)),)
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[tuple[str, ...], int, str]:
+            """追加混合 session 事件并执行 session-scoped filtered read。
+
+            :param transaction: Host transaction。
+            :returns: 匹配 event id、covered sequence 与 covered event id。
+            :raises AssertionError: covered cursor 断言失败时抛出。
+            """
+
+            append_event(
+                transaction,
+                _request("event-1", session_id="session-a", event_type="TYPE_A"),
+            )
+            append_event(
+                transaction,
+                _request("event-2", session_id="session-b", event_type="TYPE_A"),
+            )
+            append_event(
+                transaction,
+                _request("event-3", session_id="session-a", event_type="TYPE_B"),
+            )
+            append_event(
+                transaction,
+                _request("event-4", session_id="session-b", event_type="TYPE_A"),
+            )
+            page = read_events_after_matching(
+                transaction,
+                0,
+                event_filter=event_filter,
+                limit=10,
+                session_id="session-a",
+            )
+            covered_event_id = page.covered_event_id
+            assert covered_event_id is not None
+            return (
+                tuple(row.event_id for row in page.rows),
+                page.covered_event_sequence,
+                covered_event_id,
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            ("event-1",),
+            3,
+            "event-3",
+        )
+
+
+def test_read_events_after_matching_empty_log_and_cursor_at_latest_are_idle(
+    tmp_path: Path,
+) -> None:
+    """空 EventLog 或 cursor 已到 latest 时 filtered read 不推进 covered cursor。"""
+
+    event_filter = EventLogReadFilter(
+        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, None),)
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def empty_log(transaction: HostTransaction) -> tuple[int, str | None]:
+            """读取空 EventLog。
+
+            :param transaction: Host transaction。
+            :returns: covered cursor 与 covered event id。
+            """
+
+            page = read_events_after_matching(
+                transaction,
+                7,
+                event_filter=event_filter,
+                limit=10,
+            )
+            return page.covered_event_sequence, page.covered_event_id
+
+        assert store.transaction_runner.run_write(empty_log) == (7, None)
+
+        def cursor_at_latest(transaction: HostTransaction) -> tuple[int, str | None]:
+            """读取已到 latest cursor 的 EventLog。
+
+            :param transaction: Host transaction。
+            :returns: covered cursor 与 covered event id。
+            """
+
+            row = append_event(transaction, _request("event-1")).row
+            page = read_events_after_matching(
+                transaction,
+                row.event_sequence,
+                event_filter=event_filter,
+                limit=10,
+            )
+            return page.covered_event_sequence, page.covered_event_id
+
+        assert store.transaction_runner.run_write(cursor_at_latest) == (1, None)
+
+
+def test_read_events_after_matching_covers_real_row_for_max_sequence_boundaries(
+    tmp_path: Path,
+) -> None:
+    """max_event_sequence 超过 latest 或落在 gap 时 covered cursor 指向真实 row。"""
+
+    event_filter = EventLogReadFilter(
+        (EventLogReadClassFilter(EventClass.PREVIEW, None),)
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[tuple[int, str], tuple[int, str]]:
+            """构造 sequence gap 并验证 covered row。
+
+            :param transaction: Host transaction。
+            :returns: beyond-latest 与 gap 两种 covered cursor。
+            """
+
+            append_event(transaction, _request("event-1"))
+            append_event(transaction, _request("event-2"))
+            append_event(transaction, _request("event-3"))
+            append_event(transaction, _request("event-4"))
+            append_event(transaction, _request("event-5"))
+            transaction.execute(
+                f"DELETE FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
+                ("event-4",),
+            )
+            beyond_latest = read_events_after_matching(
+                transaction,
+                0,
+                event_filter=event_filter,
+                limit=10,
+                max_event_sequence=99,
+            )
+            in_gap = read_events_after_matching(
+                transaction,
+                0,
+                event_filter=event_filter,
+                limit=10,
+                max_event_sequence=4,
+            )
+            assert beyond_latest.covered_event_id is not None
+            assert in_gap.covered_event_id is not None
+            return (
+                (beyond_latest.covered_event_sequence, beyond_latest.covered_event_id),
+                (in_gap.covered_event_sequence, in_gap.covered_event_id),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            (5, "event-5"),
+            (3, "event-3"),
+        )
 
 
 def test_event_log_store_wrapper_methods_delegate_to_functions(

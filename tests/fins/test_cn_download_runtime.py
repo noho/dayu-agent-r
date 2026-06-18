@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +33,7 @@ from dayu.fins.pipelines.cn_pipeline import (
     CnPipeline,
     CnPipelineDownloadResult,
 )
+from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import (
     FsCompanyMetaRepository,
@@ -272,6 +273,53 @@ class _RecordingPipeline(CnPipeline):
                 "converted": 0,
             },
         }
+
+    async def download_stream(
+        self,
+        ticker: str,
+        form_type: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        overwrite: bool = False,
+        rebuild: bool = False,
+        ticker_aliases: list[str] | None = None,
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> AsyncIterator[DownloadEvent]:
+        """记录 rebuild 参数并返回确定性完成事件流。
+
+        Args:
+            ticker: 股票代码。
+            form_type: form 过滤。
+            start_date: 开始日期。
+            end_date: 结束日期。
+            overwrite: 是否覆盖。
+            rebuild: OLD 本地 rebuild 标记。
+            ticker_aliases: ticker aliases。
+            cancel_checker: 可选取消检查器。
+
+        Yields:
+            单个 pipeline completed 事件。
+
+        Raises:
+            无。
+        """
+
+        result = self.download(
+            ticker=ticker,
+            form_type=form_type,
+            start_date=start_date,
+            end_date=end_date,
+            overwrite=overwrite,
+            rebuild=rebuild,
+            ticker_aliases=ticker_aliases,
+            cancel_checker=cancel_checker,
+        )
+        yield DownloadEvent(
+            event_type=DownloadEventType.PIPELINE_COMPLETED,
+            ticker=ticker,
+            payload={"result": result},
+        )
 
 
 @dataclass(frozen=True)

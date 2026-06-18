@@ -72,11 +72,6 @@ from dayu.host.durable.connection import (
     open_host_durable_store,
 )
 from dayu.host.durable.event_log import EventLogStore
-from dayu.host.memory_repair import (
-    MemoryProjectionCatchupBudget,
-    MemoryProjectionRepairPurpose,
-    catch_up_conversation_memory_projection,
-)
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.outbox import (
     DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE,
@@ -133,10 +128,6 @@ _TOOL_TRACE_COLD_JSONL_FILE_NAME = "tool-trace-cold.jsonl"
 _TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
 """默认 Tool Trace cold JSONL lock 文件名后缀。"""
 
-_OPPORTUNISTIC_AFTER_COMMIT_MEMORY_PROJECTION_BATCH_COUNT = 1
-"""open_host after-commit 非 correctness memory projection catch-up 批次数。"""
-
-
 @dataclass(frozen=True, slots=True)
 class _CommandContextBudgetFields:
     """内部 command handle context budget 字段组。
@@ -147,55 +138,6 @@ class _CommandContextBudgetFields:
 
     context_window_size: int
     reserved_output_tokens: int
-
-
-def _after_commit_memory_projection_budget(
-    batch_size: int,
-) -> MemoryProjectionCatchupBudget:
-    """构造 open_host after-commit opportunistic memory projection 预算。
-
-    该预算只影响 commit 后轻量投影推进，不参与 dispatch 前 required / rebuild
-    correctness catch-up。
-
-    :param batch_size: 单批 projection scan 上限。
-    :returns: Host 内部 memory projection 总预算。
-    """
-
-    return MemoryProjectionCatchupBudget(
-        max_batches=_OPPORTUNISTIC_AFTER_COMMIT_MEMORY_PROJECTION_BATCH_COUNT,
-        max_scanned_events=(
-            batch_size * _OPPORTUNISTIC_AFTER_COMMIT_MEMORY_PROJECTION_BATCH_COUNT
-        ),
-        purpose=MemoryProjectionRepairPurpose.BEST_EFFORT_AFTER_COMMIT,
-    )
-
-
-@dataclass(slots=True)
-class _MemoryProjectionCatchupPort(ProjectionCatchupPort):
-    """conversation memory projection catch-up 端口。
-
-    :param durable_store: 当前 opener 持有的 durable store。
-    :param options: 当前 opener 的 public construction options。
-    """
-
-    durable_store: HostDurableStore
-    options: OpenHostOptions
-
-    def catch_up_projection(self) -> None:
-        """追平 conversation memory projection。
-
-        :returns: ``None``。
-        :raises HostDurableError: durable projection catch-up 失败时抛出。
-        """
-
-        catch_up_conversation_memory_projection(
-            self.durable_store.transaction_runner,
-            policy=self.options.memory_projection_policy,
-            batch_size=self.options.memory_projection_catchup_batch_size,
-            budget=_after_commit_memory_projection_budget(
-                self.options.memory_projection_catchup_batch_size
-            ),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -684,10 +626,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         close_projection_catchup_port: ProjectionCatchupPort | None = None
         try:
             active_registry = ActiveWorkerRegistry()
-            memory_projection_catchup_port = _MemoryProjectionCatchupPort(
-                durable_store=durable_store,
-                options=self._options,
-            )
             audit_projection_catchup_port = _LogAuditProjectionCatchupPort(
                 durable_store=durable_store,
                 options=default_log_audit_sink_options(
@@ -704,7 +642,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             )
             close_projection_catchup_port = _CompositeProjectionCatchupPort(
                 ports=(
-                    memory_projection_catchup_port,
                     audit_projection_catchup_port,
                     tool_trace_projection_catchup_port,
                     outbox_projection_catchup_port,
@@ -715,7 +652,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 local_execution=local_execution,
                 host_handle_id=host_handle_id,
                 active_registry=active_registry,
-                projection_catchup_port=memory_projection_catchup_port,
+                projection_catchup_port=None,
             )
             StartupRecoveryScanner(
                 transaction_runner=durable_store.transaction_runner,
@@ -726,7 +663,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
                 wakeup_port=scheduler,
-                projection_catchup_port=memory_projection_catchup_port,
+                projection_catchup_port=None,
                 ordinary_run_baseline=self._options.ordinary_run_baseline,
                 tooling_options=self._options.tooling_options,
             )

@@ -25,6 +25,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
+    write_projection_failure,
 )
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -338,7 +339,7 @@ def test_runner_filters_matching_events_in_sequence_order(
             "event-1",
             "event-3",
         ]
-        assert result.events_scanned == 3
+        assert result.events_scanned == 2
         assert result.events_matched == 2
         assert result.events_applied == 2
         assert result.finished_cursor == 3
@@ -575,6 +576,261 @@ def test_success_after_failure_clears_failure_row(tmp_path: Path) -> None:
             lambda transaction: read_projection_failure(transaction, "consumer")
         )
         assert failure is None
+
+
+def test_runner_skips_unmatched_events_and_advances_to_matching_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """runner 通过 durable filter 跳过不匹配事件，并推进到匹配 row。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _append_event(
+            store.transaction_runner,
+            event_id="event-1",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_B",
+            marker="unmatched-canonical",
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-2",
+            event_class=EventClass.DIAGNOSTIC,
+            event_type="DIAG_A",
+            marker="unmatched-diagnostic",
+        )
+        matched = _append_event(
+            store.transaction_runner,
+            event_id="event-3",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_A",
+            marker="matched",
+        )
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"), limit=1
+        )
+        checkpoint = store.transaction_runner.run_write(
+            lambda transaction: read_projection_checkpoint(transaction, "consumer")
+        )
+        assert [event.event_id for event in consumer.applied_events] == ["event-3"]
+        assert result.events_scanned == 1
+        assert result.events_matched == 1
+        assert result.finished_cursor == matched.event_sequence
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == matched.event_sequence
+
+
+def test_runner_advances_covered_cursor_without_apply_when_no_matching_rows(
+    tmp_path: Path,
+) -> None:
+    """没有匹配 row 但存在 covered row 时 runner 只推进 checkpoint。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _append_event(
+            store.transaction_runner,
+            event_id="event-1",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_B",
+            marker="one",
+        )
+        latest = _append_event(
+            store.transaction_runner,
+            event_id="event-2",
+            event_class=EventClass.DIAGNOSTIC,
+            event_type="DIAG_A",
+            marker="two",
+        )
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"), limit=10
+        )
+        checkpoint = store.transaction_runner.run_write(
+            lambda transaction: read_projection_checkpoint(transaction, "consumer")
+        )
+        assert consumer.applied_events == []
+        assert result.events_scanned == 1
+        assert result.events_matched == 0
+        assert result.finished_cursor == latest.event_sequence
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == latest.event_sequence
+        assert checkpoint.checkpoint_event_id == latest.event_id
+
+
+def test_runner_clears_failure_when_covered_cursor_advances_without_match(
+    tmp_path: Path,
+) -> None:
+    """无匹配 row 的 covered cursor 推进也会清除旧 failure row。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        latest = _append_event(
+            store.transaction_runner,
+            event_id="event-1",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_B",
+            marker="unmatched",
+        )
+
+        def write_failure(transaction: HostTransaction) -> None:
+            """写入测试用旧 projection failure。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            write_projection_failure(
+                transaction,
+                "consumer",
+                failed_event_sequence=latest.event_sequence,
+                failed_event_id=latest.event_id,
+                error_code="TEST_FAILURE",
+                error_message="previous failure",
+                now="2026-06-18T00:00:00+00:00",
+            )
+
+        store.transaction_runner.run_write(write_failure)
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"), limit=10
+        )
+        failure = store.transaction_runner.run_write(
+            lambda transaction: read_projection_failure(transaction, "consumer")
+        )
+        assert result.events_scanned == 1
+        assert result.events_matched == 0
+        assert result.finished_cursor == latest.event_sequence
+        assert failure is None
+
+
+def test_runner_target_before_next_matching_row_advances_to_target_without_apply(
+    tmp_path: Path,
+) -> None:
+    """target cursor 位于下一条匹配 row 之前时，runner 推进到 target 且不 apply。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        target = _append_event(
+            store.transaction_runner,
+            event_id="event-1",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_B",
+            marker="target",
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-2",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_A",
+            marker="future-match",
+        )
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"),
+            limit=10,
+            max_event_sequence=target.event_sequence,
+        )
+        checkpoint = store.transaction_runner.run_write(
+            lambda transaction: read_projection_checkpoint(transaction, "consumer")
+        )
+        assert consumer.applied_events == []
+        assert result.events_scanned == 1
+        assert result.events_matched == 0
+        assert result.finished_cursor == target.event_sequence
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == target.event_sequence
+        assert checkpoint.checkpoint_event_id == target.event_id
+
+
+def test_matching_row_failure_does_not_advance_past_failed_row(
+    tmp_path: Path,
+) -> None:
+    """匹配 row apply 失败时 checkpoint 不会越过失败 row。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _append_event(
+            store.transaction_runner,
+            event_id="event-1",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_B",
+            marker="unmatched",
+        )
+        failed = _append_event(
+            store.transaction_runner,
+            event_id="event-2",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_A",
+            marker="failed",
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-3",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_A",
+            marker="not-reached",
+        )
+        consumer = _FakeConsumer(
+            "consumer",
+            _canonical_type_filter("TYPE_A"),
+            fail_event_ids=frozenset({"event-2"}),
+        )
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"), limit=10
+        )
+        checkpoint = store.transaction_runner.run_write(
+            lambda transaction: read_projection_checkpoint(transaction, "consumer")
+        )
+        failure = store.transaction_runner.run_write(
+            lambda transaction: read_projection_failure(transaction, "consumer")
+        )
+        assert [event.event_id for event in consumer.applied_events] == ["event-2"]
+        assert result.failures == 1
+        assert result.finished_cursor == 0
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence < failed.event_sequence
+        assert failure is not None
+        assert failure.failed_event_sequence == failed.event_sequence
+        assert failure.failed_event_id == failed.event_id
+
+
+def test_run_once_limit_caps_steps_when_matching_events_remain(
+    tmp_path: Path,
+) -> None:
+    """dense matching rows 下 limit 是本轮 step cap，不一次 apply 整页。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        events = tuple(
+            _append_event(
+                store.transaction_runner,
+                event_id=f"event-{index}",
+                event_class=EventClass.CANONICAL_FACT,
+                event_type="TYPE_A",
+                marker=f"marker-{index}",
+            )
+            for index in range(1, 6)
+        )
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"), limit=3
+        )
+        checkpoint = store.transaction_runner.run_write(
+            lambda transaction: read_projection_checkpoint(transaction, "consumer")
+        )
+        assert [event.event_id for event in consumer.applied_events] == [
+            "event-1",
+            "event-2",
+            "event-3",
+        ]
+        assert result.events_scanned == 3
+        assert result.events_matched == 3
+        assert result.events_applied == 3
+        assert result.finished_cursor == events[2].event_sequence
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == events[2].event_sequence
+        assert checkpoint.checkpoint_event_id == events[2].event_id
 
 
 def test_runner_rejects_unknown_consumer(tmp_path: Path) -> None:

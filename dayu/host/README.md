@@ -88,7 +88,7 @@ Host 与其它层的稳定边界如下：
 
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
-`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up batch size 与 truncation manager 开关。
+`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size 与 truncation manager 开关。
 
 本地执行边界由 `LocalEngineWorkerFactory`、`LocalEngineWorker` 与 `LocalWorkerHandle` 表达。Host 创建 `AttemptDispatchSnapshot` 与 `AgentRunRequest`，worker 接住后返回 handle；Host 消费 handle 的 EngineEvent stream，并在 cancel 或 shutdown 时调用 handle 的关闭 / cancel hook。
 
@@ -207,7 +207,7 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 - `RunSnapshot` / `RunStatus` / `FollowupSnapshot` / `SourceRunRelation`：用户可见 Run 生命周期与 retry / replay 来源关系。
 - `AttemptDispatchSnapshot` / `AttemptStatus`：Host 派发给 worker 的 Attempt 执行快照。
 - request dataclass：`EnsureSessionRequest`、`CreateSessionRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`ResolveWaitRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、outbox read / drain request。
-- `HostEvent` / `HostEventClass` / `HostEventKind` / `HostTerminalStatus` / `HostFinalAnswerView`：Host 对 UI / Service 暴露的 typed event view。
+- `HostEvent` / `HostEventClass` / `HostEventKind` / `HostActivityView` / `HostActivityKind` / `HostActivityStatus` / `HostActivitySeverity` / `HostActivityCounts` / `HostTerminalStatus` / `HostFinalAnswerView`：Host 对 UI / Service 暴露的 typed event view 与安全 activity view。
 - `OutboxTerminalItem` / `OutboxTerminalItemsBatch` / `OutboxTerminalCursor` / `OutboxProjectionStatus` / `OutboxTerminalItemState`：离线 terminal notification 读取与 drain 契约。
 - `HostApiError` / `HostApiErrorCode` / `HostApiErrorDetail`：public API 错误；错误码包括 `NOT_FOUND`、`INVALID_STATE`、`CONFLICT`、`IDEMPOTENCY_CONFLICT`、`PERMISSION_DENIED`、`UNSUPPORTED_OPERATION`、`INTERNAL_ERROR`。
 - `HostCallContext` / `OperationContext` / `AuthorizationClaim` / `HostMetadataEntry`：调用上下文、授权声明与稳定 metadata。
@@ -314,7 +314,7 @@ Stream 术语固定如下：
 
 ### Public API 与 opener
 
-`api.py` 定义 public dataclass、enum、Protocol、error 与 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 durable store、admission service、scheduler、active worker registry、projection catch-up ports、memory catch-up port、context compactor 和本地 worker typed port，并在 async context 退出时关闭当前 opener runtime。
+`api.py` 定义 public dataclass、enum、Protocol、error 与 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 durable store、admission service、scheduler、active worker registry、audit / tool trace / outbox projection catch-up ports、context compactor 和本地 worker typed port，并在 async context 退出时关闭当前 opener runtime。Conversation Memory 的 required repair / catch-up 由 dispatch 前 correctness path 触发，opener 的 after-commit 热路径不执行 memory projection 追平。
 
 ### Admission 与 command
 
@@ -489,11 +489,11 @@ Attempt 是一次执行生命周期。旧 Attempt 永不 resume；wait resolve�
 Host EventLog event class 包括：
 
 - `CANONICAL_FACT`：恢复、状态索引、memory、outbox、audit 和 Run terminal truth 的事实来源。
-- `PREVIEW`：面向 UI 流式体验的展示事件，例如 content / reasoning / tool delta 和 iteration preview。
+- `PREVIEW`：面向 UI 流式体验的展示事件，例如 iteration preview、content completed、tool batch ready / done、tool request / result accepted preview。content / reasoning / tool-call delta 默认只作为 transient ingest 信号接受，不写入主 EventLog，也不参与 durable replay。
 - `DIAGNOSTIC`：诊断、拒绝、provider protocol、closeout、projection 或 recovery 观察。
 - `PROJECTION_SIGNAL`：projection catch-up 与派生视图状态信号。
 
-Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、`kind`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。
+Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；content / reasoning delta 不投影 raw delta activity。
 
 EngineEvent ingest 与 HostEvent projection 是两条边界：
 
@@ -620,7 +620,7 @@ snapshot 包含五类稳定视图：
 
 Memory policy 是按语义分区的 budget 模型，不是简单截断全文。`MemoryProjectionPolicy` 包含 `context_window_size`、selected recent window item / char cap、selected recent turn floor、fallback selected recent caps、evidence fact floor / cap、session summary cap、answer anchor cap、forward intent cap、reference continuity floor / cap、inline delta repair 上限和 `policy_ref`。projection 会按 item 数量、字符预算和 floor/cap 裁剪，并生成 budget diagnostics；facts 会按 claim/evidence 去重合并。
 
-snapshot 自带稳定 `snapshot_id`、policy digest、cursor、built_at 与 snapshot digest。cursor 记录当前覆盖到的 EventLog `checkpoint_event_sequence` / `checkpoint_event_id`；projection lag、snapshot missing / damaged、snapshot ahead、inline delta repair 等情况以 typed diagnostics 表达。RunInputBuilder 可以在 snapshot 轻微滞后时用 EventLog delta 做 inline repair；超过 policy 上限时必须走 repair / catch-up 路径，而不是让模型看到不一致 memory。
+snapshot 自带稳定 `snapshot_id`、policy digest、cursor、built_at 与 snapshot digest。cursor 记录当前覆盖到的 EventLog `checkpoint_event_sequence` / `checkpoint_event_id`；projection lag、snapshot missing / damaged、snapshot ahead、inline delta repair 等情况以 typed diagnostics 表达。RunInputBuilder 可以在 snapshot 轻微滞后时用 EventLog delta 做 inline repair；超过 policy 上限时必须走 repair / catch-up 路径，而不是让模型看到不一致 memory。Memory repair / catch-up 的 batch size 只控制单页读取和事务粒度；required path 会追到目标 cursor、idle 或 failure，不把 page size 当作正确性停止预算。
 
 Memory 与 compact 的关系必须保持单向：Context Governance / compactor 产出 accepted `CONTEXT_COMPACTED` fact 和 artifact；Memory projection 消费它并更新 read model。Memory 不直接写 compact artifact，不把 failed compact fallback 写成 compact 成功，也不把普通 final answer 或工具结果自动升级为 evidence-backed fact。ordinary RunInput 可以读取 memory snapshot 作为已物化 read model；pre-dispatch compact material 则由 EventLog / payload / artifact truth 构造 latest accepted compact、post-compact delta 与 current input anchor，不把 memory snapshot 当 compact input truth。任何 Run / Attempt truth 仍只来自 EventLog 与状态索引。
 

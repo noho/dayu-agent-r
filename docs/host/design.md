@@ -96,7 +96,7 @@ usage 是 provider capability 驱动的治理观测信号，不是 scene / Servi
 
 `tool_truncation_policy` 只配置默认治理参数，不配置 per-tool strategy / target。它至少包含 `enabled`、`default_cursor_ttl_seconds` 与 `default_limits`，其中 `default_limits` 覆盖 `text_chars.max_chars`、`text_lines.max_lines`、`list_items.max_items` 与 `binary_bytes.max_bytes`。工具声明负责提供 `ToolTruncateSpec.strategy`、`target_field` / `field_path` 与是否启用截断；如果工具声明启用截断但未提供 limit 或 ttl，Service / composition root 用 policy default 补齐成 effective truncate spec。`fetch_more` 名称由 `FrameworkToolName.FETCH_MORE` 固定，不作为配置项。
 
-`host_runtime.json` 表达 Host opener 的部署默认值：store / artifact roots、SQLite、`host_execution_lane_name`、worker backend、dispatch poll interval 与 memory projection catch-up batch size 等。这些都是 `open_host(options)` construction-time assembly inputs，不是 per-run override。顶层 selector 使用 `default_host_runtime_id`；host runtime record 不重复内部 id。`worker_backend` 当前支持 `local`，未来可扩展 `remote`；ConfigLoader 只读取该值，Service / composition root 负责映射为 `OpenHostOptions.worker_factory`。`runtime_lanes.json` 表达层中立 runtime lane coordinator 与 lane catalog；`host_runtime.json.host_execution_lane_name` 引用该 lane catalog，Service / composition root 再映射到 `OpenHostOptions` 的 lane fields。`tool_discovery.json` 表达 ToolsDiscovery provider 配置：provider id、import path 或 entry point、source kind、source id、enabled 与 `allow_empty`；ConfigLoader 只读出 typed provider specs，ToolsDiscovery 才负责 import provider、聚合 `ToolBundle` 与计算 digest。
+`host_runtime.json` 表达 Host opener 的部署默认值：store / artifact roots、SQLite、`host_execution_lane_name`、worker backend、dispatch poll interval 与 memory projection catch-up page size 等。这些都是 `open_host(options)` construction-time assembly inputs，不是 per-run override。`memory_projection_catchup_batch_size` 只表示 required catch-up / rebuild 的内部读取页大小和单批 transaction 粒度，不表示“本次最多追多少事件”的语义预算，也不能作为 correctness 停止条件。顶层 selector 使用 `default_host_runtime_id`；host runtime record 不重复内部 id。`worker_backend` 当前支持 `local`，未来可扩展 `remote`；ConfigLoader 只读取该值，Service / composition root 负责映射为 `OpenHostOptions.worker_factory`。`runtime_lanes.json` 表达层中立 runtime lane coordinator 与 lane catalog；`host_runtime.json.host_execution_lane_name` 引用该 lane catalog，Service / composition root 再映射到 `OpenHostOptions` 的 lane fields。`tool_discovery.json` 表达 ToolsDiscovery provider 配置：provider id、import path 或 entry point、source kind、source id、enabled 与 `allow_empty`；ConfigLoader 只读出 typed provider specs，ToolsDiscovery 才负责 import provider、聚合 `ToolBundle` 与计算 digest。
 
 ConfigLoader overlay 规则必须保持可预测：包内默认配置与 workspace 覆盖配置按配置文件类型分别加载；顶层 map 按稳定 id 合并，同 id 记录由 workspace 整条替换，不做隐式 deep merge。需要复用配置时使用显式 `extends`，且只允许单继承；继承解析后必须得到完整 typed record。ConfigLoader 不解析环境变量、不替换 secret、不脱敏，只原样读取 schema 表达的值。`dayu.runtime` 提供层中立 location resolver：当 `workspace/config` 存在时输出 `config_overlay_dir=workspace/config`，否则输出 `None`；同时解析 `prompt_asset_root` 与 `scene_manifest_root` 的实际可用路径。ConfigLoader 和 ScenePrepare 都不内置 workspace fallback 策略。
 
@@ -114,7 +114,7 @@ Service / composition root 是三者输出进入 Host 的唯一映射方。Servi
 
 运行时 override 合并由 Service / composition root 执行，优先级固定为未来 UI 显式输入 > scene manifest hints > ConfigLoader typed config view > 代码默认值。该优先级只适用于 Host 外部装配阶段，Host 接收的仍然是最终 typed inputs，不解释 override provenance。当前 Host public contract 允许的 per-run override 仅限 `SubmitFollowupRequest` 的 `system_prompt`、`tool_names`、`runner_spec`、`runner_options` 与 `agent_policy`：`system_prompt` 承接 `ScenePrepare` 已装配的 system messages；`tool_names` 只在已发现业务 `ToolBundle` 内选择子集，`None` 表示使用全量业务工具，空集合表示禁用业务工具，非空集合表示显式白名单；`runner_spec`、`runner_options` 与 `agent_policy` 必须由 Service 映射为完整 typed value，不接受 patch dict、profile lookup、extra payload 或 raw config fragment。`SubmitFollowupRequest.user_prompt` 是调用方本次输入，不来自 scene / config；`behavior` 与 `target_run_id` 属于 Service / UI 请求控制，不属于 scene manifest 的稳定职责。
 
-`open_host(options)` 的 construction-time inputs 也由 Service / composition root 从 ConfigLoader、ToolsDiscovery、代码默认值以及部署环境组装，但它们不是当前 per-run override。包括 durable store / artifact roots、SQLite 与 lane 参数、worker factory、ordinary run baseline、`HostToolingOptions`、context budget policy、compactor runner baseline、memory projection policy、memory catch-up batch size 与 truncation manager 开关在内的 Host opener 参数，在 Host handle 打开后不由 scene 或单个 Run 改写。Scene 可以表达 model / tool selection hints 与 typed agent policy override，ConfigLoader 可以表达 execution profile 与部署默认值，最终是否转化为 opener baseline 或 per-run override 由 Service 根据现有 Host typed contract 决定；若发现需要新增 per-run override 字段，必须回到 Host public interface design gate，不能通过 runtime assembly 旁路扩展。
+`open_host(options)` 的 construction-time inputs 也由 Service / composition root 从 ConfigLoader、ToolsDiscovery、代码默认值以及部署环境组装，但它们不是当前 per-run override。包括 durable store / artifact roots、SQLite 与 lane 参数、worker factory、ordinary run baseline、`HostToolingOptions`、context budget policy、compactor runner baseline、memory projection policy、memory catch-up page size 与 truncation manager 开关在内的 Host opener 参数，在 Host handle 打开后不由 scene 或单个 Run 改写。Scene 可以表达 model / tool selection hints 与 typed agent policy override，ConfigLoader 可以表达 execution profile 与部署默认值，最终是否转化为 opener baseline 或 per-run override 由 Service 根据现有 Host typed contract 决定；若发现需要新增 per-run override 字段，必须回到 Host public interface design gate，不能通过 runtime assembly 旁路扩展。
 
 Host 不知道 scene manifest、config 文件或 tool provider，不扫描业务工具，不拼 prompt，不解释 workflow，也不接收 raw `ToolBundle` 作为 per-run request。runtime assembly 可以修正 Host public policy dataclass 或 tool truncate declaration 的 typed shape，但不得改变 Host public command、Host handle method、`open_host(options)` 字段、public request / response dataclass 字段或 `dayu.host` public exports；runtime assembly 结果只能通过现有 `open_host` construction-time inputs 与 per-run typed request inputs 交给 Host。
 
@@ -335,6 +335,8 @@ EventLog
 - `preview event`：面向 UI 流式体验的临时事件，可以进入 Host event stream，但不能作为恢复、投递、RunResult、memory 或 audit 的唯一事实来源。
 - `preview delta`：模型 content / reasoning / tool-call 的增量片段，只服务展示体验，默认不是 canonical fact。
 - `stream fanout`：把已提交 Host events 分发给多个客户端的 projection / sink。慢客户端必须通过 `event_sequence` cursor 补读，不能反压 EventLog append。
+
+Host 默认不把 `content_delta`、`reasoning_delta`、`tool_call_delta` 这三类 per-delta EngineEvent 写入主 EventLog。Host 可以接受这些事件并把它们用于本次运行的即时展示路径，但 durable replay、Host event stream 补读、memory、audit 与 RunResult 不能承诺 token-level delta replay；可恢复真源仍是 terminal final answer、工具接受事实、compact canonical fact、usage / diagnostic / projection signal 等已提交 EventLog facts。若未来需要多客户端 live token fanout，必须另行设计 transient fanout 能力，不能把主 EventLog 的 durable replay 语义改成 token-level 保真。
 
 ## 5. Session 生命周期
 
@@ -1588,7 +1590,7 @@ Runner-call reconstruction contract 使用以下 scalar aliases：`Digest` 表�
 EngineEvent 到 Host EventLog 的映射原则：
 
 - 参与恢复、resume、memory、audit、governance 的 EngineEvent 映射为 canonical event。
-- 只服务 UI 流式体验的 delta 映射为 preview event，不进入 canonical projection。
+- 只服务 UI 流式体验的 per-delta EngineEvent 默认被 Host 接受但不写入主 EventLog；它们不进入 canonical projection，也不承诺 durable replay。非 delta 的 UI / progress 事件可以映射为 preview event。
 - Host 可以把多个 EngineEvent 聚合成一个 canonical fact，但不得丢失恢复必须的信息。
 - 工具事实 canonical owner 是 ToolRuntime Host accept path。EngineEvent ingest 不得为同一工具 outcome 追加第二条工具 canonical fact；描述已 accepted 工具结果的 EngineEvent 必须携带 accepted event refs / accepted tool fact ids，并只能映射为 preview、diagnostic、trace 或 idempotent no-op。
 
@@ -1596,10 +1598,10 @@ EngineEvent 到 Host EventLog 的映射原则：
 
 ```text
 iteration_started              -> preview
-content_delta                  -> preview
-reasoning_delta                -> preview
+content_delta                  -> accepted non-durable delta; no EventLog row by default
+reasoning_delta                -> accepted non-durable delta; no EventLog row by default
 content_completed              -> preview
-tool_call_delta                -> preview
+tool_call_delta                -> accepted non-durable delta; no EventLog row by default
 tool_calls_batch_ready         -> preview or diagnostic
 tool_call_requested            -> TOOL_CALL_REQUESTED
 ToolRuntime policy decision     -> TOOL_CALL_GOVERNED when decision affects execution / guidance / audit / duplicate handling
@@ -3210,7 +3212,9 @@ material data block 的 section 映射必须一对一，不允许同一 canonica
 
 Compact material data block build 启动前必须校验 EventLog / payload / artifact source refs 与 digest 可读、可校验，并且 latest accepted compact boundary 与 post-compact delta boundary 一致。它不得因为 Conversation Memory snapshot lag 而要求先追平 memory projection；如果 EventLog-backed material source 不完整、payload 损坏、artifact 缺失或 source boundary 不可校验，按 compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
 
-Ordinary RunInput 的 memory section 仍依赖 Conversation Memory snapshot。若 ordinary dispatch 前 snapshot cursor 不能覆盖 required EventLog cursor，Host 必须执行 bounded memory projection catch-up / rebuild 或在 policy 允许范围内做 inline delta repair；失败或超出 catch-up 执行预算时产生结构化 diagnostic，并按 pre-dispatch failure / retry / defer 策略收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`，也不得让 dispatch hot path 无上限同步补账。
+Ordinary RunInput 的 memory section 仍依赖 Conversation Memory snapshot。若 ordinary dispatch 前 snapshot cursor 不能覆盖 required EventLog cursor，Host 必须执行 page-bounded memory projection catch-up / rebuild，直到达到 required cursor、确认当前已 idle，或遇到 projection failure；也可以在 policy 允许范围内做 inline delta repair。`memory_projection_catchup_batch_size` 与相关 page limit 只控制单批读取和单次 transaction 粒度，不是“最多追多少事件”的语义预算，不得作为 required catch-up / rebuild 的 correctness 停止条件。追到 idle 仍不能覆盖 required cursor，或 catch-up / rebuild / inline repair 失败时，必须产生结构化 diagnostic，并按 pre-dispatch failure / retry / defer 策略收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
+
+Dispatch hot path 不得做无上限同步补账。after-commit / after-compact hook 尤其不能为了追平 required cursor 执行无界 catch-up / rebuild；它们只能不执行机会性 projection，或执行有显式页数上限、只改善后续读取延迟的 latency-only maintenance。latency-only maintenance 的页数上限不得被解释为 memory 已追平，也不得用于判定 required cursor 是否满足；ordinary dispatch 的 correctness 仍必须由 required catch-up / rebuild / inline repair 的目标 cursor、idle 或 failure 结果决定。
 
 Host 必须同时维护 prompt-local label 到 canonical provenance 的内部映射，例如 `E1 -> TOOL_RESULT_ACCEPTED event -> TOOL_CALL_REQUESTED event -> payload / artifact / source locator refs`。该映射用于 accept barrier、audit 与 rebuild，不作为 LLM 主要语义输入。compact material data block 不得包含 full EventLog range wrapper、裸 event id / payload ref / digest / cursor / policy / artifact descriptor 作为模型阅读主体，也不得重复渲染同一 current input、raw turn 或 raw tool result。当单条 accepted evidence 被 chunk 成 `E1.1`、`E1.2` 等子 label 时，Host proposal parser 可以把父 label `E1` 解析为同一 canonical evidence 的 shorthand；该 shorthand 只允许用于 evidence section，仍必须拒绝未知 label 或跨 section label。
 

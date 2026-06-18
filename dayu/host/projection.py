@@ -20,7 +20,13 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host._event_payload import payload_object
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
-from dayu.host.durable.event_log import EventClass, EventLogRow, read_events_after
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogReadClassFilter,
+    EventLogReadFilter,
+    EventLogRow,
+    read_events_after_matching,
+)
 from dayu.host.durable.projection import (
     advance_projection_checkpoint,
     clear_projection_failure,
@@ -34,7 +40,6 @@ PROJECTION_CONSUMER_ID_MAX_LENGTH = 128
 
 _CONSUMER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _MIN_BATCH_LIMIT = 1
-_READ_ONE_EVENT_LIMIT = 1
 _NO_EVENTS_CURSOR = 0
 _EMPTY_ERROR_MESSAGE = "<empty projection error message>"
 _LOGGER = logging.getLogger(__name__)
@@ -302,7 +307,7 @@ class ProjectionRunResult:
     :param consumer_id: 本次运行的 consumer id。
     :param started_cursor: 本次运行开始时的 checkpoint cursor。
     :param finished_cursor: 本次运行结束时的 checkpoint cursor。
-    :param events_scanned: 本次扫描的 EventLog row 数。
+    :param events_scanned: 本次执行的 EventLog read/apply step 数。
     :param events_matched: 命中 consumer filter 的 EventLog row 数。
     :param events_applied: consumer 返回 ``APPLIED`` 的数量。
     :param events_skipped: consumer 返回 ``SKIPPED`` 的数量。
@@ -323,7 +328,14 @@ class ProjectionRunResult:
 
 @dataclass(frozen=True, slots=True)
 class _ProjectionStepResult:
-    """单个 EventLog row projection step 的内部结果。"""
+    """单个 projection read/apply step 的内部结果。
+
+    :param started_cursor: step 开始时的 checkpoint cursor。
+    :param finished_cursor: step 结束时的 checkpoint cursor。
+    :param scanned: 本 step 是否读取到可处理匹配 row 或推进 covered cursor。
+    :param matched: 本 step 是否命中并调用 consumer。
+    :param apply_status: consumer apply 结果；未调用 consumer 时为 ``None``。
+    """
 
     started_cursor: int
     finished_cursor: int
@@ -414,15 +426,20 @@ class ProjectionRunner:
     ) -> ProjectionRunResult:
         """按 checkpoint 为单个 consumer catch up 一批 EventLog rows。
 
-        每个 EventLog row 都在独立 ``HostTransactionRunner.run_write()``
-        transaction 内完成 consumer write 与 checkpoint advance。consumer
-        失败时，该 row 的 consumer write 会 rollback，runner 随后只写
-        projection-local failure row，并停止当前批次。EventLog payload 无法
-        构造成 typed projection view 时同样记录 projection-local failure，
-        不推进 checkpoint。
+        ``limit`` 是单步 filtered read page size 与本轮最多 read/apply step
+        数，不表达 consumer 必须停在某个语义 catch-up 预算。每个 step 都在
+        独立 ``HostTransactionRunner.run_write()`` transaction 内完成：命中
+        consumer filter 的 row 会被 apply 并推进 checkpoint；没有匹配 row 但
+        filtered page 返回 covered cursor 时，只推进 checkpoint，不调用
+        consumer。consumer 失败时，该 row 的 consumer write 会 rollback，
+        runner 随后只写 projection-local failure row，并停止当前批次。
+        EventLog payload 无法构造成 typed projection view 时同样记录
+        projection-local failure，不推进 checkpoint。每个 step 只 apply 第一条
+        matching row；较大的 page 可以在无匹配时更快推进 covered cursor，但
+        密集 matching rows 仍按每条一个 transaction 处理。
 
         :param consumer_id: 要运行的 consumer id。
-        :param limit: 本次最多扫描的 EventLog row 数，必须为正数。
+        :param limit: filtered read page size 与本轮 step cap，必须为正数。
         :param max_event_sequence: 可选最大 EventLog sequence；下一条事件超过
             该值时停止，不推进 checkpoint。
         :returns: 本次运行结果。
@@ -448,6 +465,7 @@ class ProjectionRunner:
                     lambda transaction: self._process_next_event(
                         transaction,
                         consumer,
+                        read_limit=limit,
                         max_event_sequence=max_event_sequence,
                     )
                 )
@@ -542,12 +560,18 @@ class ProjectionRunner:
         transaction: HostTransaction,
         consumer: ProjectionConsumer,
         *,
+        read_limit: int,
         max_event_sequence: int | None,
     ) -> _ProjectionStepResult:
         """在单个 write transaction 内处理 checkpoint 后的下一条 EventLog。
 
+        ``read_limit`` 只控制 filtered read page 大小。page 中有 matching row
+        时，本 step 只消费第一条 matching row；没有 matching row 时才使用
+        covered cursor 批量跳过不相关 rows。
+
         :param transaction: 当前 Host durable transaction。
         :param consumer: concrete projection consumer。
+        :param read_limit: filtered EventLog read page size。
         :param max_event_sequence: 可选最大 EventLog sequence。
         :returns: 单步处理结果。
         :raises _ProjectionApplyFailed: consumer apply 失败时抛出。
@@ -559,12 +583,39 @@ class ProjectionRunner:
         checkpoint = ensure_projection_checkpoint(
             transaction, consumer_id, now=_utc_now_text()
         )
-        rows = read_events_after(
+        event_filter = event_log_read_filter_from_projection_filter(
+            consumer.event_filter
+        )
+        page = read_events_after_matching(
             transaction,
             checkpoint.checkpoint_event_sequence,
-            limit=_READ_ONE_EVENT_LIMIT,
+            event_filter=event_filter,
+            limit=read_limit,
+            max_event_sequence=max_event_sequence,
         )
-        if len(rows) == 0:
+        if len(page.rows) == 0:
+            if page.covered_event_sequence > checkpoint.checkpoint_event_sequence:
+                covered_event_id = page.covered_event_id
+                if covered_event_id is None:
+                    raise HostDurableError(
+                        "filtered EventLog covered event_id is missing"
+                    )
+                now = _utc_now_text()
+                advance_projection_checkpoint(
+                    transaction,
+                    consumer_id,
+                    event_sequence=page.covered_event_sequence,
+                    event_id=covered_event_id,
+                    now=now,
+                )
+                clear_projection_failure(transaction, consumer_id)
+                return _ProjectionStepResult(
+                    started_cursor=checkpoint.checkpoint_event_sequence,
+                    finished_cursor=page.covered_event_sequence,
+                    scanned=True,
+                    matched=False,
+                    apply_status=None,
+                )
             return _ProjectionStepResult(
                 started_cursor=checkpoint.checkpoint_event_sequence,
                 finished_cursor=checkpoint.checkpoint_event_sequence,
@@ -572,29 +623,16 @@ class ProjectionRunner:
                 matched=False,
                 apply_status=None,
             )
-        row = rows[0]
-        if (
-            max_event_sequence is not None
-            and row.event_sequence > max_event_sequence
-        ):
-            return _ProjectionStepResult(
-                started_cursor=checkpoint.checkpoint_event_sequence,
-                finished_cursor=checkpoint.checkpoint_event_sequence,
-                scanned=False,
-                matched=False,
-                apply_status=None,
-            )
+        row = page.rows[0]
         try:
             event = projection_event_view_from_row(row)
         except HostDurableError as exc:
             raise _ProjectionEventViewFailed(row, exc) from exc
-        apply_status: ProjectionApplyStatus | None = None
-        if consumer.event_filter.matches(event):
-            try:
-                apply_result = consumer.apply_event(transaction, event)
-            except Exception as exc:
-                raise _ProjectionApplyFailed(event, exc) from exc
-            apply_status = apply_result.status
+        try:
+            apply_result = consumer.apply_event(transaction, event)
+        except Exception as exc:
+            raise _ProjectionApplyFailed(event, exc) from exc
+        apply_status = apply_result.status
         now = _utc_now_text()
         advance_projection_checkpoint(
             transaction,
@@ -608,7 +646,7 @@ class ProjectionRunner:
             started_cursor=checkpoint.checkpoint_event_sequence,
             finished_cursor=event.event_sequence,
             scanned=True,
-            matched=apply_status is not None,
+            matched=True,
             apply_status=apply_status,
         )
 
@@ -668,6 +706,27 @@ def projection_event_view_from_row(row: EventLogRow) -> ProjectionEventView:
         payload_ref=row.payload_ref,
         payload_digest=row.payload_digest,
         payload=payload_object(row),
+    )
+
+
+def event_log_read_filter_from_projection_filter(
+    event_filter: ProjectionEventFilter,
+) -> EventLogReadFilter:
+    """把 projection consumer filter 转换为 durable EventLog read filter。
+
+    :param event_filter: projection consumer 的 EventLog filter。
+    :returns: durable-neutral EventLog read filter。
+    :raises HostDurableError: durable read filter 构造失败时抛出。
+    """
+
+    return EventLogReadFilter(
+        tuple(
+            EventLogReadClassFilter(
+                class_filter.event_class,
+                class_filter.event_types,
+            )
+            for class_filter in event_filter.class_filters
+        )
     )
 
 

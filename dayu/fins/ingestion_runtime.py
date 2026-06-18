@@ -132,6 +132,11 @@ _MAX_JOB_EVENT_READ_LIMIT: Final[int] = 1000
 _OBSERVATION_RETRY_AFTER_SECONDS: Final[float] = 1.0
 _PROGRESS_DOWNLOAD_STARTED: Final[str] = "download.started"
 _PROGRESS_DOWNLOAD_PREPARING: Final[str] = "download.preparing"
+_PROGRESS_DOWNLOAD_FILE_STARTED: Final[str] = "download.file_started"
+_PROGRESS_DOWNLOAD_FILE_COMPLETED: Final[str] = "download.file_completed"
+_PROGRESS_DOWNLOAD_FILE_SKIPPED: Final[str] = "download.file_skipped"
+_PROGRESS_DOWNLOAD_FILE_FAILED: Final[str] = "download.file_failed"
+_PROGRESS_DOWNLOAD_CONVERSION_STARTED: Final[str] = "download.conversion_started"
 _PROGRESS_DOWNLOAD_COMPLETED: Final[str] = "download.completed"
 _PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES: Final[str] = "download.completed_with_failures"
 _PROGRESS_UPLOAD_PREPARING: Final[str] = "upload.preparing"
@@ -165,6 +170,7 @@ _PAYLOAD_NOT_SUPPORTED_COUNT: Final[str] = "not_supported_count"
 _PAYLOAD_DOCUMENT_INDEX: Final[str] = "document_index"
 _PAYLOAD_DOCUMENT_TOTAL: Final[str] = "document_total"
 _PAYLOAD_UPLOAD_STATUS: Final[str] = "upload_status"
+_PAYLOAD_FILE_NAME: Final[str] = "file_name"
 _DIRECT_EVENT_QUEUE_MAX_SIZE: Final[int] = 32
 _DIRECT_QUEUE_GET_TIMEOUT_SECONDS: Final[float] = 0.05
 _DIRECT_QUEUE_PUT_TIMEOUT_SECONDS: Final[float] = 0.05
@@ -325,6 +331,29 @@ class FinsRejectedFilingDownloadArtifact:
 
 
 @dataclass(frozen=True)
+class FinsDownloadProgressEvent:
+    """source-specific 下载 adapter 回传给 runtime 的业务进度。
+
+    Attributes:
+        stage: runtime 可直接投影的下载阶段标签。
+        message: 用户可读进度说明。
+        document_id: 可选业务文档 ID。
+        file_name: 可选文件名；存在时优先作为 CLI 文档短标签展示。
+        payload: 额外有界业务摘要，不得包含本地路径或 provider raw payload。
+    """
+
+    stage: str
+    message: str
+    document_id: str | None = None
+    file_name: str | None = None
+    payload: dict[str, JsonValue] = field(default_factory=dict)
+
+
+FinsDownloadProgressSink = Callable[[FinsDownloadProgressEvent], None]
+"""下载 adapter 到 runtime 的同步进度回调。"""
+
+
+@dataclass(frozen=True)
 class FinsSourceDownloadAdapterRequest:
     """传给 source-specific 下载 adapter 的请求。
 
@@ -337,6 +366,7 @@ class FinsSourceDownloadAdapterRequest:
         overwrite_existing: 是否允许覆盖已存在源文档。
         rebuild_processed: 下载后是否要求后续重建 processed 产物。
         cancellation_checker: runtime 提供的协作式取消检查器。
+        progress_sink: 可选同步进度回调；adapter 仅用它上报业务进度，不负责 CLI 渲染。
     """
 
     normalized_ticker: NormalizedTicker
@@ -347,6 +377,7 @@ class FinsSourceDownloadAdapterRequest:
     overwrite_existing: bool
     rebuild_processed: bool
     cancellation_checker: FinsJobCancellationChecker
+    progress_sink: FinsDownloadProgressSink | None = None
 
 
 @dataclass(frozen=True)
@@ -1220,6 +1251,29 @@ class _FinsIngestionExecutionContext:
     job_record: FinsIngestionJobRecord | None
     direct_queue: Queue[_DirectStreamQueueItem] | None
     cancellation_state: _DirectStreamCancellationState | None
+
+
+@dataclass(frozen=True)
+class _DownloadProgressEmitter:
+    """把 adapter 进度回调绑定到一次 runtime 执行上下文。"""
+
+    runtime: FinsIngestionRuntime
+    context: _FinsIngestionExecutionContext
+
+    def __call__(self, event: FinsDownloadProgressEvent) -> None:
+        """投递 adapter 下载进度。
+
+        Args:
+            event: source-specific adapter 产出的业务进度。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: event 文本或 payload 不满足 bounded contract 时抛出。
+        """
+
+        self.runtime._emit_download_adapter_progress(self.context, event)
 
 
 @dataclass(frozen=True)
@@ -3380,6 +3434,7 @@ class FinsIngestionRuntime:
             overwrite_existing=request.overwrite_existing,
             rebuild_processed=request.rebuild_processed,
             cancellation_checker=context.cancellation_checker,
+            progress_sink=_DownloadProgressEmitter(self, context),
         )
         self._emit_context_progress(
             context,
@@ -4083,6 +4138,41 @@ class FinsIngestionRuntime:
         )
         _put_direct_queue(context, event)
 
+    def _emit_download_adapter_progress(
+        self,
+        context: _FinsIngestionExecutionContext,
+        event: FinsDownloadProgressEvent,
+    ) -> None:
+        """投递 source-specific adapter 下载进度。
+
+        Args:
+            context: 当前 ingestion 执行上下文。
+            event: adapter 回传的下载进度。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: stage、message、document_id、file_name 或 payload 非法时抛出。
+        """
+
+        payload = dict(event.payload)
+        display_document = event.file_name or event.document_id
+        if event.file_name is not None:
+            payload[_PAYLOAD_FILE_NAME] = _bounded_text(
+                event.file_name,
+                _PAYLOAD_FILE_NAME,
+                reject_path_separators=False,
+            )
+        bounded_payload = validate_bounded_job_event_payload(payload, "download_progress_payload")
+        self._emit_context_progress(
+            context,
+            source_event_type=_bounded_text(event.stage, "download_progress_stage"),
+            message=_bounded_text(event.message, "download_progress_message", reject_path_separators=False),
+            document_id=display_document,
+            payload=bounded_payload,
+        )
+
     def _emit_direct_result(
         self,
         context: _FinsIngestionExecutionContext,
@@ -4503,10 +4593,11 @@ def _download_result_details(summary: FinsDownloadResultSummary) -> tuple[FinsEv
     """
 
     bounded = _bounded_download_summary(summary)
+    displayed_skipped_count = max(bounded.skipped_count - bounded.rejected_count, 0)
     return (
         FinsEventDetail("discovered", str(bounded.discovered_count)),
         FinsEventDetail("downloaded", str(bounded.downloaded_count)),
-        FinsEventDetail("skipped", str(bounded.skipped_count)),
+        FinsEventDetail("skipped", str(displayed_skipped_count)),
         FinsEventDetail("rejected", str(bounded.rejected_count)),
         FinsEventDetail("failed", str(bounded.failed_count)),
         FinsEventDetail("written documents", str(len(bounded.written_document_ids))),
@@ -6300,6 +6391,8 @@ __all__ = [
     "FinsDownloadedFile",
     "FinsDownloadedSourceDocument",
     "FinsDownloadRequest",
+    "FinsDownloadProgressEvent",
+    "FinsDownloadProgressSink",
     "FinsDownloadResultSummary",
     "FinsJobCancellationChecker",
     "FinsIngestionJobRecord",

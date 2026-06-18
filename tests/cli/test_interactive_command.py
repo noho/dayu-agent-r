@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,10 @@ import pytest
 
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
+from dayu.cli.composer import InputReaderComposer
+from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
+from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -29,7 +34,13 @@ from dayu.host.api import (
     FollowupBehavior,
     FollowupSnapshot,
     Host,
+    HostActivityCounts,
+    HostActivityKind,
+    HostActivitySeverity,
+    HostActivityStatus,
+    HostActivityView,
     HostEvent,
+    HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
     HostStreamCursor,
@@ -46,8 +57,11 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.service.entrypoint_runtime import (
+    EntrypointRunTerminalResult,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
+    EntrypointStartupReconnectRequest,
+    EntrypointStartupReconnectResult,
     EntrypointTerminalSource,
 )
 
@@ -129,6 +143,7 @@ class _FakeHost:
     cancel_requests: list[CancelRunRequest]
     read_outbox_requests: list[ReadOutboxTerminalItemsRequest]
     _submit_statuses: tuple[HostTerminalStatus | None, ...]
+    _submit_activities: tuple[bool, ...]
     _cancel_status: HostTerminalStatus | None
     _run_statuses: tuple[RunStatus, ...]
     _submit_index: int
@@ -139,6 +154,7 @@ class _FakeHost:
         self,
         *,
         submit_statuses: tuple[HostTerminalStatus | None, ...] = (),
+        submit_activities: tuple[bool, ...] = (),
         cancel_status: HostTerminalStatus | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         block_cancel_after_record: bool = False,
@@ -147,6 +163,7 @@ class _FakeHost:
 
         :param submit_statuses: 每轮 submit 返回前推入 watcher 的 terminal
             状态；``None`` 表示该轮 watcher 不产生 terminal。
+        :param submit_activities: 每轮 submit 是否先推入 activity event。
         :param cancel_status: cancel 返回前推入 watcher 的 terminal 状态。
         :param run_statuses: ``get_run`` 依次返回的状态。
         :param block_cancel_after_record: 是否在记录 cancel 后阻塞。
@@ -162,6 +179,7 @@ class _FakeHost:
         self.cancel_requests = []
         self.read_outbox_requests = []
         self._submit_statuses = submit_statuses
+        self._submit_activities = submit_activities
         self._cancel_status = cancel_status
         self._run_statuses = run_statuses
         self._submit_index = 0
@@ -211,9 +229,7 @@ class _FakeHost:
         self.watchers.append(watcher)
         return watcher
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """记录 submit_followup 请求。
 
         :param session_id: 目标 Session id。
@@ -231,6 +247,8 @@ class _FakeHost:
         if status_index < len(self._submit_statuses):
             status = self._submit_statuses[status_index]
         if status is not None:
+            if status_index < len(self._submit_activities) and self._submit_activities[status_index]:
+                await self.watchers[-1].push(_activity_event(run_id=run_id))
             await self.watchers[-1].push(_terminal_event(run_id=run_id, status=status))
             await asyncio.sleep(0)
         return FollowupSnapshot(
@@ -256,6 +274,17 @@ class _FakeHost:
         status = self._run_statuses[status_index]
         self._run_status_index += 1
         return _run_snapshot(run_id=run_id, status=status)
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """返回 idle SessionSnapshot 供 startup barrier 结束。
+
+        :param session_id: 目标 Session id。
+        :returns: SessionSnapshot。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append(f"get_session:{session_id}")
+        return _session_snapshot(session_id=session_id, slot=None)
 
     async def read_outbox_terminal_items(
         self,
@@ -295,9 +324,7 @@ class _FakeHost:
         self.calls.append(f"cancel:{run_id}")
         self.cancel_requests.append(request)
         if self._cancel_status is not None:
-            await self.watchers[-1].push(
-                _terminal_event(run_id=run_id, status=self._cancel_status)
-            )
+            await self.watchers[-1].push(_terminal_event(run_id=run_id, status=self._cancel_status))
             await asyncio.sleep(0)
         if self.block_cancel_after_record:
             await asyncio.Event().wait()
@@ -442,6 +469,65 @@ class _NoopSigintMonitor(CliSigintMonitor):
 
         await asyncio.Event().wait()
         return observed_count
+
+
+class _FakeRunningKeyMonitor:
+    """测试用运行态按键 monitor。"""
+
+    started_count: int
+    closed_count: int
+    _actions: asyncio.Queue[RunningKeyAction]
+    _delay_ticks: int
+
+    def __init__(
+        self,
+        actions: tuple[RunningKeyAction, ...],
+        *,
+        delay_ticks: int = 0,
+    ) -> None:
+        """初始化 fake monitor。
+
+        :param actions: 依次返回的运行态按键动作。
+        :param delay_ticks: 返回每个动作前等待的 event loop tick 数。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.started_count = 0
+        self.closed_count = 0
+        self._actions = asyncio.Queue()
+        self._delay_ticks = delay_ticks
+        for action in actions:
+            self._actions.put_nowait(action)
+
+    def start(self) -> None:
+        """记录 monitor 启动。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.started_count += 1
+
+    async def wait_next(self) -> RunningKeyAction:
+        """返回下一条预设按键动作。
+
+        :returns: 运行态按键动作。
+        :raises asyncio.CancelledError: 等待任务被取消时透传。
+        """
+
+        for _tick_index in range(self._delay_ticks):
+            await asyncio.sleep(0)
+        return await self._actions.get()
+
+    def close(self) -> None:
+        """记录 monitor 关闭。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.closed_count += 1
 
 
 class _SecondSigintAfterCancelMonitor(CliSigintMonitor):
@@ -607,6 +693,10 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
     assert fake_host.create_requests == []
     assert fake_host.calls == [
         "watch:session-existing",
+        "read_outbox:session-existing",
+        "get_session:session-existing",
+        "read_outbox:session-existing",
+        "watch:session-existing",
         "submit:session-existing",
         "watch:session-existing",
         "submit:session-existing",
@@ -615,6 +705,108 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         "第一轮",
         "第二轮",
     ]
+
+
+@pytest.mark.asyncio
+async def test_interactive_existing_session_runs_startup_before_first_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """existing-session interactive 必须在读取第一条输入前执行 startup。"""
+
+    events: list[str] = []
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+        args,
+        command_name="session",
+        scenario="interactive",
+    )
+    fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
+
+    async def fake_startup_reconnect(
+        host: Host,
+        *,
+        request: EntrypointStartupReconnectRequest,
+    ) -> EntrypointStartupReconnectResult:
+        """记录 startup 调用并返回一条离线 terminal。
+
+        :param host: Host public handle。
+        :param request: startup reconnect 请求。
+        :returns: startup reconnect result。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        events.append(f"startup:{request.session_id}")
+        return EntrypointStartupReconnectResult(
+            terminal_results=(
+                EntrypointRunTerminalResult(
+                    source=EntrypointTerminalSource.OUTBOX_READ,
+                    session_id=request.session_id,
+                    run_id="run-startup",
+                    terminal_event_id="terminal-startup",
+                    event_sequence=5,
+                    terminal_status=HostTerminalStatus.SUCCEEDED,
+                    dedupe_key="terminal-startup",
+                    final_answer=_final_answer(run_id="run-startup"),
+                    error_message=None,
+                    cancel_reason=None,
+                    watcher_failure_message=None,
+                ),
+            ),
+            next_terminal_cursor=OutboxTerminalCursor(event_sequence=5),
+            seen_terminal_event_ids=frozenset({"terminal-startup"}),
+        )
+
+    def input_reader(prompt: str) -> str:
+        """记录输入读取顺序。
+
+        :param prompt: 输入提示文本。
+        :returns: 第一轮用户输入。
+        :raises EOFError: 第二次读取时表示输入结束。
+        """
+
+        events.append(f"input:{prompt}")
+        if events.count(f"input:{prompt}") > 1:
+            raise EOFError
+        return "第一轮"
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "startup_reconnect_entrypoint_session",
+        fake_startup_reconnect,
+    )
+
+    exit_code = await interactive_command._execute_interactive_on_existing_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        input_reader=input_reader,
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == EXIT_SUCCESS
+    assert events[:2] == ["startup:session-existing", "input:dayu> "]
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=5)
+    assert cursor_record.seen_terminal_event_ids == (
+        "terminal-startup",
+        "terminal-run-1",
+    )
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))
@@ -704,9 +896,7 @@ def test_interactive_empty_label_exits_with_usage_error(
         lambda _options: _FakeOpenHostContext(fake_host),
     )
 
-    exit_code = cli_main.main(
-        ("interactive", "--base", str(tmp_path), "--label", " ")
-    )
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path), "--label", " "))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
@@ -805,6 +995,51 @@ def test_interactive_two_turns_use_same_session_and_independent_watchers(
     assert first_submit.client_request_id.endswith(":turn-1:submit")
     assert second_submit.client_request_id.endswith(":turn-2:submit")
     assert first_submit.context.request_id != second_submit.context.request_id
+
+
+def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interactive activity 应进入 run view buffer，final answer 保持 stdout 清晰。"""
+
+    fake_host = _FakeHost(
+        submit_statuses=(
+            HostTerminalStatus.SUCCEEDED,
+            HostTerminalStatus.SUCCEEDED,
+        ),
+        submit_activities=(True, True),
+    )
+    run_view = TerminalInteractiveRunView(
+        options=InteractiveRunViewOptions(enabled=True),
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "_read_user_input",
+        _input_reader(("第一轮", "第二轮")),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "new_interactive_run_view",
+        lambda: run_view,
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.splitlines() == ["answer for run-1", "answer for run-2"]
+    assert "Activity:" not in captured.err
+    assert len(run_view.activity_lines) == 2
+    assert all("工具批次完成" in line for line in run_view.activity_lines)
+    assert run_view.transcript_lines == ("answer for run-1", "answer for run-2")
 
 
 def test_interactive_skips_blank_input_before_submit(
@@ -934,12 +1169,105 @@ async def test_interactive_sigint_after_run_id_cancels_host_run(
     cancel_request = fake_host.cancel_requests[0]
     assert cancel_request.reason == "cli_sigint"
     assert cancel_request.mode is CancelMode.GRACEFUL
-    assert cancel_request.client_request_id.endswith(
-        ":turn-1:run-run-1:cancel:cli_sigint"
+    assert cancel_request.client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
+    assert cancel_request.context.operation_context.operation_name == ("dayu_cli.interactive.cancel_run")
+
+
+@pytest.mark.asyncio
+async def test_interactive_esc_requests_cancel_after_run_id(
+    tmp_path: Path,
+) -> None:
+    """interactive 运行态 Esc 应请求取消当前 accepted Run。"""
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    invocation = interactive_command.new_cli_invocation(
+        command_name="interactive",
+        scenario="interactive",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
     )
-    assert cancel_request.context.operation_context.operation_name == (
-        "dayu_cli.interactive.cancel_run"
+    fake_host = _FakeHost(
+        submit_statuses=(None,),
+        cancel_status=HostTerminalStatus.CANCELLED,
+        run_statuses=(RunStatus.RUNNING,),
     )
+    stderr = io.StringIO()
+    run_view = TerminalInteractiveRunView(
+        stderr=stderr,
+        options=InteractiveRunViewOptions(enabled=True),
+    )
+    key_monitor = _FakeRunningKeyMonitor(
+        (RunningKeyAction.CANCEL_RUN,),
+        delay_ticks=2,
+    )
+
+    result = await interactive_command._submit_interactive_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        turn_index=1,
+        user_prompt="请总结收入变化",
+        run_overrides=interactive_command.ServiceRunOverrides(),
+        sigint_monitor=_NoopSigintMonitor(),
+        run_view=run_view,
+        key_monitor=key_monitor,
+    )
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert len(fake_host.cancel_requests) == 1
+    assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
+    assert "Interactive: cancel requested" in stderr.getvalue()
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_interactive_ctrl_t_switches_run_view_without_cancel(
+    tmp_path: Path,
+) -> None:
+    """interactive 运行态 Ctrl+T 应切换 run view，且不得触发 Host cancel。"""
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    invocation = interactive_command.new_cli_invocation(
+        command_name="interactive",
+        scenario="interactive",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost(
+        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+        submit_activities=(True,),
+    )
+    stderr = io.StringIO()
+    run_view = TerminalInteractiveRunView(
+        stderr=stderr,
+        options=InteractiveRunViewOptions(enabled=True),
+    )
+    key_monitor = _FakeRunningKeyMonitor((RunningKeyAction.TOGGLE_ACTIVITY,))
+
+    result = await interactive_command._submit_interactive_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        turn_index=1,
+        user_prompt="请总结收入变化",
+        run_overrides=interactive_command.ServiceRunOverrides(),
+        sigint_monitor=_NoopSigintMonitor(),
+        run_view=run_view,
+        key_monitor=key_monitor,
+    )
+
+    assert result is not None
+    assert result.terminal_status is HostTerminalStatus.SUCCEEDED
+    assert fake_host.cancel_requests == []
+    assert run_view.activity_lines
+    assert "[Interactive activity]" in stderr.getvalue()
+    assert "Activity hidden" not in stderr.getvalue()
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
 
 
 @pytest.mark.asyncio
@@ -974,9 +1302,7 @@ async def test_interactive_second_sigint_exits_after_cancel_request(
 
     assert result is None
     assert len(fake_host.cancel_requests) == 1
-    assert fake_host.cancel_requests[0].client_request_id.endswith(
-        ":turn-1:run-run-1:cancel:cli_sigint"
-    )
+    assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
 
 
 @pytest.mark.asyncio
@@ -1001,6 +1327,7 @@ async def test_interactive_repl_returns_130_on_second_sigint(
     exit_code = await interactive_command._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
+        workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
         run_overrides=interactive_command.ServiceRunOverrides(),
@@ -1143,9 +1470,7 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
 
     accepted_run = interactive_command._AcceptedRunState()
     accepted_run.record("run-1")
-    submit_task = asyncio.create_task(
-        _already_terminal(_terminal_result(status=HostTerminalStatus.SUCCEEDED))
-    )
+    submit_task = asyncio.create_task(_already_terminal(_terminal_result(status=HostTerminalStatus.SUCCEEDED)))
     await asyncio.sleep(0)
 
     result = await interactive_command._cancel_interactive_turn_after_first_sigint(
@@ -1185,9 +1510,7 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
                 "fins_default_subject": "AAPL",
                 "base_user": "本地 CLI 用户",
             },
-            assembly_overrides=interactive_command.ServiceAssemblyOverrides(
-                model_id=_MODEL_ID
-            ),
+            assembly_overrides=interactive_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
@@ -1340,22 +1663,53 @@ def _terminal_event(*, run_id: str, status: HostTerminalStatus) -> HostEvent:
         event_sequence=int(run_id.removeprefix("run-")) + 1,
         session_id="session-1",
         run_id=run_id,
+        event_class=HostEventClass.CANONICAL_FACT,
+        event_type=_event_type(status),
         kind=_event_kind(status),
+        activity=None,
         dedupe_key=f"terminal-{run_id}",
         terminal_status=status,
-        final_answer=_final_answer(run_id=run_id)
-        if status is HostTerminalStatus.SUCCEEDED
-        else None,
+        final_answer=_final_answer(run_id=run_id) if status is HostTerminalStatus.SUCCEEDED else None,
         error_message=_error_message(run_id=run_id, status=status),
-        cancel_reason=f"cancelled for {run_id}"
-        if status is HostTerminalStatus.CANCELLED
-        else None,
+        cancel_reason=f"cancelled for {run_id}" if status is HostTerminalStatus.CANCELLED else None,
     )
 
 
-def _terminal_result(
-    *, status: HostTerminalStatus
-) -> interactive_command.EntrypointRunTerminalResult:
+def _activity_event(*, run_id: str) -> HostEvent:
+    """构造 Host activity event。
+
+    :param run_id: Run id。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"activity-{run_id}",
+        event_sequence=int(run_id.removeprefix("run-")) + 1,
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.PREVIEW,
+        event_type="TOOL_CALLS_BATCH_DONE",
+        kind=HostEventKind.PROGRESS,
+        activity=HostActivityView(
+            kind=HostActivityKind.TOOL_BATCH,
+            status=HostActivityStatus.COMPLETED,
+            title="工具批次完成",
+            summary="完成 1 个工具调用。",
+            severity=HostActivitySeverity.INFO,
+            tool_name="record_smoke_fact",
+            tool_display_name="记录烟测事实",
+            counts=HostActivityCounts(total=1, completed=1, failed=0, cancelled=0),
+        ),
+        dedupe_key=f"activity-{run_id}",
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _terminal_result(*, status: HostTerminalStatus) -> interactive_command.EntrypointRunTerminalResult:
     """构造 interactive terminal result。
 
     :param status: terminal status。
@@ -1371,13 +1725,9 @@ def _terminal_result(
         event_sequence=2,
         terminal_status=status,
         dedupe_key="terminal-run-1",
-        final_answer=_final_answer(run_id="run-1")
-        if status is HostTerminalStatus.SUCCEEDED
-        else None,
+        final_answer=_final_answer(run_id="run-1") if status is HostTerminalStatus.SUCCEEDED else None,
         error_message=_error_message(run_id="run-1", status=status),
-        cancel_reason="cancelled for run-1"
-        if status is HostTerminalStatus.CANCELLED
-        else None,
+        cancel_reason="cancelled for run-1" if status is HostTerminalStatus.CANCELLED else None,
         watcher_failure_message=None,
     )
 
@@ -1431,4 +1781,23 @@ def _event_kind(status: HostTerminalStatus) -> HostEventKind:
         return HostEventKind.CANCELLED
     if status is HostTerminalStatus.LOST:
         return HostEventKind.LOST
+    raise AssertionError(f"unexpected terminal status: {status}")
+
+
+def _event_type(status: HostTerminalStatus) -> str:
+    """把 terminal status 映射为 EventLog event_type。
+
+    :param status: terminal status。
+    :returns: EventLog event_type。
+    :raises AssertionError: 未覆盖状态时抛出。
+    """
+
+    if status is HostTerminalStatus.SUCCEEDED:
+        return "RUN_SUCCEEDED"
+    if status is HostTerminalStatus.FAILED:
+        return "RUN_FAILED"
+    if status is HostTerminalStatus.CANCELLED:
+        return "RUN_CANCELLED"
+    if status is HostTerminalStatus.LOST:
+        return "RUN_LOST"
     raise AssertionError(f"unexpected terminal status: {status}")

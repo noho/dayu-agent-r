@@ -120,7 +120,6 @@ from dayu.host.memory import (
 )
 from dayu.host.memory_repair import (
     ConversationMemoryProjectionRepairResult,
-    MemoryProjectionCatchupBudget,
     catch_up_conversation_memory_projection,
 )
 from dayu.host.run_input import (
@@ -2009,7 +2008,6 @@ async def test_dispatch_checkpoint_covered_catchup_accepts_ordinary_run_input(
             policy=policy,
             batch_size=32,
             max_event_sequence=required_event_sequence,
-            budget=None,
         )
         checkpoint_before_dispatch = _read_memory_checkpoint_sequence(
             store.transaction_runner
@@ -2022,7 +2020,6 @@ async def test_dispatch_checkpoint_covered_catchup_accepts_ordinary_run_input(
             batch_size: int,
             consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
             max_event_sequence: int | None = None,
-            budget: MemoryProjectionCatchupBudget | None = None,
         ) -> ConversationMemoryProjectionRepairResult:
             """调用真实 catch-up 并记录 dispatch 内部返回值。
 
@@ -2031,7 +2028,6 @@ async def test_dispatch_checkpoint_covered_catchup_accepts_ordinary_run_input(
             :param batch_size: 每批扫描事件数。
             :param consumer_id: projection consumer id。
             :param max_event_sequence: 本次最多追到的 EventLog sequence。
-            :param budget: 可选 catch-up 预算。
             :returns: 真实 catch-up 返回值。
             """
 
@@ -2041,7 +2037,6 @@ async def test_dispatch_checkpoint_covered_catchup_accepts_ordinary_run_input(
                 batch_size=batch_size,
                 consumer_id=consumer_id,
                 max_event_sequence=max_event_sequence,
-                budget=budget,
             )
             observed_catchups.append(result)
             return result
@@ -3906,6 +3901,68 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
             assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
             assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_compact_accepted_hot_path_does_not_call_memory_catchup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """compact accepted 后的 queue promotion 不执行无界 memory correctness catch-up。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    def forbidden_catch_up(
+        transaction_runner: HostTransactionRunner,
+        *,
+        policy: MemoryProjectionPolicy,
+        batch_size: int,
+        consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
+        max_event_sequence: int | None = None,
+    ) -> ConversationMemoryProjectionRepairResult:
+        """若 compact accepted 热路径调用 memory repair，则让测试失败。
+
+        :param transaction_runner: Host transaction runner。
+        :param policy: memory projection policy。
+        :param batch_size: projection page size。
+        :param consumer_id: projection consumer id。
+        :param max_event_sequence: 目标 EventLog sequence。
+        :returns: 不会返回。
+        :raises AssertionError: 始终抛出，标记禁止路径被调用。
+        """
+
+        del transaction_runner, policy, batch_size, consumer_id, max_event_sequence
+        raise AssertionError("compact accepted hot path must not run memory catch-up")
+
+    monkeypatch.setattr(
+        host_dispatch,
+        "catch_up_conversation_memory_projection",
+        forbidden_catch_up,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-compact-no-memory-catchup",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=_PreparedManifestProactiveCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
         finally:
             await scheduler.close()
 

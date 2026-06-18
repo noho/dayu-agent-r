@@ -20,6 +20,8 @@ class DownloadEventType(StrEnum):
     PIPELINE_STARTED = "pipeline_started"
     COMPANY_RESOLVED = "company_resolved"
     FILING_STARTED = "filing_started"
+    FILE_DOWNLOAD_STARTED = "file_download_started"
+    CONVERSION_STARTED = "conversion_started"
     FILE_DOWNLOADED = "file_downloaded"
     FILE_SKIPPED = "file_skipped"
     FILE_FAILED = "file_failed"

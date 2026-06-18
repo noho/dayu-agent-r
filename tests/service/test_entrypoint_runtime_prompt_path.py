@@ -16,6 +16,7 @@ from dayu.host.api import (
     Host,
     HostCallContext,
     HostEvent,
+    HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
     HostStreamCursor,
@@ -344,7 +345,10 @@ def _terminal_event() -> HostEvent:
         event_sequence=2,
         session_id="session-1",
         run_id="run-1",
+        event_class=HostEventClass.CANONICAL_FACT,
+        event_type="RUN_SUCCEEDED",
         kind=HostEventKind.SUCCEEDED,
+        activity=None,
         dedupe_key="terminal-run-1-2",
         terminal_status=HostTerminalStatus.SUCCEEDED,
         final_answer=HostFinalAnswerView(

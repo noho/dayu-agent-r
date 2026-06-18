@@ -25,25 +25,24 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.evidence import (
+    ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH,
     AcceptedEvidenceEnvelope,
-    accepted_evidence_envelope_from_json_value,
+    accepted_evidence_envelope_from_payload,
+    accepted_tool_raw_outcome_text_from_payload,
 )
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.payload_resolution import event_payload_object_for_result_ref
 from dayu.host.payload_resolution import tool_call_request_atoms
 from dayu.host.payload_resolution import ToolCallRequestAtoms
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
-from dayu.host.terminal_summary_payload import (
+from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
 )
 
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
-_PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
-_PAYLOAD_FIELD_RESULT_PREVIEW = "result_preview"
 _MEMORY_ITEM_EVIDENCE_BACKED_FACT_PREFIX = "memory-item:evidence_backed_fact"
 _PAYLOAD_REF_PREFIX = "payload"
 _LOCATOR_REF_SEPARATOR = ", "
@@ -183,15 +182,17 @@ def _accepted_evidence_envelope_from_event(
         row,
         payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
-    envelope_value = payload.get(_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE)
-    if envelope_value is None:
-        return ()
     try:
-        envelope = accepted_evidence_envelope_from_json_value(envelope_value)
+        envelope = accepted_evidence_envelope_from_payload(
+            payload,
+            producer_event_ref=row.event_id,
+        )
     except ValueError as exc:
+        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
+            raise HostDurableError(str(exc)) from exc
         raise HostDurableError("canonical evidence envelope is invalid") from exc
-    if envelope.producer_event_ref != row.event_id:
-        raise HostDurableError("accepted evidence producer_event_ref mismatch")
+    if envelope is None:
+        return ()
     return (envelope,)
 
 
@@ -214,11 +215,12 @@ def _tool_result_evidence_materials(
     if len(envelopes) == 0:
         return ()
     payload = _accepted_tool_result_payload(transaction, row, envelopes[0])
-    _reject_result_preview(payload)
-    raw_outcome = payload.get(_PAYLOAD_FIELD_RAW_TOOL_OUTCOME)
-    if raw_outcome is None:
+    try:
+        raw_text = accepted_tool_raw_outcome_text_from_payload(payload)
+    except ValueError as exc:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed") from exc
+    if raw_text is None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
-    raw_text = canonical_json_dumps(raw_outcome)
     materials: list[InitialEvidenceMaterial] = []
     for envelope in envelopes:
         materials.append(
@@ -266,18 +268,6 @@ def _accepted_tool_result_payload(
         expected_payload_digest=envelope.result_ref.payload_digest,
         payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
-
-
-def _reject_result_preview(payload: Mapping[str, JsonValue]) -> None:
-    """拒绝旧 ``result_preview`` evidence content 字段。
-
-    :param payload: TOOL_RESULT_ACCEPTED payload。
-    :returns: ``None``。
-    :raises HostDurableError: payload 中出现 result_preview 时抛出。
-    """
-
-    if _PAYLOAD_FIELD_RESULT_PREVIEW in payload:
-        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed")
 
 
 def _readable_query_text(

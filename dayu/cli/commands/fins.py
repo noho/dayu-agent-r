@@ -89,6 +89,7 @@ _UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = (
 _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
+_FINS_DIRECT_DEBUG_BASE_PART_COUNT: Final[int] = 2
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
@@ -743,10 +744,12 @@ def _log_fins_direct_event_received(event: FinsEvent) -> None:
         "Fins direct event received; %s",
         " ".join(_fins_event_verbose_diagnostic_parts(event)),
     )
-    _LOGGER.debug(
-        "Fins direct event detail; %s",
-        " ".join(_fins_event_debug_diagnostic_parts(event)),
-    )
+    debug_parts = _fins_event_debug_diagnostic_parts(event)
+    if len(debug_parts) > _FINS_DIRECT_DEBUG_BASE_PART_COUNT:
+        _LOGGER.debug(
+            "Fins direct event detail; %s",
+            " ".join(debug_parts),
+        )
 
 
 def _fins_event_verbose_diagnostic_parts(event: FinsEvent) -> tuple[str, ...]:

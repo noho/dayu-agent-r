@@ -23,8 +23,14 @@ from dayu.host.api import (
     Host,
     HostApiError,
     HostApiErrorCode,
+    HostActivityCounts,
+    HostActivityKind,
+    HostActivitySeverity,
+    HostActivityStatus,
+    HostActivityView,
     HostCallContext,
     HostEvent,
+    HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
     HostStreamCursor,
@@ -44,15 +50,22 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.service.entrypoint_runtime import (
+    ClosableHostEventIterator,
+    EntrypointActivity,
+    EntrypointActivityKind,
+    EntrypointActivitySeverity,
+    EntrypointActivityStatus,
     EntrypointCancelRequest,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
     EntrypointRuntimeError,
+    EntrypointStartupReconnectRequest,
     EntrypointTerminalSource,
     EntrypointTurnRequest,
     cancel_entrypoint_run_and_wait,
     ensure_or_create_entrypoint_session,
     prepare_entrypoint_runtime,
+    startup_reconnect_entrypoint_session,
     submit_entrypoint_turn_and_wait,
     _close_watcher,
 )
@@ -168,8 +181,12 @@ class _FakeHost:
     _cancel_error: HostApiError | None
     _run_statuses: tuple[RunStatus, ...]
     _outbox_batches: tuple[OutboxTerminalItemsBatch, ...]
+    _session_snapshots: tuple[SessionSnapshot, ...]
+    _session_get_watcher_errors: tuple[Exception, ...]
     _run_status_index: int
     _outbox_index: int
+    _session_snapshot_index: int
+    _session_get_watcher_error_index: int
 
     def __init__(
         self,
@@ -180,6 +197,8 @@ class _FakeHost:
         cancel_error: HostApiError | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         outbox_batches: tuple[OutboxTerminalItemsBatch, ...] = (),
+        session_snapshots: tuple[SessionSnapshot, ...] = (),
+        session_get_watcher_errors: tuple[Exception, ...] = (),
     ) -> None:
         """初始化测试 Host。
 
@@ -189,6 +208,8 @@ class _FakeHost:
         :param cancel_error: cancel_run 应抛出的 Host API 错误。
         :param run_statuses: get_run 依次返回的 RunStatus。
         :param outbox_batches: read_outbox_terminal_items 依次返回的批次。
+        :param session_snapshots: get_session 依次返回的 SessionSnapshot。
+        :param session_get_watcher_errors: get_session 返回后推入 startup watcher 的异常。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -206,8 +227,12 @@ class _FakeHost:
         self._cancel_error = cancel_error
         self._run_statuses = run_statuses
         self._outbox_batches = outbox_batches
+        self._session_snapshots = session_snapshots
+        self._session_get_watcher_errors = session_get_watcher_errors
         self._run_status_index = 0
         self._outbox_index = 0
+        self._session_snapshot_index = 0
+        self._session_get_watcher_error_index = 0
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 调用并返回测试 Session。
@@ -287,6 +312,30 @@ class _FakeHost:
         self._run_status_index += 1
         return _run_snapshot(run_id=run_id, status=status)
 
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """按预设返回 Session snapshot。
+
+        :param session_id: 目标 Session id。
+        :returns: SessionSnapshot。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append(f"get_session:{session_id}")
+        if not self._session_snapshots:
+            return _session_snapshot(session_id=session_id, slot_key=None)
+        snapshot_index = min(
+            self._session_snapshot_index,
+            len(self._session_snapshots) - 1,
+        )
+        self._session_snapshot_index += 1
+        if self._session_get_watcher_error_index < len(self._session_get_watcher_errors):
+            await self.watchers[-1].fail(
+                self._session_get_watcher_errors[self._session_get_watcher_error_index]
+            )
+            self._session_get_watcher_error_index += 1
+            await asyncio.sleep(0)
+        return self._session_snapshots[snapshot_index]
+
     async def read_outbox_terminal_items(
         self,
         session_id: str,
@@ -355,6 +404,45 @@ class _SleepRecorder:
         """
 
         self.calls.append(seconds)
+        await asyncio.sleep(0)
+
+
+class _SleepAndPushTerminal:
+    """测试用 sleep coroutine，在第一次 sleep 时推送 live terminal。"""
+
+    calls: list[float]
+    _host: _FakeHost
+    _event: HostEvent
+    _pushed: bool
+
+    def __init__(self, *, host: _FakeHost, event: HostEvent) -> None:
+        """初始化 sleep 推送器。
+
+        :param host: 接收 watcher 的 fake Host。
+        :param event: 第一次 sleep 时推送的 terminal event。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls = []
+        self._host = host
+        self._event = event
+        self._pushed = False
+
+    async def __call__(self, seconds: float) -> None:
+        """记录 sleep 秒数，并在首次调用时推送 terminal。
+
+        :param seconds: sleep 秒数。
+        :returns: ``None``。
+        :raises AssertionError: watcher 尚未 attach 时抛出。
+        """
+
+        self.calls.append(seconds)
+        if not self._pushed:
+            self._pushed = True
+            if len(self._host.watchers) == 0:
+                raise AssertionError("watcher must be attached before sleep")
+            await self._host.watchers[-1].push(self._event)
         await asyncio.sleep(0)
 
 
@@ -537,22 +625,110 @@ async def test_submit_entrypoint_turn_filters_unrelated_terminal(
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_uses_outbox_when_live_terminal_missing(
+async def test_submit_entrypoint_turn_emits_host_public_activity(
     tmp_path: Path,
 ) -> None:
-    """get_run 已终态但 watcher 未给 terminal 时必须用 public outbox 补读。"""
+    """submit helper 应把目标 Run 的 Host public activity 投影给 callback。"""
 
     runtime = await _prepare_runtime(tmp_path)
-    outbox_item = _outbox_item(event_sequence=5, run_id="run-1")
+    activities: list[EntrypointActivity] = []
     fake_host = _FakeHost(
-        run_statuses=(RunStatus.SUCCEEDED,),
-        outbox_batches=(
-            _outbox_batch(
-                items=(outbox_item,),
-                next_sequence=5,
-                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="activity-tool-call",
             ),
-        ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.terminal_event_id == "terminal-run-1-3"
+    assert len(activities) == 1
+    activity = activities[0]
+    assert activity.kind is EntrypointActivityKind.TOOL_BATCH
+    assert activity.status is EntrypointActivityStatus.COMPLETED
+    assert activity.run_id == "run-1"
+    assert activity.event_sequence == 2
+    assert activity.dedupe_key == "activity-tool-call"
+    assert activity.title == "工具批次完成"
+    assert activity.summary == "完成 2 个工具调用。"
+    assert activity.severity is EntrypointActivitySeverity.INFO
+    assert activity.tool_name == "record_smoke_fact"
+    assert activity.tool_display_name == "记录烟测事实"
+    assert activity.counts is not None
+    assert activity.counts.total == 2
+    assert activity.counts.completed == 2
+    assert activity.counts.failed == 0
+    assert activity.counts.cancelled == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_deduplicates_activity_by_dedupe_key(
+    tmp_path: Path,
+) -> None:
+    """重复 dedupe key 的 progress activity 不得重复 callback。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="activity-duplicate",
+            ),
+            _activity_event(
+                event_sequence=3,
+                run_id="run-1",
+                dedupe_key="activity-duplicate",
+            ),
+            _terminal_event(event_sequence=4, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.run_id == "run-1"
+    assert [activity.dedupe_key for activity in activities] == ["activity-duplicate"]
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_non_terminal_dedupe_key_does_not_hide_terminal(
+    tmp_path: Path,
+) -> None:
+    """非终态事件与 terminal 共用 dedupe key 时仍必须返回 terminal。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    shared_dedupe_key = "shared-progress-terminal-dedupe"
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key=shared_dedupe_key,
+            ),
+            _terminal_event(
+                event_sequence=3,
+                run_id="run-1",
+                dedupe_key=shared_dedupe_key,
+            ),
+        )
     )
 
     result = await submit_entrypoint_turn_and_wait(
@@ -562,12 +738,515 @@ async def test_submit_entrypoint_turn_uses_outbox_when_live_terminal_missing(
         host_assembly=runtime.host_assembly,
     )
 
-    assert result.source is EntrypointTerminalSource.OUTBOX_READ
-    assert result.terminal_event_id == "terminal-run-1-5"
-    read_request = fake_host.read_outbox_requests[0]
-    assert read_request.after == OutboxTerminalCursor(event_sequence=0)
-    assert read_request.seen_terminal_event_ids == ()
-    assert read_request.limit == 50
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.run_id == "run-1"
+    assert result.terminal_event_id == "terminal-run-1-3"
+    assert result.dedupe_key == shared_dedupe_key
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_activity_callback_exception_propagates(
+    tmp_path: Path,
+) -> None:
+    """on_activity callback 抛错时应向调用方传播，不被 watcher wait 吞掉。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="activity-callback-error",
+            ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    def raise_from_activity(activity: EntrypointActivity) -> None:
+        """测试 activity callback 异常传播。
+
+        :param activity: Service activity。
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        raise RuntimeError(f"activity callback failed: {activity.dedupe_key}")
+
+    with pytest.raises(RuntimeError, match="activity callback failed: activity-callback-error"):
+        await submit_entrypoint_turn_and_wait(
+            cast(Host, fake_host),
+            request=_turn_request(),
+            scene_inputs=runtime.scene_inputs,
+            host_assembly=runtime.host_assembly,
+            on_activity=raise_from_activity,
+        )
+
+    assert fake_host.watchers[0].closed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_suppresses_progress_without_activity(
+    tmp_path: Path,
+) -> None:
+    """无 Host public activity 的 progress 不得生成伪工具展示。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _progress_without_activity(event_sequence=2, run_id="run-1"),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.run_id == "run-1"
+    assert activities == []
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_filters_unrelated_activity(
+    tmp_path: Path,
+) -> None:
+    """同 Session 其它 Run 的 activity 不得进入当前 turn callback。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="other-run",
+                dedupe_key="activity-other-run",
+            ),
+            _activity_event(
+                event_sequence=3,
+                run_id="run-1",
+                dedupe_key="activity-current-run",
+            ),
+            _terminal_event(event_sequence=4, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert result.run_id == "run-1"
+    assert [activity.dedupe_key for activity in activities] == ["activity-current-run"]
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_waits_live_terminal_when_run_snapshot_is_terminal(
+    tmp_path: Path,
+) -> None:
+    """submit 已 attach 时，get_run 先见终态也必须等待 live terminal。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    outbox_item = _outbox_item(event_sequence=5, run_id="run-1")
+    terminal_event = _terminal_event(event_sequence=6, run_id="run-1")
+    fake_host = _FakeHost(
+        run_statuses=(RunStatus.SUCCEEDED, RunStatus.SUCCEEDED),
+        outbox_batches=(
+            _outbox_batch(
+                items=(outbox_item,),
+                next_sequence=5,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+    sleep = _SleepAndPushTerminal(host=fake_host, event=terminal_event)
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        sleep=sleep,
+    )
+
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.terminal_event_id == "terminal-run-1-6"
+    assert fake_host.read_outbox_requests == []
+    assert sleep.calls == [0.05]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_attaches_watcher_before_session_outbox_backfill() -> None:
+    """interactive startup 必须 watcher-first 后读取 session-scoped outbox。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(
+                    _outbox_item(event_sequence=2, run_id="run-1"),
+                    _outbox_item(event_sequence=3, run_id="run-2"),
+                ),
+                next_sequence=3,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        )
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-1",
+        "run-2",
+    ]
+    assert result.next_terminal_cursor == OutboxTerminalCursor(event_sequence=3)
+    assert fake_host.calls[:2] == ["watch:session-1", "read_outbox:session-1"]
+    assert fake_host.read_outbox_requests[0].after == OutboxTerminalCursor(event_sequence=0)
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_treats_caught_up_empty_backfill_as_idle_success() -> None:
+    """startup session backfill 追平且无新 terminal 时应正常进入 idle success。"""
+
+    fake_host = _FakeHost()
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert result.terminal_results == ()
+    assert fake_host.calls == [
+        "watch:session-1",
+        "read_outbox:session-1",
+        "get_session:session-1",
+        "read_outbox:session-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_reads_idle_tail_outbox_before_returning() -> None:
+    """idle snapshot 后必须补读 tail outbox，避免 terminal 在输入态前丢失。"""
+
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=7, run_id="run-tail"),),
+                next_sequence=7,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(),
+                next_sequence=7,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-tail"
+    ]
+    assert result.next_terminal_cursor == OutboxTerminalCursor(event_sequence=7)
+    assert [request.after for request in fake_host.read_outbox_requests] == [
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=7),
+    ]
+    assert fake_host.calls == [
+        "watch:session-1",
+        "read_outbox:session-1",
+        "get_session:session-1",
+        "read_outbox:session-1",
+        "get_session:session-1",
+        "read_outbox:session-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_rechecks_idle_tail_after_watcher_failure() -> None:
+    """tail drain 首次发现 watcher failure 后必须再用 outbox 关闭缺口。"""
+
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        session_get_watcher_errors=(RuntimeError("startup watcher stopped"),),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=11, run_id="run-after-failure"),),
+                next_sequence=11,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(),
+                next_sequence=11,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-after-failure"
+    ]
+    assert result.terminal_results[0].watcher_failure_message is not None
+    assert "RuntimeError" in result.terminal_results[0].watcher_failure_message
+    assert [request.after for request in fake_host.read_outbox_requests] == [
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=0),
+        OutboxTerminalCursor(event_sequence=11),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_deduplicates_seen_terminal_ids() -> None:
+    """startup backfill 必须按 CLI seen terminal ids 去重。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=2, run_id="run-1"),),
+                next_sequence=2,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        )
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(
+            seen_terminal_event_ids=frozenset({"terminal-run-1-2"}),
+        ),
+    )
+
+    assert result.terminal_results == ()
+    assert fake_host.read_outbox_requests[0].seen_terminal_event_ids == (
+        "terminal-run-1-2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_retries_lagged_by_parameter() -> None:
+    """startup backfill 的 LAGGED 重试次数必须由请求参数控制。"""
+
+    sleep = _SleepRecorder()
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.LAGGED,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=4, run_id="run-1"),),
+                next_sequence=4,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        )
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(outbox_lagged_max_attempts=1),
+        sleep=sleep,
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == ["run-1"]
+    assert sleep.calls == [0.05]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_lagged_retry_exhaustion_fails() -> None:
+    """startup backfill 的 LAGGED 重试耗尽必须结构化失败。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.LAGGED,
+            ),
+        )
+    )
+
+    with pytest.raises(EntrypointRuntimeError, match="projection lagged"):
+        await startup_reconnect_entrypoint_session(
+            cast(Host, fake_host),
+            request=_startup_request(outbox_lagged_max_attempts=0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_projection_failed_fails() -> None:
+    """startup backfill 遇到 projection FAILED 必须失败而不是进入 REPL。"""
+
+    fake_host = _FakeHost(
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.FAILED,
+                projection_error_code="projection_failed",
+                projection_error_message="projection stopped",
+            ),
+        )
+    )
+
+    with pytest.raises(EntrypointRuntimeError, match="projection_failed"):
+        await startup_reconnect_entrypoint_session(
+            cast(Host, fake_host),
+            request=_startup_request(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_observes_existing_active_run_terminal() -> None:
+    """startup 发现 active Run 时必须先观察 terminal 再进入 idle。"""
+
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                active_run_id="run-active",
+            ),
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=8, run_id="run-active"),),
+                next_sequence=8,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(),
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-active"
+    ]
+    assert "get_run:run-active" in fake_host.calls
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_waits_for_queued_promotion_then_observes_terminal() -> None:
+    """queued-only startup 应等待 promotion，promoted 后观察 terminal。"""
+
+    sleep = _SleepRecorder()
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                queued_run_ids=("run-queued",),
+            ),
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                queued_run_ids=("run-queued",),
+            ),
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                active_run_id="run-queued",
+            ),
+            _session_snapshot(session_id="session-1", slot_key=None),
+        ),
+        outbox_batches=(
+            _outbox_batch(
+                items=(),
+                next_sequence=0,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+            _outbox_batch(
+                items=(_outbox_item(event_sequence=9, run_id="run-queued"),),
+                next_sequence=9,
+                projection_status=OutboxProjectionStatus.CAUGHT_UP,
+            ),
+        ),
+    )
+
+    result = await startup_reconnect_entrypoint_session(
+        cast(Host, fake_host),
+        request=_startup_request(promotion_max_attempts=2),
+        sleep=sleep,
+    )
+
+    assert [terminal.run_id for terminal in result.terminal_results] == [
+        "run-queued"
+    ]
+    assert sleep.calls == [0.05]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconnect_queued_only_exhaustion_fails_before_input() -> None:
+    """queued-only bounded wait 耗尽时必须失败，不允许静默进入输入态。"""
+
+    sleep = _SleepRecorder()
+    fake_host = _FakeHost(
+        session_snapshots=(
+            _session_snapshot(
+                session_id="session-1",
+                slot_key=None,
+                queued_run_ids=("run-queued",),
+            ),
+        )
+    )
+
+    with pytest.raises(EntrypointRuntimeError, match="queued Run"):
+        await startup_reconnect_entrypoint_session(
+            cast(Host, fake_host),
+            request=_startup_request(promotion_max_attempts=1),
+            sleep=sleep,
+        )
+
+    assert sleep.calls == [0.05]
 
 
 @pytest.mark.asyncio
@@ -577,6 +1256,7 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
     """watcher 失败后必须带诊断并仍可通过 public outbox 返回终态。"""
 
     runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
     outbox_item = _outbox_item(event_sequence=9, run_id="run-1")
     fake_host = _FakeHost(
         submit_watcher_errors=(RuntimeError("watch stream disconnected"),),
@@ -595,6 +1275,7 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
         request=_turn_request(),
         scene_inputs=runtime.scene_inputs,
         host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
     )
 
     assert result.source is EntrypointTerminalSource.OUTBOX_READ
@@ -603,15 +1284,19 @@ async def test_submit_entrypoint_turn_records_watcher_failure_and_uses_outbox(
     assert "RuntimeError" in result.watcher_failure_message
     assert "watch stream disconnected" in result.watcher_failure_message
     assert fake_host.read_outbox_requests[0].after == OutboxTerminalCursor(event_sequence=0)
+    assert len(activities) == 1
+    assert activities[0].kind is EntrypointActivityKind.WATCHER_DIAGNOSTIC
+    assert activities[0].severity is EntrypointActivitySeverity.WARNING
+    assert activities[0].run_id is None
+    assert activities[0].event_sequence is None
+    assert activities[0].dedupe_key == "entrypoint_watcher_failure"
+    assert activities[0].summary == "RuntimeError: watch stream disconnected"
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_reads_outbox_pages_until_target(
-    tmp_path: Path,
-) -> None:
-    """outbox fallback 必须按 has_more 分页推进直到命中目标 Run。"""
+async def test_cancel_entrypoint_run_reads_outbox_pages_until_target() -> None:
+    """未 attach 补读路径必须按 has_more 分页推进直到命中目标 Run。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_batches=(
@@ -629,11 +1314,9 @@ async def test_submit_entrypoint_turn_reads_outbox_pages_until_target(
         ),
     )
 
-    result = await submit_entrypoint_turn_and_wait(
+    result = await cancel_entrypoint_run_and_wait(
         cast(Host, fake_host),
-        request=_turn_request(),
-        scene_inputs=runtime.scene_inputs,
-        host_assembly=runtime.host_assembly,
+        request=_cancel_request(),
     )
 
     assert result.run_id == "run-1"
@@ -642,12 +1325,9 @@ async def test_submit_entrypoint_turn_reads_outbox_pages_until_target(
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_retries_when_outbox_lagged(
-    tmp_path: Path,
-) -> None:
-    """outbox LAGGED 且未命中时不能视为完整，必须继续轮询。"""
+async def test_cancel_entrypoint_run_retries_when_outbox_lagged() -> None:
+    """补读路径下 outbox LAGGED 且未命中时必须继续轮询。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     sleep = _SleepRecorder()
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED, RunStatus.SUCCEEDED),
@@ -665,11 +1345,9 @@ async def test_submit_entrypoint_turn_retries_when_outbox_lagged(
         ),
     )
 
-    result = await submit_entrypoint_turn_and_wait(
+    result = await cancel_entrypoint_run_and_wait(
         cast(Host, fake_host),
-        request=_turn_request(),
-        scene_inputs=runtime.scene_inputs,
-        host_assembly=runtime.host_assembly,
+        request=_cancel_request(),
         sleep=sleep,
     )
 
@@ -678,12 +1356,9 @@ async def test_submit_entrypoint_turn_retries_when_outbox_lagged(
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_raises_on_outbox_projection_failed(
-    tmp_path: Path,
-) -> None:
-    """outbox projection FAILED 必须转为 Service error。"""
+async def test_cancel_entrypoint_run_raises_on_outbox_projection_failed() -> None:
+    """补读路径下 outbox projection FAILED 必须转为 Service error。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_batches=(
@@ -698,21 +1373,16 @@ async def test_submit_entrypoint_turn_raises_on_outbox_projection_failed(
     )
 
     with pytest.raises(EntrypointRuntimeError, match="projection_failed"):
-        await submit_entrypoint_turn_and_wait(
+        await cancel_entrypoint_run_and_wait(
             cast(Host, fake_host),
-            request=_turn_request(),
-            scene_inputs=runtime.scene_inputs,
-            host_assembly=runtime.host_assembly,
+            request=_cancel_request(),
         )
 
 
 @pytest.mark.asyncio
-async def test_submit_entrypoint_turn_raises_when_caught_up_without_match(
-    tmp_path: Path,
-) -> None:
-    """Run 已终态且 outbox 追平仍无目标 terminal 时必须报 contract error。"""
+async def test_cancel_entrypoint_run_raises_when_caught_up_without_match() -> None:
+    """补读路径已追平仍无目标 terminal 时必须报 contract error。"""
 
-    runtime = await _prepare_runtime(tmp_path)
     fake_host = _FakeHost(
         run_statuses=(RunStatus.SUCCEEDED,),
         outbox_batches=(
@@ -725,11 +1395,9 @@ async def test_submit_entrypoint_turn_raises_when_caught_up_without_match(
     )
 
     with pytest.raises(EntrypointRuntimeError, match="caught up without"):
-        await submit_entrypoint_turn_and_wait(
+        await cancel_entrypoint_run_and_wait(
             cast(Host, fake_host),
-            request=_turn_request(),
-            scene_inputs=runtime.scene_inputs,
-            host_assembly=runtime.host_assembly,
+            request=_cancel_request(),
         )
 
 
@@ -853,6 +1521,42 @@ async def test_close_watcher_cancels_and_awaits_drain_when_aclose_is_cancelled()
 
     assert watcher.closed_count == 1
     assert drain_cancel_observed.is_set()
+    assert drain_task.done()
+    assert drain_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_close_watcher_cancels_drain_before_closing_async_generator() -> None:
+    """真实 async generator watcher 关闭前必须先停止 drain task。"""
+
+    generator_entered = asyncio.Event()
+    generator_closed = asyncio.Event()
+    keep_running = asyncio.Event()
+
+    async def host_event_stream() -> AsyncIterator[HostEvent]:
+        """模拟 Host watch_session_events 返回的 async generator。"""
+
+        try:
+            generator_entered.set()
+            await keep_running.wait()
+            yield _terminal_event(run_id="run-1", event_sequence=1)
+        finally:
+            generator_closed.set()
+
+    watcher = host_event_stream()
+
+    async def drain() -> None:
+        """持续消费 watcher，直到被取消。"""
+
+        async for _event in watcher:
+            pass
+
+    drain_task = asyncio.create_task(drain())
+    await generator_entered.wait()
+
+    await _close_watcher(watcher=cast(ClosableHostEventIterator, watcher), drain_task=drain_task)
+
+    assert generator_closed.is_set()
     assert drain_task.done()
     assert drain_task.cancelled()
 
@@ -1006,6 +1710,33 @@ def _cancel_request() -> EntrypointCancelRequest:
     )
 
 
+def _startup_request(
+    *,
+    seen_terminal_event_ids: frozenset[str] = frozenset(),
+    outbox_lagged_max_attempts: int = 3,
+    promotion_max_attempts: int = 3,
+) -> EntrypointStartupReconnectRequest:
+    """构造默认 startup reconnect request。
+
+    :param seen_terminal_event_ids: 已展示 terminal id 集合。
+    :param outbox_lagged_max_attempts: outbox LAGGED 最大重试次数。
+    :param promotion_max_attempts: queued promotion 最大轮询次数。
+    :returns: startup reconnect request。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EntrypointStartupReconnectRequest(
+        context=_host_context("startup-context"),
+        session_id="session-1",
+        terminal_cursor=OutboxTerminalCursor(event_sequence=0),
+        seen_terminal_event_ids=seen_terminal_event_ids,
+        poll_interval_seconds=0.05,
+        outbox_lagged_max_attempts=outbox_lagged_max_attempts,
+        promotion_poll_interval_seconds=0.05,
+        promotion_max_attempts=promotion_max_attempts,
+    )
+
+
 def _host_context(request_id: str) -> HostCallContext:
     """构造测试 HostCallContext。
 
@@ -1031,11 +1762,19 @@ def _host_context(request_id: str) -> HostCallContext:
     )
 
 
-def _session_snapshot(*, session_id: str, slot_key: str | None) -> SessionSnapshot:
+def _session_snapshot(
+    *,
+    session_id: str,
+    slot_key: str | None,
+    active_run_id: str | None = None,
+    queued_run_ids: tuple[str, ...] = (),
+) -> SessionSnapshot:
     """构造测试 SessionSnapshot。
 
     :param session_id: Session id。
     :param slot_key: slot key。
+    :param active_run_id: 当前 active Run id。
+    :param queued_run_ids: 当前 queued Run ids。
     :returns: SessionSnapshot。
     :raises Exception: 不主动抛出异常。
     """
@@ -1047,8 +1786,8 @@ def _session_snapshot(*, session_id: str, slot_key: str | None) -> SessionSnapsh
         session_id=session_id,
         status=SessionStatus.OPEN,
         slot=slot,
-        active_run_id=None,
-        queued_run_ids=(),
+        active_run_id=active_run_id,
+        queued_run_ids=queued_run_ids,
         timeline_cursor=HostStreamCursor(event_sequence=0),
     )
 
@@ -1080,12 +1819,14 @@ def _terminal_event(
     event_sequence: int,
     run_id: str,
     terminal_status: HostTerminalStatus = HostTerminalStatus.SUCCEEDED,
+    dedupe_key: str | None = None,
 ) -> HostEvent:
     """构造测试 terminal HostEvent。
 
     :param event_sequence: event sequence。
     :param run_id: Run id。
     :param terminal_status: terminal 状态。
+    :param dedupe_key: Host public dedupe key；``None`` 表示使用默认 terminal key。
     :returns: HostEvent。
     :raises Exception: 不主动抛出异常。
     """
@@ -1099,12 +1840,87 @@ def _terminal_event(
         event_sequence=event_sequence,
         session_id="session-1",
         run_id=run_id,
+        event_class=HostEventClass.CANONICAL_FACT,
+        event_type=_event_type_for_terminal_status(terminal_status),
         kind=kind,
-        dedupe_key=f"terminal-{run_id}-{event_sequence}",
+        activity=None,
+        dedupe_key=dedupe_key if dedupe_key is not None else f"terminal-{run_id}-{event_sequence}",
         terminal_status=terminal_status,
         final_answer=final_answer,
         error_message=("run failed" if terminal_status is HostTerminalStatus.FAILED else None),
         cancel_reason=("cli_sigint" if terminal_status is HostTerminalStatus.CANCELLED else None),
+    )
+
+
+def _activity_event(
+    *,
+    event_sequence: int,
+    run_id: str,
+    dedupe_key: str,
+) -> HostEvent:
+    """构造带 Host public activity 的 progress HostEvent。
+
+    :param event_sequence: event sequence。
+    :param run_id: Run id。
+    :param dedupe_key: Host public dedupe key。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"activity-{run_id}-{event_sequence}",
+        event_sequence=event_sequence,
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.DIAGNOSTIC,
+        event_type="IGNORED_BY_SERVICE_UI_BRANCHING",
+        kind=HostEventKind.PROGRESS,
+        activity=HostActivityView(
+            kind=HostActivityKind.TOOL_BATCH,
+            status=HostActivityStatus.COMPLETED,
+            title="工具批次完成",
+            summary="完成 2 个工具调用。",
+            severity=HostActivitySeverity.INFO,
+            tool_name="record_smoke_fact",
+            tool_display_name="记录烟测事实",
+            counts=HostActivityCounts(
+                total=2,
+                completed=2,
+                failed=0,
+                cancelled=0,
+            ),
+        ),
+        dedupe_key=dedupe_key,
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _progress_without_activity(*, event_sequence: int, run_id: str) -> HostEvent:
+    """构造没有 public activity 的 progress HostEvent。
+
+    :param event_sequence: event sequence。
+    :param run_id: Run id。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"progress-{run_id}-{event_sequence}",
+        event_sequence=event_sequence,
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.PREVIEW,
+        event_type="CONTENT_DELTA",
+        kind=HostEventKind.PROGRESS,
+        activity=None,
+        dedupe_key=f"progress-{run_id}-{event_sequence}",
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
     )
 
 
@@ -1208,4 +2024,25 @@ def _event_kind_for_terminal_status(
         return HostEventKind.CANCELLED
     if terminal_status is HostTerminalStatus.LOST:
         return HostEventKind.LOST
+    raise AssertionError(f"unexpected terminal status: {terminal_status}")
+
+
+def _event_type_for_terminal_status(
+    terminal_status: HostTerminalStatus,
+) -> str:
+    """把 terminal status 映射为测试 EventLog event_type。
+
+    :param terminal_status: terminal status。
+    :returns: EventLog event_type。
+    :raises AssertionError: 未覆盖的 terminal status 时抛出。
+    """
+
+    if terminal_status is HostTerminalStatus.SUCCEEDED:
+        return "RUN_SUCCEEDED"
+    if terminal_status is HostTerminalStatus.FAILED:
+        return "RUN_FAILED"
+    if terminal_status is HostTerminalStatus.CANCELLED:
+        return "RUN_CANCELLED"
+    if terminal_status is HostTerminalStatus.LOST:
+        return "RUN_LOST"
     raise AssertionError(f"unexpected terminal status: {terminal_status}")

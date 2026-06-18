@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import io
+import logging
 import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TextIO
 
 import pytest
@@ -35,6 +38,8 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "prompt",
         "--ticker",
         "--label",
+        "--detail",
+        "--no-detail",
         "--model-name",
         "--temperature",
         "--tool-timeout-seconds",
@@ -78,6 +83,10 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "process_material": ("--ticker", "--document-id", "--overwrite", "--ci"),
     "session": ("list", "resume", "purge"),
 }
+_TEST_LOGGER_NAME: str = "dayu.cli.test_arg_parsing"
+_FIRST_LOG_FILE_DIAGNOSTIC: str = "first run diagnostic"
+_SECOND_STDERR_DIAGNOSTIC: str = "second run diagnostic"
+_RESTORE_FAILURE_MESSAGE: str = "restore stderr failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +99,33 @@ class _LogAssemblyCall:
     info: bool
     quiet: bool
     stream: TextIO | None
+
+
+class _TrackingLogStream(io.StringIO):
+    """记录 close 顺序的测试日志流。"""
+
+    events: list[str]
+
+    def __init__(self, events: list[str]) -> None:
+        """初始化测试日志流。
+
+        :param events: 共享事件列表。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.events = events
+
+    def close(self) -> None:
+        """记录关闭事件后关闭底层流。
+
+        :returns: ``None``。
+        :raises Exception: 底层 ``StringIO.close`` 失败时透传。
+        """
+
+        self.events.append("close")
+        super().close()
 
 
 def _capture_help(
@@ -130,6 +166,29 @@ def _return_success(_args: ParsedCliArgs) -> int:
     """
 
     return EXIT_SUCCESS
+
+
+def _log_prompt_and_return_success(args: ParsedCliArgs) -> int:
+    """测试用命令 runner，把 prompt 文本写入 Dayu 诊断日志后返回成功。
+
+    :param args: 已解析的 CLI 参数。
+    :returns: 成功退出码。
+    :raises Exception: stdlib logging handler 写入失败时透传。
+    """
+
+    logging.getLogger(_TEST_LOGGER_NAME).info(args.prompt)
+    return EXIT_SUCCESS
+
+
+def _raise_runtime_error(_args: ParsedCliArgs) -> int:
+    """测试用命令 runner，模拟未预期异常。
+
+    :param _args: 已解析的 CLI 参数。
+    :returns: 正常路径不会返回。
+    :raises RuntimeError: 始终抛出以验证 main 的 finally 清理。
+    """
+
+    raise RuntimeError("runner boom")
 
 
 def test_top_level_help_registers_scoped_commands(
@@ -273,6 +332,7 @@ def test_placeholder_runner_returns_not_implemented(
     args = ParsedCliArgs()
     args.command_name = "future_command"
     args.log_level = "info"
+    args.log_file = None
     monkeypatch.setattr(cli_main, "parse_cli_args", lambda _argv: args)
     monkeypatch.setitem(
         cli_main.COMMAND_RUNNERS,
@@ -340,7 +400,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
     expected_log_level: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CLI main 必须把默认值或显式日志参数交给 runtime log helper。
+    """CLI main 必须把默认日志参数交给 runtime log helper 与临时文件。
 
     :param argv: 待执行的 CLI 参数。
     :param expected_log_level: argparse 归一后的日志级别字符串。
@@ -350,6 +410,8 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
     """
 
     calls: list[_LogAssemblyCall] = []
+    events: list[str] = []
+    log_stream = _TrackingLogStream(events)
 
     def spy_set_level_from_flags(
         *,
@@ -389,19 +451,433 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
         "set_level_from_flags",
         spy_set_level_from_flags,
     )
+    monkeypatch.setattr(cli_main, "_open_default_log_file", lambda: log_stream)
     monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _return_success)
 
     assert cli_main.main(argv) == EXIT_SUCCESS
-    assert calls == [
-        _LogAssemblyCall(
-            log_level=expected_log_level,
-            debug=False,
-            verbose=False,
-            info=False,
-            quiet=False,
-            stream=sys.stderr,
+    assert len(calls) == 2
+    assert calls[0] == _LogAssemblyCall(
+        log_level=expected_log_level,
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        stream=log_stream,
+    )
+    assert calls[1] == _LogAssemblyCall(
+        log_level=expected_log_level,
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        stream=sys.stderr,
+    )
+    assert events == ["close"]
+    assert log_stream.closed
+
+
+def test_main_configures_runtime_log_file_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--log-file`` 必须只替换 runtime log helper 的诊断 stream。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: main 未把日志文件流传给 runtime helper 时抛出。
+    """
+
+    calls: list[_LogAssemblyCall] = []
+
+    def spy_set_level_from_flags(
+        *,
+        log_level: str | None,
+        debug: bool,
+        verbose: bool,
+        info: bool,
+        quiet: bool,
+        stream: TextIO | None = None,
+    ) -> runtime_log.LogLevel:
+        """记录 runtime log helper 调用。
+
+        :param log_level: argparse 已解析的日志级别字符串。
+        :param debug: runtime helper 的 debug flag。
+        :param verbose: runtime helper 的 verbose flag。
+        :param info: runtime helper 的 info flag。
+        :param quiet: runtime helper 的 quiet flag。
+        :param stream: runtime helper 的诊断日志输出流。
+        :returns: 测试用日志级别。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        calls.append(
+            _LogAssemblyCall(
+                log_level=log_level,
+                debug=debug,
+                verbose=verbose,
+                info=info,
+                quiet=quiet,
+                stream=stream,
+            )
         )
-    ]
+        return runtime_log.LogLevel.INFO
+
+    monkeypatch.setattr(
+        cli_main.runtime_log,
+        "set_level_from_flags",
+        spy_set_level_from_flags,
+    )
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _return_success)
+
+    log_file = tmp_path / "dayu.log"
+
+    assert (
+        cli_main.main(("prompt", "请分析收入变化", "--log-file", str(log_file)))
+        == EXIT_SUCCESS
+    )
+    assert len(calls) == 2
+    assert calls[0].log_level == "info"
+    assert calls[0].stream is not sys.stderr
+    assert calls[0].stream is not None
+    assert calls[0].stream.closed
+    assert calls[1] == _LogAssemblyCall(
+        log_level="info",
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        stream=sys.stderr,
+    )
+
+
+def test_open_default_log_file_creates_persistent_temp_file() -> None:
+    """默认日志文件必须创建为可回查的持久临时文件。
+
+    :returns: ``None``。
+    :raises AssertionError: 临时日志文件不可写或关闭后不存在时抛出。
+    """
+
+    stream = cli_main._open_default_log_file()
+    assert stream is not None
+    log_path = Path(stream.name)
+    try:
+        stream.write("default diagnostic\n")
+        stream.close()
+        assert log_path.exists()
+        assert log_path.read_text(encoding="utf-8") == "default diagnostic\n"
+    finally:
+        if not stream.closed:
+            stream.close()
+        if log_path.exists():
+            log_path.unlink()
+
+
+def test_main_uses_separate_log_files_for_explicit_and_default_calls(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """连续调用时显式日志文件不得污染后续默认临时日志文件。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 第二次调用写入 stderr 或继续写显式日志文件时抛出。
+    """
+
+    monkeypatch.setitem(
+        cli_main.COMMAND_RUNNERS,
+        "prompt",
+        _log_prompt_and_return_success,
+    )
+    log_file = tmp_path / "dayu.log"
+    default_log_file = tmp_path / "dayu-default.log"
+
+    def open_default_log_file() -> TextIO:
+        """打开测试用默认日志文件。
+
+        :returns: 已打开的默认日志文件流。
+        :raises OSError: 文件打开失败时由 ``open`` 透传。
+        """
+
+        return open(default_log_file, mode="a", encoding="utf-8")
+
+    monkeypatch.setattr(cli_main, "_open_default_log_file", open_default_log_file)
+
+    assert (
+        cli_main.main(
+            (
+                "prompt",
+                _FIRST_LOG_FILE_DIAGNOSTIC,
+                "--log-file",
+                str(log_file),
+            )
+        )
+        == EXIT_SUCCESS
+    )
+    assert (
+        cli_main.main(("prompt", _SECOND_STDERR_DIAGNOSTIC))
+        == EXIT_SUCCESS
+    )
+
+    captured = capsys.readouterr()
+    log_content = log_file.read_text(encoding="utf-8")
+    default_log_content = default_log_file.read_text(encoding="utf-8")
+    assert _FIRST_LOG_FILE_DIAGNOSTIC in log_content
+    assert _SECOND_STDERR_DIAGNOSTIC not in log_content
+    assert _FIRST_LOG_FILE_DIAGNOSTIC not in default_log_content
+    assert _SECOND_STDERR_DIAGNOSTIC in default_log_content
+    assert _FIRST_LOG_FILE_DIAGNOSTIC not in captured.err
+    assert _SECOND_STDERR_DIAGNOSTIC not in captured.err
+
+
+def test_main_restores_stderr_before_closing_log_file_on_unexpected_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """runner 抛出未预期异常时也必须先恢复 stderr handler 再关闭文件。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 清理顺序不符合日志 handler 生命周期要求时抛出。
+    """
+
+    events: list[str] = []
+    log_stream = _TrackingLogStream(events)
+
+    def fake_open_log_file(_log_file: str) -> TextIO | None:
+        """返回可追踪 close 顺序的测试日志流。
+
+        :param _log_file: 用户传入的日志路径。
+        :returns: 测试日志流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return log_stream
+
+    def spy_set_level_from_flags(
+        *,
+        log_level: str | None,
+        debug: bool,
+        verbose: bool,
+        info: bool,
+        quiet: bool,
+        stream: TextIO | None = None,
+    ) -> runtime_log.LogLevel:
+        """记录恢复 stderr 与关闭文件的相对顺序。
+
+        :param log_level: argparse 已解析的日志级别字符串。
+        :param debug: runtime helper 的 debug flag。
+        :param verbose: runtime helper 的 verbose flag。
+        :param info: runtime helper 的 info flag。
+        :param quiet: runtime helper 的 quiet flag。
+        :param stream: runtime helper 的诊断日志输出流。
+        :returns: 测试用日志级别。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if stream is sys.stderr:
+            events.append("restore-stderr")
+        elif stream is log_stream:
+            events.append("configure-file")
+        return runtime_log.LogLevel.INFO
+
+    monkeypatch.setattr(cli_main, "_open_log_file", fake_open_log_file)
+    monkeypatch.setattr(
+        cli_main.runtime_log,
+        "set_level_from_flags",
+        spy_set_level_from_flags,
+    )
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _raise_runtime_error)
+
+    with pytest.raises(RuntimeError, match="runner boom"):
+        cli_main.main(("prompt", "请分析收入变化", "--log-file", "dayu.log"))
+
+    assert events == ["configure-file", "restore-stderr", "close"]
+    assert log_stream.closed
+
+
+def test_main_closes_log_file_when_restoring_stderr_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """恢复 stderr handler 抛异常时仍必须关闭已打开日志文件。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 日志文件未关闭或事件顺序不符合预期时抛出。
+    """
+
+    events: list[str] = []
+    log_stream = _TrackingLogStream(events)
+
+    def fake_open_log_file(_log_file: str) -> TextIO | None:
+        """返回可追踪 close 顺序的测试日志流。
+
+        :param _log_file: 用户传入的日志路径。
+        :returns: 测试日志流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return log_stream
+
+    def spy_set_level_from_flags(
+        *,
+        log_level: str | None,
+        debug: bool,
+        verbose: bool,
+        info: bool,
+        quiet: bool,
+        stream: TextIO | None = None,
+    ) -> runtime_log.LogLevel:
+        """模拟恢复 stderr handler 失败并记录文件关闭顺序。
+
+        :param log_level: argparse 已解析的日志级别字符串。
+        :param debug: runtime helper 的 debug flag。
+        :param verbose: runtime helper 的 verbose flag。
+        :param info: runtime helper 的 info flag。
+        :param quiet: runtime helper 的 quiet flag。
+        :param stream: runtime helper 的诊断日志输出流。
+        :returns: 测试用日志级别。
+        :raises ValueError: 恢复 stderr handler 时按测试设定抛出。
+        """
+
+        if stream is sys.stderr:
+            events.append("restore-stderr")
+            raise ValueError(_RESTORE_FAILURE_MESSAGE)
+        if stream is log_stream:
+            events.append("configure-file")
+        return runtime_log.LogLevel.INFO
+
+    monkeypatch.setattr(cli_main, "_open_log_file", fake_open_log_file)
+    monkeypatch.setattr(
+        cli_main.runtime_log,
+        "set_level_from_flags",
+        spy_set_level_from_flags,
+    )
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _return_success)
+
+    with pytest.raises(ValueError, match=_RESTORE_FAILURE_MESSAGE):
+        cli_main.main(("prompt", "请分析收入变化", "--log-file", "dayu.log"))
+
+    assert events == ["configure-file", "restore-stderr", "close"]
+    assert log_stream.closed
+
+
+def test_main_restores_stderr_before_closing_log_file_on_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--log-file`` 下 ``KeyboardInterrupt`` 也必须先恢复 stderr 再关闭文件。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 中断退出码或清理顺序不符合预期时抛出。
+    """
+
+    events: list[str] = []
+    log_stream = _TrackingLogStream(events)
+
+    def fake_open_log_file(_log_file: str) -> TextIO | None:
+        """返回可追踪 close 顺序的测试日志流。
+
+        :param _log_file: 用户传入的日志路径。
+        :returns: 测试日志流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return log_stream
+
+    def spy_set_level_from_flags(
+        *,
+        log_level: str | None,
+        debug: bool,
+        verbose: bool,
+        info: bool,
+        quiet: bool,
+        stream: TextIO | None = None,
+    ) -> runtime_log.LogLevel:
+        """记录 ``KeyboardInterrupt`` 路径的恢复 stderr 与关闭文件顺序。
+
+        :param log_level: argparse 已解析的日志级别字符串。
+        :param debug: runtime helper 的 debug flag。
+        :param verbose: runtime helper 的 verbose flag。
+        :param info: runtime helper 的 info flag。
+        :param quiet: runtime helper 的 quiet flag。
+        :param stream: runtime helper 的诊断日志输出流。
+        :returns: 测试用日志级别。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if stream is sys.stderr:
+            events.append("restore-stderr")
+        elif stream is log_stream:
+            events.append("configure-file")
+        return runtime_log.LogLevel.INFO
+
+    monkeypatch.setattr(cli_main, "_open_log_file", fake_open_log_file)
+    monkeypatch.setattr(
+        cli_main.runtime_log,
+        "set_level_from_flags",
+        spy_set_level_from_flags,
+    )
+    monkeypatch.setitem(
+        cli_main.COMMAND_RUNNERS,
+        "prompt",
+        _raise_keyboard_interrupt,
+    )
+
+    assert (
+        cli_main.main(("prompt", "请分析收入变化", "--log-file", "dayu.log"))
+        == EXIT_KEYBOARD_INTERRUPT
+    )
+
+    assert events == ["configure-file", "restore-stderr", "close"]
+    assert log_stream.closed
+
+
+def test_main_returns_usage_error_when_log_file_cannot_open(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--log-file`` 打开失败必须返回 usage error 且不执行命令 runner。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 打开失败没有被收敛为 usage error 时抛出。
+    """
+
+    monkeypatch.setitem(cli_main.COMMAND_RUNNERS, "prompt", _return_success)
+    missing_parent = tmp_path / "missing" / "dayu.log"
+
+    assert (
+        cli_main.main(("prompt", "请分析收入变化", "--log-file", str(missing_parent)))
+        == EXIT_USAGE_ERROR
+    )
+    captured = capsys.readouterr()
+    assert "--log-file" in captured.err
+    assert "cannot open" in captured.err
+
+
+def test_main_returns_usage_error_when_log_file_is_empty(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """空白 ``--log-file`` 路径必须返回 usage error。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 空白路径没有被拒绝时抛出。
+    """
+
+    assert (
+        cli_main.main(("prompt", "请分析收入变化", "--log-file", "   "))
+        == EXIT_USAGE_ERROR
+    )
+    captured = capsys.readouterr()
+    assert "--log-file" in captured.err
+    assert "must not be empty" in captured.err
 
 
 def test_python_module_help_runs() -> None:
@@ -449,16 +925,18 @@ def test_parse_args_accepts_global_options_before_and_after_command() -> None:
 
     parser = build_parser()
     before_command = parser.parse_args(
-        ("--base", "workspace-a", "prompt", "hello"),
+        ("--base", "workspace-a", "--log-file", "before.log", "prompt", "hello"),
         namespace=argparse.Namespace(),
     )
     after_command = parser.parse_args(
-        ("prompt", "hello", "--base", "workspace-b"),
+        ("prompt", "hello", "--base", "workspace-b", "--log-file", "after.log"),
         namespace=argparse.Namespace(),
     )
 
     assert before_command.workspace_root == "workspace-a"
+    assert before_command.log_file == "before.log"
     assert after_command.workspace_root == "workspace-b"
+    assert after_command.log_file == "after.log"
 
 
 def test_default_namespace_initializes_reset_false() -> None:
@@ -474,3 +952,60 @@ def test_default_namespace_initializes_reset_false() -> None:
     assert init_args.reset is False
     assert init_args.overwrite is False
     assert prompt_args.reset is False
+    assert prompt_args.detail is False
+
+
+def test_prompt_detail_defaults_to_no_detail() -> None:
+    """验证 prompt 默认不显示运行态细节。
+
+    :returns: ``None``。
+    :raises AssertionError: ``detail`` 默认值不符合契约时抛出。
+    """
+
+    args = parse_cli_args(("prompt", "hello"))
+
+    assert args.detail is False
+    assert args.log_level == "info"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_detail", "expected_log_level"),
+    (
+        (("prompt", "hello", "--detail"), True, "info"),
+        (("prompt", "hello", "--no-detail"), False, "info"),
+        (("prompt", "hello", "--verbose"), False, "verbose"),
+        (("prompt", "hello", "--debug"), False, "debug"),
+        (("prompt", "hello", "--detail", "--verbose"), True, "verbose"),
+    ),
+)
+def test_prompt_detail_flags_are_orthogonal_to_log_level(
+    argv: tuple[str, ...],
+    expected_detail: bool,
+    expected_log_level: str,
+) -> None:
+    """验证 prompt detail flag 与日志等级互不隐式联动。
+
+    :param argv: 待解析的 CLI 参数。
+    :param expected_detail: 预期 detail 值。
+    :param expected_log_level: 预期日志等级。
+    :returns: ``None``。
+    :raises AssertionError: 解析结果不符合契约时抛出。
+    """
+
+    args = parse_cli_args(argv)
+
+    assert args.detail is expected_detail
+    assert args.log_level == expected_log_level
+
+
+def test_prompt_detail_flags_are_mutually_exclusive() -> None:
+    """验证 ``--detail`` 与 ``--no-detail`` 互斥。
+
+    :returns: ``None``。
+    :raises AssertionError: argparse 未拒绝互斥参数时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(("prompt", "hello", "--detail", "--no-detail"))
+
+    assert raised.value.code == EXIT_USAGE_ERROR

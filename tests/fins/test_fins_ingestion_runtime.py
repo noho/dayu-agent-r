@@ -36,6 +36,7 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.ingestion_runtime import (
     FinsDownloadedFile,
     FinsDownloadedSourceDocument,
+    FinsDownloadProgressEvent,
     FinsDownloadRequest,
     FinsDownloadResultSummary,
     FinsJobCancellationChecker,
@@ -243,6 +244,60 @@ class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
 
         self.requests.append(request)
         return FinsSourceDownloadAdapterResult(discovered_count=1, persisted_summary=self.summary)
+
+
+class _ProgressReportingDownloadAdapter(FinsSourceDownloadAdapter):
+    """测试用会通过 progress sink 上报文件级进度的 adapter。"""
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """上报文件进度并返回 persisted summary。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            固定 persisted summary。
+
+        Raises:
+            无。
+        """
+
+        if request.progress_sink is not None:
+            request.progress_sink(
+                FinsDownloadProgressEvent(
+                    stage="download.file_started",
+                    message="开始下载",
+                    document_id="fil-test",
+                    file_name="sample-10k.htm",
+                )
+            )
+            request.progress_sink(
+                FinsDownloadProgressEvent(
+                    stage="download.conversion_started",
+                    message="开始 convert",
+                    document_id="fil-test",
+                    file_name="sample-10k_docling.json",
+                )
+            )
+            request.progress_sink(
+                FinsDownloadProgressEvent(
+                    stage="download.file_completed",
+                    message="完成下载",
+                    document_id="fil-test",
+                    file_name="sample-10k.htm",
+                )
+            )
+        return FinsSourceDownloadAdapterResult(
+            discovered_count=1,
+            persisted_summary=FinsDownloadResultSummary(
+                discovered_count=1,
+                downloaded_count=1,
+                skipped_count=0,
+                rejected_count=0,
+                failed_count=0,
+                written_document_ids=("fil-test",),
+            ),
+        )
 
 
 class _CancellationAwareDownloadAdapter(FinsSourceDownloadAdapter):
@@ -951,6 +1006,87 @@ async def test_direct_download_stream_writes_storage_and_does_not_create_job_rec
     assert content == b"# Fake 10-K\n\nRevenue increased."
     assert tuple(jobs_dir.glob("*.json")) == ()
     assert tuple(jobs_dir.glob("*.jsonl")) == ()
+
+
+@pytest.mark.asyncio
+async def test_direct_download_projects_adapter_file_progress_events(
+    tmp_path: Path,
+) -> None:
+    """direct download 应投影 adapter 上报的文件级下载进度。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _ProgressReportingDownloadAdapter()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=_HoldingExecutor(),
+        download_adapters={("fake", "US"): adapter},
+    )
+
+    events = await _collect_direct_events(
+        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="FAKE"))
+    )
+    progress_events = [event for event in events if event.event_type is FinsEventType.PROGRESS]
+    file_progress = [
+        event
+        for event in progress_events
+        if event.progress is not None and event.progress.stage.startswith("download.file")
+    ]
+    conversion_progress = [
+        event
+        for event in progress_events
+        if event.progress is not None and event.progress.stage == "download.conversion_started"
+    ]
+
+    file_progress_details: list[tuple[str, str | None, str]] = []
+    for event in file_progress:
+        assert event.progress is not None
+        file_progress_details.append((event.progress.stage, event.document_label, event.message))
+    assert file_progress_details == [
+        ("download.file_started", "sample-10k.htm", "开始下载"),
+        ("download.file_completed", "sample-10k.htm", "完成下载"),
+    ]
+    assert [(event.document_label, event.message) for event in conversion_progress] == [
+        ("sample-10k_docling.json", "开始 convert"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_direct_download_result_details_do_not_double_display_rejected_skips(
+    tmp_path: Path,
+) -> None:
+    """direct download summary 展示应避免 skipped/rejected 重复表达同一批拒绝项。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _PersistedSummaryDownloadAdapter(
+        FinsDownloadResultSummary(
+            discovered_count=17,
+            downloaded_count=15,
+            skipped_count=2,
+            rejected_count=2,
+            failed_count=0,
+            written_document_ids=tuple(f"fil-{index}" for index in range(15)),
+        )
+    )
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=_HoldingExecutor(),
+        download_adapters={("fake", "US"): adapter},
+    )
+
+    events = await _collect_direct_events(
+        ingestion.download(FinsDownloadRequest(ticker="FUTU", source="FAKE"))
+    )
+    result_event = events[-1]
+
+    assert result_event.result is not None
+    assert {detail.label: detail.value for detail in result_event.result.details} == {
+        "discovered": "17",
+        "downloaded": "15",
+        "skipped": "0",
+        "rejected": "2",
+        "failed": "0",
+        "written documents": "15",
+    }
 
 
 @pytest.mark.asyncio

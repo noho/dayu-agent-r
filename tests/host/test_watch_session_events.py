@@ -21,7 +21,11 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.host import (
     AttemptDispatchSnapshot,
     CancelMode,
@@ -35,6 +39,7 @@ from dayu.host import (
     HostCallContext,
     HostClosedError,
     HostEvent,
+    HostEventClass,
     HostEventKind,
     HostTerminalStatus,
     LocalEngineWorker,
@@ -368,6 +373,8 @@ async def test_two_watchers_observe_same_terminal_event_and_iterator_continues(
         assert first_terminal.event_id == second_terminal.event_id
         assert first_terminal.event_sequence == second_terminal.event_sequence
         assert first_terminal.dedupe_key == second_terminal.dedupe_key
+        assert first_terminal.event_class is HostEventClass.CANONICAL_FACT
+        assert first_terminal.event_type == "RUN_SUCCEEDED"
         assert first_terminal.kind is HostEventKind.SUCCEEDED
         assert first_terminal.final_answer is not None
         assert first_terminal.final_answer.content.startswith("answer:")
@@ -438,6 +445,8 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
         )
         failed = await _next_terminal(watcher)
         assert failed.kind is HostEventKind.FAILED
+        assert failed.event_class is HostEventClass.CANONICAL_FACT
+        assert failed.event_type == "RUN_FAILED"
         assert failed.terminal_status is HostTerminalStatus.FAILED
         assert failed.error_message == "provider failed safely"
         assert failed.final_answer is None
@@ -470,6 +479,8 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
         cancelled = await _next_terminal(watcher)
 
         assert cancelled.kind is HostEventKind.CANCELLED
+        assert cancelled.event_class is HostEventClass.CANONICAL_FACT
+        assert cancelled.event_type == "RUN_CANCELLED"
         assert cancelled.terminal_status is HostTerminalStatus.CANCELLED
         assert cancelled.cancel_reason == "user_stop_queued"
         assert cancelled.final_answer is None
@@ -495,6 +506,8 @@ async def test_empty_final_answer_terminal_projects_as_failed_event(
         terminal = await _next_terminal(watcher)
 
     assert terminal.kind is HostEventKind.FAILED
+    assert terminal.event_class is HostEventClass.CANONICAL_FACT
+    assert terminal.event_type == "RUN_FAILED"
     assert terminal.terminal_status is HostTerminalStatus.FAILED
     assert terminal.final_answer is None
     assert terminal.error_message is not None
@@ -624,9 +637,7 @@ async def _wait_run_status(
         if snapshot.status is expected_status:
             return snapshot
         await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"run {run_id} did not reach {expected_status.value} status"
-    )
+    raise AssertionError(f"run {run_id} did not reach {expected_status.value} status")
 
 
 def _event_log_count(db_path: pathlib.Path) -> int:
@@ -637,9 +648,7 @@ def _event_log_count(db_path: pathlib.Path) -> int:
     """
 
     with sqlite3.connect(db_path) as connection:
-        row = connection.execute(
-            f"SELECT COUNT(*) FROM {TABLE_EVENT_LOG}"
-        ).fetchone()
+        row = connection.execute(f"SELECT COUNT(*) FROM {TABLE_EVENT_LOG}").fetchone()
     if row is None:
         raise AssertionError("EventLog count query returned no row")
     value = row[0]

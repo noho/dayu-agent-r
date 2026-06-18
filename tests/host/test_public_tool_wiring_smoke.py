@@ -82,6 +82,10 @@ async def test_mock_tool_result_feeds_same_run_and_later_run_continuity(
     assert "tool fact accepted" in joined
     assert "调用 lookup_mock_fact 查询 DAYU。" in joined
     assert "event_id=event-tool-result-accepted-" not in joined
+    assert "event_ref=" not in joined
+    assert "payload_ref=" not in joined
+    assert "payload_digest=" not in joined
+    assert "result_preview" not in joined
 
 
 @pytest.mark.asyncio

@@ -62,10 +62,13 @@ from dayu.host.memory import (
     project_conversation_memory_event,
 )
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
-from dayu.host.terminal_summary_payload import (
+from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
 )
+from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
+from dayu.host.evidence import accepted_evidence_envelope_from_payload
+from dayu.host.payload_resolution import event_payload_object_for_result_ref
 from dayu.host.projection import (
     ProjectionApplyResult,
     ProjectionApplyStatus,
@@ -74,7 +77,7 @@ from dayu.host.projection import (
     ProjectionEventFilter,
     ProjectionEventView,
 )
-from dayu.host.durable.event_log import EventClass
+from dayu.host.durable.event_log import EventClass, EventLogRow
 
 _ZERO_CURSOR_SEQUENCE = 0
 _ITEM_KIND_EVIDENCE_BACKED_FACT = "evidence_backed_fact"
@@ -88,6 +91,8 @@ _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
+_PROJECTION_EVENT_ROW_BODY_DIGEST_PLACEHOLDER = "memory-projection-view"
+_EMPTY_PAYLOAD_JSON = "{}"
 _EVENT_TYPE_FILTER = (
     _EVENT_TYPE_USER_INPUT_ACCEPTED,
     _EVENT_TYPE_RUN_SUCCEEDED,
@@ -210,6 +215,23 @@ class _MemorySnapshotIntegrityRowIdentity:
     checkpoint_event_sequence: int
 
 
+def conversation_memory_projection_event_filter() -> ProjectionEventFilter:
+    """返回 Conversation Memory projection 的唯一 EventLog filter 真源。
+
+    :returns: 只覆盖 conversation memory 可消费 canonical facts 的 projection filter。
+    :raises HostDurableError: filter 构造失败时抛出。
+    """
+
+    return ProjectionEventFilter(
+        (
+            ProjectionEventClassFilter(
+                event_class=EventClass.CANONICAL_FACT,
+                event_types=_EVENT_TYPE_FILTER,
+            ),
+        )
+    )
+
+
 class ConversationMemoryProjectionConsumer:
     """Conversation memory projection consumer。
 
@@ -237,14 +259,7 @@ class ConversationMemoryProjectionConsumer:
         self._policy = policy
         self._policy_digest = digest_memory_projection_policy(policy)
         self._consumer_id = ProjectionConsumerId(consumer_id)
-        self._event_filter = ProjectionEventFilter(
-            (
-                ProjectionEventClassFilter(
-                    event_class=EventClass.CANONICAL_FACT,
-                    event_types=_EVENT_TYPE_FILTER,
-                ),
-            )
-        )
+        self._event_filter = conversation_memory_projection_event_filter()
 
     @property
     def consumer_id(self) -> ProjectionConsumerId:
@@ -330,14 +345,16 @@ def _memory_projection_event_from_view(
 def _payload_with_assistant_final_answer(
     transaction: HostTransaction, event: ProjectionEventView
 ) -> Mapping[str, JsonValue]:
-    """必要时把 assistant final answer 合并进 ``RUN_SUCCEEDED`` transient payload。
+    """必要时把 memory projection 需要的 transient payload 补齐。
 
     :param transaction: Host transaction。
     :param event: projection runner event view。
     :returns: memory projection 消费的 payload。
-    :raises HostDurableError: terminal summary descriptor 损坏时抛出。
+    :raises HostDurableError: terminal artifact descriptor 或工具 payload 损坏时抛出。
     """
 
+    if event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
+        return _tool_result_memory_payload(transaction, event)
     if event.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
         return event.payload
     if (
@@ -358,6 +375,69 @@ def _payload_with_assistant_final_answer(
     merged: dict[str, JsonValue] = dict(event.payload)
     merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
     return merged
+
+
+def _tool_result_memory_payload(
+    transaction: HostTransaction,
+    event: ProjectionEventView,
+) -> Mapping[str, JsonValue]:
+    """读取 memory projection 使用的完整 accepted tool result payload。
+
+    :param transaction: Host transaction。
+    :param event: ``TOOL_RESULT_ACCEPTED`` projection event view。
+    :returns: digest-checked 工具结果 payload。
+    :raises HostDurableError: envelope 或 payload descriptor 损坏时抛出。
+    """
+
+    try:
+        envelope = accepted_evidence_envelope_from_payload(
+            event.payload,
+            producer_event_ref=event.event_id,
+        )
+    except ValueError as exc:
+        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
+            raise HostDurableError(str(exc)) from exc
+        raise HostDurableError("canonical evidence envelope is invalid") from exc
+    if envelope is None:
+        return event.payload
+    return event_payload_object_for_result_ref(
+        transaction,
+        _event_row_from_projection_event(event),
+        expected_payload_ref=envelope.result_ref.payload_ref,
+        expected_payload_digest=envelope.result_ref.payload_digest,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
+
+
+def _event_row_from_projection_event(event: ProjectionEventView) -> EventLogRow:
+    """把 projection event view 转成只读 payload resolution 所需 EventLog row。
+
+    :param event: projection event view。
+    :returns: EventLog row view。
+    """
+
+    return EventLogRow(
+        event_sequence=event.event_sequence,
+        event_id=event.event_id,
+        event_body_digest=_PROJECTION_EVENT_ROW_BODY_DIGEST_PLACEHOLDER,
+        event_class=event.event_class,
+        session_id=event.session_id,
+        run_id=event.run_id,
+        attempt_id=event.attempt_id,
+        execution_id=event.execution_id,
+        event_type=event.event_type,
+        occurred_at=event.occurred_at,
+        actor=None,
+        source=None,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json=_EMPTY_PAYLOAD_JSON,
+        payload_ref=event.payload_ref,
+        payload_digest=event.payload_digest,
+        appended_at=event.occurred_at,
+    )
 
 
 @dataclass(frozen=True, slots=True)

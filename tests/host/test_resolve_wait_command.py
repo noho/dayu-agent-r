@@ -74,7 +74,7 @@ from dayu.host.memory import (
     default_memory_projection_policy,
     digest_memory_projection_policy,
 )
-from dayu.host.memory_repair import ConversationMemoryProjectionCatchupPort
+from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
@@ -191,10 +191,10 @@ def test_resolve_wait_survives_projection_catchup_failure(
         host.close()
 
 
-def test_resolve_wait_committed_tool_result_catches_up_memory_without_fact(
+def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
     tmp_path: Path,
 ) -> None:
-    """显式 concrete catch-up port 会追平 accepted tool result cursor。
+    """resolve_wait 提交工具结果后直接 catch-up 可覆盖 accepted tool result cursor。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -203,19 +203,21 @@ def test_resolve_wait_committed_tool_result_catches_up_memory_without_fact(
 
     policy = default_memory_projection_policy()
     host = create_host_command_handle(_options(tmp_path))
-    host._admission_service = create_host_admission_service(
-        host._transaction_runner(),
-        projection_catchup_port=ConversationMemoryProjectionCatchupPort(
-            transaction_runner=host._transaction_runner(),
-            policy=policy,
-            batch_size=8,
-        ),
-    )
     try:
         seeded = _seed_waiting_run(host)
 
         snapshot = resolve_wait(
             host, seeded.wait_id, _completed_request("resolve-memory-catchup")
+        )
+        tool_events = _events_by_type(
+            _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
+        )
+        assert len(tool_events) > 0
+        catch_up_conversation_memory_projection(
+            host._transaction_runner(),
+            policy=policy,
+            batch_size=8,
+            max_event_sequence=tool_events[-1].event_sequence,
         )
         memory_snapshot = host._transaction_runner().run_read(
             lambda transaction: read_latest_memory_snapshot(
@@ -228,11 +230,7 @@ def test_resolve_wait_committed_tool_result_catches_up_memory_without_fact(
 
         assert snapshot.status is RunStatus.RUNNING
         assert memory_snapshot is not None
-        tool_events = _events_by_type(
-            _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
-        )
         assert memory_snapshot.snapshot.evidence_fact_memory.evidence_backed_facts == ()
-        assert len(tool_events) > 0
         assert (
             memory_snapshot.snapshot.cursor.checkpoint_event_sequence
             >= tool_events[-1].event_sequence

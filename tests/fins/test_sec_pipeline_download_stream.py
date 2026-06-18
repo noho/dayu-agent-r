@@ -12,8 +12,14 @@ from typing import BinaryIO, Optional, cast
 
 from dayu.fins.domain.document_models import FileObjectMeta
 from dayu.fins.downloaders.sec_downloader import DownloaderEvent, RemoteFileDescriptor, SecDownloader
-from dayu.fins.pipelines.download_events import DownloadEvent
-from dayu.fins.pipelines.sec_pipeline import SEC_PIPELINE_DOWNLOAD_VERSION, SecPipeline, SecPipelineDownloadResult
+from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
+from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
+from dayu.fins.pipelines.sec_pipeline import (
+    SEC_PIPELINE_DOWNLOAD_VERSION,
+    SecPipeline,
+    SecPipelineDownloadResult,
+    collect_download_result_from_events,
+)
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage.fs_source_document_repository import FsSourceDocumentRepository
 
@@ -112,6 +118,14 @@ class StreamStubDownloader(SecDownloader):
 
         del overwrite, existing_files, primary_document
         descriptor = remote_files[0]
+        yield DownloaderEvent(
+            event_type="file_download_started",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=descriptor.http_status,
+        )
         file_meta = store_file(descriptor.name, BytesIO(b"payload"))
         yield DownloaderEvent(
             event_type="file_downloaded",
@@ -175,6 +189,14 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
             "sample_htm.xml": b"<xbrl></xbrl>",
         }
         for descriptor in remote_files:
+            yield DownloaderEvent(
+                event_type="file_download_started",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=descriptor.http_status,
+            )
             file_meta = store_file(descriptor.name, BytesIO(payload_by_name[descriptor.name]))
             yield DownloaderEvent(
                 event_type="file_downloaded",
@@ -212,6 +234,13 @@ async def _collect_events(pipeline: SecPipeline, ticker: str) -> list[DownloadEv
     return events
 
 
+async def _event_stream(events: tuple[DownloadEvent, ...]) -> AsyncIterator[DownloadEvent]:
+    """把固定事件元组转为异步事件流。"""
+
+    for event in events:
+        yield event
+
+
 def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     """验证事件顺序与完成事件负载。"""
 
@@ -227,6 +256,7 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     assert event_types[0] == "pipeline_started"
     assert "company_resolved" in event_types
     assert "filing_started" in event_types
+    assert "file_download_started" in event_types
     assert "file_downloaded" in event_types
     assert "filing_completed" in event_types
     assert event_types[-1] == "pipeline_completed"
@@ -245,6 +275,96 @@ def test_download_sync_wrapper_aggregates_stream_result(tmp_path: Path) -> None:
     result = pipeline.download(ticker="AAPL", overwrite=False)
     assert result["action"] == "download"
     assert result["summary"]["downloaded"] == 1
+
+
+def test_adapter_progress_sink_uses_filing_granularity(tmp_path: Path) -> None:
+    """验证 SEC adapter progress 投影按 filing 而不是文件输出。"""
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=StreamStubDownloader(),
+        processor_registry=build_fins_processor_registry(),
+    )
+    progress_events: list[FinsDownloadProgressEvent] = []
+
+    import asyncio
+
+    result = asyncio.run(
+        collect_download_result_from_events(
+            pipeline.download_stream(ticker="AAPL", overwrite=False),
+            progress_sink=progress_events.append,
+        )
+    )
+
+    assert result["summary"]["downloaded"] == 1
+    assert [(event.stage, event.document_id, event.file_name, event.message) for event in progress_events] == [
+        ("download.filing_started", "fil_0000000000-25-000001", None, "开始下载"),
+        ("download.filing_completed", "fil_0000000000-25-000001", None, "完成下载"),
+    ]
+
+
+def test_adapter_progress_sink_reports_filing_failure() -> None:
+    """验证 SEC adapter progress 用 filing failed 表达下载失败。"""
+
+    progress_events: list[FinsDownloadProgressEvent] = []
+    pipeline_result: SecPipelineDownloadResult = {
+        "pipeline": "sec",
+        "action": "download",
+        "status": "ok",
+        "ticker": "AAPL",
+        "market_profile": {},
+        "filters": {},
+        "warnings": [],
+        "filings": [],
+        "summary": {
+            "total": 1,
+            "downloaded": 0,
+            "skipped": 0,
+            "rejected": 0,
+            "failed": 1,
+            "elapsed_ms": 0,
+            "reused_downloads": 0,
+            "converted": 0,
+        },
+    }
+
+    import asyncio
+
+    asyncio.run(
+        collect_download_result_from_events(
+            _event_stream(
+                (
+                    DownloadEvent(
+                        event_type=DownloadEventType.FILING_STARTED,
+                        ticker="AAPL",
+                        document_id="fil-failed",
+                    ),
+                    DownloadEvent(
+                        event_type=DownloadEventType.FILE_FAILED,
+                        ticker="AAPL",
+                        document_id="fil-failed",
+                        payload={"name": "detail.xml"},
+                    ),
+                    DownloadEvent(
+                        event_type=DownloadEventType.FILING_FAILED,
+                        ticker="AAPL",
+                        document_id="fil-failed",
+                    ),
+                    DownloadEvent(
+                        event_type=DownloadEventType.PIPELINE_COMPLETED,
+                        ticker="AAPL",
+                        payload={"result": cast(JsonValue, pipeline_result)},
+                    ),
+                )
+            ),
+            progress_sink=progress_events.append,
+        )
+    )
+
+    assert [(event.stage, event.document_id, event.file_name, event.message) for event in progress_events] == [
+        ("download.filing_started", "fil-failed", None, "开始下载"),
+        ("download.filing_failed", "fil-failed", None, "下载失败"),
+    ]
 
 
 def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path) -> None:

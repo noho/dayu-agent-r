@@ -13,6 +13,15 @@
 本文档面向读者：
 - 最终使用者。
 
+## Agent更新约束【必须遵守】
+
+- 本文档是最终用户使用手册，只写用户完成安装、初始化、配置、下载 / 上传财报、提问、交互式分析、写报告、渲染输出、查看日志与排障所需的当前可用操作。
+- 更新本文档时必须先核对当前 CLI / Web / WeChat 入口、参数解析、用户可见输出和对应实现；代码真源高于设计文档和历史说明。
+- 本文档可以写面向用户的命令、参数、工作区文件位置、输出文件位置、日志定位方式、常见错误和排障步骤。
+- 不写 Host / Engine / Service / Runtime / Fins 内部架构、公共契约细节、状态机、测试清单、代码阅读顺序、review / work unit 过程状态或开发者迁移计划。
+- 不写未来计划、未落地能力或内部治理术语；若必须提到尚未实现的用户入口，只能作为用户可见限制简短说明。
+- 涉及开发者架构、包边界或代码阅读路径时，链接到 `dayu/README.md` 或对应子包 README，不在本文档展开。
+
 如果你要参与开发，而不是只使用系统：
 - Engine 手册：[dayu/engine/README.md](dayu/engine/README.md)
 - 配置手册：[dayu/config/README.md](dayu/config/README.md)
@@ -279,6 +288,7 @@ dayu-cli <subcommand> [参数]
 | `--config` | 全部主命令 | 配置目录，默认 `workspace/config` |
 | `--ticker` | `prompt` `write` | 股票代码；传入后会把该 `ticker` 作为当前研究对象 |
 | `--log-level` | 全部主命令 | 直接指定日志级别，可选 `debug`、`verbose`、`info`、`warn`、`error`、`critical` |
+| `--log-file` | 全部主命令 | 指定诊断日志文件；未提供时默认写入系统临时目录下的 `dayu-cli-*.log` |
 | `--debug` | 全部主命令 | 把日志级别设为 `DEBUG` |
 | `--verbose` | 全部主命令 | 把日志级别设为 `VERBOSE` |
 | `--info` | 全部主命令 | 把日志级别设为 `INFO` |
@@ -289,11 +299,21 @@ dayu-cli <subcommand> [参数]
 | `--new-session` | `interactive` | 不续接上一次 interactive 多轮会话，改为从头开始一个新会话 |
 | `--web-provider` | `prompt` `interactive` `write` | 指定联网检索 provider，如 `auto`、`tavily`、`serper`、`duckduckgo` |
 | `--thinking` / `--no-thinking` | `prompt` `interactive` | 控制是否在终端回显模型思考过程 |
+| `--detail` / `--no-detail` | `prompt` | 控制是否显示运行态 activity stream；默认 `--no-detail` |
 
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。
+- CLI 的用户可见输出和诊断日志默认分离：回答、进度、错误提示仍走 stdout / stderr；Python logging 诊断默认写入系统临时目录下的 `dayu-cli-*.log`。需要固定日志位置时使用 `--log-file <path>`，它只改变诊断日志位置，不改变用户可见输出通道。
+- 全局参数可以写在子命令前，也可以写在子命令后。例如 `dayu-cli --debug prompt "问题"` 和 `dayu-cli prompt "问题" --debug` 等价；`--log-file` 也同理。
 - `prompt`、`interactive`、`write` 还支持更多 Agent 运行参数，例如 `--tool-timeout-seconds`、`--max-iterations`、`--doc-limits-json`、`--fins-limits-json`；需要时可用 `dayu-cli <subcommand> --help` 查看完整列表。
 - `interactive` 默认会续接本地绑定的同一个多轮会话；如果上一次回答还没完整回显到终端，重启 CLI 会先把那次回答补完，再进入新的输入循环。
+
+日志示例：
+
+```bash
+dayu-cli prompt "总结苹果最新财报中的主要风险" --debug --log-file workspace/tmp/prompt.log
+dayu-cli download --ticker AAPL --verbose --log-file workspace/tmp/download.log
+```
 
 ### 2.2 Web 入口（Streamlit）
 
@@ -419,8 +439,25 @@ dayu-cli download --ticker BABA,9988,9988.HK --infer
 - `download`、`upload_filing`、`upload_material`、`upload_filings_from` 的 `--ticker` 支持 CSV（半角逗号分隔）；CSV 中**每个 token 都会走真源归一化**（如 `9988.HK`→`9988`）后再整体去重。首个归一化结果作为 canonical ticker，其余作为显式 alias 写入 meta，便于工具后续用任意跨市场变形命中同一公司。
 - `--ticker` 支持 `0700.HK` / `HK.00700` / `600519.SH` / `sh600519` / `AAPL.US` / `BRK.B` 等常见变形，内部统一归一化到裸码（港 4 位补零、沪深 6 位、美股类股分隔符统一为横杠，如 `BRK.B`→`BRK-B`）。公司名仍可作为 ticker 传入，由仓储 alias 查表兜底。
 - 显式传 `--infer` 时，CLI 会把 `--ticker` 里的显式 alias 与 FMP infer 结果合并；`download` 场景下 pipeline 还会继续与 SEC 返回的 alias 合并。
-- 美股下载未显式传 `--start` 时，年报（`10-K`/`20-F`）默认覆盖 5 年，季报（`10-Q`/季报型 `6-K`）默认覆盖 2 年；`8-K`、SC13 等事件类表单仍按各自默认窗口处理。
-- A 股下载当前使用巨潮主源，港股下载当前使用披露易主源，默认 forms 均为 `FY H1 Q1 Q2 Q3 Q4`；未显式传 `--start` 时，年报默认覆盖 5 年，半年报/季报默认覆盖 2 年；`Q2` 与 `H1`、`Q4` 与 `FY` 均作为独立期间处理，不互相归一。CN/HK 下载默认只保留中文/繁中文财报候选，英文财报会在 discovery 阶段过滤。下载完成定义为 PDF 落盘、`_docling.json` 落盘、source meta `ingest_complete=True` 且 `primary_document` 指向 `_docling.json`。中断后再次运行会优先复用已落盘 PDF，避免重复下载；`--rebuild` 只基于本地已下载的 PDF + Docling JSON 重建 meta/manifest，不访问主源。
+- 美股下载按 SEC `filingDate` 过滤，日期区间为闭区间 `[start, end]`；未显式传 `--end` 时，`end` 为运行当天。显式传 `--start` 时，所有目标 form 共用该起点；未显式传 `--start` 时，系统按 form 使用默认回溯窗口，并额外加入 60 天宽限，避免遗漏申报间隔落在边界附近的 filing。
+
+  | 美股 form | 默认窗口 |
+  |------|------|
+  | `10-K` / `20-F` | 5 年 + 60 天 |
+  | `10-Q` / `6-K` | 2 年 + 60 天 |
+  | `DEF 14A` | 3 年 + 60 天 |
+  | `8-K` / `8-K/A` | 1 年 + 60 天 |
+  | `SC 13D` / `SC 13D/A` / `SC 13G` / `SC 13G/A` | 1 年 + 60 天；若初始窗口内没有找到 SC13，会最多重试 2 次，每次再向前扩 1 年 |
+
+  默认美股 form 集合为 `10-K`、`20-F`、`10-Q`、`6-K`、`8-K`、`DEF 14A`、`SC 13D/G`；其中 `SC 13D/G` 会展开为 `SC 13D`、`SC 13D/A`、`SC 13G`、`SC 13G/A`。`6-K` 会先做财报型材料预筛选：未命中保留条件的 6-K 不进入正式 `filings` manifest，会以 rejected artifact 保存在 `.rejections/` 供诊断。
+- A 股下载当前使用巨潮主源，港股下载当前使用披露易主源，默认 forms 均为 `FY H1 Q1 Q2 Q3 Q4`。A 股 / 港股下载按公告日期过滤，日期区间为闭区间 `[start, end]`；未显式传 `--end` 时，`end` 为运行当天。显式传 `--start` 时，所有目标期间共用该起点；未显式传 `--start` 时，系统按期间使用默认回溯窗口，并额外加入 60 天宽限，避免遗漏公告间隔落在边界附近的财报。
+
+  | A 股 / 港股 form | 默认窗口 |
+  |------|------|
+  | `FY` | 5 年 + 60 天 |
+  | `H1` / `Q1` / `Q2` / `Q3` / `Q4` | 2 年 + 60 天 |
+
+  `Q2` 与 `H1`、`Q4` 与 `FY` 均作为独立期间处理，不互相归一；主源没有对应独立期间候选时会按 skipped 统计，而不是 failed。CN/HK 下载默认只保留中文/繁中文财报候选，英文财报会在 discovery 阶段过滤。下载完成定义为 PDF 落盘、`_docling.json` 落盘、source meta `ingest_complete=True` 且 `primary_document` 指向 `_docling.json`。中断后再次运行会优先复用已落盘 PDF，避免重复下载；`--rebuild` 只基于本地已下载的 PDF + Docling JSON 重建 meta/manifest，不访问主源。
 - 港股 ticker 示例 `0700` / `00700` / `700.HK` 会归一化到同一 canonical ticker；A 股/港股缺失的独立季度报告会按 skipped 统计而不是 failed。
 - 使用 `--infer` 功能需要申请FMP_API_KEY。
 - 首次写入时会自动创建 `workspace/portfolio/{ticker}` 下的源文档目录，不要求你预先手动建好 `filings/`。
@@ -503,6 +540,7 @@ dayu-cli upload_material \
 | `--model-name` | 可选，指定模型配置 |
 | `--temperature` | 可选，覆盖模型 temperature |
 | `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
+| `--detail` / `--no-detail` | 可选，控制是否显示运行态 activity stream，默认不显示 |
 | `--debug` / `--verbose` | 可选，仅调整日志级别，不改变会话行为 |
 
 命令示例：
@@ -519,6 +557,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --thinking
 dayu-cli prompt --label apple "先总结苹果最新财报中的主要风险"
 dayu-cli prompt "总结苹果最新财报中的主要风险" --model-name mimo-v2.5-pro
 dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
+dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
 ```
 
 命令说明：
@@ -527,6 +566,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
 - 不带 `--label` 时，`prompt` 保持 one-shot，不承诺后续恢复；带 `--label` 时，本次提问会挂到该 label 对应的可恢复 conversation 上，后续可继续用 `prompt --label <label>` 或 `interactive --label <label>` 接着问。
 - 带 `--label` 的 prompt 在本轮拿到最终回答前会独占该 label；如果另一个进程此时也尝试复用同一个 label，CLI 会直接报错并提示等待当前对话结束，或改用新的 `--label`。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
+- 默认不显示运行态 activity stream；如需查看工具调用、运行状态等过程信息，显式传 `--detail`。
 
 ### 3.4 交互式对话：`interactive`
 

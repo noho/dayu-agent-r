@@ -49,6 +49,7 @@ from dayu.host.api import (
     RunStatus,
 )
 from dayu.service.entrypoint_runtime import (
+    EntrypointRuntimeError,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
 )
@@ -964,6 +965,84 @@ def test_session_resume_by_label_toctou_error_includes_selector_and_host_context
     assert host.calls == ["list_sessions", "submit:session-A"]
 
 
+def test_session_resume_interactive_startup_error_includes_selector_and_session(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """interactive startup barrier 失败时必须输出 selector 与 Session 上下文。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: 错误没有结构化展示时抛出。
+    """
+
+    host = _FakeSessionHost(
+        list_result=ListSessionsResult(
+            sessions=(
+                _session_list_item(
+                    session_id="session-A",
+                    slot=SessionSlotRef(
+                        scope="cli.interactive",
+                        slot_key="cli.interactive.proj.v1",
+                    ),
+                ),
+            )
+        )
+    )
+    _install_fake_open_host(monkeypatch, host)
+    _install_fake_resume_execution(monkeypatch)
+
+    async def fake_execute_interactive_on_existing_session(
+        *,
+        host: Host,
+        prepared: interactive_command._PreparedInteractiveExistingSessionExecution,
+        session_id: str,
+    ) -> int:
+        """模拟 interactive startup barrier 失败。
+
+        :param host: fake Host。
+        :param prepared: fake interactive prepared execution。
+        :param session_id: 目标 Session id。
+        :returns: 不返回；始终抛出。
+        :raises EntrypointRuntimeError: 始终抛出 startup 失败。
+        """
+
+        raise EntrypointRuntimeError("queued run did not become active")
+
+    monkeypatch.setattr(
+        session_command,
+        "_execute_interactive_on_existing_session",
+        fake_execute_interactive_on_existing_session,
+    )
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--label",
+            "proj.v1",
+            "--kind",
+            "interactive",
+            "--mode",
+            "interactive",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "interactive startup failed" in captured.err
+    assert "--label proj.v1 --kind interactive" in captured.err
+    assert "session-A" in captured.err
+    assert "queued run did not become active" in captured.err
+    assert host.calls == ["list_sessions"]
+    assert host.submit_requests == []
+
+
 def _session_list_item(
     *,
     session_id: str,
@@ -1116,6 +1195,7 @@ def _install_fake_resume_execution(
                 EntrypointRuntimeResult,
                 _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
             ),
+            workspace_root=Path(args.workspace_root or "."),
             invocation=session_command.new_cli_invocation(
                 command_name=command_name,
                 scenario=scenario,
@@ -1179,6 +1259,7 @@ def _install_fake_resume_execution(
                 EntrypointRuntimeResult,
                 _FakeRuntime(host_assembly=_FakeHostAssembly(options="fake-options")),
             ),
+            workspace_root=Path(args.workspace_root or "."),
             invocation=session_command.new_cli_invocation(
                 command_name=command_name,
                 scenario=scenario,

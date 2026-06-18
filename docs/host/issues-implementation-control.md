@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | completed |
-| implementation status | WU-CLI-SESSION-01 final closeout completed; draft PR #146 https://github.com/noho/dayu-agent-r/pull/146; final closeout `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; PR review accepted commit `c7f79f03` |
-| active work unit | WU-CLI-SESSION-01 |
-| default next work unit | WU-OBS-00 |
-| next entry point | WU-CLI-SESSION-01 final-closeout complete; next work unit selection after user merge / issue decision |
-| design source | `docs/host/design.md`; `docs/engine/design.md` |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | none |
+| gate | draft-PR-pass |
+| implementation status | WU-CLI-ACTIVITY-01 final closeout completed on current `wu-cli-activity-01` branch; draft PR #149 open; PR review and focused PR re-review PASS; no blocking findings remain; WU-CM-12 added as the next user-directed work unit for Conversation Memory design refinement and implementation drift repair |
+| active work unit | WU-CLI-ACTIVITY-01 |
+| default next work unit | WU-CM-12 |
+| next entry point | After WU-CLI-ACTIVITY-01 branch handoff / merge or explicit user direction to start the next WU, start WU-CM-12 phaseflow preflight / goal confirmation using `docs/host/conversation-memory-material-budget-discussion.md` as startup design input; first implementation slice must write accepted design semantics back to `docs/host/design.md` before code repair |
+| design source | Current active WU: `docs/host/design.md`; `docs/engine/design.md`. WU-CM-12 startup: `docs/host/conversation-memory-material-budget-discussion.md` as refinement design input; implementation / review after design write-back: `docs/host/design.md`; cross-check `docs/engine/design.md` if Engine contracts are touched |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01; WU-CLI-INTERACTIVE-RESUME-01 did not modify Host / Engine public API or contracts. |
 
 状态约定：
 
@@ -202,6 +202,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
+| WU-CLI-ACTIVITY-01-PR-R1 | deferred-with-owner | WU-CM-12 | PR review 发现 `tests/host/test_public_open_host_multiturn_smoke.py::test_deterministic_two_turn_request_contains_prior_final_answer` 与 `tests/host/test_public_tool_wiring_smoke.py::test_mock_tool_result_feeds_same_run_and_later_run_continuity` 在 `main` 分支同样失败；不属于 WU-CLI-ACTIVITY-01 引入，已由 WU-CM-12 Conversation Memory design refinement and implementation drift repair 覆盖。 |
 
 ## 当前 Work Units
 
@@ -210,7 +211,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
 | WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 closed on 2026-06-17 after user authorization |
-| WU-CLI-ACTIVITY-01 | pending | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Runs after WU-CLI-SESSION-01; show collapsible/hideable activity summaries for prompt / interactive without exposing hidden chain-of-thought; do not use logging as UI |
+| WU-CLI-ACTIVITY-01 | draft-PR-pass | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Final closeout completed in `docs/reviews/wu-cli-activity-01-final-closeout-20260618.md`; draft PR #149 open; PR review and focused PR re-review PASS; residual `WU-CLI-ACTIVITY-01-PR-R1` deferred with owner. |
+| WU-CLI-INTERACTIVE-RESUME-01 | ready-to-open-draft-PR | prompt / interactive existing-session startup resume semantics | 用户裁决；无 GitHub Issue | Final closeout completed locally: prompt does no startup backfill or unfinished-run wait/replay but records displayed terminal cursor; interactive existing-session entrypoints run watcher-first attach/reconnect before REPL, session-scoped Outbox backfill, idle-tail closure, active / queued barrier, and async CLI cursor store. Implementation review PASS from AgentMiMo / AgentDS; validation: `tests/service -q` 110 passed, affected CLI subset 74 passed, `pyright dayu/ tests/ utils/` 0 errors. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -234,6 +236,161 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+| WU-CM-12 | discussion-ready | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Next phaseflow entry. Startup design input is `docs/host/conversation-memory-material-budget-discussion.md`; first slice must write accepted semantics back to `docs/host/design.md`, then repair implementation drift against updated design truth. |
+
+## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
+
+### 状态
+
+本 work unit 已完成 plan review / re-review。BQ-1 已由用户裁决解除：本 WU 允许修改 event 相关 contracts。Plan 方向为 contract-first：先扩展 Host public `HostEvent` activity projection，再由 Service / CLI 消费该 public activity view；CLI 不读取 Host durable internals、Tool Trace、payload ref / digest、logging 或 ToolBundle。
+
+### Current gate artifacts
+
+- plan: `docs/host/host-issues/wu-cli-activity-01-activity-composer-plan.md`
+- plan review: `docs/reviews/plan-review-20260617-124817.md` (AgentMiMo); `docs/reviews/plan-review-20260617-124923.md` (AgentDS)
+- plan review adjudication: `docs/reviews/plan-review-wu-cli-activity-01-adjudication-20260617-125229.md`
+- plan re-review: `docs/reviews/plan-review-20260617-130417.md` (AgentMiMo); `docs/reviews/plan-review-20260617-130248.md` (AgentDS)
+- plan gate validation: `git diff --check` clean; untracked plan artifact whitespace check clean via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cli-activity-01-activity-composer-plan.md` with expected nonzero no-index exit and no whitespace output
+- accepted plan commit: `012fee0a`
+
+### Accepted plan scope
+
+- Slice A: Host public activity event contract; `HostEvent` keeps coarse `HostEventKind` and adds existing `HostEventClass`, EventLog row `event_type`, and safe `HostActivityView`.
+- Slice B: Service activity callback consumes Host public activity, without parsing durable internals.
+- Slice C: Prompt activity renderer, visibility toggle, and running-state cancel behavior.
+- Slice D: Interactive composer with multiline input, history search, external editor, and early prompt_toolkit compatibility validation.
+- Slice E: Interactive running activity and cancel integration.
+- Slice F: README/doc checks, affected tests, coverage, pyright, and validation cleanup.
+
+### Slice A status
+
+- implementation artifact: `docs/reviews/wu-cli-activity-01-slice-a-implementation-codex.md`
+- code review: `docs/reviews/code-review-20260617-132628.md` (AgentMiMo); `docs/reviews/code-review-20260617-132508.md` (AgentDS)
+- code review adjudication: `docs/reviews/code-review-wu-cli-activity-01-slice-a-adjudication-20260617-132855.md`
+- fix artifact: `docs/reviews/wu-cli-activity-01-slice-a-fix-codex.md`
+- re-review: `docs/reviews/code-review-wu-cli-activity-01-slice-a-re-review-20260617-133529.md` (AgentMiMo); `docs/reviews/code-review-20260617-133606.md` (AgentDS)
+- validation: `pytest tests/host/test_public_host_event.py tests/host/test_public_open_host_options.py tests/host/test_package_exports.py tests/host/test_host_activity_event_projection.py tests/host/test_watch_session_events.py tests/host/test_context_compact_events.py tests/cli/test_interactive_command.py tests/cli/test_prompt_command.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_interactive_path.py tests/service/test_entrypoint_runtime_prompt_path.py -q` passed with 149 passed and 3 third-party edgar deprecation warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
+- accepted slice commit: `992a641d`
+
+### Slice B status
+
+- implementation artifact: `docs/reviews/wu-cli-activity-01-slice-b-implementation-codex.md`
+- code review: `docs/reviews/code-review-20260617-135557.md` (AgentMiMo); `docs/reviews/code-review-20260617-135353.md` (AgentDS)
+- code review adjudication: `docs/reviews/code-review-wu-cli-activity-01-slice-b-adjudication-20260617-135835.md`
+- fix artifact: `docs/reviews/wu-cli-activity-01-slice-b-fix-codex.md`
+- re-review: `docs/reviews/code-review-wu-cli-activity-01-slice-b-rereview-mimo-20260617-140637.md` (AgentMiMo); `docs/reviews/code-review-wu-cli-activity-01-slice-b-rereview-ds-20260617-140637.md` (AgentDS)
+- validation: `pytest tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py -q` passed with 32 passed and 3 third-party edgar deprecation warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
+- accepted slice commit: `152292da`
+
+### CLI slices C/D/E/F status
+
+- implementation artifact: `docs/reviews/wu-cli-activity-01-cli-implementation-codex.md`
+- initial fix artifact: `docs/reviews/wu-cli-activity-01-cli-fix-codex.md`
+- code review: `docs/reviews/code-review-wu-cli-activity-01-cli-mimo-20260617-145226.md` (AgentMiMo); `docs/reviews/code-review-wu-cli-activity-01-cli-ds-20260617-145226.md` (AgentDS)
+- review fix artifact: `docs/reviews/wu-cli-activity-01-cli-review-fix-codex.md`
+- targeted re-review: `docs/reviews/code-review-wu-cli-activity-01-cli-rereview-mimo-20260617-151159.md` (AgentMiMo); `docs/reviews/code-review-wu-cli-activity-01-cli-rereview-ds-20260617-151159.md` (AgentDS)
+- validation: `pytest tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py -q` passed with 97 passed and 3 third-party edgar deprecation warnings; `pytest tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py --cov=dayu.cli.activity --cov=dayu.cli.composer --cov=dayu.cli.run_keys --cov-fail-under=80 -q` passed with 17 passed and total coverage 89.53%; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
+- accepted slice commit: `1a6f4bb2`
+
+### Aggregate review and final closeout
+
+- aggregate deepreview: `docs/reviews/deepreview-wu-cli-activity-01-aggregate-mimo-20260617-153030.md` (AgentMiMo, non-blocking with CLI subagent limitation noted); `docs/reviews/deepreview-wu-cli-activity-01-aggregate-ds-20260617-151950.md` (AgentDS, non-blocking)
+- final validation: `pytest tests/host/test_public_host_event.py tests/host/test_public_open_host_options.py tests/host/test_package_exports.py tests/host/test_host_activity_event_projection.py tests/host/test_watch_session_events.py tests/host/test_context_compact_events.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py -q` passed with 179 passed and 3 third-party edgar deprecation warnings; `pytest tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py --cov=dayu.cli.activity --cov=dayu.cli.composer --cov=dayu.cli.run_keys --cov-fail-under=80 -q` passed with 17 passed and total coverage 89.53%; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
+- final closeout: `docs/reviews/wu-cli-activity-01-final-closeout-20260617.md`
+- post-closeout fix: `docs/reviews/wu-cli-activity-01-interactive-composer-async-fix.md`; validation `pytest tests/cli/test_interactive_composer.py tests/cli/test_interactive_command.py tests/cli/test_prompt_command.py tests/cli/test_activity_renderer.py tests/cli/test_run_keys.py -q` passed with 66 passed and 3 third-party edgar deprecation warnings; `pytest tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py --cov=dayu.cli.activity --cov=dayu.cli.composer --cov=dayu.cli.run_keys --cov-fail-under=80 -q` passed with 18 passed and total coverage 90.25%; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean
+
+### Residual risks
+
+- `RR-ACT-01` closed by Slice A: Host admission records Host-owned `effective_tool_display_names` without durable schema migration.
+- `RR-ACT-02` closed by CLI implementation and tests: prompt_toolkit composer key bindings for Ctrl+J / Ctrl+R / Ctrl+X Ctrl+E are isolated in CLI and covered by `tests/cli/test_interactive_composer.py`.
+- `RR-ACT-03` closed by CLI implementation and tests: activity renderer is TTY-gated, stderr-only, line-oriented, and closed before terminal rendering; prompt / interactive tests cover stdout cleanliness.
+- `RR-ACT-04` closed by CLI fix and tests: repeated Ctrl+C local exit returns local 130 without forging Host terminal facts.
+- `RR-ACT-05` closed by CLI fix and tests: prompt cancel terminal race prefers terminal when cancel terminal arrives before the second Ctrl+C local exit.
+
+### Follow-up delta EventLog / projection catch-up status
+
+- accepted follow-up plan: `docs/host/host-issues/wu-cli-activity-01-followup-delta-eventlog-projection-catchup-plan.md`
+- accepted plan commit: `906c1ffa`
+- current slice: follow-up implementation completed locally through aggregate deepreview and focused re-review; next gate is draft PR.
+- Slice 1 scope: clarify Host default durable policy for `content_delta` / `reasoning_delta` / `tool_call_delta`, durable replay non-goal for token-level delta, memory projection catch-up cursor / idle / failure semantics, hot path no-unbounded-sync-catch-up constraint, and `memory_projection_catchup_batch_size` as internal page size.
+- Slice 1 allowed files: `docs/host/design.md`, optional `docs/engine/design.md`, `docs/host/issues-implementation-control.md`, and implementation artifact under `docs/reviews/`.
+- Slice 1 implementation artifact: `docs/reviews/wu-cli-activity-01-followup-slice-1-implementation-codex-20260618.md`
+- Slice 1 validation: `git diff --check` clean; grep confirmed old catch-up budget wording is absent and new non-durable delta / page-size wording is present.
+- Slice 1 accepted commit: `3cb5fcb4`.
+- Slice 2 scope: Host ingest accepts `content_delta` / `reasoning_delta` / `tool_call_delta` after durable identity / stale / late governance but returns accepted no-row results by default; non-delta preview mapping remains durable preview.
+- Slice 2 implementation artifact: `docs/reviews/wu-cli-activity-01-followup-slice-2-implementation-codex-20260618.md`.
+- Slice 2 code review: `docs/reviews/code-review-20260618-065959-mimo-wu-cli-activity-01-followup-slice-2.md`; `docs/reviews/code-review-20260618-070001-ds-wu-cli-activity-01-followup-slice-2.md`.
+- Slice 2 fix artifact: `docs/reviews/wu-cli-activity-01-followup-slice-2-fix-codex-20260618.md`.
+- Slice 2 re-review: `docs/reviews/code-review-20260618-070713-mimo-rereview-wu-cli-activity-01-followup-slice-2.md`; `docs/reviews/code-review-20260618-070659-ds-rereview-wu-cli-activity-01-followup-slice-2.md`.
+- Slice 2 validation: `pytest tests/host/test_engine_ingest_mapping.py` passed with 64 passed; `pyright dayu/host/engine_ingest.py tests/host/test_engine_ingest_mapping.py` passed with 0 errors; `git diff --check` clean.
+- Slice 2 accepted commit: `8d0a06f1`.
+- Slice 3 scope: add durable-neutral EventLog filtered read with covered cursor semantics; update ProjectionRunner to use consumer filter at read path, apply only matching rows, advance checkpoint over covered non-matching ranges without consumer apply, and preserve failure stop before failed matching row.
+- Slice 3 implementation artifact: `docs/reviews/wu-cli-activity-01-followup-slice-3-implementation-codex-20260618.md`.
+- Slice 3 code review: `docs/reviews/mimo-wu-cli-activity-01-followup-slice-3-20260618-072504.md`; `docs/reviews/ds-wu-cli-activity-01-followup-slice-3-20260618-072339.md`.
+- Slice 3 fix artifact: `docs/reviews/wu-cli-activity-01-followup-slice-3-fix-codex-20260618.md`.
+- Slice 3 re-review: `docs/reviews/mimo-rereview-wu-cli-activity-01-followup-slice-3-20260618-073105.md`; `docs/reviews/ds-rereview-wu-cli-activity-01-followup-slice-3-20260618-073110.md`.
+- Slice 3 validation: `pytest tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py` passed with 46 passed; `pyright dayu/host/durable/event_log.py dayu/host/projection.py tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py` passed with 0 errors; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
+- Slice 3 accepted commit: `f67a55b6`.
+- Slice 4 scope: remove `MemoryProjectionCatchupBudget` / `MemoryProjectionRepairPurpose` / `BUDGET_EXHAUSTED` memory repair semantics, make catch-up / rebuild loop to target / idle / failure using page size only, remove open_host after-commit and dispatch compact accepted conversation-memory catch-up hooks, and delete the residual `ConversationMemoryProjectionCatchupPort` adapter.
+- Slice 4 implementation artifact: `docs/reviews/wu-cli-activity-01-followup-slice-4-implementation-codex-20260618.md`.
+- Slice 4 code review: `docs/reviews/mimo-wu-cli-activity-01-followup-slice-4-20260618-074855.md`; `docs/reviews/ds-wu-cli-activity-01-followup-slice-4-code-review-20260618-074930.md`.
+- Slice 4 fix artifact: `docs/reviews/wu-cli-activity-01-followup-slice-4-fix-codex-20260618.md`.
+- Slice 4 re-review: `docs/reviews/mimo-rereview-wu-cli-activity-01-followup-slice-4-20260618-075452.md`; `docs/reviews/ds-rereview-wu-cli-activity-01-followup-slice-4-20260618-075450.md`.
+- Slice 4 validation: `pytest tests/host/test_memory_repair.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_open_host_runtime.py tests/host/test_dispatch_scheduler.py tests/host/test_logging.py -q` passed with 160 passed; relevant pyright passed with 0 errors; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `rg` found no `ConversationMemoryProjectionCatchupPort`, `MemoryProjectionCatchupBudget`, `MemoryProjectionRepairPurpose`, `MemoryProjectionRepairStopReason.BUDGET_EXHAUSTED`, or memory repair `budget_exhausted` in `dayu/` and `tests/`; `git diff --check` clean.
+- Slice 4 accepted commit: `794d3b74`.
+- Slice 5 scope: make Conversation Memory projection filter a single truth via `conversation_memory_projection_event_filter()`, reuse projection-to-EventLog read filter conversion in inline repair, remove RunInputBuilder-local memory event type filter, and use session-scoped `read_events_after_matching(...)` / covered cursor semantics for inline delta repair.
+- Slice 5 implementation artifact: `docs/reviews/wu-cli-activity-01-followup-slice-5-implementation-codex-20260618.md`.
+- Slice 5 code review: `docs/reviews/mimo-wu-cli-activity-01-followup-slice-5-review-20260618-081119.md`; `docs/reviews/ds-wu-cli-activity-01-followup-slice-5-20260618-080958.md`.
+- Slice 5 validation: `pytest tests/host/test_run_input_builder.py tests/host/test_memory_projection.py` passed with 76 passed; relevant pyright passed with 0 errors; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
+- Slice 5 accepted commit: `49c813a5`.
+- Aggregate deepreview: `docs/reviews/mimo-aggregate-wu-cli-activity-01-followup-20260618-081816.md`; `docs/reviews/ds-aggregate-wu-cli-activity-01-followup-20260618-081532.md`.
+- Aggregate fix: `docs/reviews/wu-cli-activity-01-followup-aggregate-fix-codex-20260618.md`.
+- Aggregate focused re-review: `docs/reviews/mimo-aggregate-rereview-wu-cli-activity-01-followup-20260618.md`; `docs/reviews/ds-aggregate-rereview-wu-cli-activity-01-followup-20260618-082351.md`.
+- Aggregate fix validation: `pytest tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_memory_repair.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q` passed with 120 passed; final follow-up validation `pytest tests/host/test_engine_ingest_mapping.py tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py tests/host/test_memory_repair.py tests/host/test_open_host_runtime.py tests/host/test_dispatch_scheduler.py tests/host/test_logging.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q` passed with 348 passed; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
+- Draft PR: https://github.com/noho/dayu-agent-r/pull/149.
+- PR review: `docs/reviews/wu-cli-activity-01-pr-review-mimo-20260618.md`; `docs/reviews/wu-cli-activity-01-pr-review-ds-20260618.md`.
+- PR review fix: `docs/reviews/wu-cli-activity-01-pr-review-fix-codex-20260618.md`.
+- PR review fix validation: `pytest tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py -q` passed with 114 passed and 3 third-party edgar deprecation warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; grep found no duplicated `_cancel_and_await_task` in `dayu/cli`.
+- PR focused re-review: `docs/reviews/wu-cli-activity-01-pr-rereview-mimo-20260618.md`; `docs/reviews/wu-cli-activity-01-pr-rereview-ds-20260618.md`.
+- Final closeout: `docs/reviews/wu-cli-activity-01-final-closeout-20260618.md`.
+- PR checks: GitHub reports no checks for branch `wu-cli-activity-01`; closeout relies on local validation and dual-agent review.
+- next entry point: WU-OBS-00 preflight / planning when requested.
+
+## WU-CLI-INTERACTIVE-RESUME-01 Prompt / Interactive Existing-Session Startup
+
+### 状态
+
+本 work unit 已完成本地 final closeout。语义裁决为：`prompt` 不执行离线 terminal backfill，也不等待 / 重放历史未完成 Run；`interactive` existing-session 入口在进入 REPL 前执行 attach / reconnect startup barrier，处理 selected Session 的离线 terminal、active Run 与 queued-only 状态。
+
+### Gate artifacts
+
+- initial plan: `docs/reviews/wu-cli-interactive-resume-01-plan-codex-20260617.md`
+- plan reviews: `docs/reviews/plan-review-20260617-183641.md`; `docs/reviews/plan-review-20260617-183910.md`
+- plan adjudication: `docs/reviews/wu-cli-interactive-resume-01-plan-adjudication-20260617.md`
+- revised plan: `docs/reviews/wu-cli-interactive-resume-01-plan-fix-codex-20260617.md`
+- idle-tail fix artifact: `docs/reviews/wu-cli-interactive-resume-01-idle-tail-fix-codex-20260617.md`
+- implementation reviews: `docs/reviews/wu-cli-interactive-resume-01-implementation-review-mimo-20260617.md`; `docs/reviews/wu-cli-interactive-resume-01-implementation-review-20260617.md`
+
+### Implementation summary
+
+- Service 新增 `startup_reconnect_entrypoint_session(...)`，使用 watcher-first 顺序：先 attach `watch_session_events(session_id)` 并启动 drain task，再执行 session-scoped Outbox backfill。
+- Startup backfill 不按 `run_id` 过滤；`CAUGHT_UP` 且无新 terminal 是正常 idle，不复用 run-scoped terminal fallback 的异常语义。
+- idle snapshot 后增加 tail closure：再次 session-scoped Outbox backfill 并 drain watcher queue，发现 terminal 或首次 watcher failure 时重新读取 Session snapshot，避免 terminal 已提交但尚未进入 watcher queue 的窗口。
+- interactive existing-session 入口在首条输入前执行 startup barrier；active Run 先观察 terminal，queued-only 按 bounded promotion wait，耗尽后结构化失败，不静默进入 REPL。
+- prompt existing-session 入口不读 cursor、不补读旧 terminal、不等待旧 active / queued；仅在本次 terminal 成功渲染后推进 CLI terminal cursor。
+- CLI terminal cursor 是 workspace-local UI state，通过 `asyncio.to_thread()` 包裹同步 JSON / file lock / atomic replace；腐坏 JSON 与非法字段 fail fast。
+
+### Validation
+
+- `source .venv/bin/activate && pytest tests/service -q` passed: 110 passed, 3 third-party edgar deprecation warnings.
+- `source .venv/bin/activate && pytest tests/cli/test_session_terminal_cursor.py tests/cli/test_interactive_command.py tests/cli/test_prompt_command.py tests/cli/test_session_command.py -q` passed: 74 passed, 3 third-party edgar deprecation warnings. This CLI subset is slow; final run completed in 360.44s.
+- `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/` passed: 0 errors, 0 warnings.
+
+### Residual risks
+
+- `WU-CLI-INTERACTIVE-RESUME-01-R1` rejected by user裁决: workspace-local cursor is sufficient because CLI already has `--base` to select a workspace directory; no future per-client cursor identity WU is needed for this concern.
+- `WU-CLI-INTERACTIVE-RESUME-01-R2` fixed immediately: `session resume --mode interactive` now catches startup `EntrypointRuntimeError` after target resolution and renders a structured CLI error containing selector, Session id, and startup message.
+- Rendering success followed by cursor write crash can duplicate terminal on next startup; accepted by design because no terminal loss is preferred over false acknowledgement.
 
 ## WU-CLI-SESSION-01 CLI Session Management
 
@@ -1331,3 +1488,84 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - WU-CM-11 后续 plan 能定义 durable store / projection / prompt assembly / privacy controls / tests。
 - tests 或 eval scenarios 能覆盖动态偏好更新、supersession、当前偏好选择、source refs，以及不能覆盖本轮用户输入或财报 evidence。
 - GitHub Issue #80 dynamic profile 评测维度被映射为 current-scope behavior、deferred owner 或 explicit non-goal。
+
+## WU-CM-12 Conversation Memory Design Refinement And Implementation Drift Repair
+
+### 状态
+
+本条是用户裁决纳入本文档留痕的 immediate residual work unit，不创建 GitHub Issue。目标是把 `docs/host/conversation-memory-material-budget-discussion.md` 中已经裁决清楚的 Conversation Memory material / assemble / compact / fallback / five semantic memories 语义写回 Host 设计真源，并据此修复当前实现漂移。
+
+### Design source / phaseflow 启动裁决
+
+下一轮启动 `$phaseflow` 时，推荐入口为：
+
+```text
+$phaseflow design_doc=docs/host/conversation-memory-material-budget-discussion.md control_doc=docs/host/issues-implementation-control.md
+```
+
+原因：当前 `docs/host/design.md` 是最终 Host 架构真源，但尚未包含本轮讨论中对 normal path、five fallback tiers、展开版 `assemble(...)`、compact / dispatch fallback 输入输出、accepted compact 五类 memory 输出，以及 no silent truncation / cap ownership 的细化。若下一轮直接以旧 `docs/host/design.md` 作为唯一 `design_doc`，implementation Agent 容易看不出哪些语义已经被细化、哪些当前代码属于实现漂移。
+
+本 WU 的第一交付 slice 必须把讨论稿中的 accepted design semantics 写回 `docs/host/design.md`。该 design write-back 完成并通过 review 后，后续 implementation / review / finding adjudication 必须以更新后的 `docs/host/design.md` 为设计真源；讨论稿只保留为 rationale / handoff reference，不再替代设计真源。
+
+如果 plan 需要修改 Host / Engine public API、durable schema、EventLog canonical semantics、Engine provider contract 或跨层 contracts，必须在 plan gate 停下来交给用户裁决；不得在 implementation 中顺手修改。
+
+### 目标
+
+- 将 Conversation Memory 设计从以下源头无歧义细化到可实施层：
+
+```text
+rendered_context =
+  assemble(
+    latest_accepted_compacted_view,
+    post_compact_delta_material,
+    current_input_anchor,
+    selected_recent_window_policy,
+    protected_recent_floor_policy
+  )
+```
+
+- 在 `docs/host/design.md` 中定义 normal path 与 five fallback tiers：
+  - tier 0 normal；
+  - tier 1 compact recovery with tighter recent window；
+  - tier 2 compact recovery with section-aware compacted view degrade；
+  - tier 3 compact recovery delta-only；
+  - tier 4 dispatch fallback floor-only；
+  - tier 5 dispatch fallback current-input-only。
+- 明确 tier 1-3 送 LLM compactor，accepted output 可提交 `CONTEXT_COMPACTED` 并 projection 为五类 Session Semantic Memory；tier 4-5 不送 LLM compactor，不提交 `CONTEXT_COMPACTED`，不生成 compact artifact / memory snapshot / 五类 memory。
+- 明确 accepted compact output 只能投影为：
+  - `trace_memory.reference_continuity_items`；
+  - `evidence_fact_memory.evidence_backed_facts`；
+  - `session_summary_memory.summary_text`；
+  - `answer_anchor_memory.anchors`；
+  - `forward_intent_memory.intents`。
+- 将 `memory_projection_policy` 在 Host 内部解释为明确分组的 typed sections，至少包括：
+  - `selected_recent_window_policy`；
+  - `fallback_selected_recent_window_policy`；
+  - `protected_recent_floor_policy`；
+  - `semantic_memory_section_caps`；
+  - `projection_repair_policy` / parser safety guard policy。
+  JSON 结构是否保持 flat 可由 plan 裁决，但 Host 内部不得继续用零散字段和私有常量共同决定 LLM-facing material 产量。
+- 强约束 Agent：`latest_accepted_compacted_view`、`post_compact_delta_material`、`current_input_anchor` 进入 LLM-facing memory / compact / RunInput material 时禁止截断、preview 化或 summary 化。上下文缩小只能通过 deterministic selection、whole-item / whole-section keep-drop、chunking with provenance 或 fail closed 表达；不能把这些源 material 改写成摘要、预览文本或字段级裁剪文本。
+- 修复当前实现漂移：字段级 silent truncation、compact input DTO 私有 1200 cap、ordinary RunInput compact summary 旁路、compactor output schema cap 与 `memory_projection_policy` 双真源、fallback selected window policy 未真正生效、selection / rendering material id 空间漂移、turn floor 按 raw item 而非 `host_run_id` turn group 保护等问题。
+- 覆盖 residual `WU-CLI-ACTIVITY-01-PR-R1`：重新裁决并修复 Host public multiturn / tool wiring conversation memory smoke 中 final answer / tool result continuity 相关失败，前提是修复必须对齐本 WU 写回后的 Conversation Memory 设计真源。
+- 保持代码修复与设计写回同源：实现只能细化更新后的 `docs/host/design.md`，不得重新发明 compact selector、fallback selector、memory material 产量路径或 summary / preview 语义。
+
+### 非目标
+
+- 不引入 semantic search、vector recall、prompt-conditioned retrieval 或长期 memory retrieval framework。
+- 不实现 User Profile Memory；该能力仍由 WU-CM-11 / GitHub Issue #115 承接。
+- 不实现 Conversation Memory eval benchmark；该能力仍由 WU-CM-10 / GitHub Issue #80 承接。
+- 不修改 UI / log / diagnostic preview 的展示截断规则，除非发现它们被错误投影进 LLM-facing memory material。
+- 不修改 tool 原始输出抓取、下载、转换或 tool truncation policy。
+- 不把 fallback tier / compact diagnostic / projection diagnostic 投影给 LLM 作为业务事实。
+- 不把讨论稿中的 `Implementation Handoff Notes`、current code owner、current gap、allowed files、测试命令或 plan slice 参考写入 `docs/host/design.md` 作为设计真源。
+
+### 验收信号
+
+- `docs/host/design.md` 已写入 normal + five fallback tiers、展开版 `assemble(...)`、compact / dispatch fallback 输入输出、five semantic memory output、no silent truncation、cap ownership 与 fallback state machine。
+- `docs/host/design.md` 写回内容足以让 Gateflow plan 从设计真源直接进入 implementation，不需要实施 Agent 再从讨论稿补设计。
+- `dayu/config/execution_profiles.json` 中 `memory_projection_policy` 的字段在 Host 内部有单一 typed section 解释入口，至少覆盖 selected recent window、fallback selected recent window、protected floor、semantic memory section caps 与 projection repair / parser safety guard；不再被 DTO / schema 私有 cap 改写为另一套 LLM-facing material 产量真源。
+- normal RunInput、compact input、tier 1-3 compact recovery fallback、tier 4-5 dispatch fallback 共享同一个 material selection / rendering 语义，差异只在 renderer、source label、accept barrier 和 tier output。
+- `protected_recent_floor_policy` 以 `host_run_id` 为 turn group 保护最近 N 个 Host admitted user Run；floor 超预算时进入 tier 5，而不是静默截断或打散 turn group。
+- final closeout 必须输出一份代码常量审计清单：列出代码中仍出现、且没有在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 中定义的 LLM-facing memory material / compact material 产量相关常量；对每个常量说明状态为“已删除 / 已迁入 policy / 保留但非 LLM-facing / 保留为 parser safety guard / deferred-with-owner”，并说明理由。
+- 受影响 Host memory / compact / RunInput / fallback tests 和相关 smoke 已更新并通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。

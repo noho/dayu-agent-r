@@ -5,7 +5,8 @@ from __future__ import annotations
 from dayu.contracts.json_value import JsonValue
 
 import json
-from collections.abc import Callable, Mapping
+import logging
+from collections.abc import AsyncIterator, Callable, Mapping
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Optional, cast
@@ -14,6 +15,7 @@ import pytest
 
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
+    DownloaderEvent,
     RemoteFileDescriptor,
     Sc13PartyRoles,
     SecDownloader,
@@ -268,6 +270,7 @@ class StubDownloader:
         self.browse_calls.append(filenum)
         return self._browse_entries
 
+
     def resolve_primary_document(self, cik: str, accession_no_dash: str, form_type: str) -> str:
         """模拟解析 primary_document。
 
@@ -310,6 +313,74 @@ class StubDownloader:
             return Sc13PartyRoles(filed_by_cik=filed_by_cik, subject_cik=subject_cik)
         # 默认保留：模拟“别人持股当前 ticker(320193)”。
         return Sc13PartyRoles(filed_by_cik="999999", subject_cik="320193")
+
+
+class StreamStubDownloader(StubDownloader):
+    """带流式文件事件的下载器桩。"""
+
+    async def download_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+    ) -> AsyncIterator[DownloaderEvent]:
+        """模拟流式下载并在每个文件结果前产出 started 事件。
+
+        Args:
+            remote_files: 远端文件列表。
+            overwrite: 是否覆盖。
+            store_file: 文件存储回调。
+            existing_files: 既有文件映射。
+            primary_document: 主文档文件名。
+
+        Yields:
+            文件 started 事件与终态文件事件。
+
+        Raises:
+            无。
+        """
+
+        self.download_files_called = True
+        del remote_files, overwrite, existing_files, primary_document
+        for item in self._download_results:
+            name = str(item.get("name", ""))
+            source_url = str(item.get("source_url", ""))
+            http_etag = str(item.get("http_etag", "")) or None
+            http_last_modified = str(item.get("http_last_modified", "")) or None
+            yield DownloaderEvent(
+                event_type="file_download_started",
+                name=name,
+                source_url=source_url,
+                http_etag=http_etag,
+                http_last_modified=http_last_modified,
+                http_status=200,
+            )
+            if item.get("status") == "downloaded":
+                payload = self._content_by_name.get(name, f"dummy:{name}".encode("utf-8"))
+                file_meta = store_file(name, BytesIO(payload))
+                yield DownloaderEvent(
+                    event_type="file_downloaded",
+                    name=name,
+                    source_url=source_url,
+                    http_etag=http_etag,
+                    http_last_modified=http_last_modified,
+                    http_status=200,
+                    file_meta=file_meta,
+                )
+                continue
+            yield DownloaderEvent(
+                event_type="file_failed",
+                name=name,
+                source_url=source_url,
+                http_etag=http_etag,
+                http_last_modified=http_last_modified,
+                http_status=500,
+                reason_code=str(item.get("reason_code", "download_error")),
+                reason_message=str(item.get("reason_message", "download failed")),
+                error=str(item.get("error", "download failed")),
+            )
 
 
 class RebuildOnlyDownloader:
@@ -518,7 +589,7 @@ def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
     """
 
     remote_files = [_make_descriptor("etag-v1")]
-    downloader = StubDownloader(
+    downloader = StreamStubDownloader(
         submissions=_build_submissions(),
         remote_files=remote_files,
         download_results=[
@@ -1163,11 +1234,15 @@ def test_sec_pipeline_download_resolves_foreign_issuer_from_submissions(tmp_path
     assert company_meta["market"] == "US"
 
 
-def test_sec_pipeline_filters_6k_excluded(tmp_path: Path) -> None:
+def test_sec_pipeline_filters_6k_excluded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """验证 6-K 命中排除规则时跳过落盘。
 
     Args:
         tmp_path: 临时目录。
+        caplog: 日志捕获夹具。
 
     Returns:
         无。
@@ -1223,9 +1298,16 @@ def test_sec_pipeline_filters_6k_excluded(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
+    caplog.set_level(logging.INFO, logger="dayu.fins.FINS.SEC_PIPELINE")
+
     result = pipeline.download(ticker="TCOM", overwrite=False)
 
-    assert result["summary"]["skipped"] == 1
+    assert result["summary"]["skipped"] == 0
+    assert result["summary"]["rejected"] == 1
+    assert (
+        "美股下载完成: ticker=TCOM total=1 downloaded=0 skipped=0 rejected=1 failed=0"
+        in caplog.text
+    )
     assert downloader.download_files_called is True
     meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
     assert not meta_path.exists()
@@ -1311,7 +1393,7 @@ def test_sec_download_adapter_counts_6k_filtered_as_rejected_in_persisted_summar
     summary = result.persisted_summary
     assert summary is not None
     assert summary.rejected_count == 1
-    assert summary.skipped_count == 1
+    assert summary.skipped_count == 0
     assert summary.downloaded_count == 0
 
 

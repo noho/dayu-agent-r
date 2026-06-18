@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.api import HostEventKind, HostTerminalStatus
+from dayu.host.api import HostEventClass, HostEventKind, HostTerminalStatus
 from dayu.host.compaction import (
     AnswerAnchorCandidateVNext,
     AnswerAnchorChildVNext,
@@ -157,7 +157,9 @@ def test_compacted_payload_rejects_summary_proposed_evidence_backed_fact_refs() 
     """vNext compacted payload 拒绝旧 proposed fact summary 字段入口。"""
 
     payload = dict(_valid_compacted_payload())
-    payload["episode_summary_candidate"] = {"proposed_evidence_backed_fact_refs": ["fake-fact"]}
+    payload["episode_summary_candidate"] = {
+        "proposed_evidence_backed_fact_refs": ["fake-fact"]
+    }
 
     with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
         validate_context_compacted_payload(payload)
@@ -167,7 +169,9 @@ def test_compacted_payload_rejects_old_summary_proposed_verified_fact_refs() -> 
     """vNext compacted payload 拒绝旧 proposed_verified_fact_refs key。"""
 
     payload = dict(_valid_compacted_payload())
-    payload["episode_summary_candidate"] = {"proposed_verified_fact_refs": ["fake-fact"]}
+    payload["episode_summary_candidate"] = {
+        "proposed_verified_fact_refs": ["fake-fact"]
+    }
 
     with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
         validate_context_compacted_payload(payload)
@@ -179,7 +183,9 @@ def test_compacted_payload_rejects_patch_without_preservation_evidence() -> None
     payload = dict(_valid_compacted_payload())
     payload["pinned_state_patch_candidate"] = {}
 
-    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
+    with pytest.raises(
+        ValueError, match="pinned_state_patch_candidate is not supported"
+    ):
         validate_context_compacted_payload(payload)
 
 
@@ -189,7 +195,9 @@ def test_compacted_payload_rejects_replace_patch_without_value() -> None:
     payload = dict(_valid_compacted_payload())
     payload["pinned_state_patch_candidate"] = {"current_goal": {"operation": "replace"}}
 
-    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
+    with pytest.raises(
+        ValueError, match="pinned_state_patch_candidate is not supported"
+    ):
         validate_context_compacted_payload(payload)
 
 
@@ -199,7 +207,9 @@ def test_compacted_payload_rejects_direct_patch_field_without_tristate() -> None
     payload = dict(_valid_compacted_payload())
     payload["pinned_state_patch_candidate"] = {"current_goal": "direct goal"}
 
-    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
+    with pytest.raises(
+        ValueError, match="pinned_state_patch_candidate is not supported"
+    ):
         validate_context_compacted_payload(payload)
 
 
@@ -207,9 +217,13 @@ def test_compacted_payload_rejects_free_form_confirmed_subject() -> None:
     """vNext compacted payload 拒绝旧 confirmed_subjects patch 字段。"""
 
     payload = dict(_valid_compacted_payload())
-    payload["pinned_state_patch_candidate"] = {"confirmed_subjects": {"value": ["Apple Inc."]}}
+    payload["pinned_state_patch_candidate"] = {
+        "confirmed_subjects": {"value": ["Apple Inc."]}
+    }
 
-    with pytest.raises(ValueError, match="pinned_state_patch_candidate is not supported"):
+    with pytest.raises(
+        ValueError, match="pinned_state_patch_candidate is not supported"
+    ):
         validate_context_compacted_payload(payload)
 
 
@@ -622,23 +636,32 @@ def test_run_lost_projects_to_lost_host_event(tmp_path: Path) -> None:
 
         def _operation(
             transaction: HostTransaction,
-        ) -> tuple[HostEventKind, HostTerminalStatus | None]:
+        ) -> tuple[HostEventKind, HostEventClass, str, HostTerminalStatus | None]:
             """执行 HostEvent 投影。
 
             :param transaction: 当前 Host read transaction。
-            :returns: public HostEvent kind 与 terminal status。
+            :returns: public HostEvent kind、identity 与 terminal status。
             """
 
             host_event = _host_event_from_row(transaction, _run_lost_row())
-            return host_event.kind, host_event.terminal_status
+            return (
+                host_event.kind,
+                host_event.event_class,
+                host_event.event_type,
+                host_event.terminal_status,
+            )
 
         assert store.transaction_runner.run_read(_operation) == (
             HostEventKind.LOST,
+            HostEventClass.CANONICAL_FACT,
+            "RUN_LOST",
             HostTerminalStatus.LOST,
         )
 
 
-def _valid_failed_payload_with_fallback(fallback_action: str) -> Mapping[str, JsonValue]:
+def _valid_failed_payload_with_fallback(
+    fallback_action: str,
+) -> Mapping[str, JsonValue]:
     """构造带完整 fallback 诊断字段的 failed payload。
 
     :param fallback_action: fallback action，必须是 validator 允许的非空文本。
@@ -812,7 +835,9 @@ def _candidate() -> ConversationCompactOutputVNext:
         answer_anchors=(
             AnswerAnchorCandidateVNext(
                 anchor_title="Revenue answer",
-                anchor_items=(AnswerAnchorChildVNext(display_text="Revenue increased."),),
+                anchor_items=(
+                    AnswerAnchorChildVNext(display_text="Revenue increased."),
+                ),
                 answer_source_labels=("A1",),
             ),
         ),

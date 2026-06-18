@@ -95,6 +95,8 @@ _SEC_THROTTLE_RECOVERY_SECONDS: Final[float] = 600.0
 _SEC_THROTTLE_MAX_RETRIES: Final[int] = 3
 _ETAG_WEAK_PREFIX: Final[str] = "W/"
 _ETAG_GZIP_SUFFIX: Final[str] = "-gzip"
+_SEC_REQUEST_RESERVED_LOG_EVENT: Final[str] = "SEC request reserved"
+_SEC_RESPONSE_RECEIVED_LOG_EVENT: Final[str] = "SEC response received"
 _AwaitedValueT = TypeVar("_AwaitedValueT")
 _HttpResultT = TypeVar("_HttpResultT")
 
@@ -132,7 +134,7 @@ class Sc13PartyRoles:
     subject_cik: str
 
 
-DownloaderEventType = Literal["file_downloaded", "file_skipped", "file_failed"]
+DownloaderEventType = Literal["file_download_started", "file_downloaded", "file_skipped", "file_failed"]
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,15 @@ class _SecThrottleState:
 
     next_request_at: float = 0.0
     cooldown_until: float = 0.0
+
+
+@dataclass(frozen=True)
+class _SecThrottleReservation:
+    """单次 SEC 请求限流预留诊断。"""
+
+    shared_wait_seconds: float
+    min_interval_seconds: float
+    cooldown_hit: bool
 
 
 def _build_empty_content_failure_event(
@@ -1277,6 +1288,14 @@ class SecDownloader:
 
         previous_map = existing_files or {}
         for descriptor in remote_files:
+            yield DownloaderEvent(
+                event_type="file_download_started",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=descriptor.http_status,
+            )
             previous = previous_map.get(descriptor.name, {})
             previous_etag = str(previous.get("http_etag") or previous.get("etag") or "").strip() or None
             previous_last_modified = (
@@ -1410,6 +1429,8 @@ class SecDownloader:
             existing_files=existing_files,
             primary_document=primary_document,
         ):
+            if event.event_type == "file_download_started":
+                continue
             if event.event_type == "file_downloaded":
                 results.append(
                     {
@@ -1480,6 +1501,7 @@ class SecDownloader:
 
         Raises:
             RuntimeError: 重试耗尽后抛出。
+            OSError: 共享限流状态读写失败时抛出。
         """
 
         headers = self._build_headers()
@@ -1489,7 +1511,16 @@ class SecDownloader:
         throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
         attempt_index = 0
         while attempt_index < self._max_retries:
-            await self._rate_limit()
+            throttle_reservation = await self._rate_limit()
+            Log.debug(
+                f"{_SEC_REQUEST_RESERVED_LOG_EVENT}: method={method} url={url} "
+                f"attempt={attempt_index + 1} max_retries={self._max_retries} "
+                f"throttle_retries_remaining={throttle_retries_remaining} "
+                f"shared_throttle_wait_seconds={throttle_reservation.shared_wait_seconds:.6f} "
+                f"effective_min_interval_seconds={throttle_reservation.min_interval_seconds:.6f} "
+                f"cooldown_hit={throttle_reservation.cooldown_hit}",
+                module=self.MODULE,
+            )
             try:
                 if method == "GET":
                     response = await self._client.get(
@@ -1504,6 +1535,16 @@ class SecDownloader:
                         timeout=self._request_timeout_seconds,
                         follow_redirects=allow_redirects,
                     )
+                Log.debug(
+                    f"{_SEC_RESPONSE_RECEIVED_LOG_EVENT}: method={method} url={url} "
+                    f"status_code={response.status_code} attempt={attempt_index + 1} "
+                    f"max_retries={self._max_retries} "
+                    f"throttle_retries_remaining={throttle_retries_remaining} "
+                    f"shared_throttle_wait_seconds={throttle_reservation.shared_wait_seconds:.6f} "
+                    f"effective_min_interval_seconds={throttle_reservation.min_interval_seconds:.6f} "
+                    f"cooldown_hit={throttle_reservation.cooldown_hit}",
+                    module=self.MODULE,
+                )
                 if response.status_code in _THROTTLE_STATUS_CODES and throttle_retries_remaining > 0:
                     throttle_retries_remaining -= 1
                     delay = _resolve_sec_throttle_delay(response)
@@ -1518,7 +1559,11 @@ class SecDownloader:
             except handled_exceptions as exc:
                 last_exception = exc
                 Log.debug(
-                    f"{attempt_log_prefix}: url={url} attempt={attempt_index + 1} error={exc}",
+                    f"{attempt_log_prefix}: method={method} url={url} "
+                    f"attempt={attempt_index + 1} "
+                    f"shared_throttle_wait_seconds={throttle_reservation.shared_wait_seconds:.6f} "
+                    f"effective_min_interval_seconds={throttle_reservation.min_interval_seconds:.6f} "
+                    f"cooldown_hit={throttle_reservation.cooldown_hit} error={exc}",
                     module=self.MODULE,
                 )
                 await self._retry_backoff(attempt_index)
@@ -1596,7 +1641,7 @@ class SecDownloader:
             Response 对象；失败时返回 `None`。
 
         Raises:
-            无。
+            OSError: 共享限流状态读写失败时抛出。
         """
 
         try:
@@ -1791,7 +1836,7 @@ class SecDownloader:
             "Accept-Encoding": "gzip, deflate",
         }
 
-    def _reserve_global_request_slot(self, min_interval: float) -> float:
+    def _reserve_global_request_slot(self, min_interval: float) -> _SecThrottleReservation:
         """在共享状态中预留下一个请求时间片。
 
         设计目标：
@@ -1803,7 +1848,7 @@ class SecDownloader:
             min_interval: 请求最小间隔秒数。
 
         Returns:
-            当前请求应等待的秒数。
+            当前请求的共享限流预留诊断。
 
         Raises:
             OSError: 状态文件读写失败时抛出。
@@ -1813,12 +1858,17 @@ class SecDownloader:
         with _sec_throttle_lock(self._throttle_lock_path):
             state = _load_sec_throttle_state(self._throttle_state_path)
             allowed_at = max(now, state.cooldown_until, state.next_request_at)
+            cooldown_hit = state.cooldown_until > now
             next_state = _SecThrottleState(
                 next_request_at=allowed_at + min_interval,
                 cooldown_until=state.cooldown_until,
             )
             _save_sec_throttle_state(self._throttle_state_path, next_state)
-        return max(allowed_at - now, 0.0)
+        return _SecThrottleReservation(
+            shared_wait_seconds=max(allowed_at - now, 0.0),
+            min_interval_seconds=min_interval,
+            cooldown_hit=cooldown_hit,
+        )
 
     def _register_global_throttle_cooldown(self, delay_seconds: float) -> None:
         """登记 SEC 限流后的共享冷却窗口。
@@ -1842,7 +1892,7 @@ class SecDownloader:
             )
             _save_sec_throttle_state(self._throttle_state_path, next_state)
 
-    async def _rate_limit(self) -> None:
+    async def _rate_limit(self) -> _SecThrottleReservation:
         """基于单调时钟的请求速率限制器。
 
         确保相邻请求间隔 ≥ max(_SEC_MIN_REQUEST_INTERVAL_SECONDS, sleep_seconds)。
@@ -1852,25 +1902,30 @@ class SecDownloader:
             无。
 
         Returns:
-            无。
+            本次请求的共享限流预留诊断。
 
         Raises:
-            无。
+            OSError: 共享限流状态读写失败时抛出。
         """
 
         min_interval = max(_SEC_MIN_REQUEST_INTERVAL_SECONDS, self._sleep_seconds)
         if min_interval <= 0:
-            return
+            return _SecThrottleReservation(
+                shared_wait_seconds=0.0,
+                min_interval_seconds=min_interval,
+                cooldown_hit=False,
+            )
         # 先执行实例内限流，避免同一 event loop 内短时间打爆共享锁。
         now = time.monotonic()
         elapsed = now - self._last_request_time
         if elapsed < min_interval:
             await asyncio.sleep(min_interval - elapsed)
         # 再执行跨进程共享限流，确保同一工作区下所有下载进程共用节流状态。
-        shared_wait_seconds = self._reserve_global_request_slot(min_interval)
-        if shared_wait_seconds > 0:
-            await asyncio.sleep(shared_wait_seconds)
+        reservation = self._reserve_global_request_slot(min_interval)
+        if reservation.shared_wait_seconds > 0:
+            await asyncio.sleep(reservation.shared_wait_seconds)
         self._last_request_time = time.monotonic()
+        return reservation
 
     async def _retry_backoff(self, attempt_index: int) -> None:
         """执行指数退避。

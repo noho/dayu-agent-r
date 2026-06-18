@@ -32,6 +32,8 @@ from dayu.fins.downloaders.hkexnews_downloader import (
     HkexnewsDiscoveryClient,
 )
 from dayu.fins.ingestion_runtime import (
+    FinsDownloadProgressEvent,
+    FinsDownloadProgressSink,
     FinsDownloadResultSummary,
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
@@ -88,6 +90,11 @@ CN_PIPELINE_NAME: Final[str] = "cn"
 HK_PIPELINE_NAME: Final[str] = "hk"
 _CN_FORMS_ADAPTER_JOINER: Final[str] = ","
 _CN_STATUS_DOWNLOADED: Final[str] = "downloaded"
+_ADAPTER_PROGRESS_FILE_STARTED: Final[str] = "download.file_started"
+_ADAPTER_PROGRESS_FILE_COMPLETED: Final[str] = "download.file_completed"
+_ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
+_ADAPTER_PROGRESS_FILE_FAILED: Final[str] = "download.file_failed"
+_ADAPTER_PROGRESS_CONVERSION_STARTED: Final[str] = "download.conversion_started"
 
 
 CnPipelineDownloadResult: TypeAlias = dict[str, JsonValue]
@@ -143,11 +150,14 @@ def _run_async_upload_sync(
 
 async def collect_cn_download_result_from_events(
     events: AsyncIterator[DownloadEvent],
+    *,
+    progress_sink: FinsDownloadProgressSink | None = None,
 ) -> CnPipelineDownloadResult:
     """从 CN/HK 下载事件流收集最终结果。
 
     Args:
         events: CN/HK 下载事件流。
+        progress_sink: 可选 runtime 进度回调。
 
     Returns:
         ``PIPELINE_COMPLETED`` 事件携带的结果字典。
@@ -157,12 +167,94 @@ async def collect_cn_download_result_from_events(
     """
 
     async for event in events:
+        _emit_adapter_download_progress(event, progress_sink)
         if event.event_type == DownloadEventType.PIPELINE_COMPLETED:
             result = event.payload.get("result")
             if isinstance(result, Mapping):
                 return cast(CnPipelineDownloadResult, dict(result))
             raise RuntimeError("CN/HK 下载完成事件缺少结果 payload")
     raise RuntimeError("CN/HK 下载事件流未产生完成事件")
+
+
+def _emit_adapter_download_progress(
+    event: DownloadEvent,
+    progress_sink: FinsDownloadProgressSink | None,
+) -> None:
+    """把 CN/HK pipeline 文件事件投影为 runtime 下载进度。
+
+    Args:
+        event: CN/HK pipeline 下载事件。
+        progress_sink: runtime adapter 进度回调。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 回调拒绝非法进度字段时抛出。
+    """
+
+    if progress_sink is None:
+        return
+    if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_FILE_STARTED,
+                message="开始下载",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.CONVERSION_STARTED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_CONVERSION_STARTED,
+                message="开始 convert",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.FILE_DOWNLOADED:
+        status = _payload_text(event.payload, "status")
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_FILE_SKIPPED if status == "skipped" else _ADAPTER_PROGRESS_FILE_COMPLETED,
+                message="跳过下载" if status == "skipped" else "完成下载",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.FILE_FAILED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_FILE_FAILED,
+                message="下载失败",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+
+
+def _payload_text(payload: Mapping[str, JsonValue], key: str) -> str | None:
+    """从 pipeline event payload 读取短文本。
+
+    Args:
+        payload: pipeline event payload。
+        key: 字段名。
+
+    Returns:
+        非空文本或 ``None``。
+
+    Raises:
+        无。
+    """
+
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    return None
 
 
 async def collect_cn_upload_result_from_events(
@@ -1219,14 +1311,19 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
             )
         if request.source not in {self._source, "auto"}:
             raise ValueError(f"CN/HK 下载来源不匹配: expected={self._source} actual={request.source}")
-        result = self._pipeline.download(
-            ticker=request.normalized_ticker.canonical,
-            form_type=_form_type_from_adapter_request(request.form_types),
-            start_date=request.filed_after,
-            end_date=request.filed_before,
-            overwrite=request.overwrite_existing,
-            rebuild=False,
-            cancel_checker=request.cancellation_checker,
+        result = _run_async_download_sync(
+            collect_cn_download_result_from_events(
+                self._pipeline.download_stream(
+                    ticker=request.normalized_ticker.canonical,
+                    form_type=_form_type_from_adapter_request(request.form_types),
+                    start_date=request.filed_after,
+                    end_date=request.filed_before,
+                    overwrite=request.overwrite_existing,
+                    rebuild=False,
+                    cancel_checker=request.cancellation_checker,
+                ),
+                progress_sink=request.progress_sink,
+            )
         )
         return FinsSourceDownloadAdapterResult(
             discovered_count=_summary_int(result, "total"),

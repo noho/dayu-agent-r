@@ -130,6 +130,8 @@ class ParsedCliArgs(argparse.Namespace):
     workspace_root: str
     config_dir: str | None
     log_level: str
+    log_file: str | None
+    detail: bool
     prompt: str
     ticker: str | None
     label: str | None
@@ -244,6 +246,8 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.workspace_root = DEFAULT_WORKSPACE
     namespace.config_dir = None
     namespace.log_level = DEFAULT_LOG_LEVEL
+    namespace.log_file = None
+    namespace.detail = False
     namespace.ticker = None
     namespace.label = None
     namespace.model_name = None
@@ -325,6 +329,12 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         choices=LOG_LEVEL_CHOICES,
         default=argparse.SUPPRESS,
         help="日志等级。",
+    )
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        default=argparse.SUPPRESS,
+        help="把诊断日志追加写入指定文件；未提供时写入系统临时目录 dayu-cli-*.log。",
     )
     parser.add_argument(
         "--debug",
@@ -431,6 +441,21 @@ def _register_prompt_command(
     parser.add_argument("prompt", type=_non_empty_prompt, help="本轮用户问题。")
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
+    detail_group = parser.add_mutually_exclusive_group()
+    detail_group.add_argument(
+        "--detail",
+        dest="detail",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="显示运行态 activity stream。",
+    )
+    detail_group.add_argument(
+        "--no-detail",
+        dest="detail",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="不显示运行态 activity stream。",
+    )
     _add_agent_execution_arguments(parser)
 
 

@@ -51,8 +51,10 @@ from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import RunRow
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
 from dayu.host.evidence import OpaqueEvidenceRef
-from dayu.host.evidence import accepted_evidence_envelope_from_json_value
+from dayu.host.evidence import accepted_evidence_envelope_from_payload
+from dayu.host.evidence import accepted_tool_raw_outcome_text_from_payload
 from dayu.host.memory import (
     ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
@@ -67,7 +69,7 @@ from dayu.host.payload_resolution import (
     event_payload_object_for_result_ref,
     tool_call_request_atoms,
 )
-from dayu.host.terminal_summary_payload import PayloadTextReadPolicy
+from dayu.host.terminal_payload import PayloadTextReadPolicy
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 
 _CURRENT_INPUT_PREFIX = "C"
@@ -117,9 +119,6 @@ _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
 _PAYLOAD_FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
-_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
-_PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
-_PAYLOAD_FIELD_RESULT_PREVIEW = "result_preview"
 _PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
 _PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
@@ -2001,7 +2000,7 @@ def _assistant_answer_delta_block(
     :param transaction: 当前 Host transaction。
     :param row: run succeeded EventLog row。
     :returns: answer material block；无可读 final answer continuity 时返回 ``None``。
-    :raises HostDurableError: terminal summary payload 损坏时抛出。
+    :raises HostDurableError: terminal payload 损坏时抛出。
     """
 
     payload = event_payload_object(
@@ -2053,15 +2052,17 @@ def _accepted_tool_evidence_delta_blocks(
         row,
         payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
-    envelope_value = payload.get(_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE)
-    if envelope_value is None:
-        return ()
     try:
-        envelope = accepted_evidence_envelope_from_json_value(envelope_value)
+        envelope = accepted_evidence_envelope_from_payload(
+            payload,
+            producer_event_ref=row.event_id,
+        )
     except ValueError as exc:
+        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
+            raise HostDurableError(str(exc)) from exc
         raise HostDurableError("canonical evidence envelope is invalid") from exc
-    if envelope.producer_event_ref != row.event_id:
-        raise HostDurableError("accepted evidence producer_event_ref mismatch")
+    if envelope is None:
+        return ()
     if envelope.evidence_id in represented_evidence_refs:
         return ()
     result_payload = event_payload_object_for_result_ref(
@@ -2071,10 +2072,11 @@ def _accepted_tool_evidence_delta_blocks(
         expected_payload_digest=envelope.result_ref.payload_digest,
         payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
-    if _PAYLOAD_FIELD_RESULT_PREVIEW in result_payload:
-        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed")
-    raw_outcome = result_payload.get(_PAYLOAD_FIELD_RAW_TOOL_OUTCOME)
-    if raw_outcome is None:
+    try:
+        raw_text = accepted_tool_raw_outcome_text_from_payload(result_payload)
+    except ValueError as exc:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed") from exc
+    if raw_text is None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
     tool_call_event_ref = envelope.tool_query.tool_call_requested_event_ref
     if tool_call_event_ref is None:
@@ -2085,7 +2087,7 @@ def _accepted_tool_evidence_delta_blocks(
             block_id=f"eventlog:evidence:{row.event_id}:{envelope.evidence_id}",
             section=CompactMaterialSection.EVIDENCE_MATERIAL,
             kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-            text=canonical_json_dumps(raw_outcome),
+            text=raw_text,
             canonical_source_refs=(envelope.evidence_id,),
             event_sequence=row.event_sequence,
             accepted_evidence_id=envelope.evidence_id,

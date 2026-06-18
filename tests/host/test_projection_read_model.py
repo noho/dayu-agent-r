@@ -575,7 +575,6 @@ def _assert_invalid_display_text_fails_without_timeline_item(
             event_type="USER_INPUT_ACCEPTED",
             payload={"display_text": display_text},
         )
-        previous_cursor = invalid_event.event_sequence - 1
 
         result = ProjectionRunner(
             transaction_runner, (MinimalReadModelProjectionConsumer(),)
@@ -595,9 +594,9 @@ def _assert_invalid_display_text_fails_without_timeline_item(
         )
 
         assert result.failures == 1
-        assert result.finished_cursor == previous_cursor
         assert checkpoint is not None
-        assert checkpoint.checkpoint_event_sequence == previous_cursor
+        assert result.finished_cursor == checkpoint.checkpoint_event_sequence
+        assert checkpoint.checkpoint_event_sequence < invalid_event.event_sequence
         assert failure is not None
         assert failure.failed_event_id == invalid_event.event_id
         assert failure.failed_event_sequence == invalid_event.event_sequence
@@ -826,7 +825,9 @@ def test_conflicting_terminal_event_records_failure_without_overwrite(
             transaction_runner, (MinimalReadModelProjectionConsumer(),)
         )
         first_result = runner.run_once(
-            MINIMAL_READ_MODEL_CONSUMER_ID, limit=first.event_sequence
+            MINIMAL_READ_MODEL_CONSUMER_ID,
+            limit=100,
+            max_event_sequence=first.event_sequence,
         )
         conflict_result = runner.run_once(MINIMAL_READ_MODEL_CONSUMER_ID, limit=100)
         stored = transaction_runner.run_write(

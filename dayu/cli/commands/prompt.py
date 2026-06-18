@@ -12,10 +12,12 @@ import asyncio
 import os
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
+    cancel_and_await_task,
     optional_stripped_text,
     package_config_root,
     resolve_explicit_config_dir,
@@ -23,10 +25,12 @@ from dayu.cli.agent_entrypoint import (
     service_run_overrides_from_args,
     unsupported_execution_option_names,
 )
+from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.arg_parsing import COMMAND_PROMPT, ParsedCliArgs
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
+    EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
 from dayu.cli.host_context import (
@@ -42,6 +46,13 @@ from dayu.cli.host_context import (
     prompt_submit_client_request_id,
 )
 from dayu.cli.output import render_cli_error, render_prompt_terminal_result
+from dayu.cli.run_keys import (
+    NoopRunningKeyMonitor,
+    RunningKeyAction,
+    RunningKeyMonitor,
+    new_running_key_monitor,
+)
+from dayu.cli.session_terminal_cursor import advance_cli_terminal_cursor
 from dayu.contracts import JsonValue
 from dayu.host.api import (
     CancelMode,
@@ -86,12 +97,14 @@ class _PreparedPromptExistingSessionExecution:
     """在已有 Session 上执行 prompt turn 所需的准备结果。
 
     :param runtime: entrypoint runtime assembly 结果。
+    :param workspace_root: 当前 workspace 根目录。
     :param invocation: 当前 CLI invocation 身份。
     :param user_prompt: 本轮用户 prompt。
     :param run_overrides: 本轮可映射执行 override。
     """
 
     runtime: EntrypointRuntimeResult
+    workspace_root: Path
     invocation: CliInvocation
     user_prompt: str
     run_overrides: ServiceRunOverrides
@@ -171,6 +184,7 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
             prepared=prepared,
             session_id=session_id,
             sigint_monitor=CliSigintMonitor(),
+            detail=args.detail,
         )
 
 
@@ -232,6 +246,7 @@ async def _prepare_prompt_existing_session_execution(
     )
     return _PreparedPromptExistingSessionExecution(
         runtime=runtime,
+        workspace_root=workspace_root,
         invocation=invocation,
         user_prompt=user_prompt,
         run_overrides=service_run_overrides_from_args(
@@ -247,6 +262,7 @@ async def _execute_prompt_on_existing_session(
     prepared: _PreparedPromptExistingSessionExecution,
     session_id: str,
     sigint_monitor: CliSigintMonitor,
+    detail: bool = False,
 ) -> int:
     """在已解析的已有 Session 上执行 prompt turn。
 
@@ -254,6 +270,7 @@ async def _execute_prompt_on_existing_session(
     :param prepared: prompt existing-session 执行准备结果。
     :param session_id: 已存在且调用方已选择的 Host Session id。
     :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
+    :param detail: 是否显示运行态 activity stream。
     :returns: CLI 退出码。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
@@ -266,10 +283,35 @@ async def _execute_prompt_on_existing_session(
         user_prompt=prepared.user_prompt,
         run_overrides=prepared.run_overrides,
         sigint_monitor=sigint_monitor,
+        activity_renderer=_new_detail_activity_renderer() if detail else None,
+        key_monitor=new_running_key_monitor(),
     )
     if terminal is None:
         return EXIT_KEYBOARD_INTERRUPT
-    return render_prompt_terminal_result(terminal)
+    render_exit_code = render_prompt_terminal_result(terminal)
+    if render_exit_code == EXIT_SUCCESS:
+        await advance_cli_terminal_cursor(
+            workspace_root=prepared.workspace_root,
+            session_id=session_id,
+            terminal_event_id=terminal.terminal_event_id,
+            event_sequence=terminal.event_sequence,
+        )
+    return render_exit_code
+
+
+def _new_detail_activity_renderer() -> CliActivityRenderer:
+    """创建 ``--detail`` 模式使用的 activity renderer。
+
+    :returns: 强制可见且启用的 CLI activity renderer。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return CliActivityRenderer(
+        options=CliActivityRendererOptions(
+            visible=True,
+            enabled=True,
+        )
+    )
 
 
 async def _ensure_prompt_session(
@@ -300,9 +342,7 @@ async def _ensure_prompt_session(
                 invocation,
                 operation=_PROMPT_OPERATION_CREATE_SESSION,
             ),
-            create_client_request_id=prompt_create_session_client_request_id(
-                invocation
-            ),
+            create_client_request_id=prompt_create_session_client_request_id(invocation),
         )
         return session.session_id
     try:
@@ -329,6 +369,8 @@ async def _submit_prompt_turn_handling_sigint(
     user_prompt: str,
     run_overrides: ServiceRunOverrides,
     sigint_monitor: CliSigintMonitor,
+    activity_renderer: CliActivityRenderer | None = None,
+    key_monitor: RunningKeyMonitor | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """提交 prompt turn，并在 SIGINT 时按 Host public cancel 语义收口。
 
@@ -339,13 +381,18 @@ async def _submit_prompt_turn_handling_sigint(
     :param user_prompt: 本轮用户 prompt。
     :param run_overrides: 本轮可映射执行 override。
     :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
+    :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
+    :param key_monitor: 运行态 TTY 按键 monitor；``None`` 表示 no-op。
     :returns: Host terminal result；Run accepted 前 SIGINT 返回 ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
     accepted_run = _AcceptedRunState()
+    renderer = activity_renderer
+    monitor = NoopRunningKeyMonitor() if key_monitor is None else key_monitor
     sigint_monitor.install()
     observed_sigint_count = sigint_monitor.count
+    monitor.start()
     submit_task = asyncio.create_task(
         submit_entrypoint_turn_and_wait(
             host,
@@ -368,46 +415,152 @@ async def _submit_prompt_turn_handling_sigint(
             scene_inputs=runtime.scene_inputs,
             host_assembly=runtime.host_assembly,
             on_run_accepted=accepted_run.record,
+            on_activity=None if renderer is None else renderer.record,
         )
     )
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+    key_task = asyncio.create_task(monitor.wait_next())
     try:
-        done, _pending = await asyncio.wait(
-            (submit_task, sigint_task),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if submit_task in done:
-            sigint_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await sigint_task
-            return await submit_task
-        submit_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await submit_task
-        if accepted_run.run_id is None:
-            return None
-        return await cancel_entrypoint_run_and_wait(
+        while True:
+            done, _pending = await asyncio.wait(
+                (submit_task, sigint_task, key_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if submit_task in done:
+                return await submit_task
+            if key_task in done:
+                action = await key_task
+                if action is RunningKeyAction.TOGGLE_ACTIVITY:
+                    if renderer is not None:
+                        renderer.toggle_visible()
+                    key_task = asyncio.create_task(monitor.wait_next())
+                    continue
+                return await _cancel_prompt_turn_after_local_request(
+                    host=host,
+                    invocation=invocation,
+                    accepted_run=accepted_run,
+                    submit_task=submit_task,
+                    sigint_monitor=sigint_monitor,
+                    observed_sigint_count=observed_sigint_count,
+                    activity_renderer=renderer,
+                )
+            first_sigint_count = await sigint_task
+            return await _cancel_prompt_turn_after_local_request(
+                host=host,
+                invocation=invocation,
+                accepted_run=accepted_run,
+                submit_task=submit_task,
+                sigint_monitor=sigint_monitor,
+                observed_sigint_count=first_sigint_count,
+                activity_renderer=renderer,
+            )
+    finally:
+        if renderer is not None:
+            renderer.close()
+        monitor.close()
+        sigint_monitor.close()
+        await cancel_and_await_task(sigint_task)
+        await cancel_and_await_task(key_task)
+
+
+async def _cancel_prompt_turn_after_local_request(
+    *,
+    host: Host,
+    invocation: CliInvocation,
+    accepted_run: _AcceptedRunState,
+    submit_task: asyncio.Task[EntrypointRunTerminalResult],
+    sigint_monitor: CliSigintMonitor,
+    observed_sigint_count: int,
+    activity_renderer: CliActivityRenderer | None = None,
+) -> EntrypointRunTerminalResult | None:
+    """本地取消请求后取消 prompt turn 并等待 Host terminal 或二次 SIGINT。
+
+    :param host: Host public handle。
+    :param invocation: 当前 CLI invocation 身份。
+    :param accepted_run: 本轮 accepted Run id 状态。
+    :param submit_task: 正在运行的 submit / terminal wait task。
+    :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
+    :param observed_sigint_count: 第一次取消请求后的 SIGINT 计数；Esc 取消
+        时传入进入运行态前的计数，避免 Esc 被当作 Ctrl+C 次数。
+    :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
+    :returns: cancel 后 terminal result；Run accepted 前或二次 SIGINT 时返回
+        ``None``。
+    :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
+    """
+
+    submit_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await submit_task
+    if accepted_run.run_id is None:
+        return None
+    if activity_renderer is not None:
+        activity_renderer.render_cancel_requested()
+    return await _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
+        host=host,
+        invocation=invocation,
+        run_id=accepted_run.run_id,
+        sigint_monitor=sigint_monitor,
+        observed_sigint_count=observed_sigint_count,
+        activity_renderer=activity_renderer,
+    )
+
+
+async def _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
+    *,
+    host: Host,
+    invocation: CliInvocation,
+    run_id: str,
+    sigint_monitor: CliSigintMonitor,
+    observed_sigint_count: int,
+    activity_renderer: CliActivityRenderer | None = None,
+) -> EntrypointRunTerminalResult | None:
+    """发起 prompt Host cancel，并在二次 SIGINT 时本地退出。
+
+    :param host: Host public handle。
+    :param invocation: 当前 CLI invocation 身份。
+    :param run_id: 待取消 Run id。
+    :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
+    :param observed_sigint_count: 第一次取消请求后的 SIGINT 计数。
+    :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
+    :returns: cancel terminal result；二次 SIGINT 先到时返回 ``None``。
+    :raises Exception: cancel 或 terminal observation 失败时向上抛出。
+    """
+
+    cancel_task = asyncio.create_task(
+        cancel_entrypoint_run_and_wait(
             host,
             request=EntrypointCancelRequest(
                 context=build_prompt_host_context(
                     invocation,
                     operation=_PROMPT_OPERATION_CANCEL_RUN,
                 ),
-                run_id=accepted_run.run_id,
+                run_id=run_id,
                 client_request_id=prompt_cancel_client_request_id(
                     invocation,
                     turn_index=PROMPT_TURN_INDEX,
-                    run_id=accepted_run.run_id,
+                    run_id=run_id,
                 ),
                 reason=CLI_SIGINT_REASON,
                 mode=CancelMode.GRACEFUL,
             ),
         )
-    finally:
-        sigint_monitor.close()
-        sigint_task.cancel()
+    )
+    second_sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
+    try:
+        done, _pending = await asyncio.wait(
+            (cancel_task, second_sigint_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_task in done:
+            return await cancel_task
+        if activity_renderer is not None:
+            activity_renderer.render_local_exit_after_cancel()
+        cancel_task.cancel()
         with suppress(asyncio.CancelledError):
-            await sigint_task
+            await cancel_task
+        return None
+    finally:
+        await cancel_and_await_task(second_sigint_task)
 
 
 def _raise_for_unsupported_execution_options(args: ParsedCliArgs) -> None:
@@ -420,9 +573,7 @@ def _raise_for_unsupported_execution_options(args: ParsedCliArgs) -> None:
 
     unsupported = unsupported_execution_option_names(args)
     if unsupported:
-        raise CliCommandUsageError(
-            f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}"
-        )
+        raise CliCommandUsageError(f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}")
 
 
 def _prompt_context_slot_values(*, ticker: str | None) -> dict[str, JsonValue]:
@@ -434,9 +585,7 @@ def _prompt_context_slot_values(*, ticker: str | None) -> dict[str, JsonValue]:
     """
 
     return {
-        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: (
-            ticker if ticker is not None else DEFAULT_FINS_SUBJECT
-        ),
+        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: (ticker if ticker is not None else DEFAULT_FINS_SUBJECT),
         CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER,
     }
 
