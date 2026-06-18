@@ -69,6 +69,7 @@ from dayu.host.api import (
 from dayu.host.open_host import open_host
 from dayu.runtime.location import RuntimeLocationError
 from dayu.service.entrypoint_runtime import (
+    EntrypointRuntimeError,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
     prepare_entrypoint_runtime,
@@ -287,6 +288,9 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
                 exc,
                 resolved_from_label=target.resolved_from_label,
             )
+        except EntrypointRuntimeError as exc:
+            render_cli_error(_resume_startup_error_message(target=target, error=exc))
+            return EXIT_FAILURE
 
 
 async def _run_session_purge(
@@ -586,6 +590,26 @@ def _resume_host_error_message(
         "dayu-cli session resume: "
         f"selector={target.selector} session_id={target.session_id} "
         f"{_host_error_context(error)}"
+    )
+
+
+def _resume_startup_error_message(
+    *,
+    target: _ExistingSessionTarget,
+    error: EntrypointRuntimeError,
+) -> str:
+    """把 interactive resume startup 错误映射成用户可读错误。
+
+    :param target: 已解析 resume 目标。
+    :param error: Service startup barrier 抛出的运行期错误。
+    :returns: stderr 错误文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        "dayu-cli session resume: interactive startup failed "
+        f"selector={target.selector} session_id={target.session_id} "
+        f"message={error}"
     )
 
 
