@@ -204,6 +204,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 | WU-CLI-INTERACTIVE-RESUME-01-R1 | deferred-with-owner | Future CLI client-state / multi-client isolation WU | 当前按 workspace-local CLI terminal cursor 处理；若需要多个本地 CLI 客户端互不遮蔽 terminal backfill，应引入 per-client cursor identity。 |
 | WU-CLI-INTERACTIVE-RESUME-01-R2 | deferred-with-owner | Future CLI UX / error-handling WU | `session resume --mode interactive` 的 startup `EntrypointRuntimeError` 仍沿现有 CLI runtime error 路径传播；后续可统一渲染为结构化 CLI 错误。 |
+| WU-CLI-ACTIVITY-01-PR-R1 | deferred-with-owner | Future Host public multiturn / memory smoke stabilization WU | PR review 发现 `tests/host/test_public_open_host_multiturn_smoke.py::test_deterministic_two_turn_request_contains_prior_final_answer` 与 `tests/host/test_public_tool_wiring_smoke.py::test_mock_tool_result_feeds_same_run_and_later_run_continuity` 在 `main` 分支同样失败；不属于 WU-CLI-ACTIVITY-01 引入，后续由 Host public continuity / memory smoke owner 单独裁决。 |
 
 ## 当前 Work Units
 
@@ -347,7 +348,11 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - Aggregate fix: `docs/reviews/wu-cli-activity-01-followup-aggregate-fix-codex-20260618.md`.
 - Aggregate focused re-review: `docs/reviews/mimo-aggregate-rereview-wu-cli-activity-01-followup-20260618.md`; `docs/reviews/ds-aggregate-rereview-wu-cli-activity-01-followup-20260618-082351.md`.
 - Aggregate fix validation: `pytest tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_memory_repair.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q` passed with 120 passed; final follow-up validation `pytest tests/host/test_engine_ingest_mapping.py tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py tests/host/test_memory_repair.py tests/host/test_open_host_runtime.py tests/host/test_dispatch_scheduler.py tests/host/test_logging.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q` passed with 348 passed; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
-- next entry point: open / update draft PR for WU-CLI-ACTIVITY-01.
+- Draft PR: https://github.com/noho/dayu-agent-r/pull/149.
+- PR review: `docs/reviews/wu-cli-activity-01-pr-review-mimo-20260618.md`; `docs/reviews/wu-cli-activity-01-pr-review-ds-20260618.md`.
+- PR review fix: `docs/reviews/wu-cli-activity-01-pr-review-fix-codex-20260618.md`.
+- PR review fix validation: `pytest tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py tests/cli/test_activity_renderer.py tests/cli/test_interactive_composer.py tests/cli/test_run_keys.py tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/service/test_entrypoint_runtime_interactive_path.py -q` passed with 114 passed and 3 third-party edgar deprecation warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; grep found no duplicated `_cancel_and_await_task` in `dayu/cli`.
+- next entry point: focused PR re-review, then update PR body and close out draft PR gate.
 
 ## WU-CLI-INTERACTIVE-RESUME-01 Prompt / Interactive Existing-Session Startup
 

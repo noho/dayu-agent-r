@@ -13,10 +13,11 @@ import os
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypeVar
+from typing import Final
 
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
+    cancel_and_await_task,
     optional_stripped_text,
     package_config_root,
     resolve_explicit_config_dir,
@@ -85,7 +86,6 @@ _PROMPT_OPERATION_CREATE_SESSION: Final[str] = "create_session"
 _PROMPT_OPERATION_SUBMIT_FOLLOWUP: Final[str] = "submit_followup"
 _PROMPT_OPERATION_CANCEL_RUN: Final[str] = "cancel_run"
 _UNSUPPORTED_OPTION_PREFIX: Final[str] = "unsupported option"
-_TaskResult = TypeVar("_TaskResult")
 
 
 class CliCommandUsageError(ValueError):
@@ -459,8 +459,8 @@ async def _submit_prompt_turn_handling_sigint(
             renderer.close()
         monitor.close()
         sigint_monitor.close()
-        await _cancel_and_await_task(sigint_task)
-        await _cancel_and_await_task(key_task)
+        await cancel_and_await_task(sigint_task)
+        await cancel_and_await_task(key_task)
 
 
 async def _cancel_prompt_turn_after_local_request(
@@ -560,21 +560,7 @@ async def _cancel_prompt_run_waiting_for_terminal_or_second_sigint(
             await cancel_task
         return None
     finally:
-        await _cancel_and_await_task(second_sigint_task)
-
-
-async def _cancel_and_await_task(task: asyncio.Task[_TaskResult]) -> None:
-    """取消并回收 asyncio task。
-
-    :param task: 待取消或已结束的 task。
-    :returns: ``None``。
-    :raises Exception: task 已以非取消异常结束时向上透传。
-    """
-
-    if not task.done():
-        task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
+        await cancel_and_await_task(second_sigint_task)
 
 
 def _raise_for_unsupported_execution_options(args: ParsedCliArgs) -> None:

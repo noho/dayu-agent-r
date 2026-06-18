@@ -299,6 +299,7 @@ dayu-cli <subcommand> [参数]
 | `--new-session` | `interactive` | 不续接上一次 interactive 多轮会话，改为从头开始一个新会话 |
 | `--web-provider` | `prompt` `interactive` `write` | 指定联网检索 provider，如 `auto`、`tavily`、`serper`、`duckduckgo` |
 | `--thinking` / `--no-thinking` | `prompt` `interactive` | 控制是否在终端回显模型思考过程 |
+| `--detail` / `--no-detail` | `prompt` | 控制是否显示运行态 activity stream；默认 `--no-detail` |
 
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。
@@ -539,6 +540,7 @@ dayu-cli upload_material \
 | `--model-name` | 可选，指定模型配置 |
 | `--temperature` | 可选，覆盖模型 temperature |
 | `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
+| `--detail` / `--no-detail` | 可选，控制是否显示运行态 activity stream，默认不显示 |
 | `--debug` / `--verbose` | 可选，仅调整日志级别，不改变会话行为 |
 
 命令示例：
@@ -555,6 +557,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --thinking
 dayu-cli prompt --label apple "先总结苹果最新财报中的主要风险"
 dayu-cli prompt "总结苹果最新财报中的主要风险" --model-name mimo-v2.5-pro
 dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
+dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
 ```
 
 命令说明：
@@ -563,6 +566,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
 - 不带 `--label` 时，`prompt` 保持 one-shot，不承诺后续恢复；带 `--label` 时，本次提问会挂到该 label 对应的可恢复 conversation 上，后续可继续用 `prompt --label <label>` 或 `interactive --label <label>` 接着问。
 - 带 `--label` 的 prompt 在本轮拿到最终回答前会独占该 label；如果另一个进程此时也尝试复用同一个 label，CLI 会直接报错并提示等待当前对话结束，或改用新的 `--label`。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
+- 默认不显示运行态 activity stream；如需查看工具调用、运行状态等过程信息，显式传 `--detail`。
 
 ### 3.4 交互式对话：`interactive`
 

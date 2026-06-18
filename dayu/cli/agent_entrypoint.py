@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import signal
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from types import FrameType
+from typing import TypeVar
 
 from dayu.cli.arg_parsing import ParsedCliArgs
 from dayu.service.host_assembly import ServiceRunOverrides
@@ -23,6 +25,7 @@ BASE_OPTION_NAME: str = "--base"
 CONFIG_DIR_OPTION_NAME: str = "--config"
 FALLBACK_MODE_OPTION_NAME: str = "--fallback-mode"
 FALLBACK_PROMPT_OPTION_NAME: str = "--fallback-prompt"
+_TaskResult = TypeVar("_TaskResult")
 
 
 class CliSigintMonitor:
@@ -108,6 +111,21 @@ class CliSigintMonitor:
             await self._event.wait()
             self._event.clear()
         return self.count
+
+
+async def cancel_and_await_task(task: asyncio.Task[_TaskResult]) -> None:
+    """取消并回收 asyncio task。
+
+    :param task: 待取消或已结束的 task。
+    :returns: ``None``。
+    :raises Exception: task 已经以非取消异常结束时向上透传，避免吞掉异步
+        状态机错误。
+    """
+
+    if not task.done():
+        task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 def resolve_workspace_root(value: str, *, error_factory: UsageErrorFactory) -> Path:
@@ -295,6 +313,7 @@ def package_config_root() -> Path:
 
 __all__: tuple[str, ...] = (
     "CliSigintMonitor",
+    "cancel_and_await_task",
     "package_config_root",
     "optional_stripped_text",
     "resolve_explicit_config_dir",
