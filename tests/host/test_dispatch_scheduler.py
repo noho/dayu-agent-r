@@ -4193,7 +4193,11 @@ async def test_second_proactive_compact_uses_previous_view_without_old_raw_repla
             tmp_path,
             store,
             factory,
-            context_budget_policy=_soft_compact_policy(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=180,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=140,
+            ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
@@ -4897,9 +4901,9 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
             context_budget_policy=_soft_compact_policy(
                 # 同源 material view 估算包含 previous view、delta 与 current input；
                 # 这里需超过 soft threshold 且低于 hard threshold，目标仍是 proactive lifecycle。
-                context_window_size=200,
+                context_window_size=320,
                 soft_threshold_tokens=60,
-                hard_threshold_tokens=160,
+                hard_threshold_tokens=260,
             ),
             context_compactor=_PreparedManifestProactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",

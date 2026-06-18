@@ -566,6 +566,31 @@ def selected_material_source_refs(
     return tuple(dict.fromkeys(refs))
 
 
+def selected_material_view_digest(
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+) -> str:
+    """计算 selected material view 的稳定 digest。
+
+    :param selected_blocks: 已按 material view 顺序选中的 blocks。
+    :returns: selected view digest。
+    :raises TypeError: 参数类型非法时抛出。
+    """
+
+    _require_material_block_tuple(selected_blocks, "selected_blocks")
+    return sha256_digest_json(
+        {
+            "selected_blocks": [
+                {
+                    "block_id": block.block_id,
+                    "canonical_source_refs": list(block.canonical_source_refs),
+                    "content_digest": block.content_digest,
+                }
+                for block in selected_blocks
+            ]
+        }
+    )
+
+
 def conversation_compact_input_vnext_from_material_pack(
     material_pack: CompactMaterialPack,
 ) -> ConversationCompactInputVNext:
@@ -3495,5 +3520,6 @@ __all__ = [
     "run_input_material_block",
     "select_compact_segment",
     "selected_material_source_refs",
+    "selected_material_view_digest",
     "validate_material_label",
 ]

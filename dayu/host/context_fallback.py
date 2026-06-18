@@ -17,6 +17,7 @@ from dayu.host.compact_material import (
     RunInputMaterialBlock,
     is_turn_group_material_block,
     protected_recent_turn_group_ids_for_material_blocks,
+    selected_material_view_digest,
 )
 from dayu.host.compaction import CompactMaterialSection
 from dayu.host.context_budget import (
@@ -30,6 +31,7 @@ from dayu.host.context_budget import (
 from dayu.host.context_events import CONTEXT_COMPACTION_FAILED
 from dayu.host.context_policy import ContextBudgetPolicy, ContextCompactionTriggerSource
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
@@ -51,6 +53,9 @@ _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
 _FIELD_SELECTED_BLOCK_IDS = "selected_block_ids"
 _FIELD_CURRENT_INPUT_REF = "current_input_ref"
 _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR = "selected_recent_window_turn_floor"
+_FIELD_SELECTED_MATERIAL_VIEW_DIGEST = "selected_material_view_digest"
+_FIELD_SELECTED_RAW_TURN_COUNT = "selected_raw_turn_count"
+_FIELD_SOURCE_REFS = "source_refs"
 
 
 class RecentWindowFallbackAction(StrEnum):
@@ -202,12 +207,15 @@ class RecentWindowFallbackSelection:
             _FIELD_SELECTED_BLOCK_IDS: list(self.selected_block_ids),
             "dropped_block_ids": list(self.dropped_block_ids),
             _FIELD_CURRENT_INPUT_REF: self.current_input_ref,
-            "source_refs": list(self.source_refs),
+            _FIELD_SOURCE_REFS: list(self.source_refs),
             _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR: self.selected_recent_window_turn_floor,
             "trigger_source": self.trigger_source.value,
             "policy_ref": self.policy_ref,
             "input_cursor": self.input_cursor,
-            "selected_raw_turn_count": _raw_turn_count(self.selected_blocks),
+            _FIELD_SELECTED_RAW_TURN_COUNT: _raw_turn_count(self.selected_blocks),
+            _FIELD_SELECTED_MATERIAL_VIEW_DIGEST: selected_material_view_digest(
+                self.selected_blocks
+            ),
         }
         if self.blocked_next_block_id is not None:
             payload["blocked_next_block_id"] = self.blocked_next_block_id
@@ -220,12 +228,22 @@ class ActiveRecentWindowFallback:
 
     :param selected_block_ids: 应从 ordinary material blocks 中保留的 block ids。
     :param current_input_ref: fallback 绑定的当前输入 ref。
+    :param source_refs: selection 时 selected blocks 的 canonical source refs。
     :param fallback_input_digest: failed payload 中记录的 fallback input digest。
+    :param selected_recent_window_turn_floor: selection 使用的 recent turn floor。
+    :param selected_raw_turn_count: selection 时 selected raw turn block 数。
+    :param selected_material_view_digest: selection 时 selected material view digest。
+    :param fallback_input_window: failed payload 中记录的 fallback window。
     """
 
     selected_block_ids: tuple[str, ...]
     current_input_ref: str
+    source_refs: tuple[str, ...]
     fallback_input_digest: str
+    selected_recent_window_turn_floor: int | None = None
+    selected_raw_turn_count: int | None = None
+    selected_material_view_digest: str | None = None
+    fallback_input_window: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
         """校验 active fallback view。
@@ -236,7 +254,24 @@ class ActiveRecentWindowFallback:
 
         _require_text_tuple(self.selected_block_ids, "selected_block_ids")
         _require_non_empty_text(self.current_input_ref, "current_input_ref")
+        _require_text_tuple(self.source_refs, "source_refs")
         _require_non_empty_text(self.fallback_input_digest, "fallback_input_digest")
+        _require_optional_non_negative_int(
+            self.selected_recent_window_turn_floor,
+            "selected_recent_window_turn_floor",
+        )
+        _require_optional_non_negative_int(
+            self.selected_raw_turn_count,
+            "selected_raw_turn_count",
+        )
+        _require_optional_non_empty_text(
+            self.selected_material_view_digest,
+            "selected_material_view_digest",
+        )
+        if self.fallback_input_window is not None and not isinstance(
+            self.fallback_input_window, Mapping
+        ):
+            raise TypeError("fallback_input_window must be mapping")
 
 
 class EventLogContextFallbackProvider:
@@ -321,17 +356,33 @@ class EventLogContextFallbackProvider:
         window = _optional_mapping(payload, _FIELD_FALLBACK_INPUT_WINDOW)
         digest = _optional_text(payload, _FIELD_FALLBACK_INPUT_DIGEST)
         if window is None or digest is None:
-            return None
+            raise HostDurableError("active fallback input window is missing")
+        if fallback_window_digest(window) != digest:
+            raise HostDurableError("fallback input digest mismatch")
         window_current_ref = _optional_text(window, _FIELD_CURRENT_INPUT_REF)
         if window_current_ref != current_input_ref:
-            return None
+            raise HostDurableError("fallback current_input_ref mismatch")
         actual_current_input_ref = window_current_ref
         if actual_current_input_ref is None:
-            return None
+            raise HostDurableError("fallback current_input_ref is missing")
         return ActiveRecentWindowFallback(
             selected_block_ids=_required_text_tuple(window, _FIELD_SELECTED_BLOCK_IDS),
             current_input_ref=actual_current_input_ref,
+            source_refs=_required_text_tuple(window, _FIELD_SOURCE_REFS),
             fallback_input_digest=digest,
+            selected_recent_window_turn_floor=_required_non_negative_int(
+                window,
+                _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR,
+            ),
+            selected_raw_turn_count=_required_non_negative_int(
+                window,
+                _FIELD_SELECTED_RAW_TURN_COUNT,
+            ),
+            selected_material_view_digest=_required_text(
+                window,
+                _FIELD_SELECTED_MATERIAL_VIEW_DIGEST,
+            ),
+            fallback_input_window=window,
         )
 
 
@@ -712,6 +763,38 @@ def _optional_text(payload: Mapping[str, JsonValue], field_name: str) -> str | N
     return None
 
 
+def _required_non_negative_int(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> int:
+    """读取必填非负整数字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 非负整数。
+    :raises HostDurableError: 字段缺失、类型非法或为负数时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise HostDurableError(f"{field_name} must be a non-negative integer")
+
+
+def _required_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取必填非空文本字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises HostDurableError: 字段缺失、类型非法或为空时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"{field_name} must be non-empty text")
+
+
 def _required_text_tuple(
     payload: Mapping[str, JsonValue], field_name: str
 ) -> tuple[str, ...]:
@@ -794,6 +877,38 @@ def _require_non_empty_text(value: str, field_name: str) -> None:
 
     if value.strip() == "":
         raise ValueError(f"{field_name} must be non-empty")
+
+
+def _require_optional_non_empty_text(value: str | None, field_name: str) -> None:
+    """校验可选非空文本。
+
+    :param value: 待校验文本。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises ValueError: 文本为空时抛出。
+    """
+
+    if value is None:
+        return
+    _require_non_empty_text(value, field_name)
+
+
+def _require_optional_non_negative_int(value: int | None, field_name: str) -> None:
+    """校验可选非负整数。
+
+    :param value: 待校验整数。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 类型非法时抛出。
+    :raises ValueError: 数值为负时抛出。
+    """
+
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be int")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
 
 
 __all__ = [

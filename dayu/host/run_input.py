@@ -53,10 +53,14 @@ from dayu.host.context_events import CONTEXT_COMPACTED
 from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
     EventLogContextFallbackProvider,
+    fallback_window_digest,
 )
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
+    is_turn_group_material_block,
+    protected_recent_turn_group_ids_for_material_blocks,
     run_input_material_block,
+    selected_material_view_digest,
 )
 from dayu.host.compaction_evidence import (
     SelectedEvidenceBlockRef,
@@ -155,12 +159,22 @@ _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
 _PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_TEXT = "text"
+_PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
+_PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
+_PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
+_PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
+_PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
+_PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
+_PAYLOAD_FIELD_ORDINAL = "ordinal"
+_PAYLOAD_FIELD_INTENT_TYPE = "intent_type"
+_PAYLOAD_FIELD_STATUS = "status"
+_PAYLOAD_FIELD_REASON = "reason"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
 _PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
 _PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
 _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
-_COMPACT_SUMMARY_MAX_CHARS = 1200
 _SYSTEM_ENVELOPE_SEPARATOR = "\n\n"
 _SYSTEM_ENVELOPE_HEADER_PREFIX = "## "
 _SYSTEM_SECTION_TASK_INSTRUCTIONS = "Task Instructions"
@@ -1478,27 +1492,19 @@ class DurableCompactArtifactProvider:
     """基于 EventLog 读取 accepted compact artifact 的 provider。
 
     :param transaction_runner: Host durable transaction runner。
-    :param max_summary_chars: compact candidate 摘要渲染字符上限。
     """
 
     def __init__(
         self,
         transaction_runner: HostTransactionRunner,
-        *,
-        max_summary_chars: int = _COMPACT_SUMMARY_MAX_CHARS,
     ) -> None:
         """初始化 provider。
 
         :param transaction_runner: Host durable transaction runner。
-        :param max_summary_chars: compact candidate 摘要渲染字符上限。
         :returns: ``None``。
-        :raises ValueError: 上限非正数时抛出。
         """
 
-        if max_summary_chars <= 0:
-            raise ValueError("max_summary_chars must be positive")
         self._transaction_runner = transaction_runner
-        self._max_summary_chars = max_summary_chars
 
     def load_compact_artifact(
         self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
@@ -1546,16 +1552,22 @@ class DurableCompactArtifactProvider:
         artifact_digest = _required_text_field(
             payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
         )
-        message = SystemMessage(
-            role=AgentMessageRole.SYSTEM,
-            content=_compact_artifact_message_content(
-                compacted_event=row,
-                payload=payload,
-                max_summary_chars=self._max_summary_chars,
-            ),
+        message_content = _compact_artifact_message_content(
+            compacted_event=row,
+            payload=payload,
+        )
+        messages: tuple[SystemMessage, ...] = (
+            ()
+            if message_content is None
+            else (
+                SystemMessage(
+                    role=AgentMessageRole.SYSTEM,
+                    content=message_content,
+                ),
+            )
         )
         return CompactArtifactView(
-            messages=(message,),
+            messages=messages,
             compact_artifact_ref=artifact_ref,
             compact_artifact_digest=artifact_digest,
             represented_evidence_refs=_accepted_evidence_mapping_refs(payload),
@@ -2710,6 +2722,22 @@ def _raise_unsupported_agent_message(message: NoReturn) -> NoReturn:
     raise HostDurableError(f"unsupported AgentMessage type: {type(message).__name__}")
 
 
+@dataclass(frozen=True, slots=True)
+class _SelectedMaterialRenderView:
+    """已选 material 的渲染视图。
+
+    :param selected_blocks: 已选 blocks，保持原 material view 顺序。
+    :param current_input_block: 已选 current input anchor。
+    :param source_refs: 已选 blocks 的 canonical source refs。
+    :param material_view_digest: 已选 material view digest。
+    """
+
+    selected_blocks: tuple[RunInputMaterialBlock, ...]
+    current_input_block: RunInputMaterialBlock
+    source_refs: tuple[str, ...]
+    material_view_digest: str
+
+
 def _fallback_context_messages(
     *,
     fallback: ActiveRecentWindowFallback,
@@ -2723,6 +2751,33 @@ def _fallback_context_messages(
     :raises HostDurableError: fallback view 与 ordinary material 不一致时抛出。
     """
 
+    render_view = _selected_material_render_view(
+        fallback=fallback,
+        material_blocks=material_blocks,
+    )
+    messages: list[AgentMessage] = []
+    for block in render_view.selected_blocks:
+        if block.block_id == render_view.current_input_block.block_id:
+            continue
+        messages.append(_fallback_message_from_material_block(block))
+    return tuple(messages)
+
+
+def _selected_material_render_view(
+    *,
+    fallback: ActiveRecentWindowFallback,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+) -> _SelectedMaterialRenderView:
+    """从 frozen material view 取回 selected blocks 并校验 provenance。
+
+    :param fallback: active fallback view。
+    :param material_blocks: ordinary material blocks。
+    :returns: 可渲染的 selected material view。
+    :raises HostDurableError: selected id、source refs、digest 或 protected group
+        与 material view 不一致时抛出。
+    """
+
+    _validate_material_block_ids_unique(material_blocks)
     selected_ids = frozenset(fallback.selected_block_ids)
     if len(selected_ids) != len(fallback.selected_block_ids):
         raise HostDurableError("fallback selected block ids must be unique")
@@ -2731,20 +2786,137 @@ def _fallback_context_messages(
     )
     if len(selected_blocks) != len(selected_ids):
         raise HostDurableError("fallback selected block id is missing from material view")
+    current_block = _selected_current_input_block(
+        selected_blocks,
+        current_input_ref=fallback.current_input_ref,
+    )
+    source_refs = _material_source_refs(selected_blocks)
+    if source_refs != fallback.source_refs:
+        raise HostDurableError("fallback selected source refs mismatch")
+    if (
+        fallback.fallback_input_window is not None
+        and fallback_window_digest(fallback.fallback_input_window)
+        != fallback.fallback_input_digest
+    ):
+        raise HostDurableError("fallback input digest mismatch")
+    view_digest = selected_material_view_digest(selected_blocks)
+    if (
+        fallback.selected_material_view_digest is not None
+        and fallback.selected_material_view_digest != view_digest
+    ):
+        raise HostDurableError("fallback selected material view digest mismatch")
+    _validate_fallback_protected_groups(
+        fallback=fallback,
+        material_blocks=material_blocks,
+        selected_blocks=selected_blocks,
+    )
+    return _SelectedMaterialRenderView(
+        selected_blocks=selected_blocks,
+        current_input_block=current_block,
+        source_refs=source_refs,
+        material_view_digest=view_digest,
+    )
+
+
+def _validate_material_block_ids_unique(
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+) -> None:
+    """校验 material view block ids 唯一。
+
+    :param material_blocks: ordinary material blocks。
+    :returns: ``None``。
+    :raises HostDurableError: block id 重复时抛出。
+    """
+
+    block_ids = tuple(block.block_id for block in material_blocks)
+    if len(frozenset(block_ids)) != len(block_ids):
+        raise HostDurableError("material view block ids must be unique")
+
+
+def _selected_current_input_block(
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+    *,
+    current_input_ref: str,
+) -> RunInputMaterialBlock:
+    """读取 selected view 中唯一 current input anchor。
+
+    :param selected_blocks: 已选 blocks。
+    :param current_input_ref: fallback 绑定的当前输入 ref。
+    :returns: current input anchor block。
+    :raises HostDurableError: current input ref 不匹配时抛出。
+    """
+
     current_blocks = tuple(
         block
         for block in selected_blocks
         if block.section is CompactMaterialSection.CURRENT_INPUT_ANCHOR
-        and fallback.current_input_ref in block.canonical_source_refs
+        and current_input_ref in block.canonical_source_refs
     )
     if len(current_blocks) != 1:
-        raise HostDurableError("fallback view requires exactly one current input anchor")
-    messages: list[AgentMessage] = []
-    for block in selected_blocks:
-        if block.block_id == current_blocks[0].block_id:
-            continue
-        messages.append(_fallback_message_from_material_block(block))
-    return tuple(messages)
+        raise HostDurableError("fallback current_input_ref mismatch")
+    return current_blocks[0]
+
+
+def _material_source_refs(
+    blocks: tuple[RunInputMaterialBlock, ...],
+) -> tuple[str, ...]:
+    """收集 material blocks 的 canonical source refs。
+
+    :param blocks: material blocks。
+    :returns: 去重后的 canonical source refs。
+    """
+
+    refs: list[str] = []
+    for block in blocks:
+        refs.extend(block.canonical_source_refs)
+    return tuple(dict.fromkeys(refs))
+
+
+def _validate_fallback_protected_groups(
+    *,
+    fallback: ActiveRecentWindowFallback,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+) -> None:
+    """校验 fallback protected turn-group floor 没有漂移。
+
+    :param fallback: active fallback view。
+    :param material_blocks: ordinary material blocks。
+    :param selected_blocks: 已选 material blocks。
+    :returns: ``None``。
+    :raises HostDurableError: protected group 或 raw turn 计数不一致时抛出。
+    """
+
+    if fallback.selected_raw_turn_count is not None:
+        selected_raw_turn_count = sum(
+            1 for block in selected_blocks if is_turn_group_material_block(block)
+        )
+        if selected_raw_turn_count != fallback.selected_raw_turn_count:
+            raise HostDurableError("fallback selected raw turn count mismatch")
+    if fallback.selected_recent_window_turn_floor is None:
+        return
+    if fallback.selected_recent_window_turn_floor == 0:
+        return
+    try:
+        protected_group_ids = protected_recent_turn_group_ids_for_material_blocks(
+            material_blocks,
+            selected_recent_window_turn_floor=(
+                fallback.selected_recent_window_turn_floor
+            ),
+        )
+    except ValueError as exc:
+        raise HostDurableError(
+            "fallback protected turn_group_id consistency mismatch"
+        ) from exc
+    selected_ids = frozenset(block.block_id for block in selected_blocks)
+    expected_protected_ids = frozenset(
+        block.block_id
+        for block in material_blocks
+        if block.turn_group_id in protected_group_ids
+        and is_turn_group_material_block(block)
+    )
+    if not expected_protected_ids.issubset(selected_ids):
+        raise HostDurableError("fallback protected group consistency mismatch")
 
 
 def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
@@ -3164,23 +3336,21 @@ def _compact_artifact_message_content(
     *,
     compacted_event: EventLogRow,
     payload: Mapping[str, JsonValue],
-    max_summary_chars: int,
-) -> str:
-    """构造 bounded compact artifact SystemMessage 内容。
+) -> str | None:
+    """构造 compact artifact SystemMessage 内容。
 
     :param compacted_event: ``CONTEXT_COMPACTED`` event row。
     :param payload: compacted payload。
-    :param max_summary_chars: summary 字符上限。
-    :returns: message 内容。
+    :returns: message 内容；没有可渲染语义项时返回 ``None``。
     """
 
     del compacted_event
-    candidate_summary = _vnext_compact_candidate_summary(
-        payload, max_summary_chars=max_summary_chars
-    )
+    semantic_lines = _vnext_compact_candidate_semantic_lines(payload)
+    if len(semantic_lines) == 0:
+        return None
     lines = [
         _ACCEPTED_COMPACTED_VIEW_PREFIX,
-        candidate_summary,
+        *semantic_lines,
     ]
     return "\n".join(lines)
 
@@ -3200,14 +3370,13 @@ def _accepted_evidence_mapping_refs(
     )
 
 
-def _vnext_compact_candidate_summary(
-    payload: Mapping[str, JsonValue], *, max_summary_chars: int
-) -> str:
-    """从 vNext accepted candidate 渲染 bounded compact 摘要。
+def _vnext_compact_candidate_semantic_lines(
+    payload: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    """从 vNext accepted candidate 渲染完整语义条目。
 
     :param payload: ``CONTEXT_COMPACTED`` vNext payload。
-    :param max_summary_chars: 最大字符数。
-    :returns: accepted candidate 摘要。
+    :returns: LLM-facing semantic lines。
     :raises HostDurableError: accepted candidate 结构损坏时抛出。
     """
 
@@ -3221,22 +3390,147 @@ def _vnext_compact_candidate_summary(
     references = _required_mapping_list_field(
         candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS
     )
-    parts: list[str] = []
+    lines: list[str] = []
     session_summary = _optional_session_summary_text(candidate)
     if session_summary is not None:
-        parts.append(f"session_summary={session_summary}")
-    parts.extend(
-        (
-            f"evidence_backed_facts={len(facts)}",
-            f"answer_anchors={len(anchors)}",
-            f"forward_intents={len(intents)}",
-            f"reference_continuity_items={len(references)}",
+        lines.append(f"session_summary={session_summary}")
+    lines.extend(_accepted_compact_fact_lines(facts))
+    lines.extend(_accepted_compact_answer_anchor_lines(anchors))
+    lines.extend(_accepted_compact_forward_intent_lines(intents))
+    lines.extend(_accepted_compact_reference_lines(references))
+    return tuple(lines)
+
+
+def _accepted_compact_fact_lines(
+    facts: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[str, ...]:
+    """渲染 accepted compact fact 语义条目。
+
+    :param facts: fact JSON objects。
+    :returns: LLM-facing fact lines。
+    :raises HostDurableError: fact 结构损坏时抛出。
+    """
+
+    lines: list[str] = []
+    for index, fact in enumerate(facts, start=1):
+        parts = [
+            f"fact {index}: claim_text={_required_text_field(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}"
+        ]
+        evidence_kind = _optional_semantic_text_field(
+            fact,
+            _PAYLOAD_FIELD_EVIDENCE_KIND,
         )
-    )
-    text = " | ".join(parts)
-    if len(text) <= max_summary_chars:
-        return text
-    return text[:max_summary_chars]
+        if evidence_kind is not None:
+            parts.append(f"evidence_kind={evidence_kind}")
+        evidence_labels = _optional_text_list_field(
+            fact,
+            _PAYLOAD_FIELD_EVIDENCE_LABELS,
+        )
+        if len(evidence_labels) > 0:
+            parts.append(f"evidence_labels={', '.join(evidence_labels)}")
+        source_labels = _optional_text_list_field(fact, _PAYLOAD_FIELD_SOURCE_LABELS)
+        if len(source_labels) > 0:
+            parts.append(f"source_labels={', '.join(source_labels)}")
+        lines.append("; ".join(parts))
+    return tuple(lines)
+
+
+def _accepted_compact_answer_anchor_lines(
+    anchors: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[str, ...]:
+    """渲染 accepted compact answer anchor 语义条目。
+
+    :param anchors: answer anchor JSON objects。
+    :returns: LLM-facing answer anchor lines。
+    :raises HostDurableError: anchor 结构损坏时抛出。
+    """
+
+    lines: list[str] = []
+    for index, anchor in enumerate(anchors, start=1):
+        title = _required_text_field(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)
+        item_text = _accepted_compact_anchor_item_text(anchor)
+        line = f"answer_anchor {index}: title={title}"
+        if item_text != "":
+            line = f"{line}; items={item_text}"
+        lines.append(line)
+    return tuple(lines)
+
+
+def _accepted_compact_anchor_item_text(anchor: Mapping[str, JsonValue]) -> str:
+    """渲染 answer anchor 子项文本。
+
+    :param anchor: answer anchor JSON object。
+    :returns: 子项文本；没有子项时返回空字符串。
+    :raises HostDurableError: 子项结构损坏时抛出。
+    """
+
+    value = anchor.get(_PAYLOAD_FIELD_ANCHOR_ITEMS)
+    if value is None:
+        return ""
+    if not isinstance(value, list):
+        raise HostDurableError("answer_anchor.anchor_items must be list")
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HostDurableError("answer_anchor.anchor_items item must be object")
+        display_text = _required_text_field(item, _PAYLOAD_FIELD_DISPLAY_TEXT)
+        ordinal = item.get(_PAYLOAD_FIELD_ORDINAL)
+        if ordinal is None:
+            items.append(display_text)
+        elif isinstance(ordinal, int):
+            items.append(f"{ordinal}. {display_text}")
+        else:
+            raise HostDurableError("answer_anchor.anchor_items ordinal must be int")
+    return "; ".join(items)
+
+
+def _accepted_compact_forward_intent_lines(
+    intents: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[str, ...]:
+    """渲染 accepted compact forward intent 语义条目。
+
+    :param intents: forward intent JSON objects。
+    :returns: LLM-facing forward intent lines。
+    :raises HostDurableError: intent 结构损坏时抛出。
+    """
+
+    lines: list[str] = []
+    for index, intent in enumerate(intents, start=1):
+        lines.append(
+            "forward_intent "
+            f"{index}: type={_required_text_field(intent, _PAYLOAD_FIELD_INTENT_TYPE)}; "
+            f"status={_required_text_field(intent, _PAYLOAD_FIELD_STATUS)}; "
+            f"text={_required_text_field(intent, _PAYLOAD_FIELD_TEXT)}"
+        )
+    return tuple(lines)
+
+
+def _accepted_compact_reference_lines(
+    references: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[str, ...]:
+    """渲染 accepted compact reference continuity 语义条目。
+
+    :param references: reference continuity JSON objects。
+    :returns: LLM-facing reference continuity lines。
+    :raises HostDurableError: reference 结构损坏时抛出。
+    """
+
+    lines: list[str] = []
+    for index, reference in enumerate(references, start=1):
+        parts = [
+            f"reference_continuity {index}: text={_required_text_field(reference, _PAYLOAD_FIELD_TEXT)}"
+        ]
+        reason = _optional_semantic_text_field(reference, _PAYLOAD_FIELD_REASON)
+        if reason is not None:
+            parts.append(f"reason={reason}")
+        source_labels = _optional_text_list_field(
+            reference,
+            _PAYLOAD_FIELD_SOURCE_LABELS,
+        )
+        if len(source_labels) > 0:
+            parts.append(f"source_labels={', '.join(source_labels)}")
+        lines.append("; ".join(parts))
+    return tuple(lines)
 
 
 def _optional_session_summary_text(
@@ -3318,6 +3612,30 @@ def _required_text_list_field(
     return tuple(result)
 
 
+def _optional_text_list_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """读取可选文本 list 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 文本 tuple；字段不存在时返回空 tuple。
+    :raises HostDurableError: 字段存在但非 list 或元素非文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise HostDurableError(f"payload field {field_name} must be list")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item.strip() == "":
+            raise HostDurableError(f"payload field {field_name} item must be text")
+        result.append(item)
+    return tuple(result)
+
+
 def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:
     """读取必填文本字段。
 
@@ -3331,6 +3649,25 @@ def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> s
     if not isinstance(value, str) or value.strip() == "":
         raise HostDurableError(f"payload field {field_name} must be text")
     return value
+
+
+def _optional_semantic_text_field(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """读取 accepted compact semantic renderer 的可选文本字段。
+
+    字段不存在时表示该 semantic item 不提供该属性；字段一旦存在，必须是
+    非空文本，避免把损坏 compact payload 静默渲染为缺省语义。
+
+    :param payload: payload 映射。
+    :param field_name: 字段名。
+    :returns: 文本或 ``None``。
+    :raises HostDurableError: 字段存在但不是非空文本时抛出。
+    """
+
+    if field_name not in payload:
+        return None
+    return _required_text_field(payload, field_name)
 
 
 def _optional_mapping_text(

@@ -94,11 +94,17 @@ from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactMaterialSection,
 )
-from dayu.host.compact_material import RunInputMaterialBlock, run_input_material_block
+from dayu.host.compact_material import (
+    RunInputMaterialBlock,
+    run_input_material_block,
+    selected_material_view_digest,
+)
 from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
+    EventLogContextFallbackProvider,
     build_recent_window_fallback_selection,
     estimate_recent_window_fallback_budget,
+    fallback_window_digest,
 )
 from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
@@ -118,8 +124,10 @@ from dayu.host.run_input import (
     MemorySnapshotView,
     _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
     _accepted_evidence_mapping_refs,
+    _compact_artifact_message_content,
+    _fallback_context_messages,
     _normalize_ordinary_run_messages,
-    _vnext_compact_candidate_summary,
+    _vnext_compact_candidate_semantic_lines,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -1304,10 +1312,27 @@ def test_fallback_provider_renders_only_selected_window_and_current_input(
             session_id=session_id,
             payload=_user_input_payload("current prompt"),
         )
-        fallback = ActiveRecentWindowFallback(
-            selected_block_ids=("memory:2", "current:event-current-input"),
+        fallback = _active_fallback(
+            selected_blocks=(
+                _material_block(
+                    "memory:2",
+                    CompactMaterialSection.TRACE_MATERIAL,
+                    CompactMaterialBlockKind.USER_INPUT,
+                    "selected recent raw turn",
+                    event_sequence=None,
+                    source_ref="memory:no-snapshot",
+                ),
+                _material_block(
+                    "current:event-current-input",
+                    CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                    CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                    "current prompt",
+                    event_sequence=None,
+                    source_ref="event-current-input",
+                ),
+            ),
+            dropped_block_ids=("memory:0", "memory:1"),
             current_input_ref="event-current-input",
-            fallback_input_digest=_DIGEST_A,
         )
         builder = create_no_tool_run_input_builder(
             transaction_runner=store.transaction_runner,
@@ -1345,6 +1370,238 @@ def test_fallback_provider_renders_only_selected_window_and_current_input(
         assert "current prompt" in contents
         assert "dropped older raw turn" not in contents
         assert "dropped older assistant turn" not in contents
+
+
+def test_fallback_context_messages_render_all_and_only_selected_blocks() -> None:
+    """fallback renderer 只消费 selected ids，并保持 source refs 同源校验。"""
+
+    old = _material_block(
+        "old:user",
+        CompactMaterialSection.TRACE_MATERIAL,
+        CompactMaterialBlockKind.USER_INPUT,
+        "dropped old user",
+        event_sequence=1,
+        source_ref="event-old",
+        turn_group_id="run-old",
+    )
+    selected = _material_block(
+        "selected:assistant",
+        CompactMaterialSection.ANSWER_MATERIAL,
+        CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+        "selected answer",
+        event_sequence=2,
+        source_ref="event-selected-answer",
+        turn_group_id="run-selected",
+    )
+    current = _material_block(
+        "current:event-current",
+        CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        "current prompt",
+        event_sequence=3,
+        source_ref="event-current",
+    )
+    fallback = _active_fallback(
+        selected_blocks=(selected, current),
+        dropped_block_ids=(old.block_id,),
+        current_input_ref="event-current",
+    )
+
+    messages = _fallback_context_messages(
+        fallback=fallback,
+        material_blocks=(old, selected, current),
+    )
+
+    assert tuple(_message_content(message) for message in messages) == (
+        "selected answer",
+    )
+    assert fallback.source_refs == ("event-selected-answer", "event-current")
+
+
+@pytest.mark.parametrize(
+    ("case_name", "message"),
+    (
+        ("missing_window", "active fallback input window is missing"),
+        ("digest_mismatch", "fallback input digest mismatch"),
+        ("current_ref_mismatch", "fallback current_input_ref mismatch"),
+        ("missing_material_digest", "selected_material_view_digest"),
+        ("blank_material_digest", "selected_material_view_digest"),
+        ("missing_raw_turn_count", "selected_raw_turn_count"),
+        ("negative_raw_turn_count", "selected_raw_turn_count"),
+        ("missing_turn_floor", "selected_recent_window_turn_floor"),
+        ("bad_turn_floor_type", "selected_recent_window_turn_floor"),
+    ),
+)
+def test_eventlog_context_fallback_provider_fail_closes_on_payload_drift(
+    tmp_path: Path,
+    case_name: str,
+    message: str,
+) -> None:
+    """EventLog fallback provider 对 active fallback payload 漂移 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        _append_context_fallback_failed_event(
+            store.transaction_runner,
+            session_id=session_id,
+            case_name=case_name,
+        )
+        provider = EventLogContextFallbackProvider(store.transaction_runner)
+
+        with pytest.raises(HostDurableError, match=message):
+            provider.load_context_fallback(
+                run_id="run-current",
+                run_started_event_sequence=999,
+                current_input_ref="event-current-input",
+            )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "message"),
+    (
+        ("missing_id", "missing from material view"),
+        ("duplicate_id", "selected block ids must be unique"),
+        ("current_input_ref", "current_input_ref mismatch"),
+        ("source_refs", "selected source refs mismatch"),
+        ("fallback_digest", "input digest mismatch"),
+        ("material_view_digest", "material view digest mismatch"),
+    ),
+)
+def test_fallback_context_messages_fail_closed_on_selected_view_drift(
+    case_name: str,
+    message: str,
+) -> None:
+    """selected id、source ref、digest 与当前 material view 漂移时 fail closed。"""
+
+    selected = _material_block(
+        "selected:user",
+        CompactMaterialSection.TRACE_MATERIAL,
+        CompactMaterialBlockKind.USER_INPUT,
+        "selected",
+        event_sequence=1,
+        source_ref="event-selected",
+        turn_group_id="run-selected",
+    )
+    current = _material_block(
+        "current:event-current",
+        CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        "current",
+        event_sequence=2,
+        source_ref="event-current",
+    )
+    material_blocks = (
+        selected,
+        current,
+    )
+    selected_block_ids = {
+        "missing_id": ("selected:user", "missing:block", "current:event-current"),
+        "duplicate_id": ("selected:user", "selected:user", "current:event-current"),
+    }.get(case_name)
+    fallback = _active_fallback(
+        selected_blocks=(selected, current),
+        current_input_ref=(
+            "event-other-current" if case_name == "current_input_ref" else "event-current"
+        ),
+        selected_block_ids=selected_block_ids,
+        source_refs=(
+            ("event-stale", "event-current")
+            if case_name == "source_refs"
+            else None
+        ),
+        fallback_input_digest=(
+            _DIGEST_A if case_name == "fallback_digest" else None
+        ),
+        selected_material_view_digest=(
+            _DIGEST_B if case_name == "material_view_digest" else None
+        ),
+    )
+
+    with pytest.raises(HostDurableError, match=message):
+        _fallback_context_messages(
+            fallback=fallback,
+            material_blocks=material_blocks,
+    )
+
+
+def test_fallback_context_messages_fail_closed_on_selected_raw_turn_count_mismatch() -> None:
+    """fallback 记录的 selected raw turn count 与当前 selected blocks 不一致时 fail closed。"""
+
+    selected = _material_block(
+        "selected:user",
+        CompactMaterialSection.TRACE_MATERIAL,
+        CompactMaterialBlockKind.USER_INPUT,
+        "selected",
+        event_sequence=1,
+        source_ref="event-selected",
+        turn_group_id="run-selected",
+    )
+    current = _material_block(
+        "current:event-current",
+        CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        "current",
+        event_sequence=2,
+        source_ref="event-current",
+    )
+    fallback = _active_fallback(
+        selected_blocks=(selected, current),
+        current_input_ref="event-current",
+        selected_raw_turn_count=2,
+    )
+
+    with pytest.raises(HostDurableError, match="selected raw turn count mismatch"):
+        _fallback_context_messages(
+            fallback=fallback,
+            material_blocks=(selected, current),
+        )
+
+
+def test_fallback_context_messages_fail_closed_on_protected_group_mismatch() -> None:
+    """protected floor group 有 block 缺失于 selected ids 时 fail closed。"""
+
+    protected_user = _material_block(
+        "new:user",
+        CompactMaterialSection.TRACE_MATERIAL,
+        CompactMaterialBlockKind.USER_INPUT,
+        "new user",
+        event_sequence=2,
+        source_ref="event-new-user",
+        turn_group_id="run-new",
+    )
+    protected_answer = _material_block(
+        "new:answer",
+        CompactMaterialSection.ANSWER_MATERIAL,
+        CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+        "new answer",
+        event_sequence=3,
+        source_ref="event-new-answer",
+        turn_group_id="run-new",
+    )
+    current = _material_block(
+        "current:event-current",
+        CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        "current",
+        event_sequence=4,
+        source_ref="event-current",
+    )
+    fallback = _active_fallback(
+        selected_blocks=(protected_user, current),
+        current_input_ref="event-current",
+        selected_recent_window_turn_floor=1,
+    )
+
+    with pytest.raises(HostDurableError, match="protected group consistency mismatch"):
+        _fallback_context_messages(
+            fallback=fallback,
+            material_blocks=(protected_user, protected_answer, current),
+        )
 
 
 def test_covered_memory_snapshot_filters_current_user_input(
@@ -2087,22 +2344,103 @@ def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
             "evidence_backed_facts": [
                 {"claim_text": "收入增长", "evidence_labels": ["E1"]}
             ],
-            "answer_anchors": [],
-            "forward_intents": [],
-            "reference_continuity_items": [],
+            "answer_anchors": [
+                {
+                    "anchor_title": "收入质量",
+                    "anchor_items": [
+                        {"display_text": "关注经常性收入", "ordinal": 1}
+                    ],
+                }
+            ],
+            "forward_intents": [
+                {
+                    "intent_type": "follow_up",
+                    "status": "open",
+                    "text": "继续核对毛利率。",
+                }
+            ],
+            "reference_continuity_items": [
+                {
+                    "reason": "followup_reference",
+                    "text": "这个因素指收入增长。",
+                    "source_labels": ["T1"],
+                }
+            ],
             "diagnostics": [],
         },
         "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
     }
 
-    assert _accepted_evidence_mapping_refs(payload) == ("evidence:memory-tool",)
-    assert _vnext_compact_candidate_summary(payload, max_summary_chars=1200) == (
-        "session_summary=用户关注收入与毛利率。 | "
-        "evidence_backed_facts=1 | "
-        "answer_anchors=0 | "
-        "forward_intents=0 | "
-        "reference_continuity_items=0"
+    lines = _vnext_compact_candidate_semantic_lines(payload)
+    content = _compact_artifact_message_content(
+        compacted_event=_event_log_row("event-compact"),
+        payload=payload,
     )
+
+    assert _accepted_evidence_mapping_refs(payload) == ("evidence:memory-tool",)
+    assert lines == (
+        "session_summary=用户关注收入与毛利率。",
+        "fact 1: claim_text=收入增长; evidence_labels=E1",
+        "answer_anchor 1: title=收入质量; items=1. 关注经常性收入",
+        "forward_intent 1: type=follow_up; status=open; text=继续核对毛利率。",
+        "reference_continuity 1: text=这个因素指收入增长。; "
+        "reason=followup_reference; source_labels=T1",
+    )
+    assert all("evidence_backed_facts=" not in line for line in lines)
+    assert all("answer_anchors=" not in line for line in lines)
+    assert content is not None
+    assert "Accepted compacted conversation view:" in content
+    assert "fact 1: claim_text=收入增长" in content
+    assert "evidence_backed_facts=1" not in content
+    assert "answer_anchors=1" not in content
+
+
+@pytest.mark.parametrize(
+    ("field_path", "bad_value"),
+    (
+        ("fact.evidence_kind", 123),
+        ("reference.reason", ""),
+    ),
+)
+def test_compact_artifact_semantic_renderer_rejects_invalid_optional_text(
+    field_path: str,
+    bad_value: JsonValue,
+) -> None:
+    """accepted compact 新 semantic renderer 对坏可选文本字段 fail closed。"""
+
+    payload: dict[str, JsonValue] = {
+        "accepted_candidate": {
+            "schema_version": "conversation_compact_output_v1",
+            "session_summary": None,
+            "evidence_backed_facts": [
+                {"claim_text": "收入增长", "evidence_labels": ["E1"]}
+            ],
+            "answer_anchors": [],
+            "forward_intents": [],
+            "reference_continuity_items": [
+                {"reason": "followup_reference", "text": "这个因素指收入增长。"}
+            ],
+            "diagnostics": [],
+        },
+        "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
+    }
+    candidate = payload["accepted_candidate"]
+    assert isinstance(candidate, dict)
+    if field_path == "fact.evidence_kind":
+        facts = candidate["evidence_backed_facts"]
+        assert isinstance(facts, list)
+        fact = facts[0]
+        assert isinstance(fact, dict)
+        fact["evidence_kind"] = bad_value
+    else:
+        references = candidate["reference_continuity_items"]
+        assert isinstance(references, list)
+        reference = references[0]
+        assert isinstance(reference, dict)
+        reference["reason"] = bad_value
+
+    with pytest.raises(HostDurableError, match="must be text"):
+        _vnext_compact_candidate_semantic_lines(payload)
 
 
 def test_reference_continuity_resolves_second_factor_without_full_long_input(
@@ -2421,6 +2759,197 @@ def _material_block(
         event_sequence=event_sequence,
         turn_group_id=turn_group_id,
     )
+
+
+def _active_fallback(
+    *,
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+    current_input_ref: str,
+    dropped_block_ids: tuple[str, ...] = (),
+    selected_recent_window_turn_floor: int = 0,
+    selected_block_ids: tuple[str, ...] | None = None,
+    source_refs: tuple[str, ...] | None = None,
+    fallback_input_digest: str | None = None,
+    selected_material_view_digest: str | None = None,
+    selected_raw_turn_count: int | None = None,
+) -> ActiveRecentWindowFallback:
+    """从 selected material blocks 构造 active fallback fixture。
+
+    :param selected_blocks: 已选 material blocks。
+    :param current_input_ref: current input ref。
+    :param dropped_block_ids: dropped block ids。
+    :param selected_recent_window_turn_floor: selected recent turn floor。
+    :param selected_block_ids: 可选覆盖 selected ids。
+    :param source_refs: 可选覆盖 source refs。
+    :param fallback_input_digest: 可选覆盖 fallback input digest。
+    :param selected_material_view_digest: 可选覆盖 selected material digest。
+    :param selected_raw_turn_count: 可选覆盖 selected raw turn count。
+    :returns: ActiveRecentWindowFallback。
+    """
+
+    actual_selected_ids = (
+        tuple(block.block_id for block in selected_blocks)
+        if selected_block_ids is None
+        else selected_block_ids
+    )
+    actual_source_refs = (
+        _source_refs_from_blocks(selected_blocks) if source_refs is None else source_refs
+    )
+    actual_view_digest = (
+        selected_material_view_digest
+        if selected_material_view_digest is not None
+        else selected_material_view_digest_from_blocks(selected_blocks)
+    )
+    actual_selected_raw_turn_count = (
+        sum(
+            1
+            for block in selected_blocks
+            if block.kind
+            in (
+                CompactMaterialBlockKind.USER_INPUT,
+                CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+                CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+            )
+        )
+        if selected_raw_turn_count is None
+        else selected_raw_turn_count
+    )
+    window: dict[str, JsonValue] = {
+        "selected_block_ids": list(actual_selected_ids),
+        "dropped_block_ids": list(dropped_block_ids),
+        "current_input_ref": current_input_ref,
+        "source_refs": list(actual_source_refs),
+        "selected_recent_window_turn_floor": selected_recent_window_turn_floor,
+        "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+        "policy_ref": "test-fallback-policy",
+        "input_cursor": 1,
+        "selected_raw_turn_count": actual_selected_raw_turn_count,
+        "selected_material_view_digest": actual_view_digest,
+    }
+    return ActiveRecentWindowFallback(
+        selected_block_ids=actual_selected_ids,
+        current_input_ref=current_input_ref,
+        source_refs=actual_source_refs,
+        fallback_input_digest=(
+            fallback_window_digest(window)
+            if fallback_input_digest is None
+            else fallback_input_digest
+        ),
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+        selected_raw_turn_count=actual_selected_raw_turn_count,
+        selected_material_view_digest=actual_view_digest,
+        fallback_input_window=window,
+    )
+
+
+def _append_context_fallback_failed_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    case_name: str,
+) -> None:
+    """追加 provider fail-closed 测试用 CONTEXT_COMPACTION_FAILED event。
+
+    :param transaction_runner: transaction runner。
+    :param session_id: Session id。
+    :param case_name: payload 损坏 case。
+    :returns: ``None``。
+    """
+
+    payload = _context_fallback_failed_payload(case_name)
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加 fallback failed event。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id=f"event-context-fallback-{case_name}",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-current",
+                event_type="CONTEXT_COMPACTION_FAILED",
+                payload=payload,
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _context_fallback_failed_payload(case_name: str) -> dict[str, JsonValue]:
+    """构造 provider fail-closed 测试用 fallback failed payload。
+
+    :param case_name: payload 损坏 case。
+    :returns: CONTEXT_COMPACTION_FAILED payload。
+    """
+
+    window: dict[str, JsonValue] = {
+        "selected_block_ids": ["current:event-current-input"],
+        "dropped_block_ids": [],
+        "current_input_ref": "event-current-input",
+        "source_refs": ["event-current-input"],
+        "selected_recent_window_turn_floor": 0,
+        "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+        "policy_ref": "test-fallback-policy",
+        "input_cursor": 1,
+        "selected_raw_turn_count": 0,
+        "selected_material_view_digest": _DIGEST_A,
+    }
+    if case_name == "current_ref_mismatch":
+        window["current_input_ref"] = "event-other-input"
+    elif case_name == "missing_material_digest":
+        del window["selected_material_view_digest"]
+    elif case_name == "blank_material_digest":
+        window["selected_material_view_digest"] = ""
+    elif case_name == "missing_raw_turn_count":
+        del window["selected_raw_turn_count"]
+    elif case_name == "negative_raw_turn_count":
+        window["selected_raw_turn_count"] = -1
+    elif case_name == "missing_turn_floor":
+        del window["selected_recent_window_turn_floor"]
+    elif case_name == "bad_turn_floor_type":
+        window["selected_recent_window_turn_floor"] = "zero"
+    payload: dict[str, JsonValue] = {
+        "fallback_action": "dispatch",
+        "fallback_input_window": window,
+        "fallback_input_digest": fallback_window_digest(window),
+    }
+    if case_name == "missing_window":
+        del payload["fallback_input_window"]
+    elif case_name == "digest_mismatch":
+        payload["fallback_input_digest"] = _DIGEST_B
+    return payload
+
+
+def selected_material_view_digest_from_blocks(
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+) -> str:
+    """返回 selected material view digest。
+
+    :param selected_blocks: selected material blocks。
+    :returns: digest。
+    """
+
+    return selected_material_view_digest(selected_blocks)
+
+
+def _source_refs_from_blocks(
+    blocks: tuple[RunInputMaterialBlock, ...],
+) -> tuple[str, ...]:
+    """收集测试 material blocks 的 canonical source refs。
+
+    :param blocks: material blocks。
+    :returns: 去重 source refs。
+    """
+
+    refs: list[str] = []
+    for block in blocks:
+        refs.extend(block.canonical_source_refs)
+    return tuple(dict.fromkeys(refs))
 
 
 def _required_memory_cursor(
@@ -3856,6 +4385,37 @@ def _attempt_snapshot(seeded: _SeededRun) -> AttemptDispatchSnapshot:
         execution_target="local-default",
         policy_snapshot_ref=_POLICY_REF,
         cancellation_token=_token(),
+    )
+
+
+def _event_log_row(event_id: str) -> EventLogRow:
+    """构造测试用 EventLogRow。
+
+    :param event_id: event id。
+    :returns: EventLogRow。
+    """
+
+    return EventLogRow(
+        event_sequence=1,
+        event_id=event_id,
+        event_body_digest=_DIGEST_A,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-test",
+        run_id="run-test",
+        attempt_id=None,
+        execution_id=None,
+        event_type="CONTEXT_COMPACTED",
+        occurred_at="2026-05-15T01:02:03.000000Z",
+        actor="test",
+        source="test",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json="{}",
+        payload_ref=None,
+        payload_digest=None,
+        appended_at="2026-05-15T01:02:03.000000Z",
     )
 
 
