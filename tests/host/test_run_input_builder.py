@@ -1211,6 +1211,177 @@ def test_small_memory_lag_repairs_inline_without_checkpoint_advance(
         assert any("prior memory prompt" in content for content in contents)
 
 
+def test_inline_delta_uses_memory_filter_and_covers_required_cursor(
+    tmp_path: Path,
+) -> None:
+    """inline repair 只投影 memory facts，但 cursor 覆盖 required row。"""
+
+    policy = _memory_policy(max_lag_events_for_inline_delta=16)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior memory prompt",
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(
+                _memory_projection_event_from_test_row(prior_event),
+            ),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+        _append_inline_repair_filter_noise(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        contents = tuple(_message_content(message) for message in memory_view.messages)
+        cursor_ref = memory_view.memory_snapshot_cursor
+        assert cursor_ref is not None
+
+        assert any("prior memory prompt" in content for content in contents)
+        assert any("matching assistant answer" in content for content in contents)
+        assert all(
+            "preview should not enter memory" not in content for content in contents
+        )
+        assert all(
+            "diagnostic should not enter memory" not in content for content in contents
+        )
+        assert all(
+            "canonical unrelated should not enter memory" not in content
+            for content in contents
+        )
+        assert all(
+            "foreign session should not enter memory" not in content
+            for content in contents
+        )
+        assert (
+            f"checkpoint_event_sequence={required_cursor.checkpoint_event_sequence}"
+            in cursor_ref
+        )
+        assert (
+            f"checkpoint_event_id={required_cursor.checkpoint_event_id}" in cursor_ref
+        )
+
+
+def test_inline_delta_no_matching_rows_still_covers_required_cursor(
+    tmp_path: Path,
+) -> None:
+    """无 matching memory rows 时，covered cursor 足够则返回原 snapshot 与诊断。"""
+
+    policy = _memory_policy(max_lag_events_for_inline_delta=16)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        current_input = _read_event_by_id(
+            store.transaction_runner, "event-current-input"
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        snapshot = replace(
+            snapshot,
+            cursor=MemorySnapshotCursor(
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                checkpoint_event_sequence=current_input.event_sequence,
+                checkpoint_event_id=current_input.event_id,
+                session_id=session_id,
+            ),
+        )
+        snapshot = replace(
+            snapshot,
+            snapshot_digest=calculate_memory_snapshot_digest(snapshot),
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        cursor_ref = memory_view.memory_snapshot_cursor
+        assert cursor_ref is not None
+
+        assert memory_view.messages == ()
+        assert any(
+            diagnostic.reason is MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED
+            for diagnostic in memory_view.diagnostics
+        )
+        assert (
+            f"checkpoint_event_sequence={required_cursor.checkpoint_event_sequence}"
+            in cursor_ref
+        )
+        assert (
+            f"checkpoint_event_id={required_cursor.checkpoint_event_id}" in cursor_ref
+        )
+
+
+def test_inline_delta_unable_to_cover_required_cursor_raises_repair_required(
+    tmp_path: Path,
+) -> None:
+    """filtered read 无法证明覆盖 required cursor 时仍要求 projection repair。"""
+
+    policy = _memory_policy(max_lag_events_for_inline_delta=16)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior memory prompt",
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(
+                _memory_projection_event_from_test_row(prior_event),
+            ),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        provider = DurableMemorySnapshotProvider(store.transaction_runner, policy)
+
+        with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+            store.transaction_runner.run_read(
+                lambda transaction: provider._repair_inline_delta(
+                    transaction,
+                    snapshot=snapshot,
+                    required_event_sequence=prior_event.event_sequence + 1,
+                    lag_events=1,
+                )
+            )
+
+        assert (
+            exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_DAMAGED
+        )
+
+
 def test_inline_delta_uses_terminal_content_and_ignores_summary_fallback(
     tmp_path: Path,
 ) -> None:
@@ -2650,6 +2821,84 @@ def _append_prior_user_event(
             event_class=EventClass.CANONICAL_FACT,
         )
     )
+
+
+def _append_inline_repair_filter_noise(
+    transaction_runner: HostTransactionRunner,
+    session_id: str,
+) -> None:
+    """追加 inline repair 过滤语义测试所需的 matching 与 non-matching rows。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: 当前 Session id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加一组跨 class、type 与 session 的 EventLog rows。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        store = EventLogStore()
+        store.append_event(
+            transaction,
+            _event_request(
+                event_id="event-inline-preview-noise",
+                event_class=EventClass.PREVIEW,
+                session_id=session_id,
+                run_id="run-inline-preview",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("preview should not enter memory"),
+            ),
+        )
+        store.append_event(
+            transaction,
+            _event_request(
+                event_id="event-inline-diagnostic-noise",
+                event_class=EventClass.DIAGNOSTIC,
+                session_id=session_id,
+                run_id="run-inline-diagnostic",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={"message": "diagnostic should not enter memory"},
+            ),
+        )
+        store.append_event(
+            transaction,
+            _event_request(
+                event_id="event-inline-canonical-noise",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-inline-noise",
+                event_type="RUN_ACCEPTED",
+                payload={"message": "canonical unrelated should not enter memory"},
+            ),
+        )
+        store.append_event(
+            transaction,
+            _event_request(
+                event_id="event-inline-foreign-memory",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id="session-inline-foreign",
+                run_id="run-inline-foreign",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("foreign session should not enter memory"),
+            ),
+        )
+        store.append_event(
+            transaction,
+            _event_request(
+                event_id="event-inline-matching-success",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-inline-matching",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "matching assistant answer"},
+            ),
+        )
+
+    transaction_runner.run_write(operation)
 
 
 def _memory_projection_event_from_test_row(row: EventLogRow) -> MemoryProjectionEvent:

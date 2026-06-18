@@ -75,7 +75,10 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.codec import sha256_digest_json
-from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
+from dayu.host.durable.memory import (
+    conversation_memory_projection_event_filter,
+    read_latest_memory_snapshot_at_or_before,
+)
 from dayu.host.durable.payload import (
     PayloadDescriptor,
     PayloadStore,
@@ -101,6 +104,7 @@ from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransact
 from dayu.host.payload_resolution import (
     event_payload_object,
 )
+from dayu.host.projection import event_log_read_filter_from_projection_filter
 from dayu.host.terminal_summary_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
@@ -233,14 +237,6 @@ _PROJECTOR_ID_RECENT_WINDOW = "recent_window_material"
 _PROJECTOR_PURPOSE_ORDINARY = "ordinary_run_input"
 _PROJECTOR_PURPOSE_POST_COMPACTION = "post_compaction_input"
 _PROJECTOR_SCHEMA_VERSION = "run_input_projector.v1"
-_MEMORY_EVENT_TYPES = frozenset(
-    (
-        _EVENT_TYPE_USER_INPUT_ACCEPTED,
-        _EVENT_TYPE_RUN_SUCCEEDED,
-        _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-        CONTEXT_COMPACTED,
-    )
-)
 
 
 class ToolExecutionMode(StrEnum):
@@ -1182,23 +1178,26 @@ class DurableMemorySnapshotProvider:
         :raises MemoryProjectionRepairRequired: delta 无法覆盖 required cursor 时抛出。
         """
 
-        rows = self._event_log_store.read_events_after(
+        event_filter = event_log_read_filter_from_projection_filter(
+            conversation_memory_projection_event_filter()
+        )
+        page = self._event_log_store.read_events_after_matching(
             transaction,
             snapshot.cursor.checkpoint_event_sequence,
+            event_filter=event_filter,
             limit=lag_events,
+            max_event_sequence=required_event_sequence,
+            session_id=snapshot.session_id,
         )
-        if len(rows) != lag_events:
+        if page.covered_event_sequence != required_event_sequence:
             self._raise_repair_required(
                 session_id=snapshot.session_id,
                 reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
                 required_event_sequence=required_event_sequence,
                 observed_cursor=snapshot.cursor,
             )
-        required_row = rows[-1]
-        if (
-            required_row.event_sequence != required_event_sequence
-            or required_row.session_id != snapshot.session_id
-        ):
+        required_event_id = page.covered_event_id
+        if required_event_id is None:
             self._raise_repair_required(
                 session_id=snapshot.session_id,
                 reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
@@ -1206,15 +1205,14 @@ class DurableMemorySnapshotProvider:
                 observed_cursor=snapshot.cursor,
             )
         repaired = snapshot
-        for row in rows:
-            if _is_memory_projection_row(row, session_id=snapshot.session_id):
-                repaired = project_conversation_memory_event(
-                    previous_snapshot=repaired,
-                    event=_memory_projection_event_from_row(transaction, row),
-                    policy=self._policy,
-                    built_at=row.occurred_at,
-                    consumer_id=self._consumer_id,
-                )
+        for row in page.rows:
+            repaired = project_conversation_memory_event(
+                previous_snapshot=repaired,
+                event=_memory_projection_event_from_row(transaction, row),
+                policy=self._policy,
+                built_at=row.occurred_at,
+                consumer_id=self._consumer_id,
+            )
         diagnostic = build_inline_delta_repair_diagnostic(
             event_sequence=required_event_sequence,
             policy_digest=self._policy_digest,
@@ -1223,8 +1221,8 @@ class DurableMemorySnapshotProvider:
             snapshot=repaired,
             cursor=MemorySnapshotCursor(
                 consumer_id=self._consumer_id,
-                checkpoint_event_sequence=required_row.event_sequence,
-                checkpoint_event_id=required_row.event_id,
+                checkpoint_event_sequence=required_event_sequence,
+                checkpoint_event_id=required_event_id,
                 session_id=snapshot.session_id,
             ),
             diagnostics=(diagnostic,),
@@ -2956,21 +2954,6 @@ def _memory_cursor_ref(cursor: MemorySnapshotCursor) -> str:
         f"session_id={cursor.session_id};"
         f"checkpoint_event_sequence={cursor.checkpoint_event_sequence};"
         f"checkpoint_event_id={event_id}"
-    )
-
-
-def _is_memory_projection_row(row: EventLogRow, *, session_id: str) -> bool:
-    """判断 EventLog row 是否应进入 memory delta projection。
-
-    :param row: EventLog row。
-    :param session_id: 当前 Session id。
-    :returns: 命中 memory projection 返回 ``True``。
-    """
-
-    return (
-        row.session_id == session_id
-        and row.event_class == EventClass.CANONICAL_FACT
-        and row.event_type in _MEMORY_EVENT_TYPES
     )
 
 

@@ -583,7 +583,7 @@ class ProjectionRunner:
         checkpoint = ensure_projection_checkpoint(
             transaction, consumer_id, now=_utc_now_text()
         )
-        event_filter = _event_log_read_filter_from_projection_filter(
+        event_filter = event_log_read_filter_from_projection_filter(
             consumer.event_filter
         )
         page = read_events_after_matching(
@@ -709,7 +709,7 @@ def projection_event_view_from_row(row: EventLogRow) -> ProjectionEventView:
     )
 
 
-def _event_log_read_filter_from_projection_filter(
+def event_log_read_filter_from_projection_filter(
     event_filter: ProjectionEventFilter,
 ) -> EventLogReadFilter:
     """把 projection consumer filter 转换为 durable EventLog read filter。

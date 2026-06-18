@@ -26,6 +26,7 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.memory import (
     ConversationMemoryProjectionConsumer,
     MemorySnapshotIntegrityFailureKind,
+    conversation_memory_projection_event_filter,
     inspect_memory_snapshot_integrity,
     read_latest_memory_snapshot,
     read_memory_snapshot,
@@ -777,6 +778,15 @@ def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
             "reference_continuity",
             "session_summary",
         }
+
+
+def test_conversation_memory_consumer_uses_shared_projection_event_filter() -> None:
+    """Conversation Memory consumer 直接使用模块级 projection filter 真源。"""
+
+    policy = _policy()
+    consumer = ConversationMemoryProjectionConsumer(policy)
+
+    assert consumer.event_filter == conversation_memory_projection_event_filter()
 
 
 def test_projection_consumer_skips_failed_compact_without_memory_snapshot(

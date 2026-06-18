@@ -210,6 +210,23 @@ class _MemorySnapshotIntegrityRowIdentity:
     checkpoint_event_sequence: int
 
 
+def conversation_memory_projection_event_filter() -> ProjectionEventFilter:
+    """返回 Conversation Memory projection 的唯一 EventLog filter 真源。
+
+    :returns: 只覆盖 conversation memory 可消费 canonical facts 的 projection filter。
+    :raises HostDurableError: filter 构造失败时抛出。
+    """
+
+    return ProjectionEventFilter(
+        (
+            ProjectionEventClassFilter(
+                event_class=EventClass.CANONICAL_FACT,
+                event_types=_EVENT_TYPE_FILTER,
+            ),
+        )
+    )
+
+
 class ConversationMemoryProjectionConsumer:
     """Conversation memory projection consumer。
 
@@ -237,14 +254,7 @@ class ConversationMemoryProjectionConsumer:
         self._policy = policy
         self._policy_digest = digest_memory_projection_policy(policy)
         self._consumer_id = ProjectionConsumerId(consumer_id)
-        self._event_filter = ProjectionEventFilter(
-            (
-                ProjectionEventClassFilter(
-                    event_class=EventClass.CANONICAL_FACT,
-                    event_types=_EVENT_TYPE_FILTER,
-                ),
-            )
-        )
+        self._event_filter = conversation_memory_projection_event_filter()
 
     @property
     def consumer_id(self) -> ProjectionConsumerId:
