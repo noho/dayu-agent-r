@@ -15,11 +15,13 @@ from enum import StrEnum
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
+    build_pre_dispatch_compact_material_view,
     is_turn_group_material_block,
     protected_recent_turn_group_ids_for_material_blocks,
+    run_input_material_block,
     selected_material_view_digest,
 )
-from dayu.host.compaction import CompactMaterialSection
+from dayu.host.compaction import CompactMaterialBlockKind, CompactMaterialSection
 from dayu.host.context_budget import (
     BudgetEstimate,
     BudgetEstimateInput,
@@ -34,6 +36,7 @@ from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.state import read_run_by_id
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.payload_resolution import event_payload_object
@@ -56,6 +59,9 @@ _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR = "selected_recent_window_turn_floor"
 _FIELD_SELECTED_MATERIAL_VIEW_DIGEST = "selected_material_view_digest"
 _FIELD_SELECTED_RAW_TURN_COUNT = "selected_raw_turn_count"
 _FIELD_SOURCE_REFS = "source_refs"
+_FIELD_TRIGGER_SOURCE = "trigger_source"
+_FIELD_DISPLAY_TEXT = "display_text"
+_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 
 
 class RecentWindowFallbackAction(StrEnum):
@@ -226,7 +232,7 @@ class RecentWindowFallbackSelection:
 class ActiveRecentWindowFallback:
     """RunInputBuilder 可消费的 active fallback view 摘要。
 
-    :param selected_block_ids: 应从 ordinary material blocks 中保留的 block ids。
+    :param selected_block_ids: 应从 fallback material view 中保留的 block ids。
     :param current_input_ref: fallback 绑定的当前输入 ref。
     :param source_refs: selection 时 selected blocks 的 canonical source refs。
     :param fallback_input_digest: failed payload 中记录的 fallback input digest。
@@ -234,6 +240,8 @@ class ActiveRecentWindowFallback:
     :param selected_raw_turn_count: selection 时 selected raw turn block 数。
     :param selected_material_view_digest: selection 时 selected material view digest。
     :param fallback_input_window: failed payload 中记录的 fallback window。
+    :param material_blocks: 与 selected ids 同源的 frozen material view；仅 proactive
+        EventLog-backed fallback provider 能重建时填充。
     """
 
     selected_block_ids: tuple[str, ...]
@@ -244,6 +252,7 @@ class ActiveRecentWindowFallback:
     selected_raw_turn_count: int | None = None
     selected_material_view_digest: str | None = None
     fallback_input_window: Mapping[str, JsonValue] | None = None
+    material_blocks: tuple[RunInputMaterialBlock, ...] | None = None
 
     def __post_init__(self) -> None:
         """校验 active fallback view。
@@ -272,6 +281,8 @@ class ActiveRecentWindowFallback:
             self.fallback_input_window, Mapping
         ):
             raise TypeError("fallback_input_window must be mapping")
+        if self.material_blocks is not None:
+            _require_block_tuple(self.material_blocks, "material_blocks")
 
 
 class EventLogContextFallbackProvider:
@@ -365,6 +376,15 @@ class EventLogContextFallbackProvider:
         actual_current_input_ref = window_current_ref
         if actual_current_input_ref is None:
             raise HostDurableError("fallback current_input_ref is missing")
+        trigger_source = _required_text(window, _FIELD_TRIGGER_SOURCE)
+        material_blocks: tuple[RunInputMaterialBlock, ...] | None = None
+        if trigger_source == ContextCompactionTriggerSource.PROACTIVE.value:
+            material_blocks = _proactive_material_blocks_for_window(
+                transaction,
+                self._event_log_store,
+                run_id=run_id,
+                current_input_ref=actual_current_input_ref,
+            )
         return ActiveRecentWindowFallback(
             selected_block_ids=_required_text_tuple(window, _FIELD_SELECTED_BLOCK_IDS),
             current_input_ref=actual_current_input_ref,
@@ -383,7 +403,79 @@ class EventLogContextFallbackProvider:
                 _FIELD_SELECTED_MATERIAL_VIEW_DIGEST,
             ),
             fallback_input_window=window,
+            material_blocks=material_blocks,
         )
+
+
+def _proactive_material_blocks_for_window(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run_id: str,
+    current_input_ref: str,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """重建 proactive fallback selection 使用的 EventLog-backed material view。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog store。
+    :param run_id: 当前 Run id。
+    :param current_input_ref: fallback 绑定的 current input event id。
+    :returns: 与 proactive fallback payload selected ids 同源的 material blocks。
+    :raises HostDurableError: Run、current input 或 material source 损坏时抛出。
+    """
+
+    run = read_run_by_id(transaction, run_id)
+    if run is None:
+        raise HostDurableError("fallback run is missing")
+    if run.input_event_id != current_input_ref:
+        raise HostDurableError("fallback current_input_ref mismatch")
+    current_event = event_log_store.read_event_by_id(transaction, current_input_ref)
+    if current_event is None:
+        raise HostDurableError("fallback current input event is missing")
+    payload = event_payload_object(
+        transaction,
+        current_event,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    current_display_text = _required_text(payload, _FIELD_DISPLAY_TEXT)
+    material_view = build_pre_dispatch_compact_material_view(
+        transaction,
+        event_log_store,
+        run=run,
+        current_display_text=current_display_text,
+    )
+    return (
+        *material_view.material_blocks,
+        _current_input_material_block_for_fallback(
+            current_input_ref=current_input_ref,
+            current_input_sequence=run.input_event_sequence,
+            display_text=material_view.current_input_text,
+        ),
+    )
+
+
+def _current_input_material_block_for_fallback(
+    *,
+    current_input_ref: str,
+    current_input_sequence: int,
+    display_text: str,
+) -> RunInputMaterialBlock:
+    """构造 proactive fallback selection 使用的 current input block。
+
+    :param current_input_ref: 当前输入 event id。
+    :param current_input_sequence: 当前输入 EventLog sequence。
+    :param display_text: 当前输入展示文本。
+    :returns: current input material block。
+    """
+
+    return run_input_material_block(
+        block_id=f"current:{current_input_ref}",
+        section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        text=display_text,
+        canonical_source_refs=(current_input_ref,),
+        event_sequence=current_input_sequence,
+    )
 
 
 def build_recent_window_fallback_selection(

@@ -1822,17 +1822,14 @@ def _facts_from_accepted_event(
             continue
         labels = _required_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
         if len(labels) == 0:
-            return (
-                (),
-                tuple(diagnostics)
-                + (
-                    _fact_candidate_invalid_diagnostic(
-                        event,
-                        policy_digest=policy_digest,
-                        message="fact candidate has no evidence label",
-                    ),
-                ),
+            diagnostics.append(
+                _fact_candidate_invalid_diagnostic(
+                    event,
+                    policy_digest=policy_digest,
+                    message="fact candidate has no evidence label",
+                )
             )
+            continue
         facts.append(
             EvidenceBackedFactView(
                 item_id=item_id,

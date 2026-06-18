@@ -906,6 +906,40 @@ def test_accepted_compact_preserves_budget_diagnostic_before_invalid_fact() -> N
     )
 
 
+def test_accepted_compact_keeps_valid_fact_before_empty_evidence_labels() -> None:
+    """后续空 evidence labels candidate 不得清空此前 valid facts。"""
+
+    invalid_fact = _fact("无标签")
+    invalid_fact["evidence_labels"] = []
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-valid-then-empty-labels",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(
+                    facts=[
+                        _fact("有效事实应保留。"),
+                        invalid_fact,
+                    ]
+                ),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=_policy(),
+        built_at=_NOW,
+    )
+
+    assert tuple(
+        fact.claim_text
+        for fact in snapshot.evidence_fact_memory.evidence_backed_facts
+    ) == ("有效事实应保留。",)
+    assert MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID in tuple(
+        diagnostic.reason for diagnostic in snapshot.diagnostics
+    )
+
+
 def test_accepted_compact_drops_oversized_summary_without_prefix_text() -> None:
     """超出 summary char cap 的 compact summary 整体丢弃，不返回前缀文本。"""
 

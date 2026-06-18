@@ -5125,7 +5125,7 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             session_id=session_id,
             run_id="run-compact-failure-old",
             event_id="event-input-run-compact-failure-old",
-            display_text="older fallback material that cap must drop",
+            display_text="older fallback floor material that must render",
             client_request_id="client-run-compact-failure-old",
             idempotency_key="idem-run-compact-failure-old",
         )
@@ -5135,12 +5135,21 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             display_text=_soft_threshold_prompt(),
             session_id=session_id,
         )
+        memory_policy = replace(
+            _fallback_cap_memory_policy(),
+            selected_recent_window_turn_floor=1,
+            fallback_selected_recent_window_item_cap=2,
+        )
         scheduler = await _open_scheduler(
             tmp_path,
             store,
             factory,
-            context_budget_policy=_soft_compact_policy(),
-            memory_projection_policy=_fallback_cap_memory_policy(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=200,
+                soft_threshold_tokens=70,
+                hard_threshold_tokens=120,
+            ),
+            memory_projection_policy=memory_policy,
             compact_artifact_root=compact_artifact_root,
         )
         try:
@@ -5172,16 +5181,24 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
                 f"event-input-{seeded.run_id}"
             )
             assert payload["fallback_input_window"]["selected_block_ids"] == [
-                f"current:event-input-{seeded.run_id}"
+                "eventlog:user:event-input-run-compact-failure-old",
+                f"current:event-input-{seeded.run_id}",
             ]
-            assert "eventlog:user:event-input-run-compact-failure-old" in (
-                _required_json_text_tuple(
-                    payload["fallback_input_window"]["dropped_block_ids"]
-                )
+            assert "eventlog:user:event-input-run-compact-failure-old" not in (
+                _required_json_text_tuple(payload["fallback_input_window"]["dropped_block_ids"])
             )
             assert isinstance(payload["fallback_budget_result"], Mapping)
             assert payload["fallback_budget_result"]["status"] == "within_hard_budget"
             assert _compact_artifact_files(compact_artifact_root) == ()
+            rendered = "\n".join(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[0].messages
+                )
+                if content is not None
+            )
+            assert "older fallback floor material that must render" in rendered
         finally:
             await scheduler.close()
 

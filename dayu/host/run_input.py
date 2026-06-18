@@ -1898,15 +1898,20 @@ class RunInputBuilder:
                     compact,
                 )
             )
-            bounded_context_messages = _fallback_context_messages(
-                fallback=fallback,
-                material_blocks=build_run_input_material_blocks(
+            fallback_material_blocks = (
+                fallback.material_blocks
+                if fallback.material_blocks is not None
+                else build_run_input_material_blocks(
                     current_facts=current_facts,
                     memory=memory,
                     compact=compact,
                     continuity=continuity,
                     accepted_tool_evidence=evidence,
-                ),
+                )
+            )
+            bounded_context_messages = _fallback_context_messages(
+                fallback=fallback,
+                material_blocks=fallback_material_blocks,
             )
         tool_snapshot = self._tool_schema_snapshot_provider.load_tool_schema_snapshot(
             attempt_snapshot, current_facts
@@ -2746,9 +2751,9 @@ def _fallback_context_messages(
     """按 fallback selected block ids 渲染 bounded context messages。
 
     :param fallback: active fallback view。
-    :param material_blocks: ordinary material blocks。
+    :param material_blocks: fallback 使用的 frozen material blocks。
     :returns: fallback bounded context messages，不包含当前 input anchor。
-    :raises HostDurableError: fallback view 与 ordinary material 不一致时抛出。
+    :raises HostDurableError: fallback view 与 material view 不一致时抛出。
     """
 
     render_view = _selected_material_render_view(
@@ -2771,7 +2776,7 @@ def _selected_material_render_view(
     """从 frozen material view 取回 selected blocks 并校验 provenance。
 
     :param fallback: active fallback view。
-    :param material_blocks: ordinary material blocks。
+    :param material_blocks: fallback 使用的 frozen material blocks。
     :returns: 可渲染的 selected material view。
     :raises HostDurableError: selected id、source refs、digest 或 protected group
         与 material view 不一致时抛出。
@@ -2823,7 +2828,7 @@ def _validate_material_block_ids_unique(
 ) -> None:
     """校验 material view block ids 唯一。
 
-    :param material_blocks: ordinary material blocks。
+    :param material_blocks: fallback 使用的 frozen material blocks。
     :returns: ``None``。
     :raises HostDurableError: block id 重复时抛出。
     """
@@ -2881,7 +2886,7 @@ def _validate_fallback_protected_groups(
     """校验 fallback protected turn-group floor 没有漂移。
 
     :param fallback: active fallback view。
-    :param material_blocks: ordinary material blocks。
+    :param material_blocks: fallback 使用的 frozen material blocks。
     :param selected_blocks: 已选 material blocks。
     :returns: ``None``。
     :raises HostDurableError: protected group 或 raw turn 计数不一致时抛出。

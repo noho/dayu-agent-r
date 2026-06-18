@@ -380,7 +380,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
             followup_request(
                 session.session_id,
                 "p12-6-tool-evidence-compact",
-                _long_compaction_prompt("tool-evidence-compact-trigger"),
+                _soft_threshold_prompt(),
             ),
         )
         second_terminal = await next_terminal_for_run(watcher, second.accepted_run_id)
@@ -524,7 +524,7 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
                 followup_request(
                     session.session_id,
                     f"p12-6-multi-compact-{index}",
-                    _long_compaction_prompt(f"multi-compact-marker-{index}"),
+                    f"{_soft_threshold_prompt()} multi-compact-marker-{index}",
                 ),
             )
             await next_terminal_for_run(watcher, followup.accepted_run_id)
@@ -551,15 +551,15 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
 
 
 @pytest.mark.asyncio
-async def test_proactive_compact_duplicate_prompt_does_not_exceed_compactor_window(
+async def test_proactive_compact_duplicate_prompt_falls_back_without_lossy_anchor(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """重复长 prompt 触发 proactive compact 时不会因 compactor 输入重复超窗失败。
+    """超长 current input 不能无损进入 compact schema 时走 dispatch fallback。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
-    :raises AssertionError: compact 未触发、Run 失败或 compactor prompt 过大时抛出。
+    :raises AssertionError: Run 失败或错误调用 compactor 时抛出。
     """
 
     fake_compactor = FakeCompactorRunAgent()
@@ -590,22 +590,8 @@ async def test_proactive_compact_duplicate_prompt_does_not_exceed_compactor_wind
         terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
 
     assert terminal.kind is HostEventKind.SUCCEEDED
-    assert len(fake_compactor.prompt_lengths) == 1
-    assert fake_compactor.prompt_lengths[0] <= _FAKE_COMPACTOR_MAX_PROMPT_CHARS
-    manifest = _runner_call_manifest_for_run(
-        _compact_artifact_files(tmp_path / "compact-artifacts"),
-        followup.accepted_run_id,
-    )
-    assert manifest["runner_call_kind"] == "compactor_proposal"
-    assert manifest["runner_call_trigger_reason"] == (
-        "context_compaction_initial_proposal"
-    )
-    _assert_runner_call_manifest_messages(
-        manifest,
-        expected_roles=(AgentMessageRole.SYSTEM, AgentMessageRole.USER),
-    )
-    manifest_text = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
-    assert _DUPLICATE_PROMPT_SENTENCE * 20 not in manifest_text
+    assert fake_compactor.prompt_lengths == []
+    assert _compact_artifact_files(tmp_path / "compact-artifacts") == ()
 
 
 @pytest.mark.asyncio
