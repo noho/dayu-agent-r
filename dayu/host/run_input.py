@@ -57,14 +57,11 @@ from dayu.host.context_fallback import (
 )
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
+    build_pre_dispatch_compact_material_view,
     is_turn_group_material_block,
     protected_recent_turn_group_ids_for_material_blocks,
     run_input_material_block,
     selected_material_view_digest,
-)
-from dayu.host.compaction_evidence import (
-    SelectedEvidenceBlockRef,
-    collect_selected_compaction_request_evidence_inputs,
 )
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
@@ -229,7 +226,6 @@ _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS = (
     "checkpoint_event_sequence",
     "ConversationCompactOutputVNext",
 )
-_ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT = 8
 _RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX = "payload-runner-call-input-manifest"
 _RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
     "sqlite-payload-runner-call-input-manifest"
@@ -1320,34 +1316,24 @@ class NoopAcceptedToolEvidenceMaterialProvider:
 class DurableAcceptedToolEvidenceMaterialProvider:
     """基于 EventLog 读取当前 Attempt 前 accepted tool evidence material。
 
-    Provider 只读取当前 Session、当前 Attempt start cursor 之前的最近
-    ``TOOL_RESULT_ACCEPTED`` 事件，并用固定上限约束读取规模。raw evidence
-    payload 解析复用 ``compaction_evidence`` 的 accepted envelope 逻辑，避免
-    在 RunInputBuilder 内重复解释工具结果结构。
+    Provider 复用 pre-dispatch compact material view 的 EventLog-backed 语义，
+    只做 accepted evidence kind 与已表示 evidence refs 的 whole-block 过滤。
 
     :param transaction_runner: Host durable transaction runner。
-    :param max_evidence_blocks: 单次最多暴露给 compactor 的 accepted evidence 数。
     """
 
     def __init__(
         self,
         transaction_runner: HostTransactionRunner,
-        *,
-        max_evidence_blocks: int = _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT,
     ) -> None:
         """初始化 provider。
 
         :param transaction_runner: Host durable transaction runner。
-        :param max_evidence_blocks: accepted evidence material 上限。
         :returns: ``None``。
-        :raises ValueError: 上限非正数时抛出。
         """
 
-        if max_evidence_blocks <= 0:
-            raise ValueError("max_evidence_blocks must be positive")
         self._transaction_runner = transaction_runner
         self._event_log_store = EventLogStore()
-        self._max_evidence_blocks = max_evidence_blocks
 
     def load_accepted_tool_evidence_materials(
         self,
@@ -1356,7 +1342,7 @@ class DurableAcceptedToolEvidenceMaterialProvider:
         memory: MemorySnapshotView,
         compact: CompactArtifactView,
     ) -> tuple[RunInputMaterialBlock, ...]:
-        """读取 bounded accepted tool evidence material。
+        """读取 EventLog-backed accepted tool evidence material。
 
         :param snapshot: Attempt dispatch snapshot。
         :param current_facts: 当前 Run facts。
@@ -1369,7 +1355,6 @@ class DurableAcceptedToolEvidenceMaterialProvider:
         return self._transaction_runner.run_read(
             lambda transaction: self._load_accepted_tool_evidence_materials_tx(
                 transaction,
-                snapshot=snapshot,
                 current_facts=current_facts,
                 represented_evidence_refs=_represented_evidence_refs(
                     memory, compact
@@ -1381,111 +1366,30 @@ class DurableAcceptedToolEvidenceMaterialProvider:
         self,
         transaction: HostTransaction,
         *,
-        snapshot: AttemptDispatchSnapshot,
         current_facts: CurrentRunFacts,
         represented_evidence_refs: tuple[str, ...],
     ) -> tuple[RunInputMaterialBlock, ...]:
         """在 read transaction 内读取 accepted evidence material。
 
         :param transaction: Host transaction。
-        :param snapshot: Attempt dispatch snapshot。
         :param current_facts: 当前 Run facts。
         :param represented_evidence_refs: 已由 memory / compact 表示的 evidence refs。
         :returns: evidence material blocks。
         """
 
-        return build_accepted_tool_evidence_material_blocks(
+        material_view = build_pre_dispatch_compact_material_view(
             transaction,
             self._event_log_store,
-            session_id=snapshot.session_id,
-            before_event_sequence=current_facts.attempt.started_event_sequence,
-            represented_evidence_refs=represented_evidence_refs,
-            max_evidence_blocks=self._max_evidence_blocks,
+            run=current_facts.run,
+            current_display_text=current_facts.user_prompt,
         )
-
-
-def build_accepted_tool_evidence_material_blocks(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
-    *,
-    session_id: str,
-    before_event_sequence: int,
-    represented_evidence_refs: tuple[str, ...] = (),
-    max_evidence_blocks: int = _ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT,
-) -> tuple[RunInputMaterialBlock, ...]:
-    """从 bounded EventLog window 构造 accepted tool evidence material。
-
-    本 helper 只读取当前 Session 中 ``before_event_sequence`` 之前最近的
-    ``TOOL_RESULT_ACCEPTED``，并复用 compaction evidence reader 解析 raw
-    accepted evidence；canonical refs 只写入 material block 内部 provenance
-    字段，不进入 LLM-facing material JSON。
-
-    :param transaction: Host transaction。
-    :param event_log_store: EventLog store。
-    :param session_id: 当前 Session id。
-    :param before_event_sequence: 当前输入 / Attempt cursor 的排他上界。
-    :param represented_evidence_refs: 已由 stable facts 或 compact artifact 表示
-        的 accepted evidence refs。
-    :param max_evidence_blocks: 单次最多读取的 accepted evidence 数。
-    :returns: evidence material blocks。
-    :raises HostDurableError: EventLog 或 evidence payload 损坏时抛出。
-    """
-
-    rows = _recent_accepted_tool_result_rows(
-        transaction,
-        event_log_store,
-        session_id=session_id,
-        before_event_sequence=before_event_sequence,
-        limit=max_evidence_blocks,
-    )
-    if len(rows) == 0:
-        return ()
-    selected_refs = tuple(
-        SelectedEvidenceBlockRef(
-            block_id=f"accepted-tool-evidence:{row.event_id}",
-            tool_result_event_ref=row.event_id,
+        represented = frozenset(represented_evidence_refs)
+        return tuple(
+            block
+            for block in material_view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+            and block.accepted_evidence_id not in represented
         )
-        for row in rows
-    )
-    inputs = collect_selected_compaction_request_evidence_inputs(
-        transaction,
-        event_log_store,
-        session_id=session_id,
-        selected_evidence_block_refs=selected_refs,
-    )
-    sequence_by_event_id = {row.event_id: row.event_sequence for row in rows}
-    run_id_by_event_id = {row.event_id: row.run_id for row in rows}
-    represented = frozenset(represented_evidence_refs)
-    blocks: list[RunInputMaterialBlock] = []
-    for index, material in enumerate(inputs.evidence_materials):
-        if material.accepted_evidence_id in represented:
-            continue
-        blocks.append(
-            run_input_material_block(
-                block_id=(
-                    "accepted-tool-evidence:"
-                    f"{material.tool_result_event_ref}:"
-                    f"{material.accepted_evidence_id}"
-                ),
-                section=CompactMaterialSection.EVIDENCE_MATERIAL,
-                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-                text=material.raw_result_text,
-                canonical_source_refs=(material.canonical_source_ref,),
-                event_sequence=sequence_by_event_id[material.tool_result_event_ref],
-                turn_group_id=run_id_by_event_id[material.tool_result_event_ref],
-                event_sub_index=index,
-                accepted_evidence_id=material.accepted_evidence_id,
-                tool_result_event_ref=material.tool_result_event_ref,
-                tool_call_event_ref=material.tool_call_event_ref,
-                payload_refs=material.payload_refs,
-                artifact_refs=material.artifact_refs,
-                source_locator_refs=material.source_locator_refs,
-                readable_tool_name=material.readable_tool_name,
-                readable_query_text=material.readable_query_text,
-                readable_source_text=material.readable_source_text,
-            )
-        )
-    return tuple(blocks)
 
 
 class DurableCompactArtifactProvider:
@@ -3277,66 +3181,6 @@ def _latest_compacted_event_before_attempt(
     return event
 
 
-def _recent_accepted_tool_result_rows(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
-    *,
-    session_id: str,
-    before_event_sequence: int,
-    limit: int,
-) -> tuple[EventLogRow, ...]:
-    """读取当前 Attempt 前最近的 accepted tool result rows。
-
-    查询先按倒序取固定上限，再恢复为 event_sequence 升序，保证读取有界且
-    selection / prompt label 分配稳定。
-
-    :param transaction: Host transaction。
-    :param event_log_store: EventLog store。
-    :param session_id: 当前 Session id。
-    :param before_event_sequence: 当前 Attempt started event sequence。
-    :param limit: 最大读取 row 数。
-    :returns: 稳定升序的 EventLog rows。
-    :raises HostDurableError: 参数非法或 row 消失时抛出。
-    """
-
-    if before_event_sequence <= 0:
-        raise HostDurableError("before_event_sequence must be positive")
-    if limit <= 0:
-        raise HostDurableError("accepted tool evidence limit must be positive")
-    rows = transaction.fetchall(
-        f"""
-        SELECT event_id
-        FROM {TABLE_EVENT_LOG}
-        WHERE session_id = ?
-          AND event_type = ?
-          AND event_class = ?
-          AND event_sequence < ?
-        ORDER BY event_sequence DESC
-        LIMIT ?
-        """,
-        (
-            session_id,
-            _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-            EventClass.CANONICAL_FACT.value,
-            before_event_sequence,
-            limit,
-        ),
-    )
-    result: list[EventLogRow] = []
-    for row in reversed(rows):
-        event_id = _required_host_row_text(row, field_name="event_id")
-        event = event_log_store.read_event_by_id(transaction, event_id)
-        if event is None:
-            raise HostDurableError("accepted tool evidence event disappeared")
-        result.append(
-            _require_event(
-                event,
-                expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-            )
-        )
-    return tuple(result)
-
-
 def _compact_artifact_message_content(
     *,
     compacted_event: EventLogRow,
@@ -4753,7 +4597,6 @@ __all__ = [
     "ToolRuntimeSchemaSnapshotProvider",
     "ToolSchemaSnapshot",
     "ToolSchemaSnapshotProvider",
-    "build_accepted_tool_evidence_material_blocks",
     "build_run_input_material_blocks",
     "create_no_tool_run_input_builder",
     "create_tool_enabled_run_input_builder",

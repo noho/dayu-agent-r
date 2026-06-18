@@ -67,7 +67,11 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+)
 from dayu.host.durable.payload import (
     PayloadStore,
     SQLitePayloadFormat,
@@ -113,6 +117,7 @@ from dayu.host.context_policy import (
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
+    CompactArtifactView,
     CurrentRunFacts,
     DurableCurrentRunFactProvider,
     DurableMemorySnapshotProvider,
@@ -130,6 +135,13 @@ from dayu.host.run_input import (
     _vnext_compact_candidate_semantic_lines,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
+)
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    OpaqueEvidenceRef,
+    accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -190,6 +202,17 @@ class _SeededRun:
     attempt_id: str
     execution_id: str
     dispatch_record_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SeededAcceptedEvidence:
+    """测试中创建的 accepted tool evidence。"""
+
+    tool_call_event_id: str
+    tool_result_event_id: str
+    accepted_evidence_id: str
+    semantic_query_text: str
+    raw_outcome: JsonValue
 
 
 class _OpenCancellationToken:
@@ -261,6 +284,28 @@ class _StaticMemorySnapshotProvider:
         :param snapshot: Attempt dispatch snapshot。
         :param current_facts: 当前 Run facts。
         :returns: 预置 memory view。
+        """
+
+        del snapshot, current_facts
+        return self.view
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticCompactArtifactProvider:
+    """测试用静态 compact artifact provider。"""
+
+    view: CompactArtifactView
+
+    def load_compact_artifact(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+    ) -> CompactArtifactView:
+        """返回预置 compact artifact view。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: 预置 compact artifact view。
         """
 
         del snapshot, current_facts
@@ -821,6 +866,146 @@ def test_run_input_builder_exposes_shared_material_block_source(
         assert blocks[0].text == "current prompt"
         assert blocks[0].canonical_source_refs == ("event-current-input",)
         assert blocks[0].turn_group_id == seeded.run_id
+
+
+def test_run_input_builder_accepted_tool_evidence_material_has_no_private_row_cap(
+    tmp_path: Path,
+) -> None:
+    """真实 provider 入口可读取超过旧 8 条的 accepted evidence blocks。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded_evidence = _append_prior_accepted_tool_evidence_batch(
+            store.transaction_runner,
+            session_id=session_id,
+            count=10,
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt after accepted evidence"),
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+        )
+
+        blocks = builder.build_material_blocks(_attempt_snapshot(seeded))
+        evidence_blocks = _accepted_tool_evidence_blocks(blocks)
+
+        assert len(evidence_blocks) == 10
+        assert tuple(block.accepted_evidence_id for block in evidence_blocks) == tuple(
+            evidence.accepted_evidence_id for evidence in seeded_evidence
+        )
+        assert evidence_blocks[-1].text == canonical_json_dumps(
+            seeded_evidence[-1].raw_outcome
+        )
+
+
+def test_run_input_builder_represented_refs_exclude_whole_accepted_evidence_blocks(
+    tmp_path: Path,
+) -> None:
+    """memory 与 compact 已表示的 evidence refs 会 whole-block 排除。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded_evidence = _append_prior_accepted_tool_evidence_batch(
+            store.transaction_runner,
+            session_id=session_id,
+            count=3,
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt after represented evidence"),
+        )
+        memory_view = MemorySnapshotView(
+            messages=(),
+            memory_snapshot_cursor=None,
+            policy_digest=None,
+            diagnostics=(),
+            represented_evidence_refs=(
+                seeded_evidence[0].accepted_evidence_id,
+            ),
+        )
+        compact_view = CompactArtifactView(
+            messages=(),
+            compact_artifact_ref="compact-artifact:test",
+            compact_artifact_digest=None,
+            represented_evidence_refs=(
+                seeded_evidence[1].accepted_evidence_id,
+            ),
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+            memory_snapshot_provider=_StaticMemorySnapshotProvider(memory_view),
+            compact_artifact_provider=_StaticCompactArtifactProvider(compact_view),
+        )
+
+        blocks = builder.build_material_blocks(_attempt_snapshot(seeded))
+        evidence_blocks = _accepted_tool_evidence_blocks(blocks)
+
+        assert tuple(block.accepted_evidence_id for block in evidence_blocks) == (
+            seeded_evidence[2].accepted_evidence_id,
+        )
+        assert evidence_blocks[0].text == canonical_json_dumps(
+            seeded_evidence[2].raw_outcome
+        )
+
+
+def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
+    tmp_path: Path,
+) -> None:
+    """accepted evidence material 使用 raw outcome 与可读 query，不用 ref/digest。"""
+
+    raw_outcome: JsonValue = {
+        "kind": "completed",
+        "result": {
+            "text": "full raw outcome for LLM material",
+            "preview_decoy": "not a result_preview field",
+        },
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded_evidence = _append_prior_accepted_tool_evidence_batch(
+            store.transaction_runner,
+            session_id=session_id,
+            count=1,
+            raw_outcome=raw_outcome,
+            semantic_query_text="Read MSFT FY2025 revenue from filing",
+        )[0]
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt after raw evidence"),
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+        )
+
+        blocks = builder.build_material_blocks(_attempt_snapshot(seeded))
+        evidence_block = _accepted_tool_evidence_blocks(blocks)[0]
+
+        assert evidence_block.text == canonical_json_dumps(raw_outcome)
+        assert "full raw outcome for LLM material" in evidence_block.text
+        assert _DIGEST_A not in evidence_block.text
+        assert seeded_evidence.tool_result_event_id not in evidence_block.text
+        assert evidence_block.readable_tool_name == "fins.search"
+        assert evidence_block.readable_query_text == (
+            "Read MSFT FY2025 revenue from filing"
+        )
+        assert evidence_block.accepted_evidence_id == (
+            seeded_evidence.accepted_evidence_id
+        )
+        assert evidence_block.canonical_source_refs == (
+            seeded_evidence.accepted_evidence_id,
+        )
+        assert evidence_block.payload_refs == (
+            f"payload:{seeded_evidence.tool_result_event_id}",
+        )
+        assert evidence_block.tool_call_event_ref == seeded_evidence.tool_call_event_id
 
 
 def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None:
@@ -3305,6 +3490,199 @@ def _write_memory_snapshot(
             snapshot,
             now="2026-05-15T01:02:03.000000Z",
         )
+    )
+
+
+def _accepted_tool_evidence_blocks(
+    blocks: tuple[RunInputMaterialBlock, ...],
+) -> tuple[RunInputMaterialBlock, ...]:
+    """筛选 accepted tool evidence material blocks。
+
+    :param blocks: RunInputBuilder 输出的 material blocks。
+    :returns: accepted tool evidence blocks。
+    """
+
+    return tuple(
+        block
+        for block in blocks
+        if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+    )
+
+
+def _append_prior_accepted_tool_evidence_batch(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    count: int,
+    raw_outcome: JsonValue | None = None,
+    semantic_query_text: str | None = None,
+) -> tuple[_SeededAcceptedEvidence, ...]:
+    """追加当前输入之前的 accepted tool evidence 事件。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :param count: 追加的 evidence 数量。
+    :param raw_outcome: 可选覆盖 raw outcome；缺省时按 ordinal 生成。
+    :param semantic_query_text: 可选覆盖 semantic query；缺省时按 ordinal 生成。
+    :returns: 写入的 evidence 元数据。
+    :raises ValueError: count 非正数时抛出。
+    """
+
+    if count <= 0:
+        raise ValueError("count must be positive")
+
+    def operation(transaction: HostTransaction) -> tuple[_SeededAcceptedEvidence, ...]:
+        """在一个 transaction 内追加 prior evidence 事件。
+
+        :param transaction: Host transaction。
+        :returns: 写入的 evidence 元数据。
+        """
+
+        seeded: list[_SeededAcceptedEvidence] = []
+        for ordinal in range(count):
+            seeded.append(
+                _append_prior_accepted_tool_evidence_tx(
+                    transaction,
+                    session_id=session_id,
+                    ordinal=ordinal,
+                    raw_outcome=raw_outcome,
+                    semantic_query_text=semantic_query_text,
+                )
+            )
+        return tuple(seeded)
+
+    return transaction_runner.run_write(operation)
+
+
+def _append_prior_accepted_tool_evidence_tx(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    ordinal: int,
+    raw_outcome: JsonValue | None,
+    semantic_query_text: str | None,
+) -> _SeededAcceptedEvidence:
+    """追加一组 prior TOOL_CALL_REQUESTED / TOOL_RESULT_ACCEPTED 事件。
+
+    :param transaction: Host transaction。
+    :param session_id: Session id。
+    :param ordinal: 批内序号。
+    :param raw_outcome: 可选 raw outcome。
+    :param semantic_query_text: 可选 semantic query。
+    :returns: 写入的 evidence 元数据。
+    """
+
+    tool_call_event_id = f"event-prior-tool-call-{ordinal:02d}"
+    tool_result_event_id = f"event-prior-tool-result-{ordinal:02d}"
+    tool_call_id = f"tool-call-prior-{ordinal:02d}"
+    query_text = (
+        f"Read MSFT FY2025 revenue detail {ordinal}"
+        if semantic_query_text is None
+        else semantic_query_text
+    )
+    actual_raw_outcome = (
+        {
+            "kind": "completed",
+            "result": {
+                "text": f"full raw outcome {ordinal}",
+                "ordinal": ordinal,
+            },
+        }
+        if raw_outcome is None
+        else raw_outcome
+    )
+    arguments: dict[str, JsonValue] = {
+        "ticker": "MSFT",
+        "ordinal": ordinal,
+    }
+    arguments_json: dict[str, JsonValue] = {"arguments": arguments}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query_digest = sha256_digest_json(
+        {"semantic_query_text": query_text}
+    )
+    EventLogStore().append_event(
+        transaction,
+        _event_request(
+            event_id=tool_call_event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=session_id,
+            run_id=f"run-prior-evidence-{ordinal:02d}",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": tool_call_id,
+                "tool_name": "fins.search",
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_payload_digest": arguments_digest,
+                "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+                "arguments_inline_json": arguments_json,
+                "arguments_payload_ref": None,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
+                "semantic_input_digest": semantic_query_digest,
+                "semantic_query_storage_kind": (
+                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+                ),
+                "semantic_query_text": query_text,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": semantic_query_digest,
+            },
+        ),
+    )
+    evidence_id = f"evidence:{tool_result_event_id}"
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id=evidence_id,
+        producer_event_ref=tool_result_event_id,
+        tool_name="fins.search",
+        tool_call_id=tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=tool_call_event_id,
+            normalized_arguments_digest=arguments_digest,
+            semantic_input_digest=semantic_query_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=_DIGEST_A,
+            truncation_applied=False,
+        ),
+        source_refs=(
+            OpaqueEvidenceRef(
+                ref_kind="tool_call_event",
+                ref_id=tool_call_event_id,
+                digest=None,
+            ),
+        ),
+        locator_refs=(
+            OpaqueEvidenceRef(
+                ref_kind="filing",
+                ref_id=f"msft-fy2025-{ordinal:02d}",
+                digest=None,
+            ),
+        ),
+    )
+    EventLogStore().append_event(
+        transaction,
+        _event_request(
+            event_id=tool_result_event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=session_id,
+            run_id=f"run-prior-evidence-{ordinal:02d}",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "accepted_evidence_envelope": (
+                    accepted_evidence_envelope_to_json_value(envelope)
+                ),
+                "raw_tool_outcome": actual_raw_outcome,
+            },
+        ),
+    )
+    return _SeededAcceptedEvidence(
+        tool_call_event_id=tool_call_event_id,
+        tool_result_event_id=tool_result_event_id,
+        accepted_evidence_id=evidence_id,
+        semantic_query_text=query_text,
+        raw_outcome=actual_raw_outcome,
     )
 
 
