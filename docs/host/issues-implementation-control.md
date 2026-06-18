@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-CM-12 draft PR #150 opened, but user review rejected remaining over-designed LLM input material legality guards. Current WU is reopened for fix: EventLog-derived LLM-facing input material must not be rejected by DTO field-length guards or private retrieval-count constants; shrinking must come from selection / floor / budget / provenance / fail-closed only. |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-CM-12-FIX-R1 completed locally through aggregate deepreview fix and focused re-review. EventLog-derived LLM-facing input material is no longer rejected by private DTO field-length guards, default evidence chunking, or private accepted-evidence retrieval-count constants; remaining shrinkage semantics are selection / floor / budget / provenance / fail-closed only. |
 | active work unit | WU-CM-12 |
 | default next work unit | WU-CM-12 |
-| next entry point | Implement accepted WU-CM-12-FIX-R1 plan `docs/host/host-issues/wu-cm-12-fix-r1-material-guard-plan.md` from commit `d904445e`: remove over-designed compact input field-length guards / default evidence chunking / private accepted-tool-evidence row limit from EventLog-derived LLM input material paths, then run code review and final closeout. |
+| next entry point | Push local branch to update existing WU-CM-12 draft PR #150, then run PR review gate for WU-CM-12-FIX-R1 before restoring draft-PR-pass / final closeout. |
 | design source | Current active WU: updated `docs/host/design.md`; `docs/engine/design.md` only if Engine contracts are touched. `docs/host/conversation-memory-material-budget-discussion.md` remains rationale / handoff reference and no longer replaces design truth after completed write-back. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 draft PR #150 https://github.com/noho/dayu-agent-r/pull/150; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | WU-CM-12-FIX-R1 must be resolved before returning to ready-to-open-draft-PR / draft-PR-pass. |
+| blocking open questions | None for local implementation gates. Draft PR #150 still needs push and PR review before draft-PR-pass can be restored. |
 
 状态约定：
 
@@ -202,7 +202,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
-| WU-CM-12-FIX-R1 | open | WU-CM-12 current fix | User review rejected remaining over-designed legality guards on EventLog-derived LLM-facing input material. Fix scope: compact input DTO field-length guards must not reject accepted EventLog material; `CurrentInputAnchorVNext.text` and `EvidenceReadableItemVNext.response_text` limits / default evidence chunking / `_ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT` must be removed, relaxed, or replaced by design-approved selection / floor / budget / provenance / fail-closed semantics. Current input, prior conversation material, and accepted tool evidence read from EventLog are legal LLM input material by default; Host may not mark them illegal only because a private DTO field cap is exceeded. |
 | WU-CM-12-S4-R1 | deferred-with-owner | WU-CM-13 Reactive compact recovery follow-up | S4/S5 accepted proactive tier 1-3 compact recovery before dispatch fallback only. S5 adjudication concluded reactive tier 1-3 recovery would require separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Current WU does not add schema/API/EventLog/Engine role changes and defers reactive recovery to WU-CM-13, which must not enter implementation until a user or GitHub Issue assigns it as active owner. |
 
 ## 当前 Work Units
@@ -237,7 +236,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
-| WU-CM-12 | implementation | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open but not accepted as pass. User review reopened the WU for `WU-CM-12-FIX-R1`: remove over-designed EventLog-derived LLM input material legality guards and private retrieval-count limit before final closeout can be restored. |
+| WU-CM-12 | ready-to-open-draft-PR | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open but not accepted as pass. User review reopened the WU for `WU-CM-12-FIX-R1`; local fix is complete through aggregate deepreview accepted commit `a729ab18`. Next gate is push existing branch to update PR #150, then run PR review before restoring draft-PR-pass. |
 | WU-CM-13 | deferred | Reactive compact recovery tier 1-3 follow-up | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Deferred destination only. WU-CM-12 implements proactive tier 1-3 recovery; reactive recovery requires separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
@@ -1572,6 +1571,13 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - WU-CM-12-FIX-R1 Slice 3 adjudication: `docs/reviews/code-review-wu-cm-12-fix-r1-s3-adjudication-20260618.md`
 - WU-CM-12-FIX-R1 Slice 3 validation commands: combined Host memory/compact/run-input suite PASS (`240 passed`); repository pyright PASS (`0 errors`); old private guard symbols absent from `dayu` and `tests`; `git diff --check` PASS.
 - accepted WU-CM-12-FIX-R1 Slice 3 commit: `cc30b304`
+- WU-CM-12-FIX-R1 aggregate deepreview: `docs/reviews/code-review-20260618-193713.md`; `docs/reviews/code-review-20260618-195224.md`
+- WU-CM-12-FIX-R1 aggregate accepted findings: DS low finding `_provenance_from_evidence_blocks` dead `evidence_blocks` parameter accepted and fixed; MiMo low finding stale chunking test name accepted and fixed. No blocking correctness findings remained.
+- WU-CM-12-FIX-R1 aggregate fix: `docs/reviews/wu-cm-12-fix-r1-aggregate-fix-codex-20260618.md`
+- WU-CM-12-FIX-R1 aggregate focused re-review: `docs/reviews/code-review-20260618-195017.md`; `docs/reviews/code-review-20260618-195038.md`
+- WU-CM-12-FIX-R1 aggregate fix validation: `pytest tests/host/test_compact_material.py tests/host/test_compaction_operation.py -q` PASS (`90 passed`); `pyright dayu/host/compact_material.py tests/host/test_compaction_operation.py` PASS (`0 errors`); full `pyright dayu/ tests/ utils/` PASS (`0 errors`); `git diff --check` PASS.
+- accepted WU-CM-12-FIX-R1 aggregate deepreview commit: `a729ab18`
+- WU-CM-12-FIX-R1 local gate conclusion: implementation, slice reviews, aggregate deepreview fix and focused re-review are complete. `WU-CM-12-FIX-R1` is closed locally; next gate is push existing branch to update draft PR #150, then run PR review before draft-PR-pass / final closeout.
 
 ### Design source / phaseflow 启动裁决
 
