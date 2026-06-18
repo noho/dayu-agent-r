@@ -25,6 +25,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
+    write_projection_failure,
 )
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -655,6 +656,52 @@ def test_runner_advances_covered_cursor_without_apply_when_no_matching_rows(
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == latest.event_sequence
         assert checkpoint.checkpoint_event_id == latest.event_id
+
+
+def test_runner_clears_failure_when_covered_cursor_advances_without_match(
+    tmp_path: Path,
+) -> None:
+    """无匹配 row 的 covered cursor 推进也会清除旧 failure row。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        latest = _append_event(
+            store.transaction_runner,
+            event_id="event-1",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_B",
+            marker="unmatched",
+        )
+
+        def write_failure(transaction: HostTransaction) -> None:
+            """写入测试用旧 projection failure。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            write_projection_failure(
+                transaction,
+                "consumer",
+                failed_event_sequence=latest.event_sequence,
+                failed_event_id=latest.event_id,
+                error_code="TEST_FAILURE",
+                error_message="previous failure",
+                now="2026-06-18T00:00:00+00:00",
+            )
+
+        store.transaction_runner.run_write(write_failure)
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"), limit=10
+        )
+        failure = store.transaction_runner.run_write(
+            lambda transaction: read_projection_failure(transaction, "consumer")
+        )
+        assert result.events_scanned == 1
+        assert result.events_matched == 0
+        assert result.finished_cursor == latest.event_sequence
+        assert failure is None
 
 
 def test_runner_target_before_next_matching_row_advances_to_target_without_apply(

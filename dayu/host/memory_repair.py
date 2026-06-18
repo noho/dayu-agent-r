@@ -314,7 +314,7 @@ def _log_memory_projection_result(
 def _validate_batch_size(batch_size: int) -> None:
     """校验 repair batch size。
 
-    :param batch_size: 每批最多扫描的 EventLog row 数。
+    :param batch_size: 每次 projection 读取使用的 page size。
     :returns: ``None``。
     :raises HostDurableError: batch size 非正数时抛出。
     """

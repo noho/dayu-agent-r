@@ -480,6 +480,48 @@ def test_read_events_after_matching_filters_mixed_classes_and_covers_latest(
         )
 
 
+def test_read_events_after_matching_limit_covers_last_matching_row(
+    tmp_path: Path,
+) -> None:
+    """matching rows 填满 page 时 covered cursor 停在最后一个匹配 row。"""
+
+    event_filter = EventLogReadFilter(
+        (EventLogReadClassFilter(EventClass.CANONICAL_FACT, ("TYPE_A",)),)
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[tuple[str, ...], int, str]:
+            """追加超过 page 的匹配事件并执行 filtered read。
+
+            :param transaction: Host transaction。
+            :returns: 匹配 event id、covered sequence 与 covered event id。
+            :raises AssertionError: covered cursor 断言失败时抛出。
+            """
+
+            append_event(transaction, _request("event-1", event_type="TYPE_A"))
+            append_event(transaction, _request("event-2", event_type="TYPE_A"))
+            append_event(transaction, _request("event-3", event_type="TYPE_B"))
+            page = read_events_after_matching(
+                transaction,
+                0,
+                event_filter=event_filter,
+                limit=2,
+            )
+            covered_event_id = page.covered_event_id
+            assert covered_event_id is not None
+            return (
+                tuple(row.event_id for row in page.rows),
+                page.covered_event_sequence,
+                covered_event_id,
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            ("event-1", "event-2"),
+            2,
+            "event-2",
+        )
+
+
 def test_filtered_event_log_page_requires_covered_event_id_for_real_cursor(
     tmp_path: Path,
 ) -> None:

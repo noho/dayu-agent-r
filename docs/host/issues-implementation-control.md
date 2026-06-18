@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-CLI-ACTIVITY-01 follow-up accepted plan commit `906c1ffa`; Slice 1 accepted commit `3cb5fcb4`; Slice 2 accepted commit `8d0a06f1`; Slice 3 accepted commit `f67a55b6`; Slice 4 accepted commit `794d3b74`; Slice 5 RunInputBuilder inline repair filter共源化 completed, accepted slice commit next |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-CLI-ACTIVITY-01 follow-up accepted plan commit `906c1ffa`; Slice 1 accepted commit `3cb5fcb4`; Slice 2 accepted commit `8d0a06f1`; Slice 3 accepted commit `f67a55b6`; Slice 4 accepted commit `794d3b74`; Slice 5 accepted commit `49c813a5`; aggregate deepreview and focused re-review PASS; local gate ready for draft PR |
 | active work unit | WU-CLI-ACTIVITY-01 follow-up |
 | default next work unit | WU-OBS-00 |
-| next entry point | Commit WU-CLI-ACTIVITY-01 follow-up Slice 5, then enter aggregate deepreview |
+| next entry point | Open / update draft PR for WU-CLI-ACTIVITY-01 |
 | design source | `docs/host/design.md`; `docs/engine/design.md` |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01; WU-CLI-INTERACTIVE-RESUME-01 did not modify Host / Engine public API or contracts. |
@@ -212,7 +212,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CLI-FINS-OBS-01 | completed | Fins direct CLI live event stream / log / UI print residual | 用户裁决；无 GitHub Issue | Replacement implementation final closeout completed locally; residuals R3/R5 closed by WU-CLI-FINS-DIAG-01; CLI session management follow-up transferred to #145 |
 | WU-CLI-FINS-DIAG-01 | completed | CLI/Fins diagnostic output policy residual closeout | 用户裁决；无 GitHub Issue | Closed WU-CLI-FINS-OBS-01-R3/R5 locally: runtime/CLI diagnostics use stderr, stdout remains UI/result, Fins output no longer redacts paths as secrets, and Fins direct diagnostics include bounded useful summaries. |
 | WU-CLI-SESSION-01 | completed | CLI session management: resume / list / purge and remove `--new-session` | GitHub Issue #145 | Final closeout completed in `docs/reviews/wu-cli-session-01-final-closeout-20260616.md`; draft PR #146 open; Host formally added public `list_sessions`; issue #145 closed on 2026-06-17 after user authorization |
-| WU-CLI-ACTIVITY-01 | implementation | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Original activity stream work completed locally and remains ready for draft PR; follow-up delta EventLog / projection catch-up hardening accepted plan commit `906c1ffa`; Slice 1 accepted commit `3cb5fcb4`; Slice 2 accepted commit `8d0a06f1`; Slice 3 accepted commit `f67a55b6`; Slice 4 accepted commit `794d3b74`; Slice 5 RunInputBuilder inline repair filter共源化 completed, accepted slice commit next. |
+| WU-CLI-ACTIVITY-01 | ready-to-open-draft-PR | Prompt / interactive user-visible activity stream UI | GitHub Issue #144 | Original activity stream work completed locally; follow-up delta EventLog / projection catch-up hardening completed locally with aggregate deepreview PASS and focused re-review PASS; next gate is draft PR. |
 | WU-CLI-INTERACTIVE-RESUME-01 | ready-to-open-draft-PR | prompt / interactive existing-session startup resume semantics | 用户裁决；无 GitHub Issue | Final closeout completed locally: prompt does no startup backfill or unfinished-run wait/replay but records displayed terminal cursor; interactive existing-session entrypoints run watcher-first attach/reconnect before REPL, session-scoped Outbox backfill, idle-tail closure, active / queued barrier, and async CLI cursor store. Implementation review PASS from AgentMiMo / AgentDS; validation: `tests/service -q` 110 passed, affected CLI subset 74 passed, `pyright dayu/ tests/ utils/` 0 errors. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -311,7 +311,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 - accepted follow-up plan: `docs/host/host-issues/wu-cli-activity-01-followup-delta-eventlog-projection-catchup-plan.md`
 - accepted plan commit: `906c1ffa`
-- current slice: Slice 5 RunInputBuilder inline repair filter共源化 completed through review; accepted slice commit next.
+- current slice: follow-up implementation completed locally through aggregate deepreview and focused re-review; next gate is draft PR.
 - Slice 1 scope: clarify Host default durable policy for `content_delta` / `reasoning_delta` / `tool_call_delta`, durable replay non-goal for token-level delta, memory projection catch-up cursor / idle / failure semantics, hot path no-unbounded-sync-catch-up constraint, and `memory_projection_catchup_batch_size` as internal page size.
 - Slice 1 allowed files: `docs/host/design.md`, optional `docs/engine/design.md`, `docs/host/issues-implementation-control.md`, and implementation artifact under `docs/reviews/`.
 - Slice 1 implementation artifact: `docs/reviews/wu-cli-activity-01-followup-slice-1-implementation-codex-20260618.md`
@@ -342,7 +342,12 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - Slice 5 implementation artifact: `docs/reviews/wu-cli-activity-01-followup-slice-5-implementation-codex-20260618.md`.
 - Slice 5 code review: `docs/reviews/mimo-wu-cli-activity-01-followup-slice-5-review-20260618-081119.md`; `docs/reviews/ds-wu-cli-activity-01-followup-slice-5-20260618-080958.md`.
 - Slice 5 validation: `pytest tests/host/test_run_input_builder.py tests/host/test_memory_projection.py` passed with 76 passed; relevant pyright passed with 0 errors; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
-- next entry point: commit Slice 5, then enter aggregate deepreview.
+- Slice 5 accepted commit: `49c813a5`.
+- Aggregate deepreview: `docs/reviews/mimo-aggregate-wu-cli-activity-01-followup-20260618-081816.md`; `docs/reviews/ds-aggregate-wu-cli-activity-01-followup-20260618-081532.md`.
+- Aggregate fix: `docs/reviews/wu-cli-activity-01-followup-aggregate-fix-codex-20260618.md`.
+- Aggregate focused re-review: `docs/reviews/mimo-aggregate-rereview-wu-cli-activity-01-followup-20260618.md`; `docs/reviews/ds-aggregate-rereview-wu-cli-activity-01-followup-20260618-082351.md`.
+- Aggregate fix validation: `pytest tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_memory_repair.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q` passed with 120 passed; final follow-up validation `pytest tests/host/test_engine_ingest_mapping.py tests/host/test_event_log_store.py tests/host/test_projection_runner.py tests/host/test_projection_read_model.py tests/host/test_memory_repair.py tests/host/test_open_host_runtime.py tests/host/test_dispatch_scheduler.py tests/host/test_logging.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q` passed with 348 passed; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
+- next entry point: open / update draft PR for WU-CLI-ACTIVITY-01.
 
 ## WU-CLI-INTERACTIVE-RESUME-01 Prompt / Interactive Existing-Session Startup
 
