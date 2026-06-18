@@ -30,6 +30,12 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     PressureMode,
     SmokeArgs,
     SuiteMode,
+    _ASSERT_B_CFO,
+    _LABEL_CORE_B1,
+    _MARKER_CATL_CASHFLOW,
+    _VALUE_CATL_LARGEST_GAP,
+    _VALUE_CATL_NET_PROFIT,
+    _VALUE_CATL_OPERATING_CF,
     _build_byd_long_input,
     _compact_pressure_padding,
     _compact_pressure_reserve_tokens,
@@ -202,6 +208,29 @@ def test_pure_spec_selection_counts_and_long20_final_label(
     assert all_specs[len(core_specs)].expected_tool_calls_after_round == 5
     assert long20_specs[-1].label == "long-l25-constraint-assert"
     assert _select_long_templates(20)[-1].label == "long-l25-constraint-assert"
+
+
+def test_core_b1_tool_round_prompt_does_not_leak_cashflow_answer_values(
+    tmp_path: pathlib.Path,
+) -> None:
+    """core-b1 强制工具轮的 prompt 不泄露工具结果值。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    """
+
+    specs = select_round_specs(_args(tmp_path, suite=SuiteMode.CORE))
+    core_b1 = next(spec for spec in specs if spec.label == _LABEL_CORE_B1)
+
+    assert "get_mock_finance_memory_fact" in core_b1.prompt
+    assert _ASSERT_B_CFO not in core_b1.prompt
+    assert _MARKER_CATL_CASHFLOW not in core_b1.prompt
+    assert _VALUE_CATL_OPERATING_CF not in core_b1.prompt
+    assert _VALUE_CATL_NET_PROFIT not in core_b1.prompt
+    assert _VALUE_CATL_LARGEST_GAP not in core_b1.prompt
+    assert _MARKER_CATL_CASHFLOW in core_b1.hard_answer_contains
+    assert _VALUE_CATL_OPERATING_CF in core_b1.hard_answer_contains
+    assert _VALUE_CATL_LARGEST_GAP in core_b1.hard_answer_contains
 
 
 def test_byd_long_input_is_deterministic_with_expected_anchors() -> None:

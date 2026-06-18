@@ -1395,7 +1395,9 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
                 "请调用 get_mock_finance_memory_fact 查询宁德时代 300750.SZ 2024A "
                 "现金流关键数据，参数 company=宁德时代、ticker=300750.SZ、period=2024A、"
                 "topic=cashflow、metric=catl_cashflow、include_pressure=false。"
-                f"回答末尾输出 {_ASSERT_B_CFO}。"
+                "回答末尾输出断言行：DAYU_MEM_ASSERT_B_CFO "
+                "marker=<工具返回marker> operating_cf=<工具返回经营现金流> "
+                "net_profit=<工具返回净利润> largest_gap=<工具返回最大差异项目>。"
             ),
             tool,
             3,
