@@ -144,10 +144,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-CM-12 accepted plan commit `8186f678` created on current `wu-cm-12-conversation-memory-drift` branch; pre-plan design truth repair completed; code-generation-ready plan produced, plan review initially failed, accepted findings fixed, focused plan re-review PASS; next step is implementation Slice S1 dispatch |
+| implementation status | WU-CM-12 accepted plan commit `8186f678`; implementation Slice S1 accepted in commit `7f71c731`; next step is implementation Slice S2 dispatch |
 | active work unit | WU-CM-12 |
 | default next work unit | WU-CM-12 |
-| next entry point | Dispatch implementation Slice S1 from `docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md` to AgentCodex. |
+| next entry point | Dispatch implementation Slice S2 "Turn-Group Selected Recent Window And Fallback Selection" from `docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md` to AgentCodex. |
 | design source | Current active WU: updated `docs/host/design.md`; `docs/engine/design.md` only if Engine contracts are touched. `docs/host/conversation-memory-material-budget-discussion.md` remains rationale / handoff reference and no longer replaces design truth after completed write-back. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | None. |
@@ -203,6 +203,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 | WU-CLI-ACTIVITY-01-PR-R1 | deferred-with-owner | WU-CM-12 | PR review 发现 `tests/host/test_public_open_host_multiturn_smoke.py::test_deterministic_two_turn_request_contains_prior_final_answer` 与 `tests/host/test_public_tool_wiring_smoke.py::test_mock_tool_result_feeds_same_run_and_later_run_continuity` 在 `main` 分支同样失败；不属于 WU-CLI-ACTIVITY-01 引入，已由 WU-CM-12 Conversation Memory design refinement and implementation drift repair 覆盖。 |
+| WU-CM-12-S1-R1 | deferred-with-owner | WU-CM-12 S3 provenance guard / compact fact rendering review | S1 code review DS-F2 observed that `_facts_from_accepted_event` still drops previously accumulated valid facts when a later fact candidate has empty evidence labels. This predates S1 and changes fact selection semantics if fixed; S1 preserved the existing empty-facts behavior and only fixed diagnostics loss. S3 must decide whether mixed valid/invalid compact facts should invalidate the whole event or skip invalid candidates with provenance-safe diagnostics. |
 
 ## 当前 Work Units
 
@@ -236,7 +237,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
-| WU-CM-12 | planning | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Pre-plan design truth repair completed; next gate is code-generation-ready plan using updated `docs/host/design.md` as design truth, then implementation drift repair against that truth. |
+| WU-CM-12 | implementation | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Pre-plan design truth repair and accepted plan completed; implementation Slice S1 accepted in `7f71c731`; next gate is Slice S2 turn-group selected recent window and fallback selection. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
 
@@ -1510,7 +1511,14 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - plan re-review: `docs/reviews/plan-review-20260618-140854.md`; `docs/reviews/plan-review-20260618-141022.md`
 - plan gate validation: `git diff --check` PASS; plan artifact whitespace check PASS via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md`; WU-CLI-ACTIVITY-01 residual public smokes re-adjudicated PASS (`2 passed`).
 - accepted plan commit: `8186f678`
-- next gate after commit: dispatch AgentCodex for implementation Slice S1. Plan must explicitly account for residual implementation drift including DTO private caps, selector / renderer material id 同源性, fallback tier implementation, protected floor by `host_run_id` turn group, and WU-CLI-ACTIVITY-01 residual smoke re-adjudication under current code evidence.
+- Slice S1 implementation: `docs/reviews/wu-cm-12-s1-implementation-codex-20260618.md`
+- Slice S1 code review: `docs/reviews/code-review-20260618-142551.md`; `docs/reviews/code-review-20260618-143243.md`
+- Slice S1 code review adjudication: `docs/reviews/code-review-wu-cm-12-s1-adjudication-20260618-143543.md`
+- Slice S1 fix: `docs/reviews/wu-cm-12-s1-fix-codex-20260618.md`
+- Slice S1 focused re-review: `docs/reviews/code-review-20260618-143944.md`; `docs/reviews/code-review-20260618-144008.md`
+- Slice S1 validation: `pytest tests/host/test_compact_material.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py -q` PASS (`118 passed`); `pyright dayu/ tests/ utils/` PASS (`0 errors`); `git diff --check` PASS.
+- accepted Slice S1 commit: `7f71c731`
+- next gate after commit: dispatch AgentCodex for implementation Slice S2 "Turn-Group Selected Recent Window And Fallback Selection". S2 must implement `host_run_id` turn-group protected floor and fallback selected window caps without nullable silent removal of eligible raw turn blocks.
 
 ### Design source / phaseflow 启动裁决
 
