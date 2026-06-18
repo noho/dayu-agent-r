@@ -1624,3 +1624,48 @@ rendered_context =
 - `protected_recent_floor_policy` 以 `host_run_id` 为 turn group 保护最近 N 个 Host admitted user Run；floor 超预算时进入 tier 5，而不是静默截断或打散 turn group。
 - final closeout 必须输出一份代码常量审计清单：列出代码中仍出现、且没有在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 中定义的 LLM-facing memory material / compact material 产量相关常量；对每个常量说明状态为“已删除 / 已迁入 policy / 保留但非 LLM-facing / 保留为 parser safety guard / deferred-with-owner”，并说明理由。
 - 受影响 Host memory / compact / RunInput / fallback tests 和相关 smoke 已更新并通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+
+## WU-CM-13 Reactive Compact Recovery Tier 1-3 Follow-up
+
+### 状态
+
+Deferred destination only。当前不创建 GitHub Issue，不是默认 next entry point，不进入 implementation。它只承接 `WU-CM-12-S4-R1`：`WU-CM-12` S4/S5 已接受 proactive pre-dispatch compact recovery tier 1-3；reactive compact recovery 需要另一条 Engine ingest recovery sequencing，因此从 `WU-CM-12` 当前实现范围中显式拆出。
+
+当前 active WU 仍是 `WU-CM-12`，当前 open 修复项仍是 `WU-CM-12-FIX-R1`。`WU-CM-13` 不得阻塞 `WU-CM-12-FIX-R1`，也不得作为继续保留 EventLog-derived material 私有合法性检查、字段级 cap、默认 evidence chunking 或 `_ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT` 的理由。
+
+### 背景与动机
+
+`WU-CM-12` 的 compact recovery 已覆盖 proactive path：dispatch 前发现 normal context 超预算时，可按 tier 1-3 尝试更紧 recent window、section-aware compacted view degrade 或 delta-only compact recovery；接受后再进入 dispatch。该路径的 sequencing、accept barrier 与 `CONTEXT_COMPACTED` commit point 都在 Host pre-dispatch control 内。
+
+Reactive compact recovery 不同：它发生在 Engine ingest / dispatch 已经进入执行后的上下文失败或 provider context pressure 反馈之后。若直接复用 proactive compact recovery，容易混淆 Engine 已执行状态、Host run cancellation、cursor commit、accepted/fallback ordering 与 final response material，因此必须作为独立 WU 重新设计。
+
+### 目标
+
+- 设计并实现 reactive compact recovery tier 1-3 的 Host / Engine ingest sequencing，前提是用户或 GitHub Issue 后续明确把 `WU-CM-13` 设为 active owner。
+- 明确 reactive path 中 compact recovery proposal、LLM compactor 调用、accepted compact commit、fallback dispatch / response ordering 的状态机。
+- 在 reactive compact recovery 的每个 commit 点检查 run-local cancellation token、execution identity、cursor identity 与 Host admitted run identity，避免 stale recovery 写入或覆盖后续 run。
+- 确保 accepted reactive compact output 仍只投影为五类 Session Semantic Memory，不产生新的 durable truth 或旁路 memory shape。
+- 保持 EventLog-derived LLM-facing material 的同一原则：从 EventLog 读取的 current input、prior conversation material、accepted tool evidence 默认是合法 LLM input material；上下文缩小只能通过 deterministic selection、whole-item / whole-section keep-drop、chunking with provenance 或 fail closed 表达。
+
+### 非目标
+
+- 不在当前 `WU-CM-12-FIX-R1` 中实现 reactive compact recovery。
+- 不修改 public API、durable schema、EventLog canonical semantics、Engine provider contract 或跨层 contract，除非 `WU-CM-13` 激活后在 plan gate 获得单独裁决。
+- 不把 reactive compact recovery 用作私有 DTO 字段长度上限、preview 化、summary 化、默认 evidence 条数限制或字段级裁剪的依据。
+- 不引入 semantic search、vector recall、长期 memory retrieval framework 或 User Profile Memory。
+- 不改变 `WU-CM-12` 已接受的 proactive tier 1-3 / dispatch fallback tier 4-5 语义，除非后续设计真源明确修订。
+
+### 激活条件
+
+- 用户或 GitHub Issue 明确指定 `WU-CM-13` 为 active owner；仅有 `WU-CM-12-S4-R1` deferred row 不足以启动实现。
+- `WU-CM-12-FIX-R1` 已关闭，或用户明确要求打断当前 material guard fix 转入 reactive recovery。
+- 启动时重新核对 `docs/host/design.md` 与本总控，确认 reactive recovery 仍符合 Conversation Memory 的 normal / fallback state machine 与 no silent truncation 约束。
+- 若计划触及 Host / Engine public API、durable schema、EventLog canonical semantics 或 provider contract，必须在 plan gate 停下交给用户裁决。
+
+### 验收信号
+
+- `WU-CM-13` plan 明确 reactive compact recovery 与 proactive pre-dispatch compact recovery 的状态机差异、输入输出、accept barrier、fallback ordering 和 commit guard。
+- 测试覆盖 reactive tier 1、tier 2、tier 3 recovery；run cancellation；execution identity mismatch；cursor mismatch；stale recovery proposal；accepted compact commit；reactive fallback dispatch / response ordering。
+- 验证 reactive accepted compact output 仍只生成五类 Session Semantic Memory，并且不把 fallback / diagnostic / Host governance state 投影为业务事实。
+- 受影响 Host / Engine ingest / compact / RunInput tests 通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+- 若引入任何新的 LLM-facing memory material / compact material 产量常量，必须在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 或本 WU 明确批准的 policy owner 中定义；否则 final closeout 的常量审计必须列为 open residual。
