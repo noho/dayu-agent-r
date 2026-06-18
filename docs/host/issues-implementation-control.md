@@ -1555,6 +1555,12 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - WU-CM-12-FIX-R1 focused plan re-review: `docs/reviews/plan-review-20260618-183710.md`; `docs/reviews/plan-review-20260618-183827.md`
 - WU-CM-12-FIX-R1 plan gate validation: `git diff --check` PASS. Review findings accepted and closed: Slice 2 material view mapping clarified; default evidence chunk helper retention ambiguity closed by delete-if-no-production-caller; no-default-chunk test assertions specified; long-session evidence scan performance residual deferred to a future Host material source performance hardening WU, not WU-CM-13.
 - accepted WU-CM-12-FIX-R1 plan commit: `d904445e`
+- WU-CM-12-FIX-R1 Slice 1 implementation: `docs/reviews/wu-cm-12-fix-r1-s1-implementation-codex-20260618.md`
+- WU-CM-12-FIX-R1 Slice 1 code review: `docs/reviews/code-review-20260618-184822.md`; `docs/reviews/code-review-20260618-185121.md`
+- WU-CM-12-FIX-R1 Slice 1 fix: `docs/reviews/wu-cm-12-fix-r1-s1-fix-codex-20260618.md`
+- WU-CM-12-FIX-R1 Slice 1 focused re-review: `docs/reviews/code-review-20260618-185732.md`; `docs/reviews/code-review-20260618-185843.md`
+- WU-CM-12-FIX-R1 Slice 1 validation: `pytest tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py -q` PASS (`127 passed`); `pyright dayu/host/compaction.py dayu/host/compact_material.py tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py` PASS (`0 errors`); `git diff --check` PASS.
+- accepted WU-CM-12-FIX-R1 Slice 1 commit: `21ae992b`
 
 ### Design source / phaseflow 启动裁决
 
