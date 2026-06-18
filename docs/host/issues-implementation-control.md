@@ -1561,6 +1561,11 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - WU-CM-12-FIX-R1 Slice 1 focused re-review: `docs/reviews/code-review-20260618-185732.md`; `docs/reviews/code-review-20260618-185843.md`
 - WU-CM-12-FIX-R1 Slice 1 validation: `pytest tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py -q` PASS (`127 passed`); `pyright dayu/host/compaction.py dayu/host/compact_material.py tests/host/test_compact_material.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py` PASS (`0 errors`); `git diff --check` PASS.
 - accepted WU-CM-12-FIX-R1 Slice 1 commit: `21ae992b`
+- WU-CM-12-FIX-R1 Slice 2 implementation: `docs/reviews/wu-cm-12-fix-r1-s2-implementation-codex-20260618.md`
+- WU-CM-12-FIX-R1 Slice 2 code review: `docs/reviews/code-review-20260618-191048.md`; `docs/reviews/code-review-20260618-191823.md`
+- WU-CM-12-FIX-R1 Slice 2 code review adjudication: `docs/reviews/code-review-wu-cm-12-fix-r1-s2-adjudication-20260618.md`
+- WU-CM-12-FIX-R1 Slice 2 validation: `pytest tests/host/test_run_input_builder.py tests/host/test_compact_material.py -q` PASS (`118 passed`); `pyright dayu/host/run_input.py tests/host/test_run_input_builder.py tests/host/test_compact_material.py` PASS (`0 errors`); old private accepted-evidence limit symbols absent from `dayu` and `tests`; `git diff --check` PASS.
+- accepted WU-CM-12-FIX-R1 Slice 2 commit: `f468654c`
 
 ### Design source / phaseflow 启动裁决
 
