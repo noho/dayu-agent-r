@@ -1033,7 +1033,7 @@ def build_compact_material_pack(
     provenance_entries = (
         *_provenance_from_blocks(previous_blocks),
         *_provenance_from_blocks(trace_blocks),
-        *_provenance_from_evidence_blocks(evidence_blocks, selected_blocks),
+        *_provenance_from_evidence_blocks(selected_blocks),
         *_provenance_from_blocks(answer_blocks),
         _current_anchor_provenance(current_anchor),
     )
@@ -2860,19 +2860,16 @@ def _provenance_from_blocks(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[P
 
 
 def _provenance_from_evidence_blocks(
-    evidence_blocks: tuple[CompactEvidenceBlock, ...],
     selected_blocks: tuple[RunInputMaterialBlock, ...],
 ) -> tuple[PromptLocalProvenanceEntry, ...]:
     """构造 evidence provenance entries。
 
-    :param evidence_blocks: prompt-local evidence blocks。
     :param selected_blocks: selected ordinary material blocks。
     :returns: provenance entries。
     """
 
     source_blocks = tuple(block for block in selected_blocks if block.section is CompactMaterialSection.EVIDENCE_MATERIAL)
     entries: list[PromptLocalProvenanceEntry] = []
-    del evidence_blocks
     for index, source in enumerate(source_blocks, start=_FIRST_ORDINAL):
         if source.accepted_evidence_id is None:
             raise ValueError("RunInputMaterialBlock.accepted_evidence_id is required")

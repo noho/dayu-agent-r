@@ -1629,7 +1629,7 @@ def test_evidence_input_missing_tool_request_atom_emits_limited_signal(
         assert event_id not in query_text
 
 
-def test_evidence_chunks_share_same_durable_query_text(
+def test_evidence_block_shares_durable_query_text_without_chunking(
     tmp_path: Path,
 ) -> None:
     """长 evidence 默认不 chunk，单个 block 使用同一 durable request 的 query_text。"""
