@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-CLI-ACTIVITY-01 final closeout completed on current `wu-cli-activity-01` branch; draft PR #149 open; PR review and focused PR re-review PASS; no blocking findings remain; WU-CM-12 added as the next user-directed work unit for Conversation Memory design refinement and implementation drift repair |
-| active work unit | WU-CLI-ACTIVITY-01 |
+| gate | accepted plan commit |
+| implementation status | WU-CM-12 plan gate completed on current `wu-cm-12-conversation-memory-drift` branch; pre-plan design truth repair completed; code-generation-ready plan produced, plan review initially failed, accepted findings fixed, focused plan re-review PASS; next step is accepted plan local commit, then implementation slice dispatch |
+| active work unit | WU-CM-12 |
 | default next work unit | WU-CM-12 |
-| next entry point | After WU-CLI-ACTIVITY-01 branch handoff / merge or explicit user direction to start the next WU, start WU-CM-12 phaseflow preflight / goal confirmation using `docs/host/conversation-memory-material-budget-discussion.md` as startup design input; first implementation slice must write accepted design semantics back to `docs/host/design.md` before code repair |
-| design source | Current active WU: `docs/host/design.md`; `docs/engine/design.md`. WU-CM-12 startup: `docs/host/conversation-memory-material-budget-discussion.md` as refinement design input; implementation / review after design write-back: `docs/host/design.md`; cross-check `docs/engine/design.md` if Engine contracts are touched |
+| next entry point | Create accepted plan local commit for WU-CM-12, then dispatch implementation Slice S1 from `docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md` to AgentCodex. |
+| design source | Current active WU: updated `docs/host/design.md`; `docs/engine/design.md` only if Engine contracts are touched. `docs/host/conversation-memory-material-budget-discussion.md` remains rationale / handoff reference and no longer replaces design truth after completed write-back. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None. BQ-1 resolved by user裁决: event-related contracts may be changed for WU-CLI-ACTIVITY-01; WU-CLI-INTERACTIVE-RESUME-01 did not modify Host / Engine public API or contracts. |
+| blocking open questions | None. |
 
 状态约定：
 
@@ -236,7 +236,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
-| WU-CM-12 | discussion-ready | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Next phaseflow entry. Startup design input is `docs/host/conversation-memory-material-budget-discussion.md`; first slice must write accepted semantics back to `docs/host/design.md`, then repair implementation drift against updated design truth. |
+| WU-CM-12 | planning | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Pre-plan design truth repair completed; next gate is code-generation-ready plan using updated `docs/host/design.md` as design truth, then implementation drift repair against that truth. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
 
@@ -1495,6 +1495,23 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 
 本条是用户裁决纳入本文档留痕的 immediate residual work unit，不创建 GitHub Issue。目标是把 `docs/host/conversation-memory-material-budget-discussion.md` 中已经裁决清楚的 Conversation Memory material / assemble / compact / fallback / five semantic memories 语义写回 Host 设计真源，并据此修复当前实现漂移。
 
+2026-06-18 pre-plan design truth repair 已完成：`docs/host/design.md` 已写入 expanded `assemble(...)`、五类 Session Semantic Memory 映射、`post_compact_delta_material` / `current_input_anchor` / selected recent window / protected floor 边界、tier 0-5 fallback 状态机、no silent truncation / preview / summary 化约束、`memory_projection_policy` owner 边界、section-aware degrade 禁止动作与 fail closed 条件。两路 review 与 focused re-review 均 PASS；后续 plan / implementation / review 必须以更新后的 `docs/host/design.md` 为设计真源。
+
+### Current gate artifacts
+
+- design write-back: `docs/reviews/wu-cm-12-design-writeback-codex-20260618.md`
+- design write-back review: `docs/reviews/wu-cm-12-design-writeback-review-mimo-20260618.md`; `docs/reviews/wu-cm-12-design-writeback-review-ds-20260618.md`
+- accepted design write-back fix: `docs/reviews/wu-cm-12-design-writeback-fix-codex-20260618.md`
+- focused re-review: `docs/reviews/wu-cm-12-design-writeback-rereview-mimo-20260618.md`; `docs/reviews/wu-cm-12-design-writeback-rereview-ds-20260618.md`
+- design write-back validation: `git diff --check` PASS; targeted `rg` checks for tier 0-5, expanded `assemble(...)`, no silent truncation, `host_run_id` turn group, policy owner, section-aware degrade restrictions, and fallback fail closed conditions PASS.
+- plan: `docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md`
+- plan review: `docs/reviews/plan-review-20260618-135627.md`; `docs/reviews/plan-review-20260618-135902.md`
+- plan review adjudication: `docs/reviews/plan-review-wu-cm-12-adjudication-20260618-140218.md`
+- plan re-review: `docs/reviews/plan-review-20260618-140854.md`; `docs/reviews/plan-review-20260618-141022.md`
+- plan gate validation: `git diff --check` PASS; plan artifact whitespace check PASS via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md`; WU-CLI-ACTIVITY-01 residual public smokes re-adjudicated PASS (`2 passed`).
+- accepted plan commit: pending local commit.
+- next gate after commit: dispatch AgentCodex for implementation Slice S1. Plan must explicitly account for residual implementation drift including DTO private caps, selector / renderer material id 同源性, fallback tier implementation, protected floor by `host_run_id` turn group, and WU-CLI-ACTIVITY-01 residual smoke re-adjudication under current code evidence.
+
 ### Design source / phaseflow 启动裁决
 
 下一轮启动 `$phaseflow` 时，推荐入口为：
@@ -1503,9 +1520,9 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 $phaseflow design_doc=docs/host/conversation-memory-material-budget-discussion.md control_doc=docs/host/issues-implementation-control.md
 ```
 
-原因：当前 `docs/host/design.md` 是最终 Host 架构真源，但尚未包含本轮讨论中对 normal path、five fallback tiers、展开版 `assemble(...)`、compact / dispatch fallback 输入输出、accepted compact 五类 memory 输出，以及 no silent truncation / cap ownership 的细化。若下一轮直接以旧 `docs/host/design.md` 作为唯一 `design_doc`，implementation Agent 容易看不出哪些语义已经被细化、哪些当前代码属于实现漂移。
+原因：本 WU 启动时 `docs/host/design.md` 尚未包含本轮讨论中对 normal path、five fallback tiers、展开版 `assemble(...)`、compact / dispatch fallback 输入输出、accepted compact 五类 memory 输出，以及 no silent truncation / cap ownership 的细化，因此先以讨论稿作为 phaseflow 启动设计输入完成 design truth repair。
 
-本 WU 的第一交付 slice 必须把讨论稿中的 accepted design semantics 写回 `docs/host/design.md`。该 design write-back 完成并通过 review 后，后续 implementation / review / finding adjudication 必须以更新后的 `docs/host/design.md` 为设计真源；讨论稿只保留为 rationale / handoff reference，不再替代设计真源。
+本 WU 的 pre-plan design truth repair 已完成并通过两路 review / focused re-review。后续 plan、implementation、review 与 finding adjudication 必须以更新后的 `docs/host/design.md` 为设计真源；讨论稿只保留为 rationale / handoff reference，不再替代设计真源。
 
 如果 plan 需要修改 Host / Engine public API、durable schema、EventLog canonical semantics、Engine provider contract 或跨层 contracts，必须在 plan gate 停下来交给用户裁决；不得在 implementation 中顺手修改。
 
