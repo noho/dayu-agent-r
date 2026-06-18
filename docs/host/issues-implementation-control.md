@@ -1566,6 +1566,12 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - WU-CM-12-FIX-R1 Slice 2 code review adjudication: `docs/reviews/code-review-wu-cm-12-fix-r1-s2-adjudication-20260618.md`
 - WU-CM-12-FIX-R1 Slice 2 validation: `pytest tests/host/test_run_input_builder.py tests/host/test_compact_material.py -q` PASS (`118 passed`); `pyright dayu/host/run_input.py tests/host/test_run_input_builder.py tests/host/test_compact_material.py` PASS (`0 errors`); old private accepted-evidence limit symbols absent from `dayu` and `tests`; `git diff --check` PASS.
 - accepted WU-CM-12-FIX-R1 Slice 2 commit: `f468654c`
+- WU-CM-12-FIX-R1 Slice 3 validation: `docs/reviews/wu-cm-12-fix-r1-s3-validation-codex-20260618.md`
+- WU-CM-12-FIX-R1 Slice 3 code review: `docs/reviews/code-review-20260618-192722.md`; `docs/reviews/code-review-20260618-192801.md`
+- WU-CM-12-FIX-R1 Slice 3 focused re-review: `docs/reviews/code-review-20260618-193123.md`; `docs/reviews/code-review-20260618-193135.md`
+- WU-CM-12-FIX-R1 Slice 3 adjudication: `docs/reviews/code-review-wu-cm-12-fix-r1-s3-adjudication-20260618.md`
+- WU-CM-12-FIX-R1 Slice 3 validation commands: combined Host memory/compact/run-input suite PASS (`240 passed`); repository pyright PASS (`0 errors`); old private guard symbols absent from `dayu` and `tests`; `git diff --check` PASS.
+- accepted WU-CM-12-FIX-R1 Slice 3 commit: `cc30b304`
 
 ### Design source / phaseflow 启动裁决
 
