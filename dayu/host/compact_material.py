@@ -86,9 +86,6 @@ _INITIAL_REASON_TRACE = "initial_trace_material"
 _INITIAL_REASON_EVIDENCE = "initial_evidence_material"
 _INITIAL_REASON_PREVIOUS = "initial_previous_compacted_view"
 _INITIAL_REASON_ANSWER = "initial_answer_material"
-EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS = 4096
-"""单个 evidence block 直接暴露给 LLM 前的确定性 chunk 字符上限。"""
-
 _NO_EVENT_SEQUENCE = 0
 _DEFAULT_EVENT_SUB_INDEX = 0
 _REASON_SELECTED = "selected"
@@ -703,17 +700,6 @@ class InitialEvidenceMaterial:
     source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class _EvidenceChunk:
-    """Evidence material 的确定性 chunk 描述。"""
-
-    label: PromptLocalMaterialLabel
-    parent_label: PromptLocalMaterialLabel | None
-    chunk_ordinal: int | None
-    text: str
-    content_digest: str
-
-
 def material_label(section: CompactMaterialSection, ordinal: int) -> PromptLocalMaterialLabel:
     """构造普通 prompt-local material label。
 
@@ -729,22 +715,6 @@ def material_label(section: CompactMaterialSection, ordinal: int) -> PromptLocal
     if ordinal < _FIRST_ORDINAL:
         raise ValueError("ordinal must be positive")
     return f"{_SECTION_PREFIXES[section]}{ordinal}"
-
-
-def evidence_chunk_label(evidence_ordinal: int, chunk_ordinal: int) -> PromptLocalMaterialLabel:
-    """构造 evidence chunk prompt-local label。
-
-    :param evidence_ordinal: evidence block ordinal。
-    :param chunk_ordinal: chunk ordinal。
-    :returns: prompt-local chunk label。
-    :raises ValueError: ordinal 非法时抛出。
-    """
-
-    if evidence_ordinal < _FIRST_ORDINAL:
-        raise ValueError("evidence_ordinal must be positive")
-    if chunk_ordinal < _FIRST_ORDINAL:
-        raise ValueError("chunk_ordinal must be positive")
-    return f"{_EVIDENCE_PREFIX}{evidence_ordinal}" f"{_LABEL_CHUNK_SEPARATOR}{chunk_ordinal}"
 
 
 def current_input_anchor_label() -> PromptLocalMaterialLabel:
@@ -1346,19 +1316,19 @@ def _evidence_blocks(materials: tuple[InitialEvidenceMaterial, ...]) -> tuple[Co
 
     blocks: list[CompactEvidenceBlock] = []
     for index, material in enumerate(materials, start=_FIRST_ORDINAL):
-        for chunk in _evidence_chunks(index, material.raw_result_text):
-            blocks.append(
-                CompactEvidenceBlock(
-                    evidence_label=chunk.label,
-                    readable_tool_name=material.readable_tool_name,
-                    readable_query_text=material.readable_query_text,
-                    raw_result_text=chunk.text,
-                    readable_source_text=material.readable_source_text,
-                    size_units=len(chunk.text),
-                    canonical_source_refs=(material.canonical_source_ref,),
-                    content_digest=chunk.content_digest,
-                )
+        _require_non_empty_text(material.raw_result_text, "raw_result_text")
+        blocks.append(
+            CompactEvidenceBlock(
+                evidence_label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                readable_tool_name=material.readable_tool_name,
+                readable_query_text=material.readable_query_text,
+                raw_result_text=material.raw_result_text,
+                readable_source_text=material.readable_source_text,
+                size_units=len(material.raw_result_text),
+                canonical_source_refs=(material.canonical_source_ref,),
+                content_digest=_text_digest(material.raw_result_text),
             )
+        )
     return tuple(blocks)
 
 
@@ -1426,25 +1396,23 @@ def _evidence_provenance(
 
     entries: list[PromptLocalProvenanceEntry] = []
     for index, material in enumerate(materials, start=_FIRST_ORDINAL):
-        for chunk in _evidence_chunks(index, material.raw_result_text):
-            entries.append(
-                PromptLocalProvenanceEntry(
-                    label=chunk.label,
-                    section=CompactMaterialSection.EVIDENCE_MATERIAL,
-                    kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-                    canonical_source_refs=(material.canonical_source_ref,),
-                    source_event_refs=(material.tool_result_event_ref,),
-                    content_digest=chunk.content_digest,
-                    accepted_evidence_id=material.accepted_evidence_id,
-                    tool_result_event_ref=material.tool_result_event_ref,
-                    tool_call_event_ref=material.tool_call_event_ref,
-                    payload_refs=material.payload_refs,
-                    artifact_refs=material.artifact_refs,
-                    source_locator_refs=material.source_locator_refs,
-                    chunk_parent_label=chunk.parent_label,
-                    chunk_ordinal=chunk.chunk_ordinal,
-                )
+        _require_non_empty_text(material.raw_result_text, "raw_result_text")
+        entries.append(
+            PromptLocalProvenanceEntry(
+                label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                section=CompactMaterialSection.EVIDENCE_MATERIAL,
+                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+                canonical_source_refs=(material.canonical_source_ref,),
+                source_event_refs=(material.tool_result_event_ref,),
+                content_digest=_text_digest(material.raw_result_text),
+                accepted_evidence_id=material.accepted_evidence_id,
+                tool_result_event_ref=material.tool_result_event_ref,
+                tool_call_event_ref=material.tool_call_event_ref,
+                payload_refs=material.payload_refs,
+                artifact_refs=material.artifact_refs,
+                source_locator_refs=material.source_locator_refs,
             )
+        )
     return tuple(entries)
 
 
@@ -2849,19 +2817,19 @@ def _pack_evidence_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[Co
             raise ValueError("RunInputMaterialBlock.readable_query_text is required")
         if block.readable_source_text is None:
             raise ValueError("RunInputMaterialBlock.readable_source_text is required")
-        for chunk in _evidence_chunks(index, block.text):
-            result.append(
-                CompactEvidenceBlock(
-                    evidence_label=chunk.label,
-                    readable_tool_name=block.readable_tool_name,
-                    readable_query_text=block.readable_query_text,
-                    raw_result_text=chunk.text,
-                    readable_source_text=block.readable_source_text,
-                    size_units=len(chunk.text),
-                    canonical_source_refs=block.canonical_source_refs,
-                    content_digest=chunk.content_digest,
-                )
+        _require_non_empty_text(block.text, "evidence_text")
+        result.append(
+            CompactEvidenceBlock(
+                evidence_label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                readable_tool_name=block.readable_tool_name,
+                readable_query_text=block.readable_query_text,
+                raw_result_text=block.text,
+                readable_source_text=block.readable_source_text,
+                size_units=len(block.text),
+                canonical_source_refs=block.canonical_source_refs,
+                content_digest=block.content_digest,
             )
+        )
     return tuple(result)
 
 
@@ -2912,71 +2880,24 @@ def _provenance_from_evidence_blocks(
             raise ValueError("RunInputMaterialBlock.tool_result_event_ref is required")
         if source.tool_call_event_ref is None:
             raise ValueError("RunInputMaterialBlock.tool_call_event_ref is required")
-        for chunk in _evidence_chunks(index, source.text):
-            entries.append(
-                PromptLocalProvenanceEntry(
-                    label=chunk.label,
-                    section=CompactMaterialSection.EVIDENCE_MATERIAL,
-                    kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-                    canonical_source_refs=source.canonical_source_refs,
-                    source_event_refs=(source.tool_result_event_ref,),
-                    content_digest=chunk.content_digest,
-                    accepted_evidence_id=source.accepted_evidence_id,
-                    tool_result_event_ref=source.tool_result_event_ref,
-                    tool_call_event_ref=source.tool_call_event_ref,
-                    payload_refs=source.payload_refs,
-                    artifact_refs=source.artifact_refs,
-                    source_locator_refs=source.source_locator_refs,
-                    chunk_parent_label=chunk.parent_label,
-                    chunk_ordinal=chunk.chunk_ordinal,
-                )
+        _require_non_empty_text(source.text, "evidence_text")
+        entries.append(
+            PromptLocalProvenanceEntry(
+                label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                section=CompactMaterialSection.EVIDENCE_MATERIAL,
+                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+                canonical_source_refs=source.canonical_source_refs,
+                source_event_refs=(source.tool_result_event_ref,),
+                content_digest=source.content_digest,
+                accepted_evidence_id=source.accepted_evidence_id,
+                tool_result_event_ref=source.tool_result_event_ref,
+                tool_call_event_ref=source.tool_call_event_ref,
+                payload_refs=source.payload_refs,
+                artifact_refs=source.artifact_refs,
+                source_locator_refs=source.source_locator_refs,
             )
+        )
     return tuple(entries)
-
-
-def _evidence_chunks(evidence_ordinal: int, text: str) -> tuple[_EvidenceChunk, ...]:
-    """把单个 evidence text 拆成确定性 prompt-local chunks。
-
-    :param evidence_ordinal: evidence section 内 ordinal。
-    :param text: digest-checked raw evidence text。
-    :returns: evidence chunk tuple；未超限时返回单个非 chunk label。
-    :raises ValueError: text 为空或 ordinal 非法时抛出。
-    """
-
-    _require_non_empty_text(text, "evidence_text")
-    if evidence_ordinal < _FIRST_ORDINAL:
-        raise ValueError("evidence_ordinal must be positive")
-    if len(text) <= EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS:
-        return (
-            _EvidenceChunk(
-                label=material_label(
-                    CompactMaterialSection.EVIDENCE_MATERIAL,
-                    evidence_ordinal,
-                ),
-                parent_label=None,
-                chunk_ordinal=None,
-                text=text,
-                content_digest=_text_digest(text),
-            ),
-        )
-    chunks: list[_EvidenceChunk] = []
-    parent_label = material_label(CompactMaterialSection.EVIDENCE_MATERIAL, evidence_ordinal)
-    start = 0
-    chunk_ordinal = _FIRST_ORDINAL
-    while start < len(text):
-        chunk_text = text[start : start + EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS]
-        chunks.append(
-            _EvidenceChunk(
-                label=evidence_chunk_label(evidence_ordinal, chunk_ordinal),
-                parent_label=parent_label,
-                chunk_ordinal=chunk_ordinal,
-                text=chunk_text,
-                content_digest=_text_digest(chunk_text),
-            )
-        )
-        start += EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS
-        chunk_ordinal += 1
-    return tuple(chunks)
 
 
 def _raise_on_duplicate_section_owner(entries: tuple[PromptLocalProvenanceEntry, ...]) -> None:
@@ -3630,7 +3551,6 @@ def _require_non_empty_text(value: str | None, field_name: str) -> None:
 
 
 __all__ = [
-    "EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS",
     "CompactMaterialBuildError",
     "CompactMaterialSourceBoundary",
     "CompactMemorySnapshotRepairRequired",
@@ -3648,7 +3568,6 @@ __all__ = [
     "check_compact_memory_snapshot_cursor",
     "conversation_compact_input_vnext_from_material_pack",
     "current_input_anchor_label",
-    "evidence_chunk_label",
     "initial_segment_selection",
     "material_label",
     "normalized_material_text",

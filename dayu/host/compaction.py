@@ -662,11 +662,7 @@ class CurrentInputAnchorVNext:
         """
 
         _require_non_empty(self.anchor_label, field_name="CurrentInputAnchorVNext.anchor_label")
-        _require_bounded_non_empty_text(
-            self.text,
-            field_name="CurrentInputAnchorVNext.text",
-            max_chars=CURRENT_INPUT_ANCHOR_VNEXT_TEXT_MAX_CHARS,
-        )
+        _require_non_empty(self.text, field_name="CurrentInputAnchorVNext.text")
 
     def to_json(self) -> JsonValue:
         """转换为 JSON object。
@@ -675,10 +671,6 @@ class CurrentInputAnchorVNext:
         """
 
         return {"anchor_label": self.anchor_label, "text": self.text}
-
-
-CURRENT_INPUT_ANCHOR_VNEXT_TEXT_MAX_CHARS = 1200
-"""vNext current input anchor 可读文本字符数上限。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1053,11 +1045,7 @@ class EvidenceReadableItemVNext:
         _require_non_empty(self.source_label, field_name="EvidenceReadableItemVNext.source_label")
         _require_non_empty(self.tool_name, field_name="EvidenceReadableItemVNext.tool_name")
         _require_optional_non_empty(self.query_text, field_name="EvidenceReadableItemVNext.query_text")
-        _require_bounded_non_empty_text(
-            self.response_text,
-            field_name="EvidenceReadableItemVNext.response_text",
-            max_chars=EVIDENCE_BLOCK_CHUNK_VNEXT_TEXT_MAX_CHARS,
-        )
+        _require_non_empty(self.response_text, field_name="EvidenceReadableItemVNext.response_text")
         _require_optional_non_empty(self.source_note, field_name="EvidenceReadableItemVNext.source_note")
 
     def to_json(self) -> JsonValue:
@@ -1073,10 +1061,6 @@ class EvidenceReadableItemVNext:
             "response_text": self.response_text,
             "source_note": self.source_note,
         }
-
-
-EVIDENCE_BLOCK_CHUNK_VNEXT_TEXT_MAX_CHARS = 4096
-"""vNext evidence readable response text 字符数上限。"""
 
 
 @dataclass(frozen=True, slots=True)

@@ -1632,18 +1632,18 @@ def test_evidence_input_missing_tool_request_atom_emits_limited_signal(
 def test_evidence_chunks_share_same_durable_query_text(
     tmp_path: Path,
 ) -> None:
-    """同一 durable request 被 chunk 后各 evidence chunk 复用同一 query_text。"""
+    """长 evidence 默认不 chunk，单个 block 使用同一 durable request 的 query_text。"""
 
-    session_id = "session-selected-query-chunk"
-    event_id = "event-tool-result-query-chunk"
-    tool_call_event_id = "event-tool-call-query-chunk"
+    session_id = "session-selected-query-no-chunk"
+    event_id = "event-tool-result-query-no-chunk"
+    tool_call_event_id = "event-tool-call-query-no-chunk"
     tool_arguments: dict[str, JsonValue] = {"ticker": "MSFT", "chapter": "MD&A"}
     arguments_digest = _accepted_arguments_digest(tool_arguments)
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
 
         def append_rows(transaction: HostTransaction) -> None:
-            """写入会被 chunk 的 selected evidence。
+            """写入长 selected evidence。
 
             :param transaction: Host transaction。
             :returns: ``None``。
@@ -1689,7 +1689,7 @@ def test_evidence_chunks_share_same_durable_query_text(
         store.transaction_runner.run_write(append_rows)
 
         def read_query_texts(transaction: HostTransaction) -> tuple[tuple[str, str], ...]:
-            """读取 chunk labels 与 query_text。
+            """读取 evidence label 与 query_text。
 
             :param transaction: Host transaction。
             :returns: ``(label, query_text)`` tuple。
@@ -1701,13 +1701,13 @@ def test_evidence_chunks_share_same_durable_query_text(
                 session_id=session_id,
                 selected_evidence_block_refs=(
                     SelectedEvidenceBlockRef(
-                        block_id="selected-evidence-chunk",
+                        block_id="selected-evidence-no-chunk",
                         tool_result_event_ref=event_id,
                     ),
                 ),
             )
             pack = build_initial_material_pack(
-                current_input_ref="input-query-chunk",
+                current_input_ref="input-query-no-chunk",
                 current_input_text="current user text",
                 history_materials=(),
                 evidence_materials=inputs.evidence_materials,
@@ -1718,11 +1718,10 @@ def test_evidence_chunks_share_same_durable_query_text(
             )
 
         query_texts = store.transaction_runner.run_read(read_query_texts)
-        assert tuple(label for label, _query_text in query_texts) == (
-            "E1.1",
-            "E1.2",
-            "E1.3",
-        )
+        labels = tuple(label for label, _query_text in query_texts)
+        assert labels == ("E1",)
+        assert not {"E1.1", "E1.2", "E1.3"}.intersection(labels)
+        assert all("." not in label for label in labels)
         assert len({query_text for _label, query_text in query_texts}) == 1
         assert query_texts[0][1] == '工具参数: {"arguments":{"chapter":"MD&A","ticker":"MSFT"}}'
 

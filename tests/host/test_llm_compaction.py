@@ -145,8 +145,9 @@ def test_llm_context_compactor_requires_scene_prompt_template() -> None:
 def test_llm_context_compactor_prepares_same_source_runner_input() -> None:
     """prepared proposal input 与真实 Engine request messages 同源。"""
 
+    compaction_request = _request_with_long_input_material()
     prepared = _llm_compactor().prepare_compactor_proposal_run_input(
-        _request(),
+        compaction_request,
         StubCancellationToken(),
         compaction_operation_id="event-context-compact-requested-test",
         compaction_attempt_number=2,
@@ -158,7 +159,7 @@ def test_llm_context_compactor_prepares_same_source_runner_input() -> None:
     assert prepared.message_count == len(request.messages) == 2
     assert prepared.role_sequence_digest == runner_role_sequence_digest(roles)
     assert roles == ("system", "user")
-    assert prepared.compaction_request_digest == _request().digest()
+    assert prepared.compaction_request_digest == compaction_request.digest()
     assert prepared.compactor_input_projection_digest == llm_compaction_module.sha256_digest_json(
         prepared.compactor_input_projection
     )
@@ -169,6 +170,21 @@ def test_llm_context_compactor_prepares_same_source_runner_input() -> None:
     )
     assert _TEST_SYSTEM_PROMPT not in projection_text
     assert _TEST_USER_PROMPT_TEMPLATE not in projection_text
+    user_prompt = request.messages[1].content
+    assert isinstance(user_prompt, str)
+    material_json = _material_json_from_compactor_prompt(user_prompt)
+    current_anchor = _required_mapping(
+        material_json["current_input_anchor"],
+        field_name="current_input_anchor",
+    )
+    evidence_items = _required_list(
+        material_json["evidence_material"],
+        field_name="evidence_material",
+    )
+    evidence_item = _required_mapping(evidence_items[0], field_name="evidence_item")
+    assert current_anchor["text"] == "current " + ("input " * 300)
+    assert evidence_item["source_label"] == "E1"
+    assert evidence_item["response_text"] == "evidence " + ("detail " * 700)
 
 
 def test_parse_conversation_compact_output_vnext_accepts_design_schema() -> None:
@@ -873,6 +889,19 @@ def _required_mapping(value: JsonValue, *, field_name: str) -> Mapping[str, Json
     return value
 
 
+def _required_list(value: JsonValue, *, field_name: str) -> list[JsonValue]:
+    """校验并返回 JSON array。
+
+    :param value: 待校验 JSON value。
+    :param field_name: 错误定位字段名。
+    :returns: JSON array。
+    :raises AssertionError: value 不是 JSON array 时抛出。
+    """
+
+    assert _is_json_list(value), field_name
+    return value
+
+
 def _is_json_mapping(value: JsonValue) -> TypeGuard[Mapping[str, JsonValue]]:
     """判断 JSON value 是否为 JSON object。
 
@@ -881,6 +910,16 @@ def _is_json_mapping(value: JsonValue) -> TypeGuard[Mapping[str, JsonValue]]:
     """
 
     return isinstance(value, Mapping)
+
+
+def _is_json_list(value: JsonValue) -> TypeGuard[list[JsonValue]]:
+    """判断 JSON value 是否为 JSON array。
+
+    :param value: 待判断 JSON value。
+    :returns: ``value`` 是 JSON array 时返回 ``True``，否则返回 ``False``。
+    """
+
+    return isinstance(value, list)
 
 
 def _prompt_schema_pipe_values(field_name: str) -> tuple[str, ...]:
@@ -968,6 +1007,65 @@ def _request() -> CompactionRequest:
         evidence_backed_fact_refs=(),
         recent_raw_turn_refs=("event-current",),
         older_raw_turn_refs=("event-user-old", "event-answer-old"),
+        existing_episode_summary_refs=(),
+        budget_before_compact=BudgetEstimate(
+            estimated_input_tokens=900,
+            input_budget_tokens=4096,
+            soft_threshold_tokens=3200,
+            hard_threshold_tokens=3900,
+            safety_margin_tokens=200,
+            estimator_digest="estimate-digest",
+            overage_reason=None,
+        ),
+    )
+
+
+def _request_with_long_input_material() -> CompactionRequest:
+    """构造包含长 current input 与长 evidence 的 compaction request。
+
+    :returns: compaction request。
+    """
+
+    material_pack = build_initial_material_pack(
+        current_input_ref="event-current-long",
+        current_input_text="current " + ("input " * 300),
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-user-old",
+                text="上一轮用户问题",
+                kind=CompactMaterialBlockKind.USER_INPUT,
+            ),
+        ),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-long",
+                accepted_evidence_id="evidence:accepted-long",
+                tool_result_event_ref="event-tool-result-long",
+                tool_call_event_ref="event-tool-call-long",
+                readable_tool_name="fins.search",
+                readable_query_text="cash flow",
+                raw_result_text="evidence " + ("detail " * 700),
+                readable_source_text="2025 年年报现金流量表",
+                payload_refs=("payload:evidence-long",),
+            ),
+        ),
+    )
+    return CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        session_id="session-llm",
+        run_id="run-llm",
+        attempt_id=None,
+        execution_id=None,
+        memory_snapshot_cursor=None,
+        material_pack=material_pack,
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=3,
+            material_pack=material_pack,
+        ),
+        evidence_backed_fact_refs=(),
+        recent_raw_turn_refs=("event-current-long",),
+        older_raw_turn_refs=("event-user-old",),
         existing_episode_summary_refs=(),
         budget_before_compact=BudgetEstimate(
             estimated_input_tokens=900,

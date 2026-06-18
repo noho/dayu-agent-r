@@ -16,7 +16,6 @@ from dayu.host.compact_material import (
     CompactMaterialPack,
     CompactMemorySnapshotRepairRequired,
     DuplicateMaterialSectionOwnerError,
-    EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     InlineDeltaRepairMaterialView,
@@ -108,6 +107,7 @@ _SESSION_ID = "session-compact-material"
 _POLICY_DIGEST = "policy-digest-compact-material"
 _NOW = "2026-05-24T00:00:00.000000Z"
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_LONG_EVIDENCE_TEXT_CHAR_COUNT = 5000
 _CURRENT_VNEXT_MATERIAL_KEYS = (
     "previous_compacted_view",
     "trace_material",
@@ -856,6 +856,7 @@ def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer
 def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -> None:
     """vNext material 映射必须把 accepted evidence 放入 evidence_material。"""
 
+    long_evidence_text = "accepted evidence text " * 250
     pack = build_initial_material_pack(
         current_input_ref="event-current",
         current_input_text="current input",
@@ -868,7 +869,7 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
                 tool_call_event_ref="event-tool-call",
                 readable_tool_name="fins.search",
                 readable_query_text="revenue query",
-                raw_result_text="accepted evidence text",
+                raw_result_text=long_evidence_text,
                 readable_source_text="source note",
                 payload_refs=("payload:accepted",),
             ),
@@ -878,12 +879,18 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
     assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    assert pack.evidence_labels == ("E1",)
+    assert tuple(block.raw_result_text for block in pack.evidence_material) == (
+        long_evidence_text,
+    )
     assert tuple(item.response_text for item in vnext_input.evidence_material) == (
-        "accepted evidence text",
+        long_evidence_text,
     )
     assert tuple(item.tool_name for item in vnext_input.evidence_material) == (
         "fins.search",
     )
+    assert "E1.1" not in vnext_input.citable_source_labels
+    assert "E1.2" not in vnext_input.citable_source_labels
 
 
 def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> None:
@@ -1133,15 +1140,18 @@ def test_evidence_labels_are_prompt_local_and_map_to_canonical_evidence() -> Non
     )
 
 
-def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
-    """单个超大 evidence block 拆成 E1.1/E1.2 并保留同一 canonical provenance。"""
+def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
+    """单个超大 evidence block 默认不拆分，并保留 canonical provenance。"""
 
-    large_text = "A" * (EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS + 7)
+    large_text = "A" * _LONG_EVIDENCE_TEXT_CHAR_COUNT
+    locator_ref = OpaqueEvidenceRef(ref_kind="locator", ref_id="large", digest=None)
     evidence = _evidence_block(
         "evidence-large",
         event_sequence=3,
         text=large_text,
         payload_refs=("payload:evidence-large",),
+        artifact_refs=("artifact:evidence-large",),
+        source_locator_refs=(locator_ref,),
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.REACTIVE,
@@ -1166,27 +1176,36 @@ def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
         expected=_MaterialPackShape(
             previous_labels=(),
             trace_labels=(),
-            evidence_labels=("E1.1", "E1.2"),
+            evidence_labels=("E1",),
             answer_labels=(),
             current_anchor_label="C1",
-            citable_source_labels=("E1.1", "E1.2"),
+            citable_source_labels=("E1",),
         ),
     )
-    assert pack.evidence_labels == ("E1.1", "E1.2")
-    assert tuple(block.raw_result_text for block in pack.evidence_material) == (
-        "A" * EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
-        "A" * 7,
+    assert pack.evidence_labels == ("E1",)
+    assert tuple(block.raw_result_text for block in pack.evidence_material) == (large_text,)
+    assert tuple(block.content_digest for block in pack.evidence_material) == (
+        sha256_digest_json({"text": large_text}),
     )
-    assert evidence_map["E1.1"].accepted_evidence_id == "evidence:evidence-large"
-    assert evidence_map["E1.2"].accepted_evidence_id == "evidence:evidence-large"
-    assert evidence_map["E1.1"].canonical_source_refs == ("event:evidence-large",)
-    assert evidence_map["E1.2"].canonical_source_refs == ("event:evidence-large",)
-    assert evidence_map["E1.1"].payload_refs == ("payload:evidence-large",)
-    assert evidence_map["E1.2"].payload_refs == ("payload:evidence-large",)
-    assert evidence_map["E1.1"].chunk_parent_label == "E1"
-    assert evidence_map["E1.2"].chunk_parent_label == "E1"
-    assert evidence_map["E1.1"].chunk_ordinal == 1
-    assert evidence_map["E1.2"].chunk_ordinal == 2
+    assert "E1.1" not in evidence_map
+    assert "E1.2" not in evidence_map
+    assert evidence_map["E1"].accepted_evidence_id == "evidence:evidence-large"
+    assert evidence_map["E1"].tool_result_event_ref == "tool-result:evidence-large"
+    assert evidence_map["E1"].tool_call_event_ref == "tool-call:evidence-large"
+    assert evidence_map["E1"].canonical_source_refs == ("event:evidence-large",)
+    assert evidence_map["E1"].content_digest == sha256_digest_json({"text": large_text})
+    assert evidence_map["E1"].payload_refs == ("payload:evidence-large",)
+    assert evidence_map["E1"].artifact_refs == ("artifact:evidence-large",)
+    assert evidence_map["E1"].source_locator_refs == (locator_ref,)
+    assert evidence_map["E1"].chunk_parent_label is None
+    assert evidence_map["E1"].chunk_ordinal is None
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    assert tuple(item.response_text for item in vnext_input.evidence_material) == (
+        large_text,
+    )
+    assert "E1.1" not in vnext_input.citable_source_labels
+    assert "E1.2" not in vnext_input.citable_source_labels
 
 
 def test_current_input_anchor_keeps_whole_text_without_private_cap() -> None:
@@ -1211,6 +1230,8 @@ def test_current_input_anchor_keeps_whole_text_without_private_cap() -> None:
     expected = " ".join(long_current_input.split())
     assert pack.current_input_anchor.anchor_text == expected
     assert pack.current_input_anchor.truncated is False
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    assert vnext_input.current_input_anchor.text == expected
 
 
 def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp_path: Path) -> None:
