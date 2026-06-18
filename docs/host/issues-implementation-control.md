@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted plan commit |
-| implementation status | WU-CM-12 plan gate completed on current `wu-cm-12-conversation-memory-drift` branch; pre-plan design truth repair completed; code-generation-ready plan produced, plan review initially failed, accepted findings fixed, focused plan re-review PASS; next step is accepted plan local commit, then implementation slice dispatch |
+| gate | implementation |
+| implementation status | WU-CM-12 accepted plan commit `8186f678` created on current `wu-cm-12-conversation-memory-drift` branch; pre-plan design truth repair completed; code-generation-ready plan produced, plan review initially failed, accepted findings fixed, focused plan re-review PASS; next step is implementation Slice S1 dispatch |
 | active work unit | WU-CM-12 |
 | default next work unit | WU-CM-12 |
-| next entry point | Create accepted plan local commit for WU-CM-12, then dispatch implementation Slice S1 from `docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md` to AgentCodex. |
+| next entry point | Dispatch implementation Slice S1 from `docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md` to AgentCodex. |
 | design source | Current active WU: updated `docs/host/design.md`; `docs/engine/design.md` only if Engine contracts are touched. `docs/host/conversation-memory-material-budget-discussion.md` remains rationale / handoff reference and no longer replaces design truth after completed write-back. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
 | blocking open questions | None. |
@@ -1509,7 +1509,7 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - plan review adjudication: `docs/reviews/plan-review-wu-cm-12-adjudication-20260618-140218.md`
 - plan re-review: `docs/reviews/plan-review-20260618-140854.md`; `docs/reviews/plan-review-20260618-141022.md`
 - plan gate validation: `git diff --check` PASS; plan artifact whitespace check PASS via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cm-12-conversation-memory-drift-plan.md`; WU-CLI-ACTIVITY-01 residual public smokes re-adjudicated PASS (`2 passed`).
-- accepted plan commit: pending local commit.
+- accepted plan commit: `8186f678`
 - next gate after commit: dispatch AgentCodex for implementation Slice S1. Plan must explicitly account for residual implementation drift including DTO private caps, selector / renderer material id 同源性, fallback tier implementation, protected floor by `host_run_id` turn group, and WU-CLI-ACTIVITY-01 residual smoke re-adjudication under current code evidence.
 
 ### Design source / phaseflow 启动裁决
