@@ -1,10 +1,10 @@
 """Host assistant final-answer continuity 文本解析器。
 
 本模块解析 ``RUN_SUCCEEDED`` 的 assistant final-answer continuity 文本。解析顺序为：
-先读取 inline ``final_answer``，缺失或空白时再通过 terminal summary descriptor
-读取并校验 artifact ``content``。artifact ``content`` 只是成功终态 continuity 的
-fallback，不是通用 terminal summary、失败诊断、取消原因、lost 诊断、episode
-summary 或 evidence-backed fact 来源。
+先读取 inline ``final_answer``，缺失或空白时再通过 terminal artifact descriptor
+读取并校验顶层 ``content``。artifact ``content`` 只是成功终态 continuity 的
+fallback，不是失败诊断、取消原因、lost 诊断、compact session_summary、
+answer anchor 或 evidence-backed fact 来源。
 
 consumer 边界固定如下：compaction material 使用本 strict continuity resolver 并允许
 digest-checked artifact fallback；Conversation Memory selected recent window 直接消费
@@ -22,10 +22,10 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.payload_resolution import sqlite_payload_object
-from dayu.host.terminal_summary_payload import (
+from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
-    terminal_summary_content_text_from_payload,
+    terminal_payload_content_text_from_payload,
 )
 
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
@@ -42,9 +42,9 @@ def assistant_final_answer_continuity_text(
 
     读取顺序固定为 ``RUN_SUCCEEDED.final_answer``，再按
     ``terminal_summary_ref`` / ``terminal_summary_digest`` 读取并校验 terminal
-    summary artifact，只接受 artifact payload 的 ``content``。裸
+    artifact payload，只接受 artifact payload 的顶层 ``content``。裸
     ``RUN_SUCCEEDED.content``、``summary_text`` 或 nested ``summary`` 均不是
-    assistant final-answer 来源。terminal summary artifact ``content`` 只在
+    assistant final-answer 来源。terminal artifact ``content`` 只在
     ``RUN_SUCCEEDED`` continuity 路径中作为 fallback；失败、取消和 lost 终态的
     diagnostic 文本不能通过本 resolver 变成 assistant final answer。本 resolver
     不截断过长文本。
@@ -54,7 +54,7 @@ def assistant_final_answer_continuity_text(
     :param text_policy: 文本字段读取策略。
     :returns: final answer continuity 文本；缺失时返回 ``None``。
     :raises HostDurableError: strict 策略下允许字段类型非法，或 terminal
-        summary descriptor 损坏时抛出。
+        artifact descriptor 损坏时抛出。
     """
 
     final_answer = assistant_final_answer_text_from_run_payload(
@@ -63,22 +63,22 @@ def assistant_final_answer_continuity_text(
     )
     if final_answer is not None:
         return final_answer
-    terminal_summary_ref = _optional_descriptor_text(
+    terminal_payload_ref = _optional_descriptor_text(
         run_payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF
     )
-    terminal_summary_digest = _optional_descriptor_text(
+    terminal_payload_digest = _optional_descriptor_text(
         run_payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST
     )
-    if terminal_summary_ref is None or terminal_summary_digest is None:
+    if terminal_payload_ref is None or terminal_payload_digest is None:
         return None
-    terminal_summary = sqlite_payload_object(
+    terminal_payload = sqlite_payload_object(
         transaction,
-        payload_ref=terminal_summary_ref,
-        payload_digest=terminal_summary_digest,
-        payload_label="terminal summary",
+        payload_ref=terminal_payload_ref,
+        payload_digest=terminal_payload_digest,
+        payload_label="terminal payload",
     )
-    return terminal_summary_content_text_from_payload(
-        terminal_summary,
+    return terminal_payload_content_text_from_payload(
+        terminal_payload,
         text_policy=text_policy,
     )
 
@@ -86,7 +86,7 @@ def assistant_final_answer_continuity_text(
 def _optional_descriptor_text(
     payload: Mapping[str, JsonValue], *, field_name: str
 ) -> str | None:
-    """读取可选 terminal summary descriptor 文本字段。
+    """读取可选 terminal artifact descriptor 文本字段。
 
     descriptor 只是 artifact 引用标签和 digest 校验材料，不是业务事实或 assistant
     final-answer 文本。字段缺失或空白代表没有可用 fallback descriptor。

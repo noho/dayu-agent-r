@@ -1,10 +1,10 @@
-"""Host assistant final-answer continuity 文本源选择 helper。
+"""Host terminal payload 文本源选择 helper。
 
 本模块只负责从已经允许作为 assistant final answer continuity 的 payload
-字段中读取非空文本，不负责截断、预算控制或展示格式化。terminal summary
-artifact 的 ``content`` 只是在 ``RUN_SUCCEEDED`` continuity 路径中，由上层
-descriptor 校验后使用的 fallback 文本源；它不是通用 terminal summary、
-episode summary 或 evidence-backed fact 来源。
+字段中读取非空文本，不负责截断、预算控制或展示格式化。terminal payload
+artifact 的顶层 ``content`` 只是在 ``RUN_SUCCEEDED`` continuity 路径中，
+由上层 descriptor 校验后使用的 fallback 文本源；它不是 compact
+session_summary、answer anchor 或 evidence-backed fact 来源。
 """
 
 from __future__ import annotations
@@ -50,17 +50,17 @@ def assistant_final_answer_text_from_run_payload(
     )
 
 
-def terminal_summary_content_text_from_payload(
+def terminal_payload_content_text_from_payload(
     payload: Mapping[str, JsonValue], *, text_policy: PayloadTextReadPolicy
 ) -> str | None:
-    """从 terminal summary artifact payload 读取 continuity fallback ``content``。
+    """从 terminal payload artifact 读取 continuity fallback ``content``。
 
     该 ``content`` 只供 ``RUN_SUCCEEDED`` 的 assistant final-answer continuity
-    fallback 使用，前提是调用方已经通过 terminal summary descriptor 完成 artifact
+    fallback 使用，前提是调用方已经通过 terminal payload descriptor 完成 artifact
     定位与 digest 校验。它不是失败、取消或 lost 终态的 assistant final answer，
-    也不会被本 helper 升级为 evidence-backed fact。本 helper 不执行过长文本截断。
+    也不会被本 helper 升级为 compact fact。本 helper 不执行过长文本截断。
 
-    :param payload: terminal summary artifact payload。
+    :param payload: terminal payload artifact。
     :param text_policy: 文本字段读取策略。
     :returns: 非空 ``content``；缺失或空白时返回 ``None``。
     :raises HostDurableError: strict 策略下 ``content`` 类型非法时抛出。
@@ -104,5 +104,5 @@ def _text_field(
 __all__ = [
     "PayloadTextReadPolicy",
     "assistant_final_answer_text_from_run_payload",
-    "terminal_summary_content_text_from_payload",
+    "terminal_payload_content_text_from_payload",
 ]

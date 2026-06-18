@@ -423,7 +423,7 @@ class _TerminalPlan:
     attempt_status: AttemptStatus
     run_status: RunStatus
     reason: str
-    terminal_summary: Mapping[str, JsonValue]
+    terminal_payload: Mapping[str, JsonValue]
     finish_reason: str | None
     filtered: bool | None
     degraded: bool | None
@@ -1100,11 +1100,11 @@ class EngineEventIngestor:
                 promotion_triggered=False,
                 reason=plan.reason,
             )
-        descriptor = self._write_terminal_summary(
+        descriptor = self._write_terminal_payload(
             transaction,
             candidate=candidate,
             event_id=attempt_event_id,
-            summary=plan.terminal_summary,
+            payload=plan.terminal_payload,
         )
         result = terminal_closeout_in_transaction(
             transaction,
@@ -3018,39 +3018,42 @@ class EngineEventIngestor:
             stop_worker_stream=stop_worker_stream,
         )
 
-    def _write_terminal_summary(
+    def _write_terminal_payload(
         self,
         transaction: HostTransaction,
         *,
         candidate: EngineEventCandidate,
         event_id: str,
-        summary: Mapping[str, JsonValue],
+        payload: Mapping[str, JsonValue],
     ) -> PayloadDescriptor:
-        """写入 terminal summary payload descriptor。
+        """写入 terminal payload descriptor。
 
         :param transaction: 当前 Host transaction。
         :param candidate: 触发 terminal 的 candidate。
         :param event_id: terminal attempt event id。
-        :param summary: terminal summary JSON。
+        :param payload: terminal payload JSON。
         :returns: payload descriptor。
         """
 
+        payload_json: dict[str, JsonValue] = dict(payload)
+        payload_json.update(
+            {
+                "attempt_id": candidate.envelope.attempt_id,
+                "execution_id": candidate.envelope.execution_id,
+                "worker_event_index": candidate.worker_event_index,
+            }
+        )
         return self._payload_store.write_sqlite_payload(
             transaction,
             SQLitePayloadWriteRequest(
                 payload_ref=f"{_PAYLOAD_REF_PREFIX}-{event_id}",
                 payload_id=f"{_PAYLOAD_ID_PREFIX}-{event_id}",
                 payload_format=SQLitePayloadFormat.CANONICAL_JSON,
-                payload_json={
-                    "attempt_id": candidate.envelope.attempt_id,
-                    "execution_id": candidate.envelope.execution_id,
-                    "worker_event_index": candidate.worker_event_index,
-                    "summary": summary,
-                },
+                payload_json=payload_json,
                 payload_bytes=None,
                 media_type="application/json",
                 metadata={
-                    "kind": "engine_terminal_summary",
+                    "kind": "engine_terminal_payload",
                     "engine_event_type": candidate.engine_event.type.value,
                 },
                 expected_digest=None,
@@ -4420,7 +4423,7 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
         attempt_status=AttemptStatus.SUCCEEDED,
         run_status=RunStatus.SUCCEEDED,
         reason=_REASON_FINAL_ANSWER,
-        terminal_summary={
+        terminal_payload={
             "content": data.content,
             "finish_reason": data.finish_reason.value,
             "filtered": data.filtered,
@@ -4459,7 +4462,7 @@ def _run_failed_plan(data: RunFailedData) -> _TerminalPlan:
         attempt_status=AttemptStatus.FAILED,
         run_status=RunStatus.FAILED,
         reason=reason,
-        terminal_summary={
+        terminal_payload={
             "error_code": data.error_code,
             "message": data.message,
             "provider_request_id": data.provider_request_id,
@@ -4561,7 +4564,7 @@ def _lost_lifecycle_plan(
         attempt_status=AttemptStatus.LOST,
         run_status=RunStatus.LOST,
         reason=_REASON_WORKER_LOST_BEFORE_TERMINAL,
-        terminal_summary={
+        terminal_payload={
             "reason": _REASON_WORKER_LOST_BEFORE_TERMINAL,
             "worker_lifecycle_signal": worker_lifecycle_signal,
             "stream_error_code": stream_error_code,
@@ -4610,7 +4613,7 @@ def _failed_plan(
         attempt_status=AttemptStatus.FAILED,
         run_status=RunStatus.FAILED,
         reason=reason,
-        terminal_summary={
+        terminal_payload={
             "error_code": error_code,
             "message": message,
             "provider_request_id": provider_request_id,
@@ -4649,7 +4652,7 @@ def _replace_lifecycle_index(
         attempt_status=plan.attempt_status,
         run_status=plan.run_status,
         reason=plan.reason,
-        terminal_summary=plan.terminal_summary,
+        terminal_payload=plan.terminal_payload,
         finish_reason=plan.finish_reason,
         filtered=plan.filtered,
         degraded=plan.degraded,

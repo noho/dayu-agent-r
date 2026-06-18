@@ -21,10 +21,10 @@ from dayu.host.durable.payload import (
 )
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
-from dayu.host.terminal_summary_payload import (
+from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
-    terminal_summary_content_text_from_payload,
+    terminal_payload_content_text_from_payload,
 )
 
 _OVERLONG_TEXT = "终态回答" * 4096
@@ -86,11 +86,11 @@ def test_run_payload_summary_fields_are_not_final_answer_sources() -> None:
     )
 
 
-def test_terminal_summary_payload_content_is_read() -> None:
-    """terminal summary artifact payload 的 content 可作为 final answer continuity。"""
+def test_terminal_payload_content_is_read() -> None:
+    """terminal artifact payload 的顶层 content 可作为 final answer continuity。"""
 
     assert (
-        terminal_summary_content_text_from_payload(
+        terminal_payload_content_text_from_payload(
             {"content": "artifact final answer"},
             text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
@@ -98,11 +98,11 @@ def test_terminal_summary_payload_content_is_read() -> None:
     )
 
 
-def test_blank_terminal_summary_content_is_missing() -> None:
-    """terminal summary artifact payload 空白 content 按缺失处理。"""
+def test_blank_terminal_payload_content_is_missing() -> None:
+    """terminal artifact payload 空白 content 按缺失处理。"""
 
     assert (
-        terminal_summary_content_text_from_payload(
+        terminal_payload_content_text_from_payload(
             {"content": "\n\t"},
             text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
@@ -110,16 +110,18 @@ def test_blank_terminal_summary_content_is_missing() -> None:
     )
 
 
-def test_terminal_summary_payload_summary_fields_are_not_content_sources() -> None:
-    """terminal summary artifact 的 summary_text 与 nested summary 均不被读取。"""
+def test_terminal_payload_summary_preview_fields_are_not_content_sources() -> None:
+    """terminal artifact 的 summary、preview 与 nested content 均不被读取。"""
 
     payload: dict[str, JsonValue] = {
         "summary_text": "摘要",
+        "preview": "preview 不应读取",
+        "result_preview": "result preview 不应读取",
         "summary": {"content": "nested content", "summary_text": "nested summary"},
     }
 
     assert (
-        terminal_summary_content_text_from_payload(
+        terminal_payload_content_text_from_payload(
             payload,
             text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
@@ -144,13 +146,13 @@ def test_allowed_non_string_field_strict_raises_and_lenient_returns_none() -> No
         is None
     )
     with pytest.raises(HostDurableError):
-        terminal_summary_content_text_from_payload(
+        terminal_payload_content_text_from_payload(
             {"content": 123},
             text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
 
     assert (
-        terminal_summary_content_text_from_payload(
+        terminal_payload_content_text_from_payload(
             {"content": 123},
             text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
         )
@@ -169,7 +171,7 @@ def test_disallowed_summary_text_type_does_not_trigger_strict_error() -> None:
         is None
     )
     assert (
-        terminal_summary_content_text_from_payload(
+        terminal_payload_content_text_from_payload(
             {"summary_text": 123},
             text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
@@ -192,7 +194,7 @@ def test_overlong_allowed_text_is_preserved_by_source_selection() -> None:
         == _OVERLONG_TEXT
     )
     assert (
-        terminal_summary_content_text_from_payload(
+        terminal_payload_content_text_from_payload(
             {"content": _OVERLONG_TEXT},
             text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
         )
@@ -222,8 +224,8 @@ def test_continuity_resolver_prefers_run_final_answer_over_artifact(
             descriptor = PayloadStore().write_sqlite_payload(
                 transaction,
                 SQLitePayloadWriteRequest(
-                    payload_ref="payload-terminal-summary-preference",
-                    payload_id="sqlite-terminal-summary-preference",
+                    payload_ref="payload-terminal-payload-preference",
+                    payload_id="sqlite-terminal-payload-preference",
                     payload_format=SQLitePayloadFormat.CANONICAL_JSON,
                     payload_json={"content": "artifact fallback answer"},
                 ),
@@ -244,7 +246,7 @@ def test_continuity_resolver_prefers_run_final_answer_over_artifact(
 def test_continuity_resolver_requires_complete_terminal_descriptor(
     tmp_path: Path,
 ) -> None:
-    """terminal summary descriptor 缺任一侧时不读取 fallback。
+    """terminal artifact descriptor 缺任一侧时不读取 fallback。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -265,7 +267,7 @@ def test_continuity_resolver_requires_complete_terminal_descriptor(
                 {
                     "content": "裸 content 不应读取",
                     "summary_text": "summary 不应读取",
-                    "terminal_summary_ref": "payload-terminal-summary-missing",
+                    "terminal_summary_ref": "payload-terminal-payload-missing",
                 },
                 text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
             )
@@ -286,7 +288,7 @@ def test_continuity_resolver_requires_complete_terminal_descriptor(
 def test_continuity_resolver_rejects_malformed_terminal_descriptor(
     tmp_path: Path,
 ) -> None:
-    """terminal summary descriptor 字段类型非法时抛出 durable error。
+    """terminal artifact descriptor 字段类型非法时抛出 durable error。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -319,7 +321,7 @@ def test_continuity_resolver_rejects_malformed_terminal_descriptor(
 def test_continuity_resolver_rejects_malformed_terminal_digest(
     tmp_path: Path,
 ) -> None:
-    """terminal summary digest 字段类型非法时抛出 durable error。
+    """terminal artifact digest 字段类型非法时抛出 durable error。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -339,7 +341,7 @@ def test_continuity_resolver_rejects_malformed_terminal_digest(
             assistant_final_answer_continuity_text(
                 transaction,
                 {
-                    "terminal_summary_ref": "payload-terminal-summary",
+                    "terminal_summary_ref": "payload-terminal-payload",
                     "terminal_summary_digest": 123,
                 },
                 text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
@@ -357,7 +359,7 @@ def test_continuity_resolver_reads_digest_checked_terminal_content(
     with open_host_durable_store(_options(tmp_path)) as store:
 
         def operation(transaction: HostTransaction) -> str | None:
-            """写入 terminal summary artifact 并读取 continuity 文本。
+            """写入 terminal artifact 并读取 continuity 文本。
 
             :param transaction: Host transaction。
             :returns: continuity 文本。
@@ -366,12 +368,14 @@ def test_continuity_resolver_reads_digest_checked_terminal_content(
             descriptor = PayloadStore().write_sqlite_payload(
                 transaction,
                 SQLitePayloadWriteRequest(
-                    payload_ref="payload-terminal-summary",
-                    payload_id="sqlite-terminal-summary",
+                    payload_ref="payload-terminal-payload",
+                    payload_id="sqlite-terminal-payload",
                     payload_format=SQLitePayloadFormat.CANONICAL_JSON,
                     payload_json={
                         "content": "artifact final answer",
                         "summary_text": "artifact summary",
+                        "summary": {"content": "nested summary content must not win"},
+                        "preview": "preview must not win",
                     },
                 ),
             )

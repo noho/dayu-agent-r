@@ -101,11 +101,14 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
+from dayu.host.evidence import accepted_evidence_envelope_from_payload
 from dayu.host.payload_resolution import (
     event_payload_object,
+    event_payload_object_for_result_ref,
 )
 from dayu.host.projection import event_log_read_filter_from_projection_filter
-from dayu.host.terminal_summary_payload import (
+from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
 )
@@ -2988,15 +2991,17 @@ def _memory_projection_event_from_row(
 def _payload_with_assistant_final_answer(
     transaction: HostTransaction, row: EventLogRow
 ) -> Mapping[str, JsonValue]:
-    """必要时把 assistant final answer 合并进 ``RUN_SUCCEEDED`` transient payload。
+    """必要时把 memory projection 需要的 transient payload 补齐。
 
     :param transaction: Host transaction。
     :param row: EventLog row。
     :returns: memory projection 消费的 payload。
-    :raises HostDurableError: terminal summary descriptor 损坏时抛出。
+    :raises HostDurableError: terminal artifact descriptor 或工具 payload 损坏时抛出。
     """
 
     payload = _payload_object(row)
+    if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
+        return _tool_result_memory_payload(transaction, row, payload)
     if row.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
         return payload
     if (
@@ -3017,6 +3022,40 @@ def _payload_with_assistant_final_answer(
     merged: dict[str, JsonValue] = dict(payload)
     merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
     return merged
+
+
+def _tool_result_memory_payload(
+    transaction: HostTransaction,
+    row: EventLogRow,
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """读取 memory inline repair 使用的完整 accepted tool result payload。
+
+    :param transaction: Host transaction。
+    :param row: ``TOOL_RESULT_ACCEPTED`` EventLog row。
+    :param payload: inline hot payload。
+    :returns: digest-checked 工具结果 payload。
+    :raises HostDurableError: envelope 或 payload descriptor 损坏时抛出。
+    """
+
+    try:
+        envelope = accepted_evidence_envelope_from_payload(
+            payload,
+            producer_event_ref=row.event_id,
+        )
+    except ValueError as exc:
+        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
+            raise HostDurableError(str(exc)) from exc
+        raise HostDurableError("canonical evidence envelope is invalid") from exc
+    if envelope is None:
+        return payload
+    return event_payload_object_for_result_ref(
+        transaction,
+        row,
+        expected_payload_ref=envelope.result_ref.payload_ref,
+        expected_payload_digest=envelope.result_ref.payload_digest,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
 
 
 def _latest_compacted_event_before_attempt(

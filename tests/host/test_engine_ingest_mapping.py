@@ -122,6 +122,7 @@ from dayu.host.durable.run_transition import (
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
+from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
@@ -425,6 +426,23 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
         assert payload["finish_reason"] == "stop"
         assert isinstance(payload["terminal_summary_ref"], str)
         assert isinstance(payload["terminal_summary_digest"], str)
+
+        terminal_payload = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=cast(str, payload["terminal_summary_ref"]),
+                payload_digest=cast(str, payload["terminal_summary_digest"]),
+                payload_label="terminal payload",
+            )
+        )
+        assert terminal_payload["content"] == "完成答案"
+        assert terminal_payload["finish_reason"] == "stop"
+        assert terminal_payload["filtered"] is False
+        assert terminal_payload["degraded"] is False
+        assert terminal_payload["attempt_id"] == seeded.attempt_id
+        assert terminal_payload["execution_id"] == seeded.execution_id
+        assert "summary" not in terminal_payload
+        assert "summary_text" not in terminal_payload
 
 
 def test_empty_final_answer_closes_failed_without_run_succeeded(

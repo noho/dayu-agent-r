@@ -11,8 +11,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.codec import is_sha256_digest
+from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
 
+_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _EVIDENCE_ID_PREFIX = "evidence:"
 _FIELD_DIGEST = "digest"
 _FIELD_EVIDENCE_ID = "evidence_id"
@@ -24,6 +25,8 @@ _FIELD_PAYLOAD_REF = "payload_ref"
 _FIELD_PRODUCER_EVENT_REF = "producer_event_ref"
 _FIELD_REF_ID = "ref_id"
 _FIELD_REF_KIND = "ref_kind"
+_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
+_FIELD_RESULT_PREVIEW = "result_preview"
 _FIELD_RESULT_REF = "result_ref"
 _FIELD_SEMANTIC_INPUT_DIGEST = "semantic_input_digest"
 _FIELD_SOURCE_REFS = "source_refs"
@@ -32,6 +35,10 @@ _FIELD_TOOL_CALL_REQUESTED_EVENT_REF = "tool_call_requested_event_ref"
 _FIELD_TOOL_NAME = "tool_name"
 _FIELD_TOOL_QUERY = "tool_query"
 _FIELD_TRUNCATION_APPLIED = "truncation_applied"
+ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH = (
+    "accepted evidence producer_event_ref mismatch"
+)
+"""Accepted evidence envelope producer event ref 与当前事件不一致的错误文本。"""
 _ENVELOPE_FIELDS = frozenset(
     {
         _FIELD_EVIDENCE_ID,
@@ -302,6 +309,52 @@ def accepted_evidence_envelope_from_json_value(
     )
 
 
+def accepted_evidence_envelope_from_payload(
+    payload: Mapping[str, JsonValue],
+    *,
+    producer_event_ref: str,
+) -> AcceptedEvidenceEnvelope | None:
+    """从 ``TOOL_RESULT_ACCEPTED`` payload 读取 accepted evidence envelope。
+
+    :param payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :param producer_event_ref: 当前 producer event id，用于校验 envelope 同源。
+    :returns: envelope；payload 未携带 envelope 时返回 ``None``。
+    :raises ValueError: envelope 结构非法或 producer event ref 不匹配时抛出。
+    """
+
+    _require_non_empty_text(producer_event_ref, "producer_event_ref")
+    envelope_value = payload.get(_FIELD_ACCEPTED_EVIDENCE_ENVELOPE)
+    if envelope_value is None:
+        return None
+    envelope = accepted_evidence_envelope_from_json_value(envelope_value)
+    if envelope.producer_event_ref != producer_event_ref:
+        raise ValueError(ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH)
+    return envelope
+
+
+def accepted_tool_raw_outcome_text_from_payload(
+    payload: Mapping[str, JsonValue],
+) -> str | None:
+    """从 accepted tool result payload 读取原始工具响应文本。
+
+    该 helper 只读取 Host accept barrier 写入的 ``raw_tool_outcome``，并拒绝旧
+    ``result_preview`` 字段。返回值是 canonical JSON 文本，用于 LLM-facing
+    post-compact delta / memory continuity；不得用 event id、payload ref 或 digest
+    代替该文本。
+
+    :param payload: digest-checked ``TOOL_RESULT_ACCEPTED`` payload。
+    :returns: canonical raw tool outcome 文本；缺失时返回 ``None``。
+    :raises ValueError: payload 中存在旧 ``result_preview`` 字段时抛出。
+    """
+
+    if _FIELD_RESULT_PREVIEW in payload:
+        raise ValueError("TOOL_RESULT_ACCEPTED result_preview is not allowed")
+    raw_outcome = payload.get(_FIELD_RAW_TOOL_OUTCOME)
+    if raw_outcome is None:
+        return None
+    return canonical_json_dumps(raw_outcome)
+
+
 def _opaque_evidence_ref_to_json_value(ref: OpaqueEvidenceRef) -> JsonValue:
     """把 opaque evidence ref 编码为 JSON 值。
 
@@ -508,8 +561,11 @@ __all__ = [
     "AcceptedEvidenceEnvelope",
     "AcceptedEvidenceResultRef",
     "AcceptedEvidenceToolQuery",
+    "ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH",
     "OpaqueEvidenceRef",
+    "accepted_evidence_envelope_from_payload",
     "accepted_evidence_envelope_from_json_value",
     "accepted_evidence_envelope_to_json_value",
+    "accepted_tool_raw_outcome_text_from_payload",
     "derive_accepted_evidence_id",
 ]

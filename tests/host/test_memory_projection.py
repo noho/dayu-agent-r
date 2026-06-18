@@ -16,7 +16,7 @@ from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_FAILE
 from dayu.host.durable import memory as durable_memory_module
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.connection import HostDurableStore
-from dayu.host.durable.codec import canonical_json_dumps
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
@@ -48,6 +48,12 @@ from dayu.host.durable.schema import (
     TABLE_HOST_MEMORY_SNAPSHOTS,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    accepted_evidence_envelope_to_json_value,
+)
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
@@ -397,6 +403,41 @@ def test_run_succeeded_payload_refs_do_not_materialize_assistant_window() -> Non
     assert snapshot.trace_memory.selected_recent_window == ()
 
 
+def test_user_input_missing_display_text_does_not_expose_refs() -> None:
+    """USER_INPUT_ACCEPTED 缺 display_text 时不把内部 refs 投给 LLM。
+
+    :returns: ``None``。
+    :raises AssertionError: selected recent user text 泄漏内部治理标识时抛出。
+    """
+
+    policy = _policy()
+    event = _event(1, "event-user-input-ref-only", "USER_INPUT_ACCEPTED", {})
+    event = replace(
+        event,
+        payload_ref="payload-user-input-ref-only",
+        payload_digest=sha256_digest_json({"display_text": "hidden"}),
+    )
+
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(event,),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    selected = snapshot.trace_memory.selected_recent_window
+    assert len(selected) == 1
+    text = selected[0].text
+    assert selected[0].role is SelectedRecentWindowRole.USER
+    assert "event_ref=" not in text
+    assert "payload_ref=" not in text
+    assert "payload_digest=" not in text
+    assert "sha256:" not in text
+    assert "event-user-input-ref-only" not in text
+    assert "payload-user-input-ref-only" not in text
+
+
 def test_durable_projection_hydrates_terminal_content_as_selected_recent_window(
     tmp_path: Path,
 ) -> None:
@@ -510,6 +551,131 @@ def test_memory_direct_consumer_does_not_follow_terminal_descriptor() -> None:
 
     assert snapshot.trace_memory.selected_recent_window == ()
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
+
+
+def test_accepted_tool_evidence_uses_raw_outcome_not_preview_or_refs() -> None:
+    """accepted tool evidence 只把原始工具响应投影给 selected recent window。
+
+    :returns: ``None``。
+    :raises AssertionError: memory 错误读取 preview、event id 或 payload ref 时抛出。
+    """
+
+    policy = _policy()
+    event_id = "event-tool-result-raw-memory"
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id="evidence:tool-result-raw-memory",
+        producer_event_ref=event_id,
+        tool_name="lookup_mock_fact",
+        tool_call_id="tool-call-raw-memory",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref="event-tool-call-raw-memory",
+            normalized_arguments_digest=sha256_digest_json({"query": "DAYU"}),
+            semantic_input_digest=sha256_digest_json("DAYU"),
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref="payload-tool-result-raw-memory",
+            payload_digest=sha256_digest_json(
+                {"status": "ok", "text": "tool fact accepted"}
+            ),
+            outcome_digest=sha256_digest_json(
+                {"status": "ok", "text": "tool fact accepted"}
+            ),
+            truncation_applied=False,
+        ),
+        locator_refs=(),
+        source_refs=(),
+    )
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                event_id,
+                "TOOL_RESULT_ACCEPTED",
+                {
+                    "accepted_evidence_envelope": (
+                        accepted_evidence_envelope_to_json_value(envelope)
+                    ),
+                    "display_text": "preview display must not enter memory",
+                    "content": "preview content must not enter memory",
+                    "raw_tool_outcome": {
+                        "status": "ok",
+                        "text": "tool fact accepted",
+                    },
+                },
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    selected = snapshot.trace_memory.selected_recent_window
+    assert len(selected) == 1
+    text = selected[0].text
+    assert "tool fact accepted" in text
+    assert "preview display" not in text
+    assert "preview content" not in text
+    assert event_id not in text
+    assert "payload-tool-result-raw-memory" not in text
+    assert "sha256:" not in text
+
+
+def test_accepted_tool_evidence_rejects_result_preview() -> None:
+    """accepted tool evidence 出现旧 preview 字段时不生成 memory continuity。
+
+    :returns: ``None``。
+    :raises AssertionError: projection 未拒绝 preview 字段时抛出。
+    """
+
+    policy = _policy()
+    event_id = "event-tool-result-preview-memory"
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id="evidence:tool-result-preview-memory",
+        producer_event_ref=event_id,
+        tool_name="lookup_mock_fact",
+        tool_call_id="tool-call-preview-memory",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref="event-tool-call-preview-memory",
+            normalized_arguments_digest=sha256_digest_json({"query": "DAYU"}),
+            semantic_input_digest=sha256_digest_json("DAYU"),
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=sha256_digest_json(
+                {"status": "ok", "text": "tool fact accepted"}
+            ),
+            truncation_applied=False,
+        ),
+        locator_refs=(),
+        source_refs=(),
+    )
+
+    with pytest.raises(ValueError, match="result_preview"):
+        build_conversation_memory_snapshot_from_events(
+            events=(
+                _event(
+                    1,
+                    event_id,
+                    "TOOL_RESULT_ACCEPTED",
+                    {
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(envelope)
+                        ),
+                        "raw_tool_outcome": {
+                            "status": "ok",
+                            "text": "tool fact accepted",
+                        },
+                        "result_preview": "preview must be rejected",
+                    },
+                ),
+            ),
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at=_NOW,
+        )
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:

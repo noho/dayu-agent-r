@@ -106,7 +106,6 @@ _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_RE
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
-_PAYLOAD_FIELD_SUMMARY = "summary"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_FINISH_REASON = "finish_reason"
 _PAYLOAD_FIELD_FILTERED = "filtered"
@@ -195,7 +194,7 @@ def read_session_host_events_after(
     :param cursor: 已消费的全局 EventLog 序号。
     :returns: 本批 Host-owned typed event 与推进后的 cursor。
     :raises HostApiError: Session 不存在时抛出。
-    :raises HostDurableError: EventLog 或 terminal summary payload 损坏时抛出。
+    :raises HostDurableError: EventLog 或 terminal payload 损坏时抛出。
     """
 
     return host._run_read(
@@ -895,7 +894,7 @@ def _succeeded_host_event(transaction: HostTransaction, row: EventLogRow) -> Hos
     :param transaction: 当前 Host transaction。
     :param row: ``RUN_SUCCEEDED`` EventLog row。
     :returns: 成功终态 HostEvent。
-    :raises HostDurableError: terminal summary payload 缺失或字段非法时抛出。
+    :raises HostDurableError: terminal payload 缺失或字段非法时抛出。
     """
 
     payload = _payload_object(row)
@@ -909,7 +908,7 @@ def _succeeded_host_event(transaction: HostTransaction, row: EventLogRow) -> Hos
         field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST,
         row=row,
     )
-    terminal_summary = _terminal_summary_object(
+    terminal_payload = _terminal_payload_object(
         transaction,
         payload_ref=summary_ref,
         payload_digest=summary_digest,
@@ -917,22 +916,22 @@ def _succeeded_host_event(transaction: HostTransaction, row: EventLogRow) -> Hos
     )
     final_answer = HostFinalAnswerView(
         content=_required_payload_text(
-            terminal_summary,
+            terminal_payload,
             field_name=_PAYLOAD_FIELD_CONTENT,
             row=row,
         ),
         filtered=_required_payload_bool(
-            terminal_summary,
+            terminal_payload,
             field_name=_PAYLOAD_FIELD_FILTERED,
             row=row,
         ),
         degraded=_required_payload_bool(
-            terminal_summary,
+            terminal_payload,
             field_name=_PAYLOAD_FIELD_DEGRADED,
             row=row,
         ),
         finish_reason=_optional_payload_text(
-            terminal_summary,
+            terminal_payload,
             field_name=_PAYLOAD_FIELD_FINISH_REASON,
             row=row,
         ),
@@ -1504,33 +1503,29 @@ def _join_summary_parts(first: str | None, second: str | None) -> str | None:
     return _bounded_summary("；".join(parts))
 
 
-def _terminal_summary_object(
+def _terminal_payload_object(
     transaction: HostTransaction,
     *,
     payload_ref: str,
     payload_digest: str,
     row: EventLogRow,
 ) -> Mapping[str, JsonValue]:
-    """读取 terminal summary descriptor 并返回 summary object。
+    """读取 terminal artifact descriptor 并返回顶层 payload object。
 
     :param transaction: 当前 Host transaction。
-    :param payload_ref: terminal summary payload ref。
-    :param payload_digest: terminal summary payload digest。
+    :param payload_ref: terminal payload ref。
+    :param payload_digest: terminal payload digest。
     :param row: 关联 terminal EventLog row，用于错误上下文。
-    :returns: terminal summary JSON object。
-    :raises HostDurableError: descriptor、digest 或 summary 字段非法时抛出。
+    :returns: terminal payload JSON object。
+    :raises HostDurableError: descriptor、digest 或 payload 字段非法时抛出。
     """
 
-    payload = _sqlite_payload_object(
+    return _sqlite_payload_object(
         transaction,
         payload_ref=payload_ref,
         payload_digest=payload_digest,
         row=row,
     )
-    summary = payload.get(_PAYLOAD_FIELD_SUMMARY)
-    if not isinstance(summary, Mapping):
-        raise HostDurableError("terminal summary payload is missing summary object")
-    return cast(Mapping[str, JsonValue], summary)
 
 
 def _sqlite_payload_object(
@@ -1552,11 +1547,11 @@ def _sqlite_payload_object(
 
     descriptor = read_payload_descriptor(transaction, payload_ref)
     if descriptor is None:
-        raise HostDurableError("terminal summary payload descriptor is missing")
+        raise HostDurableError("terminal payload descriptor is missing")
     if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
-        raise HostDurableError("terminal summary payload must be sqlite payload")
+        raise HostDurableError("terminal payload must be sqlite payload")
     if descriptor.payload_digest != payload_digest:
-        raise HostDurableError("terminal summary payload digest mismatch")
+        raise HostDurableError("terminal payload digest mismatch")
     if descriptor.sqlite_payload_id is None:
         raise HostDurableError("terminal summary sqlite payload id is missing")
     payload_row = transaction.fetchone(
