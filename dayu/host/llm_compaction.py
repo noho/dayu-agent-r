@@ -61,12 +61,6 @@ from dayu.host.compaction import (
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
-    MAX_VNEXT_ANSWER_ANCHOR_ITEMS,
-    MAX_VNEXT_DIAGNOSTIC_ITEMS,
-    MAX_VNEXT_FACT_ITEMS,
-    MAX_VNEXT_FORWARD_INTENT_ITEMS,
-    MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS,
-    MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
     ReferenceContinuityCandidateVNext,
     ReferenceContinuityReasonVNext,
     SessionSummaryCandidateVNext,
@@ -659,7 +653,6 @@ def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[EvidenceB
         proposal,
         _EVIDENCE_BACKED_FACTS_FIELD,
         parent_path="",
-        max_items=MAX_VNEXT_FACT_ITEMS,
     )
     candidates: list[EvidenceBackedFactCandidateVNext] = []
     for index, item in enumerate(values):
@@ -694,7 +687,6 @@ def _answer_anchor_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[
         proposal,
         _ANSWER_ANCHORS_FIELD,
         parent_path="",
-        max_items=MAX_VNEXT_ANSWER_ANCHOR_ITEMS,
     )
     candidates: list[AnswerAnchorCandidateVNext] = []
     for index, item in enumerate(values):
@@ -725,7 +717,6 @@ def _answer_anchor_children_vnext(
         source,
         _ANCHOR_ITEMS_FIELD,
         parent_path=parent_path,
-        max_items=MAX_VNEXT_ANSWER_ANCHOR_ITEMS,
     )
     field_path = _field_path(parent_path, _ANCHOR_ITEMS_FIELD)
     children: list[AnswerAnchorChildVNext] = []
@@ -752,7 +743,6 @@ def _forward_intent_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple
         proposal,
         _FORWARD_INTENTS_FIELD,
         parent_path="",
-        max_items=MAX_VNEXT_FORWARD_INTENT_ITEMS,
     )
     candidates: list[ForwardIntentCandidateVNext] = []
     for index, item in enumerate(values):
@@ -794,7 +784,6 @@ def _reference_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[Refe
         proposal,
         _REFERENCE_CONTINUITY_ITEMS_FIELD,
         parent_path="",
-        max_items=MAX_VNEXT_REFERENCE_CONTINUITY_ITEMS,
     )
     candidates: list[ReferenceContinuityCandidateVNext] = []
     for index, item in enumerate(values):
@@ -828,7 +817,6 @@ def _diagnostics_vnext(proposal: Mapping[str, JsonValue]) -> tuple[CompactCandid
         proposal,
         _DIAGNOSTICS_FIELD,
         parent_path="",
-        max_items=MAX_VNEXT_DIAGNOSTIC_ITEMS,
     )
     diagnostics: list[CompactCandidateDiagnosticVNext] = []
     for index, item in enumerate(values):
@@ -1009,26 +997,21 @@ def _required_array(
     key: str,
     *,
     parent_path: str,
-    max_items: int,
 ) -> tuple[JsonValue, ...]:
     """读取必需 JSON array 字段。
 
     :param source: JSON object。
     :param key: 字段名。
     :param parent_path: ``source`` 对应的父字段路径。
-    :param max_items: 数组元素上限。
     :returns: JSON 值 tuple。
     :raises KeyError: 字段缺失时抛出。
     :raises TypeError: 字段不是 array 时抛出。
-    :raises ValueError: 数组超过上限时抛出。
     """
 
     field_path = _field_path(parent_path, key)
     value = _required_value(source, key, parent_path=parent_path)
     if not isinstance(value, list):
         raise TypeError(f"{field_path} must be array")
-    if len(value) > max_items:
-        raise ValueError(f"{field_path} exceeds maximum item count")
     return tuple(value)
 
 
@@ -1128,7 +1111,6 @@ def _optional_string_tuple(
     :param parent_path: ``source`` 对应的父字段路径。
     :returns: 字符串 tuple；缺省时为空 tuple。
     :raises TypeError: 字段不是字符串数组时抛出。
-    :raises ValueError: 数组超过上限时抛出。
     """
 
     if key not in source:
@@ -1136,7 +1118,6 @@ def _optional_string_tuple(
     return _string_tuple(
         source[key],
         _field_path(parent_path, key),
-        max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
     )
 
 
@@ -1154,32 +1135,26 @@ def _required_string_tuple(
     :returns: 字符串 tuple。
     :raises KeyError: 字段缺失时抛出。
     :raises TypeError: 字段不是字符串数组时抛出。
-    :raises ValueError: 数组超过上限时抛出。
     """
 
     field_path = _field_path(parent_path, key)
     return _string_tuple(
         _required_value(source, key, parent_path=parent_path),
         field_path,
-        max_items=MAX_VNEXT_SOURCE_LABELS_PER_ITEM,
     )
 
 
-def _string_tuple(value: JsonValue, field_path: str, *, max_items: int) -> tuple[str, ...]:
+def _string_tuple(value: JsonValue, field_path: str) -> tuple[str, ...]:
     """校验 JSON 值为字符串数组。
 
     :param value: JSON 值。
     :param field_path: 待校验值的完整字段路径。
-    :param max_items: 字符串数组元素上限。
     :returns: 字符串 tuple。
     :raises TypeError: 值不是字符串数组时抛出。
-    :raises ValueError: 数组超过上限时抛出。
     """
 
     if not isinstance(value, list):
         raise TypeError(f"{field_path} must be array")
-    if len(value) > max_items:
-        raise ValueError(f"{field_path} exceeds maximum item count")
     strings: list[str] = []
     for index, item in enumerate(value):
         if not isinstance(item, str):

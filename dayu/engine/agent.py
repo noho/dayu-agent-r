@@ -2531,6 +2531,21 @@ class _AsyncAgent:
                 decision.filtered,
                 decision.degraded,
             )
+            if decision.filtered:
+                _LOGGER.debug(
+                    "engine.agent.filtered_final_diagnostic session_id=%s "
+                    "run_id=%s iteration_id=%s iteration_index=%s "
+                    "finish_reason=%s degraded=%s content_chars=%s "
+                    "answer_preview=%s",
+                    self._request.session_id,
+                    self._request.run_id,
+                    iteration_id,
+                    iteration_index,
+                    decision.finish_reason.value,
+                    decision.degraded,
+                    len(decision.content),
+                    _safe_log_message(decision.content),
+                )
             return
         if isinstance(decision, _ToolCallsDecision):
             _LOGGER.log(

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -31,13 +34,16 @@ from dayu.host.compact_material import (
     initial_segment_selection,
 )
 from dayu.host.compaction import (
+    CompactMaterialBlock,
     CompactMaterialBlockKind,
+    CompactMaterialSection,
     CompactSegmentTrigger,
     CompactQualityCheckResultVNext,
     CompactQualityIssueVNext,
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
+    PromptLocalProvenanceEntry,
 )
 from dayu.host.compaction_evidence import (
     SelectedEvidenceBlockRef,
@@ -52,6 +58,7 @@ from dayu.host.context_events import build_context_compaction_attempt_rejected_p
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
@@ -568,6 +575,37 @@ class _PreparedManifestCompactor(FakeContextCompactor):
         )
 
 
+class _PreparedCancelledCompactor(_PreparedManifestCompactor):
+    """prepared proposal run 阶段请求取消并抛出 CancelledError。"""
+
+    def __init__(self, events: list[str], token: StubCancellationToken) -> None:
+        """初始化 compactor。
+
+        :param events: 共享顺序记录列表。
+        :param token: 测试用 cancellation token。
+        :returns: ``None``。
+        """
+
+        super().__init__(events)
+        self._token = token
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """模拟 Host cancellation 已生效后的 proposal 取消。
+
+        :param prepared_input: prepared proposal input。
+        :returns: 不会返回。
+        :raises asyncio.CancelledError: 始终抛出。
+        """
+
+        del prepared_input
+        self.events.append("run")
+        self._token.request_cancel("host_cancelled_during_proposal")
+        raise asyncio.CancelledError()
+
+
 def _proposal_agent_request(
     request: CompactionRequest,
     *,
@@ -748,6 +786,39 @@ async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest
     assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
 
 
+@pytest.mark.asyncio
+async def test_run_compaction_operation_cancelled_proposal_keeps_manifest_ref() -> None:
+    """proposal 已写 manifest 后被 Host 取消时仍返回 rejected attempt。"""
+
+    events: list[str] = []
+    token = StubCancellationToken()
+    recorder = _RecordingProposalManifestRecorder(events)
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_PreparedCancelledCompactor(events, token),
+        max_attempts=1,
+        cancellation_token=token,
+        compaction_operation_id="operation-prepared-cancelled",
+        proposal_manifest_recorder=recorder,
+    )
+
+    assert events == ["prepare", "record", "run"]
+    assert result.accepted_candidate is None
+    assert result.failure_reason == "cancellation_requested"
+    assert len(result.rejected_attempts) == 1
+    rejected = result.rejected_attempts[0]
+    assert rejected.failure_category == (
+        compaction_operation.CompactionFailureCategory.CANCELLATION_REQUESTED
+    )
+    assert rejected.repairable is False
+    assert rejected.proposal_manifest_ref == (
+        "runner-call-manifest:operation-prepared-cancelled:1"
+    )
+    assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
+    assert "host_cancelled_during_proposal" in rejected.diagnostic_refs[0]
+
+
 def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> None:
     """accepted compaction 缺 proposal manifest ref/digest 时 fail-closed。"""
 
@@ -898,6 +969,107 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
     assert result.rejected_attempts[1].repairable is False
     assert "proposal failed" in result.rejected_attempts[0].diagnostic_refs[0]
     assert result.failure_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_rejected_attempt_diagnostic_captures_invalid_previous_reference(
+    tmp_path: Path,
+) -> None:
+    """previous_compacted_view parse 失败时生成可持久化 diagnostic artifact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: diagnostic 缺失或 raw material 泄漏到 EventLog payload。
+    """
+
+    raw_text = "reference_continuity=previous_fact text=offending raw continuity"
+    request = _request_with_previous_reference_continuity(raw_text)
+    result = await run_compaction_operation(
+        request=request,
+        compactor=FakeContextCompactor(),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+        compaction_operation_id="operation-invalid-reference",
+    )
+
+    assert result.accepted_candidate is None
+    assert result.failure_reason == "proposal_failed"
+    assert len(result.rejected_attempts) == 1
+    rejected = result.rejected_attempts[0]
+    assert rejected.proposal_manifest_ref is None
+    assert rejected.proposal_manifest_digest is None
+    diagnostic = rejected.diagnostic
+    assert diagnostic is not None
+    assert diagnostic.failure_stage == "previous_compacted_view_parse"
+    assert diagnostic.parser_or_validator == "previous_reference_continuity"
+    assert diagnostic.exception_class == "ValueError"
+    assert diagnostic.exception_message == "previous reference continuity text is invalid"
+    assert diagnostic.offending_block is not None
+    assert diagnostic.offending_block.kind == "reference_continuity"
+    assert diagnostic.offending_block.block_label == "P-REF"
+    assert diagnostic.offending_block.text_length == len(raw_text)
+
+    reference, artifact_json, metadata_json = _write_and_read_rejected_diagnostic(
+        tmp_path,
+        diagnostic=diagnostic,
+        operation_id="operation-invalid-reference",
+        attempt_number=rejected.attempt_number,
+    )
+    payload = dict(
+        build_context_compaction_attempt_rejected_payload(
+            operation_id="operation-invalid-reference",
+            attempt_number=rejected.attempt_number,
+            failure_category=rejected.failure_category.value,
+            repairable=rejected.repairable,
+            runner_attempt_summary_refs=rejected.runner_attempt_summary_refs,
+            diagnostic_refs=rejected.diagnostic_refs,
+            next_policy_decision=rejected.next_policy_decision.value,
+            budget_after_attempted_compact=rejected.budget_after_attempted_compact,
+            proposal_manifest_ref=rejected.proposal_manifest_ref,
+            proposal_manifest_digest=rejected.proposal_manifest_digest,
+            diagnostic_artifact_ref=reference.payload_ref,
+            diagnostic_artifact_digest=reference.payload_digest,
+            failure_stage=diagnostic.failure_stage,
+            diagnostic_suffix=diagnostic.diagnostic_suffix,
+            parser_or_validator=diagnostic.parser_or_validator,
+            exception_class=diagnostic.exception_class,
+            exception_message=diagnostic.exception_message,
+            offending_block_section=diagnostic.offending_block.section,
+            offending_block_kind=diagnostic.offending_block.kind,
+            offending_block_label=diagnostic.offending_block.block_label,
+            offending_block_ordinal=diagnostic.offending_block.block_ordinal,
+            offending_block_text_digest=diagnostic.offending_block.text_digest,
+            offending_block_text_length=diagnostic.offending_block.text_length,
+            material_pack_digest=diagnostic.material_pack_digest,
+        )
+    )
+
+    assert payload["proposal_manifest_ref"] is None
+    assert payload["diagnostic_artifact_ref"] == reference.payload_ref
+    assert payload["diagnostic_artifact_digest"] == reference.payload_digest
+    assert payload["failure_stage"] == "previous_compacted_view_parse"
+    assert payload["offending_block_kind"] == "reference_continuity"
+    assert raw_text not in canonical_json_dumps(payload)
+    assert metadata_json["descriptor_kind"] == (
+        "compaction_rejected_attempt_diagnostic"
+    )
+    assert metadata_json["event_type"] == "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+    assert metadata_json["compaction_operation_id"] == "operation-invalid-reference"
+    assert metadata_json["compaction_attempt_number"] == rejected.attempt_number
+    assert metadata_json["failure_stage"] == "previous_compacted_view_parse"
+    assert metadata_json["parser_or_validator"] == "previous_reference_continuity"
+    assert metadata_json["contains_raw_material"] is True
+    assert metadata_json["confidential"] is True
+    assert artifact_json["proposal_manifest_ref"] is None
+    assert artifact_json["failure_stage"] == "previous_compacted_view_parse"
+    assert artifact_json["parser_or_validator"] == "previous_reference_continuity"
+    offending = artifact_json["offending_block"]
+    assert isinstance(offending, dict)
+    assert offending["raw_text"] == raw_text
+    assert offending["kind"] == "reference_continuity"
+    previous_view = artifact_json["previous_compacted_view"]
+    assert isinstance(previous_view, list)
+    assert previous_view == [request.material_pack.previous_compacted_view[0].to_json()]
 
 
 @pytest.mark.asyncio
@@ -1629,21 +1801,21 @@ def test_evidence_input_missing_tool_request_atom_emits_limited_signal(
         assert event_id not in query_text
 
 
-def test_evidence_chunks_share_same_durable_query_text(
+def test_evidence_block_shares_durable_query_text_without_chunking(
     tmp_path: Path,
 ) -> None:
-    """同一 durable request 被 chunk 后各 evidence chunk 复用同一 query_text。"""
+    """长 evidence 默认不 chunk，单个 block 使用同一 durable request 的 query_text。"""
 
-    session_id = "session-selected-query-chunk"
-    event_id = "event-tool-result-query-chunk"
-    tool_call_event_id = "event-tool-call-query-chunk"
+    session_id = "session-selected-query-no-chunk"
+    event_id = "event-tool-result-query-no-chunk"
+    tool_call_event_id = "event-tool-call-query-no-chunk"
     tool_arguments: dict[str, JsonValue] = {"ticker": "MSFT", "chapter": "MD&A"}
     arguments_digest = _accepted_arguments_digest(tool_arguments)
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
 
         def append_rows(transaction: HostTransaction) -> None:
-            """写入会被 chunk 的 selected evidence。
+            """写入长 selected evidence。
 
             :param transaction: Host transaction。
             :returns: ``None``。
@@ -1689,7 +1861,7 @@ def test_evidence_chunks_share_same_durable_query_text(
         store.transaction_runner.run_write(append_rows)
 
         def read_query_texts(transaction: HostTransaction) -> tuple[tuple[str, str], ...]:
-            """读取 chunk labels 与 query_text。
+            """读取 evidence label 与 query_text。
 
             :param transaction: Host transaction。
             :returns: ``(label, query_text)`` tuple。
@@ -1701,13 +1873,13 @@ def test_evidence_chunks_share_same_durable_query_text(
                 session_id=session_id,
                 selected_evidence_block_refs=(
                     SelectedEvidenceBlockRef(
-                        block_id="selected-evidence-chunk",
+                        block_id="selected-evidence-no-chunk",
                         tool_result_event_ref=event_id,
                     ),
                 ),
             )
             pack = build_initial_material_pack(
-                current_input_ref="input-query-chunk",
+                current_input_ref="input-query-no-chunk",
                 current_input_text="current user text",
                 history_materials=(),
                 evidence_materials=inputs.evidence_materials,
@@ -1718,11 +1890,10 @@ def test_evidence_chunks_share_same_durable_query_text(
             )
 
         query_texts = store.transaction_runner.run_read(read_query_texts)
-        assert tuple(label for label, _query_text in query_texts) == (
-            "E1.1",
-            "E1.2",
-            "E1.3",
-        )
+        labels = tuple(label for label, _query_text in query_texts)
+        assert labels == ("E1",)
+        assert not {"E1.1", "E1.2", "E1.3"}.intersection(labels)
+        assert all("." not in label for label in labels)
         assert len({query_text for _label, query_text in query_texts}) == 1
         assert query_texts[0][1] == '工具参数: {"arguments":{"chapter":"MD&A","ticker":"MSFT"}}'
 
@@ -2335,6 +2506,131 @@ def _request(
             overage_reason=None,
         ),
     )
+
+
+def _request_with_previous_reference_continuity(raw_text: str) -> CompactionRequest:
+    """构造包含坏 reference continuity previous view 的 compaction request。
+
+    :param raw_text: previous compacted view 中的 raw block text。
+    :returns: compaction request。
+    """
+
+    base = _request()
+    content_digest = sha256_digest_json({"text": raw_text})
+    previous_block = CompactMaterialBlock(
+        block_label="P-REF",
+        section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+        kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+        text=raw_text,
+        size_units=len(raw_text),
+        source_labels=(),
+        canonical_source_refs=("event-previous-reference",),
+        content_digest=content_digest,
+    )
+    provenance_map = {
+        **base.material_pack.provenance_map,
+        "P-REF": PromptLocalProvenanceEntry(
+            label="P-REF",
+            section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+            canonical_source_refs=("event-previous-reference",),
+            source_event_refs=("event-previous-reference",),
+            content_digest=content_digest,
+            accepted_evidence_id=None,
+            tool_result_event_ref=None,
+            tool_call_event_ref=None,
+            payload_refs=(),
+            artifact_refs=(),
+            source_locator_refs=(),
+        ),
+    }
+    material_pack = replace(
+        base.material_pack,
+        previous_compacted_view=(previous_block,),
+        provenance_map=provenance_map,
+    )
+    return replace(
+        base,
+        material_pack=material_pack,
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=base.segment_selection.input_cursor,
+            material_pack=material_pack,
+        ),
+    )
+
+
+def _write_and_read_rejected_diagnostic(
+    tmp_path: Path,
+    *,
+    diagnostic: compaction_operation.CompactionRejectedAttemptDiagnostic,
+    operation_id: str,
+    attempt_number: int,
+) -> tuple[
+    compaction_operation.CompactionRejectedAttemptDiagnosticReference,
+    dict[str, JsonValue],
+    dict[str, JsonValue],
+]:
+    """写入并读回 rejected attempt diagnostic artifact 与 descriptor metadata。
+
+    :param tmp_path: pytest 临时目录。
+    :param diagnostic: 内存态 diagnostic。
+    :param operation_id: compaction operation id。
+    :param attempt_number: compaction attempt number。
+    :returns: diagnostic reference、artifact JSON、metadata JSON。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[
+            compaction_operation.CompactionRejectedAttemptDiagnosticReference,
+            str,
+            str,
+        ]:
+            """写入 artifact descriptor 并读回 descriptor JSON 文本。
+
+            :param transaction: Host transaction。
+            :returns: diagnostic reference、artifact relative path、metadata JSON 文本。
+            """
+
+            reference = (
+                compaction_operation.write_compaction_rejected_attempt_diagnostic_artifact(
+                    transaction=transaction,
+                    artifact_store=LocalArtifactStore(
+                        options.payload_policy.artifact_root
+                    ),
+                    payload_store=PayloadStore(),
+                    diagnostic=diagnostic,
+                    compaction_operation_id=operation_id,
+                    compaction_attempt_number=attempt_number,
+                )
+            )
+            descriptor = PayloadStore().read_payload_descriptor(
+                transaction,
+                reference.payload_ref,
+            )
+            assert descriptor is not None
+            assert descriptor.payload_digest == reference.payload_digest
+            assert descriptor.artifact_relative_path == reference.artifact_relative_path
+            return reference, reference.artifact_relative_path, descriptor.metadata_json
+
+        reference, relative_path, metadata_text = store.transaction_runner.run_write(
+            operation
+        )
+
+        artifact_path = options.payload_policy.artifact_root / relative_path
+        artifact_json = cast(
+            dict[str, JsonValue],
+            json.loads(artifact_path.read_text(encoding="utf-8")),
+        )
+        metadata_json = cast(dict[str, JsonValue], json.loads(metadata_text))
+        assert reference.payload_digest == sha256_digest_json(artifact_json)
+        return reference, artifact_json, metadata_json
+
+    raise AssertionError("durable store context did not return diagnostic artifact")
 
 
 def _material_pack():

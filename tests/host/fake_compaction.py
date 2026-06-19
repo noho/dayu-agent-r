@@ -110,12 +110,9 @@ def fake_compaction_proposal_from_material_json(material_json: Mapping[str, Json
     trace_labels = _source_labels(material_json, "trace_material")
     previous_labels = _previous_labels(material_json)
     answer_labels = tuple(item.source_label for item in answer_items)
-    summary_labels = (
-        previous_labels
-        + trace_labels
-        + tuple(item.source_label for item in evidence_items)
-        + answer_labels
-    )
+    summary_labels = trace_labels + tuple(
+        item.source_label for item in evidence_items
+    ) + answer_labels
     continuity_labels = previous_labels + trace_labels + answer_labels
     if len(summary_labels) == 0:
         summary_json: JsonValue = None
@@ -175,7 +172,7 @@ def _fake_session_summary_vnext(request: ConversationCompactInputVNext) -> Sessi
     :returns: session summary；无可引用 material 时返回 ``None``。
     """
 
-    labels = _continuity_labels_vnext(request)
+    labels = _summary_labels_vnext(request)
     if len(labels) == 0:
         return None
     return SessionSummaryCandidateVNext(
@@ -284,18 +281,13 @@ def _fake_diagnostics_vnext(
 
 
 def _summary_labels_vnext(request: ConversationCompactInputVNext) -> tuple[str, ...]:
-    """返回 fake vNext 可用于 summary / continuity 的 labels。
+    """返回 fake vNext 可用于 summary 的 labels。
 
     :param request: vNext compactor input。
-    :returns: prompt-local labels。
+    :returns: 本次新材料的 prompt-local labels。
     """
 
     labels: list[str] = []
-    if request.previous_compacted_view is not None:
-        labels.extend(item.source_label for item in request.previous_compacted_view.evidence_backed_facts)
-        labels.extend(item.source_label for item in request.previous_compacted_view.answer_anchors)
-        labels.extend(item.source_label for item in request.previous_compacted_view.forward_intents)
-        labels.extend(item.source_label for item in request.previous_compacted_view.reference_continuity_items)
     labels.extend(item.source_label for item in request.trace_material)
     labels.extend(item.source_label for item in request.evidence_material)
     labels.extend(item.source_label for item in request.answer_material)

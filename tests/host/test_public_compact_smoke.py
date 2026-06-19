@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import cast
 
 import pytest
@@ -27,15 +28,24 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
 )
 from dayu.engine.contracts.engine_events import runner_role_sequence_digest
+from dayu.engine.contracts.engine_events import (
+    ContextCompactionRequestedData,
+    EngineEvent,
+    EngineEventType,
+    FinalAnswerData,
+)
 from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import (
+    AttemptDispatchSnapshot,
     CompactorRunnerBaseline,
     HostEventKind,
     HostToolingOptions,
+    LocalEngineWorker,
     LocalEngineWorkerFactory,
+    LocalWorkerHandle,
     OpenHostOptions,
     open_host,
 )
@@ -89,6 +99,13 @@ _FAKE_COMPACT_HARD_THRESHOLD_TOKENS = 9000
 _FAKE_COMPACTOR_MAX_PROMPT_CHARS = 9000
 _FAKE_PUBLIC_MEMORY_MAX_CHARS = 16000
 _FAKE_COMPACT_PAYLOAD_INLINE_THRESHOLD_BYTES = 65536
+_PUBLIC_COMPACT_TEST_TIME = datetime(2026, 6, 19, 8, 0, 0, tzinfo=UTC)
+_PUBLIC_REACTIVE_COMPACTION_REASON = "provider_overflow"
+_PUBLIC_REACTIVE_PROVIDER_REQUEST_ID = "public-reactive-provider-request"
+_PUBLIC_REACTIVE_ITERATION_ID = "public-reactive-iteration"
+_PUBLIC_REACTIVE_FINAL_CONTENT = "reactive recovery final answer"
+_PUBLIC_REACTIVE_WORKER_ID = "public-reactive-worker"
+_PUBLIC_FINAL_WORKER_ID = "public-final-worker"
 _LONG_CHAPTER_MARKER = "DAYU_LONG_CHAPTER_RAW_EVIDENCE_OPERATING_MARGIN_42"
 _SECOND_FACTOR_MARKER = "第二个因素=库存周转率"
 _DUPLICATE_PROMPT_SENTENCE = "DAYU_DUPLICATE_PROMPT_COMPACT_SEGMENT。"
@@ -170,6 +187,18 @@ def test_default_compactor_prompt_is_llm_facing_and_self_contained() -> None:
     assert "输出 JSON 最小示例" in user_prompt_template
     assert "label 是本次请求内的引用标签" in user_prompt_template
     assert "label 本身不是业务事实、财报事实或结论" in system_prompt
+    assert (
+        "本次 `session_summary.source_labels` 只标注本次新材料来源"
+        in user_prompt_template
+    )
+    assert (
+        "不要引用 `previous_compacted_view` 或 `current_input_anchor` 中的 label"
+        in user_prompt_template
+    )
+    assert '"source_labels": ["P1", "T1", "E1", "A1"]' not in (
+        user_prompt_template
+    )
+    assert '"source_labels": ["T1", "E1", "A1"]' in user_prompt_template
     assert "唯一允许值为 `conversation_compact_output_v1`" in user_prompt_template
     assert (
         "必须为每个确实需要保留的 evidence label 产出至少一个 "
@@ -380,7 +409,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
             followup_request(
                 session.session_id,
                 "p12-6-tool-evidence-compact",
-                _long_compaction_prompt("tool-evidence-compact-trigger"),
+                _soft_threshold_prompt(),
             ),
         )
         second_terminal = await next_terminal_for_run(watcher, second.accepted_run_id)
@@ -524,7 +553,7 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
                 followup_request(
                     session.session_id,
                     f"p12-6-multi-compact-{index}",
-                    _long_compaction_prompt(f"multi-compact-marker-{index}"),
+                    f"{_soft_threshold_prompt()} multi-compact-marker-{index}",
                 ),
             )
             await next_terminal_for_run(watcher, followup.accepted_run_id)
@@ -551,17 +580,18 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
 
 
 @pytest.mark.asyncio
-async def test_proactive_compact_duplicate_prompt_does_not_exceed_compactor_window(
+async def test_proactive_compact_long_current_input_reaches_compactor_without_lossy_anchor(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """重复长 prompt 触发 proactive compact 时不会因 compactor 输入重复超窗失败。
+    """超长 current input 完整进入 compactor current_input_anchor。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
-    :raises AssertionError: compact 未触发、Run 失败或 compactor prompt 过大时抛出。
+    :raises AssertionError: Run 失败、未调用 compactor 或 current input 被截断。
     """
 
+    long_prompt = _DUPLICATE_PROMPT_SENTENCE * 500
     fake_compactor = FakeCompactorRunAgent()
     monkeypatch.setattr(
         "dayu.host.llm_compaction._run_agent_request",
@@ -584,28 +614,132 @@ async def test_proactive_compact_duplicate_prompt_does_not_exceed_compactor_wind
             followup_request(
                 session.session_id,
                 "p12-6-duplicate-first",
-                _DUPLICATE_PROMPT_SENTENCE * 500,
+                long_prompt,
             ),
         )
         terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
 
     assert terminal.kind is HostEventKind.SUCCEEDED
     assert len(fake_compactor.prompt_lengths) == 1
-    assert fake_compactor.prompt_lengths[0] <= _FAKE_COMPACTOR_MAX_PROMPT_CHARS
-    manifest = _runner_call_manifest_for_run(
-        _compact_artifact_files(tmp_path / "compact-artifacts"),
-        followup.accepted_run_id,
+    assert len(fake_compactor.material_jsons) == 1
+    material_json = fake_compactor.material_jsons[0]
+    current_anchor = _required_mapping(
+        material_json["current_input_anchor"],
+        field_name="current_input_anchor",
     )
-    assert manifest["runner_call_kind"] == "compactor_proposal"
-    assert manifest["runner_call_trigger_reason"] == (
-        "context_compaction_initial_proposal"
+    assert current_anchor["anchor_label"] == "C1"
+    assert current_anchor["text"] == long_prompt
+    assert material_json["previous_compacted_view"] is None
+    assert material_json["trace_material"] == []
+    assert material_json["evidence_material"] == []
+    assert material_json["answer_material"] == []
+    material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
+    assert "truncated" not in material_text
+    assert "preview" not in material_text
+    assert "summary" not in material_text
+    assert len(_compact_artifact_files(tmp_path / "compact-artifacts")) >= 1
+
+
+@pytest.mark.asyncio
+async def test_public_reactive_compact_recovers_with_followup_attempt(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """public Host reactive compact 成功后创建 recovery attempt 并终态成功。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: reactive compact 未调用 compactor 或未创建 recovery attempt。
+    """
+
+    fake_compactor = FakeCompactorRunAgent()
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction._run_agent_request",
+        fake_compactor,
     )
-    _assert_runner_call_manifest_messages(
-        manifest,
-        expected_roles=(AgentMessageRole.SYSTEM, AgentMessageRole.USER),
+    factory = _ReactivePublicWorkerFactory()
+    async with open_host(
+        _fake_compact_open_options(
+            tmp_path,
+            worker_factory=factory,
+            allow_tool_calls=False,
+            tooling_options=None,
+            policy_ref="p12-6-public-reactive-compact",
+        )
+    ) as host:
+        session = await host.ensure_session(ensure_request("p12-6-reactive"))
+        watcher = host.watch_session_events(session.session_id)
+        followup = await host.submit_followup(
+            session.session_id,
+            followup_request(
+                session.session_id,
+                "p12-6-reactive-first",
+                "短输入触发 worker 侧 reactive compact。",
+            ),
+        )
+        terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
+
+    assert terminal.kind is HostEventKind.SUCCEEDED
+    assert len(fake_compactor.prompt_lengths) == 1
+    assert len(factory.requests) == 2
+    assert len(factory.snapshots) == 2
+    assert factory.snapshots[0].attempt_id != factory.snapshots[1].attempt_id
+    assert factory.snapshots[0].execution_id != factory.snapshots[1].execution_id
+    assert factory.requests[1].run_id == factory.requests[0].run_id
+    for index, request in enumerate(factory.requests):
+        assert_at_most_one_system_message(
+            request.messages, label=f"reactive compact request {index}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_compact_failure_dispatches_deterministic_recent_window(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """public Host compact proposal 全部被拒后 fallback dispatch 仍保留当前输入。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: fallback 未 dispatch 或当前输入未进入 recovery request。
+    """
+
+    bad_compactor = RejectingCompactorRunAgent()
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction._run_agent_request",
+        bad_compactor,
     )
-    manifest_text = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
-    assert _DUPLICATE_PROMPT_SENTENCE * 20 not in manifest_text
+    factory = FinalAnswerWorkerFactory()
+    prompt = f"{_soft_threshold_prompt()} public fallback current input marker"
+    async with open_host(
+        _fake_compact_open_options(
+            tmp_path,
+            worker_factory=factory,
+            allow_tool_calls=False,
+            tooling_options=None,
+            policy_ref="p12-6-public-fallback-compact",
+            max_compaction_attempts_per_operation=(
+                _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
+            ),
+        )
+    ) as host:
+        session = await host.ensure_session(ensure_request("p12-6-fallback"))
+        watcher = host.watch_session_events(session.session_id)
+        followup = await host.submit_followup(
+            session.session_id,
+            followup_request(
+                session.session_id,
+                "p12-6-fallback-first",
+                prompt,
+            ),
+        )
+        terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
+
+    assert terminal.kind is HostEventKind.SUCCEEDED
+    assert len(bad_compactor.prompt_lengths) >= _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
+    assert len(factory.requests) == 1
+    assert prompt in _joined_message_content(factory.requests[0].messages)
+    assert len(_compact_artifact_files(tmp_path / "compact-artifacts")) >= 1
 
 
 @pytest.mark.asyncio
@@ -781,6 +915,175 @@ class FakeCompactorRunAgent:
         )
 
 
+@dataclass(slots=True)
+class RejectingCompactorRunAgent:
+    """记录 compactor request，并返回必然被 semantic barrier 拒绝的 proposal。
+
+    :param prompt_lengths: 每次 compactor user prompt 字符数。
+    :param prompts: 每次 compactor user prompt 原文。
+    :param material_jsons: 每次 compactor request 的 LLM-facing material JSON。
+    """
+
+    prompt_lengths: list[int] = field(default_factory=list)
+    prompts: list[str] = field(default_factory=list)
+    material_jsons: list[Mapping[str, JsonValue]] = field(default_factory=list)
+
+    async def __call__(
+        self, request: AgentRunRequest, *, timeout_seconds: float
+    ) -> AgentRunResult:
+        """模拟反复产出非法引用标签的 compactor runner。
+
+        :param request: compactor 构造的 Engine request。
+        :param timeout_seconds: 单次 compactor runner timeout；fake 不使用。
+        :returns: strict JSON final answer outcome。
+        :raises AssertionError: request 不是单 user material JSON 时抛出。
+        """
+
+        del timeout_seconds
+        assert_at_most_one_system_message(
+            request.messages, label="rejecting compactor request"
+        )
+        material_json = _material_json_from_compactor_request(request)
+        _assert_compactor_material_instruction_contract(material_json)
+        user_prompt = _compactor_user_prompt(request)
+        self.material_jsons.append(material_json)
+        self.prompts.append(user_prompt)
+        self.prompt_lengths.append(len(user_prompt))
+        return EngineRunOutcomeFinalAnswer(
+            session_id=request.session_id,
+            run_id=request.run_id,
+            content=_invalid_current_anchor_citation_proposal(),
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        )
+
+
+class _PublicSingleEventHandle:
+    """public compact smoke 使用的单事件 worker handle。
+
+    :param worker_id: 本地 worker id。
+    :param event: 要产出的 Engine 事件。
+    """
+
+    def __init__(self, *, worker_id: str, event: EngineEvent) -> None:
+        """初始化 handle。
+
+        :param worker_id: 本地 worker id。
+        :param event: 要产出的 Engine 事件。
+        :returns: ``None``。
+        :raises ValueError: worker_id 为空时抛出。
+        """
+
+        if worker_id.strip() == "":
+            raise ValueError("worker_id must be non-empty")
+        self._worker_id = worker_id
+        self._event = event
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回 worker id。
+
+        :returns: worker id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._worker_id
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """产出单个 Engine 事件。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        yield self._event
+
+    async def close(self) -> None:
+        """关闭 handle。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
+    def on_cancel(self, reason: str) -> None:
+        """忽略取消通知。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del reason
+
+
+class _ReactivePublicWorker:
+    """第一次 accept 产出 reactive compact 请求，第二次产出 final answer。
+
+    :param factory: 所属 worker factory。
+    """
+
+    def __init__(self, factory: "_ReactivePublicWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 worker factory。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """接受 dispatch 并按序返回 reactive 或 final handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: worker handle。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory.requests.append(request)
+        self._factory.snapshots.append(snapshot)
+        if len(self._factory.requests) == 1:
+            return _PublicSingleEventHandle(
+                worker_id=_PUBLIC_REACTIVE_WORKER_ID,
+                event=_reactive_compaction_requested_event(snapshot),
+            )
+        return _PublicSingleEventHandle(
+            worker_id=_PUBLIC_FINAL_WORKER_ID,
+            event=_final_answer_event(snapshot, _PUBLIC_REACTIVE_FINAL_CONTENT),
+        )
+
+
+class _ReactivePublicWorkerFactory:
+    """public reactive compact smoke 的 deterministic worker factory。"""
+
+    def __init__(self) -> None:
+        """初始化 factory。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.requests: list[AgentRunRequest] = []
+        self.snapshots: list[AttemptDispatchSnapshot] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 reactive public worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: deterministic worker。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del snapshot
+        return _ReactivePublicWorker(self)
+
+
 def _fake_compact_open_options(
     tmp_path: pathlib.Path,
     *,
@@ -789,6 +1092,9 @@ def _fake_compact_open_options(
     tooling_options: HostToolingOptions | None,
     policy_ref: str,
     soft_threshold_tokens: int = _FAKE_COMPACT_SOFT_THRESHOLD_TOKENS,
+    max_compaction_attempts_per_operation: int = (
+        _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
+    ),
 ) -> OpenHostOptions:
     """构造带 deterministic compactor baseline 的 public ``OpenHostOptions``。
 
@@ -798,6 +1104,7 @@ def _fake_compact_open_options(
     :param tooling_options: 可选工具装配。
     :param policy_ref: context policy ref。
     :param soft_threshold_tokens: proactive compact soft threshold。
+    :param max_compaction_attempts_per_operation: 单次 compact operation proposal 上限。
     :returns: public OpenHostOptions。
     :raises ValueError: typed options 字段非法时由底层抛出。
     """
@@ -818,6 +1125,9 @@ def _fake_compact_open_options(
             soft_threshold_tokens=soft_threshold_tokens,
             hard_threshold_tokens=_FAKE_COMPACT_HARD_THRESHOLD_TOKENS,
             policy_ref=policy_ref,
+            max_compaction_attempts_per_operation=(
+                max_compaction_attempts_per_operation
+            ),
         ),
         compactor_runner_baseline=_fake_compactor_baseline(tmp_path),
     )
@@ -850,6 +1160,79 @@ def _fake_compactor_baseline(tmp_path: pathlib.Path) -> CompactorRunnerBaseline:
         compact_artifact_root=tmp_path / "compact-artifacts",
         compact_artifact_create_parent_dirs=True,
     )
+
+
+def _reactive_compaction_requested_event(
+    snapshot: AttemptDispatchSnapshot,
+) -> EngineEvent:
+    """构造 public smoke 用 reactive compaction requested 事件。
+
+    :param snapshot: dispatch snapshot。
+    :returns: EngineEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EngineEvent(
+        occurred_at=_PUBLIC_COMPACT_TEST_TIME,
+        session_id=snapshot.session_id,
+        run_id=snapshot.run_id,
+        type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+        data=ContextCompactionRequestedData(
+            iteration_id=_PUBLIC_REACTIVE_ITERATION_ID,
+            budget_state=None,
+            reason=_PUBLIC_REACTIVE_COMPACTION_REASON,
+            provider_request_id=_PUBLIC_REACTIVE_PROVIDER_REQUEST_ID,
+        ),
+        metadata=None,
+    )
+
+
+def _final_answer_event(snapshot: AttemptDispatchSnapshot, content: str) -> EngineEvent:
+    """构造 public smoke 用 final answer 事件。
+
+    :param snapshot: dispatch snapshot。
+    :param content: final answer 正文。
+    :returns: EngineEvent。
+    :raises ValueError: content 为空时抛出。
+    """
+
+    if content.strip() == "":
+        raise ValueError("content must be non-empty")
+    return EngineEvent(
+        occurred_at=_PUBLIC_COMPACT_TEST_TIME,
+        session_id=snapshot.session_id,
+        run_id=snapshot.run_id,
+        type=EngineEventType.FINAL_ANSWER,
+        data=FinalAnswerData(
+            content=content,
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        ),
+        metadata=None,
+    )
+
+
+def _invalid_current_anchor_citation_proposal() -> str:
+    """构造会因引用 current input anchor 而被拒绝的 compact proposal。
+
+    :returns: strict JSON proposal 文本。
+    :raises TypeError: JSON 编码失败时由标准库抛出。
+    """
+
+    proposal: Mapping[str, JsonValue] = {
+        "schema_version": _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER,
+        "session_summary": {
+            "summary_text": "invalid current-anchor citation",
+            "source_labels": ["C1"],
+        },
+        "evidence_backed_facts": [],
+        "answer_anchors": [],
+        "forward_intents": [],
+        "reference_continuity_items": [],
+        "diagnostics": [],
+    }
+    return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
 
 
 def _material_json_from_compactor_request(

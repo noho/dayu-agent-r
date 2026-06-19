@@ -2593,10 +2593,10 @@ system envelope 的 LLM-facing section 顺序、标题和分隔符是设计契�
 | 5 | `Prior Answer Anchors` | Answer Anchor Memory | 写可被后续指代的历史回答轮廓；不得把 anchor 当作事实证明。 |
 | 6 | `Open Follow-up Context` | Forward Intent Memory | 写未完成任务、待澄清点或下一步上下文；不得把 intent 当作工具执行计划或事实。 |
 | 7 | `Reference Continuity` | Trace Memory reference continuity items | 写解析“刚才”“第二点”等局部指代所需的最小文本。 |
-| 8 | `Recent Evidence` | 未进入 memory / fact pipeline 的 recent-window fallback、wait-resume 或其它 evidence-like bounded material | 仅在 material 不能作为合法 `user` / `assistant` role 进入 Engine contract，且尚未被 memory / fact pipeline 接受时使用；不得暴露 fallback diagnostic、wait record id 或内部恢复状态。 |
+| 8 | `Recent Evidence` | 未进入 memory / fact pipeline 的 fallback bounded material、wait-resume 或其它 evidence-like bounded material | 仅在 material 不能作为合法 `user` / `assistant` role 进入 Engine contract，且尚未被 memory / fact pipeline 接受时使用；不得暴露 fallback diagnostic、wait record id 或内部恢复状态。 |
 | 9 | `Resume Guidance` | replay / retry / steer / resume / wait continuity guidance | 只写当前继续目标和用户可理解的恢复说明；不得写 tool_call_id、Attempt id、execution id、runner iteration id 或内部账本字段。 |
 
-evidence material 的 section routing 必须唯一归属：已经作为 verified / accepted memory facts 或 memory / fact pipeline accepted evidence 的材料只能进入 `Verified Evidence and Facts`；未进入 memory / fact pipeline 的 recent-window fallback、wait-resume 或其它 evidence-like bounded material 只能进入 `Recent Evidence`；同一条 evidence material 不得同时渲染到两个 section。若某条 recent material 已被 memory / fact pipeline 接受，后续只能按 accepted memory / fact material 路由，不再按 recent fallback material 路由。
+evidence material 的 section routing 必须唯一归属：已经作为 verified / accepted memory facts 或 memory / fact pipeline accepted evidence 的材料只能进入 `Verified Evidence and Facts`；未进入 memory / fact pipeline 的 fallback bounded material、wait-resume 或其它 evidence-like bounded material 只能进入 `Recent Evidence`；同一条 evidence material 不得同时渲染到两个 section。若某条 recent material 已被 memory / fact pipeline 接受，后续只能按 accepted memory / fact material 路由，不再按 recent fallback material 路由。
 
 selected recent window 的 role preservation 优先于原始交错位置 preservation。用户输入和助手最终回答必须保持原 role 和相对顺序；当前 Engine message contract 不支持 ordinary RunInput historical evidence 使用 `tool` role，因此 selected recent evidence 和其它不能作为 `user` / `assistant` role 保留的 historical evidence 默认进入首条 system envelope，并按上一段唯一归属规则路由到 `Verified Evidence and Facts` 或 `Recent Evidence` section。该选择会把原本夹在历史 user / assistant turn 中间的 evidence 提前到 system envelope 内，是被接受的 trade-off：它用稳定的 provider-independent one-system-message shape 换取 evidence 原始交错位置的弱化。实现必须用 public path smoke 证明 role shape 收敛，并用 focused tests 证明 follow-up 仍能读取 evidence 中的关键业务文本；未来如果 Engine contract 支持 historical evidence 使用 `tool` role，可在后续 work unit 中重新评估是否把 selected recent evidence 保留在原交错位置。
 
@@ -2687,7 +2687,7 @@ Engine ingest 接受 `ITERATION_STARTED` 后，Host 必须通过追加式 `RUNNE
 | `tool_schema_snapshot_refs` | `list[HostInternalRef]` | no | tool schema snapshots visible to the call | required when tools are available |
 | `memory_snapshot_cursor_ref` | `HostInternalRef | null` | no | memory read model cursor used by RunInputBuilder | missing historical snapshot body leaves manifest valid and emits limited-signal for body reconstruction |
 | `compact_artifact_refs` | `list[HostInternalRef]` | no | accepted compact artifacts or fallback diagnostic artifacts used in input selection | refs must point to accepted compact or explicit fallback diagnostic |
-| `context_fallback_decision_ref` | `HostInternalRef | null` | no | recent-window fallback decision when compaction failed but dispatch continued | present only when fallback affected this input |
+| `context_fallback_decision_ref` | `HostInternalRef | null` | no | tiered dispatch fallback decision when compaction recovery failed but dispatch continued | present only when tier 4/5 fallback affected this input |
 | `projector_metadata` | `list[ProjectorMetadata]` | yes | stable producer metadata for each message/source projection | every message `projector_metadata_id` must resolve here |
 | `compactor_identity` | `CompactorRunnerCallIdentity | null` | conditional | parent/self identity for Host-owned compactor calls | required when `runner_call_kind == "compactor_proposal"` |
 | `diagnostic` | `RunnerCallReconstructionDiagnostic | null` | no | typed incomplete/mismatch signal | required when validation status is not `complete` |
@@ -2729,7 +2729,7 @@ Closed `RunnerCallKind` enum：
 | `initial_user_dispatch` | ordinary Session 中第一个被 Host admitted user input 触发的 runner call |
 | `followup_user_dispatch` | 同一 Session 中后续 user input 触发的 ordinary runner call |
 | `tool_result_continuation` | tool results accepted 后继续同一 logical run 的 runner call |
-| `post_compaction_dispatch` | accepted compact 或 deterministic recent-window fallback 后的 ordinary/recovery dispatch |
+| `post_compaction_dispatch` | accepted compact 或 tier 4/5 dispatch fallback 后的 ordinary/recovery dispatch |
 | `compactor_proposal` | Host-owned compactor proposal / repair attempt 的 runner call，不是 Host admitted user Run |
 
 Closed `RunnerCallTriggerReason` enum：
@@ -2785,20 +2785,36 @@ memory_material =
 
 rendered_context =
   assemble(
-    memory_material,
+    latest_accepted_compacted_view,
+    post_compact_delta_material,
     current_input_anchor,
     selected_recent_window_policy,
     protected_recent_floor_policy
   )
 ```
 
-`latest_accepted_compacted_view` 是 Host 内部已接受的 compact projection，用于代表 compact 覆盖范围内的旧历史；没有 accepted compact 时为空。给 LLM 的只能是 Host 从它投影出的业务语义视图，不是 raw compact artifact JSON、EventLog payload 或内部字段全集。
+`latest_accepted_compacted_view` 是 Host 内部已接受的 compact projection，用于代表 compact 覆盖范围内的旧历史；没有 accepted compact 时为空。给 LLM 的只能是 Host 从它投影出的业务语义视图，不是 raw compact artifact JSON、EventLog payload 或内部字段全集。该视图必须展开为五类 Session Semantic Memory，而不是一个黑盒 material：
 
-`post_compact_delta_material` 是最近一次 accepted compact 之后新产生、尚未被 compact 覆盖的 canonical EventLog material；没有 accepted compact 时从 session 起点开始。它是 Host 内部材料边界，不等于全部进入 prompt 的 view。
+```text
+latest_accepted_compacted_view =
+  trace_memory.reference_continuity_items
+  + evidence_fact_memory.evidence_backed_facts
+  + session_summary_memory.summary_text
+  + answer_anchor_memory.anchors
+  + forward_intent_memory.intents
+```
+
+`post_compact_delta_material` 是最近一次 accepted compact 之后新产生、尚未被 compact 覆盖的 committed canonical material；没有 accepted compact 时从 session 起点开始。它是 Host 内部材料边界，不等于全部进入 prompt 的 view。该 material 至少包含历史 `USER_INPUT_ACCEPTED.display_text`、历史 `RUN_SUCCEEDED.final_answer`、readable accepted tool evidence，以及用户可见的 Run outcome material。用户可见 outcome material 只表达用户已经感知到的业务状态，例如取消、失败、等待确认 / 澄清或无 final answer 的终止；不得包含 attempt id、execution id、cursor、compact failure、fallback tier、projection diagnostic、payload ref、digest、event id 或 Host 内部治理状态。如果某个 Run 已有 `RUN_SUCCEEDED.final_answer`，通常不需要额外渲染 succeeded outcome，因为 final answer 本身就是用户可见结果。
 
 `current_input_anchor` 是当前 Run 的用户输入保护锚点。它不是 memory 语义类，而是 compact、fallback 与 prompt assembly 的边界字段；给模型的仍只是当前用户输入文本。当前用户说“继续刚才失败的任务”或“恢复刚才那个”属于 current input，而不是 Trace Memory。
 
-`selected_recent_window_policy` 从 material 中确定性选择 bounded recent window；`protected_recent_floor_policy` 在 selected recent window 内保底最近若干 turn / item，用来保护“刚才”“继续”“第二点”等短链路承接。二者都是 Host policy，不暴露给模型。
+current input anchor 单独传入 `assemble(...)`，不得被当作历史 material source。当前 Run 的 prompt 只有到下一轮成为历史时，才可能成为 `post_compact_delta_material` 的一部分。reactive / recovery / continuation 这类当前 Run 已执行到一半的 assembly snapshot 中，已经 committed 且 accepted 的 current-run tool result 可以作为 current-run delta / evidence material 参与 assembly；裸 `TOOL_CALL_REQUESTED` 没有 response 时，不应直接当成 evidence memory。
+
+`selected_recent_window_policy` 只从 `post_compact_delta_material` 中确定性选择 bounded recent context view，不从 `latest_accepted_compacted_view` 中重新选择 raw recent window。selected item 的基本单位是完整 material block；material block 必须带 `turn_group_id`、role / material kind、source refs 与稳定 block id。`protected_recent_floor_policy` 保护最近 N 个 turn group，而不是最近 N 个 raw item；当前设计中 `turn_group_id = host_run_id`，即一个 turn group 等于一个 Host admitted user Run。一个受保护 turn group 至少覆盖该 Run 的 user prompt、assistant final answer、accepted tool evidence 和用户可见 Run outcome material 中已经 committed 且 eligible 的部分。floor 与 item / char cap 冲突时，floor 优先；若 floor 本身按当前 conservative estimator 仍超过 hard threshold，进入 tier 5，必要时 fail closed。
+
+`selected_recent_window` 不是第六类 Semantic Memory。它是 `post_compact_delta_material` 的 bounded recent context view，可以包含 user input、assistant final answer、user-visible run outcome material 与 readable evidence material；`trace_memory.reference_continuity_items` 才是 compact 后属于 Trace Memory 的 semantic item。把 selected recent window 当成独立 semantic memory 会混淆 compacted view 与 post-compact delta material，也会让 fallback 漂移成另一套 memory 系统。
+
+`memory_projection_policy` 是 Host 内部 LLM-facing memory / material 产量的唯一 policy owner，至少覆盖 `selected_recent_window_policy`、`fallback_selected_recent_window_policy`、`protected_recent_floor_policy`、`semantic_memory_section_caps` 与 `projection_repair_policy`。JSON 配置是否保持 flat 属于实现形态，不是本设计真源要固定的要求；但 Host 内部不得用 DTO 私有 cap、renderer 私有截断值或零散常量作为另一套 LLM-facing material 产量真源。
 
 Compact material 的真源是 Host durable EventLog、payload descriptor 与 artifact。构造 compact input 时，Host 必须从这些真源读取 latest accepted compact event、post-compact delta canonical material 与当前 input anchor；不得依赖 Conversation Memory projection checkpoint 作为 compact input 是否可构造的前置真源。Conversation Memory projection 是 accepted compact 之后的 read model 物化路径，不是 compact operation 的材料所有者。
 
@@ -2811,7 +2827,8 @@ before_compact_memory_material =
 
 before_compact_rendered_context =
   assemble(
-    before_compact_memory_material,
+    empty_latest_accepted_compacted_view,
+    session_start_delta_material,
     current_input_anchor,
     selected_recent_window_policy,
     protected_recent_floor_policy
@@ -2846,7 +2863,11 @@ compact material / prompt / query_text 的 LLM-facing 语义必须自解释。�
 
 F02 的稳定问题陈述固定为：`EvidenceReadableItem.tool_name` 已有业务可读位置；真实缺口是 `query_text` 缺少 durable arguments / semantic query 的业务可读表达。实现和测试不得把该问题降级成“tool name 缺失”，也不得用 `tool_call_id=...`、payload ref、digest 或 Host 内部 id 伪装成业务 query。
 
+LLM-facing memory / compact / RunInput material 不允许字段级 silent truncation、preview 化或 summary 化。任何给模型阅读的 `display_text`、`text`、`claim_text`、`answer_text`、`response_text`、`summary_text` 或等价业务字段，要么是完整选中 material / item / section 的可读内容，要么带明确 provenance 做 chunking，要么整体 keep / drop，要么 fail closed。上下文缩小只能通过 deterministic selection、whole-item 或 whole-section keep-drop、chunking with provenance、section-aware degrade 或 fail closed 表达；不得把超长字段静默切到固定字符数后继续让模型当作完整事实、完整证据或完整回答理解。
+
 ### 24.3 vNext Compact I/O Contract
+
+Compact input 与 ordinary RunInput、fallback RunInput 共享同一套 material selection / rendering 语义：都从 `latest_accepted_compacted_view`、`post_compact_delta_material`、`current_input_anchor`、`selected_recent_window_policy` 与 `protected_recent_floor_policy` 推导 `rendered_context = assemble(...)`。三者差异只在 renderer、source label、accept barrier 与 tier output：compact input 使用 compactor renderer 和 prompt-local labels，并经过 compact output accept barrier；ordinary RunInput 使用普通 runner renderer；fallback RunInput 使用对应 fallback tier 的 bounded renderer。设计层不得为 compact input 另起一套 selector，也不得让 fallback selected recent window 变成独立 memory 系统。
 
 `ConversationCompactInputVNext` 是 Host 渲染给 compactor 的唯一 user material data block，结构固定为：
 
@@ -3023,12 +3044,15 @@ ForwardIntentMemoryView
 
 `HostInternalRef` 是 Host 内部 typed provenance ref，不进入 LLM-readable prompt。Snapshot item 必须保存 internal source refs、source labels mapping digest、producer compact event ref、created cursor、last updated cursor、policy ref、item digest 与 bounded diagnostic。RunInputBuilder 渲染 snapshot 时只输出业务可读文本和必要的短来源说明，不输出 durable refs、digest 或 cursor。
 
+`latest_compaction_event_ref` 只是 provenance ref，用来说明当前 snapshot 的 compacted semantic view 来自哪个 accepted compact event；它不是 `latest_accepted_compacted_view` 本体。`TraceMemoryView.selected_recent_window` 与 `EvidenceFactMemoryView.recent_evidence_items` 如果物化在 snapshot 中，也只是对 `post_compact_delta_material` 的 bounded recent view，服务 ordinary RunInput 渲染与诊断；它们不是 compact output 生成的第六类 Semantic Memory，也不会自动生成 summary、answer anchor、forward intent 或 evidence-backed fact。
+
 Projection 规则：
 
 - compact 前，Session Summary Memory、Answer Anchor Memory 与 Forward Intent Memory 为空。
 - compact 前，Trace Memory 与 Evidence / Fact Memory 只能从 selected recent window 中的 user / assistant / user-visible state / readable tool material 表达；它们不自动生成高阶结构化 item。
 - compact 成功后，accepted compact output 生成或更新五类 session memory；post-compact delta material 继续按 selected recent window 进入 prompt assembly。
-- compact failure fallback 不 materialize snapshot，不生成 Session Summary、Answer Anchor、Forward Intent、reference continuity item 或 `evidence_backed_facts`。
+- fallback tier 1-3 属于 compact recovery fallback：它们仍送 LLM compactor；accepted output 可以提交 `CONTEXT_COMPACTED`，并由 projection 生成五类 Session Semantic Memory。
+- fallback tier 4-5 属于 dispatch fallback：它们不送 LLM compactor，不提交 `CONTEXT_COMPACTED`，不生成 compact artifact / memory snapshot / 五类 memory。
 - accepted evidence 存在但 compactor 没有产出合法 fact candidate 时，Host 只记录 diagnostic，不合成 fallback fact。
 - assistant final answer、用户输入、session summary、answer anchor、reference continuity item、User Profile、Forward Intent 都不能自动升级成 `evidence_backed_fact`。
 
@@ -3050,11 +3074,11 @@ producer mapping 汇总如下；实现不得从旧字段或旧 renderer 反推�
 
 | 语义 | compact 前 | compact 成功后 | post-compact delta | compact failure fallback |
 | --- | --- | --- | --- | --- |
-| Trace Memory | selected recent window 中的 user input、assistant final answer、用户可见 Run 状态 | accepted `reference_continuity_items` 与 trace projection | latest compact cursor 之后的 eligible user / assistant / user-visible state material 继续进入 selected recent window | 只渲染 fallback selected recent window，不物化 Trace snapshot item |
-| Evidence / Fact Memory | selected recent window 中的 readable tool query / response / source text | 通过 accept barrier 的 `evidence_backed_facts` | latest compact cursor 之后的 readable accepted evidence material 继续进入 selected recent window | 只渲染 fallback selected recent window 中仍被选中的 tool material，不生成 fact |
-| Session Summary Memory | 空 | accepted `session_summary` roll-forward view | 不由 delta 直接生成 summary | 空，不生成 summary |
-| Answer Anchor Memory | 空 | 通过 accept barrier 的 `answer_anchors` | 不对 final answer 做 compact 前 parser | 空，不生成 anchor |
-| Forward Intent Memory | 空 | 通过 accept barrier 的 `forward_intents` | 不对 prompt / final answer 做 intent parser | 空，不生成 intent |
+| Trace Memory | selected recent window 中的 user input、assistant final answer、用户可见 Run 状态只作为 recent view 表达 | accepted `reference_continuity_items` 与 trace projection | latest compact cursor 之后的 eligible user / assistant / user-visible state material 继续进入 selected recent window | tier 1-3 accepted output 可生成 `reference_continuity_items`；tier 4-5 只渲染 fallback input，不物化 Trace snapshot item |
+| Evidence / Fact Memory | selected recent window 中的 readable tool query / response / source text 只作为 recent view 表达 | 通过 accept barrier 的 `evidence_backed_facts` | latest compact cursor 之后的 readable accepted evidence material 继续进入 selected recent window | tier 1-3 accepted output 可生成 fact；tier 4-5 只渲染 fallback input 中仍被选中的 tool material，不生成 fact |
+| Session Summary Memory | 空 | accepted `session_summary` roll-forward view | 不由 delta 直接生成 summary | tier 1-3 accepted output 可生成 summary；tier 4-5 为空，不生成 summary |
+| Answer Anchor Memory | 空 | 通过 accept barrier 的 `answer_anchors` | 不对 final answer 做 compact 前 parser | tier 1-3 accepted output 可生成 anchor；tier 4-5 为空，不生成 anchor |
+| Forward Intent Memory | 空 | 通过 accept barrier 的 `forward_intents` | 不对 prompt / final answer 做 intent parser | tier 1-3 accepted output 可生成 intent；tier 4-5 为空，不生成 intent |
 
 ### 24.6 Prompt Assembly
 
@@ -3076,28 +3100,19 @@ Session Summary 只提供会话框架，不能替代 Evidence / Fact Memory；�
 渲染原则固定为：
 
 ```text
-if no accepted compacted view:
-  memory_context =
-    selected_recent_window
-  current_input = final user message
-
-if compact failed and recent-window fallback is allowed:
-  memory_context =
-    fallback_selected_recent_window
-  current_input = final user message
-
-if accepted compacted view exists:
-  memory_context =
-    session_summary_memory
-    evidence_fact_memory
-    answer_anchor_memory
-    forward_intent_memory
-    trace_memory.reference_continuity_items
-    selected_recent_window_after_compact_boundary
-  current_input = final user message
+rendered_context =
+  assemble(
+    latest_accepted_compacted_view,
+    post_compact_delta_material,
+    current_input_anchor,
+    selected_recent_window_policy,
+    protected_recent_floor_policy
+  )
 ```
 
-第一阶段不根据 token estimator 在 runtime 做逐 section 裁剪。各 section 必须在 projection / assembly 前通过配置化 item cap、char cap、selected recent window cap、selected recent window floor 与 per-semantic bounded working set 形成确定性上限；provider context length failure 由 Context Governance 的 reactive compact / fallback 收口。需要 floor 的 section 只固定两类：`selected_recent_window_turn_floor` 与 `evidence_fact_floor`。其它 section 默认只有 cap，没有 floor；`reference_continuity_item_floor = 0` 可以显式进入配置。fallback selected recent window caps 必须不小于 selected recent window floor 所需材料，并且不大于普通 selected recent window caps。
+如果没有 accepted compacted view，`latest_accepted_compacted_view` 为空，assembly 只从 `post_compact_delta_material` 选择 selected recent window 并追加 current input anchor。如果存在 accepted compacted view，assembly 先渲染五类 semantic memory 的非空 section，再渲染 compact boundary 之后的 selected recent window，最后渲染 current input anchor。无论 ordinary RunInput、compact input 还是 fallback RunInput，current input anchor 都是最终用户输入保护锚点，不得被吞掉、重复渲染成历史 trace material，或作为 compact candidate source 引用。
+
+ordinary path 不根据 token estimator 在 runtime 做字段级或逐 section silent truncation。各 section 必须在 projection / assembly 前通过配置化 item cap、char cap、selected recent window cap、selected recent window floor 与 per-semantic bounded working set 形成确定性上限；provider context length failure 由 Context Governance 的 reactive compact / fallback 收口。需要 floor 的 section 只固定两类：`selected_recent_window_turn_floor` 与 `evidence_fact_floor`。其它 section 默认只有 cap，没有 floor；`reference_continuity_item_floor = 0` 可以显式进入配置。fallback selected recent window caps 必须不小于 selected recent window floor 所需材料，并且不大于普通 selected recent window caps。
 
 Prompt Assembly 渲染给 ordinary RunInput 时必须遵守 23 节 one-system-message hard contract。Conversation Memory 可以在内部维护 snapshot cursor、compact event ref、source refs、source label mapping digest、producer policy ref、projection checkpoint、diagnostic 与 item digest；但投影给 LLM 的 system envelope 和 selected recent window 只能包含业务可读内容、必要短来源说明和 prompt-local opaque label。ordinary RunInput 不得暴露 EventLog id、event sequence、payload ref、artifact ref、digest、cursor、policy ref、projection checkpoint、projector metadata、Attempt / execution ledger、tool_call_id、Python 类型名或 Host 内部治理术语。
 
@@ -3121,7 +3136,7 @@ Host 负责：
 - `ConversationCompactInputVNext` 构造。
 - `ConversationCompactOutputVNext` accept barrier。
 - compaction whole-candidate repair / retry 编排。
-- failure closeout 与 deterministic recent-window fallback。
+- failure closeout、tier 1-3 compact recovery fallback 与 tier 4-5 dispatch fallback。
 - context overflow recovery dispatch。
 - compact-related EventLog facts。
 - compact event 与 Conversation Memory projection 输入。
@@ -3175,7 +3190,79 @@ Compactor 与 retry / repair 的 owner 边界固定为：
 - stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。proactive compaction 在 worker 启动前没有 active worker token，必须使用 durable Run 状态观察 token；reactive compaction 必须复用 Engine envelope 中的 run-local cancellation token。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
 
-LLM compaction repair 耗尽或 compactor 不可用时，Host 可以进入 deterministic recent-window fallback。该 fallback 不是 compact 成功，不提交 `CONTEXT_COMPACTED`，不写 compact artifact，不 materialize memory snapshot，不生成 Session Summary、Answer Anchor、Forward Intent、reference continuity item 或 `evidence_backed_fact`。fallback 只为本次 dispatch 渲染 policy-bounded selected recent window 与当前输入，并在 selected recent window 内应用 protected recent floor；不得渲染 accepted compacted view、高阶 memory section、失败 proposal、fallback diagnostic 或任何 Host 内部状态。fallback 必须写 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic，并标明本次 dispatch 使用了 recent-window fallback；记录内容至少包含 compact failure reason、fallback policy decision、fallback input window / digest、重新估算后的 budget result 和 diagnostic refs。fallback 后必须重新估算预算；若该 bounded input view 仍超过 hard threshold，Host 不得 dispatch，必须按 failure policy 收口。
+Context Governance fallback 是同一套 `assemble(...)` material 语义下的分级状态机，不是另一套 memory 逻辑：
+
+```text
+tier 0 normal:
+  rendered_context =
+    assemble(
+      latest_accepted_compacted_view,
+      post_compact_delta_material,
+      current_input_anchor,
+      normal_selected_recent_window_policy,
+      protected_recent_floor_policy
+    )
+  output:
+    ordinary RunInput or compact input according to Context Governance decision
+
+tier 1 compact recovery with tighter recent window:
+  rendered_context =
+    assemble(
+      latest_accepted_compacted_view,
+      post_compact_delta_material,
+      current_input_anchor,
+      fallback_selected_recent_window_policy,
+      protected_recent_floor_policy
+    )
+  output:
+    compact input -> send to LLM compactor
+
+tier 2 compact recovery with section-aware compacted view degrade:
+  rendered_context =
+    assemble(
+      degraded latest_accepted_compacted_view,
+      post_compact_delta_material,
+      current_input_anchor,
+      fallback_selected_recent_window_policy,
+      protected_recent_floor_policy
+    )
+  output:
+    compact input -> send to LLM compactor
+
+tier 3 compact recovery delta-only:
+  rendered_context =
+    assemble(
+      post_compact_delta_material,
+      current_input_anchor,
+      fallback_selected_recent_window_policy,
+      protected_recent_floor_policy
+    )
+  output:
+    compact input -> send to LLM compactor
+
+tier 4 dispatch fallback floor-only:
+  rendered_context =
+    assemble(
+      protected_recent_turn_floor,
+      current_input_anchor
+    )
+  output:
+    fallback RunInput; no LLM compactor; no CONTEXT_COMPACTED
+
+tier 5 dispatch fallback current-input-only:
+  rendered_context =
+    assemble(
+      current_input_anchor
+    )
+  output:
+    fallback RunInput; no LLM compactor; no CONTEXT_COMPACTED
+```
+
+Tier 1-3 是 compact recovery fallback：它们对同一套 material 用更保守的 selected recent window、section-aware compacted view degrade 或 delta-only 视图重新构造 compact input，并继续送 LLM compactor。tier 1-3 的 accepted output 可以提交 `CONTEXT_COMPACTED`，随后由 Conversation Memory projection 生成五类 Session Semantic Memory。tier 4-5 是 compact recovery 全失败后的 dispatch fallback：它们不送 LLM compactor，不提交 `CONTEXT_COMPACTED`，不生成 compact artifact，不 materialize memory snapshot，不生成 Session Summary、Answer Anchor、Forward Intent、reference continuity item 或 `evidence_backed_fact`；它们只影响本次 RunInput rendering，并且必须有 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic 痕迹，不能静默发生。
+
+Section-aware compacted view degrade 是 deterministic keep / drop 规则，不是新的 compact、summary 或 LLM 修复。保留优先级固定为：`evidence_fact_memory.evidence_backed_facts`、`trace_memory.reference_continuity_items`、`answer_anchor_memory.anchors`、`forward_intent_memory.intents`、`session_summary_memory.summary_text`。允许动作只有保留完整 semantic section、丢弃完整 semantic section，或在 section 内按确定性顺序保留 / 丢弃完整 semantic item。section 内 item 的保留 / 丢弃顺序必须由设计固定，不得由实施代码临时判断重要 / 不重要；本文只固定设计原则：排序依据必须业务可解释、稳定、可在同一 input cursor、material source cursor 与 policy 下确定性复现。后续 code-generation-ready plan 必须基于该原则选择稳定排序字段和排序方向，并确保 ordinary / compact / fallback 路径复用同一规则。degrade 禁止动作列表固定为：禁止截断 semantic item text；禁止重新 summary 或改写 summary；禁止改写 fact、answer anchor、forward intent 或 reference continuity item；禁止临时生成新的 compacted view；禁止让 fallback 产生新的 Session Semantic Memory。tier 4 的 `protected_recent_turn_floor` 使用 `host_run_id` turn group 保护最近 N 个 Host admitted user Run；如果 floor-only 仍超过 hard threshold，进入 tier 5；如果 current-input-only 仍无法合法 dispatch，必须 fail closed。
+
+Fallback fail closed 条件必须集中收窄为真正不可恢复，或继续 dispatch 会破坏 Host 治理 / 事实边界的场景：current input anchor 本身超过 hard context budget；durable EventLog、payload 或 artifact 损坏，导致 Host 无法构造可信 LLM-facing 输入；selected material provenance 不一致，继续 dispatch 会污染事实边界；cancellation、session closed 或当前 Run state 已不允许继续执行。其它可恢复的 compaction proposal 质量问题、schema 问题、预算问题或 provider overflow，应先按 bounded repair、tier 1-3 compact recovery fallback、tier 4/5 dispatch fallback 或 failure policy 收口，不能绕过上述 hard stop 边界静默 dispatch。
 
 Compaction operation 的 durable 语义固定为：
 
@@ -3198,9 +3285,11 @@ compact material selection 必须满足：
 
 - proactive path 的目标是压缩旧 prefix，为当前 Run dispatch 腾出预算；current input anchor 与 protected recent floor 必须保留。
 - reactive path 来自被冻结的 overflow ordinary input material list，优先压缩 older prefix；current input anchor 与 protected recent floor 必须保留到 recovery dispatch。
-- selection 按 material block 与 budget 压力裁剪，不按固定轮数裁剪；一轮中包含的长 tool result 可以单独形成 evidence material block 或 evidence-block 内部分段。
+- selection 的候选集合是 `post_compact_delta_material`，不从 `latest_accepted_compacted_view` 中重新选择 raw recent window；fallback 与 ordinary selected recent window 复用同一个 recent-window selection 语义，只替换 fallback caps / tier。
+- selection 按完整 material block 与 budget 压力裁剪，不按 raw item、固定轮数或字段字符数裁剪；一轮中包含的长 tool result 可以单独形成 evidence material block 或 evidence-block 内部分段。
 - 给定 input cursor、material source cursor、policy 与 ordinary input material list，selection 必须确定性输出本次进入 compact input 的 block ids，供 tests、trace 与 audit 解释。
 - 已被 latest accepted compacted view 代表的旧 raw turns / old tool results 不应在下一次 compact 中重新展开。
+- selection 输出的 block id / provenance 必须从 selection 到 rendering 全程同源；LLM-facing material 缩小时只能 whole-block keep-drop、section-aware keep-drop、chunking with provenance 或 fail closed，不能用字段级 silent truncation 或 lossy preview 冒充完整 material。
 
 material data block 的 section 映射必须一对一，不允许同一 canonical content 同时进入两个 LLM-facing section：
 
@@ -3251,7 +3340,7 @@ proactive trigger before dispatch
   -> append CONTEXT_COMPACTION_REQUESTED(trigger_source=proactive)
   -> Host ContextGovernance runs bounded compaction operation outside write transaction
   -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
-  -> if compact failed and policy allows fallback: build deterministic recent-window input view and re-estimate
+  -> if compact failed and policy allows dispatch fallback: build tier 4/5 fallback input view and re-estimate
   -> RunInputBuilder rebuilds complete AgentRunRequest.messages
   -> append RUN_STARTED / ATTEMPT_STARTED
   -> dispatch Engine
@@ -3263,7 +3352,7 @@ reactive trigger from EngineEvent.context_compaction_requested
   -> Run -> RECOVERING when policy allows recovery
   -> Host ContextGovernance runs bounded compaction operation outside write transaction
   -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
-  -> if compact failed and policy allows fallback: build deterministic recent-window input view and re-estimate
+  -> if compact failed and policy allows dispatch fallback: build tier 4/5 fallback input view and re-estimate
   -> append RUN_STARTED(start_reason=recovery)
   -> create new Attempt with new execution_id
   -> append ATTEMPT_STARTED
@@ -3277,21 +3366,21 @@ reactive path 约束：
 - Host 必须先按 `attempt_id + execution_id` 校验 `context_compaction_requested` 是否来自当前 active Attempt。
 - Engine 后续的 recoverable `run_failed(context_compaction_required)` 只能关闭当前 Attempt；它不能让 Engine 自己重试，也不能让旧 Attempt resume。
 - Host 若接受恢复，应把 Run 标为 `RECOVERING`，执行 compact 后创建新 Attempt；若 compact policy 放弃恢复，Run 才进入 `FAILED`。
-- proactive compact failure 在 dispatch 前优先尝试 deterministic recent-window fallback；fallback 预算通过时允许创建 Attempt，但不得写 `CONTEXT_COMPACTED` 或 memory projection。fallback 仍超预算或 policy 不允许 fallback 时，Run 按 failure policy 收口，后续引入 `REJECTED` 后应归入 governance rejection，不得进入 `RECOVERING`。
-- reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Host 可按 policy 尝试 deterministic recent-window fallback，并创建新的 recovery Attempt。fallback 仍超预算或 policy 不允许 fallback 时，Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
+- proactive compact failure 在 dispatch 前先完成 tier 1-3 compact recovery fallback；若仍失败且 policy 允许 dispatch fallback，再尝试 tier 4 floor-only / tier 5 current-input-only。tier 4/5 fallback 预算通过时允许创建 Attempt，但不得写 `CONTEXT_COMPACTED` 或 memory projection。fallback 仍超预算或 policy 不允许 fallback 时，Run 按 failure policy 收口，后续引入 `REJECTED` 后应归入 governance rejection，不得进入 `RECOVERING`。
+- reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Host 可按 policy 完成 tier 1-3 compact recovery fallback，仍失败后再尝试 tier 4/5 dispatch fallback，并在 fallback 预算通过时创建新的 recovery Attempt。fallback 仍超预算或 policy 不允许 fallback 时，Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
 - `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 operation id、trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor、retry / repair budget snapshot 和 reason。
 - `CONTEXT_COMPACTION_ATTEMPT_REJECTED` payload 至少记录 operation id、attempt number、failure category、whether repairable、runner attempt summary refs、quality / parse / budget diagnostic refs 和 next policy decision。
 - `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、accepted candidate digest、prompt-local label mapping refs、source boundary refs、accepted evidence mapping refs、quality check result、budget after compact 与 projection signal。
-- `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs；若 policy decision 采用 deterministic recent-window fallback，还必须记录 fallback input window / digest、fallback budget result，以及 fallback 后是 dispatch 还是 fail closed。
+- `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs；若 policy decision 采用 tier 4/5 dispatch fallback，还必须记录 fallback tier、fallback input window / digest、fallback budget result，以及 fallback 后是 dispatch 还是 fail closed。
 
 compact 不变量：
 
 - compact 不能改写历史 EventLog facts，也不能让 summary 替代 evidence anchor。
 - compacted snapshot / summary 是 read model 或 input artifact；是否进入 memory projection 必须由 memory policy 决定。
 - RunInputBuilder 必须从 `USER_INPUT_ACCEPTED`、canonical facts、memory snapshot 和 compacted artifacts 重建完整 messages；不能复用失败 Attempt 的 provider request payload。
-- deterministic recent-window fallback 只能影响本次 RunInputBuilder 输入选择，不得改写 EventLog 历史事实，不得提交 `CONTEXT_COMPACTED`，不得 materialize memory snapshot；但它必须有 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic 痕迹，不能静默发生。
+- tier 4/5 dispatch fallback 只能影响本次 RunInputBuilder 输入选择，不得改写 EventLog 历史事实，不得提交 `CONTEXT_COMPACTED`，不得 materialize memory snapshot；但它必须有 `CONTEXT_COMPACTION_FAILED` 或等价 diagnostic 痕迹，不能静默发生。
 - 新 Attempt 必须有新的 `attempt_id` / `execution_id`；旧 Attempt 不 takeover、不 resume。
-- compact 必须有 policy 上限。proactive operation 内 bounded repair attempts 耗尽后，Host 必须 append `CONTEXT_COMPACTION_FAILED`；若 deterministic recent-window fallback 预算通过，可继续 dispatch，否则按 failure policy 收口。reactive path 中 compact 后若真实 recovery dispatch 再次触发 Engine overflow，可在 `max_reactive_compactions_per_run` 范围内追加下一次 reactive compact；超过上限后 append `CONTEXT_COMPACTION_FAILED`，可按 policy 尝试 deterministic recent-window fallback，仍失败则让 Run 进入 `FAILED`。不得进入 `LOST`，不得无限 compact retry。
+- compact 必须有 policy 上限。proactive operation 内 bounded repair attempts 和 tier 1-3 compact recovery fallback 耗尽后，Host 必须 append `CONTEXT_COMPACTION_FAILED`；若 tier 4/5 dispatch fallback 预算通过，可继续 dispatch，否则按 failure policy 收口。reactive path 中 compact 后若真实 recovery dispatch 再次触发 Engine overflow，可在 `max_reactive_compactions_per_run` 范围内追加下一次 reactive compact；超过上限后 append `CONTEXT_COMPACTION_FAILED`，可按 policy 尝试 tier 4/5 dispatch fallback，仍失败则让 Run 进入 `FAILED`。不得进入 `LOST`，不得无限 compact retry。
 - tool trace / audit 必须能解释哪些内容被保留、压缩、丢弃，以及为什么这样做。
 
 参数默认值由 memory / context policy provider 定义。设计固定治理范围，policy 固定优先级和默认值。

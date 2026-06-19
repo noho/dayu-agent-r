@@ -86,13 +86,6 @@ _INITIAL_REASON_TRACE = "initial_trace_material"
 _INITIAL_REASON_EVIDENCE = "initial_evidence_material"
 _INITIAL_REASON_PREVIOUS = "initial_previous_compacted_view"
 _INITIAL_REASON_ANSWER = "initial_answer_material"
-CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS = 1200
-"""Current input anchor 允许直接暴露给 LLM 的最大字符数。"""
-
-EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS = 4096
-"""单个 evidence block 直接暴露给 LLM 前的确定性 chunk 字符上限。"""
-
-_CURRENT_INPUT_TRUNCATED_MARKER = "\n[truncated_current_input_anchor]"
 _NO_EVENT_SEQUENCE = 0
 _DEFAULT_EVENT_SUB_INDEX = 0
 _REASON_SELECTED = "selected"
@@ -170,6 +163,13 @@ _BLOCK_KIND_ORDER = {
     CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE: 2,
     CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR: 3,
 }
+_RECOVERY_PREVIOUS_VIEW_KIND_PRIORITY = (
+    CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+    CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+    CompactMaterialBlockKind.ANSWER_ANCHOR,
+    CompactMaterialBlockKind.FORWARD_INTENT,
+    CompactMaterialBlockKind.SESSION_SUMMARY,
+)
 
 
 class CompactMaterialBuildError(ValueError):
@@ -218,6 +218,7 @@ class RunInputMaterialBlock:
     :param canonical_source_refs: canonical source refs。
     :param content_digest: 完整内容 digest。
     :param event_sequence: 来源 EventLog sequence；stable memory block 可为 ``None``。
+    :param turn_group_id: Host admitted user Run id；stable semantic block 可为 ``None``。
     :param event_sub_index: 同一 event 内的稳定子序。
     :param source_labels: prompt-local source labels。
     :param already_represented: 是否已被 accepted compact output / stable fact 充分代表。
@@ -241,6 +242,7 @@ class RunInputMaterialBlock:
     canonical_source_refs: tuple[str, ...]
     content_digest: str
     event_sequence: int | None
+    turn_group_id: str | None = None
     event_sub_index: int = _DEFAULT_EVENT_SUB_INDEX
     source_labels: tuple[PromptLocalMaterialLabel, ...] = ()
     already_represented: bool = False
@@ -278,6 +280,7 @@ class RunInputMaterialBlock:
         _require_non_empty_text(self.content_digest, "RunInputMaterialBlock.content_digest")
         if self.event_sequence is not None and self.event_sequence < 0:
             raise ValueError("RunInputMaterialBlock.event_sequence must be non-negative")
+        _require_optional_text(self.turn_group_id, "RunInputMaterialBlock.turn_group_id")
         if self.event_sub_index < 0:
             raise ValueError("RunInputMaterialBlock.event_sub_index must be non-negative")
         _require_string_tuple(self.source_labels, "RunInputMaterialBlock.source_labels")
@@ -567,6 +570,31 @@ def selected_material_source_refs(
     return tuple(dict.fromkeys(refs))
 
 
+def selected_material_view_digest(
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+) -> str:
+    """计算 selected material view 的稳定 digest。
+
+    :param selected_blocks: 已按 material view 顺序选中的 blocks。
+    :returns: selected view digest。
+    :raises TypeError: 参数类型非法时抛出。
+    """
+
+    _require_material_block_tuple(selected_blocks, "selected_blocks")
+    return sha256_digest_json(
+        {
+            "selected_blocks": [
+                {
+                    "block_id": block.block_id,
+                    "canonical_source_refs": list(block.canonical_source_refs),
+                    "content_digest": block.content_digest,
+                }
+                for block in selected_blocks
+            ]
+        }
+    )
+
+
 def conversation_compact_input_vnext_from_material_pack(
     material_pack: CompactMaterialPack,
 ) -> ConversationCompactInputVNext:
@@ -672,17 +700,6 @@ class InitialEvidenceMaterial:
     source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class _EvidenceChunk:
-    """Evidence material 的确定性 chunk 描述。"""
-
-    label: PromptLocalMaterialLabel
-    parent_label: PromptLocalMaterialLabel | None
-    chunk_ordinal: int | None
-    text: str
-    content_digest: str
-
-
 def material_label(section: CompactMaterialSection, ordinal: int) -> PromptLocalMaterialLabel:
     """构造普通 prompt-local material label。
 
@@ -698,22 +715,6 @@ def material_label(section: CompactMaterialSection, ordinal: int) -> PromptLocal
     if ordinal < _FIRST_ORDINAL:
         raise ValueError("ordinal must be positive")
     return f"{_SECTION_PREFIXES[section]}{ordinal}"
-
-
-def evidence_chunk_label(evidence_ordinal: int, chunk_ordinal: int) -> PromptLocalMaterialLabel:
-    """构造 evidence chunk prompt-local label。
-
-    :param evidence_ordinal: evidence block ordinal。
-    :param chunk_ordinal: chunk ordinal。
-    :returns: prompt-local chunk label。
-    :raises ValueError: ordinal 非法时抛出。
-    """
-
-    if evidence_ordinal < _FIRST_ORDINAL:
-        raise ValueError("evidence_ordinal must be positive")
-    if chunk_ordinal < _FIRST_ORDINAL:
-        raise ValueError("chunk_ordinal must be positive")
-    return f"{_EVIDENCE_PREFIX}{evidence_ordinal}" f"{_LABEL_CHUNK_SEPARATOR}{chunk_ordinal}"
 
 
 def current_input_anchor_label() -> PromptLocalMaterialLabel:
@@ -760,14 +761,45 @@ def normalized_material_text(text: str) -> str:
     """规范化 material 可读文本。
 
     :param text: 原始文本。
-    :returns: 去除首尾空白并折叠连续空白后的文本。
+    :returns: 去除首尾空白、折叠行内连续空白并保留非空行边界后的文本。
     :raises TypeError: 文本类型非法时抛出。
     :raises ValueError: 规范化后为空时抛出。
     """
 
     if not isinstance(text, str):
         raise TypeError("text must be str")
-    normalized = " ".join(text.split())
+    normalized_lines = tuple(
+        _normalized_material_line(line)
+        for line in text.splitlines()
+    )
+    normalized = "\n".join(line for line in normalized_lines if line != "")
+    if normalized == "":
+        raise ValueError("text must be non-empty after normalization")
+    return normalized
+
+
+def _normalized_material_line(text: str) -> str:
+    """规范化单行 material 文本。
+
+    :param text: 原始单行文本。
+    :returns: 去除首尾空白并折叠连续空白后的文本。
+    """
+
+    return " ".join(text.split())
+
+
+def _normalized_structured_field_text(text: str) -> str:
+    """把结构化 previous view 字段规范化为单行文本。
+
+    :param text: 字段原始文本。
+    :returns: 单行字段文本。
+    :raises TypeError: 文本类型非法时抛出。
+    :raises ValueError: 规范化后为空时抛出。
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    normalized = _normalized_material_line(text)
     if normalized == "":
         raise ValueError("text must be non-empty after normalization")
     return normalized
@@ -781,6 +813,7 @@ def run_input_material_block(
     text: str,
     canonical_source_refs: tuple[str, ...],
     event_sequence: int | None,
+    turn_group_id: str | None = None,
     event_sub_index: int = _DEFAULT_EVENT_SUB_INDEX,
     source_labels: tuple[PromptLocalMaterialLabel, ...] = (),
     already_represented: bool = False,
@@ -803,6 +836,7 @@ def run_input_material_block(
     :param text: 原始或已规范化文本。
     :param canonical_source_refs: canonical source refs。
     :param event_sequence: 来源 EventLog sequence；stable block 可为 ``None``。
+    :param turn_group_id: Host admitted user Run id；stable semantic block 可为 ``None``。
     :param event_sub_index: 同 event 内稳定子序。
     :param source_labels: prompt-local source labels。
     :param already_represented: 是否已被 compact output / stable fact 代表。
@@ -831,6 +865,7 @@ def run_input_material_block(
         canonical_source_refs=canonical_source_refs,
         content_digest=_text_digest(normalized),
         event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
         event_sub_index=event_sub_index,
         source_labels=source_labels,
         already_represented=already_represented,
@@ -856,6 +891,7 @@ def select_compact_segment(
     material_blocks: tuple[RunInputMaterialBlock, ...],
     selected_recent_window_turn_floor: int = 0,
     max_selected_size_units: int | None = None,
+    max_selected_item_count: int | None = None,
 ) -> CompactSegmentSelection:
     """按确定性规则选择 compact segment。
 
@@ -866,6 +902,7 @@ def select_compact_segment(
     :param material_blocks: ordinary input 或 frozen overflow material list。
     :param selected_recent_window_turn_floor: 需要保护的 selected recent-window turn 数量。
     :param max_selected_size_units: 可选 selected segment 尺寸上限。
+    :param max_selected_item_count: 可选 selected segment item 数量上限。
     :returns: CompactSegmentSelection。
     :raises TypeError: 参数类型非法时抛出。
     :raises ValueError: 参数值非法时抛出。
@@ -879,15 +916,20 @@ def select_compact_segment(
         material_blocks=material_blocks,
         selected_recent_window_turn_floor=selected_recent_window_turn_floor,
         max_selected_size_units=max_selected_size_units,
+        max_selected_item_count=max_selected_item_count,
     )
-    protected_recent_ids = _protected_recent_raw_block_ids(
+    protected_recent_ids = _protected_recent_turn_group_block_ids(
         material_blocks,
         selected_recent_window_turn_floor,
     )
     selected: list[str] = []
     excluded_reasons: dict[str, str] = {}
     selected_units = 0
+    budget_blocked = False
     for block in _sorted_material_blocks(material_blocks, memory_snapshot_cursor=memory_snapshot_cursor):
+        if budget_blocked:
+            excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+            continue
         reason = _block_exclusion_reason(block, protected_recent_ids)
         if reason is not None:
             excluded_reasons[block.block_id] = reason
@@ -895,9 +937,15 @@ def select_compact_segment(
         if (
             max_selected_size_units is not None
             and selected_units + block.size_units > max_selected_size_units
-            and len(selected) > 0
+            and (len(selected) > 0 or max_selected_item_count is not None)
         ):
             excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+            if max_selected_item_count is not None:
+                budget_blocked = True
+            continue
+        if max_selected_item_count is not None and len(selected) >= max_selected_item_count:
+            excluded_reasons[block.block_id] = _REASON_BUDGET_LIMIT
+            budget_blocked = True
             continue
         selected.append(block.block_id)
         selected_units += block.size_units
@@ -935,6 +983,35 @@ def select_compact_segment(
         selection_digest=sha256_digest_json(digest_input),
         excluded_reason_codes=excluded_reasons,
     )
+
+
+def degrade_previous_compacted_view_for_recovery(
+    previous_compacted_view: tuple[CompactMaterialBlock, ...]
+) -> tuple[CompactMaterialBlock, ...]:
+    """按 S4 recovery 优先级对 latest accepted compacted view 做 whole-drop 降级。
+
+    该 helper 只保留最高优先级的非空 semantic section，并按确定性顺序返回
+    原始 block；不会截断、改写、重写摘要或合成新的 semantic memory。
+
+    :param previous_compacted_view: latest accepted compacted view blocks。
+    :returns: 降级后的 previous compacted view blocks；无可保留项时为空元组。
+    :raises TypeError: 参数类型非法时抛出。
+    :raises ValueError: 参数值非法时抛出。
+    """
+
+    _require_compact_material_block_tuple(
+        previous_compacted_view,
+        "previous_compacted_view",
+    )
+    for kind in _RECOVERY_PREVIOUS_VIEW_KIND_PRIORITY:
+        candidates = tuple(
+            (index, block)
+            for index, block in enumerate(previous_compacted_view)
+            if block.kind is kind
+        )
+        if len(candidates) > 0:
+            return tuple(block for _index, block in _sort_recovery_previous_blocks(candidates))
+    return ()
 
 
 def build_compact_material_pack(
@@ -987,7 +1064,7 @@ def build_compact_material_pack(
     provenance_entries = (
         *_provenance_from_blocks(previous_blocks),
         *_provenance_from_blocks(trace_blocks),
-        *_provenance_from_evidence_blocks(evidence_blocks, selected_blocks),
+        *_provenance_from_evidence_blocks(selected_blocks),
         *_provenance_from_blocks(answer_blocks),
         _current_anchor_provenance(current_anchor),
     )
@@ -1270,19 +1347,19 @@ def _evidence_blocks(materials: tuple[InitialEvidenceMaterial, ...]) -> tuple[Co
 
     blocks: list[CompactEvidenceBlock] = []
     for index, material in enumerate(materials, start=_FIRST_ORDINAL):
-        for chunk in _evidence_chunks(index, material.raw_result_text):
-            blocks.append(
-                CompactEvidenceBlock(
-                    evidence_label=chunk.label,
-                    readable_tool_name=material.readable_tool_name,
-                    readable_query_text=material.readable_query_text,
-                    raw_result_text=chunk.text,
-                    readable_source_text=material.readable_source_text,
-                    size_units=len(chunk.text),
-                    canonical_source_refs=(material.canonical_source_ref,),
-                    content_digest=chunk.content_digest,
-                )
+        _require_non_empty_text(material.raw_result_text, "raw_result_text")
+        blocks.append(
+            CompactEvidenceBlock(
+                evidence_label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                readable_tool_name=material.readable_tool_name,
+                readable_query_text=material.readable_query_text,
+                raw_result_text=material.raw_result_text,
+                readable_source_text=material.readable_source_text,
+                size_units=len(material.raw_result_text),
+                canonical_source_refs=(material.canonical_source_ref,),
+                content_digest=_text_digest(material.raw_result_text),
             )
+        )
     return tuple(blocks)
 
 
@@ -1350,25 +1427,23 @@ def _evidence_provenance(
 
     entries: list[PromptLocalProvenanceEntry] = []
     for index, material in enumerate(materials, start=_FIRST_ORDINAL):
-        for chunk in _evidence_chunks(index, material.raw_result_text):
-            entries.append(
-                PromptLocalProvenanceEntry(
-                    label=chunk.label,
-                    section=CompactMaterialSection.EVIDENCE_MATERIAL,
-                    kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-                    canonical_source_refs=(material.canonical_source_ref,),
-                    source_event_refs=(material.tool_result_event_ref,),
-                    content_digest=chunk.content_digest,
-                    accepted_evidence_id=material.accepted_evidence_id,
-                    tool_result_event_ref=material.tool_result_event_ref,
-                    tool_call_event_ref=material.tool_call_event_ref,
-                    payload_refs=material.payload_refs,
-                    artifact_refs=material.artifact_refs,
-                    source_locator_refs=material.source_locator_refs,
-                    chunk_parent_label=chunk.parent_label,
-                    chunk_ordinal=chunk.chunk_ordinal,
-                )
+        _require_non_empty_text(material.raw_result_text, "raw_result_text")
+        entries.append(
+            PromptLocalProvenanceEntry(
+                label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                section=CompactMaterialSection.EVIDENCE_MATERIAL,
+                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+                canonical_source_refs=(material.canonical_source_ref,),
+                source_event_refs=(material.tool_result_event_ref,),
+                content_digest=_text_digest(material.raw_result_text),
+                accepted_evidence_id=material.accepted_evidence_id,
+                tool_result_event_ref=material.tool_result_event_ref,
+                tool_call_event_ref=material.tool_call_event_ref,
+                payload_refs=material.payload_refs,
+                artifact_refs=material.artifact_refs,
+                source_locator_refs=material.source_locator_refs,
             )
+        )
     return tuple(entries)
 
 
@@ -1424,6 +1499,7 @@ def _validate_selection_inputs(
     material_blocks: tuple[RunInputMaterialBlock, ...],
     selected_recent_window_turn_floor: int,
     max_selected_size_units: int | None,
+    max_selected_item_count: int | None,
 ) -> None:
     """校验 segment selection 输入。
 
@@ -1434,6 +1510,7 @@ def _validate_selection_inputs(
     :param material_blocks: material blocks。
     :param selected_recent_window_turn_floor: protected selected recent-window turn floor。
     :param max_selected_size_units: 可选选择预算。
+    :param max_selected_item_count: 可选选择 item 数量上限。
     :returns: ``None``。
     :raises TypeError: 参数类型非法时抛出。
     :raises ValueError: 参数值非法时抛出。
@@ -1451,6 +1528,91 @@ def _validate_selection_inputs(
         raise ValueError("selected_recent_window_turn_floor must be non-negative")
     if max_selected_size_units is not None and max_selected_size_units < 0:
         raise ValueError("max_selected_size_units must be non-negative")
+    if max_selected_item_count is not None and max_selected_item_count < 0:
+        raise ValueError("max_selected_item_count must be non-negative")
+
+
+def _sort_recovery_previous_blocks(
+    indexed_blocks: tuple[tuple[int, CompactMaterialBlock], ...]
+) -> tuple[tuple[int, CompactMaterialBlock], ...]:
+    """按 S4 Decision 5 排序 previous compacted view recovery items。
+
+    若所有候选 item 都带可解析 source EventLog sequence，则按最大 sequence
+    降序；否则回退到原 material 顺序升序，再按稳定 block label 升序。
+
+    :param indexed_blocks: 原始 material index 与 previous compact block。
+    :returns: 排序后的 indexed blocks。
+    """
+
+    sequences = tuple(
+        _max_recovery_source_event_sequence(block)
+        for _index, block in indexed_blocks
+    )
+    if len(sequences) == len(indexed_blocks) and all(sequence is not None for sequence in sequences):
+        return tuple(
+            sorted(
+                indexed_blocks,
+                key=lambda item: (
+                    -_required_recovery_source_event_sequence(item[1]),
+                    item[0],
+                    item[1].block_label,
+                ),
+            )
+        )
+    return tuple(sorted(indexed_blocks, key=lambda item: (item[0], item[1].block_label)))
+
+
+def _max_recovery_source_event_sequence(block: CompactMaterialBlock) -> int | None:
+    """从 canonical source refs 中读取最大 EventLog sequence。
+
+    当前 compacted semantic block 的 canonical refs 通常是 event id 而非
+    sequence。只有 ref 自身以 ``eventlog-seq:`` 显式携带 sequence 时才使用；
+    否则返回 ``None`` 并让排序回退到 material 顺序。
+
+    :param block: previous compacted view block。
+    :returns: 最大 source EventLog sequence；不可解析时为 ``None``。
+    """
+
+    sequences: list[int] = []
+    for ref in block.canonical_source_refs:
+        sequence = _recovery_source_event_sequence(ref)
+        if sequence is None:
+            return None
+        sequences.append(sequence)
+    if len(sequences) == 0:
+        return None
+    return max(sequences)
+
+
+def _required_recovery_source_event_sequence(block: CompactMaterialBlock) -> int:
+    """读取已确认存在的 recovery source EventLog sequence。
+
+    :param block: previous compacted view block。
+    :returns: 最大 source EventLog sequence。
+    :raises ValueError: block 缺少可解析 sequence 时抛出。
+    """
+
+    sequence = _max_recovery_source_event_sequence(block)
+    if sequence is None:
+        raise ValueError("recovery source event sequence is missing")
+    return sequence
+
+
+def _recovery_source_event_sequence(ref: str) -> int | None:
+    """解析 recovery source sequence ref。
+
+    :param ref: canonical source ref。
+    :returns: ``eventlog-seq:<n>`` 中的非负 sequence；不匹配时为 ``None``。
+    :raises ValueError: sequence ref 为负数时抛出。
+    """
+
+    prefix = "eventlog-seq:"
+    if not ref.startswith(prefix):
+        return None
+    value = int(ref.removeprefix(prefix))
+    if value < 0:
+        raise ValueError("recovery source event sequence must be non-negative")
+    return value
 
 
 def _sorted_material_blocks(
@@ -1493,45 +1655,90 @@ def _block_event_sequence(block: RunInputMaterialBlock, memory_snapshot_cursor: 
     return _NO_EVENT_SEQUENCE
 
 
-def _protected_recent_raw_block_ids(
+def _protected_recent_turn_group_block_ids(
     blocks: tuple[RunInputMaterialBlock, ...], selected_recent_window_turn_floor: int
 ) -> frozenset[str]:
-    """计算 protected recent raw floor 对应 block ids。
+    """计算 protected recent turn-group floor 对应 block ids。
 
     :param blocks: material blocks。
     :param selected_recent_window_turn_floor: selected recent-window turn 保底数量。
     :returns: protected block id 集合。
+    :raises ValueError: floor 依赖的 eligible block 缺少 turn_group_id 时抛出。
     """
 
-    explicit = [block.block_id for block in blocks if block.protected_recent_raw_turn and _is_raw_turn_block(block)]
+    explicit = [
+        block.block_id
+        for block in blocks
+        if block.protected_recent_raw_turn and is_turn_group_material_block(block)
+    ]
     if selected_recent_window_turn_floor == 0:
         return frozenset(explicit)
-    raw_blocks = sorted(
-        (block for block in blocks if _is_raw_turn_block(block)),
-        key=lambda block: (
-            _NO_EVENT_SEQUENCE if block.event_sequence is None else block.event_sequence,
-            block.event_sub_index,
-            block.block_id,
-        ),
-        reverse=True,
+    protected_turn_group_ids = protected_recent_turn_group_ids_for_material_blocks(
+        blocks,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
     )
     protected = [
-        block.block_id for block in raw_blocks[:selected_recent_window_turn_floor]
+        block.block_id
+        for block in blocks
+        if block.turn_group_id in protected_turn_group_ids
+        and is_turn_group_material_block(block)
     ]
     protected.extend(explicit)
     return frozenset(protected)
 
 
-def _is_raw_turn_block(block: RunInputMaterialBlock) -> bool:
-    """判断 block 是否为 raw turn continuity。
+def protected_recent_turn_group_ids_for_material_blocks(
+    blocks: tuple[RunInputMaterialBlock, ...],
+    *,
+    selected_recent_window_turn_floor: int,
+    missing_turn_group_message: str = "eligible material block is missing turn_group_id",
+) -> frozenset[str]:
+    """返回最近 N 个 Host Run turn group id。
+
+    :param blocks: material blocks。
+    :param selected_recent_window_turn_floor: 需要保护的 turn group 数。
+    :param missing_turn_group_message: eligible block 缺 group 时使用的错误消息。
+    :returns: 需要保护的 turn_group_id 集合。
+    :raises ValueError: floor 依赖的 eligible block 缺少 turn_group_id 时抛出。
+    """
+
+    eligible = tuple(block for block in blocks if is_turn_group_material_block(block))
+    missing = tuple(block.block_id for block in eligible if block.turn_group_id is None)
+    if len(missing) > 0:
+        raise ValueError(missing_turn_group_message)
+    latest_by_group: dict[str, tuple[int, int, int]] = {}
+    for index, block in enumerate(eligible):
+        if block.turn_group_id is None:
+            continue
+        event_sequence = (
+            _NO_EVENT_SEQUENCE if block.event_sequence is None else block.event_sequence
+        )
+        candidate = (event_sequence, block.event_sub_index, index)
+        current = latest_by_group.get(block.turn_group_id)
+        if current is None or candidate > current:
+            latest_by_group[block.turn_group_id] = candidate
+    ordered = tuple(
+        turn_group_id
+        for turn_group_id, _latest in sorted(
+            latest_by_group.items(),
+            key=lambda pair: (pair[1][0], pair[1][1], pair[1][2], pair[0]),
+            reverse=True,
+        )
+    )
+    return frozenset(ordered[:selected_recent_window_turn_floor])
+
+
+def is_turn_group_material_block(block: RunInputMaterialBlock) -> bool:
+    """判断 block 是否属于 Host Run turn group recent material。
 
     :param block: material block。
-    :returns: raw user / assistant turn 返回 ``True``。
+    :returns: user / assistant / accepted evidence block 返回 ``True``。
     """
 
     return block.kind in (
         CompactMaterialBlockKind.USER_INPUT,
         CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+        CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
     )
 
 
@@ -1748,56 +1955,61 @@ def _previous_compacted_view_from_compacted_event(
                 event_sub_index=0,
             )
         )
-    facts_text = _candidate_facts_text(candidate)
-    if facts_text is not None:
+    for index, fact_text in enumerate(_candidate_facts_texts(candidate), start=1):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:evidence_backed_facts",
+                block_id=f"previous:{row.event_id}:evidence_backed_fact:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
-                text=facts_text,
+                text=fact_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=1,
+                event_sub_index=len(blocks),
             )
         )
-    anchors_text = _candidate_answer_anchors_text(candidate)
-    if anchors_text is not None:
+    for index, anchor_text in enumerate(
+        _candidate_answer_anchor_texts(candidate),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:answer_anchors",
+                block_id=f"previous:{row.event_id}:answer_anchor:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-                text=anchors_text,
+                text=anchor_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=2,
+                event_sub_index=len(blocks),
             )
         )
-    intents_text = _candidate_forward_intents_text(candidate)
-    if intents_text is not None:
+    for index, intent_text in enumerate(
+        _candidate_forward_intent_texts(candidate),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:forward_intents",
+                block_id=f"previous:{row.event_id}:forward_intent:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.FORWARD_INTENT,
-                text=intents_text,
+                text=intent_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=3,
+                event_sub_index=len(blocks),
             )
         )
-    references_text = _candidate_reference_continuity_text(candidate)
-    if references_text is not None:
+    for index, reference_text in enumerate(
+        _candidate_reference_continuity_texts(candidate),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:reference_continuity",
+                block_id=f"previous:{row.event_id}:reference_continuity:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
-                text=references_text,
+                text=reference_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=4,
+                event_sub_index=len(blocks),
             )
         )
     return _pack_previous_blocks(tuple(blocks))
@@ -1988,6 +2200,7 @@ def _user_input_delta_block(
         text=_required_json_text(payload, _PAYLOAD_FIELD_DISPLAY_TEXT),
         canonical_source_refs=(row.event_id,),
         event_sequence=row.event_sequence,
+        turn_group_id=row.run_id,
     )
 
 
@@ -2022,6 +2235,7 @@ def _assistant_answer_delta_block(
         text=answer_text,
         canonical_source_refs=(row.event_id,),
         event_sequence=row.event_sequence,
+        turn_group_id=row.run_id,
     )
 
 
@@ -2090,6 +2304,7 @@ def _accepted_tool_evidence_delta_blocks(
             text=raw_text,
             canonical_source_refs=(envelope.evidence_id,),
             event_sequence=row.event_sequence,
+            turn_group_id=row.run_id,
             accepted_evidence_id=envelope.evidence_id,
             tool_result_event_ref=row.event_id,
             tool_call_event_ref=tool_call_event_ref,
@@ -2266,73 +2481,92 @@ def _candidate_session_summary_text(
     return _required_json_text(summary, _PAYLOAD_FIELD_SUMMARY_TEXT)
 
 
-def _candidate_facts_text(candidate: Mapping[str, JsonValue]) -> str | None:
-    """把 accepted candidate facts 渲染为 previous view 文本。
+def _candidate_facts_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """把 accepted candidate facts 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: facts 文本；无 facts 时为 ``None``。
+    :returns: facts 单项文本 tuple；无 facts 时为空 tuple。
     :raises HostDurableError: candidate facts 结构损坏时抛出。
     """
 
     facts = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
-    if len(facts) == 0:
-        return None
     lines: list[str] = []
     for fact in facts:
+        claim_text = _normalized_structured_field_text(
+            _required_json_text(fact, _PAYLOAD_FIELD_CLAIM_TEXT)
+        )
+        evidence_refs = ",".join(
+            _normalized_structured_field_text(label)
+            for label in _required_json_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
+        )
+        evidence_kind = _normalized_structured_field_text(
+            _required_json_text(fact, _PAYLOAD_FIELD_EVIDENCE_KIND)
+        )
         lines.append(
             "fact="
-            f"claim_text={_required_json_text(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}; "
-            f"evidence_refs={','.join(_required_json_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS))}; "
-            f"evidence_kind={_required_json_text(fact, _PAYLOAD_FIELD_EVIDENCE_KIND)}"
+            f"claim_text={claim_text}; "
+            f"evidence_refs={evidence_refs}; "
+            f"evidence_kind={evidence_kind}"
         )
-    return "\n".join(lines)
+    return tuple(lines)
 
 
-def _candidate_answer_anchors_text(candidate: Mapping[str, JsonValue]) -> str | None:
-    """把 accepted candidate answer anchors 渲染为 previous view 文本。
+def _candidate_answer_anchor_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """把 accepted candidate answer anchors 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: answer anchors 文本；无 anchors 时为 ``None``。
+    :returns: answer anchors 单项文本 tuple；无 anchors 时为空 tuple。
     :raises HostDurableError: candidate anchors 结构损坏时抛出。
     """
 
     anchors = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
-    if len(anchors) == 0:
-        return None
-    return "\n".join(
-        f"{_PREVIOUS_ANSWER_ANCHOR_PREFIX}{_required_json_text(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)}"
-        for anchor in anchors
-    )
+    lines: list[str] = []
+    for anchor in anchors:
+        title = _normalized_structured_field_text(
+            _required_json_text(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)
+        )
+        lines.append(f"{_PREVIOUS_ANSWER_ANCHOR_PREFIX}{title}")
+    return tuple(lines)
 
 
-def _candidate_forward_intents_text(candidate: Mapping[str, JsonValue]) -> str | None:
-    """把 accepted candidate forward intents 渲染为 previous view 文本。
+def _candidate_forward_intent_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """把 accepted candidate forward intents 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: forward intents 文本；无 intents 时为 ``None``。
+    :returns: forward intents 单项文本 tuple；无 intents 时为空 tuple。
     :raises HostDurableError: candidate intents 结构损坏时抛出。
     """
 
     intents = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
-    if len(intents) == 0:
-        return None
     lines: list[str] = []
     for intent in intents:
-        lines.append(
-            f"{_PREVIOUS_FORWARD_INTENT_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_INTENT_TYPE)}; "
-            f"{_PREVIOUS_FORWARD_STATUS_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_STATUS)}; "
-            f"{_PREVIOUS_FORWARD_TEXT_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_TEXT)}"
+        intent_type = _normalized_structured_field_text(
+            _required_json_text(intent, _PAYLOAD_FIELD_INTENT_TYPE)
         )
-    return "\n".join(lines)
+        status = _normalized_structured_field_text(
+            _required_json_text(intent, _PAYLOAD_FIELD_STATUS)
+        )
+        text = _normalized_structured_field_text(
+            _required_json_text(intent, _PAYLOAD_FIELD_TEXT)
+        )
+        lines.append(
+            f"{_PREVIOUS_FORWARD_INTENT_PREFIX}"
+            f"{intent_type}; "
+            f"{_PREVIOUS_FORWARD_STATUS_PREFIX}"
+            f"{status}; "
+            f"{_PREVIOUS_FORWARD_TEXT_PREFIX}"
+            f"{text}"
+        )
+    return tuple(lines)
 
 
-def _candidate_reference_continuity_text(
+def _candidate_reference_continuity_texts(
     candidate: Mapping[str, JsonValue],
-) -> str | None:
-    """把 accepted candidate reference continuity 渲染为 previous view 文本。
+) -> tuple[str, ...]:
+    """把 accepted candidate reference continuity 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: reference continuity 文本；无 items 时为 ``None``。
+    :returns: reference continuity 单项文本 tuple；无 items 时为空 tuple。
     :raises HostDurableError: candidate references 结构损坏时抛出。
     """
 
@@ -2340,15 +2574,21 @@ def _candidate_reference_continuity_text(
         candidate,
         _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS,
     )
-    if len(items) == 0:
-        return None
     lines: list[str] = []
     for item in items:
-        lines.append(
-            f"{_PREVIOUS_REFERENCE_PREFIX}{_required_json_text(item, _PAYLOAD_FIELD_REASON)}; "
-            f"{_PREVIOUS_REFERENCE_TEXT_PREFIX}{_required_json_text(item, _PAYLOAD_FIELD_TEXT)}"
+        reason = _normalized_structured_field_text(
+            _required_json_text(item, _PAYLOAD_FIELD_REASON)
         )
-    return "\n".join(lines)
+        text = _normalized_structured_field_text(
+            _required_json_text(item, _PAYLOAD_FIELD_TEXT)
+        )
+        lines.append(
+            f"{_PREVIOUS_REFERENCE_PREFIX}"
+            f"{reason}; "
+            f"{_PREVIOUS_REFERENCE_TEXT_PREFIX}"
+            f"{text}"
+        )
+    return tuple(lines)
 
 
 def _current_input_anchor(current_input_ref: str, current_input_text: str) -> CurrentInputAnchor:
@@ -2359,20 +2599,13 @@ def _current_input_anchor(current_input_ref: str, current_input_text: str) -> Cu
     :returns: CurrentInputAnchor。
     """
 
-    normalized = normalized_material_text(current_input_text)
-    if len(normalized) <= CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS:
-        anchor_text = normalized
-        truncated = False
-    else:
-        prefix_len = CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS - len(_CURRENT_INPUT_TRUNCATED_MARKER)
-        anchor_text = normalized[:prefix_len].rstrip() + _CURRENT_INPUT_TRUNCATED_MARKER
-        truncated = True
+    anchor_text = normalized_material_text(current_input_text)
     return CurrentInputAnchor(
         anchor_label=current_input_anchor_label(),
         anchor_text=anchor_text,
-        truncated=truncated,
+        truncated=False,
         canonical_source_refs=(current_input_ref,),
-        content_digest=_text_digest(normalized),
+        content_digest=_text_digest(anchor_text),
     )
 
 
@@ -2445,56 +2678,61 @@ def _previous_blocks_from_snapshot(
                 event_sub_index=0,
             )
         )
-    facts_text = _snapshot_facts_text(snapshot)
-    if facts_text is not None:
+    for index, fact_text in enumerate(_snapshot_fact_texts(snapshot), start=1):
         blocks.append(
             run_input_material_block(
-                block_id=_STABLE_FACTS_BLOCK_ID,
+                block_id=f"{_STABLE_FACTS_BLOCK_ID}:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
-                text=facts_text,
+                text=fact_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=1,
+                event_sub_index=len(blocks),
             )
         )
-    anchors_text = _snapshot_answer_anchors_text(snapshot)
-    if anchors_text is not None:
+    for index, anchor_text in enumerate(
+        _snapshot_answer_anchor_texts(snapshot),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id="previous:answer_anchors",
+                block_id=f"previous:answer_anchor:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-                text=anchors_text,
+                text=anchor_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=2,
+                event_sub_index=len(blocks),
             )
         )
-    intents_text = _snapshot_forward_intents_text(snapshot)
-    if intents_text is not None:
+    for index, intent_text in enumerate(
+        _snapshot_forward_intent_texts(snapshot),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id="previous:forward_intents",
+                block_id=f"previous:forward_intent:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.FORWARD_INTENT,
-                text=intents_text,
+                text=intent_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=3,
+                event_sub_index=len(blocks),
             )
         )
-    reference_text = _snapshot_reference_continuity_text(snapshot)
-    if reference_text is not None:
+    for index, reference_text in enumerate(
+        _snapshot_reference_continuity_texts(snapshot),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id="previous:reference_continuity",
+                block_id=f"previous:reference_continuity:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
                 text=reference_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=4,
+                event_sub_index=len(blocks),
             )
         )
     return _pack_previous_blocks(tuple(blocks))
@@ -2510,70 +2748,75 @@ def _snapshot_summary_text(snapshot: ConversationMemorySnapshotVNext) -> str | N
     return snapshot.session_summary_memory.summary_text
 
 
-def _snapshot_facts_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 evidence-backed facts stable 文本。
+def _snapshot_fact_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 evidence-backed facts stable 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: stable 文本；无内容时返回 ``None``。
+    :returns: stable 单项文本 tuple；无内容时为空 tuple。
     """
 
     facts = snapshot.evidence_fact_memory.evidence_backed_facts
-    if not facts:
-        return None
     lines: list[str] = []
     for fact in facts:
+        evidence_refs = ",".join(
+            _normalized_structured_field_text(ref)
+            for ref in fact.evidence_refs
+        )
         lines.append(
             "fact="
-            f"claim_text={fact.claim_text}; "
-            f"evidence_refs={','.join(fact.evidence_refs)}; "
-            f"evidence_kind={fact.evidence_kind.value}"
+            f"claim_text={_normalized_structured_field_text(fact.claim_text)}; "
+            f"evidence_refs={evidence_refs}; "
+            f"evidence_kind={_normalized_structured_field_text(fact.evidence_kind.value)}"
         )
-    return "\n".join(lines)
+    return tuple(lines)
 
 
-def _snapshot_answer_anchors_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 previous answer anchors 文本。
+def _snapshot_answer_anchor_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 previous answer anchor 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: answer anchor 文本；无内容时返回 ``None``。
+    :returns: answer anchor 单项文本 tuple；无内容时为空 tuple。
     """
 
-    if not snapshot.answer_anchor_memory.anchors:
-        return None
     lines: list[str] = []
     for anchor in snapshot.answer_anchor_memory.anchors:
-        lines.append(f"answer_anchor={anchor.anchor_title}")
-    return "\n".join(lines)
+        lines.append(
+            f"answer_anchor={_normalized_structured_field_text(anchor.anchor_title)}"
+        )
+    return tuple(lines)
 
 
-def _snapshot_forward_intents_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 previous forward intents 文本。
+def _snapshot_forward_intent_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 previous forward intent 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: forward intent 文本；无内容时返回 ``None``。
+    :returns: forward intent 单项文本 tuple；无内容时为空 tuple。
     """
 
-    if not snapshot.forward_intent_memory.intents:
-        return None
     lines: list[str] = []
     for intent in snapshot.forward_intent_memory.intents:
-        lines.append(f"forward_intent={intent.intent_type}; status={intent.status}; text={intent.text}")
-    return "\n".join(lines)
+        lines.append(
+            f"forward_intent={_normalized_structured_field_text(intent.intent_type)}; "
+            f"status={_normalized_structured_field_text(intent.status)}; "
+            f"text={_normalized_structured_field_text(intent.text)}"
+        )
+    return tuple(lines)
 
 
-def _snapshot_reference_continuity_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 previous reference continuity 文本。
+def _snapshot_reference_continuity_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 previous reference continuity 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: reference continuity 文本；无内容时返回 ``None``。
+    :returns: reference continuity 单项文本 tuple；无内容时为空 tuple。
     """
 
-    if not snapshot.trace_memory.reference_continuity_items:
-        return None
     lines: list[str] = []
     for item in snapshot.trace_memory.reference_continuity_items:
-        lines.append(f"reference_continuity={item.reason}; text={item.text}")
-    return "\n".join(lines)
+        lines.append(
+            f"reference_continuity={_normalized_structured_field_text(item.reason)}; "
+            f"text={_normalized_structured_field_text(item.text)}"
+        )
+    return tuple(lines)
 
 
 def _pack_previous_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[CompactMaterialBlock, ...]:
@@ -2645,19 +2888,19 @@ def _pack_evidence_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[Co
             raise ValueError("RunInputMaterialBlock.readable_query_text is required")
         if block.readable_source_text is None:
             raise ValueError("RunInputMaterialBlock.readable_source_text is required")
-        for chunk in _evidence_chunks(index, block.text):
-            result.append(
-                CompactEvidenceBlock(
-                    evidence_label=chunk.label,
-                    readable_tool_name=block.readable_tool_name,
-                    readable_query_text=block.readable_query_text,
-                    raw_result_text=chunk.text,
-                    readable_source_text=block.readable_source_text,
-                    size_units=len(chunk.text),
-                    canonical_source_refs=block.canonical_source_refs,
-                    content_digest=chunk.content_digest,
-                )
+        _require_non_empty_text(block.text, "evidence_text")
+        result.append(
+            CompactEvidenceBlock(
+                evidence_label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                readable_tool_name=block.readable_tool_name,
+                readable_query_text=block.readable_query_text,
+                raw_result_text=block.text,
+                readable_source_text=block.readable_source_text,
+                size_units=len(block.text),
+                canonical_source_refs=block.canonical_source_refs,
+                content_digest=block.content_digest,
             )
+        )
     return tuple(result)
 
 
@@ -2688,19 +2931,16 @@ def _provenance_from_blocks(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[P
 
 
 def _provenance_from_evidence_blocks(
-    evidence_blocks: tuple[CompactEvidenceBlock, ...],
     selected_blocks: tuple[RunInputMaterialBlock, ...],
 ) -> tuple[PromptLocalProvenanceEntry, ...]:
     """构造 evidence provenance entries。
 
-    :param evidence_blocks: prompt-local evidence blocks。
     :param selected_blocks: selected ordinary material blocks。
     :returns: provenance entries。
     """
 
     source_blocks = tuple(block for block in selected_blocks if block.section is CompactMaterialSection.EVIDENCE_MATERIAL)
     entries: list[PromptLocalProvenanceEntry] = []
-    del evidence_blocks
     for index, source in enumerate(source_blocks, start=_FIRST_ORDINAL):
         if source.accepted_evidence_id is None:
             raise ValueError("RunInputMaterialBlock.accepted_evidence_id is required")
@@ -2708,71 +2948,24 @@ def _provenance_from_evidence_blocks(
             raise ValueError("RunInputMaterialBlock.tool_result_event_ref is required")
         if source.tool_call_event_ref is None:
             raise ValueError("RunInputMaterialBlock.tool_call_event_ref is required")
-        for chunk in _evidence_chunks(index, source.text):
-            entries.append(
-                PromptLocalProvenanceEntry(
-                    label=chunk.label,
-                    section=CompactMaterialSection.EVIDENCE_MATERIAL,
-                    kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-                    canonical_source_refs=source.canonical_source_refs,
-                    source_event_refs=(source.tool_result_event_ref,),
-                    content_digest=chunk.content_digest,
-                    accepted_evidence_id=source.accepted_evidence_id,
-                    tool_result_event_ref=source.tool_result_event_ref,
-                    tool_call_event_ref=source.tool_call_event_ref,
-                    payload_refs=source.payload_refs,
-                    artifact_refs=source.artifact_refs,
-                    source_locator_refs=source.source_locator_refs,
-                    chunk_parent_label=chunk.parent_label,
-                    chunk_ordinal=chunk.chunk_ordinal,
-                )
+        _require_non_empty_text(source.text, "evidence_text")
+        entries.append(
+            PromptLocalProvenanceEntry(
+                label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
+                section=CompactMaterialSection.EVIDENCE_MATERIAL,
+                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+                canonical_source_refs=source.canonical_source_refs,
+                source_event_refs=(source.tool_result_event_ref,),
+                content_digest=source.content_digest,
+                accepted_evidence_id=source.accepted_evidence_id,
+                tool_result_event_ref=source.tool_result_event_ref,
+                tool_call_event_ref=source.tool_call_event_ref,
+                payload_refs=source.payload_refs,
+                artifact_refs=source.artifact_refs,
+                source_locator_refs=source.source_locator_refs,
             )
+        )
     return tuple(entries)
-
-
-def _evidence_chunks(evidence_ordinal: int, text: str) -> tuple[_EvidenceChunk, ...]:
-    """把单个 evidence text 拆成确定性 prompt-local chunks。
-
-    :param evidence_ordinal: evidence section 内 ordinal。
-    :param text: digest-checked raw evidence text。
-    :returns: evidence chunk tuple；未超限时返回单个非 chunk label。
-    :raises ValueError: text 为空或 ordinal 非法时抛出。
-    """
-
-    _require_non_empty_text(text, "evidence_text")
-    if evidence_ordinal < _FIRST_ORDINAL:
-        raise ValueError("evidence_ordinal must be positive")
-    if len(text) <= EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS:
-        return (
-            _EvidenceChunk(
-                label=material_label(
-                    CompactMaterialSection.EVIDENCE_MATERIAL,
-                    evidence_ordinal,
-                ),
-                parent_label=None,
-                chunk_ordinal=None,
-                text=text,
-                content_digest=_text_digest(text),
-            ),
-        )
-    chunks: list[_EvidenceChunk] = []
-    parent_label = material_label(CompactMaterialSection.EVIDENCE_MATERIAL, evidence_ordinal)
-    start = 0
-    chunk_ordinal = _FIRST_ORDINAL
-    while start < len(text):
-        chunk_text = text[start : start + EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS]
-        chunks.append(
-            _EvidenceChunk(
-                label=evidence_chunk_label(evidence_ordinal, chunk_ordinal),
-                parent_label=parent_label,
-                chunk_ordinal=chunk_ordinal,
-                text=chunk_text,
-                content_digest=_text_digest(chunk_text),
-            )
-        )
-        start += EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS
-        chunk_ordinal += 1
-    return tuple(chunks)
 
 
 def _raise_on_duplicate_section_owner(entries: tuple[PromptLocalProvenanceEntry, ...]) -> None:
@@ -3318,7 +3511,7 @@ def _parse_previous_forward_intent_text(
 ) -> tuple[ForwardIntentTypeVNext, ForwardIntentStatusVNext, str]:
     """解析本模块生成的 previous forward intent 文本。
 
-    :param text: ``_snapshot_forward_intents_text`` 生成的文本。
+    :param text: ``_snapshot_forward_intent_texts`` 生成的单项文本。
     :returns: intent type、status 与可读文本。
     :raises ValueError: 文本格式或枚举值非法时抛出。
     """
@@ -3347,7 +3540,7 @@ def _parse_previous_reference_continuity_text(
 ) -> tuple[ReferenceContinuityReasonVNext, str]:
     """解析本模块生成的 previous reference continuity 文本。
 
-    :param text: ``_snapshot_reference_continuity_text`` 生成的文本。
+    :param text: ``_snapshot_reference_continuity_texts`` 生成的单项文本。
     :returns: reference reason 与可读文本。
     :raises ValueError: 文本格式或枚举值非法时抛出。
     """
@@ -3426,8 +3619,6 @@ def _require_non_empty_text(value: str | None, field_name: str) -> None:
 
 
 __all__ = [
-    "CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS",
-    "EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS",
     "CompactMaterialBuildError",
     "CompactMaterialSourceBoundary",
     "CompactMemorySnapshotRepairRequired",
@@ -3445,7 +3636,6 @@ __all__ = [
     "check_compact_memory_snapshot_cursor",
     "conversation_compact_input_vnext_from_material_pack",
     "current_input_anchor_label",
-    "evidence_chunk_label",
     "initial_segment_selection",
     "material_label",
     "normalized_material_text",
@@ -3453,5 +3643,6 @@ __all__ = [
     "run_input_material_block",
     "select_compact_segment",
     "selected_material_source_refs",
+    "selected_material_view_digest",
     "validate_material_label",
 ]

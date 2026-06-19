@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -38,6 +38,7 @@ from dayu.host.api import (
     HostLocalExecutionOptions,
     LocalWorkerHandle,
     RunStatus,
+    SessionStatus,
     SourceRunRelation,
 )
 from dayu.host.durable.codec import canonical_json_dumps, format_utc_timestamp, sha256_digest_json
@@ -138,23 +139,29 @@ from dayu.host.compact_material import (
     RunInputMaterialBlock,
     build_pre_dispatch_compact_material_view,
     build_compact_material_pack,
+    degrade_previous_compacted_view_for_recovery,
     run_input_material_block,
     select_compact_segment,
     selected_material_source_refs,
 )
 from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
+    CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialSection,
+    CompactSegmentSelection,
     CompactSegmentTrigger,
     CompactionRequest,
     ConversationCompactOutputVNext,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
+    CompactionRejectedAttemptDiagnosticReference,
+    CompactionFailureCategory,
     CompactionOperationResult,
     DurableCompactorProposalManifestRecorder,
     run_compaction_operation,
+    write_compaction_rejected_attempt_diagnostic_artifact,
 )
 from dayu.host.context_budget import (
     BudgetEstimate,
@@ -232,6 +239,8 @@ _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
 _COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
 _COMPACTION_CANCEL_REASON_RUN_MISSING = "run_missing"
+_COMPACTION_CANCEL_REASON_SESSION_MISSING = "session_missing"
+_COMPACTION_CANCEL_REASON_SESSION_CLOSED = "session_closed"
 _COMPACTION_CANCEL_REASON_INPUT_CHANGED = "run_input_event_sequence_changed"
 _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
@@ -434,6 +443,18 @@ class _GovernanceCompactPending:
     operation_id: str
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
+
+
+@dataclass(frozen=True, slots=True)
+class _ProactiveCompactionRecoveryAttempt:
+    """proactive compaction recovery tier 的内存态 attempt 摘要。
+
+    :param request: recovery tier 使用的 compaction request。
+    :param reason: 日志诊断用本地 tier 原因，不写入 durable payload。
+    """
+
+    request: CompactionRequest
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -697,11 +718,13 @@ class _ReadCompactionCancelReasonOperation:
     """读取 proactive compaction 是否已失效的 durable operation。
 
     :param run_id: 目标 Run id。
+    :param session_id: 目标 Session id。
     :param expected_status: compaction request 写入时的 Run 状态。
     :param expected_input_event_sequence: compaction request 对应输入 cursor。
     """
 
     run_id: str
+    session_id: str
     expected_status: RunStatus
     expected_input_event_sequence: int
 
@@ -715,6 +738,11 @@ class _ReadCompactionCancelReasonOperation:
         run = read_run_by_id(transaction, self.run_id)
         if run is None:
             return _COMPACTION_CANCEL_REASON_RUN_MISSING
+        session = read_session_by_id(transaction, self.session_id)
+        if session is None:
+            return _COMPACTION_CANCEL_REASON_SESSION_MISSING
+        if session.status is not SessionStatus.OPEN or session.closed_at is not None:
+            return _COMPACTION_CANCEL_REASON_SESSION_CLOSED
         if run.input_event_sequence != self.expected_input_event_sequence:
             return _COMPACTION_CANCEL_REASON_INPUT_CHANGED
         if run.status != self.expected_status:
@@ -736,6 +764,7 @@ class _DurableRunCancellationToken(CancellationToken):
         *,
         transaction_runner: HostTransactionRunner,
         run_id: str,
+        session_id: str,
         expected_status: RunStatus,
         expected_input_event_sequence: int,
     ) -> None:
@@ -743,6 +772,7 @@ class _DurableRunCancellationToken(CancellationToken):
 
         :param transaction_runner: Host durable transaction runner。
         :param run_id: 目标 Run id。
+        :param session_id: 目标 Session id。
         :param expected_status: compaction request 写入时的 Run 状态。
         :param expected_input_event_sequence: compaction request 对应输入 cursor。
         :returns: ``None``。
@@ -750,6 +780,7 @@ class _DurableRunCancellationToken(CancellationToken):
 
         self._transaction_runner = transaction_runner
         self._run_id = run_id
+        self._session_id = session_id
         self._expected_status = expected_status
         self._expected_input_event_sequence = expected_input_event_sequence
 
@@ -773,6 +804,7 @@ class _DurableRunCancellationToken(CancellationToken):
             return self._transaction_runner.run_read(
                 _ReadCompactionCancelReasonOperation(
                     run_id=self._run_id,
+                    session_id=self._session_id,
                     expected_status=self._expected_status,
                     expected_input_event_sequence=(self._expected_input_event_sequence),
                 )
@@ -1288,21 +1320,73 @@ class HostDispatchScheduler:
             if self._local_execution.context_budget_policy is not None
             else 1
         )
+        cancellation_token = _DurableRunCancellationToken(
+            transaction_runner=self._transaction_runner,
+            run_id=pending.run_id,
+            session_id=pending.session_id,
+            expected_status=pending.expected_status,
+            expected_input_event_sequence=pending.expected_input_event_sequence,
+        )
+        proposal_manifest_recorder = self._compactor_proposal_manifest_recorder()
         result = await run_compaction_operation(
             request=pending.request,
             compactor=compactor,
             max_attempts=attempts,
-            cancellation_token=_DurableRunCancellationToken(
-                transaction_runner=self._transaction_runner,
-                run_id=pending.run_id,
-                expected_status=pending.expected_status,
-                expected_input_event_sequence=pending.expected_input_event_sequence,
-            ),
+            cancellation_token=cancellation_token,
             compaction_operation_id=pending.operation_id,
-            proposal_manifest_recorder=(
-                self._compactor_proposal_manifest_recorder()
-            ),
+            proposal_manifest_recorder=proposal_manifest_recorder,
         )
+        accepted_request = pending.request
+        accepted_result = result
+        accepted_attempt_number = _accepted_attempt_number(result)
+        completed_attempt_count = _completed_compaction_proposal_attempt_count(result)
+        operation_rejected_attempts = list(result.rejected_attempts)
+        budget_after_attempted_compact = result.budget_after_attempted_compact
+        if not _compaction_result_accepted(result):
+            for recovery in self._proactive_compaction_recovery_attempts(pending):
+                if cancellation_token.is_cancelled():
+                    break
+                tier_result = await run_compaction_operation(
+                    request=recovery.request,
+                    compactor=compactor,
+                    max_attempts=1,
+                    cancellation_token=cancellation_token,
+                    compaction_operation_id=pending.operation_id,
+                    proposal_manifest_recorder=proposal_manifest_recorder,
+                )
+                operation_rejected_attempts.extend(
+                    _renumber_compaction_rejected_attempts(
+                        tier_result.rejected_attempts,
+                        offset=completed_attempt_count,
+                    )
+                )
+                if tier_result.budget_after_attempted_compact is not None:
+                    budget_after_attempted_compact = (
+                        tier_result.budget_after_attempted_compact
+                    )
+                if cancellation_token.is_cancelled():
+                    break
+                if _compaction_result_accepted(tier_result):
+                    accepted_attempt_number = (
+                        completed_attempt_count
+                        + _accepted_attempt_number(tier_result)
+                    )
+                    _LOGGER.log(
+                        VERBOSE_LOG_LEVEL,
+                        "dispatch.compact.recovery_accepted session_id=%s "
+                        "run_id=%s operation_id=%s reason=%s",
+                        pending.session_id,
+                        pending.run_id,
+                        pending.operation_id,
+                        recovery.reason,
+                    )
+                    accepted_request = recovery.request
+                    accepted_result = tier_result
+                    break
+                completed_attempt_count += (
+                    _completed_compaction_proposal_attempt_count(tier_result)
+                )
+        rejected_attempts = tuple(operation_rejected_attempts)
 
         def _operation(transaction: HostTransaction) -> _ProactiveCompactionExecutionResult:
             run = read_run_by_id(transaction, pending.run_id)
@@ -1319,22 +1403,38 @@ class HostDispatchScheduler:
                         decision=pending.decision,
                         operation_id=pending.operation_id,
                         failure_reason="stale_compaction_result",
-                        attempt_count=len(result.rejected_attempts),
+                        attempt_count=len(rejected_attempts),
                         retry_repair_budget_exhausted=False,
-                        budget_after_attempted_compact=(result.budget_after_attempted_compact),
+                        budget_after_attempted_compact=budget_after_attempted_compact,
                     )
                 return _ProactiveCompactionExecutionResult(
                     compacted_event_sequence=None,
                     pending_dispatch=None,
                 )
-            for rejected in result.rejected_attempts:
+            for rejected in rejected_attempts:
                 self._append_compaction_attempt_rejected_event(
                     transaction,
                     run=run,
                     operation_id=pending.operation_id,
                     rejected=rejected,
                 )
-            if result.accepted_candidate is None or result.quality_result is None or result.failure_reason is not None:
+            if not _run_session_allows_proactive_compaction(transaction, run):
+                self._append_compaction_failed_event(
+                    transaction,
+                    run=run,
+                    estimate=pending.estimate,
+                    decision=pending.decision,
+                    operation_id=pending.operation_id,
+                    failure_reason="stale_compaction_result",
+                    attempt_count=len(rejected_attempts),
+                    retry_repair_budget_exhausted=False,
+                    budget_after_attempted_compact=budget_after_attempted_compact,
+                )
+                return _ProactiveCompactionExecutionResult(
+                    compacted_event_sequence=None,
+                    pending_dispatch=None,
+                )
+            if not _compaction_result_accepted(accepted_result):
                 fallback_dispatch = self._append_compaction_failed_with_proactive_fallback(
                     transaction,
                     run=run,
@@ -1342,12 +1442,12 @@ class HostDispatchScheduler:
                     estimate=pending.estimate,
                     decision=pending.decision,
                     operation_id=pending.operation_id,
-                    failure_reason=result.failure_reason or "compaction_failed",
-                    attempt_count=len(result.rejected_attempts),
+                    failure_reason=accepted_result.failure_reason or "compaction_failed",
+                    attempt_count=len(rejected_attempts),
                     retry_repair_budget_exhausted=(
-                        len(result.rejected_attempts) > 0
+                        len(rejected_attempts) > 0
                     ),
-                    budget_after_attempted_compact=(result.budget_after_attempted_compact),
+                    budget_after_attempted_compact=budget_after_attempted_compact,
                 )
                 if fallback_dispatch is not None:
                     return _ProactiveCompactionExecutionResult(
@@ -1365,26 +1465,31 @@ class HostDispatchScheduler:
                     compacted_event_sequence=None,
                     pending_dispatch=None,
                 )
+            if (
+                accepted_result.accepted_candidate is None
+                or accepted_result.quality_result is None
+            ):
+                raise RuntimeError("accepted compaction result is incomplete")
             compacted_sequence = self._append_compacted_event(
                 transaction,
                 run=run,
                 estimate=pending.estimate,
                 decision=pending.decision,
-                request=pending.request,
-                candidate=result.accepted_candidate,
-                quality=result.quality_result,
+                request=accepted_request,
+                candidate=accepted_result.accepted_candidate,
+                quality=accepted_result.quality_result,
                 operation_id=pending.operation_id,
-                accepted_attempt_number=_accepted_attempt_number(result),
+                accepted_attempt_number=accepted_attempt_number,
                 budget_after_compact=(
-                    result.budget_after_attempted_compact
-                    if result.budget_after_attempted_compact is not None
+                    accepted_result.budget_after_attempted_compact
+                    if accepted_result.budget_after_attempted_compact is not None
                     else pending.estimate.estimated_input_tokens
                 ),
                 accepted_proposal_manifest_ref=(
-                    _required_compactor_manifest_ref(result)
+                    _required_compactor_manifest_ref(accepted_result)
                 ),
                 accepted_proposal_manifest_digest=(
-                    _required_compactor_manifest_digest(result)
+                    _required_compactor_manifest_digest(accepted_result)
                 ),
             )
             return _ProactiveCompactionExecutionResult(
@@ -1393,6 +1498,126 @@ class HostDispatchScheduler:
             )
 
         return self._transaction_runner.run_write(_operation)
+
+    def _proactive_compaction_recovery_attempts(
+        self, pending: _GovernanceCompactPending
+    ) -> tuple[_ProactiveCompactionRecoveryAttempt, ...]:
+        """构造 S4 proactive compact recovery tier attempts。
+
+        所有 attempt 都基于 pending 中冻结的 selected material view，不重新读取
+        EventLog，也不重新选择 compact 以外的材料来源。
+
+        :param pending: 已冻结的 proactive compact pending 摘要。
+        :returns: tier 1-3 recovery attempt 元组。
+        """
+
+        memory_policy = self._local_execution.memory_projection_policy
+        bounded_selection = select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=pending.expected_input_event_sequence,
+            memory_snapshot_cursor=None,
+            policy_digest=pending.estimate.estimator_digest,
+            material_blocks=pending.material_view.material_blocks,
+            selected_recent_window_turn_floor=(
+                memory_policy.selected_recent_window_turn_floor
+            ),
+            max_selected_size_units=(
+                memory_policy.fallback_selected_recent_window_char_cap
+            ),
+            max_selected_item_count=(
+                memory_policy.fallback_selected_recent_window_item_cap
+            ),
+        )
+        attempts: list[_ProactiveCompactionRecoveryAttempt] = [
+            _ProactiveCompactionRecoveryAttempt(
+                request=self._proactive_compaction_recovery_request(
+                    pending=pending,
+                    selected_segment=bounded_selection,
+                    previous_compacted_view=pending.material_view.previous_compacted_view,
+                ),
+                reason="tier_1_fallback_caps",
+            )
+        ]
+        degraded_previous_view = degrade_previous_compacted_view_for_recovery(
+            pending.material_view.previous_compacted_view
+        )
+        if (
+            len(degraded_previous_view) > 0
+            and degraded_previous_view != pending.material_view.previous_compacted_view
+        ):
+            attempts.append(
+                _ProactiveCompactionRecoveryAttempt(
+                    request=self._proactive_compaction_recovery_request(
+                        pending=pending,
+                        selected_segment=pending.request.segment_selection,
+                        previous_compacted_view=degraded_previous_view,
+                    ),
+                    reason="tier_2_section_degrade",
+                )
+            )
+        attempts.append(
+            _ProactiveCompactionRecoveryAttempt(
+                request=self._proactive_compaction_recovery_request(
+                    pending=pending,
+                    selected_segment=bounded_selection,
+                    previous_compacted_view=(),
+                ),
+                reason="tier_3_delta_only",
+            )
+        )
+        return tuple(attempts)
+
+    def _proactive_compaction_recovery_request(
+        self,
+        *,
+        pending: _GovernanceCompactPending,
+        selected_segment: CompactSegmentSelection,
+        previous_compacted_view: tuple[CompactMaterialBlock, ...],
+    ) -> CompactionRequest:
+        """用同一个 frozen material view 构造 proactive recovery request。
+
+        :param pending: 已冻结的 proactive compact pending 摘要。
+        :param selected_segment: recovery tier 使用的 selected segment。
+        :param previous_compacted_view: recovery tier 使用的 previous compacted view。
+        :returns: proactive recovery compaction request。
+        """
+
+        material_pack = build_compact_material_pack(
+            selected_segment=selected_segment,
+            material_blocks=pending.material_view.material_blocks,
+            memory_snapshot=None,
+            inline_delta_repair_view=None,
+            current_input_ref=pending.request.recent_raw_turn_refs[0],
+            current_input_text=pending.material_view.current_input_text,
+            previous_compacted_view=previous_compacted_view,
+        )
+        selected_evidence_refs = _selected_evidence_refs(
+            material_blocks=pending.material_view.material_blocks,
+            selected_block_ids=selected_segment.selected_block_ids,
+        )
+        selected_raw_turn_refs = _selected_raw_turn_refs(
+            material_blocks=pending.material_view.material_blocks,
+            selected_block_ids=selected_segment.selected_block_ids,
+        )
+        current_input_ref = pending.request.recent_raw_turn_refs[0]
+        return CompactionRequest(
+            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+            session_id=pending.session_id,
+            run_id=pending.run_id,
+            attempt_id=None,
+            execution_id=None,
+            memory_snapshot_cursor=None,
+            material_pack=material_pack,
+            segment_selection=selected_segment,
+            evidence_backed_fact_refs=selected_evidence_refs,
+            recent_raw_turn_refs=_dedupe_texts((current_input_ref, *selected_raw_turn_refs)),
+            older_raw_turn_refs=selected_material_source_refs(
+                material_blocks=pending.material_view.material_blocks,
+                selected_block_ids=selected_segment.selected_block_ids,
+            ),
+            existing_episode_summary_refs=(),
+            budget_before_compact=pending.estimate,
+        )
 
     def _compactor_proposal_manifest_recorder(
         self,
@@ -1986,6 +2211,7 @@ class HostDispatchScheduler:
         )
         return build_recent_window_fallback_selection(
             policy=policy,
+            memory_policy=self._local_execution.memory_projection_policy,
             session_id=run.session_id,
             run_id=run.run_id,
             material_blocks=material_blocks,
@@ -2090,6 +2316,11 @@ class HostDispatchScheduler:
         :returns: ``None``。
         """
 
+        diagnostic_reference = self._write_compaction_rejected_diagnostic(
+            transaction,
+            operation_id=operation_id,
+            rejected=rejected,
+        )
         self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
@@ -2118,11 +2349,128 @@ class HostDispatchScheduler:
                     budget_after_attempted_compact=(rejected.budget_after_attempted_compact),
                     proposal_manifest_ref=rejected.proposal_manifest_ref,
                     proposal_manifest_digest=rejected.proposal_manifest_digest,
+                    diagnostic_artifact_ref=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.payload_ref
+                    ),
+                    diagnostic_artifact_digest=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.payload_digest
+                    ),
+                    failure_stage=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.failure_stage
+                    ),
+                    diagnostic_suffix=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.diagnostic_suffix
+                    ),
+                    parser_or_validator=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.parser_or_validator
+                    ),
+                    exception_class=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.exception_class
+                    ),
+                    exception_message=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.exception_message
+                    ),
+                    offending_block_section=_diagnostic_offending_section(
+                        diagnostic_reference
+                    ),
+                    offending_block_kind=_diagnostic_offending_kind(
+                        diagnostic_reference
+                    ),
+                    offending_block_label=_diagnostic_offending_label(
+                        diagnostic_reference
+                    ),
+                    offending_block_ordinal=_diagnostic_offending_ordinal(
+                        diagnostic_reference
+                    ),
+                    offending_block_text_digest=_diagnostic_offending_text_digest(
+                        diagnostic_reference
+                    ),
+                    offending_block_text_length=_diagnostic_offending_text_length(
+                        diagnostic_reference
+                    ),
+                    material_pack_digest=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.material_pack_digest
+                    ),
                 ),
                 payload_ref=None,
                 payload_digest=None,
             ),
         )
+
+    def _write_compaction_rejected_diagnostic(
+        self,
+        transaction: HostTransaction,
+        *,
+        operation_id: str,
+        rejected: CompactionAttemptRejected,
+    ) -> CompactionRejectedAttemptDiagnosticReference | None:
+        """写入 proactive rejected attempt diagnostic artifact。
+
+        :param transaction: 当前 Host transaction。
+        :param operation_id: compaction operation id。
+        :param rejected: rejected attempt 摘要。
+        :returns: 已持久化 diagnostic 引用；没有 diagnostic 或写入失败时为
+            ``None``。
+        """
+
+        diagnostic = rejected.diagnostic
+        artifact_root = self._local_execution.compact_artifact_root
+        if diagnostic is None or artifact_root is None:
+            return None
+        try:
+            reference = write_compaction_rejected_attempt_diagnostic_artifact(
+                transaction=transaction,
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    create_artifact_root=(
+                        self._local_execution.compact_artifact_create_parent_dirs
+                    ),
+                ),
+                payload_store=PayloadStore(),
+                diagnostic=diagnostic,
+                compaction_operation_id=operation_id,
+                compaction_attempt_number=rejected.attempt_number,
+            )
+        except HostDurableError as exc:
+            _LOGGER.warning(
+                "dispatch.compact.rejected_diagnostic_write_failed "
+                "operation_id=%s attempt_number=%s failure_stage=%s "
+                "error_code=%s message=%s",
+                operation_id,
+                rejected.attempt_number,
+                diagnostic.failure_stage,
+                None,
+                str(exc),
+            )
+            return None
+        _LOGGER.info(
+            "dispatch.compact.rejected_diagnostic_artifact "
+            "operation_id=%s attempt_number=%s failure_stage=%s "
+            "payload_ref=%s payload_digest=%s artifact_path=%s",
+            operation_id,
+            rejected.attempt_number,
+            diagnostic.failure_stage,
+            reference.payload_ref,
+            reference.payload_digest,
+            reference.artifact_relative_path,
+        )
+        return reference
 
     async def drain_once(self) -> DispatchDrainResult:
         """同步处理当前队列中的 dispatch wakeup。
@@ -3651,6 +3999,38 @@ def _display_text_from_input_event(transaction: HostTransaction, event: EventLog
     return value
 
 
+def _run_session_allows_proactive_compaction(
+    transaction: HostTransaction, run: RunRow
+) -> bool:
+    """判断 proactive compaction commit 前 Session 仍允许提交。
+
+    :param transaction: 当前 Host transaction。
+    :param run: 目标 Run row。
+    :returns: Session 仍 open 且未 closed 时返回 ``True``。
+    """
+
+    session = read_session_by_id(transaction, run.session_id)
+    return (
+        session is not None
+        and session.status is SessionStatus.OPEN
+        and session.closed_at is None
+    )
+
+
+def _compaction_result_accepted(result: CompactionOperationResult) -> bool:
+    """判断 compaction operation result 是否包含可提交 accepted candidate。
+
+    :param result: compaction operation result。
+    :returns: accepted candidate 与 quality 均存在且无 failure reason 时返回 ``True``。
+    """
+
+    return (
+        result.accepted_candidate is not None
+        and result.quality_result is not None
+        and result.failure_reason is None
+    )
+
+
 def _is_worker_acceptable(
     *,
     run: RunRow | None,
@@ -3873,6 +4253,49 @@ def _accepted_attempt_number(result: CompactionOperationResult) -> int:
     return len(result.rejected_attempts) + 1
 
 
+def _completed_compaction_proposal_attempt_count(
+    result: CompactionOperationResult,
+) -> int:
+    """返回 operation result 中已完成真实 proposal call 的数量。
+
+    cancellation-before-attempt 会产生 rejected 诊断，但没有执行 proposal call；
+    因此该诊断不计入全局 accepted attempt number。
+
+    :param result: compaction operation result。
+    :returns: 已完成 proposal call 数量。
+    """
+
+    rejected_completed = sum(
+        1
+        for rejected in result.rejected_attempts
+        if rejected.failure_category
+        is not CompactionFailureCategory.CANCELLATION_REQUESTED
+    )
+    if _compaction_result_accepted(result):
+        return rejected_completed + 1
+    return rejected_completed
+
+
+def _renumber_compaction_rejected_attempts(
+    rejected_attempts: tuple[CompactionAttemptRejected, ...],
+    *,
+    offset: int,
+) -> tuple[CompactionAttemptRejected, ...]:
+    """把 recovery pass 的 rejected attempts 重编号为 operation 内序号。
+
+    :param rejected_attempts: 单个 recovery pass 返回的 rejected attempts。
+    :param offset: 该 pass 前已经完成的 proposal attempt 数。
+    :returns: attempt_number 连续递增后的 rejected attempts。
+    """
+
+    if offset == 0:
+        return rejected_attempts
+    return tuple(
+        replace(rejected, attempt_number=offset + rejected.attempt_number)
+        for rejected in rejected_attempts
+    )
+
+
 def _required_compactor_manifest_ref(result: CompactionOperationResult) -> str:
     """读取 accepted proposal manifest ref。
 
@@ -4085,6 +4508,84 @@ async def _safe_release_lane_token(token: LaneClaimToken) -> None:
             exc_info=True,
         )
         return
+
+
+def _diagnostic_offending_section(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block section。
+
+    :param reference: persisted diagnostic reference。
+    :returns: section；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.section
+
+
+def _diagnostic_offending_kind(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block kind。
+
+    :param reference: persisted diagnostic reference。
+    :returns: kind；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.kind
+
+
+def _diagnostic_offending_label(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block label。
+
+    :param reference: persisted diagnostic reference。
+    :returns: label；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.block_label
+
+
+def _diagnostic_offending_ordinal(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> int | None:
+    """返回 diagnostic offending block ordinal。
+
+    :param reference: persisted diagnostic reference。
+    :returns: ordinal；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.block_ordinal
+
+
+def _diagnostic_offending_text_digest(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block text digest。
+
+    :param reference: persisted diagnostic reference。
+    :returns: text digest；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.text_digest
+
+
+def _diagnostic_offending_text_length(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> int | None:
+    """返回 diagnostic offending block text length。
+
+    :param reference: persisted diagnostic reference。
+    :returns: text length；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.text_length
 
 
 async def _suppress_task_cancel(task: asyncio.Task[None]) -> None:

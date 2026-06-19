@@ -12,7 +12,11 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_FAILED
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    CONTEXT_COMPACTION_FAILED,
+)
 from dayu.host.durable import memory as durable_memory_module
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.connection import HostDurableStore
@@ -171,6 +175,8 @@ def _event(
     event_id: str,
     event_type: str,
     payload: dict[str, JsonValue],
+    *,
+    run_id: str | None = _RUN_ID,
 ) -> MemoryProjectionEvent:
     """构造 memory projection event。
 
@@ -178,6 +184,7 @@ def _event(
     :param event_id: event id。
     :param event_type: event type。
     :param payload: canonical payload。
+    :param run_id: Host Run id。
     :returns: memory projection event。
     """
 
@@ -187,7 +194,7 @@ def _event(
         event_class=EventClass.CANONICAL_FACT.value,
         event_type=event_type,
         session_id=_SESSION_ID,
-        run_id=_RUN_ID,
+        run_id=run_id,
         attempt_id=_ATTEMPT_ID,
         execution_id=_EXECUTION_ID,
         occurred_at=_NOW,
@@ -325,6 +332,152 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
     assert snapshot.answer_anchor_memory.anchors == ()
     assert snapshot.forward_intent_memory.intents == ()
+
+
+def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
+    """selected recent window floor 保护最近 Run group 的全部 eligible material。"""
+
+    policy = MemoryProjectionPolicy(
+        context_window_size=8192,
+        selected_recent_window_item_cap=2,
+        selected_recent_window_char_cap=4096,
+        selected_recent_window_turn_floor=2,
+        fallback_selected_recent_window_item_cap=2,
+        fallback_selected_recent_window_char_cap=2048,
+        evidence_fact_item_cap=4,
+        evidence_fact_char_cap=2048,
+        evidence_fact_floor=1,
+        session_summary_char_cap=1024,
+        answer_anchor_item_cap=4,
+        answer_anchor_char_cap=1024,
+        forward_intent_item_cap=4,
+        forward_intent_char_cap=1024,
+        reference_continuity_item_cap=4,
+        reference_continuity_char_cap=1024,
+        reference_continuity_item_floor=0,
+        max_lag_events_for_inline_delta=4,
+        max_delta_repair_events=16,
+        policy_ref="test-memory-vnext",
+    )
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "user-old",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "old user"},
+                run_id="run-old",
+            ),
+            _event(
+                2,
+                "answer-old",
+                "RUN_SUCCEEDED",
+                {"final_answer": "old answer"},
+                run_id="run-old",
+            ),
+            _event(
+                3,
+                "user-mid",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "mid user"},
+                run_id="run-mid",
+            ),
+            _event(
+                4,
+                "answer-mid",
+                "RUN_SUCCEEDED",
+                {"final_answer": "mid answer"},
+                run_id="run-mid",
+            ),
+            _event(
+                5,
+                "tool-mid",
+                "TOOL_RESULT_ACCEPTED",
+                {"display_text": "mid evidence"},
+                run_id="run-mid",
+            ),
+            _event(
+                6,
+                "user-new",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "new user"},
+                run_id="run-new",
+            ),
+            _event(
+                7,
+                "answer-new",
+                "RUN_SUCCEEDED",
+                {"final_answer": "new answer"},
+                run_id="run-new",
+            ),
+            _event(
+                8,
+                "tool-new",
+                "TOOL_RESULT_ACCEPTED",
+                {"display_text": "new evidence"},
+                run_id="run-new",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    selected = snapshot.trace_memory.selected_recent_window
+    assert tuple(item.run_id for item in selected) == (
+        "run-mid",
+        "run-mid",
+        "run-mid",
+        "run-new",
+        "run-new",
+        "run-new",
+    )
+    assert tuple(item.text for item in selected) == (
+        "mid user",
+        "mid answer",
+        "工具结果已接受；原始工具响应不可用。",
+        "new user",
+        "new answer",
+        "工具结果已接受；原始工具响应不可用。",
+    )
+
+
+def test_selected_recent_window_floor_skips_missing_run_id_group() -> None:
+    """缺 run_id 的 item 不参与 turn floor 保护，也不阻断 projection。"""
+
+    policy = replace(
+        _policy(),
+        selected_recent_window_item_cap=1,
+        selected_recent_window_turn_floor=1,
+        fallback_selected_recent_window_item_cap=1,
+    )
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "user-missing-run",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "missing run"},
+                run_id=None,
+            ),
+            _event(
+                2,
+                "user-with-run",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "with run"},
+                run_id="run-with-id",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert tuple(item.text for item in snapshot.trace_memory.selected_recent_window) == (
+        "with run",
+    )
 
 
 def test_accepted_compact_materializes_vnext_memory_sections() -> None:
@@ -679,7 +832,7 @@ def test_accepted_tool_evidence_rejects_result_preview() -> None:
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:
-    """Evidence facts 超过 section cap 时截断并记录 budget diagnostic。"""
+    """Evidence facts 超过 section item cap 时整体丢弃并记录 budget diagnostic。"""
 
     policy = replace(_policy(), evidence_fact_item_cap=1, evidence_fact_floor=0)
     snapshot = build_conversation_memory_snapshot_from_events(
@@ -706,6 +859,134 @@ def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() 
         fact.claim_text
         for fact in snapshot.evidence_fact_memory.evidence_backed_facts
     ) == ("新 fact 应被保留。",)
+    assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
+        diagnostic.reason for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_accepted_compact_drops_oversized_fact_without_prefix_text() -> None:
+    """超出 fact char cap 的 compact fact 整体丢弃，不返回前缀文本。"""
+
+    policy = replace(_policy(), evidence_fact_char_cap=8, evidence_fact_floor=0)
+    long_claim = "这是一条超过上限且不能被前缀截断的完整事实。"
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-oversized-fact",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(facts=[_fact(long_claim)]),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
+    assert long_claim[: policy.evidence_fact_char_cap] not in tuple(
+        fact.claim_text for fact in snapshot.evidence_fact_memory.evidence_backed_facts
+    )
+    assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
+        diagnostic.reason for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_accepted_compact_preserves_budget_diagnostic_before_invalid_fact() -> None:
+    """oversized fact 后续遇到 invalid fact 时保留已记录 budget diagnostic。"""
+
+    policy = replace(_policy(), evidence_fact_char_cap=8, evidence_fact_floor=0)
+    invalid_fact = _fact("无标签")
+    invalid_fact["evidence_labels"] = []
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-oversized-then-invalid-fact",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(
+                    facts=[
+                        _fact("这是一条超过上限的完整事实。"),
+                        invalid_fact,
+                    ]
+                ),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
+    assert tuple(diagnostic.reason for diagnostic in snapshot.diagnostics) == (
+        MemoryDiagnosticReason.BUDGET_LIMIT_REACHED,
+        MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID,
+    )
+
+
+def test_accepted_compact_keeps_valid_fact_before_empty_evidence_labels() -> None:
+    """后续空 evidence labels candidate 不得清空此前 valid facts。"""
+
+    invalid_fact = _fact("无标签")
+    invalid_fact["evidence_labels"] = []
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-valid-then-empty-labels",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(
+                    facts=[
+                        _fact("有效事实应保留。"),
+                        invalid_fact,
+                    ]
+                ),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=_policy(),
+        built_at=_NOW,
+    )
+
+    assert tuple(
+        fact.claim_text
+        for fact in snapshot.evidence_fact_memory.evidence_backed_facts
+    ) == ("有效事实应保留。",)
+    assert MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID in tuple(
+        diagnostic.reason for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_accepted_compact_drops_oversized_summary_without_prefix_text() -> None:
+    """超出 summary char cap 的 compact summary 整体丢弃，不返回前缀文本。"""
+
+    policy = replace(_policy(), session_summary_char_cap=8)
+    long_summary = "用户需要完整保留的长 summary，不能静默截断。"
+    payload = _accepted_compact_payload()
+    candidate = cast(dict[str, JsonValue], payload["accepted_candidate"])
+    candidate["session_summary"] = {
+        "summary_text": long_summary,
+        "source_labels": ["u1"],
+    }
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-oversized-summary",
+                CONTEXT_COMPACTED,
+                payload,
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.session_summary_memory.summary_text is None
     assert MemoryDiagnosticReason.BUDGET_LIMIT_REACHED in tuple(
         diagnostic.reason for diagnostic in snapshot.diagnostics
     )
@@ -771,6 +1052,28 @@ def test_snapshot_json_roundtrip_preserves_vnext_sections() -> None:
 
     assert restored == snapshot
     assert restored.snapshot_digest == calculate_memory_snapshot_digest(restored)
+
+
+def test_snapshot_json_rejects_bool_for_integer_fields() -> None:
+    """snapshot JSON 的 integer 字段拒绝 bool，避免 true 被当成 1。"""
+
+    policy = _policy()
+    snapshot = project_conversation_memory_event(
+        previous_snapshot=None,
+        event=_event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "hello"}),
+        policy=policy,
+        built_at=_NOW,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+    )
+    value = conversation_memory_snapshot_to_json_value(snapshot)
+    mapping = cast(dict[str, JsonValue], value)
+    trace_memory = cast(dict[str, JsonValue], mapping["trace_memory"])
+    selected = cast(list[JsonValue], trace_memory["selected_recent_window"])
+    selected_item = cast(dict[str, JsonValue], selected[0])
+    selected_item["event_sequence"] = True
+
+    with pytest.raises(ValueError, match="event_sequence must be integer"):
+        conversation_memory_snapshot_from_json_value(mapping)
 
 
 def test_write_snapshot_with_checkpoint_commits_snapshot_before_checkpoint(
@@ -1016,6 +1319,58 @@ def test_projection_consumer_skips_failed_compact_without_memory_snapshot(
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == 1
         assert checkpoint.checkpoint_event_id == "compact-failed-1"
+
+
+def test_projection_consumer_skips_compaction_attempt_rejected(
+    tmp_path: Path,
+) -> None:
+    """attempt rejected 诊断事件不进入 Conversation Memory snapshot。"""
+
+    policy = _policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="compact-attempt-rejected-1",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=_SESSION_ID,
+                    run_id=_RUN_ID,
+                    attempt_id=_ATTEMPT_ID,
+                    execution_id=_EXECUTION_ID,
+                    event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                    occurred_at=_OCCURRED_AT,
+                    actor="pytest",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"failure_category": "proposal_failed"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        policy_digest = digest_memory_projection_policy(policy)
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=policy_digest,
+            )
+        )
+
+        assert result.events_scanned == 1
+        assert result.events_matched == 0
+        assert result.events_applied == 0
+        assert latest is None
 
 
 def test_policy_digest_changes_when_design_field_changes() -> None:

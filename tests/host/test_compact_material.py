@@ -16,7 +16,6 @@ from dayu.host.compact_material import (
     CompactMaterialPack,
     CompactMemorySnapshotRepairRequired,
     DuplicateMaterialSectionOwnerError,
-    EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     InlineDeltaRepairMaterialView,
@@ -27,6 +26,8 @@ from dayu.host.compact_material import (
     build_pre_dispatch_compact_material_view,
     check_compact_memory_snapshot_cursor,
     conversation_compact_input_vnext_from_material_pack,
+    degrade_previous_compacted_view_for_recovery,
+    normalized_material_text,
     prompt_local_evidence_map,
     run_input_material_block,
     select_compact_segment,
@@ -107,6 +108,7 @@ _SESSION_ID = "session-compact-material"
 _POLICY_DIGEST = "policy-digest-compact-material"
 _NOW = "2026-05-24T00:00:00.000000Z"
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_LONG_EVIDENCE_TEXT_CHAR_COUNT = 5000
 _CURRENT_VNEXT_MATERIAL_KEYS = (
     "previous_compacted_view",
     "trace_material",
@@ -138,6 +140,21 @@ class _VNextInputShape(NamedTuple):
     evidence_count: int
     answer_count: int
     current_anchor_label: str
+
+
+def test_normalized_material_text_preserves_line_boundaries() -> None:
+    """material 规范化按行折叠空白并保留非空行边界。"""
+
+    assert normalized_material_text(" first\tline \n\n second   line ") == (
+        "first line\nsecond line"
+    )
+
+
+def test_normalized_material_text_rejects_blank_text() -> None:
+    """纯空白 material 文本不可生成有效 material digest。"""
+
+    with pytest.raises(ValueError, match="text must be non-empty after normalization"):
+        normalized_material_text(" \n\t ")
 
 
 def _material_pack_shape(pack: CompactMaterialPack) -> _MaterialPackShape:
@@ -264,8 +281,18 @@ def test_proactive_segment_excludes_current_anchor_and_recent_raw_floor() -> Non
     """Proactive selection 不能压缩当前 anchor 与 recent raw floor。"""
 
     blocks = (
-        _history_block("history-old", event_sequence=1, text="old user"),
-        _history_block("history-recent", event_sequence=3, text="recent user"),
+        _history_block(
+            "history-old",
+            event_sequence=1,
+            text="old user",
+            turn_group_id="run-old",
+        ),
+        _history_block(
+            "history-recent",
+            event_sequence=3,
+            text="recent user",
+            turn_group_id="run-recent",
+        ),
         _current_block("current", event_sequence=4, text="current user"),
     )
 
@@ -283,6 +310,217 @@ def test_proactive_segment_excludes_current_anchor_and_recent_raw_floor() -> Non
     assert (
         selection.excluded_reason_codes["history-recent"]
         == "protected_recent_raw_floor"
+    )
+
+
+def test_proactive_segment_recent_floor_uses_turn_groups() -> None:
+    """Recent floor 按 Host Run group 保护多 block，而不是 raw block count。"""
+
+    blocks = (
+        _history_block(
+            "run-old-user",
+            event_sequence=1,
+            text="old user",
+            turn_group_id="run-old",
+        ),
+        _history_block(
+            "run-mid-user",
+            event_sequence=2,
+            text="mid user",
+            turn_group_id="run-mid",
+        ),
+        _evidence_block(
+            "run-mid-evidence",
+            event_sequence=3,
+            text="mid evidence",
+            turn_group_id="run-mid",
+        ),
+        _history_block(
+            "run-new-user",
+            event_sequence=4,
+            text="new user",
+            turn_group_id="run-new",
+        ),
+        _history_block(
+            "run-new-answer",
+            event_sequence=5,
+            text="new answer",
+            kind=CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            turn_group_id="run-new",
+        ),
+        _current_block("current", event_sequence=6, text="current user"),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=6,
+        memory_snapshot_cursor=5,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        selected_recent_window_turn_floor=2,
+    )
+
+    assert selection.selected_block_ids == ("run-old-user",)
+    assert selection.excluded_reason_codes["run-mid-user"] == "protected_recent_raw_floor"
+    assert (
+        selection.excluded_reason_codes["run-mid-evidence"]
+        == "protected_recent_raw_floor"
+    )
+    assert selection.excluded_reason_codes["run-new-user"] == "protected_recent_raw_floor"
+    assert (
+        selection.excluded_reason_codes["run-new-answer"]
+        == "protected_recent_raw_floor"
+    )
+
+
+def test_proactive_segment_recent_floor_rejects_missing_turn_group_id() -> None:
+    """floor 依赖的 eligible block 缺 turn_group_id 时不静默跳过。"""
+
+    blocks = (
+        _history_block(
+            "history-missing-group",
+            event_sequence=1,
+            text="missing group",
+            turn_group_id=None,
+        ),
+        _current_block("current", event_sequence=2, text="current user"),
+    )
+
+    with pytest.raises(ValueError, match="missing turn_group_id"):
+        select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            memory_snapshot_cursor=1,
+            policy_digest=_POLICY_DIGEST,
+            material_blocks=blocks,
+            selected_recent_window_turn_floor=1,
+        )
+
+
+def test_recovery_segment_selection_enforces_fallback_item_cap() -> None:
+    """S4 tier 1/3 selection 按 fallback item cap whole-drop。"""
+
+    blocks = (
+        _history_block("history-a", event_sequence=1, text="history a"),
+        _history_block("history-b", event_sequence=2, text="history b"),
+        _current_block("current", event_sequence=3, text="current user"),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=1024,
+        max_selected_item_count=1,
+    )
+
+    assert selection.selected_block_ids == ("history-a",)
+    assert selection.excluded_reason_codes["history-b"] == "budget_limit"
+
+
+def test_recovery_segment_selection_does_not_use_later_block_to_evade_char_cap() -> None:
+    """S4 strict cap 首个 block 超预算后不选择更晚小 block 绕过顺序。"""
+
+    blocks = (
+        _history_block("history-large", event_sequence=1, text="large material"),
+        _history_block("history-small", event_sequence=2, text="x"),
+        _current_block("current", event_sequence=3, text="current user"),
+    )
+
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=blocks,
+        max_selected_size_units=3,
+        max_selected_item_count=2,
+    )
+
+    assert selection.selected_block_ids == ()
+    assert selection.excluded_reason_codes["history-large"] == "budget_limit"
+    assert selection.excluded_reason_codes["history-small"] == "budget_limit"
+
+
+def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() -> None:
+    """Tier 2 只保留最高优先级 section，文本 byte-exact 不改写。"""
+
+    previous = (
+        _previous_compact_block(
+            label="P5",
+            kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+            text="summary must drop whole",
+        ),
+        _previous_compact_block(
+            label="P3",
+            kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
+            text="answer must drop whole",
+        ),
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="fact must stay byte exact",
+        ),
+        _previous_compact_block(
+            label="P4",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="second fact must stay byte exact",
+        ),
+        _previous_compact_block(
+            label="P2",
+            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+            text="reference must drop whole",
+        ),
+    )
+
+    degraded = degrade_previous_compacted_view_for_recovery(previous)
+
+    assert tuple(block.block_label for block in degraded) == ("P1", "P4")
+    assert tuple(block.text for block in degraded) == (
+        "fact must stay byte exact",
+        "second fact must stay byte exact",
+    )
+
+
+def test_degrade_previous_compacted_view_sorts_source_sequences_descending() -> None:
+    """Tier 2 同 section 全有 source sequence 时按最大 sequence 降序。"""
+
+    previous = (
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="older fact remains exact",
+            canonical_source_refs=("eventlog-seq:10",),
+        ),
+        _previous_compact_block(
+            label="P2",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="newer fact remains exact",
+            canonical_source_refs=("eventlog-seq:30",),
+        ),
+        _previous_compact_block(
+            label="P3",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="middle fact remains exact",
+            canonical_source_refs=("eventlog-seq:20",),
+        ),
+        _previous_compact_block(
+            label="P4",
+            kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+            text="lower priority summary drops whole",
+            canonical_source_refs=("eventlog-seq:40",),
+        ),
+    )
+
+    degraded = degrade_previous_compacted_view_for_recovery(previous)
+
+    assert tuple(block.block_label for block in degraded) == ("P2", "P3", "P1")
+    assert tuple(block.text for block in degraded) == (
+        "newer fact remains exact",
+        "middle fact remains exact",
+        "older fact remains exact",
     )
 
 
@@ -634,6 +872,7 @@ def test_conversation_compact_input_vnext_does_not_map_session_summary_to_answer
 def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -> None:
     """vNext material 映射必须把 accepted evidence 放入 evidence_material。"""
 
+    long_evidence_text = "accepted evidence text " * 250
     pack = build_initial_material_pack(
         current_input_ref="event-current",
         current_input_text="current input",
@@ -646,7 +885,7 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
                 tool_call_event_ref="event-tool-call",
                 readable_tool_name="fins.search",
                 readable_query_text="revenue query",
-                raw_result_text="accepted evidence text",
+                raw_result_text=long_evidence_text,
                 readable_source_text="source note",
                 payload_refs=("payload:accepted",),
             ),
@@ -656,12 +895,18 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
 
     assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    assert pack.evidence_labels == ("E1",)
+    assert tuple(block.raw_result_text for block in pack.evidence_material) == (
+        long_evidence_text,
+    )
     assert tuple(item.response_text for item in vnext_input.evidence_material) == (
-        "accepted evidence text",
+        long_evidence_text,
     )
     assert tuple(item.tool_name for item in vnext_input.evidence_material) == (
         "fins.search",
     )
+    assert "E1.1" not in vnext_input.citable_source_labels
+    assert "E1.2" not in vnext_input.citable_source_labels
 
 
 def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> None:
@@ -721,6 +966,110 @@ def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> 
     assert tuple(
         item.reason.value for item in previous_view.reference_continuity_items
     ) == ("local_reference",)
+
+
+def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks() -> None:
+    """previous compacted view 多记录 block 往返时必须保留记录边界。"""
+
+    base = _snapshot_with_stable_blocks(
+        snapshot_id="snapshot-stable-multi-record-blocks",
+        checkpoint_event_sequence=2,
+    )
+    snapshot_without_digest = replace(
+        base,
+        forward_intent_memory=ForwardIntentMemoryView(
+            intents=(
+                ForwardIntent(
+                    item_id="memory-item:forward-intent-1",
+                    intent_type="next_step_note",
+                    text="follow up one",
+                    status="open",
+                    source_refs=("event:intent:1",),
+                    event_id="event-intent-1",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(13),
+                ),
+                ForwardIntent(
+                    item_id="memory-item:forward-intent-2",
+                    intent_type="pending_user_visible_task",
+                    text="follow up two\nwith wrapped source text",
+                    status="superseded",
+                    source_refs=("event:intent:2",),
+                    event_id="event-intent-2",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(38),
+                ),
+            )
+        ),
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(),
+            reference_continuity_items=(
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity-1",
+                    text="first reference",
+                    reason="local_reference",
+                    source_refs=("event:reference:1",),
+                    event_id="event-reference-1",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(15),
+                ),
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity-2",
+                    text="second reference\nwith wrapped source text",
+                    reason="recent_state",
+                    source_refs=("event:reference:2",),
+                    event_id="event-reference-2",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(41),
+                ),
+            ),
+        ),
+        snapshot_digest="pending",
+    )
+    snapshot = replace(
+        snapshot_without_digest,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=2,
+        memory_snapshot_cursor=2,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(),
+    )
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(),
+        memory_snapshot=snapshot,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    previous_view = vnext_input.previous_compacted_view
+    assert previous_view is not None
+    assert tuple(item.text for item in previous_view.forward_intents) == (
+        "follow up one",
+        "follow up two with wrapped source text",
+    )
+    assert tuple(item.intent_type.value for item in previous_view.forward_intents) == (
+        "next_step_note",
+        "pending_user_visible_task",
+    )
+    assert tuple(item.status.value for item in previous_view.forward_intents) == (
+        "open",
+        "superseded",
+    )
+    assert tuple(item.text for item in previous_view.reference_continuity_items) == (
+        "first reference",
+        "second reference with wrapped source text",
+    )
+    assert tuple(item.reason.value for item in previous_view.reference_continuity_items) == (
+        "local_reference",
+        "recent_state",
+    )
 
 
 def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> None:
@@ -911,15 +1260,18 @@ def test_evidence_labels_are_prompt_local_and_map_to_canonical_evidence() -> Non
     )
 
 
-def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
-    """单个超大 evidence block 拆成 E1.1/E1.2 并保留同一 canonical provenance。"""
+def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
+    """单个超大 evidence block 默认不拆分，并保留 canonical provenance。"""
 
-    large_text = "A" * (EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS + 7)
+    large_text = "A" * _LONG_EVIDENCE_TEXT_CHAR_COUNT
+    locator_ref = OpaqueEvidenceRef(ref_kind="locator", ref_id="large", digest=None)
     evidence = _evidence_block(
         "evidence-large",
         event_sequence=3,
         text=large_text,
         payload_refs=("payload:evidence-large",),
+        artifact_refs=("artifact:evidence-large",),
+        source_locator_refs=(locator_ref,),
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.REACTIVE,
@@ -944,23 +1296,62 @@ def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
         expected=_MaterialPackShape(
             previous_labels=(),
             trace_labels=(),
-            evidence_labels=("E1.1", "E1.2"),
+            evidence_labels=("E1",),
             answer_labels=(),
             current_anchor_label="C1",
-            citable_source_labels=("E1.1", "E1.2"),
+            citable_source_labels=("E1",),
         ),
     )
-    assert pack.evidence_labels == ("E1.1", "E1.2")
-    assert tuple(block.raw_result_text for block in pack.evidence_material) == (
-        "A" * EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
-        "A" * 7,
+    assert pack.evidence_labels == ("E1",)
+    assert tuple(block.raw_result_text for block in pack.evidence_material) == (large_text,)
+    assert tuple(block.content_digest for block in pack.evidence_material) == (
+        sha256_digest_json({"text": large_text}),
     )
-    assert evidence_map["E1.1"].accepted_evidence_id == "evidence:evidence-large"
-    assert evidence_map["E1.2"].accepted_evidence_id == "evidence:evidence-large"
-    assert evidence_map["E1.1"].chunk_parent_label == "E1"
-    assert evidence_map["E1.2"].chunk_parent_label == "E1"
-    assert evidence_map["E1.1"].chunk_ordinal == 1
-    assert evidence_map["E1.2"].chunk_ordinal == 2
+    assert "E1.1" not in evidence_map
+    assert "E1.2" not in evidence_map
+    assert evidence_map["E1"].accepted_evidence_id == "evidence:evidence-large"
+    assert evidence_map["E1"].tool_result_event_ref == "tool-result:evidence-large"
+    assert evidence_map["E1"].tool_call_event_ref == "tool-call:evidence-large"
+    assert evidence_map["E1"].canonical_source_refs == ("event:evidence-large",)
+    assert evidence_map["E1"].content_digest == sha256_digest_json({"text": large_text})
+    assert evidence_map["E1"].payload_refs == ("payload:evidence-large",)
+    assert evidence_map["E1"].artifact_refs == ("artifact:evidence-large",)
+    assert evidence_map["E1"].source_locator_refs == (locator_ref,)
+    assert evidence_map["E1"].chunk_parent_label is None
+    assert evidence_map["E1"].chunk_ordinal is None
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    assert tuple(item.source_label for item in vnext_input.evidence_material) == ("E1",)
+    assert tuple(item.response_text for item in vnext_input.evidence_material) == (
+        large_text,
+    )
+    assert "E1.1" not in vnext_input.citable_source_labels
+    assert "E1.2" not in vnext_input.citable_source_labels
+
+
+def test_current_input_anchor_keeps_whole_text_without_private_cap() -> None:
+    """current input anchor 不再按私有字符上限截断。"""
+
+    long_current_input = "current " + ("segment " * 400)
+    pack = build_compact_material_pack(
+        selected_segment=select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=1,
+            memory_snapshot_cursor=None,
+            policy_digest=_POLICY_DIGEST,
+            material_blocks=(),
+        ),
+        material_blocks=(),
+        memory_snapshot=None,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current-long",
+        current_input_text=long_current_input,
+    )
+
+    expected = " ".join(long_current_input.split())
+    assert pack.current_input_anchor.anchor_text == expected
+    assert pack.current_input_anchor.truncated is False
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+    assert vnext_input.current_input_anchor.text == expected
 
 
 def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp_path: Path) -> None:
@@ -981,6 +1372,7 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
                 event_id="event-user-old",
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "old user question"},
+                run_id="run-old",
             )
             answer = _append_event(
                 transaction,
@@ -988,11 +1380,13 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
                 event_id="event-answer-old",
                 event_type="RUN_SUCCEEDED",
                 payload={"final_answer": "old assistant answer"},
+                run_id="run-old",
             )
             evidence = _append_tool_result_event(
                 transaction,
                 event_log,
                 event_id="event-tool-result-old",
+                run_id="run-old",
             )
             current = _append_event(
                 transaction,
@@ -1000,6 +1394,7 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
                 event_id="event-current-input",
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "current user question"},
+                run_id="run:event-current-input",
             )
             assert user.event_sequence < answer.event_sequence < evidence.event_sequence
             return _run_row(current)
@@ -1034,6 +1429,11 @@ def test_pre_dispatch_first_compact_uses_eventlog_delta_before_current_input(tmp
             CompactMaterialBlockKind.USER_INPUT,
             CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
             CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+        )
+        assert tuple(block.turn_group_id for block in view.material_blocks) == (
+            "run-old",
+            "run-old",
+            "run-old",
         )
         assert "current user question" not in tuple(
             block.text for block in view.material_blocks
@@ -1440,6 +1840,81 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_candidate(tmp_pa
         )
 
 
+def test_pre_dispatch_previous_view_splits_each_accepted_candidate_item(
+    tmp_path: Path,
+) -> None:
+    """latest accepted candidate 的每个 semantic item 独立进入 previous view。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 multi-item compact fact 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-multi-item",
+                accepted_evidence_refs=("evidence:event-before-multi",),
+                accepted_candidate=_accepted_candidate_with_multiple_items(),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-multi-item",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after multi compact"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after multi compact",
+            )
+        )
+
+        assert tuple(block.kind for block in view.previous_compacted_view) == (
+            CompactMaterialBlockKind.SESSION_SUMMARY,
+            CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            CompactMaterialBlockKind.ANSWER_ANCHOR,
+            CompactMaterialBlockKind.ANSWER_ANCHOR,
+            CompactMaterialBlockKind.FORWARD_INTENT,
+            CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+        )
+        assert tuple(block.block_label for block in view.previous_compacted_view) == (
+            "P1",
+            "P2",
+            "P3",
+            "P4",
+            "P5",
+            "P6",
+            "P7",
+        )
+        assert tuple(block.text for block in view.previous_compacted_view) == (
+            "accepted session summary",
+            (
+                "fact=claim_text=accepted fact one; evidence_refs=E1; "
+                "evidence_kind=accepted_evidence_material"
+            ),
+            (
+                "fact=claim_text=accepted fact two; evidence_refs=E2; "
+                "evidence_kind=accepted_evidence_material"
+            ),
+            "answer_anchor=accepted anchor one",
+            "answer_anchor=accepted anchor two",
+            "forward_intent=next_step_note; status=open; text=accepted next step",
+            "reference_continuity=local_reference; text=accepted reference",
+        )
+
+
 def test_pre_dispatch_builder_ignores_memory_snapshot_lag_or_missing(tmp_path: Path) -> None:
     """Builder 不读取 memory snapshot，snapshot 缺失或滞后不影响输出。"""
 
@@ -1689,6 +2164,8 @@ def _history_block(
     event_sequence: int,
     text: str,
     already_represented: bool = False,
+    kind: CompactMaterialBlockKind = CompactMaterialBlockKind.USER_INPUT,
+    turn_group_id: str | None = "run:test",
 ) -> RunInputMaterialBlock:
     """构造 history material block。
 
@@ -1696,16 +2173,19 @@ def _history_block(
     :param event_sequence: event sequence。
     :param text: 文本。
     :param already_represented: 是否已被代表。
+    :param kind: material kind。
+    :param turn_group_id: Host Run turn group id。
     :returns: RunInputMaterialBlock。
     """
 
     return run_input_material_block(
         block_id=block_id,
         section=CompactMaterialSection.TRACE_MATERIAL,
-        kind=CompactMaterialBlockKind.USER_INPUT,
+        kind=kind,
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
         already_represented=already_represented,
     )
 
@@ -1718,6 +2198,7 @@ def _evidence_block(
     payload_refs: tuple[str, ...] = ("payload:test",),
     artifact_refs: tuple[str, ...] = (),
     source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
+    turn_group_id: str | None = "run:test",
 ) -> RunInputMaterialBlock:
     """构造 evidence material block。
 
@@ -1727,6 +2208,7 @@ def _evidence_block(
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
     :param source_locator_refs: source locator refs。
+    :param turn_group_id: Host Run turn group id。
     :returns: RunInputMaterialBlock。
     """
 
@@ -1737,6 +2219,7 @@ def _evidence_block(
         text=text,
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
+        turn_group_id=turn_group_id,
         accepted_evidence_id=f"evidence:{block_id}",
         tool_result_event_ref=f"tool-result:{block_id}",
         tool_call_event_ref=f"tool-call:{block_id}",
@@ -1775,12 +2258,14 @@ def _previous_compact_block(
     label: str,
     kind: CompactMaterialBlockKind,
     text: str,
+    canonical_source_refs: tuple[str, ...] = ("event-explicit-compact",),
 ) -> CompactMaterialBlock:
     """构造测试用 explicit previous compact block。
 
     :param label: prompt-local label。
     :param kind: block kind。
     :param text: block text。
+    :param canonical_source_refs: canonical source refs。
     :returns: CompactMaterialBlock。
     """
 
@@ -1791,7 +2276,7 @@ def _previous_compact_block(
         text=text,
         size_units=len(text),
         source_labels=(),
-        canonical_source_refs=("event-explicit-compact",),
+        canonical_source_refs=canonical_source_refs,
         content_digest=sha256_digest_json({"text": text}),
     )
 
@@ -1823,6 +2308,7 @@ def _append_event(
     event_id: str,
     event_type: str,
     payload: JsonValue,
+    run_id: str | None = None,
 ) -> EventLogRow:
     """向测试 EventLog 追加 canonical fact。
 
@@ -1831,6 +2317,7 @@ def _append_event(
     :param event_id: event id。
     :param event_type: event type。
     :param payload: inline payload JSON。
+    :param run_id: 可选 Host Run id。
     :returns: appended EventLog row。
     """
 
@@ -1840,7 +2327,7 @@ def _append_event(
             event_id=event_id,
             event_class=EventClass.CANONICAL_FACT,
             session_id=_SESSION_ID,
-            run_id=None,
+            run_id=run_id,
             attempt_id=None,
             execution_id=None,
             event_type=event_type,
@@ -1865,6 +2352,7 @@ def _append_tool_call_requested_event(
     event_id: str,
     tool_call_id: str,
     semantic_query_text: str,
+    run_id: str | None = None,
 ) -> EventLogRow:
     """追加带完整 request atom 的 TOOL_CALL_REQUESTED。
 
@@ -1873,6 +2361,7 @@ def _append_tool_call_requested_event(
     :param event_id: event id。
     :param tool_call_id: tool call id。
     :param semantic_query_text: 业务可读 query 文本。
+    :param run_id: 可选 Host Run id。
     :returns: appended EventLog row。
     """
 
@@ -1886,6 +2375,7 @@ def _append_tool_call_requested_event(
         event_log,
         event_id=event_id,
         event_type="TOOL_CALL_REQUESTED",
+        run_id=run_id,
         payload={
             "tool_call_id": tool_call_id,
             "tool_name": "fins.search",
@@ -1916,6 +2406,7 @@ def _append_tool_result_event(
     tool_call_requested_event_ref: str | None = None,
     tool_call_id: str | None = None,
     normalized_arguments_digest: str = _DIGEST,
+    run_id: str | None = None,
 ) -> EventLogRow:
     """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
 
@@ -1925,6 +2416,7 @@ def _append_tool_result_event(
     :param tool_call_requested_event_ref: 可选 TOOL_CALL_REQUESTED event ref。
     :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
     :param normalized_arguments_digest: envelope 参数 digest。
+    :param run_id: 可选 Host Run id。
     :returns: appended EventLog row。
     """
 
@@ -1939,6 +2431,7 @@ def _append_tool_result_event(
         event_log,
         event_id=event_id,
         event_type="TOOL_RESULT_ACCEPTED",
+        run_id=run_id,
         payload={
             "accepted_evidence_envelope": (
                 accepted_evidence_envelope_to_json_value(envelope)
@@ -1999,6 +2492,7 @@ def _append_compacted_event(
     *,
     event_id: str,
     accepted_evidence_refs: tuple[str, ...],
+    accepted_candidate: ConversationCompactOutputVNext | None = None,
 ) -> EventLogRow:
     """追加 accepted CONTEXT_COMPACTED canonical fact。
 
@@ -2006,6 +2500,7 @@ def _append_compacted_event(
     :param event_log: EventLog store。
     :param event_id: compacted event id。
     :param accepted_evidence_refs: accepted evidence mapping refs。
+    :param accepted_candidate: 可选 accepted compact candidate。
     :returns: appended EventLog row。
     """
 
@@ -2014,16 +2509,22 @@ def _append_compacted_event(
         event_log,
         event_id=event_id,
         event_type="CONTEXT_COMPACTED",
-        payload=_compacted_payload(accepted_evidence_refs=accepted_evidence_refs),
+        payload=_compacted_payload(
+            accepted_evidence_refs=accepted_evidence_refs,
+            accepted_candidate=accepted_candidate,
+        ),
     )
 
 
 def _compacted_payload(
-    *, accepted_evidence_refs: tuple[str, ...]
+    *,
+    accepted_evidence_refs: tuple[str, ...],
+    accepted_candidate: ConversationCompactOutputVNext | None = None,
 ) -> dict[str, JsonValue]:
     """构造测试用 accepted compact payload。
 
     :param accepted_evidence_refs: accepted evidence mapping refs。
+    :param accepted_candidate: 可选 accepted compact candidate。
     :returns: compacted payload。
     """
 
@@ -2033,7 +2534,11 @@ def _compacted_payload(
             accepted_attempt_number=1,
             compact_artifact_ref="artifact:compact-test",
             compact_artifact_digest=_DIGEST,
-            accepted_candidate=_accepted_candidate(),
+            accepted_candidate=(
+                _accepted_candidate()
+                if accepted_candidate is None
+                else accepted_candidate
+            ),
             quality_check_result=CompactQualityCheckResultVNext(
                 accepted=True,
                 rejection_reasons=(),
@@ -2076,6 +2581,71 @@ def _accepted_candidate() -> ConversationCompactOutputVNext:
                     ),
                 ),
                 answer_source_labels=("A1",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="accepted next step",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="accepted reference",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("T1",),
+            ),
+        ),
+        diagnostics=(),
+    )
+
+
+def _accepted_candidate_with_multiple_items() -> ConversationCompactOutputVNext:
+    """构造含多 fact / anchor 的 accepted compact candidate。
+
+    :returns: ConversationCompactOutputVNext。
+    """
+
+    return ConversationCompactOutputVNext(
+        schema_version="conversation_compact_output_v1",
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text="accepted session summary",
+            source_labels=("T1",),
+        ),
+        evidence_backed_facts=(
+            EvidenceBackedFactCandidateVNext(
+                claim_text="accepted fact one",
+                evidence_labels=("E1",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+            ),
+            EvidenceBackedFactCandidateVNext(
+                claim_text="accepted fact two",
+                evidence_labels=("E2",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+            ),
+        ),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="accepted anchor one",
+                anchor_items=(
+                    AnswerAnchorChildVNext(
+                        display_text="accepted anchor item one",
+                        ordinal=1,
+                    ),
+                ),
+                answer_source_labels=("A1",),
+            ),
+            AnswerAnchorCandidateVNext(
+                anchor_title="accepted anchor two",
+                anchor_items=(
+                    AnswerAnchorChildVNext(
+                        display_text="accepted anchor item two",
+                        ordinal=1,
+                    ),
+                ),
+                answer_source_labels=("A2",),
             ),
         ),
         forward_intents=(

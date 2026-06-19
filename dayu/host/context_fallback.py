@@ -13,7 +13,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.compact_material import RunInputMaterialBlock
+from dayu.host.compact_material import (
+    RunInputMaterialBlock,
+    build_pre_dispatch_compact_material_view,
+    is_turn_group_material_block,
+    protected_recent_turn_group_ids_for_material_blocks,
+    run_input_material_block,
+    selected_material_view_digest,
+)
 from dayu.host.compaction import CompactMaterialBlockKind, CompactMaterialSection
 from dayu.host.context_budget import (
     BudgetEstimate,
@@ -26,9 +33,12 @@ from dayu.host.context_budget import (
 from dayu.host.context_events import CONTEXT_COMPACTION_FAILED
 from dayu.host.context_policy import ContextBudgetPolicy, ContextCompactionTriggerSource
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.state import read_run_by_id
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.payload_resolution import event_payload_object
 
 FALLBACK_ACTION_DISPATCH = "dispatch"
@@ -46,6 +56,12 @@ _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
 _FIELD_SELECTED_BLOCK_IDS = "selected_block_ids"
 _FIELD_CURRENT_INPUT_REF = "current_input_ref"
 _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR = "selected_recent_window_turn_floor"
+_FIELD_SELECTED_MATERIAL_VIEW_DIGEST = "selected_material_view_digest"
+_FIELD_SELECTED_RAW_TURN_COUNT = "selected_raw_turn_count"
+_FIELD_SOURCE_REFS = "source_refs"
+_FIELD_TRIGGER_SOURCE = "trigger_source"
+_FIELD_DISPLAY_TEXT = "display_text"
+_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 
 
 class RecentWindowFallbackAction(StrEnum):
@@ -197,12 +213,15 @@ class RecentWindowFallbackSelection:
             _FIELD_SELECTED_BLOCK_IDS: list(self.selected_block_ids),
             "dropped_block_ids": list(self.dropped_block_ids),
             _FIELD_CURRENT_INPUT_REF: self.current_input_ref,
-            "source_refs": list(self.source_refs),
+            _FIELD_SOURCE_REFS: list(self.source_refs),
             _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR: self.selected_recent_window_turn_floor,
             "trigger_source": self.trigger_source.value,
             "policy_ref": self.policy_ref,
             "input_cursor": self.input_cursor,
-            "selected_raw_turn_count": _raw_turn_count(self.selected_blocks),
+            _FIELD_SELECTED_RAW_TURN_COUNT: _raw_turn_count(self.selected_blocks),
+            _FIELD_SELECTED_MATERIAL_VIEW_DIGEST: selected_material_view_digest(
+                self.selected_blocks
+            ),
         }
         if self.blocked_next_block_id is not None:
             payload["blocked_next_block_id"] = self.blocked_next_block_id
@@ -213,14 +232,27 @@ class RecentWindowFallbackSelection:
 class ActiveRecentWindowFallback:
     """RunInputBuilder 可消费的 active fallback view 摘要。
 
-    :param selected_block_ids: 应从 ordinary material blocks 中保留的 block ids。
+    :param selected_block_ids: 应从 fallback material view 中保留的 block ids。
     :param current_input_ref: fallback 绑定的当前输入 ref。
+    :param source_refs: selection 时 selected blocks 的 canonical source refs。
     :param fallback_input_digest: failed payload 中记录的 fallback input digest。
+    :param selected_recent_window_turn_floor: selection 使用的 recent turn floor。
+    :param selected_raw_turn_count: selection 时 selected raw turn block 数。
+    :param selected_material_view_digest: selection 时 selected material view digest。
+    :param fallback_input_window: failed payload 中记录的 fallback window。
+    :param material_blocks: 与 selected ids 同源的 frozen material view；仅 proactive
+        EventLog-backed fallback provider 能重建时填充。
     """
 
     selected_block_ids: tuple[str, ...]
     current_input_ref: str
+    source_refs: tuple[str, ...]
     fallback_input_digest: str
+    selected_recent_window_turn_floor: int | None = None
+    selected_raw_turn_count: int | None = None
+    selected_material_view_digest: str | None = None
+    fallback_input_window: Mapping[str, JsonValue] | None = None
+    material_blocks: tuple[RunInputMaterialBlock, ...] | None = None
 
     def __post_init__(self) -> None:
         """校验 active fallback view。
@@ -231,7 +263,26 @@ class ActiveRecentWindowFallback:
 
         _require_text_tuple(self.selected_block_ids, "selected_block_ids")
         _require_non_empty_text(self.current_input_ref, "current_input_ref")
+        _require_text_tuple(self.source_refs, "source_refs")
         _require_non_empty_text(self.fallback_input_digest, "fallback_input_digest")
+        _require_optional_non_negative_int(
+            self.selected_recent_window_turn_floor,
+            "selected_recent_window_turn_floor",
+        )
+        _require_optional_non_negative_int(
+            self.selected_raw_turn_count,
+            "selected_raw_turn_count",
+        )
+        _require_optional_non_empty_text(
+            self.selected_material_view_digest,
+            "selected_material_view_digest",
+        )
+        if self.fallback_input_window is not None and not isinstance(
+            self.fallback_input_window, Mapping
+        ):
+            raise TypeError("fallback_input_window must be mapping")
+        if self.material_blocks is not None:
+            _require_block_tuple(self.material_blocks, "material_blocks")
 
 
 class EventLogContextFallbackProvider:
@@ -316,23 +367,121 @@ class EventLogContextFallbackProvider:
         window = _optional_mapping(payload, _FIELD_FALLBACK_INPUT_WINDOW)
         digest = _optional_text(payload, _FIELD_FALLBACK_INPUT_DIGEST)
         if window is None or digest is None:
-            return None
+            raise HostDurableError("active fallback input window is missing")
+        if fallback_window_digest(window) != digest:
+            raise HostDurableError("fallback input digest mismatch")
         window_current_ref = _optional_text(window, _FIELD_CURRENT_INPUT_REF)
+        if window_current_ref is None:
+            raise HostDurableError("fallback current_input_ref is missing")
         if window_current_ref != current_input_ref:
-            return None
+            raise HostDurableError("fallback current_input_ref mismatch")
         actual_current_input_ref = window_current_ref
-        if actual_current_input_ref is None:
-            return None
+        trigger_source = _required_text(window, _FIELD_TRIGGER_SOURCE)
+        material_blocks: tuple[RunInputMaterialBlock, ...] | None = None
+        if trigger_source == ContextCompactionTriggerSource.PROACTIVE.value:
+            material_blocks = _proactive_material_blocks_for_window(
+                transaction,
+                self._event_log_store,
+                run_id=run_id,
+                current_input_ref=actual_current_input_ref,
+            )
         return ActiveRecentWindowFallback(
             selected_block_ids=_required_text_tuple(window, _FIELD_SELECTED_BLOCK_IDS),
             current_input_ref=actual_current_input_ref,
+            source_refs=_required_text_tuple(window, _FIELD_SOURCE_REFS),
             fallback_input_digest=digest,
+            selected_recent_window_turn_floor=_required_non_negative_int(
+                window,
+                _FIELD_SELECTED_RECENT_WINDOW_TURN_FLOOR,
+            ),
+            selected_raw_turn_count=_required_non_negative_int(
+                window,
+                _FIELD_SELECTED_RAW_TURN_COUNT,
+            ),
+            selected_material_view_digest=_required_text(
+                window,
+                _FIELD_SELECTED_MATERIAL_VIEW_DIGEST,
+            ),
+            fallback_input_window=window,
+            material_blocks=material_blocks,
         )
+
+
+def _proactive_material_blocks_for_window(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run_id: str,
+    current_input_ref: str,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """重建 proactive fallback selection 使用的 EventLog-backed material view。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog store。
+    :param run_id: 当前 Run id。
+    :param current_input_ref: fallback 绑定的 current input event id。
+    :returns: 与 proactive fallback payload selected ids 同源的 material blocks。
+    :raises HostDurableError: Run、current input 或 material source 损坏时抛出。
+    """
+
+    run = read_run_by_id(transaction, run_id)
+    if run is None:
+        raise HostDurableError("fallback run is missing")
+    if run.input_event_id != current_input_ref:
+        raise HostDurableError("fallback current_input_ref mismatch")
+    current_event = event_log_store.read_event_by_id(transaction, current_input_ref)
+    if current_event is None:
+        raise HostDurableError("fallback current input event is missing")
+    payload = event_payload_object(
+        transaction,
+        current_event,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    current_display_text = _required_text(payload, _FIELD_DISPLAY_TEXT)
+    material_view = build_pre_dispatch_compact_material_view(
+        transaction,
+        event_log_store,
+        run=run,
+        current_display_text=current_display_text,
+    )
+    return (
+        *material_view.material_blocks,
+        _current_input_material_block_for_fallback(
+            current_input_ref=current_input_ref,
+            current_input_sequence=run.input_event_sequence,
+            display_text=material_view.current_input_text,
+        ),
+    )
+
+
+def _current_input_material_block_for_fallback(
+    *,
+    current_input_ref: str,
+    current_input_sequence: int,
+    display_text: str,
+) -> RunInputMaterialBlock:
+    """构造 proactive fallback selection 使用的 current input block。
+
+    :param current_input_ref: 当前输入 event id。
+    :param current_input_sequence: 当前输入 EventLog sequence。
+    :param display_text: 当前输入展示文本。
+    :returns: current input material block。
+    """
+
+    return run_input_material_block(
+        block_id=f"current:{current_input_ref}",
+        section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        text=display_text,
+        canonical_source_refs=(current_input_ref,),
+        event_sequence=current_input_sequence,
+    )
 
 
 def build_recent_window_fallback_selection(
     *,
     policy: ContextBudgetPolicy,
+    memory_policy: MemoryProjectionPolicy | None = None,
     session_id: str,
     run_id: str,
     material_blocks: tuple[RunInputMaterialBlock, ...],
@@ -344,11 +493,14 @@ def build_recent_window_fallback_selection(
     """按 deterministic recent-window policy 选择 fallback input view。
 
     选择顺序为：固定 current input anchor、stable / compact represented
-    context、recent raw turn floor；若必保留集合未超过 hard budget，再按
-    reverse chronological raw turn block order 追加最近 raw turn，直到下一
-    block 会触发 hard threshold 或 material 耗尽。
+    context、recent turn-group floor；若必保留集合未超过 hard budget，再按
+    reverse chronological turn-group block order 整块追加最近 material。floor
+    不受 fallback item / char caps 裁剪；非 floor block 同时受 fallback caps
+    与 hard budget 保护。
 
     :param policy: context budget policy。
+    :param memory_policy: memory projection policy；传入时使用 fallback selected
+        recent window caps 限制非 floor 追加。
     :param session_id: Session id。
     :param run_id: Run id。
     :param material_blocks: ordinary material blocks。
@@ -363,9 +515,16 @@ def build_recent_window_fallback_selection(
     if selected_recent_window_turn_floor < 0:
         raise ValueError("selected_recent_window_turn_floor must be non-negative")
     current = _current_input_block(material_blocks, current_input_ref=current_input_ref)
-    raw_blocks = _reverse_chronological_raw_blocks(material_blocks)
+    raw_blocks = _reverse_chronological_turn_group_blocks(
+        material_blocks,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+    )
+    floor_group_ids = protected_recent_turn_group_ids_for_material_blocks(
+        raw_blocks,
+        selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+    )
     floor_ids = frozenset(
-        block.block_id for block in raw_blocks[:selected_recent_window_turn_floor]
+        block.block_id for block in raw_blocks if block.turn_group_id in floor_group_ids
     )
     selected_ids = _required_block_ids(
         material_blocks,
@@ -385,6 +544,13 @@ def build_recent_window_fallback_selection(
         for block in raw_blocks:
             if block.block_id in selected_ids:
                 continue
+            if not _fallback_caps_allow_append(
+                selected_blocks=_blocks_by_material_order(material_blocks, selected_ids),
+                candidate=block,
+                memory_policy=memory_policy,
+            ):
+                blocked_next_block_id = block.block_id
+                break
             candidate_ids = frozenset((*selected_ids, block.block_id))
             candidate_blocks = _blocks_by_material_order(material_blocks, candidate_ids)
             candidate_budget = estimate_recent_window_fallback_budget(
@@ -561,18 +727,31 @@ def _required_block_ids(
     return frozenset(selected)
 
 
-def _reverse_chronological_raw_blocks(
+def _reverse_chronological_turn_group_blocks(
     blocks: tuple[RunInputMaterialBlock, ...],
+    *,
+    selected_recent_window_turn_floor: int,
 ) -> tuple[RunInputMaterialBlock, ...]:
-    """按 reverse chronological material order 返回 raw turn blocks。
+    """按 reverse chronological material order 返回 turn-group blocks。
 
     :param blocks: material blocks。
-    :returns: raw turn blocks。
+    :param selected_recent_window_turn_floor: 需要保护的 turn group 数。
+    :returns: turn-group blocks。
+    :raises ValueError: floor 依赖的 eligible block 缺少 turn_group_id 时抛出。
     """
 
+    eligible = tuple(block for block in blocks if is_turn_group_material_block(block))
+    if selected_recent_window_turn_floor > 0:
+        protected_recent_turn_group_ids_for_material_blocks(
+            eligible,
+            selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+            missing_turn_group_message=(
+                "eligible fallback material block is missing turn_group_id"
+            ),
+        )
     return tuple(
         sorted(
-            (block for block in blocks if _is_raw_turn_block(block)),
+            eligible,
             key=lambda block: (
                 _NO_EVENT_SEQUENCE if block.event_sequence is None else block.event_sequence,
                 block.event_sub_index,
@@ -580,6 +759,31 @@ def _reverse_chronological_raw_blocks(
             ),
             reverse=True,
         )
+    )
+
+
+def _fallback_caps_allow_append(
+    *,
+    selected_blocks: tuple[RunInputMaterialBlock, ...],
+    candidate: RunInputMaterialBlock,
+    memory_policy: MemoryProjectionPolicy | None,
+) -> bool:
+    """判断 fallback selected window caps 是否允许整块追加。
+
+    :param selected_blocks: 当前已选 blocks。
+    :param candidate: 待追加 block。
+    :param memory_policy: memory projection policy；``None`` 表示旧调用点未提供 caps。
+    :returns: caps 允许追加时返回 ``True``。
+    """
+
+    if memory_policy is None:
+        return True
+    if len(selected_blocks) + 1 > memory_policy.fallback_selected_recent_window_item_cap:
+        return False
+    selected_chars = sum(block.size_units for block in selected_blocks)
+    return (
+        selected_chars + candidate.size_units
+        <= memory_policy.fallback_selected_recent_window_char_cap
     )
 
 
@@ -616,20 +820,7 @@ def _raw_turn_count(blocks: tuple[RunInputMaterialBlock, ...]) -> int:
     :returns: raw turn 数量。
     """
 
-    return sum(1 for block in blocks if _is_raw_turn_block(block))
-
-
-def _is_raw_turn_block(block: RunInputMaterialBlock) -> bool:
-    """判断 block 是否为 raw user / assistant turn。
-
-    :param block: material block。
-    :returns: raw turn 返回 ``True``。
-    """
-
-    return block.kind in (
-        CompactMaterialBlockKind.USER_INPUT,
-        CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
-    )
+    return sum(1 for block in blocks if is_turn_group_material_block(block))
 
 
 def _optional_mapping(
@@ -662,6 +853,38 @@ def _optional_text(payload: Mapping[str, JsonValue], field_name: str) -> str | N
     if isinstance(value, str) and value.strip() != "":
         return value
     return None
+
+
+def _required_non_negative_int(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> int:
+    """读取必填非负整数字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 非负整数。
+    :raises HostDurableError: 字段缺失、类型非法或为负数时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise HostDurableError(f"{field_name} must be a non-negative integer")
+
+
+def _required_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取必填非空文本字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises HostDurableError: 字段缺失、类型非法或为空时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"{field_name} must be non-empty text")
 
 
 def _required_text_tuple(
@@ -746,6 +969,38 @@ def _require_non_empty_text(value: str, field_name: str) -> None:
 
     if value.strip() == "":
         raise ValueError(f"{field_name} must be non-empty")
+
+
+def _require_optional_non_empty_text(value: str | None, field_name: str) -> None:
+    """校验可选非空文本。
+
+    :param value: 待校验文本。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises ValueError: 文本为空时抛出。
+    """
+
+    if value is None:
+        return
+    _require_non_empty_text(value, field_name)
+
+
+def _require_optional_non_negative_int(value: int | None, field_name: str) -> None:
+    """校验可选非负整数。
+
+    :param value: 待校验整数。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 类型非法时抛出。
+    :raises ValueError: 数值为负时抛出。
+    """
+
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be int")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
 
 
 __all__ = [

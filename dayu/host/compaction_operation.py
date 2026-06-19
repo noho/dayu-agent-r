@@ -8,6 +8,7 @@ EventLog 写入、artifact 写入、memory projection 与 durable state recheck 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Mapping
@@ -24,11 +25,14 @@ from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compaction import (
+    CompactMaterialBlock,
+    CompactMaterialBlockKind,
     CompactQualityCheckResultVNext,
     CompactionRequest,
     ContextCompactor,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
+    ReferenceContinuityReasonVNext,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS, estimate_budget_text_tokens
 from dayu.host.context_governance import check_conversation_compact_output_vnext
@@ -80,6 +84,41 @@ _COMPACTOR_USER_PROJECTOR_ID = "compactor_user_prompt"
 _COMPACTOR_INPUT_PROJECTION_PAYLOAD_PREFIX = "compactor-input-projection"
 _RUNNER_CALL_MANIFEST_PAYLOAD_PREFIX = "runner-call-manifest"
 _GOVERNANCE_ACTOR = "host.context_governance"
+_COMPACTION_REJECTED_DIAGNOSTIC_SCHEMA_VERSION = (
+    "compaction_rejected_attempt_diagnostic.v1"
+)
+_COMPACTION_REJECTED_DIAGNOSTIC_MEDIA_TYPE = (
+    "application/vnd.dayu.compaction-rejected-attempt-diagnostic+json"
+)
+_COMPACTION_REJECTED_DIAGNOSTIC_PAYLOAD_PREFIX = "compaction-diagnostic"
+_EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX = (
+    "event-compaction-rejected-diagnostic"
+)
+_EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = (
+    "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+)
+_DIAGNOSTIC_DESCRIPTOR_KIND_COMPACTION_REJECTED_ATTEMPT = (
+    "compaction_rejected_attempt_diagnostic"
+)
+_DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT = (
+    "material_pack_to_compact_input"
+)
+_DIAGNOSTIC_STAGE_PREVIOUS_COMPACTED_VIEW_PARSE = (
+    "previous_compacted_view_parse"
+)
+_DIAGNOSTIC_STAGE_PROPOSAL_EXECUTION = "proposal_execution"
+_DIAGNOSTIC_PARSER_PREVIOUS_REFERENCE_CONTINUITY = (
+    "previous_reference_continuity"
+)
+_DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR = (
+    "conversation_compact_input_vnext_from_material_pack"
+)
+_DIAGNOSTIC_PARSER_PROPOSAL_EXECUTION = "compactor_proposal_execution"
+_PREVIOUS_REFERENCE_CONTINUITY_TEXT_INVALID = (
+    "previous reference continuity text is invalid"
+)
+_PREVIOUS_REFERENCE_PREFIX = "reference_continuity="
+_PREVIOUS_REFERENCE_TEXT_PREFIX = "text="
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,6 +404,78 @@ _NEXT_DECISION_FAIL_COMPACTION = CompactionNextPolicyDecision.FAIL_COMPACTION
 
 
 @dataclass(frozen=True, slots=True)
+class CompactionRejectedAttemptOffendingBlock:
+    """rejected attempt diagnostic 中定位到的 offending material block。
+
+    :param section: material section。
+    :param kind: material block kind。
+    :param block_label: prompt-local block label。
+    :param block_ordinal: block 在 previous compacted view 中的 0-based 序号。
+    :param block_path: artifact 内稳定 locator path。
+    :param content_digest: block content digest。
+    :param text_digest: block text digest。
+    :param text_length: block text 字符数。
+    """
+
+    section: str
+    kind: str
+    block_label: str
+    block_ordinal: int
+    block_path: str
+    content_digest: str
+    text_digest: str
+    text_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionRejectedAttemptDiagnostic:
+    """rejected attempt 的内存态 diagnostic artifact body。
+
+    该对象可包含 raw previous compacted view 文本，只能在 Host 内部传递，
+    不得投影进 EventLog canonical payload、Conversation Memory、compact
+    LLM input 或 ordinary RunInput。
+
+    :param artifact_body: 将写入 diagnostic artifact 的 canonical JSON object。
+    :param failure_category: 失败分类。
+    :param failure_stage: 失败阶段。
+    :param diagnostic_suffix: 与 diagnostic refs 对齐的诊断后缀。
+    :param parser_or_validator: 失败来源 parser / validator。
+    :param exception_class: 异常类型。
+    :param exception_message: 已脱敏异常消息。
+    :param offending_block: offending block locator；无法定位时为 ``None``。
+    :param material_pack_digest: material pack digest。
+    :param compaction_request_digest: compaction request digest。
+    """
+
+    artifact_body: Mapping[str, JsonValue]
+    failure_category: CompactionFailureCategory
+    failure_stage: str
+    diagnostic_suffix: str
+    parser_or_validator: str
+    exception_class: str
+    exception_message: str
+    offending_block: CompactionRejectedAttemptOffendingBlock | None
+    material_pack_digest: str
+    compaction_request_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionRejectedAttemptDiagnosticReference:
+    """已持久化 rejected attempt diagnostic artifact 引用。
+
+    :param payload_ref: payload descriptor ref。
+    :param payload_digest: artifact digest。
+    :param artifact_relative_path: artifact root 下的相对路径。
+    :param diagnostic: 原始内存态 diagnostic 摘要。
+    """
+
+    payload_ref: str
+    payload_digest: str
+    artifact_relative_path: str
+    diagnostic: CompactionRejectedAttemptDiagnostic
+
+
+@dataclass(frozen=True, slots=True)
 class CompactionAttemptRejected:
     """compaction semantic attempt reject 摘要。
 
@@ -377,6 +488,8 @@ class CompactionAttemptRejected:
     :param budget_after_attempted_compact: attempt 后预算；未知时为 ``None``。
     :param proposal_manifest_ref: 对应该 proposal attempt 的 manifest ref。
     :param proposal_manifest_digest: 对应该 proposal attempt 的 manifest digest。
+    :param diagnostic: material / proposal failure diagnostic；没有额外
+        artifact 时为 ``None``。
     """
 
     attempt_number: int
@@ -388,6 +501,7 @@ class CompactionAttemptRejected:
     budget_after_attempted_compact: int | None
     proposal_manifest_ref: str | None
     proposal_manifest_digest: str | None
+    diagnostic: CompactionRejectedAttemptDiagnostic | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +551,16 @@ class _CompactorProposalExecutionError(Exception):
     """
 
     original_exception: Exception
+    proposal_manifest_reference: CompactorProposalManifestReference | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactorProposalCancelledError(Exception):
+    """proposal 在 Host cancellation 生效后取消并携带 manifest ref。
+
+    :param proposal_manifest_reference: 已写 manifest ref。
+    """
+
     proposal_manifest_reference: CompactorProposalManifestReference | None
 
 
@@ -518,6 +642,16 @@ async def run_compaction_operation(
                 candidate = proposal.candidate
             except _CompactorProposalExecutionError as exc:
                 proposal_manifest_reference = exc.proposal_manifest_reference
+                diagnostic_suffix = _exception_diagnostic_suffix(exc.original_exception)
+                diagnostic = _proposal_failure_diagnostic(
+                    request=pass_request,
+                    compaction_operation_id=compaction_operation_id,
+                    attempt_number=attempt_number,
+                    failure_category=_FAILURE_PROPOSAL_FAILED,
+                    diagnostic_suffix=diagnostic_suffix,
+                    exception=exc.original_exception,
+                    proposal_manifest_reference=proposal_manifest_reference,
+                )
                 rejected_attempt = _attempt_rejected(
                     request=pass_request,
                     attempt_number=attempt_number,
@@ -525,10 +659,9 @@ async def run_compaction_operation(
                     repairable=repairable,
                     next_policy_decision=next_decision,
                     budget_after_attempted_compact=None,
-                    diagnostic_suffix=_exception_diagnostic_suffix(
-                        exc.original_exception
-                    ),
+                    diagnostic_suffix=diagnostic_suffix,
                     proposal_manifest_reference=proposal_manifest_reference,
+                    diagnostic=diagnostic,
                 )
                 rejected.append(rejected_attempt)
                 _log_rejected_attempt(
@@ -548,7 +681,44 @@ async def run_compaction_operation(
                     )
                 attempt_number += 1
                 continue
+            except _CompactorProposalCancelledError as exc:
+                proposal_manifest_reference = exc.proposal_manifest_reference
+                rejected_attempt = _attempt_rejected(
+                    request=pass_request,
+                    attempt_number=attempt_number,
+                    failure_category=_FAILURE_CANCELLATION_REQUESTED,
+                    repairable=False,
+                    next_policy_decision=_NEXT_DECISION_FAIL_COMPACTION,
+                    budget_after_attempted_compact=last_budget,
+                    diagnostic_suffix=_cancellation_suffix(cancellation_token),
+                    proposal_manifest_reference=proposal_manifest_reference,
+                )
+                rejected.append(rejected_attempt)
+                _log_rejected_attempt(
+                    request=pass_request,
+                    rejected=rejected_attempt,
+                    exception=None,
+                )
+                return CompactionOperationResult(
+                    accepted_candidate=None,
+                    quality_result=None,
+                    rejected_attempts=tuple(rejected),
+                    failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
+                    budget_after_attempted_compact=last_budget,
+                    accepted_proposal_manifest_ref=None,
+                    accepted_proposal_manifest_digest=None,
+                )
             except Exception as exc:
+                diagnostic_suffix = _exception_diagnostic_suffix(exc)
+                diagnostic = _proposal_failure_diagnostic(
+                    request=pass_request,
+                    compaction_operation_id=compaction_operation_id,
+                    attempt_number=attempt_number,
+                    failure_category=_FAILURE_PROPOSAL_FAILED,
+                    diagnostic_suffix=diagnostic_suffix,
+                    exception=exc,
+                    proposal_manifest_reference=proposal_manifest_reference,
+                )
                 rejected_attempt = _attempt_rejected(
                     request=pass_request,
                     attempt_number=attempt_number,
@@ -556,8 +726,9 @@ async def run_compaction_operation(
                     repairable=repairable,
                     next_policy_decision=next_decision,
                     budget_after_attempted_compact=None,
-                    diagnostic_suffix=_exception_diagnostic_suffix(exc),
+                    diagnostic_suffix=diagnostic_suffix,
                     proposal_manifest_reference=proposal_manifest_reference,
+                    diagnostic=diagnostic,
                 )
                 rejected.append(rejected_attempt)
                 _log_rejected_attempt(
@@ -764,6 +935,12 @@ async def _prepare_compactor_proposal(
             candidate = await compactor.run_prepared_compactor_proposal(
                 prepared_input
             )
+        except asyncio.CancelledError as exc:
+            if not cancellation_token.is_cancelled():
+                raise
+            raise _CompactorProposalCancelledError(
+                proposal_manifest_reference=manifest_reference,
+            ) from exc
         except Exception as exc:
             raise _CompactorProposalExecutionError(
                 original_exception=exc,
@@ -777,9 +954,17 @@ async def _prepare_compactor_proposal(
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
     )
+    try:
+        candidate = await compactor.compact(request, cancellation_token)
+    except asyncio.CancelledError as exc:
+        if not cancellation_token.is_cancelled():
+            raise
+        raise _CompactorProposalCancelledError(
+            proposal_manifest_reference=None,
+        ) from exc
     return _CompactorProposalAttempt(
         compact_input=compact_input,
-        candidate=await compactor.compact(request, cancellation_token),
+        candidate=candidate,
         proposal_manifest_reference=None,
     )
 
@@ -815,6 +1000,69 @@ def _record_compactor_proposal_manifest(
     )
 
 
+def write_compaction_rejected_attempt_diagnostic_artifact(
+    *,
+    transaction: HostTransaction,
+    artifact_store: LocalArtifactStore,
+    payload_store: PayloadStore,
+    diagnostic: CompactionRejectedAttemptDiagnostic,
+    compaction_operation_id: str,
+    compaction_attempt_number: int,
+) -> CompactionRejectedAttemptDiagnosticReference:
+    """在调用方事务内写入 rejected attempt diagnostic artifact descriptor。
+
+    artifact 文件写入本身发生在文件系统；payload descriptor 插入使用调用方
+    ``transaction``，以便与随后写入的 ``CONTEXT_COMPACTION_ATTEMPT_REJECTED``
+    EventLog row 共享同一个 SQLite transaction。
+
+    :param transaction: 调用方 Host transaction。
+    :param artifact_store: 调用方显式创建的 artifact store。
+    :param payload_store: payload descriptor store。
+    :param diagnostic: 内存态 diagnostic body。
+    :param compaction_operation_id: compaction operation id。
+    :param compaction_attempt_number: proposal attempt 序号。
+    :returns: 已持久化 diagnostic artifact 引用。
+    :raises HostDurableError: descriptor 或 artifact 写入失败时抛出。
+    """
+
+    diagnostic_event_id = _new_event_id(
+        _EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX
+    )
+    artifact_digest = sha256_digest_json(diagnostic.artifact_body)
+    artifact_ref = artifact_store.write_artifact_bytes(
+        canonical_json_dumps(diagnostic.artifact_body).encode("utf-8"),
+        expected_digest=artifact_digest,
+    )
+    payload_ref = _compaction_rejected_diagnostic_payload_ref(diagnostic_event_id)
+    descriptor = payload_store.write_payload_descriptor_for_artifact(
+        transaction,
+        payload_ref,
+        artifact_ref,
+        _COMPACTION_REJECTED_DIAGNOSTIC_MEDIA_TYPE,
+        {
+            "descriptor_kind": _DIAGNOSTIC_DESCRIPTOR_KIND_COMPACTION_REJECTED_ATTEMPT,
+            "schema_version": _COMPACTION_REJECTED_DIAGNOSTIC_SCHEMA_VERSION,
+            "event_type": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            "diagnostic_event_id": diagnostic_event_id,
+            "compaction_operation_id": compaction_operation_id,
+            "compaction_attempt_number": compaction_attempt_number,
+            "compaction_request_digest": diagnostic.compaction_request_digest,
+            "failure_stage": diagnostic.failure_stage,
+            "failure_category": diagnostic.failure_category.value,
+            "exception_class": diagnostic.exception_class,
+            "parser_or_validator": diagnostic.parser_or_validator,
+            "contains_raw_material": True,
+            "confidential": True,
+        },
+    )
+    return CompactionRejectedAttemptDiagnosticReference(
+        payload_ref=descriptor.payload_ref,
+        payload_digest=descriptor.payload_digest,
+        artifact_relative_path=artifact_ref.artifact_relative_path,
+        diagnostic=diagnostic,
+    )
+
+
 def _new_event_id(prefix: str) -> str:
     """生成事件 id。
 
@@ -823,6 +1071,16 @@ def _new_event_id(prefix: str) -> str:
     """
 
     return f"{prefix}-{uuid4().hex}"
+
+
+def _compaction_rejected_diagnostic_payload_ref(diagnostic_event_id: str) -> str:
+    """派生 rejected attempt diagnostic descriptor ref。
+
+    :param diagnostic_event_id: diagnostic artifact event-like id。
+    :returns: payload descriptor ref。
+    """
+
+    return f"{_COMPACTION_REJECTED_DIAGNOSTIC_PAYLOAD_PREFIX}:{diagnostic_event_id}"
 
 
 def _compactor_runner_call_manifest_body(
@@ -1261,6 +1519,408 @@ def _candidate_text_fragments(candidate: ConversationCompactOutputVNext) -> tupl
     return tuple(fragments)
 
 
+def _proposal_failure_diagnostic(
+    *,
+    request: CompactionRequest,
+    compaction_operation_id: str | None,
+    attempt_number: int,
+    failure_category: CompactionFailureCategory,
+    diagnostic_suffix: str,
+    exception: Exception,
+    proposal_manifest_reference: CompactorProposalManifestReference | None,
+) -> CompactionRejectedAttemptDiagnostic | None:
+    """构造 proposal failure 的内存态 diagnostic。
+
+    该 helper 只生成 Host 内部 artifact body，不写文件、不写 SQLite，也不改变
+    compact 决策。若 diagnostic 构造自身失败，返回 ``None`` 并保留原本的
+    rejected attempt 行为。
+
+    :param request: Host compaction request。
+    :param compaction_operation_id: compaction operation id。
+    :param attempt_number: proposal attempt 序号。
+    :param failure_category: 失败分类。
+    :param diagnostic_suffix: 与 diagnostic ref 对齐的后缀。
+    :param exception: proposal / material projection 异常。
+    :param proposal_manifest_reference: 已写 proposal manifest ref；没有时为
+        ``None``。
+    :returns: diagnostic；构造失败时返回 ``None``。
+    """
+
+    try:
+        return _proposal_failure_diagnostic_unchecked(
+            request=request,
+            compaction_operation_id=compaction_operation_id,
+            attempt_number=attempt_number,
+            failure_category=failure_category,
+            diagnostic_suffix=diagnostic_suffix,
+            exception=exception,
+            proposal_manifest_reference=proposal_manifest_reference,
+        )
+    except Exception as diagnostic_exc:
+        _LOGGER.warning(
+            "host.compaction_operation.diagnostic_build_failed "
+            "session_id=%s run_id=%s operation_id=%s attempt_number=%s "
+            "failure_category=%s error_code=%s message=%s",
+            request.session_id,
+            request.run_id,
+            compaction_operation_id,
+            attempt_number,
+            failure_category.value,
+            _exception_error_code(diagnostic_exc),
+            _safe_exception_message(diagnostic_exc),
+        )
+        return None
+
+
+def _proposal_failure_diagnostic_unchecked(
+    *,
+    request: CompactionRequest,
+    compaction_operation_id: str | None,
+    attempt_number: int,
+    failure_category: CompactionFailureCategory,
+    diagnostic_suffix: str,
+    exception: Exception,
+    proposal_manifest_reference: CompactorProposalManifestReference | None,
+) -> CompactionRejectedAttemptDiagnostic:
+    """构造 proposal failure diagnostic，错误由调用方兜底。
+
+    :param request: Host compaction request。
+    :param compaction_operation_id: compaction operation id。
+    :param attempt_number: proposal attempt 序号。
+    :param failure_category: 失败分类。
+    :param diagnostic_suffix: 与 diagnostic ref 对齐的后缀。
+    :param exception: proposal / material projection 异常。
+    :param proposal_manifest_reference: 已写 proposal manifest ref。
+    :returns: diagnostic。
+    """
+
+    exception_message = _safe_exception_message(exception)
+    previous_blocks = request.material_pack.previous_compacted_view
+    offending = _proposal_failure_offending_block(
+        previous_blocks=previous_blocks,
+        exception_message=exception_message,
+    )
+    failure_stage, parser_or_validator = _proposal_failure_stage(
+        exception_message=exception_message,
+        has_reference_blocks=_has_reference_continuity_blocks(previous_blocks),
+        proposal_manifest_reference=proposal_manifest_reference,
+    )
+    material_pack_digest = sha256_digest_json(
+        {"material_pack": request.material_pack.to_json()}
+    )
+    compaction_request_digest = request.digest()
+    artifact_body = _proposal_failure_diagnostic_artifact_body(
+        request=request,
+        compaction_operation_id=compaction_operation_id,
+        attempt_number=attempt_number,
+        failure_category=failure_category,
+        diagnostic_suffix=diagnostic_suffix,
+        exception=exception,
+        exception_message=exception_message,
+        proposal_manifest_reference=proposal_manifest_reference,
+        failure_stage=failure_stage,
+        parser_or_validator=parser_or_validator,
+        offending_block=offending,
+        material_pack_digest=material_pack_digest,
+        compaction_request_digest=compaction_request_digest,
+    )
+    return CompactionRejectedAttemptDiagnostic(
+        artifact_body=artifact_body,
+        failure_category=failure_category,
+        failure_stage=failure_stage,
+        diagnostic_suffix=diagnostic_suffix,
+        parser_or_validator=parser_or_validator,
+        exception_class=exception.__class__.__name__,
+        exception_message=exception_message,
+        offending_block=offending,
+        material_pack_digest=material_pack_digest,
+        compaction_request_digest=compaction_request_digest,
+    )
+
+
+def _proposal_failure_stage(
+    *,
+    exception_message: str,
+    has_reference_blocks: bool,
+    proposal_manifest_reference: CompactorProposalManifestReference | None,
+) -> tuple[str, str]:
+    """返回 proposal failure 的稳定 stage 与 parser/validator 名称。
+
+    :param exception_message: 已脱敏异常消息。
+    :param has_reference_blocks: previous view 是否存在 reference continuity block。
+    :param proposal_manifest_reference: proposal manifest ref。
+    :returns: ``(failure_stage, parser_or_validator)``。
+    """
+
+    if (
+        exception_message == _PREVIOUS_REFERENCE_CONTINUITY_TEXT_INVALID
+        and has_reference_blocks
+    ):
+        return (
+            _DIAGNOSTIC_STAGE_PREVIOUS_COMPACTED_VIEW_PARSE,
+            _DIAGNOSTIC_PARSER_PREVIOUS_REFERENCE_CONTINUITY,
+        )
+    if proposal_manifest_reference is None:
+        return (
+            _DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT,
+            _DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR,
+        )
+    return (
+        _DIAGNOSTIC_STAGE_PROPOSAL_EXECUTION,
+        _DIAGNOSTIC_PARSER_PROPOSAL_EXECUTION,
+    )
+
+
+def _proposal_failure_offending_block(
+    *,
+    previous_blocks: tuple[CompactMaterialBlock, ...],
+    exception_message: str,
+) -> CompactionRejectedAttemptOffendingBlock | None:
+    """定位 previous compacted view 中的 offending block。
+
+    该诊断逻辑镜像 ``compact_material._parse_previous_reference_continuity_text``
+    当前文本协议，只用于定位 artifact 中的 raw block，不改变 parser 行为。
+
+    :param previous_blocks: previous compacted view blocks。
+    :param exception_message: 已脱敏异常消息。
+    :returns: offending block locator；无法定位时返回 ``None``。
+    """
+
+    if exception_message != _PREVIOUS_REFERENCE_CONTINUITY_TEXT_INVALID:
+        return None
+    for ordinal, block in enumerate(previous_blocks):
+        if block.kind is not CompactMaterialBlockKind.REFERENCE_CONTINUITY:
+            continue
+        if any(_previous_reference_continuity_line_invalid(line) for line in block.text.splitlines()):
+            return _offending_block_locator(block=block, ordinal=ordinal)
+    return None
+
+
+def _previous_reference_continuity_line_invalid(line: str) -> bool:
+    """判断 previous reference continuity 单行是否违反当前 parser 协议。
+
+    :param line: previous reference continuity raw line。
+    :returns: 违反协议时返回 ``True``。
+    """
+
+    parts = line.split("; ")
+    if len(parts) != 2:
+        return True
+    reason_text = parts[0].removeprefix(_PREVIOUS_REFERENCE_PREFIX)
+    readable_text = parts[1].removeprefix(_PREVIOUS_REFERENCE_TEXT_PREFIX)
+    if reason_text == parts[0] or readable_text == parts[1]:
+        return True
+    try:
+        ReferenceContinuityReasonVNext(reason_text)
+    except ValueError:
+        return True
+    return False
+
+
+def _offending_block_locator(
+    *, block: CompactMaterialBlock, ordinal: int
+) -> CompactionRejectedAttemptOffendingBlock:
+    """构造 offending block locator。
+
+    :param block: offending material block。
+    :param ordinal: block 在 previous view 中的序号。
+    :returns: locator。
+    """
+
+    return CompactionRejectedAttemptOffendingBlock(
+        section=block.section.value,
+        kind=block.kind.value,
+        block_label=block.block_label,
+        block_ordinal=ordinal,
+        block_path=f"previous_compacted_view[{ordinal}]",
+        content_digest=block.content_digest,
+        text_digest=_diagnostic_text_digest(block.text),
+        text_length=len(block.text),
+    )
+
+
+def _proposal_failure_diagnostic_artifact_body(
+    *,
+    request: CompactionRequest,
+    compaction_operation_id: str | None,
+    attempt_number: int,
+    failure_category: CompactionFailureCategory,
+    diagnostic_suffix: str,
+    exception: Exception,
+    exception_message: str,
+    proposal_manifest_reference: CompactorProposalManifestReference | None,
+    failure_stage: str,
+    parser_or_validator: str,
+    offending_block: CompactionRejectedAttemptOffendingBlock | None,
+    material_pack_digest: str,
+    compaction_request_digest: str,
+) -> Mapping[str, JsonValue]:
+    """构造 rejected attempt diagnostic artifact body。
+
+    :param request: Host compaction request。
+    :param compaction_operation_id: compaction operation id。
+    :param attempt_number: proposal attempt 序号。
+    :param failure_category: 失败分类。
+    :param diagnostic_suffix: diagnostic ref 后缀。
+    :param exception: 原始异常。
+    :param exception_message: 已脱敏异常消息。
+    :param proposal_manifest_reference: proposal manifest ref。
+    :param failure_stage: 失败阶段。
+    :param parser_or_validator: parser / validator 名称。
+    :param offending_block: offending block locator。
+    :param material_pack_digest: material pack digest。
+    :param compaction_request_digest: compaction request digest。
+    :returns: artifact JSON object。
+    """
+
+    previous_blocks = request.material_pack.previous_compacted_view
+    return {
+        "schema_version": _COMPACTION_REJECTED_DIAGNOSTIC_SCHEMA_VERSION,
+        "event_type": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        "session_id": request.session_id,
+        "host_run_id": request.run_id,
+        "attempt_id": request.attempt_id,
+        "execution_id": request.execution_id,
+        "input_snapshot_cursor": request.segment_selection.input_cursor,
+        "memory_snapshot_cursor": request.memory_snapshot_cursor,
+        "compaction_operation_id": compaction_operation_id,
+        "compaction_attempt_number": attempt_number,
+        "failure_stage": failure_stage,
+        "failure_category": failure_category.value,
+        "parser_or_validator": parser_or_validator,
+        "exception_class": exception.__class__.__name__,
+        "exception_message": exception_message,
+        "diagnostic_suffix": diagnostic_suffix,
+        "proposal_manifest_ref": (
+            None
+            if proposal_manifest_reference is None
+            else proposal_manifest_reference.manifest_payload_ref
+        ),
+        "proposal_manifest_digest": (
+            None
+            if proposal_manifest_reference is None
+            else proposal_manifest_reference.manifest_digest
+        ),
+        "material_pack_digest": material_pack_digest,
+        "compaction_request_digest": compaction_request_digest,
+        "contains_raw_material": True,
+        "confidential": True,
+        "previous_compacted_view": [block.to_json() for block in previous_blocks],
+        "material_pack_summary": _material_pack_summary(request),
+        "offending_block": _offending_block_artifact_json(
+            previous_blocks=previous_blocks,
+            offending_block=offending_block,
+        ),
+        "all_previous_compacted_view_blocks": [
+            _previous_block_locator_json(block=block, ordinal=ordinal)
+            for ordinal, block in enumerate(previous_blocks)
+        ],
+    }
+
+
+def _material_pack_summary(request: CompactionRequest) -> Mapping[str, JsonValue]:
+    """构造不含 raw trace/evidence/answer 文本的 material pack 摘要。
+
+    :param request: Host compaction request。
+    :returns: material pack 摘要。
+    """
+
+    anchor_text = request.material_pack.current_input_anchor.anchor_text
+    return {
+        "trace_material_count": len(request.material_pack.trace_material),
+        "evidence_material_count": len(request.material_pack.evidence_material),
+        "answer_material_count": len(request.material_pack.answer_material),
+        "current_input_anchor_digest": (
+            request.material_pack.current_input_anchor.content_digest
+        ),
+        "current_input_anchor_length": len(anchor_text),
+    }
+
+
+def _offending_block_artifact_json(
+    *,
+    previous_blocks: tuple[CompactMaterialBlock, ...],
+    offending_block: CompactionRejectedAttemptOffendingBlock | None,
+) -> Mapping[str, JsonValue] | None:
+    """构造 artifact 中的 offending block JSON。
+
+    :param previous_blocks: previous compacted view blocks。
+    :param offending_block: offending block locator。
+    :returns: JSON object；未定位时返回 ``None``。
+    """
+
+    if offending_block is None:
+        return None
+    if (
+        offending_block.block_ordinal < 0
+        or offending_block.block_ordinal >= len(previous_blocks)
+    ):
+        return None
+    block = previous_blocks[offending_block.block_ordinal]
+    return {
+        "section": offending_block.section,
+        "kind": offending_block.kind,
+        "block_label": offending_block.block_label,
+        "ordinal": offending_block.block_ordinal,
+        "path": offending_block.block_path,
+        "content_digest": offending_block.content_digest,
+        "text_digest": offending_block.text_digest,
+        "text_length": offending_block.text_length,
+        "source_labels": list(block.source_labels),
+        "canonical_source_refs": list(block.canonical_source_refs),
+        "raw_text": block.text,
+    }
+
+
+def _previous_block_locator_json(
+    *, block: CompactMaterialBlock, ordinal: int
+) -> Mapping[str, JsonValue]:
+    """构造 previous view block locator 摘要。
+
+    :param block: previous view block。
+    :param ordinal: block 序号。
+    :returns: locator JSON object。
+    """
+
+    return {
+        "section": block.section.value,
+        "kind": block.kind.value,
+        "block_label": block.block_label,
+        "ordinal": ordinal,
+        "path": f"previous_compacted_view[{ordinal}]",
+        "content_digest": block.content_digest,
+        "text_digest": _diagnostic_text_digest(block.text),
+        "text_length": len(block.text),
+        "source_labels": list(block.source_labels),
+        "canonical_source_refs": list(block.canonical_source_refs),
+    }
+
+
+def _has_reference_continuity_blocks(
+    previous_blocks: tuple[CompactMaterialBlock, ...]
+) -> bool:
+    """判断 previous view 是否包含 reference continuity block。
+
+    :param previous_blocks: previous compacted view blocks。
+    :returns: 存在 reference continuity block 时返回 ``True``。
+    """
+
+    return any(
+        block.kind is CompactMaterialBlockKind.REFERENCE_CONTINUITY
+        for block in previous_blocks
+    )
+
+
+def _diagnostic_text_digest(text: str) -> str:
+    """计算 diagnostic text digest。
+
+    :param text: 文本。
+    :returns: SHA-256 JSON digest。
+    """
+
+    return sha256_digest_json({"text": text})
+
+
 def _attempt_rejected(
     *,
     request: CompactionRequest,
@@ -1271,6 +1931,7 @@ def _attempt_rejected(
     budget_after_attempted_compact: int | None,
     diagnostic_suffix: str,
     proposal_manifest_reference: CompactorProposalManifestReference | None,
+    diagnostic: CompactionRejectedAttemptDiagnostic | None = None,
 ) -> CompactionAttemptRejected:
     """构造 attempt reject 摘要。
 
@@ -1282,6 +1943,7 @@ def _attempt_rejected(
     :param budget_after_attempted_compact: attempt 后预算。
     :param diagnostic_suffix: 诊断 ref 后缀。
     :param proposal_manifest_reference: proposal manifest ref。
+    :param diagnostic: material / proposal failure diagnostic。
     :returns: attempt reject 摘要。
     """
 
@@ -1306,6 +1968,7 @@ def _attempt_rejected(
             if proposal_manifest_reference is None
             else proposal_manifest_reference.manifest_digest
         ),
+        diagnostic=diagnostic,
     )
 
 
@@ -1368,8 +2031,14 @@ def _log_rejected_attempt(
         "session_id=%s run_id=%s trigger_source=%s attempt_number=%s "
         "failure_category=%s repairable=%s error_code=%s message=%s "
         "diagnostic_refs=%s next_policy_decision=%s "
-        "budget_after_attempted_compact=%s"
+        "budget_after_attempted_compact=%s failure_stage=%s "
+        "diagnostic_suffix=%s parser_or_validator=%s exception_class=%s "
+        "offending_block_kind=%s offending_block_label=%s "
+        "offending_block_ordinal=%s offending_block_text_digest=%s "
+        "offending_block_text_length=%s material_pack_digest=%s"
     )
+    diagnostic = rejected.diagnostic
+    offending = None if diagnostic is None else diagnostic.offending_block
     args = (
         request.session_id,
         request.run_id,
@@ -1382,6 +2051,16 @@ def _log_rejected_attempt(
         ",".join(rejected.diagnostic_refs),
         rejected.next_policy_decision.value,
         rejected.budget_after_attempted_compact,
+        None if diagnostic is None else diagnostic.failure_stage,
+        None if diagnostic is None else diagnostic.diagnostic_suffix,
+        None if diagnostic is None else diagnostic.parser_or_validator,
+        None if diagnostic is None else diagnostic.exception_class,
+        None if offending is None else offending.kind,
+        None if offending is None else offending.block_label,
+        None if offending is None else offending.block_ordinal,
+        None if offending is None else offending.text_digest,
+        None if offending is None else offending.text_length,
+        None if diagnostic is None else diagnostic.material_pack_digest,
     )
     if rejected.repairable:
         _LOGGER.warning(log_message, *args)

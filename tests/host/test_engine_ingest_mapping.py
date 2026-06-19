@@ -8,10 +8,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 import pytest
 
+import dayu.host.engine_ingest as engine_ingest_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest
@@ -119,6 +120,8 @@ from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CreateRunningRunInput,
+    FailRecoveringRunInput,
+    RunTransitionResult,
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
@@ -133,6 +136,7 @@ from dayu.host.durable.state import (
     DispatchRecordRow,
     DispatchRecordStatus,
     RunStartReason,
+    StateMutationStatus,
     WaitResumePolicy,
     WorkerKind,
     insert_attempt,
@@ -146,6 +150,7 @@ from dayu.host.durable.state import (
     steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.payload_resolution import event_payload_object
 from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
 from tests.host.fake_cancellation import StubCancellationToken
@@ -652,6 +657,59 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
 
 
 @pytest.mark.asyncio
+async def test_reactive_memory_catch_up_failure_still_starts_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """accepted compact 后 memory catch-up 失败不阻断 recovery attempt。"""
+
+    def fail_memory_catch_up(
+        transaction_runner: HostTransactionRunner,
+        *,
+        policy: MemoryProjectionPolicy,
+        batch_size: int,
+        max_event_sequence: int,
+    ) -> NoReturn:
+        """模拟事务外 memory catch-up 失败。
+
+        :param transaction_runner: Host transaction runner。
+        :param policy: memory projection policy。
+        :param batch_size: catch-up batch size。
+        :param max_event_sequence: catch-up 目标 event sequence。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        del transaction_runner, policy, batch_size, max_event_sequence
+        raise RuntimeError("catch up failed")
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "catch_up_conversation_memory_projection",
+        fail_memory_catch_up,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        wakeup = _WakeupSpy()
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=52))
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert tuple(event.event_type for event in result.events)[-2:] == (
+            "RUN_STARTED",
+            "ATTEMPT_STARTED",
+        )
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+        assert len(wakeup.dispatches) == 1
+
+
+@pytest.mark.asyncio
 async def test_reactive_prepared_compaction_records_accepted_proposal_manifest(
     tmp_path: Path,
 ) -> None:
@@ -971,6 +1029,63 @@ async def test_reactive_fallback_over_budget_fails_closed_without_lost(
         )
         assert isinstance(failed_payload["fallback_budget_result"], Mapping)
         assert failed_payload["fallback_budget_result"]["status"] == "over_hard_budget"
+
+
+@pytest.mark.asyncio
+async def test_reactive_fail_closed_propagates_recovering_fail_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recovering Run fail CAS 拒绝时 ingest 结果必须传播 REJECTED。"""
+
+    def reject_fail_recovering_run(
+        transaction: HostTransaction,
+        event_log_store: EventLogStore,
+        request: FailRecoveringRunInput,
+    ) -> RunTransitionResult:
+        """模拟 fail_recovering_run 的状态前置条件失败。
+
+        :param transaction: Host transaction。
+        :param event_log_store: EventLog store。
+        :param request: fail recovering run 输入。
+        :returns: INVALID_STATE transition result。
+        """
+
+        del transaction, event_log_store, request
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+        )
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "fail_recovering_run_in_transaction",
+        reject_fail_recovering_run,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(
+            store.transaction_runner,
+            display_text="overflow " * 80,
+        )
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+        ).ingest_async(
+            _context_compaction_candidate(seeded, worker_event_index=53)
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.terminal_closeout is False
+        assert result.reason == "recovering_run_failed_precondition_failed"
+        assert tuple(event.event_type for event in result.events) == (
+            CONTEXT_COMPACTION_REQUESTED,
+            "ATTEMPT_FAILED",
+            "RUN_RECOVERING",
+            CONTEXT_COMPACTION_FAILED,
+        )
 
 
 @pytest.mark.asyncio
