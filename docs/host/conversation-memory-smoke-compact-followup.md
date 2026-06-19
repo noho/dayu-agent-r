@@ -227,6 +227,19 @@ Smoke/log diagnostics work unit 完成后，long25 再失败时应无需查 SQLi
 - 最终是 compacted、failed、fallback dispatch 还是 fail closed。
 - 若无法定位 offending material block，stdout 应明确标记 log insufficiency。
 
+## 实施状态
+
+2026-06-19 本 work unit 已将前两个问题收敛为 smoke/log diagnostics 与
+smoke coverage boundary：
+
+- `memory-core` 保持轻量日常 smoke，不要求 compact。
+- `memory-compact` 作为压力 / 诊断入口，输出 compact operation timeline、
+  rejected histogram、proposal manifest ref present / missing、fallback action
+  与 log insufficiency 标记。
+- `CONTEXT_COMPACTION_FAILED` 仍是 hard fail，即使 fallback dispatch 让当前
+  Run 继续执行。
+- production memory compact failure 仍属于第 3 个问题，未在本 work unit 修复。
+
 Production memory work unit 完成后：
 
 - long25 不应再出现 `CONTEXT_COMPACTION_FAILED`。

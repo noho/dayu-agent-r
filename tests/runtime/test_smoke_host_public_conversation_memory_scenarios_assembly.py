@@ -22,6 +22,7 @@ from dayu.contracts.tool_schema import (
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
 )
 from dayu.host.durable.event_log import EventClass, EventLogRow
@@ -49,10 +50,12 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _VALUE_CATL_NET_PROFIT,
     _VALUE_CATL_OPERATING_CF,
     _build_byd_long_input,
+    _compact_audit_report_from_rows,
     _compact_audit_summary_from_rows,
     _compact_pressure_padding,
     _compact_pressure_reserve_tokens,
     _estimate_chars_as_tokens,
+    _print_compact_audit_report,
     _ensure_request,
     _mock_pressure_blob,
     _prepare_runtime_assembly,
@@ -478,6 +481,176 @@ def test_compact_audit_summary_maps_operation_id_to_request_trigger_source() -> 
     assert summary.compacted_reactive == 0
 
 
+def test_compact_audit_report_prints_operation_histograms_and_manifest_stage(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """compact report 输出 operation timeline、histogram 与 manifest 缺失阶段。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param capsys: pytest stdout 捕获 fixture。
+    :returns: ``None``。
+    """
+
+    rows = (
+        _event_row(
+            sequence=100,
+            event_id="event-context-compact-requested-100",
+            event_type=CONTEXT_COMPACTION_REQUESTED,
+            payload={"trigger_source": "proactive"},
+            run_id="run-request-100",
+        ),
+        _event_row(
+            sequence=101,
+            event_id="event-context-compaction-attempt-rejected-101",
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            payload={
+                "operation_id": "event-context-compact-requested-100",
+                "attempt_number": 1,
+                "failure_category": "invalid_candidate",
+                "repairable": True,
+                "next_policy_decision": "repair",
+                "diagnostic_refs": [
+                    "compact:operation:attempt:ValueError:previous reference continuity text is invalid",
+                ],
+                "budget_after_attempted_compact": 8192,
+            },
+            run_id="run-request-100",
+        ),
+        _event_row(
+            sequence=102,
+            event_id="event-context-compaction-attempt-rejected-102",
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            payload={
+                "operation_id": "event-context-compact-requested-100",
+                "attempt_number": 2,
+                "failure_category": "source_boundary",
+                "repairable": True,
+                "next_policy_decision": "repair",
+                "diagnostic_refs": ["ValueError:short diagnostic"],
+                "proposal_manifest_ref": "manifest-ref-102",
+                "proposal_manifest_digest": "sha256:manifest",
+            },
+            run_id="run-request-100",
+        ),
+        _event_row(
+            sequence=103,
+            event_id="event-context-compacted-103",
+            event_type=CONTEXT_COMPACTED,
+            payload={"operation_id": "event-context-compact-requested-100"},
+            run_id="run-request-100",
+        ),
+        _event_row(
+            sequence=104,
+            event_id="event-context-compaction-failed-104",
+            event_type=CONTEXT_COMPACTION_FAILED,
+            payload={
+                "operation_id": "event-context-compact-requested-100",
+                "failure_reason": "repair budget exhausted",
+                "policy_decision": "fallback",
+                "fallback_policy_decision": "deterministic_recent_window",
+                "fallback_action": "dispatch",
+                "fallback_tier": "tier4",
+                "attempt_count": 2,
+                "retry_repair_budget_exhausted": True,
+                "budget_after_attempted_compact": 4096,
+            },
+            run_id="run-request-100",
+        ),
+    )
+
+    report = _compact_audit_report_from_rows(rows)
+
+    assert report.summary.requested_proactive == 1
+    assert report.summary.rejected_proactive == 2
+    assert report.summary.compacted_proactive == 1
+    assert report.summary.failed_proactive == 1
+    assert report.rejected_failure_histogram == (
+        ("invalid_candidate", 1),
+        ("source_boundary", 1),
+    )
+    assert report.rejected_diagnostic_histogram == (
+        ("ValueError:short diagnostic", 1),
+        ("previous reference continuity text is invalid", 1),
+    )
+    assert report.rejected_manifest_presence_histogram == (("missing", 1), ("present", 1))
+    operation = report.operations[0]
+    assert operation.operation_id == "event-context-compact-requested-100"
+    assert operation.request_event_sequence == 100
+    assert operation.run_id == "run-request-100"
+    assert operation.compacted_event_sequences == (103,)
+    assert operation.failed_events[0].fallback_action == "dispatch"
+
+    with pytest.raises(RuntimeError, match="CONTEXT_COMPACTION_FAILED"):
+        _assert_compact_acceptance(
+            suite=SuiteMode.MEMORY_COMPACT,
+            audit=report.summary,
+            options=_prepare_runtime_assembly(_args(tmp_path), env={"DEEPSEEK_API_KEY": _API_KEY}).options,
+        )
+
+    _print_compact_audit_report(report, debug_smoke_output=True)
+    output = capsys.readouterr().out
+
+    assert "SMOKE COMPACT_OPERATION operation_id=event-context-compact-requested-100" in output
+    assert "request_seq=100" in output
+    assert "run_id=run-request-100" in output
+    assert "fallback_action=dispatch" in output
+    assert "kind=proposal_manifest_ref value='missing' count=1" in output
+    assert "kind=proposal_manifest_ref value='present' count=1" in output
+    assert "failure_stage=prepare_or_material_projection" in output
+    assert "log_insufficient=offending_material_block_unavailable" in output
+    for line in output.splitlines():
+        assert line.startswith("SMOKE ")
+
+
+def test_compact_audit_report_handles_empty_missing_and_malformed_payloads() -> None:
+    """compact report 覆盖空 rows、缺失 operation id 与 malformed payload 边界。
+
+    :returns: ``None``。
+    """
+
+    empty_report = _compact_audit_report_from_rows(())
+    assert empty_report.operations == ()
+    assert empty_report.rejected_failure_histogram == ()
+    assert empty_report.rejected_diagnostic_histogram == ()
+    assert empty_report.rejected_manifest_presence_histogram == ()
+
+    missing_operation_report = _compact_audit_report_from_rows(
+        (
+            _event_row(
+                sequence=1,
+                event_id="event-context-compaction-attempt-rejected-missing-operation",
+                event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                payload={
+                    "attempt_number": "1",
+                    "repairable": "true",
+                    "diagnostic_refs": [],
+                },
+            ),
+        )
+    )
+    operation = missing_operation_report.operations[0]
+    attempt = operation.rejected_attempts[0]
+    assert operation.operation_id == "<missing-operation-id>"
+    assert attempt.attempt_number is None
+    assert attempt.repairable is None
+    assert attempt.diagnostic_refs == ()
+    assert operation.diagnostic_histogram == ()
+    assert missing_operation_report.rejected_manifest_presence_histogram == (("missing", 1),)
+
+    with pytest.raises(ValueError, match="compact event payload must be object"):
+        _compact_audit_report_from_rows(
+            (
+                _raw_payload_event_row(
+                    sequence=2,
+                    event_id="event-context-compaction-attempt-rejected-bad-payload",
+                    event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                    payload="not-an-object",
+                ),
+            )
+        )
+
+
 def test_answer_normalization_contains_and_forbidden_behavior() -> None:
     """回答断言只做稳定文本归一化，缺失与 forbidden 都会硬失败。
 
@@ -549,6 +722,7 @@ def _event_row(
     event_id: str,
     event_type: str,
     payload: Mapping[str, JsonValue],
+    run_id: str | None = "run-compact-test",
 ) -> EventLogRow:
     """构造 compact audit helper 测试用 EventLog row。
 
@@ -556,6 +730,47 @@ def _event_row(
     :param event_id: EventLog id。
     :param event_type: EventLog type。
     :param payload: payload JSON object。
+    :param run_id: Host run id。
+    :returns: EventLogRow。
+    """
+
+    return EventLogRow(
+        event_sequence=sequence,
+        event_id=event_id,
+        event_body_digest=f"sha256:{'0' * 64}",
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-compact-test",
+        run_id=run_id,
+        attempt_id=None,
+        execution_id=None,
+        event_type=event_type,
+        occurred_at="2026-06-19T00:00:00.000000Z",
+        actor=None,
+        source=None,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        payload_ref=None,
+        payload_digest=None,
+        appended_at="2026-06-19T00:00:00.000000Z",
+    )
+
+
+def _raw_payload_event_row(
+    *,
+    sequence: int,
+    event_id: str,
+    event_type: str,
+    payload: JsonValue,
+) -> EventLogRow:
+    """构造任意 JSON payload 的 EventLog row。
+
+    :param sequence: EventLog sequence。
+    :param event_id: EventLog id。
+    :param event_type: EventLog type。
+    :param payload: 任意 JSON payload。
     :returns: EventLogRow。
     """
 

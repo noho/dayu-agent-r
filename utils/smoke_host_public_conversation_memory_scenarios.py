@@ -25,7 +25,6 @@ from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from io import TextIOWrapper
 from math import floor
 from typing import Final, cast
 from uuid import uuid4
@@ -195,6 +194,7 @@ _PAYLOAD_FIELD_FAILURE_REASON: Final[str] = "failure_reason"
 _PAYLOAD_FIELD_POLICY_DECISION: Final[str] = "policy_decision"
 _PAYLOAD_FIELD_FALLBACK_POLICY_DECISION: Final[str] = "fallback_policy_decision"
 _PAYLOAD_FIELD_FALLBACK_ACTION: Final[str] = "fallback_action"
+_PAYLOAD_FIELD_FALLBACK_TIER: Final[str] = "fallback_tier"
 _PAYLOAD_FIELD_ATTEMPT_COUNT: Final[str] = "attempt_count"
 _PAYLOAD_FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED: Final[str] = "retry_repair_budget_exhausted"
 _PAYLOAD_FIELD_RUNNER_ATTEMPT_SUMMARY_REFS: Final[str] = "runner_attempt_summary_refs"
@@ -212,6 +212,8 @@ _COMPACT_FAILURE_STAGE_PROPOSAL_OR_QUALITY: Final[str] = "proposal_or_quality"
 _COMPACT_FAILURE_STAGE_PREPARE_OR_MATERIAL: Final[str] = "prepare_or_material_projection"
 _COMPACT_LOG_INSUFFICIENT_NONE: Final[str] = "none"
 _COMPACT_LOG_INSUFFICIENT_OFFENDING_BLOCK: Final[str] = "offending_material_block_unavailable"
+_COMPACT_MANIFEST_PRESENT: Final[str] = "present"
+_COMPACT_MANIFEST_MISSING: Final[str] = "missing"
 _DIAGNOSTIC_REF_SEPARATOR: Final[str] = ":"
 _DIAGNOSTIC_REF_SUFFIX_OFFSET: Final[int] = 4
 _COMPACT_HISTOGRAM_PRINT_LIMIT: Final[int] = 8
@@ -666,6 +668,8 @@ class CompactFailedOperationAudit:
     :param trigger_source: request 归因后的 trigger source；无法归因时为 ``None``。
     :param failure_reason: Host failure reason；payload 缺失时为 ``None``。
     :param policy_decision: Host policy decision；payload 缺失时为 ``None``。
+    :param fallback_policy_decision: fallback policy decision；payload 缺失时为
+        ``None``。
     :param fallback_action: fallback 后动作；payload 缺失时为 ``None``。
     :param fallback_tier: fallback tier；payload 缺失时为 ``None``。
     :param attempt_count: compact attempt count；payload 缺失时为 ``None``。
@@ -680,6 +684,7 @@ class CompactFailedOperationAudit:
     trigger_source: str | None
     failure_reason: str | None
     policy_decision: str | None
+    fallback_policy_decision: str | None
     fallback_action: str | None
     fallback_tier: str | None
     attempt_count: int | None
@@ -694,8 +699,12 @@ class CompactOperationAudit:
     :param operation_id: compact operation id；无法归因时使用占位符。
     :param trigger_source: trigger source；无法归因时使用占位符。
     :param request_event_id: request EventLog id；缺失时为 ``None``。
+    :param request_event_sequence: request EventLog sequence；缺失时为
+        ``None``。
+    :param run_id: request row 对应的 run id；缺失时为 ``None``。
     :param requested: request event 数。
     :param compacted: accepted compact event 数。
+    :param compacted_event_sequences: accepted compact event sequences。
     :param failed: failed compact event 数。
     :param rejected: rejected attempt event 数。
     :param rejected_attempts: rejected attempt 明细。
@@ -707,8 +716,11 @@ class CompactOperationAudit:
     operation_id: str
     trigger_source: str
     request_event_id: str | None
+    request_event_sequence: int | None
+    run_id: str | None
     requested: int
     compacted: int
+    compacted_event_sequences: tuple[int, ...]
     failed: int
     rejected: int
     rejected_attempts: tuple[CompactRejectedAttemptAudit, ...]
@@ -725,12 +737,15 @@ class CompactAuditReport:
     :param operations: per-operation 审计摘要。
     :param rejected_failure_histogram: 全局 rejected failure category histogram。
     :param rejected_diagnostic_histogram: 全局 rejected diagnostic suffix histogram。
+    :param rejected_manifest_presence_histogram: 全局 proposal manifest ref
+        present / missing histogram。
     """
 
     summary: CompactAuditSummary
     operations: tuple[CompactOperationAudit, ...]
     rejected_failure_histogram: tuple[tuple[str, int], ...]
     rejected_diagnostic_histogram: tuple[tuple[str, int], ...]
+    rejected_manifest_presence_histogram: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2084,13 +2099,13 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             _assert_session_open(snapshot, label=spec.label)
             _print_session_observation(snapshot, label=spec.label)
             if spec.print_calls_by_key:
-                print(calls_by_key_summary(assembly.smoke_tool.calls_by_key))
+                print(calls_by_key_summary(assembly.smoke_tool.calls_by_key), flush=True)
 
         final_session = await host.get_session(session.session_id)
         _assert_session_open(final_session, label="final")
         print(f"SMOKE SESSION_STATUS {final_session.status.value}")
 
-    print(calls_by_key_summary(assembly.smoke_tool.calls_by_key))
+    print(calls_by_key_summary(assembly.smoke_tool.calls_by_key), flush=True)
     _print_compact_summary(assembly.options)
     compact_audit = _compact_audit_report(assembly.options, session_id=session_id)
     _print_compact_audit_summary(compact_audit.summary)
@@ -2100,11 +2115,11 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
         audit=compact_audit.summary,
         options=assembly.options,
     )
-    print("SMOKE PASS public Host conversation memory scenario smoke")
+    print("SMOKE PASS public Host conversation memory scenario smoke", flush=True)
     if args.keep_workspace:
-        print("SMOKE WORKSPACE_KEPT true")
+        print("SMOKE WORKSPACE_KEPT true", flush=True)
     else:
-        print("SMOKE WORKSPACE_KEPT true  # smoke never deletes Host/runtime artifacts")
+        print("SMOKE WORKSPACE_KEPT true  # smoke never deletes Host/runtime artifacts", flush=True)
     return 0
 
 
@@ -2919,38 +2934,44 @@ def _print_assembly_diagnostics(
     :raises Exception: 不主动抛出异常。
     """
 
-    print("SMOKE ASSEMBLY_MODE runtime")
-    print(f"SMOKE ASSEMBLY config_overlay={diagnostics.config_overlay_dir}")
-    print(f"SMOKE ASSEMBLY prompt_asset_root={diagnostics.prompt_asset_root}")
-    print(f"SMOKE ASSEMBLY scene_manifest_root={diagnostics.scene_manifest_root}")
-    print(f"SMOKE ASSEMBLY host_runtime_id={diagnostics.host_runtime_id}")
-    print(f"SMOKE ASSEMBLY execution_profile_id={diagnostics.execution_profile_id}")
-    print(f"SMOKE ASSEMBLY model_id={diagnostics.model_id} source={diagnostics.model_source}")
+    print("SMOKE ASSEMBLY_MODE runtime", flush=True)
+    print(f"SMOKE ASSEMBLY config_overlay={diagnostics.config_overlay_dir}", flush=True)
+    print(f"SMOKE ASSEMBLY prompt_asset_root={diagnostics.prompt_asset_root}", flush=True)
+    print(f"SMOKE ASSEMBLY scene_manifest_root={diagnostics.scene_manifest_root}", flush=True)
+    print(f"SMOKE ASSEMBLY host_runtime_id={diagnostics.host_runtime_id}", flush=True)
+    print(f"SMOKE ASSEMBLY execution_profile_id={diagnostics.execution_profile_id}", flush=True)
+    print(f"SMOKE ASSEMBLY model_id={diagnostics.model_id} source={diagnostics.model_source}", flush=True)
     print(
         "SMOKE ASSEMBLY runner_option_hint_id="
         f"{diagnostics.runner_option_hint_id} "
-        f"source={diagnostics.runner_option_hint_source}"
+        f"source={diagnostics.runner_option_hint_source}",
+        flush=True,
     )
-    print(f"SMOKE ASSEMBLY compactor_model_id={diagnostics.compactor_model_id}")
-    print("SMOKE ASSEMBLY compactor_runner_option_hint_id=" f"{diagnostics.compactor_runner_option_hint_id}")
-    print(f"SMOKE ASSEMBLY lane_name={diagnostics.lane_name}")
+    print(f"SMOKE ASSEMBLY compactor_model_id={diagnostics.compactor_model_id}", flush=True)
+    print(
+        "SMOKE ASSEMBLY compactor_runner_option_hint_id=" f"{diagnostics.compactor_runner_option_hint_id}",
+        flush=True,
+    )
+    print(f"SMOKE ASSEMBLY lane_name={diagnostics.lane_name}", flush=True)
     if diagnostics.tool_provider_reports:
         for report in diagnostics.tool_provider_reports:
-            print(f"SMOKE ASSEMBLY tool_provider_report={report}")
+            print(f"SMOKE ASSEMBLY tool_provider_report={report}", flush=True)
     else:
-        print("SMOKE ASSEMBLY tool_provider_report=<none>")
-    print(f"SMOKE ASSEMBLY tool_selection={diagnostics.tool_selection}")
+        print("SMOKE ASSEMBLY tool_provider_report=<none>", flush=True)
+    print(f"SMOKE ASSEMBLY tool_selection={diagnostics.tool_selection}", flush=True)
     print(
         "SMOKE ASSEMBLY policy_refs="
         f"context_budget:{diagnostics.context_budget_policy_ref},"
-        f"tool_truncation:{diagnostics.tool_truncation_policy}"
+        f"tool_truncation:{diagnostics.tool_truncation_policy}",
+        flush=True,
     )
     print_duplicate_governance_diagnostics(options)
-    print("SMOKE ASSEMBLY agent_policy_sources=" f"{','.join(diagnostics.agent_policy_sources)}")
+    print("SMOKE ASSEMBLY agent_policy_sources=" f"{','.join(diagnostics.agent_policy_sources)}", flush=True)
     print(
         "SMOKE ASSEMBLY provider_extension_status="
         f"ordinary:{diagnostics.ordinary_provider_extension_status},"
-        f"compactor:{diagnostics.compactor_provider_extension_status}"
+        f"compactor:{diagnostics.compactor_provider_extension_status}",
+        flush=True,
     )
 
 
@@ -2967,11 +2988,11 @@ def _print_compact_pressure_plan(
     """
 
     if pressure_mode is PressureMode.OFF:
-        print("SMOKE COMPACT_PRESSURE skipped pressure_mode=off")
+        print("SMOKE COMPACT_PRESSURE skipped pressure_mode=off", flush=True)
         return
     policy = options.context_budget_policy
     if policy is None:
-        print("SMOKE COMPACT_PRESSURE disabled")
+        print("SMOKE COMPACT_PRESSURE disabled", flush=True)
         return
     soft_threshold_tokens = _threshold_tokens(
         policy.context_window_size,
@@ -2992,7 +3013,8 @@ def _print_compact_pressure_plan(
         f"tool_pressure_tokens={_tool_pressure_estimated_tokens()} "
         f"prompt_pressure_chars={prompt_chars} "
         f"estimated_prompt_tokens={estimated_prompt_tokens} "
-        f"estimated_total_pressure_tokens={estimated_total_pressure_tokens}"
+        f"estimated_total_pressure_tokens={estimated_total_pressure_tokens}",
+        flush=True,
     )
 
 
@@ -3012,9 +3034,10 @@ def _print_round(result: RoundResult) -> None:
         f"label={result.label} run_id={result.run_id} "
         f"event_id={result.event.event_id} "
         f"event_sequence={result.event.event_sequence} "
-        f"terminal={terminal}"
+        f"terminal={terminal}",
+        flush=True,
     )
-    print(f"{_STDOUT_PREFIX_FINAL_PREVIEW} label={result.label} content={preview!r}")
+    print(f"{_STDOUT_PREFIX_FINAL_PREVIEW} label={result.label} content={preview!r}", flush=True)
 
 
 def _print_session_observation(snapshot: SessionSnapshot, *, label: str) -> None:
@@ -3031,7 +3054,8 @@ def _print_session_observation(snapshot: SessionSnapshot, *, label: str) -> None
     print(
         f"{_STDOUT_PREFIX_SESSION_OBSERVE} label={label} "
         f"status={snapshot.status.value} active_run_id={active_run_id} "
-        f"queued_run_count={queued_count}"
+        f"queued_run_count={queued_count}",
+        flush=True,
     )
 
 
@@ -3052,8 +3076,141 @@ def _print_compact_audit_summary(summary: CompactAuditSummary) -> None:
         f"failed_proactive={summary.failed_proactive} "
         f"failed_reactive={summary.failed_reactive} "
         f"rejected_proactive={summary.rejected_proactive} "
-        f"rejected_reactive={summary.rejected_reactive}"
+        f"rejected_reactive={summary.rejected_reactive}",
+        flush=True,
     )
+
+
+def _print_compact_audit_report(report: CompactAuditReport, *, debug_smoke_output: bool) -> None:
+    """打印 compact EventLog 结构化审计报告。
+
+    :param report: compact EventLog 结构化审计报告。
+    :param debug_smoke_output: 是否打印 rejected attempt 明细。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for operation in report.operations:
+        _print_compact_operation(operation)
+    _print_compact_histogram(
+        kind="failure_category",
+        histogram=report.rejected_failure_histogram,
+    )
+    _print_compact_histogram(
+        kind="diagnostic_suffix",
+        histogram=report.rejected_diagnostic_histogram,
+    )
+    _print_compact_histogram(
+        kind="proposal_manifest_ref",
+        histogram=report.rejected_manifest_presence_histogram,
+    )
+    if debug_smoke_output:
+        for operation in report.operations:
+            for attempt in operation.rejected_attempts:
+                _print_compact_reject_detail(operation, attempt)
+
+
+def _print_compact_operation(operation: CompactOperationAudit) -> None:
+    """打印单个 compact operation timeline。
+
+    :param operation: compact operation 审计摘要。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    accepted_seq = _compact_sequence_text(operation.compacted_event_sequences)
+    failed_seq = _compact_sequence_text(tuple(event.event_sequence for event in operation.failed_events))
+    last_failed = operation.failed_events[-1] if operation.failed_events else None
+    print(
+        f"{_STDOUT_PREFIX_COMPACT_OPERATION} "
+        f"operation_id={operation.operation_id} "
+        f"request_seq={_compact_optional_text(operation.request_event_sequence)} "
+        f"request_event_id={_compact_optional_text(operation.request_event_id)} "
+        f"run_id={_compact_optional_text(operation.run_id)} "
+        f"trigger_source={operation.trigger_source} "
+        f"requested={operation.requested} "
+        f"rejected={operation.rejected} "
+        f"compacted={operation.compacted} "
+        f"accepted_seq={accepted_seq} "
+        f"failed={operation.failed} "
+        f"failed_seq={failed_seq} "
+        f"failure_reason={_compact_optional_text(last_failed.failure_reason if last_failed is not None else None)} "
+        f"policy_decision={_compact_optional_text(last_failed.policy_decision if last_failed is not None else None)} "
+        "fallback_policy_decision="
+        f"{_compact_optional_text(last_failed.fallback_policy_decision if last_failed is not None else None)} "
+        f"fallback_action={_compact_optional_text(last_failed.fallback_action if last_failed is not None else None)} "
+        f"attempt_count={_compact_optional_text(last_failed.attempt_count if last_failed is not None else None)}",
+        flush=True,
+    )
+
+
+def _print_compact_histogram(*, kind: str, histogram: tuple[tuple[str, int], ...]) -> None:
+    """打印 compact rejected attempt histogram。
+
+    :param kind: histogram 类型。
+    :param histogram: histogram items。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not histogram:
+        print(
+            f"{_STDOUT_PREFIX_COMPACT_REJECT_HISTOGRAM} "
+            f"kind={kind} value={_COMPACT_HISTOGRAM_EMPTY} count=0",
+            flush=True,
+        )
+        return
+    for value, count in histogram[:_COMPACT_HISTOGRAM_PRINT_LIMIT]:
+        print(
+            f"{_STDOUT_PREFIX_COMPACT_REJECT_HISTOGRAM} "
+            f"kind={kind} value={value!r} count={count}",
+            flush=True,
+        )
+
+
+def _print_compact_reject_detail(
+    operation: CompactOperationAudit,
+    attempt: CompactRejectedAttemptAudit,
+) -> None:
+    """打印单个 compact rejected attempt 明细。
+
+    :param operation: compact operation 审计摘要。
+    :param attempt: rejected attempt 审计摘要。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    diagnostic_suffixes = tuple(_compact_normalized_diagnostic_suffix(ref) for ref in attempt.diagnostic_refs)
+    print(
+        f"{_STDOUT_PREFIX_COMPACT_REJECT_DETAIL} "
+        f"operation_id={operation.operation_id} "
+        f"event_seq={attempt.event_sequence} "
+        f"attempt_number={_compact_optional_text(attempt.attempt_number)} "
+        f"trigger_source={_compact_optional_text(attempt.trigger_source)} "
+        f"failure_category={_compact_optional_text(attempt.failure_category)} "
+        f"repairable={_compact_optional_text(attempt.repairable)} "
+        f"next_policy_decision={_compact_optional_text(attempt.next_policy_decision)} "
+        f"proposal_manifest_ref={_compact_manifest_presence(attempt.proposal_manifest_ref)} "
+        f"failure_stage={_compact_failure_stage(attempt.proposal_manifest_ref)} "
+        f"log_insufficient={_compact_log_insufficient(attempt.proposal_manifest_ref)} "
+        f"diagnostic_suffixes={_compact_sequence_text(diagnostic_suffixes)} "
+        "budget_after_attempted_compact="
+        f"{_compact_optional_text(attempt.budget_after_attempted_compact)}",
+        flush=True,
+    )
+
+
+def _compact_sequence_text(values: tuple[int, ...] | tuple[str, ...]) -> str:
+    """格式化 compact 诊断序列。
+
+    :param values: 整数或字符串元组。
+    :returns: 逗号分隔文本；空序列返回占位符。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not values:
+        return _COMPACT_NONE_VALUE
+    return ",".join(str(value) for value in values)
 
 
 def _assert_compact_acceptance(
@@ -3092,7 +3249,8 @@ def _assert_compact_acceptance(
         f"requested_proactive={audit.requested_proactive} "
         f"compacted_proactive={audit.compacted_proactive} "
         f"failed_total={failed_total} "
-        f"artifact_files={artifact_count}"
+        f"artifact_files={artifact_count}",
+        flush=True,
     )
 
 
@@ -3102,6 +3260,18 @@ def _compact_audit_summary(options: OpenHostOptions, *, session_id: str) -> Comp
     :param options: 本次 Host opener options。
     :param session_id: 本次 smoke session id。
     :returns: compact event 计数摘要。
+    :raises Exception: durable store 打开、EventLog 读取或 payload 解析失败时向上抛出。
+    """
+
+    return _compact_audit_report(options, session_id=session_id).summary
+
+
+def _compact_audit_report(options: OpenHostOptions, *, session_id: str) -> CompactAuditReport:
+    """读取本次 session 的 compact EventLog 审计报告。
+
+    :param options: 本次 Host opener options。
+    :param session_id: 本次 smoke session id。
+    :returns: compact EventLog 结构化审计报告。
     :raises Exception: durable store 打开、EventLog 读取或 payload 解析失败时向上抛出。
     """
 
@@ -3115,7 +3285,66 @@ def _compact_audit_summary(options: OpenHostOptions, *, session_id: str) -> Comp
                 session_id=session_id,
             )
         )
-    return _compact_audit_summary_from_rows(rows)
+    return _compact_audit_report_from_rows(rows)
+
+
+def _compact_audit_report_from_rows(rows: tuple[EventLogRow, ...]) -> CompactAuditReport:
+    """从 compact EventLog rows 构造结构化审计报告。
+
+    :param rows: compact EventLog rows。
+    :returns: compact EventLog 结构化审计报告。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    summary = _compact_audit_summary_from_rows(rows)
+    request_trigger_sources = _compact_request_trigger_sources(rows)
+    request_rows: dict[str, list[EventLogRow]] = {}
+    compacted_rows: dict[str, list[EventLogRow]] = {}
+    rejected_attempts: dict[str, list[CompactRejectedAttemptAudit]] = {}
+    failed_events: dict[str, list[CompactFailedOperationAudit]] = {}
+    operation_ids: set[str] = set()
+    for row in rows:
+        operation_id = _compact_operation_key(row)
+        operation_ids.add(operation_id)
+        if row.event_type == CONTEXT_COMPACTION_REQUESTED:
+            request_rows.setdefault(operation_id, []).append(row)
+        elif row.event_type == CONTEXT_COMPACTED:
+            compacted_rows.setdefault(operation_id, []).append(row)
+        elif row.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED:
+            rejected_attempts.setdefault(operation_id, []).append(
+                _compact_rejected_attempt_audit(row, request_trigger_sources=request_trigger_sources)
+            )
+        elif row.event_type == CONTEXT_COMPACTION_FAILED:
+            failed_events.setdefault(operation_id, []).append(
+                _compact_failed_operation_audit(row, request_trigger_sources=request_trigger_sources)
+            )
+    operations = tuple(
+        _compact_operation_audit(
+            operation_id,
+            request_rows=tuple(request_rows.get(operation_id, ())),
+            compacted_rows=tuple(compacted_rows.get(operation_id, ())),
+            rejected_attempts=tuple(rejected_attempts.get(operation_id, ())),
+            failed_events=tuple(failed_events.get(operation_id, ())),
+            request_trigger_sources=request_trigger_sources,
+        )
+        for operation_id in sorted(
+            operation_ids,
+            key=lambda item: _compact_operation_sort_key(
+                item,
+                request_rows=request_rows,
+                compacted_rows=compacted_rows,
+                rejected_attempts=rejected_attempts,
+                failed_events=failed_events,
+            ),
+        )
+    )
+    return CompactAuditReport(
+        summary=summary,
+        operations=operations,
+        rejected_failure_histogram=_compact_rejected_failure_histogram(operations),
+        rejected_diagnostic_histogram=_compact_rejected_diagnostic_histogram(operations),
+        rejected_manifest_presence_histogram=_compact_rejected_manifest_presence_histogram(operations),
+    )
 
 
 def _durable_options_from_open_host_options(options: OpenHostOptions) -> HostDurableStoreOptions:
@@ -3181,6 +3410,300 @@ def _read_compact_event_rows(
         if page.covered_event_sequence == cursor:
             return tuple(rows)
         cursor = page.covered_event_sequence
+
+
+def _compact_operation_key(row: EventLogRow) -> str:
+    """返回 compact row 的 operation 分组键。
+
+    :param row: compact EventLog row。
+    :returns: operation 分组键；缺失时返回固定占位符。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    if row.event_type == CONTEXT_COMPACTION_REQUESTED:
+        return row.event_id
+    operation_id = _compact_row_operation_id(row)
+    if operation_id is None:
+        return _COMPACT_OPERATION_MISSING_ID
+    return operation_id
+
+
+def _compact_operation_sort_key(
+    operation_id: str,
+    *,
+    request_rows: Mapping[str, list[EventLogRow]],
+    compacted_rows: Mapping[str, list[EventLogRow]],
+    rejected_attempts: Mapping[str, list[CompactRejectedAttemptAudit]],
+    failed_events: Mapping[str, list[CompactFailedOperationAudit]],
+) -> tuple[int, str]:
+    """返回 compact operation 的稳定排序键。
+
+    :param operation_id: compact operation id。
+    :param request_rows: operation 到 request rows 的映射。
+    :param compacted_rows: operation 到 accepted rows 的映射。
+    :param rejected_attempts: operation 到 rejected attempt 审计的映射。
+    :param failed_events: operation 到 failed event 审计的映射。
+    :returns: 以最早 EventLog sequence 和 operation id 组成的排序键。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    sequences: list[int] = []
+    sequences.extend(row.event_sequence for row in request_rows.get(operation_id, ()))
+    sequences.extend(row.event_sequence for row in compacted_rows.get(operation_id, ()))
+    sequences.extend(attempt.event_sequence for attempt in rejected_attempts.get(operation_id, ()))
+    sequences.extend(event.event_sequence for event in failed_events.get(operation_id, ()))
+    if not sequences:
+        return (0, operation_id)
+    return (min(sequences), operation_id)
+
+
+def _compact_operation_audit(
+    operation_id: str,
+    *,
+    request_rows: tuple[EventLogRow, ...],
+    compacted_rows: tuple[EventLogRow, ...],
+    rejected_attempts: tuple[CompactRejectedAttemptAudit, ...],
+    failed_events: tuple[CompactFailedOperationAudit, ...],
+    request_trigger_sources: Mapping[str, str],
+) -> CompactOperationAudit:
+    """构造单个 compact operation 的审计摘要。
+
+    :param operation_id: compact operation id。
+    :param request_rows: 归属该 operation 的 request rows。
+    :param compacted_rows: 归属该 operation 的 accepted compact rows。
+    :param rejected_attempts: 归属该 operation 的 rejected attempt 审计。
+    :param failed_events: 归属该 operation 的 failed event 审计。
+    :param request_trigger_sources: request event id 到 trigger source 的映射。
+    :returns: 单个 compact operation 审计摘要。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    first_request = request_rows[0] if request_rows else None
+    trigger_source = _compact_operation_trigger_source(
+        operation_id,
+        request_rows=request_rows,
+        rejected_attempts=rejected_attempts,
+        failed_events=failed_events,
+        request_trigger_sources=request_trigger_sources,
+    )
+    return CompactOperationAudit(
+        operation_id=operation_id,
+        trigger_source=trigger_source,
+        request_event_id=first_request.event_id if first_request is not None else None,
+        request_event_sequence=first_request.event_sequence if first_request is not None else None,
+        run_id=first_request.run_id if first_request is not None else None,
+        requested=len(request_rows),
+        compacted=len(compacted_rows),
+        compacted_event_sequences=tuple(row.event_sequence for row in compacted_rows),
+        failed=len(failed_events),
+        rejected=len(rejected_attempts),
+        rejected_attempts=rejected_attempts,
+        failed_events=failed_events,
+        failure_categories=_compact_operation_failure_categories(rejected_attempts),
+        diagnostic_histogram=_compact_operation_diagnostic_histogram(rejected_attempts),
+    )
+
+
+def _compact_operation_trigger_source(
+    operation_id: str,
+    *,
+    request_rows: tuple[EventLogRow, ...],
+    rejected_attempts: tuple[CompactRejectedAttemptAudit, ...],
+    failed_events: tuple[CompactFailedOperationAudit, ...],
+    request_trigger_sources: Mapping[str, str],
+) -> str:
+    """返回 compact operation 的 trigger source。
+
+    :param operation_id: compact operation id。
+    :param request_rows: 归属该 operation 的 request rows。
+    :param rejected_attempts: 归属该 operation 的 rejected attempt 审计。
+    :param failed_events: 归属该 operation 的 failed event 审计。
+    :param request_trigger_sources: request event id 到 trigger source 的映射。
+    :returns: trigger source；无法确定时返回占位符。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    if request_rows:
+        trigger_source = _compact_row_trigger_source(request_rows[0])
+        if trigger_source is not None:
+            return trigger_source
+    trigger_source = request_trigger_sources.get(operation_id)
+    if trigger_source is not None:
+        return trigger_source
+    for attempt in rejected_attempts:
+        if attempt.trigger_source is not None:
+            return attempt.trigger_source
+    for event in failed_events:
+        if event.trigger_source is not None:
+            return event.trigger_source
+    return _COMPACT_OPERATION_UNKNOWN_TRIGGER
+
+
+def _compact_rejected_attempt_audit(
+    row: EventLogRow,
+    *,
+    request_trigger_sources: Mapping[str, str],
+) -> CompactRejectedAttemptAudit:
+    """构造单个 compact rejected attempt 审计摘要。
+
+    :param row: rejected attempt EventLog row。
+    :param request_trigger_sources: request event id 到 trigger source 的映射。
+    :returns: rejected attempt 审计摘要。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    payload = _compact_row_payload(row)
+    return CompactRejectedAttemptAudit(
+        event_id=row.event_id,
+        event_sequence=row.event_sequence,
+        operation_id=_compact_payload_str(payload, _PAYLOAD_FIELD_OPERATION_ID),
+        trigger_source=_compact_row_effective_trigger_source(row, request_trigger_sources),
+        attempt_number=_compact_payload_int(payload, _PAYLOAD_FIELD_ATTEMPT_NUMBER),
+        failure_category=_compact_payload_str(payload, _PAYLOAD_FIELD_FAILURE_CATEGORY),
+        repairable=_compact_payload_bool(payload, _PAYLOAD_FIELD_REPAIRABLE),
+        next_policy_decision=_compact_payload_str(payload, _PAYLOAD_FIELD_NEXT_POLICY_DECISION),
+        budget_after_attempted_compact=_compact_payload_int(
+            payload,
+            _PAYLOAD_FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT,
+        ),
+        runner_attempt_summary_refs=_compact_payload_str_tuple(
+            payload,
+            _PAYLOAD_FIELD_RUNNER_ATTEMPT_SUMMARY_REFS,
+        ),
+        diagnostic_refs=_compact_payload_str_tuple(payload, _PAYLOAD_FIELD_DIAGNOSTIC_REFS),
+        proposal_manifest_ref=_compact_payload_str(payload, _PAYLOAD_FIELD_PROPOSAL_MANIFEST_REF),
+        proposal_manifest_digest=_compact_payload_str(payload, _PAYLOAD_FIELD_PROPOSAL_MANIFEST_DIGEST),
+    )
+
+
+def _compact_failed_operation_audit(
+    row: EventLogRow,
+    *,
+    request_trigger_sources: Mapping[str, str],
+) -> CompactFailedOperationAudit:
+    """构造单个 compact failed event 审计摘要。
+
+    :param row: failed compact EventLog row。
+    :param request_trigger_sources: request event id 到 trigger source 的映射。
+    :returns: failed compact event 审计摘要。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    payload = _compact_row_payload(row)
+    return CompactFailedOperationAudit(
+        event_id=row.event_id,
+        event_sequence=row.event_sequence,
+        operation_id=_compact_payload_str(payload, _PAYLOAD_FIELD_OPERATION_ID),
+        trigger_source=_compact_row_effective_trigger_source(row, request_trigger_sources),
+        failure_reason=_compact_payload_str(payload, _PAYLOAD_FIELD_FAILURE_REASON),
+        policy_decision=_compact_payload_str(payload, _PAYLOAD_FIELD_POLICY_DECISION),
+        fallback_policy_decision=_compact_payload_str(payload, _PAYLOAD_FIELD_FALLBACK_POLICY_DECISION),
+        fallback_action=_compact_payload_str(payload, _PAYLOAD_FIELD_FALLBACK_ACTION),
+        fallback_tier=_compact_payload_str(payload, _PAYLOAD_FIELD_FALLBACK_TIER),
+        attempt_count=_compact_payload_int(payload, _PAYLOAD_FIELD_ATTEMPT_COUNT),
+        retry_repair_budget_exhausted=_compact_payload_bool(
+            payload,
+            _PAYLOAD_FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED,
+        ),
+        budget_after_attempted_compact=_compact_payload_int(
+            payload,
+            _PAYLOAD_FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT,
+        ),
+    )
+
+
+def _compact_operation_failure_categories(
+    attempts: tuple[CompactRejectedAttemptAudit, ...],
+) -> tuple[tuple[str, int], ...]:
+    """统计单个 operation 的 rejected failure category。
+
+    :param attempts: rejected attempt 审计摘要。
+    :returns: 按名称排序的 histogram。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    counter: Counter[str] = Counter(
+        attempt.failure_category if attempt.failure_category is not None else _COMPACT_NONE_VALUE
+        for attempt in attempts
+    )
+    return _compact_counter_items(counter)
+
+
+def _compact_operation_diagnostic_histogram(
+    attempts: tuple[CompactRejectedAttemptAudit, ...],
+) -> tuple[tuple[str, int], ...]:
+    """统计单个 operation 的 rejected diagnostic suffix。
+
+    :param attempts: rejected attempt 审计摘要。
+    :returns: 按名称排序的 histogram。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    counter: Counter[str] = Counter()
+    for attempt in attempts:
+        counter.update(_compact_normalized_diagnostic_suffix(ref) for ref in attempt.diagnostic_refs)
+    return _compact_counter_items(counter)
+
+
+def _compact_rejected_failure_histogram(
+    operations: tuple[CompactOperationAudit, ...],
+) -> tuple[tuple[str, int], ...]:
+    """统计全部 operation 的 rejected failure category。
+
+    :param operations: compact operation 审计摘要。
+    :returns: 按名称排序的 histogram。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    counter: Counter[str] = Counter()
+    for operation in operations:
+        for name, count in operation.failure_categories:
+            counter.update({name: count})
+    return _compact_counter_items(counter)
+
+
+def _compact_rejected_diagnostic_histogram(
+    operations: tuple[CompactOperationAudit, ...],
+) -> tuple[tuple[str, int], ...]:
+    """统计全部 operation 的 rejected diagnostic suffix。
+
+    :param operations: compact operation 审计摘要。
+    :returns: 按名称排序的 histogram。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    counter: Counter[str] = Counter()
+    for operation in operations:
+        for name, count in operation.diagnostic_histogram:
+            counter.update({name: count})
+    return _compact_counter_items(counter)
+
+
+def _compact_rejected_manifest_presence_histogram(
+    operations: tuple[CompactOperationAudit, ...],
+) -> tuple[tuple[str, int], ...]:
+    """统计全部 rejected attempt 的 proposal manifest ref 有无。
+
+    :param operations: compact operation 审计摘要。
+    :returns: present / missing histogram。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    counter: Counter[str] = Counter()
+    for operation in operations:
+        counter.update(_compact_manifest_presence(attempt.proposal_manifest_ref) for attempt in operation.rejected_attempts)
+    return _compact_counter_items(counter)
+
+
+def _compact_counter_items(counter: Counter[str]) -> tuple[tuple[str, int], ...]:
+    """返回稳定排序后的 counter items。
+
+    :param counter: 字符串 counter。
+    :returns: 按 key 排序的 ``(key, count)`` 元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return tuple((key, counter[key]) for key in sorted(counter))
 
 
 def _compact_audit_summary_from_rows(rows: tuple[EventLogRow, ...]) -> CompactAuditSummary:
@@ -3319,13 +3842,7 @@ def _compact_row_trigger_source(row: EventLogRow) -> str | None:
     :raises ValueError: payload JSON 不是 object 时抛出。
     """
 
-    payload_json = cast(JsonValue, json.loads(row.payload_json))
-    if not isinstance(payload_json, Mapping):
-        raise ValueError(f"compact event payload must be object: event_id={row.event_id}")
-    trigger_source = payload_json.get("trigger_source")
-    if isinstance(trigger_source, str):
-        return trigger_source
-    return None
+    return _compact_payload_str(_compact_row_payload(row), _PAYLOAD_FIELD_TRIGGER_SOURCE)
 
 
 def _compact_row_operation_id(row: EventLogRow) -> str | None:
@@ -3336,13 +3853,151 @@ def _compact_row_operation_id(row: EventLogRow) -> str | None:
     :raises ValueError: payload JSON 不是 object 时抛出。
     """
 
+    return _compact_payload_str(_compact_row_payload(row), _PAYLOAD_FIELD_OPERATION_ID)
+
+
+def _compact_row_payload(row: EventLogRow) -> Mapping[str, JsonValue]:
+    """读取 compact EventLog row 的 JSON object payload。
+
+    :param row: compact EventLog row。
+    :returns: JSON object payload。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
     payload_json = cast(JsonValue, json.loads(row.payload_json))
     if not isinstance(payload_json, Mapping):
         raise ValueError(f"compact event payload must be object: event_id={row.event_id}")
-    operation_id = payload_json.get("operation_id")
-    if isinstance(operation_id, str):
-        return operation_id
+    return cast(Mapping[str, JsonValue], payload_json)
+
+
+def _compact_payload_str(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
+    """读取 compact payload 中的字符串字段。
+
+    :param payload: compact event payload。
+    :param field_name: 字段名。
+    :returns: 字符串字段；字段缺失或类型不匹配时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, str):
+        return value
     return None
+
+
+def _compact_payload_int(payload: Mapping[str, JsonValue], field_name: str) -> int | None:
+    """读取 compact payload 中的整数字段。
+
+    :param payload: compact event payload。
+    :param field_name: 字段名。
+    :returns: 整数字段；字段缺失、JSON 浮点数或其它类型不匹配时返回
+        ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _compact_payload_bool(payload: Mapping[str, JsonValue], field_name: str) -> bool | None:
+    """读取 compact payload 中的布尔字段。
+
+    :param payload: compact event payload。
+    :param field_name: 字段名。
+    :returns: 布尔字段；字段缺失或类型不匹配时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _compact_payload_str_tuple(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
+    """读取 compact payload 中的字符串序列字段。
+
+    :param payload: compact event payload。
+    :param field_name: 字段名。
+    :returns: 字符串元组；字段缺失或类型不匹配时返回空元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        return ()
+    values = cast(Sequence[JsonValue], value)
+    return tuple(item for item in values if isinstance(item, str))
+
+
+def _compact_normalized_diagnostic_suffix(diagnostic_ref: str) -> str:
+    """返回 compact diagnostic ref 的归一化后缀。
+
+    :param diagnostic_ref: Host diagnostic ref。
+    :returns: 可用于 histogram 的诊断后缀；分段不足时返回原文。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts = diagnostic_ref.split(_DIAGNOSTIC_REF_SEPARATOR)
+    if len(parts) > _DIAGNOSTIC_REF_SUFFIX_OFFSET:
+        return _DIAGNOSTIC_REF_SEPARATOR.join(parts[_DIAGNOSTIC_REF_SUFFIX_OFFSET:])
+    return diagnostic_ref
+
+
+def _compact_manifest_presence(proposal_manifest_ref: str | None) -> str:
+    """返回 proposal manifest ref 的存在性分类。
+
+    :param proposal_manifest_ref: proposal manifest ref。
+    :returns: ``present`` 或 ``missing``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if proposal_manifest_ref:
+        return _COMPACT_MANIFEST_PRESENT
+    return _COMPACT_MANIFEST_MISSING
+
+
+def _compact_failure_stage(proposal_manifest_ref: str | None) -> str:
+    """返回 rejected attempt 的失败阶段分类。
+
+    :param proposal_manifest_ref: proposal manifest ref。
+    :returns: 失败阶段分类。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if proposal_manifest_ref:
+        return _COMPACT_FAILURE_STAGE_PROPOSAL_OR_QUALITY
+    return _COMPACT_FAILURE_STAGE_PREPARE_OR_MATERIAL
+
+
+def _compact_log_insufficient(proposal_manifest_ref: str | None) -> str:
+    """返回 rejected attempt 的日志不足分类。
+
+    :param proposal_manifest_ref: proposal manifest ref。
+    :returns: 日志不足分类；日志足够时返回 ``none``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if proposal_manifest_ref:
+        return _COMPACT_LOG_INSUFFICIENT_NONE
+    return _COMPACT_LOG_INSUFFICIENT_OFFENDING_BLOCK
+
+
+def _compact_optional_text(value: str | int | bool | None) -> str:
+    """格式化可选 compact 诊断值。
+
+    :param value: 可选字符串、整数或布尔值。
+    :returns: stdout 诊断文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return _COMPACT_NONE_VALUE
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
 
 
 def _print_compact_summary(options: OpenHostOptions) -> None:
@@ -3355,14 +4010,14 @@ def _print_compact_summary(options: OpenHostOptions) -> None:
 
     compact_root = _compact_artifact_root(options)
     if compact_root is None:
-        print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT} <none>")
-        print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT} 0")
+        print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT} <none>", flush=True)
+        print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT} 0", flush=True)
         return
     artifacts = _compact_artifact_files(options)
-    print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT} {compact_root}")
-    print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT} {len(artifacts)}")
+    print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT} {compact_root}", flush=True)
+    print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT} {len(artifacts)}", flush=True)
     for path in artifacts[:_COMPACT_ARTIFACT_PRINT_LIMIT]:
-        print(f"SMOKE COMPACT_ARTIFACT {path}")
+        print(f"SMOKE COMPACT_ARTIFACT {path}", flush=True)
 
 
 def _compact_artifact_root(options: OpenHostOptions) -> pathlib.Path | None:
@@ -3426,7 +4081,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return asyncio.run(run_smoke(args, os.environ))
     except Exception as exc:
-        print(f"SMOKE FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"SMOKE FAIL {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 1
 
 
