@@ -4027,29 +4027,6 @@ def _frozen_reactive_material_blocks(
     )
 
 
-def _current_only_material_blocks(
-    *,
-    run: RunRow,
-    input_event: EventLogRow,
-    display_text: str,
-) -> tuple[RunInputMaterialBlock, ...]:
-    """构造 current-input-only material list。
-
-    :param run: 当前 Run row。
-    :param input_event: 当前输入 EventLog row。
-    :param display_text: 当前输入展示文本。
-    :returns: material blocks。
-    """
-
-    return (
-        _current_input_anchor_material_block(
-            run=run,
-            display_text=display_text,
-            event_sequence=input_event.event_sequence,
-        ),
-    )
-
-
 def _current_input_anchor_material_block(
     *,
     run: RunRow,
