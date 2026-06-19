@@ -76,10 +76,15 @@ from dayu.host.compaction import (
     SessionSummaryCandidateVNext,
 )
 from dayu.host.compact_material import (
+    CompactMaterialSourceBoundary,
     PreDispatchCompactMaterialView,
     build_pre_dispatch_compact_material_view,
     conversation_compact_input_vnext_from_material_pack,
     run_input_material_block,
+)
+from dayu.host.compact_pipeline import (
+    CompactPipelineSourceSnapshot,
+    build_fallback_decision_input,
 )
 from dayu.host.compaction_operation import CompactorProposalRunInput
 from dayu.host.context_budget import (
@@ -5881,63 +5886,24 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
             await scheduler.close()
 
 
-def test_reactive_fallback_decision_uses_memory_policy_caps(tmp_path: Path) -> None:
-    """reactive fallback production helper 使用 MemoryProjectionPolicy fallback caps。"""
+def test_reactive_fallback_pipeline_uses_memory_policy_caps(tmp_path: Path) -> None:
+    """reactive fallback pipeline helper 使用 MemoryProjectionPolicy fallback caps。"""
 
     run, attempt, dispatch_record = _seed_current_run_rows(tmp_path)
-    candidate = host_engine_ingest.EngineEventCandidate(
-        envelope=LocalEngineEnvelope(
-            session_id=run.session_id,
-            run_id=run.run_id,
-            attempt_id=attempt.attempt_id,
-            execution_id=attempt.execution_id,
-            dispatch_record_id=dispatch_record.dispatch_record_id,
-            worker_kind=WorkerKind.LOCAL,
-            execution_target=dispatch_record.execution_target,
-            local_worker_id="local-worker-test",
-            cancellation_token=_HostCancellationToken(),
-        ),
-        worker_event_index=1,
-        engine_event=EngineEvent(
-            occurred_at=_NOW,
-            session_id=run.session_id,
-            run_id=run.run_id,
-            type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
-            data=ContextCompactionRequestedData(
-                iteration_id="iter-reactive",
-                budget_state=None,
-                reason="provider_overflow",
-                provider_request_id="req-reactive",
-            ),
-            metadata=None,
-        ),
-        observed_at=_NOW,
-    )
-    context = host_engine_ingest._ValidatedCandidate(
-        candidate=candidate,
-        run=run,
-        attempt=attempt,
-        dispatch_record=dispatch_record,
-    )
     policy = _soft_compact_policy(
         context_window_size=500,
         soft_threshold_tokens=300,
         hard_threshold_tokens=420,
     )
     memory_policy = _fallback_cap_memory_policy()
-    pending = host_engine_ingest._ReactiveCompactPending(
-        result_prefix=EngineIngestResult(
-            status=EngineIngestStatus.ACCEPTED,
-            events=(),
-            terminal_closeout=False,
-            promotion_triggered=False,
-            reason=None,
-            stop_worker_stream=True,
-        ),
-        context=context,
-        expected_input_event_sequence=context.run.input_event_sequence,
-        display_text="dispatch prompt",
-        frozen_material_blocks=(
+    source_snapshot = CompactPipelineSourceSnapshot(
+        session_id=run.session_id,
+        run_id=run.run_id,
+        trigger_source=ContextCompactionTriggerSource.REACTIVE,
+        current_input_ref=run.input_event_id,
+        current_input_text="dispatch prompt",
+        input_event_sequence=run.input_event_sequence,
+        material_blocks=(
             run_input_material_block(
                 block_id="eventlog:user:event-input-run-dispatch-old",
                 section=CompactMaterialSection.TRACE_MATERIAL,
@@ -5947,54 +5913,40 @@ def test_reactive_fallback_decision_uses_memory_policy_caps(tmp_path: Path) -> N
                 event_sequence=1,
                 turn_group_id="run-dispatch-old",
             ),
-            run_input_material_block(
-                block_id="current:event-input-dispatch",
-                section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
-                kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
-                text="dispatch prompt",
-                canonical_source_refs=("event-input-dispatch",),
-                event_sequence=2,
-                turn_group_id="run-dispatch",
-            ),
         ),
         previous_compacted_view=(),
-        frozen_material_list_digest="digest:frozen",
-        frozen_material_refs=("event-input-run-dispatch-old", "event-input-dispatch"),
+        source_boundary=CompactMaterialSourceBoundary(
+            latest_compacted_event_id=None,
+            latest_compacted_event_sequence=None,
+            post_compact_delta_start_sequence=1,
+            post_compact_delta_end_sequence=run.input_event_sequence,
+            current_input_event_sequence=run.input_event_sequence,
+        ),
+        material_view_digest="digest:reactive-fallback-test-view",
+        material_source_refs=("event-input-run-dispatch-old",),
+    )
+
+    decision = build_fallback_decision_input(
+        source_snapshot=source_snapshot,
+        context_policy=policy,
+        memory_policy=memory_policy,
         operation_id="event-reactive-request",
-        estimate=estimate_context_budget(
-            policy,
-            BudgetEstimateInput(
-                session_id=context.run.session_id,
-                run_id=context.run.run_id,
-                message_fragments=(
-                    BudgetTextFragment(
-                        fragment_ref="current:event-input-dispatch",
-                        text="dispatch prompt",
-                    ),
-                ),
-                current_prompt_ref="event-input-dispatch",
-            ),
-        ),
-        decision=ContextBudgetDecision.COMPACT_SOFT_THRESHOLD,
-        policy=policy,
-        memory_projection_policy=memory_policy,
-        selected_recent_window_turn_floor=(
-            memory_policy.selected_recent_window_turn_floor
-        ),
-    )
-
-    decision = host_engine_ingest._reactive_fallback_decision(
-        pending=pending,
         failure_reason="test_failure",
+        attempt_count=1,
+        retry_repair_budget_exhausted=True,
+        budget_after_attempted_compact=None,
     )
+    failed_input = decision.failed_payload_input
 
-    assert decision.action == "dispatch"
-    assert decision.input_window["selected_block_ids"] == [
+    assert decision.action_hint == "dispatch"
+    assert failed_input.fallback_input_window is not None
+    assert failed_input.fallback_input_window["selected_block_ids"] == [
         "current:event-input-dispatch"
     ]
     assert "eventlog:user:event-input-run-dispatch-old" in (
-        _required_json_text_tuple(decision.input_window["dropped_block_ids"])
+        _required_json_text_tuple(failed_input.fallback_input_window["dropped_block_ids"])
     )
+    assert "fallback_tier" not in failed_input.fallback_input_window
 
 
 @pytest.mark.asyncio

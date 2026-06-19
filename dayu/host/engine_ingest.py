@@ -70,18 +70,19 @@ from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
     build_pre_dispatch_compact_material_view,
-    build_compact_material_pack,
     run_input_material_block,
-    select_compact_segment,
-    selected_material_source_refs,
+)
+from dayu.host.compact_pipeline import (
+    CompactPipelineSourceSnapshot,
+    build_fallback_decision_input,
+    build_normal_compact_request_plan,
+    build_reactive_pass_queue_plan,
+    compact_pipeline_source_snapshot_from_pre_dispatch_view,
 )
 from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
-    CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    CompactSegmentSelection,
-    CompactSegmentTrigger,
     CompactionRequest,
     ContextCompactor,
     ConversationCompactOutputVNext,
@@ -109,15 +110,7 @@ from dayu.host.context_budget import (
 )
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
-    FALLBACK_ACTION_FAIL_CLOSED,
     FALLBACK_ACTION_NOT_APPLICABLE,
-    FALLBACK_POLICY_DECISION_RECENT_WINDOW,
-    FALLBACK_POLICY_DECISION_SELECTION_FAILED,
-    build_recent_window_fallback_selection,
-    build_selection_failure_budget_payload,
-    build_selection_failure_window_payload,
-    estimate_recent_window_fallback_budget,
-    fallback_window_digest,
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
@@ -192,7 +185,11 @@ from dayu.host._event_payload import (
     required_payload_text as _required_payload_text,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
-from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
+from dayu.host.memory import (
+    MemoryProjectionPolicy,
+    default_memory_projection_policy,
+    digest_memory_projection_policy,
+)
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.tool_trace_signals import (
@@ -488,33 +485,23 @@ class _ReactiveCompactPending:
     :param result_prefix: request / closeout 已提交后的结果前缀。
     :param context: Engine event durable context。
     :param expected_input_event_sequence: 冻结 ordinary material list 对应 cursor。
-    :param display_text: 当前输入展示文本。
-    :param frozen_material_blocks: overflow 时冻结的 ordinary input material list。
-    :param previous_compacted_view: latest accepted compact 映射出的 previous view。
-    :param frozen_material_list_digest: 冻结 material list digest。
-    :param frozen_material_refs: 冻结 material source refs。
+    :param source_snapshot: reactive compact 使用的 source snapshot。
     :param operation_id: request fact event id。
     :param estimate: reactive compact 前估算。
     :param decision: reactive compact 前预算决策。
     :param policy: reactive context budget policy。
     :param memory_projection_policy: reactive fallback selected window policy。
-    :param selected_recent_window_turn_floor: fallback selected recent-window turn floor。
     """
 
     result_prefix: EngineIngestResult
     context: _ValidatedCandidate
     expected_input_event_sequence: int
-    display_text: str
-    frozen_material_blocks: tuple[RunInputMaterialBlock, ...]
-    previous_compacted_view: tuple[CompactMaterialBlock, ...]
-    frozen_material_list_digest: str
-    frozen_material_refs: tuple[str, ...]
+    source_snapshot: CompactPipelineSourceSnapshot
     operation_id: str
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
     policy: ContextBudgetPolicy
     memory_projection_policy: MemoryProjectionPolicy
-    selected_recent_window_turn_floor: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,24 +510,6 @@ class _ReactiveRecoveryStarted:
 
     result: EngineIngestResult
     pending_dispatch: PendingDispatchRecord
-
-
-@dataclass(frozen=True, slots=True)
-class _ReactiveFallbackDecision:
-    """reactive compact failed 后的 deterministic fallback 决策。
-
-    :param action: fallback 动作。
-    :param policy_decision: fallback policy decision。
-    :param input_window: fallback input window 诊断。
-    :param input_digest: fallback input window digest。
-    :param budget_result: fallback budget 诊断。
-    """
-
-    action: str
-    policy_decision: str
-    input_window: Mapping[str, JsonValue]
-    input_digest: str
-    budget_result: Mapping[str, JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1342,7 +1311,11 @@ class EngineEventIngestor:
                 display_text=display_text,
                 material_view=material_view,
             )
-            previous_compacted_view = material_view.previous_compacted_view
+            source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
+                trigger_source=ContextCompactionTriggerSource.REACTIVE,
+                run=context.run,
+                material_view=material_view,
+            )
         except Exception:
             _LOGGER.error(
                 "engine_ingest.reactive_compact_material_source_failed "
@@ -1389,19 +1362,12 @@ class EngineEventIngestor:
             ),
             context=context,
             expected_input_event_sequence=context.run.input_event_sequence,
-            display_text=display_text,
-            frozen_material_blocks=frozen_material_blocks,
-            previous_compacted_view=previous_compacted_view,
-            frozen_material_list_digest=frozen_material_list_digest,
-            frozen_material_refs=frozen_material_refs,
+            source_snapshot=source_snapshot,
             operation_id=requested.event_id,
             estimate=estimate,
             decision=decision,
             policy=policy,
             memory_projection_policy=self._memory_projection_policy,
-            selected_recent_window_turn_floor=(
-                self._memory_projection_policy.selected_recent_window_turn_floor
-            ),
         )
 
     def _fail_reactive_recovery_without_request(
@@ -1649,8 +1615,22 @@ class EngineEventIngestor:
         :returns: ingest result 或 accepted recovery 摘要。
         """
 
-        request = _reactive_compaction_request(pending)
-        pass_queue = _reactive_compaction_pass_queue(pending, request)
+        memory_policy = pending.memory_projection_policy
+        request_plan = build_normal_compact_request_plan(
+            source_snapshot=pending.source_snapshot,
+            selection_policy_digest=digest_memory_projection_policy(memory_policy),
+            budget_before_compact=pending.estimate,
+            selected_recent_window_turn_floor=(
+                memory_policy.selected_recent_window_turn_floor
+            ),
+            attempt_id=pending.context.attempt.attempt_id,
+            execution_id=pending.context.attempt.execution_id,
+        )
+        request = request_plan.request
+        pass_queue = build_reactive_pass_queue_plan(
+            source_snapshot=pending.source_snapshot,
+            root_request_plan=request_plan,
+        ).pass_requests
         compactor = self._context_compactor
         artifact_root = self._compact_artifact_root
         if compactor is None or artifact_root is None:
@@ -1734,34 +1714,44 @@ class EngineEventIngestor:
                 or operation_result.quality_result is None
                 or operation_result.failure_reason is not None
             ):
-                fallback = _reactive_fallback_decision(
-                    pending=pending,
-                    failure_reason=(
-                        operation_result.failure_reason or "compaction_failed"
+                failure_reason = (
+                    operation_result.failure_reason or "compaction_failed"
+                )
+                attempt_count = len(operation_result.rejected_attempts)
+                retry_repair_budget_exhausted = attempt_count > 0
+                fallback_decision = build_fallback_decision_input(
+                    source_snapshot=pending.source_snapshot,
+                    context_policy=pending.policy,
+                    memory_policy=pending.memory_projection_policy,
+                    operation_id=pending.operation_id,
+                    failure_reason=failure_reason,
+                    attempt_count=attempt_count,
+                    retry_repair_budget_exhausted=retry_repair_budget_exhausted,
+                    budget_after_attempted_compact=(
+                        operation_result.budget_after_attempted_compact
                     ),
                 )
+                failed_input = fallback_decision.failed_payload_input
                 failed = self._append_reactive_compaction_failed_event(
                     transaction,
                     context=latest,
                     estimate=pending.estimate,
-                    operation_id=pending.operation_id,
-                    failure_reason=(
-                        operation_result.failure_reason or "compaction_failed"
-                    ),
-                    attempt_count=len(operation_result.rejected_attempts),
+                    operation_id=failed_input.operation_id,
+                    failure_reason=failed_input.failure_reason,
+                    attempt_count=failed_input.attempt_count,
                     retry_repair_budget_exhausted=(
-                        len(operation_result.rejected_attempts) > 0
+                        failed_input.retry_repair_budget_exhausted
                     ),
                     budget_after_attempted_compact=(
-                        operation_result.budget_after_attempted_compact
+                        failed_input.budget_after_attempted_compact
                     ),
-                    fallback_policy_decision=fallback.policy_decision,
-                    fallback_input_window=fallback.input_window,
-                    fallback_input_digest=fallback.input_digest,
-                    fallback_budget_result=fallback.budget_result,
-                    fallback_action=fallback.action,
+                    fallback_policy_decision=failed_input.fallback_policy_decision,
+                    fallback_input_window=failed_input.fallback_input_window,
+                    fallback_input_digest=failed_input.fallback_input_digest,
+                    fallback_budget_result=failed_input.fallback_budget_result,
+                    fallback_action=failed_input.fallback_action,
                 )
-                if fallback.action == FALLBACK_ACTION_DISPATCH:
+                if fallback_decision.action_hint == FALLBACK_ACTION_DISPATCH:
                     return _ReactiveRecoveryAccepted(
                         result=EngineIngestResult(
                             status=EngineIngestStatus.ACCEPTED,
@@ -3775,231 +3765,6 @@ def _event_id(
         }
     ).removeprefix("sha256:")
     return f"{_EVENT_ID_PREFIX}{digest}"
-
-
-def _reactive_compaction_request(
-    pending: _ReactiveCompactPending,
-) -> CompactionRequest:
-    """构造 reactive Host compaction request。
-
-    :param pending: reactive compact pending 摘要。
-    :returns: CompactionRequest。
-    """
-
-    context = pending.context
-    segment_selection = select_compact_segment(
-        trigger_source=CompactSegmentTrigger.REACTIVE,
-        input_cursor=context.run.input_event_sequence,
-        memory_snapshot_cursor=None,
-        policy_digest=pending.frozen_material_list_digest,
-        material_blocks=pending.frozen_material_blocks,
-        selected_recent_window_turn_floor=pending.selected_recent_window_turn_floor,
-    )
-    material_pack = build_compact_material_pack(
-        selected_segment=segment_selection,
-        material_blocks=pending.frozen_material_blocks,
-        memory_snapshot=None,
-        inline_delta_repair_view=None,
-        current_input_ref=context.run.input_event_id,
-        current_input_text=pending.display_text,
-        previous_compacted_view=pending.previous_compacted_view,
-    )
-    return CompactionRequest(
-        trigger_source=ContextCompactionTriggerSource.REACTIVE,
-        session_id=context.run.session_id,
-        run_id=context.run.run_id,
-        attempt_id=context.attempt.attempt_id,
-        execution_id=context.attempt.execution_id,
-        memory_snapshot_cursor=None,
-        material_pack=material_pack,
-        segment_selection=segment_selection,
-        evidence_backed_fact_refs=(),
-        recent_raw_turn_refs=(context.run.input_event_id,),
-        older_raw_turn_refs=selected_material_source_refs(
-            material_blocks=pending.frozen_material_blocks,
-            selected_block_ids=segment_selection.selected_block_ids,
-        ),
-        existing_episode_summary_refs=(),
-        budget_before_compact=pending.estimate,
-    )
-
-
-def _reactive_compaction_pass_queue(
-    pending: _ReactiveCompactPending, root_request: CompactionRequest
-) -> tuple[CompactionRequest, ...]:
-    """按冻结 material list 构造 reactive multi-pass request 队列。
-
-    :param pending: reactive compact pending 摘要。
-    :param root_request: 覆盖完整 selected segment 的 root request。
-    :returns: pass request 队列；单 pass 时为空以复用 operation 默认语义。
-    """
-
-    selected = root_request.segment_selection.selected_block_ids
-    if len(selected) <= 1:
-        return ()
-    pass_requests: list[CompactionRequest] = []
-    for block_id in selected:
-        selection = _single_block_segment_selection(
-            root_request=root_request,
-            block_id=block_id,
-            material_blocks=pending.frozen_material_blocks,
-        )
-        material_pack = build_compact_material_pack(
-            selected_segment=selection,
-            material_blocks=pending.frozen_material_blocks,
-            memory_snapshot=None,
-            inline_delta_repair_view=None,
-            current_input_ref=pending.context.run.input_event_id,
-            current_input_text=pending.display_text,
-            previous_compacted_view=pending.previous_compacted_view,
-        )
-        pass_requests.append(
-            CompactionRequest(
-                trigger_source=root_request.trigger_source,
-                session_id=root_request.session_id,
-                run_id=root_request.run_id,
-                attempt_id=root_request.attempt_id,
-                execution_id=root_request.execution_id,
-                memory_snapshot_cursor=root_request.memory_snapshot_cursor,
-                material_pack=material_pack,
-                segment_selection=selection,
-                evidence_backed_fact_refs=(),
-                recent_raw_turn_refs=root_request.recent_raw_turn_refs,
-                older_raw_turn_refs=selected_material_source_refs(
-                    material_blocks=pending.frozen_material_blocks,
-                    selected_block_ids=selection.selected_block_ids,
-                ),
-                existing_episode_summary_refs=(),
-                budget_before_compact=root_request.budget_before_compact,
-            )
-        )
-    return tuple(pass_requests)
-
-
-def _reactive_fallback_decision(
-    *, pending: _ReactiveCompactPending, failure_reason: str
-) -> _ReactiveFallbackDecision:
-    """为 reactive compact final failure 构造 recent-window fallback 决策。
-
-    本函数只使用 overflow 时冻结的 ordinary material blocks 与同一个
-    context budget policy；不读取 compact artifact，不写 memory，也不伪造
-    ``CONTEXT_COMPACTED``。selection 或 budget 估算异常时 fail closed。
-
-    :param pending: reactive compact pending 摘要。
-    :param failure_reason: compact final failure reason。
-    :returns: fallback 决策与 failed payload 诊断字段。
-    """
-
-    try:
-        selection = build_recent_window_fallback_selection(
-            policy=pending.policy,
-            memory_policy=pending.memory_projection_policy,
-            session_id=pending.context.run.session_id,
-            run_id=pending.context.run.run_id,
-            material_blocks=pending.frozen_material_blocks,
-            current_input_ref=pending.context.run.input_event_id,
-            input_cursor=pending.expected_input_event_sequence,
-            selected_recent_window_turn_floor=pending.selected_recent_window_turn_floor,
-            trigger_source=ContextCompactionTriggerSource.REACTIVE,
-        )
-        budget = estimate_recent_window_fallback_budget(
-            policy=pending.policy,
-            session_id=pending.context.run.session_id,
-            run_id=pending.context.run.run_id,
-            selection_blocks=selection.selected_blocks,
-            current_input_ref=pending.context.run.input_event_id,
-        )
-    except Exception as error:
-        window = build_selection_failure_window_payload(
-            current_input_ref=pending.context.run.input_event_id,
-            trigger_source=ContextCompactionTriggerSource.REACTIVE,
-            policy_ref=pending.policy.policy_ref,
-            input_cursor=pending.expected_input_event_sequence,
-            failure_reason=_fallback_selection_failure_reason(
-                error,
-                compact_failure_reason=failure_reason,
-            ),
-        )
-        return _ReactiveFallbackDecision(
-            action=FALLBACK_ACTION_FAIL_CLOSED,
-            policy_decision=FALLBACK_POLICY_DECISION_SELECTION_FAILED,
-            input_window=window,
-            input_digest=fallback_window_digest(window),
-            budget_result=build_selection_failure_budget_payload(
-                policy_ref=pending.policy.policy_ref
-            ),
-        )
-    action = (
-        FALLBACK_ACTION_DISPATCH
-        if budget.hard_budget_passed
-        else FALLBACK_ACTION_FAIL_CLOSED
-    )
-    return _ReactiveFallbackDecision(
-        action=action,
-        policy_decision=FALLBACK_POLICY_DECISION_RECENT_WINDOW,
-        input_window=selection.to_window_payload(),
-        input_digest=selection.digest,
-        budget_result=budget.to_payload(),
-    )
-
-
-def _fallback_selection_failure_reason(
-    error: Exception, *, compact_failure_reason: str
-) -> str:
-    """构造 fallback selection / estimate failure 诊断原因。
-
-    :param error: 捕获到的 fallback 异常。
-    :param compact_failure_reason: 触发 fallback 的 compact failure reason。
-    :returns: 结构化 reason 文本。
-    """
-
-    return (
-        "reactive_fallback_selection_failed:"
-        f"{compact_failure_reason}:{type(error).__name__}"
-    )
-
-
-def _single_block_segment_selection(
-    *,
-    root_request: CompactionRequest,
-    block_id: str,
-    material_blocks: tuple[RunInputMaterialBlock, ...],
-) -> CompactSegmentSelection:
-    """构造只包含单个 selected block 的 reactive selection。
-
-    :param root_request: root compaction request。
-    :param block_id: 本 pass 选中的 block id。
-    :param material_blocks: 冻结 ordinary material blocks。
-    :returns: 单 block segment selection。
-    :raises ValueError: block id 不在冻结列表时抛出。
-    """
-
-    known = {block.block_id for block in material_blocks}
-    if block_id not in known:
-        raise ValueError("reactive pass block_id is not in frozen material list")
-    excluded = {
-        block.block_id: "not_in_pass"
-        for block in material_blocks
-        if block.block_id != block_id
-    }
-    digest = sha256_digest_json(
-        {
-            "root_selection_digest": root_request.segment_selection.selection_digest,
-            "selected_block_ids": [block_id],
-            "excluded_reason_codes": excluded,
-        }
-    )
-    return CompactSegmentSelection(
-        selected_block_ids=(block_id,),
-        excluded_protected_ids=(),
-        trigger_source=CompactSegmentTrigger.REACTIVE,
-        input_cursor=root_request.segment_selection.input_cursor,
-        memory_snapshot_cursor=root_request.segment_selection.memory_snapshot_cursor,
-        policy_digest=root_request.segment_selection.policy_digest,
-        deterministic_reason_codes=("reactive_single_pass_block",),
-        selection_digest=digest,
-        excluded_reason_codes=excluded,
-    )
 
 
 def _frozen_reactive_material_blocks(
