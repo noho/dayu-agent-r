@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | planning |
-| implementation status | WU-CM-14 local phaseflow gates completed after aggregate deepreview and focused re-review. Protected recent raw tail preservation now reuses existing `selected_recent_window_turn_floor` across compact selection, ordinary post-compaction RunInput, and reactive frozen material assembly. |
+| gate | accepted-plan |
+| implementation status | WU-CM-13 plan, plan review, plan fix, and focused plan re-review PASS. Plan accepted scope: thin Host-internal compact pipeline helper owner, caller-owned lifecycle guards, no tier 5 implementation, and WU-CM-14 pipeline-owned audited raw-tail selection. |
 | active work unit | WU-CM-13 |
 | default next work unit | WU-CM-13 |
-| next entry point | Start WU-CM-13 goal confirmation / plan gate using design sources `docs/host/design.md` and `docs/engine/design.md`, WU-CM-13 section below, WU-CM-14 implementation and review artifacts, and acceptance signal `utils/smoke_host_public_conversation_memory_scenarios.py`. |
+| next entry point | Create WU-CM-13 accepted plan commit, then dispatch implementation gate using accepted plan `docs/host/host-issues/wu-cm-13-unified-compact-pipeline-plan.md`, plan reviews `docs/reviews/plan-review-20260619-194515.md` / `docs/reviews/plan-review-20260619-194657.md`, focused re-reviews `docs/reviews/plan-review-20260619-195507.md` / `docs/reviews/plan-review-20260619-195521.md` / `docs/reviews/plan-review-20260619-200133.md` / `docs/reviews/plan-review-20260619-200143.md`, and adjudication `docs/reviews/plan-review-wu-cm-13-adjudication-20260619.md`. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for WU-CM-13 unified compact pipeline convergence. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 draft PR #150 https://github.com/noho/dayu-agent-r/pull/150; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for WU-CM-13 plan gate. WU-CLI-DEBUG-STREAM-01 still needs discussion / plan confirmation before code changes. Draft PR #150 remains open draft; merge, mark-ready, reviewer requests, and issue closure require separate user authorization. |
+| blocking open questions | None for WU-CM-13 implementation after accepted plan commit. WU-CLI-DEBUG-STREAM-01 still needs discussion / plan confirmation before code changes. Draft PR #150 remains open draft; merge, mark-ready, reviewer requests, and issue closure require separate user authorization. |
 
 状态约定：
 
@@ -242,7 +242,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 | WU-CM-12 | draft-PR-pass | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open draft. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
-| WU-CM-13 | planning | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | User assigned WU-CM-13 after WU-CM-14. WU-CM-12 already has reactive Engine ingest recovery sequencing; the remaining owner is unifying proactive / reactive material-to-compact-result and fallback semantics so five Session Semantic Memory, `assemble(...)`, tier 1-3 compact recovery, tier 4/5 fallback, and WU-CM-14 protected recent raw tail preservation cannot drift. |
+| WU-CM-13 | accepted-plan | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Plan, plan review, plan fix, and focused plan re-review PASS. Accepted plan narrows scope to a thin Host-internal compact pipeline helper owner, caller-owned lifecycle guards, current fallback behavior only, WU-CM-14 pipeline-owned audited raw-tail selection, `compaction_evidence.py` cleanup, and final smoke hard gate. |
 | WU-CM-14 | completed | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Local phaseflow completed. Accepted slice commit `921c6219`; aggregate deepreview PASS after deleting dead `_current_only_material_blocks`. Root cause fixed by passing existing floor into compact selection, adding ordinary post-compaction protected raw tail rendering, and repairing reactive frozen material assembly for protected floor semantics. Full proactive / reactive compact pipeline convergence remains WU-CM-13 scope. |
 | WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
 
@@ -1746,6 +1746,19 @@ Deferred destination only。当前不创建 GitHub Issue，不是默认 next ent
 - 验证 accepted compact output 仍只生成五类 Session Semantic Memory，并且 fallback / diagnostic / Host governance state / Engine state 不投影为业务事实。
 - 受影响 Host dispatch / Engine ingest / compact / RunInput / memory projection tests 通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
 - `utils/smoke_host_public_conversation_memory_scenarios.py` 必须真实运行成功，作为 WU-CM-13 final acceptance 的硬门槛；不得通过修改该 smoke、降低覆盖、绕过场景、放宽断言或改成无效通过来满足验收。
+
+### Current gate artifacts
+
+- plan: `docs/host/host-issues/wu-cm-13-unified-compact-pipeline-plan.md`
+- plan review: `docs/reviews/plan-review-20260619-194515.md`
+- plan review: `docs/reviews/plan-review-20260619-194657.md`
+- focused plan re-review: `docs/reviews/plan-review-20260619-195507.md`
+- focused plan re-review: `docs/reviews/plan-review-20260619-195521.md`
+- final focused plan re-review: `docs/reviews/plan-review-20260619-200133.md`
+- final focused plan re-review: `docs/reviews/plan-review-20260619-200143.md`
+- plan adjudication: `docs/reviews/plan-review-wu-cm-13-adjudication-20260619.md`
+- accepted scope: thin `compact_pipeline.py` helper owner; no tier 5 current-input-only fallback implementation; lifecycle guards remain caller-owned; WU-CM-14 uses pipeline-owned audited second-read raw-tail selection; `compaction_evidence.py` must be removed or fully migrated.
+- next gate: accepted plan commit, then implementation.
 - 若引入任何新的 LLM-facing memory material / compact material 产量常量，必须在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 或本 WU 明确批准的 policy owner 中定义；否则 final closeout 的常量审计必须列为 open residual。
 
 ## WU-CM-14 Recent Final Answer Preservation for Ordinal Follow-ups
