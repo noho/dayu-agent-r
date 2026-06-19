@@ -8,12 +8,15 @@
 
 脚本不读取 durable store、EventLog、memory 表、compact payload 内容或
 private Host implementation；所有财报事实均来自 deterministic mock tool。
+``compact`` suite 额外观察本次 session 的 compact public event 与 compact
+artifact 文件数作为验收信号。
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import pathlib
 import re
@@ -22,8 +25,9 @@ from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from io import TextIOWrapper
 from math import floor
-from typing import Final
+from typing import Final, cast
 from uuid import uuid4
 
 _PROJECT_ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parents[1]
@@ -66,6 +70,26 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    CONTEXT_COMPACTION_FAILED,
+    CONTEXT_COMPACTION_REQUESTED,
+)
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogReadClassFilter,
+    EventLogReadFilter,
+    EventLogRow,
+    EventLogStore,
+)
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.transaction import HostTransaction
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.log import LogLevel, configure
@@ -106,7 +130,6 @@ _DEFAULT_LOG_LEVEL: Final[str] = "INFO"
 _DEFAULT_LONG_ROUNDS: Final[int] = 25
 _MIN_LONG_ROUNDS: Final[int] = 20
 _MAX_LONG_ROUNDS: Final[int] = 25
-_INITIAL_TOOL_CALL_COUNT: Final[int] = 0
 _TOOL_NAME: Final[str] = "get_mock_finance_memory_fact"
 _TOOL_TAG: Final[str] = "manual-smoke"
 _PROVIDER_ID: Final[str] = "host-public-conversation-memory-scenarios-smoke"
@@ -123,14 +146,19 @@ _STDOUT_PREFIX_ROUND_DONE: Final[str] = "SMOKE ROUND_DONE"
 _STDOUT_PREFIX_FINAL_PREVIEW: Final[str] = "SMOKE FINAL_PREVIEW"
 _STDOUT_PREFIX_SOFT_OBSERVE: Final[str] = "SMOKE SOFT_OBSERVE"
 _STDOUT_PREFIX_SESSION_OBSERVE: Final[str] = "SMOKE SESSION_OBSERVE"
+_STDOUT_PREFIX_TOOL_DELTA: Final[str] = "SMOKE TOOL_DELTA"
+_STDOUT_PREFIX_TOOL_CALL: Final[str] = "SMOKE TOOL_CALL"
+_STDOUT_PREFIX_TOOL_EXTRA: Final[str] = "SMOKE TOOL_EXTRA"
+_STDOUT_PREFIX_COMPACT_AUDIT: Final[str] = "SMOKE COMPACT_AUDIT"
+_STDOUT_PREFIX_COMPACT_OPERATION: Final[str] = "SMOKE COMPACT_OPERATION"
+_STDOUT_PREFIX_COMPACT_REJECT_HISTOGRAM: Final[str] = "SMOKE COMPACT_REJECT_HISTOGRAM"
+_STDOUT_PREFIX_COMPACT_REJECT_DETAIL: Final[str] = "SMOKE COMPACT_REJECT_DETAIL"
+_STDOUT_PREFIX_COMPACT_ACCEPTANCE: Final[str] = "SMOKE COMPACT_ACCEPTANCE"
 _STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT: Final[str] = "SMOKE COMPACT_ARTIFACT_ROOT"
-_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT: Final[str] = (
-    "SMOKE COMPACT_ARTIFACT_FILE_COUNT"
-)
+_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT: Final[str] = "SMOKE COMPACT_ARTIFACT_FILE_COUNT"
 _NO_TOOL_SELECTION: Final[frozenset[str]] = frozenset()
 _MOCK_PRESSURE_UNIT: Final[str] = (
-    "DAYU_MEM_SCENARIO_PRESSURE_PAD 财报场景记忆压力文本，"
-    "仅用于 public Host conversation memory smoke。"
+    "DAYU_MEM_SCENARIO_PRESSURE_PAD 财报场景记忆压力文本，" "仅用于 public Host conversation memory smoke。"
 )
 _MOCK_PRESSURE_REPEAT: Final[int] = 128
 _FINAL_PREVIEW_CHARS: Final[int] = 600
@@ -142,6 +170,7 @@ _COMPACT_PRESSURE_MIN_PROMPT_TOKENS: Final[int] = 1_024
 _COMPACT_PRESSURE_LARGE_WINDOW_TOKENS: Final[int] = 1_000_000
 _PRESSURE_LINE_CHARS: Final[int] = 120
 _COMPACT_ARTIFACT_PRINT_LIMIT: Final[int] = 10
+_COMPACT_EVENT_AUDIT_PAGE_SIZE: Final[int] = 512
 _NORMALIZED_SPACE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s+")
 _ASSERTION_FAILURE_PREFIX: Final[str] = "answer assertion failed"
 _SOURCE_NAME: Final[str] = "utils.smoke_host_public_conversation_memory_scenarios"
@@ -149,6 +178,43 @@ _OPERATION_NAME: Final[str] = "host_public_conversation_memory_scenarios_smoke"
 _OPERATION_KIND: Final[str] = "manual_smoke"
 _BUSINESS_DOMAIN: Final[str] = "host"
 _SCENARIO: Final[str] = "phase12_5_conversation_memory_scenarios_smoke"
+_COMPACT_TRIGGER_PROACTIVE: Final[str] = "proactive"
+_COMPACT_TRIGGER_REACTIVE: Final[str] = "reactive"
+_COMPACT_EVENT_TYPES: Final[tuple[str, ...]] = (
+    CONTEXT_COMPACTION_REQUESTED,
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_FAILED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+)
+_PAYLOAD_FIELD_TRIGGER_SOURCE: Final[str] = "trigger_source"
+_PAYLOAD_FIELD_OPERATION_ID: Final[str] = "operation_id"
+_PAYLOAD_FIELD_ATTEMPT_NUMBER: Final[str] = "attempt_number"
+_PAYLOAD_FIELD_FAILURE_CATEGORY: Final[str] = "failure_category"
+_PAYLOAD_FIELD_REPAIRABLE: Final[str] = "repairable"
+_PAYLOAD_FIELD_FAILURE_REASON: Final[str] = "failure_reason"
+_PAYLOAD_FIELD_POLICY_DECISION: Final[str] = "policy_decision"
+_PAYLOAD_FIELD_FALLBACK_POLICY_DECISION: Final[str] = "fallback_policy_decision"
+_PAYLOAD_FIELD_FALLBACK_ACTION: Final[str] = "fallback_action"
+_PAYLOAD_FIELD_ATTEMPT_COUNT: Final[str] = "attempt_count"
+_PAYLOAD_FIELD_RETRY_REPAIR_BUDGET_EXHAUSTED: Final[str] = "retry_repair_budget_exhausted"
+_PAYLOAD_FIELD_RUNNER_ATTEMPT_SUMMARY_REFS: Final[str] = "runner_attempt_summary_refs"
+_PAYLOAD_FIELD_DIAGNOSTIC_REFS: Final[str] = "diagnostic_refs"
+_PAYLOAD_FIELD_NEXT_POLICY_DECISION: Final[str] = "next_policy_decision"
+_PAYLOAD_FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: Final[str] = "budget_after_attempted_compact"
+_PAYLOAD_FIELD_PROPOSAL_MANIFEST_REF: Final[str] = "proposal_manifest_ref"
+_PAYLOAD_FIELD_PROPOSAL_MANIFEST_DIGEST: Final[str] = "proposal_manifest_digest"
+_COMPACT_OPERATION_UNKNOWN_TRIGGER: Final[str] = "<unknown>"
+_COMPACT_OPERATION_MISSING_ID: Final[str] = "<missing-operation-id>"
+_COMPACT_HISTOGRAM_EMPTY: Final[str] = "<none>"
+_COMPACT_NONE_VALUE: Final[str] = "<none>"
+_COMPACT_NOT_APPLICABLE: Final[str] = "not_applicable"
+_COMPACT_FAILURE_STAGE_PROPOSAL_OR_QUALITY: Final[str] = "proposal_or_quality"
+_COMPACT_FAILURE_STAGE_PREPARE_OR_MATERIAL: Final[str] = "prepare_or_material_projection"
+_COMPACT_LOG_INSUFFICIENT_NONE: Final[str] = "none"
+_COMPACT_LOG_INSUFFICIENT_OFFENDING_BLOCK: Final[str] = "offending_material_block_unavailable"
+_DIAGNOSTIC_REF_SEPARATOR: Final[str] = ":"
+_DIAGNOSTIC_REF_SUFFIX_OFFSET: Final[int] = 4
+_COMPACT_HISTOGRAM_PRINT_LIMIT: Final[int] = 8
 
 _FIELD_COMPANY: Final[str] = "company"
 _FIELD_TICKER: Final[str] = "ticker"
@@ -244,24 +310,20 @@ _ASSERT_B_CFO: Final[str] = (
     "operating_cf=928.0亿元 net_profit=507.5亿元 largest_gap=经营性应付款增加"
 )
 _ASSERT_B_FOLLOW: Final[str] = (
-    "DAYU_MEM_ASSERT_B_FOLLOW marker=DAYU_MEM_CATL_CFO_2024A_V1 "
-    "referent=operating_cf largest_gap=经营性应付款增加"
+    "DAYU_MEM_ASSERT_B_FOLLOW marker=DAYU_MEM_CATL_CFO_2024A_V1 " "referent=operating_cf largest_gap=经营性应付款增加"
 )
 _ASSERT_C_LONG: Final[str] = (
-    "DAYU_MEM_ASSERT_C_LONG marker=DAYU_MEM_BYD_LONG_FACTOR2_V1 "
-    "factor2=BATTERY_PRICE_PRESSURE_FACTOR_2"
+    "DAYU_MEM_ASSERT_C_LONG marker=DAYU_MEM_BYD_LONG_FACTOR2_V1 " "factor2=BATTERY_PRICE_PRESSURE_FACTOR_2"
 )
 _ASSERT_C_FOLLOW: Final[str] = (
-    "DAYU_MEM_ASSERT_C_FOLLOW marker=DAYU_MEM_BYD_LONG_FACTOR2_V1 "
-    "factor2=BATTERY_PRICE_PRESSURE_FACTOR_2"
+    "DAYU_MEM_ASSERT_C_FOLLOW marker=DAYU_MEM_BYD_LONG_FACTOR2_V1 " "factor2=BATTERY_PRICE_PRESSURE_FACTOR_2"
 )
 _ASSERT_D_NIM: Final[str] = (
     "DAYU_MEM_ASSERT_D_NIM marker=DAYU_MEM_CMB_NIM_2024H1_V2 "
     "nim=1.88% yoy=-0.14pct asset_yield=3.45% liability_cost=1.74%"
 )
 _ASSERT_D_RETURN: Final[str] = (
-    "DAYU_MEM_ASSERT_D_RETURN marker=DAYU_MEM_CMB_NIM_2024H1_V2 "
-    "nim=1.88% yoy=-0.14pct consistent=yes"
+    "DAYU_MEM_ASSERT_D_RETURN marker=DAYU_MEM_CMB_NIM_2024H1_V2 " "nim=1.88% yoy=-0.14pct consistent=yes"
 )
 _ASSERT_E_CONSTRAINTS: Final[str] = (
     "DAYU_MEM_ASSERT_E_CONSTRAINTS marker=DAYU_MEM_MIDEA_LONG_2024H1_V1 "
@@ -326,9 +388,10 @@ _LONG_PROMPT_04_REVENUE_RISK: Final[str] = (
     "不调用工具。仅基于会话中已确认的信息，列出收入分析还缺哪些事实；不能编造缺失数据。"
 )
 _LONG_PROMPT_05_MARGIN_TOOL: Final[str] = (
-    "请调用 get_mock_finance_memory_fact 查询美的集团 2024H1 毛利主题，"
-    "metric=midea_margin_profile、include_pressure=true。回答时继续保留人民币百万元、"
-    "内销/外销拆分和不使用估值倍数外推三条约束。"
+    "请调用 get_mock_finance_memory_fact 查询美的集团 000333.SZ 2024H1 毛利主题，"
+    "参数 company=美的集团、ticker=000333.SZ、period=2024H1、"
+    "topic=long_session_profile、metric=midea_margin_profile、include_pressure=true。"
+    "回答时继续保留人民币百万元、内销/外销拆分和不使用估值倍数外推三条约束。"
 )
 _LONG_PROMPT_06_MARGIN_FOLLOWUP: Final[str] = (
     "不调用工具。把刚才毛利主题和收入结构连起来，说明哪些结论已经确认、哪些只是待验证。"
@@ -342,8 +405,10 @@ _LONG_PROMPT_08_MARGIN_PRESSURE: Final[str] = (
     "下面是长会话稳定性压力文本：{auto_user_pressure}"
 )
 _LONG_PROMPT_09_EXPENSE_TOOL: Final[str] = (
-    "请调用 get_mock_finance_memory_fact 查询美的集团 2024H1 费用主题，"
-    "metric=midea_expense_profile、include_pressure=true。回答只基于工具结果和本会话既有约束。"
+    "请调用 get_mock_finance_memory_fact 查询美的集团 000333.SZ 2024H1 费用主题，"
+    "参数 company=美的集团、ticker=000333.SZ、period=2024H1、"
+    "topic=long_session_profile、metric=midea_expense_profile、include_pressure=true。"
+    "回答只基于工具结果和本会话既有约束。"
 )
 _LONG_PROMPT_10_EXPENSE_FOLLOWUP: Final[str] = (
     "不调用工具。把费用主题和毛利主题做一个承接说明，指出费用分析仍然沿用人民币百万元口径。"
@@ -355,8 +420,10 @@ _LONG_PROMPT_12_PROFIT_CONSTRAINT_CHECK: Final[str] = (
     "不调用工具。复述本会话到目前为止的三条口径约束，并说明这些约束如何影响利润分析。"
 )
 _LONG_PROMPT_13_ASSET_TOOL: Final[str] = (
-    "请调用 get_mock_finance_memory_fact 查询美的集团 2024H1 资产主题，"
-    "metric=midea_asset_profile、include_pressure=true。回答中保持当前主体和三条口径约束。"
+    "请调用 get_mock_finance_memory_fact 查询美的集团 000333.SZ 2024H1 资产主题，"
+    "参数 company=美的集团、ticker=000333.SZ、period=2024H1、"
+    "topic=long_session_profile、metric=midea_asset_profile、include_pressure=true。"
+    "回答中保持当前主体和三条口径约束。"
 )
 _LONG_PROMPT_14_ASSET_FOLLOWUP: Final[str] = (
     "不调用工具。把资产主题和利润桥接框架连接起来，明确哪些资产相关信息已经确认。"
@@ -369,8 +436,10 @@ _LONG_PROMPT_16_LIABILITY_PRESSURE: Final[str] = (
     "下面是长会话稳定性压力文本：{auto_user_pressure}"
 )
 _LONG_PROMPT_17_CASHFLOW_TOOL: Final[str] = (
-    "请调用 get_mock_finance_memory_fact 查询美的集团 2024H1 现金流主题，"
-    "metric=midea_cashflow_profile、include_pressure=true。回答要把现金流主题接到收入、利润和资产讨论上。"
+    "请调用 get_mock_finance_memory_fact 查询美的集团 000333.SZ 2024H1 现金流主题，"
+    "参数 company=美的集团、ticker=000333.SZ、period=2024H1、"
+    "topic=long_session_profile、metric=midea_cashflow_profile、include_pressure=true。"
+    "回答要把现金流主题接到收入、利润和资产讨论上。"
 )
 _LONG_PROMPT_18_CASHFLOW_FOLLOWUP: Final[str] = (
     "不调用工具。解释现金流主题对前面收入、费用和资产分析的校验作用；缺失的具体数值要标明未确认。"
@@ -382,8 +451,10 @@ _LONG_PROMPT_20_VALUATION_APPLICATION: Final[str] = (
     "不调用工具。在不使用估值倍数外推的约束下，给出可以讨论和不可以讨论的估值相关内容边界。"
 )
 _LONG_PROMPT_21_PEER_TOOL: Final[str] = (
-    "请调用 get_mock_finance_memory_fact 查询美的集团 2024H1 同行对比主题，"
-    "metric=midea_peer_profile、include_pressure=true。回答只说明对比维度，不引入未确认的同行数值。"
+    "请调用 get_mock_finance_memory_fact 查询美的集团 000333.SZ 2024H1 同行对比主题，"
+    "参数 company=美的集团、ticker=000333.SZ、period=2024H1、"
+    "topic=long_session_profile、metric=midea_peer_profile、include_pressure=true。"
+    "回答只说明对比维度，不引入未确认的同行数值。"
 )
 _LONG_PROMPT_22_PEER_FOLLOWUP: Final[str] = (
     "不调用工具。把同行对比维度与内销/外销拆分约束连接起来，说明哪些比较是可做的。"
@@ -424,28 +495,26 @@ _BYD_LONG_INPUT_TEMPLATE_PARAGRAPHS: Final[tuple[str, ...]] = (
     "若价格下降快于成本下降，短期可能形成毛利压力。",
     "规模效应段：产量爬坡、平台化零部件复用和制造费用摊薄会改善单位成本，"
     "但产能利用率不足时规模效应会被固定成本吸收。",
-    "原材料与产能利用率段：铝、钢、锂相关材料波动需要和库存周期一起观察，"
-    "单一价格变化不能直接推出毛利率结论。",
+    "原材料与产能利用率段：铝、钢、锂相关材料波动需要和库存周期一起观察，" "单一价格变化不能直接推出毛利率结论。",
 )
 
 
 class SuiteMode(StrEnum):
     """场景套件模式。
 
-    :param CORE: 只生成 core 场景规格。
-    :param LONG: 只生成 long 场景规格。
-    :param ALL: 在同一逻辑序列中先生成 core 再生成 long 场景规格。
+    :param MEMORY_CORE: 公开多轮记忆基础 smoke，不要求 compact。
+    :param MEMORY_COMPACT: compact 专项 smoke，必须断言 proactive compact
+        accepted，且 compact failed 会硬失败。
     """
 
-    CORE = "core"
-    LONG = "long"
-    ALL = "all"
+    MEMORY_CORE = "memory-core"
+    MEMORY_COMPACT = "memory-compact"
 
 
 class PressureMode(StrEnum):
     """压力注入模式。
 
-    :param AUTO: 后续 Host 实现按预算自适应注入压力。
+    :param AUTO: 按 context budget 自适应注入 compact 压力。
     :param OFF: 不注入人工压力文本。
     """
 
@@ -469,6 +538,7 @@ class SmokeArgs:
     :param suite: 场景套件。
     :param long_rounds: long suite 轮数，范围为 20 到 25。
     :param pressure_mode: 压力注入模式。
+    :param debug_smoke_output: 是否打印 smoke 自身的工具调用诊断。
     """
 
     workspace_root: pathlib.Path
@@ -483,6 +553,7 @@ class SmokeArgs:
     suite: SuiteMode
     long_rounds: int
     pressure_mode: PressureMode
+    debug_smoke_output: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,7 +563,8 @@ class RoundSpec:
     :param label: 轮次标签。
     :param prompt: 用户输入文本。
     :param tool_names: 本轮允许使用的工具名集合。
-    :param expected_tool_calls_after_round: 本轮结束后的期望工具调用总数。
+    :param expected_tool_fact_key: 本轮必须命中的 fact key；为 ``None`` 时仅
+        执行工具调用泄漏检查和诊断。
     :param hard_answer_contains: 最终回答必须包含的文本片段。
     :param hard_answer_forbidden: 最终回答禁止包含的文本片段。
     :param soft_answer_contains: 最终回答建议包含的观察片段。
@@ -502,7 +574,7 @@ class RoundSpec:
     label: str
     prompt: str
     tool_names: frozenset[str]
-    expected_tool_calls_after_round: int
+    expected_tool_fact_key: str | None
     hard_answer_contains: tuple[str, ...]
     hard_answer_forbidden: tuple[str, ...]
     soft_answer_contains: tuple[str, ...]
@@ -521,6 +593,144 @@ class RoundResult:
     label: str
     run_id: str
     event: HostEvent
+
+
+@dataclass(frozen=True, slots=True)
+class CompactAuditSummary:
+    """本次 session 的 compact EventLog 摘要。
+
+    :param requested_proactive: proactive compact request 数。
+    :param requested_reactive: reactive compact request 数。
+    :param compacted_proactive: proactive accepted compact 数。
+    :param compacted_reactive: reactive accepted compact 数。
+    :param failed_proactive: proactive compact failed 数。
+    :param failed_reactive: reactive compact failed 数。
+    :param rejected_proactive: proactive compact attempt rejected 数。
+    :param rejected_reactive: reactive compact attempt rejected 数。
+    """
+
+    requested_proactive: int
+    requested_reactive: int
+    compacted_proactive: int
+    compacted_reactive: int
+    failed_proactive: int
+    failed_reactive: int
+    rejected_proactive: int
+    rejected_reactive: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompactRejectedAttemptAudit:
+    """单次 compact rejected attempt 的诊断摘要。
+
+    :param event_id: rejected attempt EventLog id。
+    :param event_sequence: rejected attempt EventLog sequence。
+    :param operation_id: compact operation id；payload 缺失时为 ``None``。
+    :param trigger_source: request 归因后的 trigger source；无法归因时为 ``None``。
+    :param attempt_number: operation 内 attempt 序号；payload 缺失时为 ``None``。
+    :param failure_category: compact failure category；payload 缺失时为 ``None``。
+    :param repairable: 是否可 repair；payload 缺失时为 ``None``。
+    :param next_policy_decision: 下一步 policy decision；payload 缺失时为 ``None``。
+    :param budget_after_attempted_compact: attempt 后预算；payload 缺失或未知时为
+        ``None``。
+    :param runner_attempt_summary_refs: runner attempt 摘要 refs。
+    :param diagnostic_refs: Host diagnostic refs。
+    :param proposal_manifest_ref: proposal manifest ref；prepare 阶段失败时为
+        ``None``。
+    :param proposal_manifest_digest: proposal manifest digest；prepare 阶段失败时
+        为 ``None``。
+    """
+
+    event_id: str
+    event_sequence: int
+    operation_id: str | None
+    trigger_source: str | None
+    attempt_number: int | None
+    failure_category: str | None
+    repairable: bool | None
+    next_policy_decision: str | None
+    budget_after_attempted_compact: int | None
+    runner_attempt_summary_refs: tuple[str, ...]
+    diagnostic_refs: tuple[str, ...]
+    proposal_manifest_ref: str | None
+    proposal_manifest_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompactFailedOperationAudit:
+    """单个 ``CONTEXT_COMPACTION_FAILED`` 的诊断摘要。
+
+    :param event_id: failed EventLog id。
+    :param event_sequence: failed EventLog sequence。
+    :param operation_id: compact operation id；payload 缺失时为 ``None``。
+    :param trigger_source: request 归因后的 trigger source；无法归因时为 ``None``。
+    :param failure_reason: Host failure reason；payload 缺失时为 ``None``。
+    :param policy_decision: Host policy decision；payload 缺失时为 ``None``。
+    :param fallback_action: fallback 后动作；payload 缺失时为 ``None``。
+    :param fallback_tier: fallback tier；payload 缺失时为 ``None``。
+    :param attempt_count: compact attempt count；payload 缺失时为 ``None``。
+    :param retry_repair_budget_exhausted: retry / repair budget 是否耗尽。
+    :param budget_after_attempted_compact: attempt 后预算；payload 缺失或未知时为
+        ``None``。
+    """
+
+    event_id: str
+    event_sequence: int
+    operation_id: str | None
+    trigger_source: str | None
+    failure_reason: str | None
+    policy_decision: str | None
+    fallback_action: str | None
+    fallback_tier: str | None
+    attempt_count: int | None
+    retry_repair_budget_exhausted: bool | None
+    budget_after_attempted_compact: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompactOperationAudit:
+    """单个 compact operation 的结构化审计摘要。
+
+    :param operation_id: compact operation id；无法归因时使用占位符。
+    :param trigger_source: trigger source；无法归因时使用占位符。
+    :param request_event_id: request EventLog id；缺失时为 ``None``。
+    :param requested: request event 数。
+    :param compacted: accepted compact event 数。
+    :param failed: failed compact event 数。
+    :param rejected: rejected attempt event 数。
+    :param rejected_attempts: rejected attempt 明细。
+    :param failed_events: failed event 明细。
+    :param failure_categories: rejected failure category histogram。
+    :param diagnostic_histogram: rejected diagnostic suffix histogram。
+    """
+
+    operation_id: str
+    trigger_source: str
+    request_event_id: str | None
+    requested: int
+    compacted: int
+    failed: int
+    rejected: int
+    rejected_attempts: tuple[CompactRejectedAttemptAudit, ...]
+    failed_events: tuple[CompactFailedOperationAudit, ...]
+    failure_categories: tuple[tuple[str, int], ...]
+    diagnostic_histogram: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CompactAuditReport:
+    """本次 session 的 compact EventLog 审计报告。
+
+    :param summary: compact event 计数摘要。
+    :param operations: per-operation 审计摘要。
+    :param rejected_failure_histogram: 全局 rejected failure category histogram。
+    :param rejected_diagnostic_histogram: 全局 rejected diagnostic suffix histogram。
+    """
+
+    summary: CompactAuditSummary
+    operations: tuple[CompactOperationAudit, ...]
+    rejected_failure_histogram: tuple[tuple[str, int], ...]
+    rejected_diagnostic_histogram: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +773,46 @@ class LongRoundTemplate:
     include_user_pressure: bool
     hard_contains: tuple[str, ...]
     hard_forbidden: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallSnapshot:
+    """mock 工具调用计数快照。
+
+    :param total_count: tracked session 内累计工具调用次数。
+    :param calls_by_key: 按 fact key 聚合的累计调用次数。
+    """
+
+    total_count: int
+    calls_by_key: Mapping[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallObservation:
+    """mock 工具单次调用诊断。
+
+    :param sequence: tracked session 内递增调用序号。
+    :param tool_call_id: Engine 传入的工具调用 id。
+    :param known: 是否命中已知 mock fact。
+    :param fact_key: 命中的 fact key；未知时为 ``_UNKNOWN_FACT_KEY``。
+    :param company: 工具参数 company。
+    :param ticker: 工具参数 ticker。
+    :param period: 工具参数 period。
+    :param topic: 工具参数 topic。
+    :param metric: 工具参数 metric。
+    :param include_pressure: 工具参数 include_pressure。
+    """
+
+    sequence: int
+    tool_call_id: str
+    known: bool
+    fact_key: str
+    company: str
+    ticker: str
+    period: str
+    topic: str
+    metric: str
+    include_pressure: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -961,6 +1211,8 @@ class MockFinanceMemoryTool:
         self._tracked_session_id: str | None = None
         self._call_count = 0
         self._calls_by_key: Counter[str] = Counter()
+        self._observations: list[ToolCallObservation] = []
+        self._debug_output = False
 
     def set_pressure_mode(self, pressure_mode: PressureMode) -> None:
         """设置本次 smoke 的压力注入模式。
@@ -974,6 +1226,17 @@ class MockFinanceMemoryTool:
         """
 
         self._pressure_mode = pressure_mode
+
+    def set_debug_output(self, enabled: bool) -> None:
+        """设置是否打印 smoke 工具调用诊断。
+
+        :param enabled: ``True`` 时每次 tracked session 工具调用都会打印
+            ``SMOKE TOOL_CALL``。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._debug_output = enabled
 
     @property
     def call_count(self) -> int:
@@ -994,6 +1257,28 @@ class MockFinanceMemoryTool:
         """
 
         return self._calls_by_key
+
+    def snapshot(self) -> ToolCallSnapshot:
+        """返回当前 tracked session 工具调用快照。
+
+        :returns: 工具调用累计计数与 fact key 计数副本。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return ToolCallSnapshot(
+            total_count=self._call_count,
+            calls_by_key=dict(self._calls_by_key),
+        )
+
+    def observations_since(self, snapshot: ToolCallSnapshot) -> tuple[ToolCallObservation, ...]:
+        """返回指定快照之后新增的工具调用诊断。
+
+        :param snapshot: 本轮运行前的工具调用快照。
+        :returns: 新增调用诊断，按调用顺序排列。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return tuple(observation for observation in self._observations if observation.sequence > snapshot.total_count)
 
     def track_session(self, session_id: str) -> None:
         """限定本次 smoke 计数观察的 session。
@@ -1023,6 +1308,15 @@ class MockFinanceMemoryTool:
         if self._tracked_session_id == context.session_id:
             self._call_count += 1
             self._calls_by_key.update((fact_key,))
+            observation = _tool_call_observation(
+                sequence=self._call_count,
+                call=call,
+                fact_key=fact_key,
+                known=record is not None,
+            )
+            self._observations.append(observation)
+            if self._debug_output:
+                print_tool_call_observation(observation)
         if record is None:
             return ToolCompletedOutcome(
                 result=ToolResultSuccess(
@@ -1061,7 +1355,7 @@ def discover_smoke_tools(
     :raises ValueError: 工具定义字段非法时由底层抛出。
     """
 
-    smoke_tool = MockFinanceMemoryTool(pressure_mode=PressureMode.AUTO)
+    smoke_tool = MockFinanceMemoryTool(pressure_mode=PressureMode.OFF)
     return ToolsDiscoveryProviderOutput(
         provider_id=_PROVIDER_ID,
         version_ref=_PROVIDER_VERSION,
@@ -1083,9 +1377,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     :raises SystemExit: 参数非法时由 ``argparse`` fail closed。
     """
 
-    parser = argparse.ArgumentParser(
-        description="Host public 财报对话记忆场景 smoke。"
-    )
+    parser = argparse.ArgumentParser(description="Host public 财报对话记忆场景 smoke。")
     parser.add_argument(
         "--workspace-root",
         default=None,
@@ -1109,7 +1401,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     parser.add_argument(
         "--suite",
         choices=tuple(item.value for item in SuiteMode),
-        default=SuiteMode.CORE.value,
+        default=SuiteMode.MEMORY_CORE.value,
     )
     parser.add_argument(
         "--long-rounds",
@@ -1119,7 +1411,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     parser.add_argument(
         "--pressure-mode",
         choices=tuple(item.value for item in PressureMode),
-        default=PressureMode.AUTO.value,
+        default=PressureMode.OFF.value,
     )
     namespace = parser.parse_args(tuple(argv))
     workspace_root_text: str | None = namespace.workspace_root
@@ -1134,6 +1426,9 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     suite_text: str = namespace.suite
     long_rounds: int = namespace.long_rounds
     pressure_mode_text: str = namespace.pressure_mode
+    if SuiteMode(suite_text) is SuiteMode.MEMORY_COMPACT and PressureMode(pressure_mode_text) is PressureMode.OFF:
+        parser.error("--suite memory-compact requires --pressure-mode auto")
+    log_level = LogLevel[log_level_text]
     return SmokeArgs(
         workspace_root=_resolve_workspace_root(workspace_root_text),
         scene_id=scene_id,
@@ -1141,12 +1436,13 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         host_runtime_id=host_runtime_id,
         model_id=model_id,
         runner_option_hint_id=runner_option_hint_id,
-        log_level=LogLevel[log_level_text],
+        log_level=log_level,
         reuse_session=reuse_session,
         keep_workspace=keep_workspace,
         suite=SuiteMode(suite_text),
         long_rounds=long_rounds,
         pressure_mode=PressureMode(pressure_mode_text),
+        debug_smoke_output=log_level is LogLevel.DEBUG,
     )
 
 
@@ -1161,10 +1457,7 @@ def _resolve_workspace_root(workspace_root_text: str | None) -> pathlib.Path:
 
     if workspace_root_text is not None:
         return pathlib.Path(workspace_root_text).resolve()
-    return (
-        _DEFAULT_WORKSPACE_PARENT
-        / f"{_DEFAULT_WORKSPACE_PREFIX}-{uuid4().hex[:12]}"
-    ).resolve()
+    return (_DEFAULT_WORKSPACE_PARENT / f"{_DEFAULT_WORKSPACE_PREFIX}-{uuid4().hex[:12]}").resolve()
 
 
 def select_round_specs(args: SmokeArgs) -> tuple[RoundSpec, ...]:
@@ -1197,30 +1490,11 @@ def _round_specs_for_suite(
     :raises ValueError: long 轮数超出 20 到 25 时抛出。
     """
 
-    if suite is SuiteMode.CORE:
+    if suite is SuiteMode.MEMORY_CORE:
         return _core_round_specs(user_pressure_text)
-    if suite is SuiteMode.LONG:
-        return _long_round_specs(user_pressure_text, long_rounds)
-    core_specs = _core_round_specs(user_pressure_text)
-    long_specs = _long_round_specs(
-        user_pressure_text,
-        long_rounds,
-        base_expected_calls=_final_expected_tool_calls(core_specs),
-    )
-    return (*core_specs, *long_specs)
-
-
-def _final_expected_tool_calls(specs: Sequence[RoundSpec]) -> int:
-    """读取一组轮次规格结束后的累计工具调用数。
-
-    :param specs: 已生成的轮次规格序列。
-    :returns: 最后一轮结束后的期望工具调用总数；空序列返回初始计数。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if not specs:
-        return _INITIAL_TOOL_CALL_COUNT
-    return specs[-1].expected_tool_calls_after_round
+    if suite is SuiteMode.MEMORY_COMPACT:
+        return (*_core_round_specs(user_pressure_text), *_long_round_specs(user_pressure_text, long_rounds))
+    raise ValueError(f"unsupported suite: {suite.value}")
 
 
 def calls_by_key_summary(calls_by_key: Mapping[str, int]) -> str:
@@ -1272,15 +1546,11 @@ def assert_answer_contains(
     for item in required:
         expected = normalize_answer(item)
         if expected not in normalized:
-            raise AssertionError(
-                f"{_ASSERTION_FAILURE_PREFIX}: label={label} missing={item}"
-            )
+            raise AssertionError(f"{_ASSERTION_FAILURE_PREFIX}: label={label} missing={item}")
     for item in forbidden:
         blocked = normalize_answer(item)
         if blocked in normalized:
-            raise AssertionError(
-                f"{_ASSERTION_FAILURE_PREFIX}: label={label} forbidden={item}"
-            )
+            raise AssertionError(f"{_ASSERTION_FAILURE_PREFIX}: label={label} forbidden={item}")
 
 
 def observe_soft_answer_contains(
@@ -1339,7 +1609,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
                 f"回答末尾输出 {_ASSERT_A}。"
             ),
             tool,
-            1,
+            _FACT_KEY_MAOTAI_REVENUE,
             (_MARKER_MAOTAI_REVENUE, _VALUE_MAOTAI_WINE_YOY, _VALUE_MAOTAI_SERIES_YOY),
             (),
             (),
@@ -1350,7 +1620,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             "把刚才提到的产品系列对应的销量也一起列出来；如果会话里没有销量事实，请明确说没有，不要编数字。"
             "回答仍需保留当前主体、期间和百万元口径。",
             _NO_TOOL_SELECTION,
-            1,
+            None,
             (),
             (_MARKER_WULIANGYE_REVENUE,),
             ("没有",),
@@ -1365,7 +1635,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
                 f"回答末尾输出 {_ASSERT_A_SWITCH}。"
             ),
             tool,
-            2,
+            _FACT_KEY_WULIANGYE_REVENUE,
             (
                 _MARKER_WULIANGYE_REVENUE,
                 _VALUE_WULIANGYE_CORE_YOY,
@@ -1379,7 +1649,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             _LABEL_CORE_A4,
             f"回到茅台，刚才茅台酒和系列酒同比增速再确认一遍；不要调用工具，最后输出 {_ASSERT_A_RETURN}。",
             _NO_TOOL_SELECTION,
-            2,
+            None,
             (_MARKER_MAOTAI_REVENUE, _VALUE_MAOTAI_WINE_YOY, _VALUE_MAOTAI_SERIES_YOY),
             (
                 _MARKER_WULIANGYE_REVENUE,
@@ -1400,7 +1670,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
                 "net_profit=<工具返回净利润> largest_gap=<工具返回最大差异项目>。"
             ),
             tool,
-            3,
+            _FACT_KEY_CATL_CASHFLOW,
             (_MARKER_CATL_CASHFLOW, _VALUE_CATL_OPERATING_CF, _VALUE_CATL_LARGEST_GAP),
             (),
             (),
@@ -1410,7 +1680,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             _LABEL_CORE_B2,
             f"这个数和净利润比，差异在哪个项目最大？不要调用工具。最后输出 {_ASSERT_B_FOLLOW}。",
             _NO_TOOL_SELECTION,
-            3,
+            None,
             (_MARKER_CATL_CASHFLOW, _VALUE_CATL_LARGEST_GAP),
             (),
             (),
@@ -1420,7 +1690,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             _LABEL_CORE_B3,
             "投资活动的支出主要花在什么上？如果当前会话没有确认过，不要编造。",
             _NO_TOOL_SELECTION,
-            3,
+            None,
             (),
             (),
             ("没有确认",),
@@ -1430,7 +1700,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             _LABEL_CORE_C1,
             "我准备分析比亚迪 2024H1 毛利率结构变化。后续只根据我贴的原文回答。",
             _NO_TOOL_SELECTION,
-            3,
+            None,
             (),
             (),
             (),
@@ -1444,7 +1714,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
                 f"回答最后输出 {_ASSERT_C_LONG}。"
             ),
             _NO_TOOL_SELECTION,
-            3,
+            None,
             (),
             (),
             (_MARKER_BYD_LONG_FACTOR2, _BYD_FACTOR2_MARKER),
@@ -1454,7 +1724,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             _LABEL_CORE_C3,
             f"第二个因素能再展开讲讲吗？不要调用工具。最后单独输出 {_ASSERT_C_FOLLOW}。",
             _NO_TOOL_SELECTION,
-            3,
+            None,
             (_MARKER_BYD_LONG_FACTOR2, _BYD_FACTOR2_MARKER),
             (),
             (),
@@ -1468,7 +1738,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
                 f"metric=cmb_nim、include_pressure=true。回答末尾输出 {_ASSERT_D_NIM}。"
             ),
             tool,
-            4,
+            _FACT_KEY_CMB_NIM,
             (_MARKER_CMB_NIM, _VALUE_CMB_NIM, _VALUE_CMB_NIM_YOY),
             (),
             (),
@@ -1479,7 +1749,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             f"按“资产 / 负债 / 息差”三组重排，不要调用工具，并追加压力观察文本：{user_pressure_text}。"
             f"回答末尾尽量输出同一 {_ASSERT_D_NIM}。",
             _NO_TOOL_SELECTION,
-            4,
+            None,
             (),
             (),
             (_MARKER_CMB_NIM, _VALUE_CMB_NIM, _VALUE_CMB_NIM_YOY),
@@ -1489,7 +1759,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             _LABEL_CORE_D3,
             "不调用工具。招商银行刚才讨论中不良率是多少？如果会话里没有确认，明确说明未确认。",
             _NO_TOOL_SELECTION,
-            4,
+            None,
             (),
             (),
             (_VALUE_CMB_NPL_RATIO,),
@@ -1499,7 +1769,7 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
             _LABEL_CORE_D4,
             f"回到刚才息差讨论，净息差具体数值和同比变化再确认，最后输出 {_ASSERT_D_RETURN}。",
             _NO_TOOL_SELECTION,
-            4,
+            None,
             (_MARKER_CMB_NIM, _VALUE_CMB_NIM, _VALUE_CMB_NIM_YOY),
             (),
             (),
@@ -1511,24 +1781,18 @@ def _core_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
 def _long_round_specs(
     user_pressure_text: str,
     round_count: int,
-    *,
-    base_expected_calls: int = _INITIAL_TOOL_CALL_COUNT,
 ) -> tuple[RoundSpec, ...]:
     """构造 long suite 场景规格。
 
     :param user_pressure_text: 已按当前模式生成的用户侧压力文本。
     :param round_count: long suite 轮数，范围为 20 到 25。
-    :param base_expected_calls: long suite 首轮之前已经累计的工具调用次数。
     :returns: long suite 的轮次规格。
     :raises ValueError: ``round_count`` 超出 20 到 25 时抛出。
     """
 
     templates = _select_long_templates(round_count)
-    expected_calls = base_expected_calls
     specs: list[RoundSpec] = []
     for template in templates:
-        if template.tool_enabled:
-            expected_calls += 1
         tool_names = frozenset((_TOOL_NAME,)) if template.tool_enabled else _NO_TOOL_SELECTION
         pressure_text = user_pressure_text if template.include_user_pressure else ""
         specs.append(
@@ -1536,7 +1800,7 @@ def _long_round_specs(
                 label=template.label,
                 prompt=template.prompt_template.format(auto_user_pressure=pressure_text),
                 tool_names=tool_names,
-                expected_tool_calls_after_round=expected_calls,
+                expected_tool_fact_key=_long_required_tool_fact_key(template),
                 hard_answer_contains=template.hard_contains,
                 hard_answer_forbidden=template.hard_forbidden,
                 soft_answer_contains=(),
@@ -1544,6 +1808,23 @@ def _long_round_specs(
             )
         )
     return tuple(specs)
+
+
+def _long_required_tool_fact_key(template: LongRoundTemplate) -> str | None:
+    """返回 long suite 本轮必须命中的工具 fact key。
+
+    long suite 只有 L01 负责建立美的长会话主体事实；后续 tool-enabled 轮次
+    允许模型调用工具以刷新语境，但不把是否再次调用工具作为 conversation
+    memory 的硬失败条件。
+
+    :param template: long suite 轮次模板。
+    :returns: 必须命中的 fact key；无硬要求时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if template.label == _LONG_LABEL_01:
+        return _FACT_KEY_MIDEA_LONG_SESSION
+    return None
 
 
 def _select_long_templates(round_count: int) -> tuple[LongRoundTemplate, ...]:
@@ -1569,18 +1850,11 @@ def _build_byd_long_input() -> str:
     :raises AssertionError: 生成结果不满足长度或 anchor 约束时抛出。
     """
 
-    head = (
-        f"{_BYD_LONG_INPUT_HEAD_ANCHOR}：出口车型结构是本段原文固定 anchor，"
-        "后续回答只能依据该原文。"
-    )
+    head = f"{_BYD_LONG_INPUT_HEAD_ANCHOR}：出口车型结构是本段原文固定 anchor，" "后续回答只能依据该原文。"
     middle = (
-        f"{_BYD_LONG_INPUT_MIDDLE_ANCHOR}：动力电池价格压力是第二因素固定 anchor，"
-        "用于验证长输入 minimum-preserve。"
+        f"{_BYD_LONG_INPUT_MIDDLE_ANCHOR}：动力电池价格压力是第二因素固定 anchor，" "用于验证长输入 minimum-preserve。"
     )
-    tail = (
-        f"{_BYD_LONG_INPUT_TAIL_ANCHOR}：规模效应是第三因素固定 anchor，"
-        "用于验证结尾信息可被引用。"
-    )
+    tail = f"{_BYD_LONG_INPUT_TAIL_ANCHOR}：规模效应是第三因素固定 anchor，" "用于验证结尾信息可被引用。"
     paragraphs: list[str] = [head]
     while _joined_length(paragraphs) < (_BYD_LONG_INPUT_TARGET_CHARS // 2):
         paragraphs.extend(_BYD_LONG_INPUT_TEMPLATE_PARAGRAPHS)
@@ -1763,6 +2037,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
 
     assembly = _prepare_runtime_assembly(args, env=env)
     assembly.smoke_tool.set_pressure_mode(args.pressure_mode)
+    assembly.smoke_tool.set_debug_output(args.debug_smoke_output)
     specs = _runtime_round_specs(args, assembly.options)
     _print_assembly_diagnostics(assembly.diagnostics, assembly.options)
     smoke_run_id = _new_smoke_run_id()
@@ -1780,6 +2055,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
 
     async with open_host(assembly.options) as host:
         session = await host.ensure_session(_ensure_request(args, smoke_run_id))
+        session_id = session.session_id
         assembly.smoke_tool.track_session(session.session_id)
         watcher = host.watch_session_events(session.session_id)
         print(f"SMOKE SESSION session_id={session.session_id}")
@@ -1787,6 +2063,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
         _print_session_observation(session, label="ensure-session")
 
         for index, spec in enumerate(specs, start=1):
+            tool_snapshot = assembly.smoke_tool.snapshot()
             result = await _run_round(
                 host=host,
                 watcher=watcher,
@@ -1796,7 +2073,13 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
                 scene_inputs=assembly.scene_inputs,
             )
             _print_round(result)
-            _assert_round_result(result, assembly.smoke_tool, spec)
+            _assert_round_result(
+                result,
+                assembly.smoke_tool,
+                spec,
+                before_tools=tool_snapshot,
+                debug_smoke_output=args.debug_smoke_output,
+            )
             snapshot = await host.get_session(session.session_id)
             _assert_session_open(snapshot, label=spec.label)
             _print_session_observation(snapshot, label=spec.label)
@@ -1809,6 +2092,14 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
 
     print(calls_by_key_summary(assembly.smoke_tool.calls_by_key))
     _print_compact_summary(assembly.options)
+    compact_audit = _compact_audit_report(assembly.options, session_id=session_id)
+    _print_compact_audit_summary(compact_audit.summary)
+    _print_compact_audit_report(compact_audit, debug_smoke_output=args.debug_smoke_output)
+    _assert_compact_acceptance(
+        suite=args.suite,
+        audit=compact_audit.summary,
+        options=assembly.options,
+    )
     print("SMOKE PASS public Host conversation memory scenario smoke")
     if args.keep_workspace:
         print("SMOKE WORKSPACE_KEPT true")
@@ -1817,9 +2108,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     return 0
 
 
-def _prepare_runtime_assembly(
-    args: SmokeArgs, *, env: Mapping[str, str]
-) -> RuntimeAssemblyResult:
+def _prepare_runtime_assembly(args: SmokeArgs, *, env: Mapping[str, str]) -> RuntimeAssemblyResult:
     """执行 Host 调用前的 runtime/config/tools/scene typed assembly。
 
     :param args: smoke 参数。
@@ -1845,9 +2134,7 @@ def _prepare_runtime_assembly(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={},
-            available_tools=SceneToolCatalog.from_tool_bundle(
-                discovered_tools.tool_bundle
-            ),
+            available_tools=SceneToolCatalog.from_tool_bundle(discovered_tools.tool_bundle),
         )
     )
     assembly = compose_open_host_options(
@@ -1943,9 +2230,7 @@ def _discover_builtin_smoke_tools() -> ToolsDiscoveryResult:
             ToolsDiscoveryProviderBinding(
                 spec=ToolsDiscoveryProviderSpec(
                     spec_id=_PROVIDER_SPEC_ID,
-                    location=PythonImportPathProvider(
-                        import_path=_PROVIDER_IMPORT_DISPLAY_PATH
-                    ),
+                    location=PythonImportPathProvider(import_path=_PROVIDER_IMPORT_DISPLAY_PATH),
                 ),
                 provider=discover_smoke_tools,
             ),
@@ -2041,7 +2326,7 @@ def _runtime_round_specs(
     :param args: smoke 参数。
     :param options: 本次 Host opener options。
     :returns: 需要执行的场景轮次规格。
-    :raises RuntimeError: pressure auto 需要 context budget policy 但缺失时抛出。
+    :raises RuntimeError: compact pressure 需要 context budget policy 但缺失时抛出。
     """
 
     user_pressure_text = _runtime_user_pressure_text(args.pressure_mode, options)
@@ -2061,7 +2346,7 @@ def _runtime_user_pressure_text(
     :param pressure_mode: 压力注入模式。
     :param options: 本次 Host opener options。
     :returns: 用户 prompt 中使用的压力文本。
-    :raises RuntimeError: auto 模式需要 context budget policy 但缺失时抛出。
+    :raises RuntimeError: auto pressure 需要 context budget policy 但缺失时抛出。
     """
 
     if pressure_mode is PressureMode.OFF:
@@ -2078,11 +2363,7 @@ def _ensure_request(args: SmokeArgs, smoke_run_id: str) -> EnsureSessionRequest:
     :raises ValueError: 字段非法时由底层抛出。
     """
 
-    slot_key = (
-        _DEFAULT_SLOT_KEY_PREFIX
-        if args.reuse_session
-        else f"{_DEFAULT_SLOT_KEY_PREFIX}-{smoke_run_id}"
-    )
+    slot_key = _DEFAULT_SLOT_KEY_PREFIX if args.reuse_session else f"{_DEFAULT_SLOT_KEY_PREFIX}-{smoke_run_id}"
     return EnsureSessionRequest(
         scope="workspace",
         slot_key=slot_key,
@@ -2102,9 +2383,7 @@ def _host_context(request_id: str) -> HostCallContext:
         actor=_DEFAULT_USER_ID,
         source=_SOURCE_NAME,
         request_id=request_id,
-        authorization_claims=(
-            AuthorizationClaim(name="role", value="manual-smoke"),
-        ),
+        authorization_claims=(AuthorizationClaim(name="role", value="manual-smoke"),),
         operation_context=OperationContext(
             operation_name=_OPERATION_NAME,
             operation_kind=_OPERATION_KIND,
@@ -2164,12 +2443,15 @@ async def _run_round(
             )
         )
         raise RuntimeError(
-            f"round {spec.label} terminal kind is {event.kind.value}; "
-            f"run_id={accepted.accepted_run_id}"
+            f"round {spec.label} terminal kind is {event.kind.value}; " f"run_id={accepted.accepted_run_id}"
         )
     if event.final_answer is None or event.final_answer.content.strip() == "":
         raise RuntimeError(f"round {spec.label} returned empty final answer")
-    return RoundResult(label=spec.label, run_id=accepted.accepted_run_id, event=event)
+    return RoundResult(
+        label=spec.label,
+        run_id=accepted.accepted_run_id,
+        event=event,
+    )
 
 
 async def _terminal_failure_summary(
@@ -2192,15 +2474,9 @@ async def _terminal_failure_summary(
     snapshot = await host.get_run(run_id)
     terminal_summary = snapshot.terminal_result_summary
     summary_ref = terminal_summary.summary_ref if terminal_summary is not None else None
-    summary_digest = (
-        terminal_summary.summary_digest if terminal_summary is not None else None
-    )
+    summary_digest = terminal_summary.summary_digest if terminal_summary is not None else None
     message = _safe_summary_text(event.error_message)
-    terminal_status = (
-        event.terminal_status.value
-        if event.terminal_status is not None
-        else "unknown"
-    )
+    terminal_status = event.terminal_status.value if event.terminal_status is not None else "unknown"
     return (
         f"label={label} run_id={run_id} kind={event.kind.value} "
         f"terminal_status={terminal_status} "
@@ -2230,9 +2506,7 @@ def _safe_summary_text(text: str | None) -> str:
     return text[:max_length] + "..."
 
 
-async def _next_terminal_for_run(
-    iterator: AsyncIterator[HostEvent], run_id: str
-) -> HostEvent:
+async def _next_terminal_for_run(iterator: AsyncIterator[HostEvent], run_id: str) -> HostEvent:
     """读取指定 Run 的 terminal HostEvent。
 
     :param iterator: HostEvent iterator。
@@ -2255,21 +2529,28 @@ def _assert_round_result(
     result: RoundResult,
     smoke_tool: MockFinanceMemoryTool,
     spec: RoundSpec,
+    *,
+    before_tools: ToolCallSnapshot,
+    debug_smoke_output: bool,
 ) -> None:
     """按 RoundSpec 执行本轮硬断言与软观察。
 
     :param result: 单轮运行摘要。
     :param smoke_tool: tracked session 的 mock tool 实例。
     :param spec: 本轮场景规格。
+    :param before_tools: 本轮运行前的工具调用计数快照。
+    :param debug_smoke_output: 是否打印本轮工具调用 delta 诊断。
     :returns: ``None``。
-    :raises RuntimeError: 工具调用次数不符合预期时抛出。
+    :raises RuntimeError: 工具禁用轮次出现工具调用，或工具启用轮次未命中
+        目标 fact key 时抛出。
     :raises AssertionError: 回答硬断言失败时抛出。
     """
 
-    _assert_tool_call_count(
-        smoke_tool,
-        expected=spec.expected_tool_calls_after_round,
-        label=spec.label,
+    _assert_tool_usage(
+        spec,
+        smoke_tool=smoke_tool,
+        before=before_tools,
+        debug_smoke_output=debug_smoke_output,
     )
     content = _final_answer_content(result)
     assert_answer_contains(
@@ -2285,28 +2566,201 @@ def _assert_round_result(
     )
     if missing_soft:
         print(
-            f"{_STDOUT_PREFIX_SOFT_OBSERVE} label={spec.label} "
-            f"status=soft-missing markers={','.join(missing_soft)}"
+            f"{_STDOUT_PREFIX_SOFT_OBSERVE} label={spec.label} " f"status=soft-missing markers={','.join(missing_soft)}"
         )
 
 
-def _assert_tool_call_count(
-    smoke_tool: MockFinanceMemoryTool, *, expected: int, label: str
+def _assert_tool_usage(
+    spec: RoundSpec,
+    *,
+    smoke_tool: MockFinanceMemoryTool,
+    before: ToolCallSnapshot,
+    debug_smoke_output: bool,
 ) -> None:
-    """断言 tracked session 内工具调用次数。
+    """断言本轮工具使用符合 conversation memory smoke 语义。
 
-    :param smoke_tool: effective ToolBundle 中恢复出的 mock 工具实例。
-    :param expected: 期望调用次数。
-    :param label: 当前轮次标签。
+    工具禁用轮次的硬契约是没有新增工具调用；工具启用轮次的硬契约是
+    至少命中目标 fact key 一次。额外工具调用属于模型行为诊断，不作为
+    conversation memory 失败条件。
+
+    :param spec: 本轮场景规格。
+    :param smoke_tool: tracked session 的 mock 工具实例。
+    :param before: 本轮运行前的工具调用快照。
+    :param debug_smoke_output: 是否打印本轮 delta 诊断。
     :returns: ``None``。
-    :raises RuntimeError: 工具调用次数不符合预期时抛出。
+    :raises RuntimeError: 工具禁用轮次出现调用，或工具启用轮次未命中目标
+        fact key 时抛出。
     """
 
-    if smoke_tool.call_count != expected:
-        raise RuntimeError(
-            f"{label} tool call count expected {expected}, "
-            f"got {smoke_tool.call_count}"
+    after = smoke_tool.snapshot()
+    observations = smoke_tool.observations_since(before)
+    total_delta = after.total_count - before.total_count
+    expected_key = spec.expected_tool_fact_key
+    key_delta = (
+        _tool_call_count(after.calls_by_key, expected_key) - _tool_call_count(before.calls_by_key, expected_key)
+        if expected_key is not None
+        else 0
+    )
+    if debug_smoke_output:
+        print_tool_delta(
+            label=spec.label,
+            spec=spec,
+            total_delta=total_delta,
+            key_delta=key_delta,
         )
+
+    if not spec.tool_names:
+        if total_delta != 0:
+            raise RuntimeError(
+                f"{spec.label} no-tool round produced {total_delta} tool calls: "
+                f"{_format_tool_observations(observations)}"
+            )
+        return
+    if expected_key is None:
+        return
+    if key_delta < 1:
+        raise RuntimeError(
+            f"{spec.label} expected tool fact {expected_key}, got delta "
+            f"{key_delta}; calls={_format_tool_observations(observations)}"
+        )
+    extra_observations = tuple(observation for observation in observations if observation.fact_key != expected_key)
+    if debug_smoke_output and extra_observations:
+        print_tool_extra(label=spec.label, observations=extra_observations)
+
+
+def _tool_call_count(calls_by_key: Mapping[str, int], key: str | None) -> int:
+    """读取 fact key 对应的工具调用计数。
+
+    :param calls_by_key: fact key 到调用次数的映射。
+    :param key: 需要读取的 fact key；为 ``None`` 时返回 0。
+    :returns: 对应调用次数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if key is None:
+        return 0
+    return calls_by_key.get(key, 0)
+
+
+def _tool_call_observation(
+    *,
+    sequence: int,
+    call: ToolCallRequest,
+    fact_key: str,
+    known: bool,
+) -> ToolCallObservation:
+    """从工具调用请求构造 smoke 诊断记录。
+
+    :param sequence: tracked session 内递增调用序号。
+    :param call: 工具调用请求。
+    :param fact_key: 命中的 fact key；未知时为 ``_UNKNOWN_FACT_KEY``。
+    :param known: 是否命中已知 mock fact。
+    :returns: 单次工具调用诊断。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ToolCallObservation(
+        sequence=sequence,
+        tool_call_id=call.tool_call_id,
+        known=known,
+        fact_key=fact_key,
+        company=_argument_str(call.arguments, _FIELD_COMPANY),
+        ticker=_argument_str(call.arguments, _FIELD_TICKER),
+        period=_argument_str(call.arguments, _FIELD_PERIOD),
+        topic=_argument_str(call.arguments, _FIELD_TOPIC),
+        metric=_argument_str(call.arguments, _FIELD_METRIC),
+        include_pressure=_argument_bool(
+            call.arguments,
+            _FIELD_INCLUDE_PRESSURE,
+            default=False,
+        ),
+    )
+
+
+def print_tool_delta(
+    *,
+    label: str,
+    spec: RoundSpec,
+    total_delta: int,
+    key_delta: int,
+) -> None:
+    """打印本轮工具调用 delta 诊断。
+
+    :param label: 当前轮次标签。
+    :param spec: 当前轮次规格。
+    :param total_delta: 本轮新增工具调用次数。
+    :param key_delta: 目标 fact key 本轮新增命中次数。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    tools = "<none>" if not spec.tool_names else ",".join(sorted(spec.tool_names))
+    expected_key = spec.expected_tool_fact_key or "<none>"
+    print(
+        f"{_STDOUT_PREFIX_TOOL_DELTA} label={label} tools={tools} "
+        f"expected_fact_key={expected_key} total_delta={total_delta} "
+        f"expected_key_delta={key_delta}"
+    )
+
+
+def print_tool_call_observation(observation: ToolCallObservation) -> None:
+    """打印单次 mock 工具调用诊断。
+
+    :param observation: 工具调用诊断。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    print(f"{_STDOUT_PREFIX_TOOL_CALL} {_format_tool_observation(observation)}")
+
+
+def print_tool_extra(*, label: str, observations: tuple[ToolCallObservation, ...]) -> None:
+    """打印工具启用轮次中的非目标工具调用诊断。
+
+    :param label: 当前轮次标签。
+    :param observations: 非目标 fact key 调用诊断。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    print(
+        f"{_STDOUT_PREFIX_TOOL_EXTRA} label={label} count={len(observations)} "
+        f"calls={_format_tool_observations(observations)}"
+    )
+
+
+def _format_tool_observations(
+    observations: tuple[ToolCallObservation, ...],
+) -> str:
+    """格式化多条工具调用诊断。
+
+    :param observations: 工具调用诊断序列。
+    :returns: 单行诊断字符串。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not observations:
+        return "<none>"
+    return " | ".join(_format_tool_observation(item) for item in observations)
+
+
+def _format_tool_observation(observation: ToolCallObservation) -> str:
+    """格式化单条工具调用诊断。
+
+    :param observation: 工具调用诊断。
+    :returns: 单行诊断字符串。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    include_pressure = "true" if observation.include_pressure else "false"
+    known = "true" if observation.known else "false"
+    return (
+        f"seq={observation.sequence} tool_call_id={observation.tool_call_id} "
+        f"known={known} fact_key={observation.fact_key} "
+        f"company={observation.company} ticker={observation.ticker} "
+        f"period={observation.period} topic={observation.topic} "
+        f"metric={observation.metric} include_pressure={include_pressure}"
+    )
 
 
 def _final_answer_content(result: RoundResult) -> str:
@@ -2359,9 +2813,7 @@ def _compact_pressure_padding(options: OpenHostOptions) -> str:
         soft_threshold_tokens + _COMPACT_PRESSURE_TARGET_EXTRA_TOKENS,
         hard_threshold_tokens - _COMPACT_PRESSURE_HARD_MARGIN_TOKENS,
     )
-    pressure_reserve_tokens = _compact_pressure_reserve_tokens(
-        context_window_size=policy.context_window_size
-    )
+    pressure_reserve_tokens = _compact_pressure_reserve_tokens(context_window_size=policy.context_window_size)
     tool_pressure_tokens = _tool_pressure_estimated_tokens()
     prompt_tokens = max(
         _COMPACT_PRESSURE_MIN_PROMPT_TOKENS,
@@ -2416,9 +2868,7 @@ def _estimate_chars_as_tokens(char_count: int) -> int:
     :raises Exception: 不主动抛出异常。
     """
 
-    return (
-        char_count + DEFAULT_ESTIMATOR_CHARS_PER_TOKEN - 1
-    ) // DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
+    return (char_count + DEFAULT_ESTIMATOR_CHARS_PER_TOKEN - 1) // DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
 
 
 def _repeat_to_chars(*, token: str, target_chars: int) -> str:
@@ -2482,10 +2932,7 @@ def _print_assembly_diagnostics(
         f"source={diagnostics.runner_option_hint_source}"
     )
     print(f"SMOKE ASSEMBLY compactor_model_id={diagnostics.compactor_model_id}")
-    print(
-        "SMOKE ASSEMBLY compactor_runner_option_hint_id="
-        f"{diagnostics.compactor_runner_option_hint_id}"
-    )
+    print("SMOKE ASSEMBLY compactor_runner_option_hint_id=" f"{diagnostics.compactor_runner_option_hint_id}")
     print(f"SMOKE ASSEMBLY lane_name={diagnostics.lane_name}")
     if diagnostics.tool_provider_reports:
         for report in diagnostics.tool_provider_reports:
@@ -2499,10 +2946,7 @@ def _print_assembly_diagnostics(
         f"tool_truncation:{diagnostics.tool_truncation_policy}"
     )
     print_duplicate_governance_diagnostics(options)
-    print(
-        "SMOKE ASSEMBLY agent_policy_sources="
-        f"{','.join(diagnostics.agent_policy_sources)}"
-    )
+    print("SMOKE ASSEMBLY agent_policy_sources=" f"{','.join(diagnostics.agent_policy_sources)}")
     print(
         "SMOKE ASSEMBLY provider_extension_status="
         f"ordinary:{diagnostics.ordinary_provider_extension_status},"
@@ -2539,9 +2983,7 @@ def _print_compact_pressure_plan(
     )
     prompt_chars = len(_compact_pressure_padding(options))
     estimated_prompt_tokens = _estimate_chars_as_tokens(prompt_chars)
-    estimated_total_pressure_tokens = (
-        estimated_prompt_tokens + _tool_pressure_estimated_tokens()
-    )
+    estimated_total_pressure_tokens = estimated_prompt_tokens + _tool_pressure_estimated_tokens()
     print(
         "SMOKE COMPACT_PRESSURE "
         f"context_window_tokens={policy.context_window_size} "
@@ -2564,11 +3006,7 @@ def _print_round(result: RoundResult) -> None:
 
     content = _final_answer_content(result)
     preview = content[:_FINAL_PREVIEW_CHARS]
-    terminal = (
-        result.event.terminal_status.value
-        if result.event.terminal_status is not None
-        else "none"
-    )
+    terminal = result.event.terminal_status.value if result.event.terminal_status is not None else "none"
     print(
         f"{_STDOUT_PREFIX_ROUND_DONE} "
         f"label={result.label} run_id={result.run_id} "
@@ -2597,6 +3035,316 @@ def _print_session_observation(snapshot: SessionSnapshot, *, label: str) -> None
     )
 
 
+def _print_compact_audit_summary(summary: CompactAuditSummary) -> None:
+    """打印 compact EventLog audit 摘要。
+
+    :param summary: 本次 session 的 compact EventLog 摘要。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    print(
+        f"{_STDOUT_PREFIX_COMPACT_AUDIT} "
+        f"requested_proactive={summary.requested_proactive} "
+        f"requested_reactive={summary.requested_reactive} "
+        f"compacted_proactive={summary.compacted_proactive} "
+        f"compacted_reactive={summary.compacted_reactive} "
+        f"failed_proactive={summary.failed_proactive} "
+        f"failed_reactive={summary.failed_reactive} "
+        f"rejected_proactive={summary.rejected_proactive} "
+        f"rejected_reactive={summary.rejected_reactive}"
+    )
+
+
+def _assert_compact_acceptance(
+    *,
+    suite: SuiteMode,
+    audit: CompactAuditSummary,
+    options: OpenHostOptions,
+) -> None:
+    """按 suite 断言 compact 验收信号。
+
+    ``memory-core`` 不要求 compact；``memory-compact`` 必须看到 proactive
+    compact request 与 accepted compact，且任何 compact failed 都是硬失败。
+
+    :param suite: 本次 smoke suite。
+    :param audit: 本次 session 的 compact EventLog 摘要。
+    :param options: 本次 Host opener options，用于检查 compact artifact 文件数。
+    :returns: ``None``。
+    :raises RuntimeError: compact suite 未观察到 accepted compact 或观察到
+        failed compact 时抛出。
+    """
+
+    if suite is not SuiteMode.MEMORY_COMPACT:
+        return
+    artifact_count = len(_compact_artifact_files(options))
+    failed_total = audit.failed_proactive + audit.failed_reactive
+    if audit.requested_proactive < 1:
+        raise RuntimeError("memory-compact did not observe proactive CONTEXT_COMPACTION_REQUESTED")
+    if audit.compacted_proactive < 1:
+        raise RuntimeError("memory-compact did not observe proactive CONTEXT_COMPACTED")
+    if failed_total > 0:
+        raise RuntimeError("memory-compact observed CONTEXT_COMPACTION_FAILED")
+    if artifact_count < 1:
+        raise RuntimeError("memory-compact did not observe compact artifact files")
+    print(
+        f"{_STDOUT_PREFIX_COMPACT_ACCEPTANCE} status=pass "
+        f"requested_proactive={audit.requested_proactive} "
+        f"compacted_proactive={audit.compacted_proactive} "
+        f"failed_total={failed_total} "
+        f"artifact_files={artifact_count}"
+    )
+
+
+def _compact_audit_summary(options: OpenHostOptions, *, session_id: str) -> CompactAuditSummary:
+    """读取本次 session 的 compact EventLog 摘要。
+
+    :param options: 本次 Host opener options。
+    :param session_id: 本次 smoke session id。
+    :returns: compact event 计数摘要。
+    :raises Exception: durable store 打开、EventLog 读取或 payload 解析失败时向上抛出。
+    """
+
+    durable_options = _durable_options_from_open_host_options(options)
+    rows: tuple[EventLogRow, ...] = ()
+    with open_host_durable_store(durable_options) as store:
+        rows = store.transaction_runner.run_read(
+            lambda transaction: _read_compact_event_rows(
+                transaction,
+                event_log_store=EventLogStore(),
+                session_id=session_id,
+            )
+        )
+    return _compact_audit_summary_from_rows(rows)
+
+
+def _durable_options_from_open_host_options(options: OpenHostOptions) -> HostDurableStoreOptions:
+    """从 Host opener options 构造 durable store options。
+
+    :param options: 本次 Host opener options。
+    :returns: durable store 打开选项。
+    :raises Exception: 字段非法时由 durable options 校验抛出。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=options.db_path,
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=options.artifact_root,
+            payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
+            create_artifact_root=options.create_parent_dirs,
+        ),
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+            write_busy_retry_count=options.sqlite_write_busy_retry_count,
+            write_retry_initial_delay_seconds=options.sqlite_write_retry_initial_delay_seconds,
+            write_retry_backoff_multiplier=options.sqlite_write_retry_backoff_multiplier,
+            write_retry_max_delay_seconds=options.sqlite_write_retry_max_delay_seconds,
+        ),
+    )
+
+
+def _read_compact_event_rows(
+    transaction: HostTransaction,
+    *,
+    event_log_store: EventLogStore,
+    session_id: str,
+) -> tuple[EventLogRow, ...]:
+    """读取指定 session 的 compact canonical EventLog rows。
+
+    :param transaction: Host durable read transaction。
+    :param event_log_store: EventLog typed store。
+    :param session_id: 目标 session id。
+    :returns: compact EventLog rows，按 event_sequence 升序排列。
+    :raises Exception: EventLog 读取失败时向上抛出。
+    """
+
+    event_filter = EventLogReadFilter(
+        class_filters=(
+            EventLogReadClassFilter(
+                event_class=EventClass.CANONICAL_FACT,
+                event_types=_COMPACT_EVENT_TYPES,
+            ),
+        )
+    )
+    cursor = 0
+    rows: list[EventLogRow] = []
+    while True:
+        page = event_log_store.read_events_after_matching(
+            transaction,
+            cursor,
+            event_filter=event_filter,
+            limit=_COMPACT_EVENT_AUDIT_PAGE_SIZE,
+            session_id=session_id,
+        )
+        rows.extend(page.rows)
+        if page.covered_event_sequence == cursor:
+            return tuple(rows)
+        cursor = page.covered_event_sequence
+
+
+def _compact_audit_summary_from_rows(rows: tuple[EventLogRow, ...]) -> CompactAuditSummary:
+    """从 compact EventLog rows 计算摘要。
+
+    :param rows: compact EventLog rows。
+    :returns: compact event 计数摘要。
+    :raises Exception: payload JSON 非 object 时向上抛出。
+    """
+
+    request_trigger_sources = _compact_request_trigger_sources(rows)
+    return CompactAuditSummary(
+        requested_proactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTION_REQUESTED,
+            trigger_source=_COMPACT_TRIGGER_PROACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+        requested_reactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTION_REQUESTED,
+            trigger_source=_COMPACT_TRIGGER_REACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+        compacted_proactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTED,
+            trigger_source=_COMPACT_TRIGGER_PROACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+        compacted_reactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTED,
+            trigger_source=_COMPACT_TRIGGER_REACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+        failed_proactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTION_FAILED,
+            trigger_source=_COMPACT_TRIGGER_PROACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+        failed_reactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTION_FAILED,
+            trigger_source=_COMPACT_TRIGGER_REACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+        rejected_proactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            trigger_source=_COMPACT_TRIGGER_PROACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+        rejected_reactive=_compact_row_count(
+            rows,
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            trigger_source=_COMPACT_TRIGGER_REACTIVE,
+            request_trigger_sources=request_trigger_sources,
+        ),
+    )
+
+
+def _compact_request_trigger_sources(rows: tuple[EventLogRow, ...]) -> Mapping[str, str]:
+    """返回 compact request event id 到 trigger source 的映射。
+
+    :param rows: compact EventLog rows。
+    :returns: request event id 到 trigger source 的映射。
+    :raises Exception: payload JSON 非 object 时向上抛出。
+    """
+
+    trigger_sources: dict[str, str] = {}
+    for row in rows:
+        if row.event_type != CONTEXT_COMPACTION_REQUESTED:
+            continue
+        trigger_source = _compact_row_trigger_source(row)
+        if trigger_source is not None:
+            trigger_sources[row.event_id] = trigger_source
+    return trigger_sources
+
+
+def _compact_row_count(
+    rows: tuple[EventLogRow, ...],
+    *,
+    event_type: str,
+    trigger_source: str,
+    request_trigger_sources: Mapping[str, str],
+) -> int:
+    """统计指定 event type 与 trigger source 的 compact row 数。
+
+    :param rows: compact EventLog rows。
+    :param event_type: 目标 EventLog event type。
+    :param trigger_source: 目标 trigger source。
+    :param request_trigger_sources: request event id 到 trigger source 的映射。
+    :returns: 命中 row 数。
+    :raises Exception: payload JSON 非 object 时向上抛出。
+    """
+
+    return sum(
+        1
+        for row in rows
+        if row.event_type == event_type
+        and _compact_row_effective_trigger_source(row, request_trigger_sources) == trigger_source
+    )
+
+
+def _compact_row_effective_trigger_source(
+    row: EventLogRow,
+    request_trigger_sources: Mapping[str, str],
+) -> str | None:
+    """读取 compact row 的有效 trigger source。
+
+    accepted / rejected / failed payload 可能不直接携带 ``trigger_source``，
+    而是通过 ``operation_id`` 回指 request event id。
+
+    :param row: compact EventLog row。
+    :param request_trigger_sources: request event id 到 trigger source 的映射。
+    :returns: trigger source；缺失或无法归因时返回 ``None``。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    trigger_source = _compact_row_trigger_source(row)
+    if trigger_source is not None:
+        return trigger_source
+    request_event_id = _compact_row_operation_id(row)
+    if request_event_id is None:
+        return None
+    return request_trigger_sources.get(request_event_id)
+
+
+def _compact_row_trigger_source(row: EventLogRow) -> str | None:
+    """读取 compact EventLog row 的 trigger source。
+
+    :param row: compact EventLog row。
+    :returns: trigger source；缺失或非字符串时返回 ``None``。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    payload_json = cast(JsonValue, json.loads(row.payload_json))
+    if not isinstance(payload_json, Mapping):
+        raise ValueError(f"compact event payload must be object: event_id={row.event_id}")
+    trigger_source = payload_json.get("trigger_source")
+    if isinstance(trigger_source, str):
+        return trigger_source
+    return None
+
+
+def _compact_row_operation_id(row: EventLogRow) -> str | None:
+    """读取 compact EventLog row 的 operation id。
+
+    :param row: compact EventLog row。
+    :returns: operation id；缺失或非字符串时返回 ``None``。
+    :raises ValueError: payload JSON 不是 object 时抛出。
+    """
+
+    payload_json = cast(JsonValue, json.loads(row.payload_json))
+    if not isinstance(payload_json, Mapping):
+        raise ValueError(f"compact event payload must be object: event_id={row.event_id}")
+    operation_id = payload_json.get("operation_id")
+    if isinstance(operation_id, str):
+        return operation_id
+    return None
+
+
 def _print_compact_summary(options: OpenHostOptions) -> None:
     """打印 compact 观测摘要，不读取 artifact 内容。
 
@@ -2605,24 +3353,43 @@ def _print_compact_summary(options: OpenHostOptions) -> None:
     :raises Exception: 不主动抛出异常。
     """
 
-    compact_root = (
-        options.compactor_runner_baseline.compact_artifact_root
-        if options.compactor_runner_baseline is not None
-        else None
-    )
+    compact_root = _compact_artifact_root(options)
     if compact_root is None:
         print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT} <none>")
         print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT} 0")
         return
-    artifacts = (
-        tuple(path for path in compact_root.rglob("*") if path.is_file())
-        if compact_root.exists()
-        else ()
-    )
+    artifacts = _compact_artifact_files(options)
     print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT} {compact_root}")
     print(f"{_STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT} {len(artifacts)}")
     for path in artifacts[:_COMPACT_ARTIFACT_PRINT_LIMIT]:
         print(f"SMOKE COMPACT_ARTIFACT {path}")
+
+
+def _compact_artifact_root(options: OpenHostOptions) -> pathlib.Path | None:
+    """读取 compact artifact root 配置。
+
+    :param options: 本次 Host opener options。
+    :returns: compact artifact root；未配置时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if options.compactor_runner_baseline is None:
+        return None
+    return options.compactor_runner_baseline.compact_artifact_root
+
+
+def _compact_artifact_files(options: OpenHostOptions) -> tuple[pathlib.Path, ...]:
+    """列出 compact artifact 文件，不读取文件内容。
+
+    :param options: 本次 Host opener options。
+    :returns: compact artifact 文件路径元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    compact_root = _compact_artifact_root(options)
+    if compact_root is None or not compact_root.exists():
+        return ()
+    return tuple(path for path in compact_root.rglob("*") if path.is_file())
 
 
 def _format_provider_report(

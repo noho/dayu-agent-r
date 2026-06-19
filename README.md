@@ -1033,21 +1033,21 @@ python utils/smoke_host_public_conversation_memory.py --log-level VERBOSE
 
 ### 5.3 Host public 财报对话记忆场景 smoke
 
-`utils/smoke_host_public_conversation_memory_scenarios.py` 用于人工验证同一个 Host public session 中，多组 mock 财报事实在干扰、上下文压力和长轮次下的 public answer continuity。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace；显式传 `--workspace-root` 时才复用指定 workspace。脚本默认运行 `--suite core`；`--suite long` 需要显式指定，用于长轮次稳定性观察；`--suite all` 会同时运行 core 与 long 场景。
+`utils/smoke_host_public_conversation_memory_scenarios.py` 用于人工验证同一个 Host public session 中，多组 mock 财报事实在干扰、上下文压力和长轮次下的 public answer continuity。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace；显式传 `--workspace-root` 时才复用指定 workspace。脚本默认运行 `--suite memory-core --pressure-mode off`，表示公开多轮记忆基础 smoke，不要求 compact；`--suite memory-compact --pressure-mode auto` 会运行 core 与 long 场景，并额外验收 proactive compact 是否出现 accepted EventLog 摘要。
 
 ```bash
 source .venv/bin/activate
-python utils/smoke_host_public_conversation_memory_scenarios.py --suite core --log-level VERBOSE
+python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-core --log-level VERBOSE
 ```
 
-长轮次 smoke 需要显式开启：
+compact 专项 smoke 需要显式开启：
 
 ```bash
 source .venv/bin/activate
-python utils/smoke_host_public_conversation_memory_scenarios.py --suite long --long-rounds 25 --log-level VERBOSE
+python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-compact --pressure-mode auto --long-rounds 25 --log-level DEBUG
 ```
 
-该脚本只通过 public Host handle 观察行为，不读取 durable DB、EventLog、memory 表或 compact payload 内容。脚本只注入 `manual-smoke` mock finance tool，不调用真实 Fins 工具；stdout 输出每个 scenario 的 terminal 摘要、final answer 预览、工具调用次数、pressure 计划和 compact artifact 路径。通过时输出 `SMOKE PASS public Host conversation memory scenario smoke`。
+`memory-core` 只通过 public Host handle 观察行为，不读取 durable DB、EventLog、memory 表或 compact payload 内容。`memory-compact` 会额外读取本次 session 的 compact EventLog 摘要，只审计 event type、trigger source 和计数，不读取 memory / compact material 正文。脚本只注入 `manual-smoke` mock finance tool，不调用真实 Fins 工具；stdout 输出每个 scenario 的 terminal 摘要、final answer 预览、工具调用次数、pressure 计划、compact audit 摘要和 compact artifact 路径。compact suite 通过时会先输出 `SMOKE COMPACT_ACCEPTANCE status=pass ...`，再输出 `SMOKE PASS public Host conversation memory scenario smoke`。
 
 ### 5.4 Engine provider smoke
 

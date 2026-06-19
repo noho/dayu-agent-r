@@ -6,7 +6,6 @@ import json
 import pathlib
 from collections.abc import Mapping
 from datetime import datetime
-from typing import cast
 
 import pytest
 
@@ -20,23 +19,37 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    CONTEXT_COMPACTION_REQUESTED,
+)
+from dayu.host.durable.event_log import EventClass, EventLogRow
 from dayu.runtime.log import LogLevel
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscoveryProviderSpec,
 )
 from utils.smoke_host_public_conversation_memory_scenarios import (
+    CompactAuditSummary,
     MockFinanceMemoryTool,
     PressureMode,
     SmokeArgs,
     SuiteMode,
     _ASSERT_B_CFO,
+    _assert_compact_acceptance,
+    _FACT_KEY_CATL_CASHFLOW,
+    _FACT_KEY_CMB_NIM,
+    _FACT_KEY_MAOTAI_REVENUE,
+    _FACT_KEY_MIDEA_LONG_SESSION,
+    _FACT_KEY_WULIANGYE_REVENUE,
     _LABEL_CORE_B1,
     _MARKER_CATL_CASHFLOW,
     _VALUE_CATL_LARGEST_GAP,
     _VALUE_CATL_NET_PROFIT,
     _VALUE_CATL_OPERATING_CF,
     _build_byd_long_input,
+    _compact_audit_summary_from_rows,
     _compact_pressure_padding,
     _compact_pressure_reserve_tokens,
     _estimate_chars_as_tokens,
@@ -108,9 +121,7 @@ class _NonSmokeTool:
         """
 
         del call, context
-        return ToolCompletedOutcome(
-            result=ToolResultSuccess(ok=True, value={"known": False}, meta=None)
-        )
+        return ToolCompletedOutcome(result=ToolResultSuccess(ok=True, value={"known": False}, meta=None))
 
 
 def test_runtime_assembly_adds_builtin_mock_tool_and_selects_manual_smoke(
@@ -159,13 +170,17 @@ def test_runtime_assembly_fails_closed_on_non_smoke_same_name_tool(
 
 
 def test_cli_bounds_for_suite_and_long_rounds(tmp_path: pathlib.Path) -> None:
-    """CLI suite 与 long-rounds 边界按 20..25 fail closed。
+    """CLI suite、pressure 与 long-rounds 边界按新语义 fail closed。
 
     :param tmp_path: pytest 临时 workspace root。
     :returns: ``None``。
     """
 
-    for suite in ("core", "long", "all"):
+    default_args = parse_args(("--workspace-root", str(tmp_path)))
+    assert default_args.suite is SuiteMode.MEMORY_CORE
+    assert default_args.pressure_mode is PressureMode.OFF
+
+    for suite in ("memory-core",):
         args = parse_args(
             (
                 "--workspace-root",
@@ -179,6 +194,22 @@ def test_cli_bounds_for_suite_and_long_rounds(tmp_path: pathlib.Path) -> None:
         assert args.suite is SuiteMode(suite)
         assert args.long_rounds == 20
 
+    compact_args = parse_args(
+        (
+            "--workspace-root",
+            str(tmp_path),
+            "--suite",
+            "memory-compact",
+            "--pressure-mode",
+            "auto",
+        )
+    )
+    assert compact_args.suite is SuiteMode.MEMORY_COMPACT
+    assert compact_args.pressure_mode is PressureMode.AUTO
+
+    with pytest.raises(SystemExit):
+        parse_args(("--workspace-root", str(tmp_path), "--suite", "memory-compact"))
+
     for value in ("20", "25"):
         assert parse_args(("--workspace-root", str(tmp_path), "--long-rounds", value)).long_rounds == int(value)
 
@@ -187,26 +218,38 @@ def test_cli_bounds_for_suite_and_long_rounds(tmp_path: pathlib.Path) -> None:
             parse_args(("--workspace-root", str(tmp_path), "--long-rounds", value))
 
 
-def test_pure_spec_selection_counts_and_long20_final_label(
+def test_pure_spec_selection_tool_fact_requirements_and_long20_final_label(
     tmp_path: pathlib.Path,
 ) -> None:
-    """纯规格选择保持 core/long/all 工具调用累计与 long20 最终 recap 轮。
+    """纯规格选择保持工具事实要求与 long20 最终 recap 轮。
 
     :param tmp_path: pytest 临时 workspace root。
     :returns: ``None``。
     """
 
-    core_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.CORE))
-    long_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.LONG))
-    all_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.ALL))
-    long20_specs = select_round_specs(
-        _args(tmp_path, suite=SuiteMode.LONG, long_rounds=20)
+    core_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.MEMORY_CORE))
+    compact_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.MEMORY_COMPACT, pressure_mode=PressureMode.AUTO))
+    compact20_specs = select_round_specs(
+        _args(
+            tmp_path,
+            suite=SuiteMode.MEMORY_COMPACT,
+            long_rounds=20,
+            pressure_mode=PressureMode.AUTO,
+        )
     )
 
-    assert core_specs[-1].expected_tool_calls_after_round == 4
-    assert long_specs[0].expected_tool_calls_after_round == 1
-    assert all_specs[len(core_specs)].expected_tool_calls_after_round == 5
-    assert long20_specs[-1].label == "long-l25-constraint-assert"
+    assert tuple(spec.expected_tool_fact_key for spec in core_specs if spec.tool_names) == (
+        _FACT_KEY_MAOTAI_REVENUE,
+        _FACT_KEY_WULIANGYE_REVENUE,
+        _FACT_KEY_CATL_CASHFLOW,
+        _FACT_KEY_CMB_NIM,
+    )
+    first_long_index = len(core_specs)
+    assert compact_specs[first_long_index].expected_tool_fact_key == _FACT_KEY_MIDEA_LONG_SESSION
+    assert compact_specs[first_long_index + 4].tool_names
+    assert compact_specs[first_long_index + 4].expected_tool_fact_key is None
+    assert tuple(spec.label for spec in compact_specs[:first_long_index]) == tuple(spec.label for spec in core_specs)
+    assert compact20_specs[-1].label == "long-l25-constraint-assert"
     assert _select_long_templates(20)[-1].label == "long-l25-constraint-assert"
 
 
@@ -219,7 +262,7 @@ def test_core_b1_tool_round_prompt_does_not_leak_cashflow_answer_values(
     :returns: ``None``。
     """
 
-    specs = select_round_specs(_args(tmp_path, suite=SuiteMode.CORE))
+    specs = select_round_specs(_args(tmp_path, suite=SuiteMode.MEMORY_CORE))
     core_b1 = next(spec for spec in specs if spec.label == _LABEL_CORE_B1)
 
     assert "get_mock_finance_memory_fact" in core_b1.prompt
@@ -275,9 +318,7 @@ async def test_mock_finance_memory_tool_tracks_session_and_calls_by_key() -> Non
     assert known_payload["pressure_blob"] != ""
     assert unknown_payload["known"] is False
     assert tool.call_count == 2
-    assert calls_by_key_summary(tool.calls_by_key) == (
-        "SMOKE TOOL_CALLS_BY_KEY _UNKNOWN_FACT_KEY=1 cmb_nim=1"
-    )
+    assert calls_by_key_summary(tool.calls_by_key) == ("SMOKE TOOL_CALLS_BY_KEY _UNKNOWN_FACT_KEY=1 cmb_nim=1")
 
 
 def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
@@ -303,15 +344,11 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     print("SMOKE PRESSURE disabled")
     assert "SMOKE PRESSURE disabled" in capsys.readouterr().out
 
-    prompt_tokens = _estimate_chars_as_tokens(
-        len(_compact_pressure_padding(assembly.options))
-    )
+    prompt_tokens = _estimate_chars_as_tokens(len(_compact_pressure_padding(assembly.options)))
     pressure_tokens = (
         prompt_tokens
         + _tool_pressure_estimated_tokens()
-        + _compact_pressure_reserve_tokens(
-            context_window_size=policy.context_window_size
-        )
+        + _compact_pressure_reserve_tokens(context_window_size=policy.context_window_size)
     )
     soft_threshold_tokens = _threshold_tokens(
         policy.context_window_size,
@@ -323,6 +360,122 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     )
     assert pressure_tokens >= soft_threshold_tokens
     assert pressure_tokens < hard_threshold_tokens
+
+
+def test_compact_acceptance_requires_event_log_audit_summary(tmp_path: pathlib.Path) -> None:
+    """compact suite 基于 EventLog audit 摘要验收，不把最终回答当 compact PASS。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    """
+
+    assembly = _prepare_runtime_assembly(
+        _args(tmp_path),
+        env={"DEEPSEEK_API_KEY": _API_KEY},
+    )
+    assert assembly.options.compactor_runner_baseline is not None
+    compact_root = assembly.options.compactor_runner_baseline.compact_artifact_root
+    compact_root.mkdir(parents=True, exist_ok=True)
+    (compact_root / "compact-smoke.json").write_text("{}", encoding="utf-8")
+
+    accepted = CompactAuditSummary(
+        requested_proactive=1,
+        requested_reactive=0,
+        compacted_proactive=1,
+        compacted_reactive=0,
+        failed_proactive=0,
+        failed_reactive=0,
+        rejected_proactive=0,
+        rejected_reactive=0,
+    )
+    _assert_compact_acceptance(
+        suite=SuiteMode.MEMORY_COMPACT,
+        audit=accepted,
+        options=assembly.options,
+    )
+    _assert_compact_acceptance(
+        suite=SuiteMode.MEMORY_CORE,
+        audit=CompactAuditSummary(
+            requested_proactive=0,
+            requested_reactive=0,
+            compacted_proactive=0,
+            compacted_reactive=0,
+            failed_proactive=0,
+            failed_reactive=0,
+            rejected_proactive=0,
+            rejected_reactive=0,
+        ),
+        options=assembly.options,
+    )
+
+    missing_accepted = CompactAuditSummary(
+        requested_proactive=1,
+        requested_reactive=0,
+        compacted_proactive=0,
+        compacted_reactive=0,
+        failed_proactive=0,
+        failed_reactive=0,
+        rejected_proactive=0,
+        rejected_reactive=0,
+    )
+    with pytest.raises(RuntimeError, match="did not observe proactive CONTEXT_COMPACTED"):
+        _assert_compact_acceptance(
+            suite=SuiteMode.MEMORY_COMPACT,
+            audit=missing_accepted,
+            options=assembly.options,
+        )
+
+    failed = CompactAuditSummary(
+        requested_proactive=1,
+        requested_reactive=0,
+        compacted_proactive=1,
+        compacted_reactive=0,
+        failed_proactive=1,
+        failed_reactive=0,
+        rejected_proactive=0,
+        rejected_reactive=0,
+    )
+    with pytest.raises(RuntimeError, match="CONTEXT_COMPACTION_FAILED"):
+        _assert_compact_acceptance(
+            suite=SuiteMode.MEMORY_COMPACT,
+            audit=failed,
+            options=assembly.options,
+        )
+
+
+def test_compact_audit_summary_maps_operation_id_to_request_trigger_source() -> None:
+    """compact accepted / rejected row 通过 operation_id 归属到 request trigger。
+
+    :returns: ``None``。
+    """
+
+    rows = (
+        _event_row(
+            sequence=1,
+            event_id="event-context-compact-requested-1",
+            event_type=CONTEXT_COMPACTION_REQUESTED,
+            payload={"trigger_source": "proactive"},
+        ),
+        _event_row(
+            sequence=2,
+            event_id="event-context-compacted-1",
+            event_type=CONTEXT_COMPACTED,
+            payload={"operation_id": "event-context-compact-requested-1"},
+        ),
+        _event_row(
+            sequence=3,
+            event_id="event-context-compaction-attempt-rejected-1",
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            payload={"operation_id": "event-context-compact-requested-1"},
+        ),
+    )
+
+    summary = _compact_audit_summary_from_rows(rows)
+
+    assert summary.requested_proactive == 1
+    assert summary.compacted_proactive == 1
+    assert summary.rejected_proactive == 1
+    assert summary.compacted_reactive == 0
 
 
 def test_answer_normalization_contains_and_forbidden_behavior() -> None:
@@ -356,10 +509,7 @@ def test_discover_smoke_tools_contract_exposes_single_manual_tool() -> None:
         ToolsDiscoveryProviderSpec(
             spec_id="financial-tools",
             location=PythonImportPathProvider(
-                import_path=(
-                    "utils.smoke_host_public_conversation_memory_scenarios:"
-                    "discover_smoke_tools"
-                )
+                import_path=("utils.smoke_host_public_conversation_memory_scenarios:" "discover_smoke_tools")
             ),
         )
     )
@@ -393,12 +543,53 @@ def discover_non_smoke_same_name_tools(
     )
 
 
+def _event_row(
+    *,
+    sequence: int,
+    event_id: str,
+    event_type: str,
+    payload: Mapping[str, JsonValue],
+) -> EventLogRow:
+    """构造 compact audit helper 测试用 EventLog row。
+
+    :param sequence: EventLog sequence。
+    :param event_id: EventLog id。
+    :param event_type: EventLog type。
+    :param payload: payload JSON object。
+    :returns: EventLogRow。
+    """
+
+    return EventLogRow(
+        event_sequence=sequence,
+        event_id=event_id,
+        event_body_digest=f"sha256:{'0' * 64}",
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-compact-test",
+        run_id="run-compact-test",
+        attempt_id=None,
+        execution_id=None,
+        event_type=event_type,
+        occurred_at="2026-06-19T00:00:00.000000Z",
+        actor=None,
+        source=None,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        payload_ref=None,
+        payload_digest=None,
+        appended_at="2026-06-19T00:00:00.000000Z",
+    )
+
+
 def _args(
     workspace_root: pathlib.Path,
     *,
-    suite: SuiteMode = SuiteMode.CORE,
+    suite: SuiteMode = SuiteMode.MEMORY_CORE,
     long_rounds: int = 25,
     reuse_session: bool = False,
+    pressure_mode: PressureMode = PressureMode.OFF,
 ) -> SmokeArgs:
     """构造测试用 smoke 参数。
 
@@ -406,6 +597,7 @@ def _args(
     :param suite: 场景套件模式。
     :param long_rounds: long suite 轮数。
     :param reuse_session: 是否复用稳定 session slot。
+    :param pressure_mode: 压力注入方式。
     :returns: smoke 参数。
     """
 
@@ -421,7 +613,8 @@ def _args(
         keep_workspace=False,
         suite=suite,
         long_rounds=long_rounds,
-        pressure_mode=PressureMode.AUTO,
+        pressure_mode=pressure_mode,
+        debug_smoke_output=False,
     )
 
 
@@ -587,10 +780,7 @@ def test_find_mock_tool_uses_discovered_bundle_shape() -> None:
         ToolsDiscoveryProviderSpec(
             spec_id="financial-tools",
             location=PythonImportPathProvider(
-                import_path=(
-                    "utils.smoke_host_public_conversation_memory_scenarios:"
-                    "discover_smoke_tools"
-                )
+                import_path=("utils.smoke_host_public_conversation_memory_scenarios:" "discover_smoke_tools")
             ),
         )
     )
