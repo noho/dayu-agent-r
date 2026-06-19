@@ -119,7 +119,6 @@ from dayu.host.dispatch import (
     HostDispatchScheduler,
     _DurableRunCancellationToken,
     _HostCancellationToken,
-    _proactive_fallback_material_blocks,
     _safe_close_worker_handle,
     _safe_release_lane_token,
 )
@@ -4246,6 +4245,7 @@ async def test_proactive_compact_selection_passes_protected_recent_floor(
             display_text=_soft_threshold_prompt(),
             session_id=session_id,
         )
+        memory_policy = _compact_floor_one_memory_policy()
         scheduler = await _open_scheduler(
             tmp_path,
             store,
@@ -4257,12 +4257,15 @@ async def test_proactive_compact_selection_passes_protected_recent_floor(
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
-            memory_projection_policy=_compact_floor_one_memory_policy(),
+            memory_projection_policy=memory_policy,
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
 
             request = compactor.prepared_requests[0]
+            assert request.segment_selection.policy_digest == (
+                digest_memory_projection_policy(memory_policy)
+            )
             assert (
                 "eventlog:user:event-proactive-floor-old-input"
                 in request.segment_selection.selected_block_ids
@@ -4322,15 +4325,15 @@ async def test_proactive_budget_uses_pre_dispatch_material_view(
 
 
 @pytest.mark.asyncio
-async def test_proactive_fallback_material_blocks_append_current_input_once(
+async def test_proactive_fallback_payload_appends_current_input_once(
     tmp_path: Path,
 ) -> None:
-    """fallback material blocks 只追加一次 current input anchor。"""
+    """proactive fallback payload 只追加一次 current input anchor。"""
 
     current_display_text = "current question needing fallback"
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        old_input_sequence = _append_user_input(
+        _append_user_input(
             store.transaction_runner,
             session_id=session_id,
             run_id="run-proactive-fallback-old",
@@ -4343,41 +4346,48 @@ async def test_proactive_fallback_material_blocks_append_current_input_once(
             store,
             run_id="run-proactive-fallback-current",
             display_text=current_display_text,
+            session_id=session_id,
         )
-        run, material_view = _pre_dispatch_material_view_for_run(
-            store.transaction_runner,
-            run_id=seeded.run_id,
-            current_display_text=current_display_text,
+        memory_policy = replace(
+            _fallback_cap_memory_policy(),
+            selected_recent_window_turn_floor=1,
+            fallback_selected_recent_window_item_cap=2,
         )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=200,
+                soft_threshold_tokens=40,
+                hard_threshold_tokens=120,
+            ),
+            memory_projection_policy=memory_policy,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
 
-        assert material_view.material_blocks != ()
-        assert any(
-            block.event_sequence == old_input_sequence
-            for block in material_view.material_blocks
-        )
-        assert all(
-            run.input_event_id not in block.canonical_source_refs
-            for block in material_view.material_blocks
-        )
-        assert all(
-            block.event_sequence != run.input_event_sequence
-            for block in material_view.material_blocks
-        )
-
-        fallback_blocks = _proactive_fallback_material_blocks(
-            run=run,
-            material_view=material_view,
-        )
-        current_input_blocks = tuple(
-            block
-            for block in fallback_blocks
-            if block.kind is CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR
-            and run.input_event_id in block.canonical_source_refs
-        )
-
-        assert len(current_input_blocks) == 1
-        assert current_input_blocks[0].text == current_display_text
-        assert current_input_blocks[0].event_sequence == run.input_event_sequence
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            payload = _event_payload(failed)
+            window = payload["fallback_input_window"]
+            assert isinstance(window, Mapping)
+            selected_block_ids = _required_json_text_tuple(
+                window["selected_block_ids"]
+            )
+            current_block_id = f"current:event-input-{seeded.run_id}"
+            assert selected_block_ids.count(current_block_id) == 1
+            assert "eventlog:user:event-proactive-fallback-old-input" in (
+                selected_block_ids
+            )
+            assert window["current_input_ref"] == f"event-input-{seeded.run_id}"
+            assert payload["fallback_action"] == "dispatch"
+        finally:
+            await scheduler.close()
 
 
 @pytest.mark.asyncio

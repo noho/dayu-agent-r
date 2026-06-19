@@ -118,6 +118,7 @@ from dayu.host.run_input import (
 )
 from dayu.host.memory import (
     MemoryRepairReason,
+    digest_memory_projection_policy,
 )
 from dayu.host.memory_repair import (
     ConversationMemoryProjectionRepairResult,
@@ -136,21 +137,18 @@ from dayu.host.compact_payload import (
 )
 from dayu.host.compact_material import (
     PreDispatchCompactMaterialView,
-    RunInputMaterialBlock,
     build_pre_dispatch_compact_material_view,
-    build_compact_material_pack,
-    degrade_previous_compacted_view_for_recovery,
-    run_input_material_block,
-    select_compact_segment,
-    selected_material_source_refs,
+)
+from dayu.host.compact_pipeline import (
+    CompactPipelineRequestPlan,
+    CompactPipelineSourceSnapshot,
+    build_fallback_decision_input,
+    build_normal_compact_request_plan,
+    build_tier_recovery_request_plans,
+    compact_pipeline_source_snapshot_from_pre_dispatch_view,
 )
 from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
-    CompactMaterialBlock,
-    CompactMaterialBlockKind,
-    CompactMaterialSection,
-    CompactSegmentSelection,
-    CompactSegmentTrigger,
     CompactionRequest,
     ConversationCompactOutputVNext,
 )
@@ -173,17 +171,8 @@ from dayu.host.context_budget import (
 )
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
-    FALLBACK_ACTION_FAIL_CLOSED,
     FALLBACK_ACTION_NOT_APPLICABLE,
-    FALLBACK_POLICY_DECISION_RECENT_WINDOW,
-    FALLBACK_POLICY_DECISION_SELECTION_FAILED,
     EventLogContextFallbackProvider,
-    RecentWindowFallbackSelection,
-    build_recent_window_fallback_selection,
-    build_selection_failure_budget_payload,
-    build_selection_failure_window_payload,
-    estimate_recent_window_fallback_budget,
-    fallback_window_digest,
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
@@ -195,7 +184,7 @@ from dayu.host.context_events import (
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
 )
-from dayu.host.context_policy import ContextBudgetPolicy, ContextCompactionTriggerSource
+from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.payload import PayloadStore
 from dayu.host.tool_runtime import (
@@ -428,6 +417,8 @@ class _GovernanceCompactPending:
     :param expected_status: compact request 写入时 Run 状态。
     :param expected_input_event_sequence: compact request 对应输入 cursor。
     :param request: Host-owned compaction request。
+    :param source_snapshot: request 使用的 compact source snapshot。
+    :param request_plan: request 的 pipeline-owned 构造结果。
     :param material_view: request 使用的冻结 material view。
     :param operation_id: 对应 ``CONTEXT_COMPACTION_REQUESTED`` event id。
     :param estimate: compact 前预算估算。
@@ -439,6 +430,8 @@ class _GovernanceCompactPending:
     expected_status: RunStatus
     expected_input_event_sequence: int
     request: CompactionRequest
+    source_snapshot: CompactPipelineSourceSnapshot
+    request_plan: CompactPipelineRequestPlan
     material_view: PreDispatchCompactMaterialView
     operation_id: str
     estimate: BudgetEstimate
@@ -1511,112 +1504,16 @@ class HostDispatchScheduler:
         :returns: tier 1-3 recovery attempt 元组。
         """
 
-        memory_policy = self._local_execution.memory_projection_policy
-        bounded_selection = select_compact_segment(
-            trigger_source=CompactSegmentTrigger.PROACTIVE,
-            input_cursor=pending.expected_input_event_sequence,
-            memory_snapshot_cursor=None,
-            policy_digest=pending.estimate.estimator_digest,
-            material_blocks=pending.material_view.material_blocks,
-            selected_recent_window_turn_floor=(
-                memory_policy.selected_recent_window_turn_floor
-            ),
-            max_selected_size_units=(
-                memory_policy.fallback_selected_recent_window_char_cap
-            ),
-            max_selected_item_count=(
-                memory_policy.fallback_selected_recent_window_item_cap
-            ),
-        )
-        attempts: list[_ProactiveCompactionRecoveryAttempt] = [
+        return tuple(
             _ProactiveCompactionRecoveryAttempt(
-                request=self._proactive_compaction_recovery_request(
-                    pending=pending,
-                    selected_segment=bounded_selection,
-                    previous_compacted_view=pending.material_view.previous_compacted_view,
-                ),
-                reason="tier_1_fallback_caps",
+                request=plan.request_plan.request,
+                reason=plan.tier_name,
             )
-        ]
-        degraded_previous_view = degrade_previous_compacted_view_for_recovery(
-            pending.material_view.previous_compacted_view
-        )
-        if (
-            len(degraded_previous_view) > 0
-            and degraded_previous_view != pending.material_view.previous_compacted_view
-        ):
-            attempts.append(
-                _ProactiveCompactionRecoveryAttempt(
-                    request=self._proactive_compaction_recovery_request(
-                        pending=pending,
-                        selected_segment=pending.request.segment_selection,
-                        previous_compacted_view=degraded_previous_view,
-                    ),
-                    reason="tier_2_section_degrade",
-                )
+            for plan in build_tier_recovery_request_plans(
+                source_snapshot=pending.source_snapshot,
+                root_request_plan=pending.request_plan,
+                memory_policy=self._local_execution.memory_projection_policy,
             )
-        attempts.append(
-            _ProactiveCompactionRecoveryAttempt(
-                request=self._proactive_compaction_recovery_request(
-                    pending=pending,
-                    selected_segment=bounded_selection,
-                    previous_compacted_view=(),
-                ),
-                reason="tier_3_delta_only",
-            )
-        )
-        return tuple(attempts)
-
-    def _proactive_compaction_recovery_request(
-        self,
-        *,
-        pending: _GovernanceCompactPending,
-        selected_segment: CompactSegmentSelection,
-        previous_compacted_view: tuple[CompactMaterialBlock, ...],
-    ) -> CompactionRequest:
-        """用同一个 frozen material view 构造 proactive recovery request。
-
-        :param pending: 已冻结的 proactive compact pending 摘要。
-        :param selected_segment: recovery tier 使用的 selected segment。
-        :param previous_compacted_view: recovery tier 使用的 previous compacted view。
-        :returns: proactive recovery compaction request。
-        """
-
-        material_pack = build_compact_material_pack(
-            selected_segment=selected_segment,
-            material_blocks=pending.material_view.material_blocks,
-            memory_snapshot=None,
-            inline_delta_repair_view=None,
-            current_input_ref=pending.request.recent_raw_turn_refs[0],
-            current_input_text=pending.material_view.current_input_text,
-            previous_compacted_view=previous_compacted_view,
-        )
-        selected_evidence_refs = _selected_evidence_refs(
-            material_blocks=pending.material_view.material_blocks,
-            selected_block_ids=selected_segment.selected_block_ids,
-        )
-        selected_raw_turn_refs = _selected_raw_turn_refs(
-            material_blocks=pending.material_view.material_blocks,
-            selected_block_ids=selected_segment.selected_block_ids,
-        )
-        current_input_ref = pending.request.recent_raw_turn_refs[0]
-        return CompactionRequest(
-            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
-            session_id=pending.session_id,
-            run_id=pending.run_id,
-            attempt_id=None,
-            execution_id=None,
-            memory_snapshot_cursor=None,
-            material_pack=material_pack,
-            segment_selection=selected_segment,
-            evidence_backed_fact_refs=selected_evidence_refs,
-            recent_raw_turn_refs=_dedupe_texts((current_input_ref, *selected_raw_turn_refs)),
-            older_raw_turn_refs=selected_material_source_refs(
-                material_blocks=pending.material_view.material_blocks,
-                selected_block_ids=selected_segment.selected_block_ids,
-            ),
-            existing_episode_summary_refs=(),
-            budget_before_compact=pending.estimate,
         )
 
     def _compactor_proposal_manifest_recorder(
@@ -1850,51 +1747,21 @@ class HostDispatchScheduler:
                 message="Context compactor or artifact store is not configured",
             )
             return _GovernanceStageResult(pending_dispatch=None, compact_accepted=None)
-        segment_selection = select_compact_segment(
-            trigger_source=CompactSegmentTrigger.PROACTIVE,
-            input_cursor=run.input_event_sequence,
-            memory_snapshot_cursor=None,
-            policy_digest=estimate.estimator_digest,
-            material_blocks=material_view.material_blocks,
-            selected_recent_window_turn_floor=(
-                self._local_execution.memory_projection_policy.selected_recent_window_turn_floor
-            ),
-        )
-        material_pack = build_compact_material_pack(
-            selected_segment=segment_selection,
-            material_blocks=material_view.material_blocks,
-            memory_snapshot=None,
-            inline_delta_repair_view=None,
-            current_input_ref=run.input_event_id,
-            current_input_text=material_view.current_input_text,
-            previous_compacted_view=material_view.previous_compacted_view,
-        )
-        selected_evidence_refs = _selected_evidence_refs(
-            material_blocks=material_view.material_blocks,
-            selected_block_ids=segment_selection.selected_block_ids,
-        )
-        selected_raw_turn_refs = _selected_raw_turn_refs(
-            material_blocks=material_view.material_blocks,
-            selected_block_ids=segment_selection.selected_block_ids,
-        )
-        request = CompactionRequest(
+        source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
-            session_id=run.session_id,
-            run_id=run.run_id,
-            attempt_id=None,
-            execution_id=None,
-            memory_snapshot_cursor=None,
-            material_pack=material_pack,
-            segment_selection=segment_selection,
-            evidence_backed_fact_refs=selected_evidence_refs,
-            recent_raw_turn_refs=_dedupe_texts((run.input_event_id, *selected_raw_turn_refs)),
-            older_raw_turn_refs=selected_material_source_refs(
-                material_blocks=material_view.material_blocks,
-                selected_block_ids=segment_selection.selected_block_ids,
-            ),
-            existing_episode_summary_refs=(),
-            budget_before_compact=estimate,
+            run=run,
+            material_view=material_view,
         )
+        memory_policy = self._local_execution.memory_projection_policy
+        request_plan = build_normal_compact_request_plan(
+            source_snapshot=source_snapshot,
+            selection_policy_digest=digest_memory_projection_policy(memory_policy),
+            budget_before_compact=estimate,
+            selected_recent_window_turn_floor=(
+                memory_policy.selected_recent_window_turn_floor
+            ),
+        )
+        request = request_plan.request
         return _GovernanceStageResult(
             pending_dispatch=None,
             compact_accepted=None,
@@ -1904,6 +1771,8 @@ class HostDispatchScheduler:
                 expected_status=run.status,
                 expected_input_event_sequence=run.input_event_sequence,
                 request=request,
+                source_snapshot=source_snapshot,
+                request_plan=request_plan,
                 material_view=material_view,
                 operation_id=requested.event_id,
                 estimate=estimate,
@@ -2119,112 +1988,53 @@ class HostDispatchScheduler:
                 budget_after_attempted_compact=budget_after_attempted_compact,
             )
             return None
-        try:
-            selection = self._build_proactive_fallback_selection(
-                run=run,
-                material_view=material_view,
-                policy=policy,
-            )
-            budget = estimate_recent_window_fallback_budget(
-                policy=policy,
-                session_id=run.session_id,
-                run_id=run.run_id,
-                selection_blocks=selection.selected_blocks,
-                current_input_ref=run.input_event_id,
-            )
-        except Exception as exc:
-            _LOGGER.error(
-                "dispatch.compact.fallback_selection_failed session_id=%s "
-                "run_id=%s failure_reason=%s",
-                run.session_id,
-                run.run_id,
-                type(exc).__name__,
-                exc_info=True,
-            )
-            window = build_selection_failure_window_payload(
-                current_input_ref=run.input_event_id,
-                trigger_source=ContextCompactionTriggerSource.PROACTIVE,
-                policy_ref=policy.policy_ref,
-                input_cursor=run.input_event_sequence,
-                failure_reason=type(exc).__name__,
-            )
-            self._append_compaction_failed_event(
-                transaction,
-                run=run,
-                estimate=estimate,
-                decision=decision,
-                operation_id=operation_id,
-                failure_reason=failure_reason,
-                attempt_count=attempt_count,
-                retry_repair_budget_exhausted=retry_repair_budget_exhausted,
-                budget_after_attempted_compact=budget_after_attempted_compact,
-                fallback_policy_decision=FALLBACK_POLICY_DECISION_SELECTION_FAILED,
-                fallback_input_window=window,
-                fallback_input_digest=fallback_window_digest(window),
-                fallback_budget_result=build_selection_failure_budget_payload(
-                    policy_ref=policy.policy_ref,
-                ),
-                fallback_action=FALLBACK_ACTION_FAIL_CLOSED,
-            )
-            return None
-        fallback_action = (
-            FALLBACK_ACTION_DISPATCH
-            if budget.hard_budget_passed
-            else FALLBACK_ACTION_FAIL_CLOSED
-        )
-        self._append_compaction_failed_event(
-            transaction,
+        source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
+            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
             run=run,
-            estimate=estimate,
-            decision=decision,
+            material_view=material_view,
+        )
+        fallback_decision = build_fallback_decision_input(
+            source_snapshot=source_snapshot,
+            context_policy=policy,
+            memory_policy=self._local_execution.memory_projection_policy,
             operation_id=operation_id,
             failure_reason=failure_reason,
             attempt_count=attempt_count,
             retry_repair_budget_exhausted=retry_repair_budget_exhausted,
             budget_after_attempted_compact=budget_after_attempted_compact,
-            fallback_policy_decision=FALLBACK_POLICY_DECISION_RECENT_WINDOW,
-            fallback_input_window=selection.to_window_payload(),
-            fallback_input_digest=selection.digest,
-            fallback_budget_result=budget.to_payload(),
-            fallback_action=fallback_action,
         )
-        if fallback_action != FALLBACK_ACTION_DISPATCH:
+        failed_input = fallback_decision.failed_payload_input
+        if fallback_decision.selection is None:
+            _LOGGER.error(
+                "dispatch.compact.fallback_selection_failed session_id=%s "
+                "run_id=%s failure_reason=%s",
+                run.session_id,
+                run.run_id,
+                failed_input.fallback_policy_decision,
+            )
+        self._append_compaction_failed_event(
+            transaction,
+            run=run,
+            estimate=estimate,
+            decision=decision,
+            operation_id=failed_input.operation_id,
+            failure_reason=failed_input.failure_reason,
+            attempt_count=failed_input.attempt_count,
+            retry_repair_budget_exhausted=(
+                failed_input.retry_repair_budget_exhausted
+            ),
+            budget_after_attempted_compact=(
+                failed_input.budget_after_attempted_compact
+            ),
+            fallback_policy_decision=failed_input.fallback_policy_decision,
+            fallback_input_window=failed_input.fallback_input_window,
+            fallback_input_digest=failed_input.fallback_input_digest,
+            fallback_budget_result=failed_input.fallback_budget_result,
+            fallback_action=failed_input.fallback_action,
+        )
+        if fallback_decision.action_hint != FALLBACK_ACTION_DISPATCH:
             return None
         return self._start_governed_in_transaction(transaction, run)
-
-    def _build_proactive_fallback_selection(
-        self,
-        *,
-        run: RunRow,
-        material_view: PreDispatchCompactMaterialView,
-        policy: ContextBudgetPolicy,
-    ) -> RecentWindowFallbackSelection:
-        """构造 proactive fallback selection。
-
-        :param run: 目标 Run。
-        :param material_view: compact request 使用的可信冻结 material view。
-        :param policy: context budget policy。
-        :returns: recent-window fallback selection。
-        :raises ValueError: material view 无法选择 current anchor 时抛出。
-        """
-
-        material_blocks = _proactive_fallback_material_blocks(
-            run=run,
-            material_view=material_view,
-        )
-        return build_recent_window_fallback_selection(
-            policy=policy,
-            memory_policy=self._local_execution.memory_projection_policy,
-            session_id=run.session_id,
-            run_id=run.run_id,
-            material_blocks=material_blocks,
-            current_input_ref=run.input_event_id,
-            input_cursor=run.input_event_sequence,
-            selected_recent_window_turn_floor=(
-                self._local_execution.memory_projection_policy.selected_recent_window_turn_floor
-            ),
-            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
-        )
 
     def _append_compaction_failed_event(
         self,
@@ -4148,106 +3958,6 @@ def _new_event_id(prefix: str) -> str:
     """
 
     return f"{prefix}-{uuid4().hex}"
-
-
-def _proactive_fallback_material_blocks(
-    *,
-    run: RunRow,
-    material_view: PreDispatchCompactMaterialView,
-) -> tuple[RunInputMaterialBlock, ...]:
-    """从可信 material view 构造 proactive fallback 可选择视图。
-
-    fallback selector 需要 current input anchor 出现在 material list 中；
-    compact selection / pack 则由 ``build_compact_material_pack`` 单独加入
-    current anchor。这里仅把同源 view 的 current anchor 追加给 fallback，
-    不重新读取 EventLog 或 Conversation Memory projection。
-
-    :param run: 当前 Run。
-    :param material_view: 已冻结的 EventLog-backed material view。
-    :returns: fallback 可消费的 material blocks。
-    """
-
-    return (
-        *material_view.material_blocks,
-        _current_input_material_block(
-            run=run,
-            display_text=material_view.current_input_text,
-        ),
-    )
-
-
-def _current_input_material_block(*, run: RunRow, display_text: str) -> RunInputMaterialBlock:
-    """构造 proactive current input anchor material block。
-
-    :param run: 当前 Run。
-    :param display_text: 当前输入展示文本。
-    :returns: current input material block。
-    """
-
-    return run_input_material_block(
-        block_id=f"current:{run.input_event_id}",
-        section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
-        kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
-        text=display_text,
-        canonical_source_refs=(run.input_event_id,),
-        event_sequence=run.input_event_sequence,
-    )
-
-
-def _selected_evidence_refs(
-    *,
-    material_blocks: tuple[RunInputMaterialBlock, ...],
-    selected_block_ids: tuple[str, ...],
-) -> tuple[str, ...]:
-    """从 selected evidence material blocks 派生 accepted evidence refs。
-
-    :param material_blocks: 与 selection 同源的 material blocks。
-    :param selected_block_ids: selection 选中的 block ids。
-    :returns: 去重后的 accepted evidence refs。
-    """
-
-    selected = frozenset(selected_block_ids)
-    refs: list[str] = []
-    for block in material_blocks:
-        if block.block_id in selected and block.accepted_evidence_id is not None:
-            refs.append(block.accepted_evidence_id)
-    return _dedupe_texts(tuple(refs))
-
-
-def _selected_raw_turn_refs(
-    *,
-    material_blocks: tuple[RunInputMaterialBlock, ...],
-    selected_block_ids: tuple[str, ...],
-) -> tuple[str, ...]:
-    """从 selected raw turn blocks 派生 canonical source refs。
-
-    :param material_blocks: 与 selection 同源的 material blocks。
-    :param selected_block_ids: selection 选中的 block ids。
-    :returns: 去重后的 raw turn canonical refs。
-    """
-
-    selected = frozenset(selected_block_ids)
-    refs: list[str] = []
-    for block in material_blocks:
-        if block.block_id not in selected:
-            continue
-        if block.kind not in (
-            CompactMaterialBlockKind.USER_INPUT,
-            CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
-        ):
-            continue
-        refs.extend(block.canonical_source_refs)
-    return _dedupe_texts(tuple(refs))
-
-
-def _dedupe_texts(values: tuple[str, ...]) -> tuple[str, ...]:
-    """按原顺序去重文本元组。
-
-    :param values: 输入文本元组。
-    :returns: 去重后的文本元组。
-    """
-
-    return tuple(dict.fromkeys(values))
 
 
 def _accepted_attempt_number(result: CompactionOperationResult) -> int:
