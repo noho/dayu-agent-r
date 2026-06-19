@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | WU-CM-12 final closeout completed after three-way deepreview and focused re-review. Accepted fixes close proactive recovery rejected-attempt diagnostics, reactive recovery catch-up failure handling, recovering fail rejection propagation, cancellation manifest preservation, and memory projection edge cases. |
-| active work unit | WU-CLI-DEBUG-STREAM-01 |
-| default next work unit | WU-CLI-DEBUG-STREAM-01 |
-| next entry point | Start discussion / plan gate for WU-CLI-DEBUG-STREAM-01 (GitHub Issue #148). Inspect issue #148, CLI logging code, runtime log policy, stream / delta diagnostics, and README trigger scope before implementation. |
-| design source | Current active WU: GitHub Issue #148 plus current CLI / runtime logging / Host / Engine stream diagnostic code. `docs/host/design.md` and `docs/engine/design.md` must be checked only if the plan proposes Host / Engine contract or lifecycle semantics changes. |
+| gate | accepted-plan |
+| implementation status | WU-CM-12 final closeout completed after three-way deepreview and focused re-review. Accepted fixes close proactive recovery rejected-attempt diagnostics, reactive recovery catch-up failure handling, recovering fail rejection propagation, cancellation manifest preservation, and memory projection edge cases. WU-CM-14 plan, plan review, plan fix, and plan re-review PASS; accepted plan commit is next. |
+| active work unit | WU-CM-14 |
+| default next work unit | WU-CM-14 |
+| next entry point | Create WU-CM-14 accepted plan commit, then dispatch implementation gate using accepted plan `docs/host/host-issues/wu-cm-14-protected-recent-floor-plan.md`, plan reviews `docs/reviews/plan-review-wu-cm-14-mimo.md` / `docs/reviews/plan-review-wu-cm-14-ds.md`, re-reviews `docs/reviews/plan-rereview-wu-cm-14-mimo.md` / `docs/reviews/plan-rereview-wu-cm-14-ds.md`, and adjudication `docs/reviews/plan-review-wu-cm-14-adjudication-20260619.md`. |
+| design source | `docs/host/design.md` and `docs/engine/design.md` for WU-CM-14 protected recent floor preservation. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 draft PR #150 https://github.com/noho/dayu-agent-r/pull/150; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for WU-CM-12 final closeout. WU-CLI-DEBUG-STREAM-01 still needs discussion / plan confirmation before code changes. Draft PR #150 remains open draft; merge, mark-ready, reviewer requests, and issue closure require separate user authorization. |
+| blocking open questions | None for WU-CM-14 implementation after accepted plan commit. WU-CLI-DEBUG-STREAM-01 still needs discussion / plan confirmation before code changes. Draft PR #150 remains open draft; merge, mark-ready, reviewer requests, and issue closure require separate user authorization. |
 
 状态约定：
 
@@ -159,6 +159,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 - `blocked-by-issue`：需要等待指定 GitHub Issue / umbrella / dependency 完成。
 - `obsolete`：已裁决过期失效，不作为实施入口。
 - `planning`：正在形成或 review code-generation-ready plan。
+- `accepted-plan`：plan / review / re-review 已通过，等待 accepted plan commit 或进入 implementation。
 - `implementation`：正在实施或修复。
 - `review`：正在进行 code review、re-review 或 aggregate deepreview。
 - `ready-to-open-draft-PR`：本轮 work unit 已完成本地 gate，等待进入 draft PR gate。
@@ -204,7 +205,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 | WU-CM-12-S4-R1 | deferred-with-owner | WU-CM-13 Unified conversation compact pipeline convergence | Code re-check after WU-CM-12 shows reactive recovery sequencing already exists in Engine ingest; the remaining root cause is that proactive and reactive do not share one end-to-end Host compact pipeline from material view / material blocks to accepted `CONTEXT_COMPACTED`, `CONTEXT_COMPACTION_FAILED`, and fallback decision input. WU-CM-13 must converge five Session Semantic Memory projection input, `assemble(...)` rendering semantics, tier 1-3 compact recovery, and tier 4/5 fallback on one pipeline owner while keeping proactive / reactive outer state machines separate. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
 | WU-CM-12-PR-R1 | deferred-with-owner | WU-CM-13 Unified conversation compact pipeline convergence | Code re-check confirms `dayu/host/compaction_evidence.py` has no production import after FIX-R1, while tests still exercise `collect_selected_compaction_request_evidence_inputs`. This is not a runtime correctness blocker, but it is a stale / shadow compact material owner that can mislead future implementation. WU-CM-13 must either delete the module and migrate remaining useful tests to the unified compact pipeline / `compact_material.py` owner, or explicitly move any still-needed capability into that pipeline; it must not remain as an independent production owner without production callers. |
-| WU-CM-14-R1 | deferred-with-owner | WU-CM-14 Recent final answer preservation for ordinal follow-ups | CM discussion identified a separate semantic risk: after compact, Answer Anchor Memory may identify "third item" but may not carry enough raw answer text to let the next run "详细解释第三条". WU-CM-14 must discuss and decide whether recent assistant final answers, or at least the complete referenced list item with list structure, need deterministic preservation when current input contains local ordinal follow-up. This is not WU-CM-13 scope; WU-CM-13 remains limited to unifying proactive / reactive compact pipeline semantics. However, any WU-CM-14 preservation logic that touches compact material, compact acceptance, fallback, or RunInput assembly must use the same proactive / reactive shared code path and must not introduce trigger-specific preservation semantics. |
+| WU-CM-14-R1 | open | WU-CM-14 Recent final answer preservation for ordinal follow-ups | CM discussion identified a separate semantic risk: after compact, Answer Anchor Memory may identify "third item" but may not carry enough raw answer text to let the next run "详细解释第三条". Accepted plan confirms root cause: compact material selection, ordinary RunInput assembly, and reactive frozen material assembly all swallow `selected_recent_window_turn_floor`. Plan reuses existing floor and protected recent floor, no new policy/parser/schema. Full proactive / reactive compact pipeline convergence remains WU-CM-13 scope. |
 
 ## 当前 Work Units
 
@@ -240,7 +241,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 | WU-CM-12 | draft-PR-pass | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open draft. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
 | WU-CM-13 | deferred | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Deferred destination only. WU-CM-12 already has reactive Engine ingest recovery sequencing; the remaining owner is unifying proactive / reactive material-to-compact-result and fallback semantics so five Session Semantic Memory, `assemble(...)`, tier 1-3 compact recovery, and tier 4/5 fallback cannot drift. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
-| WU-CM-14 | discussion-ready | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Tracks the scenario where turn N final answer lists multiple detailed items, turn N+1 asks "详细解释第三条", and compact is triggered before dispatch. Needs design discussion before plan: Answer Anchor Memory may resolve the ordinal but may not be sufficient explanation context unless recent raw final answer or complete referenced item structure is preserved. Not part of WU-CM-13, but any implementation must share proactive / reactive compact material and preservation semantics. |
+| WU-CM-14 | accepted-plan | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Plan, plan review, plan fix, and plan re-review PASS. Root cause confirmed: compact material selection, ordinary RunInput assembly, and reactive frozen material assembly all swallow `selected_recent_window_turn_floor`. Plan reuses existing floor and protected recent floor, no new policy/parser/schema. Full proactive / reactive compact pipeline convergence remains WU-CM-13 scope. |
 | WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
@@ -1805,6 +1806,24 @@ protected recent raw tail 的基本单位仍是 turn group。最近 `selected_re
 - 测试必须覆盖 protected recent raw tail 的 eligible material 边界：history user prompt、assistant final answer、accepted readable tool evidence、user-visible outcome material；裸 tool request、Host internal refs / digest / EventLog id 不进入 LLM-facing tail。
 - 测试还必须覆盖 proactive 与 reactive compact 触发下的同义 preservation 结果，除非 plan gate 明确证明某一路径不会经过该 preservation owner。
 - 受影响 Host memory / compact / RunInput tests 通过；若发生代码修改，`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+
+### Current gate artifacts
+
+- plan: `docs/host/host-issues/wu-cm-14-protected-recent-floor-plan.md`
+- plan review: `docs/reviews/plan-review-wu-cm-14-mimo.md`
+- plan review: `docs/reviews/plan-review-wu-cm-14-ds.md`
+- plan adjudication: `docs/reviews/plan-review-wu-cm-14-adjudication-20260619.md`
+- plan re-review: `docs/reviews/plan-rereview-wu-cm-14-mimo.md`
+- plan re-review: `docs/reviews/plan-rereview-wu-cm-14-ds.md`
+- plan re-review conclusion: AgentCodex fixed the plan; AgentMiMo PASS and AgentDS PASS. Accepted findings are closed: provider / transaction contract, activation condition, reactive compact-success and fallback regression coverage, duplicate prevention, allowed test boundary cleanup, and reactive frozen material stop condition. Plan is code-generation-ready.
+- plan gate validation: `git diff --check` clean
+- next gate: accepted plan commit, then implementation
+
+### Residual risks
+
+- `WU-CM-14-RR-1` deferred-with-owner WU-CM-13: full reactive "freeze exact overflow ordinary material list" convergence remains broader than WU-CM-14.
+- `WU-CM-14-RR-2` accepted: `USER_VISIBLE_RUN_STATE` material kind may not exist; implementation discovers mechanism
+- `WU-CM-14-RR-3` accepted: EventLog double-read during RunInput building is acceptable for WU-CM-14; WU-CM-13 may revisit if unification introduces a cleaner shared material handoff.
 
 ## WU-CLI-DEBUG-STREAM-01 CLI `--debug-stream` Per-Delta Stream Diagnostics
 
