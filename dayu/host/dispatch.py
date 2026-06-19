@@ -1856,6 +1856,9 @@ class HostDispatchScheduler:
             memory_snapshot_cursor=None,
             policy_digest=estimate.estimator_digest,
             material_blocks=material_view.material_blocks,
+            selected_recent_window_turn_floor=(
+                self._local_execution.memory_projection_policy.selected_recent_window_turn_floor
+            ),
         )
         material_pack = build_compact_material_pack(
             selected_segment=segment_selection,
@@ -3254,6 +3257,9 @@ class HostDispatchScheduler:
             return create_no_tool_run_input_builder(
                 transaction_runner=self._transaction_runner,
                 policy_snapshot=policy_snapshot,
+                memory_projection_policy=(
+                    self._local_execution.memory_projection_policy
+                ),
                 memory_snapshot_provider=memory_provider,
                 compact_artifact_provider=compact_provider,
                 context_fallback_provider=fallback_provider,
@@ -3299,6 +3305,7 @@ class HostDispatchScheduler:
             transaction_runner=self._transaction_runner,
             policy_snapshot=policy_snapshot,
             tool_runtime_handle=tool_runtime,
+            memory_projection_policy=self._local_execution.memory_projection_policy,
             memory_snapshot_provider=memory_provider,
             compact_artifact_provider=compact_provider,
             context_fallback_provider=fallback_provider,

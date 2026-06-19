@@ -129,6 +129,13 @@ from dayu.host.engine_ingest import (
     EngineEventIngestor,
     LocalEngineEnvelope,
 )
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    OpaqueEvidenceRef,
+    accepted_evidence_envelope_to_json_value,
+)
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     MemoryProjectionPolicy,
@@ -147,7 +154,7 @@ from dayu.host.run_input import (
     NoToolExecutor,
     PolicySnapshot,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.durable.event_log import (
@@ -162,6 +169,10 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.projection import read_projection_checkpoint
+from dayu.host.durable.schema import (
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+)
 from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
     CreateAcceptedRunInput,
@@ -4177,6 +4188,7 @@ async def test_proactive_compaction_uses_selected_material_not_session_start_ran
             context_budget_policy=_soft_compact_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -4196,6 +4208,70 @@ async def test_proactive_compaction_uses_selected_material_not_session_start_ran
                         CONTEXT_COMPACTED,
                     )
                 )
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compact_selection_passes_protected_recent_floor(
+    tmp_path: Path,
+) -> None:
+    """normal proactive compact selection 传入 selected recent floor。"""
+
+    compactor = _MinimalSummaryCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-proactive-floor-old",
+            event_id="event-proactive-floor-old-input",
+            display_text="older compactable material",
+            client_request_id="client-proactive-floor-old",
+            idempotency_key="idem-proactive-floor-old",
+        )
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-proactive-floor-recent",
+            event_id="event-proactive-floor-recent-input",
+            display_text="recent protected material",
+            client_request_id="client-proactive-floor-recent",
+            idempotency_key="idem-proactive-floor-recent",
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-floor-current",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=300,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=200,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_floor_one_memory_policy(),
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            request = compactor.prepared_requests[0]
+            assert (
+                "eventlog:user:event-proactive-floor-old-input"
+                in request.segment_selection.selected_block_ids
+            )
+            assert (
+                request.segment_selection.excluded_reason_codes[
+                    "eventlog:user:event-proactive-floor-recent-input"
+                ]
+                == "protected_recent_raw_floor"
             )
         finally:
             await scheduler.close()
@@ -4231,6 +4307,7 @@ async def test_proactive_budget_uses_pre_dispatch_material_view(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -4338,6 +4415,7 @@ async def test_second_proactive_compact_uses_previous_view_without_old_raw_repla
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(first.session_id)
@@ -5560,6 +5638,7 @@ async def test_reactive_compact_request_uses_latest_previous_view(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=proactive_compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await proactive_scheduler.run_queue_promotion(proactive.session_id)
@@ -5599,6 +5678,137 @@ async def test_reactive_compact_request_uses_latest_previous_view(
             assert request.trigger_source is ContextCompactionTriggerSource.REACTIVE
             assert request.material_pack.previous_compacted_view != ()
             assert request.material_pack.previous_compacted_view[0].text == "rolled"
+        finally:
+            await reactive_scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_reactive_root_compact_selection_passes_protected_recent_floor(
+    tmp_path: Path,
+) -> None:
+    """reactive root compact selection 传入 selected recent floor。"""
+
+    reactive_compactor = _RequestCapturingCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-reactive-floor-old",
+            event_id="event-reactive-floor-old-input",
+            display_text="older reactive compactable material",
+            client_request_id="client-reactive-floor-old",
+            idempotency_key="idem-reactive-floor-old",
+        )
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-reactive-floor-recent",
+            event_id="event-reactive-floor-recent-input",
+            display_text="recent reactive protected material",
+            client_request_id="client-reactive-floor-recent",
+            idempotency_key="idem-reactive-floor-recent",
+        )
+        _append_run_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-reactive-floor-recent",
+            event_id="event-reactive-floor-recent-success",
+            final_answer="recent reactive protected final answer",
+        )
+        _append_accepted_tool_evidence(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-reactive-floor-recent",
+            event_prefix="event-reactive-floor-recent",
+            query_text="读取 reactive protected evidence",
+            raw_result_text="recent reactive protected evidence",
+        )
+        reactive_seed = _seed_current_run(store, session_id=session_id)
+        run, attempt, dispatch_record = _read_rows(
+            store.transaction_runner,
+            reactive_seed,
+        )
+        context = host_engine_ingest._ValidatedCandidate(
+            candidate=_reactive_compaction_candidate(
+                run=run,
+                attempt=attempt,
+                dispatch_record=dispatch_record,
+            ),
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+        frozen_blocks = store.transaction_runner.run_read(
+            lambda transaction: host_engine_ingest._frozen_reactive_material_blocks(
+                context=context,
+                display_text="dispatch prompt",
+                material_view=build_pre_dispatch_compact_material_view(
+                    transaction,
+                    EventLogStore(),
+                    run=run,
+                    current_display_text="dispatch prompt",
+                ),
+            )
+        )
+        current_blocks = tuple(
+            block
+            for block in frozen_blocks
+            if block.section is CompactMaterialSection.CURRENT_INPUT_ANCHOR
+        )
+        protected_blocks = tuple(
+            block
+            for block in frozen_blocks
+            if block.turn_group_id == "run-reactive-floor-recent"
+        )
+        protected_kinds = frozenset(block.kind for block in protected_blocks)
+
+        assert len(current_blocks) == 1
+        assert current_blocks[0].canonical_source_refs == ("event-input-dispatch",)
+        assert all(
+            block.section is not CompactMaterialSection.CURRENT_INPUT_ANCHOR
+            for block in protected_blocks
+        )
+        assert CompactMaterialBlockKind.USER_INPUT in protected_kinds
+        assert CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER in protected_kinds
+        assert CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE in protected_kinds
+        assert any(
+            block.text == "recent reactive protected material"
+            for block in protected_blocks
+        )
+        assert any(
+            block.text == "recent reactive protected final answer"
+            for block in protected_blocks
+        )
+        assert any(
+            "recent reactive protected evidence" in block.text
+            for block in protected_blocks
+        )
+        reactive_scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _ReactiveRecoveryWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=reactive_compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_floor_one_memory_policy(),
+        )
+        try:
+            reactive_scheduler.wake_dispatch(_pending_dispatch(reactive_seed))
+            assert (await reactive_scheduler.drain_once()).dispatched == 1
+            await _wait_for_compactor_request_count(reactive_compactor, 1)
+
+            request = reactive_compactor.prepared_requests[0]
+            assert request.trigger_source is ContextCompactionTriggerSource.REACTIVE
+            assert (
+                "eventlog:user:event-reactive-floor-old-input"
+                in request.segment_selection.selected_block_ids
+            )
+            for block in protected_blocks:
+                assert (
+                    request.segment_selection.excluded_reason_codes[block.block_id]
+                    == "protected_recent_raw_floor"
+                )
         finally:
             await reactive_scheduler.close()
 
@@ -6439,6 +6649,33 @@ def _fallback_cap_memory_policy() -> MemoryProjectionPolicy:
     )
 
 
+def _compact_no_floor_memory_policy() -> MemoryProjectionPolicy:
+    """构造不保护 recent floor 的 legacy compact 测试 policy。
+
+    仅用于非 floor 语义测试，避免旧测试把 protected recent floor 行为误判为
+    compactor 输入缺失。
+
+    :returns: selected recent turn floor 为 0 的 memory policy。
+    """
+
+    return replace(
+        default_memory_projection_policy(),
+        selected_recent_window_turn_floor=0,
+    )
+
+
+def _compact_floor_one_memory_policy() -> MemoryProjectionPolicy:
+    """构造保护最近一个 turn group 的 compact 测试 policy。
+
+    :returns: selected recent turn floor 为 1 的 memory policy。
+    """
+
+    return replace(
+        default_memory_projection_policy(),
+        selected_recent_window_turn_floor=1,
+    )
+
+
 def _soft_threshold_prompt() -> str:
     """返回触发 soft threshold 且未达 hard threshold 的测试 prompt。
 
@@ -6615,6 +6852,197 @@ def _append_user_input(
         return event.row.event_sequence
 
     return transaction_runner.run_write(_operation)
+
+
+def _append_run_success(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str,
+    event_id: str,
+    final_answer: str,
+) -> int:
+    """追加测试用 RUN_SUCCEEDED canonical fact。
+
+    :param transaction_runner: transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param event_id: event id。
+    :param final_answer: final answer 文本。
+    :returns: 追加后的 EventLog sequence。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        """追加 RUN_SUCCEEDED event。
+
+        :param transaction: Host transaction。
+        :returns: EventLog sequence。
+        """
+
+        event = EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="RUN_SUCCEEDED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={"final_answer": final_answer},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+        return event.row.event_sequence
+
+    return transaction_runner.run_write(_operation)
+
+
+def _append_accepted_tool_evidence(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str,
+    event_prefix: str,
+    query_text: str,
+    raw_result_text: str,
+) -> None:
+    """追加测试用 TOOL_CALL_REQUESTED 与 TOOL_RESULT_ACCEPTED facts。
+
+    :param transaction_runner: transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param event_prefix: event id 前缀。
+    :param query_text: 可读查询文本。
+    :param raw_result_text: raw outcome 文本。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """追加 accepted evidence 相关 facts。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        tool_call_event_id = f"{event_prefix}-tool-call"
+        tool_result_event_id = f"{event_prefix}-tool-result"
+        tool_call_id = f"{event_prefix}-tool-call-id"
+        arguments_json: dict[str, JsonValue] = {
+            "arguments": {"ticker": "MSFT", "topic": "risk"}
+        }
+        arguments_digest = sha256_digest_json(arguments_json)
+        semantic_query_digest = sha256_digest_json(
+            {"semantic_query_text": query_text}
+        )
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=tool_call_event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="TOOL_CALL_REQUESTED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "fins.search",
+                    "normalized_arguments_digest": arguments_digest,
+                    "arguments_payload_digest": arguments_digest,
+                    "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+                    "arguments_inline_json": arguments_json,
+                    "arguments_payload_ref": None,
+                    "arguments_json_size_bytes": len(
+                        canonical_json_dumps(arguments_json).encode("utf-8")
+                    ),
+                    "semantic_input_digest": semantic_query_digest,
+                    "semantic_query_storage_kind": (
+                        TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+                    ),
+                    "semantic_query_text": query_text,
+                    "semantic_query_payload_ref": None,
+                    "semantic_query_digest": semantic_query_digest,
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+        evidence_id = f"evidence:{tool_result_event_id}"
+        envelope = AcceptedEvidenceEnvelope(
+            evidence_id=evidence_id,
+            producer_event_ref=tool_result_event_id,
+            tool_name="fins.search",
+            tool_call_id=tool_call_id,
+            tool_query=AcceptedEvidenceToolQuery(
+                tool_call_requested_event_ref=tool_call_event_id,
+                normalized_arguments_digest=arguments_digest,
+                semantic_input_digest=semantic_query_digest,
+            ),
+            result_ref=AcceptedEvidenceResultRef(
+                payload_ref=None,
+                payload_digest=None,
+                outcome_digest=sha256_digest_json({"raw_result_text": raw_result_text}),
+                truncation_applied=False,
+            ),
+            source_refs=(
+                OpaqueEvidenceRef(
+                    ref_kind="tool_call_event",
+                    ref_id=tool_call_event_id,
+                    digest=None,
+                ),
+            ),
+            locator_refs=(
+                OpaqueEvidenceRef(ref_kind="filing", ref_id="msft-10k", digest=None),
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=tool_result_event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="TOOL_RESULT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={
+                    "accepted_evidence_envelope": (
+                        accepted_evidence_envelope_to_json_value(envelope)
+                    ),
+                    "raw_tool_outcome": {
+                        "kind": "completed",
+                        "result": {"text": raw_result_text},
+                    },
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
 
 
 def _append_previous_compacted_event(
@@ -6822,6 +7250,50 @@ def _read_rows(
         return run, attempt, dispatch_record
 
     return transaction_runner.run_read(_operation)
+
+
+def _reactive_compaction_candidate(
+    *,
+    run: RunRow,
+    attempt: AttemptRow,
+    dispatch_record: DispatchRecordRow,
+) -> host_engine_ingest.EngineEventCandidate:
+    """构造测试用 reactive compaction EngineEvent candidate。
+
+    :param run: Run row。
+    :param attempt: Attempt row。
+    :param dispatch_record: DispatchRecord row。
+    :returns: EngineEventCandidate。
+    """
+
+    return host_engine_ingest.EngineEventCandidate(
+        envelope=LocalEngineEnvelope(
+            session_id=run.session_id,
+            run_id=run.run_id,
+            attempt_id=attempt.attempt_id,
+            execution_id=attempt.execution_id,
+            dispatch_record_id=dispatch_record.dispatch_record_id,
+            worker_kind=WorkerKind.LOCAL,
+            execution_target=dispatch_record.execution_target,
+            local_worker_id="local-worker-test",
+            cancellation_token=_HostCancellationToken(),
+        ),
+        worker_event_index=1,
+        engine_event=EngineEvent(
+            occurred_at=_NOW,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+            data=ContextCompactionRequestedData(
+                iteration_id="iter-reactive",
+                budget_state=None,
+                reason="provider_overflow",
+                provider_request_id="req-reactive",
+            ),
+            metadata=None,
+        ),
+        observed_at=_NOW,
+    )
 
 
 def _read_run(transaction_runner: HostTransactionRunner, run_id: str) -> RunRow:

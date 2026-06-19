@@ -67,6 +67,7 @@ from dayu.host.compact_payload import (
     source_boundary_refs,
 )
 from dayu.host.compact_material import (
+    PreDispatchCompactMaterialView,
     RunInputMaterialBlock,
     build_pre_dispatch_compact_material_view,
     build_compact_material_pack,
@@ -193,13 +194,6 @@ from dayu.host._event_payload import (
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
-from dayu.host.run_input import (
-    CompactArtifactView,
-    CurrentRunFacts,
-    MemorySnapshotView,
-    SessionContinuityView,
-    build_run_input_material_blocks,
-)
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.tool_trace_signals import (
     CONTEXT_PRESSURE_SCHEMA_VERSION as _CONTEXT_PRESSURE_SCHEMA_VERSION,
@@ -1336,18 +1330,19 @@ class EngineEventIngestor:
                 message="Run already used its reactive compaction budget",
                 estimate=estimate,
             )
-        frozen_material_blocks = _frozen_reactive_material_blocks(
-            transaction=transaction,
-            context=context,
-            display_text=display_text,
-        )
         try:
-            previous_compacted_view = build_pre_dispatch_compact_material_view(
+            material_view = build_pre_dispatch_compact_material_view(
                 transaction,
                 self._event_log_store,
                 run=context.run,
                 current_display_text=display_text,
-            ).previous_compacted_view
+            )
+            frozen_material_blocks = _frozen_reactive_material_blocks(
+                context=context,
+                display_text=display_text,
+                material_view=material_view,
+            )
+            previous_compacted_view = material_view.previous_compacted_view
         except Exception:
             _LOGGER.error(
                 "engine_ingest.reactive_compact_material_source_failed "
@@ -3798,6 +3793,7 @@ def _reactive_compaction_request(
         memory_snapshot_cursor=None,
         policy_digest=pending.frozen_material_list_digest,
         material_blocks=pending.frozen_material_blocks,
+        selected_recent_window_turn_floor=pending.selected_recent_window_turn_floor,
     )
     material_pack = build_compact_material_pack(
         selected_segment=segment_selection,
@@ -4008,67 +4004,26 @@ def _single_block_segment_selection(
 
 def _frozen_reactive_material_blocks(
     *,
-    transaction: HostTransaction,
     context: _ValidatedCandidate,
     display_text: str,
+    material_view: PreDispatchCompactMaterialView,
 ) -> tuple[RunInputMaterialBlock, ...]:
     """冻结 reactive overflow 对应 ordinary input material list。
 
-    :param transaction: 当前 Host transaction。
     :param context: 已校验 Engine event context。
     :param display_text: 当前输入展示文本。
+    :param material_view: 与 reactive compact request 同源的 pre-dispatch
+        compact material view。
     :returns: 冻结 material blocks。
     """
 
-    input_event = _require_event_row(
-        transaction,
-        event_log_store=EventLogStore(),
-        event_id=context.run.input_event_id,
-        expected_type="USER_INPUT_ACCEPTED",
-    )
-    accepted_event = _require_event_row(
-        transaction,
-        event_log_store=EventLogStore(),
-        event_id=context.run.accepted_event_id,
-        expected_type="RUN_ACCEPTED",
-    )
-    if context.run.started_event_id is None:
-        return _current_only_material_blocks(
+    return (
+        *material_view.material_blocks,
+        _current_input_anchor_material_block(
             run=context.run,
-            input_event=input_event,
             display_text=display_text,
-        )
-    started_event = _require_event_row(
-        transaction,
-        event_log_store=EventLogStore(),
-        event_id=context.run.started_event_id,
-        expected_type="RUN_STARTED",
-    )
-    current_facts = CurrentRunFacts(
-        run=context.run,
-        attempt=context.attempt,
-        dispatch_record=context.dispatch_record,
-        user_input_event=input_event,
-        run_accepted_event=accepted_event,
-        run_started_event=started_event,
-        user_prompt=display_text,
-        system_prompt=None,
-        operation_kind="run",
-    )
-    return build_run_input_material_blocks(
-        current_facts=current_facts,
-        memory=MemorySnapshotView(
-            messages=(),
-            memory_snapshot_cursor=None,
-            policy_digest=None,
-            diagnostics=(),
+            event_sequence=material_view.source_boundary.current_input_event_sequence,
         ),
-        compact=CompactArtifactView(
-            messages=(),
-            compact_artifact_ref=None,
-            compact_artifact_digest=None,
-        ),
-        continuity=SessionContinuityView(messages=()),
     )
 
 
@@ -4087,14 +4042,35 @@ def _current_only_material_blocks(
     """
 
     return (
-        run_input_material_block(
-            block_id=f"current:{run.input_event_id}",
-            section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
-            kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
-            text=display_text,
-            canonical_source_refs=(run.input_event_id,),
+        _current_input_anchor_material_block(
+            run=run,
+            display_text=display_text,
             event_sequence=input_event.event_sequence,
         ),
+    )
+
+
+def _current_input_anchor_material_block(
+    *,
+    run: RunRow,
+    display_text: str,
+    event_sequence: int,
+) -> RunInputMaterialBlock:
+    """构造 current input anchor material block。
+
+    :param run: 当前 Run row。
+    :param display_text: 当前输入展示文本。
+    :param event_sequence: 当前输入 EventLog sequence。
+    :returns: current input anchor material block。
+    """
+
+    return run_input_material_block(
+        block_id=f"current:{run.input_event_id}",
+        section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        text=display_text,
+        canonical_source_refs=(run.input_event_id,),
+        event_sequence=event_sequence,
     )
 
 

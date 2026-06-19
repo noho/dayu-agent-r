@@ -119,6 +119,7 @@ from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
     CompactArtifactView,
     CurrentRunFacts,
+    DurableCompactArtifactProvider,
     DurableCurrentRunFactProvider,
     DurableMemorySnapshotProvider,
     MemoryProjectionRepairRequired,
@@ -131,6 +132,8 @@ from dayu.host.run_input import (
     _accepted_evidence_mapping_refs,
     _compact_artifact_message_content,
     _fallback_context_messages,
+    _is_internal_evidence_source_part,
+    _llm_facing_evidence_source_text,
     _normalize_ordinary_run_messages,
     _vnext_compact_candidate_semantic_lines,
     create_no_tool_run_input_builder,
@@ -2712,6 +2715,250 @@ def test_no_compaction_recent_raw_turns_continuity_still_works(
         assert contents[-1] == "继续说明这个增长因素"
 
 
+def test_post_compaction_ordinary_build_preserves_protected_recent_raw_tail(
+    tmp_path: Path,
+) -> None:
+    """compact-success 后普通 build 保留最近历史 raw user / answer / evidence。"""
+
+    policy = _memory_policy()
+    answer_text = _four_item_answer()
+    current_prompt = "详细解释第三条"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-ordinal-answer",
+            user_text="请列出四条关键风险",
+            answer_text=answer_text,
+        )
+        _append_prior_accepted_tool_evidence_batch(
+            store.transaction_runner,
+            session_id=session_id,
+            count=1,
+            run_id="run-ordinal-answer",
+            raw_outcome={
+                "kind": "completed",
+                "result": {"text": "第三条风险来自客户集中度原始证据"},
+            },
+            semantic_query_text="读取客户集中度风险证据",
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload(current_prompt),
+        )
+        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        recovery = _start_recovery_attempt(store.transaction_runner, seeded)
+
+        request = _build_post_compaction_request(store, recovery, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+        system_content = _single_system_content(request.messages)
+
+        assert "请列出四条关键风险" in contents
+        assert answer_text in contents
+        assert "3. 第三条是客户集中度升高，需要拆解前五大客户变化。" in (
+            "\n".join(contents)
+        )
+        assert "第三条风险来自客户集中度原始证据" in system_content
+        assert "## Recent Evidence" in system_content
+        assert _message_occurrences(contents, current_prompt) == 1
+        assert contents[-1] == current_prompt
+        assert all("tool_call_id" not in content for content in contents)
+        assert all("event-prior-tool" not in content for content in contents)
+
+
+def test_post_compaction_raw_tail_dedupes_memory_selected_recent_window(
+    tmp_path: Path,
+) -> None:
+    """memory selected recent window 已覆盖的 raw tail 不重复渲染。"""
+
+    policy = _memory_policy()
+    answer_text = _four_item_answer()
+    current_prompt = "详细解释第三条"
+    memory_view = MemorySnapshotView(
+        messages=(
+            UserMessage(
+                role=AgentMessageRole.USER,
+                content="请列出四条关键风险",
+            ),
+            AssistantMessage(
+                role=AgentMessageRole.ASSISTANT,
+                content=answer_text,
+                reasoning_content=None,
+                tool_calls=(),
+            ),
+        ),
+        memory_snapshot_cursor=None,
+        policy_digest=None,
+        diagnostics=(),
+        selected_recent_source_refs=(
+            "event-run-ordinal-answer-input",
+            "event-run-ordinal-answer-success",
+        ),
+        selected_recent_content_digests=(
+            sha256_digest_json({"text": "请列出四条关键风险"}),
+            sha256_digest_json({"text": answer_text}),
+        ),
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-ordinal-answer",
+            user_text="请列出四条关键风险",
+            answer_text=answer_text,
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload(current_prompt),
+        )
+        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        recovery = _start_recovery_attempt(store.transaction_runner, seeded)
+
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+            memory_projection_policy=policy,
+            memory_snapshot_provider=_StaticMemorySnapshotProvider(memory_view),
+            compact_artifact_provider=DurableCompactArtifactProvider(
+                store.transaction_runner
+            ),
+        )
+        request = builder.build(_attempt_snapshot(recovery))
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert _message_occurrences(contents, "请列出四条关键风险") == 1
+        assert _message_occurrences(contents, answer_text) == 1
+        assert _message_occurrences(contents, current_prompt) == 1
+        assert contents[-1] == current_prompt
+
+
+def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
+    tmp_path: Path,
+) -> None:
+    """raw-tail provider 只在 accepted compact 且非 fallback ordinary path 激活。"""
+
+    policy = _memory_policy()
+    answer_text = _four_item_answer()
+    current_prompt = "详细解释第三条"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-ordinal-answer",
+            user_text="请列出四条关键风险",
+            answer_text=answer_text,
+        )
+        seeded_without_compact = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload(current_prompt),
+        )
+        no_compact = _build_post_compaction_request(
+            store,
+            seeded_without_compact,
+            policy,
+        )
+
+        assert all(
+            answer_text not in _message_content(message)
+            for message in no_compact.messages
+        )
+
+    with open_host_durable_store(_options(tmp_path / "fallback")) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-ordinal-answer",
+            user_text="请列出四条关键风险",
+            answer_text=answer_text,
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload(current_prompt),
+        )
+        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        recovery = _start_recovery_attempt(store.transaction_runner, seeded)
+        fallback = _active_fallback(
+            selected_blocks=(
+                _material_block(
+                    "current:event-current-input",
+                    CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                    CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                    current_prompt,
+                    event_sequence=None,
+                    source_ref="event-current-input",
+                ),
+            ),
+            dropped_block_ids=(),
+            current_input_ref="event-current-input",
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+            memory_projection_policy=policy,
+            compact_artifact_provider=DurableCompactArtifactProvider(
+                store.transaction_runner
+            ),
+            context_fallback_provider=_StaticContextFallbackProvider(fallback),
+        )
+
+        request = builder.build(_attempt_snapshot(recovery))
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert all(answer_text not in content for content in contents)
+        assert _message_occurrences(contents, current_prompt) == 1
+        assert contents[-1] == current_prompt
+
+
+@pytest.mark.parametrize(
+    ("source_text", "expected"),
+    (
+        (None, None),
+        ("", None),
+        ("tool_call_event:event-a, payload:payload-a, digest:sha256-a", None),
+        (
+            "tool_call_event:event-a, filing:msft-10k, payload:payload-a",
+            "filing:msft-10k",
+        ),
+        ("filing:msft-10k, page:42", "filing:msft-10k, page:42"),
+    ),
+)
+def test_llm_facing_evidence_source_text_filters_internal_provenance(
+    source_text: str | None, expected: str | None
+) -> None:
+    """evidence source 过滤内部 provenance 且保留业务可读 source。"""
+
+    assert _llm_facing_evidence_source_text(source_text) == expected
+
+
+@pytest.mark.parametrize(
+    ("source_part", "expected"),
+    (
+        ("tool_call_event:event-a", True),
+        ("tool_result_event:event-b", True),
+        ("event:event-c", True),
+        ("eventlog:event-d", True),
+        ("payload:payload-a", True),
+        ("artifact:artifact-a", True),
+        ("digest:sha256-a", True),
+        ("filing:msft-10k", False),
+    ),
+)
+def test_internal_evidence_source_part_detection(
+    source_part: str, expected: bool
+) -> None:
+    """内部 evidence source part 检测只匹配治理 provenance 前缀。"""
+
+    assert _is_internal_evidence_source_part(source_part) is expected
+
+
 def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
     """compact artifact reader 只读取 vNext accepted evidence mapping refs。"""
 
@@ -3090,9 +3337,86 @@ def _build_request_with_memory(
     builder = create_no_tool_run_input_builder(
         transaction_runner=store.transaction_runner,
         policy_snapshot=_policy_snapshot(),
+        memory_projection_policy=policy,
         memory_snapshot_provider=provider,
     )
     return builder.build(_attempt_snapshot(seeded))
+
+
+def _build_post_compaction_request(
+    store: HostDurableStore,
+    seeded: _SeededRun,
+    policy: MemoryProjectionPolicy,
+) -> AgentRunRequest:
+    """通过 durable compact provider 构造 post-compaction AgentRunRequest。
+
+    :param store: Host durable store。
+    :param seeded: post-compaction Attempt 引用。
+    :param policy: memory projection policy。
+    :returns: AgentRunRequest。
+    """
+
+    builder = create_no_tool_run_input_builder(
+        transaction_runner=store.transaction_runner,
+        policy_snapshot=_policy_snapshot(),
+        memory_projection_policy=policy,
+        compact_artifact_provider=DurableCompactArtifactProvider(
+            store.transaction_runner
+        ),
+    )
+    return builder.build(_attempt_snapshot(seeded))
+
+
+def _four_item_answer() -> str:
+    """构造 ordinal follow-up 回归测试的四条回答。
+
+    :returns: 四条编号回答文本。
+    """
+
+    return "\n".join(
+        (
+            "1. 第一条是收入确认节奏，需要核对合同负债。",
+            "2. 第二条是毛利率波动，需要拆解产品结构。",
+            "3. 第三条是客户集中度升高，需要拆解前五大客户变化。",
+            "4. 第四条是现金流转弱，需要核对回款周期。",
+        )
+    )
+
+
+def _append_current_run_compacted_event(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> None:
+    """为当前 Run 追加 accepted CONTEXT_COMPACTED fact。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: 当前 Run 引用。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加 compacted event。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id=f"event-{seeded.run_id}-compacted",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="current run compacted semantic view",
+                    pinned_patch={"candidate_id": "patch-current-run"},
+                    fact_candidates=[],
+                ),
+            ),
+        )
+
+    transaction_runner.run_write(operation)
 
 
 def _material_block(
@@ -3714,6 +4038,7 @@ def _append_prior_accepted_tool_evidence_batch(
     *,
     session_id: str,
     count: int,
+    run_id: str | None = None,
     raw_outcome: JsonValue | None = None,
     semantic_query_text: str | None = None,
 ) -> tuple[_SeededAcceptedEvidence, ...]:
@@ -3722,6 +4047,7 @@ def _append_prior_accepted_tool_evidence_batch(
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
     :param count: 追加的 evidence 数量。
+    :param run_id: 可选绑定 evidence 的 Host Run id；缺省按 ordinal 生成。
     :param raw_outcome: 可选覆盖 raw outcome；缺省时按 ordinal 生成。
     :param semantic_query_text: 可选覆盖 semantic query；缺省时按 ordinal 生成。
     :returns: 写入的 evidence 元数据。
@@ -3745,6 +4071,7 @@ def _append_prior_accepted_tool_evidence_batch(
                     transaction,
                     session_id=session_id,
                     ordinal=ordinal,
+                    run_id=run_id,
                     raw_outcome=raw_outcome,
                     semantic_query_text=semantic_query_text,
                 )
@@ -3759,6 +4086,7 @@ def _append_prior_accepted_tool_evidence_tx(
     *,
     session_id: str,
     ordinal: int,
+    run_id: str | None,
     raw_outcome: JsonValue | None,
     semantic_query_text: str | None,
 ) -> _SeededAcceptedEvidence:
@@ -3767,6 +4095,7 @@ def _append_prior_accepted_tool_evidence_tx(
     :param transaction: Host transaction。
     :param session_id: Session id。
     :param ordinal: 批内序号。
+    :param run_id: 可选绑定 evidence 的 Host Run id。
     :param raw_outcome: 可选 raw outcome。
     :param semantic_query_text: 可选 semantic query。
     :returns: 写入的 evidence 元数据。
@@ -3775,6 +4104,7 @@ def _append_prior_accepted_tool_evidence_tx(
     tool_call_event_id = f"event-prior-tool-call-{ordinal:02d}"
     tool_result_event_id = f"event-prior-tool-result-{ordinal:02d}"
     tool_call_id = f"tool-call-prior-{ordinal:02d}"
+    target_run_id = f"run-prior-evidence-{ordinal:02d}" if run_id is None else run_id
     query_text = (
         f"Read MSFT FY2025 revenue detail {ordinal}"
         if semantic_query_text is None
@@ -3806,7 +4136,7 @@ def _append_prior_accepted_tool_evidence_tx(
             event_id=tool_call_event_id,
             event_class=EventClass.CANONICAL_FACT,
             session_id=session_id,
-            run_id=f"run-prior-evidence-{ordinal:02d}",
+            run_id=target_run_id,
             event_type="TOOL_CALL_REQUESTED",
             payload={
                 "tool_call_id": tool_call_id,
@@ -3867,7 +4197,7 @@ def _append_prior_accepted_tool_evidence_tx(
             event_id=tool_result_event_id,
             event_class=EventClass.CANONICAL_FACT,
             session_id=session_id,
-            run_id=f"run-prior-evidence-{ordinal:02d}",
+            run_id=target_run_id,
             event_type="TOOL_RESULT_ACCEPTED",
             payload={
                 "accepted_evidence_envelope": (
