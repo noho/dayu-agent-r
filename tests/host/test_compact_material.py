@@ -27,6 +27,7 @@ from dayu.host.compact_material import (
     check_compact_memory_snapshot_cursor,
     conversation_compact_input_vnext_from_material_pack,
     degrade_previous_compacted_view_for_recovery,
+    normalized_material_text,
     prompt_local_evidence_map,
     run_input_material_block,
     select_compact_segment,
@@ -139,6 +140,21 @@ class _VNextInputShape(NamedTuple):
     evidence_count: int
     answer_count: int
     current_anchor_label: str
+
+
+def test_normalized_material_text_preserves_line_boundaries() -> None:
+    """material 规范化按行折叠空白并保留非空行边界。"""
+
+    assert normalized_material_text(" first\tline \n\n second   line ") == (
+        "first line\nsecond line"
+    )
+
+
+def test_normalized_material_text_rejects_blank_text() -> None:
+    """纯空白 material 文本不可生成有效 material digest。"""
+
+    with pytest.raises(ValueError, match="text must be non-empty after normalization"):
+        normalized_material_text(" \n\t ")
 
 
 def _material_pack_shape(pack: CompactMaterialPack) -> _MaterialPackShape:
@@ -1824,6 +1840,81 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_candidate(tmp_pa
         )
 
 
+def test_pre_dispatch_previous_view_splits_each_accepted_candidate_item(
+    tmp_path: Path,
+) -> None:
+    """latest accepted candidate 的每个 semantic item 独立进入 previous view。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 multi-item compact fact 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_compacted_event(
+                transaction,
+                event_log,
+                event_id="event-compact-multi-item",
+                accepted_evidence_refs=("evidence:event-before-multi",),
+                accepted_candidate=_accepted_candidate_with_multiple_items(),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-multi-item",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current after multi compact"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current after multi compact",
+            )
+        )
+
+        assert tuple(block.kind for block in view.previous_compacted_view) == (
+            CompactMaterialBlockKind.SESSION_SUMMARY,
+            CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            CompactMaterialBlockKind.ANSWER_ANCHOR,
+            CompactMaterialBlockKind.ANSWER_ANCHOR,
+            CompactMaterialBlockKind.FORWARD_INTENT,
+            CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+        )
+        assert tuple(block.block_label for block in view.previous_compacted_view) == (
+            "P1",
+            "P2",
+            "P3",
+            "P4",
+            "P5",
+            "P6",
+            "P7",
+        )
+        assert tuple(block.text for block in view.previous_compacted_view) == (
+            "accepted session summary",
+            (
+                "fact=claim_text=accepted fact one; evidence_refs=E1; "
+                "evidence_kind=accepted_evidence_material"
+            ),
+            (
+                "fact=claim_text=accepted fact two; evidence_refs=E2; "
+                "evidence_kind=accepted_evidence_material"
+            ),
+            "answer_anchor=accepted anchor one",
+            "answer_anchor=accepted anchor two",
+            "forward_intent=next_step_note; status=open; text=accepted next step",
+            "reference_continuity=local_reference; text=accepted reference",
+        )
+
+
 def test_pre_dispatch_builder_ignores_memory_snapshot_lag_or_missing(tmp_path: Path) -> None:
     """Builder 不读取 memory snapshot，snapshot 缺失或滞后不影响输出。"""
 
@@ -2401,6 +2492,7 @@ def _append_compacted_event(
     *,
     event_id: str,
     accepted_evidence_refs: tuple[str, ...],
+    accepted_candidate: ConversationCompactOutputVNext | None = None,
 ) -> EventLogRow:
     """追加 accepted CONTEXT_COMPACTED canonical fact。
 
@@ -2408,6 +2500,7 @@ def _append_compacted_event(
     :param event_log: EventLog store。
     :param event_id: compacted event id。
     :param accepted_evidence_refs: accepted evidence mapping refs。
+    :param accepted_candidate: 可选 accepted compact candidate。
     :returns: appended EventLog row。
     """
 
@@ -2416,16 +2509,22 @@ def _append_compacted_event(
         event_log,
         event_id=event_id,
         event_type="CONTEXT_COMPACTED",
-        payload=_compacted_payload(accepted_evidence_refs=accepted_evidence_refs),
+        payload=_compacted_payload(
+            accepted_evidence_refs=accepted_evidence_refs,
+            accepted_candidate=accepted_candidate,
+        ),
     )
 
 
 def _compacted_payload(
-    *, accepted_evidence_refs: tuple[str, ...]
+    *,
+    accepted_evidence_refs: tuple[str, ...],
+    accepted_candidate: ConversationCompactOutputVNext | None = None,
 ) -> dict[str, JsonValue]:
     """构造测试用 accepted compact payload。
 
     :param accepted_evidence_refs: accepted evidence mapping refs。
+    :param accepted_candidate: 可选 accepted compact candidate。
     :returns: compacted payload。
     """
 
@@ -2435,7 +2534,11 @@ def _compacted_payload(
             accepted_attempt_number=1,
             compact_artifact_ref="artifact:compact-test",
             compact_artifact_digest=_DIGEST,
-            accepted_candidate=_accepted_candidate(),
+            accepted_candidate=(
+                _accepted_candidate()
+                if accepted_candidate is None
+                else accepted_candidate
+            ),
             quality_check_result=CompactQualityCheckResultVNext(
                 accepted=True,
                 rejection_reasons=(),
@@ -2478,6 +2581,71 @@ def _accepted_candidate() -> ConversationCompactOutputVNext:
                     ),
                 ),
                 answer_source_labels=("A1",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="accepted next step",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="accepted reference",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("T1",),
+            ),
+        ),
+        diagnostics=(),
+    )
+
+
+def _accepted_candidate_with_multiple_items() -> ConversationCompactOutputVNext:
+    """构造含多 fact / anchor 的 accepted compact candidate。
+
+    :returns: ConversationCompactOutputVNext。
+    """
+
+    return ConversationCompactOutputVNext(
+        schema_version="conversation_compact_output_v1",
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text="accepted session summary",
+            source_labels=("T1",),
+        ),
+        evidence_backed_facts=(
+            EvidenceBackedFactCandidateVNext(
+                claim_text="accepted fact one",
+                evidence_labels=("E1",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+            ),
+            EvidenceBackedFactCandidateVNext(
+                claim_text="accepted fact two",
+                evidence_labels=("E2",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+            ),
+        ),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="accepted anchor one",
+                anchor_items=(
+                    AnswerAnchorChildVNext(
+                        display_text="accepted anchor item one",
+                        ordinal=1,
+                    ),
+                ),
+                answer_source_labels=("A1",),
+            ),
+            AnswerAnchorCandidateVNext(
+                anchor_title="accepted anchor two",
+                anchor_items=(
+                    AnswerAnchorChildVNext(
+                        display_text="accepted anchor item two",
+                        ordinal=1,
+                    ),
+                ),
+                answer_source_labels=("A2",),
             ),
         ),
         forward_intents=(

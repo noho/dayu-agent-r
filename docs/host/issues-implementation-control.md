@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-CM-12-FIX-R1 final closeout completed locally and pushed to draft PR #150. EventLog-derived LLM-facing input material is no longer rejected by private DTO field-length guards, default evidence chunking, or private accepted-evidence retrieval-count constants; remaining shrinkage semantics are selection / floor / budget / provenance / fail-closed only. |
-| active work unit | WU-CM-12 |
-| default next work unit | WU-CM-12 |
-| next entry point | WU-CM-12-FIX-R1 is in draft-PR-pass. Await user review / merge decision for draft PR #150; do not implement WU-CM-13 or other follow-ups unless explicitly assigned. |
-| design source | Current active WU: updated `docs/host/design.md`; `docs/engine/design.md` only if Engine contracts are touched. `docs/host/conversation-memory-material-budget-discussion.md` remains rationale / handoff reference and no longer replaces design truth after completed write-back. |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 draft PR #150 https://github.com/noho/dayu-agent-r/pull/150; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for local gates. Draft PR #150 remains open draft; merge, mark-ready, reviewer requests, issue closure, and follow-up WU selection require separate user authorization. |
+| gate | discussion-ready |
+| implementation status | WU-CM-12 final closeout completed after three-way deepreview and focused re-review. Accepted fixes close proactive recovery rejected-attempt diagnostics, reactive recovery catch-up failure handling, recovering fail rejection propagation, cancellation manifest preservation, and memory projection edge cases. |
+| active work unit | WU-CLI-DEBUG-STREAM-01 |
+| default next work unit | WU-CLI-DEBUG-STREAM-01 |
+| next entry point | Start discussion / plan gate for WU-CLI-DEBUG-STREAM-01 (GitHub Issue #148). Inspect issue #148, CLI logging code, runtime log policy, stream / delta diagnostics, and README trigger scope before implementation. |
+| design source | Current active WU: GitHub Issue #148 plus current CLI / runtime logging / Host / Engine stream diagnostic code. `docs/host/design.md` and `docs/engine/design.md` must be checked only if the plan proposes Host / Engine contract or lifecycle semantics changes. |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 draft PR #150 https://github.com/noho/dayu-agent-r/pull/150; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| blocking open questions | None for WU-CM-12 final closeout. WU-CLI-DEBUG-STREAM-01 still needs discussion / plan confirmation before code changes. Draft PR #150 remains open draft; merge, mark-ready, reviewer requests, and issue closure require separate user authorization. |
 
 状态约定：
 
@@ -204,7 +204,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 | WU-CM-12-S4-R1 | deferred-with-owner | WU-CM-13 Reactive compact recovery follow-up | S4/S5 accepted proactive tier 1-3 compact recovery before dispatch fallback only. S5 adjudication concluded reactive tier 1-3 recovery would require separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Current WU does not add schema/API/EventLog/Engine role changes and defers reactive recovery to WU-CM-13, which must not enter implementation until a user or GitHub Issue assigns it as active owner. |
 | WU-CM-12-PR-R1 | deferred-with-owner | Future Host compact evidence cleanup WU；no default next entry | PR review observed `dayu/host/compaction_evidence.py` appears to have no production import after FIX-R1. Current PR review PASS does not require deleting it because deletion would be cleanup scope, not material-guard correctness. Future cleanup must decide whether to delete the module and migrate tests, or document its deferred owner if still needed. |
-| WU-CM-12-PR-R3 | deferred-with-owner | Future context compaction diagnostics WU；no default next entry | PR review observed recovery tier rejected attempts are not fully materialized as individual diagnostic EventLog records. Current design / plan treats this as non-blocking diagnostic completeness, not material correctness; future diagnostics work may decide whether to accumulate and persist per-tier rejected attempts. |
+| WU-CM-12-PR-R3 | closed | WU-CM-12 final closeout 2026-06-19 | Closed by operation-level rejected attempt aggregation and renumbering in proactive compact recovery; initial and recovery tier rejected attempts are now persisted as `CONTEXT_COMPACTION_ATTEMPT_REJECTED` and counted in `CONTEXT_COMPACTION_FAILED.attempt_count`. |
 
 ## 当前 Work Units
 
@@ -238,8 +238,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
-| WU-CM-12 | draft-PR-pass | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open draft and WU-CM-12-FIX-R1 final closeout is complete. User review reopened the WU for `WU-CM-12-FIX-R1`; private material legality guards, default evidence chunking, private accepted-evidence row cap, and lossy compact summary / memory truncation paths are removed or replaced by policy-backed whole-item / selection / fail-closed behavior. |
+| WU-CM-12 | draft-PR-pass | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open draft. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
 | WU-CM-13 | deferred | Reactive compact recovery tier 1-3 follow-up | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Deferred destination only. WU-CM-12 implements proactive tier 1-3 recovery; reactive recovery requires separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
+| WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
 
@@ -1594,6 +1595,12 @@ GitHub Issue #115，作为 GitHub Issue #81 的后续子任务；deferred behind
 - WU-CM-12-FIX-R1 final closeout constant audit: no remaining production code constant acts as a private field-length cap, lossy preview / summary cap, default evidence chunk cap, accepted-evidence row cap, or compact output parser item / text cap for EventLog-derived LLM-facing material outside `memory_projection_policy`. Retained non-policy constants are fixed message-envelope estimators, diagnostics limits, projection maintenance batch size, or prompt-local label grammar constants.
 - WU-CM-12-FIX-R1 final residual owners: `WU-CM-12-S4-R1` remains deferred to WU-CM-13 only when explicitly assigned; `WU-CM-12-PR-R1` compact evidence cleanup and `WU-CM-12-PR-R3` recovery-tier diagnostic completeness are deferred-with-owner and not blockers. `WU-CM-12-PR-R2` is closed by deleting compact output `MAX_VNEXT_*` guards.
 - WU-CM-12-FIX-R1 final state: draft-PR-pass. PR #150 remains draft; no merge, mark-ready, reviewer request, external issue closure, or follow-up WU selection was performed.
+- WU-CM-12 final closeout 2026-06-19 three-way deepreview artifacts: `docs/reviews/repo-review-20260619-164637.md`, `docs/reviews/repo-review-20260619-164912.md`, `docs/reviews/repo-review-20260619-165328.md`.
+- WU-CM-12 final closeout 2026-06-19 accepted fixes: proactive compact recovery persists operation-level rejected attempts from initial and recovery tiers with continuous attempt numbers; reactive recovery catch-up failure no longer blocks recovery dispatch; reactive fail-closed propagates recovering fail rejection; proposal cancellation after manifest recording returns a cancellation rejected attempt with manifest ref when Host cancellation is active; memory projection skips missing-run-id turn-floor protection and JSON bool integer confusion is rejected.
+- WU-CM-12 final closeout 2026-06-19 focused re-review: AgentCodex and AgentDS reported blocking findings closed; AgentMiMo reported high-priority coverage findings closed and only non-blocking old debt / broader design observations remaining. Accepted formatting observation in `dispatch.py` was fixed before closeout.
+- WU-CM-12 final closeout 2026-06-19 validation: `pytest tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py tests/host/test_compact_material.py tests/host/test_compaction_operation.py -q` PASS (`277 passed`); focused dispatch regression after final formatting fix PASS (`2 passed`); `pyright dayu/ tests/ utils/` PASS (`0 errors`).
+- WU-CM-12 final closeout 2026-06-19 artifact: `docs/reviews/wu-cm-12-final-closeout-20260619.md`.
+- WU-CM-12 final closeout 2026-06-19 residual reconciliation: `WU-CM-12-PR-R3` is closed by persisted recovery-tier rejected attempts; `WU-CM-13` remains deferred and not default next entry; broader old-debt observations require separate owner assignment.
 
 ### Design source / phaseflow 启动裁决
 
@@ -1714,3 +1721,44 @@ Reactive compact recovery 不同：它发生在 Engine ingest / dispatch 已经�
 - 验证 reactive accepted compact output 仍只生成五类 Session Semantic Memory，并且不把 fallback / diagnostic / Host governance state 投影为业务事实。
 - 受影响 Host / Engine ingest / compact / RunInput tests 通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
 - 若引入任何新的 LLM-facing memory material / compact material 产量常量，必须在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 或本 WU 明确批准的 policy owner 中定义；否则 final closeout 的常量审计必须列为 open residual。
+
+## WU-CLI-DEBUG-STREAM-01 CLI `--debug-stream` Per-Delta Stream Diagnostics
+
+### 状态
+
+`discussion-ready`。Owner / destination is GitHub Issue #148: https://github.com/noho/dayu-agent-r/issues/148.
+
+本 WU 是 WU-CM-12 final closeout 后新增的 issue-backed follow-up。当前只完成总控登记，不代表 plan gate 已通过，也不代表可以绕过 issue / code / README scope 核对直接实现。
+
+### Issue Scope
+
+Issue #148 要求把普通 `--debug` 与高噪音 stream delta diagnostics 分离：
+
+- `--debug` 保持常规诊断级别，不输出大量 per `reasoning_delta` / `content_delta` ingest 日志。
+- 新增显式 `--debug-stream`，仅在该开关启用时输出 stream delta / SSE / per-delta accepted / committed diagnostics。
+- `--debug-stream` 可与 `--debug` 组合；具体日志级别和 handler owner 必须在 plan gate 核对当前 CLI / runtime log 装配后确定。
+- `--help`、README 或对应 CLI 用户可见说明需要解释 `--debug` 与 `--debug-stream` 的差异。
+- 需要覆盖 CLI parsing / logging switch tests，验证 `--debug` 不再开启海量 per-delta ingest 日志，`--debug-stream` 可开启这些诊断。
+
+Issue comment 还要求核对 best-effort after-commit `host.memory_repair.catch_up.budget_exhausted` 的普通 `--debug` warning 噪音：required catch-up / rebuild / projection failures 仍应 warning；best-effort budget exhausted 不应在普通 debug 下制造误导性 WARN 噪音。该项是否与 `--debug-stream` 同 slice 处理，必须在 plan gate 以代码证据裁决。
+
+### Non-goals
+
+- 不改变 Host / Engine EventLog canonical fact contract。
+- 不改变 activity stream 用户可见行为。
+- 不把 final answer、业务正文或大块 LLM content 复制进 debug 日志，除非当前日志 contract 已允许且 `--debug-stream` 明确限定。
+- 不借本 WU 重构整个 CLI logging subsystem；仅处理 Issue #148 直接支撑的开关、日志分类和测试。
+
+### Entry Conditions
+
+- 先核对 Issue #148 当前状态和评论。
+- 核对 CLI parser、runtime logging、Engine / Host stream delta ingest logging sites、memory repair logging sites、现有 CLI tests 和 README 更新触发范围。
+- 若发现需要新的 public CLI contract 或 README 用户说明，先在 plan 中明确。
+
+### Acceptance Signals
+
+- `--debug` 不再输出 massive per-delta reasoning/content ingest logs。
+- `--debug-stream` 明确启用 stream delta / SSE / per-delta accepted / committed diagnostics。
+- `--debug-stream` 可与 `--debug` 组合且行为可测试。
+- CLI help / relevant README 更新完成并符合各 README 的更新约束。
+- CLI parsing / logging switch tests 覆盖上述行为；pyright 通过；必要的 affected tests 通过。

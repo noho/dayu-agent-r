@@ -8,6 +8,7 @@ EventLog 写入、artifact 写入、memory projection 与 durable state recheck 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Mapping
@@ -553,6 +554,16 @@ class _CompactorProposalExecutionError(Exception):
     proposal_manifest_reference: CompactorProposalManifestReference | None
 
 
+@dataclass(frozen=True, slots=True)
+class _CompactorProposalCancelledError(Exception):
+    """proposal 在 Host cancellation 生效后取消并携带 manifest ref。
+
+    :param proposal_manifest_reference: 已写 manifest ref。
+    """
+
+    proposal_manifest_reference: CompactorProposalManifestReference | None
+
+
 async def run_compaction_operation(
     *,
     request: CompactionRequest,
@@ -670,6 +681,33 @@ async def run_compaction_operation(
                     )
                 attempt_number += 1
                 continue
+            except _CompactorProposalCancelledError as exc:
+                proposal_manifest_reference = exc.proposal_manifest_reference
+                rejected_attempt = _attempt_rejected(
+                    request=pass_request,
+                    attempt_number=attempt_number,
+                    failure_category=_FAILURE_CANCELLATION_REQUESTED,
+                    repairable=False,
+                    next_policy_decision=_NEXT_DECISION_FAIL_COMPACTION,
+                    budget_after_attempted_compact=last_budget,
+                    diagnostic_suffix=_cancellation_suffix(cancellation_token),
+                    proposal_manifest_reference=proposal_manifest_reference,
+                )
+                rejected.append(rejected_attempt)
+                _log_rejected_attempt(
+                    request=pass_request,
+                    rejected=rejected_attempt,
+                    exception=None,
+                )
+                return CompactionOperationResult(
+                    accepted_candidate=None,
+                    quality_result=None,
+                    rejected_attempts=tuple(rejected),
+                    failure_reason=_FAILURE_CANCELLATION_REQUESTED.value,
+                    budget_after_attempted_compact=last_budget,
+                    accepted_proposal_manifest_ref=None,
+                    accepted_proposal_manifest_digest=None,
+                )
             except Exception as exc:
                 diagnostic_suffix = _exception_diagnostic_suffix(exc)
                 diagnostic = _proposal_failure_diagnostic(
@@ -897,6 +935,12 @@ async def _prepare_compactor_proposal(
             candidate = await compactor.run_prepared_compactor_proposal(
                 prepared_input
             )
+        except asyncio.CancelledError as exc:
+            if not cancellation_token.is_cancelled():
+                raise
+            raise _CompactorProposalCancelledError(
+                proposal_manifest_reference=manifest_reference,
+            ) from exc
         except Exception as exc:
             raise _CompactorProposalExecutionError(
                 original_exception=exc,
@@ -910,9 +954,17 @@ async def _prepare_compactor_proposal(
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
     )
+    try:
+        candidate = await compactor.compact(request, cancellation_token)
+    except asyncio.CancelledError as exc:
+        if not cancellation_token.is_cancelled():
+            raise
+        raise _CompactorProposalCancelledError(
+            proposal_manifest_reference=None,
+        ) from exc
     return _CompactorProposalAttempt(
         compact_input=compact_input,
-        candidate=await compactor.compact(request, cancellation_token),
+        candidate=candidate,
         proposal_manifest_reference=None,
     )
 

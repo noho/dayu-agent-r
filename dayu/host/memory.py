@@ -1973,7 +1973,6 @@ def _limit_selected_recent_window(
     :param items: 候选 items。
     :param policy: memory policy。
     :returns: 裁剪后的 items。
-    :raises ValueError: floor 依赖的 eligible item 缺少 run_id 时抛出。
     """
 
     protected_run_ids = _protected_recent_run_ids(
@@ -2007,23 +2006,24 @@ def _protected_recent_run_ids(
     :param items: selected recent window 候选 items。
     :param selected_recent_window_turn_floor: 需要保护的 turn group 数。
     :returns: 需要保护的 run_id 集合。
-    :raises ValueError: floor 依赖的 eligible item 缺少 run_id 时抛出。
     """
 
     if selected_recent_window_turn_floor == 0:
         return frozenset()
-    eligible = tuple(item for item in items if _is_selected_recent_turn_item(item))
-    missing = tuple(item.item_id for item in eligible if item.run_id is None)
-    if len(missing) > 0:
-        raise ValueError("selected recent window item is missing run_id")
+    eligible = tuple(
+        item
+        for item in items
+        if _is_selected_recent_turn_item(item) and item.run_id is not None
+    )
     latest_by_run: dict[str, tuple[int, int]] = {}
     for index, item in enumerate(eligible):
-        if item.run_id is None:
+        run_id = item.run_id
+        if run_id is None:
             continue
-        current = latest_by_run.get(item.run_id)
+        current = latest_by_run.get(run_id)
         candidate = (item.event_sequence, index)
         if current is None or candidate > current:
-            latest_by_run[item.run_id] = candidate
+            latest_by_run[run_id] = candidate
     ordered = tuple(
         run_id
         for run_id, _latest in sorted(
@@ -3200,6 +3200,8 @@ def _required_int(mapping: Mapping[str, JsonValue], field_name: str) -> int:
     """
 
     value = _required_value(mapping, field_name)
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be integer")
     if isinstance(value, int):
         return value
     raise ValueError(f"{field_name} must be integer")
@@ -3216,6 +3218,8 @@ def _optional_int(mapping: Mapping[str, JsonValue], field_name: str) -> int | No
     value = _required_value(mapping, field_name)
     if value is None:
         return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be integer")
     if isinstance(value, int):
         return value
     raise ValueError(f"{field_name} must be integer")

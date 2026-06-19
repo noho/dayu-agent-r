@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -574,6 +575,37 @@ class _PreparedManifestCompactor(FakeContextCompactor):
         )
 
 
+class _PreparedCancelledCompactor(_PreparedManifestCompactor):
+    """prepared proposal run 阶段请求取消并抛出 CancelledError。"""
+
+    def __init__(self, events: list[str], token: StubCancellationToken) -> None:
+        """初始化 compactor。
+
+        :param events: 共享顺序记录列表。
+        :param token: 测试用 cancellation token。
+        :returns: ``None``。
+        """
+
+        super().__init__(events)
+        self._token = token
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> ConversationCompactOutputVNext:
+        """模拟 Host cancellation 已生效后的 proposal 取消。
+
+        :param prepared_input: prepared proposal input。
+        :returns: 不会返回。
+        :raises asyncio.CancelledError: 始终抛出。
+        """
+
+        del prepared_input
+        self.events.append("run")
+        self._token.request_cancel("host_cancelled_during_proposal")
+        raise asyncio.CancelledError()
+
+
 def _proposal_agent_request(
     request: CompactionRequest,
     *,
@@ -752,6 +784,39 @@ async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest
         "runner-call-manifest:operation-prepared-failed:1"
     )
     assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_cancelled_proposal_keeps_manifest_ref() -> None:
+    """proposal 已写 manifest 后被 Host 取消时仍返回 rejected attempt。"""
+
+    events: list[str] = []
+    token = StubCancellationToken()
+    recorder = _RecordingProposalManifestRecorder(events)
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_PreparedCancelledCompactor(events, token),
+        max_attempts=1,
+        cancellation_token=token,
+        compaction_operation_id="operation-prepared-cancelled",
+        proposal_manifest_recorder=recorder,
+    )
+
+    assert events == ["prepare", "record", "run"]
+    assert result.accepted_candidate is None
+    assert result.failure_reason == "cancellation_requested"
+    assert len(result.rejected_attempts) == 1
+    rejected = result.rejected_attempts[0]
+    assert rejected.failure_category == (
+        compaction_operation.CompactionFailureCategory.CANCELLATION_REQUESTED
+    )
+    assert rejected.repairable is False
+    assert rejected.proposal_manifest_ref == (
+        "runner-call-manifest:operation-prepared-cancelled:1"
+    )
+    assert rejected.proposal_manifest_digest == recorder.references[0].manifest_digest
+    assert "host_cancelled_during_proposal" in rejected.diagnostic_refs[0]
 
 
 def test_accepted_compaction_missing_proposal_manifest_guard_fails_closed() -> None:

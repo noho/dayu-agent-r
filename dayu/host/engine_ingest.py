@@ -1793,6 +1793,19 @@ class EngineEventIngestor:
                     error_code="context_compaction_failed",
                     message="Context compaction failed during reactive recovery",
                 )
+                if fail_result.status is not EngineIngestStatus.ACCEPTED:
+                    return EngineIngestResult(
+                        status=fail_result.status,
+                        events=(
+                            *pending.result_prefix.events,
+                            *tuple(attempt_rows),
+                            failed,
+                            *fail_result.events,
+                        ),
+                        terminal_closeout=False,
+                        promotion_triggered=False,
+                        reason=fail_result.reason,
+                    )
                 return EngineIngestResult(
                     status=EngineIngestStatus.ACCEPTED,
                     events=(
@@ -2316,12 +2329,25 @@ class EngineEventIngestor:
         """
 
         if accepted.compacted_event_sequence is not None:
-            catch_up_conversation_memory_projection(
-                self._transaction_runner,
-                policy=self._memory_projection_policy,
-                batch_size=self._memory_projection_catchup_batch_size,
-                max_event_sequence=accepted.compacted_event_sequence,
-            )
+            try:
+                catch_up_conversation_memory_projection(
+                    self._transaction_runner,
+                    policy=self._memory_projection_policy,
+                    batch_size=self._memory_projection_catchup_batch_size,
+                    max_event_sequence=accepted.compacted_event_sequence,
+                )
+            except Exception as exc:
+                _LOGGER.warning(
+                    "engine_ingest.reactive_recovery.memory_catch_up_failed "
+                    "session_id=%s run_id=%s compacted_event_sequence=%s "
+                    "error_type=%s message=%s",
+                    accepted.session_id,
+                    accepted.run_id,
+                    accepted.compacted_event_sequence,
+                    type(exc).__name__,
+                    str(exc),
+                    exc_info=True,
+                )
         started = self._transaction_runner.run_write(
             _StartReactiveRecoveryOperation(
                 event_log_store=self._event_log_store,

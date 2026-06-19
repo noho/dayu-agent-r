@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -1340,6 +1340,8 @@ class HostDispatchScheduler:
         accepted_result = result
         accepted_attempt_number = _accepted_attempt_number(result)
         completed_attempt_count = _completed_compaction_proposal_attempt_count(result)
+        operation_rejected_attempts = list(result.rejected_attempts)
+        budget_after_attempted_compact = result.budget_after_attempted_compact
         if not _compaction_result_accepted(result):
             for recovery in self._proactive_compaction_recovery_attempts(pending):
                 if cancellation_token.is_cancelled():
@@ -1352,6 +1354,16 @@ class HostDispatchScheduler:
                     compaction_operation_id=pending.operation_id,
                     proposal_manifest_recorder=proposal_manifest_recorder,
                 )
+                operation_rejected_attempts.extend(
+                    _renumber_compaction_rejected_attempts(
+                        tier_result.rejected_attempts,
+                        offset=completed_attempt_count,
+                    )
+                )
+                if tier_result.budget_after_attempted_compact is not None:
+                    budget_after_attempted_compact = (
+                        tier_result.budget_after_attempted_compact
+                    )
                 if cancellation_token.is_cancelled():
                     break
                 if _compaction_result_accepted(tier_result):
@@ -1374,6 +1386,7 @@ class HostDispatchScheduler:
                 completed_attempt_count += (
                     _completed_compaction_proposal_attempt_count(tier_result)
                 )
+        rejected_attempts = tuple(operation_rejected_attempts)
 
         def _operation(transaction: HostTransaction) -> _ProactiveCompactionExecutionResult:
             run = read_run_by_id(transaction, pending.run_id)
@@ -1390,15 +1403,15 @@ class HostDispatchScheduler:
                         decision=pending.decision,
                         operation_id=pending.operation_id,
                         failure_reason="stale_compaction_result",
-                        attempt_count=len(result.rejected_attempts),
+                        attempt_count=len(rejected_attempts),
                         retry_repair_budget_exhausted=False,
-                        budget_after_attempted_compact=(result.budget_after_attempted_compact),
+                        budget_after_attempted_compact=budget_after_attempted_compact,
                     )
                 return _ProactiveCompactionExecutionResult(
                     compacted_event_sequence=None,
                     pending_dispatch=None,
                 )
-            for rejected in result.rejected_attempts:
+            for rejected in rejected_attempts:
                 self._append_compaction_attempt_rejected_event(
                     transaction,
                     run=run,
@@ -1413,9 +1426,9 @@ class HostDispatchScheduler:
                     decision=pending.decision,
                     operation_id=pending.operation_id,
                     failure_reason="stale_compaction_result",
-                    attempt_count=len(result.rejected_attempts),
+                    attempt_count=len(rejected_attempts),
                     retry_repair_budget_exhausted=False,
-                    budget_after_attempted_compact=(result.budget_after_attempted_compact),
+                    budget_after_attempted_compact=budget_after_attempted_compact,
                 )
                 return _ProactiveCompactionExecutionResult(
                     compacted_event_sequence=None,
@@ -1430,13 +1443,11 @@ class HostDispatchScheduler:
                     decision=pending.decision,
                     operation_id=pending.operation_id,
                     failure_reason=accepted_result.failure_reason or "compaction_failed",
-                    attempt_count=len(result.rejected_attempts),
+                    attempt_count=len(rejected_attempts),
                     retry_repair_budget_exhausted=(
-                        len(result.rejected_attempts) > 0
+                        len(rejected_attempts) > 0
                     ),
-                    budget_after_attempted_compact=(
-                        accepted_result.budget_after_attempted_compact
-                    ),
+                    budget_after_attempted_compact=budget_after_attempted_compact,
                 )
                 if fallback_dispatch is not None:
                     return _ProactiveCompactionExecutionResult(
@@ -4263,6 +4274,26 @@ def _completed_compaction_proposal_attempt_count(
     if _compaction_result_accepted(result):
         return rejected_completed + 1
     return rejected_completed
+
+
+def _renumber_compaction_rejected_attempts(
+    rejected_attempts: tuple[CompactionAttemptRejected, ...],
+    *,
+    offset: int,
+) -> tuple[CompactionAttemptRejected, ...]:
+    """把 recovery pass 的 rejected attempts 重编号为 operation 内序号。
+
+    :param rejected_attempts: 单个 recovery pass 返回的 rejected attempts。
+    :param offset: 该 pass 前已经完成的 proposal attempt 数。
+    :returns: attempt_number 连续递增后的 rejected attempts。
+    """
+
+    if offset == 0:
+        return rejected_attempts
+    return tuple(
+        replace(rejected, attempt_number=offset + rejected.attempt_number)
+        for rejected in rejected_attempts
+    )
 
 
 def _required_compactor_manifest_ref(result: CompactionOperationResult) -> str:

@@ -12,7 +12,11 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_FAILED
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    CONTEXT_COMPACTION_FAILED,
+)
 from dayu.host.durable import memory as durable_memory_module
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.connection import HostDurableStore
@@ -439,25 +443,41 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
     )
 
 
-def test_selected_recent_window_floor_rejects_missing_run_id() -> None:
-    """floor 依赖的 eligible item 缺 run_id 时不静默跳过。"""
+def test_selected_recent_window_floor_skips_missing_run_id_group() -> None:
+    """缺 run_id 的 item 不参与 turn floor 保护，也不阻断 projection。"""
 
-    with pytest.raises(ValueError, match="missing run_id"):
-        build_conversation_memory_snapshot_from_events(
-            events=(
-                _event(
-                    1,
-                    "user-missing-run",
-                    "USER_INPUT_ACCEPTED",
-                    {"display_text": "missing run"},
-                    run_id=None,
-                ),
+    policy = replace(
+        _policy(),
+        selected_recent_window_item_cap=1,
+        selected_recent_window_turn_floor=1,
+        fallback_selected_recent_window_item_cap=1,
+    )
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "user-missing-run",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "missing run"},
+                run_id=None,
             ),
-            session_id=_SESSION_ID,
-            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-            policy=_policy(),
-            built_at=_NOW,
-        )
+            _event(
+                2,
+                "user-with-run",
+                "USER_INPUT_ACCEPTED",
+                {"display_text": "with run"},
+                run_id="run-with-id",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert tuple(item.text for item in snapshot.trace_memory.selected_recent_window) == (
+        "with run",
+    )
 
 
 def test_accepted_compact_materializes_vnext_memory_sections() -> None:
@@ -1034,6 +1054,28 @@ def test_snapshot_json_roundtrip_preserves_vnext_sections() -> None:
     assert restored.snapshot_digest == calculate_memory_snapshot_digest(restored)
 
 
+def test_snapshot_json_rejects_bool_for_integer_fields() -> None:
+    """snapshot JSON 的 integer 字段拒绝 bool，避免 true 被当成 1。"""
+
+    policy = _policy()
+    snapshot = project_conversation_memory_event(
+        previous_snapshot=None,
+        event=_event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "hello"}),
+        policy=policy,
+        built_at=_NOW,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+    )
+    value = conversation_memory_snapshot_to_json_value(snapshot)
+    mapping = cast(dict[str, JsonValue], value)
+    trace_memory = cast(dict[str, JsonValue], mapping["trace_memory"])
+    selected = cast(list[JsonValue], trace_memory["selected_recent_window"])
+    selected_item = cast(dict[str, JsonValue], selected[0])
+    selected_item["event_sequence"] = True
+
+    with pytest.raises(ValueError, match="event_sequence must be integer"):
+        conversation_memory_snapshot_from_json_value(mapping)
+
+
 def test_write_snapshot_with_checkpoint_commits_snapshot_before_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -1277,6 +1319,58 @@ def test_projection_consumer_skips_failed_compact_without_memory_snapshot(
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == 1
         assert checkpoint.checkpoint_event_id == "compact-failed-1"
+
+
+def test_projection_consumer_skips_compaction_attempt_rejected(
+    tmp_path: Path,
+) -> None:
+    """attempt rejected 诊断事件不进入 Conversation Memory snapshot。"""
+
+    policy = _policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="compact-attempt-rejected-1",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=_SESSION_ID,
+                    run_id=_RUN_ID,
+                    attempt_id=_ATTEMPT_ID,
+                    execution_id=_EXECUTION_ID,
+                    event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                    occurred_at=_OCCURRED_AT,
+                    actor="pytest",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"failure_category": "proposal_failed"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        policy_digest = digest_memory_projection_policy(policy)
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=policy_digest,
+            )
+        )
+
+        assert result.events_scanned == 1
+        assert result.events_matched == 0
+        assert result.events_applied == 0
+        assert latest is None
 
 
 def test_policy_digest_changes_when_design_field_changes() -> None:

@@ -758,6 +758,12 @@ def _first_citable_compact_input_label(
     """
 
     compact_input = prepared_input.compact_input
+    for item in compact_input.trace_material:
+        return item.source_label
+    for item in compact_input.evidence_material:
+        return item.source_label
+    for item in compact_input.answer_material:
+        return item.source_label
     previous_view = compact_input.previous_compacted_view
     if previous_view is not None:
         for item in previous_view.evidence_backed_facts:
@@ -768,12 +774,6 @@ def _first_citable_compact_input_label(
             return item.source_label
         for item in previous_view.forward_intents:
             return item.source_label
-    for item in compact_input.trace_material:
-        return item.source_label
-    for item in compact_input.evidence_material:
-        return item.source_label
-    for item in compact_input.answer_material:
-        return item.source_label
     raise AssertionError("compact input has no citable label")
 
 
@@ -5033,6 +5033,34 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
                 == 0
             )
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+            rejected_events = _events_for_run_by_type(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            )
+            assert len(rejected_events) == 4
+            rejected_payloads = tuple(_event_payload(row) for row in rejected_events)
+            assert tuple(payload["attempt_number"] for payload in rejected_payloads) == (
+                1,
+                2,
+                3,
+                4,
+            )
+            assert all(
+                payload["failure_category"] == "proposal_failed"
+                for payload in rejected_payloads
+            )
+            for payload in rejected_payloads:
+                _assert_rejected_payload_has_proposal_manifest(payload)
+            failed_payload = _event_payload(
+                _latest_event_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTION_FAILED,
+                )
+            )
+            assert failed_payload["attempt_count"] == len(rejected_events)
+            assert failed_payload["retry_repair_budget_exhausted"] is True
             assert len(factory.accepted_requests) == 1
         finally:
             await scheduler.close()
@@ -5070,7 +5098,7 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                     store.transaction_runner,
                     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
                 )
-                == 2
+                == 4
             )
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
             requested = _latest_event_for_run(
@@ -5094,14 +5122,18 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                 CONTEXT_COMPACTION_FAILED,
             )
             assert _event_payload(rejected)["operation_id"] == requested.event_id
-            assert len(rejected_rows) == 2
+            assert len(rejected_rows) == 4
+            assert tuple(
+                _event_payload(rejected_row)["attempt_number"]
+                for rejected_row in rejected_rows
+            ) == (1, 2, 3, 4)
             for rejected_row in rejected_rows:
                 _assert_rejected_payload_has_proposal_manifest(
                     _event_payload(rejected_row)
                 )
             payload = _event_payload(failed)
             assert payload["operation_id"] == requested.event_id
-            assert payload["attempt_count"] == 2
+            assert payload["attempt_count"] == 4
             assert payload["retry_repair_budget_exhausted"] is True
             assert payload["fallback_action"] == "dispatch"
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
