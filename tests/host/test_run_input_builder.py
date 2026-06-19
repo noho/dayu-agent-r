@@ -3400,6 +3400,29 @@ def _append_current_run_compacted_event(
         :returns: ``None``。
         """
 
+        request_event_id = f"event-{seeded.run_id}-compact-requested"
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id=request_event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                event_type="CONTEXT_COMPACTION_REQUESTED",
+                payload={
+                    "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+                    "budget_reason": "test_post_compaction_raw_tail",
+                    "budget_snapshot_ref": _DIGEST_A,
+                    "input_snapshot_cursor": 1,
+                    "estimator_digest": _DIGEST_A,
+                    "policy_ref": "test-policy",
+                    "provider_request_id": None,
+                    "provider_error_ref": None,
+                    "attempt_id": seeded.attempt_id,
+                    "execution_id": seeded.execution_id,
+                },
+            ),
+        )
         EventLogStore().append_event(
             transaction,
             _event_request(
@@ -3409,6 +3432,7 @@ def _append_current_run_compacted_event(
                 run_id=seeded.run_id,
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
+                    operation_id=request_event_id,
                     summary_text="current run compacted semantic view",
                     pinned_patch={"candidate_id": "patch-current-run"},
                     fact_candidates=[],
@@ -5796,6 +5820,7 @@ def _user_input_payload(text: str) -> dict[str, JsonValue]:
 
 def _compact_payload(
     *,
+    operation_id: str = "event-compact-requested",
     summary_text: str,
     pinned_patch: dict[str, JsonValue],
     fact_candidates: list[JsonValue] | None = None,
@@ -5803,6 +5828,7 @@ def _compact_payload(
 ) -> dict[str, JsonValue]:
     """构造测试用 CONTEXT_COMPACTED payload。
 
+    :param operation_id: 对应 CONTEXT_COMPACTION_REQUESTED event id。
     :param summary_text: session summary 文本。
     :param pinned_patch: pinned patch candidate。
     :param fact_candidates: 可选 evidence-backed fact candidates。
@@ -5859,6 +5885,7 @@ def _compact_payload(
             if isinstance(values, list) and values and isinstance(values[0], str):
                 forward_text = values[0]
     payload: dict[str, JsonValue] = {
+        "operation_id": operation_id,
         "accepted_candidate": {
             "schema_version": "conversation_compact_output_v1",
             "session_summary": {

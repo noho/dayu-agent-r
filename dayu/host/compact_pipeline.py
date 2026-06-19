@@ -65,7 +65,7 @@ from dayu.host.context_fallback import (
 from dayu.host.context_policy import ContextBudgetPolicy, ContextCompactionTriggerSource
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
-from dayu.host.durable.state import RunRow
+from dayu.host.durable.state import AttemptRow, RunRow
 from dayu.host.memory import MemoryProjectionPolicy
 
 _REACTIVE_SINGLE_PASS_REASON = "reactive_single_pass_block"
@@ -73,6 +73,16 @@ _REACTIVE_NOT_IN_PASS_REASON = "not_in_pass"
 _RECENT_EVIDENCE_PREFIX = "Recent accepted tool evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
 _UNAVAILABLE_TOOL_QUERY = "The original tool query is not available in readable form."
+_EVIDENCE_SOURCE_PART_SEPARATOR = ", "
+_INTERNAL_EVIDENCE_SOURCE_PREFIXES = (
+    "tool_call_event:",
+    "tool_result_event:",
+    "event:",
+    "eventlog:",
+    "payload:",
+    "artifact:",
+    "digest:",
+)
 
 
 class MemorySnapshotView(Protocol):
@@ -114,17 +124,72 @@ class MemorySnapshotView(Protocol):
 class CompactPipelineCurrentRunFacts(Protocol):
     """pipeline-owned second-read provider hook 所需的 current facts 协议。"""
 
-    run: RunRow
-    user_prompt: str
+    @property
+    def run(self) -> RunRow:
+        """返回当前 Run row。
+
+        :returns: Run row。
+        """
+
+        ...
+
+    @property
+    def attempt(self) -> AttemptRow:
+        """返回当前 Attempt row。
+
+        :returns: Attempt row。
+        """
+
+        ...
+
+    @property
+    def user_prompt(self) -> str:
+        """返回当前用户输入文本。
+
+        :returns: 用户输入文本。
+        """
+
+        ...
 
 
 class CompactPipelineCompactArtifactView(Protocol):
     """pipeline-owned second-read provider hook 所需的 compact artifact 协议。"""
 
-    messages: tuple[AgentMessage, ...]
-    compact_artifact_ref: str | None
-    compact_artifact_digest: str | None
-    represented_evidence_refs: tuple[str, ...]
+    @property
+    def messages(self) -> tuple[AgentMessage, ...]:
+        """返回 compact artifact messages。
+
+        :returns: Agent messages。
+        """
+
+        ...
+
+    @property
+    def compact_artifact_ref(self) -> str | None:
+        """返回 compact artifact ref。
+
+        :returns: artifact ref；不存在时为 ``None``。
+        """
+
+        ...
+
+    @property
+    def compact_artifact_digest(self) -> str | None:
+        """返回 compact artifact digest。
+
+        :returns: artifact digest；不存在时为 ``None``。
+        """
+
+        ...
+
+    @property
+    def represented_evidence_refs(self) -> tuple[str, ...]:
+        """返回 compact artifact 已表示的 evidence refs。
+
+        :returns: evidence refs。
+        """
+
+        ...
 
 
 class CompactPipelineAttemptDispatchSnapshot(Protocol):
@@ -1061,10 +1126,49 @@ def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
         f"tool_name={block.readable_tool_name}",
         f"query={query_text}",
     ]
-    if block.readable_source_text is not None:
-        lines.append(f"source={block.readable_source_text}")
+    source_text = _llm_facing_evidence_source_text(block.readable_source_text)
+    if source_text is not None:
+        lines.append(f"source={source_text}")
     lines.append(f"result={block.text}")
     return "\n".join(lines)
+
+
+def _llm_facing_evidence_source_text(source_text: str | None) -> str | None:
+    """过滤 accepted evidence source note 中的内部 provenance。
+
+    :param source_text: compact material provider 给出的 source note。
+    :returns: 仅含业务可读 source locator 的文本；无可读项时返回 ``None``。
+    """
+
+    if source_text is None:
+        return None
+    parts = tuple(
+        part.strip()
+        for part in source_text.split(_EVIDENCE_SOURCE_PART_SEPARATOR)
+        if part.strip() != ""
+    )
+    visible_parts = tuple(
+        part for part in parts if not _is_internal_evidence_source_part(part)
+    )
+    if len(visible_parts) == 0:
+        return None
+    return _EVIDENCE_SOURCE_PART_SEPARATOR.join(visible_parts)
+
+
+def _is_internal_evidence_source_part(source_part: str) -> bool:
+    """判断 source note 分片是否为内部 provenance。
+
+    :param source_part: ``readable_source_text`` 的逗号分片。
+    :returns: 属于内部 ref / digest / artifact 标识时返回 ``True``。
+    """
+
+    normalized = source_part.strip().lower()
+    if normalized == "":
+        return True
+    return any(
+        normalized.startswith(prefix)
+        for prefix in _INTERNAL_EVIDENCE_SOURCE_PREFIXES
+    )
 
 
 __all__ = [

@@ -329,6 +329,50 @@ def test_ordinary_protected_raw_tail_selects_recent_group_and_memory_dedupes() -
     assert deduped.messages == ()
 
 
+def test_ordinary_protected_raw_tail_filters_internal_evidence_source() -> None:
+    """ordinary raw-tail evidence message 不暴露内部 provenance refs。"""
+
+    snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
+    evidence = run_input_material_block(
+        block_id="evidence-new",
+        section=CompactMaterialSection.EVIDENCE_MATERIAL,
+        kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+        text="raw evidence new",
+        canonical_source_refs=("evidence:new",),
+        event_sequence=4,
+        turn_group_id="run-new",
+        accepted_evidence_id="evidence:new",
+        tool_result_event_ref="event-tool-result-new",
+        tool_call_event_ref="event-tool-call-new",
+        payload_refs=("payload-new",),
+        readable_tool_name="fins.search",
+        readable_query_text="query new",
+        readable_source_text=(
+            "event:event-tool-result-new, filing page 12, "
+            "payload:payload-new"
+        ),
+    )
+    raw_tail_snapshot = replace(
+        snapshot,
+        material_blocks=(*snapshot.material_blocks, evidence),
+    )
+
+    handoff = select_ordinary_protected_raw_tail(
+        source_snapshot=raw_tail_snapshot,
+        selected_recent_window_turn_floor=1,
+        memory=_MemoryView(messages=()),
+    )
+    contents = tuple(
+        message.content
+        for message in handoff.messages
+        if message.content is not None
+    )
+
+    assert any("source=filing page 12" in content for content in contents)
+    assert all("event-tool-result-new" not in content for content in contents)
+    assert all("payload-new" not in content for content in contents)
+
+
 def _source_snapshot(
     trigger_source: ContextCompactionTriggerSource,
 ) -> CompactPipelineSourceSnapshot:

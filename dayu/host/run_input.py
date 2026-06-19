@@ -49,7 +49,7 @@ from dayu.host._event_payload import (
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
-from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_REQUESTED
 from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
     EventLogContextFallbackProvider,
@@ -63,10 +63,21 @@ from dayu.host.compact_material import (
     run_input_material_block,
     selected_material_view_digest,
 )
+from dayu.host.compact_pipeline import (
+    CompactPipelineAttemptDispatchSnapshot,
+    CompactPipelineCompactArtifactView,
+    CompactPipelineCurrentRunFacts,
+    CompactPipelineOrdinaryRawTailHandoff,
+    CompactPipelineProtectedRawTailProvider,
+    MemorySnapshotView as CompactPipelineMemorySnapshotView,
+    compact_pipeline_source_snapshot_from_pre_dispatch_view,
+    select_ordinary_protected_raw_tail,
+)
 from dayu.host.compaction import (
     CompactMaterialBlockKind,
     CompactMaterialSection,
 )
+from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -151,6 +162,8 @@ _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
+_PAYLOAD_FIELD_OPERATION_ID = "operation_id"
+_PAYLOAD_FIELD_TRIGGER_SOURCE = "trigger_source"
 _PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
@@ -416,21 +429,6 @@ class CompactArtifactView:
 
 
 @dataclass(frozen=True, slots=True)
-class _ProtectedRecentRawTailView:
-    """Post-compaction protected recent raw tail provider 输出。
-
-    :param messages: 可注入 ordinary RunInput 的 raw-tail messages。
-    :param material_blocks: messages 对应的 EventLog-backed material blocks。
-    :param source_refs: material blocks 覆盖的内部 provenance refs，仅用于校验
-        与 manifest，不进入 LLM-facing messages。
-    """
-
-    messages: tuple[AgentMessage, ...]
-    material_blocks: tuple[RunInputMaterialBlock, ...]
-    source_refs: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class ToolSchemaSnapshot:
     """工具 schema snapshot provider 输出。
 
@@ -550,28 +548,6 @@ class AcceptedToolEvidenceMaterialProvider(Protocol):
         :param compact: 当前 compact artifact provider view。
         :returns: evidence material blocks。
         :raises HostDurableError: evidence payload 损坏时抛出。
-        """
-        ...
-
-
-class _ProtectedRecentRawTailProvider(Protocol):
-    """Post-compaction protected recent raw tail provider 协议。"""
-
-    def load_protected_recent_raw_tail(
-        self,
-        snapshot: AttemptDispatchSnapshot,
-        current_facts: CurrentRunFacts,
-        memory: MemorySnapshotView,
-        compact: CompactArtifactView,
-    ) -> _ProtectedRecentRawTailView:
-        """读取当前 ordinary dispatch 可注入的 protected raw tail。
-
-        :param snapshot: Attempt dispatch snapshot。
-        :param current_facts: 当前 Run facts。
-        :param memory: 当前 memory provider view。
-        :param compact: 当前 compact artifact provider view。
-        :returns: protected recent raw tail view。
-        :raises HostDurableError: EventLog 或 compact artifact provenance 损坏时抛出。
         """
         ...
 
@@ -1369,13 +1345,13 @@ class NoopAcceptedToolEvidenceMaterialProvider:
 class _NoopProtectedRecentRawTailProvider:
     """不读取 protected recent raw tail 的 provider。"""
 
-    def load_protected_recent_raw_tail(
+    def load_ordinary_raw_tail(
         self,
-        snapshot: AttemptDispatchSnapshot,
-        current_facts: CurrentRunFacts,
-        memory: MemorySnapshotView,
-        compact: CompactArtifactView,
-    ) -> _ProtectedRecentRawTailView:
+        snapshot: CompactPipelineAttemptDispatchSnapshot,
+        current_facts: CompactPipelineCurrentRunFacts,
+        memory: CompactPipelineMemorySnapshotView,
+        compact: CompactPipelineCompactArtifactView,
+    ) -> CompactPipelineOrdinaryRawTailHandoff:
         """返回空 raw-tail view。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -1386,10 +1362,12 @@ class _NoopProtectedRecentRawTailProvider:
         """
 
         del snapshot, current_facts, memory, compact
-        return _ProtectedRecentRawTailView(
+        return CompactPipelineOrdinaryRawTailHandoff(
             messages=(),
             material_blocks=(),
             source_refs=(),
+            material_view_digest=selected_material_view_digest(()),
+            selected_recent_window_turn_floor=0,
         )
 
 
@@ -1420,13 +1398,13 @@ class _DurableProtectedRecentRawTailProvider:
         self._event_log_store = EventLogStore()
         self._policy = policy
 
-    def load_protected_recent_raw_tail(
+    def load_ordinary_raw_tail(
         self,
-        snapshot: AttemptDispatchSnapshot,
-        current_facts: CurrentRunFacts,
-        memory: MemorySnapshotView,
-        compact: CompactArtifactView,
-    ) -> _ProtectedRecentRawTailView:
+        snapshot: CompactPipelineAttemptDispatchSnapshot,
+        current_facts: CompactPipelineCurrentRunFacts,
+        memory: CompactPipelineMemorySnapshotView,
+        compact: CompactPipelineCompactArtifactView,
+    ) -> CompactPipelineOrdinaryRawTailHandoff:
         """读取当前 ordinary dispatch 可注入的 protected raw tail。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -1439,10 +1417,12 @@ class _DurableProtectedRecentRawTailProvider:
 
         del snapshot
         if compact.compact_artifact_ref is None:
-            return _ProtectedRecentRawTailView(
+            return CompactPipelineOrdinaryRawTailHandoff(
                 messages=(),
                 material_blocks=(),
                 source_refs=(),
+                material_view_digest=selected_material_view_digest(()),
+                selected_recent_window_turn_floor=0,
             )
         return self._transaction_runner.run_read(
             lambda transaction: self._load_protected_recent_raw_tail_tx(
@@ -1457,10 +1437,10 @@ class _DurableProtectedRecentRawTailProvider:
         self,
         transaction: HostTransaction,
         *,
-        current_facts: CurrentRunFacts,
-        memory: MemorySnapshotView,
-        compact: CompactArtifactView,
-    ) -> _ProtectedRecentRawTailView:
+        current_facts: CompactPipelineCurrentRunFacts,
+        memory: CompactPipelineMemorySnapshotView,
+        compact: CompactPipelineCompactArtifactView,
+    ) -> CompactPipelineOrdinaryRawTailHandoff:
         """在 read transaction 内读取 protected recent raw tail。
 
         :param transaction: Host transaction。
@@ -1475,10 +1455,12 @@ class _DurableProtectedRecentRawTailProvider:
             transaction, current_facts
         )
         if compacted_event is None:
-            return _ProtectedRecentRawTailView(
+            return CompactPipelineOrdinaryRawTailHandoff(
                 messages=(),
                 material_blocks=(),
                 source_refs=(),
+                material_view_digest=selected_material_view_digest(()),
+                selected_recent_window_turn_floor=0,
             )
         _validate_loaded_compact_view_matches_event(
             compact=compact,
@@ -1490,17 +1472,20 @@ class _DurableProtectedRecentRawTailProvider:
             run=current_facts.run,
             current_display_text=current_facts.user_prompt,
         )
-        blocks = _protected_recent_raw_tail_blocks(
-            material_view.material_blocks,
+        source_snapshot = compact_pipeline_source_snapshot_from_pre_dispatch_view(
+            trigger_source=_compaction_trigger_source_for_compacted_event(
+                transaction,
+                compacted_event=compacted_event,
+            ),
+            run=current_facts.run,
+            material_view=material_view,
+        )
+        return select_ordinary_protected_raw_tail(
+            source_snapshot=source_snapshot,
             selected_recent_window_turn_floor=(
                 self._policy.selected_recent_window_turn_floor
             ),
             memory=memory,
-        )
-        return _ProtectedRecentRawTailView(
-            messages=tuple(_fallback_message_from_material_block(block) for block in blocks),
-            material_blocks=blocks,
-            source_refs=_material_source_refs(blocks),
         )
 
 
@@ -1908,7 +1893,9 @@ class RunInputBuilder:
         policy_snapshot_provider: PolicySnapshotProvider,
         tool_execution_mode: ToolExecutionMode,
         runner_call_manifest_recorder: RunnerCallManifestRecorder | None = None,
-        protected_recent_raw_tail_provider: _ProtectedRecentRawTailProvider | None = None,
+        protected_recent_raw_tail_provider: (
+            CompactPipelineProtectedRawTailProvider | None
+        ) = None,
     ) -> None:
         """初始化 RunInputBuilder。
 
@@ -1988,17 +1975,19 @@ class RunInputBuilder:
         if fallback is None:
             protected_recent_raw_tail = (
                 self._protected_recent_raw_tail_provider
-                .load_protected_recent_raw_tail(
+                .load_ordinary_raw_tail(
                     attempt_snapshot,
                     current_facts,
                     memory,
                     compact,
                 )
                 if compact.compact_artifact_ref is not None
-                else _ProtectedRecentRawTailView(
+                else CompactPipelineOrdinaryRawTailHandoff(
                     messages=(),
                     material_blocks=(),
                     source_refs=(),
+                    material_view_digest=selected_material_view_digest(()),
+                    selected_recent_window_turn_floor=0,
                 )
             )
             bounded_context_messages = (
@@ -3463,7 +3452,7 @@ def _tool_result_memory_payload(
 
 
 def _latest_compacted_event_before_attempt(
-    transaction: HostTransaction, current_facts: CurrentRunFacts
+    transaction: HostTransaction, current_facts: CompactPipelineCurrentRunFacts
 ) -> EventLogRow | None:
     """读取当前 Attempt start cursor 前最新 ``CONTEXT_COMPACTED``。
 
@@ -3502,7 +3491,7 @@ def _latest_compacted_event_before_attempt(
 
 
 def _validate_loaded_compact_view_matches_event(
-    *, compact: CompactArtifactView, compacted_event: EventLogRow
+    *, compact: CompactPipelineCompactArtifactView, compacted_event: EventLogRow
 ) -> None:
     """校验 compact provider view 来自同一个 current-run compact event。
 
@@ -3523,64 +3512,39 @@ def _validate_loaded_compact_view_matches_event(
         raise HostDurableError("compact artifact digest does not match current run")
 
 
-def _protected_recent_raw_tail_blocks(
-    blocks: tuple[RunInputMaterialBlock, ...],
+def _compaction_trigger_source_for_compacted_event(
+    transaction: HostTransaction,
     *,
-    selected_recent_window_turn_floor: int,
-    memory: MemorySnapshotView,
-) -> tuple[RunInputMaterialBlock, ...]:
-    """选择需要注入 ordinary RunInput 的 protected recent raw tail blocks。
+    compacted_event: EventLogRow,
+) -> ContextCompactionTriggerSource:
+    """读取 compacted event 对应 requested fact 的 trigger source。
 
-    :param blocks: EventLog-backed post-compact delta material blocks。
-    :param selected_recent_window_turn_floor: existing selected recent turn floor。
-    :param memory: 当前 memory provider view，用于去重。
-    :returns: 去重后的 protected raw tail blocks。
-    :raises HostDurableError: protected floor 依赖的 material provenance 非法时抛出。
+    :param transaction: Host transaction。
+    :param compacted_event: current Run / current Attempt 前的 compacted event。
+    :returns: compaction trigger source。
+    :raises HostDurableError: requested fact 缺失或 trigger source 非法时抛出。
     """
 
-    if selected_recent_window_turn_floor == 0:
-        return ()
+    compacted_payload = _payload_object(compacted_event)
+    operation_id = _required_text_field(
+        compacted_payload,
+        _PAYLOAD_FIELD_OPERATION_ID,
+    )
+    requested_event = EventLogStore().read_event_by_id(transaction, operation_id)
+    if (
+        requested_event is None
+        or requested_event.event_type != CONTEXT_COMPACTION_REQUESTED
+    ):
+        raise HostDurableError("compaction requested event is missing")
+    requested_payload = _payload_object(requested_event)
+    trigger_value = _required_text_field(
+        requested_payload,
+        _PAYLOAD_FIELD_TRIGGER_SOURCE,
+    )
     try:
-        protected_group_ids = protected_recent_turn_group_ids_for_material_blocks(
-            blocks,
-            selected_recent_window_turn_floor=selected_recent_window_turn_floor,
-        )
+        return ContextCompactionTriggerSource(trigger_value)
     except ValueError as exc:
-        raise HostDurableError("protected recent raw tail group selection failed") from exc
-    selected = tuple(
-        block
-        for block in blocks
-        if block.turn_group_id in protected_group_ids
-        and is_turn_group_material_block(block)
-    )
-    return tuple(
-        block for block in selected if not _raw_tail_block_represented_by_memory(block, memory)
-    )
-
-
-def _raw_tail_block_represented_by_memory(
-    block: RunInputMaterialBlock, memory: MemorySnapshotView
-) -> bool:
-    """判断 raw-tail block 是否已由 memory selected recent window 表示。
-
-    :param block: EventLog-backed raw-tail material block。
-    :param memory: 当前 memory provider view。
-    :returns: 已表示时返回 ``True``。
-    """
-
-    source_refs = frozenset(memory.selected_recent_source_refs)
-    content_digests = frozenset(memory.selected_recent_content_digests)
-    if block.content_digest in content_digests:
-        return True
-    for ref in block.canonical_source_refs:
-        if ref in source_refs:
-            return True
-    evidence_refs = (
-        block.accepted_evidence_id,
-        block.tool_result_event_ref,
-        block.tool_call_event_ref,
-    )
-    return any(ref is not None and ref in source_refs for ref in evidence_refs)
+        raise HostDurableError("compaction trigger source is invalid") from exc
 
 
 def _text_content_digest(text: str) -> str:
