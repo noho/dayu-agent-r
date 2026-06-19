@@ -551,17 +551,18 @@ async def test_multi_compact_public_path_keeps_memory_and_compactor_input_bounde
 
 
 @pytest.mark.asyncio
-async def test_proactive_compact_duplicate_prompt_falls_back_without_lossy_anchor(
+async def test_proactive_compact_long_current_input_reaches_compactor_without_lossy_anchor(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """超长 current input 不能无损进入 compact schema 时走 dispatch fallback。
+    """超长 current input 完整进入 compactor current_input_anchor。
 
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
-    :raises AssertionError: Run 失败或错误调用 compactor 时抛出。
+    :raises AssertionError: Run 失败、未调用 compactor 或 current input 被截断。
     """
 
+    long_prompt = _DUPLICATE_PROMPT_SENTENCE * 500
     fake_compactor = FakeCompactorRunAgent()
     monkeypatch.setattr(
         "dayu.host.llm_compaction._run_agent_request",
@@ -584,14 +585,30 @@ async def test_proactive_compact_duplicate_prompt_falls_back_without_lossy_ancho
             followup_request(
                 session.session_id,
                 "p12-6-duplicate-first",
-                _DUPLICATE_PROMPT_SENTENCE * 500,
+                long_prompt,
             ),
         )
         terminal = await next_terminal_for_run(watcher, followup.accepted_run_id)
 
     assert terminal.kind is HostEventKind.SUCCEEDED
-    assert fake_compactor.prompt_lengths == []
-    assert _compact_artifact_files(tmp_path / "compact-artifacts") == ()
+    assert len(fake_compactor.prompt_lengths) == 1
+    assert len(fake_compactor.material_jsons) == 1
+    material_json = fake_compactor.material_jsons[0]
+    current_anchor = _required_mapping(
+        material_json["current_input_anchor"],
+        field_name="current_input_anchor",
+    )
+    assert current_anchor["anchor_label"] == "C1"
+    assert current_anchor["text"] == long_prompt
+    assert material_json["previous_compacted_view"] is None
+    assert material_json["trace_material"] == []
+    assert material_json["evidence_material"] == []
+    assert material_json["answer_material"] == []
+    material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
+    assert "truncated" not in material_text
+    assert "preview" not in material_text
+    assert "summary" not in material_text
+    assert len(_compact_artifact_files(tmp_path / "compact-artifacts")) >= 1
 
 
 @pytest.mark.asyncio
