@@ -115,12 +115,11 @@ class ReferenceContinuityReasonVNext(StrEnum):
 
 
 CONVERSATION_COMPACT_SUMMARY_SOURCE_SECTIONS_VNEXT = (
-    ConversationCompactLabelSectionVNext.PREVIOUS_COMPACTED_VIEW,
     ConversationCompactLabelSectionVNext.TRACE_MATERIAL,
     ConversationCompactLabelSectionVNext.EVIDENCE_MATERIAL,
     ConversationCompactLabelSectionVNext.ANSWER_MATERIAL,
 )
-"""vNext session summary candidate 允许引用的 label section。"""
+"""vNext session summary candidate 允许引用的本次新材料 label section。"""
 
 CONVERSATION_COMPACT_FACT_SOURCE_SECTIONS_VNEXT = (
     ConversationCompactLabelSectionVNext.EVIDENCE_MATERIAL,

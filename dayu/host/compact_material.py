@@ -761,14 +761,45 @@ def normalized_material_text(text: str) -> str:
     """规范化 material 可读文本。
 
     :param text: 原始文本。
-    :returns: 去除首尾空白并折叠连续空白后的文本。
+    :returns: 去除首尾空白、折叠行内连续空白并保留非空行边界后的文本。
     :raises TypeError: 文本类型非法时抛出。
     :raises ValueError: 规范化后为空时抛出。
     """
 
     if not isinstance(text, str):
         raise TypeError("text must be str")
-    normalized = " ".join(text.split())
+    normalized_lines = tuple(
+        _normalized_material_line(line)
+        for line in text.splitlines()
+    )
+    normalized = "\n".join(line for line in normalized_lines if line != "")
+    if normalized == "":
+        raise ValueError("text must be non-empty after normalization")
+    return normalized
+
+
+def _normalized_material_line(text: str) -> str:
+    """规范化单行 material 文本。
+
+    :param text: 原始单行文本。
+    :returns: 去除首尾空白并折叠连续空白后的文本。
+    """
+
+    return " ".join(text.split())
+
+
+def _normalized_structured_field_text(text: str) -> str:
+    """把结构化 previous view 字段规范化为单行文本。
+
+    :param text: 字段原始文本。
+    :returns: 单行字段文本。
+    :raises TypeError: 文本类型非法时抛出。
+    :raises ValueError: 规范化后为空时抛出。
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    normalized = _normalized_material_line(text)
     if normalized == "":
         raise ValueError("text must be non-empty after normalization")
     return normalized
@@ -1924,56 +1955,61 @@ def _previous_compacted_view_from_compacted_event(
                 event_sub_index=0,
             )
         )
-    facts_text = _candidate_facts_text(candidate)
-    if facts_text is not None:
+    for index, fact_text in enumerate(_candidate_facts_texts(candidate), start=1):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:evidence_backed_facts",
+                block_id=f"previous:{row.event_id}:evidence_backed_fact:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
-                text=facts_text,
+                text=fact_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=1,
+                event_sub_index=len(blocks),
             )
         )
-    anchors_text = _candidate_answer_anchors_text(candidate)
-    if anchors_text is not None:
+    for index, anchor_text in enumerate(
+        _candidate_answer_anchor_texts(candidate),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:answer_anchors",
+                block_id=f"previous:{row.event_id}:answer_anchor:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-                text=anchors_text,
+                text=anchor_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=2,
+                event_sub_index=len(blocks),
             )
         )
-    intents_text = _candidate_forward_intents_text(candidate)
-    if intents_text is not None:
+    for index, intent_text in enumerate(
+        _candidate_forward_intent_texts(candidate),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:forward_intents",
+                block_id=f"previous:{row.event_id}:forward_intent:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.FORWARD_INTENT,
-                text=intents_text,
+                text=intent_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=3,
+                event_sub_index=len(blocks),
             )
         )
-    references_text = _candidate_reference_continuity_text(candidate)
-    if references_text is not None:
+    for index, reference_text in enumerate(
+        _candidate_reference_continuity_texts(candidate),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id=f"previous:{row.event_id}:reference_continuity",
+                block_id=f"previous:{row.event_id}:reference_continuity:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
-                text=references_text,
+                text=reference_text,
                 canonical_source_refs=(row.event_id,),
                 event_sequence=row.event_sequence,
-                event_sub_index=4,
+                event_sub_index=len(blocks),
             )
         )
     return _pack_previous_blocks(tuple(blocks))
@@ -2445,73 +2481,92 @@ def _candidate_session_summary_text(
     return _required_json_text(summary, _PAYLOAD_FIELD_SUMMARY_TEXT)
 
 
-def _candidate_facts_text(candidate: Mapping[str, JsonValue]) -> str | None:
-    """把 accepted candidate facts 渲染为 previous view 文本。
+def _candidate_facts_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """把 accepted candidate facts 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: facts 文本；无 facts 时为 ``None``。
+    :returns: facts 单项文本 tuple；无 facts 时为空 tuple。
     :raises HostDurableError: candidate facts 结构损坏时抛出。
     """
 
     facts = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
-    if len(facts) == 0:
-        return None
     lines: list[str] = []
     for fact in facts:
+        claim_text = _normalized_structured_field_text(
+            _required_json_text(fact, _PAYLOAD_FIELD_CLAIM_TEXT)
+        )
+        evidence_refs = ",".join(
+            _normalized_structured_field_text(label)
+            for label in _required_json_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
+        )
+        evidence_kind = _normalized_structured_field_text(
+            _required_json_text(fact, _PAYLOAD_FIELD_EVIDENCE_KIND)
+        )
         lines.append(
             "fact="
-            f"claim_text={_required_json_text(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}; "
-            f"evidence_refs={','.join(_required_json_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS))}; "
-            f"evidence_kind={_required_json_text(fact, _PAYLOAD_FIELD_EVIDENCE_KIND)}"
+            f"claim_text={claim_text}; "
+            f"evidence_refs={evidence_refs}; "
+            f"evidence_kind={evidence_kind}"
         )
-    return "\n".join(lines)
+    return tuple(lines)
 
 
-def _candidate_answer_anchors_text(candidate: Mapping[str, JsonValue]) -> str | None:
-    """把 accepted candidate answer anchors 渲染为 previous view 文本。
+def _candidate_answer_anchor_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """把 accepted candidate answer anchors 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: answer anchors 文本；无 anchors 时为 ``None``。
+    :returns: answer anchors 单项文本 tuple；无 anchors 时为空 tuple。
     :raises HostDurableError: candidate anchors 结构损坏时抛出。
     """
 
     anchors = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
-    if len(anchors) == 0:
-        return None
-    return "\n".join(
-        f"{_PREVIOUS_ANSWER_ANCHOR_PREFIX}{_required_json_text(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)}"
-        for anchor in anchors
-    )
+    lines: list[str] = []
+    for anchor in anchors:
+        title = _normalized_structured_field_text(
+            _required_json_text(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)
+        )
+        lines.append(f"{_PREVIOUS_ANSWER_ANCHOR_PREFIX}{title}")
+    return tuple(lines)
 
 
-def _candidate_forward_intents_text(candidate: Mapping[str, JsonValue]) -> str | None:
-    """把 accepted candidate forward intents 渲染为 previous view 文本。
+def _candidate_forward_intent_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """把 accepted candidate forward intents 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: forward intents 文本；无 intents 时为 ``None``。
+    :returns: forward intents 单项文本 tuple；无 intents 时为空 tuple。
     :raises HostDurableError: candidate intents 结构损坏时抛出。
     """
 
     intents = _required_json_mapping_tuple(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
-    if len(intents) == 0:
-        return None
     lines: list[str] = []
     for intent in intents:
-        lines.append(
-            f"{_PREVIOUS_FORWARD_INTENT_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_INTENT_TYPE)}; "
-            f"{_PREVIOUS_FORWARD_STATUS_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_STATUS)}; "
-            f"{_PREVIOUS_FORWARD_TEXT_PREFIX}{_required_json_text(intent, _PAYLOAD_FIELD_TEXT)}"
+        intent_type = _normalized_structured_field_text(
+            _required_json_text(intent, _PAYLOAD_FIELD_INTENT_TYPE)
         )
-    return "\n".join(lines)
+        status = _normalized_structured_field_text(
+            _required_json_text(intent, _PAYLOAD_FIELD_STATUS)
+        )
+        text = _normalized_structured_field_text(
+            _required_json_text(intent, _PAYLOAD_FIELD_TEXT)
+        )
+        lines.append(
+            f"{_PREVIOUS_FORWARD_INTENT_PREFIX}"
+            f"{intent_type}; "
+            f"{_PREVIOUS_FORWARD_STATUS_PREFIX}"
+            f"{status}; "
+            f"{_PREVIOUS_FORWARD_TEXT_PREFIX}"
+            f"{text}"
+        )
+    return tuple(lines)
 
 
-def _candidate_reference_continuity_text(
+def _candidate_reference_continuity_texts(
     candidate: Mapping[str, JsonValue],
-) -> str | None:
-    """把 accepted candidate reference continuity 渲染为 previous view 文本。
+) -> tuple[str, ...]:
+    """把 accepted candidate reference continuity 渲染为 previous view 单项文本。
 
     :param candidate: accepted candidate JSON object。
-    :returns: reference continuity 文本；无 items 时为 ``None``。
+    :returns: reference continuity 单项文本 tuple；无 items 时为空 tuple。
     :raises HostDurableError: candidate references 结构损坏时抛出。
     """
 
@@ -2519,15 +2574,21 @@ def _candidate_reference_continuity_text(
         candidate,
         _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS,
     )
-    if len(items) == 0:
-        return None
     lines: list[str] = []
     for item in items:
-        lines.append(
-            f"{_PREVIOUS_REFERENCE_PREFIX}{_required_json_text(item, _PAYLOAD_FIELD_REASON)}; "
-            f"{_PREVIOUS_REFERENCE_TEXT_PREFIX}{_required_json_text(item, _PAYLOAD_FIELD_TEXT)}"
+        reason = _normalized_structured_field_text(
+            _required_json_text(item, _PAYLOAD_FIELD_REASON)
         )
-    return "\n".join(lines)
+        text = _normalized_structured_field_text(
+            _required_json_text(item, _PAYLOAD_FIELD_TEXT)
+        )
+        lines.append(
+            f"{_PREVIOUS_REFERENCE_PREFIX}"
+            f"{reason}; "
+            f"{_PREVIOUS_REFERENCE_TEXT_PREFIX}"
+            f"{text}"
+        )
+    return tuple(lines)
 
 
 def _current_input_anchor(current_input_ref: str, current_input_text: str) -> CurrentInputAnchor:
@@ -2617,56 +2678,61 @@ def _previous_blocks_from_snapshot(
                 event_sub_index=0,
             )
         )
-    facts_text = _snapshot_facts_text(snapshot)
-    if facts_text is not None:
+    for index, fact_text in enumerate(_snapshot_fact_texts(snapshot), start=1):
         blocks.append(
             run_input_material_block(
-                block_id=_STABLE_FACTS_BLOCK_ID,
+                block_id=f"{_STABLE_FACTS_BLOCK_ID}:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
-                text=facts_text,
+                text=fact_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=1,
+                event_sub_index=len(blocks),
             )
         )
-    anchors_text = _snapshot_answer_anchors_text(snapshot)
-    if anchors_text is not None:
+    for index, anchor_text in enumerate(
+        _snapshot_answer_anchor_texts(snapshot),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id="previous:answer_anchors",
+                block_id=f"previous:answer_anchor:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-                text=anchors_text,
+                text=anchor_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=2,
+                event_sub_index=len(blocks),
             )
         )
-    intents_text = _snapshot_forward_intents_text(snapshot)
-    if intents_text is not None:
+    for index, intent_text in enumerate(
+        _snapshot_forward_intent_texts(snapshot),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id="previous:forward_intents",
+                block_id=f"previous:forward_intent:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.FORWARD_INTENT,
-                text=intents_text,
+                text=intent_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=3,
+                event_sub_index=len(blocks),
             )
         )
-    reference_text = _snapshot_reference_continuity_text(snapshot)
-    if reference_text is not None:
+    for index, reference_text in enumerate(
+        _snapshot_reference_continuity_texts(snapshot),
+        start=1,
+    ):
         blocks.append(
             run_input_material_block(
-                block_id="previous:reference_continuity",
+                block_id=f"previous:reference_continuity:{index}",
                 section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
                 kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
                 text=reference_text,
                 canonical_source_refs=(snapshot.snapshot_id,),
                 event_sequence=None,
-                event_sub_index=4,
+                event_sub_index=len(blocks),
             )
         )
     return _pack_previous_blocks(tuple(blocks))
@@ -2682,70 +2748,75 @@ def _snapshot_summary_text(snapshot: ConversationMemorySnapshotVNext) -> str | N
     return snapshot.session_summary_memory.summary_text
 
 
-def _snapshot_facts_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 evidence-backed facts stable 文本。
+def _snapshot_fact_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 evidence-backed facts stable 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: stable 文本；无内容时返回 ``None``。
+    :returns: stable 单项文本 tuple；无内容时为空 tuple。
     """
 
     facts = snapshot.evidence_fact_memory.evidence_backed_facts
-    if not facts:
-        return None
     lines: list[str] = []
     for fact in facts:
+        evidence_refs = ",".join(
+            _normalized_structured_field_text(ref)
+            for ref in fact.evidence_refs
+        )
         lines.append(
             "fact="
-            f"claim_text={fact.claim_text}; "
-            f"evidence_refs={','.join(fact.evidence_refs)}; "
-            f"evidence_kind={fact.evidence_kind.value}"
+            f"claim_text={_normalized_structured_field_text(fact.claim_text)}; "
+            f"evidence_refs={evidence_refs}; "
+            f"evidence_kind={_normalized_structured_field_text(fact.evidence_kind.value)}"
         )
-    return "\n".join(lines)
+    return tuple(lines)
 
 
-def _snapshot_answer_anchors_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 previous answer anchors 文本。
+def _snapshot_answer_anchor_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 previous answer anchor 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: answer anchor 文本；无内容时返回 ``None``。
+    :returns: answer anchor 单项文本 tuple；无内容时为空 tuple。
     """
 
-    if not snapshot.answer_anchor_memory.anchors:
-        return None
     lines: list[str] = []
     for anchor in snapshot.answer_anchor_memory.anchors:
-        lines.append(f"answer_anchor={anchor.anchor_title}")
-    return "\n".join(lines)
+        lines.append(
+            f"answer_anchor={_normalized_structured_field_text(anchor.anchor_title)}"
+        )
+    return tuple(lines)
 
 
-def _snapshot_forward_intents_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 previous forward intents 文本。
+def _snapshot_forward_intent_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 previous forward intent 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: forward intent 文本；无内容时返回 ``None``。
+    :returns: forward intent 单项文本 tuple；无内容时为空 tuple。
     """
 
-    if not snapshot.forward_intent_memory.intents:
-        return None
     lines: list[str] = []
     for intent in snapshot.forward_intent_memory.intents:
-        lines.append(f"forward_intent={intent.intent_type}; status={intent.status}; text={intent.text}")
-    return "\n".join(lines)
+        lines.append(
+            f"forward_intent={_normalized_structured_field_text(intent.intent_type)}; "
+            f"status={_normalized_structured_field_text(intent.status)}; "
+            f"text={_normalized_structured_field_text(intent.text)}"
+        )
+    return tuple(lines)
 
 
-def _snapshot_reference_continuity_text(snapshot: ConversationMemorySnapshotVNext) -> str | None:
-    """构造 previous reference continuity 文本。
+def _snapshot_reference_continuity_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str, ...]:
+    """构造 previous reference continuity 单项文本。
 
     :param snapshot: memory snapshot。
-    :returns: reference continuity 文本；无内容时返回 ``None``。
+    :returns: reference continuity 单项文本 tuple；无内容时为空 tuple。
     """
 
-    if not snapshot.trace_memory.reference_continuity_items:
-        return None
     lines: list[str] = []
     for item in snapshot.trace_memory.reference_continuity_items:
-        lines.append(f"reference_continuity={item.reason}; text={item.text}")
-    return "\n".join(lines)
+        lines.append(
+            f"reference_continuity={_normalized_structured_field_text(item.reason)}; "
+            f"text={_normalized_structured_field_text(item.text)}"
+        )
+    return tuple(lines)
 
 
 def _pack_previous_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[CompactMaterialBlock, ...]:
@@ -3440,7 +3511,7 @@ def _parse_previous_forward_intent_text(
 ) -> tuple[ForwardIntentTypeVNext, ForwardIntentStatusVNext, str]:
     """解析本模块生成的 previous forward intent 文本。
 
-    :param text: ``_snapshot_forward_intents_text`` 生成的文本。
+    :param text: ``_snapshot_forward_intent_texts`` 生成的单项文本。
     :returns: intent type、status 与可读文本。
     :raises ValueError: 文本格式或枚举值非法时抛出。
     """
@@ -3469,7 +3540,7 @@ def _parse_previous_reference_continuity_text(
 ) -> tuple[ReferenceContinuityReasonVNext, str]:
     """解析本模块生成的 previous reference continuity 文本。
 
-    :param text: ``_snapshot_reference_continuity_text`` 生成的文本。
+    :param text: ``_snapshot_reference_continuity_texts`` 生成的单项文本。
     :returns: reference reason 与可读文本。
     :raises ValueError: 文本格式或枚举值非法时抛出。
     """

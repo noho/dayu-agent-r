@@ -952,6 +952,110 @@ def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> 
     ) == ("local_reference",)
 
 
+def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks() -> None:
+    """previous compacted view 多记录 block 往返时必须保留记录边界。"""
+
+    base = _snapshot_with_stable_blocks(
+        snapshot_id="snapshot-stable-multi-record-blocks",
+        checkpoint_event_sequence=2,
+    )
+    snapshot_without_digest = replace(
+        base,
+        forward_intent_memory=ForwardIntentMemoryView(
+            intents=(
+                ForwardIntent(
+                    item_id="memory-item:forward-intent-1",
+                    intent_type="next_step_note",
+                    text="follow up one",
+                    status="open",
+                    source_refs=("event:intent:1",),
+                    event_id="event-intent-1",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(13),
+                ),
+                ForwardIntent(
+                    item_id="memory-item:forward-intent-2",
+                    intent_type="pending_user_visible_task",
+                    text="follow up two\nwith wrapped source text",
+                    status="superseded",
+                    source_refs=("event:intent:2",),
+                    event_id="event-intent-2",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(38),
+                ),
+            )
+        ),
+        trace_memory=TraceMemoryView(
+            selected_recent_window=(),
+            reference_continuity_items=(
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity-1",
+                    text="first reference",
+                    reason="local_reference",
+                    source_refs=("event:reference:1",),
+                    event_id="event-reference-1",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(15),
+                ),
+                ReferenceContinuityItem(
+                    item_id="memory-item:reference-continuity-2",
+                    text="second reference\nwith wrapped source text",
+                    reason="recent_state",
+                    source_refs=("event:reference:2",),
+                    event_id="event-reference-2",
+                    event_sequence=2,
+                    size_units=MemorySizeUnits(41),
+                ),
+            ),
+        ),
+        snapshot_digest="pending",
+    )
+    snapshot = replace(
+        snapshot_without_digest,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=2,
+        memory_snapshot_cursor=2,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(),
+    )
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(),
+        memory_snapshot=snapshot,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+
+    vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
+
+    previous_view = vnext_input.previous_compacted_view
+    assert previous_view is not None
+    assert tuple(item.text for item in previous_view.forward_intents) == (
+        "follow up one",
+        "follow up two with wrapped source text",
+    )
+    assert tuple(item.intent_type.value for item in previous_view.forward_intents) == (
+        "next_step_note",
+        "pending_user_visible_task",
+    )
+    assert tuple(item.status.value for item in previous_view.forward_intents) == (
+        "open",
+        "superseded",
+    )
+    assert tuple(item.text for item in previous_view.reference_continuity_items) == (
+        "first reference",
+        "second reference with wrapped source text",
+    )
+    assert tuple(item.reason.value for item in previous_view.reference_continuity_items) == (
+        "local_reference",
+        "recent_state",
+    )
+
+
 def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> None:
     """vNext trace material 必须包含用户可见 Run 状态。"""
 

@@ -25,6 +25,7 @@ label 规则：
 - label 是本次请求内的引用标签，只能逐字复制输入里已有的 `source_label` 或 `anchor_label`；不要生成不存在的 label。
 - label 只说明“输出内容来自哪段输入”，不是业务事实、财报事实、用户意图或结论。
 - 不要引用 `current_input_anchor.anchor_label`。
+- `previous_compacted_view` 是此前已经整理好的可读记忆。可以用它理解已有状态；本次 `session_summary.source_labels` 只标注本次新材料来源，不要引用 `previous_compacted_view` 中的 label。
 - `evidence_material` 的 label 通常形如 `E1`；`answer_material` 的 label 通常形如 `A1`；其它可引用材料的 label 可能形如 `P1` 或 `T1`。具体以本次输入实际出现的 label 为准。
 
 输出 JSON 字段：
@@ -32,7 +33,7 @@ label 规则：
 - `schema_version`：必填 JSON string，唯一允许值为 `conversation_compact_output_v1`。
 - `session_summary`：必填 JSON object 或 null。有足够来源时输出 object；没有足够来源时输出 null。
 - `session_summary.summary_text`：当 `session_summary` 为 object 时必填，JSON string，简短概括仍需保留的会话状态。
-- `session_summary.source_labels`：当 `session_summary` 为 object 时必填，JSON string array。只能引用 `previous_compacted_view`、`trace_material`、`evidence_material`、`answer_material` 中的 label。
+- `session_summary.source_labels`：当 `session_summary` 为 object 时必填，JSON string array。只能引用 `trace_material`、`evidence_material`、`answer_material` 中的 label；不要引用 `previous_compacted_view` 或 `current_input_anchor` 中的 label。
 - `evidence_backed_facts`：必填 JSON array。每个元素是一条被证据文本直接支撑的事实；没有足够证据时输出空数组。
 - `evidence_backed_facts[*].claim_text`：必填 JSON string，只写可由证据文本支撑的事实。
 - `evidence_backed_facts[*].evidence_labels`：必填 JSON string array，必须非空，只能引用 `evidence_material` 中的 label。
@@ -65,7 +66,7 @@ label 规则：
   "schema_version": "conversation_compact_output_v1",
   "session_summary": {
     "summary_text": "non-empty text",
-    "source_labels": ["P1", "T1", "E1", "A1"]
+    "source_labels": ["T1", "E1", "A1"]
   },
   "evidence_backed_facts": [
     {
