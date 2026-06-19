@@ -1758,7 +1758,9 @@ Deferred destination only。当前不创建 GitHub Issue，不是默认 next ent
 
 第 N 轮 assistant final answer 列出 4 条详细内容。第 N+1 轮用户输入“详细解释第三条”，并且本轮 dispatch 前触发 compact。
 
-需要讨论的问题是：compact 后第 N+1 轮送给 Engine 的 messages 中，仅有 Answer Anchor Memory 是否足够；如果不足，Host 是否必须把第 N 轮 final answer 的完整文本，或至少完整第三条及其列表结构，作为 recent raw material / selected recent window / 等价 bounded material 保留下来。
+需求裁决：compact 后第 N+1 轮送给 Engine 的 messages 不能只等价于 `latest_accepted_compacted_view + current user prompt`。Host 必须在 compact boundary 后继续保留既有 protected recent raw tail；该 tail 复用现有 `selected_recent_window_turn_floor` / protected recent floor 语义，不新增 WU-CM-14 专属 floor、ordinal follow-up floor 或 prompt-pattern-specific cap。
+
+protected recent raw tail 的基本单位仍是 turn group。最近 `selected_recent_window_turn_floor` 个 turn group 中已 committed、eligible、LLM-readable 的 material 应按 whole block / whole section keep-drop 进入 ordinary RunInput / fallback RunInput，至少覆盖历史 user prompt、assistant final answer、accepted readable tool evidence 与用户可见 Run outcome material。裸 tool request 不应单独作为 evidence；若 tool interaction 需要保留，必须通过 accepted readable evidence 或成对且自解释的 material 表达，不暴露 tool_call_id、digest、EventLog id、payload ref 或 Host 内部治理状态。
 
 ### 初步代码核对结论
 
@@ -1767,11 +1769,12 @@ Deferred destination only。当前不创建 GitHub Issue，不是默认 next ent
 - selected recent window 按设计可以承载 post-compact delta material 中的 raw user input、assistant final answer、accepted tool evidence 和用户可见 outcome material。
 - 一旦第 N 轮 final answer 被 compact 覆盖，而 accepted compact output 只保留短 answer anchor，第 N+1 轮 Engine 可能只能解析“第三条指什么”，但缺少“详细解释第三条”所需的完整文本和列表上下文。
 
-### 待讨论问题
+### 设计裁决与剩余讨论点
 
-- “详细解释第三条”这类 ordinal follow-up 的最低上下文要求是什么：完整第 N 轮 final answer、完整 4 条列表、完整第三条、还是 answer anchor + reference continuity 即可。
-- local ordinal follow-up 是否应触发 deterministic recent-final-answer preservation policy，而不是依赖 compactor 自行把足够文本写入 Answer Anchor Memory。
-- preservation owner 应归属于 selected recent window / protected recent floor / compact accept quality gate / ordinary RunInput assembly 中的哪一层，避免 prompt-conditioned retrieval、semantic search 或 ad hoc parser。
+- Answer Anchor Memory 负责指代解析，不负责承载完整展开所需的原回答上下文；recent raw tail 负责最近回答、工具证据和 outcome 的原始业务语义连续性。
+- WU-CM-14 不新增 memory kind、不新增 floor、不实现 ordinal parser；preservation 复用 `selected_recent_window_turn_floor` / protected recent floor。
+- compact accepted 后，`latest_accepted_compacted_view` 只代表 compact 覆盖范围内的旧历史语义视图；它不得吞掉仍处于 protected recent floor 内的 raw tail。
+- preservation owner 初步归属于 selected recent window / protected recent floor 与 ordinary RunInput / fallback RunInput assembly 的共享 material selection 语义；plan gate 仍需用代码证据确认当前 owner 位置和最小改动点。
 - preservation owner 如何复用 proactive / reactive shared compact pipeline，确保同一段 history、同一个 current input anchor 和同一项 accepted compact candidate 在两种触发方式下得到同义的 preservation / fallback / RunInput assembly 结果。
 - 若第 N 轮 final answer 本身超预算，应采用 whole-item keep-drop、chunking with provenance、section-aware degrade 还是 fail closed；不得 silent truncation、preview 化或 summary 化后伪装为完整回答。
 - 是否需要在 `docs/host/design.md` 增补 Answer Anchor Memory 与 recent raw final answer preservation 的边界说明。
@@ -1780,8 +1783,9 @@ Deferred destination only。当前不创建 GitHub Issue，不是默认 next ent
 
 - 不并入 `WU-CM-13`；不借本 WU 重新设计 proactive / reactive compact pipeline unification。
 - 不允许为 proactive compact 与 reactive compact 分别实现语义不同的 recent final answer preservation 分支；触发方式不同不应改变 preservation 结果。
+- 不新增 WU-CM-14 专属 protected floor、ordinal follow-up floor、recent answer cap 或另一套 selected recent window policy；复用 `selected_recent_window_turn_floor` / protected recent floor。
 - 不引入 semantic search、vector recall、prompt-conditioned reranker 或长期 memory retrieval framework。
-- 不实现 deterministic final answer outline parser，除非后续设计讨论明确裁决。
+- 不实现 deterministic final answer outline parser 或“第三条”prompt-pattern parser。
 - 不把 Answer Anchor Memory 升级成事实证明、完整回答存储或替代 raw final answer 的通用机制。
 - 不通过字段级截断、固定 preview、私有 DTO cap 或 summary 化来保留超长 final answer。
 
@@ -1789,15 +1793,16 @@ Deferred destination only。当前不创建 GitHub Issue，不是默认 next ent
 
 - 重新核对 `docs/host/design.md` 中 latest accepted compacted view、post-compact delta material、selected recent window、protected recent floor、Answer Anchor Memory、Reference Continuity 和 Prompt Assembly 的设计真源。
 - 重新核对 RunInputBuilder、Conversation Memory projection、compact material selection 与相关测试，确认第 N+1 轮触发 compact 后 ordinary Engine messages 的实际组成。
-- 先完成需求讨论并写明设计裁决，再决定是否进入 plan gate、是否需要 GitHub Issue。
+- plan gate 先验证当前 `selected_recent_window_turn_floor` / protected recent floor 是否已经跨 compact boundary 生效；若未生效，plan 必须定位 root cause 并提出最小修复，不新增平行 policy owner。
 
 ### Acceptance Signals
 
 - 文档明确裁决 ordinal follow-up 场景下，recent assistant final answer 与 Answer Anchor Memory 的职责边界。
+- 文档和实现明确复用 `selected_recent_window_turn_floor` / protected recent floor；不得新增 WU-CM-14 专属 floor 或 prompt-pattern-specific retention rule。
 - 文档明确裁决 WU-CM-14 preservation 逻辑与 WU-CM-13 shared compact pipeline 的关系：策略可以独立讨论，但实现必须避免 proactive / reactive 语义漂移。
-- 若裁决需要保留 raw final answer 或完整被引用条目，测试必须覆盖：第 N 轮 final answer 列 4 条详细文本，第 N+1 轮“详细解释第三条”触发 compact，最终 Engine messages 包含足以解释第三条的完整业务上下文。
-- 若裁决需要保留 raw final answer 或完整被引用条目，测试还必须覆盖 proactive 与 reactive compact 触发下的同义 preservation 结果，除非 plan gate 明确证明某一路径不会经过该 preservation owner。
-- 若裁决认为 Answer Anchor / Reference Continuity 已足够，必须有代码证据和测试证明 accepted compact output 能稳定携带完整解释所需文本，而不是只携带短轮廓。
+- 测试必须覆盖：第 N 轮 final answer 列 4 条详细文本，第 N+1 轮“详细解释第三条”触发 compact，最终 Engine messages 除 accepted compacted view / memory sections 与 current user prompt 外，还包含 protected recent raw tail 中足以解释第三条的完整业务上下文。
+- 测试必须覆盖 protected recent raw tail 的 eligible material 边界：history user prompt、assistant final answer、accepted readable tool evidence、user-visible outcome material；裸 tool request、Host internal refs / digest / EventLog id 不进入 LLM-facing tail。
+- 测试还必须覆盖 proactive 与 reactive compact 触发下的同义 preservation 结果，除非 plan gate 明确证明某一路径不会经过该 preservation owner。
 - 受影响 Host memory / compact / RunInput tests 通过；若发生代码修改，`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
 
 ## WU-CLI-DEBUG-STREAM-01 CLI `--debug-stream` Per-Delta Stream Diagnostics
