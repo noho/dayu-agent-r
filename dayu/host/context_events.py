@@ -80,6 +80,20 @@ _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT = "budget_after_attempted_compact"
 _FIELD_PROPOSAL_MANIFEST_REF = "proposal_manifest_ref"
 _FIELD_PROPOSAL_MANIFEST_DIGEST = "proposal_manifest_digest"
+_FIELD_DIAGNOSTIC_ARTIFACT_REF = "diagnostic_artifact_ref"
+_FIELD_DIAGNOSTIC_ARTIFACT_DIGEST = "diagnostic_artifact_digest"
+_FIELD_FAILURE_STAGE = "failure_stage"
+_FIELD_DIAGNOSTIC_SUFFIX = "diagnostic_suffix"
+_FIELD_PARSER_OR_VALIDATOR = "parser_or_validator"
+_FIELD_EXCEPTION_CLASS = "exception_class"
+_FIELD_EXCEPTION_MESSAGE = "exception_message"
+_FIELD_OFFENDING_BLOCK_SECTION = "offending_block_section"
+_FIELD_OFFENDING_BLOCK_KIND = "offending_block_kind"
+_FIELD_OFFENDING_BLOCK_LABEL = "offending_block_label"
+_FIELD_OFFENDING_BLOCK_ORDINAL = "offending_block_ordinal"
+_FIELD_OFFENDING_BLOCK_TEXT_DIGEST = "offending_block_text_digest"
+_FIELD_OFFENDING_BLOCK_TEXT_LENGTH = "offending_block_text_length"
+_FIELD_MATERIAL_PACK_DIGEST = "material_pack_digest"
 _FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
 _FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
 _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
@@ -561,6 +575,20 @@ def build_context_compaction_attempt_rejected_payload(
     budget_after_attempted_compact: int | None,
     proposal_manifest_ref: str | None = None,
     proposal_manifest_digest: str | None = None,
+    diagnostic_artifact_ref: str | None = None,
+    diagnostic_artifact_digest: str | None = None,
+    failure_stage: str | None = None,
+    diagnostic_suffix: str | None = None,
+    parser_or_validator: str | None = None,
+    exception_class: str | None = None,
+    exception_message: str | None = None,
+    offending_block_section: str | None = None,
+    offending_block_kind: str | None = None,
+    offending_block_label: str | None = None,
+    offending_block_ordinal: int | None = None,
+    offending_block_text_digest: str | None = None,
+    offending_block_text_length: int | None = None,
+    material_pack_digest: str | None = None,
 ) -> Mapping[str, JsonValue]:
     """构造 ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` payload。
 
@@ -577,6 +605,20 @@ def build_context_compaction_attempt_rejected_payload(
         未发起 proposal call 时为 ``None``。
     :param proposal_manifest_digest: 对应该 attempt 的 proposal manifest digest；
         未发起 proposal call 时为 ``None``。
+    :param diagnostic_artifact_ref: material/proposal diagnostic artifact ref。
+    :param diagnostic_artifact_digest: diagnostic artifact digest。
+    :param failure_stage: 失败阶段分类。
+    :param diagnostic_suffix: 与 ``diagnostic_refs`` 对齐的诊断后缀。
+    :param parser_or_validator: 失败来源 parser / validator 名称。
+    :param exception_class: 脱敏异常类型。
+    :param exception_message: 脱敏异常消息。
+    :param offending_block_section: offending material block section。
+    :param offending_block_kind: offending material block kind。
+    :param offending_block_label: offending material block label。
+    :param offending_block_ordinal: offending block 在 previous view 中的序号。
+    :param offending_block_text_digest: offending block text digest。
+    :param offending_block_text_length: offending block text 字符长度。
+    :param material_pack_digest: compact material pack digest。
     :returns: 可写入 EventLog 的 JSON payload。
     :raises ValueError: payload 字段非法时抛出。
     """
@@ -594,6 +636,20 @@ def build_context_compaction_attempt_rejected_payload(
         _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: budget_after_attempted_compact,
         _FIELD_PROPOSAL_MANIFEST_REF: proposal_manifest_ref,
         _FIELD_PROPOSAL_MANIFEST_DIGEST: proposal_manifest_digest,
+        _FIELD_DIAGNOSTIC_ARTIFACT_REF: diagnostic_artifact_ref,
+        _FIELD_DIAGNOSTIC_ARTIFACT_DIGEST: diagnostic_artifact_digest,
+        _FIELD_FAILURE_STAGE: failure_stage,
+        _FIELD_DIAGNOSTIC_SUFFIX: diagnostic_suffix,
+        _FIELD_PARSER_OR_VALIDATOR: parser_or_validator,
+        _FIELD_EXCEPTION_CLASS: exception_class,
+        _FIELD_EXCEPTION_MESSAGE: exception_message,
+        _FIELD_OFFENDING_BLOCK_SECTION: offending_block_section,
+        _FIELD_OFFENDING_BLOCK_KIND: offending_block_kind,
+        _FIELD_OFFENDING_BLOCK_LABEL: offending_block_label,
+        _FIELD_OFFENDING_BLOCK_ORDINAL: offending_block_ordinal,
+        _FIELD_OFFENDING_BLOCK_TEXT_DIGEST: offending_block_text_digest,
+        _FIELD_OFFENDING_BLOCK_TEXT_LENGTH: offending_block_text_length,
+        _FIELD_MATERIAL_PACK_DIGEST: material_pack_digest,
     }
     validate_context_compaction_attempt_rejected_payload(payload)
     return payload
@@ -627,6 +683,23 @@ def validate_context_compaction_attempt_rejected_payload(
         ref_field=_FIELD_PROPOSAL_MANIFEST_REF,
         digest_field=_FIELD_PROPOSAL_MANIFEST_DIGEST,
     )
+    _validate_optional_ref_digest_pair(
+        payload,
+        ref_field=_FIELD_DIAGNOSTIC_ARTIFACT_REF,
+        digest_field=_FIELD_DIAGNOSTIC_ARTIFACT_DIGEST,
+    )
+    _optional_text(payload, _FIELD_FAILURE_STAGE)
+    _optional_text(payload, _FIELD_DIAGNOSTIC_SUFFIX)
+    _optional_text(payload, _FIELD_PARSER_OR_VALIDATOR)
+    _optional_text(payload, _FIELD_EXCEPTION_CLASS)
+    _optional_text(payload, _FIELD_EXCEPTION_MESSAGE)
+    _optional_text(payload, _FIELD_OFFENDING_BLOCK_SECTION)
+    _optional_text(payload, _FIELD_OFFENDING_BLOCK_KIND)
+    _optional_text(payload, _FIELD_OFFENDING_BLOCK_LABEL)
+    _optional_non_negative_int(payload, _FIELD_OFFENDING_BLOCK_ORDINAL)
+    _validate_optional_digest(payload, _FIELD_OFFENDING_BLOCK_TEXT_DIGEST)
+    _optional_non_negative_int(payload, _FIELD_OFFENDING_BLOCK_TEXT_LENGTH)
+    _validate_optional_digest(payload, _FIELD_MATERIAL_PACK_DIGEST)
 
 
 def _string_list_json(values: tuple[str, ...]) -> list[JsonValue]:
@@ -702,6 +775,22 @@ def _required_digest(payload: Mapping[str, JsonValue], field_name: str) -> str:
     if not is_sha256_digest(value):
         raise ValueError(f"{field_name} must be sha256 digest")
     return value
+
+
+def _validate_optional_digest(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> None:
+    """校验可选 sha256 digest 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises ValueError: 字段存在但不是 SHA-256 digest 时抛出。
+    """
+
+    value = _optional_text(payload, field_name)
+    if value is not None and not is_sha256_digest(value):
+        raise ValueError(f"{field_name} must be sha256 digest")
 
 
 def _required_non_negative_int(

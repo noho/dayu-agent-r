@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -31,13 +33,16 @@ from dayu.host.compact_material import (
     initial_segment_selection,
 )
 from dayu.host.compaction import (
+    CompactMaterialBlock,
     CompactMaterialBlockKind,
+    CompactMaterialSection,
     CompactSegmentTrigger,
     CompactQualityCheckResultVNext,
     CompactQualityIssueVNext,
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
+    PromptLocalProvenanceEntry,
 )
 from dayu.host.compaction_evidence import (
     SelectedEvidenceBlockRef,
@@ -52,6 +57,7 @@ from dayu.host.context_events import build_context_compaction_attempt_rejected_p
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
@@ -898,6 +904,107 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
     assert result.rejected_attempts[1].repairable is False
     assert "proposal failed" in result.rejected_attempts[0].diagnostic_refs[0]
     assert result.failure_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_rejected_attempt_diagnostic_captures_invalid_previous_reference(
+    tmp_path: Path,
+) -> None:
+    """previous_compacted_view parse 失败时生成可持久化 diagnostic artifact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: diagnostic 缺失或 raw material 泄漏到 EventLog payload。
+    """
+
+    raw_text = "reference_continuity=previous_fact text=offending raw continuity"
+    request = _request_with_previous_reference_continuity(raw_text)
+    result = await run_compaction_operation(
+        request=request,
+        compactor=FakeContextCompactor(),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+        compaction_operation_id="operation-invalid-reference",
+    )
+
+    assert result.accepted_candidate is None
+    assert result.failure_reason == "proposal_failed"
+    assert len(result.rejected_attempts) == 1
+    rejected = result.rejected_attempts[0]
+    assert rejected.proposal_manifest_ref is None
+    assert rejected.proposal_manifest_digest is None
+    diagnostic = rejected.diagnostic
+    assert diagnostic is not None
+    assert diagnostic.failure_stage == "previous_compacted_view_parse"
+    assert diagnostic.parser_or_validator == "previous_reference_continuity"
+    assert diagnostic.exception_class == "ValueError"
+    assert diagnostic.exception_message == "previous reference continuity text is invalid"
+    assert diagnostic.offending_block is not None
+    assert diagnostic.offending_block.kind == "reference_continuity"
+    assert diagnostic.offending_block.block_label == "P-REF"
+    assert diagnostic.offending_block.text_length == len(raw_text)
+
+    reference, artifact_json, metadata_json = _write_and_read_rejected_diagnostic(
+        tmp_path,
+        diagnostic=diagnostic,
+        operation_id="operation-invalid-reference",
+        attempt_number=rejected.attempt_number,
+    )
+    payload = dict(
+        build_context_compaction_attempt_rejected_payload(
+            operation_id="operation-invalid-reference",
+            attempt_number=rejected.attempt_number,
+            failure_category=rejected.failure_category.value,
+            repairable=rejected.repairable,
+            runner_attempt_summary_refs=rejected.runner_attempt_summary_refs,
+            diagnostic_refs=rejected.diagnostic_refs,
+            next_policy_decision=rejected.next_policy_decision.value,
+            budget_after_attempted_compact=rejected.budget_after_attempted_compact,
+            proposal_manifest_ref=rejected.proposal_manifest_ref,
+            proposal_manifest_digest=rejected.proposal_manifest_digest,
+            diagnostic_artifact_ref=reference.payload_ref,
+            diagnostic_artifact_digest=reference.payload_digest,
+            failure_stage=diagnostic.failure_stage,
+            diagnostic_suffix=diagnostic.diagnostic_suffix,
+            parser_or_validator=diagnostic.parser_or_validator,
+            exception_class=diagnostic.exception_class,
+            exception_message=diagnostic.exception_message,
+            offending_block_section=diagnostic.offending_block.section,
+            offending_block_kind=diagnostic.offending_block.kind,
+            offending_block_label=diagnostic.offending_block.block_label,
+            offending_block_ordinal=diagnostic.offending_block.block_ordinal,
+            offending_block_text_digest=diagnostic.offending_block.text_digest,
+            offending_block_text_length=diagnostic.offending_block.text_length,
+            material_pack_digest=diagnostic.material_pack_digest,
+        )
+    )
+
+    assert payload["proposal_manifest_ref"] is None
+    assert payload["diagnostic_artifact_ref"] == reference.payload_ref
+    assert payload["diagnostic_artifact_digest"] == reference.payload_digest
+    assert payload["failure_stage"] == "previous_compacted_view_parse"
+    assert payload["offending_block_kind"] == "reference_continuity"
+    assert raw_text not in canonical_json_dumps(payload)
+    assert metadata_json["descriptor_kind"] == (
+        "compaction_rejected_attempt_diagnostic"
+    )
+    assert metadata_json["event_type"] == "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+    assert metadata_json["compaction_operation_id"] == "operation-invalid-reference"
+    assert metadata_json["compaction_attempt_number"] == rejected.attempt_number
+    assert metadata_json["failure_stage"] == "previous_compacted_view_parse"
+    assert metadata_json["parser_or_validator"] == "previous_reference_continuity"
+    assert metadata_json["contains_raw_material"] is True
+    assert metadata_json["confidential"] is True
+    assert artifact_json["proposal_manifest_ref"] is None
+    assert artifact_json["failure_stage"] == "previous_compacted_view_parse"
+    assert artifact_json["parser_or_validator"] == "previous_reference_continuity"
+    offending = artifact_json["offending_block"]
+    assert isinstance(offending, dict)
+    assert offending["raw_text"] == raw_text
+    assert offending["kind"] == "reference_continuity"
+    previous_view = artifact_json["previous_compacted_view"]
+    assert isinstance(previous_view, list)
+    assert previous_view == [request.material_pack.previous_compacted_view[0].to_json()]
 
 
 @pytest.mark.asyncio
@@ -2334,6 +2441,131 @@ def _request(
             overage_reason=None,
         ),
     )
+
+
+def _request_with_previous_reference_continuity(raw_text: str) -> CompactionRequest:
+    """构造包含坏 reference continuity previous view 的 compaction request。
+
+    :param raw_text: previous compacted view 中的 raw block text。
+    :returns: compaction request。
+    """
+
+    base = _request()
+    content_digest = sha256_digest_json({"text": raw_text})
+    previous_block = CompactMaterialBlock(
+        block_label="P-REF",
+        section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+        kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+        text=raw_text,
+        size_units=len(raw_text),
+        source_labels=(),
+        canonical_source_refs=("event-previous-reference",),
+        content_digest=content_digest,
+    )
+    provenance_map = {
+        **base.material_pack.provenance_map,
+        "P-REF": PromptLocalProvenanceEntry(
+            label="P-REF",
+            section=CompactMaterialSection.PREVIOUS_COMPACTED_VIEW,
+            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+            canonical_source_refs=("event-previous-reference",),
+            source_event_refs=("event-previous-reference",),
+            content_digest=content_digest,
+            accepted_evidence_id=None,
+            tool_result_event_ref=None,
+            tool_call_event_ref=None,
+            payload_refs=(),
+            artifact_refs=(),
+            source_locator_refs=(),
+        ),
+    }
+    material_pack = replace(
+        base.material_pack,
+        previous_compacted_view=(previous_block,),
+        provenance_map=provenance_map,
+    )
+    return replace(
+        base,
+        material_pack=material_pack,
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=base.segment_selection.input_cursor,
+            material_pack=material_pack,
+        ),
+    )
+
+
+def _write_and_read_rejected_diagnostic(
+    tmp_path: Path,
+    *,
+    diagnostic: compaction_operation.CompactionRejectedAttemptDiagnostic,
+    operation_id: str,
+    attempt_number: int,
+) -> tuple[
+    compaction_operation.CompactionRejectedAttemptDiagnosticReference,
+    dict[str, JsonValue],
+    dict[str, JsonValue],
+]:
+    """写入并读回 rejected attempt diagnostic artifact 与 descriptor metadata。
+
+    :param tmp_path: pytest 临时目录。
+    :param diagnostic: 内存态 diagnostic。
+    :param operation_id: compaction operation id。
+    :param attempt_number: compaction attempt number。
+    :returns: diagnostic reference、artifact JSON、metadata JSON。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[
+            compaction_operation.CompactionRejectedAttemptDiagnosticReference,
+            str,
+            str,
+        ]:
+            """写入 artifact descriptor 并读回 descriptor JSON 文本。
+
+            :param transaction: Host transaction。
+            :returns: diagnostic reference、artifact relative path、metadata JSON 文本。
+            """
+
+            reference = (
+                compaction_operation.write_compaction_rejected_attempt_diagnostic_artifact(
+                    transaction=transaction,
+                    artifact_store=LocalArtifactStore(
+                        options.payload_policy.artifact_root
+                    ),
+                    payload_store=PayloadStore(),
+                    diagnostic=diagnostic,
+                    compaction_operation_id=operation_id,
+                    compaction_attempt_number=attempt_number,
+                )
+            )
+            descriptor = PayloadStore().read_payload_descriptor(
+                transaction,
+                reference.payload_ref,
+            )
+            assert descriptor is not None
+            assert descriptor.payload_digest == reference.payload_digest
+            assert descriptor.artifact_relative_path == reference.artifact_relative_path
+            return reference, reference.artifact_relative_path, descriptor.metadata_json
+
+        reference, relative_path, metadata_text = store.transaction_runner.run_write(
+            operation
+        )
+
+        artifact_path = options.payload_policy.artifact_root / relative_path
+        artifact_json = cast(
+            dict[str, JsonValue],
+            json.loads(artifact_path.read_text(encoding="utf-8")),
+        )
+        metadata_json = cast(dict[str, JsonValue], json.loads(metadata_text))
+        assert reference.payload_digest == sha256_digest_json(artifact_json)
+        return reference, artifact_json, metadata_json
+
+    raise AssertionError("durable store context did not return diagnostic artifact")
 
 
 def _material_pack():

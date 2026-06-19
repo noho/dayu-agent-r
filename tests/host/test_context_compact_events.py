@@ -518,6 +518,9 @@ def test_failed_payload_rejects_missing_required_fields() -> None:
 def test_attempt_rejected_payload_builder_and_validator() -> None:
     """attempt rejected payload 输出 operation / attempt / diagnostics。"""
 
+    offending_text_digest = (
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    )
     payload = dict(
         build_context_compaction_attempt_rejected_payload(
             operation_id="operation-1",
@@ -530,6 +533,20 @@ def test_attempt_rejected_payload_builder_and_validator() -> None:
             budget_after_attempted_compact=128,
             proposal_manifest_ref="runner-call-manifest:rejected",
             proposal_manifest_digest=_DIGEST_A,
+            diagnostic_artifact_ref="compaction-diagnostic:event-1",
+            diagnostic_artifact_digest=_DIGEST_B,
+            failure_stage="previous_compacted_view_parse",
+            diagnostic_suffix="ValueError:previous reference continuity text is invalid",
+            parser_or_validator="previous_reference_continuity",
+            exception_class="ValueError",
+            exception_message="previous reference continuity text is invalid",
+            offending_block_section="previous_compacted_view",
+            offending_block_kind="reference_continuity",
+            offending_block_label="P1",
+            offending_block_ordinal=0,
+            offending_block_text_digest=offending_text_digest,
+            offending_block_text_length=42,
+            material_pack_digest=_DIGEST_B,
         )
     )
 
@@ -540,6 +557,13 @@ def test_attempt_rejected_payload_builder_and_validator() -> None:
     assert payload["attempt_number"] == 1
     assert payload["proposal_manifest_ref"] == "runner-call-manifest:rejected"
     assert payload["proposal_manifest_digest"] == _DIGEST_A
+    assert payload["diagnostic_artifact_ref"] == "compaction-diagnostic:event-1"
+    assert payload["diagnostic_artifact_digest"] == _DIGEST_B
+    assert payload["failure_stage"] == "previous_compacted_view_parse"
+    assert payload["parser_or_validator"] == "previous_reference_continuity"
+    assert payload["offending_block_kind"] == "reference_continuity"
+    assert payload["offending_block_text_digest"] == offending_text_digest
+    assert "raw_text" not in payload
 
 
 def test_attempt_rejected_payload_requires_proposal_manifest_ref_digest_pair() -> None:
@@ -562,6 +586,39 @@ def test_attempt_rejected_payload_requires_proposal_manifest_ref_digest_pair() -
     payload["proposal_manifest_digest"] = None
 
     with pytest.raises(ValueError, match="proposal_manifest"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_attempt_rejected_payload_requires_diagnostic_artifact_ref_digest_pair() -> None:
+    """diagnostic artifact ref / digest 必须成对出现。"""
+
+    payload = dict(
+        build_context_compaction_attempt_rejected_payload(
+            operation_id="operation-1",
+            attempt_number=1,
+            failure_category="proposal_failed",
+            repairable=False,
+            runner_attempt_summary_refs=("runner-attempt:1",),
+            diagnostic_refs=("diagnostic:1",),
+            next_policy_decision="fail_compaction",
+            budget_after_attempted_compact=None,
+            diagnostic_artifact_ref="compaction-diagnostic:event-1",
+            diagnostic_artifact_digest=_DIGEST_A,
+        )
+    )
+    payload["diagnostic_artifact_digest"] = None
+
+    with pytest.raises(ValueError, match="diagnostic_artifact"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_attempt_rejected_payload_rejects_invalid_diagnostic_digests() -> None:
+    """diagnostic 小字段中的 digest 必须是 sha256 digest。"""
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["offending_block_text_digest"] = "not-a-digest"
+
+    with pytest.raises(ValueError, match="offending_block_text_digest"):
         validate_context_compaction_attempt_rejected_payload(payload)
 
 

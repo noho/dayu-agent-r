@@ -156,10 +156,12 @@ from dayu.host.compaction import (
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
+    CompactionRejectedAttemptDiagnosticReference,
     CompactionFailureCategory,
     CompactionOperationResult,
     DurableCompactorProposalManifestRecorder,
     run_compaction_operation,
+    write_compaction_rejected_attempt_diagnostic_artifact,
 )
 from dayu.host.context_budget import (
     BudgetEstimate,
@@ -2303,6 +2305,11 @@ class HostDispatchScheduler:
         :returns: ``None``。
         """
 
+        diagnostic_reference = self._write_compaction_rejected_diagnostic(
+            transaction,
+            operation_id=operation_id,
+            rejected=rejected,
+        )
         self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
@@ -2331,11 +2338,128 @@ class HostDispatchScheduler:
                     budget_after_attempted_compact=(rejected.budget_after_attempted_compact),
                     proposal_manifest_ref=rejected.proposal_manifest_ref,
                     proposal_manifest_digest=rejected.proposal_manifest_digest,
+                    diagnostic_artifact_ref=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.payload_ref
+                    ),
+                    diagnostic_artifact_digest=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.payload_digest
+                    ),
+                    failure_stage=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.failure_stage
+                    ),
+                    diagnostic_suffix=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.diagnostic_suffix
+                    ),
+                    parser_or_validator=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.parser_or_validator
+                    ),
+                    exception_class=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.exception_class
+                    ),
+                    exception_message=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.exception_message
+                    ),
+                    offending_block_section=_diagnostic_offending_section(
+                        diagnostic_reference
+                    ),
+                    offending_block_kind=_diagnostic_offending_kind(
+                        diagnostic_reference
+                    ),
+                    offending_block_label=_diagnostic_offending_label(
+                        diagnostic_reference
+                    ),
+                    offending_block_ordinal=_diagnostic_offending_ordinal(
+                        diagnostic_reference
+                    ),
+                    offending_block_text_digest=_diagnostic_offending_text_digest(
+                        diagnostic_reference
+                    ),
+                    offending_block_text_length=_diagnostic_offending_text_length(
+                        diagnostic_reference
+                    ),
+                    material_pack_digest=(
+                        None
+                        if diagnostic_reference is None
+                        else diagnostic_reference.diagnostic.material_pack_digest
+                    ),
                 ),
                 payload_ref=None,
                 payload_digest=None,
             ),
         )
+
+    def _write_compaction_rejected_diagnostic(
+        self,
+        transaction: HostTransaction,
+        *,
+        operation_id: str,
+        rejected: CompactionAttemptRejected,
+    ) -> CompactionRejectedAttemptDiagnosticReference | None:
+        """写入 proactive rejected attempt diagnostic artifact。
+
+        :param transaction: 当前 Host transaction。
+        :param operation_id: compaction operation id。
+        :param rejected: rejected attempt 摘要。
+        :returns: 已持久化 diagnostic 引用；没有 diagnostic 或写入失败时为
+            ``None``。
+        """
+
+        diagnostic = rejected.diagnostic
+        artifact_root = self._local_execution.compact_artifact_root
+        if diagnostic is None or artifact_root is None:
+            return None
+        try:
+            reference = write_compaction_rejected_attempt_diagnostic_artifact(
+                transaction=transaction,
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    create_artifact_root=(
+                        self._local_execution.compact_artifact_create_parent_dirs
+                    ),
+                ),
+                payload_store=PayloadStore(),
+                diagnostic=diagnostic,
+                compaction_operation_id=operation_id,
+                compaction_attempt_number=rejected.attempt_number,
+            )
+        except HostDurableError as exc:
+            _LOGGER.warning(
+                "dispatch.compact.rejected_diagnostic_write_failed "
+                "operation_id=%s attempt_number=%s failure_stage=%s "
+                "error_code=%s message=%s",
+                operation_id,
+                rejected.attempt_number,
+                diagnostic.failure_stage,
+                None,
+                str(exc),
+            )
+            return None
+        _LOGGER.info(
+            "dispatch.compact.rejected_diagnostic_artifact "
+            "operation_id=%s attempt_number=%s failure_stage=%s "
+            "payload_ref=%s payload_digest=%s artifact_path=%s",
+            operation_id,
+            rejected.attempt_number,
+            diagnostic.failure_stage,
+            reference.payload_ref,
+            reference.payload_digest,
+            reference.artifact_relative_path,
+        )
+        return reference
 
     async def drain_once(self) -> DispatchDrainResult:
         """同步处理当前队列中的 dispatch wakeup。
@@ -4353,6 +4477,84 @@ async def _safe_release_lane_token(token: LaneClaimToken) -> None:
             exc_info=True,
         )
         return
+
+
+def _diagnostic_offending_section(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block section。
+
+    :param reference: persisted diagnostic reference。
+    :returns: section；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.section
+
+
+def _diagnostic_offending_kind(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block kind。
+
+    :param reference: persisted diagnostic reference。
+    :returns: kind；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.kind
+
+
+def _diagnostic_offending_label(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block label。
+
+    :param reference: persisted diagnostic reference。
+    :returns: label；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.block_label
+
+
+def _diagnostic_offending_ordinal(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> int | None:
+    """返回 diagnostic offending block ordinal。
+
+    :param reference: persisted diagnostic reference。
+    :returns: ordinal；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.block_ordinal
+
+
+def _diagnostic_offending_text_digest(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> str | None:
+    """返回 diagnostic offending block text digest。
+
+    :param reference: persisted diagnostic reference。
+    :returns: text digest；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.text_digest
+
+
+def _diagnostic_offending_text_length(
+    reference: CompactionRejectedAttemptDiagnosticReference | None,
+) -> int | None:
+    """返回 diagnostic offending block text length。
+
+    :param reference: persisted diagnostic reference。
+    :returns: text length；没有定位时为 ``None``。
+    """
+
+    offending = None if reference is None else reference.diagnostic.offending_block
+    return None if offending is None else offending.text_length
 
 
 async def _suppress_task_cancel(task: asyncio.Task[None]) -> None:
