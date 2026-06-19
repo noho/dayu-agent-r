@@ -2605,7 +2605,7 @@ def test_run_input_memory_messages_include_context_compacted_projection(
         assert contents[-1] == "current prompt"
 
 
-def test_gross_margin_followup_uses_post_compaction_evidence_backed_facts(
+def test_gross_margin_followup_uses_post_compact_evidence_backed_facts(
     tmp_path: Path,
 ) -> None:
     """毛利率追问通过 post-compaction facts 读取收入与毛利。"""

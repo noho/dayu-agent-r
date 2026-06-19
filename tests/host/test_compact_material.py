@@ -66,6 +66,11 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import (
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+)
 from dayu.host.durable.schema import (
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
@@ -1658,6 +1663,257 @@ def test_pre_dispatch_evidence_query_text_is_not_truncated(tmp_path: Path) -> No
         assert len(query_text) > 1200
 
 
+def test_pre_dispatch_evidence_reads_descriptor_raw_payload(tmp_path: Path) -> None:
+    """pre-dispatch evidence 从 descriptor raw payload 读取，不读 envelope preview。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 descriptor-backed accepted evidence。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            payload_ref = "payload-descriptor-evidence"
+            envelope = _accepted_evidence_envelope_for_event(
+                "event-tool-result-descriptor",
+                payload_ref=payload_ref,
+            )
+            descriptor = PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref=payload_ref,
+                    payload_id="sqlite-payload-descriptor-evidence",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(envelope)
+                        ),
+                        "raw_tool_outcome": {
+                            "kind": "completed",
+                            "result": {"content": "descriptor raw content"},
+                        },
+                    },
+                ),
+            )
+            event_log.append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-tool-result-descriptor",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=_SESSION_ID,
+                    run_id=None,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    occurred_at=datetime(2026, 5, 24, 0, 0, 0, tzinfo=UTC),
+                    actor="pytest",
+                    source="test_compact_material",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"result_preview": "must not be used"},
+                    payload_ref=descriptor.payload_ref,
+                    payload_digest=descriptor.payload_digest,
+                ),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-descriptor",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        assert tuple(block.text for block in view.material_blocks) == (
+            '{"kind":"completed","result":{"content":"descriptor raw content"}}',
+        )
+        assert view.material_blocks[0].payload_refs == ("payload-descriptor-evidence",)
+
+
+def test_pre_dispatch_tool_result_without_envelope_yields_no_evidence_block(
+    tmp_path: Path,
+) -> None:
+    """TOOL_RESULT_ACCEPTED 无 accepted evidence envelope 时不生成 evidence block。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入无 evidence envelope 的工具结果与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-no-envelope",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={"tool_name": "legacy-free"},
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-no-envelope",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        assert view.material_blocks == ()
+
+
+def test_pre_dispatch_evidence_missing_request_atom_emits_limited_signal(
+    tmp_path: Path,
+) -> None:
+    """缺 TOOL_CALL_REQUESTED atom 时 query 文本为 limited signal 且不泄漏 id。"""
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入缺 request atom 的 accepted evidence。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-missing-request",
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-missing-request",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        query_text = view.material_blocks[0].readable_query_text
+        assert query_text is not None
+        assert "limited_signal" in query_text
+        assert "event-tool-result-missing-request" not in query_text
+        assert "tool-call-event-tool-result-missing-request" not in query_text
+
+
+@pytest.mark.parametrize(
+    ("event_id", "include_raw", "include_preview", "message"),
+    (
+        (
+            "event-tool-result-missing-raw",
+            False,
+            False,
+            "raw_tool_outcome",
+        ),
+        (
+            "event-tool-result-preview",
+            True,
+            True,
+            "result_preview",
+        ),
+    ),
+)
+def test_pre_dispatch_evidence_payload_damage_fails_closed(
+    tmp_path: Path,
+    event_id: str,
+    include_raw: bool,
+    include_preview: bool,
+    message: str,
+) -> None:
+    """raw evidence 缺失或旧 preview 字段出现时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param event_id: TOOL_RESULT_ACCEPTED event id。
+    :param include_raw: 是否写入 raw_tool_outcome。
+    :param include_preview: 是否写入旧 result_preview。
+    :param message: 期望错误消息片段。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入损坏 evidence payload 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            payload: dict[str, JsonValue] = {
+                "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
+                    _accepted_evidence_envelope_for_event(event_id)
+                )
+            }
+            if include_raw:
+                payload["raw_tool_outcome"] = {
+                    "kind": "completed",
+                    "result": {"content": "raw content"},
+                }
+            if include_preview:
+                payload["result_preview"] = "legacy preview must not be used"
+            _append_event(
+                transaction,
+                event_log,
+                event_id=event_id,
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=payload,
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id=f"event-current-{event_id}",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(HostDurableError, match=message):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current user question",
+                )
+            )
+
+
 def test_compact_material_source_boundary_rejects_inverted_delta_boundary() -> None:
     """Source boundary 直接拒绝 inverted delta 边界。"""
 
@@ -2450,6 +2706,8 @@ def _accepted_evidence_envelope_for_event(
     tool_call_requested_event_ref: str | None = None,
     tool_call_id: str | None = None,
     normalized_arguments_digest: str = _DIGEST,
+    payload_ref: str | None = None,
+    payload_digest: str | None = None,
 ) -> AcceptedEvidenceEnvelope:
     """构造测试用 accepted evidence envelope。
 
@@ -2457,6 +2715,8 @@ def _accepted_evidence_envelope_for_event(
     :param tool_call_requested_event_ref: 可选 TOOL_CALL_REQUESTED event ref。
     :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
     :param normalized_arguments_digest: envelope 参数 digest。
+    :param payload_ref: raw result payload descriptor ref。
+    :param payload_digest: raw result payload digest。
     :returns: AcceptedEvidenceEnvelope。
     """
 
@@ -2474,8 +2734,8 @@ def _accepted_evidence_envelope_for_event(
             semantic_input_digest=_DIGEST,
         ),
         result_ref=AcceptedEvidenceResultRef(
-            payload_ref=None,
-            payload_digest=None,
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
             outcome_digest=_DIGEST,
             truncation_applied=False,
         ),
