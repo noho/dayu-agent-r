@@ -202,9 +202,9 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
-| WU-CM-12-S4-R1 | deferred-with-owner | WU-CM-13 Reactive compact recovery follow-up | S4/S5 accepted proactive tier 1-3 compact recovery before dispatch fallback only. S5 adjudication concluded reactive tier 1-3 recovery would require separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Current WU does not add schema/API/EventLog/Engine role changes and defers reactive recovery to WU-CM-13, which must not enter implementation until a user or GitHub Issue assigns it as active owner. |
-| WU-CM-12-PR-R1 | deferred-with-owner | Future Host compact evidence cleanup WU；no default next entry | PR review observed `dayu/host/compaction_evidence.py` appears to have no production import after FIX-R1. Current PR review PASS does not require deleting it because deletion would be cleanup scope, not material-guard correctness. Future cleanup must decide whether to delete the module and migrate tests, or document its deferred owner if still needed. |
-| WU-CM-12-PR-R3 | closed | WU-CM-12 final closeout 2026-06-19 | Closed by operation-level rejected attempt aggregation and renumbering in proactive compact recovery; initial and recovery tier rejected attempts are now persisted as `CONTEXT_COMPACTION_ATTEMPT_REJECTED` and counted in `CONTEXT_COMPACTION_FAILED.attempt_count`. |
+| WU-CM-12-S4-R1 | deferred-with-owner | WU-CM-13 Unified conversation compact pipeline convergence | Code re-check after WU-CM-12 shows reactive recovery sequencing already exists in Engine ingest; the remaining root cause is that proactive and reactive do not share one end-to-end Host compact pipeline from material view / material blocks to accepted `CONTEXT_COMPACTED`, `CONTEXT_COMPACTION_FAILED`, and fallback decision input. WU-CM-13 must converge five Session Semantic Memory projection input, `assemble(...)` rendering semantics, tier 1-3 compact recovery, and tier 4/5 fallback on one pipeline owner while keeping proactive / reactive outer state machines separate. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
+| WU-CM-12-PR-R1 | deferred-with-owner | WU-CM-13 Unified conversation compact pipeline convergence | Code re-check confirms `dayu/host/compaction_evidence.py` has no production import after FIX-R1, while tests still exercise `collect_selected_compaction_request_evidence_inputs`. This is not a runtime correctness blocker, but it is a stale / shadow compact material owner that can mislead future implementation. WU-CM-13 must either delete the module and migrate remaining useful tests to the unified compact pipeline / `compact_material.py` owner, or explicitly move any still-needed capability into that pipeline; it must not remain as an independent production owner without production callers. |
+| WU-CM-14-R1 | deferred-with-owner | WU-CM-14 Recent final answer preservation for ordinal follow-ups | CM discussion identified a separate semantic risk: after compact, Answer Anchor Memory may identify "third item" but may not carry enough raw answer text to let the next run "详细解释第三条". WU-CM-14 must discuss and decide whether recent assistant final answers, or at least the complete referenced list item with list structure, need deterministic preservation when current input contains local ordinal follow-up. This is not WU-CM-13 scope; WU-CM-13 remains limited to unifying proactive / reactive compact pipeline semantics. However, any WU-CM-14 preservation logic that touches compact material, compact acceptance, fallback, or RunInput assembly must use the same proactive / reactive shared code path and must not introduce trigger-specific preservation semantics. |
 
 ## 当前 Work Units
 
@@ -239,7 +239,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 | WU-CM-12 | draft-PR-pass | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open draft. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
-| WU-CM-13 | deferred | Reactive compact recovery tier 1-3 follow-up | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Deferred destination only. WU-CM-12 implements proactive tier 1-3 recovery; reactive recovery requires separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
+| WU-CM-13 | deferred | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Deferred destination only. WU-CM-12 already has reactive Engine ingest recovery sequencing; the remaining owner is unifying proactive / reactive material-to-compact-result and fallback semantics so five Session Semantic Memory, `assemble(...)`, tier 1-3 compact recovery, and tier 4/5 fallback cannot drift. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
+| WU-CM-14 | discussion-ready | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Tracks the scenario where turn N final answer lists multiple detailed items, turn N+1 asks "详细解释第三条", and compact is triggered before dispatch. Needs design discussion before plan: Answer Anchor Memory may resolve the ordinal but may not be sufficient explanation context unless recent raw final answer or complete referenced item structure is preserved. Not part of WU-CM-13, but any implementation must share proactive / reactive compact material and preservation semantics. |
 | WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
@@ -1677,50 +1678,127 @@ rendered_context =
 - final closeout 必须输出一份代码常量审计清单：列出代码中仍出现、且没有在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 中定义的 LLM-facing memory material / compact material 产量相关常量；对每个常量说明状态为“已删除 / 已迁入 policy / 保留但非 LLM-facing / 保留为 parser safety guard / deferred-with-owner”，并说明理由。
 - 受影响 Host memory / compact / RunInput / fallback tests 和相关 smoke 已更新并通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
 
-## WU-CM-13 Reactive Compact Recovery Tier 1-3 Follow-up
+## WU-CM-13 Unified Conversation Compact Pipeline Convergence
 
 ### 状态
 
-Deferred destination only。当前不创建 GitHub Issue，不是默认 next entry point，不进入 implementation。它只承接 `WU-CM-12-S4-R1`：`WU-CM-12` S4/S5 已接受 proactive pre-dispatch compact recovery tier 1-3；reactive compact recovery 需要另一条 Engine ingest recovery sequencing，因此从 `WU-CM-12` 当前实现范围中显式拆出。
+Deferred destination only。当前不创建 GitHub Issue，不是默认 next entry point，不进入 implementation。它承接 `WU-CM-12-S4-R1`，但 owner 语义经代码核对后重新收敛：问题不是“reactive recovery sequencing 从零缺失”，而是 proactive / reactive 目前只共享部分 compact 内核，尚未共享从 Conversation Memory material 到 accepted compact / failed compact / fallback decision 的完整 Host compact pipeline。
 
-当前 active WU 仍是 `WU-CM-12`，当前 open 修复项仍是 `WU-CM-12-FIX-R1`。`WU-CM-13` 不得阻塞 `WU-CM-12-FIX-R1`，也不得作为继续保留 EventLog-derived material 私有合法性检查、字段级 cap、默认 evidence chunking 或 `_ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT` 的理由。
+当前代码事实：reactive path 已具备 Engine ingest recovery sequencing、run-local cancellation token 传递、execution / cursor commit guard、accepted compact 后 recovery Attempt 启动，以及 fallback dispatch / fail-closed ordering。`WU-CM-13` 不应再按“补 reactive 状态机”理解；它的目标是消除 compact semantic pipeline 分散在 `dispatch.py` 与 `engine_ingest.py` 后导致的语义漂移风险。
+
+实施顺序允许 `WU-CM-14` 先于 `WU-CM-13`。若 `WU-CM-14` 先落地 recent final answer preservation 逻辑，`WU-CM-13` 后续激活时必须把该逻辑作为 compact semantic pipeline 的组成部分重新核对并纳入共享路径；不得把 `WU-CM-14` 留作 proactive-only、reactive-only 或 RunInput-only 的旁路例外。
 
 ### 背景与动机
 
-`WU-CM-12` 的 compact recovery 已覆盖 proactive path：dispatch 前发现 normal context 超预算时，可按 tier 1-3 尝试更紧 recent window、section-aware compacted view degrade 或 delta-only compact recovery；接受后再进入 dispatch。该路径的 sequencing、accept barrier 与 `CONTEXT_COMPACTED` commit point 都在 Host pre-dispatch control 内。
+从第一性原理看，proactive compact 与 reactive compact 的触发 envelope 不同，但 compact 语义本身应是同一套：给定同源 EventLog / material source、latest accepted compacted view、post-compact delta material 与 current input anchor，Host 应通过同一组 selection / rendering / compact operation / quality gate / accepted-or-failed result construction 得到：
 
-Reactive compact recovery 不同：它发生在 Engine ingest / dispatch 已经进入执行后的上下文失败或 provider context pressure 反馈之后。若直接复用 proactive compact recovery，容易混淆 Engine 已执行状态、Host run cancellation、cursor commit、accepted/fallback ordering 与 final response material，因此必须作为独立 WU 重新设计。
+- accepted `CONTEXT_COMPACTED`，由 Conversation Memory projection 物化为五类 Session Semantic Memory；
+- 或 `CONTEXT_COMPACTION_FAILED`，携带 retry / repair / fallback diagnostic；
+- 或 tier 4/5 fallback decision input，只影响本次 RunInput rendering，不提交 compacted memory truth。
+
+当前实现已共享 `run_compaction_operation()`、compact material pack builder 与 context event payload builder，但 proactive 与 reactive 仍分别拥有 material-to-result orchestration、accepted compact event append、failed compact event append、fallback decision glue，以及 tier 1-3 / multi-pass / tier 4/5 的局部策略入口。若继续分散实现，五类 Session Semantic Memory、展开版 `assemble(...)`、tier 1-3 compact recovery、tier 4/5 fallback、artifact / payload descriptor、attempt_count / rejected-attempt diagnostic 和 accepted compacted view 语义都可能漂移。
+
+`WU-CM-14` 的 recent final answer preservation 也是同一原则下的 compact / RunInput material 语义：触发方式可以不同，但给定同一段 history、同一个 current input anchor、同一个 compact candidate / fallback decision 时，preservation 结果不应因 proactive 或 reactive trigger 漂移。若 `WU-CM-14` 在 `WU-CM-13` 之前实现，`WU-CM-13` 需要把它纳入 unified pipeline audit，而不是只统一既有 compact event construction。
+
+外层状态机仍必须分开：proactive 是 pre-dispatch input governance；reactive 是 Engine overflow 后关闭当前 Attempt、Run 进入 `RECOVERING`、再启动 recovery Attempt。`WU-CM-13` 只统一 compact semantic pipeline，不把 proactive / reactive lifecycle 强行合并。
 
 ### 目标
 
-- 设计并实现 reactive compact recovery tier 1-3 的 Host / Engine ingest sequencing，前提是用户或 GitHub Issue 后续明确把 `WU-CM-13` 设为 active owner。
-- 明确 reactive path 中 compact recovery proposal、LLM compactor 调用、accepted compact commit、fallback dispatch / response ordering 的状态机。
-- 在 reactive compact recovery 的每个 commit 点检查 run-local cancellation token、execution identity、cursor identity 与 Host admitted run identity，避免 stale recovery 写入或覆盖后续 run。
-- 确保 accepted reactive compact output 仍只投影为五类 Session Semantic Memory，不产生新的 durable truth 或旁路 memory shape。
-- 保持 EventLog-derived LLM-facing material 的同一原则：从 EventLog 读取的 current input、prior conversation material、accepted tool evidence 默认是合法 LLM input material；上下文缩小只能通过 deterministic selection、whole-item / whole-section keep-drop、chunking with provenance 或 fail closed 表达。
+- 抽出一个 Host 内部 compact pipeline owner，使 proactive / reactive 共享从 material view / material blocks 到 compact result 的语义代码路径。
+- 若 `WU-CM-14` 已先实施，审计其 recent final answer preservation owner，并将其纳入 proactive / reactive shared compact material、fallback material 或 RunInput assembly 路径；不得保留触发方式专属的 preservation 分支。
+- 收口 `dayu/host/compaction_evidence.py` 的旧 owner 状态：若其能力已由 unified pipeline / `compact_material.py` 覆盖，则删除模块并迁移测试；若仍有必要能力，则迁入 unified pipeline，不保留无生产调用的旁路 material helper。
+- 统一 compact request generation：latest accepted compacted view、post-compact delta material、current input anchor、selected material blocks、prompt-local labels、source boundary refs 与 accepted evidence mapping refs 必须同源。
+- 统一 compact recovery tiers：tier 1 fallback selected recent window、tier 2 section-aware compacted view degrade、tier 3 delta-only compact input 必须对 proactive / reactive 使用同一组 request builder / renderer 规则；reactive 需要 multi-pass 时也必须建立在同一组 material block 与 provenance 语义上。
+- 统一 accepted compact result construction：artifact JSON、payload descriptor、`CONTEXT_COMPACTED` payload、accepted proposal manifest refs、quality check result、budget after compact、projection signal 与 accepted compacted view 语义不得在 dispatch / engine ingest 两处重复漂移。
+- 统一 failed compact / fallback result construction：`CONTEXT_COMPACTION_FAILED` payload、attempt_count、retry / repair budget exhausted、rejected attempt diagnostic refs、tier 4/5 fallback input window、fallback budget result 与 fallback action 必须由同一套 helper 生成。
+- 保持五类 Session Semantic Memory projection 只消费 accepted `CONTEXT_COMPACTED`；fallback、diagnostic、Host governance state、Engine state 不得被投影为业务事实。
 
 ### 非目标
 
-- 不在当前 `WU-CM-12-FIX-R1` 中实现 reactive compact recovery。
+- 不新增另一套 reactive-only compact implementation。
+- 不保留 `dayu/host/compaction_evidence.py` 作为无生产调用、仅测试依赖的 shadow owner。
+- 不把 dispatch lifecycle、Engine ingest lifecycle、Attempt closeout、`RUN_RECOVERING`、recovery Attempt creation 合并成一个 God pipeline；这些仍由各自 outer orchestration 持有。
 - 不修改 public API、durable schema、EventLog canonical semantics、Engine provider contract 或跨层 contract，除非 `WU-CM-13` 激活后在 plan gate 获得单独裁决。
-- 不把 reactive compact recovery 用作私有 DTO 字段长度上限、preview 化、summary 化、默认 evidence 条数限制或字段级裁剪的依据。
+- 不把 unified pipeline 用作私有 DTO 字段长度上限、preview 化、summary 化、默认 evidence 条数限制或字段级裁剪的依据。
 - 不引入 semantic search、vector recall、长期 memory retrieval framework 或 User Profile Memory。
-- 不改变 `WU-CM-12` 已接受的 proactive tier 1-3 / dispatch fallback tier 4-5 语义，除非后续设计真源明确修订。
+- 不改变 `WU-CM-12` 已接受的 proactive / reactive lifecycle 语义，除非后续设计真源明确修订。
 
 ### 激活条件
 
 - 用户或 GitHub Issue 明确指定 `WU-CM-13` 为 active owner；仅有 `WU-CM-12-S4-R1` deferred row 不足以启动实现。
-- `WU-CM-12-FIX-R1` 已关闭，或用户明确要求打断当前 material guard fix 转入 reactive recovery。
-- 启动时重新核对 `docs/host/design.md` 与本总控，确认 reactive recovery 仍符合 Conversation Memory 的 normal / fallback state machine 与 no silent truncation 约束。
+- 若 `WU-CM-14` 已经进入 plan 或 implementation，`WU-CM-13` preflight 必须读取其设计裁决、代码路径和测试，明确哪些 preservation helper 属于 unified compact pipeline audit 范围。
+- 启动时重新核对 `docs/host/design.md`、`docs/engine/design.md` 与本总控，确认 unified compact pipeline 仍符合 Conversation Memory 的 normal / fallback state machine、five semantic memory、`assemble(...)` 与 no silent truncation 约束。
 - 若计划触及 Host / Engine public API、durable schema、EventLog canonical semantics 或 provider contract，必须在 plan gate 停下交给用户裁决。
 
 ### 验收信号
 
-- `WU-CM-13` plan 明确 reactive compact recovery 与 proactive pre-dispatch compact recovery 的状态机差异、输入输出、accept barrier、fallback ordering 和 commit guard。
-- 测试覆盖 reactive tier 1、tier 2、tier 3 recovery；run cancellation；execution identity mismatch；cursor mismatch；stale recovery proposal；accepted compact commit；reactive fallback dispatch / response ordering。
-- 验证 reactive accepted compact output 仍只生成五类 Session Semantic Memory，并且不把 fallback / diagnostic / Host governance state 投影为业务事实。
-- 受影响 Host / Engine ingest / compact / RunInput tests 通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+- `WU-CM-13` plan 明确 shared compact pipeline owner、outer proactive / reactive lifecycle boundary、commit guard 输入、result shape、fallback ordering 与测试边界。
+- `WU-CM-13` plan 明确 `WU-CM-14` recent final answer preservation 与 shared compact pipeline 的关系：若该逻辑已存在，必须说明它被迁入 / 复用 / 保持在共享 owner 下；若尚未存在，必须说明未来 `WU-CM-14` 不得绕过 shared owner。
+- proactive 与 reactive 的 compact request builder 使用同一组 material selection / rendering helper；差异只来自 trigger envelope、attempt / execution identity、cancellation token 与 commit guard。
+- proactive 与 reactive 下的 recent final answer preservation / fallback / RunInput assembly 语义一致；如果某一路径不适用，测试或 plan 必须用状态机证据说明它不会经过该 preservation owner。
+- `dayu/host/compaction_evidence.py` 已删除并完成测试迁移，或其仍需要的能力已迁入 unified compact pipeline owner 且存在生产调用；不得留下只有测试 import 的 Host material owner。
+- proactive 与 reactive 的 accepted compact artifact / payload descriptor / `CONTEXT_COMPACTED` payload 由同一组 helper 生成；测试断言同一 compact candidate 在两种触发路径下产生一致的 accepted compacted view 语义。
+- proactive 与 reactive 的 `CONTEXT_COMPACTION_FAILED` / tier 4/5 fallback diagnostic 由同一组 helper 生成；测试覆盖 fallback dispatch 与 fail-closed。
+- 测试覆盖 proactive tier 1、tier 2、tier 3；reactive tier 1、tier 2、tier 3；reactive multi-pass；run cancellation；execution identity mismatch；cursor mismatch；stale recovery proposal；accepted compact commit；fallback dispatch / fail-closed ordering。
+- 验证 accepted compact output 仍只生成五类 Session Semantic Memory，并且 fallback / diagnostic / Host governance state / Engine state 不投影为业务事实。
+- 受影响 Host dispatch / Engine ingest / compact / RunInput / memory projection tests 通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
 - 若引入任何新的 LLM-facing memory material / compact material 产量常量，必须在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 或本 WU 明确批准的 policy owner 中定义；否则 final closeout 的常量审计必须列为 open residual。
+
+## WU-CM-14 Recent Final Answer Preservation for Ordinal Follow-ups
+
+### 状态
+
+`discussion-ready`。当前不创建 GitHub Issue，不进入 plan / implementation。本 WU 是 CM 语义讨论中新增的独立追踪项，承接 residual `WU-CM-14-R1`。
+
+本 WU 不修改 `WU-CM-13` 的范围。`WU-CM-13` 只统一 proactive / reactive compact pipeline；本 WU 专注 compact 后 ordinary RunInput 是否仍具备回答局部序号追问所需的最近 assistant final answer 上下文。
+
+两者存在实现约束关联：`WU-CM-14` 的 preservation 语义一旦被裁决为需要进入 compact material、compact accept quality gate、fallback material 或 ordinary RunInput assembly，就必须落在 proactive / reactive 共享的代码路径上，不得分别实现主动触发 compact 与被动触发 compact 的两套 preservation 逻辑。
+
+### 场景
+
+第 N 轮 assistant final answer 列出 4 条详细内容。第 N+1 轮用户输入“详细解释第三条”，并且本轮 dispatch 前触发 compact。
+
+需要讨论的问题是：compact 后第 N+1 轮送给 Engine 的 messages 中，仅有 Answer Anchor Memory 是否足够；如果不足，Host 是否必须把第 N 轮 final answer 的完整文本，或至少完整第三条及其列表结构，作为 recent raw material / selected recent window / 等价 bounded material 保留下来。
+
+### 初步代码核对结论
+
+- Answer Anchor Memory 已有实现路径：accepted compact output 中的 `answer_anchors` 会被 Conversation Memory projection 物化，并由 RunInputBuilder 渲染为 `## Prior Answer Anchors`。
+- Answer Anchor Memory 的语义是“可被后续指代的历史回答轮廓”，不是原回答全文，也不是事实证明。
+- selected recent window 按设计可以承载 post-compact delta material 中的 raw user input、assistant final answer、accepted tool evidence 和用户可见 outcome material。
+- 一旦第 N 轮 final answer 被 compact 覆盖，而 accepted compact output 只保留短 answer anchor，第 N+1 轮 Engine 可能只能解析“第三条指什么”，但缺少“详细解释第三条”所需的完整文本和列表上下文。
+
+### 待讨论问题
+
+- “详细解释第三条”这类 ordinal follow-up 的最低上下文要求是什么：完整第 N 轮 final answer、完整 4 条列表、完整第三条、还是 answer anchor + reference continuity 即可。
+- local ordinal follow-up 是否应触发 deterministic recent-final-answer preservation policy，而不是依赖 compactor 自行把足够文本写入 Answer Anchor Memory。
+- preservation owner 应归属于 selected recent window / protected recent floor / compact accept quality gate / ordinary RunInput assembly 中的哪一层，避免 prompt-conditioned retrieval、semantic search 或 ad hoc parser。
+- preservation owner 如何复用 proactive / reactive shared compact pipeline，确保同一段 history、同一个 current input anchor 和同一项 accepted compact candidate 在两种触发方式下得到同义的 preservation / fallback / RunInput assembly 结果。
+- 若第 N 轮 final answer 本身超预算，应采用 whole-item keep-drop、chunking with provenance、section-aware degrade 还是 fail closed；不得 silent truncation、preview 化或 summary 化后伪装为完整回答。
+- 是否需要在 `docs/host/design.md` 增补 Answer Anchor Memory 与 recent raw final answer preservation 的边界说明。
+
+### 非目标
+
+- 不并入 `WU-CM-13`；不借本 WU 重新设计 proactive / reactive compact pipeline unification。
+- 不允许为 proactive compact 与 reactive compact 分别实现语义不同的 recent final answer preservation 分支；触发方式不同不应改变 preservation 结果。
+- 不引入 semantic search、vector recall、prompt-conditioned reranker 或长期 memory retrieval framework。
+- 不实现 deterministic final answer outline parser，除非后续设计讨论明确裁决。
+- 不把 Answer Anchor Memory 升级成事实证明、完整回答存储或替代 raw final answer 的通用机制。
+- 不通过字段级截断、固定 preview、私有 DTO cap 或 summary 化来保留超长 final answer。
+
+### Entry Conditions
+
+- 重新核对 `docs/host/design.md` 中 latest accepted compacted view、post-compact delta material、selected recent window、protected recent floor、Answer Anchor Memory、Reference Continuity 和 Prompt Assembly 的设计真源。
+- 重新核对 RunInputBuilder、Conversation Memory projection、compact material selection 与相关测试，确认第 N+1 轮触发 compact 后 ordinary Engine messages 的实际组成。
+- 先完成需求讨论并写明设计裁决，再决定是否进入 plan gate、是否需要 GitHub Issue。
+
+### Acceptance Signals
+
+- 文档明确裁决 ordinal follow-up 场景下，recent assistant final answer 与 Answer Anchor Memory 的职责边界。
+- 文档明确裁决 WU-CM-14 preservation 逻辑与 WU-CM-13 shared compact pipeline 的关系：策略可以独立讨论，但实现必须避免 proactive / reactive 语义漂移。
+- 若裁决需要保留 raw final answer 或完整被引用条目，测试必须覆盖：第 N 轮 final answer 列 4 条详细文本，第 N+1 轮“详细解释第三条”触发 compact，最终 Engine messages 包含足以解释第三条的完整业务上下文。
+- 若裁决需要保留 raw final answer 或完整被引用条目，测试还必须覆盖 proactive 与 reactive compact 触发下的同义 preservation 结果，除非 plan gate 明确证明某一路径不会经过该 preservation owner。
+- 若裁决认为 Answer Anchor / Reference Continuity 已足够，必须有代码证据和测试证明 accepted compact output 能稳定携带完整解释所需文本，而不是只携带短轮廓。
+- 受影响 Host memory / compact / RunInput tests 通过；若发生代码修改，`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
 
 ## WU-CLI-DEBUG-STREAM-01 CLI `--debug-stream` Per-Delta Stream Diagnostics
 
