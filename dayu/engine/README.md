@@ -495,7 +495,7 @@ Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结�
 
 ### 可观测日志与诊断载荷
 
-Engine / Runner 日志遵循 `dayu/README.md` 的级别语义。Agent 在 `VERBOSE` 记录 run、iteration、tool loop、fallback / continuation 与 terminal 骨架；OpenAI-compatible Runner 在 `VERBOSE` 记录 provider call start / done / cancelled 摘要，在 `DEBUG` 记录 HTTP attempt、response status、finish reason、usage、SSE heartbeat 与协议细节，在 `WARN` 记录 provider retry、协议差异和可恢复传输异常。
+Engine / Runner 日志遵循 `dayu/README.md` 的级别语义。Agent 在 `VERBOSE` 记录 run、iteration、tool loop、fallback / continuation 与 terminal 骨架；在 `DEBUG` 记录 Runner 事件分类细节，并在 `finish_reason=content_filter` 的降级 final 路径记录有界、脱敏的回答预览，帮助定位 provider 内容过滤收口。OpenAI-compatible Runner 在 `VERBOSE` 记录 provider call start / done / cancelled 摘要，在 `DEBUG` 记录 HTTP attempt、response status、finish reason、usage、SSE heartbeat 与协议细节，在 `WARN` 记录 provider retry、协议差异和可恢复传输异常。
 
 Engine / Runner 日志不输出完整 prompt、provider headers、API key、完整工具结果或大段响应。Runner / provider 诊断事件上的 `raw_payload` 是有界、脱敏、摘要化诊断载荷，不保证保留 provider 原始 payload。
 

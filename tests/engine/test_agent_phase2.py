@@ -1348,6 +1348,57 @@ async def test_length_and_content_filter_final_boundaries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_content_filter_final_logs_bounded_provider_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """内容过滤收口时 DEBUG 日志提供有界 provider 提示文本。
+
+    :param caplog: pytest 日志捕获夹具。
+    :returns: 无返回值。
+    :raises AssertionError: 诊断日志缺少过滤原因或回答预览时抛出。
+    """
+
+    provider_message = (
+        "The request was rejected because it was considered high risk"
+    )
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content=provider_message,
+                    reasoning_content=None,
+                    finish_reason=FinishReason.CONTENT_FILTER,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.CONTENT_FILTER,
+                    provider_request_id=None,
+                ),
+            ),
+        )
+    )
+
+    caplog.set_level(logging.DEBUG, logger=agent_module.__name__)
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert _final_event(events).type is EngineEventType.FINAL_ANSWER
+    diagnostic_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "engine.agent.filtered_final_diagnostic" in record.getMessage()
+    ]
+    assert len(diagnostic_messages) == 1
+    diagnostic = diagnostic_messages[0]
+    assert "finish_reason=content_filter" in diagnostic
+    assert "degraded=True" in diagnostic
+    assert f"content_chars={len(provider_message)}" in diagnostic
+    assert f"answer_preview={provider_message}" in diagnostic
+
+
+@pytest.mark.asyncio
 async def test_abnormal_stop_and_max_iterations_fail() -> None:
     """无 done 异常结束触发 run_failed；``max_iterations<1`` 在 contract 构造期被拒。"""
 
