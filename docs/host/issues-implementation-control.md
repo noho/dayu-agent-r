@@ -144,13 +144,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | PR #152 review PASS accepted in commit `f2970512` and pushed to draft PR #152. Local implementation, slice reviews, aggregate deepreview, pyright, affected tests, final `memory-compact` smoke, draft PR creation, and PR review are complete. |
+| implementation status | WU-CM-13 / WU-CM-14 local phaseflow completed at draft-PR-pass. PR #152 review PASS accepted in commit `f2970512`, pushed to draft PR #152, and final closeout recorded. |
 | active work unit | WU-CM-13 |
 | default next work unit | WU-CM-13 |
-| next entry point | Complete final closeout bookkeeping for WU-CM-13 / WU-CM-14 draft-PR-pass. Mark-ready, reviewer requests, merge, and issue closure remain separate user-authorized actions. |
+| next entry point | User decision: mark PR #152 ready / request reviewers / merge later, or start a new work unit. No automatic merge, mark-ready, reviewer request, branch deletion, or issue closure is authorized. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for WU-CM-13 unified compact pipeline convergence. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 PR #150 merged 2026-06-19 https://github.com/noho/dayu-agent-r/pull/150; WU-CM-13 / WU-CM-14 draft PR #152 open draft https://github.com/noho/dayu-agent-r/pull/152; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CM-13 / WU-CM-14 are user-directed work units without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for final closeout bookkeeping. Merge, mark-ready, reviewer requests, and issue closure require separate user authorization. |
+| blocking open questions | None for WU-CM-13 / WU-CM-14 local draft-PR-pass. Merge, mark-ready, reviewer requests, branch deletion, and issue closure require separate user authorization. |
 
 状态约定：
 
@@ -238,7 +238,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 | WU-CM-12 | draft-PR-pass | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open draft. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
-| WU-CM-13 | draft-PR-pass | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Draft PR #152 open draft. Accepted PR review commit `f2970512` pushed; final `memory-compact` smoke passed; `WU-CM-12-S4-R1` and `WU-CM-13-S1-R1` closed; next gate is final closeout bookkeeping. |
+| WU-CM-13 | draft-PR-pass | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Draft PR #152 open draft. Accepted PR review commit `f2970512` pushed; final closeout recorded in `docs/reviews/wu-cm-13-final-closeout-20260619.md`; `WU-CM-12-S4-R1` and `WU-CM-13-S1-R1` closed. |
 | WU-CM-14 | completed | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Local phaseflow completed. Accepted slice commit `921c6219`; aggregate deepreview PASS after deleting dead `_current_only_material_blocks`. Root cause fixed by passing existing floor into compact selection, adding ordinary post-compaction protected raw tail rendering, and repairing reactive frozen material assembly for protected floor semantics. Full proactive / reactive compact pipeline convergence remains WU-CM-13 scope. |
 | WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
 
@@ -1789,7 +1789,8 @@ Deferred destination only。当前不创建 GitHub Issue，不是默认 next ent
 - PR review adjudication: `docs/reviews/pr-152-review-adjudication-20260619.md`.
 - PR review conclusion: PASS; no fix gate required. DS low finding about duplicated internal evidence source prefix constants is rejected because ordinary/fallback rendering path separation is intentional and extracting a shared owner now would add unnecessary coupling.
 - accepted PR review commit: `f2970512`, pushed to #152.
-- next gate: draft-PR-pass final closeout bookkeeping.
+- final closeout: `docs/reviews/wu-cm-13-final-closeout-20260619.md`.
+- current gate: draft-PR-pass. PR #152 remains draft; mark-ready, reviewer requests, merge, branch deletion, and issue closure require separate user authorization.
 - 若引入任何新的 LLM-facing memory material / compact material 产量常量，必须在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 或本 WU 明确批准的 policy owner 中定义；否则 final closeout 的常量审计必须列为 open residual。
 
 ## WU-CM-14 Recent Final Answer Preservation for Ordinal Follow-ups
