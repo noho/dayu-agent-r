@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | PR review |
-| implementation status | WU-ENG-02-R1 draft PR created: https://github.com/noho/dayu-agent-r/pull/159. Branch `phase/wu-eng-02-r1` has been pushed to remote `github`; PR is in draft state and ready for PR review gate. |
+| gate | accepted PR review commit |
+| implementation status | WU-ENG-02-R1 PR review completed by AgentMiMo and AgentDS with `pass` and zero blocking findings. No PR-review fix is required. Accepted PR review commit is the next gate action. |
 | active work unit | WU-ENG-02-R1 |
 | default next work unit | WU-ENG-02-R1 |
-| next entry point | Run PR review gate using `/deepreview` on PR 159, then adjudicate findings before any PR review fix or accepted PR review commit. |
+| next entry point | Create accepted PR review commit containing PR review artifacts and this control-doc state update, then push branch and enter draft-PR-pass gate. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
-| blocking open questions | None for PR review gate. |
+| blocking open questions | None for accepted PR review commit gate. |
 
 状态约定：
 
@@ -241,7 +241,7 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 
 本 WU 是 WU-ENG-02 / PR 114 的 reopened follow-up。WU-ENG-02 已完成 lower-level typed `RunnerRequestIdentity`、`ClientCorrelationPolicy`、OpenAI-compatible `X-Client-Request-Id` 映射能力、provider `x-request-id` 采集、Host ingest 与 Tool Trace 投影；但 reopen comment 指出真实 Service / CLI 默认路径没有启用该能力，因此 #63 不能视为端到端完成。
 
-当前 gate 是 `PR review`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix、code re-review、accepted slice commit、aggregate deepreview、accepted deepreview commit、push 和 create draft PR 已完成；下一步 review PR 159。
+当前 gate 是 `accepted PR review commit`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix、code re-review、accepted slice commit、aggregate deepreview、accepted deepreview commit、push、create draft PR 和 PR review 已完成；下一步创建 accepted PR review commit。
 
 Plan artifact:
 
@@ -325,6 +325,18 @@ Draft PR readiness:
 - Remote: `github`
 - PR: https://github.com/noho/dayu-agent-r/pull/159
 - Remaining risks: no blocking risks. Deferred projection-sync risk for future lost/cancelled lifecycle payload correlation ids is owned by the future WU that changes those payloads.
+
+PR review artifacts:
+
+- `docs/reviews/pr-159-review-20260620-220319.md` by AgentDS, conclusion `pass`, blocking findings `0`
+- `docs/reviews/pr-159-review-20260620-220735.md` by AgentMiMo, conclusion `pass`, blocking findings `0`
+
+Controller PR review judgment:
+
+- `rejected-with-reason`：`client_correlation_id=None` 日志可读性观察与同一日志行既有 `provider_request_id=None` 行为一致，不影响状态、持久化或 LLM-facing material；不进入 fix。
+- `deferred-with-owner`：per-model opt-out 不在本 WU 目标内；当前 reopen 要求 default enabled，若未来 provider 证明拒绝该 header，由新的 provider-specific WU 裁决 typed policy 或 opt-out。
+- `deferred-with-owner`：lost/cancelled terminal suffix sync 仅在未来 lifecycle payload 携带 correlation ids 时需要，由对应 WU plan reviewer 复核。
+- `accepted`：GitHub PR 当前无 reported CI checks；本轮以本地 pytest / pyright / `git diff --check` 作为验证证据，merge 前若仓库启用 CI/branch protection 再按 checks 处理。
 
 Controller plan-review judgment:
 
