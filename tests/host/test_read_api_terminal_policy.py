@@ -16,6 +16,8 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.outbox import build_outbox_terminal_item_row
+from dayu.host.projection import projection_event_view_from_row
 from dayu.host.read_api import _host_event_from_row
 
 _SESSION_ID = "session-terminal-policy"
@@ -48,6 +50,32 @@ def test_failed_terminal_projection_never_builds_final_answer(tmp_path: Path) ->
     assert event.final_answer is None
     assert event.error_message == "provider failed"
     assert event.cancel_reason is None
+
+
+def test_failed_terminal_projection_appends_correlation_suffix(
+    tmp_path: Path,
+) -> None:
+    """live watcher 与 outbox fallback 使用相同 terminal 诊断后缀。"""
+
+    payload: dict[str, JsonValue] = {
+        "message": "provider failed",
+        "provider_request_id": None,
+        "client_correlation_id": "client-fallback",
+    }
+    row = _row("RUN_FAILED", payload)
+    original_payload_json = row.payload_json
+
+    event = _project_terminal_row(tmp_path, row)
+    outbox_row = build_outbox_terminal_item_row(
+        projection_event_view_from_row(row)
+    )
+
+    assert event.error_message == (
+        "provider failed\nclient_correlation_id=client-fallback"
+    )
+    assert outbox_row.error_message == event.error_message
+    assert row.payload_json == original_payload_json
+    assert payload["message"] == "provider failed"
 
 
 def test_cancelled_terminal_projection_never_builds_final_answer(tmp_path: Path) -> None:
@@ -111,6 +139,17 @@ def _project_terminal_event(
     :returns: 投影后的 HostEvent。
     """
 
+    return _project_terminal_row(tmp_path, _row(event_type, payload))
+
+
+def _project_terminal_row(tmp_path: Path, row: EventLogRow) -> HostEvent:
+    """投影测试用 terminal EventLog row。
+
+    :param tmp_path: pytest 临时目录。
+    :param row: terminal EventLog row。
+    :returns: 投影后的 HostEvent。
+    """
+
     event: HostEvent | None = None
     with open_host_durable_store(_options(tmp_path)) as store:
 
@@ -121,7 +160,7 @@ def _project_terminal_event(
             :returns: 投影后的 HostEvent。
             """
 
-            return _host_event_from_row(transaction, _row(event_type, payload))
+            return _host_event_from_row(transaction, row)
 
         event = store.transaction_runner.run_read(operation)
     assert event is not None

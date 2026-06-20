@@ -33,7 +33,11 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.engine.runners.openai.runner import AsyncOpenAIRunner, _is_sse_response
+from dayu.engine.runners.openai.runner import (
+    AsyncOpenAIRunner,
+    _extract_provider_request_id,
+    _is_sse_response,
+)
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
@@ -255,6 +259,31 @@ def test_stream_true_unknown_content_type_is_not_sse() -> None:
             stream=True,
         )
         is True
+    )
+
+
+def test_provider_request_id_extraction_ignores_infrastructure_headers() -> None:
+    """provider_request_id 只能来自 ``x-request-id``，不映射基础设施 header。"""
+
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-trace-id", "trace-id"),
+                ("x-correlation-id", "correlation-id"),
+                ("cf-ray", "cf-ray-id"),
+                ("traceparent", "00-trace-parent"),
+            )
+        )
+        is None
+    )
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-trace-id", "trace-id"),
+                ("X-Request-Id", " req-provider "),
+            )
+        )
+        == "req-provider"
     )
 
 

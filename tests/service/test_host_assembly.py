@@ -25,6 +25,7 @@ from dayu.contracts import (
     ToolSchema,
 )
 from dayu.engine import AgentFallbackMode, AgentPolicy
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
 from dayu.fins.ingestion.wait_adapter import FINS_INGESTION_WAIT_ADAPTER_KEY
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
@@ -205,9 +206,17 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
         == _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION
     )
     assert result.options.ordinary_run_baseline.runner_spec.headers["Authorization"] == f"Bearer {_API_KEY}"
+    assert (
+        result.options.ordinary_run_baseline.runner_spec.client_correlation_policy
+        is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    )
     assert result.options.ordinary_run_baseline.runner_options.max_tokens is None
     compactor_baseline = result.options.compactor_runner_baseline
     assert compactor_baseline is not None
+    assert (
+        compactor_baseline.compactor_runner_spec.client_correlation_policy
+        is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    )
     assert compactor_baseline.compactor_runner_options.temperature == 0.4
     assert compactor_baseline.compactor_runner_options.max_tokens is None
     assert compactor_baseline.compactor_runner_options.top_p == 1.0
@@ -615,6 +624,23 @@ def test_runner_spec_from_ollama_model_skips_api_key_header() -> None:
 
     assert spec.api_key_ref is None
     assert spec.headers == {"Content-Type": "application/json"}
+    assert (
+        spec.client_correlation_policy
+        is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+    )
+
+
+def test_runner_spec_rejects_static_client_request_id_header() -> None:
+    """Service 装配默认启用 policy 时必须拒绝静态客户端关联 header。"""
+
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load()
+    model = replace(
+        config.models.models["ollama"],
+        headers={"X-Client-Request-Id": "static-client-id"},
+    )
+
+    with pytest.raises(ValueError, match="X-Client-Request-Id"):
+        _runner_spec_from_model(model=model, env={})
 
 
 @pytest.mark.parametrize(

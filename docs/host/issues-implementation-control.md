@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-ENG-02-R1 accepted plan commit `913875da` created. Plan / review / fix / re-review artifacts are committed, and fixed plan is ready for implementation. |
+| gate | accepted slice commit |
+| implementation status | WU-ENG-02-R1 code re-review completed by AgentMiMo and AgentDS with `pass` and zero blocking findings. Final validation passed: assembly 53 passed, runner 38 passed, Host terminal / Tool Trace 51 passed, Service / CLI 69 passed, pyright 0 errors, and `git diff --check` passed. Accepted slice commit is the next gate action. |
 | active work unit | WU-ENG-02-R1 |
 | default next work unit | WU-ENG-02-R1 |
-| next entry point | Dispatch AgentCodex for implementation gate using accepted plan artifact `docs/host/host-issues/wu-eng-02-r1-provider-debugging-correlation-plan.md`; implementation must start from the accepted plan commit `913875da` and follow the planned slices. |
+| next entry point | Create accepted slice commit containing implementation changes, tests, README updates, implementation / code review / fix / re-review artifacts, and this control-doc state update. After commit, record the accepted slice commit hash and enter aggregate deepreview gate. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
-| blocking open questions | None for implementation gate. |
+| blocking open questions | None for accepted slice commit gate. |
 
 状态约定：
 
@@ -241,7 +241,7 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 
 本 WU 是 WU-ENG-02 / PR 114 的 reopened follow-up。WU-ENG-02 已完成 lower-level typed `RunnerRequestIdentity`、`ClientCorrelationPolicy`、OpenAI-compatible `X-Client-Request-Id` 映射能力、provider `x-request-id` 采集、Host ingest 与 Tool Trace 投影；但 reopen comment 指出真实 Service / CLI 默认路径没有启用该能力，因此 #63 不能视为端到端完成。
 
-当前 gate 是 `implementation`。Goal confirmation、plan gate、plan review、plan-fix、re-review 和 accepted plan commit 已完成；下一步由 AgentCodex 按 accepted plan 实施。
+当前 gate 是 `accepted slice commit`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix 和 code re-review 已完成；下一步创建 accepted slice commit。
 
 Plan artifact:
 
@@ -264,6 +264,41 @@ Plan re-review artifacts:
 Accepted plan commit:
 
 - `913875da` (`docs: accept WU-ENG-02-R1 plan`)
+
+Implementation artifact:
+
+- `docs/reviews/implementation-wu-eng-02-r1-codex-20260620.md` by AgentCodex
+
+Code review artifacts:
+
+- `docs/reviews/code-review-20260620-213746.md` by AgentDS, conclusion `pass`, blocking findings `0`
+- `docs/reviews/code-review-20260620-214050.md` by AgentMiMo, conclusion `pass`, blocking findings `0`
+
+Controller code-review judgment:
+
+- `accepted`：补充 `dayu.host._terminal_diagnostics` 直接测试，覆盖 only provider id、only client id、both ids、both absent、`message=None` 以及 id 截断，降低后续 projection helper 格式回归风险。
+- `accepted`：补充双 id 同时存在时的 terminal suffix 格式测试，确保 provider id 与 client correlation id 同时输出且顺序稳定。
+- `accepted`：补充 Tool Trace diagnostic 在 `provider_request_id=None`、`client_correlation_id` 存在且 `raw_payload_ref` 存在时保留 `diagnostic_ref=raw_payload_ref` 的测试。
+- `accepted`：`message=""` 是当前 production call path 不应传入的边界，但 helper 签名允许 `str`；可用最小逻辑把空字符串按 no-message 处理并用测试锁定，避免 future internal caller 产生前导空行。
+- `rejected-with-reason`：`_lost_host_event` 当前不追加 diagnostic suffix 不影响本 WU；direct evidence 显示 `_lost_lifecycle_plan` 当前写入 `provider_request_id=None` 与 `client_correlation_id=None`，且 accepted plan scope 是 failed terminal。该 future sync risk 不在当前 fix 中处理。
+
+Code-review fix artifact:
+
+- `docs/reviews/fix-wu-eng-02-r1-code-review-codex-20260620.md` by AgentCodex
+
+Code re-review artifacts:
+
+- `docs/reviews/code-review-20260620-214954.md` by AgentDS, conclusion `pass`, blocking findings `0`
+- `docs/reviews/re-review-wu-eng-02-r1-20260620-215031.md` by AgentMiMo, conclusion `pass`, blocking findings `0`
+
+Final slice validation:
+
+- `pytest tests/service/test_host_assembly.py tests/runtime/test_smoke_host_public_multiturn_assembly.py -q`: `53 passed, 3 warnings`
+- `pytest tests/engine/runners/openai/test_request_identity.py tests/engine/runners/openai/test_streaming_capability_and_content_type.py tests/engine/runners/openai/test_http_error_event.py tests/engine/runners/openai/test_runner_diagnostics.py -q`: `38 passed`
+- `pytest tests/host/test_terminal_diagnostics.py tests/host/test_read_api_terminal_policy.py tests/host/test_tool_trace_projection.py tests/host/test_tool_trace_queries.py -q`: `51 passed`
+- `pytest tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/cli/test_prompt_command.py -q`: `69 passed, 3 warnings`
+- `pyright`: `0 errors, 0 warnings, 0 informations`
+- `git diff --check`: passed
 
 Controller plan-review judgment:
 

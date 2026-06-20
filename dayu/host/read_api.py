@@ -44,6 +44,7 @@ from dayu.host.api import (
     SessionListItem,
     SessionSnapshot,
 )
+from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
 from dayu.host.command import HostCommandHandle
 from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
@@ -112,6 +113,8 @@ _PAYLOAD_FIELD_FILTERED = "filtered"
 _PAYLOAD_FIELD_DEGRADED = "degraded"
 _PAYLOAD_FIELD_MESSAGE = "message"
 _PAYLOAD_FIELD_REASON = "reason"
+_PAYLOAD_FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
+_PAYLOAD_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
 _PAYLOAD_FIELD_TERMINAL_STATUS = "terminal_status"
 _PAYLOAD_FIELD_EFFECTIVE_TOOL_SET = "effective_tool_set"
 _PAYLOAD_FIELD_EFFECTIVE_TOOL_DISPLAY_NAMES = "effective_tool_display_names"
@@ -963,6 +966,11 @@ def _failed_host_event(row: EventLogRow) -> HostEvent:
     """
 
     payload = _payload_object(row)
+    error_message = _optional_payload_text(
+        payload,
+        field_name=_PAYLOAD_FIELD_MESSAGE,
+        row=row,
+    )
     return HostEvent(
         event_id=row.event_id,
         event_sequence=row.event_sequence,
@@ -975,10 +983,18 @@ def _failed_host_event(row: EventLogRow) -> HostEvent:
         dedupe_key=row.event_id,
         terminal_status=HostTerminalStatus.FAILED,
         final_answer=None,
-        error_message=_optional_payload_text(
-            payload,
-            field_name=_PAYLOAD_FIELD_MESSAGE,
-            row=row,
+        error_message=_append_terminal_diagnostic_suffix(
+            error_message,
+            provider_request_id=_optional_payload_text(
+                payload,
+                field_name=_PAYLOAD_FIELD_PROVIDER_REQUEST_ID,
+                row=row,
+            ),
+            client_correlation_id=_optional_payload_text(
+                payload,
+                field_name=_PAYLOAD_FIELD_CLIENT_CORRELATION_ID,
+                row=row,
+            ),
         ),
         cancel_reason=None,
     )

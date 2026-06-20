@@ -381,7 +381,14 @@ class AsyncOpenAIRunner:
                 attempt_yielded_event = False
                 try:
                     async for event in self._do_attempt(
-                        payload, effective_options, headers=headers
+                        payload,
+                        effective_options,
+                        headers=headers,
+                        client_correlation_id=(
+                            request_identity.client_correlation_id
+                            if request_identity is not None
+                            else None
+                        ),
                     ):
                         attempt_yielded_event = True
                         event_count += 1
@@ -561,6 +568,7 @@ class AsyncOpenAIRunner:
         options: RunnerCallOptions,
         *,
         headers: Mapping[str, str],
+        client_correlation_id: str | None,
     ) -> AsyncIterator[RunnerEvent]:
         """执行 HTTP 请求并归一为事件。
 
@@ -568,6 +576,8 @@ class AsyncOpenAIRunner:
             视图，本路径仅做 JSON 序列化）。
         :param options: 调用参数。
         :param headers: 本次逻辑 Runner 调用复用的 HTTP 请求头。
+        :param client_correlation_id: 本次逻辑 Runner 调用的客户端关联 id；
+            未提供请求身份时为 ``None``。
         :returns: :class:`RunnerEvent` 异步迭代器。
 
         :raises _AttemptFailedRetriable: 当本次尝试失败且属于可重试
@@ -606,10 +616,11 @@ class AsyncOpenAIRunner:
             )
             _LOGGER.debug(
                 "runner.http.response status=%d content_type=%s "
-                "provider_request_id=%s",
+                "provider_request_id=%s client_correlation_id=%s",
                 response.status,
                 response.headers.get("Content-Type") or "",
                 provider_request_id,
+                client_correlation_id,
             )
             if response.status != 200:
                 error_code = classify_http_status(response.status)
