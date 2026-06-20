@@ -2062,10 +2062,7 @@ def _log_rejected_attempt(
         None if offending is None else offending.text_length,
         None if diagnostic is None else diagnostic.material_pack_digest,
     )
-    if rejected.repairable:
-        _LOGGER.warning(log_message, *args)
-    else:
-        _LOGGER.error(log_message, *args)
+    _LOGGER.warning(log_message, *args)
 
 
 def _exception_error_code(exc: Exception | None) -> str:

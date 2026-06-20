@@ -33,12 +33,16 @@ from dayu.runtime.tools_discovery import (
 )
 from utils.smoke_host_public_conversation_memory_scenarios import (
     CompactAuditSummary,
+    CompactAuditReport,
     MockFinanceMemoryTool,
     PressureMode,
     SmokeArgs,
     SuiteMode,
     _ASSERT_B_CFO,
     _assert_compact_acceptance,
+    _assert_fallback_dispatch_acceptance,
+    _assert_memory_compact_pressure_bounds,
+    _assert_reactive_compact_acceptance,
     _FACT_KEY_CATL_CASHFLOW,
     _FACT_KEY_CMB_NIM,
     _FACT_KEY_MAOTAI_REVENUE,
@@ -46,6 +50,12 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _FACT_KEY_WULIANGYE_REVENUE,
     _LABEL_CORE_B1,
     _MARKER_CATL_CASHFLOW,
+    _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS,
+    _COMPACT_PRESSURE_RESERVE_TOKENS,
+    _SMOKE_REACTIVE_CURRENT_MARKER,
+    _SMOKE_REACTIVE_OLD_MARKER,
+    _SMOKE_REACTIVE_RECENT_MARKER,
+    _SMOKE_REACTIVE_SELECTED_RECENT_ITEMS_PER_TURN,
     _VALUE_CATL_LARGEST_GAP,
     _VALUE_CATL_NET_PROFIT,
     _VALUE_CATL_OPERATING_CF,
@@ -53,12 +63,17 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _compact_audit_report_from_rows,
     _compact_audit_summary_from_rows,
     _compact_pressure_padding,
-    _compact_pressure_reserve_tokens,
+    _deterministic_dropped_old_marker,
     _estimate_chars_as_tokens,
+    _fake_compaction_proposal_from_material_json,
+    _fallback_compact_pressure_padding,
     _print_compact_audit_report,
+    DeterministicDispatchCapture,
+    DeterministicSmokeObservation,
     _ensure_request,
     _mock_pressure_blob,
     _prepare_runtime_assembly,
+    _print_compact_pressure_plan,
     _runtime_user_pressure_text,
     _select_long_templates,
     _threshold_tokens,
@@ -154,6 +169,28 @@ def test_runtime_assembly_adds_builtin_mock_tool_and_selects_manual_smoke(
     assert smoke_definitions[0].tags == (_TOOL_TAG,)
 
 
+def test_reactive_runtime_assembly_bounds_selected_recent_window(
+    tmp_path: pathlib.Path,
+) -> None:
+    """reactive smoke 本地收紧 selected recent，避免旧 marker 仍进 recovery。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    """
+
+    assembly = _prepare_runtime_assembly(
+        _args(tmp_path, suite=SuiteMode.MEMORY_REACTIVE_COMPACT),
+        env={"DEEPSEEK_API_KEY": _API_KEY},
+    )
+    policy = assembly.options.memory_projection_policy
+
+    assert policy.selected_recent_window_item_cap == (
+        policy.selected_recent_window_turn_floor
+        * _SMOKE_REACTIVE_SELECTED_RECENT_ITEMS_PER_TURN
+    )
+    assert policy.fallback_selected_recent_window_item_cap <= policy.selected_recent_window_item_cap
+
+
 def test_runtime_assembly_fails_closed_on_non_smoke_same_name_tool(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -183,7 +220,7 @@ def test_cli_bounds_for_suite_and_long_rounds(tmp_path: pathlib.Path) -> None:
     assert default_args.suite is SuiteMode.MEMORY_CORE
     assert default_args.pressure_mode is PressureMode.OFF
 
-    for suite in ("memory-core",):
+    for suite in ("memory-core", "memory-reactive-compact"):
         args = parse_args(
             (
                 "--workspace-root",
@@ -210,8 +247,23 @@ def test_cli_bounds_for_suite_and_long_rounds(tmp_path: pathlib.Path) -> None:
     assert compact_args.suite is SuiteMode.MEMORY_COMPACT
     assert compact_args.pressure_mode is PressureMode.AUTO
 
+    fallback_args = parse_args(
+        (
+            "--workspace-root",
+            str(tmp_path),
+            "--suite",
+            "memory-compact-fallback",
+            "--pressure-mode",
+            "auto",
+        )
+    )
+    assert fallback_args.suite is SuiteMode.MEMORY_COMPACT_FALLBACK
+    assert fallback_args.pressure_mode is PressureMode.AUTO
+
     with pytest.raises(SystemExit):
         parse_args(("--workspace-root", str(tmp_path), "--suite", "memory-compact"))
+    with pytest.raises(SystemExit):
+        parse_args(("--workspace-root", str(tmp_path), "--suite", "memory-compact-fallback"))
 
     for value in ("20", "25"):
         assert parse_args(("--workspace-root", str(tmp_path), "--long-rounds", value)).long_rounds == int(value)
@@ -232,6 +284,10 @@ def test_pure_spec_selection_tool_fact_requirements_and_long20_final_label(
 
     core_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.MEMORY_CORE))
     compact_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.MEMORY_COMPACT, pressure_mode=PressureMode.AUTO))
+    reactive_specs = select_round_specs(_args(tmp_path, suite=SuiteMode.MEMORY_REACTIVE_COMPACT))
+    fallback_specs = select_round_specs(
+        _args(tmp_path, suite=SuiteMode.MEMORY_COMPACT_FALLBACK, pressure_mode=PressureMode.AUTO)
+    )
     compact20_specs = select_round_specs(
         _args(
             tmp_path,
@@ -254,6 +310,25 @@ def test_pure_spec_selection_tool_fact_requirements_and_long20_final_label(
     assert tuple(spec.label for spec in compact_specs[:first_long_index]) == tuple(spec.label for spec in core_specs)
     assert compact20_specs[-1].label == "long-l25-constraint-assert"
     assert _select_long_templates(20)[-1].label == "long-l25-constraint-assert"
+    assert tuple(spec.label for spec in reactive_specs) == (
+        "reactive-r1-old-seed",
+        "reactive-r2-history-gap",
+        "reactive-r3-history-gap",
+        "reactive-r4-history-gap",
+        "reactive-r5-protected-recent",
+        "reactive-r6-overflow-target",
+    )
+    reactive_spec_by_label = {spec.label: spec for spec in reactive_specs}
+    assert _SMOKE_REACTIVE_OLD_MARKER in reactive_spec_by_label["reactive-r1-old-seed"].prompt
+    assert tuple(spec.label for spec in fallback_specs) == (
+        "fallback-f1-old-dropped",
+        "fallback-f2-old-dropped",
+        "fallback-f3-old-dropped",
+        "fallback-f4-old-dropped",
+        "fallback-f5-old-dropped",
+        "fallback-f6-selected-recent",
+        "fallback-f7-pressure-target",
+    )
 
 
 def test_core_b1_tool_round_prompt_does_not_leak_cashflow_answer_values(
@@ -351,7 +426,7 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     pressure_tokens = (
         prompt_tokens
         + _tool_pressure_estimated_tokens()
-        + _compact_pressure_reserve_tokens(context_window_size=policy.context_window_size)
+        + _COMPACT_PRESSURE_RESERVE_TOKENS
     )
     soft_threshold_tokens = _threshold_tokens(
         policy.context_window_size,
@@ -363,6 +438,43 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     )
     assert pressure_tokens >= soft_threshold_tokens
     assert pressure_tokens < hard_threshold_tokens
+    _assert_memory_compact_pressure_bounds(
+        assembly.options,
+        PressureMode.AUTO,
+        SuiteMode.MEMORY_COMPACT,
+    )
+    _print_compact_pressure_plan(
+        assembly.options,
+        PressureMode.AUTO,
+        suite=SuiteMode.MEMORY_COMPACT,
+    )
+    compact_output = capsys.readouterr().out
+    assert f"reserve_tokens={_COMPACT_PRESSURE_RESERVE_TOKENS}" in compact_output
+    assert f"estimated_effective_pressure_tokens={pressure_tokens}" in compact_output
+    assert f"estimated_total_pressure_tokens={pressure_tokens}" in compact_output
+
+    fallback_prompt_tokens = _estimate_chars_as_tokens(
+        len(_fallback_compact_pressure_padding(assembly.options))
+    )
+    fallback_effective_tokens = (
+        fallback_prompt_tokens
+        + _tool_pressure_estimated_tokens()
+        + _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS
+    )
+    _print_compact_pressure_plan(
+        assembly.options,
+        PressureMode.AUTO,
+        suite=SuiteMode.MEMORY_COMPACT_FALLBACK,
+    )
+    fallback_output = capsys.readouterr().out
+    assert (
+        f"reserve_tokens={_COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS}"
+        in fallback_output
+    )
+    assert (
+        f"estimated_effective_pressure_tokens={fallback_effective_tokens}"
+        in fallback_output
+    )
 
 
 def test_compact_acceptance_requires_event_log_audit_summary(tmp_path: pathlib.Path) -> None:
@@ -444,6 +556,232 @@ def test_compact_acceptance_requires_event_log_audit_summary(tmp_path: pathlib.P
             audit=failed,
             options=assembly.options,
         )
+
+
+def test_reactive_compact_acceptance_helper_requires_reactive_recovery_signals() -> None:
+    """reactive helper 只在 compact 成功、recovery 与旧 marker 排除都存在时通过。
+
+    :returns: ``None``。
+    """
+
+    base_rows = (
+        _event_row(
+            sequence=1,
+            event_id="event-reactive-request",
+            event_type=CONTEXT_COMPACTION_REQUESTED,
+            payload={"trigger_source": "reactive"},
+            run_id="run-reactive-target",
+        ),
+        _event_row(
+            sequence=2,
+            event_id="event-reactive-compacted",
+            event_type=CONTEXT_COMPACTED,
+            payload={"operation_id": "event-reactive-request"},
+            run_id="run-reactive-target",
+        ),
+    )
+    report = _compact_audit_report_from_rows(base_rows)
+    assert _deterministic_dropped_old_marker(SuiteMode.MEMORY_REACTIVE_COMPACT) == _SMOKE_REACTIVE_OLD_MARKER
+    observation = DeterministicSmokeObservation(
+        dispatches=(
+            _dispatch_capture(
+                run_id="run-reactive-target",
+                attempt_id="attempt-original",
+                execution_id="execution-original",
+                text=_SMOKE_REACTIVE_CURRENT_MARKER,
+            ),
+            _dispatch_capture(
+                run_id="run-reactive-target",
+                attempt_id="attempt-recovery",
+                execution_id="execution-recovery",
+                text=(
+                    f"{_SMOKE_REACTIVE_CURRENT_MARKER} "
+                    f"{_SMOKE_REACTIVE_RECENT_MARKER}"
+                ),
+            ),
+        ),
+        target_run_id="run-reactive-target",
+        current_input_marker=_SMOKE_REACTIVE_CURRENT_MARKER,
+        protected_recent_marker=_SMOKE_REACTIVE_RECENT_MARKER,
+        dropped_old_marker=_deterministic_dropped_old_marker(SuiteMode.MEMORY_REACTIVE_COMPACT),
+        pressure_tokens=None,
+        soft_threshold_tokens=None,
+        hard_threshold_tokens=None,
+    )
+
+    _assert_reactive_compact_acceptance(report, observation)
+
+    for polluted_rows in (
+        (
+            _event_row(
+                sequence=3,
+                event_id="event-proactive-request",
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload={"trigger_source": "proactive"},
+                run_id="run-reactive-target",
+            ),
+        ),
+        (
+            _event_row(
+                sequence=3,
+                event_id="event-proactive-request",
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload={"trigger_source": "proactive"},
+                run_id="run-reactive-target",
+            ),
+            _event_row(
+                sequence=4,
+                event_id="event-proactive-compacted",
+                event_type=CONTEXT_COMPACTED,
+                payload={"operation_id": "event-proactive-request"},
+                run_id="run-reactive-target",
+            ),
+        ),
+        (
+            _event_row(
+                sequence=3,
+                event_id="event-proactive-request",
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload={"trigger_source": "proactive"},
+                run_id="run-reactive-target",
+            ),
+            _event_row(
+                sequence=4,
+                event_id="event-proactive-failed",
+                event_type=CONTEXT_COMPACTION_FAILED,
+                payload={"operation_id": "event-proactive-request"},
+                run_id="run-reactive-target",
+            ),
+        ),
+    ):
+        proactive_polluted = _compact_audit_report_from_rows(
+            (
+                *base_rows,
+                *polluted_rows,
+            )
+        )
+        with pytest.raises(RuntimeError, match="unexpected proactive compact activity"):
+            _assert_reactive_compact_acceptance(proactive_polluted, observation)
+
+    missing_reactive = _compact_audit_report_from_rows(())
+    with pytest.raises(RuntimeError, match="reactive CONTEXT_COMPACTION_REQUESTED"):
+        _assert_reactive_compact_acceptance(missing_reactive, observation)
+
+    missing_dropped_marker = DeterministicSmokeObservation(
+        dispatches=observation.dispatches,
+        target_run_id=observation.target_run_id,
+        current_input_marker=observation.current_input_marker,
+        protected_recent_marker=observation.protected_recent_marker,
+        dropped_old_marker=None,
+        pressure_tokens=None,
+        soft_threshold_tokens=None,
+        hard_threshold_tokens=None,
+    )
+    with pytest.raises(RuntimeError, match="missing dropped old marker expectation"):
+        _assert_reactive_compact_acceptance(report, missing_dropped_marker)
+
+    old_marker_leaked = DeterministicSmokeObservation(
+        dispatches=(
+            observation.dispatches[0],
+            _dispatch_capture(
+                run_id="run-reactive-target",
+                attempt_id="attempt-recovery",
+                execution_id="execution-recovery",
+                text=(
+                    f"{_SMOKE_REACTIVE_CURRENT_MARKER} "
+                    f"{_SMOKE_REACTIVE_RECENT_MARKER} "
+                    f"{_SMOKE_REACTIVE_OLD_MARKER}"
+                ),
+            ),
+        ),
+        target_run_id=observation.target_run_id,
+        current_input_marker=observation.current_input_marker,
+        protected_recent_marker=observation.protected_recent_marker,
+        dropped_old_marker=observation.dropped_old_marker,
+        pressure_tokens=None,
+        soft_threshold_tokens=None,
+        hard_threshold_tokens=None,
+    )
+    with pytest.raises(RuntimeError, match="reactive recovery dropped old unexpectedly contains marker"):
+        _assert_reactive_compact_acceptance(report, old_marker_leaked)
+
+
+def test_fake_compactor_proposal_does_not_echo_material_markers() -> None:
+    """deterministic compact proposal 引用 material label 但不回写 material marker。
+
+    :returns: ``None``。
+    """
+
+    proposal = _fake_compaction_proposal_from_material_json(
+        {
+            "trace_material": [{"label": "T1"}],
+            "evidence_material": [
+                {
+                    "label": "E1",
+                    "response_text": _SMOKE_REACTIVE_OLD_MARKER,
+                }
+            ],
+            "answer_material": [
+                {
+                    "label": "A1",
+                    "answer_text": _SMOKE_REACTIVE_OLD_MARKER,
+                }
+            ],
+        }
+    )
+    parsed = json.loads(proposal)
+
+    assert _SMOKE_REACTIVE_OLD_MARKER not in proposal
+    assert parsed["session_summary"]["source_labels"] == ["T1", "E1", "A1"]
+    assert parsed["evidence_backed_facts"][0]["evidence_labels"] == ["E1"]
+    assert parsed["answer_anchors"][0]["answer_source_labels"] == ["A1"]
+
+
+def test_fallback_acceptance_helper_requires_proactive_request_and_window() -> None:
+    """fallback helper 要求 proactive request、dispatch fallback window 和 selected-only 输入。
+
+    :returns: ``None``。
+    """
+
+    report = _fallback_report(include_request=True)
+    observation = DeterministicSmokeObservation(
+        dispatches=(
+            _dispatch_capture(
+                run_id="run-fallback-target",
+                attempt_id="attempt-fallback",
+                execution_id="execution-fallback",
+                text=(
+                    "DAYU_SMOKE_FALLBACK_SELECTED_RECENT_V1 "
+                    "DAYU_SMOKE_FALLBACK_CURRENT_INPUT_V1"
+                ),
+            ),
+        ),
+        target_run_id="run-fallback-target",
+        current_input_marker="DAYU_SMOKE_FALLBACK_CURRENT_INPUT_V1",
+        protected_recent_marker="DAYU_SMOKE_FALLBACK_SELECTED_RECENT_V1",
+        dropped_old_marker="DAYU_SMOKE_FALLBACK_DROPPED_OLD_V1",
+        pressure_tokens=120,
+        soft_threshold_tokens=100,
+        hard_threshold_tokens=200,
+    )
+
+    _assert_fallback_dispatch_acceptance(report, observation)
+
+    with pytest.raises(RuntimeError, match="proactive CONTEXT_COMPACTION_REQUESTED"):
+        _assert_fallback_dispatch_acceptance(_fallback_report(include_request=False), observation)
+
+    bad_pressure = DeterministicSmokeObservation(
+        dispatches=observation.dispatches,
+        target_run_id=observation.target_run_id,
+        current_input_marker=observation.current_input_marker,
+        protected_recent_marker=observation.protected_recent_marker,
+        dropped_old_marker=observation.dropped_old_marker,
+        pressure_tokens=90,
+        soft_threshold_tokens=100,
+        hard_threshold_tokens=200,
+    )
+    with pytest.raises(RuntimeError, match="below soft threshold"):
+        _assert_fallback_dispatch_acceptance(report, bad_pressure)
 
 
 def test_compact_audit_summary_maps_operation_id_to_request_trigger_source() -> None:
@@ -713,6 +1051,81 @@ def discover_non_smoke_same_name_tools(
             ),
         ),
         definitions=(_non_smoke_tool_definition(),),
+    )
+
+
+def _dispatch_capture(
+    *,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    text: str,
+) -> DeterministicDispatchCapture:
+    """构造 deterministic dispatch capture。
+
+    :param run_id: Host Run id。
+    :param attempt_id: Host Attempt id。
+    :param execution_id: execution id。
+    :param text: joined message 文本。
+    :returns: dispatch capture。
+    """
+
+    return DeterministicDispatchCapture(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        joined_messages=text,
+        system_message_count=1,
+        system_message_at_start=True,
+    )
+
+
+def _fallback_report(*, include_request: bool) -> CompactAuditReport:
+    """构造 fallback acceptance helper 测试用 report。
+
+    :param include_request: 是否包含 proactive request row。
+    :returns: compact audit report。
+    """
+
+    operation_id = "event-fallback-request" if include_request else "event-missing-request"
+    request_rows = (
+        (
+            _event_row(
+                sequence=1,
+                event_id=operation_id,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload={"trigger_source": "proactive"},
+                run_id="run-fallback-target",
+            ),
+        )
+        if include_request
+        else ()
+    )
+    return _compact_audit_report_from_rows(
+        (
+            *request_rows,
+            _event_row(
+                sequence=2,
+                event_id="event-fallback-failed",
+                event_type=CONTEXT_COMPACTION_FAILED,
+                payload={
+                    "operation_id": operation_id,
+                    "failure_reason": "repair budget exhausted",
+                    "policy_decision": "fallback",
+                    "fallback_policy_decision": "deterministic_recent_window",
+                    "fallback_action": "dispatch",
+                    "fallback_tier": "tier4",
+                    "attempt_count": 2,
+                    "retry_repair_budget_exhausted": True,
+                    "fallback_input_window": {
+                        "selected_block_ids": ["history:recent", "current:event-current"],
+                        "dropped_block_ids": ["history:old"],
+                        "current_input_ref": "event-current",
+                    },
+                },
+                run_id="run-fallback-target",
+            ),
+        )
     )
 
 

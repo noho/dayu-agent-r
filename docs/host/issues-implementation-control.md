@@ -144,13 +144,13 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | WU-CM-13 / WU-CM-14 local phaseflow completed at draft-PR-pass. PR #152 review PASS accepted in commit `f2970512`, pushed to draft PR #152, and final closeout recorded. WU-CM-15 is registered as discussion-ready and has not entered phaseflow. |
-| active work unit | None. WU-CM-15 is the default next discussion item but not yet in plan / implementation. |
-| default next work unit | WU-CM-15 |
-| next entry point | Discuss / goal-confirm WU-CM-15, or user decision on PR #152: mark ready / request reviewers / merge later. No automatic merge, mark-ready, reviewer request, branch deletion, issue closure, or WU-CM-15 implementation is authorized. |
+| implementation status | WU-CM-15 final closeout complete. Draft PR #157 is open draft; PR review PASS from AgentMiMo / AgentDS with no material findings; accepted PR review commit `5e04a841` is recorded and follow-up push has published it to PR #157. |
+| active work unit | WU-CM-15 |
+| default next work unit | WU-CLI-DEBUG-STREAM-01 |
+| next entry point | After the user manually merges PR #157, pull latest `main` from GitHub and start WU-CLI-DEBUG-STREAM-01 from this control doc. WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148 and must begin at discussion / goal-confirmation; no automatic merge, mark-ready, reviewer request, branch deletion, issue closure, or out-of-scope implementation is authorized. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Conversation Memory, Context Governance, compact, fallback, and Host / Engine ownership boundaries. |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 PR #150 merged 2026-06-19 https://github.com/noho/dayu-agent-r/pull/150; WU-CM-13 / WU-CM-14 draft PR #152 open draft https://github.com/noho/dayu-agent-r/pull/152; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CM-13 / WU-CM-14 / WU-CM-15 are user-directed work units without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | WU-CM-15 needs discussion / goal confirmation before phaseflow. PR #152 merge, mark-ready, reviewer requests, branch deletion, and issue closure require separate user authorization. |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; #156 open as #78 child https://github.com/noho/dayu-agent-r/issues/156; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 PR #150 merged 2026-06-19 https://github.com/noho/dayu-agent-r/pull/150; WU-CM-13 / WU-CM-14 draft PR #152 open draft https://github.com/noho/dayu-agent-r/pull/152; WU-CM-15 draft PR #157 open draft https://github.com/noho/dayu-agent-r/pull/157; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CM-13 / WU-CM-14 / WU-CM-15 are user-directed work units without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| blocking open questions | None for WU-CM-15 final closeout. The latest full four-suite smoke passed with the configured provider environment; future real-provider smoke runs still require valid model API keys. Merge, mark-ready, reviewer requests, branch deletion, and issue closure require separate user authorization. |
 
 状态约定：
 
@@ -240,7 +240,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-12 | completed | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | PR #150 merged on 2026-06-19. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
 | WU-CM-13 | draft-PR-pass | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Draft PR #152 open draft. Accepted PR review commit `f2970512` pushed; final closeout recorded in `docs/reviews/wu-cm-13-final-closeout-20260619.md`; `WU-CM-12-S4-R1` and `WU-CM-13-S1-R1` closed. |
 | WU-CM-14 | completed | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Local phaseflow completed. Accepted slice commit `921c6219`; aggregate deepreview PASS after deleting dead `_current_only_material_blocks`. Root cause fixed by passing existing floor into compact selection, adding ordinary post-compaction protected raw tail rendering, and repairing reactive frozen material assembly for protected floor semantics. WU-CM-13 subsequently audited the preservation path into shared compact pipeline ownership. |
-| WU-CM-15 | discussion-ready | Conversation memory public smoke reactive compact and fallback coverage | CM smoke / eval coverage follow-up；无 GitHub Issue | Add explicit smoke coverage for reactive compact and deterministic fallback without weakening the existing `memory-compact` proactive acceptance. Must discuss suite shape before implementation. |
+| WU-CM-15 | draft-PR-pass | Conversation memory public smoke reactive compact and fallback coverage | CM smoke / eval coverage follow-up；无 GitHub Issue | Draft PR #157 open draft. Accepted plan commit `97518e93`; accepted implementation slice commit `572a88df`; pre-PR closeout commit `0fe4e910`; accepted PR review / final closeout commit `5e04a841`. PR review PASS from AgentMiMo / AgentDS with no material findings; final closeout recorded in `docs/reviews/wu-cm-15-final-closeout-20260620.md`. |
 | WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
@@ -1890,7 +1890,7 @@ protected recent raw tail 的基本单位仍是 turn group。最近 `selected_re
 
 ### 状态
 
-`discussion-ready`。当前不创建 GitHub Issue，不进入 plan / implementation。
+`draft-PR-pass`。当前不创建 GitHub Issue。Goal confirmation 已由用户裁决通过：本 WU 只是增加 public smoke 覆盖，覆盖被动 compact 和 fallback。Accepted plan commit `97518e93` 已创建；accepted implementation slice commit `572a88df` 已创建；aggregate deepreview / fix / focused re-review 已通过；closeout logging / pressure observability fix 已验证；draft PR #157 已创建；PR review PASS；final closeout 已完成。PR #157 仍为 open draft，merge / mark-ready / reviewer request / branch deletion 需要用户另行授权。
 
 本 WU 是对 `utils/smoke_host_public_conversation_memory_scenarios.py` fresh run 后发现的 smoke coverage gap 的独立追踪项。当前 `memory-compact` suite 已覆盖真实 conversation memory 主干与 proactive compact accepted 路径，但没有显式覆盖 worker / provider overflow 触发的 reactive compact，也没有显式覆盖 compact 全部失败后的 deterministic fallback dispatch。
 
@@ -1956,6 +1956,53 @@ WU-CM-15 应新增显式 suite，而不是改变现有 `memory-compact` 的语�
 ### 与 WU-CM-10 / GitHub Issue #80 的关系
 
 WU-CM-15 是 public smoke coverage hardening，不替代 #80 的完整 Conversation Memory eval benchmark。它可以为 #80 提供稳定 public-path baseline：reactive compact、fallback dispatch、compact audit 与 final outcome 行为可作为后续 eval fixtures 的底层能力，但 #80 仍需单独覆盖 memory snapshot、RunInputBuilder messages、tool behavior、diagnostics、final response facts、事实更新 / 冲突和 provenance 指标。
+
+### Implementation / Review 状态
+
+- accepted plan: `docs/host/host-issues/wu-cm-15-public-smoke-reactive-fallback-plan.md`; accepted plan commit `97518e93`.
+- initial plan review: `docs/reviews/plan-review-20260620-102108.md` (AgentMiMo); `docs/reviews/plan-review-20260620-102145.md` (AgentDS).
+- plan review adjudication: `docs/reviews/wu-cm-15-plan-review-adjudication-20260620.md`.
+- plan fix: `docs/reviews/wu-cm-15-plan-fix-codex-20260620.md`.
+- focused plan re-review: `docs/reviews/plan-review-20260620-102923.md` (AgentMiMo); `docs/reviews/plan-review-20260620-102930.md` (AgentDS).
+- implementation artifact: `docs/reviews/wu-cm-15-implementation-codex-20260620.md`.
+- code review: `docs/reviews/code-review-20260620-112127.md` (AgentDS); `docs/reviews/code-review-20260620-112301.md` (AgentMiMo).
+- code review adjudication: `docs/reviews/wu-cm-15-code-review-adjudication-20260620.md`.
+- fix artifact: `docs/reviews/wu-cm-15-code-review-fix-codex-20260620.md`.
+- focused re-review: `docs/reviews/code-review-20260620-115326.md` (AgentMiMo); `docs/reviews/code-review-rereview-ds-20260620.md` (AgentDS).
+- focused re-review adjudication: `docs/reviews/wu-cm-15-code-review-rereview-adjudication-20260620.md`.
+- accepted implementation slice commit: `572a88df`.
+- aggregate deepreview: `docs/reviews/deepreview-wu-cm-15-aggregate-mimo-20260620.md` (AgentMiMo); `docs/reviews/deepreview-wu-cm-15-aggregate-ds-20260620.md` (AgentDS).
+- aggregate fix: `docs/reviews/wu-cm-15-aggregate-fix-codex-20260620.md`.
+- aggregate fix focused re-review: `docs/reviews/deepreview-wu-cm-15-aggregate-fix-rereview-mimo-20260620.md` (AgentMiMo); `docs/reviews/deepreview-wu-cm-15-aggregate-fix-rereview-ds-20260620.md` (AgentDS).
+- aggregate adjudication: `docs/reviews/wu-cm-15-aggregate-deepreview-adjudication-20260620.md`.
+- final closeout: `docs/reviews/wu-cm-15-final-closeout-20260620.md`.
+- draft PR: https://github.com/noho/dayu-agent-r/pull/157.
+- PR review artifacts: `docs/reviews/pr-157-review-20260620-134300.md` (AgentMiMo, PASS, no material findings); `docs/reviews/pr-157-review-20260620-134346.md` (AgentDS, PASS, no material findings).
+- accepted PR review / final closeout commit: `5e04a841`.
+- follow-up push: branch `phase/wu-cm-15` is pushed to PR #157 through accepted PR review commit `5e04a841` and this final hash-record update.
+- Controller validation after fix: `pytest tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py -q` passed (`20 passed`, existing edgar deprecation warnings); `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-reactive-compact --log-level CRITICAL` passed; `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-compact-fallback --pressure-mode auto --log-level CRITICAL` passed; `python -m pyright dayu/ tests/ utils/` passed (`0 errors`); `git diff --check` clean.
+- Controller validation after aggregate fix: `pytest tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py -q` passed (`20 passed`, existing edgar deprecation warnings); `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-reactive-compact --log-level CRITICAL` passed; `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-compact-fallback --pressure-mode auto --log-level CRITICAL` passed; `python -m pyright dayu/ tests/ utils/` passed (`0 errors`); `git diff --check` clean.
+- Fresh full-suite smoke evaluation: `workspace/tmp/cm-smoke-fresh-20260620-125037` contains DEBUG logs for all four suites. `memory-core`, `memory-compact`, `memory-reactive-compact`, and `memory-compact-fallback` all passed after correcting the local rerun harness argument shape for the two `--pressure-mode auto` invocations. The logs are appropriate for diagnosis; high-volume per-delta stream output is assigned to GitHub Issue #148 / WU-CLI-DEBUG-STREAM-01 and is not counted as WU-CM-15 noise.
+- Closeout logging / pressure fix validation: `pytest tests/host/test_compaction_operation.py::test_run_compaction_operation_logs_terminal_reject_as_warning tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py::test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds` passed (`2 passed`); `pytest tests/host/test_compaction_operation.py` passed (`31 passed`); `pytest tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py` passed (`20 passed`); `pyright` passed (`0 errors`); `python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-compact-fallback --pressure-mode auto --log-level DEBUG > workspace/tmp/cm-smoke-fallback-log-fix-20260620-131005.log 2>&1` passed and emitted no `[ERROR]` lines.
+- PR checks: `gh pr checks 157` reported no checks on branch `phase/wu-cm-15`; `statusCheckRollup` is empty. Local validation above is the recorded verification source for this WU.
+- README trigger handled: `tests/README.md` updated only to reflect the added `memory-reactive-compact` / `memory-compact-fallback` assembly coverage and oracles.
+
+### Residual risks
+
+- Existing real-provider `memory-compact` smoke keeps strict proactive accepted compact semantics. The latest full four-suite run passed with the configured provider environment; future real-provider runs still require valid model / compactor provider keys as a normal smoke precondition.
+- `_patched_compactor_runner` remains a smoke-local monkey patch around `dayu.host.llm_compaction._run_agent_request`; the fix adds fail-fast identity checking and `finally` restore, but future parallel smoke execution would need a different isolation strategy.
+- The reactive suite uses a suite-local copied `MemoryProjectionPolicy` to bound selected recent items so that the old seed marker is truly written into r1 history but excluded from recovery dispatch; if the default selected recent turn floor grows beyond the six-round layout, the smoke fails closed instead of silently weakening the oracle.
+- Deferred future smoke hardening: decide whether reactive acceptance should also reject nonzero `rejected_proactive`. Current aggregate-fix finding explicitly required requested / compacted / failed proactive zero checks; both focused re-reviews passed. If future config can emit proactive rejection without request/compacted/failed counts, add this as a small smoke hardening follow-up.
+- Compaction artifact retention is tracked by GitHub Issue #156 as a child of #78. The relationship is explicit: #78 owns `purge_session`-driven session retention cleanup, and #156 can safely rely on that purge ownership to define artifact retention cleanup without adding a Host background scheduler.
+
+Residual risk reconciliation:
+
+- PR review found no material findings; no fix / re-review gate was required.
+- `_patched_compactor_runner` risk is accepted as smoke-local and fail-closed; owner is future smoke maintenance only if parallel suite execution becomes a requirement.
+- Provider key dependency is an operator/environment precondition for real-provider smoke, not a WU-CM-15 code residual.
+- Per-delta DEBUG log volume is transferred to WU-CLI-DEBUG-STREAM-01 / GitHub Issue #148.
+- Compaction artifact retention is transferred to GitHub Issue #156 under #78.
+- Next entry point after user merges PR #157: pull latest `main` and start WU-CLI-DEBUG-STREAM-01.
 
 ## WU-CLI-DEBUG-STREAM-01 CLI `--debug-stream` Per-Delta Stream Diagnostics
 
