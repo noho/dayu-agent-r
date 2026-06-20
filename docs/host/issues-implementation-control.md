@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-ENG-02-R1 accepted PR review commit `2d1737f1` created and pushed to PR 159. Draft PR gate has passed; final closeout is the next gate. |
+| gate | final-closeout-pass |
+| implementation status | WU-ENG-02-R1 final closeout pass. Draft PR 159 is open in draft state; before this final closeout record, branch `phase/wu-eng-02-r1` was pushed through `d96dcb65`. Local gate chain completed through PR review, accepted PR review commit, follow-up push, draft-PR-pass, and final closeout. |
 | active work unit | WU-ENG-02-R1 |
 | default next work unit | WU-ENG-02-R1 |
-| next entry point | Run final closeout gate: record final summary, issue closeout status, PR / commit / risk state, and mark WU-ENG-02-R1 final closeout pass. |
+| next entry point | Await user merge / PR disposition for PR 159. After merge, return to base branch and select the next active work unit from this control doc. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
-| blocking open questions | None for draft-PR-pass gate. |
+| blocking open questions | None for final closeout. |
 
 状态约定：
 
@@ -241,7 +241,7 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 
 本 WU 是 WU-ENG-02 / PR 114 的 reopened follow-up。WU-ENG-02 已完成 lower-level typed `RunnerRequestIdentity`、`ClientCorrelationPolicy`、OpenAI-compatible `X-Client-Request-Id` 映射能力、provider `x-request-id` 采集、Host ingest 与 Tool Trace 投影；但 reopen comment 指出真实 Service / CLI 默认路径没有启用该能力，因此 #63 不能视为端到端完成。
 
-当前 gate 是 `draft-PR-pass`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix、code re-review、accepted slice commit、aggregate deepreview、accepted deepreview commit、push、create draft PR、PR review、accepted PR review commit 和 follow-up push 已完成；下一步 final closeout。
+当前 gate 是 `final-closeout-pass`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix、code re-review、accepted slice commit、aggregate deepreview、accepted deepreview commit、push、create draft PR、PR review、accepted PR review commit、follow-up push、draft-PR-pass 和 final closeout 已完成。
 
 Plan artifact:
 
@@ -347,6 +347,18 @@ Draft PR pass:
 - Status: pass.
 - PR: https://github.com/noho/dayu-agent-r/pull/159
 - Last pushed commit: `2d1737f1`
+
+Final closeout:
+
+- Status: final-closeout-pass.
+- PR: https://github.com/noho/dayu-agent-r/pull/159
+- PR state at closeout: `OPEN`, draft `true`, mergeable `UNKNOWN`, latest reviews `[]`.
+- Branch: `phase/wu-eng-02-r1`
+- Branch head before final closeout record: `d96dcb65`
+- GitHub checks at closeout: none reported on branch.
+- Issue closeout handling: PR body contains `Closes #63`; Issue #63 should close on merge if GitHub auto-close rules apply. No separate issue comment or manual close was performed in this gate.
+- Validation retained from accepted slice / PR body: assembly 53 passed, runner 38 passed, Host terminal / Tool Trace 51 passed, Service / CLI 69 passed, pyright 0 errors, `git diff --check` passed.
+- Remaining risks: no blocking risks. Non-blocking deferred risk remains limited to future WU changes that make lost/cancelled lifecycle payloads carry provider/client correlation ids; that future WU must re-check terminal projection suffix behavior.
 
 Controller plan-review judgment:
 
