@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted slice commit |
-| implementation status | WU-ENG-02-R1 code re-review completed by AgentMiMo and AgentDS with `pass` and zero blocking findings. Final validation passed: assembly 53 passed, runner 38 passed, Host terminal / Tool Trace 51 passed, Service / CLI 69 passed, pyright 0 errors, and `git diff --check` passed. Accepted slice commit is the next gate action. |
+| gate | aggregate deepreview |
+| implementation status | WU-ENG-02-R1 accepted slice commit `150875e9` created. Implementation changes, tests, README updates, implementation / code review / fix / re-review artifacts, and final validation records are committed. |
 | active work unit | WU-ENG-02-R1 |
 | default next work unit | WU-ENG-02-R1 |
-| next entry point | Create accepted slice commit containing implementation changes, tests, README updates, implementation / code review / fix / re-review artifacts, and this control-doc state update. After commit, record the accepted slice commit hash and enter aggregate deepreview gate. |
+| next entry point | Run aggregate deepreview using `/deepreview --base 913875da` over the accepted implementation slice and committed gate artifacts; controller will adjudicate findings before accepted deepreview commit. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
-| blocking open questions | None for accepted slice commit gate. |
+| blocking open questions | None for aggregate deepreview gate. |
 
 状态约定：
 
@@ -241,7 +241,7 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 
 本 WU 是 WU-ENG-02 / PR 114 的 reopened follow-up。WU-ENG-02 已完成 lower-level typed `RunnerRequestIdentity`、`ClientCorrelationPolicy`、OpenAI-compatible `X-Client-Request-Id` 映射能力、provider `x-request-id` 采集、Host ingest 与 Tool Trace 投影；但 reopen comment 指出真实 Service / CLI 默认路径没有启用该能力，因此 #63 不能视为端到端完成。
 
-当前 gate 是 `accepted slice commit`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix 和 code re-review 已完成；下一步创建 accepted slice commit。
+当前 gate 是 `aggregate deepreview`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix、code re-review 和 accepted slice commit 已完成；下一步运行 aggregate deepreview。
 
 Plan artifact:
 
@@ -299,6 +299,10 @@ Final slice validation:
 - `pytest tests/service/test_entrypoint_runtime.py tests/service/test_entrypoint_runtime_prompt_path.py tests/cli/test_prompt_command.py -q`: `69 passed, 3 warnings`
 - `pyright`: `0 errors, 0 warnings, 0 informations`
 - `git diff --check`: passed
+
+Accepted slice commit:
+
+- `150875e9` (`fix: enable provider debugging correlation by default`)
 
 Controller plan-review judgment:
 
