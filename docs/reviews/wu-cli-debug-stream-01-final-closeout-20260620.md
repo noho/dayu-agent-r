@@ -1,15 +1,18 @@
 # WU-CLI-DEBUG-STREAM-01 Final Closeout
 
-> Superseded note: this closeout was written before the resumed Gate State
-> Machine correction. It is retained as historical evidence, but final closeout
-> must be rerun after PR review, any required fix / re-review, accepted PR
-> review commit, follow-up push, and draft-PR-pass complete.
-
 ## Verdict
 
-WU-CLI-DEBUG-STREAM-01 is ready for the draft PR gate.
+WU-CLI-DEBUG-STREAM-01 reached final closeout pass.
 
-All planned slices passed implementation review and aggregate deepreview. No must-fix findings remain.
+Draft PR #158 is open, PR review passed, accepted PR review commit was pushed, issue #148 is linked by closing keyword, and no residual risks remain.
+
+## Draft PR
+
+- PR: https://github.com/noho/dayu-agent-r/pull/158
+- State: open draft.
+- Base: `main`.
+- Head: `wu-cli-debug-stream-01`.
+- PR body includes `Closes #148`, so issue #148 is expected to close automatically when the PR is merged.
 
 ## Delivered
 
@@ -23,6 +26,7 @@ All planned slices passed implementation review and aggregate deepreview. No mus
 - Kept lifecycle / HTTP DEBUG diagnostics and warnings at their existing levels.
 - Added prompt / interactive guards proving `--debug-stream` is a global logging flag, not an unsupported legacy Agent execution option, and does not pollute stdout.
 - Updated root README and tests README for user-visible behavior and test coverage responsibilities.
+- Fixed user follow-up bug: `--log-level critical` is now accepted by argparse and covered by CLI tests.
 
 ## Reviews
 
@@ -31,22 +35,36 @@ All planned slices passed implementation review and aggregate deepreview. No mus
 - Slice 3 code review: PASS from AgentMiMo and AgentDS.
 - Slice 4 code review: PASS from AgentMiMo and AgentDS.
 - Aggregate deepreview: PASS from AgentMiMo and AgentDS.
+- PR review: PASS from AgentMiMo and AgentDS.
+- Accepted PR review commit: `c563d4d6`.
+- Follow-up push after accepted PR review commit: complete.
 
 ## Final Validation
 
 - `pytest tests/runtime/test_log.py tests/runtime/test_log_levels.py tests/cli/test_arg_parsing.py tests/host/test_logging.py tests/engine/runners/openai/test_runner_diagnostics.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py -q`
-  - Result after user follow-up fix: 160 passed, 3 existing third-party edgar deprecation warnings.
+  - Result: 160 passed, 3 existing third-party edgar deprecation warnings.
 - `python -m pyright dayu/ tests/ utils/`
   - Result: 0 errors, 0 warnings, 0 informations.
 - `git diff --check`
   - Result: clean.
 
+## Issue Closeout
+
+- Issue: https://github.com/noho/dayu-agent-r/issues/148
+- Issue closeout comment: https://github.com/noho/dayu-agent-r/issues/148#issuecomment-4757794264
+- Manual close: not performed.
+- Merge close expectation: PR #158 contains `Closes #148`; GitHub should close issue #148 automatically after PR merge.
+
 ## Residual Risks
 
 None.
 
-Follow-up after closeout: user rejected the future-site reminder residual as unnecessary, and the pre-existing `--log-level critical` mismatch was fixed by adding `critical` to CLI parser choices with coverage in `tests/cli/test_arg_parsing.py`.
+User follow-up removed the future-site reminder residual as unnecessary. The pre-existing `--log-level critical` parser mismatch was fixed by adding `critical` to CLI parser choices with coverage in `tests/cli/test_arg_parsing.py`.
 
 ## Explicit Non-Scope
 
-`memory_repair.catch_up.budget_exhausted` is an already-fixed bug, not a noise item for this WU. Current code has no `BUDGET_EXHAUSTED` stop reason, and aggregate deepreview found no regression evidence.
+`memory_repair.catch_up.budget_exhausted` is an already-fixed bug, not a noise item for this WU. Current code has no `BUDGET_EXHAUSTED` stop reason, and PR review found no regression evidence.
+
+## Next Entry Point
+
+After the user merges PR #158, pull the latest `main` from the `github` remote and restart phaseflow from `docs/host/issues-implementation-control.md`. The next work unit should be selected from the active/backlog table after the merged control doc is read.
