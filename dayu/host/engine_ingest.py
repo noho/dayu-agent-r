@@ -200,7 +200,7 @@ from dayu.host.tool_trace_signals import (
     PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_NONE,
     PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT as _PARTIAL_TOOL_CALL_SIGNAL_STATUS_PRESENT,
 )
-from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL, VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
 _DELTA_ENGINE_EVENT_TYPES = frozenset(
@@ -3257,11 +3257,12 @@ def _engine_ingest_log_level(engine_event_type: EngineEventType) -> int:
     """根据 Engine event 类型选择 ingest 诊断日志级别。
 
     :param engine_event_type: 待记录的 Engine event 类型。
-    :returns: stdlib logging level 数值。
+    :returns: Python logging 可消费的整数级别；delta 事件使用 Dayu
+        自定义 STREAM_DEBUG 级别。
     """
 
     if engine_event_type in _DELTA_ENGINE_EVENT_TYPES:
-        return logging.DEBUG
+        return STREAM_DEBUG_LOG_LEVEL
     return VERBOSE_LOG_LEVEL
 
 
