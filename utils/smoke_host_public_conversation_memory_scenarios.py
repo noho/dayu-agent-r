@@ -22,11 +22,13 @@ import pathlib
 import re
 import sys
 from collections import Counter
-from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from math import floor
-from typing import Final, cast
+from typing import Final, Protocol, cast
 from uuid import uuid4
 
 _PROJECT_ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parents[1]
@@ -54,7 +56,22 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from dayu.engine.contracts.agent_run import (
+    AgentRunRequest,
+    AgentRunResult,
+    EngineRunOutcomeFinalAnswer,
+)
+from dayu.engine.contracts.engine_events import (
+    ContextCompactionRequestedData,
+    EngineEvent,
+    EngineEventType,
+    FinalAnswerData,
+)
+from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
+import dayu.host.llm_compaction as llm_compaction
 from dayu.host import (
+    AttemptDispatchSnapshot,
     AuthorizationClaim,
     EnsureSessionRequest,
     FollowupBehavior,
@@ -62,11 +79,21 @@ from dayu.host import (
     HostCallContext,
     HostEvent,
     HostEventKind,
+    LocalEngineWorker,
+    LocalEngineWorkerFactory,
+    LocalWorkerHandle,
     OpenHostOptions,
     OperationContext,
     SessionSnapshot,
     SessionStatus,
     open_host,
+)
+from dayu.host.compaction import (
+    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    FactEvidenceKindVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityReasonVNext,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
 from dayu.host.context_events import (
@@ -89,6 +116,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.memory import MemoryProjectionPolicy
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.log import LogLevel, configure
@@ -155,6 +183,7 @@ _STDOUT_PREFIX_COMPACT_REJECT_DETAIL: Final[str] = "SMOKE COMPACT_REJECT_DETAIL"
 _STDOUT_PREFIX_COMPACT_ACCEPTANCE: Final[str] = "SMOKE COMPACT_ACCEPTANCE"
 _STDOUT_PREFIX_COMPACT_ARTIFACT_ROOT: Final[str] = "SMOKE COMPACT_ARTIFACT_ROOT"
 _STDOUT_PREFIX_COMPACT_ARTIFACT_FILE_COUNT: Final[str] = "SMOKE COMPACT_ARTIFACT_FILE_COUNT"
+_STDOUT_PREFIX_DETERMINISTIC_DISPATCH: Final[str] = "SMOKE DETERMINISTIC_DISPATCH"
 _NO_TOOL_SELECTION: Final[frozenset[str]] = frozenset()
 _MOCK_PRESSURE_UNIT: Final[str] = (
     "DAYU_MEM_SCENARIO_PRESSURE_PAD 财报场景记忆压力文本，" "仅用于 public Host conversation memory smoke。"
@@ -164,9 +193,9 @@ _FINAL_PREVIEW_CHARS: Final[int] = 600
 _TERMINAL_TIMEOUT_SECONDS: Final[float] = 600.0
 _COMPACT_PRESSURE_TARGET_EXTRA_TOKENS: Final[int] = 16_384
 _COMPACT_PRESSURE_HARD_MARGIN_TOKENS: Final[int] = 24_576
-_COMPACT_PRESSURE_RESERVE_TOKENS: Final[int] = 160_000
+_COMPACT_PRESSURE_RESERVE_TOKENS: Final[int] = 575_000
+_COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS: Final[int] = 160_000
 _COMPACT_PRESSURE_MIN_PROMPT_TOKENS: Final[int] = 1_024
-_COMPACT_PRESSURE_LARGE_WINDOW_TOKENS: Final[int] = 1_000_000
 _PRESSURE_LINE_CHARS: Final[int] = 120
 _COMPACT_ARTIFACT_PRINT_LIMIT: Final[int] = 10
 _COMPACT_EVENT_AUDIT_PAGE_SIZE: Final[int] = 512
@@ -201,6 +230,10 @@ _PAYLOAD_FIELD_RUNNER_ATTEMPT_SUMMARY_REFS: Final[str] = "runner_attempt_summary
 _PAYLOAD_FIELD_DIAGNOSTIC_REFS: Final[str] = "diagnostic_refs"
 _PAYLOAD_FIELD_NEXT_POLICY_DECISION: Final[str] = "next_policy_decision"
 _PAYLOAD_FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: Final[str] = "budget_after_attempted_compact"
+_PAYLOAD_FIELD_FALLBACK_INPUT_WINDOW: Final[str] = "fallback_input_window"
+_PAYLOAD_FIELD_SELECTED_BLOCK_IDS: Final[str] = "selected_block_ids"
+_PAYLOAD_FIELD_DROPPED_BLOCK_IDS: Final[str] = "dropped_block_ids"
+_PAYLOAD_FIELD_CURRENT_INPUT_REF: Final[str] = "current_input_ref"
 _PAYLOAD_FIELD_PROPOSAL_MANIFEST_REF: Final[str] = "proposal_manifest_ref"
 _PAYLOAD_FIELD_PROPOSAL_MANIFEST_DIGEST: Final[str] = "proposal_manifest_digest"
 _COMPACT_OPERATION_UNKNOWN_TRIGGER: Final[str] = "<unknown>"
@@ -217,6 +250,56 @@ _COMPACT_MANIFEST_MISSING: Final[str] = "missing"
 _DIAGNOSTIC_REF_SEPARATOR: Final[str] = ":"
 _DIAGNOSTIC_REF_SUFFIX_OFFSET: Final[int] = 4
 _COMPACT_HISTOGRAM_PRINT_LIMIT: Final[int] = 8
+_COMPACT_FALLBACK_FORBIDDEN_SECTIONS: Final[tuple[str, ...]] = (
+    "## Conversation Summary",
+    "## Verified Evidence and Facts",
+    "## Prior Answer Anchors",
+    "## Open Follow-up Context",
+    "## Reference Continuity",
+)
+_COMPACTOR_MATERIAL_BEGIN: Final[str] = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
+_COMPACTOR_MATERIAL_END: Final[str] = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
+_COMPACTOR_FIELD_TRACE_MATERIAL: Final[str] = "trace_material"
+_COMPACTOR_FIELD_EVIDENCE_MATERIAL: Final[str] = "evidence_material"
+_COMPACTOR_FIELD_ANSWER_MATERIAL: Final[str] = "answer_material"
+_COMPACTOR_FIELD_PREVIOUS_COMPACTED_VIEW: Final[str] = "previous_compacted_view"
+_COMPACTOR_FIELD_LABEL: Final[str] = "label"
+_COMPACTOR_FIELD_SOURCE_LABEL: Final[str] = "source_label"
+_COMPACTOR_FIELD_SOURCE_LABELS: Final[str] = "source_labels"
+_COMPACTOR_FIELD_RESPONSE_TEXT: Final[str] = "response_text"
+_COMPACTOR_FIELD_RESULT_TEXT: Final[str] = "result_text"
+_COMPACTOR_FIELD_ANSWER_TEXT: Final[str] = "answer_text"
+_SMOKE_COMPACTOR_SUMMARY_TEXT: Final[str] = "Deterministic smoke compact summary."
+_SMOKE_COMPACTOR_FACT_PREFIX: Final[str] = "Deterministic smoke evidence material: "
+_SMOKE_COMPACTOR_ANSWER_TITLE: Final[str] = "Previous answer"
+_SMOKE_COMPACTOR_FORWARD_TEXT: Final[str] = "Continue current user-visible analysis."
+_SMOKE_COMPACTOR_REFERENCE_TEXT: Final[str] = "Keep nearest prior context for local references."
+_SMOKE_INVALID_CURRENT_ANCHOR_LABEL: Final[str] = "C1"
+_SMOKE_REACTIVE_PROVIDER_REQUEST_ID: Final[str] = "smoke-reactive-provider-request"
+_SMOKE_REACTIVE_ITERATION_ID: Final[str] = "smoke-reactive-iteration"
+_SMOKE_REACTIVE_REASON: Final[str] = "provider_overflow"
+_SMOKE_REACTIVE_WORKER_ID: Final[str] = "smoke-reactive-worker"
+_SMOKE_FINAL_WORKER_ID: Final[str] = "smoke-final-worker"
+_SMOKE_FINAL_ANSWER_PREFIX: Final[str] = "deterministic smoke final answer"
+_SMOKE_REACTIVE_OLD_MARKER: Final[str] = "DAYU_SMOKE_REACTIVE_OLD_SEED_V1"
+_SMOKE_REACTIVE_RECENT_MARKER: Final[str] = "DAYU_SMOKE_REACTIVE_PROTECTED_RECENT_V1"
+_SMOKE_REACTIVE_CURRENT_MARKER: Final[str] = "DAYU_SMOKE_REACTIVE_CURRENT_INPUT_V1"
+_SMOKE_FALLBACK_OLD_MARKER: Final[str] = "DAYU_SMOKE_FALLBACK_DROPPED_OLD_V1"
+_SMOKE_FALLBACK_RECENT_MARKER: Final[str] = "DAYU_SMOKE_FALLBACK_SELECTED_RECENT_V1"
+_SMOKE_FALLBACK_CURRENT_MARKER: Final[str] = "DAYU_SMOKE_FALLBACK_CURRENT_INPUT_V1"
+_SMOKE_REACTIVE_TARGET_ACCEPT_INDEX: Final[int] = 6
+_SMOKE_REACTIVE_HISTORY_GAP_ROUNDS: Final[int] = 3
+_SMOKE_REACTIVE_SELECTED_RECENT_ITEMS_PER_TURN: Final[int] = 2
+_SMOKE_COMPACTOR_MARKER_REPLACEMENT: Final[str] = "[deterministic smoke marker elided]"
+_SMOKE_COMPACTOR_MARKERS: Final[tuple[str, ...]] = (
+    _SMOKE_REACTIVE_OLD_MARKER,
+    _SMOKE_REACTIVE_RECENT_MARKER,
+    _SMOKE_REACTIVE_CURRENT_MARKER,
+    _SMOKE_FALLBACK_OLD_MARKER,
+    _SMOKE_FALLBACK_RECENT_MARKER,
+    _SMOKE_FALLBACK_CURRENT_MARKER,
+)
+_SMOKE_DETERMINISTIC_EVENT_TIME: Final[datetime] = datetime(2026, 6, 20, 0, 0, 0, tzinfo=UTC)
 
 _FIELD_COMPANY: Final[str] = "company"
 _FIELD_TICKER: Final[str] = "ticker"
@@ -507,10 +590,16 @@ class SuiteMode(StrEnum):
     :param MEMORY_CORE: 公开多轮记忆基础 smoke，不要求 compact。
     :param MEMORY_COMPACT: compact 专项 smoke，必须断言 proactive compact
         accepted，且 compact failed 会硬失败。
+    :param MEMORY_REACTIVE_COMPACT: reactive compact 专项 smoke，使用
+        deterministic worker 触发 Engine overflow 并断言 Host recovery。
+    :param MEMORY_COMPACT_FALLBACK: compact failure fallback 专项 smoke，使用
+        deterministic compactor rejection 断言 fallback dispatch。
     """
 
     MEMORY_CORE = "memory-core"
     MEMORY_COMPACT = "memory-compact"
+    MEMORY_REACTIVE_COMPACT = "memory-reactive-compact"
+    MEMORY_COMPACT_FALLBACK = "memory-compact-fallback"
 
 
 class PressureMode(StrEnum):
@@ -676,6 +765,9 @@ class CompactFailedOperationAudit:
     :param retry_repair_budget_exhausted: retry / repair budget 是否耗尽。
     :param budget_after_attempted_compact: attempt 后预算；payload 缺失或未知时为
         ``None``。
+    :param selected_block_ids: fallback input window 选择的 bounded block ids。
+    :param dropped_block_ids: fallback input window 丢弃的 bounded block ids。
+    :param current_input_ref: fallback input window 绑定的当前输入 ref。
     """
 
     event_id: str
@@ -690,6 +782,9 @@ class CompactFailedOperationAudit:
     attempt_count: int | None
     retry_repair_budget_exhausted: bool | None
     budget_after_attempted_compact: int | None
+    selected_block_ids: tuple[str, ...]
+    dropped_block_ids: tuple[str, ...]
+    current_input_ref: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -746,6 +841,86 @@ class CompactAuditReport:
     rejected_failure_histogram: tuple[tuple[str, int], ...]
     rejected_diagnostic_histogram: tuple[tuple[str, int], ...]
     rejected_manifest_presence_histogram: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DeterministicDispatchCapture:
+    """deterministic worker 捕获的一次普通 dispatch 摘要。
+
+    :param run_id: Host Run id。
+    :param attempt_id: Host Attempt id。
+    :param execution_id: Attempt execution id。
+    :param joined_messages: 本次 ``AgentRunRequest.messages`` 的合并文本。
+    :param system_message_count: system message 数量。
+    :param system_message_at_start: 唯一 system message 是否位于首位；无
+        system message 时为 ``True``。
+    """
+
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    joined_messages: str
+    system_message_count: int
+    system_message_at_start: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DeterministicSmokeObservation:
+    """deterministic public Host smoke 的 bounded 观测。
+
+    :param dispatches: ordinary worker 捕获的 dispatch 摘要。
+    :param target_run_id: 目标 Run id。
+    :param current_input_marker: 当前输入稳定 marker。
+    :param protected_recent_marker: 必须保留的近期 marker。
+    :param dropped_old_marker: 应被策略窗口丢弃的旧 marker；不适用时为
+        ``None``。
+    :param pressure_tokens: fallback suite 的有效压力估算 token；不适用时为
+        ``None``。
+    :param soft_threshold_tokens: fallback suite 使用的 soft threshold；不适用
+        时为 ``None``。
+    :param hard_threshold_tokens: fallback suite 使用的 hard threshold；不适用
+        时为 ``None``。
+    """
+
+    dispatches: tuple[DeterministicDispatchCapture, ...]
+    target_run_id: str
+    current_input_marker: str
+    protected_recent_marker: str
+    dropped_old_marker: str | None
+    pressure_tokens: int | None
+    soft_threshold_tokens: int | None
+    hard_threshold_tokens: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackPressureObservation:
+    """fallback suite 的压力阈值观测。
+
+    :param pressure_tokens: 有效压力估算 token；非 fallback suite 为 ``None``。
+    :param soft_threshold_tokens: soft threshold token；非 fallback suite 为
+        ``None``。
+    :param hard_threshold_tokens: hard threshold token；非 fallback suite 为
+        ``None``。
+    """
+
+    pressure_tokens: int | None
+    soft_threshold_tokens: int | None
+    hard_threshold_tokens: int | None
+
+
+class SmokeCompactorRunner(Protocol):
+    """smoke-local compactor runner patch 协议。"""
+
+    async def __call__(self, request: AgentRunRequest, *, timeout_seconds: float) -> AgentRunResult:
+        """执行一次 compactor Engine request。
+
+        :param request: Host compactor 构造的 Engine request。
+        :param timeout_seconds: compactor 单次超时秒数。
+        :returns: Engine run result。
+        :raises Exception: fake runner 断言失败时向上抛出。
+        """
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1384,6 +1559,603 @@ def discover_smoke_tools(
     )
 
 
+class _SingleEventWorkerHandle:
+    """deterministic smoke 使用的单事件 worker handle。
+
+    :param worker_id: 本地 worker id。
+    :param event: 要产出的 Engine event。
+    """
+
+    def __init__(self, *, worker_id: str, event: EngineEvent) -> None:
+        """初始化单事件 handle。
+
+        :param worker_id: 本地 worker id。
+        :param event: 要产出的 Engine event。
+        :returns: ``None``。
+        :raises ValueError: worker id 为空时抛出。
+        """
+
+        if worker_id.strip() == "":
+            raise ValueError("worker_id must be non-empty")
+        self._worker_id = worker_id
+        self._event = event
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回 worker id。
+
+        :returns: worker id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._worker_id
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """产出单个 Engine event。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        yield self._event
+
+    async def close(self) -> None:
+        """关闭 handle。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
+    def on_cancel(self, reason: str) -> None:
+        """接收取消通知。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del reason
+
+
+class _DeterministicCompactWorker:
+    """deterministic compact smoke 的普通 worker。
+
+    :param factory: 所属 factory。
+    """
+
+    def __init__(self, factory: "_DeterministicCompactWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> LocalWorkerHandle:
+        """记录 dispatch 输入并返回 deterministic handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: 单事件 worker handle。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory.requests.append(request)
+        self._factory.snapshots.append(snapshot)
+        if self._factory.should_emit_reactive_request():
+            return _SingleEventWorkerHandle(
+                worker_id=_SMOKE_REACTIVE_WORKER_ID,
+                event=_reactive_compaction_requested_event(snapshot),
+            )
+        return _SingleEventWorkerHandle(
+            worker_id=_SMOKE_FINAL_WORKER_ID,
+            event=_final_answer_event(
+                snapshot,
+                f"{_SMOKE_FINAL_ANSWER_PREFIX}: {len(self._factory.requests)}",
+            ),
+        )
+
+
+class _DeterministicCompactWorkerFactory:
+    """deterministic compact smoke 共用 worker factory。
+
+    :param reactive_overflow_accept_index: 第几次 ordinary accept 产出 reactive
+        compact request；为 ``None`` 时所有 accept 都产出 final answer。
+    """
+
+    def __init__(self, *, reactive_overflow_accept_index: int | None) -> None:
+        """初始化 factory。
+
+        :param reactive_overflow_accept_index: reactive overflow accept 序号。
+        :returns: ``None``。
+        :raises ValueError: 序号非正时抛出。
+        """
+
+        if reactive_overflow_accept_index is not None and reactive_overflow_accept_index < 1:
+            raise ValueError("reactive_overflow_accept_index must be positive")
+        self._reactive_overflow_accept_index = reactive_overflow_accept_index
+        self.requests: list[AgentRunRequest] = []
+        self.snapshots: list[AttemptDispatchSnapshot] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 deterministic worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: deterministic worker。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del snapshot
+        return _DeterministicCompactWorker(self)
+
+    def should_emit_reactive_request(self) -> bool:
+        """判断当前 accept 是否应产出 reactive compact request。
+
+        :returns: 当前累计 accept 数命中 reactive 序号时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._reactive_overflow_accept_index == len(self.requests)
+
+
+@dataclass(slots=True)
+class _AcceptingSmokeCompactorRunner:
+    """返回 deterministic accepted compact proposal 的 smoke compactor runner。
+
+    :param prompt_lengths: 每次 compactor user prompt 字符数。
+    :param material_jsons: 每次 compactor material JSON。
+    """
+
+    prompt_lengths: list[int]
+    material_jsons: list[Mapping[str, JsonValue]]
+
+    def __init__(self) -> None:
+        """初始化记录容器。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.prompt_lengths = []
+        self.material_jsons = []
+
+    async def __call__(self, request: AgentRunRequest, *, timeout_seconds: float) -> AgentRunResult:
+        """返回 strict JSON final answer outcome。
+
+        :param request: compactor Engine request。
+        :param timeout_seconds: compactor 超时；fake 不使用。
+        :returns: final answer outcome。
+        :raises AssertionError: compactor request 不是预期单 user prompt 时抛出。
+        """
+
+        del timeout_seconds
+        _assert_at_most_one_system_message(request.messages, label="accepting compactor request")
+        user_prompt = _compactor_user_prompt(request)
+        material_json = _material_json_from_compactor_prompt(user_prompt)
+        self.prompt_lengths.append(len(user_prompt))
+        self.material_jsons.append(material_json)
+        return EngineRunOutcomeFinalAnswer(
+            session_id=request.session_id,
+            run_id=request.run_id,
+            content=_fake_compaction_proposal_from_material_json(material_json),
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        )
+
+
+@dataclass(slots=True)
+class _RejectingSmokeCompactorRunner:
+    """返回必然被 semantic barrier 拒绝的 smoke compactor runner。
+
+    :param prompt_lengths: 每次 compactor user prompt 字符数。
+    :param material_jsons: 每次 compactor material JSON。
+    """
+
+    prompt_lengths: list[int]
+    material_jsons: list[Mapping[str, JsonValue]]
+
+    def __init__(self) -> None:
+        """初始化记录容器。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.prompt_lengths = []
+        self.material_jsons = []
+
+    async def __call__(self, request: AgentRunRequest, *, timeout_seconds: float) -> AgentRunResult:
+        """返回引用 current input anchor 的非法 proposal。
+
+        :param request: compactor Engine request。
+        :param timeout_seconds: compactor 超时；fake 不使用。
+        :returns: final answer outcome。
+        :raises AssertionError: compactor request 不是预期单 user prompt 时抛出。
+        """
+
+        del timeout_seconds
+        _assert_at_most_one_system_message(request.messages, label="rejecting compactor request")
+        user_prompt = _compactor_user_prompt(request)
+        material_json = _material_json_from_compactor_prompt(user_prompt)
+        self.prompt_lengths.append(len(user_prompt))
+        self.material_jsons.append(material_json)
+        return EngineRunOutcomeFinalAnswer(
+            session_id=request.session_id,
+            run_id=request.run_id,
+            content=_invalid_current_anchor_citation_proposal(),
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        )
+
+
+def _reactive_compaction_requested_event(snapshot: AttemptDispatchSnapshot) -> EngineEvent:
+    """构造 reactive compact requested Engine event。
+
+    :param snapshot: 当前 dispatch snapshot。
+    :returns: EngineEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EngineEvent(
+        occurred_at=_SMOKE_DETERMINISTIC_EVENT_TIME,
+        session_id=snapshot.session_id,
+        run_id=snapshot.run_id,
+        type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+        data=ContextCompactionRequestedData(
+            iteration_id=_SMOKE_REACTIVE_ITERATION_ID,
+            budget_state=None,
+            reason=_SMOKE_REACTIVE_REASON,
+            provider_request_id=_SMOKE_REACTIVE_PROVIDER_REQUEST_ID,
+        ),
+        metadata=None,
+    )
+
+
+def _final_answer_event(snapshot: AttemptDispatchSnapshot, content: str) -> EngineEvent:
+    """构造 final answer Engine event。
+
+    :param snapshot: 当前 dispatch snapshot。
+    :param content: final answer 文本。
+    :returns: EngineEvent。
+    :raises ValueError: content 为空时抛出。
+    """
+
+    if content.strip() == "":
+        raise ValueError("content must be non-empty")
+    return EngineEvent(
+        occurred_at=_SMOKE_DETERMINISTIC_EVENT_TIME,
+        session_id=snapshot.session_id,
+        run_id=snapshot.run_id,
+        type=EngineEventType.FINAL_ANSWER,
+        data=FinalAnswerData(
+            content=content,
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        ),
+        metadata=None,
+    )
+
+
+@contextmanager
+def _patched_compactor_runner(runner: SmokeCompactorRunner) -> Iterator[None]:
+    """临时替换 Host LLM compactor 的 Engine runner 边界。
+
+    :param runner: smoke-local deterministic compactor runner。
+    :returns: context manager iterator。
+    :raises RuntimeError: patch 未生效时抛出。
+    :raises Exception: context 内异常原样向上抛出。
+    """
+
+    original_runner = llm_compaction._run_agent_request
+    try:
+        llm_compaction._run_agent_request = runner
+        if llm_compaction._run_agent_request is not runner:
+            raise RuntimeError("failed to patch dayu.host.llm_compaction._run_agent_request")
+        yield
+    finally:
+        llm_compaction._run_agent_request = original_runner
+
+
+def _compactor_user_prompt(request: AgentRunRequest) -> str:
+    """读取 compactor request 的唯一 user prompt。
+
+    :param request: compactor Engine request。
+    :returns: user prompt 文本。
+    :raises AssertionError: user prompt 数量不是 1 时抛出。
+    """
+
+    user_messages = tuple(message for message in request.messages if isinstance(message, UserMessage))
+    if len(user_messages) != 1:
+        raise AssertionError(f"compactor request expected one user message, got {len(user_messages)}")
+    return user_messages[0].content
+
+
+def _material_json_from_compactor_prompt(prompt: str) -> Mapping[str, JsonValue]:
+    """从 compactor prompt 中提取 bounded material JSON。
+
+    :param prompt: compactor user prompt。
+    :returns: material JSON object。
+    :raises AssertionError: prompt 缺少 material delimiter 或 JSON 不是 object 时抛出。
+    """
+
+    begin_index = prompt.find(_COMPACTOR_MATERIAL_BEGIN)
+    end_index = prompt.find(_COMPACTOR_MATERIAL_END)
+    if begin_index < 0 or end_index <= begin_index:
+        raise AssertionError("compactor prompt missing material JSON delimiters")
+    json_start = begin_index + len(_COMPACTOR_MATERIAL_BEGIN)
+    parsed = cast(JsonValue, json.loads(prompt[json_start:end_index].strip()))
+    if not isinstance(parsed, Mapping):
+        raise AssertionError("compactor material JSON must be object")
+    return cast(Mapping[str, JsonValue], parsed)
+
+
+def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, JsonValue]) -> str:
+    """从 LLM-facing material JSON 生成 deterministic strict proposal。
+
+    :param material_json: Host 投影给 compactor 的 material JSON。
+    :returns: strict JSON proposal 文本。
+    :raises TypeError: material JSON 字段类型非法时抛出。
+    """
+
+    evidence_items = _proposal_labeled_items(material_json, _COMPACTOR_FIELD_EVIDENCE_MATERIAL)
+    answer_items = _proposal_labeled_items(material_json, _COMPACTOR_FIELD_ANSWER_MATERIAL)
+    trace_labels = _proposal_source_labels(material_json, _COMPACTOR_FIELD_TRACE_MATERIAL)
+    previous_labels = _proposal_previous_labels(material_json)
+    evidence_labels = tuple(item[0] for item in evidence_items)
+    answer_labels = tuple(item[0] for item in answer_items)
+    summary_labels = (*trace_labels, *evidence_labels, *answer_labels)
+    continuity_labels = (*previous_labels, *trace_labels, *answer_labels)
+    proposal: dict[str, JsonValue] = {
+        "schema_version": CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        "session_summary": (
+            {
+                "summary_text": _SMOKE_COMPACTOR_SUMMARY_TEXT,
+                "source_labels": list(summary_labels),
+            }
+            if summary_labels
+            else None
+        ),
+        "evidence_backed_facts": [
+            {
+                "claim_text": f"{_SMOKE_COMPACTOR_FACT_PREFIX}{_sanitize_compactor_material_text(text)}",
+                "evidence_labels": [label],
+                "evidence_kind": FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL.value,
+                "source_labels": [label],
+            }
+            for label, text in evidence_items
+        ],
+        "answer_anchors": [
+            {
+                "anchor_title": _SMOKE_COMPACTOR_ANSWER_TITLE,
+                "anchor_items": [{"display_text": _sanitize_compactor_material_text(text), "ordinal": None}],
+                "answer_source_labels": [label],
+            }
+            for label, text in answer_items
+        ],
+        "forward_intents": (
+            [
+                {
+                    "intent_type": ForwardIntentTypeVNext.NEXT_STEP_NOTE.value,
+                    "text": _SMOKE_COMPACTOR_FORWARD_TEXT,
+                    "status": ForwardIntentStatusVNext.OPEN.value,
+                    "source_labels": [continuity_labels[0]],
+                }
+            ]
+            if continuity_labels
+            else []
+        ),
+        "reference_continuity_items": (
+            [
+                {
+                    "text": _SMOKE_COMPACTOR_REFERENCE_TEXT,
+                    "reason": ReferenceContinuityReasonVNext.LOCAL_REFERENCE.value,
+                    "source_labels": [continuity_labels[0]],
+                }
+            ]
+            if continuity_labels
+            else []
+        ),
+        "diagnostics": [],
+    }
+    return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+
+
+def _sanitize_compactor_material_text(text: str) -> str:
+    """移除 deterministic smoke marker，避免 fake compact view 回写测试探针。
+
+    :param text: compactor material 文本。
+    :returns: 已移除 smoke marker 的文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    sanitized = text
+    for marker in _SMOKE_COMPACTOR_MARKERS:
+        sanitized = sanitized.replace(marker, _SMOKE_COMPACTOR_MARKER_REPLACEMENT)
+    return sanitized
+
+
+def _invalid_current_anchor_citation_proposal() -> str:
+    """构造引用 current input anchor 的非法 compact proposal。
+
+    :returns: strict JSON proposal 文本。
+    :raises TypeError: JSON 编码失败时由标准库抛出。
+    """
+
+    proposal: Mapping[str, JsonValue] = {
+        "schema_version": CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        "session_summary": {
+            "summary_text": "invalid current-anchor citation",
+            "source_labels": [_SMOKE_INVALID_CURRENT_ANCHOR_LABEL],
+        },
+        "evidence_backed_facts": [],
+        "answer_anchors": [],
+        "forward_intents": [],
+        "reference_continuity_items": [],
+        "diagnostics": [],
+    }
+    return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+
+
+def _proposal_labeled_items(
+    material_json: Mapping[str, JsonValue],
+    field_name: str,
+) -> tuple[tuple[str, str], ...]:
+    """读取 material section 中的 label 与文本。
+
+    :param material_json: material JSON。
+    :param field_name: section 字段名。
+    :returns: ``(label, text)`` 元组。
+    :raises TypeError: section item 不是 object 时抛出。
+    """
+
+    values = _json_list_or_empty(material_json, field_name)
+    items: list[tuple[str, str]] = []
+    for index, value in enumerate(values):
+        item = _json_object(value, field_name=f"{field_name}[{index}]")
+        label = _json_label(item)
+        text = _json_string_alias(item, _COMPACTOR_FIELD_RESPONSE_TEXT, _COMPACTOR_FIELD_RESULT_TEXT)
+        if text == "":
+            text = _json_string_alias(item, _COMPACTOR_FIELD_ANSWER_TEXT, _COMPACTOR_FIELD_RESULT_TEXT)
+        items.append((label, text))
+    return tuple(items)
+
+
+def _proposal_source_labels(material_json: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
+    """读取 material section 中的 source labels。
+
+    :param material_json: material JSON。
+    :param field_name: section 字段名。
+    :returns: label 元组。
+    :raises TypeError: section item 不是 object 时抛出。
+    """
+
+    labels: list[str] = []
+    values = _json_list_or_empty(material_json, field_name)
+    for index, value in enumerate(values):
+        item = _json_object(value, field_name=f"{field_name}[{index}]")
+        labels.append(_json_label(item))
+    return tuple(labels)
+
+
+def _proposal_previous_labels(material_json: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """读取 previous compacted view 中可用于 continuity 的 labels。
+
+    :param material_json: material JSON。
+    :returns: previous labels。
+    :raises TypeError: previous compacted view 字段类型非法时抛出。
+    """
+
+    previous = material_json.get(_COMPACTOR_FIELD_PREVIOUS_COMPACTED_VIEW)
+    if previous is None:
+        return ()
+    if not isinstance(previous, Mapping):
+        raise TypeError("previous_compacted_view must be object or null")
+    labels: list[str] = []
+    previous_mapping = cast(Mapping[str, JsonValue], previous)
+    for key in (
+        "evidence_backed_facts",
+        "answer_anchors",
+        "forward_intents",
+        "reference_continuity_items",
+    ):
+        for index, value in enumerate(_json_list_or_empty(previous_mapping, key)):
+            item = _json_object(value, field_name=f"{key}[{index}]")
+            labels.extend(_json_source_label_values(item))
+    return tuple(labels)
+
+
+def _json_list_or_empty(data: Mapping[str, JsonValue], field_name: str) -> tuple[JsonValue, ...]:
+    """读取 JSON list 字段。
+
+    :param data: JSON object。
+    :param field_name: 字段名。
+    :returns: list 内容元组；字段缺失或为 ``None`` 时返回空元组。
+    :raises TypeError: 字段存在但不是 list 时抛出。
+    """
+
+    value = data.get(field_name)
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        raise TypeError(f"{field_name} must be list")
+    return tuple(cast(Sequence[JsonValue], value))
+
+
+def _json_object(value: JsonValue, *, field_name: str) -> Mapping[str, JsonValue]:
+    """校验并返回 JSON object。
+
+    :param value: JSON value。
+    :param field_name: 诊断字段名。
+    :returns: JSON object。
+    :raises TypeError: value 不是 object 时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be object")
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _json_label(data: Mapping[str, JsonValue]) -> str:
+    """读取 material item 的 label。
+
+    :param data: material item。
+    :returns: 非空 label。
+    :raises TypeError: label 缺失或为空时抛出。
+    """
+
+    value = data.get(_COMPACTOR_FIELD_LABEL, data.get(_COMPACTOR_FIELD_SOURCE_LABEL))
+    if not isinstance(value, str) or value.strip() == "":
+        raise TypeError("material item label must be non-empty string")
+    return value
+
+
+def _json_string_alias(data: Mapping[str, JsonValue], primary: str, fallback: str) -> str:
+    """读取字符串字段别名。
+
+    :param data: JSON object。
+    :param primary: 优先字段名。
+    :param fallback: 备选字段名。
+    :returns: 字符串值；缺失或类型不匹配时返回空字符串。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    primary_value = data.get(primary)
+    if isinstance(primary_value, str):
+        return primary_value
+    fallback_value = data.get(fallback)
+    if isinstance(fallback_value, str):
+        return fallback_value
+    return ""
+
+
+def _json_source_label_values(data: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """读取 previous view item 中的 source label 序列。
+
+    :param data: previous view item。
+    :returns: source labels。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    labels = _compact_payload_str_tuple(data, _COMPACTOR_FIELD_SOURCE_LABELS)
+    if labels:
+        return labels
+    label = _compact_payload_str(data, _COMPACTOR_FIELD_SOURCE_LABEL)
+    if label is None:
+        return ()
+    return (label,)
+
+
 def parse_args(argv: Sequence[str]) -> SmokeArgs:
     """解析命令行参数。
 
@@ -1441,8 +2213,13 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     suite_text: str = namespace.suite
     long_rounds: int = namespace.long_rounds
     pressure_mode_text: str = namespace.pressure_mode
-    if SuiteMode(suite_text) is SuiteMode.MEMORY_COMPACT and PressureMode(pressure_mode_text) is PressureMode.OFF:
-        parser.error("--suite memory-compact requires --pressure-mode auto")
+    pressure_suite = SuiteMode(suite_text)
+    pressure_mode = PressureMode(pressure_mode_text)
+    if pressure_suite in (
+        SuiteMode.MEMORY_COMPACT,
+        SuiteMode.MEMORY_COMPACT_FALLBACK,
+    ) and pressure_mode is PressureMode.OFF:
+        parser.error(f"--suite {pressure_suite.value} requires --pressure-mode auto")
     log_level = LogLevel[log_level_text]
     return SmokeArgs(
         workspace_root=_resolve_workspace_root(workspace_root_text),
@@ -1454,9 +2231,9 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         log_level=log_level,
         reuse_session=reuse_session,
         keep_workspace=keep_workspace,
-        suite=SuiteMode(suite_text),
+        suite=pressure_suite,
         long_rounds=long_rounds,
-        pressure_mode=PressureMode(pressure_mode_text),
+        pressure_mode=pressure_mode,
         debug_smoke_output=log_level is LogLevel.DEBUG,
     )
 
@@ -1509,6 +2286,10 @@ def _round_specs_for_suite(
         return _core_round_specs(user_pressure_text)
     if suite is SuiteMode.MEMORY_COMPACT:
         return (*_core_round_specs(user_pressure_text), *_long_round_specs(user_pressure_text, long_rounds))
+    if suite is SuiteMode.MEMORY_REACTIVE_COMPACT:
+        return _reactive_compact_round_specs()
+    if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
+        return _fallback_compact_round_specs(user_pressure_text)
     raise ValueError(f"unsupported suite: {suite.value}")
 
 
@@ -1825,6 +2606,147 @@ def _long_round_specs(
     return tuple(specs)
 
 
+def _reactive_compact_round_specs() -> tuple[RoundSpec, ...]:
+    """构造 reactive compact deterministic suite 轮次。
+
+    :returns: 六轮 public Host followup：旧种子、历史填充、近期保护种子和
+        reactive 目标轮。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        RoundSpec(
+            label="reactive-r1-old-seed",
+            prompt=f"记录旧上下文种子 {_SMOKE_REACTIVE_OLD_MARKER}，后续只作为 compact 可丢弃历史。",
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+        RoundSpec(
+            label="reactive-r2-history-gap",
+            prompt="记录 reactive 历史间隔 1，用于把旧种子推出 recent floor。",
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+        RoundSpec(
+            label="reactive-r3-history-gap",
+            prompt="记录 reactive 历史间隔 2，用于把旧种子推出 recent floor。",
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+        RoundSpec(
+            label="reactive-r4-history-gap",
+            prompt="记录 reactive 历史间隔 3，用于把旧种子推出 recent floor。",
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+        RoundSpec(
+            label="reactive-r5-protected-recent",
+            prompt=f"记录近期保护种子 {_SMOKE_REACTIVE_RECENT_MARKER}，用于验证 protected recent floor。",
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+        RoundSpec(
+            label="reactive-r6-overflow-target",
+            prompt=f"目标轮当前输入 marker {_SMOKE_REACTIVE_CURRENT_MARKER}，worker 将报告 reactive overflow。",
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+    )
+
+
+def _fallback_compact_round_specs(user_pressure_text: str) -> tuple[RoundSpec, ...]:
+    """构造 compact failure fallback deterministic suite 轮次。
+
+    :param user_pressure_text: 足以触发 proactive compact 的 bounded 压力文本。
+    :returns: 三轮 public Host followup：旧种子、近期种子和 fallback 目标轮。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    old_specs = tuple(
+        RoundSpec(
+            label=f"fallback-f{index}-old-dropped",
+            prompt=(
+                "记录 fallback 旧上下文 "
+                f"{_fallback_old_marker_for_index(index)} old_index={index}，"
+                "后续最老材料应被 fallback window 丢弃。"
+            ),
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        )
+        for index in range(1, 6)
+    )
+    return (
+        *old_specs,
+        RoundSpec(
+            label="fallback-f6-selected-recent",
+            prompt=f"记录 fallback 近期上下文 {_SMOKE_FALLBACK_RECENT_MARKER}，后续必须保留。",
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+        RoundSpec(
+            label="fallback-f7-pressure-target",
+            prompt=(
+                f"{user_pressure_text}\n"
+                f"目标 fallback 当前输入 marker {_SMOKE_FALLBACK_CURRENT_MARKER}，"
+                "compactor 将 deterministic reject 到 fallback dispatch。"
+            ),
+            tool_names=_NO_TOOL_SELECTION,
+            expected_tool_fact_key=None,
+            hard_answer_contains=(),
+            hard_answer_forbidden=(),
+            soft_answer_contains=(),
+            print_calls_by_key=False,
+        ),
+    )
+
+
+def _fallback_old_marker_for_index(index: int) -> str:
+    """返回 fallback 旧种子 marker。
+
+    :param index: 旧种子序号，1 表示最老材料。
+    :returns: 最老轮使用 dropped marker，其它旧轮使用填充 marker。
+    :raises ValueError: index 非正时抛出。
+    """
+
+    if index < 1:
+        raise ValueError("fallback old marker index must be positive")
+    if index == 1:
+        return _SMOKE_FALLBACK_OLD_MARKER
+    return f"DAYU_SMOKE_FALLBACK_OLD_FILLER_{index}_V1"
+
+
 def _long_required_tool_fact_key(template: LongRoundTemplate) -> str | None:
     """返回 long suite 本轮必须命中的工具 fact key。
 
@@ -2050,6 +2972,12 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     :raises Exception: Host public path、provider 调用或硬断言失败时向上抛出。
     """
 
+    if args.suite in (
+        SuiteMode.MEMORY_REACTIVE_COMPACT,
+        SuiteMode.MEMORY_COMPACT_FALLBACK,
+    ):
+        return await _run_deterministic_compact_smoke(args, env)
+
     assembly = _prepare_runtime_assembly(args, env=env)
     assembly.smoke_tool.set_pressure_mode(args.pressure_mode)
     assembly.smoke_tool.set_debug_output(args.debug_smoke_output)
@@ -2059,7 +2987,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
 
     if args.pressure_mode is PressureMode.OFF:
         print(_STDOUT_PRESSURE_DISABLED)
-    _print_compact_pressure_plan(assembly.options, args.pressure_mode)
+    _print_compact_pressure_plan(assembly.options, args.pressure_mode, suite=args.suite)
     print("SMOKE START Host public conversation memory scenario smoke")
     print(f"SMOKE WORKSPACE_ROOT {args.workspace_root}")
     print(f"SMOKE RUN_ID {smoke_run_id}")
@@ -2123,6 +3051,116 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     return 0
 
 
+async def _run_deterministic_compact_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
+    """运行 reactive / fallback deterministic compact smoke。
+
+    :param args: smoke 参数。
+    :param env: 环境变量映射。
+    :returns: 进程退出码。
+    :raises Exception: public Host 流程、compact 验收或确定性断言失败时向上抛出。
+    """
+
+    assembly = _prepare_runtime_assembly(args, env=env)
+    worker_factory = _DeterministicCompactWorkerFactory(
+        reactive_overflow_accept_index=(
+            _SMOKE_REACTIVE_TARGET_ACCEPT_INDEX
+            if args.suite is SuiteMode.MEMORY_REACTIVE_COMPACT
+            else None
+        )
+    )
+    deterministic_options = replace(assembly.options, worker_factory=worker_factory)
+    assembly = replace(assembly, options=deterministic_options)
+    assembly.smoke_tool.set_pressure_mode(args.pressure_mode)
+    assembly.smoke_tool.set_debug_output(args.debug_smoke_output)
+    specs = _runtime_round_specs(args, assembly.options)
+    _print_assembly_diagnostics(assembly.diagnostics, assembly.options)
+    smoke_run_id = _new_smoke_run_id()
+    pressure_observation = _fallback_pressure_observation(args, assembly.options)
+    compactor_runner: SmokeCompactorRunner
+    if args.suite is SuiteMode.MEMORY_REACTIVE_COMPACT:
+        compactor_runner = _AcceptingSmokeCompactorRunner()
+    else:
+        compactor_runner = _RejectingSmokeCompactorRunner()
+
+    if args.pressure_mode is PressureMode.OFF:
+        print(_STDOUT_PRESSURE_DISABLED)
+    _print_compact_pressure_plan(assembly.options, args.pressure_mode, suite=args.suite)
+    print("SMOKE START Host public conversation memory scenario smoke")
+    print(f"SMOKE WORKSPACE_ROOT {args.workspace_root}")
+    print(f"SMOKE RUN_ID {smoke_run_id}")
+    print(f"SMOKE SCENE_ID {args.scene_id}")
+    print(f"SMOKE SUITE {args.suite.value} rounds={len(specs)}")
+    print("SMOKE CONTRACT open_host -> ensure_session -> submit_followup -> watch -> get_session")
+    print(f"SMOKE LOG_LEVEL {args.log_level.name}")
+
+    results: list[RoundResult] = []
+    with _patched_compactor_runner(compactor_runner):
+        async with open_host(assembly.options) as host:
+            session = await host.ensure_session(_ensure_request(args, smoke_run_id))
+            session_id = session.session_id
+            assembly.smoke_tool.track_session(session.session_id)
+            watcher = host.watch_session_events(session.session_id)
+            print(f"SMOKE SESSION session_id={session.session_id}")
+            _assert_session_open(session, label="ensure-session")
+            _print_session_observation(session, label="ensure-session")
+
+            for index, spec in enumerate(specs, start=1):
+                tool_snapshot = assembly.smoke_tool.snapshot()
+                result = await _run_round(
+                    host=host,
+                    watcher=watcher,
+                    session_id=session.session_id,
+                    spec=spec,
+                    client_request_id=_round_client_request_id(smoke_run_id, index),
+                    scene_inputs=assembly.scene_inputs,
+                )
+                results.append(result)
+                _print_round(result)
+                _assert_round_result(
+                    result,
+                    assembly.smoke_tool,
+                    spec,
+                    before_tools=tool_snapshot,
+                    debug_smoke_output=args.debug_smoke_output,
+                )
+                snapshot = await host.get_session(session.session_id)
+                _assert_session_open(snapshot, label=spec.label)
+                _print_session_observation(snapshot, label=spec.label)
+
+            final_session = await host.get_session(session.session_id)
+            _assert_session_open(final_session, label="final")
+            print(f"SMOKE SESSION_STATUS {final_session.status.value}")
+
+    if not results:
+        raise RuntimeError("deterministic compact smoke produced no runs")
+    print(calls_by_key_summary(assembly.smoke_tool.calls_by_key), flush=True)
+    _print_deterministic_dispatches(worker_factory)
+    _print_compact_summary(assembly.options)
+    compact_audit = _compact_audit_report(assembly.options, session_id=session_id)
+    _print_compact_audit_summary(compact_audit.summary)
+    _print_compact_audit_report(compact_audit, debug_smoke_output=args.debug_smoke_output)
+    observation = DeterministicSmokeObservation(
+        dispatches=_deterministic_dispatch_captures(worker_factory),
+        target_run_id=results[-1].run_id,
+        current_input_marker=_deterministic_current_marker(args.suite),
+        protected_recent_marker=_deterministic_protected_recent_marker(args.suite),
+        dropped_old_marker=_deterministic_dropped_old_marker(args.suite),
+        pressure_tokens=pressure_observation.pressure_tokens,
+        soft_threshold_tokens=pressure_observation.soft_threshold_tokens,
+        hard_threshold_tokens=pressure_observation.hard_threshold_tokens,
+    )
+    if args.suite is SuiteMode.MEMORY_REACTIVE_COMPACT:
+        _assert_reactive_compact_acceptance(compact_audit, observation)
+    else:
+        _assert_fallback_dispatch_acceptance(compact_audit, observation)
+    print("SMOKE PASS public Host conversation memory scenario smoke", flush=True)
+    if args.keep_workspace:
+        print("SMOKE WORKSPACE_KEPT true", flush=True)
+    else:
+        print("SMOKE WORKSPACE_KEPT true  # smoke never deletes Host/runtime artifacts", flush=True)
+    return 0
+
+
 def _prepare_runtime_assembly(args: SmokeArgs, *, env: Mapping[str, str]) -> RuntimeAssemblyResult:
     """执行 Host 调用前的 runtime/config/tools/scene typed assembly。
 
@@ -2171,12 +3209,69 @@ def _prepare_runtime_assembly(args: SmokeArgs, *, env: Mapping[str, str]) -> Run
     smoke_tool = _find_mock_finance_memory_tool(assembly.effective_tool_bundle)
     if smoke_tool is None:
         raise ValueError("effective ToolBundle does not contain MockFinanceMemoryTool")
+    options = _smoke_options_for_suite(assembly.options, args.suite)
     return RuntimeAssemblyResult(
-        options=assembly.options,
+        options=options,
         scene_inputs=scene_inputs,
         diagnostics=assembly.diagnostics,
         effective_tool_bundle=assembly.effective_tool_bundle,
         smoke_tool=smoke_tool,
+    )
+
+
+def _smoke_options_for_suite(options: OpenHostOptions, suite: SuiteMode) -> OpenHostOptions:
+    """按 smoke suite 返回本地 Host options。
+
+    :param options: Service-like 装配得到的原始 Host options。
+    :param suite: 当前 smoke suite。
+    :returns: suite-local Host options。
+    :raises ValueError: reactive suite 的 recent floor 超出当前轮次布局能力时抛出。
+    """
+
+    if suite is not SuiteMode.MEMORY_REACTIVE_COMPACT:
+        return options
+    return replace(
+        options,
+        memory_projection_policy=_reactive_compact_smoke_memory_policy(
+            options.memory_projection_policy
+        ),
+    )
+
+
+def _reactive_compact_smoke_memory_policy(
+    policy: MemoryProjectionPolicy,
+) -> MemoryProjectionPolicy:
+    """返回 reactive compact smoke 使用的本地 memory policy。
+
+    该 suite 需要让 r1 old seed 真实进入 Host 历史，同时在 recovery dispatch
+    中被排除。收紧 selected recent item cap 可让 r2-r5 作为 protected recent
+    保留，并让 r1 只通过 compacted semantic view 表示。
+
+    :param policy: Service-like 装配得到的 memory policy。
+    :returns: reactive suite 的本地 memory policy。
+    :raises ValueError: selected recent floor 无法由当前三轮 gap 加一轮 recent
+        布局承载时抛出。
+    """
+
+    max_supported_turn_floor = _SMOKE_REACTIVE_HISTORY_GAP_ROUNDS + 1
+    if policy.selected_recent_window_turn_floor > max_supported_turn_floor:
+        raise ValueError(
+            "memory-reactive-compact selected recent floor exceeds deterministic "
+            "history gap layout"
+        )
+    selected_recent_item_cap = max(
+        1,
+        policy.selected_recent_window_turn_floor
+        * _SMOKE_REACTIVE_SELECTED_RECENT_ITEMS_PER_TURN,
+    )
+    fallback_selected_recent_item_cap = min(
+        policy.fallback_selected_recent_window_item_cap,
+        selected_recent_item_cap,
+    )
+    return replace(
+        policy,
+        selected_recent_window_item_cap=selected_recent_item_cap,
+        fallback_selected_recent_window_item_cap=fallback_selected_recent_item_cap,
     )
 
 
@@ -2344,7 +3439,10 @@ def _runtime_round_specs(
     :raises RuntimeError: compact pressure 需要 context budget policy 但缺失时抛出。
     """
 
-    user_pressure_text = _runtime_user_pressure_text(args.pressure_mode, options)
+    if args.suite is SuiteMode.MEMORY_COMPACT_FALLBACK and args.pressure_mode is PressureMode.AUTO:
+        user_pressure_text = _fallback_compact_pressure_padding(options)
+    else:
+        user_pressure_text = _runtime_user_pressure_text(args.pressure_mode, options)
     return _round_specs_for_suite(
         suite=args.suite,
         long_rounds=args.long_rounds,
@@ -2367,6 +3465,442 @@ def _runtime_user_pressure_text(
     if pressure_mode is PressureMode.OFF:
         return ""
     return _compact_pressure_padding(options)
+
+
+def _fallback_compact_pressure_padding(options: OpenHostOptions) -> str:
+    """构造 fallback suite 专用 proactive compact 压力文本。
+
+    fallback deterministic suite 只有一个目标压力轮，必须稳定跨过 soft
+    threshold；旧 ``memory-compact`` 长会话则使用更保守的全局 padding，避免
+    真实模型长输出把 pre-dispatch 估算推过 hard threshold。
+
+    :param options: Host opener options。
+    :returns: fallback 目标轮 pressure padding。
+    :raises RuntimeError: smoke 未启用 context budget policy 时抛出。
+    """
+
+    return _compact_pressure_padding_with_reserve(
+        options,
+        reserve_tokens=_COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS,
+    )
+
+
+def _fallback_pressure_observation(
+    args: SmokeArgs,
+    options: OpenHostOptions,
+) -> FallbackPressureObservation:
+    """计算 fallback suite 的压力阈值观测。
+
+    :param args: smoke 参数。
+    :param options: Host opener options。
+    :returns: fallback 压力观测；非 fallback suite 返回全 ``None``。
+    :raises RuntimeError: fallback suite 缺少 context budget policy 时抛出。
+    """
+
+    if args.suite is not SuiteMode.MEMORY_COMPACT_FALLBACK:
+        return FallbackPressureObservation(
+            pressure_tokens=None,
+            soft_threshold_tokens=None,
+            hard_threshold_tokens=None,
+        )
+    policy = options.context_budget_policy
+    if policy is None:
+        raise RuntimeError("memory-compact-fallback requires context budget policy")
+    prompt_tokens = _estimate_chars_as_tokens(len(_fallback_compact_pressure_padding(options)))
+    pressure_tokens = (
+        prompt_tokens
+        + _tool_pressure_estimated_tokens()
+        + _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS
+    )
+    return FallbackPressureObservation(
+        pressure_tokens=pressure_tokens,
+        soft_threshold_tokens=_threshold_tokens(
+            policy.context_window_size,
+            policy.soft_threshold_context_ratio,
+        ),
+        hard_threshold_tokens=_threshold_tokens(
+            policy.context_window_size,
+            policy.hard_threshold_context_ratio,
+        ),
+    )
+
+
+def _deterministic_dispatch_captures(
+    worker_factory: _DeterministicCompactWorkerFactory,
+) -> tuple[DeterministicDispatchCapture, ...]:
+    """把 worker 捕获的 public request 转为 bounded 断言摘要。
+
+    :param worker_factory: deterministic worker factory。
+    :returns: dispatch capture 元组。
+    :raises RuntimeError: request 与 snapshot 数量不一致时抛出。
+    """
+
+    if len(worker_factory.requests) != len(worker_factory.snapshots):
+        raise RuntimeError("deterministic worker request/snapshot capture length mismatch")
+    captures: list[DeterministicDispatchCapture] = []
+    for request, snapshot in zip(worker_factory.requests, worker_factory.snapshots, strict=True):
+        captures.append(
+            DeterministicDispatchCapture(
+                run_id=request.run_id,
+                attempt_id=snapshot.attempt_id,
+                execution_id=snapshot.execution_id,
+                joined_messages=_joined_message_content(request.messages),
+                system_message_count=_system_message_count(request.messages),
+                system_message_at_start=_system_message_at_start(request.messages),
+            )
+        )
+    return tuple(captures)
+
+
+def _print_deterministic_dispatches(worker_factory: _DeterministicCompactWorkerFactory) -> None:
+    """打印 bounded deterministic dispatch 摘要。
+
+    :param worker_factory: deterministic worker factory。
+    :returns: ``None``。
+    :raises RuntimeError: request 与 snapshot 数量不一致时抛出。
+    """
+
+    for index, capture in enumerate(_deterministic_dispatch_captures(worker_factory), start=1):
+        print(
+            f"{_STDOUT_PREFIX_DETERMINISTIC_DISPATCH} "
+            f"index={index} run_id={capture.run_id} "
+            f"attempt_id={capture.attempt_id} execution_id={capture.execution_id} "
+            f"system_messages={capture.system_message_count}",
+            flush=True,
+        )
+
+
+def _assert_reactive_compact_acceptance(
+    report: CompactAuditReport,
+    observation: DeterministicSmokeObservation,
+) -> None:
+    """断言 reactive compact deterministic suite 验收信号。
+
+    :param report: compact EventLog 审计报告。
+    :param observation: deterministic dispatch 观测。
+    :returns: ``None``。
+    :raises RuntimeError: reactive compact 或 recovery dispatch 信号缺失时抛出。
+    """
+
+    summary = report.summary
+    if summary.requested_reactive < 1:
+        raise RuntimeError("memory-reactive-compact did not observe reactive CONTEXT_COMPACTION_REQUESTED")
+    if summary.compacted_reactive < 1:
+        raise RuntimeError("memory-reactive-compact did not observe reactive CONTEXT_COMPACTED")
+    if summary.failed_reactive > 0:
+        raise RuntimeError("memory-reactive-compact observed reactive CONTEXT_COMPACTION_FAILED")
+    target_dispatches = _dispatches_for_run(observation, observation.target_run_id)
+    if len(target_dispatches) != 2:
+        raise RuntimeError(
+            "memory-reactive-compact expected original and recovery dispatch for target run, "
+            f"got {len(target_dispatches)}"
+        )
+    original = target_dispatches[0]
+    recovery = target_dispatches[1]
+    if original.attempt_id == recovery.attempt_id:
+        raise RuntimeError("memory-reactive-compact recovery attempt_id did not change")
+    if original.execution_id == recovery.execution_id:
+        raise RuntimeError("memory-reactive-compact recovery execution_id did not change")
+    _assert_one_system_message_contract(observation.dispatches, suite=SuiteMode.MEMORY_REACTIVE_COMPACT)
+    _assert_marker_present(
+        recovery.joined_messages,
+        marker=observation.current_input_marker,
+        label="reactive recovery current input",
+    )
+    _assert_marker_present(
+        recovery.joined_messages,
+        marker=observation.protected_recent_marker,
+        label="reactive recovery protected recent",
+    )
+    if observation.dropped_old_marker is None:
+        raise RuntimeError("memory-reactive-compact missing dropped old marker expectation")
+    _assert_marker_absent(
+        recovery.joined_messages,
+        marker=observation.dropped_old_marker,
+        label="reactive recovery dropped old",
+    )
+    print(
+        f"{_STDOUT_PREFIX_COMPACT_ACCEPTANCE} status=pass "
+        f"requested_reactive={summary.requested_reactive} "
+        f"compacted_reactive={summary.compacted_reactive} "
+        f"failed_reactive={summary.failed_reactive} "
+        f"recovery_attempt_id={recovery.attempt_id}",
+        flush=True,
+    )
+
+
+def _assert_fallback_dispatch_acceptance(
+    report: CompactAuditReport,
+    observation: DeterministicSmokeObservation,
+) -> None:
+    """断言 compact failure fallback deterministic suite 验收信号。
+
+    :param report: compact EventLog 审计报告。
+    :param observation: deterministic dispatch 观测。
+    :returns: ``None``。
+    :raises RuntimeError: fallback dispatch 或 bounded fallback window 信号缺失时抛出。
+    """
+
+    _assert_fallback_pressure_bounds(observation)
+    summary = report.summary
+    if summary.requested_proactive < 1:
+        raise RuntimeError("memory-compact-fallback did not observe proactive CONTEXT_COMPACTION_REQUESTED")
+    failed_operation = _fallback_failed_operation(report)
+    if failed_operation.compacted > 0:
+        raise RuntimeError("memory-compact-fallback observed CONTEXT_COMPACTED for failed fallback operation")
+    failed_event = failed_operation.failed_events[-1]
+    if failed_event.fallback_action != "dispatch":
+        raise RuntimeError("memory-compact-fallback did not observe fallback_action=dispatch")
+    if not failed_event.selected_block_ids:
+        raise RuntimeError("memory-compact-fallback missing fallback selected_block_ids")
+    if observation.dropped_old_marker is not None and not failed_event.dropped_block_ids:
+        raise RuntimeError("memory-compact-fallback expected dropped_block_ids for old seed material")
+    if failed_event.current_input_ref is None or failed_event.current_input_ref.strip() == "":
+        raise RuntimeError("memory-compact-fallback missing current_input_ref")
+    target_dispatches = _dispatches_for_run(observation, observation.target_run_id)
+    if len(target_dispatches) != 1:
+        raise RuntimeError(
+            "memory-compact-fallback expected one final fallback dispatch for target run, "
+            f"got {len(target_dispatches)}"
+        )
+    final_dispatch = target_dispatches[0]
+    _assert_one_system_message_contract(observation.dispatches, suite=SuiteMode.MEMORY_COMPACT_FALLBACK)
+    _assert_marker_present(
+        final_dispatch.joined_messages,
+        marker=observation.current_input_marker,
+        label="fallback current input",
+    )
+    _assert_marker_present(
+        final_dispatch.joined_messages,
+        marker=observation.protected_recent_marker,
+        label="fallback selected recent",
+    )
+    if observation.dropped_old_marker is not None:
+        _assert_marker_absent(
+            final_dispatch.joined_messages,
+            marker=observation.dropped_old_marker,
+            label="fallback dropped old",
+        )
+    for section in _COMPACT_FALLBACK_FORBIDDEN_SECTIONS:
+        if section in final_dispatch.joined_messages:
+            raise RuntimeError(f"memory-compact-fallback rendered fake semantic memory section: {section}")
+    print(
+        f"{_STDOUT_PREFIX_COMPACT_ACCEPTANCE} status=pass "
+        f"requested_proactive={summary.requested_proactive} "
+        f"failed_operation={failed_operation.operation_id} "
+        f"fallback_action={failed_event.fallback_action} "
+        f"selected_block_ids={len(failed_event.selected_block_ids)} "
+        f"dropped_block_ids={len(failed_event.dropped_block_ids)}",
+        flush=True,
+    )
+
+
+def _assert_fallback_pressure_bounds(observation: DeterministicSmokeObservation) -> None:
+    """断言 fallback pressure 落在 soft 与 hard threshold 之间。
+
+    :param observation: deterministic smoke 观测。
+    :returns: ``None``。
+    :raises RuntimeError: 压力或阈值缺失 / 越界时抛出。
+    """
+
+    if (
+        observation.pressure_tokens is None
+        or observation.soft_threshold_tokens is None
+        or observation.hard_threshold_tokens is None
+    ):
+        raise RuntimeError("memory-compact-fallback missing pressure threshold observation")
+    if observation.pressure_tokens < observation.soft_threshold_tokens:
+        raise RuntimeError(
+            "memory-compact-fallback pressure below soft threshold: "
+            f"pressure={observation.pressure_tokens} soft={observation.soft_threshold_tokens}"
+        )
+    if observation.pressure_tokens >= observation.hard_threshold_tokens:
+        raise RuntimeError(
+            "memory-compact-fallback pressure reached hard threshold: "
+            f"pressure={observation.pressure_tokens} hard={observation.hard_threshold_tokens}"
+        )
+
+
+def _fallback_failed_operation(report: CompactAuditReport) -> CompactOperationAudit:
+    """返回唯一 fallback dispatch failed operation。
+
+    :param report: compact EventLog 审计报告。
+    :returns: fallback dispatch operation。
+    :raises RuntimeError: 未找到或找到多个 fallback dispatch failed operation 时抛出。
+    """
+
+    operations = tuple(
+        operation
+        for operation in report.operations
+        if any(event.fallback_action == "dispatch" for event in operation.failed_events)
+    )
+    if len(operations) != 1:
+        raise RuntimeError(f"memory-compact-fallback expected exactly one dispatch fallback operation, got {len(operations)}")
+    return operations[0]
+
+
+def _dispatches_for_run(
+    observation: DeterministicSmokeObservation,
+    run_id: str,
+) -> tuple[DeterministicDispatchCapture, ...]:
+    """筛选指定 Run 的 dispatch captures。
+
+    :param observation: deterministic smoke 观测。
+    :param run_id: Host Run id。
+    :returns: dispatch captures。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return tuple(dispatch for dispatch in observation.dispatches if dispatch.run_id == run_id)
+
+
+def _assert_one_system_message_contract(
+    dispatches: tuple[DeterministicDispatchCapture, ...],
+    *,
+    suite: SuiteMode,
+) -> None:
+    """断言所有 ordinary dispatch 至多一个 system message 且位于首位。
+
+    :param dispatches: dispatch captures。
+    :param suite: suite 名称，用于错误诊断。
+    :returns: ``None``。
+    :raises RuntimeError: system message contract 被破坏时抛出。
+    """
+
+    for index, dispatch in enumerate(dispatches, start=1):
+        if dispatch.system_message_count > 1:
+            raise RuntimeError(f"{suite.value} dispatch {index} has multiple system messages")
+        if not dispatch.system_message_at_start:
+            raise RuntimeError(f"{suite.value} dispatch {index} system message is not first")
+
+
+def _assert_marker_present(text: str, *, marker: str, label: str) -> None:
+    """断言文本包含 marker。
+
+    :param text: 待检查文本。
+    :param marker: 稳定 marker。
+    :param label: 诊断标签。
+    :returns: ``None``。
+    :raises RuntimeError: marker 缺失时抛出。
+    """
+
+    if marker not in text:
+        raise RuntimeError(f"{label} missing marker {marker}")
+
+
+def _assert_marker_absent(text: str, *, marker: str, label: str) -> None:
+    """断言文本不包含 marker。
+
+    :param text: 待检查文本。
+    :param marker: 稳定 marker。
+    :param label: 诊断标签。
+    :returns: ``None``。
+    :raises RuntimeError: marker 出现时抛出。
+    """
+
+    if marker in text:
+        raise RuntimeError(f"{label} unexpectedly contains marker {marker}")
+
+
+def _deterministic_current_marker(suite: SuiteMode) -> str:
+    """返回 deterministic suite 的当前输入 marker。
+
+    :param suite: suite 模式。
+    :returns: 当前输入 marker。
+    :raises ValueError: suite 不支持时抛出。
+    """
+
+    if suite is SuiteMode.MEMORY_REACTIVE_COMPACT:
+        return _SMOKE_REACTIVE_CURRENT_MARKER
+    if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
+        return _SMOKE_FALLBACK_CURRENT_MARKER
+    raise ValueError(f"unsupported deterministic suite: {suite.value}")
+
+
+def _deterministic_protected_recent_marker(suite: SuiteMode) -> str:
+    """返回 deterministic suite 的 protected recent marker。
+
+    :param suite: suite 模式。
+    :returns: protected recent marker。
+    :raises ValueError: suite 不支持时抛出。
+    """
+
+    if suite is SuiteMode.MEMORY_REACTIVE_COMPACT:
+        return _SMOKE_REACTIVE_RECENT_MARKER
+    if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
+        return _SMOKE_FALLBACK_RECENT_MARKER
+    raise ValueError(f"unsupported deterministic suite: {suite.value}")
+
+
+def _deterministic_dropped_old_marker(suite: SuiteMode) -> str | None:
+    """返回 deterministic suite 的 dropped old marker。
+
+    :param suite: suite 模式。
+    :returns: dropped old marker；不适用时为 ``None``。
+    :raises ValueError: suite 不支持时抛出。
+    """
+
+    if suite is SuiteMode.MEMORY_REACTIVE_COMPACT:
+        return _SMOKE_REACTIVE_OLD_MARKER
+    if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
+        return _SMOKE_FALLBACK_OLD_MARKER
+    raise ValueError(f"unsupported deterministic suite: {suite.value}")
+
+
+def _joined_message_content(messages: Sequence[AgentMessage]) -> str:
+    """合并 Agent messages 中的文本内容。
+
+    :param messages: Agent messages。
+    :returns: 换行拼接后的文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts: list[str] = []
+    for message in messages:
+        content = message.content
+        if content is not None:
+            parts.append(content)
+    return "\n".join(parts)
+
+
+def _system_message_count(messages: Sequence[AgentMessage]) -> int:
+    """统计 system message 数量。
+
+    :param messages: Agent messages。
+    :returns: system message 数量。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return sum(1 for message in messages if message.role is AgentMessageRole.SYSTEM)
+
+
+def _system_message_at_start(messages: Sequence[AgentMessage]) -> bool:
+    """判断唯一 system message 是否位于首位。
+
+    :param messages: Agent messages。
+    :returns: 无 system message 或 system message 位于首位时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if _system_message_count(messages) == 0:
+        return True
+    return bool(messages) and messages[0].role is AgentMessageRole.SYSTEM
+
+
+def _assert_at_most_one_system_message(messages: Sequence[AgentMessage], *, label: str) -> None:
+    """断言 messages 至多一个 system message 且位于首位。
+
+    :param messages: Agent messages。
+    :param label: 诊断标签。
+    :returns: ``None``。
+    :raises AssertionError: system message contract 被破坏时抛出。
+    """
+
+    system_count = _system_message_count(messages)
+    if system_count > 1:
+        raise AssertionError(f"{label} expected at most one system message, got {system_count}")
+    if system_count == 1 and not _system_message_at_start(messages):
+        raise AssertionError(f"{label} expected system message at index 0")
 
 
 def _ensure_request(args: SmokeArgs, smoke_run_id: str) -> EnsureSessionRequest:
@@ -2813,6 +4347,28 @@ def _compact_pressure_padding(options: OpenHostOptions) -> str:
     :raises RuntimeError: smoke 未启用 context budget policy 时抛出。
     """
 
+    return _compact_pressure_padding_with_reserve(
+        options,
+        reserve_tokens=_COMPACT_PRESSURE_RESERVE_TOKENS,
+    )
+
+
+def _compact_pressure_padding_with_reserve(
+    options: OpenHostOptions,
+    *,
+    reserve_tokens: int,
+) -> str:
+    """按指定历史 reserve 构造预算压力 padding。
+
+    :param options: 本次 smoke 使用的 Host opener options。
+    :param reserve_tokens: 为既有历史与固定消息预留的估算 token。
+    :returns: 用于用户 prompt 的 padding。
+    :raises RuntimeError: smoke 未启用 context budget policy 时抛出。
+    :raises ValueError: reserve token 为负数时抛出。
+    """
+
+    if reserve_tokens < 0:
+        raise ValueError("reserve_tokens must be non-negative")
     policy = options.context_budget_policy
     if policy is None:
         raise RuntimeError("smoke compact pressure requires context budget policy")
@@ -2828,11 +4384,10 @@ def _compact_pressure_padding(options: OpenHostOptions) -> str:
         soft_threshold_tokens + _COMPACT_PRESSURE_TARGET_EXTRA_TOKENS,
         hard_threshold_tokens - _COMPACT_PRESSURE_HARD_MARGIN_TOKENS,
     )
-    pressure_reserve_tokens = _compact_pressure_reserve_tokens(context_window_size=policy.context_window_size)
     tool_pressure_tokens = _tool_pressure_estimated_tokens()
     prompt_tokens = max(
         _COMPACT_PRESSURE_MIN_PROMPT_TOKENS,
-        target_tokens - pressure_reserve_tokens - tool_pressure_tokens,
+        target_tokens - reserve_tokens - tool_pressure_tokens,
     )
     return _repeat_to_chars(
         token=_MOCK_PRESSURE_UNIT,
@@ -2850,19 +4405,6 @@ def _threshold_tokens(context_window_size: int, ratio: float) -> int:
     """
 
     return floor(context_window_size * ratio)
-
-
-def _compact_pressure_reserve_tokens(*, context_window_size: int) -> int:
-    """计算 pressure prompt 与工具压力之外预留的估算 token。
-
-    :param context_window_size: 当前模型上下文窗口 token 数。
-    :returns: prompt 与工具压力之外预留 token 数。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if context_window_size >= _COMPACT_PRESSURE_LARGE_WINDOW_TOKENS:
-        return _COMPACT_PRESSURE_RESERVE_TOKENS
-    return _COMPACT_PRESSURE_RESERVE_TOKENS
 
 
 def _tool_pressure_estimated_tokens() -> int:
@@ -2978,11 +4520,14 @@ def _print_assembly_diagnostics(
 def _print_compact_pressure_plan(
     options: OpenHostOptions,
     pressure_mode: PressureMode,
+    *,
+    suite: SuiteMode,
 ) -> None:
     """打印 compact pressure 摘要，不输出完整 pressure prompt。
 
     :param options: 本次 smoke 使用的 Host opener options。
     :param pressure_mode: 压力注入模式。
+    :param suite: 当前 suite，用于选择 suite-specific pressure padding。
     :returns: ``None``。
     :raises Exception: 不主动抛出异常。
     """
@@ -3002,7 +4547,12 @@ def _print_compact_pressure_plan(
         policy.context_window_size,
         policy.hard_threshold_context_ratio,
     )
-    prompt_chars = len(_compact_pressure_padding(options))
+    prompt = (
+        _fallback_compact_pressure_padding(options)
+        if suite is SuiteMode.MEMORY_COMPACT_FALLBACK
+        else _compact_pressure_padding(options)
+    )
+    prompt_chars = len(prompt)
     estimated_prompt_tokens = _estimate_chars_as_tokens(prompt_chars)
     estimated_total_pressure_tokens = estimated_prompt_tokens + _tool_pressure_estimated_tokens()
     print(
@@ -3139,7 +4689,14 @@ def _print_compact_operation(operation: CompactOperationAudit) -> None:
         "fallback_policy_decision="
         f"{_compact_optional_text(last_failed.fallback_policy_decision if last_failed is not None else None)} "
         f"fallback_action={_compact_optional_text(last_failed.fallback_action if last_failed is not None else None)} "
-        f"attempt_count={_compact_optional_text(last_failed.attempt_count if last_failed is not None else None)}",
+        f"fallback_tier={_compact_optional_text(last_failed.fallback_tier if last_failed is not None else None)} "
+        f"attempt_count={_compact_optional_text(last_failed.attempt_count if last_failed is not None else None)} "
+        "fallback_selected_block_ids="
+        f"{len(last_failed.selected_block_ids) if last_failed is not None else 0} "
+        "fallback_dropped_block_ids="
+        f"{len(last_failed.dropped_block_ids) if last_failed is not None else 0} "
+        "fallback_current_input_ref="
+        f"{_compact_optional_text(last_failed.current_input_ref if last_failed is not None else None)}",
         flush=True,
     )
 
@@ -3590,6 +5147,7 @@ def _compact_failed_operation_audit(
     """
 
     payload = _compact_row_payload(row)
+    fallback_window = _compact_payload_mapping(payload, _PAYLOAD_FIELD_FALLBACK_INPUT_WINDOW)
     return CompactFailedOperationAudit(
         event_id=row.event_id,
         event_sequence=row.event_sequence,
@@ -3608,6 +5166,18 @@ def _compact_failed_operation_audit(
         budget_after_attempted_compact=_compact_payload_int(
             payload,
             _PAYLOAD_FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT,
+        ),
+        selected_block_ids=_compact_payload_str_tuple(
+            fallback_window,
+            _PAYLOAD_FIELD_SELECTED_BLOCK_IDS,
+        ),
+        dropped_block_ids=_compact_payload_str_tuple(
+            fallback_window,
+            _PAYLOAD_FIELD_DROPPED_BLOCK_IDS,
+        ),
+        current_input_ref=_compact_payload_str(
+            fallback_window,
+            _PAYLOAD_FIELD_CURRENT_INPUT_REF,
         ),
     )
 
@@ -3914,6 +5484,21 @@ def _compact_payload_bool(payload: Mapping[str, JsonValue], field_name: str) -> 
     if isinstance(value, bool):
         return value
     return None
+
+
+def _compact_payload_mapping(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
+    """读取 compact payload 中的 JSON object 字段。
+
+    :param payload: compact event payload。
+    :param field_name: 字段名。
+    :returns: JSON object；字段缺失或类型不匹配时返回空 object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, Mapping):
+        return {}
+    return cast(Mapping[str, JsonValue], value)
 
 
 def _compact_payload_str_tuple(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
