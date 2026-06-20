@@ -144,7 +144,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | implementation |
-| implementation status | WU-CLI-DEBUG-STREAM-01 Slice 2 accepted in commit `a0611ebe`. Next slice is Slice 3 prompt / interactive compatibility guard: ensure `--debug-stream` remains a global logging flag, does not become an unsupported Agent execution option, and does not pollute stdout. |
+| implementation status | WU-CLI-DEBUG-STREAM-01 Slice 2 accepted in commit `67ca96fb`. Next slice is Slice 3 prompt / interactive compatibility guard: ensure `--debug-stream` remains a global logging flag, does not become an unsupported Agent execution option, and does not pollute stdout. |
 | active work unit | WU-CLI-DEBUG-STREAM-01 |
 | default next work unit | WU-CLI-DEBUG-STREAM-01 |
 | next entry point | AgentCodex implements WU-CLI-DEBUG-STREAM-01 Slice 3 prompt / interactive compatibility guard using the accepted plan. No push, PR, merge, mark-ready, reviewer request, branch deletion, issue closure, or out-of-scope work is authorized until later gates pass. |
@@ -241,7 +241,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-13 | draft-PR-pass | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Draft PR #152 open draft. Accepted PR review commit `f2970512` pushed; final closeout recorded in `docs/reviews/wu-cm-13-final-closeout-20260619.md`; `WU-CM-12-S4-R1` and `WU-CM-13-S1-R1` closed. |
 | WU-CM-14 | completed | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Local phaseflow completed. Accepted slice commit `921c6219`; aggregate deepreview PASS after deleting dead `_current_only_material_blocks`. Root cause fixed by passing existing floor into compact selection, adding ordinary post-compaction protected raw tail rendering, and repairing reactive frozen material assembly for protected floor semantics. WU-CM-13 subsequently audited the preservation path into shared compact pipeline ownership. |
 | WU-CM-15 | draft-PR-pass | Conversation memory public smoke reactive compact and fallback coverage | CM smoke / eval coverage follow-up；无 GitHub Issue | Draft PR #157 open draft. Accepted plan commit `97518e93`; accepted implementation slice commit `572a88df`; pre-PR closeout commit `0fe4e910`; accepted PR review / final closeout commit `5e04a841`. PR review PASS from AgentMiMo / AgentDS with no material findings; final closeout recorded in `docs/reviews/wu-cm-15-final-closeout-20260620.md`. |
-| WU-CLI-DEBUG-STREAM-01 | implementation | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Slice 2 accepted in commit `a0611ebe`. Current entry: Slice 3 prompt / interactive compatibility guard. Remaining approved slice after Slice 3: README/test README docs. `memory_repair.catch_up.budget_exhausted` is excluded from implementation scope as an already-closed bug, with only no-regression verification retained. |
+| WU-CLI-DEBUG-STREAM-01 | implementation | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Slice 2 accepted in commit `67ca96fb`. Current entry: Slice 3 prompt / interactive compatibility guard. Remaining approved slice after Slice 3: README/test README docs. `memory_repair.catch_up.budget_exhausted` is excluded from implementation scope as an already-closed bug, with only no-regression verification retained. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
 
@@ -2036,7 +2036,7 @@ Current gate artifacts:
 - Slice 2 fix validation: `pytest tests/host/test_logging.py tests/engine/runners/openai/test_runner_diagnostics.py -q` passed with 13 passed; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean; diff scan confirms no newly added `type: ignore`, `Any`, or `object` in changed Slice 2 code/test lines.
 - Slice 2 re-review: `docs/reviews/code-rereview-wu-cli-debug-stream-01-slice2-mimo-20260620.md` (AgentMiMo PASS); `docs/reviews/code-rereview-wu-cli-debug-stream-01-slice2-ds-20260620.md` (AgentDS PASS)
 - Slice 2 re-review adjudication: `docs/reviews/code-rereview-wu-cli-debug-stream-01-slice2-adjudication-20260620.md`
-- accepted Slice 2 commit: `a0611ebe`
+- accepted Slice 2 commit: `67ca96fb`
 - plan gate validation: `git diff --check` clean; untracked plan artifact whitespace check clean via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cli-debug-stream-01-debug-stream-plan.md` with expected nonzero no-index exit and no whitespace output.
 - plan fix validation: `git diff --check` clean; untracked fix artifact whitespace check clean via `git diff --no-index --check /dev/null docs/reviews/plan-fix-wu-cli-debug-stream-01-20260620.md` with expected nonzero no-index exit and no whitespace output.
 
