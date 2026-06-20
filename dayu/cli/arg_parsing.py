@@ -20,6 +20,7 @@ LOG_LEVEL_CHOICES: tuple[str, ...] = (
     "info",
     "warn",
     "error",
+    "critical",
 )
 COMMAND_INIT: str = "init"
 COMMAND_PROMPT: str = "prompt"

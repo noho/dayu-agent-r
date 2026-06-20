@@ -30,7 +30,7 @@ All planned slices passed implementation review and aggregate deepreview. No mus
 ## Final Validation
 
 - `pytest tests/runtime/test_log.py tests/runtime/test_log_levels.py tests/cli/test_arg_parsing.py tests/host/test_logging.py tests/engine/runners/openai/test_runner_diagnostics.py tests/cli/test_prompt_command.py tests/cli/test_interactive_command.py -q`
-  - Result: 159 passed, 3 existing third-party edgar deprecation warnings.
+  - Result after user follow-up fix: 160 passed, 3 existing third-party edgar deprecation warnings.
 - `python -m pyright dayu/ tests/ utils/`
   - Result: 0 errors, 0 warnings, 0 informations.
 - `git diff --check`
@@ -38,8 +38,9 @@ All planned slices passed implementation review and aggregate deepreview. No mus
 
 ## Residual Risks
 
-- `WU-CLI-DEBUG-STREAM-01-R1`: future stream diagnostic sites could accidentally use ordinary DEBUG. Status: deferred-with-owner. Owner: future WU review gates for new Host / Engine stream diagnostics. Current mitigation: tests lock current stream diagnostic sites and README defines the `--debug` / `--debug-stream` split.
-- `WU-CLI-DEBUG-STREAM-01-R2`: pre-existing root README `--log-level critical` mismatch with current parser choices. Status: deferred-with-owner. Owner: future CLI docs / parameter alignment work. Current WU did not introduce or worsen this mismatch.
+None.
+
+Follow-up after closeout: user rejected the future-site reminder residual as unnecessary, and the pre-existing `--log-level critical` mismatch was fixed by adding `critical` to CLI parser choices with coverage in `tests/cli/test_arg_parsing.py`.
 
 ## Explicit Non-Scope
 

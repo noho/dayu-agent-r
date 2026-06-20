@@ -419,6 +419,7 @@ def test_main_maps_keyboard_interrupt(
         (("prompt", "hello", "--verbose"), "verbose", False),
         (("prompt", "hello", "--quiet"), "error", False),
         (("prompt", "hello", "--log-level", "warn"), "warn", False),
+        (("prompt", "hello", "--log-level", "critical"), "critical", False),
         (("prompt", "hello", "--debug-stream"), "info", True),
     ),
 )
