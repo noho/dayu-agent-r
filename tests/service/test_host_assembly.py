@@ -943,7 +943,6 @@ def test_tool_discovery_specs_requires_provider_location() -> None:
         source_kind=ToolBundleSourceKind.CONFIG_BINDING,
         source_id="missing-location",
         enabled=True,
-        allow_empty=False,
         config={"path_policy": {"allowed_roots": ["workspace/docs"]}},
     )
 
@@ -968,7 +967,6 @@ def test_tool_discovery_specs_uses_entry_point_location() -> None:
         source_kind=ToolBundleSourceKind.PACKAGE_ENTRYPOINT,
         source_id="dayu.test_tools:provider",
         enabled=True,
-        allow_empty=False,
         config={"provider_option": "entry"},
     )
 
@@ -1001,7 +999,6 @@ def test_tool_discovery_provider_config_survives_loader_and_service_mapping(
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.tools.doc_provider",
                     "enabled": False,
-                    "allow_empty": True,
                     "config": {
                         "allowed_paths": ["workspace/docs"],
                         "limits": {"read_file_max_chars": 2048},
@@ -1042,7 +1039,6 @@ def test_web_tool_discovery_config_survives_service_mapping() -> None:
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id="dayu.tools.web",
         enabled=True,
-        allow_empty=False,
         config=web_config,
     )
 
@@ -1065,7 +1061,6 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
 
     raw_config: dict[str, JsonValue] = {
         "workspace_root": None,
-        "include_read_tools": True,
         "limits": {},
     }
     provider = ToolDiscoveryProviderConfig(
@@ -1075,7 +1070,6 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id="dayu.fins.tools.provider",
         enabled=True,
-        allow_empty=False,
         config=raw_config,
     )
 
@@ -1109,7 +1103,6 @@ def test_fins_tool_discovery_spec_preserves_explicit_workspace_root(
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id="dayu.fins.tools.download_provider",
         enabled=True,
-        allow_empty=False,
         config={"workspace_root": str(configured_workspace)},
     )
 
@@ -1121,6 +1114,110 @@ def test_fins_tool_discovery_spec_preserves_explicit_workspace_root(
 
     assert len(specs) == 1
     assert specs[0].config["workspace_root"] == str(configured_workspace)
+
+
+def test_fins_tool_discovery_spec_resolves_relative_workspace_root(
+    tmp_path: Path,
+) -> None:
+    """Fins provider 相对 workspace root 必须由 Service 解析为绝对路径。
+
+    :param tmp_path: pytest 临时 workspace。
+    :returns: ``None``。
+    :raises AssertionError: 相对 workspace root 未按 runtime workspace 解析时抛出。
+    """
+
+    runtime_workspace = (tmp_path / "project").resolve(strict=False)
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-read-tools",
+        import_path="dayu.fins.tools.provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.provider",
+        enabled=True,
+        config={"workspace_root": "workspace/", "limits": {}},
+    )
+
+    effective_providers = assemble_effective_tool_provider_configs(
+        (provider,),
+        workspace_root=runtime_workspace,
+    )
+    specs = _tool_discovery_specs(effective_providers)
+
+    assert len(specs) == 1
+    assert specs[0].config["workspace_root"] == str(
+        (runtime_workspace / "workspace").resolve(strict=False)
+    )
+    assert provider.config["workspace_root"] == "workspace/"
+
+
+def test_fins_tool_discovery_spec_rejects_non_string_workspace_root() -> None:
+    """Fins provider workspace root 必须拒绝非字符串配置。
+
+    :returns: ``None``。
+    :raises AssertionError: 非字符串 workspace root 未被拒绝时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-read-tools",
+        import_path="dayu.fins.tools.provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.provider",
+        enabled=True,
+        config={"workspace_root": 123, "limits": {}},
+    )
+
+    with pytest.raises(ValueError, match="financial-read-tools.*must be a string"):
+        assemble_effective_tool_provider_configs((provider,), workspace_root=None)
+
+
+@pytest.mark.parametrize("workspace_root_value", ("", "   "))
+def test_fins_tool_discovery_spec_rejects_empty_workspace_root(
+    workspace_root_value: str,
+) -> None:
+    """Fins provider workspace root 必须拒绝空字符串配置。
+
+    :param workspace_root_value: 待验证的 workspace root 配置值。
+    :returns: ``None``。
+    :raises AssertionError: 空 workspace root 未被拒绝时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-read-tools",
+        import_path="dayu.fins.tools.provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.provider",
+        enabled=True,
+        config={"workspace_root": workspace_root_value, "limits": {}},
+    )
+
+    with pytest.raises(ValueError, match="financial-read-tools.*must be non-empty"):
+        assemble_effective_tool_provider_configs((provider,), workspace_root=None)
+
+
+def test_fins_tool_discovery_spec_rejects_relative_workspace_root_without_runtime_root() -> None:
+    """Fins provider 相对 workspace root 缺少运行时根目录时必须失败。
+
+    :returns: ``None``。
+    :raises AssertionError: 缺少运行时根目录仍完成解析时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-read-tools",
+        import_path="dayu.fins.tools.provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.provider",
+        enabled=True,
+        config={"workspace_root": "workspace/", "limits": {}},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="financial-read-tools.*requires runtime workspace_root",
+    ):
+        assemble_effective_tool_provider_configs((provider,), workspace_root=None)
 
 
 def test_fins_workspace_bound_provider_detection_boundaries() -> None:
@@ -1140,7 +1237,6 @@ def test_fins_workspace_bound_provider_detection_boundaries() -> None:
                 source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
                 source_id="dayu.tools.doc_provider",
                 enabled=True,
-                allow_empty=True,
                 config={},
             ),
             False,
@@ -1157,7 +1253,6 @@ def test_fins_workspace_bound_provider_detection_boundaries() -> None:
                 source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
                 source_id="dayu.fins.tools.provider",
                 enabled=True,
-                allow_empty=False,
                 config={},
             ),
             True,
@@ -1220,10 +1315,9 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.fins.tools.download_provider",
                     "enabled": True,
-                    "allow_empty": False,
-                    "config": {"workspace_root": None},
+                    "config": {"workspace_root": "workspace/"},
                 }
-            }
+            },
         },
     )
     locations = resolve_runtime_locations(
@@ -1234,8 +1328,14 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
         workspace_config_dir=overlay_dir
     )
     discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=fins_workspace)
-    discovered_provider = discovered_tools.effective_provider_configs[0]
-    assert discovered_provider.config["workspace_root"] == str(fins_workspace)
+    discovered_provider = next(
+        provider_config
+        for provider_config in discovered_tools.effective_provider_configs
+        if provider_config.provider_id == "financial-download-tools"
+    )
+    assert discovered_provider.config["workspace_root"] == str(
+        (fins_workspace / "workspace").resolve(strict=False)
+    )
 
     raw_provider = config.tool_discovery.providers["financial-download-tools"]
     corrupted_config = replace(
@@ -1301,7 +1401,6 @@ def test_config_loader_and_service_discover_web_tools_with_overlay_config(
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.tools.web",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {
                         "provider": "duckduckgo",
                         "request_timeout_seconds": 4.0,
@@ -1713,7 +1812,6 @@ def _write_tool_discovery_overlay(workspace_root: Path) -> None:
                     "source_kind": "config_binding",
                     "source_id": "utils.smoke_host_public_multiturn",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {},
                 }
             }
@@ -2104,7 +2202,6 @@ def _provider_config(
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id=source_id,
         enabled=True,
-        allow_empty=False,
         config={"workspace_root": str(workspace_root)},
     )
 
@@ -2133,7 +2230,6 @@ def _provider_config_with_config(
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id=source_id,
         enabled=True,
-        allow_empty=False,
         config=config,
     )
 

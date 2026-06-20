@@ -211,7 +211,7 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
     )
     assert len(names) == len(set(names))
     assert FrameworkToolName.FETCH_MORE.value not in names
-    assert len(discovered_tools.source_refs) == 6
+    assert len(discovered_tools.source_refs) == 5
     for definition in discovered_tools.tool_bundle.definitions:
         properties = definition.schema.function.parameters.properties
         assert "execution_context" not in properties
@@ -663,10 +663,8 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.fins.tools.provider",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {
                         "workspace_root": str(_fins_workspace_root(tmp_path)),
-                        "include_read_tools": True,
                         "limits": {
                             "list_documents_max_items": 20,
                             "search_document_max_items": 10,
@@ -680,7 +678,6 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.tools.doc_provider",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {
                         "allowed_paths": [str(_doc_root(tmp_path))],
                         "limits": {
@@ -698,7 +695,6 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.tools.web",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {
                         "provider": "auto",
                         "request_timeout_seconds": 5.0,

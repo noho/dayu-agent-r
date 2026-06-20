@@ -578,7 +578,6 @@ class ToolDiscoveryProviderConfig:
     :param source_kind: 来源类别。
     :param source_id: 来源标识。
     :param enabled: 是否启用 provider。
-    :param allow_empty: 是否允许 provider 返回空工具集合。
     :param config: provider 自身的层中立 JSON 配置。
     """
 
@@ -588,7 +587,6 @@ class ToolDiscoveryProviderConfig:
     source_kind: ToolBundleSourceKind
     source_id: str
     enabled: bool
-    allow_empty: bool
     config: Mapping[str, JsonValue]
 
 
@@ -2031,7 +2029,6 @@ def _parse_tool_discovery_provider(
                 "source_kind",
                 "source_id",
                 "enabled",
-                "allow_empty",
             }
         ),
         optional=frozenset({"config"}),
@@ -2066,7 +2063,6 @@ def _parse_tool_discovery_provider(
         source_kind=source_kind,
         source_id=_require_str_field(record, field_name="source_id", context=context),
         enabled=_require_bool_field(record, field_name="enabled", context=context),
-        allow_empty=_require_bool_field(record, field_name="allow_empty", context=context),
         config=_optional_mapping_field(record, field_name="config", context=context),
     )
 

@@ -1664,7 +1664,6 @@ def _write_tool_discovery_overlay(workspace_root: Path) -> None:
                         "source_kind": "config_binding",
                         "source_id": "utils.smoke_host_public_multiturn",
                         "enabled": True,
-                        "allow_empty": False,
                         "config": {},
                     }
                 }

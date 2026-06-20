@@ -42,6 +42,7 @@ from dayu.host.tooling import default_framework_tool_policy_view
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
+    ToolsDiscoveryError,
     ToolsDiscoveryProviderBinding,
     ToolsDiscoveryProviderSpec,
 )
@@ -249,16 +250,16 @@ def test_doc_tools_cancelled_before_work_return_host_cancelled(
 
 
 def test_provider_enabled_without_allowed_paths_fails_closed() -> None:
-    """启用 provider 但没有白名单时不得注册可执行 Doc tools。"""
+    """启用 provider 但没有白名单时聚合阶段必须拒绝空工具输出。"""
 
-    spec = _spec_with_config({"limits": {}, "allowed_paths": []}, allow_empty=True)
+    spec = _spec_with_config({"limits": {}, "allowed_paths": []})
     output = discover_tools(spec)
-    result = ToolsDiscovery().discover_from_bindings(
-        (ToolsDiscoveryProviderBinding(spec=spec, provider=discover_tools),)
-    )
 
     assert output.definitions == ()
-    assert result.tool_bundle.definitions == ()
+    with pytest.raises(ToolsDiscoveryError, match="returned empty tools"):
+        ToolsDiscovery().discover_from_bindings(
+            (ToolsDiscoveryProviderBinding(spec=spec, provider=discover_tools),)
+        )
 
 
 def test_disallowed_path_returns_failed_outcome(tmp_path: Path) -> None:
@@ -1030,15 +1031,10 @@ def _spec(path: Path) -> ToolsDiscoveryProviderSpec:
     )
 
 
-def _spec_with_config(
-    config: Mapping[str, JsonValue],
-    *,
-    allow_empty: bool = False,
-) -> ToolsDiscoveryProviderSpec:
+def _spec_with_config(config: Mapping[str, JsonValue]) -> ToolsDiscoveryProviderSpec:
     """构造 Doc provider spec。
 
     :param config: provider config。
-    :param allow_empty: 是否允许空工具集合。
     :returns: provider spec。
     """
 
@@ -1046,7 +1042,6 @@ def _spec_with_config(
         spec_id="doc-tools",
         location=PythonImportPathProvider("dayu.tools.doc_provider:discover_tools"),
         enabled=True,
-        allow_empty=allow_empty,
         config=config,
     )
 

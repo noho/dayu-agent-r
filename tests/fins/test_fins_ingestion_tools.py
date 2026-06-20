@@ -688,7 +688,6 @@ def test_upload_provider_without_allowed_upload_roots_returns_empty_tools(
                 import_path="dayu.fins.tools.upload_provider:discover_tools"
             ),
             enabled=True,
-            allow_empty=True,
             config=dict(provider_config),
         )
     )
@@ -709,7 +708,6 @@ def test_upload_provider_rejects_relative_allowed_upload_roots(tmp_path: Path) -
                     import_path="dayu.fins.tools.upload_provider:discover_tools"
                 ),
                 enabled=True,
-                allow_empty=True,
                 config={
                     "workspace_root": str(workspace_root),
                     "allowed_upload_roots": ["relative/upload-root"],
@@ -1606,7 +1604,6 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.provider",
                 "enabled": True,
-                "allow_empty": False,
                 "config": {
                     "workspace_root": str(workspace_root),
                     "include_read_tools": True,
@@ -1619,7 +1616,6 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.download_provider",
                 "enabled": True,
-                "allow_empty": False,
                 "config": {"workspace_root": str(workspace_root)},
             },
             _PREPROCESS_SPEC_ID: {
@@ -1628,7 +1624,6 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.preprocess_provider",
                 "enabled": True,
-                "allow_empty": False,
                 "config": {"workspace_root": str(workspace_root)},
             },
             _UPLOAD_SPEC_ID: {
@@ -1637,7 +1632,6 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.upload_provider",
                 "enabled": True,
-                "allow_empty": False,
                 "config": {
                     "workspace_root": str(workspace_root),
                     "allowed_upload_roots": [str(upload_root)],
@@ -1671,7 +1665,6 @@ def _provider_specs_from_loaded_config(
                 spec_id=provider_config.provider_id,
                 location=PythonImportPathProvider(import_path=provider_config.import_path),
                 enabled=provider_config.enabled,
-                allow_empty=provider_config.allow_empty,
                 config=provider_config.config,
             )
         )
@@ -1720,7 +1713,6 @@ def _spec(
         spec_id=spec_id,
         location=PythonImportPathProvider(import_path=import_path),
         enabled=True,
-        allow_empty=False,
         config={"workspace_root": str(workspace_root)},
     )
 
@@ -1751,7 +1743,6 @@ def _upload_spec(
             import_path="dayu.fins.tools.upload_provider:discover_tools"
         ),
         enabled=True,
-        allow_empty=False,
         config={
             "workspace_root": str(workspace_root),
             "allowed_upload_roots": [str(root) for root in allowed_upload_roots],

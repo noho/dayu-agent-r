@@ -6,11 +6,20 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.provider",
       "enabled": true,
-      "allow_empty": true,
       "config": {
-        "workspace_root": null,
-        "include_read_tools": true,
-        "limits": {}
+        "workspace_root": "workspace/",
+        "limits": {
+          "processor_cache_max_entries": 128,
+          "list_documents_max_items": 300,
+          "get_document_sections_max_items": 1200,
+          "search_document_max_items": 20,
+          "list_tables_max_items": 50,
+          "read_section_max_chars": 80000,
+          "get_page_content_max_chars": 80000,
+          "get_table_max_items": 800,
+          "get_financial_statement_max_items": 1200,
+          "query_xbrl_facts_max_items": 1200
+        }
       }
     },
     "financial-download-tools": {
@@ -19,9 +28,8 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.download_provider",
       "enabled": true,
-      "allow_empty": true,
       "config": {
-        "workspace_root": null
+        "workspace_root": "workspace/"
       }
     },
     "financial-preprocess-tools": {
@@ -30,9 +38,8 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.preprocess_provider",
       "enabled": true,
-      "allow_empty": true,
       "config": {
-        "workspace_root": null
+        "workspace_root": "workspace/"
       }
     },
     "financial-upload-tools": {
@@ -40,11 +47,9 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.upload_provider",
-      "enabled": true,
-      "allow_empty": true,
+      "enabled": false,
       "config": {
-        "workspace_root": null,
-        "allowed_upload_roots": []
+        "workspace_root": "workspace/"
       }
     },
     "doc-tools": {
@@ -52,11 +57,16 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.tools.doc_provider",
-      "enabled": true,
-      "allow_empty": true,
+      "enabled": false,
       "config": {
         "allowed_paths": [],
-        "limits": {}
+        "limits": {
+          "list_files_max": 200,
+          "get_sections_max": 200,
+          "search_files_max_results": 50,
+          "read_file_max_chars": 80000,
+          "read_file_section_max_chars": 50000
+        }
       }
     },
     "web-tools": {
@@ -65,7 +75,6 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.tools.web",
       "enabled": true,
-      "allow_empty": true,
       "config": {
         "provider": "auto",
         "request_timeout_seconds": 20.0,

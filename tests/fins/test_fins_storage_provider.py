@@ -1153,7 +1153,6 @@ def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
             import_path="dayu.fins.tools.provider:discover_tools"
         ),
         enabled=True,
-        allow_empty=False,
         config={
             "workspace_root": "workspace/fins",
             "include_read_tools": True,
@@ -1333,7 +1332,6 @@ def _spec(
             import_path="dayu.fins.tools.provider:discover_tools"
         ),
         enabled=True,
-        allow_empty=False,
         config=config,
     )
 

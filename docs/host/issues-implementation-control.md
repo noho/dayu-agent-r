@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted plan commit |
-| implementation status | WU-TOOLS-01-F03-R4 plan re-review passed. Branch `phase/wu-tools-01-f03-r4` was created from `main`; workspace was clean at preflight. User confirmed design direction for Tools Discovery spec cleanup: remove `allow_empty`, remove `include_read_tools`, make Fins `workspace_root` default explicit as `workspace/`, migrate OLD Fins / Doc limits into packaged config, and remove upload `allowed_upload_roots` / local-file allowlist restriction. Plan artifact `docs/host/host-issues/wu-tools-01-f03-r4-tools-discovery-spec-plan.md` is accepted; awaiting accepted plan commit. |
+| gate | accepted-slice |
+| implementation status | WU-TOOLS-01-F03-R4 Slice 1 implementation completed by AgentCodex and passed AgentMiMo / AgentDS code review. Controller accepted DS-F01 as a small test hardening fix, added direct tests for Fins `workspace_root` error boundaries, and verified `pytest tests/service/test_host_assembly.py -q` plus `pyright dayu tests utils`. Awaiting accepted slice commit. |
 | active work unit | WU-TOOLS-01-F03-R4 |
 | default next work unit | WU-TOOLS-01-F03-R4 |
-| next entry point | Create accepted plan commit for WU-TOOLS-01-F03-R4, then enter implementation gate. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
+| next entry point | Commit accepted WU-TOOLS-01-F03-R4 Slice 1 changes, then continue the next implementation slice from the accepted plan. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -210,7 +210,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F03-R4 | planning | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Goal direction confirmed; plan gate is being dispatched to AgentCodex. |
+| WU-TOOLS-01-F03-R4 | accepted-slice | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 1 implementation and code review passed; accepted slice commit is next. |
 | WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -237,7 +237,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，当前进入 accepted plan commit gate。
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation 已完成，Slice 1 code review passed，当前进入 accepted slice commit gate。
 
 Plan artifact:
 
@@ -287,6 +287,47 @@ Plan re-review final finding status:
 - DS F3：已修复。
 - DS F4：已修复。
 - MiMo F04：non-blocking low severity；implementation 时核对 scene manifest 显式 `tool_names` 完整性，Slice 4 验证命令可捕获遗漏，不阻塞 accepted plan commit。
+
+Accepted plan commit:
+
+- `fe212365` (`gateflow: accept plan for WU-TOOLS-01-F03-R4`)
+
+Slice 1 implementation artifact:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice1-implementation-codex.md` by AgentCodex
+
+Slice 1 implementation validation:
+
+- `pytest tests/runtime/test_config_loader.py -q`: `41 passed`
+- `pytest tests/runtime/test_tools_discovery.py tests/runtime/test_tools_discovery_digest.py -q`: `19 passed`
+- `pytest tests/service/test_host_assembly.py tests/runtime/test_smoke_host_public_multiturn_assembly.py -q`: `54 passed`, 3 upstream `edgar` deprecation warnings
+- `pytest tests/tools/test_combined_tools_acceptance.py -q`: `8 passed`, 3 upstream `edgar` deprecation warnings
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
+
+Slice 1 code review focus:
+
+- Verify whether implementing Fins relative `workspace_root` effective resolution in `dayu/service/host_assembly.py` is an acceptable Slice 1 dependency needed to keep Service discovery callable after packaged `"workspace/"`, or a scope overrun that must be split / adjusted before acceptance.
+- Verify whether updating `utils/diagnose_web_access.py` is an acceptable signature-update fallout from `ToolsDiscoveryProviderSpec.allow_empty` removal, despite `utils/` not being part of production/test allowed files in the original dispatch.
+- Verify packaged `financial-upload-tools.enabled=false` is acceptable as a temporary Slice 1 bridge until the later upload provider slice removes `allowed_upload_roots` behavior and restores intended default registration.
+
+Slice 1 code review artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice1-code-review-mimo.md` by AgentMiMo, verdict `pass`, blocking findings `0`
+- `docs/reviews/wu-tools-01-f03-r4-slice1-code-review-ds.md` by AgentDS, verdict `pass-with-findings`, blocking findings `0`
+
+Controller Slice 1 code-review judgment:
+
+- `accepted`：DS-F01 — `_effective_fins_workspace_root_config_value()` 的非字符串、空字符串 / 全空白字符串、相对路径但缺少 runtime `workspace_root` 三条错误边界应由直接测试锁定。Controller 已在 `tests/service/test_host_assembly.py` 补测试并关闭。
+- `rejected-with-reason`：DS-F02 — `workspace_root: null` 且 runtime `workspace_root=None` 时保留原始 config、由 provider / wait adapter fail fast 是 accepted plan 的有意决策，不作为 Slice 1 缺陷。
+- `deferred-with-owner`：DS-F03 — packaged `financial-upload-tools.enabled=false` 是 Slice 1 临时桥接，owner 为本 WU Slice 4；Slice 4 必须移除 upload provider 内部 `allowed_upload_roots` 行为并恢复默认注册。
+- `informational`：DS-F04 — `dict()` 浅复制与 frozen dataclass `replace(...)` 行为正确，已有测试覆盖原始 config 未被修改。
+- `informational`：DS-F05 — `utils/diagnose_web_access.py` 修改是 `ToolsDiscoveryProviderSpec.allow_empty` 构造参数删除后的签名 fallout，可接受。
+- `accepted`：MiMo review — 无实质性问题；Slice 1 可进入 accepted slice commit gate。
+
+Slice 1 code-review fix validation:
+
+- `pytest tests/service/test_host_assembly.py -q`: `51 passed`, 3 upstream `edgar` deprecation warnings
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
 
 当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。
 
