@@ -26,6 +26,7 @@ from dayu.runtime.log_levels import (
     DEBUG_LOG_LEVEL,
     ERROR_LOG_LEVEL,
     INFO_LOG_LEVEL,
+    STREAM_DEBUG_LOG_LEVEL,
     VERBOSE_LOG_LEVEL,
     WARN_LOG_LEVEL,
 )
@@ -137,6 +138,48 @@ def test_set_level_from_flags_priority_log_level_str() -> None:
     assert resolved is LogLevel.WARN
 
 
+def test_set_level_from_flags_debug_stream_beats_log_level_str() -> None:
+    """``debug_stream`` 必须优先于 argparse 已解析的普通日志级别。"""
+
+    resolved = set_level_from_flags(
+        log_level="info",
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        debug_stream=True,
+    )
+    assert resolved is LogLevel.STREAM_DEBUG
+
+
+def test_set_level_from_flags_debug_stream_beats_debug_log_level_str() -> None:
+    """``--debug`` 与 ``--debug-stream`` 组合时 runtime 应选择 STREAM_DEBUG。"""
+
+    resolved = set_level_from_flags(
+        log_level="debug",
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        debug_stream=True,
+    )
+    assert resolved is LogLevel.STREAM_DEBUG
+
+
+def test_set_level_from_flags_debug_stream_without_log_level() -> None:
+    """仅启用 ``debug_stream`` 时 runtime 应选择 STREAM_DEBUG。"""
+
+    resolved = set_level_from_flags(
+        log_level=None,
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        debug_stream=True,
+    )
+    assert resolved is LogLevel.STREAM_DEBUG
+
+
 def test_set_level_from_flags_quiet_beats_debug() -> None:
     """quiet 优先于 debug / verbose / info。"""
 
@@ -185,6 +228,14 @@ def test_log_level_verbose_registered_with_stdlib() -> None:
     assert LogLevel.DEBUG < LogLevel.VERBOSE < LogLevel.INFO
 
 
+def test_log_level_stream_debug_registered_with_stdlib() -> None:
+    """``logging.getLevelName(9)`` 必须返回 ``STREAM_DEBUG``。"""
+
+    assert logging.getLevelName(STREAM_DEBUG_LOG_LEVEL) == "STREAM_DEBUG"
+    assert int(LogLevel.STREAM_DEBUG) == STREAM_DEBUG_LOG_LEVEL
+    assert LogLevel.STREAM_DEBUG < LogLevel.DEBUG
+
+
 def test_log_level_enum_uses_runtime_level_constants() -> None:
     """``LogLevel`` 枚举必须统一引用 runtime 日志级别常量。
 
@@ -193,6 +244,7 @@ def test_log_level_enum_uses_runtime_level_constants() -> None:
     """
 
     assert int(LogLevel.DEBUG) == DEBUG_LOG_LEVEL
+    assert int(LogLevel.STREAM_DEBUG) == STREAM_DEBUG_LOG_LEVEL
     assert int(LogLevel.VERBOSE) == VERBOSE_LOG_LEVEL
     assert int(LogLevel.INFO) == INFO_LOG_LEVEL
     assert int(LogLevel.WARN) == WARN_LOG_LEVEL
@@ -373,6 +425,28 @@ def test_configure_stream_override_keeps_diagnostics_redirectable(
     captured = capsys.readouterr()
     assert "override-runtime-log" in captured.out
     assert captured.err == ""
+
+
+def test_debug_suppresses_stream_debug_records_but_stream_debug_emits_both(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DEBUG 阈值抑制 STREAM_DEBUG；STREAM_DEBUG 阈值同时放出二者。"""
+
+    logger = logging.getLogger("dayu.test.stream_debug")
+
+    configure(level=LogLevel.DEBUG, stream=sys.stdout)
+    logger.log(STREAM_DEBUG_LOG_LEVEL, "stream-debug-hidden")
+    logger.debug("ordinary-debug-visible")
+    debug_capture = capsys.readouterr()
+    assert "stream-debug-hidden" not in debug_capture.out
+    assert "ordinary-debug-visible" in debug_capture.out
+
+    configure(level=LogLevel.STREAM_DEBUG, stream=sys.stdout)
+    logger.log(STREAM_DEBUG_LOG_LEVEL, "stream-debug-visible")
+    logger.debug("ordinary-debug-still-visible")
+    stream_debug_capture = capsys.readouterr()
+    assert "stream-debug-visible" in stream_debug_capture.out
+    assert "ordinary-debug-still-visible" in stream_debug_capture.out
 
 
 def test_configure_disables_propagate_so_caplog_default_misses(

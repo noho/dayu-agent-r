@@ -62,6 +62,7 @@ from dayu.engine.runners.openai.usage import coerce_usage
 from dayu.engine.runners.openai.xml_tag_extractor import (
     StreamingXMLTagExtractor,
 )
+from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL
 
 _DONE_TOKEN: str = "[DONE]"
 _DATA_PREFIX: str = "data:"
@@ -343,7 +344,11 @@ class SSEParser:
         joined = "\n".join(self._data_lines)
         self._data_lines.clear()
         if joined.strip() == _DONE_TOKEN:
-            _LOGGER.debug("sse.done_token received")
+            _LOGGER.log(
+                STREAM_DEBUG_LOG_LEVEL,
+                "sse.done_token received provider_request_id=%s",
+                self._provider_request_id,
+            )
             async for event in self._finalize_success():
                 yield event
             return

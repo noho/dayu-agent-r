@@ -86,7 +86,7 @@ from dayu.runtime.cancellation import (
     await_or_cancel as _runtime_await_or_cancel,
     wait_for_or_cancel as _runtime_wait_for_or_cancel,
 )
-from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL, VERBOSE_LOG_LEVEL
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -824,8 +824,8 @@ class AsyncOpenAIRunner:
         - 单次等待时长不超过
           ``stream_idle_heartbeat_seconds``（若设置且小于剩余 timeout）
           或剩余 timeout 时长。
-        - 心跳到点：发出一条 DEBUG 日志，继续等待，复用同一 readany
-          pending task（不取消、不丢弃已收到的字节）。
+        - 心跳到点：发出一条 STREAM_DEBUG 日志，继续等待，复用同一
+          readany pending task（不取消、不丢弃已收到的字节）。
         - 累计 idle 超过 ``stream_idle_timeout_seconds``：把 pending
           取消并抛 :class:`_AttemptFailedRetriable`(TIMEOUT)。
         - cancellation：透传 :class:`_RunnerInterrupted`。
@@ -894,7 +894,8 @@ class AsyncOpenAIRunner:
                         if isinstance(outcome, WaitTimedOut):
                             # heartbeat 命中：发心跳日志后继续等。
                             if heartbeat_seconds is not None:
-                                _LOGGER.debug(
+                                _LOGGER.log(
+                                    STREAM_DEBUG_LOG_LEVEL,
                                     "runner.stream_idle.heartbeat "
                                     "elapsed=%.3fs timeout=%.3fs",
                                     time.monotonic() - idle_started,

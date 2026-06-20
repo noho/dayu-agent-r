@@ -20,6 +20,7 @@ LOG_LEVEL_CHOICES: tuple[str, ...] = (
     "info",
     "warn",
     "error",
+    "critical",
 )
 COMMAND_INIT: str = "init"
 COMMAND_PROMPT: str = "prompt"
@@ -130,6 +131,7 @@ class ParsedCliArgs(argparse.Namespace):
     workspace_root: str
     config_dir: str | None
     log_level: str
+    debug_stream: bool
     log_file: str | None
     detail: bool
     prompt: str
@@ -246,6 +248,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.workspace_root = DEFAULT_WORKSPACE
     namespace.config_dir = None
     namespace.log_level = DEFAULT_LOG_LEVEL
+    namespace.debug_stream = False
     namespace.log_file = None
     namespace.detail = False
     namespace.ticker = None
@@ -343,6 +346,16 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         dest="log_level",
         default=argparse.SUPPRESS,
         help="等价于 --log-level debug。",
+    )
+    parser.add_argument(
+        "--debug-stream",
+        action="store_true",
+        dest="debug_stream",
+        default=argparse.SUPPRESS,
+        help=(
+            "启用普通 DEBUG 以及高频 stream delta、SSE、逐 delta ingest "
+            "诊断；不要与互相矛盾的日志等级参数组合使用。"
+        ),
     )
     parser.add_argument(
         "--verbose",

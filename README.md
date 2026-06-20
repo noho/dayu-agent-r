@@ -290,6 +290,7 @@ dayu-cli <subcommand> [参数]
 | `--log-level` | 全部主命令 | 直接指定日志级别，可选 `debug`、`verbose`、`info`、`warn`、`error`、`critical` |
 | `--log-file` | 全部主命令 | 指定诊断日志文件；未提供时默认写入系统临时目录下的 `dayu-cli-*.log` |
 | `--debug` | 全部主命令 | 把日志级别设为 `DEBUG` |
+| `--debug-stream` | 全部主命令 | 启用普通 `DEBUG` 诊断，并额外输出高频 stream delta / SSE / 逐 delta ingest 诊断 |
 | `--verbose` | 全部主命令 | 把日志级别设为 `VERBOSE` |
 | `--info` | 全部主命令 | 把日志级别设为 `INFO` |
 | `--quiet` | 全部主命令 | 把日志级别设为 `ERROR` |
@@ -303,7 +304,10 @@ dayu-cli <subcommand> [参数]
 
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。
+- `--debug` 适合查看普通诊断，例如 Host 打开、命令提交、调度、Runner HTTP 请求和终态收口；默认不会输出逐 token / 逐 delta 级别的 stream 诊断。
+- `--debug-stream` 用于排查高频流式链路问题，例如 stream delta、stream idle heartbeat、SSE 完成标记和 Host 逐 delta ingest 诊断；单独使用 `--debug-stream` 时已经包含普通 `--debug` 诊断。
 - CLI 的用户可见输出和诊断日志默认分离：回答、进度、错误提示仍走 stdout / stderr；Python logging 诊断默认写入系统临时目录下的 `dayu-cli-*.log`。需要固定日志位置时使用 `--log-file <path>`，它只改变诊断日志位置，不改变用户可见输出通道。
+- `--detail` 显示的是终端里的运行态 activity stream；它与 `--debug` / `--debug-stream` 的诊断日志相互独立，activity stream 不会写入 `--log-file`。
 - 全局参数可以写在子命令前，也可以写在子命令后。例如 `dayu-cli --debug prompt "问题"` 和 `dayu-cli prompt "问题" --debug` 等价；`--log-file` 也同理。
 - `prompt`、`interactive`、`write` 还支持更多 Agent 运行参数，例如 `--tool-timeout-seconds`、`--max-iterations`、`--doc-limits-json`、`--fins-limits-json`；需要时可用 `dayu-cli <subcommand> --help` 查看完整列表。
 - `interactive` 默认会续接本地绑定的同一个多轮会话；如果上一次回答还没完整回显到终端，重启 CLI 会先把那次回答补完，再进入新的输入循环。
@@ -312,6 +316,7 @@ dayu-cli <subcommand> [参数]
 
 ```bash
 dayu-cli prompt "总结苹果最新财报中的主要风险" --debug --log-file workspace/tmp/prompt.log
+dayu-cli prompt "总结苹果最新财报中的主要风险" --debug-stream --log-file workspace/tmp/prompt-stream.log
 dayu-cli download --ticker AAPL --verbose --log-file workspace/tmp/download.log
 ```
 
@@ -541,7 +546,7 @@ dayu-cli upload_material \
 | `--temperature` | 可选，覆盖模型 temperature |
 | `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
 | `--detail` / `--no-detail` | 可选，控制是否显示运行态 activity stream，默认不显示 |
-| `--debug` / `--verbose` | 可选，仅调整日志级别，不改变会话行为 |
+| `--debug` / `--debug-stream` / `--verbose` | 可选，仅调整诊断日志级别，不改变会话行为 |
 
 命令示例：
 
@@ -557,6 +562,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --thinking
 dayu-cli prompt --label apple "先总结苹果最新财报中的主要风险"
 dayu-cli prompt "总结苹果最新财报中的主要风险" --model-name mimo-v2.5-pro
 dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
+dayu-cli prompt "总结苹果最新财报中的主要风险" --debug-stream
 dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
 ```
 
@@ -567,6 +573,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
 - 带 `--label` 的 prompt 在本轮拿到最终回答前会独占该 label；如果另一个进程此时也尝试复用同一个 label，CLI 会直接报错并提示等待当前对话结束，或改用新的 `--label`。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
 - 默认不显示运行态 activity stream；如需查看工具调用、运行状态等过程信息，显式传 `--detail`。
+- `--debug-stream` 用于排查流式输出、SSE 和逐 delta ingest 问题；普通排障优先使用 `--debug`。
 
 ### 3.4 交互式对话：`interactive`
 
@@ -582,7 +589,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
 | `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
 | `--label` | 可选，恢复或创建指定 label 的可复用 conversation；首次创建时 scene 为 `interactive` |
 | `--new-session` | 可选，不续接上一次多轮会话，改为从头开始一个新会话 |
-| `--debug` / `--verbose` | 可选，仅调整日志级别，不改变会话行为 |
+| `--debug` / `--debug-stream` / `--verbose` | 可选，仅调整诊断日志级别，不改变会话行为 |
 
 命令示例：
 
@@ -599,6 +606,7 @@ dayu-cli interactive --thinking
 dayu-cli interactive --label apple
 dayu-cli interactive --new-session
 dayu-cli interactive --verbose
+dayu-cli interactive --debug-stream
 ```
 
 命令说明：

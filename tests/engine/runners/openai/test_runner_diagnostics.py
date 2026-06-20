@@ -9,16 +9,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
+from collections.abc import Mapping
+from types import TracebackType
+from typing import Protocol, cast
 
 import pytest
 
 from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_events import RunnerEvent, RunnerEventType
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
+from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
     FakeCancellationToken,
+    FakeContent,
+    FakeResponse,
     FakeResponseSpec,
     FakeSession,
 )
@@ -69,6 +76,174 @@ async def _readany_raises_runtime_error_immediately() -> bytes:
     raise RuntimeError("read failed before cleanup")
 
 
+class _DelayedContent(FakeContent):
+    """在 ``readany`` 前等待固定时间再产出下一个字节切片。"""
+
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        delay_seconds: float,
+    ) -> None:
+        """构造延迟字节流。
+
+        :param chunks: 待产出的字节切片。
+        :param delay_seconds: 每次 ``readany`` 前等待的秒数。
+        """
+
+        super().__init__(chunks=deque(chunks))
+        self._delay_seconds: float = delay_seconds
+
+    async def readany(self) -> bytes:
+        """等待后返回下一个字节切片。
+
+        :returns: 下一个字节切片；耗尽时返回 ``b""``。
+        """
+
+        await asyncio.sleep(self._delay_seconds)
+        if not self.chunks:
+            return b""
+        return self.chunks.popleft()
+
+
+class _DelayedResponse(FakeResponse):
+    """带延迟 ``content.readany`` 的 fake response。"""
+
+    def __init__(
+        self,
+        spec: FakeResponseSpec,
+        *,
+        delay_seconds: float,
+    ) -> None:
+        """构造延迟响应。
+
+        :param spec: 响应脚本。
+        :param delay_seconds: 每次 ``readany`` 前等待的秒数。
+        """
+
+        super().__init__(spec)
+        self.content = _DelayedContent(
+            list(spec.body_chunks), delay_seconds=delay_seconds
+        )
+
+
+class _DelayedRequestContext:
+    """``post`` 返回的 async context manager。"""
+
+    def __init__(self, response: _DelayedResponse) -> None:
+        """构造 context manager。
+
+        :param response: 进入上下文时返回的 fake response。
+        """
+
+        self._response: _DelayedResponse = response
+
+    async def __aenter__(self) -> _DelayedResponse:
+        """进入上下文。
+
+        :returns: fake response。
+        """
+
+        return self._response
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """退出上下文并释放响应。
+
+        :param exc_type: 异常类型。
+        :param exc: 异常实例。
+        :param tb: traceback。
+        :returns: ``None``。
+        """
+
+        self._response.release()
+
+
+class _DelayedSession:
+    """单响应、可控延迟的 fake session。"""
+
+    def __init__(
+        self,
+        *,
+        spec: FakeResponseSpec,
+        delay_seconds: float,
+    ) -> None:
+        """构造 fake session。
+
+        :param spec: 响应脚本。
+        :param delay_seconds: 每次 ``readany`` 前等待的秒数。
+        """
+
+        self._response: _DelayedResponse = _DelayedResponse(
+            spec, delay_seconds=delay_seconds
+        )
+        self.closed: bool = False
+
+    def post(
+        self,
+        url: str,
+        *,
+        data: bytes,
+        headers: Mapping[str, str],
+    ) -> _DelayedRequestContext:
+        """返回延迟 response context。
+
+        :param url: 请求 URL。
+        :param data: 请求体字节。
+        :param headers: 请求头。
+        :returns: 延迟 response context。
+        """
+
+        del url, data, headers
+        return _DelayedRequestContext(self._response)
+
+    async def close(self) -> None:
+        """关闭 fake session。
+
+        :returns: ``None``。
+        """
+
+        self.closed = True
+
+
+class _DelayedSessionClient:
+    """供 stream 诊断测试注入延迟 fake session 的 HTTP client。"""
+
+    def __init__(self, session: _DelayedSession) -> None:
+        """构造测试 HTTP client。
+
+        :param session: 本次 Runner 调用使用的延迟 fake session。
+        """
+
+        self._session: _DelayedSession = session
+
+    def session(self) -> _DelayedSession:
+        """返回延迟 fake session。
+
+        :returns: 延迟 fake session。
+        """
+
+        return self._session
+
+    async def close(self) -> None:
+        """关闭延迟 fake session。
+
+        :returns: ``None``。
+        """
+
+        await self._session.close()
+
+
+class _RunnerWithDelayedSessionClient(Protocol):
+    """描述测试需要替换的 Runner HTTP client 槽位。"""
+
+    _http_client: _DelayedSessionClient
+
+
 @pytest.mark.asyncio
 async def test_attempt_start_diagnostic_logged(
     caplog: pytest.LogCaptureFixture,
@@ -107,6 +282,50 @@ async def test_attempt_start_diagnostic_logged(
         "runner.attempt.start" in r.getMessage() for r in caplog.records
     )
     assert events[-1].type is RunnerEventType.RUNNER_DONE
+
+
+@pytest.mark.asyncio
+async def test_stream_diagnostics_require_stream_debug_log_level(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """stream heartbeat 与 SSE done 诊断只在 STREAM_DEBUG 阈值下出现。"""
+
+    namespace_logger = _attach_caplog_to_dayu(caplog)
+    try:
+        debug_events = await _collect_stream_diagnostic_events(
+            caplog=caplog,
+            log_level=logging.DEBUG,
+        )
+        debug_messages = [record.getMessage() for record in caplog.records]
+        assert debug_events[-1].type is RunnerEventType.RUNNER_DONE
+        assert any("runner.attempt.start" in msg for msg in debug_messages)
+        assert any("runner.http.post" in msg for msg in debug_messages)
+        assert any("runner.http.response" in msg for msg in debug_messages)
+        assert not any(
+            "runner.stream_idle.heartbeat" in msg
+            for msg in debug_messages
+        )
+        assert not any("sse.done_token received" in msg for msg in debug_messages)
+
+        caplog.clear()
+        stream_debug_events = await _collect_stream_diagnostic_events(
+            caplog=caplog,
+            log_level=STREAM_DEBUG_LOG_LEVEL,
+        )
+        stream_debug_messages = [
+            record.getMessage() for record in caplog.records
+        ]
+        assert stream_debug_events[-1].type is RunnerEventType.RUNNER_DONE
+        assert any(
+            "runner.stream_idle.heartbeat" in msg
+            for msg in stream_debug_messages
+        )
+        assert any(
+            "sse.done_token received provider_request_id=req-stream-1" in msg
+            for msg in stream_debug_messages
+        )
+    finally:
+        namespace_logger.removeHandler(caplog.handler)
 
 
 @pytest.mark.asyncio
@@ -276,3 +495,50 @@ async def test_runner_logs_use_dayu_namespace_only(
     for record in caplog.records:
         # 任何 caplog 抓到的日志都应来自 dayu namespace；root 不该被污染。
         assert record.name == "dayu" or record.name.startswith("dayu.")
+
+
+async def _collect_stream_diagnostic_events(
+    *,
+    caplog: pytest.LogCaptureFixture,
+    log_level: int,
+) -> list[RunnerEvent]:
+    """按指定日志阈值执行一次会触发 stream 诊断的调用。
+
+    :param caplog: pytest 日志捕获夹具。
+    :param log_level: ``dayu`` logger 使用的日志阈值。
+    :returns: Runner 事件列表。
+    """
+
+    session = _DelayedSession(
+        spec=FakeResponseSpec(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "x-request-id": "req-stream-1",
+            },
+            body_chunks=[
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                b"data: [DONE]\n\n",
+            ],
+        ),
+        delay_seconds=0.06,
+    )
+    runner = AsyncOpenAIRunner(
+        spec=make_spec(
+            max_retries=0,
+            stream_idle_timeout_seconds=0.5,
+            stream_idle_heartbeat_seconds=0.02,
+        ),
+        cancellation_token=FakeCancellationToken(),
+    )
+    runner_with_client = cast(_RunnerWithDelayedSessionClient, runner)
+    runner_with_client._http_client = _DelayedSessionClient(session)
+
+    with caplog.at_level(log_level, logger="dayu"):
+        msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
+        events: list[RunnerEvent] = []
+        async for event in runner.call(
+            messages=msgs, options=make_options(stream=True), tools=[]
+        ):
+            events.append(event)
+    return events

@@ -39,7 +39,7 @@ from dayu.host.local_proxy import DefaultLocalEngineWorker
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import NoToolExecutor
-from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL, VERBOSE_LOG_LEVEL
 
 _SECRET_PROMPT = "SECRET_FULL_PROMPT_DO_NOT_LOG"
 _SECRET_AUTH = "SECRET_AUTH_CLAIM_DO_NOT_LOG"
@@ -177,20 +177,61 @@ def test_memory_catchup_logs_cursors_and_counts(
     assert "target_reached=False" in caplog.text
 
 
-def test_engine_ingest_delta_events_use_debug_log_level() -> None:
-    """逐 token delta ingest 日志使用 DEBUG，非 delta 保持 VERBOSE 骨架。
+def test_engine_ingest_delta_events_use_stream_debug_log_level() -> None:
+    """逐 token delta ingest 日志使用 STREAM_DEBUG，非 delta 保持 VERBOSE 骨架。
 
     :returns: ``None``。
     :raises AssertionError: 日志级别选择不符合语义时抛出。
     """
 
-    assert _engine_ingest_log_level(EngineEventType.CONTENT_DELTA) == logging.DEBUG
-    assert _engine_ingest_log_level(EngineEventType.REASONING_DELTA) == logging.DEBUG
+    assert (
+        _engine_ingest_log_level(EngineEventType.CONTENT_DELTA)
+        == STREAM_DEBUG_LOG_LEVEL
+    )
+    assert (
+        _engine_ingest_log_level(EngineEventType.REASONING_DELTA)
+        == STREAM_DEBUG_LOG_LEVEL
+    )
+    assert (
+        _engine_ingest_log_level(EngineEventType.TOOL_CALL_DELTA)
+        == STREAM_DEBUG_LOG_LEVEL
+    )
     assert (
         _engine_ingest_log_level(EngineEventType.ITERATION_STARTED)
         == VERBOSE_LOG_LEVEL
     )
     assert _engine_ingest_log_level(EngineEventType.FINAL_ANSWER) == VERBOSE_LOG_LEVEL
+
+
+def test_engine_ingest_delta_stream_debug_records_are_gated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ordinary DEBUG 不捕获 delta ingest，STREAM_DEBUG 捕获。
+
+    :param caplog: pytest 日志捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: stream-debug gating 不符合预期时抛出。
+    """
+
+    logger = logging.getLogger("dayu.host.engine_ingest")
+    message = "host.engine_ingest.accepted engine_event_type=content_delta"
+
+    with caplog.at_level(logging.DEBUG, logger="dayu.host.engine_ingest"):
+        logger.log(
+            _engine_ingest_log_level(EngineEventType.CONTENT_DELTA),
+            message,
+        )
+    assert message not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(
+        STREAM_DEBUG_LOG_LEVEL, logger="dayu.host.engine_ingest"
+    ):
+        logger.log(
+            _engine_ingest_log_level(EngineEventType.CONTENT_DELTA),
+            message,
+        )
+    assert message in caplog.text
 
 
 def _command_options(tmp_path: Path) -> HostCommandHandleOptions:

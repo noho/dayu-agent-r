@@ -18,7 +18,11 @@ from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
-from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
+from dayu.cli.agent_entrypoint import (
+    CliSigintMonitor,
+    package_config_root,
+    unsupported_execution_option_names,
+)
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
@@ -809,7 +813,7 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
     )
 
 
-@pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))
+@pytest.mark.parametrize("log_flag", ("--verbose", "--debug", "--debug-stream"))
 def test_interactive_verbose_debug_diagnostics_do_not_pollute_stdout(
     log_flag: str,
     tmp_path: Path,
@@ -1350,6 +1354,18 @@ def test_interactive_unsupported_old_flag_exits_with_usage_error(
     assert exit_code == EXIT_USAGE_ERROR
     assert "unsupported option" in captured.err
     assert "--thinking/--no-thinking" in captured.err
+
+
+def test_interactive_debug_stream_is_not_unsupported_execution_option() -> None:
+    """debug-stream 是全局日志开关，不是旧 Agent 执行参数。
+
+    :returns: ``None``。
+    :raises AssertionError: debug-stream 被错误列为 unsupported option 时抛出。
+    """
+
+    args = parse_cli_args(("interactive", "--debug-stream"))
+
+    assert "--debug-stream" not in unsupported_execution_option_names(args)
 
 
 def test_interactive_reports_all_unsupported_old_execution_flags(
