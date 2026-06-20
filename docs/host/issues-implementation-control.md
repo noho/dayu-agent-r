@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted deepreview commit |
-| implementation status | WU-ENG-02-R1 aggregate deepreview completed by AgentMiMo and AgentDS with `pass` and zero blocking findings. Controller accepted no additional fix. Accepted deepreview commit is the next gate action. |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-ENG-02-R1 accepted deepreview commit `c9659dce` created. Plan, implementation, code review, aggregate deepreview, validation, and control-doc state are committed. |
 | active work unit | WU-ENG-02-R1 |
 | default next work unit | WU-ENG-02-R1 |
-| next entry point | Create accepted deepreview commit containing aggregate deepreview artifacts and this control-doc state update. After commit, record the accepted deepreview commit hash and enter ready-to-open-draft-PR gate. |
+| next entry point | Prepare draft PR readiness summary, then push branch `phase/wu-eng-02-r1` to remote `github` and create a draft PR if readiness checks remain clean. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
-| blocking open questions | None for accepted deepreview commit gate. |
+| blocking open questions | None for ready-to-open-draft-PR gate. |
 
 状态约定：
 
@@ -241,7 +241,7 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 
 本 WU 是 WU-ENG-02 / PR 114 的 reopened follow-up。WU-ENG-02 已完成 lower-level typed `RunnerRequestIdentity`、`ClientCorrelationPolicy`、OpenAI-compatible `X-Client-Request-Id` 映射能力、provider `x-request-id` 采集、Host ingest 与 Tool Trace 投影；但 reopen comment 指出真实 Service / CLI 默认路径没有启用该能力，因此 #63 不能视为端到端完成。
 
-当前 gate 是 `accepted deepreview commit`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix、code re-review、accepted slice commit 和 aggregate deepreview 已完成；下一步创建 accepted deepreview commit。
+当前 gate 是 `ready-to-open-draft-PR`。Goal confirmation、plan gate、plan review、plan-fix、plan re-review、accepted plan commit、implementation、code review、code-review fix、code re-review、accepted slice commit、aggregate deepreview 和 accepted deepreview commit 已完成；下一步准备 draft PR readiness。
 
 Plan artifact:
 
@@ -313,6 +313,15 @@ Controller aggregate deepreview judgment:
 
 - `rejected-with-reason`：`runner.http.response` 在 `client_correlation_id=None` 时输出字面量 `None` 与同日志行既有 `provider_request_id=None` 语义一致，不影响状态、持久化或 LLM-facing material；不为可读性微调追加 fix。
 - `deferred-with-owner`：`_lost_host_event` / `_cancelled_host_event` 不追加 suffix 是当前 WU scope 内的有意选择；当前 lifecycle plan 不携带 provider/client correlation ids。若后续 WU 让 lost/cancelled lifecycle payload 携带 correlation ids，由对应 WU plan reviewer 复核 terminal projection 同步。
+
+Accepted deepreview commit:
+
+- `c9659dce` (`docs: accept WU-ENG-02-R1 deepreview`)
+
+Draft PR readiness:
+
+- Status: ready pending final branch status check and remote push.
+- Remaining risks: no blocking risks. Deferred projection-sync risk for future lost/cancelled lifecycle payload correlation ids is owned by the future WU that changes those payloads.
 
 Controller plan-review judgment:
 
