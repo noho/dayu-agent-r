@@ -2,7 +2,9 @@
 
 ## Result
 
-WU-CM-15 is locally complete and ready for draft PR gate authorization.
+WU-CM-15 has passed the draft PR gate and final closeout.
+
+Draft PR: https://github.com/noho/dayu-agent-r/pull/157
 
 The work unit stayed within the user-confirmed scope: add public smoke coverage for reactive compact and deterministic compact-failure fallback. It did not modify Host / Engine / runtime / Service public contracts, schemas, or prompts. The only production code change is Host compact attempt rejection logging: attempt-level rejection diagnostics are WARNING, while terminal failure / fallback outcome severity remains owned by the surrounding dispatch and engine-ingest closeout path.
 
@@ -28,10 +30,17 @@ The work unit stayed within the user-confirmed scope: add public smoke coverage 
 
 - Accepted plan commit: `97518e93`.
 - Accepted implementation slice commit: `572a88df`.
+- Pre-PR closeout commit: `0fe4e910`.
+- Draft PR: https://github.com/noho/dayu-agent-r/pull/157.
+- PR review artifacts:
+  - `docs/reviews/pr-157-review-20260620-134300.md` (AgentMiMo): PASS, no material findings.
+  - `docs/reviews/pr-157-review-20260620-134346.md` (AgentDS): PASS, no material findings.
+- Accepted PR review / final closeout commit: `ACCEPTED_PR_REVIEW_COMMIT_PENDING`.
 - Plan review / fix / re-review passed.
 - Code review / fix / focused re-review passed.
 - Aggregate deepreview passed after small closeout fixes.
 - Aggregate-fix focused re-review passed from AgentMiMo and AgentDS.
+- PR review passed from AgentMiMo and AgentDS. No fix / re-review loop was required.
 
 ## Validation
 
@@ -46,6 +55,11 @@ The work unit stayed within the user-confirmed scope: add public smoke coverage 
   - Passed: `0 errors`.
 - `git diff --check`
   - Passed.
+- PR checks:
+  - `gh pr checks 157`
+    - No checks reported on the `phase/wu-cm-15` branch.
+  - `gh pr view 157 --json statusCheckRollup`
+    - Empty status check rollup.
 - Closeout logging fix validation:
   - `source .venv/bin/activate && pytest tests/host/test_compaction_operation.py::test_run_compaction_operation_logs_terminal_reject_as_warning tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py::test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds`
     - Passed: `2 passed`.
@@ -75,12 +89,15 @@ Evaluation result:
 
 ## Residuals
 
-- Real-provider `memory-compact` still requires a valid compactor provider key. This remains an environment validation residual and does not block deterministic reactive / fallback smoke coverage.
-- `_patched_compactor_runner(...)` remains smoke-local monkey-patching around `dayu.host.llm_compaction._run_agent_request`; it now fails clearly if the hook changes and restores the original runner in `finally`.
-- Future smoke hardening may decide whether reactive acceptance should also reject nonzero `rejected_proactive`.
-- Larger smoke maintainability refactors, such as splitting deterministic infrastructure or extracting shared public Host smoke flow, are intentionally deferred.
+- Real-provider `memory-compact` requires valid model / compactor provider keys. Owner: smoke runner environment. Destination: operational smoke precondition, not WU-CM-15 code residual.
+- `_patched_compactor_runner(...)` remains smoke-local monkey-patching around `dayu.host.llm_compaction._run_agent_request`; it fails clearly if the hook changes and restores the original runner in `finally`. Owner: future smoke maintenance if Host internal compactor runner moves. Destination: no current follow-up issue because the failure mode is fail-closed and limited to `utils/`.
+- Future smoke hardening may decide whether reactive acceptance should also reject nonzero `rejected_proactive`. Owner: future smoke hardening. Destination: deferred only if future config can emit proactive rejection without request / compacted / failed counts.
+- Larger smoke maintainability refactors, such as splitting deterministic infrastructure or extracting shared public Host smoke flow, are intentionally deferred. Owner: future smoke maintenance; not required for WU-CM-15.
+- Per-delta DEBUG log volume is owned by GitHub Issue #148 / WU-CLI-DEBUG-STREAM-01.
 - Compaction artifact retention is tracked separately by GitHub Issue #156, now recorded as a child of #78. #78 remains purge-session-driven retention cleanup; no internal automatic scheduler is required for this WU.
 
 ## Next Entry
 
-Await user authorization for draft PR gate actions: push, draft PR creation, mark-ready, reviewer requests, merge, branch deletion, or issue closure.
+After the user manually merges draft PR 157, pull the latest `main` from GitHub and start the next phaseflow from `docs/host/issues-implementation-control.md` entry point `WU-CLI-DEBUG-STREAM-01`, backed by GitHub Issue #148.
+
+No mark-ready, reviewer request, merge, branch deletion, or issue closure was performed by this closeout.
