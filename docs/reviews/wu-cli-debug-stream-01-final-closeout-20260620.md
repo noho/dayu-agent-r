@@ -1,5 +1,10 @@
 # WU-CLI-DEBUG-STREAM-01 Final Closeout
 
+> Superseded note: this closeout was written before the resumed Gate State
+> Machine correction. It is retained as historical evidence, but final closeout
+> must be rerun after PR review, any required fix / re-review, accepted PR
+> review commit, follow-up push, and draft-PR-pass complete.
+
 ## Verdict
 
 WU-CLI-DEBUG-STREAM-01 is ready for the draft PR gate.
