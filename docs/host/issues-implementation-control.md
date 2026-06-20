@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final-closeout-pass |
-| implementation status | WU-ENG-02-R1 final closeout pass. Draft PR 159 is open in draft state; before this final closeout record, branch `phase/wu-eng-02-r1` was pushed through `d96dcb65`. Local gate chain completed through PR review, accepted PR review commit, follow-up push, draft-PR-pass, and final closeout. |
-| active work unit | WU-ENG-02-R1 |
-| default next work unit | WU-ENG-02-R1 |
-| next entry point | Await user merge / PR disposition for PR 159. After merge, return to base branch and select the next active work unit from this control doc. |
+| gate | accepted plan commit |
+| implementation status | WU-TOOLS-01-F03-R4 plan re-review passed. Branch `phase/wu-tools-01-f03-r4` was created from `main`; workspace was clean at preflight. User confirmed design direction for Tools Discovery spec cleanup: remove `allow_empty`, remove `include_read_tools`, make Fins `workspace_root` default explicit as `workspace/`, migrate OLD Fins / Doc limits into packaged config, and remove upload `allowed_upload_roots` / local-file allowlist restriction. Plan artifact `docs/host/host-issues/wu-tools-01-f03-r4-tools-discovery-spec-plan.md` is accepted; awaiting accepted plan commit. |
+| active work unit | WU-TOOLS-01-F03-R4 |
+| default next work unit | WU-TOOLS-01-F03-R4 |
+| next entry point | Create accepted plan commit for WU-TOOLS-01-F03-R4, then enter implementation gate. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
-| blocking open questions | None for final closeout. |
+| blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
 
 状态约定：
 
@@ -204,13 +204,14 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
-| WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
+| WU-TOOLS-01-F03-R4 | open | WU-TOOLS-01-F03-R4 / GitHub Issue #133 | 本轮作为独立 WU 处理 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
 
 ## 当前 Work Units
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-ENG-02-R1 | discussion-ready | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened | Active work unit. PR 114 lower-level mechanism exists, but Service / CLI default path still disables `X-Client-Request-Id`; goal confirmation must confirm end-to-end default path, diagnostics, provider response header fallback, and no new config item. |
+| WU-TOOLS-01-F03-R4 | planning | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Goal direction confirmed; plan gate is being dispatched to AgentCodex. |
+| WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
 | WU-OBS-00B | pending-parent | Usage observation projection correlation boundary | GitHub Issue #119 / #70 child | #70 analyzer 子项；owner for residual `WU-ENG-02-S3-R1` |
@@ -231,6 +232,105 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+
+## WU-TOOLS-01-F03-R4 Tools Discovery Spec Semantics Cleanup
+
+### 状态
+
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，当前进入 accepted plan commit gate。
+
+Plan artifact:
+
+- `docs/host/host-issues/wu-tools-01-f03-r4-tools-discovery-spec-plan.md`
+
+Plan review artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-plan-review-mimo.md` by AgentMiMo, verdict `pass-with-findings`, blocking findings `1`
+- `docs/reviews/wu-tools-01-f03-r4-plan-review-ds.md` by AgentDS, verdict `pass-with-findings`, blocking findings `2`
+
+Controller plan-review judgment:
+
+- `accepted`：MiMo F01 — plan 必须明确 `_fins_wait_adapter_registry_from_provider_configs` 使用 effective provider configs，或复用同一 relative-to-absolute workspace 解析逻辑；否则 packaged `workspace/` 会让 wait adapter 构造直接失败。
+- `accepted`：MiMo F02 / DS F6 — plan 必须明确 `workspace/` 的解析基准为 Service request/runtime `workspace_root` 下的 `workspace/`，并给出具体测试断言；不得把该决策留给 implementation owner 猜测。
+- `accepted`：MiMo F03 / DS F5 — upload 默认注册后可能扩大 scene tool exposure，plan 必须加入默认 scene manifest / tool selection 验证步骤。
+- `accepted`：DS F1 — Doc provider 决策必须收敛为单一路径：packaged `doc-tools.enabled=false`，且 Doc provider 在 enabled + empty `allowed_paths` 时 fail fast with business-specific error；implementation agent 不得在两个方案之间自行裁决。
+- `accepted`：DS F2 — `ToolsDiscoveryProviderSpec.allow_empty` 删除与 `host_assembly.py` 映射删除必须位于同一可独立验证 slice，避免 slice 间代码库不可导入。
+- `accepted`：DS F3 — plan 必须读取并记录 Web provider 是否存在空输出路径；若存在，需在 plan 中裁决处理方式。
+- `accepted`：DS F4 — plan 必须显式确认 Fins download / preprocess providers 在有效 config 下是否返回非空 definitions。
+
+Plan-fix artifact:
+
+- `docs/reviews/wu-tools-01-f03-r4-plan-fix-codex.md` by AgentCodex
+
+Plan-fix summary:
+
+- MiMo F01：已修复，plan 要求 wait adapter construction 消费与 discovery 同一 effective provider config tuple，raw packaged `workspace/` 不得进入 `_fins_wait_adapter_registry_from_provider_configs(...)`。
+- MiMo F02 / DS F6：已修复，plan 固定相对 Fins `workspace_root` 语义：Service request/runtime `workspace_root=/path/to/project` 加 packaged `workspace/` 解析为 `/path/to/project/workspace`。
+- MiMo F03 / DS F5：已修复，plan 将默认 scene upload exposure 纳入当前 WU implementation item，要求默认非 upload scenes 不再通过 broad `fins` tag 选中 `start_fins_upload`。
+- DS F1：已修复，Doc provider 单一路径为 packaged `doc-tools.enabled=false`，且 enabled Doc provider missing / empty `allowed_paths` 必须 Doc-specific fail fast。
+- DS F2：已修复，plan 合并 provider-level `allow_empty` config 删除、`ToolsDiscoveryProviderSpec.allow_empty` 删除与 `host_assembly.py` mapping 删除到同一个可独立验证 Slice 1。
+- DS F3：已修复，plan 记录 Web provider 直接证据：`dayu.tools.web:discover_tools` 到 `dayu/tools/web/provider.py`，definitions 必须为 `search_web` / `fetch_web_page`，无正常空输出路径。
+- DS F4：已修复，plan 记录 Fins download / preprocess provider 在有效 absolute `workspace_root` 下各返回一个 awaiting tool definition。
+
+Plan re-review artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-plan-rereview-mimo.md` by AgentMiMo, verdict `pass`, blocking findings `0`
+- `docs/reviews/wu-tools-01-f03-r4-plan-rereview-ds.md` by AgentDS, verdict `pass`, blocking findings `0`
+
+Plan re-review final finding status:
+
+- MiMo F01：已修复。
+- MiMo F02 / DS F6：已修复。
+- MiMo F03 / DS F5：已修复。
+- DS F1：已修复。
+- DS F2：已修复。
+- DS F3：已修复。
+- DS F4：已修复。
+- MiMo F04：non-blocking low severity；implementation 时核对 scene manifest 显式 `tool_names` 完整性，Slice 4 验证命令可捕获遗漏，不阻塞 accepted plan commit。
+
+当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。
+
+### 目标
+
+- 收敛 Tools Discovery spec 语义，删除 provider-level `allow_empty` 字段。空工具输出不再由通用 runtime 布尔开关授权；provider 是否启用由 `enabled` 表达，provider 自身业务配置必须直接决定是否暴露工具或 fail fast。
+- 删除 Fins read provider 的 `include_read_tools` 字段。`financial-read-tools` 是独立 provider，启停必须只通过 provider-level `enabled` 表达，不保留 provider 内二级开关。
+- 将 Fins workspace root packaged 默认值从 `null` 改为显式 `workspace/`。ConfigLoader 只原样读取配置；Service / composition root 负责把相对 workspace path 解析为 effective absolute path；Fins provider 继续只接收 absolute path，不自行猜 cwd、环境变量或 workspace。
+- 将 OLD `doc_tool_limits` 与 `fins_tool_limits` 的默认值迁移到 `dayu/config/tool_discovery.json` 的 `doc-tools.config.limits` 与 `financial-read-tools.config.limits`，让 packaged config 自解释；provider dataclass 默认值只能作为代码层 fallback / 测试构造便利，不作为 packaged 默认配置唯一真源。
+- 删除 `financial-upload-tools.config.allowed_upload_roots` 与上传工具本地文件 allowlist 限制。当前裁决为：本地文件读取暂不由 tool provider 自行授权或限制，未来权限治理统一进入 Host / policy 设计，不在工具内部保留一套并行 allowlist。
+- 保持 Fins repository 写入目标边界：上传写入仍必须通过 `dayu.fins.storage` 仓储协议和 repository implementation；LLM / tool caller 不得指定仓储写入目录或绕过 repository。
+- 同步更新相关测试、README 和设计 / 总控文档，使默认配置、typed config、Service effective config、provider 行为和文档语义一致。
+
+### 非目标
+
+- 不实现 Host 统一权限系统、文件访问策略、sandbox、capability token 或 per-tool authorization policy；upload 本地文件读取权限治理只作为后续 Host / policy 方向记录，不在本 WU 落地。
+- 不把工具发现、业务工具注册、provider lifecycle 或 Fins workspace 推断放进 Host / Engine。Host / Engine 仍不读取 `tool_discovery.json`，不 import Fins / Doc / Web provider。
+- 不保留旧 schema 兼容读取；本 WU 按全新 `tool_discovery.json` schema 起库处理，除非后续用户明确要求兼容迁移。
+- 不修改 scene manifest 的 `tool_selection.allow_empty` 语义；该字段属于 scene 工具选择空匹配控制，不是 ToolsDiscovery provider 空输出控制。
+- 不改变 Host public request / response dataclass、Engine `AgentRunRequest`、ToolRuntime callable dispatch 或 framework tool 注入契约。
+- 不实现 SEC/Fins CI pipeline、CN/HK Docling CI pipeline、Web smoke 扩展或 Issue #121 / #122 范围。
+- 不重新设计 upload ingestion workflow、Docling upload conversion、Fins repository schema 或 DocumentRepository 存储布局。
+
+### 直接代码证据
+
+- `dayu/runtime/tools_discovery.py` 当前用 `ToolsDiscoveryProviderSpec.allow_empty` 判断 provider 空输出是否允许通过。
+- `dayu/config/tool_discovery.json` 当前所有 packaged providers 均携带 `allow_empty`，Fins providers 的 `workspace_root` 仍为 `null`，`financial-read-tools` 仍携带 `include_read_tools`，Doc / Fins read limits 仍为空 object，upload provider 仍携带 `allowed_upload_roots`。
+- `dayu/fins/tools/provider.py` 当前在 `include_read_tools=false` 时返回空工具集并跳过 `workspace_root` 解析；这与独立 `financial-read-tools.enabled` 职责重复。
+- `dayu/service/host_assembly.py` 当前只在 raw config `workspace_root is None` 且调用方传入 runtime workspace root 时注入 absolute path；改为 packaged `workspace/` 后需要明确相对 path effective resolution。
+- OLD `/Users/leo/workspace/dayu-agent/dayu/config/run.json` 中 `doc_tool_limits` 与 `fins_tool_limits` 已给出默认业务 limits，当前 dataclass 默认值与其基本一致，但 packaged config 未显式承载。
+- `dayu/fins/tools/upload_provider.py` 当前用 `allowed_upload_roots=[]` 返回空工具集；`dayu/fins/tools/upload_tools.py` 当前用 allowlist 校验工具参数中的本地 `files` 路径；`dayu.fins.storage` repository 写入仍由 `SourceHandle` / `ProcessedHandle` 与 filename 派生目标，不允许调用方指定任意仓储写入目录。
+
+### 成功信号
+
+- Packaged `tool_discovery.json` 不再包含 provider-level `allow_empty`、Fins read `include_read_tools` 或 upload `allowed_upload_roots`。
+- ConfigLoader typed view、ToolsDiscovery provider spec、Service assembly 和 provider tests 均对新 schema 通过；旧字段在当前 schema 下 fail fast 或不再被接受。
+- Fins workspace relative default `workspace/` 能通过 Service effective assembly 解析为 absolute path，并被 Fins read / download / preprocess / upload provider 一致消费。
+- Fins read / Doc limits 在 packaged config 中显式出现，测试覆盖它们进入 tool definitions / truncate specs。
+- Upload provider 不再因空 allowlist 返回空工具集；上传工具不再拒绝 allowlist 外本地路径，但仍校验文件存在、普通文件、非空与上传动作约束，并继续通过 Fins repository 写入。
+- `pytest` 覆盖受影响 runtime / service / tools / fins 测试，`pyright dayu tests utils` 无新增或扩散错误。
+
+### Gate 入口
+
+Plan gate 交给 AgentCodex，计划 artifact 应写入 `docs/host/host-issues/wu-tools-01-f03-r4-tools-discovery-spec-plan.md`，并明确 implementation slices、allowed files、测试命令、README 更新决策和 residual risks。
 
 ## WU-ENG-02-R1 Provider Debugging Correlation Default Enablement And Fallback Diagnostics
 
