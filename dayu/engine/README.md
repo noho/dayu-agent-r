@@ -489,7 +489,7 @@ Engine 不做 proactive threshold compaction、compact / retry、provider-aware 
 
 OpenAI-compatible Runner 只有在 `RunnerSpec.client_correlation_policy == OPENAI_X_CLIENT_REQUEST_ID` 且 `request_identity` 非空时发送 `X-Client-Request-Id`。policy 关闭或 identity 缺失时不发送。policy 开启时，静态 `RunnerSpec.headers` 不得包含大小写不敏感的 `X-Client-Request-Id`。
 
-OpenAI-compatible Runner 的 provider request id 只从响应 header `x-request-id` 提取；`x-trace-id`、`x-correlation-id`、`cf-ray`、W3C trace context、proxy 或 CDN header 不会被映射为 `provider_request_id`。
+OpenAI-compatible Runner 的 provider request id 从响应 header `x-request-id` 提取；DeepSeek 兼容入口缺少 `x-request-id` 时，也会把 `x-ds-trace-id` 映射为 `provider_request_id`。`x-trace-id`、`x-correlation-id`、`cf-ray`、W3C trace context、proxy 或 CDN header 不会被映射为 `provider_request_id`。
 
 ### Runner close
 
@@ -497,7 +497,7 @@ Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结�
 
 ### 可观测日志与诊断载荷
 
-Engine / Runner 日志遵循 `dayu/README.md` 的级别语义。Agent 在 `VERBOSE` 记录 run、iteration、tool loop、fallback / continuation 与 terminal 骨架；在 `DEBUG` 记录 Runner 事件分类细节，并在 `finish_reason=content_filter` 的降级 final 路径记录有界、脱敏的回答预览，帮助定位 provider 内容过滤收口。OpenAI-compatible Runner 在 `VERBOSE` 记录 provider call start / done / cancelled 摘要，在 `DEBUG` 记录 HTTP attempt、response status、`x-request-id`、`X-Client-Request-Id`、finish reason、usage、SSE heartbeat 与协议细节，在 `WARN` 记录 provider retry、协议差异和可恢复传输异常。
+Engine / Runner 日志遵循 `dayu/README.md` 的级别语义。Agent 在 `VERBOSE` 记录 run、iteration、tool loop、fallback / continuation 与 terminal 骨架；在 `DEBUG` 记录 Runner 事件分类细节，并在 `finish_reason=content_filter` 的降级 final 路径记录有界、脱敏的回答预览，帮助定位 provider 内容过滤收口。OpenAI-compatible Runner 在 `VERBOSE` 记录 provider call start / done / cancelled 摘要，在 `DEBUG` 记录 HTTP attempt、response status、实际存在的 provider request id headers、`X-Client-Request-Id`、finish reason、usage、SSE heartbeat 与协议细节；若 provider request id headers 全部缺失，response 日志保留 `x-request-id=None` 作为缺失信号；在 `WARN` 记录 provider retry、协议差异和可恢复传输异常。
 
 Engine / Runner 日志不输出完整 prompt、provider headers、API key、完整工具结果或大段响应。Runner / provider 诊断事件上的 `raw_payload` 是有界、脱敏、摘要化诊断载荷，不保证保留 provider 原始 payload。
 

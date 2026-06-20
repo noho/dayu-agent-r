@@ -91,7 +91,12 @@ from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL, VERBOSE_LOG_LEVEL
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _SSE_CONTENT_TYPE_FRAGMENT: str = "text/event-stream"
-_PROVIDER_REQUEST_ID_HEADER_NAMES: tuple[str, ...] = ("x-request-id",)
+_OPENAI_REQUEST_ID_HEADER_NAME: str = "x-request-id"
+_DEEPSEEK_TRACE_ID_HEADER_NAME: str = "x-ds-trace-id"
+_PROVIDER_REQUEST_ID_HEADER_NAMES: tuple[str, ...] = (
+    _OPENAI_REQUEST_ID_HEADER_NAME,
+    _DEEPSEEK_TRACE_ID_HEADER_NAME,
+)
 # HTTP error body 只用于诊断与 JSON 错误对象解析，必须显式有界读取。
 _HTTP_ERROR_BODY_MAX_BYTES: int = 65_536
 
@@ -111,22 +116,74 @@ class _HTTPErrorBody:
     raw_payload: JsonValue | None
 
 
+def _extract_provider_request_id_entry(
+    headers: Iterable[tuple[str, str]]
+) -> tuple[str, str] | None:
+    """从 provider response headers 提取 request id header 条目。
+
+    :param headers: response header 键值序列。
+    :returns: 命中的 header 名称与去除首尾空白后的值；支持
+        OpenAI-compatible ``x-request-id`` 与 DeepSeek ``x-ds-trace-id``。
+        缺失或空白时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    candidates: dict[str, tuple[str, str]] = {}
+    for name, value in headers:
+        normalized = name.lower()
+        if normalized in _PROVIDER_REQUEST_ID_HEADER_NAMES:
+            stripped = value.strip()
+            if stripped and normalized not in candidates:
+                candidates[normalized] = (name, stripped)
+    for header_name in _PROVIDER_REQUEST_ID_HEADER_NAMES:
+        candidate = candidates.get(header_name)
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def _extract_provider_request_id(headers: Iterable[tuple[str, str]]) -> str | None:
     """从 provider response headers 提取 request id。
 
     :param headers: response header 键值序列。
-    :returns: ``x-request-id`` 去除首尾空白后的值；缺失或空白时返回
-        ``None``。
+    :returns: provider request id header 去除首尾空白后的值；缺失或空白时
+        返回 ``None``。
     :raises Exception: 不主动抛出异常。
     """
 
-    wanted = frozenset(_PROVIDER_REQUEST_ID_HEADER_NAMES)
+    entry = _extract_provider_request_id_entry(headers)
+    if entry is None:
+        return None
+    return entry[1]
+
+
+def _format_provider_request_id_headers_for_log(
+    headers: Iterable[tuple[str, str]]
+) -> str:
+    """格式化 response 中实际存在的 provider request id headers。
+
+    :param headers: response header 键值序列。
+    :returns: 仅包含实际存在且非空的 provider request id header 字段；
+        若全部缺失，返回 ``x-request-id=None`` 作为稳定缺失信号。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    values: dict[str, str] = {}
     for name, value in headers:
-        if name.lower() in wanted:
+        normalized = name.lower()
+        if normalized in _PROVIDER_REQUEST_ID_HEADER_NAMES:
             stripped = value.strip()
-            if stripped:
-                return stripped
-    return None
+            if stripped and normalized not in values:
+                values[normalized] = stripped
+
+    fields = [
+        f"{header_name}={value}"
+        for header_name in _PROVIDER_REQUEST_ID_HEADER_NAMES
+        if (value := values.get(header_name)) is not None
+    ]
+    if not fields:
+        return f"{_OPENAI_REQUEST_ID_HEADER_NAME}=None"
+    return " ".join(fields)
 
 
 def _is_sse_response(*, content_type: str, stream: bool) -> bool:
@@ -616,10 +673,12 @@ class AsyncOpenAIRunner:
             )
             _LOGGER.debug(
                 "runner.http.response status=%d content_type=%s "
-                "x-request-id=%s X-Client-Request-Id=%s",
+                "%s X-Client-Request-Id=%s",
                 response.status,
                 response.headers.get("Content-Type") or "",
-                provider_request_id,
+                _format_provider_request_id_headers_for_log(
+                    response.headers.items()
+                ),
                 client_correlation_id,
             )
             if response.status != 200:

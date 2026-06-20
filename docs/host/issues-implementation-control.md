@@ -360,6 +360,7 @@ Final closeout:
 - Validation retained from accepted slice / PR body: assembly 53 passed, runner 38 passed, Host terminal / Tool Trace 51 passed, Service / CLI 69 passed, pyright 0 errors, `git diff --check` passed.
 - Remaining risks: no blocking risks. Non-blocking deferred risk remains limited to future WU changes that make lost/cancelled lifecycle payloads carry provider/client correlation ids; that future WU must re-check terminal projection suffix behavior.
 - Post-closeout user-requested PR update: OpenAI-compatible Runner `runner.http.response` log now labels the protocol fields as `x-request-id` and `X-Client-Request-Id` instead of semantic internal field names, preserving the same log site, same log level, and same log line. Validation: OpenAI runner focused tests 22 passed, pyright 0 errors, `git diff --check` passed.
+- Post-closeout user-requested PR update: OpenAI-compatible Runner now maps DeepSeek `x-ds-trace-id` into `provider_request_id` when standard `x-request-id` is absent. The existing response DEBUG line logs only present provider request id headers, falls back to `x-request-id=None` when none exist, and continues logging `X-Client-Request-Id` without dumping full response headers. Validation: OpenAI runner focused tests 23 passed, pyright 0 errors, `git diff --check` passed.
 
 Controller plan-review judgment:
 

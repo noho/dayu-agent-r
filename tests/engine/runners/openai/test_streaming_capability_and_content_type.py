@@ -36,6 +36,7 @@ from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.runners.openai.runner import (
     AsyncOpenAIRunner,
     _extract_provider_request_id,
+    _format_provider_request_id_headers_for_log,
     _is_sse_response,
 )
 
@@ -263,7 +264,7 @@ def test_stream_true_unknown_content_type_is_not_sse() -> None:
 
 
 def test_provider_request_id_extraction_ignores_infrastructure_headers() -> None:
-    """provider_request_id 只能来自 ``x-request-id``，不映射基础设施 header。"""
+    """provider_request_id 不映射基础设施 tracing header。"""
 
     assert (
         _extract_provider_request_id(
@@ -284,6 +285,53 @@ def test_provider_request_id_extraction_ignores_infrastructure_headers() -> None
             )
         )
         == "req-provider"
+    )
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-trace-id", "trace-id"),
+                ("x-ds-trace-id", " ds-trace-provider "),
+            )
+        )
+        == "ds-trace-provider"
+    )
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-ds-trace-id", "ds-trace-provider"),
+                ("x-request-id", "req-provider"),
+            )
+        )
+        == "req-provider"
+    )
+
+
+def test_provider_request_id_log_fields_only_include_present_headers() -> None:
+    """response 日志只输出实际存在的 provider request id headers。"""
+
+    assert (
+        _format_provider_request_id_headers_for_log(
+            (("x-ds-trace-id", " ds-trace-provider "),)
+        )
+        == "x-ds-trace-id=ds-trace-provider"
+    )
+    assert (
+        _format_provider_request_id_headers_for_log(
+            (
+                ("x-ds-trace-id", "ds-trace-provider"),
+                ("x-request-id", "req-provider"),
+            )
+        )
+        == "x-request-id=req-provider x-ds-trace-id=ds-trace-provider"
+    )
+    assert (
+        _format_provider_request_id_headers_for_log(
+            (
+                ("x-trace-id", "trace-id"),
+                ("x-request-id", " "),
+            )
+        )
+        == "x-request-id=None"
     )
 
 

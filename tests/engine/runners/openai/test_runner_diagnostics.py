@@ -340,12 +340,13 @@ async def test_response_log_includes_client_correlation_id(
     response_records = [
         record
         for record in caplog.records
-        if "runner.http.response" in record.getMessage()
+        if record.getMessage().startswith("runner.http.response status=")
     ]
     assert len(response_records) == 1
     assert response_records[0].levelno == logging.DEBUG
     response_message = response_records[0].getMessage()
     assert "x-request-id=req-log-correlation" in response_message
+    assert "x-ds-trace-id" not in response_message
     assert (
         f"X-Client-Request-Id={identity.client_correlation_id}"
         in response_message
