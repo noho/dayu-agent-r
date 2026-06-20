@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | draft-PR-pass |
-| implementation status | WU-CM-15 final closeout complete. Draft PR #157 is open draft; PR review PASS from AgentMiMo / AgentDS with no material findings; accepted PR review commit `5e04a841` is recorded and follow-up push has published it to PR #157. |
-| active work unit | WU-CM-15 |
+| gate | accepted plan commit |
+| implementation status | WU-CLI-DEBUG-STREAM-01 plan re-review PASS from AgentMiMo and AgentDS. Accepted plan-review findings are all `已修复`; plan is ready for accepted plan commit. No production code, tests, README, push, PR, issue closeout, or implementation gate is authorized until the accepted plan commit is created. |
+| active work unit | WU-CLI-DEBUG-STREAM-01 |
 | default next work unit | WU-CLI-DEBUG-STREAM-01 |
-| next entry point | After the user manually merges PR #157, pull latest `main` from GitHub and start WU-CLI-DEBUG-STREAM-01 from this control doc. WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148 and must begin at discussion / goal-confirmation; no automatic merge, mark-ready, reviewer request, branch deletion, issue closure, or out-of-scope implementation is authorized. |
-| design source | `docs/host/design.md` and `docs/engine/design.md` for Conversation Memory, Context Governance, compact, fallback, and Host / Engine ownership boundaries. |
+| next entry point | Create accepted plan commit for WU-CLI-DEBUG-STREAM-01, then enter implementation gate for the approved plan. No push, PR, merge, mark-ready, reviewer request, branch deletion, issue closure, or out-of-scope work is authorized. |
+| design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; #156 open as #78 child https://github.com/noho/dayu-agent-r/issues/156; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 PR #150 merged 2026-06-19 https://github.com/noho/dayu-agent-r/pull/150; WU-CM-13 / WU-CM-14 draft PR #152 open draft https://github.com/noho/dayu-agent-r/pull/152; WU-CM-15 draft PR #157 open draft https://github.com/noho/dayu-agent-r/pull/157; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CM-13 / WU-CM-14 / WU-CM-15 are user-directed work units without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for WU-CM-15 final closeout. The latest full four-suite smoke passed with the configured provider environment; future real-provider smoke runs still require valid model API keys. Merge, mark-ready, reviewer requests, branch deletion, and issue closure require separate user authorization. |
+| blocking open questions | None for WU-CLI-DEBUG-STREAM-01 accepted plan commit. Plan gate explicitly excludes `memory_repair.catch_up.budget_exhausted` from implementation scope because current code has already removed that stop reason and preserves warning only for actual memory repair failures. |
 
 状态约定：
 
@@ -241,7 +241,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-13 | draft-PR-pass | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Draft PR #152 open draft. Accepted PR review commit `f2970512` pushed; final closeout recorded in `docs/reviews/wu-cm-13-final-closeout-20260619.md`; `WU-CM-12-S4-R1` and `WU-CM-13-S1-R1` closed. |
 | WU-CM-14 | completed | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Local phaseflow completed. Accepted slice commit `921c6219`; aggregate deepreview PASS after deleting dead `_current_only_material_blocks`. Root cause fixed by passing existing floor into compact selection, adding ordinary post-compaction protected raw tail rendering, and repairing reactive frozen material assembly for protected floor semantics. WU-CM-13 subsequently audited the preservation path into shared compact pipeline ownership. |
 | WU-CM-15 | draft-PR-pass | Conversation memory public smoke reactive compact and fallback coverage | CM smoke / eval coverage follow-up；无 GitHub Issue | Draft PR #157 open draft. Accepted plan commit `97518e93`; accepted implementation slice commit `572a88df`; pre-PR closeout commit `0fe4e910`; accepted PR review / final closeout commit `5e04a841`. PR review PASS from AgentMiMo / AgentDS with no material findings; final closeout recorded in `docs/reviews/wu-cm-15-final-closeout-20260620.md`. |
-| WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
+| WU-CLI-DEBUG-STREAM-01 | accepted-plan | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Goal-confirmation, plan gate, plan review adjudication, plan fix, and plan re-review completed. Plan re-review PASS from AgentMiMo and AgentDS; accepted findings are all `已修复`. Plan scope adds explicit `--debug-stream` so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. `memory_repair.catch_up.budget_exhausted` is excluded from implementation scope as an already-closed bug, with only no-regression verification retained. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
 
@@ -2008,9 +2008,19 @@ Residual risk reconciliation:
 
 ### 状态
 
-`discussion-ready`。Owner / destination is GitHub Issue #148: https://github.com/noho/dayu-agent-r/issues/148.
+`planning`。Owner / destination is GitHub Issue #148: https://github.com/noho/dayu-agent-r/issues/148.
 
-本 WU 是 WU-CM-12 final closeout 后新增的 issue-backed follow-up。当前只完成总控登记，不代表 plan gate 已通过，也不代表可以绕过 issue / code / README scope 核对直接实现。
+本 WU 是 WU-CM-12 final closeout 后新增的 issue-backed follow-up。Goal-confirmation、plan gate、plan review adjudication、plan fix 与 plan re-review 已完成；当前必须先创建 accepted plan commit，再进入 implementation。
+
+Current gate artifacts:
+
+- plan: `docs/host/host-issues/wu-cli-debug-stream-01-debug-stream-plan.md`
+- plan review: `docs/reviews/plan-review-wu-cli-debug-stream-01-mimo-20260620.md` (AgentMiMo); `docs/reviews/plan-review-wu-cli-debug-stream-01-ds-20260620.md` (AgentDS)
+- plan review adjudication: `docs/reviews/plan-review-wu-cli-debug-stream-01-adjudication-20260620.md`
+- plan fix: `docs/reviews/plan-fix-wu-cli-debug-stream-01-20260620.md`
+- plan re-review: `docs/reviews/plan-rereview-wu-cli-debug-stream-01-mimo-20260620.md` (AgentMiMo PASS); `docs/reviews/plan-rereview-wu-cli-debug-stream-01-ds-20260620.md` (AgentDS PASS)
+- plan gate validation: `git diff --check` clean; untracked plan artifact whitespace check clean via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cli-debug-stream-01-debug-stream-plan.md` with expected nonzero no-index exit and no whitespace output.
+- plan fix validation: `git diff --check` clean; untracked fix artifact whitespace check clean via `git diff --no-index --check /dev/null docs/reviews/plan-fix-wu-cli-debug-stream-01-20260620.md` with expected nonzero no-index exit and no whitespace output.
 
 ### Issue Scope
 
@@ -2022,7 +2032,7 @@ Issue #148 要求把普通 `--debug` 与高噪音 stream delta diagnostics 分�
 - `--help`、README 或对应 CLI 用户可见说明需要解释 `--debug` 与 `--debug-stream` 的差异。
 - 需要覆盖 CLI parsing / logging switch tests，验证 `--debug` 不再开启海量 per-delta ingest 日志，`--debug-stream` 可开启这些诊断。
 
-Issue comment 还要求核对 best-effort after-commit `host.memory_repair.catch_up.budget_exhausted` 的普通 `--debug` warning 噪音：required catch-up / rebuild / projection failures 仍应 warning；best-effort budget exhausted 不应在普通 debug 下制造误导性 WARN 噪音。该项是否与 `--debug-stream` 同 slice 处理，必须在 plan gate 以代码证据裁决。
+Issue comment 还要求核对 best-effort after-commit `host.memory_repair.catch_up.budget_exhausted` 的普通 `--debug` warning 噪音。Plan gate 已按当前代码证据和用户裁决确认：这是已修复 bug，不是本 WU 的噪音优化项；当前代码已无 `budget_exhausted` stop reason，required catch-up / rebuild / projection failures 仍应 warning，本 WU 只保留 no-regression verification。
 
 ### Non-goals
 
