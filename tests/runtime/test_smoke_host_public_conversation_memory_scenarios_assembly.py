@@ -41,6 +41,7 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _ASSERT_B_CFO,
     _assert_compact_acceptance,
     _assert_fallback_dispatch_acceptance,
+    _assert_memory_compact_pressure_bounds,
     _assert_reactive_compact_acceptance,
     _FACT_KEY_CATL_CASHFLOW,
     _FACT_KEY_CMB_NIM,
@@ -434,6 +435,11 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
     )
     assert pressure_tokens >= soft_threshold_tokens
     assert pressure_tokens < hard_threshold_tokens
+    _assert_memory_compact_pressure_bounds(
+        assembly.options,
+        PressureMode.AUTO,
+        SuiteMode.MEMORY_COMPACT,
+    )
 
 
 def test_compact_acceptance_requires_event_log_audit_summary(tmp_path: pathlib.Path) -> None:
@@ -523,24 +529,23 @@ def test_reactive_compact_acceptance_helper_requires_reactive_recovery_signals()
     :returns: ``None``。
     """
 
-    report = _compact_audit_report_from_rows(
-        (
-            _event_row(
-                sequence=1,
-                event_id="event-reactive-request",
-                event_type=CONTEXT_COMPACTION_REQUESTED,
-                payload={"trigger_source": "reactive"},
-                run_id="run-reactive-target",
-            ),
-            _event_row(
-                sequence=2,
-                event_id="event-reactive-compacted",
-                event_type=CONTEXT_COMPACTED,
-                payload={"operation_id": "event-reactive-request"},
-                run_id="run-reactive-target",
-            ),
-        )
+    base_rows = (
+        _event_row(
+            sequence=1,
+            event_id="event-reactive-request",
+            event_type=CONTEXT_COMPACTION_REQUESTED,
+            payload={"trigger_source": "reactive"},
+            run_id="run-reactive-target",
+        ),
+        _event_row(
+            sequence=2,
+            event_id="event-reactive-compacted",
+            event_type=CONTEXT_COMPACTED,
+            payload={"operation_id": "event-reactive-request"},
+            run_id="run-reactive-target",
+        ),
     )
+    report = _compact_audit_report_from_rows(base_rows)
     assert _deterministic_dropped_old_marker(SuiteMode.MEMORY_REACTIVE_COMPACT) == _SMOKE_REACTIVE_OLD_MARKER
     observation = DeterministicSmokeObservation(
         dispatches=(
@@ -570,6 +575,58 @@ def test_reactive_compact_acceptance_helper_requires_reactive_recovery_signals()
     )
 
     _assert_reactive_compact_acceptance(report, observation)
+
+    for polluted_rows in (
+        (
+            _event_row(
+                sequence=3,
+                event_id="event-proactive-request",
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload={"trigger_source": "proactive"},
+                run_id="run-reactive-target",
+            ),
+        ),
+        (
+            _event_row(
+                sequence=3,
+                event_id="event-proactive-request",
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload={"trigger_source": "proactive"},
+                run_id="run-reactive-target",
+            ),
+            _event_row(
+                sequence=4,
+                event_id="event-proactive-compacted",
+                event_type=CONTEXT_COMPACTED,
+                payload={"operation_id": "event-proactive-request"},
+                run_id="run-reactive-target",
+            ),
+        ),
+        (
+            _event_row(
+                sequence=3,
+                event_id="event-proactive-request",
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                payload={"trigger_source": "proactive"},
+                run_id="run-reactive-target",
+            ),
+            _event_row(
+                sequence=4,
+                event_id="event-proactive-failed",
+                event_type=CONTEXT_COMPACTION_FAILED,
+                payload={"operation_id": "event-proactive-request"},
+                run_id="run-reactive-target",
+            ),
+        ),
+    ):
+        proactive_polluted = _compact_audit_report_from_rows(
+            (
+                *base_rows,
+                *polluted_rows,
+            )
+        )
+        with pytest.raises(RuntimeError, match="unexpected proactive compact activity"):
+            _assert_reactive_compact_acceptance(proactive_polluted, observation)
 
     missing_reactive = _compact_audit_report_from_rows(())
     with pytest.raises(RuntimeError, match="reactive CONTEXT_COMPACTION_REQUESTED"):

@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted-slice |
-| implementation status | WU-CM-15 implementation and code-review fix completed. Focused re-review PASS from AgentMiMo and AgentDS: `docs/reviews/code-review-20260620-115326.md`, `docs/reviews/code-review-rereview-ds-20260620.md`. Controller local validation passed for assembly tests, reactive compact smoke, fallback dispatch smoke, full pyright, and diff-check. |
+| gate | ready-to-open-draft-PR |
+| implementation status | WU-CM-15 local phaseflow complete. Accepted implementation slice commit `572a88df` plus aggregate fix/re-review changes are ready for final closeout commit. Aggregate deepreview and aggregate-fix re-review PASS; Controller validation passed. |
 | active work unit | WU-CM-15 |
 | default next work unit | WU-CM-15 |
-| next entry point | Create accepted implementation slice commit for WU-CM-15, then proceed to aggregate deepreview / final closeout gate. No automatic merge, mark-ready, reviewer request, branch deletion, issue closure, push, PR, or out-of-scope implementation is authorized. |
+| next entry point | Await user authorization for draft PR gate actions such as push and PR creation. No automatic merge, mark-ready, reviewer request, branch deletion, issue closure, push, PR, or out-of-scope implementation is authorized. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Conversation Memory, Context Governance, compact, fallback, and Host / Engine ownership boundaries. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 PR #150 merged 2026-06-19 https://github.com/noho/dayu-agent-r/pull/150; WU-CM-13 / WU-CM-14 draft PR #152 open draft https://github.com/noho/dayu-agent-r/pull/152; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CM-13 / WU-CM-14 / WU-CM-15 are user-directed work units without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for WU-CM-15 accepted-slice gate. Real-provider `memory-compact` smoke still depends on a valid compactor provider key and remains a validation residual, not a blocker for deterministic reactive/fallback smoke coverage. PR #152 merge, mark-ready, reviewer requests, branch deletion, and issue closure require separate user authorization. |
+| blocking open questions | None for WU-CM-15 local closeout. Real-provider `memory-compact` smoke still depends on a valid compactor provider key and remains a validation residual, not a blocker for deterministic reactive/fallback smoke coverage. PR #152 merge, mark-ready, reviewer requests, branch deletion, and issue closure require separate user authorization. |
 
 状态约定：
 
@@ -1890,7 +1890,7 @@ protected recent raw tail 的基本单位仍是 turn group。最近 `selected_re
 
 ### 状态
 
-`accepted-slice`。当前不创建 GitHub Issue。Goal confirmation 已由用户裁决通过：本 WU 只是增加 public smoke 覆盖，覆盖被动 compact 和 fallback。Accepted plan commit `97518e93` 已创建；implementation slice 已完成 code review fix 与 focused re-review，等待 accepted implementation slice commit 后进入 aggregate deepreview / final closeout gate。
+`ready-to-open-draft-PR`。当前不创建 GitHub Issue。Goal confirmation 已由用户裁决通过：本 WU 只是增加 public smoke 覆盖，覆盖被动 compact 和 fallback。Accepted plan commit `97518e93` 已创建；accepted implementation slice commit `572a88df` 已创建；aggregate deepreview / fix / focused re-review 已通过，等待本地 final closeout commit 后由用户另行授权 draft PR gate 动作。
 
 本 WU 是对 `utils/smoke_host_public_conversation_memory_scenarios.py` fresh run 后发现的 smoke coverage gap 的独立追踪项。当前 `memory-compact` suite 已覆盖真实 conversation memory 主干与 proactive compact accepted 路径，但没有显式覆盖 worker / provider overflow 触发的 reactive compact，也没有显式覆盖 compact 全部失败后的 deterministic fallback dispatch。
 
@@ -1960,13 +1960,24 @@ WU-CM-15 是 public smoke coverage hardening，不替代 #80 的完整 Conversat
 ### Implementation / Review 状态
 
 - accepted plan: `docs/host/host-issues/wu-cm-15-public-smoke-reactive-fallback-plan.md`; accepted plan commit `97518e93`.
+- initial plan review: `docs/reviews/plan-review-20260620-102108.md` (AgentMiMo); `docs/reviews/plan-review-20260620-102145.md` (AgentDS).
+- plan review adjudication: `docs/reviews/wu-cm-15-plan-review-adjudication-20260620.md`.
+- plan fix: `docs/reviews/wu-cm-15-plan-fix-codex-20260620.md`.
+- focused plan re-review: `docs/reviews/plan-review-20260620-102923.md` (AgentMiMo); `docs/reviews/plan-review-20260620-102930.md` (AgentDS).
 - implementation artifact: `docs/reviews/wu-cm-15-implementation-codex-20260620.md`.
 - code review: `docs/reviews/code-review-20260620-112127.md` (AgentDS); `docs/reviews/code-review-20260620-112301.md` (AgentMiMo).
 - code review adjudication: `docs/reviews/wu-cm-15-code-review-adjudication-20260620.md`.
 - fix artifact: `docs/reviews/wu-cm-15-code-review-fix-codex-20260620.md`.
 - focused re-review: `docs/reviews/code-review-20260620-115326.md` (AgentMiMo); `docs/reviews/code-review-rereview-ds-20260620.md` (AgentDS).
 - focused re-review adjudication: `docs/reviews/wu-cm-15-code-review-rereview-adjudication-20260620.md`.
+- accepted implementation slice commit: `572a88df`.
+- aggregate deepreview: `docs/reviews/deepreview-wu-cm-15-aggregate-mimo-20260620.md` (AgentMiMo); `docs/reviews/deepreview-wu-cm-15-aggregate-ds-20260620.md` (AgentDS).
+- aggregate fix: `docs/reviews/wu-cm-15-aggregate-fix-codex-20260620.md`.
+- aggregate fix focused re-review: `docs/reviews/deepreview-wu-cm-15-aggregate-fix-rereview-mimo-20260620.md` (AgentMiMo); `docs/reviews/deepreview-wu-cm-15-aggregate-fix-rereview-ds-20260620.md` (AgentDS).
+- aggregate adjudication: `docs/reviews/wu-cm-15-aggregate-deepreview-adjudication-20260620.md`.
+- final closeout: `docs/reviews/wu-cm-15-final-closeout-20260620.md`.
 - Controller validation after fix: `pytest tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py -q` passed (`20 passed`, existing edgar deprecation warnings); `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-reactive-compact --log-level CRITICAL` passed; `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-compact-fallback --pressure-mode auto --log-level CRITICAL` passed; `python -m pyright dayu/ tests/ utils/` passed (`0 errors`); `git diff --check` clean.
+- Controller validation after aggregate fix: `pytest tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py -q` passed (`20 passed`, existing edgar deprecation warnings); `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-reactive-compact --log-level CRITICAL` passed; `DEEPSEEK_API_KEY=test-provider-key python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-compact-fallback --pressure-mode auto --log-level CRITICAL` passed; `python -m pyright dayu/ tests/ utils/` passed (`0 errors`); `git diff --check` clean.
 - README trigger handled: `tests/README.md` updated only to reflect the added `memory-reactive-compact` / `memory-compact-fallback` assembly coverage and oracles.
 
 ### Residual risks
@@ -1974,6 +1985,7 @@ WU-CM-15 是 public smoke coverage hardening，不替代 #80 的完整 Conversat
 - Existing real-provider `memory-compact` smoke keeps strict proactive accepted compact semantics and still requires a valid compactor provider key; previous `test-provider-key` failure is an environment/provider validation residual, not a blocker for deterministic WU-CM-15 coverage.
 - `_patched_compactor_runner` remains a smoke-local monkey patch around `dayu.host.llm_compaction._run_agent_request`; the fix adds fail-fast identity checking and `finally` restore, but future parallel smoke execution would need a different isolation strategy.
 - The reactive suite uses a suite-local copied `MemoryProjectionPolicy` to bound selected recent items so that the old seed marker is truly written into r1 history but excluded from recovery dispatch; if the default selected recent turn floor grows beyond the six-round layout, the smoke fails closed instead of silently weakening the oracle.
+- Deferred future smoke hardening: decide whether reactive acceptance should also reject nonzero `rejected_proactive`. Current aggregate-fix finding explicitly required requested / compacted / failed proactive zero checks; both focused re-reviews passed. If future config can emit proactive rejection without request/compacted/failed counts, add this as a small smoke hardening follow-up.
 
 ## WU-CLI-DEBUG-STREAM-01 CLI `--debug-stream` Per-Delta Stream Diagnostics
 

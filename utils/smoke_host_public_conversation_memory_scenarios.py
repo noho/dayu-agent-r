@@ -193,6 +193,7 @@ _FINAL_PREVIEW_CHARS: Final[int] = 600
 _TERMINAL_TIMEOUT_SECONDS: Final[float] = 600.0
 _COMPACT_PRESSURE_TARGET_EXTRA_TOKENS: Final[int] = 16_384
 _COMPACT_PRESSURE_HARD_MARGIN_TOKENS: Final[int] = 24_576
+# 575K 预留既有历史、固定 system/tool 消息与真实模型输出涨幅；启动期 bounds 断言负责防止该预留把 auto pressure 压到 soft threshold 以下。
 _COMPACT_PRESSURE_RESERVE_TOKENS: Final[int] = 575_000
 _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS: Final[int] = 160_000
 _COMPACT_PRESSURE_MIN_PROMPT_TOKENS: Final[int] = 1_024
@@ -1857,7 +1858,13 @@ def _patched_compactor_runner(runner: SmokeCompactorRunner) -> Iterator[None]:
     :raises Exception: context 内异常原样向上抛出。
     """
 
-    original_runner = llm_compaction._run_agent_request
+    try:
+        original_runner = llm_compaction._run_agent_request
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Host compactor runner hook changed: "
+            "dayu.host.llm_compaction._run_agent_request is missing"
+        ) from exc
     try:
         llm_compaction._run_agent_request = runner
         if llm_compaction._run_agent_request is not runner:
@@ -2981,6 +2988,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     assembly = _prepare_runtime_assembly(args, env=env)
     assembly.smoke_tool.set_pressure_mode(args.pressure_mode)
     assembly.smoke_tool.set_debug_output(args.debug_smoke_output)
+    _assert_memory_compact_pressure_bounds(assembly.options, args.pressure_mode, args.suite)
     specs = _runtime_round_specs(args, assembly.options)
     _print_assembly_diagnostics(assembly.diagnostics, assembly.options)
     smoke_run_id = _new_smoke_run_id()
@@ -3583,6 +3591,17 @@ def _assert_reactive_compact_acceptance(
     """
 
     summary = report.summary
+    if (
+        summary.requested_proactive > 0
+        or summary.compacted_proactive > 0
+        or summary.failed_proactive > 0
+    ):
+        raise RuntimeError(
+            "memory-reactive-compact observed unexpected proactive compact activity: "
+            f"requested_proactive={summary.requested_proactive} "
+            f"compacted_proactive={summary.compacted_proactive} "
+            f"failed_proactive={summary.failed_proactive}"
+        )
     if summary.requested_reactive < 1:
         raise RuntimeError("memory-reactive-compact did not observe reactive CONTEXT_COMPACTION_REQUESTED")
     if summary.compacted_reactive < 1:
@@ -3648,6 +3667,8 @@ def _assert_fallback_dispatch_acceptance(
     failed_operation = _fallback_failed_operation(report)
     if failed_operation.compacted > 0:
         raise RuntimeError("memory-compact-fallback observed CONTEXT_COMPACTED for failed fallback operation")
+    if not failed_operation.failed_events:
+        raise RuntimeError("memory-compact-fallback expected at least one failed compact event")
     failed_event = failed_operation.failed_events[-1]
     if failed_event.fallback_action != "dispatch":
         raise RuntimeError("memory-compact-fallback did not observe fallback_action=dispatch")
@@ -3718,6 +3739,54 @@ def _assert_fallback_pressure_bounds(observation: DeterministicSmokeObservation)
         raise RuntimeError(
             "memory-compact-fallback pressure reached hard threshold: "
             f"pressure={observation.pressure_tokens} hard={observation.hard_threshold_tokens}"
+        )
+
+
+def _assert_memory_compact_pressure_bounds(
+    options: OpenHostOptions,
+    pressure_mode: PressureMode,
+    suite: SuiteMode,
+) -> None:
+    """启动期断言 real-provider memory-compact auto pressure 落在预算区间内。
+
+    :param options: 本次 Host opener options。
+    :param pressure_mode: 压力注入模式。
+    :param suite: 当前 smoke suite。
+    :returns: ``None``。
+    :raises RuntimeError: context budget policy 缺失或估算压力未落入
+        soft / hard threshold 区间时抛出。
+    """
+
+    if suite is not SuiteMode.MEMORY_COMPACT or pressure_mode is not PressureMode.AUTO:
+        return
+    policy = options.context_budget_policy
+    if policy is None:
+        raise RuntimeError("memory-compact auto pressure requires context budget policy")
+    reserve_tokens = _COMPACT_PRESSURE_RESERVE_TOKENS
+    prompt_tokens = _estimate_chars_as_tokens(len(_compact_pressure_padding(options)))
+    tool_pressure_tokens = _tool_pressure_estimated_tokens()
+    pressure_tokens = prompt_tokens + tool_pressure_tokens + reserve_tokens
+    soft_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.soft_threshold_context_ratio,
+    )
+    hard_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.hard_threshold_context_ratio,
+    )
+    if pressure_tokens < soft_threshold_tokens:
+        raise RuntimeError(
+            "memory-compact auto pressure below soft threshold: "
+            f"reserve={reserve_tokens} prompt_pressure={prompt_tokens} "
+            f"tool_pressure={tool_pressure_tokens} pressure={pressure_tokens} "
+            f"soft={soft_threshold_tokens} hard={hard_threshold_tokens}"
+        )
+    if pressure_tokens >= hard_threshold_tokens:
+        raise RuntimeError(
+            "memory-compact auto pressure reached hard threshold: "
+            f"reserve={reserve_tokens} prompt_pressure={prompt_tokens} "
+            f"tool_pressure={tool_pressure_tokens} pressure={pressure_tokens} "
+            f"soft={soft_threshold_tokens} hard={hard_threshold_tokens}"
         )
 
 
