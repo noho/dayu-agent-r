@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | goal confirmation pending |
-| implementation status | GitHub Issue #63 reopened on 2026-06-20 because PR 114 completed the lower-level Runner request identity mechanism but the real Service / CLI assembly path still sets `RunnerSpec.client_correlation_policy` to `DISABLED`, so default `dayu-cli prompt` does not send `X-Client-Request-Id`; when provider `x-request-id` is absent, users still lack a vendor-debuggable request-level id. |
+| gate | accepted plan commit |
+| implementation status | WU-ENG-02-R1 plan re-review completed by AgentMiMo and AgentDS with `pass` and zero blocking findings. Fixed plan artifact is code-generation-ready for implementation. Accepted plan commit is the next gate action. |
 | active work unit | WU-ENG-02-R1 |
 | default next work unit | WU-ENG-02-R1 |
-| next entry point | Re-run phaseflow preflight, then start goal confirmation for WU-ENG-02-R1 using GitHub Issue #63 reopen comment, `docs/engine/design.md`, `docs/host/design.md`, `dayu/service/host_assembly.py`, Engine RunnerSpec / OpenAI runner request identity code, Host ingest / Tool Trace projection, CLI diagnostics, affected tests, and README trigger rules. |
+| next entry point | Create accepted plan commit containing the fixed plan artifact, plan review artifacts, plan-fix artifact, plan re-review artifacts, and this control-doc state update. After commit, record the accepted plan commit hash and enter implementation gate. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
-| blocking open questions | None for WU-ENG-02-R1 goal confirmation. Implementation must not start until phaseflow preflight and goal confirmation complete. |
+| blocking open questions | None for accepted plan commit gate. Implementation must not start until accepted plan commit is created and recorded. |
 
 状态约定：
 
@@ -241,7 +241,34 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 
 本 WU 是 WU-ENG-02 / PR 114 的 reopened follow-up。WU-ENG-02 已完成 lower-level typed `RunnerRequestIdentity`、`ClientCorrelationPolicy`、OpenAI-compatible `X-Client-Request-Id` 映射能力、provider `x-request-id` 采集、Host ingest 与 Tool Trace 投影；但 reopen comment 指出真实 Service / CLI 默认路径没有启用该能力，因此 #63 不能视为端到端完成。
 
-当前 gate 是 `goal confirmation pending`。本条已由用户指定为 active work unit；进入 plan gate 前必须按 phaseflow 重新执行 preflight、核对 GitHub Issue #63 当前评论、读取 Host / Engine 设计真源和相关代码，再确认目标、非目标、scope boundary 与成功信号。
+当前 gate 是 `accepted plan commit`。Goal confirmation、plan gate、plan review、plan-fix 和 re-review 已完成；进入 implementation 前必须先创建并记录 accepted plan commit。
+
+Plan artifact:
+
+- `docs/host/host-issues/wu-eng-02-r1-provider-debugging-correlation-plan.md`
+
+Plan review artifacts:
+
+- `docs/reviews/plan-review-20260620-210618.md` by AgentDS
+- `docs/reviews/plan-review-20260620-210656.md` by AgentMiMo
+
+Plan fix artifact:
+
+- `docs/reviews/wu-eng-02-r1-plan-fix-codex-20260620.md` by AgentCodex
+
+Plan re-review artifacts:
+
+- `docs/reviews/plan-rereview-wu-eng-02-r1-ds-20260620.md` by AgentDS, conclusion `pass`, blocking findings `0`
+- `docs/reviews/plan-rereview-wu-eng-02-r1-mimo-20260620.md` by AgentMiMo, conclusion `pass`, blocking findings `0`
+
+Controller plan-review judgment:
+
+- `accepted`：终端诊断可见性不能留给 implementation agent 二选一；plan 必须收敛到最小 public contract 变更方案，在 Host public projection 边界追加 bounded diagnostic suffix，不修改 durable terminal payload message / payload digest。
+- `accepted`：live watcher 与 outbox fallback 是两条独立 projection path；plan 必须要求共享同一 suffix formatting helper，并测试两条路径在 `provider_request_id=None` 且 `client_correlation_id` 存在时输出一致 fallback id。
+- `accepted`：用户明确要求 log 中可见，因此 Python runner log 可见性是当前 WU 验收项；plan 必须去掉 escape hatch，要求在既有 `runner.http.response` log site 和既有 log level 上携带 `client_correlation_id`，不新增日志点、日志行或日志等级。
+- `accepted`：provider request id header allowlist 缺少当前 issue 直接证据；plan 必须保持当前 `x-request-id` 提取，不把 `x-trace-id`、`x-correlation-id`、`cf-ray` 等 tracing / infrastructure header 伪装为 provider request id。若需要 header diagnostic，只能记录有界安全 header name presence，不输出 header values。
+- `accepted`：Tool Trace `diagnostic_ref=None` 当前 validation 允许；plan 必须删除“可能需要 event_id fallback”的过度设计风险，明确不伪造 provider request id 或 diagnostic ref。
+- `accepted`：Slice 1 实施前需要基线验证受影响 assembly tests，再区分期望行为变化和 regression。
 
 ### Reopen 直接证据
 
@@ -256,7 +283,7 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 - 默认启用 OpenAI-compatible client correlation：不新增配置项，Service / CLI default assembly 不再把 `client_correlation_policy` 硬编码为 `DISABLED`。
 - 保持 typed provider policy 边界：default enablement 应通过现有 `ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID` 或等价 typed policy 进入 RunnerSpec，不在 Host / Agent / Service 中写 provider 字符串治理分支。
 - 保证真实 CLI / Service path 的普通 Agent -> Runner call 默认发送合法 `X-Client-Request-Id`，且仍不传 `safety_identifier`、fake `user_id` 或 UI / Service 用户概念。
-- 日志 / 诊断 / Tool Trace / terminal diagnostic 中应能看到 `client_correlation_id`；当 `provider_request_id=None` 时，`client_correlation_id` 至少可作为向厂商报障的 fallback id。
+- 现有日志 / 诊断 / Tool Trace / terminal diagnostic 中应能看到 `client_correlation_id`；当 `provider_request_id=None` 时，`client_correlation_id` 至少可作为向厂商报障的 fallback id。不得为此新增日志点，也不得为此修改日志等级；实现只能让现有日志或诊断输出携带 / 展示同源字段。
 - 若 mimo 或 OpenAI-compatible provider 使用非 `x-request-id` 响应 header，应在 plan gate 核对当前 response header access path 后，补充 provider request id 提取策略或输出有界响应头诊断摘要，避免漏采无法定位。
 
 ### 非目标
@@ -267,12 +294,15 @@ https://github.com/noho/dayu-agent-r/issues/63#issuecomment-4756101567
 - 不在本 WU 实现完整 Tool Trace analyzer；WU-OBS-00 / #70 仍负责 analyzer。
 - 不在本 WU 处理 usage observation 是否需要 correlation fields；该 residual 仍由 WU-OBS-00B / #119 裁决。
 - 不实现 native Anthropic / Claude Code gateway adapter-specific request id semantics；该 scope 仍属于 #64 或后续 adapter-specific work unit。
+- 不为 `client_correlation_id` 新增专用日志事件、额外日志行或提高日志等级；日志可见性必须复用已有 runner / Host / CLI diagnostics 输出边界。
 
 ### 验收信号
 
 - Service / CLI default assembly path 的 `RunnerSpec.client_correlation_policy` 默认启用 OpenAI-compatible `X-Client-Request-Id` 映射。
 - 受影响 tests 覆盖 default Service assembly 不再产生 `ClientCorrelationPolicy.DISABLED`。
 - OpenAI-compatible Runner 在 policy 默认启用且 request identity 存在时发送合法 `X-Client-Request-Id`；policy 显式 disabled 的底层契约测试仍能表达 direct Runner / special path 的关闭行为。
+- 现有日志输出能看见 `client_correlation_id`，但不新增日志点、不新增额外日志行、不调整日志等级。
+- Tool Trace hot / cold projection 能看见 `client_correlation_id`，且测试覆盖 `provider_request_id=None` 时仍保留 fallback `client_correlation_id`。
 - Host ingest / Tool Trace / diagnostics 能保留并展示 `client_correlation_id`；当 `provider_request_id=None` 时，诊断输出明确给出 fallback `client_correlation_id`，而不是只显示空 provider id。
 - 若响应 header 中存在 provider request id 的非 `x-request-id` 形式，提取或有界 header diagnostic 能证明是否漏采；不得把完整敏感 header 无界输出到日志或 LLM-facing material。
 - README / CLI help / diagnostics docs 按触发规则检查并按需更新。
