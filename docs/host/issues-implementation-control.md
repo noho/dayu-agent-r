@@ -144,7 +144,7 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | draft-PR-pass |
-| implementation status | WU-CM-15 final closeout complete. Draft PR #157 is open draft; PR review PASS from AgentMiMo / AgentDS with no material findings; accepted PR review commit `5e04a841` is recorded; follow-up push will publish it to PR #157. |
+| implementation status | WU-CM-15 final closeout complete. Draft PR #157 is open draft; PR review PASS from AgentMiMo / AgentDS with no material findings; accepted PR review commit `5e04a841` is recorded and follow-up push has published it to PR #157. |
 | active work unit | WU-CM-15 |
 | default next work unit | WU-CLI-DEBUG-STREAM-01 |
 | next entry point | After the user manually merges PR #157, pull latest `main` from GitHub and start WU-CLI-DEBUG-STREAM-01 from this control doc. WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148 and must begin at discussion / goal-confirmation; no automatic merge, mark-ready, reviewer request, branch deletion, issue closure, or out-of-scope implementation is authorized. |
