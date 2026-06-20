@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | WU-CM-12 final closeout completed after three-way deepreview and focused re-review. Accepted fixes close proactive recovery rejected-attempt diagnostics, reactive recovery catch-up failure handling, recovering fail rejection propagation, cancellation manifest preservation, and memory projection edge cases. |
-| active work unit | WU-CLI-DEBUG-STREAM-01 |
-| default next work unit | WU-CLI-DEBUG-STREAM-01 |
-| next entry point | Start discussion / plan gate for WU-CLI-DEBUG-STREAM-01 (GitHub Issue #148). Inspect issue #148, CLI logging code, runtime log policy, stream / delta diagnostics, and README trigger scope before implementation. |
-| design source | Current active WU: GitHub Issue #148 plus current CLI / runtime logging / Host / Engine stream diagnostic code. `docs/host/design.md` and `docs/engine/design.md` must be checked only if the plan proposes Host / Engine contract or lifecycle semantics changes. |
-| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 draft PR #150 https://github.com/noho/dayu-agent-r/pull/150; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CLI-FINS-OBS-01 is user-directed next work unit without GitHub Issue; WU-CM-12 is user-directed next work unit without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for WU-CM-12 final closeout. WU-CLI-DEBUG-STREAM-01 still needs discussion / plan confirmation before code changes. Draft PR #150 remains open draft; merge, mark-ready, reviewer requests, and issue closure require separate user authorization. |
+| gate | draft-PR-pass |
+| implementation status | WU-CM-13 / WU-CM-14 local phaseflow completed at draft-PR-pass. PR #152 review PASS accepted in commit `f2970512`, pushed to draft PR #152, and final closeout recorded. WU-CM-15 is registered as discussion-ready and has not entered phaseflow. |
+| active work unit | None. WU-CM-15 is the default next discussion item but not yet in plan / implementation. |
+| default next work unit | WU-CM-15 |
+| next entry point | Discuss / goal-confirm WU-CM-15, or user decision on PR #152: mark ready / request reviewers / merge later. No automatic merge, mark-ready, reviewer request, branch deletion, issue closure, or WU-CM-15 implementation is authorized. |
+| design source | `docs/host/design.md` and `docs/engine/design.md` for Conversation Memory, Context Governance, compact, fallback, and Host / Engine ownership boundaries. |
+| issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 PR #150 merged 2026-06-19 https://github.com/noho/dayu-agent-r/pull/150; WU-CM-13 / WU-CM-14 draft PR #152 open draft https://github.com/noho/dayu-agent-r/pull/152; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CM-13 / WU-CM-14 / WU-CM-15 are user-directed work units without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
+| blocking open questions | WU-CM-15 needs discussion / goal confirmation before phaseflow. PR #152 merge, mark-ready, reviewer requests, branch deletion, and issue closure require separate user authorization. |
 
 状态约定：
 
@@ -159,8 +159,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 - `blocked-by-issue`：需要等待指定 GitHub Issue / umbrella / dependency 完成。
 - `obsolete`：已裁决过期失效，不作为实施入口。
 - `planning`：正在形成或 review code-generation-ready plan。
+- `accepted-plan`：plan / review / re-review 已通过，等待 accepted plan commit 或进入 implementation。
 - `implementation`：正在实施或修复。
 - `review`：正在进行 code review、re-review 或 aggregate deepreview。
+- `accepted-slice`：implementation slice 已通过 code review / re-review，等待 accepted slice commit 或 aggregate deepreview。
 - `ready-to-open-draft-PR`：本轮 work unit 已完成本地 gate，等待进入 draft PR gate。
 - `draft-PR-pass`：draft PR gate 已通过。
 
@@ -202,9 +204,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
 | WU-TOOLS-01-F03-R4 | transferred-to-issue | GitHub Issue #133 | 评估并调整 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
-| WU-CM-12-S4-R1 | deferred-with-owner | WU-CM-13 Reactive compact recovery follow-up | S4/S5 accepted proactive tier 1-3 compact recovery before dispatch fallback only. S5 adjudication concluded reactive tier 1-3 recovery would require separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Current WU does not add schema/API/EventLog/Engine role changes and defers reactive recovery to WU-CM-13, which must not enter implementation until a user or GitHub Issue assigns it as active owner. |
-| WU-CM-12-PR-R1 | deferred-with-owner | Future Host compact evidence cleanup WU；no default next entry | PR review observed `dayu/host/compaction_evidence.py` appears to have no production import after FIX-R1. Current PR review PASS does not require deleting it because deletion would be cleanup scope, not material-guard correctness. Future cleanup must decide whether to delete the module and migrate tests, or document its deferred owner if still needed. |
-| WU-CM-12-PR-R3 | closed | WU-CM-12 final closeout 2026-06-19 | Closed by operation-level rejected attempt aggregation and renumbering in proactive compact recovery; initial and recovery tier rejected attempts are now persisted as `CONTEXT_COMPACTION_ATTEMPT_REJECTED` and counted in `CONTEXT_COMPACTION_FAILED.attempt_count`. |
 
 ## 当前 Work Units
 
@@ -238,8 +237,10 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-09 | completed | Durable memory snapshot corruption policy | GitHub Issue #41 | #81 已关闭；final closeout completed in `docs/reviews/final-closeout-20260614-cm-05-06-08-09.md`；accepted deepreview commit `3e98565d` |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
-| WU-CM-12 | draft-PR-pass | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | Draft PR #150 is open draft. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
-| WU-CM-13 | deferred | Reactive compact recovery tier 1-3 follow-up | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Deferred destination only. WU-CM-12 implements proactive tier 1-3 recovery; reactive recovery requires separate Engine ingest recovery sequencing, run-local cancellation checks, execution/cursor commit guards, and reactive accepted/fallback ordering. Do not implement until user or GitHub Issue explicitly assigns WU-CM-13 as active owner. |
+| WU-CM-12 | completed | Conversation Memory design refinement and implementation drift repair | 用户裁决；无 GitHub Issue | PR #150 merged on 2026-06-19. Final closeout completed again on 2026-06-19 after three-way deepreview and focused re-review; proactive recovery diagnostics, reactive recovery catch-up handling, cancellation manifest preservation, and memory projection edge cases are closed. |
+| WU-CM-13 | draft-PR-pass | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Draft PR #152 open draft. Accepted PR review commit `f2970512` pushed; final closeout recorded in `docs/reviews/wu-cm-13-final-closeout-20260619.md`; `WU-CM-12-S4-R1` and `WU-CM-13-S1-R1` closed. |
+| WU-CM-14 | completed | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Local phaseflow completed. Accepted slice commit `921c6219`; aggregate deepreview PASS after deleting dead `_current_only_material_blocks`. Root cause fixed by passing existing floor into compact selection, adding ordinary post-compaction protected raw tail rendering, and repairing reactive frozen material assembly for protected floor semantics. WU-CM-13 subsequently audited the preservation path into shared compact pipeline ownership. |
+| WU-CM-15 | discussion-ready | Conversation memory public smoke reactive compact and fallback coverage | CM smoke / eval coverage follow-up；无 GitHub Issue | Add explicit smoke coverage for reactive compact and deterministic fallback without weakening the existing `memory-compact` proactive acceptance. Must discuss suite shape before implementation. |
 | WU-CLI-DEBUG-STREAM-01 | discussion-ready | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Add explicit `--debug-stream` switch so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. Must inspect current CLI parser, runtime logging, stream diagnostics sites, tests, and README trigger scope before implementation. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
@@ -1677,50 +1678,284 @@ rendered_context =
 - final closeout 必须输出一份代码常量审计清单：列出代码中仍出现、且没有在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 中定义的 LLM-facing memory material / compact material 产量相关常量；对每个常量说明状态为“已删除 / 已迁入 policy / 保留但非 LLM-facing / 保留为 parser safety guard / deferred-with-owner”，并说明理由。
 - 受影响 Host memory / compact / RunInput / fallback tests 和相关 smoke 已更新并通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
 
-## WU-CM-13 Reactive Compact Recovery Tier 1-3 Follow-up
+## WU-CM-13 Unified Conversation Compact Pipeline Convergence
 
 ### 状态
 
-Deferred destination only。当前不创建 GitHub Issue，不是默认 next entry point，不进入 implementation。它只承接 `WU-CM-12-S4-R1`：`WU-CM-12` S4/S5 已接受 proactive pre-dispatch compact recovery tier 1-3；reactive compact recovery 需要另一条 Engine ingest recovery sequencing，因此从 `WU-CM-12` 当前实现范围中显式拆出。
+Deferred destination only。当前不创建 GitHub Issue，不是默认 next entry point，不进入 implementation。它承接 `WU-CM-12-S4-R1`，但 owner 语义经代码核对后重新收敛：问题不是“reactive recovery sequencing 从零缺失”，而是 proactive / reactive 目前只共享部分 compact 内核，尚未共享从 Conversation Memory material 到 accepted compact / failed compact / fallback decision 的完整 Host compact pipeline。
 
-当前 active WU 仍是 `WU-CM-12`，当前 open 修复项仍是 `WU-CM-12-FIX-R1`。`WU-CM-13` 不得阻塞 `WU-CM-12-FIX-R1`，也不得作为继续保留 EventLog-derived material 私有合法性检查、字段级 cap、默认 evidence chunking 或 `_ACCEPTED_TOOL_EVIDENCE_MATERIAL_LIMIT` 的理由。
+当前代码事实：reactive path 已具备 Engine ingest recovery sequencing、run-local cancellation token 传递、execution / cursor commit guard、accepted compact 后 recovery Attempt 启动，以及 fallback dispatch / fail-closed ordering。`WU-CM-13` 不应再按“补 reactive 状态机”理解；它的目标是消除 compact semantic pipeline 分散在 `dispatch.py` 与 `engine_ingest.py` 后导致的语义漂移风险。
+
+实施顺序允许 `WU-CM-14` 先于 `WU-CM-13`。若 `WU-CM-14` 先落地 recent final answer preservation 逻辑，`WU-CM-13` 后续激活时必须把该逻辑作为 compact semantic pipeline 的组成部分重新核对并纳入共享路径；不得把 `WU-CM-14` 留作 proactive-only、reactive-only 或 RunInput-only 的旁路例外。
 
 ### 背景与动机
 
-`WU-CM-12` 的 compact recovery 已覆盖 proactive path：dispatch 前发现 normal context 超预算时，可按 tier 1-3 尝试更紧 recent window、section-aware compacted view degrade 或 delta-only compact recovery；接受后再进入 dispatch。该路径的 sequencing、accept barrier 与 `CONTEXT_COMPACTED` commit point 都在 Host pre-dispatch control 内。
+从第一性原理看，proactive compact 与 reactive compact 的触发 envelope 不同，但 compact 语义本身应是同一套：给定同源 EventLog / material source、latest accepted compacted view、post-compact delta material 与 current input anchor，Host 应通过同一组 selection / rendering / compact operation / quality gate / accepted-or-failed result construction 得到：
 
-Reactive compact recovery 不同：它发生在 Engine ingest / dispatch 已经进入执行后的上下文失败或 provider context pressure 反馈之后。若直接复用 proactive compact recovery，容易混淆 Engine 已执行状态、Host run cancellation、cursor commit、accepted/fallback ordering 与 final response material，因此必须作为独立 WU 重新设计。
+- accepted `CONTEXT_COMPACTED`，由 Conversation Memory projection 物化为五类 Session Semantic Memory；
+- 或 `CONTEXT_COMPACTION_FAILED`，携带 retry / repair / fallback diagnostic；
+- 或 tier 4/5 fallback decision input，只影响本次 RunInput rendering，不提交 compacted memory truth。
+
+当前实现已共享 `run_compaction_operation()`、compact material pack builder 与 context event payload builder，但 proactive 与 reactive 仍分别拥有 material-to-result orchestration、accepted compact event append、failed compact event append、fallback decision glue，以及 tier 1-3 / multi-pass / tier 4/5 的局部策略入口。若继续分散实现，五类 Session Semantic Memory、展开版 `assemble(...)`、tier 1-3 compact recovery、tier 4/5 fallback、artifact / payload descriptor、attempt_count / rejected-attempt diagnostic 和 accepted compacted view 语义都可能漂移。
+
+`WU-CM-14` 的 recent final answer preservation 也是同一原则下的 compact / RunInput material 语义：触发方式可以不同，但给定同一段 history、同一个 current input anchor、同一个 compact candidate / fallback decision 时，preservation 结果不应因 proactive 或 reactive trigger 漂移。若 `WU-CM-14` 在 `WU-CM-13` 之前实现，`WU-CM-13` 需要把它纳入 unified pipeline audit，而不是只统一既有 compact event construction。
+
+外层状态机仍必须分开：proactive 是 pre-dispatch input governance；reactive 是 Engine overflow 后关闭当前 Attempt、Run 进入 `RECOVERING`、再启动 recovery Attempt。`WU-CM-13` 只统一 compact semantic pipeline，不把 proactive / reactive lifecycle 强行合并。
 
 ### 目标
 
-- 设计并实现 reactive compact recovery tier 1-3 的 Host / Engine ingest sequencing，前提是用户或 GitHub Issue 后续明确把 `WU-CM-13` 设为 active owner。
-- 明确 reactive path 中 compact recovery proposal、LLM compactor 调用、accepted compact commit、fallback dispatch / response ordering 的状态机。
-- 在 reactive compact recovery 的每个 commit 点检查 run-local cancellation token、execution identity、cursor identity 与 Host admitted run identity，避免 stale recovery 写入或覆盖后续 run。
-- 确保 accepted reactive compact output 仍只投影为五类 Session Semantic Memory，不产生新的 durable truth 或旁路 memory shape。
-- 保持 EventLog-derived LLM-facing material 的同一原则：从 EventLog 读取的 current input、prior conversation material、accepted tool evidence 默认是合法 LLM input material；上下文缩小只能通过 deterministic selection、whole-item / whole-section keep-drop、chunking with provenance 或 fail closed 表达。
+- 抽出一个 Host 内部 compact pipeline owner，使 proactive / reactive 共享从 material view / material blocks 到 compact result 的语义代码路径。
+- 若 `WU-CM-14` 已先实施，审计其 recent final answer preservation owner，并将其纳入 proactive / reactive shared compact material、fallback material 或 RunInput assembly 路径；不得保留触发方式专属的 preservation 分支。
+- 收口 `dayu/host/compaction_evidence.py` 的旧 owner 状态：若其能力已由 unified pipeline / `compact_material.py` 覆盖，则删除模块并迁移测试；若仍有必要能力，则迁入 unified pipeline，不保留无生产调用的旁路 material helper。
+- 统一 compact request generation：latest accepted compacted view、post-compact delta material、current input anchor、selected material blocks、prompt-local labels、source boundary refs 与 accepted evidence mapping refs 必须同源。
+- 统一 compact recovery tiers：tier 1 fallback selected recent window、tier 2 section-aware compacted view degrade、tier 3 delta-only compact input 必须对 proactive / reactive 使用同一组 request builder / renderer 规则；reactive 需要 multi-pass 时也必须建立在同一组 material block 与 provenance 语义上。
+- 统一 accepted compact result construction：artifact JSON、payload descriptor、`CONTEXT_COMPACTED` payload、accepted proposal manifest refs、quality check result、budget after compact、projection signal 与 accepted compacted view 语义不得在 dispatch / engine ingest 两处重复漂移。
+- 统一 failed compact / fallback result construction：`CONTEXT_COMPACTION_FAILED` payload、attempt_count、retry / repair budget exhausted、rejected attempt diagnostic refs、tier 4/5 fallback input window、fallback budget result 与 fallback action 必须由同一套 helper 生成。
+- 保持五类 Session Semantic Memory projection 只消费 accepted `CONTEXT_COMPACTED`；fallback、diagnostic、Host governance state、Engine state 不得被投影为业务事实。
 
 ### 非目标
 
-- 不在当前 `WU-CM-12-FIX-R1` 中实现 reactive compact recovery。
+- 不新增另一套 reactive-only compact implementation。
+- 不保留 `dayu/host/compaction_evidence.py` 作为无生产调用、仅测试依赖的 shadow owner。
+- 不把 dispatch lifecycle、Engine ingest lifecycle、Attempt closeout、`RUN_RECOVERING`、recovery Attempt creation 合并成一个 God pipeline；这些仍由各自 outer orchestration 持有。
 - 不修改 public API、durable schema、EventLog canonical semantics、Engine provider contract 或跨层 contract，除非 `WU-CM-13` 激活后在 plan gate 获得单独裁决。
-- 不把 reactive compact recovery 用作私有 DTO 字段长度上限、preview 化、summary 化、默认 evidence 条数限制或字段级裁剪的依据。
+- 不把 unified pipeline 用作私有 DTO 字段长度上限、preview 化、summary 化、默认 evidence 条数限制或字段级裁剪的依据。
 - 不引入 semantic search、vector recall、长期 memory retrieval framework 或 User Profile Memory。
-- 不改变 `WU-CM-12` 已接受的 proactive tier 1-3 / dispatch fallback tier 4-5 语义，除非后续设计真源明确修订。
+- 不改变 `WU-CM-12` 已接受的 proactive / reactive lifecycle 语义，除非后续设计真源明确修订。
 
 ### 激活条件
 
 - 用户或 GitHub Issue 明确指定 `WU-CM-13` 为 active owner；仅有 `WU-CM-12-S4-R1` deferred row 不足以启动实现。
-- `WU-CM-12-FIX-R1` 已关闭，或用户明确要求打断当前 material guard fix 转入 reactive recovery。
-- 启动时重新核对 `docs/host/design.md` 与本总控，确认 reactive recovery 仍符合 Conversation Memory 的 normal / fallback state machine 与 no silent truncation 约束。
+- 若 `WU-CM-14` 已经进入 plan 或 implementation，`WU-CM-13` preflight 必须读取其设计裁决、代码路径和测试，明确哪些 preservation helper 属于 unified compact pipeline audit 范围。
+- 启动时重新核对 `docs/host/design.md`、`docs/engine/design.md` 与本总控，确认 unified compact pipeline 仍符合 Conversation Memory 的 normal / fallback state machine、five semantic memory、`assemble(...)` 与 no silent truncation 约束。
 - 若计划触及 Host / Engine public API、durable schema、EventLog canonical semantics 或 provider contract，必须在 plan gate 停下交给用户裁决。
 
 ### 验收信号
 
-- `WU-CM-13` plan 明确 reactive compact recovery 与 proactive pre-dispatch compact recovery 的状态机差异、输入输出、accept barrier、fallback ordering 和 commit guard。
-- 测试覆盖 reactive tier 1、tier 2、tier 3 recovery；run cancellation；execution identity mismatch；cursor mismatch；stale recovery proposal；accepted compact commit；reactive fallback dispatch / response ordering。
-- 验证 reactive accepted compact output 仍只生成五类 Session Semantic Memory，并且不把 fallback / diagnostic / Host governance state 投影为业务事实。
-- 受影响 Host / Engine ingest / compact / RunInput tests 通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+- `WU-CM-13` plan 明确 shared compact pipeline owner、outer proactive / reactive lifecycle boundary、commit guard 输入、result shape、fallback ordering 与测试边界。
+- `WU-CM-13` plan 明确 `WU-CM-14` recent final answer preservation 与 shared compact pipeline 的关系：若该逻辑已存在，必须说明它被迁入 / 复用 / 保持在共享 owner 下；若尚未存在，必须说明未来 `WU-CM-14` 不得绕过 shared owner。
+- proactive 与 reactive 的 compact request builder 使用同一组 material selection / rendering helper；差异只来自 trigger envelope、attempt / execution identity、cancellation token 与 commit guard。
+- proactive 与 reactive 下的 recent final answer preservation / fallback / RunInput assembly 语义一致；如果某一路径不适用，测试或 plan 必须用状态机证据说明它不会经过该 preservation owner。
+- `dayu/host/compaction_evidence.py` 已删除并完成测试迁移，或其仍需要的能力已迁入 unified compact pipeline owner 且存在生产调用；不得留下只有测试 import 的 Host material owner。
+- proactive 与 reactive 的 accepted compact artifact / payload descriptor / `CONTEXT_COMPACTED` payload 由同一组 helper 生成；测试断言同一 compact candidate 在两种触发路径下产生一致的 accepted compacted view 语义。
+- proactive 与 reactive 的 `CONTEXT_COMPACTION_FAILED` / tier 4/5 fallback diagnostic 由同一组 helper 生成；测试覆盖 fallback dispatch 与 fail-closed。
+- 测试覆盖 proactive tier 1、tier 2、tier 3；reactive tier 1、tier 2、tier 3；reactive multi-pass；run cancellation；execution identity mismatch；cursor mismatch；stale recovery proposal；accepted compact commit；fallback dispatch / fail-closed ordering。
+- 验证 accepted compact output 仍只生成五类 Session Semantic Memory，并且 fallback / diagnostic / Host governance state / Engine state 不投影为业务事实。
+- 受影响 Host dispatch / Engine ingest / compact / RunInput / memory projection tests 通过；`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+- `utils/smoke_host_public_conversation_memory_scenarios.py` 必须真实运行成功，作为 WU-CM-13 final acceptance 的硬门槛；不得通过修改该 smoke、降低覆盖、绕过场景、放宽断言或改成无效通过来满足验收。
+
+### Current gate artifacts
+
+- plan: `docs/host/host-issues/wu-cm-13-unified-compact-pipeline-plan.md`
+- plan review: `docs/reviews/plan-review-20260619-194515.md`
+- plan review: `docs/reviews/plan-review-20260619-194657.md`
+- focused plan re-review: `docs/reviews/plan-review-20260619-195507.md`
+- focused plan re-review: `docs/reviews/plan-review-20260619-195521.md`
+- final focused plan re-review: `docs/reviews/plan-review-20260619-200133.md`
+- final focused plan re-review: `docs/reviews/plan-review-20260619-200143.md`
+- plan adjudication: `docs/reviews/plan-review-wu-cm-13-adjudication-20260619.md`
+- accepted scope: thin `compact_pipeline.py` helper owner; no tier 5 current-input-only fallback implementation; lifecycle guards remain caller-owned; WU-CM-14 uses pipeline-owned audited second-read raw-tail selection; `compaction_evidence.py` must be removed or fully migrated.
+- Slice 1 implementation: `dayu/host/compact_pipeline.py` helper contracts, `tests/host/test_compact_pipeline.py`, `compaction_evidence.py` deletion, migrated compact material / operation tests, and `tests/README.md` update.
+- Slice 1 code review: `docs/reviews/deepreview-20260619-211229.md`; `docs/reviews/deepreview-wu-cm-13-slice-1-20260619-211311.md`.
+- Slice 1 code review adjudication: `docs/reviews/code-review-wu-cm-13-slice-1-adjudication-20260619.md`.
+- Slice 1 validation: `pytest tests/host/test_compact_pipeline.py tests/host/test_compact_material.py tests/host/test_compaction_operation.py -q` PASS (`91 passed`); `python -m pyright dayu/ tests/ utils/` PASS (`0 errors`); `git diff --check` PASS; old `compaction_evidence` helper symbols absent from `dayu` and `tests`.
+- accepted Slice 1 commit: `0390c9ad`.
+- Slice 1 residual reconciliation: `WU-CM-12-PR-R1` closed by deleting `dayu/host/compaction_evidence.py` and migrating useful tests to `compact_material.py` / `compact_pipeline.py`; `WU-CM-13-S1-R1` and `WU-CM-13-S1-R2` deferred to Slice 2.
+- Slice 2a implementation: proactive `dispatch.py` normal request uses `build_normal_compact_request_plan(...)`; proactive tier 1-3 recovery uses `build_tier_recovery_request_plans(...)`; proactive fallback failed payload / decision input uses `build_fallback_decision_input(...)`; dispatch-owned lifecycle and EventLog writes remain in `dispatch.py`.
+- Slice 2a code review: `docs/reviews/deepreview-20260619-212804.md`; `docs/reviews/deepreview-wu-cm-13-slice-2a-20260619-212944.md`.
+- Slice 2a code review adjudication: `docs/reviews/code-review-wu-cm-13-slice-2a-adjudication-20260619.md`.
+- Slice 2a validation: `pytest tests/host/test_dispatch_scheduler.py tests/host/test_compact_pipeline.py -q` PASS (`88 passed`); `python -m pyright dayu/ tests/ utils/` PASS (`0 errors`); `git diff --check` PASS; old proactive fallback helper / tier 5 / `fallback_tier` symbols absent from `dayu/host/dispatch.py`.
+- accepted Slice 2a commit: `b180a510`.
+- Slice 2a residual reconciliation: `WU-CM-13-S1-R2` is closed for proactive dispatch; the reactive ingest half remains tracked by the same residual until Slice 2b.
+- Slice 2b implementation: reactive `engine_ingest.py` request construction uses `build_normal_compact_request_plan(...)`; reactive pass queue uses `build_reactive_pass_queue_plan(...)`; reactive fallback failed payload / decision input uses `build_fallback_decision_input(...)`; reactive lifecycle, cancellation, EventLog writes, and recovery Attempt creation remain in `engine_ingest.py`.
+- Slice 2b code review: `docs/reviews/deepreview-20260619-214447.md`; `docs/reviews/deepreview-wu-cm-13-slice-2b-20260619-214451.md`.
+- Slice 2b code review adjudication: `docs/reviews/code-review-wu-cm-13-slice-2b-adjudication-20260619.md`.
+- Slice 2b validation: `pytest tests/host/test_dispatch_scheduler.py tests/host/test_compact_pipeline.py -q` PASS (`88 passed`); `python -m pyright dayu/ tests/ utils/` PASS (`0 errors`); `git diff --check` PASS; old reactive request / pass queue / fallback helper / tier 5 / `fallback_tier` symbols absent from `dayu/host/engine_ingest.py`.
+- accepted Slice 2b commit: `7b0367ab`.
+- Slice 2b residual reconciliation: `WU-CM-13-S1-R2` closed by removing proactive and reactive duplicate helper owners from `dispatch.py` / `engine_ingest.py`.
+- Slice 2c implementation: `run_input.py` ordinary post-compaction protected raw-tail provider now consumes `CompactPipelineProtectedRawTailProvider`, returns `CompactPipelineOrdinaryRawTailHandoff`, and delegates protected recent group selection / memory dedup to `select_ordinary_protected_raw_tail(...)`; fallback RunInput assembly remains on `_fallback_context_messages(...)`.
+- Slice 2c code review: `docs/reviews/deepreview-20260619-220450.md`; `docs/reviews/deepreview-wu-cm-13-slice-2c-20260619-220501.md`.
+- Slice 2c code review adjudication: `docs/reviews/code-review-wu-cm-13-slice-2c-adjudication-20260619.md`.
+- Slice 2c validation: `pytest tests/host/test_run_input_builder.py tests/host/test_compact_pipeline.py -q` PASS (`107 passed`); `python -m pyright dayu/ tests/ utils/` PASS (`0 errors`); `git diff --check` PASS; required search confirms `compact_pipeline.py` owns ordinary protected raw-tail selection and `run_input.py` retains `protected_recent_turn_group_ids_for_material_blocks` only for the explicit fallback branch non-goal.
+- Slice 2c residual reconciliation: `WU-CM-14-RR-1` closed because WU-CM-14 preservation is now audited through shared proactive/reactive compact pipeline helpers plus pipeline-owned ordinary raw-tail selection; `WU-CM-14-RR-3` closed because the second EventLog read remains a durable freshness adapter, while selection semantics are shared in `compact_pipeline.py`. `WU-CM-13-S1-R1` remains deferred to aggregate deepreview / final smoke for whole-WU accepted compact quality/provenance audit.
+- accepted Slice 2c commit: `7aab0f94`.
+- aggregate deepreview: `docs/reviews/deepreview-wu-cm-13-aggregate-mimo-20260619.md`; `docs/reviews/deepreview-wu-cm-13-aggregate-ds-20260619.md`.
+- aggregate deepreview adjudication: `docs/reviews/deepreview-wu-cm-13-aggregate-adjudication-20260619.md`.
+- aggregate validation: `pytest tests/host/test_compact_pipeline.py tests/host/test_compact_material.py tests/host/test_compaction_operation.py tests/host/test_dispatch_scheduler.py tests/host/test_run_input_builder.py tests/host/test_memory_projection.py -q` PASS (`305 passed`); `python -m pyright dayu/ tests/ utils/` PASS (`0 errors, 0 warnings, 0 informations`); `python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-compact --pressure-mode auto` PASS (`SMOKE COMPACT_ACCEPTANCE status=pass requested_proactive=4 compacted_proactive=4 failed_total=0 artifact_files=12`); `git diff --check` PASS.
+- aggregate residual reconciliation: `WU-CM-12-S4-R1` closed by accepted proactive/reactive shared compact pipeline convergence; `WU-CM-13-S1-R1` closed because the old malformed compacted payload fact-ref edge is closed by the typed `ConversationCompactOutputVNext` helper boundary plus operation-level candidate rejection coverage and compact payload/material provenance tests.
+- accepted deepreview commit: `00da03a3`.
+- PR preflight: `gh pr status` confirmed current branch has no associated PR; `gh pr view 150 --json ...` confirmed PR #150 is merged and came from `wu-cm-12-conversation-memory-drift`, not current branch.
+- draft PR: #152 https://github.com/noho/dayu-agent-r/pull/152 (`wu-cm-14-final-answer-preservation` -> `main`, draft).
+- PR review: `docs/reviews/pr-152-review-mimo-20260619.md`; `docs/reviews/pr-152-review-ds-20260619.md`.
+- PR review adjudication: `docs/reviews/pr-152-review-adjudication-20260619.md`.
+- PR review conclusion: PASS; no fix gate required. DS low finding about duplicated internal evidence source prefix constants is rejected because ordinary/fallback rendering path separation is intentional and extracting a shared owner now would add unnecessary coupling.
+- accepted PR review commit: `f2970512`, pushed to #152.
+- final closeout: `docs/reviews/wu-cm-13-final-closeout-20260619.md`.
+- current gate: draft-PR-pass. PR #152 remains draft; mark-ready, reviewer requests, merge, branch deletion, and issue closure require separate user authorization.
 - 若引入任何新的 LLM-facing memory material / compact material 产量常量，必须在 `dayu/config/execution_profiles.json` 的 `memory_projection_policy` 或本 WU 明确批准的 policy owner 中定义；否则 final closeout 的常量审计必须列为 open residual。
+
+## WU-CM-14 Recent Final Answer Preservation for Ordinal Follow-ups
+
+### 状态
+
+`discussion-ready`。当前不创建 GitHub Issue，不进入 plan / implementation。本 WU 是 CM 语义讨论中新增的独立追踪项，承接 residual `WU-CM-14-R1`。
+
+本 WU 不修改 `WU-CM-13` 的范围。`WU-CM-13` 只统一 proactive / reactive compact pipeline；本 WU 专注 compact 后 ordinary RunInput 是否仍具备回答局部序号追问所需的最近 assistant final answer 上下文。
+
+两者存在实现约束关联：`WU-CM-14` 的 preservation 语义一旦被裁决为需要进入 compact material、compact accept quality gate、fallback material 或 ordinary RunInput assembly，就必须落在 proactive / reactive 共享的代码路径上，不得分别实现主动触发 compact 与被动触发 compact 的两套 preservation 逻辑。
+
+### 场景
+
+第 N 轮 assistant final answer 列出 4 条详细内容。第 N+1 轮用户输入“详细解释第三条”，并且本轮 dispatch 前触发 compact。
+
+需求裁决：compact 后第 N+1 轮送给 Engine 的 messages 不能只等价于 `latest_accepted_compacted_view + current user prompt`。Host 必须在 compact boundary 后继续保留既有 protected recent raw tail；该 tail 复用现有 `selected_recent_window_turn_floor` / protected recent floor 语义，不新增 WU-CM-14 专属 floor、ordinal follow-up floor 或 prompt-pattern-specific cap。
+
+protected recent raw tail 的基本单位仍是 turn group。最近 `selected_recent_window_turn_floor` 个 turn group 中已 committed、eligible、LLM-readable 的 material 应按 whole block / whole section keep-drop 进入 ordinary RunInput / fallback RunInput，至少覆盖历史 user prompt、assistant final answer、accepted readable tool evidence 与用户可见 Run outcome material。裸 tool request 不应单独作为 evidence；若 tool interaction 需要保留，必须通过 accepted readable evidence 或成对且自解释的 material 表达，不暴露 tool_call_id、digest、EventLog id、payload ref 或 Host 内部治理状态。
+
+### 初步代码核对结论
+
+- Answer Anchor Memory 已有实现路径：accepted compact output 中的 `answer_anchors` 会被 Conversation Memory projection 物化，并由 RunInputBuilder 渲染为 `## Prior Answer Anchors`。
+- Answer Anchor Memory 的语义是“可被后续指代的历史回答轮廓”，不是原回答全文，也不是事实证明。
+- selected recent window 按设计可以承载 post-compact delta material 中的 raw user input、assistant final answer、accepted tool evidence 和用户可见 outcome material。
+- 一旦第 N 轮 final answer 被 compact 覆盖，而 accepted compact output 只保留短 answer anchor，第 N+1 轮 Engine 可能只能解析“第三条指什么”，但缺少“详细解释第三条”所需的完整文本和列表上下文。
+
+### 设计裁决与剩余讨论点
+
+- Answer Anchor Memory 负责指代解析，不负责承载完整展开所需的原回答上下文；recent raw tail 负责最近回答、工具证据和 outcome 的原始业务语义连续性。
+- WU-CM-14 不新增 memory kind、不新增 floor、不实现 ordinal parser；preservation 复用 `selected_recent_window_turn_floor` / protected recent floor。
+- compact accepted 后，`latest_accepted_compacted_view` 只代表 compact 覆盖范围内的旧历史语义视图；它不得吞掉仍处于 protected recent floor 内的 raw tail。
+- preservation owner 初步归属于 selected recent window / protected recent floor 与 ordinary RunInput / fallback RunInput assembly 的共享 material selection 语义；plan gate 仍需用代码证据确认当前 owner 位置和最小改动点。
+- preservation owner 如何复用 proactive / reactive shared compact pipeline，确保同一段 history、同一个 current input anchor 和同一项 accepted compact candidate 在两种触发方式下得到同义的 preservation / fallback / RunInput assembly 结果。
+- 若第 N 轮 final answer 本身超预算，应采用 whole-item keep-drop、chunking with provenance、section-aware degrade 还是 fail closed；不得 silent truncation、preview 化或 summary 化后伪装为完整回答。
+- 是否需要在 `docs/host/design.md` 增补 Answer Anchor Memory 与 recent raw final answer preservation 的边界说明。
+
+### 非目标
+
+- 不并入 `WU-CM-13`；不借本 WU 重新设计 proactive / reactive compact pipeline unification。
+- 不允许为 proactive compact 与 reactive compact 分别实现语义不同的 recent final answer preservation 分支；触发方式不同不应改变 preservation 结果。
+- 不新增 WU-CM-14 专属 protected floor、ordinal follow-up floor、recent answer cap 或另一套 selected recent window policy；复用 `selected_recent_window_turn_floor` / protected recent floor。
+- 不引入 semantic search、vector recall、prompt-conditioned reranker 或长期 memory retrieval framework。
+- 不实现 deterministic final answer outline parser 或“第三条”prompt-pattern parser。
+- 不把 Answer Anchor Memory 升级成事实证明、完整回答存储或替代 raw final answer 的通用机制。
+- 不通过字段级截断、固定 preview、私有 DTO cap 或 summary 化来保留超长 final answer。
+
+### Entry Conditions
+
+- 重新核对 `docs/host/design.md` 中 latest accepted compacted view、post-compact delta material、selected recent window、protected recent floor、Answer Anchor Memory、Reference Continuity 和 Prompt Assembly 的设计真源。
+- 重新核对 RunInputBuilder、Conversation Memory projection、compact material selection 与相关测试，确认第 N+1 轮触发 compact 后 ordinary Engine messages 的实际组成。
+- plan gate 先验证当前 `selected_recent_window_turn_floor` / protected recent floor 是否已经跨 compact boundary 生效；若未生效，plan 必须定位 root cause 并提出最小修复，不新增平行 policy owner。
+
+### Acceptance Signals
+
+- 文档明确裁决 ordinal follow-up 场景下，recent assistant final answer 与 Answer Anchor Memory 的职责边界。
+- 文档和实现明确复用 `selected_recent_window_turn_floor` / protected recent floor；不得新增 WU-CM-14 专属 floor 或 prompt-pattern-specific retention rule。
+- 文档明确裁决 WU-CM-14 preservation 逻辑与 WU-CM-13 shared compact pipeline 的关系：策略可以独立讨论，但实现必须避免 proactive / reactive 语义漂移。
+- 测试必须覆盖：第 N 轮 final answer 列 4 条详细文本，第 N+1 轮“详细解释第三条”触发 compact，最终 Engine messages 除 accepted compacted view / memory sections 与 current user prompt 外，还包含 protected recent raw tail 中足以解释第三条的完整业务上下文。
+- 测试必须覆盖 protected recent raw tail 的 eligible material 边界：history user prompt、assistant final answer、accepted readable tool evidence、user-visible outcome material；裸 tool request、Host internal refs / digest / EventLog id 不进入 LLM-facing tail。
+- 测试还必须覆盖 proactive 与 reactive compact 触发下的同义 preservation 结果，除非 plan gate 明确证明某一路径不会经过该 preservation owner。
+- 受影响 Host memory / compact / RunInput tests 通过；若发生代码修改，`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+
+### Current gate artifacts
+
+- plan: `docs/host/host-issues/wu-cm-14-protected-recent-floor-plan.md`
+- plan review: `docs/reviews/plan-review-wu-cm-14-mimo.md`
+- plan review: `docs/reviews/plan-review-wu-cm-14-ds.md`
+- plan adjudication: `docs/reviews/plan-review-wu-cm-14-adjudication-20260619.md`
+- plan re-review: `docs/reviews/plan-rereview-wu-cm-14-mimo.md`
+- plan re-review: `docs/reviews/plan-rereview-wu-cm-14-ds.md`
+- plan re-review conclusion: AgentCodex fixed the plan; AgentMiMo PASS and AgentDS PASS. Accepted findings are closed: provider / transaction contract, activation condition, reactive compact-success and fallback regression coverage, duplicate prevention, allowed test boundary cleanup, and reactive frozen material stop condition. Plan is code-generation-ready.
+- plan gate validation: `git diff --check` clean
+- accepted plan commit: `d4b271cb`
+- implementation review: `docs/reviews/code-review-20260619-190815.md`
+- implementation review: `docs/reviews/code-review-20260619-191152.md`
+- implementation focused re-review: `docs/reviews/code-review-20260619-192312.md`
+- implementation focused re-review: `docs/reviews/code-review-20260619-192408.md`
+- code review adjudication: `docs/reviews/code-review-wu-cm-14-adjudication-20260619.md`
+- implementation validation: `pytest tests/host/test_run_input_builder.py tests/host/test_compact_material.py tests/host/test_dispatch_scheduler.py -q` passed 220 tests; `python -m pyright dayu/ tests/ utils/` passed 0 errors; `git diff --check` clean.
+- accepted slice commit: `921c6219`
+- aggregate deepreview: `docs/reviews/code-review-20260619-192740.md`
+- aggregate deepreview: `docs/reviews/code-review-20260619-193018.md`
+- aggregate focused re-review: `docs/reviews/code-review-20260619-193352.md`
+- aggregate focused re-review: `docs/reviews/code-review-20260619-193419.md`
+- aggregate adjudication: `docs/reviews/wu-cm-14-aggregate-deepreview-adjudication-20260619.md`
+- aggregate validation: `rg -n "_current_only_material_blocks" dayu tests` returned no matches; `pytest tests/host/test_run_input_builder.py tests/host/test_compact_material.py tests/host/test_dispatch_scheduler.py -q` passed 220 tests; `python -m pyright dayu/ tests/ utils/` passed 0 errors; `git diff --check` clean.
+- next gate: WU-CM-13 goal confirmation / plan gate
+
+### Residual risks
+
+- `WU-CM-14-RR-1` closed by WU-CM-13 Slice 2c: WU-CM-14 preservation is now audited through shared proactive/reactive compact pipeline helpers plus pipeline-owned ordinary raw-tail selection.
+- `WU-CM-14-RR-3` closed by WU-CM-13 Slice 2c: the second EventLog read remains a durable freshness adapter, while protected recent group eligibility and memory dedup semantics are shared in `compact_pipeline.py`.
+
+## WU-CM-15 Conversation Memory Public Smoke Reactive Compact And Fallback Coverage
+
+### 状态
+
+`discussion-ready`。当前不创建 GitHub Issue，不进入 plan / implementation。
+
+本 WU 是对 `utils/smoke_host_public_conversation_memory_scenarios.py` fresh run 后发现的 smoke coverage gap 的独立追踪项。当前 `memory-compact` suite 已覆盖真实 conversation memory 主干与 proactive compact accepted 路径，但没有显式覆盖 worker / provider overflow 触发的 reactive compact，也没有显式覆盖 compact 全部失败后的 deterministic fallback dispatch。
+
+### 动机判断
+
+问题真实存在，但严重性应按“smoke coverage gap”而不是“生产代码已知 bug”处理：
+
+- fresh `memory-compact` run 通过，且观察到 `requested_proactive=4`、`compacted_proactive=4`、`failed_total=0`。
+- 同一次 run 的 reactive 计数为 0，说明当前 public conversation memory smoke 没有 exercised reactive compact 主路径。
+- 当前 `memory-compact` 验收把任何 `CONTEXT_COMPACTION_FAILED` 视为 hard fail，因此不能直接把 fallback 成功场景塞进同一 suite。
+- 生产代码和 focused tests 已存在 reactive compact / fallback 相关覆盖，但 `utils/` public conversation memory smoke 尚未把这些路径作为一等 smoke target。
+
+### 初步设计裁决
+
+WU-CM-15 应新增显式 suite，而不是改变现有 `memory-compact` 的语义：
+
+- 保持现有 `memory-compact`：继续作为 proactive compact accepted 与长会话 conversation memory 主干 smoke；不得为了 fallback 放宽 `failed_total == 0` 断言。
+- 新增 reactive compact smoke suite：使用 public Host 路径，通过 deterministic worker 或等价测试 runner 在第一次 Attempt 返回 `context_compaction_requested`，模拟 provider overflow；Host 完成 reactive compact 后启动 recovery Attempt 并最终 succeeded。
+- 新增 fallback smoke suite：通过 deterministic bad compactor / rejecting compactor / missing compactor 等可控方式让 compact operation 失败，触发 dispatch fallback；fallback succeeded 是该 suite 的目标行为，不得被现有 proactive acceptance 规则误判为失败。
+- 不依赖真实 provider / 真实上下文窗口自然触发 reactive compact 或 fallback。真实 LLM smoke 可以保留为 `memory-compact`，reactive / fallback smoke 应优先 deterministic，避免不稳定、耗时和成本扩散。
+
+### 目标
+
+- `utils/smoke_host_public_conversation_memory_scenarios.py` 或相邻 public smoke 入口能够显式运行 reactive compact path。
+- 同一 smoke 体系能够显式运行 deterministic fallback dispatch path。
+- smoke log 能展示 reactive / fallback 的关键诊断信号，支持问题定位且不引入 per-delta stream 噪音。
+- 现有 `memory-compact` suite 的 proactive compact accepted 验收保持不变。
+
+### 非目标
+
+- 不把 fallback 成功视为 `memory-compact` proactive acceptance 的通过条件。
+- 不通过修改 smoke oracle、降低断言、跳过 compact audit 或允许 malformed compact output 来制造通过。
+- 不新增 production-only hook、私有捷径或绕过 Host public path 的 smoke 实现。
+- 不依赖真实 LLM / 真实 provider overflow 随机触发 reactive compact。
+- 不改变 Host / Engine compact contract、EventLog canonical semantics、durable schema 或 Context Governance 状态机。
+- 不把 #80 Conversation Memory benchmark 一次性并入本 WU；本 WU 只是补 public smoke 对 reactive / fallback 主路径的覆盖。
+
+### Entry Conditions
+
+- 重新核对 `docs/host/design.md` 中 Context Governance、reactive compact、fallback tier、Prompt Assembly 与 Conversation Memory 的设计真源。
+- 核对 `docs/engine/design.md` 中 Engine 只上报 context compaction request、Host 负责 compact / recovery / fallback 的边界。
+- 核对现有 `utils/smoke_host_public_conversation_memory_scenarios.py` 的 suite / pressure mode / compact audit / acceptance 结构。
+- 核对 `tests/host/test_public_compact_smoke.py`、`tests/host/test_dispatch_scheduler.py` 与 `tests/host/test_run_input_builder.py` 中 reactive compact、fallback dispatch、fallback input rendering 的既有覆盖，避免重复发明测试机制。
+
+### Acceptance Signals
+
+- 现有 `memory-compact` suite 仍要求 proactive compact request / accepted compact / artifact files，且任何 compact failed 仍为 hard fail。
+- 新增 reactive suite 至少断言：
+  - `requested_reactive >= 1`。
+  - `compacted_reactive >= 1`。
+  - `failed_reactive == 0`。
+  - recovery Attempt 被创建并最终 terminal succeeded。
+  - recovery RunInput 保持 one-system-message contract、current input anchor 与 protected recent floor 语义。
+- 新增 fallback suite 至少断言：
+  - 观察到 `CONTEXT_COMPACTION_FAILED`。
+  - failed payload 包含 `fallback_action=dispatch` 与可诊断的 fallback input window。
+  - 不写 accepted `CONTEXT_COMPACTED`。
+  - fallback dispatch 最终 terminal succeeded。
+  - fallback RunInput 只渲染 selected recent window 与 current input，不生成或伪造五类 Session Semantic Memory。
+- smoke stdout 必须打印 compact audit / operation / fallback 关键信号，但不得输出完整 pressure blob、per-delta stream log 或 Host internal refs 到 LLM-facing material。
+- 受影响 smoke assembly tests / Host public compact tests / RunInput fallback tests 通过；若发生代码修改，`python -m pyright dayu/ tests/ utils/` 通过且不新增类型错误。
+
+### 与 WU-CM-10 / GitHub Issue #80 的关系
+
+WU-CM-15 是 public smoke coverage hardening，不替代 #80 的完整 Conversation Memory eval benchmark。它可以为 #80 提供稳定 public-path baseline：reactive compact、fallback dispatch、compact audit 与 final outcome 行为可作为后续 eval fixtures 的底层能力，但 #80 仍需单独覆盖 memory snapshot、RunInputBuilder messages、tool behavior、diagnostics、final response facts、事实更新 / 冲突和 provenance 指标。
 
 ## WU-CLI-DEBUG-STREAM-01 CLI `--debug-stream` Per-Delta Stream Diagnostics
 
