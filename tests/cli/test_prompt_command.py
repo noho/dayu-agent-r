@@ -15,7 +15,11 @@ import pytest
 
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
-from dayu.cli.agent_entrypoint import CliSigintMonitor, package_config_root
+from dayu.cli.agent_entrypoint import (
+    CliSigintMonitor,
+    package_config_root,
+    unsupported_execution_option_names,
+)
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
@@ -813,7 +817,7 @@ async def test_prompt_existing_session_execution_does_not_create_or_ensure(
     assert cursor_record.seen_terminal_event_ids == ("terminal-run-1-2",)
 
 
-@pytest.mark.parametrize("log_flag", ("--verbose", "--debug"))
+@pytest.mark.parametrize("log_flag", ("--verbose", "--debug", "--debug-stream"))
 def test_prompt_verbose_debug_diagnostics_do_not_pollute_stdout(
     log_flag: str,
     tmp_path: Path,
@@ -1274,6 +1278,18 @@ def test_prompt_command_rejects_unsupported_old_execution_flags(
     assert exit_code == EXIT_USAGE_ERROR
     assert "unsupported option" in captured.err
     assert expected_fragment in captured.err
+
+
+def test_prompt_debug_stream_is_not_unsupported_execution_option() -> None:
+    """debug-stream 是全局日志开关，不是旧 Agent 执行参数。
+
+    :returns: ``None``。
+    :raises AssertionError: debug-stream 被错误列为 unsupported option 时抛出。
+    """
+
+    args = parse_cli_args(("prompt", "--debug-stream", "请总结收入变化"))
+
+    assert "--debug-stream" not in unsupported_execution_option_names(args)
 
 
 def test_prompt_command_reports_all_unsupported_old_execution_flags(
