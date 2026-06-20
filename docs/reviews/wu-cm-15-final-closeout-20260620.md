@@ -35,7 +35,7 @@ The work unit stayed within the user-confirmed scope: add public smoke coverage 
 - PR review artifacts:
   - `docs/reviews/pr-157-review-20260620-134300.md` (AgentMiMo): PASS, no material findings.
   - `docs/reviews/pr-157-review-20260620-134346.md` (AgentDS): PASS, no material findings.
-- Accepted PR review / final closeout commit: `ACCEPTED_PR_REVIEW_COMMIT_PENDING`.
+- Accepted PR review / final closeout commit: `5e04a841`.
 - Plan review / fix / re-review passed.
 - Code review / fix / focused re-review passed.
 - Aggregate deepreview passed after small closeout fixes.
