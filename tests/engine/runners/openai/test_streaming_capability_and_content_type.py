@@ -33,7 +33,12 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.engine.runners.openai.runner import AsyncOpenAIRunner, _is_sse_response
+from dayu.engine.runners.openai.runner import (
+    AsyncOpenAIRunner,
+    _extract_provider_request_id,
+    _format_provider_request_id_headers_for_log,
+    _is_sse_response,
+)
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
@@ -255,6 +260,78 @@ def test_stream_true_unknown_content_type_is_not_sse() -> None:
             stream=True,
         )
         is True
+    )
+
+
+def test_provider_request_id_extraction_ignores_infrastructure_headers() -> None:
+    """provider_request_id 不映射基础设施 tracing header。"""
+
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-trace-id", "trace-id"),
+                ("x-correlation-id", "correlation-id"),
+                ("cf-ray", "cf-ray-id"),
+                ("traceparent", "00-trace-parent"),
+            )
+        )
+        is None
+    )
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-trace-id", "trace-id"),
+                ("X-Request-Id", " req-provider "),
+            )
+        )
+        == "req-provider"
+    )
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-trace-id", "trace-id"),
+                ("x-ds-trace-id", " ds-trace-provider "),
+            )
+        )
+        == "ds-trace-provider"
+    )
+    assert (
+        _extract_provider_request_id(
+            (
+                ("x-ds-trace-id", "ds-trace-provider"),
+                ("x-request-id", "req-provider"),
+            )
+        )
+        == "req-provider"
+    )
+
+
+def test_provider_request_id_log_fields_only_include_present_headers() -> None:
+    """response 日志只输出实际存在的 provider request id headers。"""
+
+    assert (
+        _format_provider_request_id_headers_for_log(
+            (("x-ds-trace-id", " ds-trace-provider "),)
+        )
+        == "x-ds-trace-id=ds-trace-provider"
+    )
+    assert (
+        _format_provider_request_id_headers_for_log(
+            (
+                ("x-ds-trace-id", "ds-trace-provider"),
+                ("x-request-id", "req-provider"),
+            )
+        )
+        == "x-request-id=req-provider x-ds-trace-id=ds-trace-provider"
+    )
+    assert (
+        _format_provider_request_id_headers_for_log(
+            (
+                ("x-trace-id", "trace-id"),
+                ("x-request-id", " "),
+            )
+        )
+        == "x-request-id=None"
     )
 
 

@@ -418,6 +418,38 @@ def test_provider_request_id_terminal_diagnostic_query(
         assert page.rows[1].diagnostic_ref == "raw-ref"
 
 
+def test_provider_request_id_query_ignores_client_correlation_fallback(
+    tmp_path: Path,
+) -> None:
+    """provider id 查询不得把 client_correlation_id 当成 provider_request_id。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _append_event(
+            store.transaction_runner,
+            event_id="event-diagnostic-client-fallback",
+            event_type="ENGINE_EVENT_DIAGNOSTIC",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": None,
+                "client_correlation_id": "client-fallback",
+                "error_code": "provider_protocol_error",
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        by_client_id_as_provider = store.transaction_runner.run_read(
+            lambda transaction: find_tool_trace_by_provider_request_id(
+                transaction,
+                "client-fallback",
+                after_event_sequence=0,
+                limit=10,
+            )
+        )
+
+        assert by_client_id_as_provider.rows == ()
+        assert by_client_id_as_provider.has_more is False
+
+
 def test_runner_call_reconstruction_signal_query_classifies_statuses(
     tmp_path: Path,
 ) -> None:

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
 from dayu.host._event_payload import optional_payload_text
 from dayu.host.api import HostTerminalStatus
 from dayu.host.durable.codec import (
@@ -61,6 +62,8 @@ _PAYLOAD_FIELD_FINISH_REASON = "finish_reason"
 _PAYLOAD_FIELD_TERMINAL_STATUS = "terminal_status"
 _PAYLOAD_FIELD_MESSAGE = "message"
 _PAYLOAD_FIELD_REASON = "reason"
+_PAYLOAD_FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
+_PAYLOAD_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
 _IDENTITY_FIELD_TERMINAL_EVENT_ID = "terminal_event_id"
 _IDENTITY_FIELD_RUN_ID = "run_id"
 _IDENTITY_FIELD_RESULT_REF = "result_ref"
@@ -392,7 +395,17 @@ def _error_message(event: ProjectionEventView) -> str | None:
 
     if event.event_type != _EVENT_TYPE_RUN_FAILED:
         return None
-    return optional_payload_text(event.payload, field_name=_PAYLOAD_FIELD_MESSAGE)
+    return _append_terminal_diagnostic_suffix(
+        optional_payload_text(event.payload, field_name=_PAYLOAD_FIELD_MESSAGE),
+        provider_request_id=optional_payload_text(
+            event.payload,
+            field_name=_PAYLOAD_FIELD_PROVIDER_REQUEST_ID,
+        ),
+        client_correlation_id=optional_payload_text(
+            event.payload,
+            field_name=_PAYLOAD_FIELD_CLIENT_CORRELATION_ID,
+        ),
+    )
 
 
 def _cancel_reason(event: ProjectionEventView) -> str | None:

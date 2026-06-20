@@ -13,6 +13,7 @@
 - `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、`AsyncIterator[FinsEvent]` 透传、terminal result 收口和 operation-scoped cancellation；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
 
 `compose_open_host_options(request)` 会把选中的 execution profile 映射为 Host typed inputs：`tool_truncation_policy` 决定 ToolRuntime 截断默认值，`tool_duplicate_governance_policy` 决定 `HostToolingOptions.duplicate_governance_policy`，`agent_policy` 决定 ordinary run baseline 的 Agent loop policy。
+Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible client correlation policy，使 ordinary baseline 与 compactor baseline 的 Runner 调用都携带可由 Engine 映射的客户端调试关联 id；静态 `X-Client-Request-Id` header 冲突由 RunnerSpec 边界 fail fast。
 
 工具发现 provider 不读取全局 runtime config，也不自行推断 workspace。调用方负责把 raw config 与运行时参数装配为 effective spec；例如 Fins provider 的 `workspace_root` 可以来自 overlay 显式配置，也可以由调用方通过 `assemble_effective_tool_provider_configs(...)` 使用当前 `workspace_root` 注入到 provider spec。
 

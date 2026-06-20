@@ -1626,6 +1626,91 @@ def test_tool_trace_projection_includes_client_correlation_id(
         )
 
 
+def test_diagnostic_trace_preserves_client_correlation_without_provider_id(
+    tmp_path: Path,
+) -> None:
+    """diagnostic 无 provider_request_id 时仍保留客户端 fallback id。"""
+
+    cold_path = tmp_path / "trace" / "diagnostic-client-fallback.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-diagnostic-client-fallback",
+            event_type="ENGINE_EVENT_DIAGNOSTIC",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": None,
+                "client_correlation_id": "client-fallback",
+                "error_code": "provider_protocol_error",
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, event.event_id
+            )
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.provider_request_id is None
+        assert row.diagnostic_ref is None
+        assert row.trace_summary["client_correlation_id"] == "client-fallback"
+        assert len(cold_lines) == 1
+        assert cold_lines[0]["provider_request_id"] is None
+        assert cold_lines[0]["client_correlation_id"] == "client-fallback"
+        trace_summary = cold_lines[0]["trace_summary"]
+        assert isinstance(trace_summary, Mapping)
+        assert trace_summary["client_correlation_id"] == "client-fallback"
+
+
+def test_diagnostic_trace_uses_raw_payload_ref_without_provider_id(
+    tmp_path: Path,
+) -> None:
+    """diagnostic 无 provider id 时仍以 raw_payload_ref 作为诊断 ref。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Tool Trace 投影不符合预期时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "diagnostic-raw-ref-fallback.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-diagnostic-raw-ref-fallback",
+            event_type="ENGINE_EVENT_DIAGNOSTIC",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": None,
+                "client_correlation_id": "client-fallback",
+                "raw_payload_ref": "raw-ref-fallback",
+                "raw_payload_digest": "sha256:raw-fallback",
+                "error_code": "provider_protocol_error",
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, event.event_id
+            )
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.provider_request_id is None
+        assert row.diagnostic_ref == "raw-ref-fallback"
+        assert row.trace_summary["client_correlation_id"] == "client-fallback"
+        assert len(cold_lines) == 1
+        assert cold_lines[0]["diagnostic_refs"] == ["raw-ref-fallback"]
+        assert cold_lines[0]["client_correlation_id"] == "client-fallback"
+        trace_summary = cold_lines[0]["trace_summary"]
+        assert isinstance(trace_summary, Mapping)
+        assert trace_summary["client_correlation_id"] == "client-fallback"
+
+
 def test_tool_trace_projection_rejects_non_text_client_correlation_id(
     tmp_path: Path,
 ) -> None:

@@ -18,6 +18,8 @@ import pytest
 
 from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_events import RunnerEvent, RunnerEventType
+from dayu.engine.contracts.runner_identity import build_runner_request_identity
+from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL
 
@@ -280,6 +282,74 @@ async def test_attempt_start_diagnostic_logged(
 
     assert any(
         "runner.attempt.start" in r.getMessage() for r in caplog.records
+    )
+    assert events[-1].type is RunnerEventType.RUNNER_DONE
+
+
+@pytest.mark.asyncio
+async def test_response_log_includes_client_correlation_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """既有 response 日志行同时携带 provider 与客户端关联 header。"""
+
+    identity = build_runner_request_identity(
+        run_id="run-log-correlation",
+        attempt_id="attempt-log-correlation",
+        execution_id="execution-log-correlation",
+        iteration_id="iteration-log-correlation",
+        iteration_index=0,
+        runner_call_index=1,
+    )
+    session = FakeSession()
+    session.enqueue_response(
+        FakeResponseSpec(
+            status=200,
+            headers={
+                "Content-Type": "application/json",
+                "x-request-id": "req-log-correlation",
+            },
+            body_chunks=[
+                b'{"choices":[{"message":{"role":"assistant",'
+                b'"content":"hi"},"finish_reason":"stop"}]}'
+            ],
+        )
+    )
+    runner = AsyncOpenAIRunner(
+        spec=make_spec(
+            client_correlation_policy=(
+                ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+            )
+        ),
+        cancellation_token=FakeCancellationToken(),
+    )
+    runner._http_client._session = session  # type: ignore[attr-defined]
+
+    with caplog.at_level(
+        logging.DEBUG,
+        logger="dayu.engine.runners.openai.runner",
+    ):
+        events: list[RunnerEvent] = []
+        async for event in runner.call(
+            messages=[UserMessage(role=AgentMessageRole.USER, content="hi")],
+            options=make_options(stream=False),
+            tools=[],
+            request_identity=identity,
+        ):
+            events.append(event)
+
+    response_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("runner.http.response status=")
+    ]
+    assert len(response_records) == 1
+    assert response_records[0].levelno == logging.DEBUG
+    response_message = response_records[0].getMessage()
+    assert "x-request-id=req-log-correlation" in response_message
+    assert "x-ds-trace-id" not in response_message
+    assert (
+        f"X-Client-Request-Id={identity.client_correlation_id}"
+        in response_message
     )
     assert events[-1].type is RunnerEventType.RUNNER_DONE
 

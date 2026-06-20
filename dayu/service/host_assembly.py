@@ -1104,7 +1104,9 @@ def _runner_spec_from_model(*, model: ModelConfig, env: Mapping[str, str]) -> Ru
             api_key_ref=model.api_key_ref,
             env=env,
         ),
-        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
+        client_correlation_policy=(
+            ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
+        ),
         supports_tool_calling=model.supports_tool_calling,
         supports_streaming=model.supports_stream,
         supports_stream_usage=model.supports_stream_usage,

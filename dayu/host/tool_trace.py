@@ -911,6 +911,7 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
     if (
         event.event_type == _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC
         and provider_request_id is None
+        and client_correlation_id is None
     ):
         return None
     raw_payload_ref = _optional_text(payload, "raw_payload_ref")
