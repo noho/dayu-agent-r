@@ -50,6 +50,7 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _FACT_KEY_WULIANGYE_REVENUE,
     _LABEL_CORE_B1,
     _MARKER_CATL_CASHFLOW,
+    _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS,
     _COMPACT_PRESSURE_RESERVE_TOKENS,
     _SMOKE_REACTIVE_CURRENT_MARKER,
     _SMOKE_REACTIVE_OLD_MARKER,
@@ -65,12 +66,14 @@ from utils.smoke_host_public_conversation_memory_scenarios import (
     _deterministic_dropped_old_marker,
     _estimate_chars_as_tokens,
     _fake_compaction_proposal_from_material_json,
+    _fallback_compact_pressure_padding,
     _print_compact_audit_report,
     DeterministicDispatchCapture,
     DeterministicSmokeObservation,
     _ensure_request,
     _mock_pressure_blob,
     _prepare_runtime_assembly,
+    _print_compact_pressure_plan,
     _runtime_user_pressure_text,
     _select_long_templates,
     _threshold_tokens,
@@ -439,6 +442,38 @@ def test_pressure_off_and_padding_helper_cover_runtime_pressure_bounds(
         assembly.options,
         PressureMode.AUTO,
         SuiteMode.MEMORY_COMPACT,
+    )
+    _print_compact_pressure_plan(
+        assembly.options,
+        PressureMode.AUTO,
+        suite=SuiteMode.MEMORY_COMPACT,
+    )
+    compact_output = capsys.readouterr().out
+    assert f"reserve_tokens={_COMPACT_PRESSURE_RESERVE_TOKENS}" in compact_output
+    assert f"estimated_effective_pressure_tokens={pressure_tokens}" in compact_output
+    assert f"estimated_total_pressure_tokens={pressure_tokens}" in compact_output
+
+    fallback_prompt_tokens = _estimate_chars_as_tokens(
+        len(_fallback_compact_pressure_padding(assembly.options))
+    )
+    fallback_effective_tokens = (
+        fallback_prompt_tokens
+        + _tool_pressure_estimated_tokens()
+        + _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS
+    )
+    _print_compact_pressure_plan(
+        assembly.options,
+        PressureMode.AUTO,
+        suite=SuiteMode.MEMORY_COMPACT_FALLBACK,
+    )
+    fallback_output = capsys.readouterr().out
+    assert (
+        f"reserve_tokens={_COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS}"
+        in fallback_output
+    )
+    assert (
+        f"estimated_effective_pressure_tokens={fallback_effective_tokens}"
+        in fallback_output
     )
 
 

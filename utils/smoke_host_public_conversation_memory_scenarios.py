@@ -3493,6 +3493,19 @@ def _fallback_compact_pressure_padding(options: OpenHostOptions) -> str:
     )
 
 
+def _compact_pressure_reserve_tokens(suite: SuiteMode) -> int:
+    """返回 suite 专用 compact pressure reserve token 数。
+
+    :param suite: 当前 smoke suite。
+    :returns: pressure 估算需要追加的 reserve token 数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if suite is SuiteMode.MEMORY_COMPACT_FALLBACK:
+        return _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS
+    return _COMPACT_PRESSURE_RESERVE_TOKENS
+
+
 def _fallback_pressure_observation(
     args: SmokeArgs,
     options: OpenHostOptions,
@@ -3514,11 +3527,13 @@ def _fallback_pressure_observation(
     policy = options.context_budget_policy
     if policy is None:
         raise RuntimeError("memory-compact-fallback requires context budget policy")
-    prompt_tokens = _estimate_chars_as_tokens(len(_fallback_compact_pressure_padding(options)))
+    prompt_tokens = _estimate_chars_as_tokens(
+        len(_fallback_compact_pressure_padding(options))
+    )
     pressure_tokens = (
         prompt_tokens
         + _tool_pressure_estimated_tokens()
-        + _COMPACT_FALLBACK_PRESSURE_RESERVE_TOKENS
+        + _compact_pressure_reserve_tokens(args.suite)
     )
     return FallbackPressureObservation(
         pressure_tokens=pressure_tokens,
@@ -3762,7 +3777,7 @@ def _assert_memory_compact_pressure_bounds(
     policy = options.context_budget_policy
     if policy is None:
         raise RuntimeError("memory-compact auto pressure requires context budget policy")
-    reserve_tokens = _COMPACT_PRESSURE_RESERVE_TOKENS
+    reserve_tokens = _compact_pressure_reserve_tokens(suite)
     prompt_tokens = _estimate_chars_as_tokens(len(_compact_pressure_padding(options)))
     tool_pressure_tokens = _tool_pressure_estimated_tokens()
     pressure_tokens = prompt_tokens + tool_pressure_tokens + reserve_tokens
@@ -4623,16 +4638,22 @@ def _print_compact_pressure_plan(
     )
     prompt_chars = len(prompt)
     estimated_prompt_tokens = _estimate_chars_as_tokens(prompt_chars)
-    estimated_total_pressure_tokens = estimated_prompt_tokens + _tool_pressure_estimated_tokens()
+    reserve_tokens = _compact_pressure_reserve_tokens(suite)
+    tool_pressure_tokens = _tool_pressure_estimated_tokens()
+    estimated_without_reserve_tokens = estimated_prompt_tokens + tool_pressure_tokens
+    estimated_effective_pressure_tokens = estimated_without_reserve_tokens + reserve_tokens
     print(
         "SMOKE COMPACT_PRESSURE "
         f"context_window_tokens={policy.context_window_size} "
         f"soft_threshold_tokens={soft_threshold_tokens} "
         f"hard_threshold_tokens={hard_threshold_tokens} "
-        f"tool_pressure_tokens={_tool_pressure_estimated_tokens()} "
+        f"tool_pressure_tokens={tool_pressure_tokens} "
+        f"reserve_tokens={reserve_tokens} "
         f"prompt_pressure_chars={prompt_chars} "
         f"estimated_prompt_tokens={estimated_prompt_tokens} "
-        f"estimated_total_pressure_tokens={estimated_total_pressure_tokens}",
+        f"estimated_without_reserve_tokens={estimated_without_reserve_tokens} "
+        f"estimated_effective_pressure_tokens={estimated_effective_pressure_tokens} "
+        f"estimated_total_pressure_tokens={estimated_effective_pressure_tokens}",
         flush=True,
     )
 

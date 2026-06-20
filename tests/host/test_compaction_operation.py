@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -944,6 +945,37 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
     assert result.rejected_attempts[1].repairable is False
     assert "proposal failed" in result.rejected_attempts[0].diagnostic_refs[0]
     assert result.failure_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_logs_terminal_reject_as_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """terminal attempt reject 只记录为 warning，最终 fallback 决策负责 error 语义。
+
+    :param caplog: pytest 日志捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: terminal reject 被记录为 error 时抛出。
+    """
+
+    logger_name = "dayu.host.compaction_operation"
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        result = await run_compaction_operation(
+            request=_request(),
+            compactor=_AlwaysFailingCompactor(),
+            max_attempts=1,
+            cancellation_token=StubCancellationToken(),
+        )
+
+    assert result.failure_reason is not None
+    records = tuple(
+        record
+        for record in caplog.records
+        if record.name == logger_name
+        and "host.compaction_operation.attempt_rejected" in record.getMessage()
+    )
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
 
 
 @pytest.mark.asyncio
