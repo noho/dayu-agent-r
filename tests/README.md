@@ -241,7 +241,7 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 - diagnostics：覆盖 Runner HTTP attempt / response 等普通 debug 诊断、stream idle heartbeat 与 SSE done-token 的 stream-debug gating，以及 stream-debug 不输出完整 prompt、headers、API key 或响应正文。
 - non-stream：非流式响应、thought 标签处理、stream / non-stream 终态语义一致性。
 - 错误与重试：协议错误、HTTP error 分类、context overflow classifier、未知状态码、retry backoff、重试耗尽后的事件收口。
-- request identity header：覆盖 OpenAI-compatible Runner 在 `ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID` 且 `request_identity` 存在时发送 `X-Client-Request-Id`，policy disabled 或 identity 缺失时不发送，policy 开启时拒绝静态 `X-Client-Request-Id` header 冲突，并确认 transport retry 复用同一个客户端关联 header；provider request id 只从 `x-request-id` 提取，基础设施 tracing header 不映射为 provider id，既有 `runner.http.response` DEBUG 行同时包含 provider request id 与 client correlation id。
+- request identity header：覆盖 OpenAI-compatible Runner 在 `ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID` 且 `request_identity` 存在时发送 `X-Client-Request-Id`，policy disabled 或 identity 缺失时不发送，policy 开启时拒绝静态 `X-Client-Request-Id` header 冲突，并确认 transport retry 复用同一个客户端关联 header；provider request id 只从 `x-request-id` 提取，基础设施 tracing header 不映射为 provider id，既有 `runner.http.response` DEBUG 行以协议 header 名同时包含 `x-request-id` 与 `X-Client-Request-Id`。
 - 取消与资源：取消边界、取消后不补 done 事件、close 释放资源、已完成 read task 异常消费。
 - 架构边界与协议表面：Runner 只产出 RunnerEvent，不依赖 ToolExecutor，不暴露任意 `**kwargs` 或 `set_tools`，事件流顺序保持单调并以唯一终态收口。
 

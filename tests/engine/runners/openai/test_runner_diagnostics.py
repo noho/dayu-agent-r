@@ -290,7 +290,7 @@ async def test_attempt_start_diagnostic_logged(
 async def test_response_log_includes_client_correlation_id(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """既有 ``runner.http.response`` 日志行同时携带 provider 与客户端关联 id。"""
+    """既有 response 日志行同时携带 provider 与客户端关联 header。"""
 
     identity = build_runner_request_identity(
         run_id="run-log-correlation",
@@ -345,9 +345,9 @@ async def test_response_log_includes_client_correlation_id(
     assert len(response_records) == 1
     assert response_records[0].levelno == logging.DEBUG
     response_message = response_records[0].getMessage()
-    assert "provider_request_id=req-log-correlation" in response_message
+    assert "x-request-id=req-log-correlation" in response_message
     assert (
-        f"client_correlation_id={identity.client_correlation_id}"
+        f"X-Client-Request-Id={identity.client_correlation_id}"
         in response_message
     )
     assert events[-1].type is RunnerEventType.RUNNER_DONE

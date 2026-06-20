@@ -359,6 +359,7 @@ Final closeout:
 - Issue closeout handling: PR body contains `Closes #63`; Issue #63 should close on merge if GitHub auto-close rules apply. No separate issue comment or manual close was performed in this gate.
 - Validation retained from accepted slice / PR body: assembly 53 passed, runner 38 passed, Host terminal / Tool Trace 51 passed, Service / CLI 69 passed, pyright 0 errors, `git diff --check` passed.
 - Remaining risks: no blocking risks. Non-blocking deferred risk remains limited to future WU changes that make lost/cancelled lifecycle payloads carry provider/client correlation ids; that future WU must re-check terminal projection suffix behavior.
+- Post-closeout user-requested PR update: OpenAI-compatible Runner `runner.http.response` log now labels the protocol fields as `x-request-id` and `X-Client-Request-Id` instead of semantic internal field names, preserving the same log site, same log level, and same log line. Validation: OpenAI runner focused tests 22 passed, pyright 0 errors, `git diff --check` passed.
 
 Controller plan-review judgment:
 

@@ -616,7 +616,7 @@ class AsyncOpenAIRunner:
             )
             _LOGGER.debug(
                 "runner.http.response status=%d content_type=%s "
-                "provider_request_id=%s client_correlation_id=%s",
+                "x-request-id=%s X-Client-Request-Id=%s",
                 response.status,
                 response.headers.get("Content-Type") or "",
                 provider_request_id,
