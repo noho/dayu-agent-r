@@ -36,6 +36,7 @@ from dayu.runtime.log_levels import (
     DEBUG_LOG_LEVEL,
     ERROR_LOG_LEVEL,
     INFO_LOG_LEVEL,
+    STREAM_DEBUG_LOG_LEVEL,
     VERBOSE_LOG_LEVEL,
     WARN_LOG_LEVEL,
 )
@@ -45,6 +46,7 @@ _HANDLER_MARKER_ATTR: Final[str] = "_dayu_runtime_log_marker"
 _HANDLER_MARKER_VALUE: Final[str] = "dayu.runtime.log:diagnostic"
 _LOG_FORMAT: Final[str] = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 _LOG_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
+_STREAM_DEBUG_LEVEL_NAME: Final[str] = "STREAM_DEBUG"
 _VERBOSE_LEVEL_NAME: Final[str] = "VERBOSE"
 DEFAULT_LOG_PAYLOAD_KEY_LIMIT: Final[int] = 8
 LogArgument: TypeAlias = str | int | float | bool | None
@@ -68,8 +70,9 @@ _DEFAULT_THIRD_PARTY_SUPPRESSIONS: Final[tuple[str, ...]] = (
 _DEFAULT_THIRD_PARTY_LEVEL: Final[int] = WARN_LOG_LEVEL
 
 
-# 在模块导入时注册 VERBOSE level 到 stdlib logging，确保
-# logging.getLevelName(15) 返回 "VERBOSE"。
+# 在模块导入时注册 Dayu 自定义 level 到 stdlib logging，确保
+# logging.getLevelName(...) 返回稳定名称。
+logging.addLevelName(STREAM_DEBUG_LOG_LEVEL, _STREAM_DEBUG_LEVEL_NAME)
 logging.addLevelName(VERBOSE_LOG_LEVEL, _VERBOSE_LEVEL_NAME)
 
 
@@ -79,6 +82,8 @@ class LogLevel(IntEnum):
     数值由 :mod:`dayu.runtime.log_levels` 统一提供，标准级别与 stdlib
     ``logging`` 保持一致以便直接传入 ``setLevel``：
 
+    - :attr:`STREAM_DEBUG` 对应 ``STREAM_DEBUG_LOG_LEVEL``，低于 stdlib
+      DEBUG；用于高频 stream delta / SSE / per-delta ingest 诊断。
     - :attr:`DEBUG` 对应 ``DEBUG_LOG_LEVEL``。
     - :attr:`VERBOSE` 对应 ``VERBOSE_LOG_LEVEL``，介于 DEBUG 与 INFO
       之间；CLI ``--verbose`` 映射到此级别。
@@ -88,6 +93,7 @@ class LogLevel(IntEnum):
     - :attr:`CRITICAL` 对应 ``CRITICAL_LOG_LEVEL``。
     """
 
+    STREAM_DEBUG = STREAM_DEBUG_LOG_LEVEL
     DEBUG = DEBUG_LOG_LEVEL
     VERBOSE = VERBOSE_LOG_LEVEL
     INFO = INFO_LOG_LEVEL
@@ -148,21 +154,25 @@ def set_level_from_flags(
     verbose: bool,
     info: bool,
     quiet: bool,
+    debug_stream: bool = False,
     stream: TextIO | None = None,
 ) -> LogLevel:
     """根据 CLI 风格的 flag 集合解析最终级别并调用 :func:`configure`。
 
     优先级（高 -> 低）：
 
-    1. ``log_level`` 显式字符串（不区分大小写，必须为 :class:`LogLevel` 名）。
-    2. ``quiet`` -> :attr:`LogLevel.ERROR`。
-    3. ``debug`` -> :attr:`LogLevel.DEBUG`。
-    4. ``verbose`` -> :attr:`LogLevel.VERBOSE`（迁移自 OLD ``VERBOSE=15``）。
-    5. ``info`` -> :attr:`LogLevel.INFO`。
-    6. 默认 :attr:`LogLevel.INFO`。
+    1. ``debug_stream`` -> :attr:`LogLevel.STREAM_DEBUG`。
+    2. ``log_level`` 显式字符串（不区分大小写，必须为 :class:`LogLevel` 名）。
+    3. ``quiet`` -> :attr:`LogLevel.ERROR`。
+    4. ``debug`` -> :attr:`LogLevel.DEBUG`。
+    5. ``verbose`` -> :attr:`LogLevel.VERBOSE`（迁移自 OLD ``VERBOSE=15``）。
+    6. ``info`` -> :attr:`LogLevel.INFO`。
+    7. 默认 :attr:`LogLevel.INFO`。
 
     :param log_level: 显式级别字符串；为 ``None`` 表示不指定。
     :param debug: 是否启用 ``--debug``。
+    :param debug_stream: 是否启用 ``--debug-stream``；启用后包含普通
+        DEBUG 诊断以及高频 stream delta / SSE / per-delta ingest 诊断。
     :param verbose: 是否启用 ``--verbose``。
     :param info: 是否启用 ``--info``。
     :param quiet: 是否启用 ``--quiet``。
@@ -175,6 +185,7 @@ def set_level_from_flags(
     resolved = _resolve_level(
         log_level=log_level,
         debug=debug,
+        debug_stream=debug_stream,
         verbose=verbose,
         info=info,
         quiet=quiet,
@@ -219,12 +230,15 @@ def _resolve_level(
     *,
     log_level: str | None,
     debug: bool,
+    debug_stream: bool,
     verbose: bool,
     info: bool,
     quiet: bool,
 ) -> LogLevel:
     """按优先级解析 :class:`LogLevel`。"""
 
+    if debug_stream:
+        return LogLevel.STREAM_DEBUG
     if log_level is not None:
         normalized = log_level.strip().upper()
         try:

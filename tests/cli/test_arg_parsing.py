@@ -95,6 +95,7 @@ class _LogAssemblyCall:
 
     log_level: str | None
     debug: bool
+    debug_stream: bool
     verbose: bool
     info: bool
     quiet: bool
@@ -209,6 +210,18 @@ def test_top_level_help_registers_scoped_commands(
         assert command_name not in help_text
 
 
+def test_global_help_contains_debug_stream(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """验证顶层 help 暴露全局 ``--debug-stream`` 日志开关。"""
+
+    help_text = _capture_help(capsys, ())
+
+    assert "--debug-stream" in help_text
+    assert "stream delta" in help_text
+    assert "SSE" in help_text
+
+
 @pytest.mark.parametrize(
     "command_name",
     tuple(COMMAND_HELP_EXPECTATIONS.keys()),
@@ -228,6 +241,18 @@ def test_command_help_contains_core_arguments(
 
     for expected_fragment in COMMAND_HELP_EXPECTATIONS[command_name]:
         assert expected_fragment in help_text
+
+
+def test_command_help_contains_debug_stream(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """验证命令 help 继承全局 ``--debug-stream`` 日志开关。"""
+
+    help_text = _capture_help(capsys, ("prompt",))
+
+    assert "--debug-stream" in help_text
+    assert "stream delta" in help_text
+    assert "SSE" in help_text
 
 
 def test_interactive_help_contains_optional_ticker(
@@ -332,6 +357,7 @@ def test_placeholder_runner_returns_not_implemented(
     args = ParsedCliArgs()
     args.command_name = "future_command"
     args.log_level = "info"
+    args.debug_stream = False
     args.log_file = None
     monkeypatch.setattr(cli_main, "parse_cli_args", lambda _argv: args)
     monkeypatch.setitem(
@@ -386,24 +412,27 @@ def test_main_maps_keyboard_interrupt(
 
 
 @pytest.mark.parametrize(
-    ("argv", "expected_log_level"),
+    ("argv", "expected_log_level", "expected_debug_stream"),
     (
-        (("prompt", "hello"), "info"),
-        (("prompt", "hello", "--debug"), "debug"),
-        (("prompt", "hello", "--verbose"), "verbose"),
-        (("prompt", "hello", "--quiet"), "error"),
-        (("prompt", "hello", "--log-level", "warn"), "warn"),
+        (("prompt", "hello"), "info", False),
+        (("prompt", "hello", "--debug"), "debug", False),
+        (("prompt", "hello", "--verbose"), "verbose", False),
+        (("prompt", "hello", "--quiet"), "error", False),
+        (("prompt", "hello", "--log-level", "warn"), "warn", False),
+        (("prompt", "hello", "--debug-stream"), "info", True),
     ),
 )
 def test_main_configures_runtime_log_from_parsed_cli_flags(
     argv: tuple[str, ...],
     expected_log_level: str,
+    expected_debug_stream: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CLI main 必须把默认日志参数交给 runtime log helper 与临时文件。
 
     :param argv: 待执行的 CLI 参数。
     :param expected_log_level: argparse 归一后的日志级别字符串。
+    :param expected_debug_stream: 预期传入 runtime helper 的 stream debug flag。
     :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
     :raises AssertionError: main 未调用 runtime helper 或在 main 内改写参数时抛出。
@@ -417,6 +446,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
         *,
         log_level: str | None,
         debug: bool,
+        debug_stream: bool,
         verbose: bool,
         info: bool,
         quiet: bool,
@@ -426,6 +456,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
 
         :param log_level: argparse 已解析的日志级别字符串。
         :param debug: runtime helper 的 debug flag。
+        :param debug_stream: runtime helper 的 stream debug flag。
         :param verbose: runtime helper 的 verbose flag。
         :param info: runtime helper 的 info flag。
         :param quiet: runtime helper 的 quiet flag。
@@ -438,6 +469,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
             _LogAssemblyCall(
                 log_level=log_level,
                 debug=debug,
+                debug_stream=debug_stream,
                 verbose=verbose,
                 info=info,
                 quiet=quiet,
@@ -459,6 +491,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
     assert calls[0] == _LogAssemblyCall(
         log_level=expected_log_level,
         debug=False,
+        debug_stream=expected_debug_stream,
         verbose=False,
         info=False,
         quiet=False,
@@ -467,6 +500,7 @@ def test_main_configures_runtime_log_from_parsed_cli_flags(
     assert calls[1] == _LogAssemblyCall(
         log_level=expected_log_level,
         debug=False,
+        debug_stream=expected_debug_stream,
         verbose=False,
         info=False,
         quiet=False,
@@ -494,6 +528,7 @@ def test_main_configures_runtime_log_file_stream(
         *,
         log_level: str | None,
         debug: bool,
+        debug_stream: bool,
         verbose: bool,
         info: bool,
         quiet: bool,
@@ -503,6 +538,7 @@ def test_main_configures_runtime_log_file_stream(
 
         :param log_level: argparse 已解析的日志级别字符串。
         :param debug: runtime helper 的 debug flag。
+        :param debug_stream: runtime helper 的 stream debug flag。
         :param verbose: runtime helper 的 verbose flag。
         :param info: runtime helper 的 info flag。
         :param quiet: runtime helper 的 quiet flag。
@@ -515,6 +551,7 @@ def test_main_configures_runtime_log_file_stream(
             _LogAssemblyCall(
                 log_level=log_level,
                 debug=debug,
+                debug_stream=debug_stream,
                 verbose=verbose,
                 info=info,
                 quiet=quiet,
@@ -544,6 +581,7 @@ def test_main_configures_runtime_log_file_stream(
     assert calls[1] == _LogAssemblyCall(
         log_level="info",
         debug=False,
+        debug_stream=False,
         verbose=False,
         info=False,
         quiet=False,
@@ -660,6 +698,7 @@ def test_main_restores_stderr_before_closing_log_file_on_unexpected_exception(
         *,
         log_level: str | None,
         debug: bool,
+        debug_stream: bool,
         verbose: bool,
         info: bool,
         quiet: bool,
@@ -669,6 +708,7 @@ def test_main_restores_stderr_before_closing_log_file_on_unexpected_exception(
 
         :param log_level: argparse 已解析的日志级别字符串。
         :param debug: runtime helper 的 debug flag。
+        :param debug_stream: runtime helper 的 stream debug flag。
         :param verbose: runtime helper 的 verbose flag。
         :param info: runtime helper 的 info flag。
         :param quiet: runtime helper 的 quiet flag。
@@ -725,6 +765,7 @@ def test_main_closes_log_file_when_restoring_stderr_fails(
         *,
         log_level: str | None,
         debug: bool,
+        debug_stream: bool,
         verbose: bool,
         info: bool,
         quiet: bool,
@@ -734,6 +775,7 @@ def test_main_closes_log_file_when_restoring_stderr_fails(
 
         :param log_level: argparse 已解析的日志级别字符串。
         :param debug: runtime helper 的 debug flag。
+        :param debug_stream: runtime helper 的 stream debug flag。
         :param verbose: runtime helper 的 verbose flag。
         :param info: runtime helper 的 info flag。
         :param quiet: runtime helper 的 quiet flag。
@@ -791,6 +833,7 @@ def test_main_restores_stderr_before_closing_log_file_on_keyboard_interrupt(
         *,
         log_level: str | None,
         debug: bool,
+        debug_stream: bool,
         verbose: bool,
         info: bool,
         quiet: bool,
@@ -800,6 +843,7 @@ def test_main_restores_stderr_before_closing_log_file_on_keyboard_interrupt(
 
         :param log_level: argparse 已解析的日志级别字符串。
         :param debug: runtime helper 的 debug flag。
+        :param debug_stream: runtime helper 的 stream debug flag。
         :param verbose: runtime helper 的 verbose flag。
         :param info: runtime helper 的 info flag。
         :param quiet: runtime helper 的 quiet flag。
@@ -966,6 +1010,42 @@ def test_prompt_detail_defaults_to_no_detail() -> None:
 
     assert args.detail is False
     assert args.log_level == "info"
+
+
+def test_parse_cli_args_accepts_debug_stream() -> None:
+    """验证 ``--debug-stream`` 作为全局日志开关独立解析。"""
+
+    args = parse_cli_args(("prompt", "hello", "--debug-stream"))
+
+    assert args.debug_stream is True
+    assert args.log_level == "info"
+
+
+def test_parse_cli_args_accepts_debug_and_debug_stream_combination() -> None:
+    """验证 ``--debug`` 可与 ``--debug-stream`` 同时出现。"""
+
+    args = parse_cli_args(("prompt", "hello", "--debug", "--debug-stream"))
+
+    assert args.debug_stream is True
+    assert args.log_level == "debug"
+
+
+def test_parse_cli_args_debug_stream_and_quiet_runtime_precedence() -> None:
+    """验证 ``--quiet`` 不覆盖 runtime 层的 ``debug_stream`` 优先级。"""
+
+    args = parse_cli_args(("prompt", "hello", "--debug-stream", "--quiet"))
+    resolved = runtime_log.set_level_from_flags(
+        log_level=args.log_level,
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        debug_stream=args.debug_stream,
+    )
+
+    assert args.log_level == "error"
+    assert args.debug_stream is True
+    assert resolved is runtime_log.LogLevel.STREAM_DEBUG
 
 
 @pytest.mark.parametrize(

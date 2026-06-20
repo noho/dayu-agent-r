@@ -80,10 +80,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     opened_log_stream: TextIO | None = None
     log_level_for_cleanup: str | None = None
+    debug_stream_for_cleanup: bool = False
     try:
         try:
             args = parse_cli_args(argv)
             log_level_for_cleanup = args.log_level
+            debug_stream_for_cleanup = args.debug_stream
             if args.log_file is not None:
                 opened_log_stream = _open_log_file(args.log_file)
                 if opened_log_stream is None:
@@ -96,6 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_log.set_level_from_flags(
                 log_level=args.log_level,
                 debug=False,
+                debug_stream=args.debug_stream,
                 verbose=False,
                 info=False,
                 quiet=False,
@@ -117,6 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     runtime_log.set_level_from_flags(
                         log_level=log_level_for_cleanup,
                         debug=False,
+                        debug_stream=debug_stream_for_cleanup,
                         verbose=False,
                         info=False,
                         quiet=False,

@@ -143,14 +143,14 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted plan commit |
-| implementation status | WU-CLI-DEBUG-STREAM-01 plan re-review PASS from AgentMiMo and AgentDS. Accepted plan-review findings are all `已修复`; plan is ready for accepted plan commit. No production code, tests, README, push, PR, issue closeout, or implementation gate is authorized until the accepted plan commit is created. |
+| gate | accepted slice commit |
+| implementation status | WU-CLI-DEBUG-STREAM-01 Slice 1 re-review PASS from AgentMiMo and AgentDS. Accepted Slice 1 findings are all fixed; Slice 1 is ready for accepted slice commit. Host/Engine stream diagnostic migration, prompt/interactive compatibility guard, and README updates remain later approved slices. |
 | active work unit | WU-CLI-DEBUG-STREAM-01 |
 | default next work unit | WU-CLI-DEBUG-STREAM-01 |
-| next entry point | Create accepted plan commit for WU-CLI-DEBUG-STREAM-01, then enter implementation gate for the approved plan. No push, PR, merge, mark-ready, reviewer request, branch deletion, issue closure, or out-of-scope work is authorized. |
+| next entry point | Create accepted Slice 1 commit for WU-CLI-DEBUG-STREAM-01, then enter the next approved implementation slice. No push, PR, merge, mark-ready, reviewer request, branch deletion, issue closure, or out-of-scope work is authorized. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | #81 closed https://github.com/noho/dayu-agent-r/issues/81; #117 closed https://github.com/noho/dayu-agent-r/issues/117; #82 https://github.com/noho/dayu-agent-r/issues/82#issuecomment-4637480828; #97 https://github.com/noho/dayu-agent-r/issues/97#issuecomment-4637480886; #98 https://github.com/noho/dayu-agent-r/issues/98#issuecomment-4637480924; #121 open https://github.com/noho/dayu-agent-r/issues/121; #122 open https://github.com/noho/dayu-agent-r/issues/122; #130 open https://github.com/noho/dayu-agent-r/issues/130; #86 updated https://github.com/noho/dayu-agent-r/issues/86#issuecomment-4679701213; #148 open https://github.com/noho/dayu-agent-r/issues/148; #156 open as #78 child https://github.com/noho/dayu-agent-r/issues/156; PR 128 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/128; PR 131 merged 2026-06-09 https://github.com/noho/dayu-agent-r/pull/131; PR 132 merged 2026-06-10 https://github.com/noho/dayu-agent-r/pull/132; WU-PROJ-01 PR #136 merged 2026-06-11 https://github.com/noho/dayu-agent-r/pull/136; WU-OBS-SIGNALS-01 completed by control-doc裁决; draft PR #137 https://github.com/noho/dayu-agent-r/pull/137; WU-RET-00 draft PR #139 https://github.com/noho/dayu-agent-r/pull/139; WU-CM-05/06/08/09 draft PR #140 https://github.com/noho/dayu-agent-r/pull/140 final closeout recorded; WU-CLI-SESSION-01 draft PR #146 https://github.com/noho/dayu-agent-r/pull/146 final closeout recorded; WU-CLI-ACTIVITY-01 draft PR #149 https://github.com/noho/dayu-agent-r/pull/149 final closeout recorded; GitHub Issue #145 closed 2026-06-17 https://github.com/noho/dayu-agent-r/issues/145; WU-CM-12 PR #150 merged 2026-06-19 https://github.com/noho/dayu-agent-r/pull/150; WU-CM-13 / WU-CM-14 draft PR #152 open draft https://github.com/noho/dayu-agent-r/pull/152; WU-CM-15 draft PR #157 open draft https://github.com/noho/dayu-agent-r/pull/157; WU-CLI-DEBUG-STREAM-01 is backed by GitHub Issue #148; WU-CM-13 / WU-CM-14 / WU-CM-15 are user-directed work units without GitHub Issue; WU-OBS-P01 #29 open; WU-OBS-P02 #30 open; WU-OBS-P03 #31 open; WU-OBS-P04 #35 open |
-| blocking open questions | None for WU-CLI-DEBUG-STREAM-01 accepted plan commit. Plan gate explicitly excludes `memory_repair.catch_up.budget_exhausted` from implementation scope because current code has already removed that stop reason and preserves warning only for actual memory repair failures. |
+| blocking open questions | None for WU-CLI-DEBUG-STREAM-01 accepted Slice 1 commit. Plan gate explicitly excludes `memory_repair.catch_up.budget_exhausted` from implementation scope because current code has already removed that stop reason and preserves warning only for actual memory repair failures. |
 
 状态约定：
 
@@ -241,7 +241,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CM-13 | draft-PR-pass | Unified conversation compact pipeline convergence | WU-CM-12-S4-R1 follow-up；无 GitHub Issue | Draft PR #152 open draft. Accepted PR review commit `f2970512` pushed; final closeout recorded in `docs/reviews/wu-cm-13-final-closeout-20260619.md`; `WU-CM-12-S4-R1` and `WU-CM-13-S1-R1` closed. |
 | WU-CM-14 | completed | Recent final answer preservation for ordinal follow-ups | CM semantic follow-up；无 GitHub Issue | Local phaseflow completed. Accepted slice commit `921c6219`; aggregate deepreview PASS after deleting dead `_current_only_material_blocks`. Root cause fixed by passing existing floor into compact selection, adding ordinary post-compaction protected raw tail rendering, and repairing reactive frozen material assembly for protected floor semantics. WU-CM-13 subsequently audited the preservation path into shared compact pipeline ownership. |
 | WU-CM-15 | draft-PR-pass | Conversation memory public smoke reactive compact and fallback coverage | CM smoke / eval coverage follow-up；无 GitHub Issue | Draft PR #157 open draft. Accepted plan commit `97518e93`; accepted implementation slice commit `572a88df`; pre-PR closeout commit `0fe4e910`; accepted PR review / final closeout commit `5e04a841`. PR review PASS from AgentMiMo / AgentDS with no material findings; final closeout recorded in `docs/reviews/wu-cm-15-final-closeout-20260620.md`. |
-| WU-CLI-DEBUG-STREAM-01 | accepted-plan | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Goal-confirmation, plan gate, plan review adjudication, plan fix, and plan re-review completed. Plan re-review PASS from AgentMiMo and AgentDS; accepted findings are all `已修复`. Plan scope adds explicit `--debug-stream` so normal `--debug` no longer emits massive per-delta reasoning/content ingest logs, while `--debug-stream` enables stream delta / SSE / per-delta accepted/committed diagnostics. `memory_repair.catch_up.budget_exhausted` is excluded from implementation scope as an already-closed bug, with only no-regression verification retained. |
+| WU-CLI-DEBUG-STREAM-01 | accepted-slice | CLI `--debug-stream` per-delta stream diagnostics | GitHub Issue #148 | Slice 1 implementation, code review, fix, and re-review completed; accepted findings are all fixed. Slice 1 implemented runtime `STREAM_DEBUG` level, global CLI `--debug-stream`, runtime logging precedence, and CLI/runtime tests. Remaining approved slices: Host/Engine stream diagnostic level migration; prompt/interactive compatibility guard; README/test README docs. `memory_repair.catch_up.budget_exhausted` is excluded from implementation scope as an already-closed bug, with only no-regression verification retained. |
 
 ## WU-CLI-ACTIVITY-01 CLI Activity Stream UI
 
@@ -2010,7 +2010,7 @@ Residual risk reconciliation:
 
 `planning`。Owner / destination is GitHub Issue #148: https://github.com/noho/dayu-agent-r/issues/148.
 
-本 WU 是 WU-CM-12 final closeout 后新增的 issue-backed follow-up。Goal-confirmation、plan gate、plan review adjudication、plan fix 与 plan re-review 已完成；当前必须先创建 accepted plan commit，再进入 implementation。
+本 WU 是 WU-CM-12 final closeout 后新增的 issue-backed follow-up。Goal-confirmation、plan gate、plan review adjudication、plan fix、plan re-review、accepted plan commit 与 Slice 1 implementation 已完成；当前进入 Slice 1 code review gate。
 
 Current gate artifacts:
 
@@ -2019,6 +2019,14 @@ Current gate artifacts:
 - plan review adjudication: `docs/reviews/plan-review-wu-cli-debug-stream-01-adjudication-20260620.md`
 - plan fix: `docs/reviews/plan-fix-wu-cli-debug-stream-01-20260620.md`
 - plan re-review: `docs/reviews/plan-rereview-wu-cli-debug-stream-01-mimo-20260620.md` (AgentMiMo PASS); `docs/reviews/plan-rereview-wu-cli-debug-stream-01-ds-20260620.md` (AgentDS PASS)
+- accepted plan commit: `61bc9a9d`
+- Slice 1 implementation: `docs/reviews/implementation-wu-cli-debug-stream-01-slice1-20260620.md`
+- Slice 1 validation: `pytest tests/runtime/test_log.py tests/runtime/test_log_levels.py tests/cli/test_arg_parsing.py -q` passed with 88 passed and 3 existing dependency warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
+- Slice 1 code review: `docs/reviews/code-review-wu-cli-debug-stream-01-slice1-mimo-20260620.md` (AgentMiMo APPROVED with deferred nits); `docs/reviews/code-review-wu-cli-debug-stream-01-slice1-ds-20260620.md` (AgentDS findings)
+- Slice 1 code review adjudication: `docs/reviews/code-review-wu-cli-debug-stream-01-slice1-adjudication-20260620.md`
+- Slice 1 fix: `docs/reviews/fix-wu-cli-debug-stream-01-slice1-20260620.md`
+- Slice 1 fix validation: `pytest tests/runtime/test_log.py tests/runtime/test_log_levels.py tests/cli/test_arg_parsing.py -q` passed with 90 passed and 3 existing dependency warnings; `python -m pyright dayu/ tests/ utils/` passed with 0 errors; `git diff --check` clean.
+- Slice 1 re-review: `docs/reviews/code-rereview-wu-cli-debug-stream-01-slice1-mimo-20260620.md` (AgentMiMo PASS); `docs/reviews/code-rereview-wu-cli-debug-stream-01-slice1-ds-20260620.md` (AgentDS PASS)
 - plan gate validation: `git diff --check` clean; untracked plan artifact whitespace check clean via `git diff --no-index --check /dev/null docs/host/host-issues/wu-cli-debug-stream-01-debug-stream-plan.md` with expected nonzero no-index exit and no whitespace output.
 - plan fix validation: `git diff --check` clean; untracked fix artifact whitespace check clean via `git diff --no-index --check /dev/null docs/reviews/plan-fix-wu-cli-debug-stream-01-20260620.md` with expected nonzero no-index exit and no whitespace output.
 
