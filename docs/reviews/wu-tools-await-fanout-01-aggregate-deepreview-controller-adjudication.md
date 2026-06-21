@@ -22,9 +22,9 @@ Both aggregate deepreview lanes reported 0 blocking findings. Focused tests and 
 
 No code changes are required by aggregate deepreview.
 
-## Scope And Risk Decision
+## Scope And Guardrail Decision
 
 - `AWAITING_FANOUT` remains a defensive Host-internal/unit-level state and is not claimed as current production end-to-end batch behavior.
-- DS-F02 diagnostic visibility remains deferred with owner in future Engine/ToolRuntime concurrency work if fanout becomes production reachable.
+- DS-F02 diagnostic visibility is not an active residual risk for this WU. It is a future-change guardrail only: if a future Engine/ToolRuntime concurrency change makes fanout production reachable, that future WU must re-check diagnostic visibility and Engine ingest alias semantics.
+- No follow-up owner is created by this WU for `AWAITING_FANOUT` production reachability or DS-F02 diagnostic visibility.
 - No durable schema/state, public API, Engine ingest, wait adapter activation, issue-129 behavior, durable follower ledger, or wait alias schema was introduced.
-
