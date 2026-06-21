@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol, TypeAlias
+from typing import TYPE_CHECKING, Protocol, TypeAlias
 
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import (
@@ -32,6 +32,9 @@ from dayu.host.durable.state import (
     read_wait_records_for_poll_observation,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+
+if TYPE_CHECKING:
+    from dayu.host.waiting import ToolAwaitingAcceptedAck
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +99,46 @@ class WaitPollAdapter(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class WaitActivationRequest:
+    """已被 Host 接受的等待 activation 请求。
+
+    :param tool_name: 产出等待 outcome 的工具名。
+    :param await_spec: 已被 Host 接受的等待规约。
+    :param accepted_ack: Host awaiting accept durable ack。
+    """
+
+    tool_name: str
+    await_spec: ToolAwaitSpec
+    accepted_ack: "ToolAwaitingAcceptedAck"
+
+    def __post_init__(self) -> None:
+        """校验 activation 请求字段。
+
+        :returns: ``None``。
+        :raises ValueError: 工具名为空或等待规约类型非法时抛出。
+        """
+
+        if self.tool_name.strip() == "":
+            raise ValueError("tool_name must be non-empty")
+        if not isinstance(self.await_spec, ToolAwaitSpec):
+            raise ValueError("await_spec must be ToolAwaitSpec")
+
+
+class WaitActivationAdapter(Protocol):
+    """Host accepted wait 后触发外部事务 activation 的端口。"""
+
+    def activate_accepted_wait(self, request: WaitActivationRequest) -> None:
+        """激活已被 Host durable 接受的等待。
+
+        :param request: accepted wait activation 请求。
+        :returns: ``None``。
+        :raises Exception: adapter 可在外部 activation 失败时抛出普通异常。
+        """
+
+        ...
+
+
 class WaitResolvePort(Protocol):
     """poller 依赖的 resolve_wait 端口。"""
 
@@ -135,6 +178,18 @@ class WaitPollAdapterRegistration:
 
     adapter_key: WaitAdapterKey
     adapter: WaitPollAdapter
+
+
+@dataclass(frozen=True, slots=True)
+class WaitActivationAdapterRegistration:
+    """activation adapter 注册项。
+
+    :param adapter_key: adapter 稳定注册键。
+    :param adapter: activation adapter 实例。
+    """
+
+    adapter_key: WaitAdapterKey
+    adapter: WaitActivationAdapter
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +341,37 @@ class WaitPollAdapterRegistry:
         """按 adapter key 解析 poll adapter。
 
         :param adapter_key: wait record 上持久化的 adapter key。
+        :returns: adapter；未注册时为 ``None``。
+        """
+
+        return self._adapters.get(adapter_key)
+
+
+class WaitActivationRegistry:
+    """Host accepted wait activation adapter registry。"""
+
+    def __init__(
+        self, registrations: tuple[WaitActivationAdapterRegistration, ...]
+    ) -> None:
+        """初始化 activation adapter registry。
+
+        :param registrations: adapter 注册项。
+        :returns: ``None``。
+        :raises ValueError: adapter key 重复时抛出。
+        """
+
+        self._adapters: dict[WaitAdapterKey, WaitActivationAdapter] = {}
+        for registration in registrations:
+            if registration.adapter_key in self._adapters:
+                raise ValueError("duplicate wait activation adapter registration")
+            self._adapters[registration.adapter_key] = registration.adapter
+
+    def resolve_adapter(
+        self, adapter_key: WaitAdapterKey
+    ) -> WaitActivationAdapter | None:
+        """按 adapter key 解析 activation adapter。
+
+        :param adapter_key: wait binding 使用的 adapter key。
         :returns: adapter；未注册时为 ``None``。
         """
 
@@ -450,6 +536,10 @@ def _poll_idempotency_key(wait_record: WaitRecordRow) -> str:
 
 
 __all__ = [
+    "WaitActivationAdapter",
+    "WaitActivationAdapterRegistration",
+    "WaitActivationRegistry",
+    "WaitActivationRequest",
     "WaitAdapterBinding",
     "WaitAdapterRegistry",
     "WaitExternalJobRefSource",

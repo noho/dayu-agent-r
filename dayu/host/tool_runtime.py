@@ -168,7 +168,12 @@ from dayu.host.tool_runtime_schema_projection import (
 from dayu.host.tool_runtime_schema_projection import (
     validate_reserved_name_conflicts as _validate_reserved_name_conflicts,
 )
-from dayu.host.wait_adapter import WaitAdapterBinding, WaitAdapterRegistry
+from dayu.host.wait_adapter import (
+    WaitActivationRegistry,
+    WaitActivationRequest,
+    WaitAdapterBinding,
+    WaitAdapterRegistry,
+)
 from dayu.host.waiting import (
     HostToolAwaitingAcceptPort,
     ToolAwaitingAcceptCandidate,
@@ -237,6 +242,7 @@ _TOOL_RUNTIME_DUPLICATE_CLEANUP_FAILURE_REASON = "duplicate_cleanup_failed"
 _TOOL_RUNTIME_DUPLICATE_AWAITING_MARKER_FAILURE_REASON = (
     "duplicate_awaiting_marker_failed"
 )
+_TOOL_RUNTIME_WAIT_ACTIVATION_FAILURE_REASON = "wait_activation_failed"
 _TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY = "diagnostic_refs"
 _TOOL_RUNTIME_HINT_SECTION_SEPARATOR = ";"
 _TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR = ","
@@ -2127,6 +2133,8 @@ class ToolRuntimeBuildRequest:
         outcome 返回受治理错误。
     :param wait_adapter_registry: Host 等待 adapter registry；无则 awaiting
         outcome 返回受治理错误。
+    :param wait_activation_registry: Host accepted wait activation registry；无则
+        accepted wait 不执行 activation。
     :param retry_policy: accept ack 有限重试策略。
     :param policy_view: Host 内部工具 policy view。
     :param duplicate_governance_policy: ToolRuntime 使用的 duplicate governance
@@ -2139,6 +2147,7 @@ class ToolRuntimeBuildRequest:
     accept_port: HostToolFactAcceptPort | None = None
     awaiting_accept_port: HostToolAwaitingAcceptPort | None = None
     wait_adapter_registry: WaitAdapterRegistry | None = None
+    wait_activation_registry: WaitActivationRegistry | None = None
     retry_policy: ToolAcceptRetryPolicy = field(
         default_factory=_default_tool_accept_retry_policy
     )
@@ -2209,6 +2218,7 @@ class ToolRuntimeExecutor:
         accept_port: HostToolFactAcceptPort,
         awaiting_accept_port: HostToolAwaitingAcceptPort | None,
         wait_adapter_registry: WaitAdapterRegistry | None,
+        wait_activation_registry: WaitActivationRegistry | None,
         retry_policy: ToolAcceptRetryPolicy,
         policy_view: ToolRuntimePolicyView,
         diagnostic_emitter: ToolTraceDiagnosticEmitter,
@@ -2224,6 +2234,7 @@ class ToolRuntimeExecutor:
         :param accept_port: Host accept barrier。
         :param awaiting_accept_port: Host awaiting accept barrier。
         :param wait_adapter_registry: Host 等待 adapter registry。
+        :param wait_activation_registry: Host accepted wait activation registry。
         :param retry_policy: accept ack 有限重试策略。
         :param policy_view: Host 内部工具 policy view。
         :param diagnostic_emitter: 诊断 emitter。
@@ -2239,6 +2250,7 @@ class ToolRuntimeExecutor:
         self._accept_port = accept_port
         self._awaiting_accept_port = awaiting_accept_port
         self._wait_adapter_registry = wait_adapter_registry
+        self._wait_activation_registry = wait_activation_registry
         self._retry_policy = retry_policy
         self._policy_view = policy_view
         self._diagnostic_emitter = diagnostic_emitter
@@ -2761,6 +2773,13 @@ class ToolRuntimeExecutor:
                     policy_decision=policy_decision,
                 )
             )
+            if not context.cancellation_token.is_cancelled():
+                self._activate_accepted_wait_best_effort(
+                    binding=binding,
+                    tool_name=call.name,
+                    awaiting_outcome=awaiting_outcome,
+                    accepted_ack=accept_result,
+                )
             return _AwaitingAcceptExecution(
                 record=BatchToolExecutionRecord(
                     tool_call_id=call.tool_call_id,
@@ -2780,6 +2799,80 @@ class ToolRuntimeExecutor:
             duplicate_terminal_recorded=False,
             durable_missing_reason=durable_missing_reason,
         )
+
+    def _activate_accepted_wait_best_effort(
+        self,
+        *,
+        binding: WaitAdapterBinding,
+        tool_name: str,
+        awaiting_outcome: ToolAwaitingOutcome,
+        accepted_ack: ToolAwaitingAcceptedAck,
+    ) -> None:
+        """在 Host accepted wait 后 best-effort 触发 provider activation。
+
+        :param binding: 当前 awaiting outcome 使用的 Host wait binding。
+        :param tool_name: 当前工具名。
+        :param awaiting_outcome: 已 accepted 的 awaiting outcome。
+        :param accepted_ack: Host awaiting accepted ack。
+        :returns: ``None``。
+        :raises: 不向调用方传播 activation adapter 异常。
+        """
+
+        if self._wait_activation_registry is None:
+            return
+        adapter = self._wait_activation_registry.resolve_adapter(
+            binding.adapter_key
+        )
+        if adapter is None:
+            return
+        request = WaitActivationRequest(
+            tool_name=tool_name,
+            await_spec=awaiting_outcome.await_spec,
+            accepted_ack=accepted_ack,
+        )
+        try:
+            adapter.activate_accepted_wait(request)
+        except Exception as exc:
+            _LOGGER.warning(
+                "host.tool_runtime.wait_activation_failed "
+                "session_id=%s run_id=%s attempt_id=%s tool_name=%s "
+                "adapter_key=%s error_type=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                tool_name,
+                binding.adapter_key.value,
+                exc.__class__.__name__,
+            )
+            self._emit_wait_activation_diagnostic_best_effort(exc)
+
+    def _emit_wait_activation_diagnostic_best_effort(self, exc: Exception) -> None:
+        """best-effort 发出 accepted wait activation 失败诊断。
+
+        :param exc: activation adapter 抛出的异常。
+        :returns: ``None``。
+        :raises: 不向调用方传播诊断失败。
+        """
+
+        try:
+            self._diagnostic_emitter.emit(
+                ToolTraceDiagnosticRecord(
+                    reason_code=_TOOL_RUNTIME_WAIT_ACTIVATION_FAILURE_REASON,
+                    message=(
+                        "wait activation adapter failed after accepted wait: "
+                        f"{exc.__class__.__name__}"
+                    ),
+                ),
+            )
+        except Exception:
+            _LOGGER.warning(
+                "host.tool_runtime.wait_activation_diagnostic_failed "
+                "session_id=%s run_id=%s attempt_id=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                exc_info=True,
+            )
 
     def _awaiting_fanout_record(
         self, *, call: ToolCallRequest, duplicate_decision: DuplicateDecision
@@ -3216,6 +3309,7 @@ class DefaultToolRuntimeFactory:
                 accept_port=request.accept_port,
                 awaiting_accept_port=request.awaiting_accept_port,
                 wait_adapter_registry=request.wait_adapter_registry,
+                wait_activation_registry=request.wait_activation_registry,
                 retry_policy=request.retry_policy,
                 policy_view=request.policy_view,
                 diagnostic_emitter=diagnostic_emitter,
