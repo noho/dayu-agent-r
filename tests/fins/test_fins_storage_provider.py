@@ -719,20 +719,18 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
         assert "cancellation_token" not in required
 
 
-def test_fins_provider_can_disable_read_tools_without_workspace_root(tmp_path: Path) -> None:
-    """关闭 read tools 时 provider 不应解析 workspace_root。"""
+def test_fins_read_provider_requires_workspace_root_when_enabled(tmp_path: Path) -> None:
+    """启用 read provider 时必须显式提供 workspace_root。"""
 
-    result = discover_tools(
-        _spec(
-            tmp_path,
-            extra_config={
-                "workspace_root": None,
-                "include_read_tools": False,
-            },
+    with pytest.raises(ValueError, match="workspace_root"):
+        discover_tools(
+            _spec(
+                tmp_path,
+                extra_config={
+                    "workspace_root": None,
+                },
+            )
         )
-    )
-
-    assert result.definitions == ()
 
 
 def test_list_documents_executes_through_current_tool_runtime(tmp_path: Path) -> None:
@@ -1114,6 +1112,57 @@ def test_fins_truncate_specs_use_current_contract(tmp_path: Path) -> None:
     assert search_document_truncate.target_field == "matches"
 
 
+def test_fins_provider_explicit_limits_shape_truncate_specs(tmp_path: Path) -> None:
+    """Fins provider 必须把显式完整 limits 配置投影到各工具截断声明。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        ``None``。
+
+    Raises:
+        AssertionError: 截断声明未反映显式配置时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    definitions = _definitions_by_name(
+        discover_tools(
+            _spec(
+                workspace_root,
+                extra_config={
+                    "limits": {
+                        "processor_cache_max_entries": 16,
+                        "list_documents_max_items": 21,
+                        "get_document_sections_max_items": 122,
+                        "search_document_max_items": 23,
+                        "list_tables_max_items": 54,
+                        "read_section_max_chars": 8100,
+                        "get_page_content_max_chars": 8200,
+                        "get_table_max_items": 830,
+                        "get_financial_statement_max_items": 1240,
+                        "query_xbrl_facts_max_items": 1250,
+                    },
+                },
+            )
+        ).definitions
+    )
+
+    assert _truncate_limit(definitions["list_documents"], "max_items") == 21
+    assert _truncate_limit(definitions["get_document_sections"], "max_items") == 122
+    assert _truncate_limit(definitions["search_document"], "max_items") == 23
+    assert _truncate_limit(definitions["list_tables"], "max_items") == 54
+    assert _truncate_limit(definitions["read_section"], "max_chars") == 8100
+    assert _truncate_limit(definitions["get_page_content"], "max_chars") == 8200
+    assert _truncate_limit(definitions["get_table"], "max_items") == 830
+    assert _truncate_limit(definitions["get_financial_statement"], "max_items") == 1240
+    assert _truncate_limit(definitions["query_xbrl_facts"], "max_items") == 1250
+    for definition in definitions.values():
+        truncate = definition.truncate
+        assert isinstance(truncate, ToolTruncateSpec)
+        assert "processor_cache_max_entries" not in truncate.limits
+
+
 def test_read_provider_only_exposes_read_tools(tmp_path: Path) -> None:
     """read provider 不应混入 download / preprocess ingestion tools。"""
 
@@ -1153,10 +1202,8 @@ def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
             import_path="dayu.fins.tools.provider:discover_tools"
         ),
         enabled=True,
-        allow_empty=False,
         config={
             "workspace_root": "workspace/fins",
-            "include_read_tools": True,
             "limits": {},
         },
     )
@@ -1319,7 +1366,6 @@ def _spec(
 
     config: dict[str, JsonValue] = {
         "workspace_root": str(workspace_root),
-        "include_read_tools": True,
         "limits": {
             "search_document_max_items": 10,
             "list_documents_max_items": 20,
@@ -1333,7 +1379,6 @@ def _spec(
             import_path="dayu.fins.tools.provider:discover_tools"
         ),
         enabled=True,
-        allow_empty=False,
         config=config,
     )
 
@@ -1370,6 +1415,27 @@ def _definitions_by_name(
     """
 
     return {definition.name: definition for definition in definitions}
+
+
+def _truncate_limit(definition: ToolDefinition, limit_name: str) -> int:
+    """读取工具截断声明中的限制值。
+
+    Args:
+        definition: 工具定义。
+        limit_name: limit 字段名。
+
+    Returns:
+        截断限制值。
+
+    Raises:
+        AssertionError: 工具没有截断声明或限制值不是整数时抛出。
+    """
+
+    truncate = definition.truncate
+    assert isinstance(truncate, ToolTruncateSpec)
+    limit = truncate.limits[limit_name]
+    assert isinstance(limit, int)
+    return limit
 
 
 def _assert_host_cancelled_outcome(

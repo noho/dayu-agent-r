@@ -310,7 +310,6 @@ def _minimal_package_config(root: Path) -> None:
                     "source_kind": "explicit_provider",
                     "source_id": "tests.fake_tools",
                     "enabled": False,
-                    "allow_empty": True,
                     "config": {
                         "nested": {"keep": ["provider", "json"]},
                         "enabled_flag": True,
@@ -385,22 +384,42 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert read_provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
     assert read_provider.import_path == "dayu.fins.tools.provider:discover_tools"
     assert read_provider.enabled is True
-    assert read_provider.config["include_read_tools"] is True
+    assert read_provider.config["workspace_root"] == "workspace/"
     assert "include_ingestion_tools" not in read_provider.config
+    assert read_provider.config["limits"] == {
+        "processor_cache_max_entries": 128,
+        "list_documents_max_items": 300,
+        "get_document_sections_max_items": 1200,
+        "search_document_max_items": 20,
+        "list_tables_max_items": 50,
+        "read_section_max_chars": 80000,
+        "get_page_content_max_chars": 80000,
+        "get_table_max_items": 800,
+        "get_financial_statement_max_items": 1200,
+        "query_xbrl_facts_max_items": 1200,
+    }
     assert download_provider.import_path == (
         "dayu.fins.tools.download_provider:discover_tools"
     )
     assert download_provider.enabled is True
-    assert download_provider.config["workspace_root"] is None
+    assert download_provider.config["workspace_root"] == "workspace/"
     assert preprocess_provider.import_path == (
         "dayu.fins.tools.preprocess_provider:discover_tools"
     )
     assert preprocess_provider.enabled is True
-    assert preprocess_provider.config["workspace_root"] is None
+    assert preprocess_provider.config["workspace_root"] == "workspace/"
     assert upload_provider.enabled is True
-    assert upload_provider.config["allowed_upload_roots"] == []
+    assert upload_provider.config["workspace_root"] == "workspace/"
+    assert "allowed_upload_roots" not in upload_provider.config
     doc_provider = config.tool_discovery.providers["doc-tools"]
-    assert doc_provider.enabled is True
+    assert doc_provider.enabled is False
+    assert doc_provider.config["limits"] == {
+        "list_files_max": 200,
+        "get_sections_max": 200,
+        "search_files_max_results": 50,
+        "read_file_max_chars": 80000,
+        "read_file_section_max_chars": 50000,
+    }
     web_provider = config.tool_discovery.providers["web-tools"]
     assert web_provider.enabled is True
     assert web_provider.config["provider"] == "auto"
@@ -1051,7 +1070,6 @@ def test_tool_discovery_provider_config_must_be_json_object(tmp_path: Path) -> N
                     "source_kind": "explicit_provider",
                     "source_id": "bad",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": ["not", "object"],
                 }
             }
@@ -1059,6 +1077,32 @@ def test_tool_discovery_provider_config_must_be_json_object(tmp_path: Path) -> N
     )
 
     with pytest.raises(ConfigShapeError, match="config must be a JSON object"):
+        ConfigLoader(package_config_dir=package_root).load_tool_discovery()
+
+
+def test_tool_discovery_provider_allow_empty_is_rejected(tmp_path: Path) -> None:
+    """旧版 provider-level allow_empty 字段必须作为未知字段拒绝。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "tool_discovery.json",
+        {
+            "providers": {
+                "old": {
+                    "import_path": "tests.fake_tools:provider",
+                    "entry_point": None,
+                    "source_kind": "explicit_provider",
+                    "source_id": "old",
+                    "enabled": True,
+                    "allow_empty": False,
+                    "config": {},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unknown fields"):
         ConfigLoader(package_config_dir=package_root).load_tool_discovery()
 
 
@@ -1166,7 +1210,6 @@ def test_tool_discovery_entry_point_requires_import_path_xor_entry_point(
                     "source_kind": "explicit_provider",
                     "source_id": "bad",
                     "enabled": True,
-                    "allow_empty": False,
                 }
             }
         },

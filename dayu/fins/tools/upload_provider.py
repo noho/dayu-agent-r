@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from pathlib import Path
 from typing import Final
 
-from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.provider import parse_fins_workspace_root_config
@@ -19,7 +16,6 @@ from dayu.runtime.tools_discovery import (
 _PROVIDER_ID: Final[str] = "financial-upload-tools"
 _VERSION_REF: Final[str] = "fins-upload-tools-provider-v1"
 _SOURCE_ID: Final[str] = "dayu.fins.tools.upload_provider"
-_CONFIG_ALLOWED_UPLOAD_ROOTS_FIELD: Final[str] = "allowed_upload_roots"
 
 
 def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
@@ -32,20 +28,11 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         provider 输出，包含上传 start 工具定义。
 
     Raises:
-        ValueError: 注册上传工具时 provider config 缺少绝对
-            ``workspace_root``，或 ``allowed_upload_roots`` 字段类型非法时抛出。
+        ValueError: 注册上传工具时 provider config 缺少绝对 ``workspace_root`` 时抛出。
         OSError: Fins runtime 仓储初始化失败时抛出。
     """
 
-    allowed_upload_roots = parse_allowed_upload_roots_config(spec.config)
     source_ref = _source_ref()
-    if not allowed_upload_roots:
-        return ToolsDiscoveryProviderOutput(
-            provider_id=_PROVIDER_ID,
-            version_ref=_VERSION_REF,
-            source_refs=(source_ref,),
-            definitions=(),
-        )
     workspace_root = parse_fins_workspace_root_config(spec.config)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     ingestion_runtime = runtime.get_ingestion_runtime()
@@ -54,45 +41,9 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         version_ref=_VERSION_REF,
         source_refs=(source_ref,),
         definitions=(
-            build_fins_upload_tool(
-                ingestion_runtime,
-                allowed_upload_roots=allowed_upload_roots,
-            ),
+            build_fins_upload_tool(ingestion_runtime),
         ),
     )
-
-
-def parse_allowed_upload_roots_config(config: Mapping[str, JsonValue]) -> tuple[Path, ...]:
-    """解析 Fins upload provider 的上传文件 allowlist 根目录。
-
-    Args:
-        config: provider 自有 JSON 配置。
-
-    Returns:
-        已 resolve 的绝对 allowlist 根目录元组。
-
-    Raises:
-        ValueError: 字段不是数组，或数组元素不是绝对路径字符串时抛出。
-    """
-
-    value = config.get(_CONFIG_ALLOWED_UPLOAD_ROOTS_FIELD)
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise ValueError("fins upload provider config.allowed_upload_roots must be an array")
-    if not value:
-        return ()
-    roots: list[Path] = []
-    for item in value:
-        if not isinstance(item, str) or item.strip() == "":
-            raise ValueError(
-                "fins upload provider config.allowed_upload_roots must contain only non-empty absolute paths"
-            )
-        path = Path(item).expanduser()
-        if not path.is_absolute():
-            raise ValueError("fins upload provider config.allowed_upload_roots must contain only absolute paths")
-        roots.append(path.resolve(strict=False))
-    return tuple(roots)
 
 
 def _source_ref() -> ToolBundleSourceRef:
@@ -116,4 +67,4 @@ def _source_ref() -> ToolBundleSourceRef:
     )
 
 
-__all__ = ["discover_tools", "parse_allowed_upload_roots_config"]
+__all__ = ["discover_tools"]

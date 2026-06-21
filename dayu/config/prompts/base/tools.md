@@ -73,7 +73,7 @@
 
 <when_tag web>
 ## 联网工具指引
-
+- 当用户问题涉及时效性、新闻、人物近况等非财报信息时，必须优先调用 search_web。
 - 先 `search_web`，再 `fetch_web_page` 精读。
 - 同一主题连续 2 次无新增信息即停止。
 </when_tag>

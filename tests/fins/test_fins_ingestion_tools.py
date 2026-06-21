@@ -571,13 +571,50 @@ class _OSErrorExecutor:
         raise OSError("executor unavailable")
 
 
+class _NoOpExecutor:
+    """测试用后台执行器，只记录提交但不执行后台任务。"""
+
+    submitted_job_ids: tuple[str, ...]
+
+    def __init__(self) -> None:
+        """初始化提交记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.submitted_job_ids = ()
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """记录后台任务提交。
+
+        Args:
+            job_id: opaque operation id。
+            operation: 原始后台任务函数。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del operation
+        self.submitted_job_ids = self.submitted_job_ids + (job_id,)
+
+
 def test_tools_discovery_discovers_read_download_preprocess_and_upload_independently(
     tmp_path: Path,
 ) -> None:
     """ToolsDiscovery 应能独立发现 read、download、preprocess、upload provider。"""
 
     workspace_root = _build_workspace(tmp_path)
-    upload_root = _build_upload_root(tmp_path)
     result = ToolsDiscovery().discover_from_bindings(
         (
             ToolsDiscoveryProviderBinding(
@@ -608,7 +645,6 @@ def test_tools_discovery_discovers_read_download_preprocess_and_upload_independe
                 spec=_upload_spec(
                     spec_id=_UPLOAD_SPEC_ID,
                     workspace_root=workspace_root,
-                    allowed_upload_roots=(upload_root,),
                 ),
                 provider=upload_provider.discover_tools,
             ),
@@ -639,8 +675,7 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
     """workspace overlay 应能分别启用 Fins read、download、preprocess、upload providers。"""
 
     workspace_root = _build_workspace(tmp_path)
-    upload_root = _build_upload_root(tmp_path)
-    _write_split_fins_provider_overlay(tmp_path, workspace_root, upload_root)
+    _write_split_fins_provider_overlay(tmp_path, workspace_root)
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=tmp_path / "workspace" / "config"
     )
@@ -668,19 +703,12 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
     assert UPLOAD_TOOL_NAME in reports_by_spec[_UPLOAD_SPEC_ID].tool_names
 
 
-@pytest.mark.parametrize(
-    "provider_config",
-    (
-        {},
-        {"allowed_upload_roots": []},
-        {"allowed_upload_roots": None},
-    ),
-)
-def test_upload_provider_without_allowed_upload_roots_returns_empty_tools(
-    provider_config: Mapping[str, JsonValue],
+def test_upload_provider_registers_upload_tool_without_local_file_roots(
+    tmp_path: Path,
 ) -> None:
-    """upload provider 空 allowed_upload_roots 时必须安全返回空工具集。"""
+    """upload provider 启用时不依赖本地文件根目录配置，必须注册上传工具。"""
 
+    workspace_root = _build_workspace(tmp_path)
     result = upload_provider.discover_tools(
         ToolsDiscoveryProviderSpec(
             spec_id=_UPLOAD_SPEC_ID,
@@ -688,20 +716,18 @@ def test_upload_provider_without_allowed_upload_roots_returns_empty_tools(
                 import_path="dayu.fins.tools.upload_provider:discover_tools"
             ),
             enabled=True,
-            allow_empty=True,
-            config=dict(provider_config),
+            config={"workspace_root": str(workspace_root)},
         )
     )
 
     assert result.provider_id == _UPLOAD_PROVIDER_ID
-    assert result.definitions == ()
+    assert tuple(definition.name for definition in result.definitions) == (UPLOAD_TOOL_NAME,)
 
 
-def test_upload_provider_rejects_relative_allowed_upload_roots(tmp_path: Path) -> None:
-    """upload provider 对非法 allowed_upload_roots 仍必须 fail fast。"""
+def test_upload_provider_rejects_missing_workspace_root() -> None:
+    """upload provider 启用时仍必须要求明确的 Fins workspace root。"""
 
-    workspace_root = _build_workspace(tmp_path)
-    with pytest.raises(ValueError, match="absolute paths"):
+    with pytest.raises(ValueError, match="workspace_root"):
         upload_provider.discover_tools(
             ToolsDiscoveryProviderSpec(
                 spec_id=_UPLOAD_SPEC_ID,
@@ -709,11 +735,7 @@ def test_upload_provider_rejects_relative_allowed_upload_roots(tmp_path: Path) -
                     import_path="dayu.fins.tools.upload_provider:discover_tools"
                 ),
                 enabled=True,
-                allow_empty=True,
-                config={
-                    "workspace_root": str(workspace_root),
-                    "allowed_upload_roots": ["relative/upload-root"],
-                },
+                config={},
             )
         )
 
@@ -781,12 +803,10 @@ def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> No
     """上传工具应返回基于 lightweight observation handle 的 awaiting outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
-    upload_root = _build_upload_root(tmp_path)
     definition = upload_provider.discover_tools(
         _upload_spec(
             spec_id=_UPLOAD_SPEC_ID,
             workspace_root=workspace_root,
-            allowed_upload_roots=(upload_root,),
         )
     ).definitions[0]
 
@@ -841,23 +861,91 @@ def test_tool_argument_error_returns_failed_outcome_before_observation_start(tmp
     assert not tuple(job_dir.glob("*.json"))
 
 
-def test_upload_tool_path_error_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
-    """上传路径越界必须在 observation 启动前返回失败 outcome。"""
+def test_upload_tool_missing_file_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
+    """上传缺失文件必须在 observation 启动前返回失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
-    allowed_root = _build_upload_root(tmp_path)
     outside_root = tmp_path / "outside"
-    outside_file = _write_upload_file(outside_root)
+    missing_file = outside_root / "missing.pdf"
     definition = upload_provider.discover_tools(
         _upload_spec(
             spec_id=_UPLOAD_SPEC_ID,
             workspace_root=workspace_root,
-            allowed_upload_roots=(allowed_root,),
         )
     ).definitions[0]
 
     outcome = asyncio.run(
         definition.callable(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "files": [str(missing_file)],
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert "existing file" in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+def test_upload_tool_directory_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
+    """上传目录路径必须在 observation 启动前返回失败 outcome。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    directory_path = tmp_path / "outside-directory"
+    directory_path.mkdir()
+    definition = upload_provider.discover_tools(
+        _upload_spec(
+            spec_id=_UPLOAD_SPEC_ID,
+            workspace_root=workspace_root,
+        )
+    ).definitions[0]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "files": [str(directory_path)],
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert "existing file" in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+def test_upload_tool_accepts_local_file_outside_workspace_without_source_side_effect(
+    tmp_path: Path,
+) -> None:
+    """上传工具接受 workspace 外本地文件，且不在源文件目录写治理状态。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    outside_file = _write_upload_file(tmp_path / "outside-upload-source")
+    executor = _NoOpExecutor()
+    runtime = _runtime_with_executor(
+        workspace_root=workspace_root,
+        executor=executor,
+    )
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
             _call(
                 UPLOAD_TOOL_NAME,
                 {
@@ -872,10 +960,10 @@ def test_upload_tool_path_error_returns_failed_outcome_before_observation_start(
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "invalid_argument"
-    assert "outside allowed upload roots" in outcome.result.message
-    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert executor.submitted_job_ids
+    assert all(str(outside_file.parent) not in job_id for job_id in executor.submitted_job_ids)
+    assert not (outside_file.parent / ".dayu").exists()
 
 
 def test_upload_tool_empty_file_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
@@ -889,7 +977,6 @@ def test_upload_tool_empty_file_returns_failed_outcome_before_observation_start(
         _upload_spec(
             spec_id=_UPLOAD_SPEC_ID,
             workspace_root=workspace_root,
-            allowed_upload_roots=(allowed_root,),
         )
     ).definitions[0]
 
@@ -924,7 +1011,6 @@ def test_upload_tool_delete_rejects_unnecessary_files_before_job_creation(tmp_pa
         _upload_spec(
             spec_id=_UPLOAD_SPEC_ID,
             workspace_root=workspace_root,
-            allowed_upload_roots=(upload_file.parent,),
         )
     ).definitions[0]
 
@@ -993,11 +1079,10 @@ def test_upload_tool_cancelled_before_start_returns_cancelled_without_job(tmp_pa
     """上传工具 start 前收到取消 token 时应取消且不启动 observation。"""
 
     workspace_root = _build_workspace(tmp_path)
-    upload_root = _build_upload_root(tmp_path)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
 
     outcome = asyncio.run(
-        FinsUploadToolCallable(runtime=runtime, allowed_upload_roots=(upload_root,))(
+        FinsUploadToolCallable(runtime=runtime)(
             _call(
                 UPLOAD_TOOL_NAME,
                 {
@@ -1126,14 +1211,13 @@ def test_upload_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: 
     """上传工具遇到 observation start OSError 时应返回 start-failed 失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
-    upload_root = _build_upload_root(tmp_path)
     runtime = _runtime_with_executor(
         workspace_root=workspace_root,
         executor=_OSErrorExecutor(),
     )
 
     outcome = asyncio.run(
-        FinsUploadToolCallable(runtime=runtime, allowed_upload_roots=(upload_root,))(
+        FinsUploadToolCallable(runtime=runtime)(
             _call(
                 UPLOAD_TOOL_NAME,
                 {
@@ -1157,14 +1241,13 @@ def test_upload_tool_unexpected_start_exception_returns_start_failed_outcome(tmp
     """上传工具遇到 start_upload 非预期异常时应返回 start-failed 失败 outcome。"""
 
     workspace_root = _build_workspace(tmp_path)
-    upload_root = _build_upload_root(tmp_path)
     runtime = _runtime_with_executor(
         workspace_root=workspace_root,
         executor=_RuntimeErrorExecutor(),
     )
 
     outcome = asyncio.run(
-        FinsUploadToolCallable(runtime=runtime, allowed_upload_roots=(upload_root,))(
+        FinsUploadToolCallable(runtime=runtime)(
             _call(
                 UPLOAD_TOOL_NAME,
                 {
@@ -1224,7 +1307,6 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
     """下载、预处理和上传工具 schema 不应暴露 Host 内部治理字段。"""
 
     workspace_root = _build_workspace(tmp_path)
-    upload_root = _build_upload_root(tmp_path)
     definitions = (
         download_provider.discover_tools(
             _spec(
@@ -1244,7 +1326,6 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
             _upload_spec(
                 spec_id=_UPLOAD_SPEC_ID,
                 workspace_root=workspace_root,
-                allowed_upload_roots=(upload_root,),
             )
         ).definitions
     )
@@ -1582,14 +1663,12 @@ def _runtime_with_executor(
 def _write_split_fins_provider_overlay(
     tmp_path: Path,
     workspace_root: Path,
-    upload_root: Path,
 ) -> None:
     """写入启用 split Fins providers 的 workspace overlay。
 
     Args:
         tmp_path: pytest 临时目录。
         workspace_root: Fins workspace root。
-        upload_root: 上传文件 allowlist 根目录。
 
     Returns:
         无。
@@ -1606,10 +1685,8 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.provider",
                 "enabled": True,
-                "allow_empty": False,
                 "config": {
                     "workspace_root": str(workspace_root),
-                    "include_read_tools": True,
                     "limits": {},
                 },
             },
@@ -1619,7 +1696,6 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.download_provider",
                 "enabled": True,
-                "allow_empty": False,
                 "config": {"workspace_root": str(workspace_root)},
             },
             _PREPROCESS_SPEC_ID: {
@@ -1628,7 +1704,6 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.preprocess_provider",
                 "enabled": True,
-                "allow_empty": False,
                 "config": {"workspace_root": str(workspace_root)},
             },
             _UPLOAD_SPEC_ID: {
@@ -1637,11 +1712,7 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.upload_provider",
                 "enabled": True,
-                "allow_empty": False,
-                "config": {
-                    "workspace_root": str(workspace_root),
-                    "allowed_upload_roots": [str(upload_root)],
-                },
+                "config": {"workspace_root": str(workspace_root)},
             },
         }
     }
@@ -1671,7 +1742,6 @@ def _provider_specs_from_loaded_config(
                 spec_id=provider_config.provider_id,
                 location=PythonImportPathProvider(import_path=provider_config.import_path),
                 enabled=provider_config.enabled,
-                allow_empty=provider_config.allow_empty,
                 config=provider_config.config,
             )
         )
@@ -1720,7 +1790,6 @@ def _spec(
         spec_id=spec_id,
         location=PythonImportPathProvider(import_path=import_path),
         enabled=True,
-        allow_empty=False,
         config={"workspace_root": str(workspace_root)},
     )
 
@@ -1729,14 +1798,12 @@ def _upload_spec(
     *,
     spec_id: str,
     workspace_root: Path,
-    allowed_upload_roots: tuple[Path, ...],
 ) -> ToolsDiscoveryProviderSpec:
     """构造 upload provider spec。
 
     Args:
         spec_id: provider spec id。
         workspace_root: Fins workspace root。
-        allowed_upload_roots: 上传文件 allowlist 根目录。
 
     Returns:
         provider spec。
@@ -1751,22 +1818,18 @@ def _upload_spec(
             import_path="dayu.fins.tools.upload_provider:discover_tools"
         ),
         enabled=True,
-        allow_empty=False,
-        config={
-            "workspace_root": str(workspace_root),
-            "allowed_upload_roots": [str(root) for root in allowed_upload_roots],
-        },
+        config={"workspace_root": str(workspace_root)},
     )
 
 
 def _build_upload_root(tmp_path: Path) -> Path:
-    """构造上传文件 allowlist 根目录。
+    """构造上传文件目录。
 
     Args:
         tmp_path: pytest 临时目录。
 
     Returns:
-        上传文件根目录。
+        上传文件目录。
 
     Raises:
         OSError: 目录创建失败时抛出。

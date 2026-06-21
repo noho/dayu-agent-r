@@ -113,12 +113,11 @@ def _source_ref(source_id: str) -> ToolBundleSourceRef:
     )
 
 
-def _spec(spec_id: str, *, enabled: bool = True, allow_empty: bool = False) -> ToolsDiscoveryProviderSpec:
+def _spec(spec_id: str, *, enabled: bool = True) -> ToolsDiscoveryProviderSpec:
     """构造测试用 provider spec。
 
     :param spec_id: provider spec 标识。
     :param enabled: 是否启用 provider。
-    :param allow_empty: 是否允许空工具输出。
     :returns: provider spec。
     :raises ValueError: spec 字段为空时抛出。
     """
@@ -127,7 +126,6 @@ def _spec(spec_id: str, *, enabled: bool = True, allow_empty: bool = False) -> T
         spec_id=spec_id,
         location=PythonImportPathProvider(import_path="tests.runtime.test_tools_discovery:_import_path_provider"),
         enabled=enabled,
-        allow_empty=allow_empty,
     )
 
 
@@ -442,8 +440,8 @@ def test_empty_provider_without_allow_empty_fails() -> None:
         )
 
 
-def test_empty_provider_with_allow_empty_succeeds() -> None:
-    """provider 显式允许空输出时返回类型真实的空工具 bundle。"""
+def test_empty_provider_is_rejected_even_when_other_providers_are_disabled() -> None:
+    """只要 provider 被调用，空工具输出就必须失败。"""
 
     def provider(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
         """空输出测试 provider。
@@ -459,18 +457,16 @@ def test_empty_provider_with_allow_empty_succeeds() -> None:
             tool_names=(),
         )
 
-    result = ToolsDiscovery().discover_from_bindings(
-        (
-            ToolsDiscoveryProviderBinding(
-                spec=_spec("empty", allow_empty=True),
-                provider=provider,
-            ),
+    with pytest.raises(ToolsDiscoveryError, match="returned empty tools"):
+        ToolsDiscovery().discover_from_bindings(
+            (
+                ToolsDiscoveryProviderBinding(
+                    spec=_spec("disabled", enabled=False),
+                    provider=provider,
+                ),
+                ToolsDiscoveryProviderBinding(
+                    spec=_spec("empty"),
+                    provider=provider,
+                ),
+            )
         )
-    )
-
-    assert result.tool_bundle.definitions == ()
-    assert result.provider_reports[0].tool_names == ()
-    assert result.source_refs[0].source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
-    assert result.source_refs[0].source_id == "empty"
-    assert result.source_refs[0].content_digest is not None
-    assert result.source_refs[0].content_digest.startswith("sha256:")

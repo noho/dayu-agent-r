@@ -113,13 +113,34 @@ git push -u github <branch>
 
 ## Slice 切分原则
 
-维护性 slice 必须比 feature slice 更保守：
-
-- 优先提取纯函数、typed value object、私有 helper、职责明确的 collaborator。
-- 每个 slice 默认行为不变；除非 work unit 明确包含行为修复，否则不得混入 correctness fix。
-- 先补 characterization tests，再拆核心循环或调度路径。
-- 拆分后必须能解释新 owner 的职责，不接受只为缩短函数而增加的透传层。
-- 同一个 slice 不应同时拆 Engine 核心循环、Host dispatch、durable schema 和 ToolRuntime。
+- 每个 work unit 内的 implementation slices 在 discussion / plan 阶段再具体确定；总控阶段不预先替 work units 固定 slice。
+- slice 切分的初始出发点成立：单个 slice 太大时，implementation agent 容易因为上下文过长、局部约束丢失或跨边界状态过多而实现漂移。
+- slice 必须控制模型一次实施和 reviewer 一次审查能够稳定承载的上下文规模。
+- “上下文规模”不得粗暴等同于文件数、模块数、代码行数或 owner 数；更可靠的切分依据是语义闭环、依赖顺序、失败 / 回滚风险和验证矩阵。
+- slice 必须满足模型上下文窗口与 review 可承载复杂度：implementation agent 能在一个上下文中理解目标、边界、相关代码和验证要求；review agent 能在一个上下文中有效审查。
+- slice 必须沿稳定代码依赖边界切分：公共契约、状态机边界、存储边界、projection 边界、issue dependency 边界或测试矩阵边界。
+- slice 必须形成可独立验证的行为闭环：大到能形成可测试语义，小到能一次实现、一次验证、一次 review。
+- 除非明确是 contract-only slice，否则不得留下只有类型、没有路径，或只有存储、没人调用的孤立半成品。
+- slice 不是按代码行数切，也不是只要不超过上下文窗口就算合理；好的 slice 必须有明确输入、输出、non-goals、allowed files / modules、验证命令、issue handoff 和后续 slice 可依赖的稳定交付物。
+- 不得按模块数量、文件数量或 reviewer ownership 机械拆分。对代码量较小、语义上属于同一个 contract cleanup / config cleanup / schema cleanup 的 work unit，即使会同时触及配置、runtime、Service composition、provider、scene manifest、测试和 README，也应优先合并为少量可验证闭环 slices，而不是每个模块单独切片。
+- 只有当某部分存在独立失败 / 回滚风险、需要独立设计裁决、会阻塞后续代码导入，或 review 上下文确实无法承载时，才继续拆分。
+- 小型跨模块 cleanup 的默认切分上限是 3 个 implementation slices：
+  - contract / config / composition slice：稳定公共语义、typed config、composition root effective config、旧字段拒绝与基础测试；
+  - provider / behavior slice：业务 provider 行为、tool schema、存储 / 权限边界、provider 投影测试；
+  - scene / docs / final validation slice：默认 scene 暴露面、README / design 同步、stale-field grep、pyright 与受影响测试矩阵。
+- 默认 slice budget：
+  - 小型同一语义 cleanup：1-3 个 implementation slices。
+  - 中型跨 contract / provider / projection work：3-5 个 implementation slices。
+  - 超过 5 个 implementation slices：必须有明确证据表明单个 implementation agent / reviewer 的上下文容量无法稳定承载，或存在必须隔离的 schema、状态机、持久化、外部依赖、回滚风险。
+- 如果 plan 提出超过 3 个 implementation slices，必须显式说明为什么不能按上述闭环合并；仅以“涉及多个文件 / 多个模块 / 多个 owner”为理由不充分。
+- 总控裁决时必须评估 gate 成本：每增加一个 slice 都会增加 implementation artifact、双路 review、controller 裁决、测试复跑和 accepted commit 成本；当流程成本明显超过实现风险时，应倾向合并 slice。
+- 如果一个 work unit 的自然闭环超过单个 implementation agent 的上下文容量，应优先按依赖边界拆成多个 slices，并在 plan 中说明前后 slice 的 contract handoff。
+- 如果某个 slice 需要跨模块修改，plan 必须解释为什么这是同一个可验证闭环，而不是拆分失败。
+- 维护性 slice 必须比 feature slice 更保守：每个 slice 默认行为不变；除非 work unit 明确包含行为修复，否则不得混入 correctness fix。
+- 维护性 slice 应优先提取纯函数、typed value object、私有 helper、职责明确的 collaborator。
+- 维护性 slice 拆核心循环或调度路径前，必须先补 characterization tests。
+- 维护性 slice 拆分后必须能解释新 owner 的职责；不接受只为缩短函数而增加的透传层。
+- 维护性 slice 不应同时拆 Engine 核心循环、Host dispatch、durable schema 和 ToolRuntime。
 - 如果某个函数需要跨多次 slice 才能拆完，每次 slice 都必须保持可运行、可 review、可回滚。
 
 ## 当前状态

@@ -95,14 +95,12 @@ class ToolsDiscoveryProviderSpec:
     :param spec_id: 装配配置中的 provider spec 稳定标识，用于错误定位。
     :param location: provider callable 的显式解析位置。
     :param enabled: 为 ``False`` 时跳过解析和调用。
-    :param allow_empty: provider 返回空工具集合时是否允许通过。
     :param config: provider 自身的结构化 JSON 配置。
     """
 
     spec_id: str
     location: ToolsDiscoveryProviderLocation
     enabled: bool = True
-    allow_empty: bool = False
     config: Mapping[str, JsonValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -531,7 +529,7 @@ def _validate_provider_output(
     :param output: provider 输出。
     :returns: 去除首尾空白后的 provider 身份。
     :raises ToolsDiscoveryError: provider 身份为空、source refs 为空、version
-        为空字符串，或空工具输出未显式允许时抛出。
+        为空字符串，或空工具输出时抛出。
     """
 
     provider_id = _require_provider_identity(output.provider_id)
@@ -541,7 +539,7 @@ def _validate_provider_output(
     )
     if not output.source_refs:
         raise ToolsDiscoveryError(f"provider {provider_id} must return non-empty source_refs")
-    if not output.definitions and not spec.allow_empty:
+    if not output.definitions:
         raise ToolsDiscoveryError(f"provider {provider_id} returned empty tools")
     return provider_id
 

@@ -1425,7 +1425,6 @@ def _spec(config: Mapping[str, JsonValue]) -> ToolsDiscoveryProviderSpec:
         spec_id="web-tools",
         location=PythonImportPathProvider("dayu.tools.web:discover_tools"),
         enabled=True,
-        allow_empty=False,
         config=config,
     )
 

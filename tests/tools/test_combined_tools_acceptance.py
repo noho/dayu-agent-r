@@ -98,6 +98,7 @@ _FINS_TOOL_NAMES: Final[tuple[str, ...]] = (
 _FINS_AWAITING_TOOL_NAMES: Final[tuple[str, ...]] = (
     "start_fins_download",
     "start_fins_preprocess",
+    "start_fins_upload",
 )
 _WEB_TOOL_NAMES: Final[tuple[str, ...]] = ("search_web", "fetch_web_page")
 _FORBIDDEN_IMPORT_ROOTS: Final[tuple[str, ...]] = (
@@ -663,10 +664,8 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.fins.tools.provider",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {
                         "workspace_root": str(_fins_workspace_root(tmp_path)),
-                        "include_read_tools": True,
                         "limits": {
                             "list_documents_max_items": 20,
                             "search_document_max_items": 10,
@@ -680,7 +679,6 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.tools.doc_provider",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {
                         "allowed_paths": [str(_doc_root(tmp_path))],
                         "limits": {
@@ -698,7 +696,6 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.tools.web",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": {
                         "provider": "auto",
                         "request_timeout_seconds": 5.0,

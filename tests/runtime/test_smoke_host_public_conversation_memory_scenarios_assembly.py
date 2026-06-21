@@ -1346,7 +1346,6 @@ def _write_non_smoke_tool_discovery_overlay(workspace_root: pathlib.Path) -> Non
                 "source_kind": "config_binding",
                 "source_id": "tests.runtime.non_smoke_same_name",
                 "enabled": True,
-                "allow_empty": False,
             }
         }
     }

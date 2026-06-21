@@ -934,7 +934,6 @@ def _tool_discovery_specs(
                 spec_id=provider_config.provider_id,
                 location=location,
                 enabled=provider_config.enabled,
-                allow_empty=provider_config.allow_empty,
                 config=provider_config.config,
             )
         )
@@ -951,21 +950,66 @@ def _effective_tool_provider_config(
     :param provider_config: ConfigLoader 产出的 provider typed config。
     :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
     :returns: provider 可直接消费的 effective config。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: Fins workspace root 配置类型非法，或相对路径缺少
+        解析基准时抛出。
     """
 
     if not _is_fins_workspace_bound_provider_config(provider_config):
         return provider_config.config
+    effective_workspace_root = _effective_fins_workspace_root_config_value(
+        provider_config,
+        workspace_root=workspace_root,
+    )
+    if effective_workspace_root is None:
+        return provider_config.config
+    effective_config: dict[str, JsonValue] = dict(provider_config.config)
+    effective_config[_FINS_WORKSPACE_ROOT_CONFIG_FIELD] = effective_workspace_root
+    return effective_config
+
+
+def _effective_fins_workspace_root_config_value(
+    provider_config: ToolDiscoveryProviderConfig,
+    *,
+    workspace_root: pathlib.Path | None,
+) -> str | None:
+    """解析 Fins provider effective workspace root 配置值。
+
+    :param provider_config: ConfigLoader 产出的 provider typed config。
+    :param workspace_root: 当前运行时 workspace root；为 ``None`` 时无法解析
+        相对路径。
+    :returns: 需要写入 effective config 的绝对 workspace root 字符串；返回
+        ``None`` 表示保留原始 config。
+    :raises ValueError: 已配置 workspace root 不是字符串、为空字符串，或相对
+        路径缺少解析基准时抛出。
+    """
+
     configured_workspace_root = provider_config.config.get(
         _FINS_WORKSPACE_ROOT_CONFIG_FIELD
     )
-    if configured_workspace_root is not None or workspace_root is None:
-        return provider_config.config
-    effective_config: dict[str, JsonValue] = dict(provider_config.config)
-    effective_config[_FINS_WORKSPACE_ROOT_CONFIG_FIELD] = str(
-        workspace_root.expanduser().resolve(strict=False)
-    )
-    return effective_config
+    if configured_workspace_root is None:
+        if workspace_root is None:
+            return None
+        return str(workspace_root.expanduser().resolve(strict=False))
+    if not isinstance(configured_workspace_root, str):
+        raise ValueError(
+            "Fins provider "
+            f"{provider_config.provider_id} config.workspace_root must be a string"
+        )
+    stripped_workspace_root = configured_workspace_root.strip()
+    if stripped_workspace_root == "":
+        raise ValueError(
+            "Fins provider "
+            f"{provider_config.provider_id} config.workspace_root must be non-empty"
+        )
+    configured_path = pathlib.Path(stripped_workspace_root).expanduser()
+    if configured_path.is_absolute():
+        return str(configured_path.resolve(strict=False))
+    if workspace_root is None:
+        raise ValueError(
+            "Fins provider "
+            f"{provider_config.provider_id} relative config.workspace_root requires runtime workspace_root"
+        )
+    return str(_resolve_project_path(workspace_root, stripped_workspace_root))
 
 
 def _is_fins_workspace_bound_provider_config(

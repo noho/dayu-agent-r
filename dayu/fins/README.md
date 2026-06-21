@@ -108,7 +108,7 @@ Fins 与其它层的稳定边界如下：
 - `get_financial_statement`
 - `query_xbrl_facts`
 
-`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须在 provider config 中提供绝对 `workspace_root`；`include_read_tools=false` 时返回空工具集且不解析 `workspace_root`。
+`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须通过 effective spec 提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
 
 当前 read tools 名称为：
 
@@ -130,7 +130,7 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `dayu.fins.tools.preprocess_provider.discover_tools(spec)`：provider id 为 `financial-preprocess-tools`，返回 `start_fins_preprocess`。
 - `dayu.fins.tools.upload_provider.discover_tools(spec)`：provider id 为 `financial-upload-tools`，返回 `start_fins_upload`。
 
-三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 只有显式配置非空绝对路径集合 `allowed_upload_roots` 时才注册 `start_fins_upload`；为空时返回空工具集。上传工具只接受这些根目录下的本地文件。工具调用只注册 lightweight observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，不等待长事务完成、不直接 resolve Host wait，也不把 handle 当作业务事实返回给模型。
+三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 启用时注册 `start_fins_upload`；上传工具只在工具边界校验本地路径存在、指向普通文件且文件非空。当前实现不把本地源文件授权建模为 upload provider 的配置职责；调用方仍需在进入工具前承担本地文件来源可信性与用户授权。工具调用只注册 lightweight observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，不等待长事务完成、不直接 resolve Host wait，也不把 handle 当作业务事实返回给模型。上传后的 source/blob/processed 写入仍必须通过 Fins workspace repository 完成。
 
 ### Batch upload plan
 
@@ -288,7 +288,7 @@ download_start = ingestion.start_download(
 )
 ```
 
-`FinsReadRuntime` 只服务 read path；download、preprocess 与 upload 必须使用 `FinsIngestionRuntime`。当前默认 runtime 为 US ticker 的 `source="sec"` / `source="auto"` 装配 SEC production download adapter，为 CN ticker 的 `source="cninfo"` / `source="auto"` 装配巨潮 production download adapter，为 HK ticker 的 `source="hkexnews"` / `source="auto"` 装配披露易 production download adapter；没有匹配 adapter 的 download stream 会进入明确 failed RESULT。preprocess path 读取 workspace 中已有 source docs，并通过 processor registry 写入 processed repository。当前默认 runtime 内置 production upload runner：US ticker 走 SEC upload workflow，CN/HK ticker 走 CN/HK upload facade，并通过 `DoclingUploadService` 写入 source/blob 仓储。直接调用 ingestion runtime 时，调用方必须自行保证 `files` 指向可信本地普通文件；只有 `start_fins_upload` 工具 provider 会在工具边界用 `allowed_upload_roots` 做上传路径 allowlist 与非空文件校验。Material 上传使用 `FinsUploadMaterialRequest`，并必须提供 `form_type` 与 `material_name`。
+`FinsReadRuntime` 只服务 read path；download、preprocess 与 upload 必须使用 `FinsIngestionRuntime`。当前默认 runtime 为 US ticker 的 `source="sec"` / `source="auto"` 装配 SEC production download adapter，为 CN ticker 的 `source="cninfo"` / `source="auto"` 装配巨潮 production download adapter，为 HK ticker 的 `source="hkexnews"` / `source="auto"` 装配披露易 production download adapter；没有匹配 adapter 的 download stream 会进入明确 failed RESULT。preprocess path 读取 workspace 中已有 source docs，并通过 processor registry 写入 processed repository。当前默认 runtime 内置 production upload runner：US ticker 走 SEC upload workflow，CN/HK ticker 走 CN/HK upload facade，并通过 `DoclingUploadService` 写入 source/blob 仓储。直接调用 ingestion runtime 时，调用方必须自行保证 `files` 指向可信本地普通文件；`start_fins_upload` 工具会在工具边界校验本地路径存在、指向普通文件且文件非空。Material 上传使用 `FinsUploadMaterialRequest`，并必须提供 `form_type` 与 `material_name`。
 
 ## 公共契约
 
@@ -407,10 +407,11 @@ Fins 不负责：
 
 Fins workspace 规则固定如下：
 
-- Fins provider effective spec 的 `workspace_root` 必须是非空绝对路径；provider 不从 cwd 或环境变量推断。
-- 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools`、`financial-upload-tools` 均为 enabled 且 raw config 中 `workspace_root=null`；Service assembly 会注入运行时 workspace。upload provider 额外默认 `allowed_upload_roots=[]`，因此默认不注册上传工具。
+- 四个 Fins provider 的 effective spec 都必须提供非空绝对 `workspace_root`；provider 不从 cwd 或环境变量推断。
+- 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools`、`financial-upload-tools` 均为 enabled 且 raw config 中 `workspace_root="workspace/"`；Service assembly 会解析为当前运行时 workspace 下的绝对路径。upload provider 默认注册 `start_fins_upload`，默认非上传 scene 通过显式工具名选择 read/download/preprocess 工具，避免 broad Fins tag 误选 upload。
 - Service assembly 为 Fins awaiting providers 构造 wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess / upload provider 使用同一个绝对 `workspace_root`。
 - legacy ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，保存 legacy job governance records 与每个 job 的 event sidecar，不保存财报正文、processed payload、raw download payload 或 upload 本地文件路径。Direct stream 和 lightweight observation handle 不以该目录作为公共观察真源。
+- upload provider 不拥有本地源文件 allowlist 或授权配置；它只注册工具并做普通文件、存在性与非空校验。仓储写入边界仍属于 `dayu.fins.storage`，工具 caller 不能指定 source/blob/processed 的仓储写入目录。
 
 ## 主要组件
 
@@ -438,9 +439,9 @@ Read、download、preprocess、upload 是四个独立 provider：
 - read provider 只暴露 9 个 read tools。
 - download provider 只暴露 `start_fins_download`。
 - preprocess provider 只暴露 `start_fins_preprocess`。
-- upload provider 只暴露 `start_fins_upload`，并在工具边界校验 `allowed_upload_roots`。
+- upload provider 只暴露 `start_fins_upload`，并在工具边界校验本地路径存在、指向普通文件且文件非空；本地源文件授权不是 provider-owned config。
 
-四者都通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取共享 Fins 底座。
+四者都要求 effective spec 提供绝对 `workspace_root`，并通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取共享 Fins 底座。
 
 ### Ingestion runtime
 
@@ -495,7 +496,7 @@ Read path 只读取 Fins workspace 中已经存在的财报材料。需要截断
 ToolsDiscovery
   -> dayu.fins.tools.download_provider / preprocess_provider / upload_provider
   -> parse explicit absolute workspace_root
-  -> upload provider additionally parses allowed_upload_roots
+  -> upload provider builds start_fins_upload from Fins ingestion runtime
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> get_ingestion_runtime()
   -> start_fins_download / start_fins_preprocess / start_fins_upload tool call
@@ -512,7 +513,7 @@ ToolsDiscovery
 
 Download、preprocess 与 upload awaiting tools 会先观察 Host ToolRuntime 传入的 cancellation token；start 前已取消时返回 `ToolCancelledOutcome`，不注册 observation handle。后台 submit 后取消是 best-effort cooperative：runtime 通过 operation-scoped cancellation state / checker 传播取消请求，底层 blocking adapter 只有在检查点或自然返回时才会收口。
 
-工具调用边界内的参数错误、observation 启动失败或上传 allowlist 校验失败会返回工具失败 outcome；observation handle 注册成功且未取消时工具立即返回 awaiting outcome，不等待后台任务完成。
+工具调用边界内的参数错误、observation 启动失败或上传本地文件形态校验失败会返回工具失败 outcome；observation handle 注册成功且未取消时工具立即返回 awaiting outcome，不等待后台任务完成。
 
 ### Upload runtime 路径
 
@@ -663,7 +664,7 @@ SecProcessor
 
 ### Workspace root 与 provider fail fast
 
-四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 在 `include_read_tools=false` 时允许不解析 workspace；upload provider 在 `allowed_upload_roots` 为空时不注册上传工具，字段类型非法或包含相对路径时仍 fail fast。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件只在工具调用时校验存在、普通文件与非空，本地源文件授权由调用方在 provider 外部承担。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
 
 ### Storage repository boundary
 

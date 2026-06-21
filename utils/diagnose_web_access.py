@@ -1367,7 +1367,6 @@ def _fetch_web_page_definition(options: CliOptions) -> ToolDefinition:
         spec_id="diagnose-web-tools",
         location=PythonImportPathProvider("dayu.tools.web.provider:discover_tools"),
         enabled=True,
-        allow_empty=False,
         config=_provider_config(options),
     )
     output = discover_tools(spec)

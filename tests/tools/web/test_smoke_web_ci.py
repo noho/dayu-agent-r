@@ -51,6 +51,7 @@ def test_default_run_executes_local_html_pdf_and_browser_cases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """默认运行必须执行 local HTML、PDF 与 browser cases。"""
 
@@ -116,8 +117,8 @@ def test_default_run_executes_local_html_pdf_and_browser_cases(
     assert "SMOKE LOCAL_CASES 4" in captured.out
     assert "SMOKE EXTERNAL_CASES 2" in captured.out
     assert "SMOKE SEARCH_CASES 4" in captured.out
-    assert "web smoke execution started" in captured.out
-    assert "stdout_prefix=diagnostic result for" in captured.out
+    assert "web smoke execution started" in caplog.text
+    assert "stdout_prefix=diagnostic result for" in caplog.text
     assert summary["status"] == "passed"
     assert summary["exit_code"] == 0
     local_cases = _list_field(summary, "local_cases")
@@ -215,10 +216,14 @@ def test_local_assembly_config_case_writes_overlay_and_truncate_artifact(
     )
 
     artifact = _load_json_object(Path(result.evidence_path))
+    overlay = _load_json_object(tmp_path / "assembly-workspace-config" / "tool_discovery.json")
+    providers = _object_value(overlay["providers"])
+    web_provider = _object_value(providers["web-tools"])
     provider_config = _object_value(artifact["provider_config"])
     assert result.status == "passed"
     assert loaded_overlay_dirs == [tmp_path / "assembly-workspace-config"]
     assert len(discovered_configs) == 1
+    assert "allow_empty" not in web_provider
     assert provider_config["provider"] == "duckduckgo"
     assert provider_config["fetch_truncate_chars"] == 3210
     assert artifact["truncate_max_chars"] == 3210

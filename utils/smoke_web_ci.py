@@ -118,6 +118,14 @@ _ASSEMBLY_PATH_LABEL: Final[str] = (
     "discover_service_tools -> ToolDefinition.callable"
 )
 _PACKAGE_CONFIG_DIR: Final[Path] = Path(__file__).resolve().parents[1] / "dayu" / "config"
+_NOISY_DEBUG_LOGGER_NAMES: Final[tuple[str, ...]] = (
+    "dayu.fins",
+    "dayu.tools.web",
+    "filelock",
+    "htmldate",
+    "readability",
+    "trafilatura",
+)
 _ASSEMBLY_FETCH_TRUNCATE_CHARS: Final[int] = 3210
 _ASSEMBLY_PROVIDER_CONFIG: Final[JsonObject] = {
     "provider": "duckduckgo",
@@ -811,6 +819,23 @@ def _log_level_from_text(log_level_text: str) -> LogLevel:
         raise ValueError(f"--log-level 必须是以下之一: {allowed_values}") from exc
 
 
+def _suppress_noisy_debug_loggers() -> None:
+    """压低默认 debug 下与 Web smoke 判断无关的 logger。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    for logger_name in _NOISY_DEBUG_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(int(LogLevel.INFO))
+
+
 def _json_object(value: JsonValue, *, field_name: str) -> JsonObject:
     """校验并复制 JSON 对象。
 
@@ -972,7 +997,6 @@ def _write_web_tool_discovery_overlay(
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.tools.web",
                     "enabled": True,
-                    "allow_empty": False,
                     "config": dict(provider_config),
                 }
             }
@@ -3559,6 +3583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _EXIT_SCHEMA_OR_INFRA_FAILURE
 
     configure(level=options.log_level, configure_root=True)
+    _suppress_noisy_debug_loggers()
     _print_start_ui(options)
     try:
         summary = _execute_smoke(options=options, runner=_run_diagnostic_command)
