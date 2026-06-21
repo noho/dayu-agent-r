@@ -9,8 +9,14 @@ import dayu.service as service
 
 SERVICE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.config",
+    "dayu.host.durable",
     "dayu.ui",
     "dayu.fins",
+    "fastapi",
+    "flask",
+    "starlette",
+    "django",
+    "aiohttp",
 )
 SERVICE_ALLOWED_IMPORTS: tuple[str, ...] = (
     "dayu.fins.direct_events",
@@ -18,6 +24,9 @@ SERVICE_ALLOWED_IMPORTS: tuple[str, ...] = (
     "dayu.fins.ingestion",
     "dayu.fins.ingestion_runtime",
     "dayu.fins.service_runtime",
+    "dayu.fins.tools.download_tools",
+    "dayu.fins.tools.preprocess_tools",
+    "dayu.fins.tools.upload_tools",
 )
 
 
