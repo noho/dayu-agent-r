@@ -228,6 +228,10 @@ def build_fins_wait_activation_registry(
 ) -> WaitActivationRegistry:
     """为启用的 Fins awaiting tools 构造 Host activation registry。
 
+    生产 Service assembly 中，awaiting tool callable、poll adapter 与 activation
+    adapter 必须共享同一个 ``FinsIngestionRuntime`` 实例；本 standalone builder
+    只适用于由调用方自行保证 runtime 一致性的独立装配场景。
+
     :param workspace_root: 已验证的绝对 Fins workspace root；binding 本身不把
         workspace 写入 Host durable wait record，但 factory 在装配期 fail fast。
     :param tool_names: 本次 Service assembly 中由启用 provider 声明的 Fins

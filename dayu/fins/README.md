@@ -699,11 +699,11 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 ### Direct stream / observation / legacy job 与取消
 
-Direct stream 不创建 durable job record；调用方关闭 async iterator、取消 task 或传入 cancellation token 时，runtime 通过 operation-scoped cancellation state / checker 做合作式取消。Awaiting tools 不等待长事务完成，只注册 process-local observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`；Host wait cancel 通过 wait adapter 调用 `cancel_observation(handle)` / `abandon_observation(handle)`。Legacy `start_*` job helpers 仍可创建 durable `queued` job record 并通过 `request_cancel(job_id)` 合作式取消，但 Service direct 和 awaiting tools 不消费该路径。
+Direct stream 不创建 durable job record；调用方关闭 async iterator、取消 task 或传入 cancellation token 时，runtime 通过 operation-scoped cancellation state / checker 做合作式取消。Awaiting tools 不等待长事务完成，只 prepare 并注册 process-local observation handle，返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`；Host awaiting accept ack durable 成立后，ToolRuntime 通过 Fins activation adapter 调用 `activate_observation(handle)` 提交后台执行。Host wait cancel 通过 wait adapter 调用 `cancel_observation(handle)` / `abandon_observation(handle)`。Legacy `start_*` job helpers 仍可创建 durable `queued` job record 并通过 `request_cancel(job_id)` 合作式取消，但 Service direct 和 awaiting tools 不消费该路径。
 
 ### Wait adapter 与 Host resume
 
-Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry；Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
+Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry 与 wait activation registry，并确保 awaiting tool callable 与 activation adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
 
 ### Ticker normalization
 

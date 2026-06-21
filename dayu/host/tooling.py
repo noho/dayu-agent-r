@@ -17,7 +17,7 @@ from dayu.contracts.tool_source import ToolBundleSourceRef
 from dayu.host.tool_duplicate_governance import DuplicateGovernancePolicy
 
 if TYPE_CHECKING:
-    from dayu.host.wait_adapter import WaitAdapterRegistry
+    from dayu.host.wait_adapter import WaitActivationRegistry, WaitAdapterRegistry
 
 
 class FrameworkToolName(StrEnum):
@@ -76,6 +76,8 @@ class HostToolingOptions:
     :param framework_tool_policy: framework tool 预留名与启用集合视图。
     :param wait_adapter_registry: 可选等待 adapter registry；仅用于本地
         ToolRuntime awaiting production wiring，不进入 durable row 或 per-run request。
+    :param wait_activation_registry: 可选 accepted wait activation registry；仅用于
+        ToolRuntime 在 Host durable accept ack 后触发 provider 内部 activation。
     :param duplicate_governance_policy: ToolRuntime duplicate governance typed
         policy；生产 dispatch 会传入每个 Attempt 的 ToolRuntime。
     """
@@ -84,6 +86,7 @@ class HostToolingOptions:
     source_refs: tuple[ToolBundleSourceRef, ...]
     framework_tool_policy: FrameworkToolPolicyView = field(default_factory=default_framework_tool_policy_view)
     wait_adapter_registry: WaitAdapterRegistry | None = None
+    wait_activation_registry: WaitActivationRegistry | None = None
     duplicate_governance_policy: DuplicateGovernancePolicy = field(
         default_factory=DuplicateGovernancePolicy
     )

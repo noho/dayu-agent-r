@@ -15,17 +15,30 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Final
 
-from dayu.contracts import JsonValue, ToolBundle, ToolBundleSourceRef
+from dayu.contracts import (
+    JsonValue,
+    ToolBundle,
+    ToolBundleSourceKind,
+    ToolBundleSourceRef,
+)
 from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.engine.provider_extensions import provider_request_extension_from_json
+from dayu.fins.ingestion.observation_handle import FinsObservationRuntime
 from dayu.fins.ingestion.wait_adapter import (
     FINS_DOWNLOAD_AWAITING_TOOL_NAME,
     FINS_PREPROCESS_AWAITING_TOOL_NAME,
+    FINS_INGESTION_WAIT_ADAPTER_KEY,
     FINS_UPLOAD_AWAITING_TOOL_NAME,
+    FinsIngestionWaitActivationAdapter,
     build_fins_wait_adapter_registry,
 )
+from dayu.fins.ingestion_runtime import FinsIngestionRuntime
+from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.tools.download_tools import build_fins_download_tool
+from dayu.fins.tools.preprocess_tools import build_fins_preprocess_tool
+from dayu.fins.tools.upload_tools import build_fins_upload_tool
 from dayu.host.api import (
     CompactorRunnerBaseline,
     FollowupBehavior,
@@ -37,7 +50,11 @@ from dayu.host.api import (
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import MemoryProjectionPolicy
-from dayu.host.wait_adapter import WaitAdapterRegistry
+from dayu.host.wait_adapter import (
+    WaitActivationAdapterRegistration,
+    WaitActivationRegistry,
+    WaitAdapterRegistry,
+)
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
     DuplicateGovernanceMessages,
@@ -81,22 +98,34 @@ from dayu.runtime.tools_discovery import (
     PackageEntryPointProvider,
     PythonImportPathProvider,
     ToolsDiscovery,
+    ToolsDiscoveryProviderBinding,
+    ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
+    resolve_provider_callable,
 )
 
 _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
 _COMPACTOR_SYSTEM_PROMPT_FRAGMENT_COUNT: Final[int] = 1
 _FINS_WORKSPACE_ROOT_CONFIG_FIELD: Final[str] = "workspace_root"
+_FINS_DOWNLOAD_PROVIDER_ID: Final[str] = "financial-download-tools"
+_FINS_PREPROCESS_PROVIDER_ID: Final[str] = "financial-preprocess-tools"
+_FINS_UPLOAD_PROVIDER_ID: Final[str] = "financial-upload-tools"
+_FINS_DOWNLOAD_SOURCE_ID: Final[str] = "dayu.fins.tools.download_provider"
+_FINS_PREPROCESS_SOURCE_ID: Final[str] = "dayu.fins.tools.preprocess_provider"
+_FINS_UPLOAD_SOURCE_ID: Final[str] = "dayu.fins.tools.upload_provider"
+_FINS_DOWNLOAD_VERSION_REF: Final[str] = "fins-download-tools-provider-v1"
+_FINS_PREPROCESS_VERSION_REF: Final[str] = "fins-preprocess-tools-provider-v1"
+_FINS_UPLOAD_VERSION_REF: Final[str] = "fins-upload-tools-provider-v1"
 _FINS_READ_PROVIDER_IDS: Final[frozenset[str]] = frozenset({"financial-read-tools"})
 _FINS_DOWNLOAD_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
-    {"financial-download-tools"}
+    {_FINS_DOWNLOAD_PROVIDER_ID}
 )
 _FINS_PREPROCESS_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
-    {"financial-preprocess-tools"}
+    {_FINS_PREPROCESS_PROVIDER_ID}
 )
 _FINS_UPLOAD_PROVIDER_IDS: Final[frozenset[str]] = frozenset(
-    {"financial-upload-tools"}
+    {_FINS_UPLOAD_PROVIDER_ID}
 )
 _FINS_READ_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.provider:discover_tools"}
@@ -114,13 +143,13 @@ _FINS_READ_SOURCE_IDS: Final[frozenset[str]] = frozenset(
     {"dayu.fins.tools.provider"}
 )
 _FINS_DOWNLOAD_SOURCE_IDS: Final[frozenset[str]] = frozenset(
-    {"dayu.fins.tools.download_provider"}
+    {_FINS_DOWNLOAD_SOURCE_ID}
 )
 _FINS_PREPROCESS_SOURCE_IDS: Final[frozenset[str]] = frozenset(
-    {"dayu.fins.tools.preprocess_provider"}
+    {_FINS_PREPROCESS_SOURCE_ID}
 )
 _FINS_UPLOAD_SOURCE_IDS: Final[frozenset[str]] = frozenset(
-    {"dayu.fins.tools.upload_provider"}
+    {_FINS_UPLOAD_SOURCE_ID}
 )
 
 
@@ -208,12 +237,16 @@ class ServiceDiscoveredTools:
     :param provider_reports: 工具 provider 报告行。
     :param effective_provider_configs: 本次工具发现实际使用的 effective provider
         configs，供后续 Host tooling assembly 复用。
+    :param fins_awaiting_runtime: Service 为启用的 Fins awaiting providers
+        共享装配的 ingestion runtime；没有启用 Fins awaiting provider 时为
+        ``None``。
     """
 
     tool_bundle: ToolBundle
     source_refs: tuple[ToolBundleSourceRef, ...]
     provider_reports: tuple[str, ...]
     effective_provider_configs: tuple[ToolDiscoveryProviderConfig, ...]
+    fins_awaiting_runtime: FinsObservationRuntime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +361,101 @@ class _CompactorScenePrompts:
     agent_policy: AgentPolicy
 
 
+@dataclass(frozen=True, slots=True)
+class _FinsAwaitingProviderMetadata:
+    """Fins awaiting provider 的稳定 discovery 输出元数据。
+
+    :param tool_name: provider 产出的 awaiting 工具名。
+    :param provider_id: provider 自声明身份。
+    :param version_ref: provider 版本引用。
+    :param source_id: provider source ref。
+    """
+
+    tool_name: str
+    provider_id: str
+    version_ref: str
+    source_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FinsAwaitingRegistryInputs:
+    """Fins awaiting registry 构造所需的 provider 汇总信息。
+
+    :param tool_names: 当前 ToolBundle 中实际可绑定的 Fins awaiting 工具名。
+    :param workspace_root: 本次 Fins awaiting providers 共享的 workspace root。
+    """
+
+    tool_names: tuple[str, ...]
+    workspace_root: pathlib.Path
+
+
+@dataclass(frozen=True, slots=True)
+class _FinsAwaitingProviderCallable:
+    """共享 ingestion runtime 的 Fins awaiting discovery provider callable。
+
+    :param metadata: provider 输出元数据。
+    :param runtime: 本次 Service discovery 为同一 Fins workspace 创建的共享
+        ingestion runtime。
+    """
+
+    metadata: _FinsAwaitingProviderMetadata
+    runtime: FinsIngestionRuntime
+
+    def __call__(
+        self, spec: ToolsDiscoveryProviderSpec
+    ) -> ToolsDiscoveryProviderOutput:
+        """返回 Fins awaiting 工具声明。
+
+        :param spec: ToolsDiscovery provider spec；仅用于保留 discovery 协议形状。
+        :returns: provider 输出。
+        :raises ValueError: 工具名不受支持时抛出。
+        """
+
+        del spec
+        return ToolsDiscoveryProviderOutput(
+            provider_id=self.metadata.provider_id,
+            version_ref=self.metadata.version_ref,
+            source_refs=(
+                ToolBundleSourceRef(
+                    source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+                    source_id=self.metadata.source_id,
+                    version_ref=self.metadata.version_ref,
+                    content_digest=None,
+                ),
+            ),
+            definitions=(
+                _fins_awaiting_tool_definition(
+                    tool_name=self.metadata.tool_name,
+                    runtime=self.runtime,
+                ),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _DisabledProviderCallable:
+    """禁用 provider 的占位 callable。
+
+    该 callable 只用于保持 ``ToolsDiscoveryProviderBinding`` 的强类型形状；
+    ``ToolsDiscovery.discover_from_bindings`` 会在调用前跳过 disabled spec。
+    """
+
+    def __call__(
+        self, spec: ToolsDiscoveryProviderSpec
+    ) -> ToolsDiscoveryProviderOutput:
+        """禁用 provider callable 被调用时立即失败。
+
+        :param spec: disabled provider spec。
+        :returns: 不会正常返回。
+        :raises RuntimeError: 该 sentinel 被错误调用时抛出。
+        """
+
+        del spec
+        raise RuntimeError(
+            "disabled tools discovery provider callable must not be invoked"
+        )
+
+
 def discover_service_tools(
     effective_provider_configs: Sequence[ToolDiscoveryProviderConfig],
 ) -> ServiceDiscoveredTools:
@@ -341,8 +469,14 @@ def discover_service_tools(
     """
 
     provider_config_tuple = tuple(effective_provider_configs)
-    discovery_result = ToolsDiscovery().discover(
-        _tool_discovery_specs(provider_config_tuple)
+    fins_awaiting_runtime = _shared_fins_awaiting_runtime_from_provider_configs(
+        provider_config_tuple
+    )
+    discovery_result = ToolsDiscovery().discover_from_bindings(
+        _tool_discovery_bindings(
+            provider_config_tuple,
+            fins_awaiting_runtime=fins_awaiting_runtime,
+        )
     )
     return ServiceDiscoveredTools(
         tool_bundle=discovery_result.tool_bundle,
@@ -357,6 +491,7 @@ def discover_service_tools(
             for output in discovery_result.provider_reports
         ),
         effective_provider_configs=provider_config_tuple,
+        fins_awaiting_runtime=fins_awaiting_runtime,
     )
 
 
@@ -653,6 +788,7 @@ def _compose_options(
             tool_bundle=effective_tool_bundle,
             source_refs=request.discovered_tools.source_refs,
             provider_configs=request.discovered_tools.effective_provider_configs,
+            fins_awaiting_runtime=request.discovered_tools.fins_awaiting_runtime,
             duplicate_governance_policy_config=(
                 execution_profile.tool_duplicate_governance_policy
             ),
@@ -906,38 +1042,170 @@ def _model_runner_override_from_overrides(
     )
 
 
-def _tool_discovery_specs(
-    provider_configs: Sequence[ToolDiscoveryProviderConfig],
-) -> tuple[ToolsDiscoveryProviderSpec, ...]:
-    """把 ConfigLoader provider view 映射为 ToolsDiscovery specs。
+def _tool_discovery_spec(
+    provider_config: ToolDiscoveryProviderConfig,
+) -> ToolsDiscoveryProviderSpec:
+    """把单个 provider config 映射为 ToolsDiscovery spec。
 
-    :param provider_configs: 已完成运行时参数装配的 provider configs。
-    :returns: ToolsDiscovery 可消费的 provider specs。
+    :param provider_config: 已完成运行时参数装配的 provider config。
+    :returns: ToolsDiscovery 可消费的 provider spec。
     :raises ValueError: provider 同时缺少 import path 与 entry point 时抛出。
     """
 
-    specs: list[ToolsDiscoveryProviderSpec] = []
+    if provider_config.import_path is not None:
+        location = PythonImportPathProvider(provider_config.import_path)
+    elif provider_config.entry_point is not None:
+        location = PackageEntryPointProvider(
+            group=provider_config.entry_point.group,
+            name=provider_config.entry_point.name,
+        )
+    else:
+        raise ValueError(
+            "tool discovery provider must declare import_path or entry_point: " f"{provider_config.provider_id}"
+        )
+    return ToolsDiscoveryProviderSpec(
+        spec_id=provider_config.provider_id,
+        location=location,
+        enabled=provider_config.enabled,
+        config=provider_config.config,
+    )
+
+
+def _tool_discovery_bindings(
+    provider_configs: Sequence[ToolDiscoveryProviderConfig],
+    *,
+    fins_awaiting_runtime: FinsObservationRuntime | None,
+) -> tuple[ToolsDiscoveryProviderBinding, ...]:
+    """构造 ToolsDiscovery provider bindings。
+
+    Fins awaiting providers 由 Service 使用同一个 ingestion runtime 生成等价
+    provider output；其它 provider 仍走 runtime discovery 的动态解析。
+
+    :param provider_configs: 已完成运行时参数装配的 provider configs。
+    :param fins_awaiting_runtime: Fins awaiting 共享 runtime；无 Fins awaiting
+        provider 时为 ``None``。
+    :returns: provider bindings。
+    :raises ValueError: 启用 Fins awaiting provider 但缺少共享 runtime 时抛出。
+    """
+
+    bindings: list[ToolsDiscoveryProviderBinding] = []
     for provider_config in provider_configs:
-        if provider_config.import_path is not None:
-            location = PythonImportPathProvider(provider_config.import_path)
-        elif provider_config.entry_point is not None:
-            location = PackageEntryPointProvider(
-                group=provider_config.entry_point.group,
-                name=provider_config.entry_point.name,
+        spec = _tool_discovery_spec(provider_config)
+        tool_name = _fins_awaiting_tool_name_from_provider_config(provider_config)
+        if not provider_config.enabled:
+            bindings.append(
+                ToolsDiscoveryProviderBinding(
+                    spec=spec,
+                    provider=_DisabledProviderCallable(),
+                )
+            )
+        elif tool_name is not None:
+            if not isinstance(fins_awaiting_runtime, FinsIngestionRuntime):
+                raise ValueError(
+                    "enabled Fins awaiting provider requires shared ingestion runtime"
+                )
+            bindings.append(
+                ToolsDiscoveryProviderBinding(
+                    spec=spec,
+                    provider=_FinsAwaitingProviderCallable(
+                        metadata=_fins_awaiting_provider_metadata(tool_name),
+                        runtime=fins_awaiting_runtime,
+                    ),
+                )
             )
         else:
-            raise ValueError(
-                "tool discovery provider must declare import_path or entry_point: " f"{provider_config.provider_id}"
+            bindings.append(
+                ToolsDiscoveryProviderBinding(
+                    spec=spec,
+                    provider=resolve_provider_callable(spec),
+                )
             )
-        specs.append(
-            ToolsDiscoveryProviderSpec(
-                spec_id=provider_config.provider_id,
-                location=location,
-                enabled=provider_config.enabled,
-                config=provider_config.config,
-            )
+    return tuple(bindings)
+
+
+def _shared_fins_awaiting_runtime_from_provider_configs(
+    provider_configs: Sequence[ToolDiscoveryProviderConfig],
+) -> FinsIngestionRuntime | None:
+    """从启用的 Fins awaiting provider configs 创建共享 ingestion runtime。
+
+    :param provider_configs: 当前 Service discovery 使用的 provider configs。
+    :returns: 共享 ingestion runtime；没有启用 Fins awaiting provider 时为
+        ``None``。
+    :raises ValueError: workspace root 缺失、非绝对或不一致时抛出。
+    :raises OSError: Fins runtime 仓储初始化失败时抛出。
+    """
+
+    workspace_roots: list[pathlib.Path] = []
+    for provider_config in provider_configs:
+        if not provider_config.enabled:
+            continue
+        if _fins_awaiting_tool_name_from_provider_config(provider_config) is None:
+            continue
+        workspace_roots.append(
+            _fins_workspace_root_from_provider_config(provider_config)
         )
-    return tuple(specs)
+    if not workspace_roots:
+        return None
+    workspace_root = _single_fins_workspace_root(workspace_roots)
+    return DefaultFinsRuntime.create(
+        workspace_root=workspace_root
+    ).get_ingestion_runtime()
+
+
+def _fins_awaiting_provider_metadata(
+    tool_name: str,
+) -> _FinsAwaitingProviderMetadata:
+    """按 Fins awaiting 工具名返回 provider 元数据。
+
+    :param tool_name: Fins awaiting 工具名。
+    :returns: provider 元数据。
+    :raises ValueError: 工具名不受支持时抛出。
+    """
+
+    if tool_name == FINS_DOWNLOAD_AWAITING_TOOL_NAME:
+        return _FinsAwaitingProviderMetadata(
+            tool_name=tool_name,
+            provider_id=_FINS_DOWNLOAD_PROVIDER_ID,
+            version_ref=_FINS_DOWNLOAD_VERSION_REF,
+            source_id=_FINS_DOWNLOAD_SOURCE_ID,
+        )
+    if tool_name == FINS_PREPROCESS_AWAITING_TOOL_NAME:
+        return _FinsAwaitingProviderMetadata(
+            tool_name=tool_name,
+            provider_id=_FINS_PREPROCESS_PROVIDER_ID,
+            version_ref=_FINS_PREPROCESS_VERSION_REF,
+            source_id=_FINS_PREPROCESS_SOURCE_ID,
+        )
+    if tool_name == FINS_UPLOAD_AWAITING_TOOL_NAME:
+        return _FinsAwaitingProviderMetadata(
+            tool_name=tool_name,
+            provider_id=_FINS_UPLOAD_PROVIDER_ID,
+            version_ref=_FINS_UPLOAD_VERSION_REF,
+            source_id=_FINS_UPLOAD_SOURCE_ID,
+        )
+    raise ValueError(f"unsupported Fins awaiting tool: {tool_name}")
+
+
+def _fins_awaiting_tool_definition(
+    *,
+    tool_name: str,
+    runtime: FinsIngestionRuntime,
+) -> ToolDefinition:
+    """按工具名构造共享 runtime 的 Fins awaiting 工具声明。
+
+    :param tool_name: Fins awaiting 工具名。
+    :param runtime: 共享 ingestion runtime。
+    :returns: 工具声明。
+    :raises ValueError: 工具名不受支持时抛出。
+    """
+
+    if tool_name == FINS_DOWNLOAD_AWAITING_TOOL_NAME:
+        return build_fins_download_tool(runtime)
+    if tool_name == FINS_PREPROCESS_AWAITING_TOOL_NAME:
+        return build_fins_preprocess_tool(runtime)
+    if tool_name == FINS_UPLOAD_AWAITING_TOOL_NAME:
+        return build_fins_upload_tool(runtime)
+    raise ValueError(f"unsupported Fins awaiting tool: {tool_name}")
 
 
 def _effective_tool_provider_config(
@@ -1418,6 +1686,7 @@ def _tooling_options_from_discovery(
     tool_bundle: ToolBundle,
     source_refs: tuple[ToolBundleSourceRef, ...],
     provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+    fins_awaiting_runtime: FinsObservationRuntime | None,
     duplicate_governance_policy_config: ToolDuplicateGovernancePolicyConfig,
 ) -> HostToolingOptions | None:
     """把 ToolsDiscovery 输出映射为 HostToolingOptions。
@@ -1425,6 +1694,8 @@ def _tooling_options_from_discovery(
     :param tool_bundle: 已发现业务工具 bundle。
     :param source_refs: 工具来源引用。
     :param provider_configs: ConfigLoader 读出的工具 provider typed 配置。
+    :param fins_awaiting_runtime: Service discovery 为 Fins awaiting providers
+        创建的共享 runtime；没有 Fins awaiting provider 时显式传 ``None``。
     :param duplicate_governance_policy_config: execution profile 中的重复调用治理配置。
     :returns: HostToolingOptions；没有业务工具时为 ``None``。
     :raises ValueError: source refs 缺失但工具非空时抛出。
@@ -1440,10 +1711,18 @@ def _tooling_options_from_discovery(
             definition.name for definition in tool_bundle.definitions
         ),
     )
+    wait_activation_registry = _fins_wait_activation_registry_from_provider_configs(
+        provider_configs,
+        available_tool_names=frozenset(
+            definition.name for definition in tool_bundle.definitions
+        ),
+        fins_awaiting_runtime=fins_awaiting_runtime,
+    )
     return HostToolingOptions(
         business_tool_bundle=tool_bundle,
         source_refs=source_refs,
         wait_adapter_registry=wait_adapter_registry,
+        wait_activation_registry=wait_activation_registry,
         duplicate_governance_policy=_duplicate_governance_policy_from_config(
             duplicate_governance_policy_config
         ),
@@ -1464,6 +1743,75 @@ def _fins_wait_adapter_registry_from_provider_configs(
     :raises ValueError: workspace root 缺失、非绝对、不一致，或重复绑定时抛出。
     """
 
+    registry_inputs = _fins_awaiting_registry_inputs_from_provider_configs(
+        provider_configs,
+        available_tool_names=available_tool_names,
+    )
+    if registry_inputs is None:
+        return None
+    return build_fins_wait_adapter_registry(
+        workspace_root=registry_inputs.workspace_root,
+        tool_names=registry_inputs.tool_names,
+    )
+
+
+def _fins_wait_activation_registry_from_provider_configs(
+    provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+    *,
+    available_tool_names: frozenset[str],
+    fins_awaiting_runtime: FinsObservationRuntime | None,
+) -> WaitActivationRegistry | None:
+    """从显式 provider config 构造 Fins wait activation registry。
+
+    :param provider_configs: 当前 Host assembly 使用的工具发现 provider 配置。
+    :param available_tool_names: 当前 ToolBundle 中实际存在的工具名。
+    :param fins_awaiting_runtime: Service discovery 创建的共享 Fins awaiting
+        runtime；无 Fins awaiting provider 时为 ``None``。
+    :returns: Fins wait activation registry；没有可绑定 awaiting 工具时为
+        ``None``。
+    :raises ValueError: workspace root 缺失、非绝对、不一致，或共享 runtime
+        缺失时抛出。
+    """
+
+    registry_inputs = _fins_awaiting_registry_inputs_from_provider_configs(
+        provider_configs,
+        available_tool_names=available_tool_names,
+    )
+    if registry_inputs is None:
+        return None
+    if fins_awaiting_runtime is None:
+        raise ValueError("Fins wait activation registry requires shared runtime")
+    if not isinstance(fins_awaiting_runtime, FinsIngestionRuntime):
+        raise ValueError("Fins wait activation registry requires ingestion runtime")
+    _require_distinct_fins_awaiting_tool_names(registry_inputs.tool_names)
+    # 生产路径中 awaiting tool callable、poll adapter 与 activation adapter
+    # 必须共享同一个 runtime，避免 accepted activation 看不到工具准备的 observation。
+    return WaitActivationRegistry(
+        (
+            WaitActivationAdapterRegistration(
+                adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
+                adapter=FinsIngestionWaitActivationAdapter(
+                    runtime=fins_awaiting_runtime
+                ),
+            ),
+        )
+    )
+
+
+def _fins_awaiting_registry_inputs_from_provider_configs(
+    provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+    *,
+    available_tool_names: frozenset[str],
+) -> _FinsAwaitingRegistryInputs | None:
+    """收集 Fins awaiting registry 构造所需的启用工具与 workspace。
+
+    :param provider_configs: 当前 Host assembly 使用的工具发现 provider 配置。
+    :param available_tool_names: 当前 ToolBundle 中实际存在的工具名。
+    :returns: Fins awaiting registry 输入；没有可绑定 awaiting 工具时为
+        ``None``。
+    :raises ValueError: workspace root 缺失、非绝对或不一致时抛出。
+    """
+
     tool_names: list[str] = []
     workspace_roots: list[pathlib.Path] = []
     for provider_config in sorted(provider_configs, key=lambda item: item.provider_id):
@@ -1480,11 +1828,25 @@ def _fins_wait_adapter_registry_from_provider_configs(
         )
     if not tool_names:
         return None
-    workspace_root = _single_fins_workspace_root(workspace_roots)
-    return build_fins_wait_adapter_registry(
-        workspace_root=workspace_root,
+    return _FinsAwaitingRegistryInputs(
         tool_names=tuple(tool_names),
+        workspace_root=_single_fins_workspace_root(workspace_roots),
     )
+
+
+def _require_distinct_fins_awaiting_tool_names(tool_names: Sequence[str]) -> None:
+    """校验 Fins awaiting registry 不含重复工具名。
+
+    :param tool_names: 待绑定的 Fins awaiting 工具名。
+    :returns: ``None``。
+    :raises ValueError: 存在重复工具名时抛出。
+    """
+
+    seen: set[str] = set()
+    for tool_name in tool_names:
+        if tool_name in seen:
+            raise ValueError(f"duplicate Fins wait adapter binding: {tool_name}")
+        seen.add(tool_name)
 
 
 def _fins_awaiting_tool_name_from_provider_config(
