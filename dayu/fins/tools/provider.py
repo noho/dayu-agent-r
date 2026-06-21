@@ -26,7 +26,6 @@ _VERSION_REF: Final[str] = "fins-read-tools-provider-v1"
 _SOURCE_ID: Final[str] = "dayu.fins.tools.provider"
 _CONFIG_WORKSPACE_ROOT_FIELD: Final[str] = "workspace_root"
 _CONFIG_LIMITS_FIELD: Final[str] = "limits"
-_CONFIG_INCLUDE_READ_TOOLS_FIELD: Final[str] = "include_read_tools"
 
 
 def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
@@ -36,26 +35,13 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         spec: ToolsDiscovery 传入的 provider 显式配置。
 
     Returns:
-        provider 输出；read tools 关闭时返回空工具集。
+        provider 输出，包含九个 Fins read tool definitions。
 
     Raises:
         ValueError: provider config 非法时抛出。
     """
 
-    include_read_tools = _parse_bool_default(
-        spec.config,
-        _CONFIG_INCLUDE_READ_TOOLS_FIELD,
-        default=True,
-    )
     source_ref = _source_ref()
-    if not include_read_tools:
-        return ToolsDiscoveryProviderOutput(
-            provider_id=_PROVIDER_ID,
-            version_ref=_VERSION_REF,
-            source_refs=(source_ref,),
-            definitions=(),
-        )
-
     limits = _parse_limits(spec.config)
     workspace_root = parse_fins_workspace_root_config(spec.config)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
@@ -191,34 +177,6 @@ def _positive_int(
         return default
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"fins provider limits.{field_name} must be a positive integer")
-    return value
-
-
-def _parse_bool_default(
-    config: Mapping[str, JsonValue],
-    field_name: str,
-    *,
-    default: bool,
-) -> bool:
-    """解析可选布尔配置。
-
-    Args:
-        config: provider 自有 JSON 配置。
-        field_name: 字段名。
-        default: 缺省值。
-
-    Returns:
-        解析后的布尔值。
-
-    Raises:
-        ValueError: 字段存在但不是布尔值时抛出。
-    """
-
-    value = config.get(field_name)
-    if value is None:
-        return default
-    if not isinstance(value, bool):
-        raise ValueError(f"fins provider config.{field_name} must be boolean")
     return value
 
 

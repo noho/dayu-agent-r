@@ -1606,7 +1606,6 @@ def _write_split_fins_provider_overlay(
                 "enabled": True,
                 "config": {
                     "workspace_root": str(workspace_root),
-                    "include_read_tools": True,
                     "limits": {},
                 },
             },

@@ -108,7 +108,7 @@ Fins 与其它层的稳定边界如下：
 - `get_financial_statement`
 - `query_xbrl_facts`
 
-`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须在 provider config 中提供绝对 `workspace_root`；`include_read_tools=false` 时返回空工具集且不解析 `workspace_root`。
+`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须在 provider config 中提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
 
 当前 read tools 名称为：
 
@@ -663,7 +663,7 @@ SecProcessor
 
 ### Workspace root 与 provider fail fast
 
-四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 在 `include_read_tools=false` 时允许不解析 workspace；upload provider 在 `allowed_upload_roots` 为空时不注册上传工具，字段类型非法或包含相对路径时仍 fail fast。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 在 `allowed_upload_roots` 为空时不注册上传工具，字段类型非法或包含相对路径时仍 fail fast。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
 
 ### Storage repository boundary
 

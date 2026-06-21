@@ -144,10 +144,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | accepted-slice |
-| implementation status | WU-TOOLS-01-F03-R4 Slice 1 implementation completed by AgentCodex and passed AgentMiMo / AgentDS code review. Controller accepted DS-F01 as a small test hardening fix, added direct tests for Fins `workspace_root` error boundaries, and verified `pytest tests/service/test_host_assembly.py -q` plus `pyright dayu tests utils`. Awaiting accepted slice commit. |
+| implementation status | WU-TOOLS-01-F03-R4 Slice 3 implementation completed by AgentCodex and passed AgentMiMo / AgentDS code review with no blocking findings. Controller reran affected pytest plus pyright successfully. Awaiting accepted slice commit. |
 | active work unit | WU-TOOLS-01-F03-R4 |
 | default next work unit | WU-TOOLS-01-F03-R4 |
-| next entry point | Commit accepted WU-TOOLS-01-F03-R4 Slice 1 changes, then continue the next implementation slice from the accepted plan. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
+| next entry point | Commit accepted WU-TOOLS-01-F03-R4 Slice 3 changes, then continue Slice 4 from the accepted plan. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -210,7 +210,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F03-R4 | accepted-slice | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 1 implementation and code review passed; accepted slice commit is next. |
+| WU-TOOLS-01-F03-R4 | accepted-slice | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 3 implementation and code review passed; accepted slice commit is next. |
 | WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -237,7 +237,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation 已完成，Slice 1 code review passed，当前进入 accepted slice commit gate。
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review 已完成，当前进入 Slice 3 accepted slice commit gate。
 
 Plan artifact:
 
@@ -327,6 +327,49 @@ Controller Slice 1 code-review judgment:
 Slice 1 code-review fix validation:
 
 - `pytest tests/service/test_host_assembly.py -q`: `51 passed`, 3 upstream `edgar` deprecation warnings
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
+
+Accepted Slice 1 commit:
+
+- `c785f218` (`gateflow: accept WU-TOOLS-01-F03-R4 slice 1`)
+
+Slice 2 controller closure:
+
+- `closed-covered-by-slice-1`：Accepted Slice 1 commit `c785f218` already implemented Service effective Fins workspace path resolution, `_effective_fins_workspace_root_config_value(...)`, wait adapter construction through the same effective provider config tuple, packaged `"workspace/"` resolution tests, raw config immutability tests, and direct error-boundary tests. No separate Slice 2 implementation dispatch is needed; next implementation slice is Slice 3.
+
+Slice 3 implementation artifact:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice3-implementation-codex.md` by AgentCodex
+
+Slice 3 implementation validation:
+
+- `pytest tests/fins/test_fins_storage_provider.py tests/fins/test_fins_ingestion_tools.py tests/tools/test_combined_tools_acceptance.py -q`: `77 passed`, 3 upstream `edgar` deprecation warnings
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
+- `rg -n "include_read_tools|_CONFIG_INCLUDE_READ_TOOLS_FIELD|_parse_bool_default" -g '*.py' dayu tests utils`: no production or test Python references
+
+Slice 3 code review focus:
+
+- Verify `dayu/fins/tools/provider.py` no longer has any internal read-provider disable path and enabled provider always requires explicit absolute `workspace_root`, parses limits, builds `DefaultFinsRuntime`, and returns exactly nine read tool definitions.
+- Verify deleting the explicit `tests/runtime/test_config_loader.py` string assertion for `include_read_tools` is acceptable because Slice 3 completion requires no production or test code references to that removed field, while Slice 1 already asserted packaged config cleanup.
+- Verify minimal updates to `dayu/fins/README.md` and `tests/README.md` are required by AGENTS README triggers and are not an uncontrolled docs-slice overrun; stale `dayu/config/README.md` content remains intentionally deferred to the later docs slice.
+- Verify remaining `include_read_tools` grep hits are only historical plans/review artifacts, current WU control/plan text, or deferred docs content; no active production/test Python path still consumes the field.
+
+Slice 3 code review artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice3-code-review-mimo.md` by AgentMiMo, verdict `pass`, blocking findings `0`
+- `docs/reviews/wu-tools-01-f03-r4-slice3-code-review-ds.md` by AgentDS, verdict `pass`, blocking findings `0`
+
+Controller Slice 3 code-review judgment:
+
+- `accepted`：AgentMiMo and AgentDS both confirmed the read provider no longer has an `include_read_tools` branch, enabled provider parses limits / absolute workspace root, creates `DefaultFinsRuntime`, validates definitions, and returns exactly nine read tools.
+- `accepted`：Deleting the explicit `tests/runtime/test_config_loader.py` string assertion for `include_read_tools` is acceptable. Slice 1 already covered packaged config cleanup, and Slice 3 completion requires no production/test Python references to the removed field.
+- `accepted`：Minimal `dayu/fins/README.md` and `tests/README.md` updates are required by AGENTS README triggers and directly match the changed Fins read provider semantics.
+- `deferred-with-owner`：`dayu/config/README.md` still contains old config text; owner is WU-TOOLS-01-F03-R4 Slice 6 docs synchronization.
+- `deferred-with-owner`：DS noted non-string / blank-string `workspace_root` provider parse boundaries are not directly tested; existing guard covers them and severity is low. Owner is Slice 7 final validation if broader provider parse boundary hardening is still needed.
+
+Slice 3 controller validation:
+
+- `pytest tests/fins/test_fins_storage_provider.py tests/fins/test_fins_ingestion_tools.py tests/tools/test_combined_tools_acceptance.py tests/runtime/test_config_loader.py -q`: `118 passed`, 3 upstream `edgar` deprecation warnings
 - `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
 
 当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。

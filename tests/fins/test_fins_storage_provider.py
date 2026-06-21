@@ -719,20 +719,18 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
         assert "cancellation_token" not in required
 
 
-def test_fins_provider_can_disable_read_tools_without_workspace_root(tmp_path: Path) -> None:
-    """关闭 read tools 时 provider 不应解析 workspace_root。"""
+def test_fins_read_provider_requires_workspace_root_when_enabled(tmp_path: Path) -> None:
+    """启用 read provider 时必须显式提供 workspace_root。"""
 
-    result = discover_tools(
-        _spec(
-            tmp_path,
-            extra_config={
-                "workspace_root": None,
-                "include_read_tools": False,
-            },
+    with pytest.raises(ValueError, match="workspace_root"):
+        discover_tools(
+            _spec(
+                tmp_path,
+                extra_config={
+                    "workspace_root": None,
+                },
+            )
         )
-    )
-
-    assert result.definitions == ()
 
 
 def test_list_documents_executes_through_current_tool_runtime(tmp_path: Path) -> None:
@@ -1155,7 +1153,6 @@ def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
         enabled=True,
         config={
             "workspace_root": "workspace/fins",
-            "include_read_tools": True,
             "limits": {},
         },
     )
@@ -1318,7 +1315,6 @@ def _spec(
 
     config: dict[str, JsonValue] = {
         "workspace_root": str(workspace_root),
-        "include_read_tools": True,
         "limits": {
             "search_document_max_items": 10,
             "list_documents_max_items": 20,

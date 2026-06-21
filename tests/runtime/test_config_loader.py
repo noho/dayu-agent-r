@@ -385,7 +385,6 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert read_provider.import_path == "dayu.fins.tools.provider:discover_tools"
     assert read_provider.enabled is True
     assert read_provider.config["workspace_root"] == "workspace/"
-    assert "include_read_tools" not in read_provider.config
     assert "include_ingestion_tools" not in read_provider.config
     assert read_provider.config["limits"] == {
         "processor_cache_max_entries": 128,
