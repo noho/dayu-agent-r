@@ -15,8 +15,6 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_outcome import ToolCancelledOutcome
-from dayu.contracts.tool_result import ToolResultFailure, ToolResultMeta, ToolResultSuccess
 from dayu.contracts.tool_await import ToolAwaitSpec
 from dayu.host._event_payload import (
     attempt_suspended_payload,
@@ -86,6 +84,18 @@ from dayu.host.durable.state import (
     WorkerKind,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.wait_resolution_digest import (
+    WAIT_RESOLUTION_OUTCOME_KIND_CANCELLED as _TOOL_FACT_KIND_CANCELLED,
+    WAIT_RESOLUTION_OUTCOME_KIND_COMPLETED as _TOOL_FACT_KIND_COMPLETED,
+    WAIT_RESOLUTION_OUTCOME_KIND_FAILED as _TOOL_FACT_KIND_FAILED,
+    WAIT_RESOLUTION_OUTCOME_KIND_LOST as _TOOL_FACT_KIND_LOST,
+    resolve_wait_outcome_json,
+    resolve_wait_cancelled_result_json as _tool_cancelled_json,
+    resolve_wait_completed_result_json as _tool_success_json,
+    resolve_wait_failed_result_json as _tool_failure_json,
+    resolve_wait_lost_result_json as _tool_lost_json,
+    wait_resolution_digest,
+)
 from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
@@ -119,10 +129,6 @@ _RESUME_ATTEMPT_ID_PREFIX = "attempt-resume-"
 _RESUME_EXECUTION_ID_PREFIX = "execution-resume-"
 _RESUME_DISPATCH_ID_PREFIX = "dispatch-resume-"
 _TOOL_FACT_ID_PREFIX = "tool-fact-wait-"
-_TOOL_FACT_KIND_COMPLETED = "completed"
-_TOOL_FACT_KIND_FAILED = "failed"
-_TOOL_FACT_KIND_CANCELLED = "cancelled"
-_TOOL_FACT_KIND_LOST = "lost"
 _WAIT_RESOLUTION_SOURCE = "host.resolve_wait"
 _WAIT_TERMINAL_REASON_FAILED = "wait_result_failed"
 _WAIT_TERMINAL_REASON_LOST = "wait_result_lost"
@@ -1137,12 +1143,10 @@ def _wait_resolution_digest(wait_id: str, request: ResolveWaitRequest) -> str:
     :returns: Host canonical sha256 digest。
     """
 
-    return sha256_digest_json(
-        {
-            "wait_id": wait_id,
-            "idempotency_key": request.idempotency_key,
-            "outcome": _resolve_outcome_json(request.outcome),
-        }
+    return wait_resolution_digest(
+        wait_id,
+        request.idempotency_key,
+        request.outcome,
     )
 
 
@@ -1173,7 +1177,7 @@ def _wait_late_rejection_digest(
             "rejection_reason": rejection_reason.value,
             "outcome_kind": payload_plan.resolution_kind,
             "outcome_digest": payload_plan.outcome_digest,
-            "outcome": _resolve_outcome_json(request.outcome),
+            "outcome": resolve_wait_outcome_json(request.outcome),
         }
     )
 
@@ -1522,150 +1526,6 @@ def _event_payload_digest(payload_plan: _WaitResolutionPayloadPlan) -> str | Non
     if payload_plan.payload_ref is None:
         return None
     return payload_plan.payload_ref.payload_digest
-
-
-def _resolve_outcome_json(outcome: ResolveWaitOutcome) -> JsonValue:
-    """把 resolve wait outcome 投影为 digest JSON。
-
-    :param outcome: resolve wait outcome。
-    :returns: JSON 值。
-    :raises TypeError: outcome 非封闭联合成员时抛出。
-    """
-
-    if isinstance(outcome, ResolveWaitCompletedOutcome):
-        return {
-            "kind": _TOOL_FACT_KIND_COMPLETED,
-            "result": _tool_success_json(outcome.result),
-            "payload_ref": _host_payload_ref_json(outcome.payload_ref),
-        }
-    if isinstance(outcome, ResolveWaitFailedOutcome):
-        return {
-            "kind": _TOOL_FACT_KIND_FAILED,
-            "result": _tool_failure_json(outcome.result),
-            "payload_ref": _host_payload_ref_json(outcome.payload_ref),
-        }
-    if isinstance(outcome, ResolveWaitCancelledOutcome):
-        return {
-            "kind": _TOOL_FACT_KIND_CANCELLED,
-            "result": _tool_cancelled_json(outcome.result),
-            "payload_ref": _host_payload_ref_json(outcome.payload_ref),
-        }
-    if isinstance(outcome, ResolveWaitLostOutcome):
-        return {
-            "kind": _TOOL_FACT_KIND_LOST,
-            "result": _tool_lost_json(outcome),
-        }
-    raise TypeError("unsupported resolve wait outcome")
-
-
-def _tool_success_json(result: ToolResultSuccess) -> JsonValue:
-    """把工具成功结果投影为 JSON。
-
-    :param result: 工具成功结果。
-    :returns: JSON mapping。
-    """
-
-    return {
-        "ok": result.ok,
-        "value": result.value,
-        "meta": _tool_result_meta_json(result.meta),
-    }
-
-
-def _tool_failure_json(result: ToolResultFailure) -> JsonValue:
-    """把工具失败结果投影为 JSON。
-
-    :param result: 工具失败结果。
-    :returns: JSON mapping。
-    """
-
-    return {
-        "ok": result.ok,
-        "error": result.error,
-        "message": result.message,
-        "hint": result.hint,
-        "meta": _tool_result_meta_json(result.meta),
-    }
-
-
-def _tool_cancelled_json(result: ToolCancelledOutcome) -> JsonValue:
-    """把工具级取消结果投影为 JSON。
-
-    :param result: 工具级取消结果。
-    :returns: JSON mapping。
-    """
-
-    return {
-        "reason": result.reason,
-        "message": result.message,
-        "hint": result.hint,
-        "meta": _tool_result_meta_json(result.meta),
-    }
-
-
-def _tool_lost_json(outcome: ResolveWaitLostOutcome) -> JsonValue:
-    """把 lost 等待结果投影为 JSON。
-
-    :param outcome: lost outcome。
-    :returns: JSON mapping。
-    """
-
-    return {
-        "reason_code": outcome.reason_code,
-        "message": outcome.message,
-        "provider_status_ref": _provider_status_ref_json(
-            outcome.provider_status_ref
-        ),
-    }
-
-
-def _tool_result_meta_json(meta: ToolResultMeta | None) -> JsonValue:
-    """把工具结果 meta 投影为 JSON。
-
-    :param meta: 工具结果 meta。
-    :returns: JSON 值。
-    """
-
-    if meta is None:
-        return None
-    return {
-        "tool_name": meta.tool_name,
-        "started_at": meta.started_at.isoformat(),
-        "finished_at": meta.finished_at.isoformat(),
-    }
-
-
-def _host_payload_ref_json(payload_ref: HostPayloadRef | None) -> JsonValue:
-    """把 Host payload 引用投影为 JSON。
-
-    :param payload_ref: payload 引用或 ``None``。
-    :returns: JSON 值。
-    """
-
-    if payload_ref is None:
-        return None
-    return {
-        "payload_ref": payload_ref.payload_ref,
-        "payload_digest": payload_ref.payload_digest,
-    }
-
-
-def _provider_status_ref_json(
-    provider_status_ref: WaitProviderStatusRef | None,
-) -> JsonValue:
-    """把 provider 状态引用投影为 JSON。
-
-    :param provider_status_ref: provider 状态引用或 ``None``。
-    :returns: JSON 值。
-    """
-
-    if provider_status_ref is None:
-        return None
-    return {
-        "adapter_key": provider_status_ref.adapter_key.value,
-        "status_ref": provider_status_ref.status_ref,
-        "status_digest": provider_status_ref.status_digest,
-    }
 
 
 def _wait_created_event_ref(wait_record: WaitRecordRow) -> Mapping[str, JsonValue]:
