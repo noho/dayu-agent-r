@@ -2,7 +2,7 @@
 
 ## Status
 
-Final closeout is blocked on external issue comment authorization.
+Final closeout pass is complete.
 
 ## Completed Gates
 
@@ -18,6 +18,8 @@ Final closeout is blocked on external issue comment authorization.
   - `ecf83c5f` (`gateflow: accept PR review for WU-TOOLS-01-F03-R4`)
 - Final push after PR review:
   - pushed `ecf83c5f` to `github/phase/wu-tools-01-f03-r4`
+- Issue closeout comment:
+  - posted to GitHub issue-133 at https://github.com/noho/dayu-agent-r/issues/133#issuecomment-4760536817
 
 ## What Changed
 
@@ -51,4 +53,4 @@ Final closeout is blocked on external issue comment authorization.
 
 ## Blocking Item
 
-Final closeout pass still requires posting a closeout comment to GitHub issue-133. External issue comments require user authorization, so the work unit is stopped at this authorization point.
+No remaining closeout blocker. The work unit is at final-closeout-pass and awaits user merge / PR disposition for draft PR 160.
