@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final-closeout-pass |
-| implementation status | WU-TOOLS-01-F01-02-R1 / GitHub Issue #129 final closeout completed. Draft PR #162 remains open/draft; issue closeout comment posted at https://github.com/noho/dayu-agent-r/issues/129#issuecomment-4762165431. PR body uses `Closes #129`, so merge will auto-close the issue. |
-| active work unit | WU-TOOLS-01-F01-02-R1 |
+| gate | accepted plan commit |
+| implementation status | WU-WAIT-01 / GitHub Issue #89 plan re-review passed; accepted plan commit pending. |
+| active work unit | WU-WAIT-01 |
 | default next work unit | WU-WAIT-01 |
-| next entry point | Await maintainer/user handling of draft PR #162. After PR #162 is merged, sync `main`, then start the next phaseflow run from WU-WAIT-01 / GitHub Issue #89 unless this control doc is updated first. Do not mark ready, merge, close GitHub Issue #129, request reviewers, or delete branch without explicit authorization. |
+| next entry point | Accepted plan commit gate: create local commit `gateflow: accept plan for WU-WAIT-01`, then advance to implementation Slice 1. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
@@ -1559,7 +1559,27 @@ GitHub Issue #20 当前仍为 OPEN，且 issue body 已对齐 WU-CTX-01 当前 s
 
 ### 状态
 
-research 已写入 GitHub Issue #89；本条后续按 callback adapter -> common `resolve_wait` pipeline 的方向实施。Claude Code 的 background subagent / lifecycle completion 行为可作为参考；Codex 具备 subagent orchestration，但公开 callback / hook surface 不应被假设为稳定生产 primitive。
+GitHub Issue #89 当前为 OPEN。research 已写入 issue；本条后续按 callback adapter -> common `resolve_wait` pipeline 的方向实施。Claude Code 的 background subagent / lifecycle completion 行为可作为参考；Codex 具备 subagent orchestration，但公开 callback / hook surface 不应被假设为稳定生产 primitive。
+
+2026-06-21 goal confirmation 已完成。PR #162 已 merge，本地 `main` 已包含 WU-TOOLS-01-F01-02-R1 two-phase activation 前置能力。代码核对显示 `resolve_wait` 已覆盖幂等重放、同 key 不同 outcome conflict、late result rejection、completed / failed / cancelled / lost outcome 和 poller 共用路径；`dayu/host/wait_adapter.py` 当前明确不实现 callback endpoint。Plan artifact 已创建：`docs/host/wu-wait-01-callback-endpoint-auth-replay-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260621-220834.md` 与 `docs/reviews/plan-review-20260621-221033.md`；controller adjudication 为 `docs/reviews/wu-wait-01-plan-review-controller-adjudication.md`。Controller 接受全部 material findings。Plan fix artifact 为 `docs/reviews/wu-wait-01-plan-fix-codex.md`，记录 F01-F09 已全部修复。Plan re-review artifacts 为 `docs/reviews/plan-review-20260621-222106.md` 与 `docs/reviews/plan-review-20260621-222241.md`；controller adjudication 为 `docs/reviews/wu-wait-01-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，F01-F09 最终状态均为已修复。本条当前进入 accepted plan commit gate。
+
+### 设计与代码核对
+
+- `docs/host/design.md` 规定 Host 是 Session / Run / Attempt / EventLog / wait governance 真源；callback transport 不得拥有 Host durable state transition。
+- `docs/engine/design.md` 规定 Engine 不持久化 wait record，不等待外部长事务完成；恢复由调用方构造新 `AgentRunRequest`，Host 负责等待治理。
+- `dayu/host/api.py` 已有 `WaitResolutionSource.CALLBACK`，但缺少 callback adapter 的 typed envelope、auth source、payload digest 校验和错误分类契约。
+- `dayu/host/waiting.py` 的 `DefaultHostResolveWaitService.resolve_wait(...)` 是当前 wait completion 的状态迁移 owner；callback 必须调用该路径，不得直接 append EventLog 或修改 Run / Attempt / wait record。
+- `dayu/host/wait_adapter.py` 已有 poller adapter 和 activation adapter 边界，模块 docstring 明确当前不实现 callback endpoint；callback adapter 应与 poller/manual converge 到同一 `ResolveWaitRequest`。
+- `tests/host/test_resolve_wait_command.py` 已覆盖 resolve wait replay、idempotency conflict、failed/lost terminal、cancelled outcome 和 late rejection；plan 应复用这些测试边界，不重复设计状态机。
+
+### Plan Gate 约束
+
+- Plan 必须明确 callback endpoint 的形式：Host core 提供框架无关 typed callback contract / adapter；Service / Web 层负责真实 HTTP route、header/body 读取和 transport status mapping。不得把 FastAPI、Flask 或其它 HTTP framework 放入 Host core。
+- Plan 必须定义 callback request envelope 的字段语义：auth source / claims、wait id、idempotency key、payload digest、observed/completed timestamp、typed outcome refs/payload，以及哪些字段属于 transport 诊断而不是 Host durable truth。
+- Plan 必须说明认证失败、malformed payload、payload digest mismatch、unknown wait id、cancelled/lost late callback、同 key 不同 outcome digest conflict、successful replay 分别如何映射为 typed result / HostApiError / diagnostic / HTTP adapter status。
+- Plan 必须证明 endpoint adapter 不直接写 EventLog、Run、Attempt 或 wait record；所有 terminal state changes 只能通过 `resolve_wait`。
+- Plan 必须控制 slice 成本。小型同一语义 cleanup 默认 1-3 个 implementation slices；如果超过 3 个 slices，必须证明不能按 callback contract / adapter mapping / Service route or tests 的闭环合并。
+- Plan 不得实现 #90 production poller loop、#92 physical cancel / revoke / abandon、Claude Code / Codex UI parity、Engine awaiting model 变更或新的 public wait lifecycle。
 
 ### 目标
 
