@@ -136,6 +136,16 @@ slice 切分必须同时满足三个约束：
 
 slice 不是按代码行数切，也不是只要不超过上下文窗口就算合理。好的 slice 应当有明确输入、输出、non-goals、allowed files / modules、验证命令、issue handoff 和后续 slice 可依赖的稳定交付物。
 
+同时，slice 也不得按模块数量、文件数量或 reviewer ownership 机械拆分。对代码量较小、语义上属于同一个 contract cleanup / config cleanup / schema cleanup 的 work unit，即使会同时触及配置、runtime、Service composition、provider、scene manifest、测试和 README，也应优先合并为 2-3 个可验证闭环 slices，而不是每个模块单独切片。只有当某部分存在独立失败 / 回滚风险、需要独立设计裁决、会阻塞后续代码导入，或 review 上下文确实无法承载时，才继续拆分。
+
+小型跨模块 cleanup 的默认切分上限应是：
+
+- contract / config / composition slice：稳定公共语义、typed config、composition root effective config、旧字段拒绝与基础测试；
+- provider / behavior slice：业务 provider 行为、tool schema、存储 / 权限边界、provider 投影测试；
+- scene / docs / final validation slice：默认 scene 暴露面、README / design 同步、stale-field grep、pyright 与受影响测试矩阵。
+
+如果 plan 提出超过 3 个 implementation slices，必须在 plan 中显式说明为什么不能按上述闭环合并；仅以“涉及多个文件 / 多个模块 / 多个 owner”为理由不充分。总控裁决时应同时评估 gate 成本：每增加一个 slice 都会增加 implementation artifact、双路 review、controller 裁决、测试复跑和 accepted commit 成本；当流程成本明显超过实现风险时，应倾向合并 slice。
+
 如果一个 work unit 的自然闭环超过单个 implementation agent 的上下文容量，应优先按依赖边界拆成多个 slices，并在 plan 中说明前后 slice 的 contract handoff。如果某个 slice 需要跨模块修改，plan 必须解释为什么这是同一个可验证闭环，而不是拆分失败。
 
 ## 当前状态
@@ -143,11 +153,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | PR review |
-| implementation status | WU-TOOLS-01-F03-R4 draft PR 160 created from branch `phase/wu-tools-01-f03-r4` to `main` and pushed to `github`. Current gate is PR review. |
+| gate | accepted PR review commit |
+| implementation status | WU-TOOLS-01-F03-R4 PR review completed. AgentMiMo verdict `pass`; AgentDS verdict `pass-with-findings` with one low finding deferred to existing Host / policy owner. No current PR fix or re-review is required. |
 | active work unit | WU-TOOLS-01-F03-R4 |
 | default next work unit | WU-TOOLS-01-F03-R4 |
-| next entry point | Dispatch WU-TOOLS-01-F03-R4 PR review for draft PR 160 to AgentMiMo / AgentDS, then adjudicate findings. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
+| next entry point | Commit WU-TOOLS-01-F03-R4 PR review artifacts and controller judgment, then push final PR review pass commit. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -213,7 +223,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F03-R4 | PR-review | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Draft PR 160 created; PR review is next. |
+| WU-TOOLS-01-F03-R4 | accepted-PR-review-commit | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. PR review passed; accepted PR review commit is next. |
 | WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -240,7 +250,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review / accepted slice commit 已完成，Slice 7 final validation 已完成，aggregate deepreview 已完成且无阻塞 finding，accepted deepreview commit 已创建，ready-to-open-draft-PR gate 已完成，push gate 已完成，draft PR 160 已创建，当前进入 PR review gate。
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review / accepted slice commit 已完成，Slice 7 final validation 已完成，aggregate deepreview 已完成且无阻塞 finding，accepted deepreview commit 已创建，ready-to-open-draft-PR gate 已完成，push gate 已完成，draft PR 160 已创建，PR review 已完成且无需当前修复，当前进入 accepted PR review commit gate。
 
 Plan artifact:
 
@@ -600,6 +610,19 @@ Draft PR:
 - Base: `main`
 - Draft status: draft
 - Issue association: PR body uses `Closes #133` and lists deferred owners.
+
+PR review artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-pr-review-mimo.md` by AgentMiMo, verdict `pass`, blocking findings `0`
+- `docs/reviews/wu-tools-01-f03-r4-pr-review-ds.md` by AgentDS, verdict `pass-with-findings`, blocking findings `0`
+
+Controller PR review judgment:
+
+- `accepted`：AgentMiMo verified PR 160 metadata, body, issue-133 completion, residual owners, diff scope, validation claims, and stale-field grep; no issues found.
+- `deferred-with-owner`：AgentDS F01 notes `start_fins_upload.files` description no longer carries path authorization semantics. This is intentional for the current WU because tool-level upload allowlist was removed and local file-read authorization is explicitly deferred to Host / policy design. The current schema truthfully states the active tool boundary: files must be existing non-empty regular files. Future authorization wording belongs to `WU-TOOLS-01-F03-R4-POLICY-R1`, not to a local tool-provider workaround.
+- `accepted`：PR body `Closes #133` is correct because all six issue-133 requested Tools Discovery spec changes are implemented, tested, and documented. Deferred risks are separately owned and do not leave issue-133 partially implemented.
+- `accepted`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` remains a non-WU residual owned by web smoke / CI; it is listed in PR body and control doc, and does not block PR 160.
+- `accepted`：User-requested process improvement was written into the Slice 切分原则 section: small cross-module cleanup work should default to 2-3 semantic slices and any plan exceeding 3 implementation slices must justify why the work cannot be merged into those verification loops.
 
 当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。
 
