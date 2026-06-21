@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted plan commit |
-| implementation status | WU-TOOLS-01-F01-02-R1 / GitHub Issue #129 plan re-review passed with all accepted findings fixed and no new blocking findings; accepted plan is ready for local checkpoint commit. |
+| gate | implementation |
+| implementation status | WU-TOOLS-01-F01-02-R1 / GitHub Issue #129 accepted plan commit `478f5f77` created; entering Slice 1 `Host accepted-wait activation hook` implementation. |
 | active work unit | WU-TOOLS-01-F01-02-R1 |
 | default next work unit | WU-TOOLS-01-F01-02-R1 |
-| next entry point | Create accepted plan commit for WU-TOOLS-01-F01-02-R1, then enter implementation gate for Slice 1 `Host accepted-wait activation hook`. |
+| next entry point | Dispatch implementation gate for Slice 1 `Host accepted-wait activation hook` to AgentCodex. Expected artifact: `docs/reviews/wu-tools-01-f01-02-r1-slice1-implementation-codex.md`. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
@@ -232,7 +232,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F01-02-R1 | accepted-plan | Awaiting external job two-phase activation | GitHub Issue #129 | Plan re-review passed；下一步 accepted plan commit，然后进入 Slice 1 implementation。当前目标是 Host 支持 accepted-wait 后 activation hook，且 Fins download / preprocess / upload awaiting tools 本轮直接迁移到 prepare / activate；禁止过度设计。 |
+| WU-TOOLS-01-F01-02-R1 | implementation | Awaiting external job two-phase activation | GitHub Issue #129 | Accepted plan commit `478f5f77` 已创建；当前进入 Slice 1 implementation。当前目标是 Host 支持 accepted-wait 后 activation hook，且 Fins download / preprocess / upload awaiting tools 本轮直接迁移到 prepare / activate；禁止过度设计。 |
 | WU-TOOLS-AWAIT-FANOUT-01 | completed | Host ToolRuntime awaiting fanout governance hardening | GitHub Issue #111 / PR #161 | PR 161 merged on 2026-06-21; not an active implementation entry point. |
 | WU-TOOLS-01-F03-R4 | completed | Tools Discovery spec semantics cleanup | GitHub Issue #133 / PR #160 | PR 160 merged on 2026-06-21 and issue #133 is closed; not an active implementation entry point. |
 | WU-ENG-02-R1 | completed | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 / PR #159 | PR 159 merged on 2026-06-20 and issue #63 is closed; not an active WU for this branch. |
@@ -262,7 +262,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #129 当前为 OPEN。本条来自 `WU-TOOLS-01-F01-02` residual risk：Fins awaiting external job 当前存在 submit-before-accept 窗口。PR 161 / WU-TOOLS-AWAIT-FANOUT-01 已 merge，#111 的单 owner / fanout 语义已可作为本条设计依据。用户在 2026-06-21 goal confirmation 中确认本条进入 plan gate，并补充裁决：本 WU 必须一次到位实现 Host two-phase activation 支持，并让当前 Fins download / preprocess / upload awaiting tools 直接使用 two-phase；禁止引入过度设计。Plan artifact 为 `docs/host/wu-tools-01-f01-02-r1-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260621-180827.md` 与 `docs/reviews/plan-review-20260621-181350.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/plan-review-20260621-182034.md` 与 `docs/reviews/plan-review-20260621-182047.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复，当前进入 accepted plan commit gate。
+GitHub Issue #129 当前为 OPEN。本条来自 `WU-TOOLS-01-F01-02` residual risk：Fins awaiting external job 当前存在 submit-before-accept 窗口。PR 161 / WU-TOOLS-AWAIT-FANOUT-01 已 merge，#111 的单 owner / fanout 语义已可作为本条设计依据。用户在 2026-06-21 goal confirmation 中确认本条进入 plan gate，并补充裁决：本 WU 必须一次到位实现 Host two-phase activation 支持，并让当前 Fins download / preprocess / upload awaiting tools 直接使用 two-phase；禁止引入过度设计。Plan artifact 为 `docs/host/wu-tools-01-f01-02-r1-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260621-180827.md` 与 `docs/reviews/plan-review-20260621-181350.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/plan-review-20260621-182034.md` 与 `docs/reviews/plan-review-20260621-182047.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复。Accepted plan commit 为 `478f5f77`，当前进入 Slice 1 implementation gate。
 
 ### 设计与代码核对
 
