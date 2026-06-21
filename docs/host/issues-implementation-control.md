@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | planning |
-| implementation status | WU-TOOLS-AWAIT-FANOUT-01 / GitHub Issue #111 goal confirmed on branch `phase/wu-tools-await-fanout-01`; planning must preserve the current lightweight awaiting implementation and must not reintroduce a heavy durable await design. |
+| gate | accepted plan commit |
+| implementation status | WU-TOOLS-AWAIT-FANOUT-01 / GitHub Issue #111 plan re-review passed with zero unfixed accepted findings and zero new blocking findings; accepted plan is ready for local checkpoint commit. |
 | active work unit | WU-TOOLS-AWAIT-FANOUT-01 |
 | default next work unit | WU-TOOLS-AWAIT-FANOUT-01 |
-| next entry point | Dispatch WU-TOOLS-AWAIT-FANOUT-01 plan gate to AgentCodex: produce a code-generation-ready plan that fixes duplicate awaiting owner / waiter fanout while preserving the thin current wait record model and lightweight Fins observation-handle direction. |
+| next entry point | Create accepted plan commit for WU-TOOLS-AWAIT-FANOUT-01, then enter implementation gate for slice `S1 轻量 awaiting cleanup terminal marker`. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #111 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -261,7 +261,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #111 当前为 OPEN。用户在 2026-06-21 裁决将本条作为工具调用治理执行正确性的默认下一步。当前状态为 `discussion-ready`：尚未形成 code-generation-ready plan；进入 plan gate 前必须先核对 Host 设计真源、Engine 工具调用边界、当前 ToolRuntime duplicate governance 实现、awaiting accept barrier、wait record ownership、RunInputBuilder resume material 和 #111 issue scope。
+GitHub Issue #111 当前为 OPEN。用户在 2026-06-21 裁决将本条作为工具调用治理执行正确性的默认下一步。Goal confirmation 已完成。Plan gate artifact 为 `docs/host/wu-tools-await-fanout-01-plan.md`。Plan review artifacts 为 `docs/reviews/wu-tools-await-fanout-01-plan-review-mimo.md` 与 `docs/reviews/wu-tools-await-fanout-01-plan-review-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-await-fanout-01-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-tools-await-fanout-01-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/wu-tools-await-fanout-01-plan-rereview-mimo.md` 与 `docs/reviews/wu-tools-await-fanout-01-plan-rereview-ds.md`，controller adjudication 为 `docs/reviews/wu-tools-await-fanout-01-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，0 个未修复 accepted finding，0 个新增 blocking finding。当前进入 accepted plan commit gate。
 
 ### 设计与代码核对
 
