@@ -167,23 +167,6 @@ class FinsIngestionWaitActivationAdapter:
 
     runtime: FinsObservationRuntime
 
-    @classmethod
-    def from_workspace_root(
-        cls, workspace_root: Path
-    ) -> "FinsIngestionWaitActivationAdapter":
-        """由 Fins workspace root 构造 activation adapter。
-
-        :param workspace_root: 已验证的绝对 Fins workspace root。
-        :returns: Fins ingestion activation adapter。
-        :raises ValueError: workspace root 非法时由 Fins runtime 构造抛出。
-        :raises OSError: Fins runtime 仓储初始化失败时抛出。
-        """
-
-        runtime = DefaultFinsRuntime.create(
-            workspace_root=workspace_root
-        ).get_ingestion_runtime()
-        return cls(runtime=runtime)
-
     def activate_accepted_wait(self, request: WaitActivationRequest) -> None:
         """激活 Host 已 durable accepted 的 Fins observation。
 
@@ -224,16 +207,14 @@ def build_fins_wait_adapter_registry(
 
 
 def build_fins_wait_activation_registry(
-    *, workspace_root: Path, tool_names: Sequence[str]
+    *, runtime: FinsObservationRuntime, tool_names: Sequence[str]
 ) -> WaitActivationRegistry:
     """为启用的 Fins awaiting tools 构造 Host activation registry。
 
-    生产 Service assembly 中，awaiting tool callable、poll adapter 与 activation
-    adapter 必须共享同一个 ``FinsIngestionRuntime`` 实例；本 standalone builder
-    只适用于由调用方自行保证 runtime 一致性的独立装配场景。
+    activation adapter 必须接收 awaiting tool callable 使用的同一个 runtime；
+    该 runtime 保存 process-local prepared observation，不能由 builder 自建。
 
-    :param workspace_root: 已验证的绝对 Fins workspace root；binding 本身不把
-        workspace 写入 Host durable wait record，但 factory 在装配期 fail fast。
+    :param runtime: Fins awaiting tool callable 使用的共享 observation runtime。
     :param tool_names: 本次 Service assembly 中由启用 provider 声明的 Fins
         awaiting 工具名；重复名称视为配置错误。
     :returns: Host wait activation registry。
@@ -241,10 +222,9 @@ def build_fins_wait_activation_registry(
         抛出。
     """
 
-    _require_absolute_workspace_root(workspace_root)
     # activation 由单个 adapter key 分发，tool_names 只用于装配期校验。
     _deterministic_tool_names(tool_names)
-    adapter = FinsIngestionWaitActivationAdapter.from_workspace_root(workspace_root)
+    adapter = FinsIngestionWaitActivationAdapter(runtime=runtime)
     return WaitActivationRegistry(
         (
             WaitActivationAdapterRegistration(

@@ -29,9 +29,8 @@ from dayu.fins.ingestion.observation_handle import FinsObservationRuntime
 from dayu.fins.ingestion.wait_adapter import (
     FINS_DOWNLOAD_AWAITING_TOOL_NAME,
     FINS_PREPROCESS_AWAITING_TOOL_NAME,
-    FINS_INGESTION_WAIT_ADAPTER_KEY,
     FINS_UPLOAD_AWAITING_TOOL_NAME,
-    FinsIngestionWaitActivationAdapter,
+    build_fins_wait_activation_registry,
     build_fins_wait_adapter_registry,
 )
 from dayu.fins.ingestion_runtime import FinsIngestionRuntime
@@ -51,7 +50,6 @@ from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.wait_adapter import (
-    WaitActivationAdapterRegistration,
     WaitActivationRegistry,
     WaitAdapterRegistry,
 )
@@ -1783,18 +1781,11 @@ def _fins_wait_activation_registry_from_provider_configs(
         raise ValueError("Fins wait activation registry requires shared runtime")
     if not isinstance(fins_awaiting_runtime, FinsIngestionRuntime):
         raise ValueError("Fins wait activation registry requires ingestion runtime")
-    _require_distinct_fins_awaiting_tool_names(registry_inputs.tool_names)
     # 生产路径中 awaiting tool callable、poll adapter 与 activation adapter
     # 必须共享同一个 runtime，避免 accepted activation 看不到工具准备的 observation。
-    return WaitActivationRegistry(
-        (
-            WaitActivationAdapterRegistration(
-                adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-                adapter=FinsIngestionWaitActivationAdapter(
-                    runtime=fins_awaiting_runtime
-                ),
-            ),
-        )
+    return build_fins_wait_activation_registry(
+        runtime=fins_awaiting_runtime,
+        tool_names=registry_inputs.tool_names,
     )
 
 
@@ -1832,21 +1823,6 @@ def _fins_awaiting_registry_inputs_from_provider_configs(
         tool_names=tuple(tool_names),
         workspace_root=_single_fins_workspace_root(workspace_roots),
     )
-
-
-def _require_distinct_fins_awaiting_tool_names(tool_names: Sequence[str]) -> None:
-    """校验 Fins awaiting registry 不含重复工具名。
-
-    :param tool_names: 待绑定的 Fins awaiting 工具名。
-    :returns: ``None``。
-    :raises ValueError: 存在重复工具名时抛出。
-    """
-
-    seen: set[str] = set()
-    for tool_name in tool_names:
-        if tool_name in seen:
-            raise ValueError(f"duplicate Fins wait adapter binding: {tool_name}")
-        seen.add(tool_name)
 
 
 def _fins_awaiting_tool_name_from_provider_config(

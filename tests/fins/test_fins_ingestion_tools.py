@@ -1482,17 +1482,20 @@ def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> N
         raise AssertionError("重复 Fins wait adapter binding 未失败")
 
 
-def test_fins_wait_activation_registry_binds_fins_adapter_key(tmp_path: Path) -> None:
-    """Fins activation registry 应使用与 poll adapter 相同的稳定 key。"""
+def test_fins_wait_activation_registry_binds_fins_adapter_key() -> None:
+    """Fins activation registry 应绑定稳定 key 并复用传入 runtime。"""
+
+    runtime = _FakeObservationRuntime(snapshots={})
 
     registry = build_fins_wait_activation_registry(
-        workspace_root=tmp_path.resolve(strict=False),
+        runtime=runtime,
         tool_names=(DOWNLOAD_TOOL_NAME, PREPROCESS_TOOL_NAME, UPLOAD_TOOL_NAME),
     )
 
     adapter = registry.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
 
     assert isinstance(adapter, FinsIngestionWaitActivationAdapter)
+    assert adapter.runtime is runtime
 
 
 def test_fins_wait_activation_adapter_activates_existing_resume_token() -> None:

@@ -840,6 +840,7 @@ async def test_service_fins_awaiting_wiring_uses_shared_runtime_for_activation(
         FINS_INGESTION_WAIT_ADAPTER_KEY
     )
     assert isinstance(activation_adapter, FinsIngestionWaitActivationAdapter)
+    assert activation_adapter.runtime is discovered_tools.fins_awaiting_runtime
     assert activation_adapter.runtime is callable_.runtime
 
     outcome = await callable_(
