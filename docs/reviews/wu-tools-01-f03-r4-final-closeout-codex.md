@@ -41,8 +41,7 @@ Final closeout pass is complete.
 
 ## Remaining Risks / Owners
 
-- `WU-TOOLS-01-F03-R4-POLICY-R1`: Future Host / policy design owns unified local file-read authorization if needed.
-- `WU-TOOLS-01-F03-R4-PATH-R1`: Future provider path-boundary hardening owns any stronger symlink policy.
+- `WU-TOOLS-01-F03-R4-PATH-R1`: Future Doc provider path-boundary hardening owns any symlink policy that should differ from current `Path.resolve()` semantics.
 - `WU-TOOLS-01-F03-R4-SCENE-R1`: Future scene manifest maintenance owns dynamic default-scene discovery hardening.
 - `WU-TOOLS-01-F03-R4-WEB-SMOKE-R1`: Web smoke / CI owner owns the stdout-vs-logging capture mismatch in `tests/tools/web/test_smoke_web_ci.py`.
 
